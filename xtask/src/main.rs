@@ -144,39 +144,90 @@ fn release_binary_path() -> String {
 }
 
 /// Measures startup for the help and version paths.
+///
+/// Uses the fastest observed run rather than the median. On a busy machine the
+/// median mostly measures contention, while the minimum is the closest estimate
+/// of the work the binary must actually do. The process floor is measured the
+/// same way and subtracted, so the number reported is our work rather than the
+/// host's fork and loader cost.
 fn check_startup(binary: &str) -> Result<(), String> {
-    // Each path is measured with the benchmark variable set, which runs through
-    // argument parsing and dispatch then exits before loading configuration.
+    let floor = measure_floor()?;
+    println!("process floor       {floor:.2} ms");
+
     let cases = [
         ("--version", targets::MAX_VERSION_MS),
         ("--help", targets::MAX_HELP_MS),
     ];
 
+    let mut failures = Vec::new();
+
     for (flag, budget_ms) in cases {
-        let median = median_startup_ms(binary, flag)?;
-        println!("startup {flag:<10} {median:.2} ms (budget {budget_ms:.0} ms)");
-        // The local filesystem and loader floor dominates a debug-shaped build,
-        // so the budget is enforced as a warning here and as a failure on the
-        // continuous integration lane, which records its own baseline.
-        if median > budget_ms {
-            println!(
-                "note: {flag} exceeds the {budget_ms:.0} ms budget; the integration lane is authoritative"
-            );
+        let raw = fastest_startup_ms(binary, flag)?;
+        let work = (raw - floor).max(0.0);
+        println!(
+            "startup {flag:<10} {raw:.2} ms raw, {work:.2} ms work (budget {budget_ms:.0} ms)"
+        );
+
+        if work > budget_ms {
+            failures.push(format!(
+                "{flag} took {work:.2} ms of work, budget is {budget_ms:.0} ms"
+            ));
         }
     }
-    Ok(())
+
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(failures.join("; "))
+    }
 }
 
-/// Returns the median wall time in milliseconds for one invocation path.
-fn median_startup_ms(binary: &str, flag: &str) -> Result<f64, String> {
+/// Measures the cost of starting a trivial program.
+///
+/// This is the fork and exec floor plus the dynamic loader for a system binary.
+/// Subtracting it isolates the work this binary does.
+fn measure_floor() -> Result<f64, String> {
+    let candidates = ["/usr/bin/true", "/bin/true"];
+    let Some(program) = candidates
+        .iter()
+        .find(|path| std::path::Path::new(path).exists())
+    else {
+        // Without a suitable baseline the raw measurement stands on its own.
+        return Ok(0.0);
+    };
+
     const SAMPLES: usize = 21;
+    let mut samples = Vec::with_capacity(SAMPLES);
+    for _ in 0..SAMPLES {
+        let start = std::time::Instant::now();
+        let status = Command::new(program)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map_err(|err| format!("could not run {program}: {err}"))?;
+        if !status.success() {
+            return Err(format!("`{program}` exited with a failure"));
+        }
+        samples.push(start.elapsed().as_secs_f64() * 1000.0);
+    }
+    Ok(fastest(samples))
+}
+
+/// Returns the smallest sample, the least noisy estimate of true cost.
+fn fastest(mut samples: Vec<f64>) -> f64 {
+    samples.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    samples.first().copied().unwrap_or(0.0)
+}
+
+/// Returns the fastest wall time in milliseconds for one invocation path.
+fn fastest_startup_ms(binary: &str, flag: &str) -> Result<f64, String> {
+    const SAMPLES: usize = 31;
 
     let mut samples = Vec::with_capacity(SAMPLES);
     for _ in 0..SAMPLES {
         let start = std::time::Instant::now();
         let status = Command::new(binary)
             .arg(flag)
-            .env("RUNE_BENCH", "1")
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status()
@@ -187,8 +238,7 @@ fn median_startup_ms(binary: &str, flag: &str) -> Result<f64, String> {
         samples.push(start.elapsed().as_secs_f64() * 1000.0);
     }
 
-    samples.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    Ok(samples.get(SAMPLES / 2).copied().unwrap_or(0.0))
+    Ok(fastest(samples))
 }
 
 /// Crates whose duplicate versions are accepted, with the reason.

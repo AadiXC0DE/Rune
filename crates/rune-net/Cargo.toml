@@ -15,10 +15,10 @@ rune-core = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
-bytes = { workspace = true }
 sha2 = { workspace = true }
 jiff = { workspace = true }
 camino = { workspace = true }
+ureq = { workspace = true }
 
 [dev-dependencies]
 tempfile.workspace = true

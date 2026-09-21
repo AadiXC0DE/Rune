@@ -1192,9 +1192,7 @@ pub fn unconfigured_provider_error() -> RuneError {
         ErrorCode::AuthenticationRequired,
         "no model provider is connected",
     )
-    .with_hint(
-        "run `rune connect` to choose an endpoint, or set `provider` and `model` in the user config",
-    )
+    .with_hint("run `rune connect` to choose an endpoint and store a credential")
 }
 
 /// Renders the project configuration keys, for documentation consistency tests.
@@ -1560,6 +1558,7 @@ theme_unused = "x"
         assert_eq!(err.code(), ErrorCode::AuthenticationRequired);
         let hint = err.detail().hint.as_deref().expect("hint");
         assert!(hint.contains("rune connect"), "hint was `{hint}`");
+        assert_ne!(hint, err.message(), "the hint repeats the message");
     }
 
     #[test]

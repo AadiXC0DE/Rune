@@ -10,6 +10,7 @@
 // shipped build, where a panic on user input is a defect.
 #![cfg_attr(test, allow(clippy::expect_used, clippy::unwrap_used, clippy::panic))]
 
+mod ask;
 mod cli;
 mod diagnostics;
 mod help;
@@ -142,7 +143,8 @@ fn run(launch: &Launch) -> Result<ExitCode> {
         Command::Models => Err(not_yet_available("the model catalog")),
         Command::Permissions => Err(not_yet_available("the permission engine")),
         Command::Workspace => run_workspace(&settings, launch, &output_flags),
-        Command::Ask | Command::Acp | Command::Review | Command::Interactive | Command::Resume => {
+        Command::Ask => run_ask(&settings, &paths, launch, &output_flags),
+        Command::Acp | Command::Review | Command::Interactive | Command::Resume => {
             Err(not_yet_available("the agent runtime"))
         }
         Command::Upgrade | Command::Uninstall => Err(not_yet_available("the installer")),
@@ -200,6 +202,52 @@ fn run_doctor(
     }
     let code = report.exit_code();
     Ok(ExitCode::from(u8::try_from(code).unwrap_or(EXIT_FAILURE)))
+}
+
+/// Runs `ask`.
+///
+/// With `--json` the result object is always printed, including on failure, so a
+/// caller parsing standard output never receives an empty stream.
+fn run_ask(
+    settings: &Settings,
+    paths: &Paths,
+    launch: &Launch,
+    output: &OutputFlags,
+) -> Result<ExitCode> {
+    let submitted: String = launch.args.join(" ");
+    let prompt = if submitted.trim().is_empty() {
+        ask::read_stdin_prompt()?
+    } else {
+        submitted
+    };
+
+    if prompt.trim().is_empty() {
+        return Err(RuneError::missing_field("prompt")
+            .with_hint("pass the prompt as an argument, or pipe it on standard input"));
+    }
+
+    let options = ask::Options {
+        prompt,
+        json: output.json,
+        no_save: launch.has_flag("--no-save"),
+        model: launch.flag("--model").map(str::to_owned),
+        effort: launch.flag("--effort").map(str::to_owned),
+    };
+
+    match ask::run(settings, paths, &options) {
+        Ok(result) => {
+            let code = ask::report(&result, &options)?;
+            Ok(ExitCode::from(code))
+        }
+        Err(err) => {
+            if options.json {
+                let result =
+                    ask::JsonResult::failure(&settings.model, &err, i32::from(EXIT_FAILURE));
+                let _ = ask::report(&result, &options);
+            }
+            Err(err)
+        }
+    }
 }
 
 /// Runs `status`.
