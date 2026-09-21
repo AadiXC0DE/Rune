@@ -79,7 +79,9 @@ impl FileLimits {
     /// Returns the byte budget for one call.
     ///
     /// The context carries the cap resolved for this call; the limit set holds
-    /// the configured cap. The smaller wins, so neither widens the other.
+    /// the configured cap. The smaller of the two wins, so neither widens the
+    /// other, and neither can cut a result below the floor that keeps its
+    /// summary readable.
     #[must_use]
     pub fn output_cap(&self, context: &ExecutionContext) -> usize {
         context
@@ -262,6 +264,15 @@ pub fn truncate_line(line: &str, limit: usize) -> String {
 #[must_use]
 pub fn join_capped(body: String, footer: &str, cap: usize) -> String {
     let marker = "\n[output truncated at the byte cap]";
+    let mut footer = footer.to_owned();
+    // The footer carries the true counts, so it is kept whole in preference to
+    // the body; only a footer that cannot fit at all is cut.
+    if footer.len().saturating_add(marker.len()) >= cap {
+        let room = cap.saturating_sub(marker.len());
+        let end = truncate_to_bytes(&footer, room).len();
+        footer.truncate(end);
+    }
+
     let mut out = body;
     if out.len().saturating_add(footer.len()) > cap {
         let room = cap.saturating_sub(footer.len().saturating_add(marker.len()));
@@ -269,8 +280,23 @@ pub fn join_capped(body: String, footer: &str, cap: usize) -> String {
         out.truncate(end);
         out.push_str(marker);
     }
-    out.push_str(footer);
+    out.push_str(&footer);
     out
+}
+
+/// Returns at most `max` names, with a count of the rest.
+#[must_use]
+pub fn summarize(names: &[String], max: usize) -> String {
+    if names.len() <= max {
+        return names.join(", ");
+    }
+    let shown = names
+        .iter()
+        .take(max)
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("{shown} and {} more", names.len().saturating_sub(max))
 }
 
 /// Compiles a glob for matching paths relative to a walk root.
@@ -341,6 +367,7 @@ pub struct Walker {
     root: Utf8PathBuf,
     walk: Option<Walk>,
     single: Option<Utf8PathBuf>,
+    is_file: bool,
     limit: usize,
     visited: usize,
     stopped: bool,
@@ -378,6 +405,7 @@ impl Walker {
                 root: root.to_owned(),
                 walk: None,
                 single: Some(root.to_owned()),
+                is_file: true,
                 limit,
                 visited: 0,
                 stopped: false,
@@ -405,6 +433,7 @@ impl Walker {
             root: root.to_owned(),
             walk: Some(builder.build()),
             single: None,
+            is_file: false,
             limit,
             visited: 0,
             stopped: false,
@@ -437,8 +466,11 @@ impl Walker {
     }
 
     /// Returns the relative form of a walked path.
+    ///
+    /// A file named directly has no root to be relative to, so its own name is
+    /// what a pattern matches against.
     fn relative(&self, path: &Utf8Path) -> Utf8PathBuf {
-        if self.single.is_some() {
+        if self.is_file {
             return path
                 .file_name()
                 .map_or_else(|| path.to_owned(), Utf8PathBuf::from);

@@ -22,10 +22,10 @@ use std::fmt::Write as _;
 use camino::{Utf8Path, Utf8PathBuf};
 
 use rune_core::budget::LimitName;
-
-use crate::resolve_limit;
 use rune_core::error::Result;
 use rune_core::paths::{Paths, names};
+
+use crate::resolve_limit;
 
 /// One instruction file, together with the directory it governs.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -191,7 +191,7 @@ pub fn render(files: &[&InstructionFile]) -> String {
     let mut kept: Vec<Option<&str>> = vec![None; sections.len()];
     let mut remaining = total;
     for (index, part) in sections.iter().enumerate().rev() {
-        let carried = part.carried();
+        let carried = part.text.len();
         let record = part.dropped.as_str();
         if carried <= remaining {
             remaining = remaining.saturating_sub(carried);
@@ -216,13 +216,6 @@ struct Section {
     text: String,
     /// Record naming the file when the whole section does not fit.
     dropped: String,
-}
-
-impl Section {
-    /// Bytes the section occupies when it is included.
-    fn carried(&self) -> usize {
-        self.text.len()
-    }
 }
 
 /// Renders one section, shortening the content when it exceeds `cap`.

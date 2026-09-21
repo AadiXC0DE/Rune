@@ -313,6 +313,16 @@ mod tests {
         assert!(output.text.len() <= cap(LimitName::SkillCatalogBytes));
         assert!(!output.omitted.is_empty());
         assert!(output.text.contains("&lt;skill-000&gt;"));
+        let notice = output
+            .text
+            .lines()
+            .find(|line| line.contains("skill-catalog-omitted"))
+            .expect("notice");
+        assert!(
+            notice.ends_with("...\" />"),
+            "the list was shortened: {notice}"
+        );
+        assert!(notice.len() <= NOTICE_BYTES);
     }
 
     #[test]

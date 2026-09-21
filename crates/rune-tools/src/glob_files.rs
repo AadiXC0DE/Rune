@@ -11,6 +11,9 @@ use crate::workspace::{
 /// How often a long walk checks for cancellation.
 const CANCEL_CHECK_INTERVAL: usize = 1024;
 
+/// Bytes held back from the listing so the footer always fits.
+const FOOTER_RESERVE_BYTES: usize = 512;
+
 /// Matches paths against a glob pattern.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct GlobFiles;
@@ -111,25 +114,36 @@ impl Tool for GlobFiles {
             )));
         }
 
+        // Paths are added until the byte budget is spent, so the count reported
+        // is the number actually listed rather than the number collected.
+        let cap = limits.output_cap(context);
+        let reserve = FOOTER_RESERVE_BYTES.min(cap / 2);
         let mut body = format!("{total} files match `{pattern}` under `{label}`\n");
+        let mut listed = 0_usize;
         for path in &matches {
-            body.push('\n');
+            if body.len().saturating_add(path.len()).saturating_add(1) > cap.saturating_sub(reserve)
+            {
+                break;
+            }
             body.push_str(path);
+            body.push('\n');
+            listed = listed.saturating_add(1);
         }
-        let mut footer = String::from("\n");
-        if matches.len() < total {
+
+        let mut footer = String::new();
+        if listed < total {
             footer.push_str(&format!(
-                "[showing {} of {total} matches; use count mode for the exact total or narrow the \
-                 pattern]\n",
-                matches.len()
+                "[showing {listed} of {total} matches{}; use count mode for the exact total or \
+                 narrow the pattern]\n",
+                if listed < matches.len() {
+                    " within the byte cap"
+                } else {
+                    ""
+                }
             ));
         }
         footer.push_str(&notes);
-        Ok(ToolOutput::success(join_capped(
-            body,
-            &footer,
-            context.max_output_bytes,
-        )))
+        Ok(ToolOutput::success(body + &footer))
     }
 }
 

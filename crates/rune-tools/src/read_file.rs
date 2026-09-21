@@ -131,9 +131,10 @@ impl Tool for ReadFile {
         }
 
         // Collection stops at the byte cap, but every line is still counted so
-        // the footer can state the true total.
+        // the footer can state the true total. The reserve keeps the header and
+        // the footer readable even when nothing else fits.
         let cap = self.limits.output_cap(context);
-        let byte_budget = cap.saturating_sub(MIN_OUTPUT_BYTES);
+        let byte_budget = cap.saturating_sub(MIN_OUTPUT_BYTES).max(MIN_OUTPUT_BYTES);
         let window = collect(
             &mut reader,
             start_line,
@@ -480,7 +481,7 @@ mod tests {
             output.text
         );
         assert!(
-            output.text.contains("showing lines 1 to 50 of 50"),
+            output.text.contains("[end of file: 50 lines]"),
             "{}",
             output.text
         );
@@ -495,7 +496,7 @@ mod tests {
                 &repo.context(),
             )
             .expect("call");
-        assert!(output.text.contains("bytes line cap"), "{}", output.text);
+        assert!(output.text.contains("-byte line cap"), "{}", output.text);
         assert!(
             output
                 .text
