@@ -13,6 +13,8 @@
 
 pub mod catalog;
 pub mod instructions;
+pub mod mcp;
+pub mod prompt;
 pub mod skills;
 
 pub use catalog::{CatalogOutput, read_body, render_catalog};

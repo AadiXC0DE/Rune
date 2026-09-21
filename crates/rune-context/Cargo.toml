@@ -16,6 +16,8 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 camino = { workspace = true }
+sha2 = { workspace = true }
+ureq = { workspace = true }
 
 [dev-dependencies]
 tempfile.workspace = true

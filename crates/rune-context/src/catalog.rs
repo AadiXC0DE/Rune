@@ -92,9 +92,26 @@ impl CatalogOutput {
 /// names are.
 #[must_use]
 pub fn render_catalog(skills: &[Skill], limit: usize) -> CatalogOutput {
-    let budget = resolve_limit(LimitName::SkillCatalogBytes);
-    let per_description = resolve_limit(LimitName::SkillDescriptionBytes);
+    render_catalog_within(
+        skills,
+        limit,
+        resolve_limit(LimitName::SkillCatalogBytes),
+        resolve_limit(LimitName::SkillDescriptionBytes),
+    )
+}
 
+/// Renders the catalog within explicit byte caps.
+///
+/// Separate from [`render_catalog`] so a caller holding a resolved limit set can
+/// honour an override. Reading the compiled default here would make a user's
+/// configured catalog size silently ineffective.
+#[must_use]
+pub fn render_catalog_within(
+    skills: &[Skill],
+    limit: usize,
+    budget: usize,
+    per_description: usize,
+) -> CatalogOutput {
     let mut out = CatalogOutput::default();
     let fixed = HEADER
         .len()
