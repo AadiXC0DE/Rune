@@ -9,6 +9,9 @@ use std::process::{Command, ExitCode};
 
 /// Budget targets. These are Rune's own numbers, measured on the release
 /// profile, not a restatement of another project's figures.
+/// Runs per measurement. The fastest is kept, so more samples only reduce noise.
+const MEASUREMENT_SAMPLES: usize = 31;
+
 mod targets {
     /// Largest accepted stripped release binary, in bytes.
     pub const MAX_BINARY_BYTES: u64 = 8 * 1024 * 1024;
@@ -196,9 +199,8 @@ fn measure_floor() -> Result<f64, String> {
         return Ok(0.0);
     };
 
-    const SAMPLES: usize = 21;
-    let mut samples = Vec::with_capacity(SAMPLES);
-    for _ in 0..SAMPLES {
+    let mut samples = Vec::with_capacity(MEASUREMENT_SAMPLES);
+    for _ in 0..MEASUREMENT_SAMPLES {
         let start = std::time::Instant::now();
         let status = Command::new(program)
             .stdout(std::process::Stdio::null())
@@ -221,10 +223,8 @@ fn fastest(mut samples: Vec<f64>) -> f64 {
 
 /// Returns the fastest wall time in milliseconds for one invocation path.
 fn fastest_startup_ms(binary: &str, flag: &str) -> Result<f64, String> {
-    const SAMPLES: usize = 31;
-
-    let mut samples = Vec::with_capacity(SAMPLES);
-    for _ in 0..SAMPLES {
+    let mut samples = Vec::with_capacity(MEASUREMENT_SAMPLES);
+    for _ in 0..MEASUREMENT_SAMPLES {
         let start = std::time::Instant::now();
         let status = Command::new(binary)
             .arg(flag)
