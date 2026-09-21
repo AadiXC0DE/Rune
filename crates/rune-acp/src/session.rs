@@ -13,14 +13,15 @@ use std::collections::BTreeMap;
 
 use camino::Utf8PathBuf;
 use rune_agent::history::History;
-use rune_agent::steering::{Cancellation, SteeringQueue};
+use rune_agent::steering::SteeringQueue;
 use rune_core::budget::{BudgetSet, LimitName};
 use rune_core::config::{Effort, PermissionMode};
 use rune_core::error::{ErrorCode, Result, RuneError};
 use rune_core::id::{SessionId, ToolCallId};
 use rune_core::paths::Paths;
 use rune_net::message::{ContentPart, Role};
-use rune_policy::rules::{Layer, Rule, RuleSet};
+use rune_policy::decision::Layer;
+use rune_policy::rules::{Rule, RuleSet};
 use rune_session::event::{EventFrame, SessionEvent};
 use rune_session::store::{SessionStore, load_read_only};
 use rune_tools::contract::ExecutionContext;
@@ -69,7 +70,7 @@ pub struct SessionSummary {
 
 /// One active session.
 #[derive(Debug)]
-struct Session {
+pub struct Session {
     id: String,
     config: SessionConfig,
     history: History,
@@ -78,6 +79,14 @@ struct Session {
     /// Additional roots this session's tools may reach.
     additional_roots: Vec<Utf8PathBuf>,
     store: SessionStore,
+}
+
+impl Session {
+    /// Returns the configuration in force.
+    #[must_use]
+    pub const fn config(&self) -> &SessionConfig {
+        &self.config
+    }
 }
 
 /// Everything a turn needs, taken before the turn starts.
@@ -95,21 +104,8 @@ pub struct Snapshot {
     pub rules: RuleSet,
     /// Execution context for the turn's tool calls.
     pub context: ExecutionContext,
-    /// Cancellation flag the turn and its tools observe.
-    pub cancellation: Cancellation,
     /// Steering queue for the turn.
     pub steering: SteeringQueue,
-}
-
-impl Snapshot {
-    /// Returns the cancellation handle tools observe for this turn.
-    ///
-    /// The context carries its own flag so a tool can be interrupted on its own,
-    /// and both are set when the client cancels.
-    #[must_use]
-    pub fn tool_cancellation(&self) -> rune_tools::contract::Cancellation {
-        self.context.cancellation()
-    }
 }
 
 /// The sessions held by one connection.
@@ -141,18 +137,6 @@ impl Sessions {
             limits: limits.clone(),
             cap,
         }
-    }
-
-    /// Returns the number of sessions held.
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.entries.len()
-    }
-
-    /// Returns true when no session is held.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
     }
 
     /// Returns the largest number of sessions this connection may hold.
@@ -300,7 +284,8 @@ impl Sessions {
 
     /// Closes a session, releasing its writer lock.
     pub fn close(&mut self, id: &str) -> Result<()> {
-        if self.entries.remove(id).is_none() {
+        let key = Self::key(id)?;
+        if self.entries.remove(&key).is_none() {
             return Err(unknown_session(id));
         }
         Ok(())
@@ -308,13 +293,16 @@ impl Sessions {
 
     /// Returns one session.
     pub fn get(&self, id: &str) -> Result<&Session> {
-        self.entries.get(id).ok_or_else(|| unknown_session(id))
+        let key = Self::key(id)?;
+        self.entries.get(&key).ok_or_else(|| unknown_session(id))
     }
 
-    /// Returns true when the session is held.
-    #[must_use]
-    pub fn contains(&self, id: &str) -> bool {
-        self.entries.contains_key(id)
+    /// Resolves a client-supplied identifier to the key sessions are stored
+    /// under, so a malformed one is reported as a bad field rather than as a
+    /// session that does not exist.
+    fn key(id: &str) -> Result<String> {
+        let parsed: SessionId = id.parse()?;
+        Ok(parsed.to_string())
     }
 
     /// Changes a configuration option.
@@ -333,7 +321,7 @@ impl Sessions {
                 if model.len() > MAX_MODEL_BYTES {
                     return Err(RuneError::too_large("model", model.len(), MAX_MODEL_BYTES));
                 }
-                session.config.model = model.to_owned();
+                model.clone_into(&mut session.config.model);
                 Ok(())
             }
             "effort" => {
@@ -371,7 +359,10 @@ impl Sessions {
 
     /// Takes everything a turn needs.
     pub fn snapshot(&self, id: &str) -> Result<Snapshot> {
-        let session = self.entries.get(id).ok_or_else(|| unknown_session(id))?;
+        let key = Self::key(id)?;
+        let Some(session) = self.entries.get(&key) else {
+            return Err(unknown_session(id));
+        };
         let mut context = ExecutionContext::new(self.workspace.clone())
             .with_output_cap(self.limits.get_usize(LimitName::MaxToolResultBytes));
         for root in &session.additional_roots {
@@ -382,16 +373,16 @@ impl Sessions {
             config: session.config.clone(),
             rules: session.grants.clone(),
             context,
-            cancellation: Cancellation::new(),
             steering: SteeringQueue::from_limits(&self.limits),
         })
     }
 
     /// Replaces a session's conversation and approvals with what a turn produced.
     pub fn absorb(&mut self, id: &str, history: History, rules: RuleSet) -> Result<()> {
+        let key = Self::key(id)?;
         let session = self
             .entries
-            .get_mut(id)
+            .get_mut(&key)
             .ok_or_else(|| unknown_session(id))?;
         session.history = history;
         session.grants = rules;
@@ -769,6 +760,7 @@ fn effort_label(effort: Effort) -> &'static str {
 mod tests {
     use super::*;
     use rune_core::config::Layer as ConfigLayer;
+    use rune_core::id::EventSeq;
     use rune_session::event::EventFrame;
 
     fn paths_for(root: &tempfile::TempDir) -> Paths {
@@ -796,7 +788,7 @@ mod tests {
         let root = tempfile::tempdir().expect("tempdir");
         let mut sessions = sessions(&root);
         let id = sessions.create(Vec::new()).expect("create");
-        assert!(sessions.contains(&id));
+        assert!(sessions.get(&id).is_ok());
         let snapshot = sessions.snapshot(&id).expect("snapshot");
         assert!(snapshot.history.is_empty());
         assert_eq!(snapshot.config.model, "test/model");
@@ -824,7 +816,7 @@ mod tests {
         let mut sessions = sessions(&root);
         let id = sessions.create(Vec::new()).expect("create");
         sessions.close(&id).expect("close");
-        assert!(!sessions.contains(&id));
+        assert!(sessions.get(&id).is_err());
         assert!(sessions.close(&id).is_err());
     }
 
@@ -1003,14 +995,14 @@ mod tests {
     fn history_rebuilt_from_events_pairs_calls_with_results() {
         let frames = vec![
             EventFrame::new(
-                1.into(),
+                EventSeq(1),
                 0,
                 SessionEvent::UserMessage {
                     text: "run".to_owned(),
                 },
             ),
             EventFrame::new(
-                2.into(),
+                EventSeq(2),
                 0,
                 SessionEvent::ToolCall {
                     call_id: "c1".to_owned(),
@@ -1019,7 +1011,7 @@ mod tests {
                 },
             ),
             EventFrame::new(
-                3.into(),
+                EventSeq(3),
                 0,
                 SessionEvent::ToolResult {
                     call_id: "c1".to_owned(),
@@ -1028,7 +1020,7 @@ mod tests {
                 },
             ),
             EventFrame::new(
-                4.into(),
+                EventSeq(4),
                 0,
                 SessionEvent::AssistantMessage {
                     turn: 1,

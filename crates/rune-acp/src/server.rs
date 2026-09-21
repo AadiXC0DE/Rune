@@ -2,17 +2,18 @@
 //!
 //! One connection, one reader, one writer. Requests are answered on the reading
 //! thread except for a prompt turn, which runs on its own thread so the
-//! connection stays live while the model streams: that is what lets a second
-//! prompt be accepted and queued instead of rejected.
+//! connection stays live while the model streams. That is what lets a second
+//! prompt be admitted and queued instead of refused.
 //!
 //! Two invariants hold the design together:
 //!
-//! - Stdout carries frames and nothing else. Every diagnostic goes to the
-//!   configured log file, so a client's parser never sees a stray line.
-//! - A prompt that arrives during a turn is admitted. It is either queued or, at
-//!   the configured bound, refused with an error. It is never silently dropped.
+//! - Standard output carries frames and nothing else. Every diagnostic goes to
+//!   the configured log file, because a stray line on stdout is a malformed
+//!   frame as far as the client is concerned.
+//! - A prompt that arrives during a turn is admitted. It is queued, or refused
+//!   with a named reason once the queue is full. It is never dropped.
 
-use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::fs::OpenOptions;
 use std::io::{BufRead, Write};
@@ -20,17 +21,17 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use camino::Utf8PathBuf;
 use rune_agent::history::History;
 use rune_agent::steering::{Cancellation, SteeringQueue};
-use rune_agent::turn::{Event, Host, StopReason, TurnOutcome, run_turn};
+use rune_agent::turn::{Event, Host, StopReason, run_turn};
 use rune_core::budget::{BudgetSet, LimitName};
 use rune_core::config::{Effort, PermissionMode};
 use rune_core::error::{ErrorCode, Result, RuneError};
 use rune_core::paths::Paths;
-use rune_net::catalog::{Catalog, DEFAULT_CONTEXT_WINDOW};
+use rune_net::catalog::Catalog;
 use rune_net::message::ToolSpec;
 use rune_net::provider::Provider;
 use rune_net::stream::Usage;
@@ -41,28 +42,27 @@ use rune_session::event::SessionEvent;
 use rune_tools::Registry;
 use rune_tools::contract::{ExecutionContext, ToolOutput};
 use rune_tools::workspace::FileLimits;
-use serde_json::{Map, Value, json};
+use serde_json::{Value, json};
 
-use crate::jsonrpc::{FrameError, Id, Message, Notification, Request, Response, RpcError, Writer};
+use crate::jsonrpc::{FrameError, Id, Message, Request, Response, RpcError, Writer};
 use crate::session::{
-    SessionConfig, Sessions, config_options, message_chunk, modes, tool_call, tool_call_update,
-    usage_update,
+    SessionConfig, Sessions, config_options, kind_for_name, message_chunk, modes, tool_call,
+    tool_call_update, tool_title, usage_update,
 };
 
 /// Protocol version this server speaks.
 pub const PROTOCOL_VERSION: i64 = 1;
 
-/// Interval between checks of the cancellation flag while waiting.
+/// How long a blocking wait sleeps before rechecking cancellation.
 ///
-/// A client that cancels expects the turn to stop promptly, and a client that
-/// never answers a permission request must not hang the turn forever, so both
-/// waits are bounded by this poll.
+/// A cancel has to take effect within an interactive pause, and a client that
+/// never answers a permission request must not hang the turn for good.
 const POLL: Duration = Duration::from_millis(25);
 
-/// Time the server gives an in-flight turn to stop once input ends.
+/// Time an in-flight turn is given to stop once input ends.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 
-/// Which provider dialect the endpoint speaks.
+/// Which dialect an endpoint speaks.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum Dialect {
     /// An OpenAI-compatible Chat Completions endpoint.
@@ -112,13 +112,12 @@ impl Dialect {
 }
 
 /// Everything one server process needs.
-#[derive(Debug)]
 pub struct ServerConfig {
-    /// State layout, used to open and create sessions.
+    /// State layout, used to create and open sessions.
     pub paths: Paths,
     /// Primary workspace every session is rooted at.
     pub workspace: Utf8PathBuf,
-    /// Endpoint the model requests go to.
+    /// Endpoint model requests go to.
     pub endpoint: Endpoint,
     /// Dialect the endpoint speaks.
     pub dialect: Dialect,
@@ -126,7 +125,7 @@ pub struct ServerConfig {
     pub model: String,
     /// System instructions for every turn.
     pub instructions: String,
-    /// Tools advertised to the model.
+    /// Tool registry.
     pub registry: Registry,
     /// Rules in force before any session approval.
     pub rules: RuleSet,
@@ -136,10 +135,22 @@ pub struct ServerConfig {
     pub effort: Effort,
     /// Limits in force.
     pub limits: BudgetSet,
-    /// Where diagnostics are written. Stdout is never used for them.
+    /// Where diagnostics go. Standard output is never used for them.
     pub log_file: Option<Utf8PathBuf>,
-    /// Usable context size of the active model, for usage updates.
+    /// Usable context size of the active model, reported in usage updates.
     pub context_window: u64,
+}
+
+impl fmt::Debug for ServerConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ServerConfig")
+            .field("workspace", &self.workspace)
+            .field("dialect", &self.dialect)
+            .field("model", &self.model)
+            .field("mode", &self.mode)
+            .field("log_file", &self.log_file)
+            .finish_non_exhaustive()
+    }
 }
 
 impl ServerConfig {
@@ -151,13 +162,13 @@ impl ServerConfig {
         model: impl Into<String>,
     ) -> Result<Self> {
         let limits = BudgetSet::new();
-        let registry = rune_tools::inventory::builtin(&FileLimits::from_budget(&limits))?;
+        let registry = rune_tools::inventory::builtin(&FileLimits::from_budget(&limits), &limits)?;
         let model = model.into();
         let context_window = Catalog::new("acp")
             .metadata_or_default(&model)
             .usable_context();
         let instructions = format!(
-            "You are Rune, a coding agent. The workspace is {workspace}. Use the tools to inspect and change files."
+            "You are Rune, a coding agent. The workspace is {workspace}. Inspect and change files with the tools."
         );
         Ok(Self {
             paths,
@@ -220,9 +231,9 @@ impl ServerConfig {
 
     /// Sets the limits and rebuilds the tool set from them.
     pub fn with_limits(mut self, limits: BudgetSet) -> Result<Self> {
-        self.registry = rune_tools::inventory::builtin(&FileLimits::from_budget(&limits))?;
+        self.registry = rune_tools::inventory::builtin(&FileLimits::from_budget(&limits), &limits)?;
         self.limits = limits;
-        self
+        Ok(self)
     }
 
     /// Sends diagnostics to a file instead of standard error.
@@ -241,29 +252,35 @@ impl ServerConfig {
 }
 
 /// A prompt waiting for the active turn to settle.
-#[derive(Debug)]
 struct Queued {
     id: Id,
     session: String,
     text: String,
 }
 
-/// The one turn a connection may be running.
-#[derive(Debug, Default)]
+/// The state of the one turn a connection may be running.
+#[derive(Default)]
 struct Active {
-    /// Cancellation for the running turn, absent when the connection is idle.
+    /// Absent when the connection is idle.
     cancellation: Option<Cancellation>,
+    /// Cancels the tools the running turn invoked. Registered once the turn has
+    /// taken its execution context, which is the point at which a tool may exist.
+    tools: Option<rune_tools::contract::Cancellation>,
     /// Session the running turn belongs to.
     session: Option<String>,
     /// Prompts admitted while the turn runs, in arrival order.
     queue: VecDeque<Queued>,
 }
 
-/// State shared between the reading thread and any turn thread.
-struct Core<W: Write + Send + 'static> {
+/// A server serving one connection.
+///
+/// Shared between the reading thread and the turn thread, so it is always held
+/// in an [`Arc`].
+pub struct Server<W: Write + Send + 'static> {
     config: ServerConfig,
     writer: Mutex<Writer<W>>,
     sessions: Mutex<Sessions>,
+    /// Requests this server issued, by identifier, awaiting a client answer.
     pending: Mutex<BTreeMap<i64, std::sync::mpsc::Sender<Response>>>,
     next_request: AtomicI64,
     log: Mutex<Option<std::fs::File>>,
@@ -273,788 +290,10 @@ struct Core<W: Write + Send + 'static> {
     queue_depth: usize,
 }
 
-impl<W: Write + Send + 'static> fmt::Debug for Core<W> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Core")
-            .field("model", &self.config.model)
-            .field("queue_depth", &self.queue_depth)
-            .finish_non_exhaustive()
-    }
-}
-
-impl<W: Write + Send + 'static> Core<W> {
-    /// Writes one frame.
-    fn send(&self, message: Message) {
-        let outcome = match self.writer.lock() {
-            Ok(mut writer) => writer.write_message(&message),
-            Err(_) => return,
-        };
-        if let Err(err) = outcome {
-            self.note(format_args!("could not write a frame: {err}"));
-        }
-    }
-
-    /// Writes a diagnostic line.
-    ///
-    /// Never to stdout: a line there would be a frame as far as the client is
-    /// concerned, and a malformed frame ends the connection.
-    fn note(&self, message: fmt::Arguments<'_>) {
-        let Ok(mut guard) = self.log.lock() else {
-            return;
-        };
-        match guard.as_mut() {
-            Some(file) => {
-                let _ = writeln!(file, "{message}");
-            }
-            None => {
-                let _ = writeln!(std::io::stderr(), "{message}");
-            }
-        }
-    }
-
-    /// Answers a request.
-    fn respond(&self, id: Id, result: Value) {
-        self.send(Message::Response(Response::ok(id, result)));
-    }
-
-    /// Reports a failure for a request.
-    fn fail(&self, id: Option<Id>, error: RpcError) {
-        self.send(Message::Response(Response::failed(id, error)));
-    }
-
-    /// Routes a response to whoever is waiting for it.
-    fn resolve(&self, response: Response) {
-        let Some(Id::Number(id)) = response.id.clone() else {
-            self.note(format_args!(
-                "ignoring a response for an identifier this server did not issue"
-            ));
-            return;
-        };
-        let sender = self
-            .pending
-            .lock()
-            .ok()
-            .and_then(|mut guard| guard.remove(&id));
-        match sender {
-            Some(sender) => {
-                // A receiver that has gone away is a cancelled turn, which is
-                // not an error worth reporting.
-                let _ = sender.send(response);
-            }
-            None => self.note(format_args!("ignoring a response for unknown request {id}")),
-        }
-    }
-
-    /// Issues a server-to-client request and waits for its answer.
-    fn ask(&self, method: &str, params: Value, cancellation: &Cancellation) -> Option<Value> {
-        let id = self.next_request.fetch_add(1, Ordering::SeqCst);
-        let (sender, receiver) = std::sync::mpsc::channel();
-        if let Ok(mut guard) = self.pending.lock() {
-            guard.insert(id, sender);
-        }
-        self.send(Message::Request(Request::new(
-            Id::Number(id),
-            method,
-            params,
-        )));
-        let answer = wait_for(&receiver, cancellation);
-        if let Ok(mut guard) = self.pending.lock() {
-            guard.remove(&id);
-        }
-        answer
-    }
-
-    /// Dispatches one incoming message.
-    fn dispatch(&self, message: Message) {
-        match message {
-            Message::Response(response) => self.resolve(response),
-            Message::Notification(notification) => {
-                if let Err(error) = self.handle(&notification.method, &notification.params, None) {
-                    self.note(format_args!(
-                        "notification `{}` failed: {}",
-                        notification.method, error.message
-                    ));
-                }
-            }
-            Message::Request(request) => self.call(request),
-        }
-    }
-
-    /// Handles a request, answering it once.
-    fn call(&self, request: Request) {
-        let id = request.id;
-        match self.handle(&request.method, &request.params, Some(id.clone())) {
-            Ok(Some(result)) => self.respond(id, result),
-            // A queued prompt is answered when it runs.
-            Ok(None) => {}
-            Err(error) => self.fail(Some(id), error),
-        }
-    }
-
-    /// Routes a method to its handler.
-    ///
-    /// Returns `None` when the method took ownership of the response, which only
-    /// a queued prompt does.
-    fn handle(
-        &self,
-        method: &str,
-        params: &Value,
-        id: Option<Id>,
-    ) -> std::result::Result<Option<Value>, RpcError> {
-        match method {
-            "initialize" => Ok(Some(self.initialize(params))),
-            "session/new" => self.new_session(params).map(Some),
-            "session/load" => self.load_session(params).map(Some),
-            "session/resume" => self.resume_session(params).map(Some),
-            "session/close" => self.close_session(params).map(Some),
-            "session/list" => Ok(Some(self.list_sessions())),
-            "session/set_config_option" => self.set_config_option(params).map(Some),
-            "session/set_mode" => self.set_mode(params).map(Some),
-            "session/cancel" => self.cancel(params).map(Some),
-            "session/prompt" => self.prompt(params, id),
-            other => Err(RpcError::method_not_found(other)),
-        }
-    }
-
-    /// Answers `initialize`, advertising what this server supports.
-    fn initialize(&self, params: &Value) -> Value {
-        let client = params
-            .get("clientInfo")
-            .and_then(|info| info.get("name"))
-            .and_then(Value::as_str)
-            .unwrap_or("unknown");
-        self.note(format_args!("client `{client}` initialized the connection"));
-        json!({
-            "protocolVersion": PROTOCOL_VERSION,
-            "agentCapabilities": {
-                "loadSession": true,
-                "promptCapabilities": {
-                    "image": false,
-                    "audio": false,
-                    "embeddedContext": true,
-                },
-                "mcpCapabilities": { "http": false, "sse": false },
-                "sessionCapabilities": {
-                    "close": {},
-                    "list": {},
-                    "resume": {},
-                },
-            },
-            "agentInfo": {
-                "name": "rune",
-                "version": env!("CARGO_PKG_VERSION"),
-                "title": "Rune",
-            },
-            "authMethods": [],
-        })
-    }
-
-    /// Answers `session/new`.
-    fn new_session(&self, params: &Value) -> std::result::Result<Value, RpcError> {
-        let roots = additional_roots(params)?;
-        let cwd = optional_string(params, "cwd")?;
-        if let Some(cwd) = &cwd {
-            require_absolute(&Utf8PathBuf::from(cwd), "cwd")?;
-        }
-        if let Some(list) = params.get("mcpServers").and_then(Value::as_array)
-            && !list.is_empty()
-        {
-            // No MCP client is wired into this server, so the servers a client
-            // asks for are reported rather than silently implied to be connected.
-            self.note(format_args!(
-                "ignoring {} requested MCP server(s)",
-                list.len()
-            ));
-        }
-        let mut sessions = self.lock_sessions()?;
-        let id = sessions
-            .create(roots)
-            .map_err(|err| RpcError::from_rune(&err))?;
-        let session = sessions.get(&id).map_err(|err| RpcError::from_rune(&err))?;
-        Ok(json!({
-            "sessionId": id,
-            "modes": modes(session.config()),
-            "configOptions": config_options(session.config()),
-        }))
-    }
-
-    /// Answers `session/load`, replaying the stored conversation first.
-    fn load_session(&self, params: &Value) -> std::result::Result<Value, RpcError> {
-        let id = string_field(params, "sessionId")?;
-        let updates = {
-            let mut sessions = self.lock_sessions()?;
-            sessions
-                .load(&id)
-                .map_err(|err| RpcError::from_rune(&err))?
-        };
-        for update in updates {
-            self.send(Message::Notification(update));
-        }
-        let sessions = self.lock_sessions()?;
-        let session = sessions.get(&id).map_err(|err| RpcError::from_rune(&err))?;
-        Ok(json!({
-            "modes": modes(session.config()),
-            "configOptions": config_options(session.config()),
-        }))
-    }
-
-    /// Answers `session/resume`, which does not replay anything.
-    fn resume_session(&self, params: &Value) -> std::result::Result<Value, RpcError> {
-        let id = string_field(params, "sessionId")?;
-        let mut sessions = self.lock_sessions()?;
-        sessions
-            .resume(&id)
-            .map_err(|err| RpcError::from_rune(&err))?;
-        let session = sessions.get(&id).map_err(|err| RpcError::from_rune(&err))?;
-        Ok(json!({
-            "modes": modes(session.config()),
-            "configOptions": config_options(session.config()),
-        }))
-    }
-
-    /// Answers `session/close`.
-    fn close_session(&self, params: &Value) -> std::result::Result<Value, RpcError> {
-        let id = string_field(params, "sessionId")?;
-        self.cancel_session(&id);
-        let mut sessions = self.lock_sessions()?;
-        sessions
-            .close(&id)
-            .map_err(|err| RpcError::from_rune(&err))?;
-        Ok(json!({}))
-    }
-
-    /// Answers `session/list`.
-    fn list_sessions(&self) -> Value {
-        let Ok(sessions) = self.lock_sessions() else {
-            return json!({ "sessions": [] });
-        };
-        let listed: Vec<Value> = sessions
-            .list()
-            .into_iter()
-            .map(|summary| {
-                json!({
-                    "sessionId": summary.id,
-                    "cwd": summary.cwd,
-                    "title": summary.title,
-                    "updatedAt": summary.updated_at,
-                })
-            })
-            .collect();
-        json!({ "sessions": listed })
-    }
-
-    /// Answers `session/set_config_option`, returning the resulting options.
-    fn set_config_option(&self, params: &Value) -> std::result::Result<Value, RpcError> {
-        let id = string_field(params, "sessionId")?;
-        let config = string_field(params, "configId")?;
-        let value = string_field(params, "value")?;
-        let mut sessions = self.lock_sessions()?;
-        sessions
-            .set_config_option(&id, &config, &value)
-            .map_err(|err| RpcError::from_rune(&err))?;
-        let session = sessions.get(&id).map_err(|err| RpcError::from_rune(&err))?;
-        Ok(json!({ "configOptions": config_options(session.config()) }))
-    }
-
-    /// Answers `session/set_mode`.
-    fn set_mode(&self, params: &Value) -> std::result::Result<Value, RpcError> {
-        let id = string_field(params, "sessionId")?;
-        let mode = string_field(params, "modeId")?;
-        let mut sessions = self.lock_sessions()?;
-        sessions
-            .set_mode(&id, &mode)
-            .map_err(|err| RpcError::from_rune(&err))?;
-        Ok(json!({}))
-    }
-
-    /// Stops the active turn.
-    fn cancel(&self, params: &Value) -> std::result::Result<Value, RpcError> {
-        let id = string_field(params, "sessionId")?;
-        self.cancel_session(&id);
-        Ok(json!({}))
-    }
-
-    /// Requests cancellation for the active turn of a session.
-    fn cancel_session(&self, id: &str) {
-        let Ok(active) = self.active.lock() else {
-            return;
-        };
-        match (&active.session, &active.cancellation) {
-            (Some(active_session), Some(cancellation)) if active_session == id => {
-                cancellation.cancel();
-            }
-            (Some(active_session), Some(_)) => {
-                drop(active);
-                self.note(format_args!(
-                    "a cancel for `{id}` was ignored; the active turn belongs to `{active_session}`"
-                ));
-            }
-            _ => {}
-        }
-    }
-
-    /// Admits a prompt.
-    ///
-    /// The turn runs on its own thread so the reading thread stays free. A prompt
-    /// that arrives while a turn is running is queued and answered once that turn
-    /// settles, which is what keeps a client from losing a message it typed while
-    /// the agent was working.
-    fn prompt(
-        &self,
-        params: &Value,
-        id: Option<Id>,
-    ) -> std::result::Result<Option<Value>, RpcError> {
-        let Some(id) = id else {
-            return Err(RpcError::invalid_request(
-                "`session/prompt` needs an identifier so its result can be reported",
-            ));
-        };
-        let session = string_field(params, "sessionId")?;
-        let text = prompt_text(params)?;
-        {
-            let sessions = self.lock_sessions()?;
-            sessions
-                .get(&session)
-                .map_err(|err| RpcError::from_rune(&err))?;
-        }
-
-        let queued = Queued { id, session, text };
-        let start = {
-            let Ok(mut active) = self.active.lock() else {
-                return Err(RpcError::internal("the session state is unavailable"));
-            };
-            if active.cancellation.is_some() {
-                if active.queue.len() >= self.queue_depth {
-                    let error = RuneError::new(
-                        ErrorCode::LimitExceeded,
-                        format!(
-                            "{} prompts are already queued for the running turn, the limit is {}",
-                            active.queue.len(),
-                            self.queue_depth
-                        ),
-                    )
-                    .with_hint("wait for the running turn to settle");
-                    self.note(format_args!("refused a queued prompt: {}", error.message()));
-                    return Err(RpcError::from_rune(&error));
-                }
-                self.note(format_args!(
-                    "queued prompt for `{}` behind the running turn",
-                    queued.session
-                ));
-                active.queue.push_back(queued);
-                false
-            } else {
-                active.cancellation = Some(Cancellation::new());
-                active.session = Some(queued.session.clone());
-                true
-            }
-        };
-        if start {
-            spawn_turn(self.clone_handle(), queued);
-        }
-        Ok(None)
-    }
-
-    /// Returns a handle that keeps the shared state alive for a turn thread.
-    fn clone_handle(self: &Self) -> Arc<Self> {
-        // The turn thread needs an owned handle, so the server keeps one and
-        // hands out clones of it.
-        self.handle
-            .lock()
-            .map(|guard| Arc::clone(&guard))
-            .unwrap_or_else(|_| Arc::new(std::sync::Mutex::new(())))
-    }
-
-    /// Locks the session map, reporting a poisoned lock as an internal fault.
-    fn lock_sessions(&self) -> std::result::Result<std::sync::MutexGuard<'_, Sessions>, RpcError> {
-        self.sessions
-            .lock()
-            .map_err(|_| RpcError::internal("the session state is unavailable"))
-    }
-}
-
-/// Waits for a response, giving up when the turn is cancelled.
-fn wait_for(receiver: &Receiver<Response>, cancellation: &Cancellation) -> Option<Value> {
-    loop {
-        match receiver.recv_timeout(POLL) {
-            Ok(response) => return response.into_outcome().and_then(std::result::Result::ok),
-            Err(RecvTimeoutError::Timeout) => {
-                if cancellation.is_cancelled() {
-                    return None;
-                }
-            }
-            Err(RecvTimeoutError::Disconnected) => return None,
-        }
-    }
-}
-
-/// Starts a turn thread, or continues on the current one when none exists.
-fn spawn_turn<W: Write + Send + 'static>(core: Arc<Core<W>>, queued: Queued) {
-    std::thread::spawn(move || run_queued(core, queued));
-}
-
-/// Runs one turn, then every prompt that was queued behind it.
-fn run_queued<W: Write + Send + 'static>(core: Arc<Core<W>>, first: Queued) {
-    let mut next = Some(first);
-    while let Some(queued) = next.take() {
-        run_turn_once(&core, queued);
-        next = {
-            let Ok(mut active) = core.active.lock() else {
-                return;
-            };
-            match active.queue.pop_front() {
-                Some(following) => {
-                    active.cancellation = Some(Cancellation::new());
-                    active.session = Some(following.session.clone());
-                    Some(following)
-                }
-                None => {
-                    active.cancellation = None;
-                    active.session = None;
-                    core.settled.notify_all();
-                    None
-                }
-            }
-        };
-    }
-}
-
-/// Runs one prompt as a turn and reports its outcome.
-fn run_turn_once<W: Write + Send + 'static>(core: &Arc<Core<W>>, queued: Queued) {
-    let session = queued.session.clone();
-    let snapshot = match core
-        .lock_sessions()
-        .and_then(|sessions| sessions.snapshot(&session).map_err(|_| ()))
-    {
-        Ok(snapshot) => snapshot,
-        Err(()) => {
-            let error = core.lock_sessions().err().map_or_else(
-                || RuneError::new(ErrorCode::Internal, "the session state is unavailable"),
-                |err| err.to_rune_error(),
-            );
-            let error = if core
-                .lock_sessions()
-                .is_ok_and(|sessions| sessions.contains(&session))
-            {
-                error
-            } else {
-                crate::session::unknown_session(&session)
-            };
-            core.fail(Some(queued.id), RpcError::from_rune(&error));
-            return;
-        }
-    };
-
-    let cancellation = core
-        .active
-        .lock()
-        .ok()
-        .and_then(|active| active.cancellation.clone())
-        .unwrap_or_default();
-
-    if let Ok(mut sessions) = core.sessions.lock() {
-        if let Err(err) = sessions.record(
-            &session,
-            SessionEvent::UserMessage {
-                text: queued.text.clone(),
-            },
-        ) {
-            core.note(format_args!("could not record a user message: {err}"));
-        }
-    }
-    core.send(Message::Notification(message_chunk(
-        &session,
-        "user_message_chunk",
-        &queued.text,
-    )));
-
-    let host = TurnHost {
-        core: Arc::clone(core),
-        session: session.clone(),
-        config: snapshot.config.clone(),
-        rules: Mutex::new(snapshot.rules.clone()),
-        context: snapshot.context,
-        cancellation: cancellation.clone(),
-        steering: snapshot.steering,
-        tools: core.config.registry.all_schemas(),
-    };
-
-    let mut history = snapshot.history;
-    history.push_user(queued.text.clone());
-    let outcome = run_turn(&mut history, &host);
-    let rules = host
-        .rules
-        .lock()
-        .map(|guard| guard.clone())
-        .unwrap_or_default();
-
-    match outcome {
-        Ok(outcome) => {
-            if !outcome.text.is_empty()
-                && let Ok(mut sessions) = core.sessions.lock()
-            {
-                let _ = sessions.record(
-                    &session,
-                    SessionEvent::AssistantMessage {
-                        turn: u64::from(outcome.steps),
-                        text: outcome.text.clone(),
-                    },
-                );
-            }
-            if let Ok(mut sessions) = core.sessions.lock() {
-                let _ = sessions.absorb(&session, history, rules);
-            }
-            if outcome.stop_reason == StopReason::ProviderFailure {
-                let error = RuneError::new(
-                    ErrorCode::TransportFailure,
-                    "the provider failed before the turn finished",
-                );
-                core.fail(Some(queued.id), RpcError::from_rune(&error));
-                return;
-            }
-            core.respond(
-                queued.id,
-                json!({ "stopReason": stop_reason(outcome.stop_reason) }),
-            );
-        }
-        Err(err) if cancellation.is_cancelled() || err.code() == ErrorCode::Cancelled => {
-            if let Ok(mut sessions) = core.sessions.lock() {
-                let _ = sessions.absorb(&session, history, rules);
-            }
-            core.respond(queued.id, json!({ "stopReason": "cancelled" }));
-        }
-        Err(err) => {
-            if let Ok(mut sessions) = core.sessions.lock() {
-                let _ = sessions.absorb(&session, history, rules);
-            }
-            core.note(format_args!("the turn failed: {err}"));
-            core.fail(Some(queued.id), RpcError::from_rune(&err));
-        }
-    }
-}
-
-/// Returns the protocol stop reason for a turn outcome.
-#[must_use]
-pub const fn stop_reason(reason: StopReason) -> &'static str {
-    match reason {
-        StopReason::Completed => "end_turn",
-        StopReason::StepLimit => "max_turn_requests",
-        StopReason::OutputLimit => "max_tokens",
-        StopReason::Refused | StopReason::ContentFilter => "refusal",
-        StopReason::Cancelled => "cancelled",
-        StopReason::ProviderFailure => "end_turn",
-    }
-}
-
-/// The host a turn runs against.
-struct TurnHost<W: Write + Send + 'static> {
-    core: Arc<Core<W>>,
-    session: String,
-    config: SessionConfig,
-    rules: Mutex<RuleSet>,
-    context: ExecutionContext,
-    cancellation: Cancellation,
-    steering: SteeringQueue,
-    tools: Vec<ToolSpec>,
-}
-
-impl<W: Write + Send + 'static> TurnHost<W> {
-    /// Reports one tool call to the client.
-    fn announce(&self, call: &rune_agent::turn::PreparedCall) {
-        let arguments: Value = serde_json::from_str(&call.arguments).unwrap_or(Value::Null);
-        let target = rune_agent::turn::permission_target_for(
-            &self.core.config.registry,
-            &call.name,
-            &arguments,
-        );
-        self.core.send(Message::Notification(tool_call(
-            &self.session,
-            &call.id,
-            &call.name,
-            target.as_deref(),
-            "in_progress",
-            &arguments,
-        )));
-    }
-
-    /// Asks the client to approve a call.
-    fn request_permission(&self, name: &str, target: Option<&str>) -> (Outcome, String) {
-        let request_id = self.core.next_request.fetch_add(1, Ordering::SeqCst);
-        let prompt = format!("allow {} {}", name, target.unwrap_or("with no target"));
-        let params = json!({
-            "sessionId": self.session,
-            "toolCall": {
-                "toolCallId": format!("permission-{request_id}"),
-                "title": crate::session::tool_title(name, target),
-                "name": name,
-                "kind": crate::session::kind_for_name(name),
-                "status": "pending",
-            },
-            "options": [
-                {"optionId": "allow_once", "name": "Allow once", "kind": "allow_once"},
-                {"optionId": "allow_always", "name": "Allow for this session", "kind": "allow_always"},
-                {"optionId": "reject_once", "name": "Reject", "kind": "reject_once"},
-            ],
-        });
-        let answer = self
-            .core
-            .ask("session/request_permission", params, &self.cancellation);
-        let Some(answer) = answer else {
-            return (
-                Outcome::Deny,
-                format!("the {} approval was not answered", prompt),
-            );
-        };
-        let option = answer
-            .get("outcome")
-            .and_then(|outcome| outcome.get("optionId"))
-            .and_then(Value::as_str)
-            .unwrap_or("reject_once");
-        match option {
-            "allow_once" => (Outcome::Allow, format!("the user allowed {prompt} once")),
-            "allow_always" => {
-                if let Ok(mut rules) = self.rules.lock() {
-                    crate::session::grant(&mut rules, name, target);
-                }
-                (
-                    Outcome::Allow,
-                    format!("the user allowed {prompt} for this session"),
-                )
-            }
-            _ => (Outcome::Deny, format!("the user rejected {prompt}")),
-        }
-    }
-}
-
-impl<W: Write + Send + 'static> Host for TurnHost<W> {
-    fn dialect(&self) -> &dyn Provider {
-        self.core.config.dialect.provider()
-    }
-
-    fn endpoint(&self) -> &Endpoint {
-        &self.core.config.endpoint
-    }
-
-    fn model(&self) -> &str {
-        &self.config.model
-    }
-
-    fn instructions(&self) -> String {
-        self.core.config.instructions.clone()
-    }
-
-    fn tools(&self) -> Vec<ToolSpec> {
-        self.tools.clone()
-    }
-
-    fn effort(&self) -> Effort {
-        self.config.effort
-    }
-
-    fn emit(&self, event: Event) {
-        match event {
-            Event::TextDelta { delta } => {
-                self.core.send(Message::Notification(message_chunk(
-                    &self.session,
-                    "agent_message_chunk",
-                    &delta,
-                )));
-            }
-            Event::ReasoningDelta { delta } => {
-                self.core.send(Message::Notification(message_chunk(
-                    &self.session,
-                    "agent_thought_chunk",
-                    &delta,
-                )));
-            }
-            Event::ToolStarted { call, .. } => self.announce(&call),
-            Event::ToolFinished { call, is_error } => {
-                let status = if is_error { "failed" } else { "completed" };
-                self.core.send(Message::Notification(tool_call_update(
-                    &self.session,
-                    &call.id,
-                    status,
-                    None,
-                )));
-            }
-            Event::ToolDenied { call, reason } => {
-                self.core.send(Message::Notification(tool_call_update(
-                    &self.session,
-                    &call.id,
-                    "failed",
-                    Some(&reason),
-                )));
-            }
-            Event::Finished { usage, .. } => {
-                self.core.send(Message::Notification(usage_update(
-                    &self.session,
-                    reported_tokens(usage),
-                    self.core.config.context_window,
-                )));
-            }
-            Event::TurnStarted { .. } | Event::SteeringApplied { .. } => {}
-        }
-    }
-
-    fn execute(&self, name: &str, arguments: &Value) -> Result<ToolOutput> {
-        self.core
-            .config
-            .registry
-            .call(name, arguments, &self.context)
-    }
-
-    fn decide(&self, name: &str, target: Option<&str>) -> (Outcome, String) {
-        let rules = self
-            .rules
-            .lock()
-            .map(|guard| guard.clone())
-            .unwrap_or_default();
-        let (outcome, reason) =
-            rune_agent::turn::decide_call(&rules, self.config.mode, name, target);
-        match outcome {
-            // An unresolved call is the client's to answer. This server has no
-            // reviewer of its own, so the client is the reviewer.
-            Outcome::Ask => self.request_permission(name, target),
-            resolved => (resolved, reason),
-        }
-    }
-
-    fn context(&self) -> ExecutionContext {
-        self.context.clone()
-    }
-
-    fn limits(&self) -> BudgetSet {
-        self.core.config.limits.clone()
-    }
-
-    fn cancellation(&self) -> Cancellation {
-        self.cancellation.clone()
-    }
-
-    fn steering(&self) -> &SteeringQueue {
-        &self.steering
-    }
-}
-
-/// Returns the token count reported in a usage update.
-fn reported_tokens(usage: Usage) -> u64 {
-    usage
-        .input_tokens
-        .unwrap_or(0)
-        .saturating_add(usage.output_tokens.unwrap_or(0))
-}
-
-/// A server serving one connection.
-pub struct Server<W: Write + Send + 'static> {
-    core: Arc<Core<W>>,
-    /// Held so turn threads keep the shared state alive.
-    handle: Arc<Mutex<()>>,
-}
-
 impl<W: Write + Send + 'static> fmt::Debug for Server<W> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Server")
-            .field("model", &self.core.config.model)
+            .field("model", &self.config.model)
             .finish_non_exhaustive()
     }
 }
@@ -1083,74 +322,848 @@ impl<W: Write + Send + 'static> Server<W> {
             &config.limits,
         );
         Ok(Self {
-            core: Arc::new(Core {
-                config,
-                writer: Mutex::new(Writer::new(output)),
-                sessions: Mutex::new(sessions),
-                pending: Mutex::new(BTreeMap::new()),
-                next_request: AtomicI64::new(1),
-                log: Mutex::new(log),
-                active: Mutex::new(Active::default()),
-                settled: Condvar::new(),
-                queue_depth,
-            }),
-            handle: Arc::new(Mutex::new(())),
+            config,
+            writer: Mutex::new(Writer::new(output)),
+            sessions: Mutex::new(sessions),
+            pending: Mutex::new(BTreeMap::new()),
+            next_request: AtomicI64::new(1),
+            log: Mutex::new(log),
+            active: Mutex::new(Active::default()),
+            settled: Condvar::new(),
+            queue_depth,
         })
     }
 
     /// Serves messages until the input ends.
     ///
-    /// A malformed frame is answered and the connection continues: only a failure
-    /// of the stream itself ends the loop.
-    pub fn run<R: BufRead>(&self, input: R) -> Result<()> {
+    /// A frame the reader could not accept is answered with an error and the
+    /// connection carries on. Only a failure of the stream itself ends the loop.
+    pub fn run<R: BufRead>(self: &Arc<Self>, input: R) -> Result<()> {
         let mut reader = crate::jsonrpc::Reader::new(input);
         loop {
             match reader.read_message() {
                 Ok(None) => break,
-                Ok(Some(message)) => self.core.dispatch(message),
+                Ok(Some(message)) => self.dispatch(message),
                 Err(err) if err.is_fatal() => {
-                    self.core.shutdown();
+                    self.shutdown();
                     return Err(err.to_rune_error());
                 }
                 Err(err) => self.reject(&err),
             }
         }
-        self.core.shutdown();
+        self.shutdown();
         Ok(())
     }
 
     /// Reports a frame the reader could not accept.
     fn reject(&self, err: &FrameError) {
-        self.core.note(format_args!("rejected a frame: {err}"));
-        let mut error = err.to_rpc_error();
-        if let FrameError::TooLarge { observed, limit } = err {
-            error.data = Some(json!({
-                "code": ErrorCode::TooLarge.as_str(),
-                "field": "frame",
-                "observed": observed,
-                "limit": limit,
-            }));
+        self.note(format_args!("rejected a frame: {err}"));
+        self.fail(None, err.to_rpc_error());
+    }
+
+    /// Writes one frame.
+    fn send(&self, message: &Message) {
+        let outcome = match self.writer.lock() {
+            Ok(mut writer) => writer.write_message(message),
+            Err(_) => return,
+        };
+        if let Err(err) = outcome {
+            self.note(format_args!("could not write a frame: {err}"));
         }
-        self.core.fail(None, error);
+    }
+
+    /// Writes a diagnostic line.
+    ///
+    /// Never to standard output: a line there is a frame as far as the client is
+    /// concerned, and a malformed frame costs the connection.
+    fn note(&self, message: fmt::Arguments<'_>) {
+        let Ok(mut guard) = self.log.lock() else {
+            return;
+        };
+        match guard.as_mut() {
+            Some(file) => {
+                let _ = writeln!(file, "{message}");
+            }
+            None => {
+                let _ = writeln!(std::io::stderr(), "{message}");
+            }
+        }
+    }
+
+    /// Answers a request.
+    fn respond(&self, id: Id, result: Value) {
+        self.send(&Message::Response(Response::ok(id, result)));
+    }
+
+    /// Reports a failure for a request.
+    fn fail(&self, id: Option<Id>, error: RpcError) {
+        self.send(&Message::Response(Response::failed(id, error)));
+    }
+
+    /// Routes a client's answer to the request that asked for it.
+    fn resolve(&self, response: Response) {
+        let Some(Id::Number(id)) = response.id.clone() else {
+            self.note(format_args!(
+                "ignoring a response for an identifier this server did not issue"
+            ));
+            return;
+        };
+        let sender = self
+            .pending
+            .lock()
+            .ok()
+            .and_then(|mut guard| guard.remove(&id));
+        match sender {
+            Some(sender) => {
+                // A receiver that went away is a turn that already stopped,
+                // which is normal rather than a fault.
+                let _ = sender.send(response);
+            }
+            None => self.note(format_args!("ignoring a response for unknown request {id}")),
+        }
+    }
+
+    /// Issues a request to the client and waits for its answer.
+    fn ask(&self, method: &str, params: Value, cancellation: &Cancellation) -> Option<Value> {
+        let id = self.next_request.fetch_add(1, Ordering::SeqCst);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        if let Ok(mut guard) = self.pending.lock() {
+            guard.insert(id, sender);
+        }
+        self.send(&Message::Request(Request::new(
+            Id::Number(id),
+            method,
+            params,
+        )));
+        let answer = wait_for(&receiver, cancellation);
+        if let Ok(mut guard) = self.pending.lock() {
+            guard.remove(&id);
+        }
+        answer
+    }
+
+    /// Routes one incoming message.
+    fn dispatch(self: &Arc<Self>, message: Message) {
+        match message {
+            Message::Response(response) => self.resolve(response),
+            Message::Notification(notification) => {
+                if let Err(error) = self.handle(&notification.method, &notification.params, None) {
+                    self.note(format_args!(
+                        "notification `{}` failed: {}",
+                        notification.method, error.message
+                    ));
+                }
+            }
+            Message::Request(request) => self.call(request),
+        }
+    }
+
+    /// Handles a request, answering it exactly once.
+    fn call(self: &Arc<Self>, request: Request) {
+        let id = request.id;
+        match self.handle(&request.method, &request.params, Some(id.clone())) {
+            Ok(Some(result)) => self.respond(id, result),
+            // A queued prompt answers itself once it runs.
+            Ok(None) => {}
+            Err(error) => self.fail(Some(id), error),
+        }
+    }
+
+    /// Routes a method to its handler.
+    ///
+    /// Returns `None` only when the method took ownership of its response.
+    fn handle(
+        self: &Arc<Self>,
+        method: &str,
+        params: &Value,
+        id: Option<Id>,
+    ) -> std::result::Result<Option<Value>, RpcError> {
+        match method {
+            "initialize" => Ok(Some(self.initialize(params))),
+            "session/new" => self.new_session(params).map(Some),
+            "session/load" => self.load_session(params).map(Some),
+            "session/resume" => self.resume_session(params).map(Some),
+            "session/close" => self.close_session(params).map(Some),
+            "session/list" => self.list_sessions().map(Some),
+            "session/set_config_option" => self.set_config_option(params).map(Some),
+            "session/set_mode" => self.set_mode(params).map(Some),
+            "session/cancel" => self.cancel(params).map(Some),
+            "session/prompt" => self.prompt(params, id),
+            other => Err(RpcError::method_not_found(other)),
+        }
+    }
+
+    /// Answers `initialize`, advertising what this server supports.
+    fn initialize(&self, params: &Value) -> Value {
+        let client = params
+            .get("clientInfo")
+            .and_then(|info| info.get("name"))
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        self.note(format_args!("client `{client}` opened a connection"));
+        json!({
+            "protocolVersion": PROTOCOL_VERSION,
+            "agentCapabilities": {
+                "loadSession": true,
+                "promptCapabilities": {
+                    "image": false,
+                    "audio": false,
+                    "embeddedContext": true,
+                },
+                "mcpCapabilities": { "http": false, "sse": false },
+                "sessionCapabilities": {
+                    "close": {},
+                    "list": {},
+                    "resume": {},
+                },
+            },
+            "agentInfo": {
+                "name": "rune",
+                "version": env!("CARGO_PKG_VERSION"),
+                "title": "Rune",
+            },
+            "authMethods": [],
+        })
+    }
+
+    /// Answers `session/new`.
+    fn new_session(&self, params: &Value) -> std::result::Result<Value, RpcError> {
+        let roots = additional_roots(params)?;
+        if let Some(cwd) = optional_string(params, "cwd")? {
+            require_absolute(&Utf8PathBuf::from(cwd), "cwd")?;
+        }
+        if let Some(list) = params.get("mcpServers").and_then(Value::as_array)
+            && !list.is_empty()
+        {
+            // No MCP client is wired in, so the request is reported rather than
+            // implying servers the session will never reach.
+            self.note(format_args!(
+                "ignoring {} requested MCP server(s)",
+                list.len()
+            ));
+        }
+        let mut sessions = self.lock_sessions()?;
+        let id = sessions
+            .create(roots)
+            .map_err(|err| RpcError::from_rune(&err))?;
+        let session = sessions.get(&id).map_err(|err| RpcError::from_rune(&err))?;
+        Ok(json!({
+            "sessionId": id,
+            "modes": modes(session.config()),
+            "configOptions": config_options(session.config()),
+        }))
+    }
+
+    /// Answers `session/load`, replaying the stored conversation first.
+    fn load_session(&self, params: &Value) -> std::result::Result<Value, RpcError> {
+        let id = string_field(params, "sessionId")?;
+        let updates = {
+            let mut sessions = self.lock_sessions()?;
+            sessions
+                .load(&id)
+                .map_err(|err| RpcError::from_rune(&err))?
+        };
+        for update in updates {
+            self.send(&Message::Notification(update));
+        }
+        self.session_state(&id)
+    }
+
+    /// Answers `session/resume`, which replays nothing.
+    fn resume_session(&self, params: &Value) -> std::result::Result<Value, RpcError> {
+        let id = string_field(params, "sessionId")?;
+        let mut sessions = self.lock_sessions()?;
+        sessions
+            .resume(&id)
+            .map_err(|err| RpcError::from_rune(&err))?;
+        drop(sessions);
+        self.session_state(&id)
+    }
+
+    /// Renders the modes and configuration options of an open session.
+    fn session_state(&self, id: &str) -> std::result::Result<Value, RpcError> {
+        let sessions = self.lock_sessions()?;
+        let session = sessions.get(id).map_err(|err| RpcError::from_rune(&err))?;
+        Ok(json!({
+            "modes": modes(session.config()),
+            "configOptions": config_options(session.config()),
+        }))
+    }
+
+    /// Answers `session/close`.
+    fn close_session(&self, params: &Value) -> std::result::Result<Value, RpcError> {
+        let id = string_field(params, "sessionId")?;
+        self.cancel_session(&id);
+        let mut sessions = self.lock_sessions()?;
+        sessions
+            .close(&id)
+            .map_err(|err| RpcError::from_rune(&err))?;
+        Ok(json!({}))
+    }
+
+    /// Answers `session/list`.
+    fn list_sessions(&self) -> std::result::Result<Value, RpcError> {
+        let sessions = self.lock_sessions()?;
+        let listed: Vec<Value> = sessions
+            .list()
+            .into_iter()
+            .map(|summary| {
+                json!({
+                    "sessionId": summary.id,
+                    "cwd": summary.cwd,
+                    "title": summary.title,
+                    "updatedAt": summary.updated_at,
+                })
+            })
+            .collect();
+        Ok(json!({ "sessions": listed }))
+    }
+
+    /// Answers `session/set_config_option`, returning the resulting options.
+    fn set_config_option(&self, params: &Value) -> std::result::Result<Value, RpcError> {
+        let id = string_field(params, "sessionId")?;
+        let option = string_field(params, "configId")?;
+        let value = string_field(params, "value")?;
+        let mut sessions = self.lock_sessions()?;
+        sessions
+            .set_config_option(&id, &option, &value)
+            .map_err(|err| RpcError::from_rune(&err))?;
+        let session = sessions.get(&id).map_err(|err| RpcError::from_rune(&err))?;
+        Ok(json!({ "configOptions": config_options(session.config()) }))
+    }
+
+    /// Answers `session/set_mode`.
+    fn set_mode(&self, params: &Value) -> std::result::Result<Value, RpcError> {
+        let id = string_field(params, "sessionId")?;
+        let mode = string_field(params, "modeId")?;
+        let mut sessions = self.lock_sessions()?;
+        sessions
+            .set_mode(&id, &mode)
+            .map_err(|err| RpcError::from_rune(&err))?;
+        Ok(json!({}))
+    }
+
+    /// Stops the active turn.
+    fn cancel(&self, params: &Value) -> std::result::Result<Value, RpcError> {
+        let id = string_field(params, "sessionId")?;
+        self.cancel_session(&id);
+        Ok(json!({}))
+    }
+
+    /// Requests cancellation for the active turn of one session.
+    fn cancel_session(&self, id: &str) {
+        let Ok(active) = self.active.lock() else {
+            return;
+        };
+        let belongs_to_caller = active.session.as_deref() == Some(id);
+        let cancellation = active.cancellation.clone();
+        let tools = active.tools.clone();
+        drop(active);
+
+        let Some(cancellation) = cancellation else {
+            return;
+        };
+        if !belongs_to_caller {
+            self.note(format_args!(
+                "a cancel for `{id}` was ignored; the active turn belongs to another session"
+            ));
+            return;
+        }
+        cancellation.cancel();
+        if let Some(tools) = tools {
+            tools.cancel();
+        }
+    }
+
+    /// Admits a prompt.
+    ///
+    /// The turn runs on its own thread so the reading thread stays free. A prompt
+    /// arriving while a turn runs is queued and answered once that turn settles,
+    /// which is what keeps a client from losing a message typed while the agent
+    /// was working.
+    fn prompt(
+        self: &Arc<Self>,
+        params: &Value,
+        id: Option<Id>,
+    ) -> std::result::Result<Option<Value>, RpcError> {
+        let Some(id) = id else {
+            return Err(RpcError::invalid_params(
+                "`session/prompt` needs an identifier so its result has somewhere to go",
+            ));
+        };
+        let session = string_field(params, "sessionId")?;
+        let text = prompt_text(params)?;
+        {
+            let sessions = self.lock_sessions()?;
+            sessions
+                .get(&session)
+                .map_err(|err| RpcError::from_rune(&err))?;
+        }
+
+        let arriving = Queued { id, session, text };
+        let running = {
+            let Ok(mut active) = self.active.lock() else {
+                return Err(RpcError::internal("the session state is unavailable"));
+            };
+            if active.cancellation.is_some() {
+                {
+                    if active.queue.len() >= self.queue_depth {
+                        let error = RuneError::new(
+                            ErrorCode::LimitExceeded,
+                            format!(
+                                "{} prompts are already queued for the running turn, the limit is {}",
+                                active.queue.len(),
+                                self.queue_depth
+                            ),
+                        )
+                        .with_hint("wait for the running turn to settle");
+                        self.note(format_args!("refused a queued prompt: {}", error.message()));
+                        return Err(RpcError::from_rune(&error));
+                    }
+                    self.note(format_args!(
+                        "queued a prompt for `{}` behind the running turn",
+                        arriving.session
+                    ));
+                    active.queue.push_back(arriving);
+                    None
+                }
+            } else {
+                active.cancellation = Some(Cancellation::new());
+                active.tools = None;
+                active.session = Some(arriving.session.clone());
+                Some(arriving)
+            }
+        };
+        if let Some(arriving) = running {
+            let server = Arc::clone(self);
+            std::thread::spawn(move || run_queued(&server, arriving));
+        }
+        Ok(None)
+    }
+
+    /// Locks the session map, reporting a poisoned lock as an internal fault.
+    fn lock_sessions(&self) -> std::result::Result<std::sync::MutexGuard<'_, Sessions>, RpcError> {
+        self.sessions
+            .lock()
+            .map_err(|_| RpcError::internal("the session state is unavailable"))
+    }
+
+    /// Stops any running turn and waits briefly for it to finish reporting.
+    fn shutdown(&self) {
+        let Ok(mut active) = self.active.lock() else {
+            return;
+        };
+        if let Some(cancellation) = active.cancellation.clone() {
+            cancellation.cancel();
+        }
+        if let Some(tools) = active.tools.clone() {
+            tools.cancel();
+        }
+        let deadline = Instant::now().checked_add(SHUTDOWN_GRACE);
+        let expired = |at: Option<Instant>| at.is_none_or(|deadline| Instant::now() >= deadline);
+        while active.cancellation.is_some() && !expired(deadline) {
+            match self.settled.wait_timeout(active, POLL) {
+                Ok((guard, _)) => active = guard,
+                Err(_) => return,
+            }
+        }
     }
 }
 
-impl<W: Write + Send + 'static> Core<W> {
-    /// Stops any running turn and waits briefly for it to report.
-    fn shutdown(&self) {
-        if let Ok(mut active) = self.active.lock() {
-            if let Some(cancellation) = &active.cancellation {
-                cancellation.cancel();
-            }
-            let deadline = std::time::Instant::now() + SHUTDOWN_GRACE;
-            while active.cancellation.is_some() && std::time::Instant::now() < deadline {
-                match self.settled.wait_timeout(active, POLL) {
-                    Ok((guard, _)) => active = guard,
-                    Err(_) => return,
+/// Waits for a response, giving up when the turn is cancelled.
+fn wait_for(receiver: &Receiver<Response>, cancellation: &Cancellation) -> Option<Value> {
+    loop {
+        match receiver.recv_timeout(POLL) {
+            Ok(response) => return response.into_outcome().and_then(std::result::Result::ok),
+            Err(RecvTimeoutError::Timeout) => {
+                if cancellation.is_cancelled() {
+                    return None;
                 }
             }
+            Err(RecvTimeoutError::Disconnected) => return None,
         }
     }
+}
+
+/// Runs one turn, then every prompt that was queued behind it.
+///
+/// The queue drains here rather than on the reading thread, so the order the
+/// prompts arrived in is the order they run and the order they are answered in.
+fn run_queued<W: Write + Send + 'static>(server: &Arc<Server<W>>, first: Queued) {
+    let mut next = Some(first);
+    while let Some(queued) = next.take() {
+        run_one(server, queued);
+        next = {
+            let Ok(mut active) = server.active.lock() else {
+                return;
+            };
+            if let Some(following) = active.queue.pop_front() {
+                active.cancellation = Some(Cancellation::new());
+                active.tools = None;
+                active.session = Some(following.session.clone());
+                Some(following)
+            } else {
+                active.cancellation = None;
+                active.tools = None;
+                active.session = None;
+                server.settled.notify_all();
+                None
+            }
+        };
+    }
+}
+
+/// Runs one accepted prompt as a turn and reports its outcome.
+fn run_one<W: Write + Send + 'static>(server: &Arc<Server<W>>, queued: Queued) {
+    let session = queued.session.clone();
+    let snapshot = match server.sessions.lock() {
+        Ok(sessions) => sessions.snapshot(&session),
+        Err(_) => Err(RuneError::new(
+            ErrorCode::Internal,
+            "the session state is unavailable",
+        )),
+    };
+    let snapshot = match snapshot {
+        Ok(snapshot) => snapshot,
+        Err(err) => {
+            server.fail(Some(queued.id), RpcError::from_rune(&err));
+            return;
+        }
+    };
+
+    let cancellation = {
+        // The tool handle is registered here, because this is the point a tool
+        // can first be running.
+        let tools = snapshot.context.cancellation();
+        server
+            .active
+            .lock()
+            .map(|mut active| {
+                active.tools = Some(tools);
+                active.cancellation.clone().unwrap_or_default()
+            })
+            .unwrap_or_default()
+    };
+
+    server.record(
+        &session,
+        SessionEvent::UserMessage {
+            text: queued.text.clone(),
+        },
+    );
+    server.send(&Message::Notification(message_chunk(
+        &session,
+        "user_message_chunk",
+        &queued.text,
+    )));
+
+    let host = TurnHost {
+        server: Arc::clone(server),
+        session: session.clone(),
+        config: snapshot.config.clone(),
+        rules: Mutex::new(snapshot.rules),
+        context: snapshot.context.clone(),
+        cancellation: cancellation.clone(),
+        steering: snapshot.steering,
+        tools: server.config.registry.all_schemas(),
+    };
+
+    let mut history = snapshot.history;
+    history.push_user(queued.text.clone());
+    let outcome = run_turn(&mut history, &host);
+    let rules = host
+        .rules
+        .lock()
+        .map(|guard| guard.clone())
+        .unwrap_or_default();
+
+    match outcome {
+        Ok(outcome) => {
+            // The loop reports the answer once the turn finishes, so the text
+            // reaches the client as one chunk rather than as it is produced.
+            if !outcome.text.is_empty() {
+                server.send(&Message::Notification(message_chunk(
+                    &session,
+                    "agent_message_chunk",
+                    &outcome.text,
+                )));
+                server.record(
+                    &session,
+                    SessionEvent::AssistantMessage {
+                        turn: u64::from(outcome.steps),
+                        text: outcome.text.clone(),
+                    },
+                );
+            }
+            server.absorb(&session, history, rules);
+            if outcome.stop_reason == StopReason::ProviderFailure {
+                server.fail(
+                    Some(queued.id),
+                    RpcError::from_rune(&RuneError::new(
+                        ErrorCode::TransportFailure,
+                        "the provider failed before the turn finished",
+                    )),
+                );
+                return;
+            }
+            server.retire_tools();
+            server.respond(
+                queued.id,
+                json!({ "stopReason": stop_reason(outcome.stop_reason) }),
+            );
+        }
+        Err(err) if cancellation.is_cancelled() || err.code() == ErrorCode::Cancelled => {
+            server.absorb(&session, history, rules);
+            server.retire_tools();
+            server.respond(queued.id, json!({ "stopReason": "cancelled" }));
+        }
+        Err(err) => {
+            server.absorb(&session, history, rules);
+            server.retire_tools();
+            server.note(format_args!("the turn failed: {err}"));
+            server.fail(Some(queued.id), RpcError::from_rune(&err));
+        }
+    }
+}
+
+/// Returns the protocol stop reason for a turn outcome.
+///
+/// The loop's own names are internal; a client is told one of the reasons the
+/// protocol defines.
+#[must_use]
+pub const fn stop_reason(reason: StopReason) -> &'static str {
+    match reason {
+        StopReason::Completed => "end_turn",
+        StopReason::StepLimit => "max_turn_requests",
+        StopReason::OutputLimit => "max_tokens",
+        StopReason::Refused | StopReason::ContentFilter => "refusal",
+        StopReason::Cancelled => "cancelled",
+        StopReason::ProviderFailure => "end_turn",
+    }
+}
+
+impl<W: Write + Send + 'static> Server<W> {
+    /// Appends one event to a session log, reporting a failure without stopping.
+    fn record(&self, session: &str, event: SessionEvent) {
+        if let Ok(mut sessions) = self.sessions.lock()
+            && let Err(err) = sessions.record(session, event)
+        {
+            self.note(format_args!("could not record an event: {err}"));
+        }
+    }
+
+    /// Clears the tool cancellation handle of a turn that has stopped.
+    fn retire_tools(&self) {
+        if let Ok(mut active) = self.active.lock() {
+            active.tools = None;
+        }
+    }
+
+    /// Replaces a session's conversation with what the turn produced.
+    fn absorb(&self, session: &str, history: History, rules: RuleSet) {
+        if let Ok(mut sessions) = self.sessions.lock()
+            && let Err(err) = sessions.absorb(session, history, rules)
+        {
+            self.note(format_args!("could not retain the turn: {err}"));
+        }
+    }
+}
+
+/// The host a turn runs against.
+struct TurnHost<W: Write + Send + 'static> {
+    server: Arc<Server<W>>,
+    session: String,
+    config: SessionConfig,
+    rules: Mutex<RuleSet>,
+    context: ExecutionContext,
+    cancellation: Cancellation,
+    steering: SteeringQueue,
+    tools: Vec<ToolSpec>,
+}
+
+impl<W: Write + Send + 'static> TurnHost<W> {
+    /// Reports a tool call to the client.
+    fn announce(&self, call: &rune_agent::turn::PreparedCall) {
+        let arguments: Value = serde_json::from_str(&call.arguments).unwrap_or(Value::Null);
+        let target = rune_agent::turn::permission_target_for(
+            &self.server.config.registry,
+            &call.name,
+            &arguments,
+        );
+        self.server.send(&Message::Notification(tool_call(
+            &self.session,
+            &call.id,
+            &call.name,
+            target.as_deref(),
+            "in_progress",
+            &arguments,
+        )));
+    }
+
+    /// Asks the client to resolve a call the rules left open.
+    fn request_permission(&self, name: &str, target: Option<&str>) -> (Outcome, String) {
+        let reference = self.server.next_request.fetch_add(1, Ordering::SeqCst);
+        let params = json!({
+            "sessionId": self.session,
+            "toolCall": {
+                "toolCallId": format!("call-{reference}"),
+                "title": tool_title(name, target),
+                "name": name,
+                "kind": kind_for_name(name),
+                "status": "pending",
+            },
+            "options": [
+                {"optionId": "allow_once", "name": "Allow once", "kind": "allow_once"},
+                {"optionId": "allow_always", "name": "Allow for this session", "kind": "allow_always"},
+                {"optionId": "reject_once", "name": "Reject", "kind": "reject_once"},
+            ],
+        });
+        let Some(answer) =
+            self.server
+                .ask("session/request_permission", params, &self.cancellation)
+        else {
+            return (
+                Outcome::Deny,
+                format!("the approval for {name} was not answered"),
+            );
+        };
+        let option = answer
+            .get("outcome")
+            .and_then(|outcome| outcome.get("optionId"))
+            .and_then(Value::as_str)
+            .unwrap_or("reject_once");
+        match option {
+            "allow_once" => (Outcome::Allow, format!("the user allowed {name} once")),
+            "allow_always" => {
+                if let Ok(mut rules) = self.rules.lock() {
+                    crate::session::grant(&mut rules, name, target);
+                }
+                (
+                    Outcome::Allow,
+                    format!("the user allowed {name} for the rest of the session"),
+                )
+            }
+            _ => (Outcome::Deny, format!("the user rejected {name}")),
+        }
+    }
+}
+
+impl<W: Write + Send + 'static> Host for TurnHost<W> {
+    fn dialect(&self) -> &dyn Provider {
+        self.server.config.dialect.provider()
+    }
+
+    fn endpoint(&self) -> &Endpoint {
+        &self.server.config.endpoint
+    }
+
+    fn model(&self) -> &str {
+        &self.config.model
+    }
+
+    fn instructions(&self) -> String {
+        self.server.config.instructions.clone()
+    }
+
+    fn tools(&self) -> Vec<ToolSpec> {
+        self.tools.clone()
+    }
+
+    fn effort(&self) -> Effort {
+        self.config.effort
+    }
+
+    fn emit(&self, event: Event) {
+        match event {
+            Event::TextDelta { delta } => {
+                self.server.send(&Message::Notification(message_chunk(
+                    &self.session,
+                    "agent_message_chunk",
+                    &delta,
+                )));
+            }
+            Event::ReasoningDelta { delta } => {
+                self.server.send(&Message::Notification(message_chunk(
+                    &self.session,
+                    "agent_thought_chunk",
+                    &delta,
+                )));
+            }
+            Event::ToolStarted { call, .. } => self.announce(&call),
+            Event::ToolFinished { call, is_error } => {
+                let status = if is_error { "failed" } else { "completed" };
+                self.server.send(&Message::Notification(tool_call_update(
+                    &self.session,
+                    &call.id,
+                    status,
+                    None,
+                )));
+            }
+            Event::ToolDenied { call, reason } => {
+                self.server.send(&Message::Notification(tool_call_update(
+                    &self.session,
+                    &call.id,
+                    "failed",
+                    Some(&reason),
+                )));
+            }
+            Event::Finished { usage, .. } => {
+                self.server.send(&Message::Notification(usage_update(
+                    &self.session,
+                    reported_tokens(usage),
+                    self.server.config.context_window,
+                )));
+            }
+            Event::TurnStarted { .. } | Event::SteeringApplied { .. } => {}
+        }
+    }
+
+    fn execute(&self, name: &str, arguments: &Value) -> Result<ToolOutput> {
+        self.server
+            .config
+            .registry
+            .call(name, arguments, &self.context)
+    }
+
+    fn decide(&self, name: &str, target: Option<&str>) -> (Outcome, String) {
+        let rules = self
+            .rules
+            .lock()
+            .map(|guard| guard.clone())
+            .unwrap_or_default();
+        let (outcome, reason) =
+            rune_agent::turn::decide_call(&rules, self.config.mode, name, target);
+        match outcome {
+            // This server has no reviewer of its own, so the client is the
+            // reviewer for a call the rules left open.
+            Outcome::Ask => self.request_permission(name, target),
+            resolved => (resolved, reason),
+        }
+    }
+
+    fn context(&self) -> ExecutionContext {
+        self.context.clone()
+    }
+
+    fn limits(&self) -> BudgetSet {
+        self.server.config.limits.clone()
+    }
+
+    fn cancellation(&self) -> Cancellation {
+        self.cancellation.clone()
+    }
+
+    fn steering(&self) -> &SteeringQueue {
+        &self.steering
+    }
+}
+
+/// Returns the token count reported in a usage update.
+fn reported_tokens(usage: Usage) -> u64 {
+    usage
+        .input_tokens
+        .unwrap_or(0)
+        .saturating_add(usage.output_tokens.unwrap_or(0))
 }
 
 /// Reads a required string member.
@@ -1206,7 +1219,7 @@ fn additional_roots(params: &Value) -> std::result::Result<Vec<Utf8PathBuf>, Rpc
     Ok(roots)
 }
 
-/// Rejects a relative path in a field the protocol requires to be absolute.
+/// Rejects a relative path in a member the protocol requires to be absolute.
 fn require_absolute(path: &Utf8PathBuf, field: &str) -> std::result::Result<(), RpcError> {
     if path.is_absolute() {
         return Ok(());
@@ -1220,7 +1233,7 @@ fn require_absolute(path: &Utf8PathBuf, field: &str) -> std::result::Result<(), 
 /// Extracts the text of a prompt.
 ///
 /// Text blocks and embedded resources carry text; every other block type is
-/// reported and skipped, because this server advertises no image support.
+/// refused by name, because this server advertises support for none of them.
 fn prompt_text(params: &Value) -> std::result::Result<String, RpcError> {
     let Some(blocks) = params.get("prompt") else {
         return Err(RpcError::from_rune(&RuneError::missing_field("prompt")));
@@ -1277,63 +1290,18 @@ fn push_block(target: &mut String, text: &str) {
     target.push_str(text);
 }
 
-/// Convenience for callers building a prompt by hand.
-#[must_use]
-pub fn text_prompt(text: &str) -> Value {
-    json!([{ "type": "text", "text": text }])
-}
-
-/// Names the context window used when the catalog knows nothing about a model.
-#[must_use]
-pub const fn fallback_context_window() -> u64 {
-    DEFAULT_CONTEXT_WINDOW
-}
-
-/// A map from tool name to the tools a turn advertises, for diagnostics.
-#[must_use]
-pub fn tool_names(registry: &Registry) -> Vec<String> {
-    registry.names().into_iter().map(str::to_owned).collect()
-}
-
-/// Collects the identifiers a turn announced, for diagnostics.
-#[must_use]
-pub fn announced_ids(ids: &HashSet<String>) -> Vec<&str> {
-    let mut sorted: Vec<&str> = ids.iter().map(String::as_str).collect();
-    sorted.sort_unstable();
-    sorted
-}
-
-/// Renders a request map for a diagnostic line.
-#[must_use]
-pub fn describe_params(params: &Value) -> String {
-    match params.as_object() {
-        Some(object) => {
-            let keys: Vec<&str> = object.keys().map(String::as_str).collect();
-            keys.join(", ")
-        }
-        None => "not an object".to_owned(),
-    }
-}
-
-/// Returns a copy of a params object with one member replaced.
-#[must_use]
-pub fn with_member(params: &Value, name: &str, value: Value) -> Value {
-    let mut object: Map<String, Value> = params.as_object().cloned().unwrap_or_default();
-    object.insert(name.to_owned(), value);
-    Value::Object(object)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn stop_reasons_map_to_their_wire_names() {
+    fn stop_reasons_map_to_the_protocol_names() {
         assert_eq!(stop_reason(StopReason::Completed), "end_turn");
         assert_eq!(stop_reason(StopReason::Cancelled), "cancelled");
         assert_eq!(stop_reason(StopReason::OutputLimit), "max_tokens");
         assert_eq!(stop_reason(StopReason::StepLimit), "max_turn_requests");
         assert_eq!(stop_reason(StopReason::Refused), "refusal");
+        assert_eq!(stop_reason(StopReason::ContentFilter), "refusal");
     }
 
     #[test]
@@ -1411,11 +1379,5 @@ mod tests {
         };
         assert_eq!(reported_tokens(usage), 15);
         assert_eq!(reported_tokens(Usage::default()), 0);
-    }
-
-    #[test]
-    fn a_text_prompt_builds_the_documented_block() {
-        assert_eq!(text_prompt("hi")[0]["type"], "text");
-        assert_eq!(text_prompt("hi")[0]["text"], "hi");
     }
 }

@@ -20,7 +20,7 @@ mod version;
 use std::process::ExitCode;
 
 use camino::Utf8PathBuf;
-use rune_core::config::{self, EnvironmentOverrides, Layer, Settings};
+use rune_core::config::{self, EnvironmentOverrides, Layer, Provider, Settings};
 use rune_core::error::{ErrorCode, Result, RuneError};
 use rune_core::paths::Paths;
 
@@ -144,8 +144,9 @@ fn run(launch: &Launch) -> Result<ExitCode> {
         Command::Permissions => Err(not_yet_available("the permission engine")),
         Command::Workspace => run_workspace(&settings, launch, &output_flags),
         Command::Ask => run_ask(&settings, &paths, launch, &output_flags),
-        Command::Acp | Command::Review | Command::Interactive | Command::Resume => {
-            Err(not_yet_available("the agent runtime"))
+        Command::Acp => run_acp(&settings, &paths, &workspace, launch),
+        Command::Review | Command::Interactive | Command::Resume => {
+            Err(not_yet_available("the interactive shell"))
         }
         Command::Upgrade | Command::Uninstall => Err(not_yet_available("the installer")),
         Command::Help | Command::Version => Ok(ExitCode::from(EXIT_OK)),
@@ -248,6 +249,75 @@ fn run_ask(
             Err(err)
         }
     }
+}
+
+/// Runs `acp`.
+///
+/// Fails before touching the transport when the endpoint or credential is
+/// missing, so a client gets a usable error rather than a connection that
+/// accepts a session and then cannot run a turn.
+fn run_acp(
+    settings: &Settings,
+    paths: &Paths,
+    workspace: &camino::Utf8Path,
+    launch: &Launch,
+) -> Result<ExitCode> {
+    settings.require_model()?;
+
+    let provider_name = settings.provider.to_string();
+    let base_url = settings.base_url.clone().ok_or_else(|| {
+        RuneError::new(
+            ErrorCode::InvalidConfiguration,
+            format!("no endpoint is configured for provider `{provider_name}`"),
+        )
+        .with_hint("set `base_url` in the user config, or run `rune connect`")
+    })?;
+    rune_net::transport::validate_url(&base_url)?;
+
+    let credential =
+        rune_net::auth::resolve(paths, &provider_name, settings.api_key_env.as_deref())?
+            .ok_or_else(|| {
+                rune_net::auth::missing_credential_error(
+                    &provider_name,
+                    settings.api_key_env.as_deref(),
+                )
+            })?;
+
+    let dialect = match settings.provider {
+        Provider::Anthropic => rune_acp::Dialect::Anthropic,
+        Provider::Responses => rune_acp::Dialect::Responses,
+        _ => rune_acp::Dialect::ChatCompletions,
+    };
+
+    let registry = rune_tools::inventory::builtin(
+        &rune_tools::workspace::FileLimits::from_budget(&settings.limits),
+        &settings.limits,
+    )?;
+
+    let rules = rune_policy::rules::RuleSet::new();
+
+    let log_file = launch.flag("--log-file").map(Utf8PathBuf::from);
+
+    let config = rune_acp::ServerConfig {
+        paths: paths.clone(),
+        workspace: workspace.to_owned(),
+        endpoint: rune_net::transport::Endpoint::new(base_url, credential.expose().to_owned()),
+        dialect,
+        model: settings.model.clone(),
+        instructions: rune_context::prompt::SYSTEM_PROMPT.to_owned(),
+        registry,
+        rules,
+        mode: settings.permission_mode,
+        effort: settings.effort,
+        limits: settings.limits.clone(),
+        log_file,
+        context_window: rune_net::catalog::DEFAULT_CONTEXT_WINDOW,
+    };
+
+    let server = std::sync::Arc::new(rune_acp::Server::new(config, std::io::stdout())?);
+    let input = std::io::BufReader::new(std::io::stdin());
+    server.run(input)?;
+    Ok(ExitCode::from(EXIT_OK))
 }
 
 /// Runs `status`.

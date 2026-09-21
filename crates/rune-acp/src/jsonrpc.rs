@@ -150,9 +150,13 @@ impl RpcError {
     pub fn from_rune(error: &RuneError) -> Self {
         let code = match error.code() {
             ErrorCode::Unsupported => METHOD_NOT_FOUND,
+            // A limit the request itself exhausted is the client's to correct,
+            // so it travels as an invalid-params error rather than an internal
+            // fault the client cannot act on.
             ErrorCode::InvalidField
             | ErrorCode::MissingField
             | ErrorCode::TooLarge
+            | ErrorCode::LimitExceeded
             | ErrorCode::NotFound => INVALID_PARAMS,
             _ => INTERNAL_ERROR,
         };
@@ -271,7 +275,7 @@ impl Response {
 
     /// Returns the result or the error, whichever the response carries.
     #[must_use]
-    pub fn into_outcome(self) -> Option<Result<Value>> {
+    pub fn into_outcome(self) -> Option<std::result::Result<Value, RpcError>> {
         match (self.result, self.error) {
             (Some(result), _) => Some(Ok(result)),
             (None, Some(error)) => Some(Err(error)),
@@ -454,11 +458,18 @@ impl FrameError {
             Self::Syntax(message) | Self::Malformed(message) => {
                 RpcError::new(self.code(), message.clone())
             }
-            Self::TooLarge { observed, limit } => {
-                let error =
-                    RuneError::too_large("frame", *observed, *limit).with_invariant("frame_size");
-                RpcError::from_rune(&error)
-            }
+            // An oversized frame is a malformed request rather than a bad
+            // parameter, so it keeps the code the frame error declares.
+            Self::TooLarge { observed, limit } => RpcError::new(
+                self.code(),
+                format!("the frame holds {observed} bytes, limit is {limit}"),
+            )
+            .with_data(serde_json::json!({
+                "code": ErrorCode::TooLarge.as_str(),
+                "field": "frame",
+                "observed": observed,
+                "limit": limit,
+            })),
             Self::Io(error) => RpcError::from_rune(error),
         }
     }
@@ -757,7 +768,7 @@ mod tests {
             )))
             .expect("write");
         let text = String::from_utf8(writer.into_inner()).expect("utf8");
-        assert!(text.ends_with("\n"), "{text}");
+        assert!(text.ends_with('\n'), "{text}");
         assert_eq!(text.matches('\n').count(), 1);
     }
 

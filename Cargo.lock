@@ -864,8 +864,13 @@ name = "rune"
 version = "0.1.0"
 dependencies = [
  "camino",
+ "rune-acp",
+ "rune-context",
  "rune-core",
  "rune-net",
+ "rune-policy",
+ "rune-session",
+ "rune-tools",
  "serde",
  "serde_json",
  "tempfile",

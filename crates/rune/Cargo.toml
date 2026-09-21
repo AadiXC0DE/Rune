@@ -17,6 +17,11 @@ workspace = true
 [dependencies]
 rune-core.workspace = true
 rune-net.workspace = true
+rune-acp.workspace = true
+rune-tools.workspace = true
+rune-policy.workspace = true
+rune-context.workspace = true
+rune-session.workspace = true
 camino.workspace = true
 serde.workspace = true
 serde_json.workspace = true
