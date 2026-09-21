@@ -1,0 +1,18 @@
+---
+source: crates/rune-term/tests/engine_grid.rs
+expression: render(&grid)
+---
+24x6
+|**rune**                |
+|planning the change     |
+|@@@@@@@                 |
+|! warning: nothing to do|
+|done                    |
+|                        |
+cursor 4:4 wrap=false
+row 0: "**rune**"
+row 1: "planning the change"
+row 2: "issue 7"
+row 3: "! warning: nothing to do"
+row 4: "done"
+row 5: ""

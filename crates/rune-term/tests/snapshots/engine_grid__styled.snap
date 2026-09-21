@@ -1,0 +1,14 @@
+---
+source: crates/rune-term/tests/engine_grid.rs
+expression: render(&grid)
+---
+20x4
+|bold underline      |
+|truecolor           |
+|reversestrike       |
+|                    |
+cursor 2:13 wrap=false
+row 0: "bold underline"
+row 1: "truecolor"
+row 2: "reversestrike"
+row 3: ""

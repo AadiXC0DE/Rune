@@ -1,0 +1,12 @@
+---
+source: crates/rune-term/tests/engine_grid.rs
+expression: render(&grid)
+---
+12x3
+|three       |
+|four        |
+|five        |
+cursor 2:4 wrap=false
+row 0: "three"
+row 1: "four"
+row 2: "five"
