@@ -520,13 +520,14 @@ impl BudgetSet {
         value: Budget,
         layer: crate::config::Layer,
     ) -> Result<()> {
-        if let Some(raw) = value.value() {
-            if !name.range().contains(raw) {
+        if let Some(raw) = value.value().filter(|raw| !name.range().contains(*raw)) {
+            {
                 let range = name.range();
                 return Err(RuneError::invalid_field(
                     name.as_str(),
                     format!(
-                        "{raw} is outside the accepted range {}{}",
+                        "`{}` was given {raw}, outside the accepted range {}{}",
+                        name.as_str(),
                         range.min,
                         match range.max {
                             Some(max) => format!("..{max}"),

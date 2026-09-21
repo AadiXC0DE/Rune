@@ -5,6 +5,9 @@
 //! dispatch and configuration resolution stay free of that cost.
 
 #![forbid(unsafe_code)]
+// Tests assert by panicking. The guards that forbid panicking apply to the
+// shipped build, where a panic on user input is a defect.
+#![cfg_attr(test, allow(clippy::expect_used, clippy::unwrap_used, clippy::panic))]
 
 pub mod budget;
 pub mod config;

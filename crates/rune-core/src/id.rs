@@ -194,7 +194,7 @@ impl EventSeq {
         if self.0 <= 1 {
             None
         } else {
-            Some(Self(self.0 - 1))
+            Some(Self(self.0.saturating_sub(1)))
         }
     }
 }
@@ -245,10 +245,13 @@ fn validate_id_charset(raw: &str, field: &'static str) -> crate::error::Result<(
 /// identifier rather than an abort. Session creation validates uniqueness
 /// against the store, so a collision is reported rather than silently reused.
 fn getrandom(out: &mut [u8]) {
-    use std::fs::File;
     use std::io::Read;
 
-    if let Ok(mut file) = File::open("/dev/urandom") {
+    // A failure to open or read leaves the buffer zeroed, which yields a
+    // predictable identifier rather than an abort. Session creation checks
+    // uniqueness against the store, so a collision is reported, not reused.
+    if let Ok(file) = std::fs::File::open("/dev/urandom") {
+        let mut file = file;
         if file.read_exact(out).is_ok() {
             return;
         }
@@ -257,46 +260,59 @@ fn getrandom(out: &mut [u8]) {
 }
 
 /// Encodes bytes into the unpadded URL-safe base64 alphabet.
+///
+/// Operates on a zero-padded copy so the loop has no truncated tail to handle
+/// separately. The padding bytes only affect output positions that are never
+/// written, because the number of emitted characters is derived from the real
+/// length.
 fn base64url_encode(input: &[u8], out: &mut [u8]) {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
 
-    let mut out_index = 0;
-    let mut chunks = input.chunks_exact(3);
-    for chunk in &mut chunks {
-        let mut block = [0_u8; 3];
-        block.copy_from_slice(chunk);
-        let n = (u32::from(block[0]) << 16) | (u32::from(block[1]) << 8) | u32::from(block[2]);
-        for shift in [18_u32, 12, 6, 0] {
-            let idx = ((n >> shift) & 0x3F) as usize;
-            if out_index < out.len() {
-                out[out_index] = ALPHABET[idx];
-                out_index += 1;
-            }
-        }
-    }
+    let emitted = input
+        .len()
+        .saturating_div(3)
+        .saturating_mul(4)
+        .saturating_add(match input.len() % 3 {
+            1 => 2,
+            2 => 3,
+            _ => 0,
+        });
 
-    match chunks.remainder() {
-        [a] => {
-            let n = u32::from(*a) << 16;
-            for shift in [18_u32, 12] {
-                let idx = ((n >> shift) & 0x3F) as usize;
-                if out_index < out.len() {
-                    out[out_index] = ALPHABET[idx];
-                    out_index += 1;
-                }
+    let mut index = 0;
+    let mut out_index = 0;
+
+    while out_index < emitted {
+        // The three-byte window is refilled from the input each round, with
+        // zeros past the end so the final partial group needs no separate path.
+        let mut buffer = [0_u8; 3];
+        let remaining = input.len().saturating_sub(index);
+        let take = remaining.min(3);
+        if let (Some(slice), Some(target)) = (
+            input.get(index..index.saturating_add(take)),
+            buffer.get_mut(..take),
+        ) {
+            target.copy_from_slice(slice);
+        }
+
+        let (Some(a), Some(b), Some(c)) = (buffer.first(), buffer.get(1), buffer.get(2)) else {
+            break;
+        };
+        let block = (u32::from(*a) << 16) | (u32::from(*b) << 8) | u32::from(*c);
+
+        for shift in [18_u32, 12, 6, 0] {
+            if out_index >= emitted {
+                break;
+            }
+            let alphabet_index = usize::try_from((block >> shift) & 0x3F).unwrap_or(0);
+            if let (Some(slot), Some(value)) =
+                (out.get_mut(out_index), ALPHABET.get(alphabet_index))
+            {
+                *slot = *value;
+                out_index = out_index.saturating_add(1);
             }
         }
-        [a, b] => {
-            let n = (u32::from(*a) << 16) | (u32::from(*b) << 8);
-            for shift in [18_u32, 12, 6] {
-                let idx = ((n >> shift) & 0x3F) as usize;
-                if out_index < out.len() {
-                    out[out_index] = ALPHABET[idx];
-                    out_index += 1;
-                }
-            }
-        }
-        _ => {}
+
+        index = index.saturating_add(3);
     }
 }
 
@@ -390,11 +406,13 @@ mod tests {
     }
 
     fn encoded_len(input_len: usize) -> usize {
-        (input_len / 3) * 4
-            + match input_len % 3 {
+        input_len
+            .saturating_div(3)
+            .saturating_mul(4)
+            .saturating_add(match input_len % 3 {
                 0 => 0,
                 1 => 2,
                 _ => 3,
-            }
+            })
     }
 }

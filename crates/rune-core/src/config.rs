@@ -95,6 +95,20 @@ impl PermissionMode {
             Self::FullAccess => "full access",
         }
     }
+
+    /// Parses a mode written by a user.
+    ///
+    /// Accepts the canonical spelling, the hyphenated form, and the legacy
+    /// name, because all three appear in existing configuration.
+    #[must_use]
+    pub fn from_name(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "ask" => Some(Self::Ask),
+            "auto" => Some(Self::Auto),
+            "full-access" | "full_access" | "fullaccess" | "yolo" => Some(Self::FullAccess),
+            _ => None,
+        }
+    }
 }
 
 impl fmt::Display for PermissionMode {
@@ -580,21 +594,27 @@ impl EnvironmentOverrides {
     /// environment, which is not thread safe to mutate.
     #[must_use]
     pub fn from_lookup(mut lookup: impl FnMut(&str) -> Option<String>) -> Self {
-        let mut out = Self::default();
+        let boolean = |lookup: &mut dyn FnMut(&str) -> Option<String>, key: &str| {
+            lookup(key).and_then(|value| parse_bool(&value))
+        };
 
-        out.provider = lookup("RUNE_PROVIDER");
-        out.model = lookup("RUNE_MODEL");
-        out.base_url = lookup("RUNE_BASE_URL");
-        out.api_key_env = lookup("RUNE_API_KEY_ENV");
-        out.permission_mode = lookup("RUNE_PERMISSION_MODE");
-        out.effort = lookup("RUNE_EFFORT");
-        out.fast_mode = lookup("RUNE_FAST_MODE").and_then(|v| parse_bool(&v));
-        out.theme = lookup("RUNE_THEME");
-        out.auto_upgrade = lookup("RUNE_AUTO_UPGRADE").and_then(|v| parse_bool(&v));
-        out.provider_order = lookup("RUNE_PROVIDER_ORDER");
-        out.provider_strict = lookup("RUNE_PROVIDER_STRICT").and_then(|v| parse_bool(&v));
-        out.review_model = lookup("RUNE_REVIEW_MODEL");
-        out.offline = lookup("RUNE_OFFLINE").and_then(|v| parse_bool(&v));
+        let mut out = Self {
+            provider: lookup("RUNE_PROVIDER"),
+            model: lookup("RUNE_MODEL"),
+            base_url: lookup("RUNE_BASE_URL"),
+            api_key_env: lookup("RUNE_API_KEY_ENV"),
+            permission_mode: lookup("RUNE_PERMISSION_MODE"),
+            effort: lookup("RUNE_EFFORT"),
+            fast_mode: boolean(&mut lookup, "RUNE_FAST_MODE"),
+            theme: lookup("RUNE_THEME"),
+            auto_upgrade: boolean(&mut lookup, "RUNE_AUTO_UPGRADE"),
+            additional_directories: Vec::new(),
+            limits: Vec::new(),
+            provider_order: lookup("RUNE_PROVIDER_ORDER"),
+            provider_strict: boolean(&mut lookup, "RUNE_PROVIDER_STRICT"),
+            review_model: lookup("RUNE_REVIEW_MODEL"),
+            offline: boolean(&mut lookup, "RUNE_OFFLINE"),
+        };
 
         if let Some(list) = lookup("RUNE_ADDITIONAL_DIRS") {
             out.additional_directories = list
@@ -893,38 +913,43 @@ fn apply_user(settings: &mut Settings, user: &UserConfig, layer: Layer) {
 fn apply_project(settings: &mut Settings, project: &ProjectConfig, layer: Layer) {
     // Project limits and step caps sit below user settings only when the user
     // has not already set them, which the layer ordering already handles.
-    if let Some(steps) = project.max_agent_steps {
-        if settings.source_of("max_agent_steps") == Layer::Default {
-            let _ = settings
-                .limits
-                .set(LimitName::MaxAgentSteps, Budget::Bounded(steps), layer);
-        }
+    if let Some(steps) = project
+        .max_agent_steps
+        .filter(|_| settings.source_of("max_agent_steps") == Layer::Default)
+    {
+        let _ = settings
+            .limits
+            .set(LimitName::MaxAgentSteps, Budget::Bounded(steps), layer);
     }
-    if let Some(bytes) = project.max_tool_result_bytes {
-        if settings.source_of("max_tool_result_bytes") == Layer::Default {
-            let _ =
-                settings
-                    .limits
-                    .set(LimitName::MaxToolResultBytes, Budget::Bounded(bytes), layer);
-        }
+    if let Some(bytes) = project
+        .max_tool_result_bytes
+        .filter(|_| settings.source_of("max_tool_result_bytes") == Layer::Default)
+    {
+        let _ = settings
+            .limits
+            .set(LimitName::MaxToolResultBytes, Budget::Bounded(bytes), layer);
     }
-    if let Some(context) = project.context {
-        if settings.source_of("context") == Layer::Default {
-            settings.context = context;
-            settings.sources.record("context", layer);
-        }
+    if let Some(context) = project
+        .context
+        .filter(|_| settings.source_of("context") == Layer::Default)
+    {
+        settings.context = context;
+        settings.sources.record("context", layer);
     }
-    if let Some(order) = &project.provider_order {
-        if settings.provider_order.is_empty() {
-            settings.provider_order.clone_from(order);
-            settings.sources.record("provider_order", layer);
-        }
+    if let Some(order) = project
+        .provider_order
+        .as_ref()
+        .filter(|_| settings.provider_order.is_empty())
+    {
+        settings.provider_order.clone_from(order);
+        settings.sources.record("provider_order", layer);
     }
-    if let Some(strict) = project.provider_strict {
-        if settings.source_of("provider_strict") == Layer::Default {
-            settings.provider_strict = strict;
-            settings.sources.record("provider_strict", layer);
-        }
+    if let Some(strict) = project
+        .provider_strict
+        .filter(|_| settings.source_of("provider_strict") == Layer::Default)
+    {
+        settings.provider_strict = strict;
+        settings.sources.record("provider_strict", layer);
     }
     apply_limit_table(
         &mut settings.limits,
@@ -958,7 +983,7 @@ fn apply_limit_table(
                 diagnostics.push(
                     Diagnostic::new(layer, err.code(), err.message().to_owned())
                         .with_key(key.clone())
-                        .with_hint(format!("accepted keys are listed by `rune limits`")),
+                        .with_hint("accepted keys are listed by `rune limits`"),
                 );
             }
         }
@@ -986,13 +1011,7 @@ fn apply_environment(settings: &mut Settings, env: &EnvironmentOverrides) {
         settings.sources.record("api_key_env", layer);
     }
     if let Some(raw) = &env.permission_mode {
-        let parsed = match raw.trim().to_ascii_lowercase().as_str() {
-            "ask" => Some(PermissionMode::Ask),
-            "auto" => Some(PermissionMode::Auto),
-            "full-access" | "full_access" | "yolo" => Some(PermissionMode::FullAccess),
-            _ => None,
-        };
-        match parsed {
+        match PermissionMode::from_name(raw) {
             Some(mode) => {
                 settings.permission_mode = mode;
                 settings.sources.record("permission_mode", layer);
@@ -1463,8 +1482,10 @@ theme_unused = "x"
             "config.toml",
             "[models]\nanthropic = \"claude-x\"\ndefault = \"fallback\"\n",
         );
-        let mut settings = Settings::default();
-        settings.provider = Provider::Anthropic;
+        let mut settings = Settings {
+            provider: Provider::Anthropic,
+            ..Settings::default()
+        };
         apply_user(
             &mut settings,
             &read_user(&user).expect("read").expect("present"),

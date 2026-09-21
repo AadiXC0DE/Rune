@@ -258,10 +258,8 @@ fn join_home(home: &str, relative: &str) -> Utf8PathBuf {
 /// paths such as `~/.local/share` that legitimately carry wider modes, so they
 /// are created without a mode check.
 pub fn create_dir_private(path: &Utf8Path) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        if !parent.as_str().is_empty() {
-            std::fs::create_dir_all(parent)?;
-        }
+    if let Some(parent) = path.parent().filter(|parent| !parent.as_str().is_empty()) {
+        std::fs::create_dir_all(parent)?;
     }
 
     match std::fs::symlink_metadata(path) {
@@ -323,19 +321,16 @@ pub fn write_private(path: &Utf8Path, contents: &str) -> Result<()> {
     // Parent directories are created without a mode check: they may be
     // system-owned paths such as a temp directory, which legitimately carry a
     // wider mode. The file itself is what must be private.
-    if let Some(parent) = path.parent() {
-        if !parent.as_str().is_empty() {
-            std::fs::create_dir_all(parent)?;
-        }
+    if let Some(parent) = path.parent().filter(|parent| !parent.as_str().is_empty()) {
+        std::fs::create_dir_all(parent)?;
     }
 
-    if let Ok(meta) = std::fs::symlink_metadata(path) {
-        if meta.file_type().is_symlink() {
-            return Err(RuneError::new(
-                ErrorCode::UnsafePath,
-                format!("`{path}` is a symbolic link"),
-            ));
-        }
+    let existing = std::fs::symlink_metadata(path);
+    if existing.is_ok_and(|meta| meta.file_type().is_symlink()) {
+        return Err(RuneError::new(
+            ErrorCode::UnsafePath,
+            format!("`{path}` is a symbolic link"),
+        ));
     }
 
     let mut options = std::fs::OpenOptions::new();

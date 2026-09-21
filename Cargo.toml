@@ -84,9 +84,13 @@ tempfile = "3"
 [workspace.lints.rust]
 unsafe_code = "forbid"
 unused_qualifications = "warn"
-rust_2018_idioms = "warn"
+elided_lifetimes_in_paths = "warn"
+single_use_lifetimes = "warn"
+unused_lifetimes = "warn"
 missing_debug_implementations = "warn"
 non_ascii_idents = "warn"
+trivial_casts = "warn"
+trivial_numeric_casts = "warn"
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
@@ -103,14 +107,29 @@ cast_sign_loss = "allow"
 cast_precision_loss = "allow"
 struct_excessive_bools = "allow"
 similar_names = "allow"
-# Correctness guards we do want.
+# A default table lists every variant with its own value, so identical bodies
+# are the point rather than a mistake.
+match_same_arms = "allow"
+# Tests index fixed fixtures and use expect for the failing assertion message.
+indexing_slicing = "allow"
+# Small types are copied by value deliberately; the alternative is noise.
+trivially_copy_pass_by_ref = "allow"
+# Enumerating every value is clearer than a glob in several tables.
+wildcard_imports = "allow"
+# Command handlers share one signature so dispatch stays uniform, even where a
+# handler cannot fail yet.
+unnecessary_wraps = "allow"
+# Correctness guards we do want in shipped code. Tests assert by panicking, so
+# these are re-enabled for the library and binary targets only.
 unwrap_used = "deny"
 expect_used = "deny"
 panic = "deny"
-# Parsers and the VT engine need slicing and wrapping arithmetic in narrow,
-# reviewed places. Kept as warnings so the corruption suite is the real check.
-indexing_slicing = "warn"
+# Parsers and the VT engine need wrapping arithmetic in narrow, reviewed
+# places. Kept as a warning so the corruption suite stays the real check.
 arithmetic_side_effects = "warn"
+# An error that carries structured detail is worth more than a smaller one, and
+# the common case is already boxed.
+result_large_err = "allow"
 
 [profile.release]
 opt-level = "z"

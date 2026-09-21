@@ -204,7 +204,10 @@ impl ErrorDetail {
 pub struct RuneError {
     code: ErrorCode,
     message: String,
-    detail: ErrorDetail,
+    /// Boxed so the error stays small on the success path. The detail is
+    /// present on most failures but rarely observed, so paying for it inline in
+    /// every `Result` would be the wrong trade.
+    detail: Box<ErrorDetail>,
 }
 
 impl RuneError {
@@ -214,7 +217,7 @@ impl RuneError {
         Self {
             code,
             message: message.into(),
-            detail: ErrorDetail::none(),
+            detail: Box::new(ErrorDetail::none()),
         }
     }
 
@@ -225,10 +228,10 @@ impl RuneError {
         Self {
             code: ErrorCode::InvalidField,
             message: message.into(),
-            detail: ErrorDetail {
+            detail: Box::new(ErrorDetail {
                 field: Some(field),
                 ..ErrorDetail::none()
-            },
+            }),
         }
     }
 
@@ -239,10 +242,10 @@ impl RuneError {
         Self {
             code: ErrorCode::MissingField,
             message: format!("required field `{field}` is missing"),
-            detail: ErrorDetail {
+            detail: Box::new(ErrorDetail {
                 field: Some(field),
                 ..ErrorDetail::none()
-            },
+            }),
         }
     }
 
@@ -253,10 +256,10 @@ impl RuneError {
         Self {
             code: ErrorCode::CorruptRecord,
             message: message.into(),
-            detail: ErrorDetail {
+            detail: Box::new(ErrorDetail {
                 invariant: Some(invariant),
                 ..ErrorDetail::none()
-            },
+            }),
         }
     }
 
@@ -267,12 +270,12 @@ impl RuneError {
         Self {
             code: ErrorCode::TooLarge,
             message: format!("`{field}` holds {observed} bytes, limit is {limit}"),
-            detail: ErrorDetail {
+            detail: Box::new(ErrorDetail {
                 field: Some(field),
                 observed: Some(observed.to_string()),
                 hint: Some(format!("reduce to at most {limit} bytes")),
                 ..ErrorDetail::none()
-            },
+            }),
         }
     }
 
@@ -444,6 +447,13 @@ mod tests {
 
         let other = std::io::Error::other("?");
         assert_eq!(RuneError::from(other).code(), ErrorCode::TransportFailure);
+    }
+
+    #[test]
+    fn error_stays_small_on_the_success_path() {
+        // Every fallible call carries this type, so its size is a real cost.
+        let size = size_of::<RuneError>();
+        assert!(size <= 48, "RuneError grew to {size} bytes");
     }
 
     #[test]

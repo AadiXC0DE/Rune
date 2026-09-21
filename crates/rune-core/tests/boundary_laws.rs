@@ -4,6 +4,15 @@
 //! test parses the workspace manifests and fails when a crate gains a dependency
 //! that violates its layer.
 
+// Integration tests assert by panicking. The guards that forbid panicking
+// apply to shipped code, where a panic on user input is a defect.
+#![allow(
+    clippy::expect_used,
+    clippy::unwrap_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
+
 use std::collections::BTreeSet;
 use std::path::Path;
 
@@ -53,7 +62,7 @@ fn manifest(crate_name: &str) -> String {
         .join("crates")
         .join(crate_name)
         .join("Cargo.toml");
-    std::fs::read_to_string(&path).unwrap_or_else(|err| panic!("read {path:?}: {err}"))
+    std::fs::read_to_string(&path).unwrap_or_else(|err| panic!("read {}: {err}", path.display()))
 }
 
 /// Returns the dependency names declared in a manifest, from every section.

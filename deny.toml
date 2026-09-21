@@ -1,0 +1,46 @@
+# Dependency policy.
+#
+# Duplicate versions are checked by `cargo xtask budget`, which knows which
+# duplicates are accepted and why. This file covers licensing and advisories.
+
+[graph]
+all-features = false
+targets = [
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+    "aarch64-unknown-linux-musl",
+    "x86_64-unknown-linux-musl",
+    "x86_64-pc-windows-msvc",
+]
+
+[advisories]
+version = 2
+ignore = []
+
+[licenses]
+version = 2
+# Permissive licenses only. Anything copyleft in a distributed binary needs a
+# deliberate decision, not a default.
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    "MPL-2.0",
+    "CC0-1.0",
+    "Unlicense",
+]
+confidence-threshold = 0.9
+
+[bans]
+multiple-versions = "allow"
+wildcards = "deny"
+
+[[bans.deny]]
+# The advisory database stops receiving entries when a crate is unmaintained.
+name = "openssl"
+reason = "prefer rustls; a system TLS dependency breaks static Linux builds"
