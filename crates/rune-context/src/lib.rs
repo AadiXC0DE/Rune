@@ -13,22 +13,29 @@
 
 pub mod catalog;
 pub mod instructions;
+pub mod limits;
 pub mod mcp;
+pub mod mcp_trust;
 pub mod prompt;
+pub mod skill_invocation;
 pub mod skills;
 
 pub use catalog::{CatalogOutput, read_body, render_catalog};
 // `discover` exists in both modules with a different signature, so each stays
 // reachable through its module rather than being re-exported bare.
 pub use instructions::{InstructionFile, Options, render, resolve_for_target};
+pub use limits::{LimitRow, Limits, describe, effective};
+pub use skill_invocation::{LoadedSkill, load_by_location, load_whole, resolve_reference};
 pub use skills::{Discovery, SKILL_FILE, Skill, USER_ROOTS, WORKSPACE_ROOTS, Warning};
 
-use rune_core::budget::{EMERGENCY_CEILING_BYTES, LimitName};
+use rune_core::budget::LimitName;
 
-/// Resolves a limit to a byte or item count.
+/// Resolves a limit to a byte or item count from its compiled default.
 ///
-/// The emergency ceiling stands in for a limit set to `off`, so an unbounded
-/// setting cannot make discovery or rendering unbounded.
+/// Used where no configured set is available, such as a discovery scan. A
+/// caller holding a resolved [`Limits`] reads the configured value instead. The
+/// emergency ceiling stands in for a limit set to `off` either way, so an
+/// unbounded setting cannot make discovery or rendering unbounded.
 pub(crate) fn resolve_limit(name: LimitName) -> usize {
-    usize::try_from(name.default_value().effective(EMERGENCY_CEILING_BYTES)).unwrap_or(usize::MAX)
+    limits::default_limit(name)
 }

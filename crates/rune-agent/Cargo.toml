@@ -20,8 +20,9 @@ thiserror = { workspace = true }
 rune-tools = { workspace = true }
 ureq = { workspace = true }
 jiff = { workspace = true }
+camino = { workspace = true }
+sha2 = { workspace = true }
 
 [dev-dependencies]
 tempfile.workspace = true
 rune-testkit.workspace = true
-camino.workspace = true
