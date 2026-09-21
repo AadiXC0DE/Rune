@@ -1,5 +1,6 @@
 //! Bounded, line-numbered file reads.
 
+use std::fmt::Write as _;
 use std::io::{BufRead, BufReader};
 
 use camino::Utf8Path;
@@ -7,8 +8,8 @@ use rune_core::error::{ErrorCode, Result, RuneError};
 
 use crate::contract::{Activity, ExecutionContext, Tool, ToolOutput};
 use crate::workspace::{
-    FileLimits, MIN_OUTPUT_BYTES, display_path, join_capped, resolve, string_arg, truncate_line,
-    usize_arg,
+    FileLimits, SUMMARY_RESERVE_BYTES, display_path, join_capped, resolve, string_arg,
+    truncate_line, usize_arg,
 };
 
 /// Bytes read to classify a file before any content is returned.
@@ -18,17 +19,9 @@ const PROBE_BYTES: usize = 8 * 1024;
 const NUMBER_WIDTH: usize = 6;
 
 /// Reads a bounded window of lines from one text file.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct ReadFile {
     limits: FileLimits,
-}
-
-impl Default for ReadFile {
-    fn default() -> Self {
-        Self {
-            limits: FileLimits::default(),
-        }
-    }
 }
 
 impl ReadFile {
@@ -134,7 +127,7 @@ impl Tool for ReadFile {
         // the footer can state the true total. The reserve keeps the header and
         // the footer readable even when nothing else fits.
         let cap = self.limits.output_cap(context);
-        let byte_budget = cap.saturating_sub(MIN_OUTPUT_BYTES).max(MIN_OUTPUT_BYTES);
+        let byte_budget = cap.saturating_sub(SUMMARY_RESERVE_BYTES);
         let window = collect(
             &mut reader,
             start_line,
@@ -142,13 +135,41 @@ impl Tool for ReadFile {
             self.limits.line_bytes,
             byte_budget,
         )?;
+        if window.binary {
+            return Ok(ToolOutput::failure(format!(
+                "`{display}` contains binary data past its first {PROBE_BYTES} bytes, so its                  content was not returned as text."
+            )));
+        }
         let (body, footer) = render(&display, size, &window, self.limits.line_bytes);
         Ok(ToolOutput::success(join_capped(body, &footer, cap)))
     }
 }
 
 /// Opens a file for reading.
+///
+/// A directory is refused by name rather than by the read that follows, because
+/// `open` succeeds on a directory on some platforms and fails later with an
+/// unrelated error code.
 fn open(display: &str, path: &Utf8Path) -> Result<std::fs::File> {
+    let metadata = std::fs::metadata(path.as_std_path()).map_err(|err| match err.kind() {
+        std::io::ErrorKind::NotFound => {
+            RuneError::new(ErrorCode::NotFound, format!("`{display}` does not exist"))
+        }
+        std::io::ErrorKind::PermissionDenied => RuneError::new(
+            ErrorCode::PermissionDenied,
+            format!("`{display}` cannot be read"),
+        ),
+        _ => RuneError::new(
+            ErrorCode::InvalidState,
+            format!("`{display}` could not be opened: {err}"),
+        ),
+    })?;
+    if !metadata.is_file() {
+        return Err(RuneError::invalid_field(
+            "path",
+            format!("`{display}` is not a regular file"),
+        ));
+    }
     std::fs::File::open(path.as_std_path()).map_err(|err| match err.kind() {
         std::io::ErrorKind::NotFound => {
             RuneError::new(ErrorCode::NotFound, format!("`{display}` does not exist"))
@@ -157,9 +178,6 @@ fn open(display: &str, path: &Utf8Path) -> Result<std::fs::File> {
             ErrorCode::PermissionDenied,
             format!("`{display}` cannot be read"),
         ),
-        std::io::ErrorKind::IsADirectory | std::io::ErrorKind::InvalidInput => {
-            RuneError::invalid_field("path", format!("`{display}` is not a regular file"))
-        }
         _ => RuneError::new(
             ErrorCode::InvalidState,
             format!("`{display}` could not be opened: {err}"),
@@ -180,6 +198,8 @@ struct Window {
     byte_capped: bool,
     /// True when at least one line was cut at the per-line cap.
     line_capped: bool,
+    /// True when a NUL byte appeared beyond the classification probe.
+    binary: bool,
 }
 
 /// Collects the window while counting every line in the file.
@@ -204,6 +224,12 @@ fn collect<R: BufRead>(
             .read_until(b'\n', &mut buffer)
             .map_err(RuneError::from)?;
         if read == 0 {
+            break;
+        }
+        // Only the leading bytes were classified, so every line is checked
+        // before it can reach the result as mojibake.
+        if buffer.contains(&0) {
+            window.binary = true;
             break;
         }
         window.total = window.total.saturating_add(1);
@@ -237,7 +263,7 @@ fn collect<R: BufRead>(
 fn render(display: &str, size: u64, window: &Window, line_bytes: usize) -> (String, String) {
     let mut body = format!("{display}: {} lines, {size} bytes\n", window.total);
     for (number, text) in &window.lines {
-        body.push_str(&format!("{number:>NUMBER_WIDTH$}\t{text}\n"));
+        let _ = writeln!(body, "{number:>NUMBER_WIDTH$}\t{text}");
     }
 
     let shown = window.lines.len();
@@ -248,37 +274,37 @@ fn render(display: &str, size: u64, window: &Window, line_bytes: usize) -> (Stri
             *number
         });
 
+    let start = window.requested_start;
+    let total = window.total;
+    let next = last.saturating_add(1);
     let mut footer = String::new();
-    if window.total == 0 {
+    if total == 0 {
         footer.push_str("[the file is empty]\n");
     } else if shown == 0 {
-        footer.push_str(&format!(
-            "[no lines returned: the requested window starts at line {} but the file has {} \
-             lines]\n",
-            window.requested_start, window.total
-        ));
+        let _ = writeln!(
+            footer,
+            "[no lines returned: the requested window starts at line {start} but the file has \
+             {total} lines]"
+        );
     } else if window.byte_capped {
-        footer.push_str(&format!(
-            "[output truncated at the byte cap: showing lines {} to {last} of {}; pass \
-             start_line={} to continue]\n",
-            window.requested_start,
-            window.total,
-            last.saturating_add(1)
-        ));
-    } else if last < window.total {
-        footer.push_str(&format!(
-            "[showing lines {} to {last} of {}; pass start_line={} to continue]\n",
-            window.requested_start,
-            window.total,
-            last.saturating_add(1)
-        ));
+        let _ = writeln!(
+            footer,
+            "[output truncated at the byte cap: showing lines {start} to {last} of {total}; pass \
+             start_line={next} to continue]"
+        );
+    } else if last < total {
+        let _ = writeln!(
+            footer,
+            "[showing lines {start} to {last} of {total}; pass start_line={next} to continue]"
+        );
     } else {
-        footer.push_str(&format!("[end of file: {} lines]\n", window.total));
+        let _ = writeln!(footer, "[end of file: {total} lines]");
     }
     if window.line_capped {
-        footer.push_str(&format!(
-            "[some lines were truncated at the {line_bytes}-byte line cap]\n"
-        ));
+        let _ = writeln!(
+            footer,
+            "[some lines were truncated at the {line_bytes}-byte line cap]"
+        );
     }
     (body, footer)
 }
@@ -359,6 +385,15 @@ mod tests {
     use super::*;
     use crate::workspace::fixture::{Repo, binary};
 
+    /// Builds `count` numbered lines under a prefix.
+    fn numbered(prefix: &str, first: usize, last: usize) -> String {
+        let mut body = String::new();
+        for n in first..=last {
+            let _ = writeln!(body, "{prefix}{n}");
+        }
+        body
+    }
+
     /// Builds a minimal PNG header, which is all the detector reads.
     fn png_bytes() -> Vec<u8> {
         let mut bytes = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
@@ -394,7 +429,7 @@ mod tests {
     #[test]
     fn a_window_reports_the_true_total_and_how_to_continue() {
         let repo = Repo::new();
-        let body = (1..=40).map(|n| format!("line {n}\n")).collect::<String>();
+        let body = numbered("line ", 1, 40);
         repo.write("long/window.txt", &body);
 
         let output = ReadFile::default()
@@ -446,6 +481,46 @@ mod tests {
     }
 
     #[test]
+    fn a_large_file_returns_a_bounded_window_and_the_true_total() {
+        let repo = Repo::new();
+        // Roughly ten MiB of an easy-to-count shape: 10485 lines of 1000 bytes.
+        let mut body = String::with_capacity(10 * 1024 * 1024);
+        for n in 1..=10_485 {
+            let _ = writeln!(body, "{n:0>7}{}", "p".repeat(999));
+        }
+        repo.write("huge/ten.txt", &body);
+        assert!(body.len() > 10 * 1024 * 1024, "{}", body.len());
+
+        let output = ReadFile::default()
+            .call(
+                &serde_json::json!({ "path": "huge/ten.txt" }),
+                &repo.context(),
+            )
+            .expect("call");
+        let limits = FileLimits::default();
+        assert!(
+            output.text.contains("huge/ten.txt: 10485 lines"),
+            "{}",
+            &output.text[..200.min(output.text.len())]
+        );
+        // The window is bounded by the byte cap well before the line cap, and
+        // the result is a fraction of the file rather than all of it.
+        // Content lines carry a number column and are about a thousand bytes;
+        // the footer is short, so width separates them without parsing.
+        let shown = output.text.lines().filter(|line| line.len() > 512).count();
+        assert!(shown > 0 && shown < limits.read_lines, "{shown}");
+        assert!(output.text.len() < 128 * 1024, "{}", output.text.len());
+        let tail = &output.text[output.text.len().saturating_sub(300)..];
+        assert!(
+            tail.contains(&format!(
+                "showing lines 1 to {shown} of 10485; pass start_line={}",
+                shown + 1
+            )),
+            "{tail}"
+        );
+    }
+
+    #[test]
     fn an_empty_file_is_not_an_error() {
         let repo = Repo::new();
         let output = ReadFile::default()
@@ -467,7 +542,7 @@ mod tests {
     #[test]
     fn the_line_count_is_capped_and_the_remainder_is_reported() {
         let repo = Repo::new();
-        let body = (1..=50).map(|n| format!("line {n}\n")).collect::<String>();
+        let body = numbered("line ", 1, 50);
         repo.write("long/many.txt", &body);
         let output = ReadFile::default()
             .call(
@@ -540,6 +615,29 @@ mod tests {
     }
 
     #[test]
+    fn binary_content_past_the_probe_is_still_refused() {
+        let repo = Repo::new();
+        let mut bytes = "text line\n".repeat(2000).into_bytes();
+        bytes.extend_from_slice(&[0x00, 0x01, 0x02]);
+        bytes.extend_from_slice(b"needle\n");
+        repo.write_bytes("data/late.bin", &bytes);
+
+        let output = ReadFile::default()
+            .call(
+                &serde_json::json!({ "path": "data/late.bin" }),
+                &repo.context(),
+            )
+            .expect("call");
+        assert!(output.is_error);
+        assert!(
+            output.text.contains("contains binary data past"),
+            "{}",
+            output.text
+        );
+        assert!(!output.text.contains("text line"), "{}", output.text);
+    }
+
+    #[test]
     fn an_image_is_described_by_its_magic_bytes() {
         let repo = Repo::new();
         repo.write_bytes("data/pixel.png", &png_bytes());
@@ -573,6 +671,23 @@ mod tests {
         );
         assert_eq!(image_format(b"RIFF\x00\x00\x00\x00WAVEfmt "), None);
         assert_eq!(image_format(b"plain text"), None);
+    }
+
+    #[test]
+    fn a_utf8_file_without_a_nul_is_read_as_text() {
+        let repo = Repo::new();
+        repo.write_bytes(
+            "data/utf8.txt",
+            "cafe\u{301} and \u{4e2d}\u{6587}\n".as_bytes(),
+        );
+        let output = ReadFile::default()
+            .call(
+                &serde_json::json!({ "path": "data/utf8.txt" }),
+                &repo.context(),
+            )
+            .expect("call");
+        assert!(!output.is_error, "{}", output.text);
+        assert!(output.text.contains("cafe"), "{}", output.text);
     }
 
     #[test]
@@ -628,6 +743,33 @@ mod tests {
     }
 
     #[test]
+    fn a_wrongly_typed_line_count_is_refused() {
+        let repo = Repo::new();
+        let err = ReadFile::default()
+            .call(
+                &serde_json::json!({ "path": "README.md", "line_count": "many" }),
+                &repo.context(),
+            )
+            .expect_err("refused");
+        assert_eq!(err.code(), ErrorCode::InvalidField);
+        assert_eq!(err.field(), Some("line_count"));
+    }
+
+    #[test]
+    fn a_directory_is_refused_as_a_non_file() {
+        let repo = Repo::new();
+        let err = ReadFile::default()
+            .call(&serde_json::json!({ "path": "src" }), &repo.context())
+            .expect_err("refused");
+        assert_eq!(err.code(), ErrorCode::InvalidField);
+        assert!(
+            err.message().contains("is not a regular file"),
+            "{}",
+            err.message()
+        );
+    }
+
+    #[test]
     fn a_zero_start_line_is_refused() {
         let repo = Repo::new();
         let err = ReadFile::default()
@@ -642,9 +784,7 @@ mod tests {
     #[test]
     fn the_output_stays_within_the_context_byte_cap() {
         let repo = Repo::new();
-        let body = (1..=400)
-            .map(|n| format!("line {n} {}\n", "y".repeat(60)))
-            .collect::<String>();
+        let body = numbered("line ", 1, 400);
         repo.write("long/wide.txt", &body);
         let context = repo.context().with_output_cap(4096);
         let capped = ReadFile::default()

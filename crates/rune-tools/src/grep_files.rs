@@ -1,5 +1,7 @@
 //! Literal text search with pagination, counts, and explicit truncation.
 
+use std::collections::VecDeque;
+use std::fmt::Write as _;
 use std::io::{BufRead, BufReader};
 
 use camino::{Utf8Path, Utf8PathBuf};
@@ -7,8 +9,8 @@ use rune_core::error::{Result, RuneError};
 
 use crate::contract::{Activity, ExecutionContext, Tool, ToolOutput};
 use crate::workspace::{
-    FileLimits, MAX_MATCH_LINE_BYTES, Walker, bool_arg, compile_glob, default_root, display_in,
-    join_capped, resolve, roots, string_arg, truncate_line, usize_arg, walk_notes,
+    FileLimits, MAX_MATCH_LINE_BYTES, Walker, bool_arg, compile_glob_as, default_root, display_in,
+    join_capped, resolve, roots, string_arg, summarize, truncate_line, usize_arg, walk_notes,
 };
 
 /// How often a long search checks for cancellation.
@@ -16,6 +18,9 @@ const CANCEL_CHECK_INTERVAL: usize = 256;
 
 /// Bytes read to decide whether a file is binary.
 const PROBE_BYTES: usize = 8 * 1024;
+
+/// Names listed before a footer says how many more there are.
+const MAX_LISTED_NAMES: usize = 20;
 
 /// Characters that make a pattern look like a regular expression.
 ///
@@ -25,17 +30,9 @@ const REGEX_HINTS: &[&str] = &[
 ];
 
 /// Searches file contents for literal text.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct GrepFiles {
     limits: FileLimits,
-}
-
-impl Default for GrepFiles {
-    fn default() -> Self {
-        Self {
-            limits: FileLimits::default(),
-        }
-    }
 }
 
 impl GrepFiles {
@@ -129,7 +126,7 @@ impl Tool for GrepFiles {
     ) -> Result<ToolOutput> {
         let query = parse(self, arguments, context)?;
         let include = match query.include.as_deref() {
-            Some(pattern) => Some(compile_glob(pattern)?),
+            Some(pattern) => Some(compile_glob_as("include", pattern)?),
             None => None,
         };
 
@@ -138,9 +135,8 @@ impl Tool for GrepFiles {
         let mut walker = Walker::new(&query.root, self.limits.walk_files)?;
         let mut report = Report::default();
 
-        loop {
-            let Some(entry) = walker.next() else { break };
-            if report.scanned % CANCEL_CHECK_INTERVAL == 0 {
+        for entry in walker.by_ref() {
+            if report.scanned.is_multiple_of(CANCEL_CHECK_INTERVAL) {
                 context.check_cancelled()?;
             }
             report.scanned = report.scanned.saturating_add(1);
@@ -150,7 +146,7 @@ impl Tool for GrepFiles {
                 continue;
             }
             let display = display_in(&normalised, &entry.path);
-            if let Err(err) = scan(&entry.path, &display, &query, &mut report) {
+            if let Err(err) = scan(&entry.path, &display, &query, report.matches, &mut report) {
                 match err {
                     ScanError::Binary => report.binary.push(display),
                     ScanError::Unreadable(reason) => report.unreadable.push((display, reason)),
@@ -304,6 +300,7 @@ fn scan(
     path: &Utf8Path,
     display: &str,
     query: &Query,
+    base: usize,
     report: &mut Report,
 ) -> std::result::Result<(), ScanError> {
     let file = std::fs::File::open(path.as_std_path())
@@ -319,10 +316,18 @@ fn scan(
         query.pattern.clone()
     };
 
-    let mut pending: Vec<String> = Vec::new();
+    // Findings are staged locally and merged only when the whole file has been
+    // read, so a file rejected partway through leaves no trace in the report.
+    let context_lines = if query.mode == Mode::Matches {
+        query.context_lines
+    } else {
+        0
+    };
+    let mut found = Found::default();
+    // The context window is a ring, so only context_lines lines are ever held.
+    let mut pending: VecDeque<String> = VecDeque::with_capacity(context_lines);
     let mut trailing = 0_usize;
     let mut number = 0_usize;
-    let mut file_matched = false;
     let mut buffer = Vec::new();
 
     loop {
@@ -332,6 +337,11 @@ fn scan(
         })?;
         if read == 0 {
             break;
+        }
+        // Only the leading bytes were classified, so a NUL anywhere later still
+        // skips the file rather than emitting mojibake or a false match.
+        if buffer.contains(&0) {
+            return Err(ScanError::Binary);
         }
         number = number.saturating_add(1);
         let text = String::from_utf8_lossy(&buffer);
@@ -344,55 +354,69 @@ fn scan(
         };
 
         if haystack.contains(&needle) {
-            // The index before the increment is this match's place in the
-            // result, which is what offset and head_limit select on.
-            let index = report.matches;
-            report.matches = report.matches.saturating_add(1);
-            if !file_matched {
-                file_matched = true;
-                let file_index = report.files;
-                report.files = report.files.saturating_add(1);
-                // Only the page's file names are retained, so memory follows
-                // head_limit rather than the size of the result.
-                if query.mode == Mode::FilesWithMatches
-                    && file_index >= query.offset
-                    && report.named.len() < query.head_limit
-                {
-                    report.named.push(display.to_owned());
-                }
-            }
+            found.matches = found.matches.saturating_add(1);
+            // The index is this match's place in the whole result, which is
+            // what offset and head_limit select on.
+            let index = base.saturating_add(found.matches).saturating_sub(1);
             if query.mode == Mode::Matches
                 && index >= query.offset
-                && report.hits.len() < query.head_limit
+                && found.hits.len() < query.head_limit
             {
-                report.hits.push(Hit {
+                found.hits.push(Hit {
                     file: display.to_owned(),
                     number,
                     text: shown,
-                    leading: pending.clone(),
+                    leading: pending.iter().cloned().collect(),
                     trailing: Vec::new(),
                 });
             }
-            trailing = query.context_lines;
+            trailing = context_lines;
             continue;
         }
 
+        if context_lines == 0 {
+            continue;
+        }
         if trailing > 0 {
-            if let Some(hit) = report.hits.last_mut()
-                && hit.file == display
-            {
+            if let Some(hit) = found.hits.last_mut() {
                 hit.trailing.push(format!("{number:>6}-{shown}"));
             }
             trailing = trailing.saturating_sub(1);
         }
-        if query.context_lines > 0 {
-            pending.push(format!("{number:>6}-{shown}"));
-            if pending.len() > query.context_lines {
-                pending.remove(0);
-            }
+        pending.push_back(format!("{number:>6}-{shown}"));
+        if pending.len() > context_lines {
+            let _ = pending.pop_front();
         }
     }
+
+    report.matches = report.matches.saturating_add(found.matches);
+    if found.matches > 0 {
+        let file_index = report.files;
+        report.files = report.files.saturating_add(1);
+        if query.mode == Mode::FilesWithMatches
+            && file_index >= query.offset
+            && report.named.len() < query.head_limit
+        {
+            report.named.push(display.to_owned());
+        }
+    }
+    // A page never exceeds head_limit, however many files contribute to it.
+    for hit in found.hits {
+        if report.hits.len() >= query.head_limit {
+            break;
+        }
+        report.hits.push(hit);
+    }
     Ok(())
+}
+
+/// What one file contributed, staged until the file has been read in full.
+#[derive(Default)]
+struct Found {
+    /// Matching lines in this file.
+    matches: usize,
+    /// Hits to report, already limited to the page.
+    hits: Vec<Hit>,
 }
 
 /// Renders the report for the model.
@@ -411,11 +435,11 @@ fn render(query: &Query, label: &str, report: &Report, walker: &Walker, cap: usi
         Mode::Matches => {
             for hit in &report.hits {
                 for line in &hit.leading {
-                    body.push_str(&format!("{}:{line}\n", hit.file));
+                    let _ = writeln!(body, "{}:{line}", hit.file);
                 }
-                body.push_str(&format!("{}:{:>6}:{}\n", hit.file, hit.number, hit.text));
+                let _ = writeln!(body, "{}:{:>6}:{}", hit.file, hit.number, hit.text);
                 for line in &hit.trailing {
-                    body.push_str(&format!("{}:{line}\n", hit.file));
+                    let _ = writeln!(body, "{}:{line}", hit.file);
                 }
             }
         }
@@ -438,47 +462,59 @@ fn render(query: &Query, label: &str, report: &Report, walker: &Walker, cap: usi
         Mode::FilesWithMatches => report.files,
         Mode::Matches => report.matches,
     };
-    if query.mode != Mode::Count {
+    if query.mode != Mode::Count && total > 0 {
         let start = query.offset.min(total);
         let next = start.saturating_add(listed);
-        if listed < total || query.offset > 0 {
-            footer.push_str(&format!(
-                "[page: entries {} to {next} of {total}; pass offset={next} for the next page]\n",
-                if listed == 0 {
-                    0
-                } else {
-                    start.saturating_add(1)
-                }
-            ));
+        if query.offset >= total {
+            let _ = writeln!(
+                footer,
+                "[page is empty: offset {} is past the {total} entries]",
+                query.offset
+            );
+        } else if query.offset > 0 || next < total {
+            let first = start.saturating_add(1);
+            if next < total {
+                let _ = writeln!(
+                    footer,
+                    "[page: entries {first} to {next} of {total}; pass offset={next} for the next \
+                     page]"
+                );
+            } else {
+                let _ = writeln!(footer, "[page: entries {first} to {next} of {total}]");
+            }
         }
     }
     if query.context_lines > 0 && query.mode != Mode::Matches {
         footer.push_str("[context_lines applies only to matches mode]\n");
     }
     if query.looks_like_regex {
-        footer.push_str(&format!(
-            "[the pattern `{}` contains regex metacharacters, which were matched literally]\n",
+        let _ = writeln!(
+            footer,
+            "[the pattern `{}` contains regex metacharacters, which were matched literally]",
             query.pattern
-        ));
+        );
     }
     if !report.binary.is_empty() {
-        footer.push_str(&format!(
-            "[{} binary files skipped: {}]\n",
+        let _ = writeln!(
+            footer,
+            "[{} binary files skipped: {}]",
             report.binary.len(),
-            report.binary.join(", ")
-        ));
+            summarize(&report.binary, MAX_LISTED_NAMES)
+        );
     }
     if !report.unreadable.is_empty() {
-        footer.push_str(&format!(
-            "[{} files could not be read: {}]\n",
-            report.unreadable.len(),
-            report
-                .unreadable
-                .iter()
-                .map(|(file, reason)| format!("{file} ({reason})"))
-                .collect::<Vec<_>>()
-                .join("; ")
-        ));
+        let reasons = report
+            .unreadable
+            .iter()
+            .take(MAX_LISTED_NAMES)
+            .map(|(file, reason)| format!("{file} ({reason})"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        let _ = writeln!(
+            footer,
+            "[{} files could not be read: {reasons}]",
+            report.unreadable.len()
+        );
     }
     footer.push_str(&walk_notes(walker));
 
@@ -503,10 +539,19 @@ mod tests {
         GrepFiles::with_limits(FileLimits::from_budget(&budget_with_list_entries(entries)))
     }
 
+    /// Builds many matching lines of a fixed width.
+    fn wide_lines(count: usize) -> String {
+        let mut body = String::new();
+        for n in 1..=count {
+            let _ = writeln!(body, "wideword on line {n} {}", "z".repeat(40));
+        }
+        body
+    }
+
     /// Returns the summary line of a result.
     fn summary(text: &str) -> String {
         text.lines()
-            .find(|line| line.starts_with("["))
+            .find(|line| line.starts_with('['))
             .unwrap_or_default()
             .to_owned()
     }
@@ -728,11 +773,13 @@ mod tests {
         let first = names(&page(0));
         let second = names(&page(4));
         assert_eq!(first.len(), 4, "{first:?}");
-        assert_eq!(first.len() + second.len(), MATCH_FILES);
+        assert_eq!(second.len(), MATCH_FILES - 4, "{second:?}");
         for name in &first {
             assert!(!second.contains(name), "overlap on {name}");
         }
-        assert!(page(4).contains("pass offset=8"), "{}", page(4));
+        assert!(page(0).contains("pass offset=4"), "{}", page(0));
+        // The second page is the last, so it offers no further page.
+        assert!(!page(4).contains("next page"), "{}", page(4));
     }
 
     #[test]
@@ -745,7 +792,13 @@ mod tests {
             )
             .expect("call");
         assert!(!output.is_error);
-        assert!(output.text.contains("entries 0 to 0 of"), "{}", output.text);
+        assert!(
+            output
+                .text
+                .contains("page is empty: offset 500 is past the"),
+            "{}",
+            output.text
+        );
         assert!(
             output
                 .text
@@ -914,6 +967,29 @@ mod tests {
     }
 
     #[test]
+    fn a_negative_offset_is_refused_rather_than_clamped() {
+        let repo = Repo::new();
+        let err = GrepFiles::default()
+            .call(
+                &serde_json::json!({ "pattern": "needle", "offset": -1 }),
+                &repo.context(),
+            )
+            .expect_err("refused");
+        assert_eq!(err.code(), ErrorCode::InvalidField);
+        assert_eq!(err.field(), Some("offset"));
+    }
+
+    #[test]
+    fn a_wrongly_typed_argument_is_refused() {
+        let repo = Repo::new();
+        let err = GrepFiles::default()
+            .call(&serde_json::json!({ "pattern": 7 }), &repo.context())
+            .expect_err("refused");
+        assert_eq!(err.code(), ErrorCode::InvalidField);
+        assert_eq!(err.field(), Some("pattern"));
+    }
+
+    #[test]
     fn an_invalid_include_glob_is_refused() {
         let repo = Repo::new();
         let err = GrepFiles::default()
@@ -923,7 +999,7 @@ mod tests {
             )
             .expect_err("refused");
         assert_eq!(err.code(), ErrorCode::InvalidField);
-        assert_eq!(err.field(), Some("pattern"));
+        assert_eq!(err.field(), Some("include"));
     }
 
     #[test]
@@ -941,18 +1017,16 @@ mod tests {
     #[test]
     fn output_never_exceeds_the_byte_cap_and_the_true_count_survives() {
         let repo = Repo::new();
-        let body = (1..=500)
-            .map(|n| format!("needle on line {n} {}\n", "z".repeat(40)))
-            .collect::<String>();
+        let body = wide_lines(500);
         repo.write("wide/many.txt", &body);
 
         let context = repo.context().with_output_cap(4096);
         let output = GrepFiles::default()
-            .call(&serde_json::json!({ "pattern": "needle" }), &context)
+            .call(&serde_json::json!({ "pattern": "wideword" }), &context)
             .expect("call");
         assert!(output.text.len() <= 4096, "{}", output.text.len());
         assert!(
-            output.text.contains("500 matching lines"),
+            output.text.contains("500 matching lines in 1 files"),
             "{}",
             output.text
         );
@@ -988,17 +1062,86 @@ mod tests {
     #[test]
     fn a_very_long_line_is_cut_before_it_can_flood_the_result() {
         let repo = Repo::new();
-        let mut line = String::from("needle ");
+        let mut line = String::from("wideword ");
         line.push_str(&"q".repeat(200_000));
         line.push('\n');
         repo.write("wide/one.txt", &line);
 
         let context = repo.context().with_output_cap(64 * 1024);
         let output = GrepFiles::default()
-            .call(&serde_json::json!({ "pattern": "needle" }), &context)
+            .call(&serde_json::json!({ "pattern": "wideword" }), &context)
             .expect("call");
         assert!(output.text.len() <= 64 * 1024, "{}", output.text.len());
-        assert!(output.text.contains("1 matching lines"), "{}", output.text);
+        assert!(
+            output.text.contains("1 matching lines in 1 files"),
+            "{}",
+            output.text
+        );
+    }
+
+    #[test]
+    fn a_walk_cap_is_reported_in_the_result() {
+        let repo = Repo::new();
+        for index in 0..70 {
+            repo.write(&format!("many/file_{index}.txt"), "wideword\n");
+        }
+        let capped = GrepFiles::with_limits(FileLimits {
+            walk_files: 4,
+            ..FileLimits::default()
+        });
+        let output = capped
+            .call(
+                &serde_json::json!({ "pattern": "wideword" }),
+                &repo.context(),
+            )
+            .expect("call");
+        assert!(output.text.contains("searched 4 files"), "{}", output.text);
+        assert!(
+            output.text.contains("the walk stopped after 4 files"),
+            "{}",
+            output.text
+        );
+
+        // Without a cap the same search sees every seeded file.
+        let full = GrepFiles::default()
+            .call(
+                &serde_json::json!({ "pattern": "wideword" }),
+                &repo.context(),
+            )
+            .expect("call");
+        assert!(
+            full.text.contains("70 matching lines in 70 files"),
+            "{}",
+            full.text
+        );
+    }
+
+    #[test]
+    fn binary_content_past_the_probe_is_skipped_without_counting_matches() {
+        let repo = Repo::new();
+        let mut bytes = "wideword here\n".repeat(2000).into_bytes();
+        bytes.extend_from_slice(&[0x00, 0x01]);
+        bytes.extend_from_slice(b"wideword later\n");
+        repo.write_bytes("data/late.bin", &bytes);
+
+        let output = GrepFiles::default()
+            .call(
+                &serde_json::json!({ "pattern": "wideword" }),
+                &repo.context(),
+            )
+            .expect("call");
+        assert!(!output.is_error);
+        assert!(output.text.contains("data/late.bin"), "{}", output.text);
+        assert!(
+            output.text.contains("binary files skipped"),
+            "{}",
+            output.text
+        );
+        assert!(
+            output.text.contains("0 matching lines in 0 files"),
+            "{}",
+            output.text
+        );
     }
 
     #[test]

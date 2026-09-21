@@ -15,14 +15,21 @@
 
 pub mod event;
 pub mod recovery;
+pub mod report;
 pub mod store;
+pub mod usage;
 
 pub use event::{
     EventFrame, LogRead, LogSalvage, LogStop, MAX_FRAME_BYTES, MAX_LOG_BYTES, SCHEMA_VERSION,
     SessionEvent, check_log_capacity, read_log, read_log_limited, salvage_log, salvage_log_limited,
 };
 pub use recovery::{RecoveryDefect, RecoveryReport, recover};
+pub use report::{Breakdown, Period, Summary, TokenTotals, render_text, summarize, to_json};
 pub use store::{
     EVENTS_FILE, LOCK_DEADLINE_MS, LOCK_FILE, LockHolder, Metadata, SessionState, SessionStore,
     UsageTotal, load_read_only, write_log_atomic,
+};
+pub use usage::{
+    AppendOutcome, COMPACTION_BYTES, HelperKind, Ledger, LedgerCaps, LedgerRead, MAX_RECORD_BYTES,
+    MAX_RECORDS, RETENTION_MS, UsageRecord,
 };

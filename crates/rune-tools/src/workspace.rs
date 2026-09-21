@@ -39,8 +39,8 @@ pub const MAX_WALK_FILES: usize = 1_000_000;
 /// Line length the search tools display before truncating.
 pub const MAX_MATCH_LINE_BYTES: usize = 1024 * 1024;
 
-/// Floor applied to a resolved byte cap, so a footer always fits.
-pub const MIN_OUTPUT_BYTES: usize = 1024;
+/// Bytes held back inside a byte cap so a summary line always fits.
+pub const SUMMARY_RESERVE_BYTES: usize = 512;
 
 /// The caps a file tool applies, resolved once from the limit set.
 ///
@@ -80,14 +80,14 @@ impl FileLimits {
     ///
     /// The context carries the cap resolved for this call; the limit set holds
     /// the configured cap. The smaller of the two wins, so neither widens the
-    /// other, and neither can cut a result below the floor that keeps its
-    /// summary readable.
+    /// other.
     #[must_use]
-    pub fn output_cap(&self, context: &ExecutionContext) -> usize {
-        context
-            .max_output_bytes
-            .min(self.output_bytes)
-            .max(MIN_OUTPUT_BYTES)
+    pub const fn output_cap(&self, context: &ExecutionContext) -> usize {
+        if context.max_output_bytes < self.output_bytes {
+            context.max_output_bytes
+        } else {
+            self.output_bytes
+        }
     }
 }
 
@@ -263,22 +263,31 @@ pub fn truncate_line(line: &str, limit: usize) -> String {
 /// body does not.
 #[must_use]
 pub fn join_capped(body: String, footer: &str, cap: usize) -> String {
+    if cap == 0 {
+        return String::new();
+    }
+    // The footer carries the true counts, so it is kept whole in preference to
+    // the body. A cap smaller than the footer itself cuts the counts, which is
+    // the last resort rather than dropping them.
     let marker = "\n[output truncated at the byte cap]";
     let mut footer = footer.to_owned();
-    // The footer carries the true counts, so it is kept whole in preference to
-    // the body; only a footer that cannot fit at all is cut.
-    if footer.len().saturating_add(marker.len()) >= cap {
-        let room = cap.saturating_sub(marker.len());
-        let end = truncate_to_bytes(&footer, room).len();
+    if footer.len() > cap {
+        let end = truncate_to_bytes(&footer, cap).len();
         footer.truncate(end);
+        return footer;
     }
 
     let mut out = body;
     if out.len().saturating_add(footer.len()) > cap {
-        let room = cap.saturating_sub(footer.len().saturating_add(marker.len()));
-        let end = truncate_to_bytes(&out, room).len();
-        out.truncate(end);
-        out.push_str(marker);
+        let room = cap.saturating_sub(footer.len());
+        if room > marker.len() {
+            let end = truncate_to_bytes(&out, room.saturating_sub(marker.len())).len();
+            out.truncate(end);
+            out.push_str(marker);
+        } else {
+            let end = truncate_to_bytes(&out, room).len();
+            out.truncate(end);
+        }
     }
     out.push_str(&footer);
     out
@@ -305,27 +314,30 @@ pub fn summarize(names: &[String], max: usize) -> String {
 /// separator also matches a file name at any depth, which is what `*.rs` is
 /// read to mean.
 pub fn compile_glob(pattern: &str) -> Result<GlobSet> {
+    compile_glob_as("pattern", pattern)
+}
+
+/// Compiles a glob, attributing a failure to the named argument.
+pub fn compile_glob_as(field: &str, pattern: &str) -> Result<GlobSet> {
     if pattern.is_empty() {
-        return Err(RuneError::invalid_field("pattern", "pattern is empty"));
+        return Err(RuneError::invalid_field(field, "the glob is empty"));
     }
     let mut builder = GlobSetBuilder::new();
-    let _ = builder.add(build_glob(pattern)?);
+    let _ = builder.add(build_glob(field, pattern)?);
     if !pattern.contains('/') {
-        let _ = builder.add(build_glob(&format!("**/{pattern}"))?);
+        let _ = builder.add(build_glob(field, &format!("**/{pattern}"))?);
     }
-    builder.build().map_err(|err| {
-        RuneError::invalid_field("pattern", format!("invalid glob `{pattern}`: {err}"))
-    })
+    builder
+        .build()
+        .map_err(|err| RuneError::invalid_field(field, format!("invalid glob `{pattern}`: {err}")))
 }
 
 /// Builds one glob with the path separator treated literally.
-fn build_glob(pattern: &str) -> Result<Glob> {
+fn build_glob(field: &str, pattern: &str) -> Result<Glob> {
     GlobBuilder::new(pattern)
         .literal_separator(true)
         .build()
-        .map_err(|err| {
-            RuneError::invalid_field("pattern", format!("invalid glob `{pattern}`: {err}"))
-        })
+        .map_err(|err| RuneError::invalid_field(field, format!("invalid glob `{pattern}`: {err}")))
 }
 
 /// Notes produced by a finished walk, for the result footer.
@@ -378,8 +390,13 @@ impl std::fmt::Debug for Walker {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Walker")
             .field("root", &self.root)
+            .field("walk", &self.walk.as_ref().map(|_| "active"))
+            .field("single", &self.single)
+            .field("is_file", &self.is_file)
+            .field("limit", &self.limit)
             .field("visited", &self.visited)
             .field("stopped", &self.stopped)
+            .field("unreadable", &self.unreadable)
             .finish()
     }
 }
@@ -426,7 +443,7 @@ impl Walker {
             .git_global(false)
             .require_git(false)
             .follow_links(false)
-            .sort_by_file_path(|a, b| a.cmp(b))
+            .sort_by_file_path(std::path::Path::cmp)
             .filter_entry(|entry| entry.file_name() != OsStr::new(".git"));
 
         Ok(Self {
@@ -825,6 +842,45 @@ mod tests {
     }
 
     #[test]
+    fn a_nested_gitignore_is_read_at_its_own_depth() {
+        let repo = Repo::new();
+        repo.write("nested/.gitignore", "secret.txt\n");
+        repo.write("nested/secret.txt", "needle\n");
+        let walker = Walker::new(repo.path(), FileLimits::default().walk_files).expect("walker");
+        let found = walker
+            .map(|entry| entry.relative.as_str().to_owned())
+            .collect::<Vec<_>>();
+        assert!(
+            found.contains(&"nested/untracked.txt".to_owned()),
+            "{found:?}"
+        );
+        assert!(
+            !found.contains(&"nested/secret.txt".to_owned()),
+            "{found:?}"
+        );
+    }
+
+    #[test]
+    fn ignores_apply_without_a_git_directory() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = Utf8Path::from_path(dir.path()).expect("a UTF-8 temporary path");
+        std::fs::write(root.join(".gitignore"), "skipped/\n").expect("write");
+        std::fs::create_dir_all(root.join("skipped")).expect("mkdir");
+        std::fs::write(root.join("skipped/file.txt"), "no\n").expect("write");
+        std::fs::write(root.join("kept.txt"), "yes\n").expect("write");
+
+        let walker = Walker::new(root, FileLimits::default().walk_files).expect("walker");
+        let found = walker
+            .map(|entry| entry.relative.as_str().to_owned())
+            .collect::<Vec<_>>();
+        assert!(found.contains(&"kept.txt".to_owned()), "{found:?}");
+        assert!(
+            !found.iter().any(|path| path.starts_with("skipped")),
+            "{found:?}"
+        );
+    }
+
+    #[test]
     fn a_nested_walk_finds_the_same_file() {
         let repo = Repo::new();
         let nested = repo.path().join("nested");
@@ -914,9 +970,23 @@ mod tests {
         let body = "a".repeat(1000);
         let footer = "\n[footer]";
         let joined = join_capped(body.clone(), footer, 200);
+        assert!(joined.len() <= 200, "{joined}");
         assert!(joined.ends_with(footer), "{joined}");
         assert!(joined.contains("truncated"), "{joined}");
-        assert_eq!(join_capped(body, footer, 2000).ends_with(footer), true);
+        assert!(join_capped(body, footer, 2000).ends_with(footer));
+    }
+
+    #[test]
+    fn a_capped_result_never_exceeds_its_cap() {
+        for cap in [1, 16, 64, 200, 4096] {
+            let joined = join_capped("x".repeat(10_000), "\n[footer]", cap);
+            assert!(
+                joined.len() <= cap,
+                "cap {cap} produced {} bytes",
+                joined.len()
+            );
+        }
+        assert!(join_capped(String::from("body"), "footer", 0).is_empty());
     }
 
     #[test]
@@ -945,7 +1015,7 @@ mod tests {
         let repo = Repo::new();
         let limits = FileLimits::default();
         let narrow = repo.context().with_output_cap(64);
-        assert_eq!(limits.output_cap(&narrow), MIN_OUTPUT_BYTES);
+        assert_eq!(limits.output_cap(&narrow), 64);
         let wide = repo.context().with_output_cap(usize::MAX);
         assert_eq!(limits.output_cap(&wide), limits.output_bytes);
     }
