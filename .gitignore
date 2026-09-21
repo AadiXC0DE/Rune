@@ -1,0 +1,18 @@
+# Rust build output
+/target
+**/*.rs.bk
+
+# Distribution artifacts
+/dist
+
+# Node bindings
+node_modules/
+
+# Editors and operating system files
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Local documentation and planning notes
+docs/

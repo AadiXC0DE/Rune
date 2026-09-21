@@ -1,0 +1,24 @@
+[package]
+name = "rune-core"
+description = "Core types, identifiers, error taxonomy, configuration, and state paths for Rune."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+thiserror.workspace = true
+camino.workspace = true
+jiff.workspace = true
+sha2.workspace = true
+
+[dev-dependencies]
+proptest = "1"
+tempfile.workspace = true

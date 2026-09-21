@@ -1,0 +1,23 @@
+[package]
+name = "rune-agent"
+description = "Agent turn loop, history, compaction, steering, and subagent coordination."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+rune-core = { workspace = true }
+rune-net = { workspace = true }
+rune-policy = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+jiff = { workspace = true }
+
+[dev-dependencies]
+tempfile.workspace = true

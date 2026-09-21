@@ -1,0 +1,23 @@
+[package]
+name = "rune-session"
+description = "Append-only session event log, session store, trees, and the usage ledger."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+rune-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+camino = { workspace = true }
+jiff = { workspace = true }
+sha2 = { workspace = true }
+
+[dev-dependencies]
+tempfile.workspace = true

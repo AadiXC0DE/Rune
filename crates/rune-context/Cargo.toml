@@ -1,0 +1,21 @@
+[package]
+name = "rune-context"
+description = "Project instructions, skills, MCP client, and prompt assembly."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+rune-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+camino = { workspace = true }
+
+[dev-dependencies]
+tempfile.workspace = true
