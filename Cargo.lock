@@ -960,10 +960,12 @@ dependencies = [
 name = "rune-policy"
 version = "0.1.0"
 dependencies = [
+ "camino",
  "globset",
  "rune-core",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "thiserror",
 ]

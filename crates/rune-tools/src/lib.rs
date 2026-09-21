@@ -9,9 +9,11 @@ pub mod glob_files;
 pub mod grep_files;
 pub mod inventory;
 pub mod mutation;
+pub mod process;
 pub mod read_file;
 pub mod registry;
 pub mod result_store;
+pub mod shell;
 pub mod workspace;
 pub mod write_file;
 
