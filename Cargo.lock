@@ -859,14 +859,18 @@ dependencies = [
 name = "rune-agent"
 version = "0.1.0"
 dependencies = [
+ "camino",
  "jiff",
  "rune-core",
  "rune-net",
  "rune-policy",
+ "rune-testkit",
+ "rune-tools",
  "serde",
  "serde_json",
  "tempfile",
  "thiserror",
+ "ureq",
 ]
 
 [[package]]
@@ -983,6 +987,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "ureq",
 ]
 
 [[package]]
@@ -995,6 +1000,7 @@ dependencies = [
  "regex",
  "rune-core",
  "rune-exec",
+ "rune-net",
  "rune-policy",
  "serde",
  "serde_json",

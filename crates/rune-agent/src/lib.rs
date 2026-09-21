@@ -1,3 +1,12 @@
-//! Agent turn loop, history, compaction, steering, and subagent coordination.
+//! The agent turn loop, history, compaction, and steering.
 
 #![forbid(unsafe_code)]
+#![cfg_attr(test, allow(clippy::expect_used, clippy::unwrap_used, clippy::panic))]
+
+pub mod history;
+pub mod steering;
+pub mod turn;
+
+pub use history::{History, Turn};
+pub use steering::{Boundary, Cancellation, Steering, SteeringQueue};
+pub use turn::{Event, Host, StopReason, TurnOutcome, run_turn};

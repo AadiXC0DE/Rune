@@ -17,7 +17,11 @@ rune-policy = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+rune-tools = { workspace = true }
+ureq = { workspace = true }
 jiff = { workspace = true }
 
 [dev-dependencies]
 tempfile.workspace = true
+rune-testkit.workspace = true
+camino.workspace = true
