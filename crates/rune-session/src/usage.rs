@@ -416,7 +416,6 @@ impl Ledger {
     /// A missing ledger is an empty ledger, which is not an error. No lock is
     /// taken, so a read cannot delay an append from this or any other process.
     pub fn read(&self) -> Result<LedgerRead> {
-        let _guard = LockGuard::acquire(&self.lock_path())?;
         let text = paths::read_private(&self.path, EMERGENCY_CEILING_BYTES)?.unwrap_or_default();
         Self::parse(&text)
     }
@@ -755,6 +754,10 @@ mod tests {
 
     /// Deadline for a test that waits on another thread.
     const THREAD_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+
+    /// Deadline for a test that waits on a lock, kept short so a regression
+    /// fails quickly rather than stalling the suite.
+    const LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
     fn path_in(dir: &tempfile::TempDir) -> Utf8PathBuf {
         Utf8PathBuf::from_path_buf(dir.path().join("usage.jsonl")).expect("utf-8 path")
@@ -1127,8 +1130,10 @@ mod tests {
         let ledger = ledger(&dir);
         ledger.append(&at(1)).expect("append");
 
-        // Hold the append lock for the whole test, so a read that waited on it
-        // would stall until this thread released it.
+        // The lock is held for the whole read. A read that waited on it would
+        // not produce a count before the deadline, which is the failure reported
+        // below. The lock is released before the assertion either way, so a read
+        // that waits cannot deadlock the suite.
         let holder = OpenOptions::new()
             .create(true)
             .append(true)
@@ -1136,19 +1141,20 @@ mod tests {
             .expect("open lock");
         holder.lock().expect("lock");
 
-        let (tx, rx) = std::sync::mpsc::channel::<usize>();
+        let (tx, rx) = std::sync::mpsc::channel::<Result<usize, String>>();
         let outcome = std::thread::scope(|scope| {
-            scope.spawn(|| {
-                let read = ledger.read().expect("read");
-                tx.send(read.records.len()).expect("send");
+            let reader = scope.spawn(|| {
+                let count = ledger.read().map(|read| read.records.len());
+                let _ = tx.send(count.map_err(|err| err.to_string()));
             });
-            rx.recv_timeout(std::time::Duration::from_secs(5))
+            let result = rx.recv_timeout(LOCK_WAIT);
+            holder.unlock().expect("unlock");
+            reader.join().expect("reader thread");
+            result
         });
 
-        // Read before releasing, so the release cannot be what unblocked it.
-        let seen = outcome.expect("a read waited on the append lock");
-        holder.unlock().expect("unlock");
-        assert_eq!(seen, 1);
+        let read = outcome.expect("the read waited on the append lock");
+        assert_eq!(read.expect("read"), 1);
     }
 
     #[test]
