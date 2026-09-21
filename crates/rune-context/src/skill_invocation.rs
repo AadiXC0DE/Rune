@@ -77,7 +77,9 @@ pub fn load_whole(skill: &Skill, limits: &Limits) -> Result<LoadedSkill> {
 ///
 /// The path is relative to the skill, so `refs/example.md` means the file next
 /// to that skill's `SKILL.md` rather than one in the workspace. A path that
-/// leaves the skill directory, by `..` or by a symlink, is refused.
+/// leaves the skill directory, by `..` or by a symlink, is refused. A path of
+/// `.` names the skill itself, which is the reference a caller uses to read the
+/// instructions again without going through the location.
 pub fn resolve_reference(skill: &Skill, relative: &str, limits: &Limits) -> Result<String> {
     let relative = relative.trim();
     if relative.is_empty() {
@@ -85,6 +87,9 @@ pub fn resolve_reference(skill: &Skill, relative: &str, limits: &Limits) -> Resu
             "resource",
             "a skill resource path cannot be empty",
         ));
+    }
+    if relative == SELF_REFERENCE {
+        return Ok(load_whole(skill, limits)?.instructions);
     }
     if Utf8Path::new(relative).is_absolute() {
         return Err(RuneError::invalid_field(
@@ -249,7 +254,7 @@ mod tests {
     use super::*;
     use crate::skills::SKILL_FILE;
     use camino::Utf8PathBuf;
-    use rune_core::budget::BudgetSet;
+    use rune_core::budget::{BudgetSet, EMERGENCY_CEILING_BYTES};
     use tempfile::TempDir;
 
     /// Creates a fixture tree and returns its root.
@@ -382,6 +387,44 @@ mod tests {
     }
 
     #[test]
+    fn a_skill_over_the_ceiling_is_refused_even_when_the_limit_is_off() {
+        let (_dir, root) = tree();
+        let directory = root.join("huge");
+        std::fs::create_dir_all(&directory).expect("create dir");
+        let path = directory.join(SKILL_FILE);
+        // A sparse file, so the test does not write 64 MiB to disk.
+        let file = std::fs::File::create(&path).expect("create");
+        file.set_len(EMERGENCY_CEILING_BYTES.saturating_add(1))
+            .expect("truncate");
+        drop(file);
+
+        let skill = Skill {
+            name: "huge".to_owned(),
+            description: None,
+            location: path,
+            root: root.clone(),
+        };
+        let mut set = BudgetSet::new();
+        set.set(
+            LimitName::SkillFileBytes,
+            rune_core::budget::Budget::Unbounded,
+            rune_core::config::Layer::User,
+        )
+        .expect("set");
+        let limits = Limits::resolve(&set).expect("resolve");
+
+        let err = load_whole(&skill, &limits).expect_err("over the ceiling");
+        assert_eq!(err.code(), ErrorCode::TooLarge);
+        assert!(
+            err.message()
+                .contains(&EMERGENCY_CEILING_BYTES.saturating_add(1).to_string()),
+            "the refusal names the size: {}",
+            err.message()
+        );
+        assert!(err.message().contains(&EMERGENCY_CEILING_BYTES.to_string()));
+    }
+
+    #[test]
     fn a_missing_skill_file_is_reported_as_not_found() {
         let (_dir, root) = tree();
         let absent = Skill {
@@ -469,6 +512,19 @@ mod tests {
         let err = resolve_reference(&skill, "linked.md", &limits()).expect_err("escape");
         assert_eq!(err.code(), ErrorCode::UnsafePath);
         assert!(err.message().contains("linked.md"));
+    }
+
+    #[test]
+    fn a_self_reference_reads_the_instructions_again() {
+        let (_dir, root) = tree();
+        let skill = skill(&root, "alpha", "body\n");
+
+        let resolved = resolve_reference(&skill, SELF_REFERENCE, &limits()).expect("resolve");
+        assert!(resolved.contains("body"));
+        assert_eq!(
+            resolved,
+            load_whole(&skill, &limits()).expect("load").instructions
+        );
     }
 
     #[test]

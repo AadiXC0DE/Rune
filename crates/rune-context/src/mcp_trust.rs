@@ -1035,6 +1035,61 @@ mod tests {
     }
 
     #[test]
+    fn a_remote_entry_needs_no_command() {
+        let servers = parse_project_file(
+            r#"{"mcpServers": {"remote": {"type": "http", "url": "https://example.test/mcp"}}}"#,
+            Utf8Path::new("/w/.mcp.json"),
+        )
+        .expect("parse");
+
+        assert_eq!(servers.len(), 1);
+        assert!(servers[0].command.is_empty());
+        assert!(servers[0].headers.is_empty());
+    }
+
+    #[test]
+    fn an_entry_declaring_neither_a_program_nor_an_endpoint_is_refused() {
+        let err = parse_project_file(
+            r#"{"mcpServers": {"empty": {"enabled": true}}}"#,
+            Utf8Path::new("/w/.mcp.json"),
+        )
+        .expect_err("neither");
+
+        assert_eq!(err.code(), ErrorCode::InvalidField);
+        assert!(err.message().contains("neither"), "{}", err.message());
+    }
+
+    #[test]
+    fn a_file_declaring_more_servers_than_the_limit_is_refused() {
+        let cap = default_limit(LimitName::ListEntries);
+        let entries: Vec<String> = (0..cap.saturating_add(1))
+            .map(|index| format!(r#""s{index}": {{"command": "server"}}"#))
+            .collect();
+        let text = format!(r#"{{"mcpServers": {{{}}}}}"#, entries.join(", "));
+
+        let err = parse_project_file(&text, Utf8Path::new("/w/.mcp.json"))
+            .expect_err("over the entry cap");
+        assert_eq!(err.code(), ErrorCode::LimitExceeded);
+        assert!(err.message().contains(&cap.to_string()));
+    }
+
+    #[test]
+    fn a_file_at_the_entry_cap_parses() {
+        let cap = default_limit(LimitName::ListEntries);
+        let entries: Vec<String> = (0..cap)
+            .map(|index| format!(r#""s{index}": {{"command": "server"}}"#))
+            .collect();
+        let text = format!(r#"{{"mcpServers": {{{}}}}}"#, entries.join(", "));
+
+        assert_eq!(
+            parse_project_file(&text, Utf8Path::new("/w/.mcp.json"))
+                .expect("parse")
+                .len(),
+            cap
+        );
+    }
+
+    #[test]
     fn a_symlinked_project_file_is_refused() {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let workspace = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).expect("utf8 tempdir");
