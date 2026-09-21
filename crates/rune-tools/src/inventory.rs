@@ -12,6 +12,7 @@ use sha2::{Digest as _, Sha256};
 
 use crate::contract::{Tool, model_spec};
 use crate::registry::Registry;
+use crate::shell::Shell;
 use crate::workspace::FileLimits;
 use crate::{EditFile, GlobFiles, GrepFiles, ReadFile, WriteFile};
 
@@ -25,6 +26,7 @@ pub const ADVERTISEMENT_ORDER: &[&str] = &[
     "read_file",
     "write_file",
     "edit_file",
+    "shell",
 ];
 
 /// Builds a registry holding every built-in tool.
@@ -34,20 +36,21 @@ pub const ADVERTISEMENT_ORDER: &[&str] = &[
 ///
 /// A tool whose schema is invalid fails here rather than at request time, so an
 /// unreachable provider request is never caused by a malformed description.
-pub fn builtin(limits: &FileLimits) -> Result<Registry> {
+pub fn builtin(limits: &FileLimits, budget: &rune_core::budget::BudgetSet) -> Result<Registry> {
     let mut registry = Registry::new();
     registry.insert(Box::new(GlobFiles::with_limits(*limits)))?;
     registry.insert(Box::new(GrepFiles::with_limits(*limits)))?;
     registry.insert(Box::new(ReadFile::with_limits(*limits)))?;
     registry.insert(Box::new(WriteFile))?;
     registry.insert(Box::new(EditFile))?;
+    registry.insert(Box::new(Shell::new(budget)))?;
     debug_assert_eq!(registry.len(), ADVERTISEMENT_ORDER.len());
     Ok(registry)
 }
 
 /// Builds a registry with the compiled defaults.
 pub fn builtin_default() -> Result<Registry> {
-    builtin(&FileLimits::default())
+    builtin(&FileLimits::default(), &rune_core::budget::BudgetSet::new())
 }
 
 /// Returns the advertised schemas in advertisement order.
