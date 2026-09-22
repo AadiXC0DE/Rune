@@ -9,8 +9,10 @@ you want to use and it works with that.
 
 ## Status
 
-Early development. The command surface, configuration system, and diagnostics
-are in place. The agent runtime, tools, and terminal interface are being built.
+Usable for a real session against the endpoint you connect. The command surface,
+configuration, agent loop, tools, permissions, sessions, and terminal interface
+are in place. `COMMANDS.md` is the generated command reference, and `rune doctor`
+reports what your machine supports.
 
 ## Building
 
