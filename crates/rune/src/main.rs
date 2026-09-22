@@ -15,6 +15,7 @@ mod cli;
 mod diagnostics;
 mod help;
 mod permissions;
+mod provider_setup;
 mod session;
 mod session_log;
 mod spec;
@@ -143,8 +144,9 @@ fn run(launch: &Launch) -> Result<ExitCode> {
         Command::Sessions | Command::Tree => run_sessions(&paths, &output_flags),
         Command::Session => Err(not_yet_available("per-session inspection")),
         Command::Usage => run_usage(&paths, launch, &output_flags),
-        Command::Auth | Command::Connect => Err(not_yet_available("provider connection")),
-        Command::Models => Err(not_yet_available("the model catalog")),
+        Command::Auth => run_auth(&settings, &paths, launch, &output_flags),
+        Command::Connect => run_connect(&settings, &paths, launch),
+        Command::Models => run_models(&settings, &output_flags),
         Command::Permissions => run_permissions(&settings, launch, &output_flags),
         Command::Workspace => run_workspace(&settings, launch, &output_flags),
         Command::Ask => run_ask(&settings, &paths, launch, &output_flags),
@@ -272,6 +274,85 @@ fn run_interactive(
     let input = std::io::BufReader::new(stdin.lock());
     let code = session::run(config, input, std::io::stdout())?;
     Ok(ExitCode::from(code))
+}
+
+/// Reports the provider connection, or removes a stored credential.
+fn run_auth(
+    settings: &Settings,
+    paths: &Paths,
+    launch: &Launch,
+    output: &OutputFlags,
+) -> Result<ExitCode> {
+    let action = launch.args.first().map(String::as_str);
+    match action {
+        Some("remove") | Some("logout") => {
+            let provider = settings.provider.to_string();
+            let removed = provider_setup::disconnect(paths, &provider)?;
+            if output.json {
+                let value = serde_json::json!({ "provider": provider, "removed": removed });
+                println!("{}", serde_json::to_string_pretty(&value)?);
+            } else if removed {
+                println!("removed the stored credential for {provider}");
+            } else {
+                println!("no credential was stored for {provider}");
+            }
+        }
+        Some(other) => {
+            return Err(RuneError::new(
+                ErrorCode::InvalidField,
+                format!("`{other}` is not an action for auth"),
+            )
+            .with_hint("run `rune auth` to inspect, or `rune auth remove` to clear"));
+        }
+        None => {
+            if output.json {
+                let value = serde_json::json!({
+                    "provider": settings.provider.to_string(),
+                    "model": settings.model,
+                    "base_url": settings.base_url,
+                });
+                println!("{}", serde_json::to_string_pretty(&value)?);
+            } else {
+                println!("{}", provider_setup::render_connection(settings, paths));
+            }
+        }
+    }
+    Ok(ExitCode::from(EXIT_OK))
+}
+
+/// Stores a credential for the configured provider.
+///
+/// The value is read from the environment when the command does not carry one,
+/// so a credential never has to appear in a shell history or a process listing.
+fn run_connect(settings: &Settings, paths: &Paths, launch: &Launch) -> Result<ExitCode> {
+    let provider = settings.provider.to_string();
+    if settings.provider == Provider::Unconfigured {
+        return Err(
+            RuneError::new(ErrorCode::InvalidConfiguration, "no provider is selected")
+                .with_hint("set `provider` in the config, or pass `--provider`"),
+        );
+    }
+
+    let from_environment =
+        provider_setup::environment_credential(&provider, settings.api_key_env.as_deref());
+    let value = match launch.args.first() {
+        Some(value) => value.clone(),
+        None => from_environment.map_or_else(ask::read_stdin_prompt, Ok)?,
+    };
+    provider_setup::connect(paths, &provider, &value)?;
+    println!("stored a credential for {provider}");
+    Ok(ExitCode::from(EXIT_OK))
+}
+
+/// Lists the models the configured provider offers.
+fn run_models(settings: &Settings, output: &OutputFlags) -> Result<ExitCode> {
+    let catalog = provider_setup::catalog_for(settings);
+    if output.json {
+        println!("{}", serde_json::to_string_pretty(&catalog.to_json())?);
+    } else {
+        println!("{}", provider_setup::render_catalog(&catalog));
+    }
+    Ok(ExitCode::from(EXIT_OK))
 }
 
 /// Reads a reporting period from its written name.

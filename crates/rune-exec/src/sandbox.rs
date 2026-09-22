@@ -670,8 +670,13 @@ mod tests {
                 .wrap(&prepared, &policy, false)
                 .expect_err("a backend that cannot enforce");
             assert_eq!(error.code(), ErrorCode::Unsupported, "{name}: {error}");
+            // The remedy is carried as a hint rather than folded into the
+            // message, so a caller that prints them on separate lines shows it
+            // once.
             assert!(
-                error.to_string().contains(UNSANDBOXED_OVERRIDE),
+                error
+                    .hint()
+                    .is_some_and(|h| h.contains(UNSANDBOXED_OVERRIDE)),
                 "the refusal does not name the override: {error}"
             );
             assert_eq!(
@@ -704,7 +709,12 @@ mod tests {
             .wrap(&prepared, &policy(dir.as_path()), false)
             .expect_err("no backend");
         assert_eq!(error.code(), ErrorCode::Unsupported);
-        assert!(error.to_string().contains(UNSANDBOXED_OVERRIDE), "{error}");
+        assert!(
+            error
+                .hint()
+                .is_some_and(|h| h.contains(UNSANDBOXED_OVERRIDE)),
+            "{error}"
+        );
         assert!(error.to_string().contains(std::env::consts::OS), "{error}");
         assert_eq!(
             NullSandbox

@@ -340,9 +340,10 @@ impl fmt::Display for RuneError {
         if let Some(invariant) = &self.detail.invariant {
             write!(f, " (invariant `{invariant}`)")?;
         }
-        if let Some(hint) = &self.detail.hint {
-            write!(f, ": {hint}")?;
-        }
+        // The hint is not appended here. A caller that shows an error to a
+        // person prints it on its own line, and one that sends it to a machine
+        // reads it from the detail, so appending it would duplicate it in the
+        // first case and bury it in the second.
         Ok(())
     }
 }
@@ -396,7 +397,11 @@ mod tests {
         let err = RuneError::new(ErrorCode::AuthenticationRequired, "no credential")
             .with_hint("run `rune connect`");
         assert_eq!(err.hint(), Some("run `rune connect`"));
-        assert!(err.to_string().contains("run `rune connect`"));
+        assert!(err.to_string().contains("no credential"));
+        assert!(
+            !err.to_string().contains("run `rune connect`"),
+            "the hint is appended to the message, so a caller that prints it              separately shows it twice"
+        );
     }
 
     #[test]
