@@ -77,7 +77,7 @@ fn print_help() {
     println!("  gate     budget plus the full workspace test suite");
     println!("  release  stage a release artifact, its checksum, and a manifest");
     println!();
-    println!("  release takes: cargo xtask release <channel> [version]");
+    println!("  release takes: cargo xtask release <channel> [version] [target]");
 }
 
 /// The per-commit loop: format, lint, test.
@@ -163,13 +163,31 @@ fn release(extra: &[String]) -> Result<(), String> {
         Some(value) => value.clone(),
         None => manifest_version()?,
     };
-    let target = env!("TARGET");
+    // The target is taken from the caller when one is given, so a matrix can be
+    // staged from one machine with the cross targets installed. Without it the
+    // build target is used, which is the ordinary single-platform case.
+    let target = extra
+        .get(2)
+        .cloned()
+        .unwrap_or_else(|| env!("TARGET").to_owned());
     let directory = format!("target/dist/rune-{target}");
 
-    cargo(&["build", "--release", "--locked", "-p", "rune"])?;
+    if target == env!("TARGET") {
+        cargo(&["build", "--release", "--locked", "-p", "rune"])?;
+    } else {
+        cargo(&[
+            "build",
+            "--release",
+            "--locked",
+            "-p",
+            "rune",
+            "--target",
+            &target,
+        ])?;
+    }
 
-    let binary = release_binary_path();
-    let name = executable_name(target);
+    let binary = binary_path(&target);
+    let name = executable_name(&target);
     let archive = format!("rune-{version}-{target}.tar.gz");
     let archive_path = format!("{directory}/{archive}");
 
@@ -265,6 +283,20 @@ fn tar_header(name: &str, size: usize) -> [u8; 512] {
     let sum: u32 = header.iter().map(|byte| u32::from(*byte)).sum();
     put(&mut header, 148, format!("{sum:06o}\0 ").as_bytes());
     header
+}
+
+/// Returns the path of the built binary for a target.
+///
+/// A cross build puts its output under the target name; a host build does not.
+fn binary_path(target: &str) -> String {
+    let mut path = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    path.push("target");
+    if target != env!("TARGET") {
+        path.push(target);
+    }
+    path.push("release");
+    path.push(executable_name(target));
+    path.display().to_string()
 }
 
 /// Returns the executable name a platform produces.
