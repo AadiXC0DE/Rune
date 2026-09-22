@@ -676,10 +676,33 @@ mod tests {
     }
 
     /// Returns a workspace for one test.
+    /// Returns a workspace for a test about the shell itself.
+    ///
+    /// The sandbox is left off, because a host that cannot sandbox would
+    /// otherwise fail every one of these for a reason that has nothing to do
+    /// with what they assert. The tests that do assert the sandbox build their
+    /// own context.
     fn workspace() -> (tempfile::TempDir, ExecutionContext) {
         let dir = tempfile::tempdir().expect("a temporary directory");
         let path = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).expect("a UTF-8 path");
-        (dir, ExecutionContext::new(path))
+        (
+            dir,
+            ExecutionContext::new(path).with_allow_unsandboxed(true),
+        )
+    }
+
+    /// Returns a workspace whose commands are subject to the sandbox.
+    ///
+    /// Returns `None` on a host with no usable backend, where the assertions
+    /// would be about the host rather than about the code.
+    fn sandboxed_workspace() -> Option<(tempfile::TempDir, ExecutionContext)> {
+        let backend = rune_exec::detect();
+        if !backend.support().is_full() {
+            return None;
+        }
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let path = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).expect("a UTF-8 path");
+        Some((dir, ExecutionContext::new(path)))
     }
 
     /// Runs one call, expecting it to complete.
@@ -1271,8 +1294,10 @@ mod tests {
         // The workspace is the temporary directory, so a write elsewhere is
         // outside it. Without the sandbox in the command path this succeeds,
         // which is what makes the assertion meaningful rather than decorative.
+        let Some((_dir, context)) = sandboxed_workspace() else {
+            return;
+        };
         let tool = shell(4, 64 * 1024);
-        let (_dir, context) = workspace();
         let outside = std::env::temp_dir().join("rune-sandbox-escape-probe.txt");
         let _ = std::fs::remove_file(&outside);
 
@@ -1304,8 +1329,10 @@ mod tests {
     fn a_command_can_still_write_inside_the_workspace() {
         // The companion to the test above: a sandbox that denied every write
         // would pass it, so this shows the restriction is scoped.
+        let Some((_dir, context)) = sandboxed_workspace() else {
+            return;
+        };
         let tool = shell(4, 64 * 1024);
-        let (_dir, context) = workspace();
         let inside = context.workspace.join("written.txt");
 
         text(
@@ -1552,7 +1579,13 @@ mod tests {
             &allowed,
             &serde_json::json!({ "action": "run", "command": "pwd", "cwd": ".." }),
         );
-        let parent = dir.path().parent().expect("a parent directory");
+        // Resolved, because the shell prints the resolved path.
+        let parent = dir
+            .path()
+            .parent()
+            .expect("a parent directory")
+            .canonicalize()
+            .expect("resolved");
         assert!(
             observed.contains(&parent.display().to_string()),
             "{observed}"
@@ -1569,7 +1602,10 @@ mod tests {
             &context,
             &serde_json::json!({ "action": "run", "command": "pwd", "cwd": "sub" }),
         );
-        let expected = dir.path().join("sub");
+        // The shell prints the resolved path, so the expectation is resolved
+        // too: on a host where a temporary directory resolves elsewhere, the
+        // unresolved spelling would never appear in the output.
+        let expected = dir.path().join("sub").canonicalize().expect("resolved");
         assert!(
             observed.contains(&expected.display().to_string()),
             "{observed}"

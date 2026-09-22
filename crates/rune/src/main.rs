@@ -1332,11 +1332,26 @@ fn expand_tilde(raw: &str) -> String {
     let Some(rest) = raw.strip_prefix('~') else {
         return raw.to_owned();
     };
-    let home = std::env::var("HOME").unwrap_or_default();
-    if home.is_empty() {
+    let Some(home) = home_directory() else {
         return raw.to_owned();
-    }
+    };
     format!("{home}{rest}")
+}
+
+/// Returns the current user's home directory.
+///
+/// The variable differs by platform, and a shell on each expands a tilde to the
+/// value the platform sets. Reading one name leaves a tilde unexpanded
+/// everywhere the other is used, which is a path the caller did not write.
+fn home_directory() -> Option<String> {
+    let from_env = |name: &str| std::env::var(name).ok().filter(|value| !value.is_empty());
+    from_env("HOME")
+        .or_else(|| from_env("USERPROFILE"))
+        .or_else(|| {
+            let drive = from_env("HOMEDRIVE")?;
+            let path = from_env("HOMEPATH")?;
+            Some(format!("{drive}{path}"))
+        })
 }
 
 /// Writes the additional-directory list into the user config.
@@ -1507,6 +1522,12 @@ mod tests {
         let expanded = expand_tilde("~/work");
         assert!(expanded.ends_with("/work"), "{expanded}");
         assert!(!expanded.starts_with('~'), "{expanded}");
+    }
+
+    #[test]
+    fn a_home_directory_is_found_whatever_the_platform_calls_it() {
+        // The variable differs by platform, so a tilde has to expand on both.
+        assert!(home_directory().is_some(), "no home directory was found");
     }
 
     #[test]
