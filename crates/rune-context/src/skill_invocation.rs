@@ -209,16 +209,18 @@ fn read_within(path: &Utf8Path, limits: &Limits) -> Result<String> {
 
 /// Returns true when a path escapes a directory, by `..` or by a symlink.
 ///
-/// Only `..` and a Windows prefix are rejected on their own, because those are
-/// the escapes visible without touching the filesystem. An existing path is
-/// canonicalized as well, which catches a link to a file outside the directory.
+/// `..` is rejected on its own because it is the escape visible without
+/// touching the filesystem. An existing path is canonicalized as well, which
+/// catches a link to a file outside the directory.
+///
+/// A path drive or share is not treated as an escape. It is part of spelling an
+/// absolute path on some platforms, so rejecting it would refuse every path on
+/// those platforms rather than the ones that leave the directory.
 fn leaves(path: &Utf8Path, directory: &Utf8Path) -> bool {
-    if path.components().any(|component| {
-        matches!(
-            component,
-            Utf8Component::ParentDir | Utf8Component::Prefix(_)
-        )
-    }) {
+    if path
+        .components()
+        .any(|component| matches!(component, Utf8Component::ParentDir))
+    {
         return true;
     }
     let (Ok(resolved), Ok(root)) = (

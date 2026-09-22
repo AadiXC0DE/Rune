@@ -369,6 +369,18 @@ mod tests {
         (dir, root)
     }
 
+    /// Joins a path written with forward slashes.
+    ///
+    /// A separator in a fixture names a separator on the platform, so joining
+    /// the string whole leaves the forward slashes in place and the result
+    /// compares unequal to the path discovery reports where the platform spells
+    /// its separator differently.
+    fn under(base: &Utf8Path, parts: &str) -> Utf8PathBuf {
+        parts
+            .split('/')
+            .fold(base.to_path_buf(), |path, part| path.join(part))
+    }
+
     /// Writes a fixture file, creating its parents.
     fn write(path: &Utf8Path, contents: &str) {
         if let Some(parent) = path.parent() {
@@ -400,16 +412,16 @@ mod tests {
         let workspace = home.join("proj");
         let config = root.join("config");
         write(&workspace.join("AGENTS.md"), "root rules\n");
-        write(&workspace.join("pkg/nested/AGENTS.md"), "nested rules\n");
+        write(&under(&workspace, "pkg/nested/AGENTS.md"), "nested rules\n");
 
         let files = files_of(&workspace, &home, &config);
-        let chain = resolve_for_target(&files, &workspace.join("pkg/nested/src/lib.rs"));
+        let chain = resolve_for_target(&files, &under(&workspace, "pkg/nested/src/lib.rs"));
 
         assert_eq!(
             scopes(&chain),
             vec![
                 workspace.to_string(),
-                workspace.join("pkg/nested").to_string()
+                under(&workspace, "pkg/nested").to_string()
             ]
         );
         assert!(chain[1].content.contains("nested rules"));
@@ -422,10 +434,10 @@ mod tests {
         let workspace = home.join("proj");
         let config = root.join("config");
         write(&workspace.join("AGENTS.md"), "root rules\n");
-        write(&workspace.join("pkg/nested/AGENTS.md"), "nested rules\n");
+        write(&under(&workspace, "pkg/nested/AGENTS.md"), "nested rules\n");
 
         let files = files_of(&workspace, &home, &config);
-        let chain = resolve_for_target(&files, &workspace.join("other/main.rs"));
+        let chain = resolve_for_target(&files, &under(&workspace, "other/main.rs"));
 
         assert_eq!(scopes(&chain), vec![workspace.to_string()]);
         assert_eq!(chain[0].content, "root rules\n");
@@ -438,11 +450,11 @@ mod tests {
         let workspace = home.join("proj");
         let config = root.join("config");
         write(&workspace.join("AGENTS.md"), "root rules\n");
-        write(&workspace.join("pkg/AGENTS.md"), "package rules\n");
-        std::fs::create_dir_all(workspace.join("pkg/src")).expect("create dir");
+        write(&under(&workspace, "pkg/AGENTS.md"), "package rules\n");
+        std::fs::create_dir_all(under(&workspace, "pkg/src")).expect("create dir");
 
         let files = files_of(&workspace, &home, &config);
-        let chain = resolve_for_target(&files, &workspace.join("pkg/src"));
+        let chain = resolve_for_target(&files, &under(&workspace, "pkg/src"));
 
         assert_eq!(
             scopes(&chain),
@@ -462,7 +474,7 @@ mod tests {
         let files = files_of(&workspace, &home, &config);
         assert_eq!(files[0].path, config.join("AGENTS.md"));
 
-        let chain = resolve_for_target(&files, &workspace.join("src/main.rs"));
+        let chain = resolve_for_target(&files, &under(&workspace, "src/main.rs"));
         assert_eq!(chain[0].path, config.join("AGENTS.md"));
         assert_eq!(chain[1].path, workspace.join("AGENTS.md"));
         assert!(render(&chain).contains("user rules"));
@@ -472,15 +484,15 @@ mod tests {
     fn the_upward_walk_stops_below_the_home_directory() {
         let (_dir, root) = tree();
         let home = root.join("home");
-        let workspace = home.join("work/proj");
+        let workspace = under(&home, "work/proj");
         write(&home.join("AGENTS.md"), "home rules\n");
-        write(&home.join("work/AGENTS.md"), "work rules\n");
+        write(&under(&home, "work/AGENTS.md"), "work rules\n");
         write(&workspace.join("AGENTS.md"), "root rules\n");
 
         let files = files_of(&workspace, &home, &root.join("config"));
         let paths: Vec<String> = files.iter().map(|file| file.path.to_string()).collect();
 
-        assert!(paths.contains(&home.join("work/AGENTS.md").to_string()));
+        assert!(paths.contains(&under(&home, "work/AGENTS.md").to_string()));
         assert!(!paths.contains(&home.join("AGENTS.md").to_string()));
     }
 
@@ -488,12 +500,12 @@ mod tests {
     fn an_ancestor_file_widens_a_target_chain() {
         let (_dir, root) = tree();
         let home = root.join("home");
-        let workspace = home.join("work/proj");
-        write(&home.join("work/AGENTS.md"), "work rules\n");
+        let workspace = under(&home, "work/proj");
+        write(&under(&home, "work/AGENTS.md"), "work rules\n");
         write(&workspace.join("AGENTS.md"), "root rules\n");
 
         let files = files_of(&workspace, &home, &root.join("config"));
-        let chain = resolve_for_target(&files, &workspace.join("src/main.rs"));
+        let chain = resolve_for_target(&files, &under(&workspace, "src/main.rs"));
 
         assert_eq!(
             scopes(&chain),
@@ -506,14 +518,14 @@ mod tests {
         let (_dir, root) = tree();
         let workspace = root.join("proj");
         write(&workspace.join("AGENTS.md"), "root rules\n");
-        write(&workspace.join("pkg/AGENTS.md"), "package rules\n");
+        write(&under(&workspace, "pkg/AGENTS.md"), "package rules\n");
 
         let files = Options::new(&workspace, None, &root.join("config"))
             .discover()
             .expect("discover");
         assert_eq!(files.len(), 2);
 
-        let chain = resolve_for_target(&files, &workspace.join("other/main.rs"));
+        let chain = resolve_for_target(&files, &under(&workspace, "other/main.rs"));
         assert_eq!(scopes(&chain), vec![workspace.to_string()]);
     }
 
@@ -585,14 +597,14 @@ mod tests {
         let (_dir, root) = tree();
         let home = root.join("home");
         let workspace = home.join("proj");
-        let wide = workspace.join("pkg/AGENTS.md");
-        let narrow = workspace.join("pkg/nested/AGENTS.md");
+        let wide = under(&workspace, "pkg/AGENTS.md");
+        let narrow = under(&workspace, "pkg/nested/AGENTS.md");
         write(&workspace.join("AGENTS.md"), "root rules\n");
         write(&wide, &"wide rule\n".repeat(20_000));
         write(&narrow, &"narrow rule\n".repeat(20_000));
 
         let files = files_of(&workspace, &home, &root.join("config"));
-        let chain = resolve_for_target(&files, &workspace.join("pkg/nested/src/lib.rs"));
+        let chain = resolve_for_target(&files, &under(&workspace, "pkg/nested/src/lib.rs"));
         let rendered = render(&chain);
 
         assert!(rendered.len() <= resolve_limit(LimitName::ProjectInstructionsTotalBytes));
@@ -646,7 +658,7 @@ mod tests {
         let (_dir, root) = tree();
         let home = root.join("home");
         let workspace = home.join("proj");
-        write(&workspace.join(".cache/AGENTS.md"), "cache rules\n");
+        write(&under(&workspace, ".cache/AGENTS.md"), "cache rules\n");
         write(&workspace.join("AGENTS.md"), "root rules\n");
 
         let files = files_of(&workspace, &home, &root.join("config"));
@@ -661,12 +673,12 @@ mod tests {
         let home = root.join("home");
         let workspace = home.join("proj");
         std::fs::create_dir_all(workspace.join("AGENTS.md")).expect("create dir named like a file");
-        write(&workspace.join("pkg/AGENTS.md"), "package rules\n");
+        write(&under(&workspace, "pkg/AGENTS.md"), "package rules\n");
 
         let files = files_of(&workspace, &home, &root.join("config"));
         let paths: Vec<String> = files.iter().map(|file| file.path.to_string()).collect();
 
-        assert_eq!(paths, vec![workspace.join("pkg/AGENTS.md").to_string()]);
+        assert_eq!(paths, vec![under(&workspace, "pkg/AGENTS.md").to_string()]);
     }
 
     #[test]
