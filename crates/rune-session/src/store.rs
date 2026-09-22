@@ -32,6 +32,13 @@ pub const METADATA_FILE: &str = "session.json";
 /// Name of the advisory writer lock.
 pub const LOCK_FILE: &str = "session.lock";
 
+/// File holding the record of the writer that currently holds the lock.
+///
+/// Beside the lock file rather than inside it. A lock is held on the file it
+/// names, and on a platform where that lock is mandatory the holder's own record
+/// would be unreadable exactly when a refused writer needs to name the holder.
+pub const HOLDER_FILE: &str = "session.holder";
+
 /// Schema version of the metadata projection.
 pub const METADATA_VERSION: u32 = 1;
 
@@ -167,6 +174,8 @@ pub struct SessionStore {
     id: SessionId,
     dir: Utf8PathBuf,
     log: File,
+    /// The held writer lock. Closing this handle is what releases the lock, so
+    /// the handle is kept rather than the lock being released explicitly.
     lock: File,
     projection: std::cell::RefCell<Projection>,
 }
@@ -388,8 +397,10 @@ impl SessionStore {
 impl Drop for SessionStore {
     fn drop(&mut self) {
         // A released lock leaves no holder behind, so the next writer cannot be
-        // misled by a stale record.
-        let _ = self.lock.set_len(0);
+        // misled by a stale record. The lock itself is released when the handle
+        // in `lock` closes, which happens with this value.
+        let _ = self.lock.unlock();
+        let _ = paths::write_private(&self.dir.join(HOLDER_FILE), "");
     }
 }
 
@@ -502,13 +513,13 @@ fn acquire_lock(dir: &Utf8Path, id: &SessionId, deadline_ms: u64) -> Result<File
     loop {
         match file.try_lock() {
             Ok(()) => {
-                record_holder(&file)?;
+                record_holder(dir)?;
                 return Ok(file);
             }
             Err(TryLockError::WouldBlock) => {
                 let elapsed = started.elapsed();
                 if elapsed >= deadline {
-                    return Err(locked_error(dir, id, &path));
+                    return Err(locked_error(dir, id));
                 }
                 let remaining = deadline.saturating_sub(elapsed);
                 std::thread::sleep(remaining.min(Duration::from_millis(LOCK_POLL_MS)));
@@ -518,14 +529,14 @@ fn acquire_lock(dir: &Utf8Path, id: &SessionId, deadline_ms: u64) -> Result<File
     }
 }
 
-/// Writes the holder record into the lock file.
+/// Writes the holder record beside the lock file.
 ///
 /// Best effort, and deliberately so: the record is diagnostic text, while the
 /// lock itself is held by the operating system. Only one writer exists at a
-/// time, so no holder ever races another holder here; the file is empty only
+/// time, so no holder ever races another holder here; the record is empty only
 /// between one writer releasing and the next acquiring, when the lock is
 /// genuinely free.
-fn record_holder(file: &File) -> Result<()> {
+fn record_holder(dir: &Utf8Path) -> Result<()> {
     let holder = LockHolder {
         pid: std::process::id(),
         host: std::env::var("HOSTNAME")
@@ -534,18 +545,12 @@ fn record_holder(file: &File) -> Result<()> {
             .filter(|value| !value.is_empty()),
         since_ms: event::now_millis(),
     };
-    let text = serde_json::to_string(&holder)?;
-
-    let mut handle = file;
-    handle.set_len(0)?;
-    handle.write_all(text.as_bytes())?;
-    handle.sync_data()?;
-    Ok(())
+    paths::write_private(&dir.join(HOLDER_FILE), &serde_json::to_string(&holder)?)
 }
 
 /// Builds the error reported when the writer lock cannot be taken.
-fn locked_error(dir: &Utf8Path, id: &SessionId, lock_path: &Utf8Path) -> RuneError {
-    let holder = std::fs::read_to_string(lock_path)
+fn locked_error(dir: &Utf8Path, id: &SessionId) -> RuneError {
+    let holder = std::fs::read_to_string(dir.join(HOLDER_FILE))
         .ok()
         .and_then(|text| serde_json::from_str::<LockHolder>(&text).ok());
 
@@ -847,16 +852,16 @@ mod tests {
         let (paths, store) = store_in(&root);
         let dir = paths.session_dir(&store.id());
         store.append(user("first writer")).expect("append");
-        let lock_path = dir.join(LOCK_FILE);
+        let holder_path = dir.join(HOLDER_FILE);
         assert!(
-            !std::fs::read_to_string(&lock_path)
+            !std::fs::read_to_string(&holder_path)
                 .expect("read")
                 .is_empty()
         );
         drop(store);
 
         assert!(
-            std::fs::read_to_string(&lock_path)
+            std::fs::read_to_string(&holder_path)
                 .expect("read")
                 .is_empty()
         );

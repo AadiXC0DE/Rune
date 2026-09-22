@@ -641,7 +641,11 @@ impl LockGuard {
             check_ledger_file(path, &meta)?;
         }
         let mut options = OpenOptions::new();
-        options.create(true).append(true);
+        // The lock file is opened for writing rather than appending. Taking a
+        // lock on Windows needs a handle that was opened with read or write
+        // access, and a handle opened only to append does not carry it, so the
+        // lock is refused there. Nothing is written through this handle.
+        options.create(true).write(true);
         set_creation_mode(&mut options);
         let file = options.open(path)?;
         file.lock().map_err(|err| {

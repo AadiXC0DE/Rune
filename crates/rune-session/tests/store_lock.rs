@@ -16,7 +16,7 @@ use rune_core::id::{EventSeq, SessionId};
 use rune_core::paths::Paths;
 use rune_session::event::SessionEvent;
 use rune_session::store::{LockHolder, SessionStore, load_read_only};
-use rune_session::{EVENTS_FILE, LOCK_FILE};
+use rune_session::{EVENTS_FILE, HOLDER_FILE};
 
 /// Set in the child process to select the operation it performs.
 const CHILD_MODE: &str = "RUNE_SESSION_CHILD_MODE";
@@ -34,14 +34,14 @@ fn paths_for(root: &tempfile::TempDir) -> Paths {
     }
 }
 
-/// Reads the holder record a lock file currently carries.
+/// Reads the record of the writer that currently holds the lock.
 ///
 /// Returns `None` while the record is being replaced: the file is truncated and
 /// then rewritten, so a process racing the holder can observe it empty. A writer
 /// that is refused always reads a complete record, because the holder finishes
 /// writing before it starts appending.
 fn holder_record(dir: &Utf8Path) -> Option<LockHolder> {
-    let text = std::fs::read_to_string(dir.join(LOCK_FILE)).ok()?;
+    let text = std::fs::read_to_string(dir.join(HOLDER_FILE)).ok()?;
     serde_json::from_str(&text).ok()
 }
 
@@ -224,7 +224,7 @@ fn a_stale_holder_record_names_the_writer_that_holds_the_lock() {
         since_ms: 1,
     };
     std::fs::write(
-        dir.join(LOCK_FILE),
+        dir.join(HOLDER_FILE),
         serde_json::to_string(&stale).expect("json"),
     )
     .expect("write");

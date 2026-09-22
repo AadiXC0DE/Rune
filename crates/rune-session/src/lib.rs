@@ -27,8 +27,8 @@ pub use event::{
 pub use recovery::{RecoveryDefect, RecoveryReport, recover};
 pub use report::{Breakdown, Period, Summary, TokenTotals, render_text, summarize, to_json};
 pub use store::{
-    EVENTS_FILE, LOCK_DEADLINE_MS, LOCK_FILE, LockHolder, Metadata, SessionState, SessionStore,
-    UsageTotal, load_read_only, write_log_atomic,
+    EVENTS_FILE, HOLDER_FILE, LOCK_DEADLINE_MS, LOCK_FILE, LockHolder, Metadata, SessionState,
+    SessionStore, UsageTotal, load_read_only, write_log_atomic,
 };
 pub use usage::{
     AppendOutcome, COMPACTION_BYTES, HelperKind, Ledger, LedgerCaps, LedgerRead, MAX_RECORD_BYTES,
