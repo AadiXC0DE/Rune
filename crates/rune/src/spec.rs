@@ -389,6 +389,15 @@ pub const MAINTENANCE: &[CommandSpec] = &[
         supports_json: false,
     },
     CommandSpec {
+        name: "reference",
+        aliases: &[],
+        summary: "Print the generated command reference",
+        usage: "rune reference [--write <path>]",
+        flags: &[option("--write", "path", "Write the reference to a file.")],
+        requirements: Requirements::NONE,
+        supports_json: false,
+    },
+    CommandSpec {
         name: "help",
         aliases: &["-h", "--help"],
         summary: "Print help",
@@ -434,6 +443,20 @@ pub fn find(name: &str) -> Option<&'static CommandSpec> {
 #[must_use]
 pub fn spec_for(command: Command) -> Option<&'static CommandSpec> {
     find(command.as_str())
+}
+
+/// Returns true when a flag takes a value.
+///
+/// Read from the same table the parser and the reference use, so a flag declared
+/// to take a value cannot be parsed as a boolean and silently swallow nothing.
+/// A flag that is genuine but undeclared here is treated as a boolean, which is
+/// the safe reading: it consumes no argument that belongs to the command.
+#[must_use]
+pub fn takes_value(name: &str) -> bool {
+    GLOBAL_FLAGS
+        .iter()
+        .chain(all_commands().iter().flat_map(|spec| spec.flags.iter()))
+        .any(|flag| flag.name == name && flag.value.is_some())
 }
 
 #[cfg(test)]

@@ -55,6 +55,8 @@ pub enum Command {
     Upgrade,
     /// Remove the installed binary.
     Uninstall,
+    /// Print the generated command reference.
+    Reference,
     /// Print help.
     Help,
     /// Print the version.
@@ -90,6 +92,7 @@ impl Command {
             Self::Doctor => "doctor",
             Self::Upgrade => "upgrade",
             Self::Uninstall => "uninstall",
+            Self::Reference => "reference",
             Self::Help => "help",
             Self::Version => "version",
             Self::Interactive => "interactive",
@@ -380,6 +383,7 @@ pub fn parse(args: Vec<OsString>, benchmark: bool) -> Result<Launch> {
                 "doctor" => Command::Doctor,
                 "upgrade" => Command::Upgrade,
                 "uninstall" => Command::Uninstall,
+                "reference" => Command::Reference,
                 "help" => Command::Help,
                 "version" => Command::Version,
                 "resume" => {
@@ -436,19 +440,7 @@ fn finish(mut launch: Launch, tokens: &[String], mut index: usize) -> Launch {
             } else {
                 // A flag whose value is a separate token is resolved here only
                 // for flags known to take a value.
-                let known_value = matches!(
-                    rest,
-                    "id" | "limit"
-                        | "cursor"
-                        | "period"
-                        | "channel"
-                        | "explain"
-                        | "log-file"
-                        | "image"
-                        | "max-steps"
-                        | "timeout"
-                        | "prompt-file"
-                );
+                let known_value = spec::takes_value(&format!("--{rest}"));
                 if known_value && let Some(value) = tokens.get(index.saturating_add(1)) {
                     launch
                         .flags

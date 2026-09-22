@@ -18,6 +18,7 @@ mod help;
 mod permissions;
 mod prompt_history;
 mod provider_setup;
+mod reference;
 mod session;
 mod session_log;
 mod spec;
@@ -164,6 +165,7 @@ fn run(launch: &Launch) -> Result<ExitCode> {
         }
         Command::Review => run_review(&settings, &paths, launch, &workspace, &output_flags),
         Command::Upgrade | Command::Uninstall => Err(not_yet_available("the installer")),
+        Command::Reference => run_reference(launch),
         Command::Help | Command::Version => Ok(ExitCode::from(EXIT_OK)),
     }
 }
@@ -795,6 +797,20 @@ fn run_projects(
                 println!("  {decision:?}  {path}");
             }
         }
+    }
+    Ok(ExitCode::from(EXIT_OK))
+}
+
+/// Prints or writes the generated command reference.
+fn run_reference(launch: &Launch) -> Result<ExitCode> {
+    let text = reference::render();
+    match launch.flag("--write") {
+        Some(raw) => {
+            let path = Utf8PathBuf::from(raw);
+            reference::write_to(&path)?;
+            println!("wrote {path}");
+        }
+        None => print!("{text}"),
     }
     Ok(ExitCode::from(EXIT_OK))
 }
