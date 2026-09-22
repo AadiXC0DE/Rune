@@ -713,7 +713,11 @@ fn run_acp(
             .offline(settings.offline),
         dialect,
         model: settings.model.clone(),
-        instructions: rune_context::prompt::SYSTEM_PROMPT.to_owned(),
+        instructions: rune_context::prompt::instructions_for(
+            workspace,
+            &paths.config_root,
+            &settings.limits,
+        ),
         registry,
         rules,
         mode: settings.permission_mode,

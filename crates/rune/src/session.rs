@@ -12,7 +12,7 @@ use camino::Utf8Path;
 use rune_agent::history::History;
 use rune_agent::steering::{Cancellation, SteeringQueue};
 use rune_agent::turn::{self, Event, Host, StopReason};
-use rune_context::prompt::{self, Inputs, Prompt};
+use rune_context::prompt::{self, Prompt};
 use rune_core::budget::BudgetSet;
 use rune_core::config::{Effort, PermissionMode, Settings};
 use rune_core::error::{ErrorCode, Result, RuneError};
@@ -481,43 +481,12 @@ fn report_turn<W: std::io::Write>(
 
 /// Builds the prompt for a session.
 fn build_prompt(workspace: &Utf8Path, config_root: &Utf8Path, limits: &BudgetSet) -> Prompt {
-    let skills = rune_context::skills::discover(workspace, None, config_root).unwrap_or_default();
-    let project = rune_context::instructions::discover(workspace, None).unwrap_or_default();
-
-    // A profile-owned file replaces the built-in prompt rather than adding to
-    // it: an embedder retargets the agent by writing one file, which is the
-    // point of the file existing.
-    let override_text = read_prompt_override(config_root);
-    let system = override_text.as_deref().unwrap_or(prompt::SYSTEM_PROMPT);
-
-    let inputs = Inputs {
-        system,
-        tool_guidance: None,
-        skills: &skills,
-        host_instructions: None,
-        project: &project,
-    };
-
-    prompt::assemble(&inputs, limits).unwrap_or_else(|_| Prompt {
-        instructions: system.to_owned(),
+    let instructions = prompt::instructions_for(workspace, config_root, limits);
+    Prompt {
+        instructions,
         included: Vec::new(),
         omissions: Vec::new(),
-    })
-}
-
-/// Reads the system prompt override, when one is present.
-///
-/// A file that cannot be read is ignored rather than fatal: a session that will
-/// not start because a prompt file is unreadable is worse than one that runs
-/// with the built-in prompt.
-fn read_prompt_override(config_root: &Utf8Path) -> Option<String> {
-    let path = config_root.join(rune_core::paths::names::SYSTEM_PROMPT_FILE);
-    let text = std::fs::read_to_string(&path).ok()?;
-    let trimmed = text.trim();
-    if trimmed.is_empty() {
-        return None;
     }
-    Some(trimmed.to_owned())
 }
 
 /// Builds the runtime configuration for an interactive session.

@@ -4,6 +4,7 @@
 //! about what the model sees. The order is fixed and asserted by a snapshot,
 //! because an accidental reordering is invisible in review and changes behavior.
 
+use camino::Utf8Path;
 use rune_core::budget::{BudgetSet, LimitName};
 use rune_core::error::Result;
 
@@ -259,6 +260,46 @@ that rather than acting on it.
 
 Keep responses short. State what you did, what you observed, and what remains
 unresolved. Do not narrate routine steps or restate the request.";
+
+/// Builds the system instructions for a workspace.
+///
+/// A profile-owned file replaces the built-in text rather than adding to it, so
+/// an embedder retargets the agent by writing one file. Everything else a
+/// session supplies, such as project instructions and the skill catalog, is
+/// assembled around whichever text is in force.
+pub fn instructions_for(
+    workspace: &Utf8Path,
+    config_root: &Utf8Path,
+    limits: &BudgetSet,
+) -> String {
+    let skills = crate::skills::discover(workspace, None, config_root).unwrap_or_default();
+    let project = crate::instructions::discover(workspace, None).unwrap_or_default();
+    let override_text = read_override(config_root);
+    let system = override_text.as_deref().unwrap_or(SYSTEM_PROMPT);
+
+    let inputs = Inputs {
+        system,
+        tool_guidance: None,
+        skills: &skills,
+        host_instructions: None,
+        project: &project,
+    };
+    assemble(&inputs, limits).map_or_else(|_| system.to_owned(), |prompt| prompt.instructions)
+}
+
+/// Reads the system prompt override, when one is present.
+///
+/// A file that cannot be read, or that holds only whitespace, is ignored rather
+/// than fatal: a blank override would leave the model with no instructions.
+pub fn read_override(config_root: &Utf8Path) -> Option<String> {
+    let path = config_root.join(rune_core::paths::names::SYSTEM_PROMPT_FILE);
+    let text = std::fs::read_to_string(&path).ok()?;
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(trimmed.to_owned())
+}
 
 #[cfg(test)]
 mod tests {
