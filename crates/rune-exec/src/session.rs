@@ -519,20 +519,23 @@ mod tests {
     /// Returns the argv of a process that reads one line and writes it back.
     ///
     /// The test is about the write reaching the process, so the script is passed
-    /// as a single argument and no shell re-parses it. It reads one line because
-    /// the write side is never closed, so a program that reads to the end of its
-    /// input would wait there rather than finish.
+    /// as a single argument and no shell re-parses it. It reads exactly one line,
+    /// because the write side stays open for the life of the process: a program
+    /// that reads until its input ends would wait there forever.
+    ///
+    /// The platform whose shell sets a variable from a line needs delayed
+    /// expansion to read it back, because the whole line is expanded before it
+    /// runs. The argv is passed directly, so no other shell re-parses the
+    /// quotes around the builtin's argument.
     fn echo_standard_input() -> Vec<String> {
-        let (program, flag, script) = if cfg!(windows) {
-            (
-                "powershell",
-                "-Command",
-                "$x=[Console]::In.ReadLine(); Write-Output $x",
-            )
+        let argv: &[&str] = if cfg!(windows) {
+            // Delayed expansion is what lets the line be read back: the whole
+            // statement is expanded before it runs, so `%line%` would be empty.
+            &["cmd", "/V:ON", "/C", "set /p line= & echo !line!"]
         } else {
-            ("/bin/sh", "-c", "read line; echo $line")
+            &["/bin/sh", "-c", "read line; echo $line"]
         };
-        vec![program.to_owned(), flag.to_owned(), script.to_owned()]
+        argv.iter().map(|argument| (*argument).to_owned()).collect()
     }
 
     /// Waits for a condition, polling until the deadline.
