@@ -1372,7 +1372,11 @@ mod tests {
         let error =
             additional_roots(&json!({"additionalDirectories": ["nope"]})).expect_err("rejected");
         assert_eq!(error.code, crate::jsonrpc::INVALID_PARAMS);
-        let roots = additional_roots(&json!({"additionalDirectories": ["/tmp/a"]})).expect("roots");
+        // An absolute path is spelled differently per platform, so the fixture
+        // is built rather than written as one shape.
+        let absolute = std::env::temp_dir().to_string_lossy().into_owned();
+        let roots =
+            additional_roots(&json!({ "additionalDirectories": [absolute] })).expect("roots");
         assert_eq!(roots.len(), 1);
     }
 

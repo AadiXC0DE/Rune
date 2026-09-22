@@ -1060,7 +1060,7 @@ mod tests {
             .expect("set");
         let mut sessions = Sessions::new(
             paths_for(&root),
-            Utf8PathBuf::from("/tmp/work"),
+            utf8_path(&root, "work"),
             SessionConfig::new("test/model", Effort::Auto, PermissionMode::Auto),
             &limits,
             Vec::new(),
