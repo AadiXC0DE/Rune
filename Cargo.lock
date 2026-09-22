@@ -950,6 +950,7 @@ name = "rune-core"
 version = "0.1.0"
 dependencies = [
  "camino",
+ "getrandom 0.3.4",
  "jiff",
  "proptest",
  "serde",

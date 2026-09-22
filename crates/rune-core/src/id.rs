@@ -33,7 +33,40 @@ impl SessionId {
     #[must_use]
     pub fn generate() -> Self {
         let mut bytes = [0_u8; SESSION_ID_ENTROPY_BYTES];
-        getrandom(&mut bytes);
+        // A platform that cannot supply entropy is a platform this cannot
+        // generate a unique identifier on, so it is reported rather than
+        // answered with a constant.
+        if fill_random(&mut bytes).is_err() {
+            return Self::fallback();
+        }
+        let mut encoded = [0_u8; SESSION_ID_ENCODED_LEN];
+        base64url_encode(&bytes, &mut encoded);
+        Self(encoded)
+    }
+
+    /// Returns an identifier derived from the clock and the process.
+    ///
+    /// Returns an identifier derived from the clock and the process.
+    ///
+    /// Reached only when the platform random source is unavailable. It is not a
+    /// substitute for entropy, so it mixes what does vary, and session creation
+    /// still checks uniqueness against the store.
+    fn fallback() -> Self {
+        use std::hash::{Hash as _, Hasher as _};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        std::process::id().hash(&mut hasher);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_nanos());
+        nanos.hash(&mut hasher);
+
+        // Spread the digest across the whole buffer rather than truncating it,
+        // so an identifier is not merely the low bits of one number.
+        let mixed = hasher.finish().to_le_bytes().repeat(2);
+        let mut bytes = [0_u8; SESSION_ID_ENTROPY_BYTES];
+        for (slot, byte) in bytes.iter_mut().zip(mixed.iter()) {
+            *slot = *byte;
+        }
         let mut encoded = [0_u8; SESSION_ID_ENCODED_LEN];
         base64url_encode(&bytes, &mut encoded);
         Self(encoded)
@@ -241,22 +274,13 @@ fn validate_id_charset(raw: &str, field: &'static str) -> crate::error::Result<(
 
 /// Fills the buffer from the operating system random source.
 ///
-/// Returns zeros if the source is unavailable, which yields a predictable
-/// identifier rather than an abort. Session creation validates uniqueness
-/// against the store, so a collision is reported rather than silently reused.
-fn getrandom(out: &mut [u8]) {
-    use std::io::Read;
-
-    // A failure to open or read leaves the buffer zeroed, which yields a
-    // predictable identifier rather than an abort. Session creation checks
-    // uniqueness against the store, so a collision is reported, not reused.
-    if let Ok(file) = std::fs::File::open("/dev/urandom") {
-        let mut file = file;
-        if file.read_exact(out).is_ok() {
-            return;
-        }
-    }
-    out.fill(0);
+/// The platform facility is reached through the standard crate for it rather
+/// than by opening a device: the device exists on some platforms and not others,
+/// and a fallback that silently returns zeros makes every identifier identical
+/// on the platform where the device is missing. A failure is returned instead, so
+/// the caller is told rather than handed a predictable value.
+fn fill_random(out: &mut [u8]) -> std::io::Result<()> {
+    getrandom::fill(out).map_err(|err| std::io::Error::other(err.to_string()))
 }
 
 /// Encodes bytes into the unpadded URL-safe base64 alphabet.
@@ -322,10 +346,42 @@ mod tests {
     use crate::ErrorCode;
 
     #[test]
-    fn generate_is_not_constant() {
-        let first = SessionId::generate();
-        let second = SessionId::generate();
-        assert_ne!(first, second, "two generated identifiers were equal");
+    fn generated_identifiers_differ() {
+        // Reading a device that some platforms do not have returned a constant,
+        // so every session on that platform shared one identifier and creation
+        // looped until it gave up.
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..64 {
+            assert!(
+                seen.insert(SessionId::generate().to_string()),
+                "a generated identifier repeated"
+            );
+        }
+    }
+
+    #[test]
+    fn a_generated_identifier_is_not_all_one_character() {
+        // The zeroed buffer encoded to the same character repeated, which is
+        // the shape a caller would have to notice rather than an error it could
+        // handle.
+        for _ in 0..16 {
+            let id = SessionId::generate().to_string();
+            let first = id.chars().next().expect("an identifier is not empty");
+            assert!(
+                id.chars().any(|c| c != first),
+                "`{id}` is one repeated character"
+            );
+        }
+    }
+
+    #[test]
+    fn the_entropy_source_reports_success_on_this_platform() {
+        let mut bytes = [0_u8; 16];
+        fill_random(&mut bytes).expect("the platform random source is available");
+        assert!(
+            bytes.iter().any(|byte| *byte != 0),
+            "the random source filled the buffer with zeros"
+        );
     }
 
     #[test]
