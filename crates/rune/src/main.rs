@@ -154,7 +154,7 @@ fn run(launch: &Launch) -> Result<ExitCode> {
         Command::Interactive | Command::Resume => {
             run_interactive(&settings, &paths, &workspace, launch)
         }
-        Command::Review => Err(not_yet_available("the review command")),
+        Command::Review => run_review(&settings, &paths, launch, &workspace, &output_flags),
         Command::Upgrade | Command::Uninstall => Err(not_yet_available("the installer")),
         Command::Help | Command::Version => Ok(ExitCode::from(EXIT_OK)),
     }
@@ -256,6 +256,139 @@ fn run_ask(
             Err(err)
         }
     }
+}
+
+/// Reviews the pending changes in the workspace.
+///
+/// Builds the prompt from the working tree rather than asking the model to go
+/// looking, so what is reviewed is what the repository reports as pending and
+/// nothing else.
+fn run_review(
+    settings: &Settings,
+    paths: &Paths,
+    launch: &Launch,
+    workspace: &camino::Utf8Path,
+    output: &OutputFlags,
+) -> Result<ExitCode> {
+    let changes = pending_changes(workspace)?;
+    if changes.trim().is_empty() {
+        // Reviewing nothing would produce an invented report, so the condition
+        // is reported instead.
+        if output.json {
+            let value = serde_json::json!({
+                "output": "",
+                "exit_code": 0,
+                "usage": serde_json::Value::Null,
+                "note": "there are no pending changes to review",
+            });
+            println!("{}", serde_json::to_string_pretty(&value)?);
+        } else {
+            println!("there are no pending changes to review");
+        }
+        return Ok(ExitCode::from(EXIT_OK));
+    }
+
+    let context = launch.args.join(" ");
+    let mut prompt = String::from(
+        "Review the pending changes below. Report defects, risky behavior, and \
+         missing tests. Name each finding with the file it is in. Do not change \
+         any file.\n\n",
+    );
+    if !context.trim().is_empty() {
+        prompt.push_str("Additional context from the caller:\n");
+        prompt.push_str(context.trim());
+        prompt.push_str("\n\n");
+    }
+    prompt.push_str(&changes);
+
+    let options = ask::Options {
+        prompt,
+        json: output.json,
+        no_save: launch.has_flag("--no-save"),
+        model: launch.flag("--model").map(str::to_owned),
+        effort: launch.flag("--effort").map(str::to_owned),
+    };
+
+    match ask::run(settings, paths, &options) {
+        Ok(result) => Ok(ExitCode::from(ask::report(&result, &options)?)),
+        Err(err) => {
+            if options.json {
+                let result =
+                    ask::JsonResult::failure(&settings.model, &err, i32::from(EXIT_FAILURE));
+                let _ = ask::report(&result, &options);
+            }
+            Err(err)
+        }
+    }
+}
+
+/// Reads the pending changes from the working tree.
+///
+/// Uses `git diff` for tracked files and adds untracked paths by name, so a new
+/// file is not silently absent from a review.
+fn pending_changes(workspace: &camino::Utf8Path) -> Result<String> {
+    let tracked = run_git(workspace, &["diff", "HEAD"])?;
+    let untracked = run_git(workspace, &["ls-files", "--others", "--exclude-standard"])?;
+
+    let mut out = tracked;
+    let untracked = untracked.trim();
+    if !untracked.is_empty() {
+        if !out.is_empty() && !out.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push_str("Untracked files:\n");
+        out.push_str(untracked);
+        out.push('\n');
+    }
+    Ok(out)
+}
+
+/// Runs a git subcommand in the workspace.
+///
+/// A repository that is absent or has no commits yet yields no changes rather
+/// than a failure, because there is nothing to review in either case.
+fn run_git(workspace: &camino::Utf8Path, arguments: &[&str]) -> Result<String> {
+    let output = std::process::Command::new("git")
+        .args(arguments)
+        .current_dir(workspace)
+        .output()
+        .map_err(|err| {
+            RuneError::new(
+                ErrorCode::TransportFailure,
+                format!("git could not be run: {err}"),
+            )
+            .with_hint("install git, or review the changes another way")
+        })?;
+
+    if !output.status.success() {
+        // A directory that is not a repository, or one with no commits, has
+        // nothing to compare against. Both are an absence of changes rather
+        // than a failure, and neither should print git's usage text.
+        let stderr = String::from_utf8_lossy(&output.stderr).to_lowercase();
+        let nothing_to_compare = stderr.contains("not a git repository")
+            || stderr.contains("unknown revision")
+            || stderr.contains("does not have any commits");
+        if nothing_to_compare {
+            return Ok(String::new());
+        }
+        return Err(RuneError::new(
+            ErrorCode::TransportFailure,
+            format!("git reported: {}", first_line(&stderr)),
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// Returns the first non-empty line of a diagnostic.
+///
+/// A failing subcommand often prints its usage, and the first line is the part
+/// that says what actually went wrong.
+fn first_line(text: &str) -> String {
+    text.lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("no diagnostic")
+        .to_owned()
 }
 
 /// Runs the interactive session.
@@ -851,6 +984,62 @@ fn report_error(err: &RuneError) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pending_changes_are_empty_outside_a_repository() {
+        // Nothing to compare against is not an error; it is nothing to review.
+        let dir = tempfile::tempdir().expect("temp");
+        let root = camino::Utf8Path::from_path(dir.path()).expect("utf8");
+        let changes = pending_changes(root).expect("read");
+        assert!(changes.trim().is_empty(), "{changes}");
+    }
+
+    #[test]
+    fn pending_changes_include_a_modified_and_an_untracked_file() {
+        let dir = tempfile::tempdir().expect("temp");
+        let root = camino::Utf8Path::from_path(dir.path()).expect("utf8");
+        let ok = |arguments: &[&str]| {
+            std::process::Command::new("git")
+                .args(arguments)
+                .current_dir(root)
+                .output()
+                .expect("git")
+        };
+        ok(&["init", "-q", "."]);
+        std::fs::write(root.join("tracked.txt"), "first\n").expect("write");
+        ok(&["add", "tracked.txt"]);
+        ok(&[
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-qm",
+            "init",
+        ]);
+
+        std::fs::write(root.join("tracked.txt"), "first\nsecond\n").expect("write");
+        std::fs::write(root.join("untracked.txt"), "new\n").expect("write");
+
+        let changes = pending_changes(root).expect("read");
+        assert!(changes.contains("+second"), "{changes}");
+        assert!(changes.contains("untracked.txt"), "{changes}");
+    }
+
+    #[test]
+    fn a_repository_with_no_commits_yields_no_changes() {
+        let dir = tempfile::tempdir().expect("temp");
+        let root = camino::Utf8Path::from_path(dir.path()).expect("utf8");
+        std::process::Command::new("git")
+            .args(["init", "-q", "."])
+            .current_dir(root)
+            .output()
+            .expect("git");
+        // `diff HEAD` fails without a commit, and reporting failure would make
+        // a fresh repository look broken.
+        let changes = pending_changes(root).expect("read");
+        assert!(changes.trim().is_empty(), "{changes}");
+    }
 
     #[test]
     fn a_tilde_is_expanded_against_the_home_directory() {
