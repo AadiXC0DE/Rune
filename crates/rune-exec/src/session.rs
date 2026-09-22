@@ -505,22 +505,23 @@ mod tests {
         }
     }
 
-    /// Returns a command that reads one line and writes it back.
+    /// Returns the argv of a process that reads one line and writes it back.
     ///
-    /// The test is about the write reaching the process, so the command reads a
-    /// line and prints it without depending on how either shell expands a
-    /// variable. It reads one line rather than every line, because the write
-    /// side is never closed and a command that reads to the end of its input
-    /// would wait there forever.
-    fn echo_standard_input() -> String {
-        if cfg!(windows) {
-            // Reads a single line and prints it. A search program that reads to
-            // the end of its input would wait there, because the write side is
-            // never closed.
-            String::from("powershell -NoProfile -Command \"[Console]::In.ReadLine()\"")
+    /// The test is about the write reaching the process, so the script is passed
+    /// as a single argument and no shell re-parses it. It reads one line because
+    /// the write side is never closed, so a program that reads to the end of its
+    /// input would wait there rather than finish.
+    fn echo_standard_input() -> Vec<String> {
+        let (program, flag, script) = if cfg!(windows) {
+            (
+                "powershell",
+                "-Command",
+                "$x=[Console]::In.ReadLine(); Write-Output $x",
+            )
         } else {
-            String::from("read line; echo $line")
-        }
+            ("/bin/sh", "-c", "read line; echo $line")
+        };
+        vec![program.to_owned(), flag.to_owned(), script.to_owned()]
     }
 
     /// Waits for a condition, polling until the deadline.
@@ -590,7 +591,8 @@ mod tests {
 
     #[test]
     fn a_process_takes_input_from_its_standard_input() {
-        let process = Process::start(&echo_standard_input(), None, CAPTURE_BYTES).expect("start");
+        let process =
+            Process::start_argv(&echo_standard_input(), None, CAPTURE_BYTES).expect("start");
         process.write(b"hello\n").expect("write");
         assert_eq!(exit_of(&process), Exit::Code(0));
         assert!(
