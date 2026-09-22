@@ -1056,20 +1056,10 @@ impl Tool for WebFetch {
             )
             .with_hint("raise the web fetch redirect limit to follow a longer chain"));
         }
+        // Every hop passes the same refusals as the requested URL, so a chain
+        // cannot walk onto the local network after the first check.
         for hop in &fetched.redirects {
-            let hop = check_target(hop, allow_private)?;
-            if hop.host != target.host && !allow_private && is_local_host(&hop.host) {
-                return Err(RuneError::new(
-                    ErrorCode::PermissionDenied,
-                    format!(
-                        "`{}` redirects to the local address `{}`",
-                        target.url, hop.host
-                    ),
-                )
-                .with_hint(
-                    "pass allow_private: true to follow a redirect onto the local network",
-                ));
-            }
+            check_target(hop, allow_private)?;
         }
 
         let Ok(text) = String::from_utf8(fetched.body) else {
@@ -1503,6 +1493,51 @@ mod tests {
         assert_eq!(err.code(), ErrorCode::LimitExceeded);
         assert!(err.message().contains('4'), "{err}");
         assert!(err.message().contains('2'), "{err}");
+    }
+
+    #[test]
+    fn a_redirect_chain_at_the_cap_is_accepted() {
+        let mut limits = budget();
+        limits
+            .set(
+                LimitName::WebFetchRedirects,
+                Budget::Bounded(2),
+                rune_core::config::Layer::CommandLine,
+            )
+            .expect("in range");
+        let backend = Arc::new(RecordingBackend::new());
+        let mut response = fetched(200, "text/plain", "landed");
+        response.redirects = vec![
+            "https://example.com/1".to_owned(),
+            "https://example.com/2".to_owned(),
+        ];
+        backend.push(response);
+        let tool = fetch_with(backend, &limits);
+
+        let output = call(&tool, &serde_json::json!({ "url": "https://example.com/" }))
+            .expect("the call ran");
+        assert!(!output.is_error, "{}", output.text);
+        assert!(output.text.contains("2 redirects"), "{}", output.text);
+    }
+
+    #[test]
+    fn the_timeout_drawn_from_the_limits_reaches_the_backend() {
+        let mut limits = budget();
+        limits
+            .set(
+                LimitName::WebFetchTimeoutMs,
+                Budget::Bounded(1_500),
+                rune_core::config::Layer::CommandLine,
+            )
+            .expect("in range");
+        let backend = Arc::new(RecordingBackend::new());
+        backend.push(fetched(200, "text/plain", "answered"));
+        let tool = fetch_with(backend.clone(), &limits);
+
+        call(&tool, &serde_json::json!({ "url": "https://example.com/" })).expect("the call ran");
+        let requests = backend.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].1, Duration::from_millis(1_500));
     }
 
     #[test]
