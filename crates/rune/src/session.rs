@@ -198,7 +198,7 @@ pub fn run<R: BufRead, W: std::io::Write>(
     output: W,
 ) -> Result<u8> {
     let limits = config.settings.limits.clone();
-    let prompt = build_prompt(&config.workspace, &limits);
+    let prompt = build_prompt(&config.workspace, &config.paths.config_root, &limits);
 
     // A resumed session continues its stored conversation; a new one starts
     // empty and writes a fresh log.
@@ -480,13 +480,18 @@ fn report_turn<W: std::io::Write>(
 }
 
 /// Builds the prompt for a session.
-fn build_prompt(workspace: &Utf8Path, limits: &BudgetSet) -> Prompt {
-    let config_root = Paths::from_process().config_root;
-    let skills = rune_context::skills::discover(workspace, None, &config_root).unwrap_or_default();
+fn build_prompt(workspace: &Utf8Path, config_root: &Utf8Path, limits: &BudgetSet) -> Prompt {
+    let skills = rune_context::skills::discover(workspace, None, config_root).unwrap_or_default();
     let project = rune_context::instructions::discover(workspace, None).unwrap_or_default();
 
+    // A profile-owned file replaces the built-in prompt rather than adding to
+    // it: an embedder retargets the agent by writing one file, which is the
+    // point of the file existing.
+    let override_text = read_prompt_override(config_root);
+    let system = override_text.as_deref().unwrap_or(prompt::SYSTEM_PROMPT);
+
     let inputs = Inputs {
-        system: prompt::SYSTEM_PROMPT,
+        system,
         tool_guidance: None,
         skills: &skills,
         host_instructions: None,
@@ -494,10 +499,25 @@ fn build_prompt(workspace: &Utf8Path, limits: &BudgetSet) -> Prompt {
     };
 
     prompt::assemble(&inputs, limits).unwrap_or_else(|_| Prompt {
-        instructions: prompt::SYSTEM_PROMPT.to_owned(),
+        instructions: system.to_owned(),
         included: Vec::new(),
         omissions: Vec::new(),
     })
+}
+
+/// Reads the system prompt override, when one is present.
+///
+/// A file that cannot be read is ignored rather than fatal: a session that will
+/// not start because a prompt file is unreadable is worse than one that runs
+/// with the built-in prompt.
+fn read_prompt_override(config_root: &Utf8Path) -> Option<String> {
+    let path = config_root.join(rune_core::paths::names::SYSTEM_PROMPT_FILE);
+    let text = std::fs::read_to_string(&path).ok()?;
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(trimmed.to_owned())
 }
 
 /// Builds the runtime configuration for an interactive session.
@@ -558,6 +578,48 @@ pub fn prepare(
 mod tests {
     use super::*;
     use rune_term::shell::{ExitReason, ScriptedSource, Shell};
+
+    #[test]
+    fn a_prompt_override_replaces_the_built_in_text() {
+        let dir = tempfile::tempdir().expect("temp");
+        let root = Utf8Path::from_path(dir.path()).expect("utf8");
+        std::fs::write(
+            root.join(rune_core::paths::names::SYSTEM_PROMPT_FILE),
+            "You are a terse reviewer.\n",
+        )
+        .expect("write");
+
+        let prompt = build_prompt(root, root, &BudgetSet::new());
+        assert_eq!(prompt.instructions, "You are a terse reviewer.");
+        assert!(
+            !prompt.instructions.contains("coding agent"),
+            "the built-in text was kept alongside the override"
+        );
+    }
+
+    #[test]
+    fn no_override_leaves_the_built_in_text_alone() {
+        let dir = tempfile::tempdir().expect("temp");
+        let root = Utf8Path::from_path(dir.path()).expect("utf8");
+        let prompt = build_prompt(root, root, &BudgetSet::new());
+        assert!(prompt.instructions.starts_with(prompt::SYSTEM_PROMPT));
+    }
+
+    #[test]
+    fn an_empty_override_file_is_ignored() {
+        // A truncated or blanked file would otherwise leave the model with no
+        // instructions at all.
+        let dir = tempfile::tempdir().expect("temp");
+        let root = Utf8Path::from_path(dir.path()).expect("utf8");
+        std::fs::write(
+            root.join(rune_core::paths::names::SYSTEM_PROMPT_FILE),
+            "   \n\n",
+        )
+        .expect("write");
+
+        let prompt = build_prompt(root, root, &BudgetSet::new());
+        assert!(prompt.instructions.starts_with(prompt::SYSTEM_PROMPT));
+    }
 
     #[test]
     fn the_status_line_names_the_model_and_the_mode() {

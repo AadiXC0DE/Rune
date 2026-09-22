@@ -142,7 +142,7 @@ fn run(launch: &Launch) -> Result<ExitCode> {
         Command::Status => run_status(&settings, &paths, &workspace, &output_flags),
         Command::Limits => run_limits(&settings, &output_flags),
         Command::Config => run_config(&settings, &output_flags),
-        Command::Prompt => run_prompt(&settings, &output_flags),
+        Command::Prompt => run_prompt(&settings, launch, &output_flags),
         Command::Sessions => run_sessions(&paths, &output_flags),
         Command::Tree => run_tree(&paths, launch, &output_flags),
         Command::Session => run_session(&paths, launch, &output_flags),
@@ -792,12 +792,45 @@ fn run_config(settings: &Settings, output: &OutputFlags) -> Result<ExitCode> {
 }
 
 /// Runs `prompt`, which reports the prompt source without contacting a model.
-fn run_prompt(settings: &Settings, _output: &OutputFlags) -> Result<ExitCode> {
+fn run_prompt(settings: &Settings, launch: &Launch, output: &OutputFlags) -> Result<ExitCode> {
     let paths = Paths::from_process();
     let override_path = paths.system_prompt_file();
-    match std::fs::metadata(&override_path) {
-        Ok(_) => println!("system prompt  {override_path} (override)"),
-        Err(_) => println!("system prompt  built in (no override at {override_path})"),
+    let override_text = std::fs::read_to_string(&override_path)
+        .ok()
+        .filter(|text| !text.trim().is_empty());
+
+    // `--show` prints the text, which is what a user needs to see what the model
+    // is actually told. Without it the command reports where the text came from.
+    if launch.has_flag("--show") {
+        match &override_text {
+            Some(text) => print!("{text}"),
+            None => print!("{}", rune_context::prompt::SYSTEM_PROMPT),
+        }
+        return Ok(ExitCode::from(EXIT_OK));
+    }
+
+    if output.json {
+        let value = serde_json::json!({
+            "source": if override_text.is_some() { "override" } else { "builtin" },
+            "path": override_path,
+            "bytes": override_text
+                .as_ref()
+                .map_or(rune_context::prompt::SYSTEM_PROMPT.len(), String::len),
+            "context": settings.context,
+        });
+        println!("{}", serde_json::to_string_pretty(&value)?);
+        return Ok(ExitCode::from(EXIT_OK));
+    }
+
+    match override_text {
+        Some(text) => println!(
+            "system prompt  {override_path} ({} bytes, override)",
+            text.len()
+        ),
+        None => println!(
+            "system prompt  built in, {} bytes (no override at {override_path})",
+            rune_context::prompt::SYSTEM_PROMPT.len()
+        ),
     }
     println!(
         "context        {}",
