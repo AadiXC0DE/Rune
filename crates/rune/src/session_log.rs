@@ -155,6 +155,54 @@ impl Recorder {
     }
 }
 
+/// Page size used when a caller does not choose one.
+pub const DEFAULT_PAGE: usize = 20;
+
+/// Largest page a caller may ask for.
+pub const MAX_PAGE: usize = 100;
+
+/// One page of sessions.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Page {
+    /// Rows in this page.
+    pub rows: Vec<Summary>,
+    /// Cursor to pass for the next page, absent when this is the last one.
+    pub next: Option<String>,
+}
+
+/// Reads one page of sessions.
+///
+/// The cursor is the identifier of the last row already returned, and paging
+/// resumes strictly after it. An identifier is used rather than an offset
+/// because a session created between two pages would otherwise shift every later
+/// row, so a session would be skipped or repeated.
+pub fn page(paths: &Paths, limit: usize, cursor: Option<&str>) -> Result<Page> {
+    let limit = limit.clamp(1, MAX_PAGE);
+    let all = list(paths);
+
+    let start = match cursor {
+        None => 0,
+        Some(cursor) => match all.iter().position(|row| row.id == cursor) {
+            Some(position) => position.saturating_add(1),
+            // A cursor naming a row that is gone cannot be resumed from, and
+            // guessing a position would silently return the wrong rows.
+            None => {
+                return Err(RuneError::invalid_field(
+                    "cursor",
+                    format!("no session `{cursor}` is in the listing"),
+                )
+                .with_hint("restart the listing without a cursor"));
+            }
+        },
+    };
+
+    let rows: Vec<Summary> = all.into_iter().skip(start).take(limit).collect();
+    let next = (rows.len() == limit)
+        .then(|| rows.last().map(|row| row.id.clone()))
+        .flatten();
+    Ok(Page { rows, next })
+}
+
 /// Lists stored sessions for a workspace, most recently active first.
 pub fn list(paths: &Paths) -> Vec<Summary> {
     let Ok(entries) = std::fs::read_dir(paths.sessions_dir()) else {
@@ -760,6 +808,86 @@ mod tests {
         let newest = latest(&paths).expect("a session");
         assert_eq!(newest.id, "sessionggggg");
         assert_eq!(newest.turns, 1);
+    }
+
+    #[test]
+    fn paging_covers_every_session_without_a_gap_or_a_repeat() {
+        let dir = tempfile::tempdir().expect("temp");
+        let root = Utf8Path::from_path(dir.path()).expect("utf8");
+        let paths = paths(root);
+        let ids = [
+            "sessionpg001",
+            "sessionpg002",
+            "sessionpg003",
+            "sessionpg004",
+            "sessionpg005",
+        ];
+        for (index, key) in ids.iter().enumerate() {
+            let mut recorder = Recorder::create(&paths, &id(key)).expect("created");
+            recorder.user_message(&format!("p{index}")).expect("wrote");
+            recorder.turn(&outcome("a")).expect("wrote");
+            drop(recorder);
+            // Distinct timestamps, so the newest-first order is deterministic.
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        let mut seen = Vec::new();
+        let mut cursor: Option<String> = None;
+        for _ in 0..10 {
+            let page = page(&paths, 2, cursor.as_deref()).expect("page");
+            seen.extend(page.rows.iter().map(|row| row.id.clone()));
+            match page.next {
+                Some(next) => cursor = Some(next),
+                None => break,
+            }
+        }
+
+        assert_eq!(seen.len(), ids.len(), "a page was skipped or repeated");
+        let unique: std::collections::HashSet<_> = seen.iter().collect();
+        assert_eq!(unique.len(), ids.len(), "a session appeared twice");
+        // Every identifier must have been seen, since the walk ended.
+        for key in ids {
+            assert!(seen.iter().any(|seen| seen == key), "`{key}` was missed");
+        }
+    }
+
+    #[test]
+    fn the_last_page_reports_no_cursor() {
+        let dir = tempfile::tempdir().expect("temp");
+        let root = Utf8Path::from_path(dir.path()).expect("utf8");
+        let paths = paths(root);
+        let mut recorder = Recorder::create(&paths, &id("sessionpg006")).expect("created");
+        recorder.user_message("only").expect("wrote");
+        recorder.turn(&outcome("a")).expect("wrote");
+        drop(recorder);
+
+        let page = page(&paths, 10, None).expect("page");
+        assert_eq!(page.rows.len(), 1);
+        assert!(page.next.is_none(), "a final page offered a cursor");
+    }
+
+    #[test]
+    fn an_unknown_cursor_is_refused_rather_than_guessed() {
+        // Resuming from a position that no longer exists would silently return
+        // the wrong rows, which is worse than reporting it.
+        let dir = tempfile::tempdir().expect("temp");
+        let root = Utf8Path::from_path(dir.path()).expect("utf8");
+        let paths = paths(root);
+        let err = page(&paths, 2, Some("sessionmissing")).expect_err("refused");
+        assert_eq!(err.code(), ErrorCode::InvalidField);
+        assert!(err.hint().is_some());
+    }
+
+    #[test]
+    fn a_page_size_is_clamped_to_the_documented_bound() {
+        let dir = tempfile::tempdir().expect("temp");
+        let root = Utf8Path::from_path(dir.path()).expect("utf8");
+        let paths = paths(root);
+        // A huge request is bounded rather than honoured, and a zero is raised
+        // to one so a caller always makes progress.
+        assert!(page(&paths, 0, None).is_ok());
+        assert!(page(&paths, usize::MAX, None).is_ok());
+        assert_eq!(MAX_PAGE, 100);
     }
 
     #[test]

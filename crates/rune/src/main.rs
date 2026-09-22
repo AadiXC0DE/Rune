@@ -146,7 +146,7 @@ fn run(launch: &Launch) -> Result<ExitCode> {
         Command::Limits => run_limits(&settings, &output_flags),
         Command::Config => run_config(&settings, &output_flags),
         Command::Prompt => run_prompt(&settings, launch, &output_flags),
-        Command::Sessions => run_sessions(&paths, &output_flags),
+        Command::Sessions => run_sessions(&paths, launch, &output_flags),
         Command::Tree => run_tree(&paths, launch, &output_flags),
         Command::Session => run_session(&paths, launch, &output_flags),
         Command::Usage => run_usage(&paths, launch, &output_flags),
@@ -714,26 +714,38 @@ fn run_permissions(settings: &Settings, launch: &Launch, output: &OutputFlags) -
 }
 
 /// Lists the sessions stored for this workspace.
-fn run_sessions(paths: &Paths, output: &OutputFlags) -> Result<ExitCode> {
-    let rows = session_log::list(paths);
+fn run_sessions(paths: &Paths, launch: &Launch, output: &OutputFlags) -> Result<ExitCode> {
+    let limit = match launch.flag("--limit") {
+        Some(raw) => raw.parse::<usize>().map_err(|_| {
+            RuneError::invalid_field("limit", format!("`{raw}` is not a number"))
+                .with_hint("pass a count between 1 and 100")
+        })?,
+        None => session_log::DEFAULT_PAGE,
+    };
+    let cursor = launch.flag("--cursor");
+    let page = session_log::page(paths, limit, cursor)?;
+    let rows = &page.rows;
+    let entries: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|row| {
+            serde_json::json!({
+                "id": row.id,
+                "turns": row.turns,
+                "events": row.events,
+                "updated_at": row.updated_at,
+                "title": row.title,
+            })
+        })
+        .collect();
     if output.json {
-        let value = serde_json::Value::Array(
-            rows.iter()
-                .map(|row| {
-                    serde_json::json!({
-                        "id": row.id,
-                        "turns": row.turns,
-                        "events": row.events,
-                        "updated_at": row.updated_at,
-                        "title": row.title,
-                    })
-                })
-                .collect(),
-        );
+        let value = serde_json::json!({ "sessions": entries, "next": page.next });
         let rendered = serde_json::to_string_pretty(&value)?;
         println!("{rendered}");
     } else {
-        println!("{}", session_log::render_listing(&rows));
+        println!("{}", session_log::render_listing(rows));
+        if let Some(next) = &page.next {
+            println!("\nmore sessions: run again with --cursor {next}");
+        }
     }
     Ok(ExitCode::from(EXIT_OK))
 }
