@@ -118,10 +118,10 @@ impl History {
         self.entries.len()
     }
 
-    /// Returns true when nothing is recorded.
+    /// Returns the path the history is stored at.
     #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+    pub fn path(&self) -> &Utf8Path {
+        &self.path
     }
 
     /// Records one prompt.
@@ -296,7 +296,7 @@ mod tests {
         let paths = paths(root);
         let mut history = History::open(&paths).expect("open");
         history.record(Entry::new("   \n ")).expect("record");
-        assert!(history.is_empty());
+        assert_eq!(history.len(), 0);
     }
 
     #[test]
@@ -401,14 +401,14 @@ mod tests {
         history.clear().expect("cleared");
         drop(history);
 
-        assert!(History::open(&paths).expect("reopen").is_empty());
+        assert_eq!(History::open(&paths).expect("reopen").len(), 0);
     }
 
     #[test]
     fn a_missing_file_is_an_empty_history() {
         let dir = tempfile::tempdir().expect("temp");
         let root = Utf8Path::from_path(dir.path()).expect("utf8");
-        assert!(History::open(&paths(root)).expect("open").is_empty());
+        assert_eq!(History::open(&paths(root)).expect("open").len(), 0);
     }
 
     #[test]

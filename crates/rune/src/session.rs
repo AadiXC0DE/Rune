@@ -325,9 +325,24 @@ pub fn run<R: BufRead, W: std::io::Write>(
                     &arguments,
                     &commands,
                     history_file.as_ref(),
+                    &config.workspace,
                     &mut *sink,
                 )? {
                     Handled::Exit => Ok(Action::Exit),
+                    Handled::ClearHistory => {
+                        // Forgetting is reported, because a silent success would
+                        // leave the user unsure whether anything was removed.
+                        match history_file.as_mut() {
+                            Some(history) => {
+                                let _ = history.clear();
+                                let _ = writeln!(sink, "forgot every recorded prompt");
+                            }
+                            None => {
+                                let _ = writeln!(sink, "no prompt history is available");
+                            }
+                        }
+                        Ok(Action::Continue)
+                    }
                     Handled::Continue => Ok(Action::Continue),
                     // Expanded text goes to the composer for review, never
                     // straight to the model: a template with a wrong argument
@@ -444,6 +459,8 @@ enum Handled {
     Exit,
     /// Place this text in the composer for review.
     Expand(String),
+    /// Forget every recorded prompt.
+    ClearHistory,
 }
 
 /// Handles a slash command.
@@ -455,6 +472,7 @@ fn handle_command<W: std::io::Write>(
     arguments: &str,
     commands: &rune_context::commands::Discovery,
     history: Option<&crate::prompt_history::History>,
+    self_workspace: &Utf8Path,
     output: &mut W,
 ) -> Result<Handled> {
     match name {
@@ -464,22 +482,44 @@ fn handle_command<W: std::io::Write>(
                 let _ = writeln!(output, "no prompt history is available");
                 return Ok(Handled::Continue);
             };
+            // `here` scopes recall to the workspace the session is running in,
+            // which is what a composer offers; anything else is read as a
+            // session identifier.
             let entries = match arguments.trim() {
                 "" => history.entries(),
-                // A session identifier scopes the recall, so a caller can see
-                // what was typed in one session rather than across the install.
+                "here" => history.for_workspace(self_workspace),
+                "clear" => {
+                    // Clearing needs the mutable handle, so it is handled by the
+                    // caller, which owns it.
+                    return Ok(Handled::ClearHistory);
+                }
                 session => history.for_session(session),
             };
             if entries.is_empty() {
-                let _ = writeln!(output, "no prompts recorded");
+                // The path is named so a user can find or remove the file, and
+                // so an empty result is distinguishable from a missing file.
+                let _ = writeln!(output, "no prompts recorded in {}", history.path());
             }
             for (index, entry) in entries.iter().enumerate() {
                 let _ = writeln!(output, "{:>4}  {}", index.saturating_add(1), entry.text);
             }
+            if !entries.is_empty() {
+                let _ = writeln!(
+                    output,
+                    "\n{} prompt(s) recorded in {}",
+                    history.len(),
+                    history.path()
+                );
+            }
             Ok(Handled::Continue)
         }
         "help" => {
-            let _ = writeln!(output, "commands: /help /quit /history [session]");
+            let _ = writeln!(
+                output,
+                "commands: /help /quit
+/history [here|session-id]  show recorded prompts
+/history clear  forget every recorded prompt"
+            );
             let listing = rune_context::commands::render_listing(&commands.commands);
             let _ = writeln!(output, "{listing}");
             // A command file that was refused is invisible otherwise, and a
@@ -817,8 +857,15 @@ mod tests {
     #[test]
     fn the_shell_reports_an_unknown_command_without_leaving() {
         let mut output = Vec::new();
-        let action =
-            handle_command("nope", "", &empty_commands(), None, &mut output).expect("handled");
+        let action = handle_command(
+            "nope",
+            "",
+            &empty_commands(),
+            None,
+            Utf8Path::new("/w"),
+            &mut output,
+        )
+        .expect("handled");
         assert_eq!(action, Handled::Continue);
         let text = String::from_utf8_lossy(&output);
         assert!(text.contains("unknown command"), "{text}");
@@ -829,11 +876,27 @@ mod tests {
     fn the_quit_command_leaves_the_shell() {
         let mut output = Vec::new();
         assert_eq!(
-            handle_command("quit", "", &empty_commands(), None, &mut output).expect("handled"),
+            handle_command(
+                "quit",
+                "",
+                &empty_commands(),
+                None,
+                Utf8Path::new("/w"),
+                &mut output
+            )
+            .expect("handled"),
             Handled::Exit
         );
         assert_eq!(
-            handle_command("exit", "", &empty_commands(), None, &mut output).expect("handled"),
+            handle_command(
+                "exit",
+                "",
+                &empty_commands(),
+                None,
+                Utf8Path::new("/w"),
+                &mut output
+            )
+            .expect("handled"),
             Handled::Exit
         );
     }
@@ -851,8 +914,15 @@ mod tests {
         });
 
         let mut output = Vec::new();
-        let handled =
-            handle_command("fix", "parser", &discovery, None, &mut output).expect("handled");
+        let handled = handle_command(
+            "fix",
+            "parser",
+            &discovery,
+            None,
+            Utf8Path::new("/w"),
+            &mut output,
+        )
+        .expect("handled");
         assert_eq!(handled, Handled::Expand("Fix parser now".to_owned()));
     }
 
@@ -869,7 +939,15 @@ mod tests {
         });
 
         let mut output = Vec::new();
-        let handled = handle_command("fix", "", &discovery, None, &mut output).expect("handled");
+        let handled = handle_command(
+            "fix",
+            "",
+            &discovery,
+            None,
+            Utf8Path::new("/w"),
+            &mut output,
+        )
+        .expect("handled");
         assert_eq!(handled, Handled::Continue);
         let text = String::from_utf8_lossy(&output);
         assert!(text.contains("$1"), "{text}");
@@ -884,7 +962,15 @@ mod tests {
         });
 
         let mut output = Vec::new();
-        handle_command("help", "", &discovery, None, &mut output).expect("handled");
+        handle_command(
+            "help",
+            "",
+            &discovery,
+            None,
+            Utf8Path::new("/w"),
+            &mut output,
+        )
+        .expect("handled");
         let text = String::from_utf8_lossy(&output);
         assert!(text.contains("skipped"), "{text}");
         assert!(text.contains("built-in"), "{text}");
@@ -893,7 +979,15 @@ mod tests {
     #[test]
     fn help_lists_the_commands() {
         let mut output = Vec::new();
-        handle_command("help", "", &empty_commands(), None, &mut output).expect("handled");
+        handle_command(
+            "help",
+            "",
+            &empty_commands(),
+            None,
+            Utf8Path::new("/w"),
+            &mut output,
+        )
+        .expect("handled");
         let text = String::from_utf8_lossy(&output);
         assert!(text.contains("/help"));
         assert!(text.contains("/quit"));
