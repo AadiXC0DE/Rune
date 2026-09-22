@@ -1067,7 +1067,12 @@ mod tests {
         );
         assert_eq!(sessions.cap(), 2);
         sessions.create(Vec::new()).expect("first");
-        sessions.create(Vec::new()).expect("second");
+        // The store refuses a session directory it cannot create, so the
+        // failure is reported with what the store said rather than with the
+        // identifier-collision message that follows it.
+        if let Err(err) = sessions.create(Vec::new()) {
+            panic!("second: {err} (code {:?})", err.code());
+        }
         let error = sessions.create(Vec::new()).expect_err("third");
         assert_eq!(error.code(), ErrorCode::LimitExceeded);
     }

@@ -322,6 +322,13 @@ mod tests {
     use crate::ErrorCode;
 
     #[test]
+    fn generate_is_not_constant() {
+        let first = SessionId::generate();
+        let second = SessionId::generate();
+        assert_ne!(first, second, "two generated identifiers were equal");
+    }
+
+    #[test]
     fn session_id_is_twelve_url_safe_characters() {
         let id = SessionId::generate();
         assert_eq!(id.as_str().len(), SESSION_ID_ENCODED_LEN);
