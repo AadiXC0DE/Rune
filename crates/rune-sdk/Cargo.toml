@@ -22,3 +22,7 @@ ureq = { workspace = true }
 [dev-dependencies]
 rune-testkit.workspace = true
 tempfile.workspace = true
+
+[[bin]]
+name = "plugin-fixture"
+path = "tests/fixtures/plugin.rs"
