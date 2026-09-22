@@ -15,6 +15,8 @@ pub mod read_file;
 pub mod registry;
 pub mod result_store;
 pub mod shell;
+pub mod vision;
+pub mod web;
 pub mod workspace;
 pub mod write_file;
 
@@ -26,5 +28,9 @@ pub use mutation::{Applied, ChangeSpan, Occurrence, Prepared, Preview};
 pub use read_file::ReadFile;
 pub use registry::Registry;
 pub use result_store::{Handle, Preview as ResultPreview, Store};
+pub use vision::{ImageAnalysis, Vision, VisionBackend, VisionSource};
+pub use web::{
+    FetchBackend, Fetched, SearchBackend, SearchFilters, SearchResult, WebFetch, WebSearch,
+};
 pub use workspace::{FileLimits, ResolvedPath, Walker, resolve};
 pub use write_file::WriteFile;

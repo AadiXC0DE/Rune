@@ -23,9 +23,9 @@ use rune_agent::steering::Cancellation;
 use rune_agent::turn::{CallResult, Event, PreparedCall, StopReason, TurnOutcome};
 use rune_core::budget::{BudgetSet, LimitName};
 use rune_core::error::{ErrorCode, Result, RuneError};
+use rune_core::tool::ToolSpec;
 use rune_net::error::NetError;
 use rune_net::message::{ContentPart, ImageRef, validate_tool_specs};
-use rune_core::tool::ToolSpec;
 use rune_net::provider::{Provider, RequestPlan, ToolChoice};
 use rune_net::redact;
 use rune_net::sse::{Decoder, Event as SseEvent};
@@ -155,19 +155,16 @@ impl HostFetch for DefaultFetch {
         let mut body = Vec::new();
         // One byte past the bound, so an oversized body is refused rather than
         // silently truncated into a decode failure.
-        let limit = u64::try_from(MAX_RESPONSE_BYTES).unwrap_or(u64::MAX);
+        let cap = usize::try_from(MAX_RESPONSE_BYTES).unwrap_or(usize::MAX);
+        let limit = u64::try_from(cap).unwrap_or(u64::MAX);
         response
             .into_body()
             .into_reader()
             .take(limit.saturating_add(1))
             .read_to_end(&mut body)?;
-        if body.len() > MAX_RESPONSE_BYTES {
-            return Err(RuneError::too_large(
-                "fetch.body",
-                body.len(),
-                MAX_RESPONSE_BYTES,
-            )
-            .with_hint("the endpoint returned more than one response may hold"));
+        if body.len() > cap {
+            return Err(RuneError::too_large("fetch.body", body.len(), cap)
+                .with_hint("the endpoint returned more than one response may hold"));
         }
 
         Ok(FetchResponse { status, body })
@@ -433,7 +430,10 @@ impl Completion {
     fn wait(&self) -> Result<TurnProduct> {
         let mut slot = lock(&self.product);
         while slot.is_none() {
-            slot = self.ready.wait(slot).unwrap_or_else(PoisonError::into_inner);
+            slot = self
+                .ready
+                .wait(slot)
+                .unwrap_or_else(PoisonError::into_inner);
         }
         match slot.clone() {
             Some(product) => product,
@@ -594,8 +594,9 @@ impl Agent {
             .map(|model| model.trim().to_owned())
             .unwrap_or_default();
         if model.is_empty() {
-            return Err(RuneError::missing_field("model")
-                .with_hint("set `model` in the agent options"));
+            return Err(
+                RuneError::missing_field("model").with_hint("set `model` in the agent options")
+            );
         }
         if options.api_key.trim().is_empty() {
             return Err(RuneError::missing_field("api_key")
@@ -603,7 +604,7 @@ impl Agent {
         }
         rune_net::transport::validate_url(&options.base_url)?;
 
-        let specs = options.tools.iter().map(HostTool::spec).collect();
+        let specs: Vec<ToolSpec> = options.tools.iter().map(HostTool::spec).collect();
         validate_tool_specs(&specs)?;
 
         let instructions = options
@@ -687,20 +688,17 @@ impl Agent {
     /// Only one turn runs at a time. A second prompt while one is in flight is
     /// refused rather than queued, because a conversation has one order and a
     /// queue would invent a different one.
-    pub fn prompt(
-        &mut self,
-        input: impl Into<String>,
-        options: PromptOptions,
-    ) -> Result<Turn> {
+    pub fn prompt(&mut self, input: impl Into<String>, options: PromptOptions) -> Result<Turn> {
         if self.closed {
-            return Err(RuneError::new(ErrorCode::InvalidState, "the agent is closed")
-                .with_hint("build a new agent, or restore one from a checkpoint"));
+            return Err(
+                RuneError::new(ErrorCode::InvalidState, "the agent is closed")
+                    .with_hint("build a new agent, or restore one from a checkpoint"),
+            );
         }
         if self.claim.swap(true, Ordering::SeqCst) {
             return Err(
-                RuneError::new(ErrorCode::InvalidState, "a turn is already running").with_hint(
-                    "wait for the running turn, or drop its handle to cancel it",
-                ),
+                RuneError::new(ErrorCode::InvalidState, "a turn is already running")
+                    .with_hint("wait for the running turn, or drop its handle to cancel it"),
             );
         }
         self.cancel.reset();
@@ -732,9 +730,9 @@ impl Agent {
         let worker = std::thread::Builder::new()
             .name("rune-sdk-turn".to_owned())
             .spawn(move || {
-                let _guard = guard;
+                let settled = guard;
                 let product = run_turn(&context);
-                _guard.publish(product);
+                settled.publish(product);
             });
 
         let worker = match worker {
@@ -807,16 +805,9 @@ impl Agent {
 
     /// Adopts the conversation a checkpoint carries.
     fn adopt(&mut self, checkpoint: &[u8]) -> Result<()> {
-        let cap = self
-            .limits
-            .get_usize(LimitName::PromptHistoryBytes)
-            .max(1);
+        let cap = self.limits.get_usize(LimitName::PromptHistoryBytes).max(1);
         if checkpoint.len() > cap {
-            return Err(RuneError::too_large(
-                "checkpoint",
-                checkpoint.len(),
-                cap,
-            ));
+            return Err(RuneError::too_large("checkpoint", checkpoint.len(), cap));
         }
 
         let value: serde_json::Value = serde_json::from_slice(checkpoint).map_err(|err| {
@@ -954,7 +945,23 @@ fn run_turn(context: &TurnContext) -> Result<TurnProduct> {
         context.emit(Event::TurnStarted { step: steps });
 
         let plan = context.plan()?;
-        let response = request(context, provider.as_ref(), &plan)?;
+        let response = match request(context, provider.as_ref(), &plan) {
+            Ok(response) => response,
+            // A cancellation during the request settles the turn rather than
+            // failing it: the caller asked for it, so it is not an error.
+            Err(err) if err.code() == ErrorCode::Cancelled => {
+                return Ok(settle(
+                    context,
+                    StopReason::Cancelled,
+                    text,
+                    usage,
+                    steps,
+                    calls,
+                    images,
+                ));
+            }
+            Err(err) => return Err(err),
+        };
         usage = usage.merge_max(response.usage);
         context.store_usage(usage);
 
@@ -1011,6 +1018,20 @@ fn run_turn(context: &TurnContext) -> Result<TurnProduct> {
         }
 
         let finish = response.finish.unwrap_or(FinishReason::Stop);
+        // A cancellation that arrived while the response was being read ends
+        // the turn before any tool runs, which is what a caller that closed the
+        // agent while the model was thinking expects.
+        if context.cancel.is_cancelled() {
+            return Ok(settle(
+                context,
+                StopReason::Cancelled,
+                text,
+                usage,
+                steps,
+                calls,
+                images,
+            ));
+        }
         if pending.is_empty() {
             return Ok(settle(
                 context,
@@ -1073,3 +1094,269 @@ impl TurnContext {
     /// Builds the request plan for the next step.
     fn plan(&self) -> Result<RequestPlan> {
         let history = lock(&self.conversation.history);
+        history.validate()?;
+
+        let mut plan = RequestPlan::new(self.model.clone());
+        plan.instructions.clone_from(&self.instructions);
+        plan.messages = history.to_messages();
+        plan.tools.clone_from(self.specs.as_ref());
+        plan.tool_choice = ToolChoice::Auto;
+        // A budget that allows one call at a time is the only way an embedder
+        // asks for them to be serialized, and the endpoint reads the flag.
+        plan.parallel_tool_calls = self.limits.get_usize(LimitName::ParallelToolCalls) > 1;
+        Ok(plan)
+    }
+}
+
+/// Sends one request and reduces its response stream.
+fn request(
+    context: &TurnContext,
+    provider: &dyn Provider,
+    plan: &RequestPlan,
+) -> Result<StreamOutcome> {
+    context.cancel.check()?;
+    provider.validate(plan)?;
+    let body = provider.build_request(plan)?;
+
+    let mut headers = vec![
+        ("content-type".to_owned(), "application/json".to_owned()),
+        ("accept".to_owned(), "text/event-stream".to_owned()),
+        (
+            context.endpoint.auth.header().to_owned(),
+            context.endpoint.auth.value(&context.endpoint.credential),
+        ),
+    ];
+    for (name, value) in provider.extra_headers() {
+        headers.push((name.to_owned(), value));
+    }
+
+    let request = FetchRequest {
+        url: context.endpoint.url_for(provider.request_path()),
+        headers,
+        body: serde_json::to_string(&body)?,
+    };
+    let response = context.fetch.post(request)?;
+
+    if response.status >= 400 {
+        let text = String::from_utf8_lossy(&response.body);
+        let sanitized = redact::redact(&text);
+        return Err(NetError::classify_status(response.status, &sanitized)
+            .with_hint(format!(
+                "provider `{}` rejected the request",
+                provider.name()
+            ))
+            .to_rune_error());
+    }
+
+    reduce(&response.body, provider, &context.cancel)
+}
+
+/// Reduces a complete response body into normalized events.
+fn reduce(body: &[u8], provider: &dyn Provider, cancel: &Cancellation) -> Result<StreamOutcome> {
+    let mut decoder = Decoder::new(provider.limits());
+    let mut reducer = provider.reducer();
+    let mut frames: Vec<SseEvent> = Vec::new();
+    decoder.push(body, &mut frames)?;
+    decoder.finish(&mut frames)?;
+
+    let mut outcome = StreamOutcome::default();
+    for frame in &frames {
+        if frame.is_empty() && frame.name.is_none() {
+            continue;
+        }
+        reducer.apply(Some(&frame.data), &mut outcome.events)?;
+    }
+
+    cancel.check()?;
+    // A reducer that never saw a terminal payload fails here, so a truncated
+    // response can never be mistaken for a complete one.
+    reducer.apply(None, &mut outcome.events)?;
+    outcome.finish = Some(reducer.finish()?);
+    outcome.usage = reducer.usage();
+    outcome.replay = reducer.replay();
+    Ok(outcome)
+}
+
+/// One executed call, with the images it produced.
+struct Executed {
+    result: CallResult,
+    images: Vec<HostImage>,
+}
+
+/// Runs the calls the model asked for, in order.
+///
+/// Every call is answered, including one that never ran, because the history
+/// must record a result for each call the model made or the next request would
+/// carry a conversation the provider rejects.
+fn execute(context: &TurnContext, calls: &[PreparedCall]) -> (Vec<Executed>, bool) {
+    let mut results: Vec<Executed> = Vec::with_capacity(calls.len());
+    let mut cancelled = false;
+
+    for call in calls {
+        if cancelled || context.cancel.is_cancelled() {
+            cancelled = true;
+            results.push(failed(
+                call,
+                "the turn was cancelled before this call ran".to_owned(),
+            ));
+            continue;
+        }
+
+        let Some(tool) = context.tools.iter().find(|tool| tool.name == call.name) else {
+            results.push(failed(
+                call,
+                format!("there is no tool named `{}`", call.name),
+            ));
+            continue;
+        };
+
+        let arguments: serde_json::Value = match serde_json::from_str(&call.arguments) {
+            Ok(value) => value,
+            Err(err) => {
+                // Malformed arguments are the model's to correct, not a
+                // failure of the turn.
+                results.push(failed(
+                    call,
+                    format!(
+                        "the arguments for `{}` are not valid JSON: {err}",
+                        call.name
+                    ),
+                ));
+                continue;
+            }
+        };
+
+        context.emit(Event::ToolStarted {
+            call: call.clone(),
+            activity: Activity::Execute,
+        });
+        let host_context = HostToolContext {
+            signal: context.cancel.clone().into(),
+        };
+
+        match (tool.execute)(&arguments, &host_context) {
+            Ok(result) => {
+                context.emit(Event::ToolFinished {
+                    call: call.clone(),
+                    is_error: result.is_error,
+                });
+                let cap = context.limits.get_usize(LimitName::MaxToolResultBytes);
+                let produced = u64::try_from(result.text.len()).unwrap_or(u64::MAX);
+                results.push(Executed {
+                    result: CallResult {
+                        call: call.clone(),
+                        output: ToolOutput {
+                            text: bound_text(&result.text, cap),
+                            is_error: result.is_error,
+                            produced_bytes: produced,
+                        },
+                        executed: true,
+                    },
+                    images: result.images,
+                });
+            }
+            Err(err) => {
+                context.emit(Event::ToolFinished {
+                    call: call.clone(),
+                    is_error: true,
+                });
+                if err.code() == ErrorCode::Cancelled {
+                    cancelled = true;
+                }
+                results.push(failed(call, err.message().to_owned()));
+            }
+        }
+    }
+
+    (results, cancelled)
+}
+
+/// Builds the answer for a call that did not run.
+fn failed(call: &PreparedCall, message: String) -> Executed {
+    Executed {
+        result: CallResult {
+            call: call.clone(),
+            output: ToolOutput::failure(message),
+            executed: false,
+        },
+        images: Vec::new(),
+    }
+}
+
+/// Truncates a tool result to the configured bound, keeping the marker.
+pub(crate) fn bound_text(text: &str, cap: usize) -> String {
+    if text.len() <= cap {
+        return text.to_owned();
+    }
+    let mut end = cap.min(text.len());
+    while end > 0 && !text.is_char_boundary(end) {
+        end = end.saturating_sub(1);
+    }
+    let mut out = text[..end].to_owned();
+    out.push_str("\n... (truncated)");
+    out
+}
+
+/// Merges adjacent text parts, so a delta-per-token stream does not become one
+/// history entry per token.
+fn coalesce(parts: Vec<ContentPart>) -> Vec<ContentPart> {
+    let mut out: Vec<ContentPart> = Vec::with_capacity(parts.len());
+    for part in parts {
+        match (out.last_mut(), &part) {
+            (Some(ContentPart::Text { text }), ContentPart::Text { text: next }) => {
+                text.push_str(next);
+            }
+            _ => out.push(part),
+        }
+    }
+    out
+}
+
+/// Maps a normalized finish reason onto a stop reason.
+fn stop_reason(finish: FinishReason) -> StopReason {
+    match finish {
+        FinishReason::Stop | FinishReason::ToolCalls => StopReason::Completed,
+        FinishReason::MaxTokens => StopReason::OutputLimit,
+        FinishReason::ContentFilter => StopReason::ContentFilter,
+        FinishReason::MaxModelTurns => StopReason::StepLimit,
+        FinishReason::Refused => StopReason::Refused,
+        FinishReason::Cancelled => StopReason::Cancelled,
+        FinishReason::ProviderError => StopReason::ProviderFailure,
+    }
+}
+
+/// Records the end of a turn and hands its product back.
+fn settle(
+    context: &TurnContext,
+    stop_reason: StopReason,
+    text: String,
+    usage: Usage,
+    steps: u32,
+    calls: Vec<CallResult>,
+    images: Vec<HostImage>,
+) -> TurnProduct {
+    context.emit(Event::Finished {
+        reason: stop_reason,
+        usage,
+        steps,
+    });
+    TurnProduct {
+        outcome: TurnOutcome {
+            stop_reason,
+            text,
+            usage,
+            steps,
+            calls,
+        },
+        images,
+    }
+}
+
+/// Locks a mutex, ignoring poisoning.
+///
+/// A panic inside a turn must not make the conversation permanently unreadable:
+/// the data behind the lock is still consistent, because every writer holds it
+/// only while replacing a value.
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}

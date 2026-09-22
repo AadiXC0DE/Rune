@@ -331,7 +331,7 @@ fn prompt_reports_the_built_in_source() {
 
 #[test]
 fn an_unavailable_surface_says_so_explicitly() {
-    let out = run(&["sessions"]);
+    let out = run(&["upgrade"]);
     assert_eq!(out.status, Some(1));
     assert!(
         out.stderr.contains("not available in this build"),

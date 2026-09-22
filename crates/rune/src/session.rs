@@ -7,6 +7,7 @@
 use std::io::BufRead;
 use std::sync::Arc;
 
+use crate::session_log::{self, Recorder};
 use camino::Utf8Path;
 use rune_agent::history::History;
 use rune_agent::steering::{Cancellation, SteeringQueue};
@@ -15,6 +16,7 @@ use rune_context::prompt::{self, Inputs, Prompt};
 use rune_core::budget::BudgetSet;
 use rune_core::config::{Effort, PermissionMode, Settings};
 use rune_core::error::{ErrorCode, Result, RuneError};
+use rune_core::id::SessionId;
 use rune_core::paths::Paths;
 use rune_net::message::ToolSpec;
 use rune_net::provider::Provider;
@@ -30,6 +32,10 @@ use rune_tools::registry::Registry;
 pub struct SessionConfig {
     /// Resolved settings.
     pub settings: Settings,
+    /// State paths, used for the session log.
+    pub paths: Paths,
+    /// Session to resume, when the launch asked to resume one.
+    pub resume: Option<SessionId>,
     /// Primary workspace.
     pub workspace: camino::Utf8PathBuf,
     /// Endpoint for model requests.
@@ -133,6 +139,15 @@ impl Host for SessionHost {
     }
 }
 
+impl SessionHost {
+    /// Drops the events of the turn that just finished.
+    fn clear_events(&self) {
+        if let Ok(mut events) = self.events.lock() {
+            events.clear();
+        }
+    }
+}
+
 /// Runs an interactive session.
 ///
 /// Returns the exit code the process should use.
@@ -163,9 +178,26 @@ pub fn run<R: BufRead, W: std::io::Write>(
         interactive: true,
     };
 
-    let mut history = History::new();
-    let mut source = rune_term::shell::StdinSource::new(input);
+    // A resumed session continues its stored conversation; a new one starts
+    // empty and writes a fresh log.
+    let (mut recorder, mut history) = if let Some(id) = &config.resume {
+        session_log::load(&config.paths, id)?
+    } else {
+        let id = SessionId::generate();
+        (Recorder::create(&config.paths, &id)?, History::new())
+    };
+
     let out = std::sync::Mutex::new(output);
+    // The session identifier is announced up front so a resumed-or-new session
+    // can be named later without consulting the listing.
+    if let Ok(mut sink) = out.lock() {
+        let _ = writeln!(sink, "session {}", recorder.id());
+    }
+
+    // A resumed session keeps the title it was given.
+    let mut is_first_prompt = config.resume.is_none() && recorder.title_is_unset();
+
+    let mut source = rune_term::shell::StdinSource::new(input);
     let mut shell = Shell::new(&mut source);
 
     let reason = shell.run(|input| {
@@ -175,8 +207,17 @@ pub fn run<R: BufRead, W: std::io::Write>(
         match input {
             Input::Command { name, arguments } => handle_command(&name, &arguments, &mut *sink),
             Input::Prompt(text) => {
+                if is_first_prompt {
+                    recorder.set_title(&session_log::derive_title(&text))?;
+                    is_first_prompt = false;
+                }
+                recorder.user_message(&text)?;
                 history.push_user(text);
                 let outcome = turn::run_turn(&mut history, &host)?;
+                // The turn is recorded before it is reported, so a session that
+                // dies while rendering still has its exchange on disk.
+                recorder.turn(&outcome)?;
+                host.clear_events();
                 report_turn(&outcome, &host, &mut *sink)?;
                 Ok(Action::Continue)
             }
@@ -278,7 +319,12 @@ fn build_prompt(workspace: &Utf8Path, limits: &BudgetSet) -> Prompt {
 ///
 /// Split from the loop so the command surface can report a configuration problem
 /// before a terminal is taken over.
-pub fn prepare(settings: &Settings, paths: &Paths, workspace: &Utf8Path) -> Result<SessionConfig> {
+pub fn prepare(
+    settings: &Settings,
+    paths: &Paths,
+    workspace: &Utf8Path,
+    resume: Option<SessionId>,
+) -> Result<SessionConfig> {
     settings.require_model()?;
 
     let provider_name = settings.provider.to_string();
@@ -313,6 +359,8 @@ pub fn prepare(settings: &Settings, paths: &Paths, workspace: &Utf8Path) -> Resu
 
     Ok(SessionConfig {
         settings: settings.clone(),
+        paths: paths.clone(),
+        resume,
         workspace: workspace.to_owned(),
         endpoint: Endpoint::new(base_url, credential.expose().to_owned()),
         dialect,
@@ -437,7 +485,7 @@ mod tests {
     fn preparing_a_session_without_a_provider_fails_before_the_terminal() {
         let settings = Settings::default();
         let paths = Paths::resolve(Some("/tmp"), None, None, None, Some("/tmp/s"));
-        let outcome = prepare(&settings, &paths, Utf8Path::new("/tmp"));
+        let outcome = prepare(&settings, &paths, Utf8Path::new("/tmp"), None);
         let Err(err) = outcome else {
             panic!("a session started with no provider configured");
         };

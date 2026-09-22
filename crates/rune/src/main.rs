@@ -14,7 +14,9 @@ mod ask;
 mod cli;
 mod diagnostics;
 mod help;
+mod permissions;
 mod session;
+mod session_log;
 mod spec;
 mod version;
 
@@ -136,17 +138,18 @@ fn run(launch: &Launch) -> Result<ExitCode> {
         Command::Limits => run_limits(&settings, &output_flags),
         Command::Config => run_config(&settings, &output_flags),
         Command::Prompt => run_prompt(&settings, &output_flags),
-        Command::Sessions | Command::Session | Command::Tree => {
-            Err(not_yet_available("session storage"))
-        }
+        Command::Sessions | Command::Tree => run_sessions(&paths, &output_flags),
+        Command::Session => Err(not_yet_available("per-session inspection")),
         Command::Usage => Err(not_yet_available("the usage ledger")),
         Command::Auth | Command::Connect => Err(not_yet_available("provider connection")),
         Command::Models => Err(not_yet_available("the model catalog")),
-        Command::Permissions => Err(not_yet_available("the permission engine")),
+        Command::Permissions => run_permissions(&settings, launch, &output_flags),
         Command::Workspace => run_workspace(&settings, launch, &output_flags),
         Command::Ask => run_ask(&settings, &paths, launch, &output_flags),
         Command::Acp => run_acp(&settings, &paths, &workspace, launch),
-        Command::Interactive | Command::Resume => run_interactive(&settings, &paths, &workspace),
+        Command::Interactive | Command::Resume => {
+            run_interactive(&settings, &paths, &workspace, launch)
+        }
         Command::Review => Err(not_yet_available("the review command")),
         Command::Upgrade | Command::Uninstall => Err(not_yet_available("the installer")),
         Command::Help | Command::Version => Ok(ExitCode::from(EXIT_OK)),
@@ -256,12 +259,68 @@ fn run_interactive(
     settings: &Settings,
     paths: &Paths,
     workspace: &camino::Utf8Path,
+    launch: &Launch,
 ) -> Result<ExitCode> {
-    let config = session::prepare(settings, paths, workspace)?;
+    let resume = match &launch.resume {
+        Some(target) => Some(session_log::resolve_target(target, paths)?),
+        None => None,
+    };
+    let config = session::prepare(settings, paths, workspace, resume)?;
     let stdin = std::io::stdin();
     let input = std::io::BufReader::new(stdin.lock());
     let code = session::run(config, input, std::io::stdout())?;
     Ok(ExitCode::from(code))
+}
+
+/// Reports the permission rules in force.
+fn run_permissions(settings: &Settings, launch: &Launch, output: &OutputFlags) -> Result<ExitCode> {
+    let rules = permissions::validated(settings)?;
+
+    // An action given as a positional argument is explained rather than listed,
+    // because that is the question a user actually has.
+    if let Some(action) = launch.args.first() {
+        let text = permissions::explain(
+            &rules,
+            settings.permission_mode,
+            action,
+            launch.args.get(1).map_or("", String::as_str),
+        );
+        println!("{text}");
+        return Ok(ExitCode::from(EXIT_OK));
+    }
+
+    if output.json {
+        let value = permissions::to_json(&rules, settings.permission_mode);
+        println!("{}", serde_json::to_string_pretty(&value)?);
+    } else {
+        println!("{}", permissions::render(&rules, settings.permission_mode));
+    }
+    Ok(ExitCode::from(EXIT_OK))
+}
+
+/// Lists the sessions stored for this workspace.
+fn run_sessions(paths: &Paths, output: &OutputFlags) -> Result<ExitCode> {
+    let rows = session_log::list(paths);
+    if output.json {
+        let value = serde_json::Value::Array(
+            rows.iter()
+                .map(|row| {
+                    serde_json::json!({
+                        "id": row.id,
+                        "turns": row.turns,
+                        "events": row.events,
+                        "updated_at": row.updated_at,
+                        "title": row.title,
+                    })
+                })
+                .collect(),
+        );
+        let rendered = serde_json::to_string_pretty(&value)?;
+        println!("{rendered}");
+    } else {
+        println!("{}", session_log::render_listing(&rows));
+    }
+    Ok(ExitCode::from(EXIT_OK))
 }
 
 /// Runs `acp`.

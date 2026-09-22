@@ -14,6 +14,8 @@ use crate::ask_user::AskUserQuestion;
 use crate::contract::{Tool, model_spec};
 use crate::registry::Registry;
 use crate::shell::Shell;
+use crate::vision::Vision;
+use crate::web::{WebFetch, WebSearch};
 use crate::workspace::FileLimits;
 use crate::{EditFile, GlobFiles, GrepFiles, ReadFile, WriteFile};
 
@@ -29,6 +31,9 @@ pub const ADVERTISEMENT_ORDER: &[&str] = &[
     "edit_file",
     "shell",
     "ask_user_question",
+    "web_fetch",
+    "web_search",
+    "vision",
 ];
 
 /// Builds a registry holding every built-in tool.
@@ -47,6 +52,9 @@ pub fn builtin(limits: &FileLimits, budget: &rune_core::budget::BudgetSet) -> Re
     registry.insert(Box::new(EditFile))?;
     registry.insert(Box::new(Shell::new(budget)))?;
     registry.insert(Box::new(AskUserQuestion::unavailable()))?;
+    registry.insert(Box::new(WebFetch::unconfigured(budget)))?;
+    registry.insert(Box::new(WebSearch::unconfigured(budget)))?;
+    registry.insert(Box::new(Vision::unconfigured(budget)))?;
     debug_assert_eq!(registry.len(), ADVERTISEMENT_ORDER.len());
     Ok(registry)
 }
@@ -261,5 +269,49 @@ mod tests {
             .insert(Box::new(ReadFile::new()))
             .expect_err("duplicate");
         assert_eq!(err.code(), rune_core::error::ErrorCode::AlreadyExists);
+    }
+
+    #[test]
+    fn the_network_and_vision_tools_are_advertised_and_valid() {
+        let registry = builtin_default().expect("built");
+        for name in ["web_fetch", "web_search", "vision"] {
+            assert!(
+                ADVERTISEMENT_ORDER.contains(&name),
+                "`{name}` is missing from the advertisement order"
+            );
+            let tool =
+                find(&registry, name).unwrap_or_else(|| panic!("`{name}` is not registered"));
+            assert!(
+                !tool.description().is_empty(),
+                "`{name}` has no description"
+            );
+        }
+        for name in ["web_fetch", "web_search"] {
+            assert_eq!(
+                registry.activity(name),
+                Some(Activity::Network),
+                "`{name}` reaches the network"
+            );
+            assert!(
+                !find(&registry, name).expect("registered").is_read_only(),
+                "`{name}` must not be advertised as read only"
+            );
+        }
+        assert_eq!(
+            registry.activity("vision"),
+            Some(Activity::Read),
+            "a vision call reads an image rather than reaching out"
+        );
+        assert!(
+            find(&registry, "vision")
+                .expect("registered")
+                .is_read_only()
+        );
+        assert!(
+            !find(&registry, "web_fetch")
+                .expect("registered")
+                .is_read_only()
+        );
+        validate_all(&registry).expect("every tool is well formed");
     }
 }

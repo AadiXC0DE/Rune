@@ -13,10 +13,13 @@ workspace = true
 [dependencies]
 rune-core = { workspace = true }
 rune-agent = { workspace = true }
-rune-session = { workspace = true }
+rune-net = { workspace = true }
+rune-tools = { workspace = true }
+camino = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-thiserror = { workspace = true }
+ureq = { workspace = true }
 
 [dev-dependencies]
+rune-testkit.workspace = true
 tempfile.workspace = true
