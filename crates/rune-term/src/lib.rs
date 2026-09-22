@@ -6,7 +6,10 @@
 #![cfg_attr(test, allow(clippy::expect_used, clippy::unwrap_used, clippy::panic))]
 
 pub mod engine;
+pub mod footer;
+pub mod frame;
 pub mod shell;
+pub mod theme;
 pub mod transcript;
 pub mod width;
 
