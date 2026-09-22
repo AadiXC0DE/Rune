@@ -10,6 +10,7 @@ use rune_core::error::Result;
 use rune_net::message::ToolSpec;
 use sha2::{Digest as _, Sha256};
 
+use crate::ask_user::AskUserQuestion;
 use crate::contract::{Tool, model_spec};
 use crate::registry::Registry;
 use crate::shell::Shell;
@@ -27,6 +28,7 @@ pub const ADVERTISEMENT_ORDER: &[&str] = &[
     "write_file",
     "edit_file",
     "shell",
+    "ask_user_question",
 ];
 
 /// Builds a registry holding every built-in tool.
@@ -44,6 +46,7 @@ pub fn builtin(limits: &FileLimits, budget: &rune_core::budget::BudgetSet) -> Re
     registry.insert(Box::new(WriteFile))?;
     registry.insert(Box::new(EditFile))?;
     registry.insert(Box::new(Shell::new(budget)))?;
+    registry.insert(Box::new(AskUserQuestion::unavailable()))?;
     debug_assert_eq!(registry.len(), ADVERTISEMENT_ORDER.len());
     Ok(registry)
 }

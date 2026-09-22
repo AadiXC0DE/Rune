@@ -3,6 +3,7 @@
 #![forbid(unsafe_code)]
 #![cfg_attr(test, allow(clippy::expect_used, clippy::unwrap_used, clippy::panic))]
 
+pub mod ask_user;
 pub mod contract;
 pub mod edit_file;
 pub mod glob_files;
