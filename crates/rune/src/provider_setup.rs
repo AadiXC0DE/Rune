@@ -47,6 +47,46 @@ fn credential_from_environment(provider: &str, configured: Option<&str>) -> Opti
     None
 }
 
+/// Writes one key into the user configuration.
+///
+/// Reads the file first and replaces only the named key, so a value the user set
+/// by hand survives. A value of `None` removes the key.
+pub fn save_key(paths: &Paths, key: &str, value: Option<toml::Value>) -> Result<()> {
+    let path = paths.config_file(None);
+    if let Some(parent) = path.parent() {
+        rune_core::paths::create_dir_private(parent)?;
+    }
+
+    let existing = rune_core::paths::read_private(&path, MAX_CONFIG_BYTES)?;
+    let mut document: toml::Table = match existing.as_deref() {
+        Some(text) if !text.trim().is_empty() => toml::from_str(text).map_err(|err| {
+            RuneError::new(
+                ErrorCode::CorruptRecord,
+                format!("the config file could not be parsed: {err}"),
+            )
+            .with_hint("repair the file, or move it aside")
+        })?,
+        _ => toml::Table::new(),
+    };
+
+    match value {
+        Some(value) => {
+            document.insert(key.to_owned(), value);
+        }
+        None => {
+            document.remove(key);
+        }
+    }
+
+    let rendered = toml::to_string_pretty(&document).map_err(|err| {
+        RuneError::new(
+            ErrorCode::Internal,
+            format!("the configuration could not be written: {err}"),
+        )
+    })?;
+    rune_core::paths::write_private(&path, &rendered)
+}
+
 /// Writes the provider selection into the user configuration.
 ///
 /// The file is read first and the named keys are replaced, so a value the user

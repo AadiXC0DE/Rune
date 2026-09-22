@@ -139,6 +139,8 @@ pub struct ServerConfig {
     pub log_file: Option<Utf8PathBuf>,
     /// Usable context size of the active model, reported in usage updates.
     pub context_window: u64,
+    /// Directories every session may reach in addition to the workspace.
+    pub additional_roots: Vec<Utf8PathBuf>,
 }
 
 impl fmt::Debug for ServerConfig {
@@ -184,6 +186,7 @@ impl ServerConfig {
             limits,
             log_file: None,
             context_window,
+            additional_roots: Vec::new(),
         })
     }
 
@@ -320,6 +323,7 @@ impl<W: Write + Send + 'static> Server<W> {
             config.workspace.clone(),
             defaults,
             &config.limits,
+            config.additional_roots.clone(),
         );
         Ok(Self {
             config,

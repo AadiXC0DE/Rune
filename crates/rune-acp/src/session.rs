@@ -87,6 +87,13 @@ impl Session {
     pub const fn config(&self) -> &SessionConfig {
         &self.config
     }
+
+    /// Returns the directories this session's tools may reach beyond the
+    /// workspace.
+    #[must_use]
+    pub fn additional_roots(&self) -> &[Utf8PathBuf] {
+        &self.additional_roots
+    }
 }
 
 /// Everything a turn needs, taken before the turn starts.
@@ -115,6 +122,8 @@ pub struct Sessions {
     paths: Paths,
     workspace: Utf8PathBuf,
     defaults: SessionConfig,
+    /// Directories every new session may reach.
+    default_roots: Vec<Utf8PathBuf>,
     limits: BudgetSet,
     cap: usize,
 }
@@ -127,6 +136,7 @@ impl Sessions {
         workspace: Utf8PathBuf,
         defaults: SessionConfig,
         limits: &BudgetSet,
+        default_roots: Vec<Utf8PathBuf>,
     ) -> Self {
         let cap = limits.get_usize(LimitName::ListEntries).max(1);
         Self {
@@ -134,6 +144,7 @@ impl Sessions {
             paths,
             workspace,
             defaults,
+            default_roots,
             limits: limits.clone(),
             cap,
         }
@@ -151,6 +162,17 @@ impl Sessions {
     /// limit, because a client that opens sessions in a loop would otherwise hold
     /// one writer lock per iteration.
     pub fn create(&mut self, additional_roots: Vec<Utf8PathBuf>) -> Result<String> {
+        // Configured directories come first, so a session reaches what the user
+        // saved even when the client asks for none of its own. A root the client
+        // names as well is kept once, since the context would otherwise hold the
+        // same directory twice.
+        let mut roots = self.default_roots.clone();
+        for root in additional_roots {
+            if !roots.contains(&root) {
+                roots.push(root);
+            }
+        }
+        let additional_roots = roots;
         if self.entries.len() >= self.cap {
             return Err(RuneError::new(
                 ErrorCode::LimitExceeded,
@@ -763,6 +785,11 @@ mod tests {
     use rune_core::id::EventSeq;
     use rune_session::event::EventFrame;
 
+    /// Returns a path inside a temporary directory as a UTF-8 path.
+    fn utf8_path(root: &tempfile::TempDir, name: &str) -> Utf8PathBuf {
+        Utf8PathBuf::from_path_buf(root.path().join(name)).expect("utf8 path")
+    }
+
     fn paths_for(root: &tempfile::TempDir) -> Paths {
         let base =
             |name: &str| Utf8PathBuf::from_path_buf(root.path().join(name)).expect("utf8 path");
@@ -780,7 +807,67 @@ mod tests {
             Utf8PathBuf::from("/tmp/work"),
             SessionConfig::new("test/model", Effort::Auto, PermissionMode::Auto),
             &limits,
+            Vec::new(),
         )
+    }
+
+    #[test]
+    fn a_new_session_reaches_the_configured_directories() {
+        let root = tempfile::tempdir().expect("temp");
+        let configured = utf8_path(&root, "shared");
+        std::fs::create_dir(&configured).expect("create");
+        let mut sessions = Sessions::new(
+            paths_for(&root),
+            utf8_path(&root, "work"),
+            SessionConfig::new("m", Effort::default(), PermissionMode::default()),
+            &BudgetSet::new(),
+            vec![configured.clone()],
+        );
+
+        let id = sessions.create(Vec::new()).expect("created");
+        let session = sessions.get(&id).expect("present");
+        assert_eq!(session.additional_roots(), [configured]);
+    }
+
+    #[test]
+    fn a_root_the_client_names_as_well_is_kept_once() {
+        let root = tempfile::tempdir().expect("temp");
+        let configured = utf8_path(&root, "shared");
+        std::fs::create_dir(&configured).expect("create");
+        let mut sessions = Sessions::new(
+            paths_for(&root),
+            utf8_path(&root, "work"),
+            SessionConfig::new("m", Effort::default(), PermissionMode::default()),
+            &BudgetSet::new(),
+            vec![configured.clone()],
+        );
+
+        let id = sessions.create(vec![configured.clone()]).expect("created");
+        let session = sessions.get(&id).expect("present");
+        // The same directory twice would put it in the context twice, which a
+        // resolve would then report as two roots.
+        assert_eq!(session.additional_roots().len(), 1);
+    }
+
+    #[test]
+    fn a_client_root_is_added_alongside_the_configured_ones() {
+        let root = tempfile::tempdir().expect("temp");
+        let configured = utf8_path(&root, "shared");
+        let requested = utf8_path(&root, "extra");
+        std::fs::create_dir(&configured).expect("create");
+        std::fs::create_dir(&requested).expect("create");
+        let mut sessions = Sessions::new(
+            paths_for(&root),
+            utf8_path(&root, "work"),
+            SessionConfig::new("m", Effort::default(), PermissionMode::default()),
+            &BudgetSet::new(),
+            vec![configured.clone()],
+        );
+
+        let id = sessions.create(vec![requested.clone()]).expect("created");
+        let session = sessions.get(&id).expect("present");
+        assert_eq!(session.additional_roots().len(), 2);
+        assert!(session.additional_roots().contains(&requested));
     }
 
     #[test]
@@ -974,6 +1061,7 @@ mod tests {
             Utf8PathBuf::from("/tmp/work"),
             SessionConfig::new("test/model", Effort::Auto, PermissionMode::Auto),
             &limits,
+            Vec::new(),
         );
         assert_eq!(sessions.cap(), 2);
         sessions.create(Vec::new()).expect("first");

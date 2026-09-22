@@ -148,7 +148,7 @@ fn run(launch: &Launch) -> Result<ExitCode> {
         Command::Connect => run_connect(&settings, &paths, launch, &output_flags),
         Command::Models => run_models(&settings, &output_flags),
         Command::Permissions => run_permissions(&settings, launch, &output_flags),
-        Command::Workspace => run_workspace(&settings, launch, &output_flags),
+        Command::Workspace => run_workspace(&settings, &paths, launch, &output_flags),
         Command::Ask => run_ask(&settings, &paths, launch, &output_flags),
         Command::Acp => run_acp(&settings, &paths, &workspace, launch),
         Command::Interactive | Command::Resume => {
@@ -531,6 +531,7 @@ fn run_acp(
         limits: settings.limits.clone(),
         log_file,
         context_window: rune_net::catalog::DEFAULT_CONTEXT_WINDOW,
+        additional_roots: settings.additional_directories.clone(),
     };
 
     let server = std::sync::Arc::new(rune_acp::Server::new(config, std::io::stdout())?);
@@ -620,7 +621,12 @@ fn run_prompt(settings: &Settings, _output: &OutputFlags) -> Result<ExitCode> {
 }
 
 /// Runs `workspace`.
-fn run_workspace(settings: &Settings, launch: &Launch, output: &OutputFlags) -> Result<ExitCode> {
+fn run_workspace(
+    settings: &Settings,
+    paths: &Paths,
+    launch: &Launch,
+    output: &OutputFlags,
+) -> Result<ExitCode> {
     let action = launch.args.first().map_or("list", String::as_str);
     match action {
         "list" => {
@@ -641,13 +647,149 @@ fn run_workspace(settings: &Settings, launch: &Launch, output: &OutputFlags) -> 
             }
             Ok(ExitCode::from(EXIT_OK))
         }
-        "add" | "remove" | "clear" => Err(not_yet_available("saving workspace directories")),
+        "add" | "remove" | "clear" => run_workspace_edit(action, launch, paths, output),
         other => Err(RuneError::invalid_field(
             "workspace",
             format!("`{other}` is not a subcommand"),
         )
         .with_hint("use list, add, remove, or clear")),
     }
+}
+
+/// Adds, removes, or clears the additional directories in the user config.
+///
+/// The list is written whole rather than edited in place, because a partial
+/// update of a list would have to express which entry moved, and an entry is
+/// identified by its path.
+fn run_workspace_edit(
+    action: &str,
+    launch: &Launch,
+    paths: &Paths,
+    output: &OutputFlags,
+) -> Result<ExitCode> {
+    let stored = config::load(
+        None,
+        Some(&paths.config_file(None)),
+        &EnvironmentOverrides::default(),
+    );
+    let mut directories: Vec<String> = stored
+        .additional_directories
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+
+    match action {
+        "add" => {
+            let Some(raw) = launch.args.get(1) else {
+                return Err(
+                    RuneError::missing_field("directory").with_hint("name the directory to add")
+                );
+            };
+            let resolved = resolve_directory(raw)?;
+            if directories.contains(&resolved) {
+                // Adding what is already there is not an error; reporting it as
+                // one would make a repeated command look broken.
+                if !output.json {
+                    println!("{resolved} is already listed");
+                }
+            } else {
+                directories.push(resolved.clone());
+                directories.sort();
+                write_directories(paths, &directories)?;
+                if !output.json {
+                    println!("added {resolved}");
+                }
+            }
+        }
+        "remove" => {
+            let Some(raw) = launch.args.get(1) else {
+                return Err(
+                    RuneError::missing_field("directory").with_hint("name the directory to remove")
+                );
+            };
+            let before = directories.len();
+            directories.retain(|entry| entry != raw);
+            if directories.len() == before {
+                return Err(
+                    RuneError::new(ErrorCode::NotFound, format!("`{raw}` is not listed"))
+                        .with_hint("run `rune workspace list` to see what is"),
+                );
+            }
+            write_directories(paths, &directories)?;
+            if !output.json {
+                println!("removed {raw}");
+            }
+        }
+        _ => {
+            write_directories(paths, &Vec::new())?;
+            if !output.json {
+                println!("cleared the additional directories");
+            }
+        }
+    }
+
+    if output.json {
+        let value = serde_json::json!({ "directories": directories });
+        println!("{}", serde_json::to_string_pretty(&value)?);
+    }
+    Ok(ExitCode::from(EXIT_OK))
+}
+
+/// Resolves a directory argument to the path that will be stored.
+///
+/// The result is canonical, which resolves `..` and any symbolic link. Without
+/// it the same directory can be listed twice under two spellings, and a check
+/// for whether a directory is already present would miss.
+fn resolve_directory(raw: &str) -> Result<String> {
+    let expanded = Utf8PathBuf::from(expand_tilde(raw));
+    let absolute = if expanded.is_absolute() {
+        expanded
+    } else {
+        current_workspace()?.join(expanded)
+    };
+
+    if !absolute.is_dir() {
+        return Err(RuneError::new(
+            ErrorCode::NotFound,
+            format!("`{absolute}` is not a directory"),
+        )
+        .with_hint("name a directory that exists"));
+    }
+
+    let canonical = absolute.canonicalize_utf8().map_err(|err| {
+        RuneError::new(
+            ErrorCode::NotFound,
+            format!("`{absolute}` could not be resolved: {err}"),
+        )
+    })?;
+    Ok(canonical.to_string())
+}
+
+/// Expands a leading tilde to the home directory.
+fn expand_tilde(raw: &str) -> String {
+    let Some(rest) = raw.strip_prefix('~') else {
+        return raw.to_owned();
+    };
+    let home = std::env::var("HOME").unwrap_or_default();
+    if home.is_empty() {
+        return raw.to_owned();
+    }
+    format!("{home}{rest}")
+}
+
+/// Writes the additional-directory list into the user config.
+fn write_directories(paths: &Paths, directories: &[String]) -> Result<()> {
+    let value = if directories.is_empty() {
+        None
+    } else {
+        Some(toml::Value::Array(
+            directories
+                .iter()
+                .map(|entry| toml::Value::String(entry.clone()))
+                .collect(),
+        ))
+    };
+    provider_setup::save_key(paths, "additional_directories", value)
 }
 
 /// Output-related flags, resolved from either side of the command name.
@@ -687,6 +829,36 @@ fn report_error(err: &RuneError) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_tilde_is_expanded_against_the_home_directory() {
+        let expanded = expand_tilde("~/work");
+        assert!(expanded.ends_with("/work"), "{expanded}");
+        assert!(!expanded.starts_with('~'), "{expanded}");
+    }
+
+    #[test]
+    fn a_path_without_a_tilde_is_left_alone() {
+        assert_eq!(expand_tilde("/tmp/x"), "/tmp/x");
+        assert_eq!(expand_tilde("../x"), "../x");
+    }
+
+    #[test]
+    fn resolving_a_directory_that_does_not_exist_names_the_problem() {
+        let err = resolve_directory("/rune-does-not-exist-1234").expect_err("refused");
+        assert_eq!(err.code(), ErrorCode::NotFound);
+        assert!(err.hint().is_some());
+    }
+
+    #[test]
+    fn resolving_returns_a_canonical_path() {
+        // Canonical is what makes two spellings of one directory compare equal,
+        // which is what keeps a list from holding it twice.
+        let resolved = resolve_directory(".").expect("resolved");
+        assert!(Utf8PathBuf::from(&resolved).is_absolute(), "{resolved}");
+        assert!(!resolved.contains("/./"), "{resolved}");
+        assert!(!resolved.contains(".."), "{resolved}");
+    }
 
     #[test]
     fn a_usage_period_is_recognized_by_name() {
