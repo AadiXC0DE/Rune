@@ -7,6 +7,7 @@
 
 pub mod engine;
 pub mod shell;
+pub mod transcript;
 pub mod width;
 
 pub use engine::{Bounds, Cell, Color, Cursor, DiffSpan, FeedStats, Grid, Style, flag};

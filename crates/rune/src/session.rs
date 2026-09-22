@@ -25,6 +25,7 @@ use rune_policy::decision::Outcome;
 use rune_policy::rules::RuleSet;
 use rune_session::usage::{HelperKind, Ledger, UsageRecord, now_ms};
 use rune_term::shell::{Action, Input, Shell};
+use rune_term::transcript::{self, Display, Entry};
 use rune_tools::contract::{ExecutionContext, ToolOutput};
 use rune_tools::inventory;
 use rune_tools::registry::Registry;
@@ -287,30 +288,51 @@ fn report_turn<W: std::io::Write>(
         .map(|events| events.clone())
         .unwrap_or_default();
 
+    // Model and tool output both reach a terminal, so every entry is rendered
+    // through the transcript, which strips the control sequences a terminal
+    // would act on.
+    let mut entries = Vec::new();
     for event in &events {
         match event {
             Event::ToolStarted { call, activity } => {
-                let _ = writeln!(output, "  {} {}", activity.running_label(), call.name);
+                entries.push(Entry::tool(format!(
+                    "{} {}",
+                    activity.running_label(),
+                    call.name
+                )));
             }
             Event::ToolDenied { call, reason } => {
-                let _ = writeln!(output, "  refused {}: {reason}", call.name);
+                entries.push(Entry::notice(format!("refused {}: {reason}", call.name)));
             }
             Event::SteeringApplied { count, .. } => {
-                let _ = writeln!(output, "  (applied {count} queued message(s))");
+                entries.push(Entry::notice(format!("applied {count} queued message(s)")));
             }
             _ => {}
         }
     }
 
-    if !outcome.text.is_empty() {
-        let _ = writeln!(output, "{}", outcome.text);
+    for call in &outcome.calls {
+        if call.executed {
+            entries.push(Entry::tool(format!(
+                "{}: {}",
+                call.call.name, call.output.text
+            )));
+        }
     }
 
-    if outcome.stop_reason == StopReason::StepLimit {
-        let _ = writeln!(output, "[reached the model step limit]");
+    if !outcome.text.is_empty() {
+        entries.push(Entry::assistant(outcome.text.clone()));
     }
-    if outcome.stop_reason == StopReason::Cancelled {
-        let _ = writeln!(output, "[cancelled]");
+
+    match outcome.stop_reason {
+        StopReason::StepLimit => entries.push(Entry::notice("reached the model step limit")),
+        StopReason::Cancelled => entries.push(Entry::notice("cancelled")),
+        _ => {}
+    }
+
+    let rendered = transcript::render(&entries, Display::default());
+    if !rendered.is_empty() {
+        let _ = writeln!(output, "{rendered}");
     }
     let _ = output.flush();
     Ok(())
