@@ -119,6 +119,12 @@ pub fn render_catalog_within(
         .saturating_add(CLOSE.len())
         .saturating_add(NOTICE_BYTES.saturating_mul(2));
     if fixed > budget {
+        // The header alone does not fit, so nothing can be listed. Every skill
+        // is recorded as omitted rather than dropped quietly: a caller that
+        // shows the omission list, and the model that reads the assembled
+        // instructions, both need to know the catalog is absent rather than
+        // empty.
+        out.omitted = skills.iter().map(|skill| skill.name.clone()).collect();
         return out;
     }
 

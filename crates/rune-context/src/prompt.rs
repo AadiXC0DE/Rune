@@ -4,6 +4,8 @@
 //! about what the model sees. The order is fixed and asserted by a snapshot,
 //! because an accidental reordering is invisible in review and changes behavior.
 
+use std::fmt::Write as _;
+
 use camino::Utf8Path;
 use rune_core::budget::{BudgetSet, LimitName};
 use rune_core::error::Result;
@@ -192,6 +194,22 @@ pub fn assemble(inputs: &Inputs<'_>, limits: &BudgetSet) -> Result<Prompt> {
         }
     }
 
+    // A section that was shortened or dropped is named in the text itself. The
+    // list alone is for the interface: the model reads the instructions, so a
+    // bound it cannot see is a bound it does not know about.
+    if !omissions.is_empty() {
+        let mut notice = String::from("\n\nContext notice:\n");
+        for omission in &omissions {
+            let _ = writeln!(
+                notice,
+                "- {}: {}",
+                omission.section.as_str(),
+                omission.reason
+            );
+        }
+        instructions.push_str(notice.trim_end());
+    }
+
     Ok(Prompt {
         instructions,
         included,
@@ -323,6 +341,56 @@ mod tests {
             content: body.to_owned(),
             declared_bytes: body.len() as u64,
         }
+    }
+
+    #[test]
+    fn an_omission_is_stated_in_the_instructions_the_model_reads() {
+        // The omission list is for the interface. The model reads only the
+        // instruction text, so a bound it cannot see is one it does not know
+        // about, and it answers as though nothing were missing.
+        let mut limits = BudgetSet::new();
+        limits
+            .set(
+                LimitName::SkillCatalogBytes,
+                rune_core::budget::Budget::Bounded(1),
+                rune_core::config::Layer::CommandLine,
+            )
+            .expect("set");
+        let skills = vec![skill("a-skill")];
+        let inputs = Inputs {
+            skills: &skills,
+            ..Inputs::default()
+        };
+
+        let prompt = assemble(&inputs, &limits).expect("assembled");
+        assert!(
+            !prompt.omissions.is_empty(),
+            "nothing was recorded as omitted"
+        );
+        assert!(
+            prompt.instructions.contains("Context notice"),
+            "the model was not told anything was omitted: {}",
+            prompt.instructions
+        );
+        assert!(
+            prompt.instructions.contains("omitted"),
+            "the notice does not say what happened: {}",
+            prompt.instructions
+        );
+    }
+
+    #[test]
+    fn a_catalog_that_cannot_fit_its_header_still_reports_every_skill() {
+        // An empty catalog with no omission recorded is indistinguishable from
+        // a catalog that was never asked for.
+        let skills = vec![skill("a-skill")];
+        let catalog = render_catalog_within(&skills, skills.len(), 1, 1);
+        assert!(catalog.text.is_empty(), "a catalog fit into one byte");
+        assert_eq!(
+            catalog.omitted,
+            vec!["a-skill".to_owned()],
+            "the skill was dropped without being recorded"
+        );
     }
 
     #[test]

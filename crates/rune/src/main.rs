@@ -1014,12 +1014,20 @@ fn run_prompt(settings: &Settings, launch: &Launch, output: &OutputFlags) -> Res
         .ok()
         .filter(|text| !text.trim().is_empty());
 
-    // `--show` prints the text, which is what a user needs to see what the model
-    // is actually told. Without it the command reports where the text came from.
+    // `--show` prints the assembled instructions, which is what the model is
+    // actually given: the system text plus the skill catalog and the project
+    // files, with a marker wherever something was cut. Printing only the system
+    // text would hide every omission, which is the thing a reader needs to see.
     if launch.has_flag("--show") {
-        match &override_text {
-            Some(text) => print!("{text}"),
-            None => print!("{}", rune_context::prompt::SYSTEM_PROMPT),
+        let workspace = current_workspace()?;
+        let text = rune_context::prompt::instructions_for(
+            &workspace,
+            &paths.config_root,
+            &settings.limits,
+        );
+        print!("{text}");
+        if !text.ends_with('\n') {
+            println!();
         }
         return Ok(ExitCode::from(EXIT_OK));
     }
