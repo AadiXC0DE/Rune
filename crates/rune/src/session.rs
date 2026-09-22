@@ -547,7 +547,7 @@ pub fn prepare(
         paths: paths.clone(),
         resume,
         workspace: workspace.to_owned(),
-        endpoint: Endpoint::new(base_url, credential.expose().to_owned()),
+        endpoint: Endpoint::new(base_url, credential.expose().to_owned()).offline(settings.offline),
         dialect,
         registry,
         rules: RuleSet::new(),

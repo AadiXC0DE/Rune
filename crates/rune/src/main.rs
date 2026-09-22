@@ -131,7 +131,9 @@ fn run(launch: &Launch) -> Result<ExitCode> {
     };
 
     if launch.offline {
-        // Recorded here so the transport can enforce it.
+        // Set on the settings rather than only recorded, so every endpoint a
+        // command builds carries the refusal rather than just the label.
+        settings.offline = true;
         settings.sources.record("offline", Layer::CommandLine);
     }
 
@@ -675,7 +677,8 @@ fn run_acp(
     let config = rune_acp::ServerConfig {
         paths: paths.clone(),
         workspace: workspace.to_owned(),
-        endpoint: rune_net::transport::Endpoint::new(base_url, credential.expose().to_owned()),
+        endpoint: rune_net::transport::Endpoint::new(base_url, credential.expose().to_owned())
+            .offline(settings.offline),
         dialect,
         model: settings.model.clone(),
         instructions: rune_context::prompt::SYSTEM_PROMPT.to_owned(),

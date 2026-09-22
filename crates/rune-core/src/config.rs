@@ -403,6 +403,8 @@ pub struct Settings {
     pub theme: Option<String>,
     /// Whether automatic update checks run.
     pub auto_upgrade: bool,
+    /// Whether every outbound request is refused.
+    pub offline: bool,
     /// Whether tool call groups are collapsed.
     pub collapse_tool_calls: bool,
     /// Whether session titles are generated.
@@ -437,6 +439,7 @@ impl Default for Settings {
             fast_mode: false,
             theme: None,
             auto_upgrade: true,
+            offline: false,
             collapse_tool_calls: false,
             session_titles: true,
             context: true,
@@ -1068,6 +1071,10 @@ fn apply_environment(settings: &mut Settings, env: &EnvironmentOverrides) {
     if let Some(auto) = env.auto_upgrade {
         settings.auto_upgrade = auto;
         settings.sources.record("auto_upgrade", layer);
+    }
+    if let Some(offline) = env.offline {
+        settings.offline = offline;
+        settings.sources.record("offline", layer);
     }
     if !env.additional_directories.is_empty() {
         settings

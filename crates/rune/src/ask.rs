@@ -215,7 +215,9 @@ pub fn run(
     plan.provider_order.clone_from(&settings.provider_order);
     plan.provider_strict = settings.provider_strict;
 
-    let endpoint = Endpoint::new(base_url, credential.expose().to_owned()).with_auth(auth);
+    let endpoint = Endpoint::new(base_url, credential.expose().to_owned())
+        .with_auth(auth)
+        .offline(settings.offline);
 
     let agent = transport::agent();
     let head_timeout = std::time::Duration::from_millis(
