@@ -187,9 +187,11 @@ impl Sessions {
         // A collision on a generated identifier is possible, so creation retries
         // within a small bound instead of failing the request.
         let mut last: Option<RuneError> = None;
+        let mut attempts: Vec<String> = Vec::new();
         for _ in 0..8_u8 {
             let id = SessionId::generate();
             if self.entries.contains_key(id.as_str()) {
+                attempts.push(format!("{id} collided"));
                 continue;
             }
             match SessionStore::create(&self.paths, &id) {
@@ -208,7 +210,10 @@ impl Sessions {
                     );
                     return Ok(name);
                 }
-                Err(err) => last = Some(err),
+                Err(err) => {
+                    attempts.push(format!("{id}: {}", err.message()));
+                    last = Some(err);
+                }
             }
         }
         Err(last.unwrap_or_else(|| {
@@ -217,6 +222,7 @@ impl Sessions {
                 "no unused session identifier was available",
             )
             .with_hint("remove stale session directories")
+            .with_observed(attempts.join("; "))
         }))
     }
 
