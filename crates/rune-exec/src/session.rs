@@ -143,9 +143,28 @@ impl Process {
     /// is exactly what the shell parses. At most `capture_bytes` from each
     /// stream are retained.
     pub fn start(command: &str, cwd: Option<&Path>, capture_bytes: usize) -> io::Result<Self> {
-        let mut spec = Command::new(SHELL);
-        spec.arg("-c")
-            .arg(command)
+        let argv = [SHELL.to_owned(), String::from("-c"), command.to_owned()];
+        Self::start_argv(&argv, cwd, capture_bytes)
+    }
+
+    /// Starts a command from an explicit argv.
+    ///
+    /// Exists so a caller can run an argv that a sandbox produced, which is the
+    /// only way a restricted command and the command that was reviewed can be
+    /// the same thing. The argv is passed as given: nothing here re-parses it.
+    pub fn start_argv(
+        argv: &[String],
+        cwd: Option<&Path>,
+        capture_bytes: usize,
+    ) -> io::Result<Self> {
+        let Some((program, arguments)) = argv.split_first() else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "an argv needs a program to run",
+            ));
+        };
+        let mut spec = Command::new(program);
+        spec.args(arguments)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());

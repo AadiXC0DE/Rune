@@ -181,7 +181,7 @@ impl Shell {
 
         // The start happens outside the map lock, because a command that runs
         // for its whole yield window would otherwise hold every other call up.
-        let process = start(&command, cwd.as_deref(), cap)?;
+        let process = start(&command, cwd.as_deref(), cap, context)?;
         if let Some(exit) = wait_for_exit(&process, window, context)? {
             process.drain_output(DRAIN_WINDOW);
             let text = observe(&process, &command, &exit.describe(), &mut (0, 0), cap);
@@ -392,9 +392,34 @@ fn session_id(started: u64) -> String {
     format!("shell-{}-{started}", std::process::id())
 }
 
-/// Starts a command in a process group of its own.
-fn start(command: &str, cwd: Option<&Utf8Path>, cap: usize) -> Result<Process> {
-    Process::start(command, cwd.map(Utf8Path::as_std_path), cap).map_err(|err| {
+/// Starts a command in a process group of its own, under the host sandbox.
+///
+/// The command string is prepared first so the argv that runs is the one that
+/// was reviewed, then wrapped by the sandbox. A host with no usable backend
+/// refuses rather than running the command unrestricted, because a sandbox that
+/// silently does nothing is worse than one that is absent.
+fn start(
+    command: &str,
+    cwd: Option<&Utf8Path>,
+    cap: usize,
+    context: &ExecutionContext,
+) -> Result<Process> {
+    let workspace = cwd.unwrap_or(&context.workspace);
+    // The shell tool exists to run shell commands, so its input always goes to a
+    // shell: routing a bare word to direct argv would break builtins such as
+    // `exit`.
+    let prepared = rune_exec::command::prepare_shell(command, workspace, None, BTreeMap::new())?;
+    let policy = rune_exec::SandboxPolicy::new(
+        context.workspace.clone(),
+        context.additional_roots.clone(),
+        // The tool layer is not a policy decider: whether a command may reach
+        // the network is settled before it runs, so the sandbox mirrors the
+        // context rather than choosing.
+        context.external_access,
+    );
+    let wrapped = rune_exec::detect().wrap(&prepared, &policy, context.external_access)?;
+
+    Process::start_argv(&wrapped.argv, cwd.map(Utf8Path::as_std_path), cap).map_err(|err| {
         let hint = match cwd {
             Some(cwd) => format!("the command starts in `{cwd}`"),
             None => String::from("the command starts in the workspace root"),
@@ -1131,6 +1156,63 @@ mod tests {
         );
         let _ = watcher.join();
         let _ = stop(&tool, &context, &id);
+    }
+
+    #[test]
+    fn a_command_cannot_write_outside_the_workspace() {
+        // The workspace is the temporary directory, so a write elsewhere is
+        // outside it. Without the sandbox in the command path this succeeds,
+        // which is what makes the assertion meaningful rather than decorative.
+        let tool = shell(4, 64 * 1024);
+        let (_dir, context) = workspace();
+        let outside = std::env::temp_dir().join("rune-sandbox-escape-probe.txt");
+        let _ = std::fs::remove_file(&outside);
+
+        // The command itself fails, so this asserts on the call rather than
+        // through the success helper.
+        let output = call(
+            &tool,
+            &context,
+            &serde_json::json!({
+                "action": "run",
+                "command": format!("echo escaped > {}", outside.display()),
+                "yield_time_ms": 2_000,
+            }),
+        );
+        assert!(
+            !outside.exists(),
+            "a sandboxed command wrote outside the workspace: {}",
+            output.text
+        );
+        assert!(
+            output.text.contains("not permitted") || output.is_error,
+            "the refusal was not reported: {}",
+            output.text
+        );
+        let _ = std::fs::remove_file(&outside);
+    }
+
+    #[test]
+    fn a_command_can_still_write_inside_the_workspace() {
+        // The companion to the test above: a sandbox that denied every write
+        // would pass it, so this shows the restriction is scoped.
+        let tool = shell(4, 64 * 1024);
+        let (_dir, context) = workspace();
+        let inside = context.workspace.join("written.txt");
+
+        text(
+            &tool,
+            &context,
+            &serde_json::json!({
+                "action": "run",
+                "command": format!("echo kept > {inside}"),
+                "yield_time_ms": 2_000,
+            }),
+        );
+        assert!(
+            inside.exists(),
+            "a sandboxed command could not write inside the workspace"
+        );
     }
 
     #[test]

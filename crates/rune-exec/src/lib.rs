@@ -16,7 +16,7 @@ pub mod session;
 
 pub use command::{
     CommandOutcome, DEFAULT_SHELL, Exit, PreparedCommand, TRUNCATION_MARKER, prepare,
-    requires_shell, run, run_with_limits, shell_reason, verify_unchanged,
+    prepare_shell, requires_shell, run, run_with_limits, shell_reason, verify_unchanged,
 };
 pub use sandbox::{
     LinuxSandbox, MacSandbox, NAMESPACE_HELPER, NullSandbox, SEATBELT_TOOL, Sandbox, SandboxPolicy,

@@ -186,6 +186,40 @@ pub fn prepare(
     })
 }
 
+/// Prepares a command that must be parsed by a shell.
+///
+/// The shell tool exists to run shell commands, so its input is always handed to
+/// a shell: routing a bare word to direct argv would break builtins such as
+/// `exit` and would silently ignore a function or alias the same way the direct
+/// route is meant to avoid doing for an authorized command.
+pub fn prepare_shell(
+    command: &str,
+    workspace: &Utf8Path,
+    shell: Option<&str>,
+    environment: BTreeMap<String, String>,
+) -> Result<PreparedCommand> {
+    if command.trim().is_empty() {
+        return Err(RuneError::invalid_field(
+            "command",
+            "a command cannot be empty",
+        ));
+    }
+    let shell = shell.unwrap_or(DEFAULT_SHELL);
+    if !Utf8Path::new(shell).is_absolute() {
+        return Err(RuneError::invalid_field(
+            "shell",
+            format!("`{shell}` is not an absolute path"),
+        )
+        .with_hint("a shell resolved through PATH is not the program that was reviewed"));
+    }
+    Ok(PreparedCommand {
+        argv: vec![shell.to_owned(), String::from("-c"), command.to_owned()],
+        cwd: workspace.to_owned(),
+        environment,
+        reviewed: command.to_owned(),
+    })
+}
+
 /// Returns true when a command has to be parsed by a shell.
 #[must_use]
 pub fn requires_shell(command: &str) -> bool {
