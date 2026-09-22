@@ -43,6 +43,19 @@ pub struct Shell {
     state: Mutex<State>,
 }
 
+/// Returns what a stop on this session will end.
+///
+/// A group is what a session is started in where the platform has them; where it
+/// does not, the session's own process is what a stop reaches, and its tree is
+/// ended from there.
+fn ended_by(process: u32) -> String {
+    if cfg!(unix) {
+        format!("process group {process}")
+    } else {
+        format!("process tree {process}")
+    }
+}
+
 /// The sessions one tool instance owns.
 #[derive(Debug, Default)]
 struct State {
@@ -188,7 +201,7 @@ impl Shell {
             return Ok(finish(text, exit));
         }
 
-        let state = format!("session {id} running, process group {}", process.id());
+        let state = format!("session {id} running, {}", ended_by(process.id()));
         let mut seen = (0, 0);
         let text = observe(&process, &command, &state, &mut seen, cap);
         let session = Arc::new(Session {
@@ -244,7 +257,7 @@ impl Shell {
         }
         let state = match ended {
             Some(exit) => format!("session {id} ended: {}", exit.describe()),
-            None => format!("session {id} running"),
+            None => format!("session {id} running, {}", ended_by(session.process.id())),
         };
         let mut seen = lock(&session.seen);
         let text = observe(&session.process, &session.command, &state, &mut seen, cap);
@@ -769,11 +782,11 @@ mod tests {
     fn running(text: &str) -> (String, String) {
         let line = text
             .lines()
-            .find(|line| line.contains(" running, process group "))
+            .find(|line| line.contains(" running, "))
             .unwrap_or_else(|| panic!("no running session in {text}"));
         let rest = line.split_once("session ").expect("a session id").1;
         let (id, group) = rest
-            .split_once(" running, process group ")
+            .split_once(" running, ")
             .expect("a session id and a group");
         (
             id.trim().to_owned(),
@@ -853,6 +866,7 @@ mod tests {
     /// copies its input to its output. The platform that expands a variable
     /// before running the line needs a program that reads rather than a
     /// builtin that sets.
+    #[cfg(unix)]
     fn echo_input_then_sleep() -> String {
         if cfg!(windows) {
             format!("more & {}", long_sleep())
@@ -862,6 +876,7 @@ mod tests {
     }
 
     /// Returns a command that reads one line and prints it back with a prefix.
+    #[cfg(unix)]
     fn echo_input() -> String {
         if cfg!(windows) {
             // The platform's shell would expand a variable before the line is
@@ -888,9 +903,9 @@ mod tests {
     /// Returns a command that prints far more than the cap and then keeps going.
     fn flood_then_wait() -> String {
         if cfg!(windows) {
-            // The lines are emitted by a subshell so the wait that follows is
-            // run once rather than once per line.
-            format!("call {} & {}", numbered_lines(2000), long_sleep())
+            // The loop is a builtin that ends on its own, so the wait after it
+            // is reached once the lines are out.
+            format!("{} & {}", numbered_lines(2000), long_sleep())
         } else {
             format!("{}; {}", numbered_lines(2000), long_sleep())
         }
@@ -1065,6 +1080,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_server_returns_a_session_and_an_interaction_reads_its_output() {
         let tool = Shell::default();
@@ -1650,6 +1666,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_session_that_ended_is_reported_once_and_then_forgotten() {
         let tool = Shell::default();
@@ -1824,6 +1841,7 @@ mod tests {
         let _ = stop(&tool, &context, &id);
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_stopped_session_takes_no_more_input() {
         let tool = Shell::default();

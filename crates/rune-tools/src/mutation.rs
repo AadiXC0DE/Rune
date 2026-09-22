@@ -47,10 +47,34 @@ const HASH_BUFFER_BYTES: usize = 64 * 1024;
 /// The preimage hash proves the bytes are the ones that were read; the identity
 /// proves it is still the same file, which catches a replacement that happens
 /// to carry identical bytes.
+///
+/// The value is the digest of a handle to the file, which every platform can
+/// produce: one numbers a file by the device and inode it lives at, another by
+/// its volume and file index. A file's size and times are not an identity, since
+/// two files created in the same instant share them.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct FileIdentity {
-    device: u64,
-    inode: u64,
+pub struct FileIdentity(u64);
+
+impl FileIdentity {
+    /// Returns the identity of an open file.
+    ///
+    /// The handle is taken from the open file rather than from its path, so the
+    /// identity describes the file that was read even if that name now points
+    /// somewhere else. One platform numbers a file by the device and inode it
+    /// lives at, the other by its volume and file index.
+    fn of(file: &File) -> Self {
+        use std::hash::{Hash as _, Hasher as _};
+
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        // A file whose handle cannot be taken has no identity, so nothing is
+        // written into the digest and every such file compares equal to every
+        // other. The preimage hash is then the only check left, which is the
+        // guarantee this had before an identity existed.
+        if let Ok(Ok(handle)) = file.try_clone().map(same_file::Handle::from_file) {
+            handle.hash(&mut hasher);
+        }
+        Self(hasher.finish())
+    }
 }
 
 /// Which occurrence of a match an edit replaces.
@@ -496,7 +520,7 @@ fn read_preimage(path: &Utf8Path) -> Result<Option<Snapshot>> {
     }
     let file = File::open(path.as_std_path()).map_err(|err| io_error(path, &err))?;
     let metadata = file.metadata().map_err(|err| io_error(path, &err))?;
-    let identity = identity_of(&metadata);
+    let identity = FileIdentity::of(&file);
     let permissions = metadata.permissions();
     let limit = u64::try_from(MAX_TOTAL_BYTES.saturating_add(1)).unwrap_or(u64::MAX);
     let mut bytes = Vec::with_capacity(observed.min(MAX_TOTAL_BYTES));
@@ -528,7 +552,7 @@ fn identity_and_hash(path: &Utf8Path) -> Result<Option<(FileIdentity, [u8; 32])>
         Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
         Err(err) => return Err(io_error(path, &err)),
     };
-    let identity = identity_of(&file.metadata().map_err(|err| io_error(path, &err))?);
+    let identity = FileIdentity::of(&file);
     let mut hasher = Sha256::new();
     let mut buffer = vec![0u8; HASH_BUFFER_BYTES].into_boxed_slice();
     loop {
@@ -552,44 +576,6 @@ fn revalidate(path: &Utf8Path, identity: Option<&FileIdentity>, hash: &[u8; 32])
         _ => false,
     };
     if unchanged { Ok(()) } else { Err(stale(path)) }
-}
-
-#[cfg(unix)]
-fn identity_of(metadata: &std::fs::Metadata) -> FileIdentity {
-    use std::os::unix::fs::MetadataExt;
-
-    FileIdentity {
-        device: metadata.dev(),
-        inode: metadata.ino(),
-    }
-}
-
-#[cfg(windows)]
-fn identity_of(metadata: &std::fs::Metadata) -> FileIdentity {
-    use std::os::windows::fs::MetadataExt as _;
-
-    // The volume and file index this platform has are not readable without a
-    // nightly feature, so the times are used instead. They are not an identity
-    // on their own, but together with the preimage hash they tell a file that
-    // was replaced from the one that was read, including when the replacement
-    // carries the same bytes and the same length. Length alone does not: a swap
-    // between two equal-length files leaves it unchanged.
-    FileIdentity {
-        device: metadata.creation_time(),
-        inode: metadata.last_write_time(),
-    }
-}
-
-#[cfg(not(any(unix, windows)))]
-fn identity_of(metadata: &std::fs::Metadata) -> FileIdentity {
-    // No identity is available here, so the preimage length is all there is to
-    // compare. A replacement of the same length is caught by the hash rather
-    // than by the identity, which is a weaker guarantee than the other
-    // platforms give.
-    FileIdentity {
-        device: 0,
-        inode: metadata.len(),
-    }
 }
 
 #[cfg(unix)]

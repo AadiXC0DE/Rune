@@ -54,6 +54,7 @@ lexopt = "0.3"
 
 # Paths and identifiers
 camino = { version = "1", features = ["serde1"] }
+same-file = "1"
 uuid = { version = "1", features = ["v4", "v7", "serde"] }
 
 # Network. A blocking client keeps the async runtime off the command path
