@@ -5,6 +5,7 @@
 // shipped build, where a panic on user input is a defect.
 #![cfg_attr(test, allow(clippy::expect_used, clippy::unwrap_used, clippy::panic))]
 
+pub mod editor;
 pub mod engine;
 pub mod footer;
 pub mod frame;
