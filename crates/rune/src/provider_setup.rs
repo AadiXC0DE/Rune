@@ -402,6 +402,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn the_stored_credential_file_is_private() {
         use std::os::unix::fs::PermissionsExt as _;
@@ -536,6 +537,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn the_config_file_written_by_a_selection_is_private() {
         use std::os::unix::fs::PermissionsExt as _;

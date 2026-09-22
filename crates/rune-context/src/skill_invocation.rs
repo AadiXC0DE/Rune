@@ -501,6 +501,7 @@ mod tests {
         assert!(err.message().contains("absolute"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_reference_through_a_symlink_out_of_the_skill_is_refused() {
         let (_dir, root) = tree();

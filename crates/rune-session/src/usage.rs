@@ -1085,6 +1085,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_symlinked_ledger_is_refused() {
         let dir = tempfile::tempdir().expect("tempdir");

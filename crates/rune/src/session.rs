@@ -462,7 +462,16 @@ pub fn run<R: BufRead, W: std::io::Write>(
 /// configuration names, because the setting expresses a preference and the
 /// terminal states a capability.
 fn resolve_theme(config: &SessionConfig) -> Theme {
-    if std::env::var_os("NO_COLOR").is_some() {
+    resolve_theme_for(config, std::env::var_os("NO_COLOR").is_some())
+}
+
+/// Resolves the theme for a stated terminal capability.
+///
+/// The capability is a parameter because reading it from the environment makes a
+/// test that asserts the colorless path pass or fail depending on the shell it
+/// happens to run in.
+fn resolve_theme_for(config: &SessionConfig, accepts_no_color: bool) -> Theme {
+    if accepts_no_color {
         return Theme::no_color();
     }
     Theme::resolve(
@@ -996,7 +1005,14 @@ mod tests {
         // Capability beats preference: the setting expresses a wish, the
         // terminal states what it accepts, and the terminal wins.
         let config = colorless_config();
-        assert_eq!(resolve_theme(&config).base(), Theme::no_color().base());
+        let theme = resolve_theme_for(&config, true);
+        assert_eq!(theme.base(), Theme::no_color().base());
+
+        // The same configuration with a terminal that accepts color does take
+        // the configured theme, which is what shows the capability is the input
+        // rather than the configuration.
+        let with_color = resolve_theme_for(&config, false);
+        assert_ne!(with_color.base(), Theme::no_color().base());
     }
 
     #[test]

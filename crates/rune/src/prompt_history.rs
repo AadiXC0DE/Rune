@@ -411,6 +411,7 @@ mod tests {
         assert_eq!(History::open(&paths(root)).expect("open").len(), 0);
     }
 
+    #[cfg(unix)]
     #[test]
     fn the_history_file_is_private() {
         use std::os::unix::fs::PermissionsExt as _;

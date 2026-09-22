@@ -690,6 +690,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_symlinked_skill_file_inside_its_root_loads() {
         let (_dir, root) = tree();
@@ -706,6 +707,7 @@ mod tests {
         assert!(discovery.warnings.is_empty());
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_symlink_escaping_its_root_is_refused_with_a_warning() {
         let (_dir, root) = tree();
@@ -741,6 +743,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_directory_symlink_escaping_the_root_is_refused() {
         let (_dir, root) = tree();

@@ -5,6 +5,7 @@
     clippy::panic,
     clippy::indexing_slicing
 )]
+#![cfg(unix)]
 
 //! End-to-end tests for the protocol server.
 //!

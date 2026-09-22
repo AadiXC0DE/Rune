@@ -1089,6 +1089,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_symlinked_project_file_is_refused() {
         let dir = tempfile::TempDir::new().expect("tempdir");

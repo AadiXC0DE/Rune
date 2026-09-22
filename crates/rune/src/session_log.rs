@@ -51,6 +51,12 @@ pub struct Summary {
     pub events: usize,
     /// Last activity, as an ISO 8601 timestamp.
     pub updated_at: Option<String>,
+    /// Last activity in milliseconds since the epoch, used for ordering.
+    ///
+    /// The rendered timestamp has second resolution, so ordering by it leaves
+    /// two sessions started in the same second in an arbitrary order, and a
+    /// listing can then name the wrong session as the most recent one.
+    updated_at_ms: u64,
     /// Session title, when one was set.
     pub title: Option<String>,
     /// Workspace the session ran in, absent when none was recorded.
@@ -275,7 +281,7 @@ pub fn list_scoped(paths: &Paths, scope: Option<&Utf8Path>) -> Vec<Summary> {
 
     // An unreadable or absent timestamp sorts last rather than first, so a
     // damaged session never displaces a usable one.
-    out.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
+    out.sort_by_key(|row| std::cmp::Reverse(row.updated_at_ms));
     out.truncate(LIST_LIMIT);
     out
 }
@@ -589,6 +595,7 @@ fn summarize(state: &SessionState, dir: Utf8PathBuf) -> Summary {
             .events
             .last()
             .and_then(|frame| timestamp(frame.timestamp_ms)),
+        updated_at_ms: state.events.last().map_or(0, |frame| frame.timestamp_ms),
         title: state.title.clone(),
         workspace: state.workspace.clone(),
         parent: state.parent.clone(),
@@ -855,8 +862,9 @@ mod tests {
         first.turn(&outcome("old answer")).expect("wrote");
         drop(first);
 
-        std::thread::sleep(std::time::Duration::from_millis(5));
-
+        // A sleep that only spans a few milliseconds would leave the two
+        // sessions in the same whole second, which is what the ordering has to
+        // survive rather than rely on.
         let mut second = Recorder::create(&paths, &id("sessionfffff")).expect("created");
         second.user_message("new").expect("wrote");
         second.turn(&outcome("new answer")).expect("wrote");
@@ -865,6 +873,13 @@ mod tests {
         let rows = list_scoped(&paths, None);
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].id, "sessionfffff", "listing is not newest first");
+
+        // The rendered timestamps may be equal, so the order has to come from
+        // something finer than they show.
+        assert!(
+            rows[0].updated_at_ms >= rows[1].updated_at_ms,
+            "the listing is ordered against its own timestamps"
+        );
     }
 
     #[test]
@@ -981,6 +996,7 @@ mod tests {
                 turns: 3,
                 events: 9,
                 updated_at: Some("2026-01-02T03:04:05Z".to_owned()),
+                updated_at_ms: 1_704_164_645_000,
                 title: Some("parser work".to_owned()),
                 workspace: Some("/tmp/work".to_owned()),
                 parent: None,
@@ -991,6 +1007,7 @@ mod tests {
                 turns: 0,
                 events: 0,
                 updated_at: None,
+                updated_at_ms: 0,
                 title: None,
                 workspace: None,
                 parent: None,

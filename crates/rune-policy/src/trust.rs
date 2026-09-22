@@ -558,6 +558,7 @@ mod tests {
         assert!(err.hint().is_some());
     }
 
+    #[cfg(unix)]
     #[test]
     fn the_trust_file_is_private() {
         use std::os::unix::fs::PermissionsExt as _;
@@ -705,6 +706,7 @@ mod tests {
         assert!(decision.is_untrusted(), "a copied file carries no approval");
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_symlink_to_an_approved_workspace_resolves_to_it() {
         let dir = tempdir();
