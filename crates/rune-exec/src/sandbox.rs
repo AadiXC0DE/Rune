@@ -597,6 +597,7 @@ mod tests {
         assert_eq!(Support::Full.reason(), None);
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn a_full_backend_produces_the_wrapped_argv() {
         let (_dir, dir) = tempdir();
@@ -616,6 +617,7 @@ mod tests {
         assert!(verify_unchanged(&prepared).is_ok());
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn a_profile_grants_writes_under_each_writable_path_and_nowhere_else() {
         let (_dir, dir) = tempdir();
@@ -689,6 +691,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn a_full_backend_refuses_a_policy_it_cannot_express() {
         let (_dir, dir) = tempdir();
@@ -724,6 +727,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn the_linux_argv_keeps_the_route_and_carries_the_restriction() {
         let (_dir, dir) = tempdir();
@@ -765,6 +769,7 @@ mod tests {
         assert!(verify_unchanged(&prepared).is_ok());
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn the_linux_argv_grants_network_only_when_the_policy_does() {
         let (_dir, dir) = tempdir();

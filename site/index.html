@@ -58,7 +58,10 @@
     --rule-lit:   #3a352c;
     --text:       #e8e3d9;
     --dim:        #8f887a;
-    --faint:      #5d574d;
+    /* The quietest tier still has to be readable, so this clears the contrast
+       floor against the page background while staying below `--dim`, which is
+       what keeps three tiers distinguishable. */
+    --faint:      #867f73;
     --accent:     #ffb454;
     --warn:       #d98a5f;
     --ok:         #9ece6a;
@@ -104,6 +107,10 @@
     outline: 2px solid var(--accent);
     outline-offset: 3px;
   }
+
+  /* Selection is the terminal's own reversed video rather than the browser's
+     default highlight. */
+  ::selection { background: var(--accent); color: var(--ink); }
 
   .wrap {
     max-width: 1080px;
@@ -214,8 +221,47 @@
     font-size: .92rem;
     overflow-x: auto;
   }
+  /* `hidden` is how a tab panel is taken out of the layout, and a display
+     declaration beats it, so the attribute is honored explicitly. Without this
+     every panel renders at once. */
+  .cmd[hidden] { display: none; }
   .cmd span.ps { color: var(--faint); user-select: none; }
-  .cmd code { color: var(--text); white-space: nowrap; }
+  /* A terminal wraps a long line rather than pushing it off the edge, so a
+     command that does not fit continues on the next line and the pane needs no
+     horizontal scrolling. */
+  .cmd code {
+    color: var(--text);
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+  }
+
+  /* ---------- scrollbars ----------
+     The two inner panes can scroll, and a default scrollbar reads as a browser
+     control dropped into a terminal. They are drawn as a thin trough with a
+     quiet thumb instead, and the horizontal one only appears when the content
+     actually overflows. */
+  .cmd, .term-body {
+    scrollbar-width: thin;
+    scrollbar-color: var(--rule-lit) transparent;
+    overscroll-behavior-x: contain;
+  }
+  .cmd::-webkit-scrollbar, .term-body::-webkit-scrollbar {
+    height: 6px;
+    width: 6px;
+  }
+  .cmd::-webkit-scrollbar-track, .term-body::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  .cmd::-webkit-scrollbar-thumb, .term-body::-webkit-scrollbar-thumb {
+    background: var(--rule-lit);
+  }
+  .cmd::-webkit-scrollbar-thumb:hover, .term-body::-webkit-scrollbar-thumb:hover {
+    background: var(--faint);
+  }
+  /* The corner where the two bars meet has nothing to draw. */
+  .cmd::-webkit-scrollbar-corner, .term-body::-webkit-scrollbar-corner {
+    background: transparent;
+  }
 
   .copy {
     appearance: none;
@@ -270,7 +316,14 @@
     padding: 1rem .9rem;
     overflow-x: auto;
   }
-  .term-body p { margin: 0; white-space: pre; }
+  /* A terminal wraps a line at the column edge rather than running it off the
+     pane, so a long line continues on the next row. Leading spaces are part of
+     the output and are preserved. */
+  .term-body p {
+    margin: 0;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+  }
   .c-accent { color: var(--accent); }
   .c-dim { color: var(--dim); }
   .c-faint { color: var(--faint); }
@@ -310,6 +363,8 @@
     font-weight: 500;
     margin: 0 0 2rem;
   }
+  /* Sections are announced the way a document is written in a terminal. */
+  h2::before { content: "## "; color: var(--rule-lit); letter-spacing: 0; }
 
   .grid { display: grid; gap: 0; grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .cell {
@@ -340,6 +395,9 @@
     border-bottom: 1px solid var(--rule-lit);
   }
   td:first-child { color: var(--accent); white-space: nowrap; }
+  /* Each row is a command as it would be typed, so it carries the prompt a
+     terminal shows. */
+  td:first-child::before { content: "$ "; color: var(--faint); }
   td:last-child { color: var(--dim); padding-right: 0; }
   tbody tr + tr td { border-top: 1px solid var(--rule); }
 
@@ -555,7 +613,7 @@
     </div>
     <p class="credit">
       made by
-      <a href="https://github.com/AadiXC0DE" rel="author">aaditya subtlyn</a>
+      <a href="https://github.com/AadiXC0DE" rel="author">aaditya</a>
     </p>
   </div>
 </footer>

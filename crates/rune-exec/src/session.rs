@@ -487,6 +487,33 @@ mod tests {
     /// Bytes retained by the tests.
     const CAPTURE_BYTES: usize = 64 * 1024;
 
+    /// Returns a command that writes to both streams and exits with `code`.
+    fn echo_both_and_exit(code: i32) -> String {
+        if cfg!(windows) {
+            format!("echo out & echo err 1>&2 & exit /b {code}")
+        } else {
+            format!("echo out; echo err 1>&2; exit {code}")
+        }
+    }
+
+    /// Returns a command that exits with `code`.
+    fn exit_with(code: i32) -> String {
+        if cfg!(windows) {
+            format!("exit /b {code}")
+        } else {
+            format!("exit {code}")
+        }
+    }
+
+    /// Returns a command that echoes the line it reads.
+    fn read_and_echo() -> String {
+        if cfg!(windows) {
+            String::from("set /p line= & echo got %line%")
+        } else {
+            String::from("read line; echo got $line")
+        }
+    }
+
     /// Waits for a condition, polling until the deadline.
     fn wait_until(mut condition: impl FnMut() -> bool, timeout: Duration) -> bool {
         let deadline = Instant::now().checked_add(timeout);
@@ -502,6 +529,7 @@ mod tests {
     }
 
     /// Returns true while a process id exists.
+    #[cfg(unix)]
     fn alive(pid: &str) -> bool {
         Command::new("/bin/kill")
             .args(["-0", pid])
@@ -527,6 +555,7 @@ mod tests {
     }
 
     /// Returns the id the shell printed for the child it forked.
+    #[cfg(unix)]
     fn forked_child(process: &Process) -> Option<String> {
         text(process.stdout())
             .lines()
@@ -537,8 +566,7 @@ mod tests {
 
     #[test]
     fn both_streams_are_captured_and_the_status_is_reported() {
-        let process =
-            Process::start("echo out; echo err 1>&2; exit 3", None, CAPTURE_BYTES).expect("start");
+        let process = Process::start(&echo_both_and_exit(3), None, CAPTURE_BYTES).expect("start");
         let exit = exit_of(&process);
         assert_eq!(exit, Exit::Code(3));
         assert!(text(process.stdout()).contains("out"));
@@ -547,14 +575,13 @@ mod tests {
 
     #[test]
     fn a_successful_command_reports_success() {
-        let process = Process::start("exit 0", None, CAPTURE_BYTES).expect("start");
+        let process = Process::start(&exit_with(0), None, CAPTURE_BYTES).expect("start");
         assert!(exit_of(&process).is_success());
     }
 
     #[test]
     fn a_process_takes_input_from_its_standard_input() {
-        let process =
-            Process::start("read line; echo got $line", None, CAPTURE_BYTES).expect("start");
+        let process = Process::start(&read_and_echo(), None, CAPTURE_BYTES).expect("start");
         process.write(b"hello\n").expect("write");
         assert_eq!(exit_of(&process), Exit::Code(0));
         assert!(text(process.stdout()).contains("got hello"));
@@ -562,7 +589,7 @@ mod tests {
 
     #[test]
     fn input_to_an_exited_process_is_refused() {
-        let process = Process::start("exit 0", None, CAPTURE_BYTES).expect("start");
+        let process = Process::start(&exit_with(0), None, CAPTURE_BYTES).expect("start");
         let _ = exit_of(&process);
         assert!(process.write(b"hello\n").is_err());
     }
@@ -580,6 +607,7 @@ mod tests {
         assert!(buffer.since(8).bytes.is_empty());
     }
 
+    #[cfg(unix)]
     #[test]
     fn terminating_a_session_ends_a_forked_child() {
         let process =
@@ -604,6 +632,7 @@ mod tests {
         assert_eq!(process.exit(), Some(Exit::Signal(15)));
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_group_that_ignores_the_graceful_signal_is_killed() {
         // The marker is what says the trap is installed: signalling before the
@@ -628,11 +657,12 @@ mod tests {
 
     #[test]
     fn terminating_a_finished_process_reports_it_as_ended() {
-        let process = Process::start("exit 0", None, CAPTURE_BYTES).expect("start");
+        let process = Process::start(&exit_with(0), None, CAPTURE_BYTES).expect("start");
         let _ = exit_of(&process);
         assert!(process.terminate(false));
     }
 
+    #[cfg(unix)]
     #[test]
     fn dropping_a_process_ends_its_group() {
         let child;

@@ -36,6 +36,30 @@ pub const DEFAULT_SHELL: &str = "/bin/sh";
 #[cfg(not(unix))]
 pub const DEFAULT_SHELL: &str = "cmd.exe";
 
+/// Returns the shell that parses a command string on this host.
+///
+/// A shell has to be absolute to be verified as the program that was reviewed,
+/// and the platform that names its shell keeps it under the system directory,
+/// which is not always on the system drive. The conventional location is the
+/// fallback for a host that will not say where it is, so the value is always a
+/// path rather than a name to look up.
+#[must_use]
+pub fn default_shell() -> String {
+    #[cfg(windows)]
+    {
+        let root = std::env::var_os("SystemRoot").or_else(|| std::env::var_os("windir"));
+        if let Some(root) = root {
+            let candidate = Utf8PathBuf::from(root.to_string_lossy().into_owned())
+                .join("System32")
+                .join("cmd.exe");
+            if candidate.exists() {
+                return candidate.into_string();
+            }
+        }
+    }
+    DEFAULT_SHELL.to_owned()
+}
+
 /// Flag that hands a shell one string to interpret.
 #[cfg(unix)]
 pub const SHELL_COMMAND_FLAG: &str = "-c";
@@ -187,7 +211,8 @@ pub fn prepare(
             "a command cannot be empty",
         ));
     }
-    let shell = shell.unwrap_or(DEFAULT_SHELL);
+    let resolved = default_shell();
+    let shell = shell.unwrap_or(&resolved);
     if shell_reason(command).is_some() && !Utf8Path::new(shell).is_absolute() {
         return Err(RuneError::invalid_field(
             "shell",
@@ -221,7 +246,8 @@ pub fn prepare_shell(
             "a command cannot be empty",
         ));
     }
-    let shell = shell.unwrap_or(DEFAULT_SHELL);
+    let resolved = default_shell();
+    let shell = shell.unwrap_or(&resolved);
     if !Utf8Path::new(shell).is_absolute() {
         return Err(RuneError::invalid_field(
             "shell",
@@ -812,7 +838,7 @@ mod tests {
             let prepared = prepare(command, dir.as_path(), None, environment()).expect("prepare");
             assert_eq!(
                 prepared.argv,
-                [DEFAULT_SHELL, "-c", command],
+                [default_shell().as_str(), SHELL_COMMAND_FLAG, command],
                 "`{command}` did not route through the shell"
             );
             assert_eq!(prepared.reviewed, command);
@@ -1185,7 +1211,10 @@ mod tests {
         // one argument, so the shell's own parsing is what produced the words.
         let prepared =
             prepare("echo \"a  b\"", dir.as_path(), None, environment()).expect("prepare");
-        assert_eq!(prepared.argv, [DEFAULT_SHELL, "-c", "echo \"a  b\""]);
+        assert_eq!(
+            prepared.argv,
+            [default_shell().as_str(), "-c", "echo \"a  b\""]
+        );
         let outcome = run(&prepared, Duration::from_secs(10), &never).expect("run");
         assert_eq!(outcome.stdout, "a  b\n");
     }

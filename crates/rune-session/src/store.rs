@@ -1089,8 +1089,10 @@ mod tests {
         assert_eq!(read.events[1].event, user("after the tear"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_widened_log_file_is_refused_on_open() {
+        use std::os::unix::fs::PermissionsExt;
         let root = tempfile::tempdir().expect("tempdir");
         let (_paths, store) = store_in(&root);
         store.append(user("x")).expect("append");
@@ -1098,14 +1100,9 @@ mod tests {
         let log_path = store.events_path();
         drop(store);
 
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&log_path, std::fs::Permissions::from_mode(0o644))
-                .expect("widen");
-            let err = SessionStore::open(&dir).expect_err("refused");
-            assert_eq!(err.code(), ErrorCode::UnsafePath);
-        }
+        std::fs::set_permissions(&log_path, std::fs::Permissions::from_mode(0o644)).expect("widen");
+        let err = SessionStore::open(&dir).expect_err("refused");
+        assert_eq!(err.code(), ErrorCode::UnsafePath);
     }
 
     #[test]
