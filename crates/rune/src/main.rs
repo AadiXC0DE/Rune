@@ -145,7 +145,7 @@ fn run(launch: &Launch) -> Result<ExitCode> {
         Command::Session => Err(not_yet_available("per-session inspection")),
         Command::Usage => run_usage(&paths, launch, &output_flags),
         Command::Auth => run_auth(&settings, &paths, launch, &output_flags),
-        Command::Connect => run_connect(&settings, &paths, launch),
+        Command::Connect => run_connect(&settings, &paths, launch, &output_flags),
         Command::Models => run_models(&settings, &output_flags),
         Command::Permissions => run_permissions(&settings, launch, &output_flags),
         Command::Workspace => run_workspace(&settings, launch, &output_flags),
@@ -285,7 +285,7 @@ fn run_auth(
 ) -> Result<ExitCode> {
     let action = launch.args.first().map(String::as_str);
     match action {
-        Some("remove") | Some("logout") => {
+        Some("remove" | "logout") => {
             let provider = settings.provider.to_string();
             let removed = provider_setup::disconnect(paths, &provider)?;
             if output.json {
@@ -322,25 +322,59 @@ fn run_auth(
 
 /// Stores a credential for the configured provider.
 ///
-/// The value is read from the environment when the command does not carry one,
-/// so a credential never has to appear in a shell history or a process listing.
-fn run_connect(settings: &Settings, paths: &Paths, launch: &Launch) -> Result<ExitCode> {
-    let provider = settings.provider.to_string();
-    if settings.provider == Provider::Unconfigured {
+/// The provider is the positional argument. The credential comes from the
+/// environment when it is already exported, and from standard input otherwise,
+/// so it never has to appear in a shell history or a process listing.
+fn run_connect(
+    settings: &Settings,
+    paths: &Paths,
+    launch: &Launch,
+    output: &OutputFlags,
+) -> Result<ExitCode> {
+    let name = launch.args.first().map_or_else(
+        || settings.provider.to_string(),
+        |value| value.trim().to_owned(),
+    );
+    if name.is_empty() || name == "unconfigured" {
         return Err(
-            RuneError::new(ErrorCode::InvalidConfiguration, "no provider is selected")
-                .with_hint("set `provider` in the config, or pass `--provider`"),
+            RuneError::new(ErrorCode::InvalidConfiguration, "no provider was named")
+                .with_hint("name a provider, as in `rune connect anthropic`"),
         );
     }
 
+    let parsed = config::parse_provider(&name);
+    let base_url = provider_setup::resolve_endpoint(&parsed, settings.base_url.as_deref())?;
+
     let from_environment =
-        provider_setup::environment_credential(&provider, settings.api_key_env.as_deref());
-    let value = match launch.args.first() {
-        Some(value) => value.clone(),
-        None => from_environment.map_or_else(ask::read_stdin_prompt, Ok)?,
+        provider_setup::environment_credential(&name, settings.api_key_env.as_deref());
+    match from_environment {
+        Some(value) => provider_setup::connect(paths, &name, &value)?,
+        // Only prompt when no answer can be waiting: a machine caller supplies
+        // the variable rather than blocking on a terminal that will not answer.
+        None if output.json => {}
+        None => {
+            let value = ask::read_stdin_prompt()?;
+            provider_setup::connect(paths, &name, &value)?;
+        }
+    }
+
+    let selection = provider_setup::Selection {
+        provider: name.clone(),
+        model: (!settings.model.trim().is_empty()).then(|| settings.model.clone()),
+        base_url: Some(base_url),
     };
-    provider_setup::connect(paths, &provider, &value)?;
-    println!("stored a credential for {provider}");
+    provider_setup::save_selection(paths, &selection)?;
+
+    if output.json {
+        let value = serde_json::json!({
+            "provider": selection.provider,
+            "model": selection.model,
+            "base_url": selection.base_url,
+        });
+        println!("{}", serde_json::to_string_pretty(&value)?);
+    } else {
+        println!("connected {name}");
+    }
     Ok(ExitCode::from(EXIT_OK))
 }
 
