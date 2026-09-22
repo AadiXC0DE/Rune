@@ -31,6 +31,49 @@ fn state() -> FooterState {
 }
 
 #[test]
+fn a_frame_costs_bytes_in_proportion_to_what_changed() {
+    // Time is the wrong instrument for this: a loaded machine moves the number
+    // more than a regression does. The bytes are deterministic, and a full
+    // redraw is what an unbounded per-frame cost actually looks like from
+    // outside, so that is what is measured.
+    let transcript: Vec<String> = (0..40).map(|index| format!("line {index}")).collect();
+    let mut surface = FrameSurface::new(80, 24).expect("surface");
+
+    let mut first: Option<usize> = None;
+    let mut steady: Option<usize> = None;
+    let mut worst = 0_usize;
+
+    for tick in 0..200 {
+        let mut lines = transcript.clone();
+        lines.push(format!("tick {tick}"));
+        let regions = Regions::new(&lines, &[]);
+        let target = compose(&regions, 80, 24).expect("compose");
+        let bytes = surface.commit(&target).expect("commit").bytes.len();
+        if first.is_none() {
+            first = Some(bytes);
+        } else {
+            // After the first frame the screen differs by one appended line, so
+            // every later frame writes a bounded amount rather than the screen.
+            worst = worst.max(bytes);
+            steady = Some(bytes);
+        }
+    }
+
+    let first = first.expect("a first frame");
+    let steady = steady.expect("a later frame");
+    assert!(steady > 0, "a changed screen wrote nothing");
+    assert!(
+        steady < first,
+        "a steady-state frame cost {steady} bytes against {first} for the first, \
+         so a frame is redrawing the screen rather than the change"
+    );
+    assert!(
+        worst <= first,
+        "a later frame cost {worst} bytes, more than the {first} for the first"
+    );
+}
+
+#[test]
 fn a_committed_stream_rebuilds_the_screen_on_a_cleared_terminal() {
     let theme = Theme::fx_dark();
     let layout = footer::solve((80, 24), 1, false, footer::DEFAULT_MINIMUM_ROWS);
