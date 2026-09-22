@@ -462,7 +462,18 @@ impl ReviewSession {
         }
         let outcome = reviewer.review(request);
         match outcome {
-            ReviewOutcome::Clear { .. } => outcome,
+            ReviewOutcome::Clear {
+                ref reviewed_action,
+            } => {
+                // A clear names the action it reviewed. One that names a
+                // different action reviewed something else, so it settles
+                // nothing here.
+                if reviewed_action != &request.action {
+                    self.budget.hold();
+                    return ReviewOutcome::Invalid;
+                }
+                outcome
+            }
             ReviewOutcome::Caution { ref reason } => {
                 self.budget.hold();
                 self.cautions.push((request.action.clone(), reason.clone()));

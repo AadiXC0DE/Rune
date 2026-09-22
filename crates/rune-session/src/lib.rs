@@ -17,6 +17,7 @@ pub mod event;
 pub mod recovery;
 pub mod report;
 pub mod store;
+pub mod tree;
 pub mod usage;
 
 pub use event::{

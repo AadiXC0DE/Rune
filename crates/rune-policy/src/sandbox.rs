@@ -268,7 +268,7 @@ impl MacSandbox {
             };
             let _ = writeln!(
                 profile,
-                "(allow file-write* ({rule} \"{}\"))",
+                "(allow file-write* ({rule} {}))",
                 quote(&resolved)?
             );
         }
@@ -370,6 +370,7 @@ fn probe_seatbelt() -> Enforcement {
 #[derive(Clone, Debug)]
 pub struct LinuxSandbox {
     enforcement: Enforcement,
+    helper: Option<Utf8PathBuf>,
 }
 
 impl LinuxSandbox {
@@ -378,13 +379,30 @@ impl LinuxSandbox {
     pub fn detect() -> Self {
         Self {
             enforcement: probe_namespaces(),
+            helper: find_on_path(NAMESPACE_HELPER),
         }
     }
 
-    /// Builds a backend with a known probe result.
+    /// Builds a backend from a known probe result and helper location.
     #[must_use]
-    pub const fn with_enforcement(enforcement: Enforcement) -> Self {
-        Self { enforcement }
+    pub fn new(enforcement: Enforcement, helper: Option<Utf8PathBuf>) -> Self {
+        Self {
+            enforcement,
+            helper,
+        }
+    }
+
+    /// Builds a backend with a known probe result and a synthetic helper.
+    ///
+    /// Used by tests to exercise the argv a full-enforcement host would produce
+    /// without depending on the helper being installed, since the wrapping
+    /// itself is what is under test rather than whether this machine has it.
+    #[must_use]
+    pub fn with_enforcement(enforcement: Enforcement) -> Self {
+        Self {
+            enforcement,
+            helper: Some(Utf8PathBuf::from("/usr/bin/bwrap")),
+        }
     }
 
     /// Returns the argv for a workspace and its roots.
@@ -456,8 +474,11 @@ impl Sandbox for LinuxSandbox {
             }
             return Err(unavailable(self.name(), &self.support()));
         }
-        let helper = find_on_path(NAMESPACE_HELPER)
-            .ok_or_else(|| unavailable(self.name(), &self.support()))?;
+        let helper = match &self.helper {
+            Some(helper) => helper.clone(),
+            None => find_on_path(NAMESPACE_HELPER)
+                .ok_or_else(|| unavailable(self.name(), &self.support()))?,
+        };
         Self::argv(&helper, command, workspace, roots, network)
     }
 }
