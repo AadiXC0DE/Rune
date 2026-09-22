@@ -8,7 +8,7 @@
 //! - a run of tool results matches the preceding assistant tool calls exactly
 //! - every tool call identifier is unique within a message
 
-use rune_core::error::{ErrorCode, Result, RuneError};
+use rune_core::error::{Result, RuneError};
 use rune_core::id::ToolCallId;
 pub use rune_core::tool::{
     MAX_TOOL_NAME, MAX_TOOLS, ToolSpec, validate_tool_spec, validate_tool_specs,
@@ -311,6 +311,7 @@ pub fn validate(messages: &[Message]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rune_core::error::ErrorCode;
 
     fn call(id: &str, name: &str) -> ContentPart {
         ContentPart::ToolCall {

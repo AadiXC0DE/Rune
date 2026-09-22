@@ -678,7 +678,7 @@ mod tests {
         let extra = tempdir();
         let root = utf8(extra.path()).canonicalize_utf8().expect("resolve");
         let argv = MacSandbox::with_enforcement(Enforcement::Full)
-            .wrap("ls", &workspace, &[root.clone()], false, false)
+            .wrap("ls", &workspace, std::slice::from_ref(&root), false, false)
             .expect("wrapped");
         assert!(argv[2].contains(&format!("(allow file-write* (subpath \"{root}\"))")));
     }
@@ -689,7 +689,8 @@ mod tests {
         let extra = tempdir();
         let file = utf8(extra.path()).join("cache.json");
         std::fs::write(&file, "{}").expect("write");
-        let profile = MacSandbox::profile(&workspace, &[file.clone()], false).expect("profile");
+        let profile =
+            MacSandbox::profile(&workspace, std::slice::from_ref(&file), false).expect("profile");
         let resolved = file.canonicalize_utf8().expect("resolve");
         assert!(profile.contains(&format!("(allow file-write* (literal \"{resolved}\"))")));
         assert!(!profile.contains(&format!("(subpath \"{resolved}\"))")));
@@ -769,7 +770,7 @@ mod tests {
         let extra = tempdir();
         let root = utf8(extra.path()).canonicalize_utf8().expect("resolve");
         let argv = LinuxSandbox::with_enforcement(Enforcement::Full)
-            .wrap("ls", &workspace, &[root.clone()], true, true)
+            .wrap("ls", &workspace, std::slice::from_ref(&root), true, true)
             .expect("wrapped");
         assert!(
             argv.windows(3)
