@@ -1,0 +1,605 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+
+<title>Rune, a native coding agent harness</title>
+<meta name="description" content="A native coding agent harness: one small binary for the terminal, for scripts, and for embedding. Model agnostic, no daemon, no telemetry, no account. Open source, Apache-2.0.">
+<link rel="canonical" href="https://runes.dev/">
+<meta name="theme-color" content="#0c0b09">
+<meta name="color-scheme" content="dark">
+
+<meta property="og:type" content="website">
+<meta property="og:title" content="Rune, a native coding agent harness">
+<meta property="og:description" content="One small binary for the terminal, for scripts, and for embedding. Model agnostic, no daemon, no telemetry, no account. Open source.">
+<meta property="og:url" content="https://runes.dev/">
+<meta property="og:site_name" content="Rune">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="Rune, a native coding agent harness">
+<meta name="twitter:description" content="One small binary for the terminal, for scripts, and for embedding. Model agnostic, no daemon, no telemetry, no account. Open source.">
+
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' fill='%230c0b09'/><path d='M8 8h10a6 6 0 0 1 0 12h-4l6 8' fill='none' stroke='%23ffb454' stroke-width='3'/></svg>">
+
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "SoftwareApplication",
+  "name": "Rune",
+  "applicationCategory": "DeveloperApplication",
+  "operatingSystem": "macOS, Linux",
+  "description": "A native coding agent harness: one small binary for the terminal, for scripts, and for embedding.",
+  "license": "https://www.apache.org/licenses/LICENSE-2.0",
+  "isAccessibleForFree": true,
+  "codeRepository": "https://github.com/AadiXC0DE/Rune",
+  "downloadUrl": "https://github.com/AadiXC0DE/Rune/releases",
+  "author": {
+    "@type": "Person",
+    "name": "Aaditya",
+    "url": "https://github.com/AadiXC0DE"
+  },
+  "offers": {
+    "@type": "Offer",
+    "price": "0",
+    "priceCurrency": "USD"
+  }
+}
+</script>
+
+<style>
+  :root {
+    --ink:        #0c0b09;
+    --ink-raised: #131210;
+    --rule:       #26231e;
+    --rule-lit:   #3a352c;
+    --text:       #e8e3d9;
+    --dim:        #8f887a;
+    --faint:      #5d574d;
+    --accent:     #ffb454;
+    --warn:       #d98a5f;
+    --ok:         #9ece6a;
+
+    --step: 1.6rem;
+    --gutter: clamp(1.25rem, 4vw, 4rem);
+    --measure: 68ch;
+  }
+
+  *, *::before, *::after { box-sizing: border-box; }
+
+  html { -webkit-text-size-adjust: 100%; }
+
+  body {
+    margin: 0;
+    background: var(--ink);
+    color: var(--text);
+    font-family: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 15px;
+    line-height: 1.7;
+    font-feature-settings: "liga" 0;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  /* A faint scanline wash. Kept very low contrast so it reads as a surface
+     texture rather than as a pattern competing with the text. */
+  body::before {
+    content: "";
+    position: fixed;
+    inset: 0;
+    pointer-events: none;
+    z-index: 1;
+    background: repeating-linear-gradient(
+      to bottom,
+      rgb(255 255 255 / .014) 0 1px,
+      transparent 1px 3px
+    );
+  }
+
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; text-underline-offset: 3px; }
+  a:focus-visible, button:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 3px;
+  }
+
+  .wrap {
+    max-width: 1080px;
+    margin: 0 auto;
+    padding: 0 var(--gutter);
+    position: relative;
+    z-index: 2;
+  }
+
+  /* ---------- top bar ---------- */
+
+  .bar {
+    border-bottom: 1px solid var(--rule);
+    font-size: .82rem;
+    color: var(--dim);
+  }
+  .bar .wrap {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 1rem;
+    height: 56px;
+  }
+  .mark {
+    display: flex;
+    align-items: center;
+    gap: .6rem;
+    color: var(--text);
+    font-weight: 600;
+    letter-spacing: .02em;
+  }
+  .mark svg { display: block; }
+  .bar nav { display: flex; gap: 1.25rem; }
+  .bar nav a { color: var(--dim); }
+  .bar nav a:hover { color: var(--text); }
+
+  /* ---------- hero ---------- */
+
+  .hero { padding: clamp(3.5rem, 9vw, 7rem) 0 clamp(2.5rem, 6vw, 4rem); }
+
+  .hero-grid {
+    display: grid;
+    gap: clamp(2rem, 5vw, 3.5rem);
+    grid-template-columns: minmax(0, 1.4fr) minmax(0, 1fr);
+    align-items: stretch;
+  }
+
+  .eyebrow {
+    font-size: .74rem;
+    letter-spacing: .22em;
+    text-transform: uppercase;
+    color: var(--accent);
+    margin: 0 0 1.4rem;
+  }
+  .eyebrow::before { content: "// "; color: var(--faint); }
+
+  h1 {
+    font-size: clamp(1.75rem, 3.2vw, 2.7rem);
+    line-height: 1.15;
+    letter-spacing: -.02em;
+    font-weight: 600;
+    margin: 0 0 1.5rem;
+  }
+  h1 em { font-style: normal; color: var(--accent); }
+
+  .lede {
+    font-size: 1.02rem;
+    color: var(--dim);
+    max-width: 42ch;
+    margin: 0 0 2.2rem;
+  }
+  .lede strong { color: var(--text); font-weight: 500; }
+
+  /* ---------- install ---------- */
+
+  .install { border: 1px solid var(--rule-lit); background: var(--ink-raised); }
+
+  .tabs {
+    display: flex;
+    border-bottom: 1px solid var(--rule);
+    font-size: .74rem;
+    letter-spacing: .14em;
+    text-transform: uppercase;
+  }
+  .tabs button {
+    appearance: none;
+    background: none;
+    border: 0;
+    border-right: 1px solid var(--rule);
+    color: var(--faint);
+    font: inherit;
+    letter-spacing: inherit;
+    text-transform: inherit;
+    padding: .7rem 1rem;
+    cursor: pointer;
+  }
+  .tabs button:hover { color: var(--dim); }
+  .tabs button[aria-selected="true"] {
+    color: var(--accent);
+    background: rgb(255 180 84 / .05);
+  }
+
+  .cmd {
+    display: flex;
+    align-items: baseline;
+    gap: .9rem;
+    padding: 1rem 1rem;
+    font-size: .92rem;
+    overflow-x: auto;
+  }
+  .cmd span.ps { color: var(--faint); user-select: none; }
+  .cmd code { color: var(--text); white-space: nowrap; }
+
+  .copy {
+    appearance: none;
+    background: none;
+    border: 1px solid var(--rule);
+    color: var(--faint);
+    font: inherit;
+    font-size: .72rem;
+    letter-spacing: .12em;
+    text-transform: uppercase;
+    padding: .35rem .6rem;
+    margin-left: auto;
+    cursor: pointer;
+  }
+  .copy:hover { color: var(--accent); border-color: var(--rule-lit); }
+  .copy[data-done="true"] { color: var(--ok); border-color: var(--ok); }
+
+  .note {
+    border-top: 1px solid var(--rule);
+    padding: .8rem 1rem;
+    font-size: .8rem;
+    color: var(--dim);
+  }
+  .note strong { color: var(--dim); font-weight: 500; }
+
+  /* ---------- terminal panel ---------- */
+
+  .right { display: flex; flex-direction: column; gap: 1.5rem; }
+
+  .term {
+    border: 1px solid var(--rule-lit);
+    background: #0a0908;
+    font-size: .8rem;
+    line-height: 1.75;
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+  }
+  .term-body { flex: 1; }
+  .term-head {
+    display: flex;
+    align-items: center;
+    gap: .45rem;
+    padding: .55rem .8rem;
+    border-bottom: 1px solid var(--rule);
+    color: var(--faint);
+    font-size: .72rem;
+    letter-spacing: .1em;
+  }
+  .dot { width: 9px; height: 9px; border: 1px solid var(--rule-lit); }
+  .term-body {
+    padding: 1rem .9rem;
+    overflow-x: auto;
+  }
+  .term-body p { margin: 0; white-space: pre; }
+  .c-accent { color: var(--accent); }
+  .c-dim { color: var(--dim); }
+  .c-faint { color: var(--faint); }
+  .c-ok { color: var(--ok); }
+  .c-warn { color: var(--warn); }
+
+  .caret {
+    display: inline-block;
+    width: .55em;
+    height: 1em;
+    background: var(--accent);
+    vertical-align: -.16em;
+    animation: blink 1.1s steps(1) infinite;
+  }
+  @keyframes blink { 0%, 50% { opacity: 1 } 50.01%, 100% { opacity: 0 } }
+
+  .facts { margin: 0; font-size: .78rem; }
+  .facts > div {
+    display: flex;
+    gap: 1rem;
+    justify-content: space-between;
+    padding: .55rem 0;
+    border-top: 1px solid var(--rule);
+  }
+  .facts dt { color: var(--faint); }
+  .facts dd { margin: 0; color: var(--dim); text-align: right; }
+
+  /* ---------- sections ---------- */
+
+  section { border-top: 1px solid var(--rule); padding: clamp(2.5rem, 6vw, 4rem) 0; }
+
+  h2 {
+    font-size: .74rem;
+    letter-spacing: .22em;
+    text-transform: uppercase;
+    color: var(--faint);
+    font-weight: 500;
+    margin: 0 0 2rem;
+  }
+
+  .grid { display: grid; gap: 0; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .cell {
+    padding: 1.5rem 2rem 1.5rem 0;
+    border-top: 1px solid var(--rule);
+  }
+  .cell:nth-child(-n+2) { border-top: 0; padding-top: 0; }
+  .cell:nth-child(even) { padding-left: 2rem; border-left: 1px solid var(--rule); }
+  .cell h3 {
+    font-size: .95rem;
+    font-weight: 600;
+    margin: 0 0 .5rem;
+    color: var(--text);
+  }
+  .cell h3::before { content: "→ "; color: var(--accent); font-weight: 400; }
+  .cell p { margin: 0; color: var(--dim); font-size: .88rem; max-width: 46ch; }
+
+  /* ---------- commands ---------- */
+
+  table { width: 100%; border-collapse: collapse; font-size: .86rem; }
+  th, td { text-align: left; padding: .7rem 1rem .7rem 0; vertical-align: top; }
+  th {
+    font-size: .72rem;
+    letter-spacing: .14em;
+    text-transform: uppercase;
+    color: var(--faint);
+    font-weight: 500;
+    border-bottom: 1px solid var(--rule-lit);
+  }
+  td:first-child { color: var(--accent); white-space: nowrap; }
+  td:last-child { color: var(--dim); padding-right: 0; }
+  tbody tr + tr td { border-top: 1px solid var(--rule); }
+
+  /* ---------- footer ---------- */
+
+  footer {
+    border-top: 1px solid var(--rule);
+    padding: 2rem 0 3rem;
+    font-size: .82rem;
+    color: var(--faint);
+  }
+  .foot-grid {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 1rem 2rem;
+    justify-content: space-between;
+    align-items: baseline;
+  }
+  .foot-links { display: flex; flex-wrap: wrap; gap: 1.25rem; }
+  .foot-links a { color: var(--dim); }
+
+  .credit { color: var(--faint); }
+  .credit a { color: var(--dim); border-bottom: 1px solid var(--rule-lit); }
+  .credit a:hover { color: var(--accent); border-color: var(--accent); }
+
+  /* ---------- responsive ---------- */
+
+  @media (max-width: 860px) {
+    .hero-grid { grid-template-columns: minmax(0, 1fr); }
+    .grid { grid-template-columns: minmax(0, 1fr); }
+    .cell, .cell:nth-child(even) {
+      padding: 1.25rem 0;
+      border-left: 0;
+    }
+    .cell:nth-child(2) { border-top: 1px solid var(--rule); padding-top: 1.25rem; }
+    .bar nav { gap: .9rem; }
+    .bar nav a:not(.keep) { display: none; }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .caret { animation: none; opacity: 1; }
+    html { scroll-behavior: auto; }
+  }
+</style>
+</head>
+<body>
+
+<header class="bar">
+  <div class="wrap">
+    <span class="mark">
+      <svg width="18" height="18" viewBox="0 0 32 32" aria-hidden="true"><path d="M8 8h10a6 6 0 0 1 0 12h-4l6 8" fill="none" stroke="#ffb454" stroke-width="3"/></svg>
+      rune
+    </span>
+    <nav>
+      <a href="#install">install</a>
+      <a href="#why">why</a>
+      <a href="#commands">commands</a>
+      <a class="keep" href="https://github.com/AadiXC0DE/Rune">github</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+
+  <section class="hero" style="border-top:0">
+    <div class="wrap hero-grid">
+
+      <div>
+        <p class="eyebrow">Apache-2.0 · open source</p>
+        <h1>A coding agent<br>that is one <em>binary</em>.</h1>
+        <p class="lede">
+          Point it at the endpoint you already pay for. <strong>No hosted service</strong>,
+          no daemon, no telemetry, no account. It runs in your terminal, in a script,
+          or embedded in your own program.
+        </p>
+
+        <div class="install" id="install">
+          <div class="tabs" role="tablist">
+            <button role="tab" aria-selected="true" data-target="brew">homebrew</button>
+            <button role="tab" aria-selected="false" data-target="source">from source</button>
+            <button role="tab" aria-selected="false" data-target="cargo">cargo</button>
+          </div>
+
+          <div class="cmd" data-panel="brew">
+            <span class="ps">$</span>
+            <code id="cmd-brew">brew install aadixc0de/tap/rune</code>
+            <button class="copy" data-copy="cmd-brew">copy</button>
+          </div>
+          <div class="cmd" data-panel="source" hidden>
+            <span class="ps">$</span>
+            <code id="cmd-source">git clone https://github.com/AadiXC0DE/Rune &amp;&amp; cd Rune &amp;&amp; cargo build --release</code>
+            <button class="copy" data-copy="cmd-source">copy</button>
+          </div>
+          <div class="cmd" data-panel="cargo" hidden>
+            <span class="ps">$</span>
+            <code id="cmd-cargo">cargo install --git https://github.com/AadiXC0DE/Rune rune</code>
+            <button class="copy" data-copy="cmd-cargo">copy</button>
+          </div>
+
+          <p class="note">
+            <strong>rune</strong> is taken in Homebrew core by an unrelated language,
+            so the tap is named explicitly. Then connect a provider, because a fresh
+            install has none.
+          </p>
+        </div>
+      </div>
+
+      <div class="right">
+      <div class="term">
+        <div class="term-head">
+          <span class="dot"></span><span class="dot"></span><span class="dot"></span>
+          <span style="margin-left:.5rem">rune doctor</span>
+        </div>
+        <div class="term-body">
+          <p><span class="c-faint">$</span> <span class="c-accent">rune doctor</span></p>
+          <p>rune <span class="c-dim">0.1.0</span></p>
+          <p> </p>
+          <p><span class="c-ok">ok</span>   <span class="c-dim">workspace</span>      /Users/you/project</p>
+          <p><span class="c-ok">ok</span>   <span class="c-dim">state root</span>     ~/.local/state/rune</p>
+          <p><span class="c-ok">ok</span>   <span class="c-dim">configuration</span>  every layer parsed</p>
+          <p><span class="c-warn">?</span>    <span class="c-dim">provider</span>       no provider connected</p>
+          <p>                    <span class="c-faint">run 'rune connect' to choose one</span></p>
+          <p><span class="c-ok">ok</span>   <span class="c-dim">sandbox</span>        seatbelt restricts every command</p>
+          <p> </p>
+          <p><span class="c-faint">$</span> <span class="c-accent">rune</span> <span class="c-dim">"why does the build fail on CI?"</span><span class="caret"></span></p>
+        </div>
+      </div>
+
+      <dl class="facts">
+        <div><dt>license</dt><dd>Apache-2.0</dd></div>
+        <div><dt>runtime</dt><dd>none, one binary</dd></div>
+        <div><dt>writes</dt><dd>your workspace, nothing else</dd></div>
+        <div><dt>telemetry</dt><dd>none</dd></div>
+      </dl>
+      </div>
+
+    </div>
+  </section>
+
+  <section id="why">
+    <div class="wrap">
+      <h2>what it does differently</h2>
+      <div class="grid">
+        <div class="cell">
+          <h3>Small and fast, enforced</h3>
+          <p>Binary size and startup are budgets checked in CI, not aspirations. The
+             argument and configuration paths never load the agent runtime.</p>
+        </div>
+        <div class="cell">
+          <h3>Model and provider agnostic</h3>
+          <p>Any OpenAI-compatible endpoint, the Responses API, Anthropic, or one you
+             name yourself. Connect it once and it is remembered.</p>
+        </div>
+        <div class="cell">
+          <h3>Permission first</h3>
+          <p>Every sensitive action passes a policy gate, and <code>rune permissions</code>
+             tells you exactly which rule decided it rather than leaving you guessing.</p>
+        </div>
+        <div class="cell">
+          <h3>Sandboxed execution</h3>
+          <p>Commands run under the platform sandbox where one exists, so an agent
+             cannot write outside your workspace. <code>rune doctor</code> reports what
+             your host can enforce.</p>
+        </div>
+        <div class="cell">
+          <h3>Sessions you can resume</h3>
+          <p>Every turn is written as it runs. Interrupt anything and pick the session
+             back up, or copy a damaged one into a new one rather than losing it.</p>
+        </div>
+        <div class="cell">
+          <h3>Local by default</h3>
+          <p>Sessions, usage, and credentials stay on your machine. <code>--offline</code>
+             refuses every outbound request, and a test proves it makes none.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section id="commands">
+    <div class="wrap">
+      <h2>the surface</h2>
+      <table>
+        <thead>
+          <tr><th>Command</th><th>What it does</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>rune</td><td>Start an interactive session.</td></tr>
+          <tr><td>rune ask "..."</td><td>One request, prints the answer. Pipe it, script it, read it as JSON.</td></tr>
+          <tr><td>rune review</td><td>Review the pending changes in this repository.</td></tr>
+          <tr><td>rune resume last</td><td>Continue the most recent session in this workspace.</td></tr>
+          <tr><td>rune connect</td><td>Connect a provider and remember the choice.</td></tr>
+          <tr><td>rune permissions</td><td>See the rules, and why one of them decided what it did.</td></tr>
+          <tr><td>rune doctor</td><td>Check what this machine supports.</td></tr>
+          <tr><td>rune acp</td><td>Serve the Agent Client Protocol so an editor can drive a session.</td></tr>
+        </tbody>
+      </table>
+      <p class="note" style="border:0;padding-left:0;margin-top:1.5rem">
+        Custom slash commands live in <code>.rune/commands/*.md</code> in a repository,
+        so a team can ship a workflow alongside the code.
+      </p>
+    </div>
+  </section>
+
+</main>
+
+<footer>
+  <div class="wrap foot-grid">
+    <div class="foot-links">
+      <a href="https://github.com/AadiXC0DE/Rune">source</a>
+      <a href="https://github.com/AadiXC0DE/Rune/releases">releases</a>
+      <a href="https://github.com/AadiXC0DE/Rune/blob/main/COMMANDS.md">commands</a>
+      <a href="https://github.com/AadiXC0DE/Rune/blob/main/LICENSE">apache-2.0</a>
+    </div>
+    <p class="credit">
+      made by
+      <a href="https://github.com/AadiXC0DE" rel="author">aaditya subtlyn</a>
+    </p>
+  </div>
+</footer>
+
+<script>
+  // Tabs swap one panel at a time; the command panel is the only state on the
+  // page, so this stays a handful of lines rather than a framework.
+  const tabs = document.querySelectorAll('.tabs button');
+  const panels = document.querySelectorAll('[data-panel]');
+
+  function select(name) {
+    tabs.forEach((tab) => {
+      tab.setAttribute('aria-selected', String(tab.dataset.target === name));
+    });
+    panels.forEach((panel) => {
+      panel.hidden = panel.dataset.panel !== name;
+    });
+  }
+
+  tabs.forEach((tab) => {
+    tab.addEventListener('click', () => select(tab.dataset.target));
+  });
+
+  // Copy is the one action a visitor takes here, so the button reports what
+  // happened rather than leaving them unsure whether it worked.
+  document.querySelectorAll('.copy').forEach((button) => {
+    button.addEventListener('click', async () => {
+      const source = document.getElementById(button.dataset.copy);
+      if (!source) return;
+      try {
+        await navigator.clipboard.writeText(source.textContent.trim());
+        button.textContent = 'copied';
+        button.dataset.done = 'true';
+      } catch {
+        // A browser without clipboard access still lets the text be selected.
+        button.textContent = 'select it';
+      }
+      setTimeout(() => {
+        button.textContent = 'copy';
+        button.dataset.done = 'false';
+      }, 1600);
+    });
+  });
+</script>
+
+</body>
+</html>
