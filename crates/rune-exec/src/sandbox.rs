@@ -839,4 +839,58 @@ mod tests {
             "the sandboxed command wrote outside the workspace"
         );
     }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_sandboxed_command_can_still_write_inside_the_workspace() {
+        // Without this, a backend that denied every write would pass the test
+        // above. The pair is what shows the restriction is scoped rather than
+        // blanket.
+        let sandbox = MacSandbox::detect();
+        if !sandbox.support().is_full() {
+            return;
+        }
+        let (_dir, dir) = tempdir();
+        let inside = dir.join("written.txt");
+        let command = format!("/bin/sh -c 'echo kept > {inside}'");
+        let prepared = prepare(&command, dir.as_path(), None, environment()).expect("prepare");
+        let wrapped = sandbox
+            .wrap(&prepared, &policy(dir.as_path()), false)
+            .expect("wrap");
+        let outcome = run(&wrapped, Duration::from_secs(20), &never).expect("run");
+        assert!(
+            outcome.exit.is_success(),
+            "a write inside the workspace was refused: {outcome:?}"
+        );
+        assert!(
+            inside.exists(),
+            "the sandboxed command did not write inside the workspace"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_sandboxed_command_still_reads_a_path_it_may_read() {
+        let sandbox = MacSandbox::detect();
+        if !sandbox.support().is_full() {
+            return;
+        }
+        let (_dir, dir) = tempdir();
+        let readable = dir.join("input.txt");
+        std::fs::write(&readable, "contents").expect("write");
+        let command = format!("/bin/cat {readable}");
+        let prepared = prepare(&command, dir.as_path(), None, environment()).expect("prepare");
+        let wrapped = sandbox
+            .wrap(&prepared, &policy(dir.as_path()), false)
+            .expect("wrap");
+        let outcome = run(&wrapped, Duration::from_secs(20), &never).expect("run");
+        assert!(
+            outcome.exit.is_success(),
+            "reading a permitted path was refused: {outcome:?}"
+        );
+        assert!(
+            outcome.stdout.contains("contents"),
+            "the read produced nothing: {outcome:?}"
+        );
+    }
 }
