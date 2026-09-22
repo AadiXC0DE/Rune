@@ -505,12 +505,16 @@ mod tests {
         }
     }
 
-    /// Returns a command that echoes the line it reads.
-    fn read_and_echo() -> String {
+    /// Returns a command that copies its standard input to its output.
+    ///
+    /// The test is about the write reaching the process, so the command echoes
+    /// what it read without depending on how either shell expands a variable.
+    fn echo_standard_input() -> String {
         if cfg!(windows) {
-            String::from("set /p line= & echo got %line%")
+            // Prints every line it reads.
+            String::from("findstr \".\"")
         } else {
-            String::from("read line; echo got $line")
+            String::from("read line; echo $line")
         }
     }
 
@@ -581,10 +585,14 @@ mod tests {
 
     #[test]
     fn a_process_takes_input_from_its_standard_input() {
-        let process = Process::start(&read_and_echo(), None, CAPTURE_BYTES).expect("start");
+        let process = Process::start(&echo_standard_input(), None, CAPTURE_BYTES).expect("start");
         process.write(b"hello\n").expect("write");
         assert_eq!(exit_of(&process), Exit::Code(0));
-        assert!(text(process.stdout()).contains("got hello"));
+        assert!(
+            text(process.stdout()).contains("hello"),
+            "the write did not reach the process: {:?}",
+            text(process.stdout())
+        );
     }
 
     #[test]

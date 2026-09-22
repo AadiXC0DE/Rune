@@ -848,15 +848,21 @@ mod tests {
     #[test]
     fn a_caller_supplied_shell_is_used_and_has_to_be_absolute() {
         let (_dir, dir) = tempdir();
-        let prepared = prepare(
-            "echo a | cat",
-            dir.as_path(),
-            Some("/bin/bash"),
-            environment(),
-        )
-        .expect("prepare");
-        assert_eq!(prepared.argv, ["/bin/bash", "-c", "echo a | cat"]);
-        let relative = prepare("echo a | cat", dir.as_path(), Some("bash"), environment());
+        // The shell a caller names is whatever they name, and the rule is about
+        // the shape of the path rather than about which shell it is, so the
+        // fixture names one this host has.
+        let named = default_shell();
+        let prepared =
+            prepare("echo a | cat", dir.as_path(), Some(&named), environment()).expect("prepare");
+        assert_eq!(
+            prepared.argv,
+            [named.as_str(), SHELL_COMMAND_FLAG, "echo a | cat"]
+        );
+
+        let bare = Utf8Path::new(&named)
+            .file_name()
+            .expect("the shell has a file name");
+        let relative = prepare("echo a | cat", dir.as_path(), Some(bare), environment());
         assert_eq!(
             relative.expect_err("a relative shell").code(),
             ErrorCode::InvalidField
