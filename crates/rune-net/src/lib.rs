@@ -20,6 +20,6 @@ pub use auth::{Credential, CredentialSource};
 pub use catalog::{Capabilities, Catalog, ModelMetadata};
 pub use error::{FailureKind, NetError, NetResult};
 pub use message::{ContentPart, ImageRef, Message, Role, ToolSpec};
-pub use provider::{Provider, RequestPlan, ToolChoice};
+pub use provider::{Provider, RequestPlan, Routing, ToolChoice, validate_order, validate_slug};
 pub use stream::{FinishReason, Limit, ProviderEvent, StreamReducer, Usage};
 pub use transport::{Endpoint, StreamOutcome, agent};

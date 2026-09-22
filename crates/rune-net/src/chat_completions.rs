@@ -40,6 +40,10 @@ impl Provider for ChatCompletions {
         NAME
     }
 
+    fn routing(&self) -> crate::provider::Routing {
+        crate::provider::Routing::Supported
+    }
+
     fn request_path(&self) -> &'static str {
         PATH
     }
@@ -104,6 +108,10 @@ impl Provider for ChatCompletions {
             // `max_tokens` rather than `max_completion_tokens`, because the
             // compatible-server ecosystem understands the former.
             body.insert("max_tokens".to_owned(), serde_json::json!(max));
+        }
+
+        if let Some(options) = crate::provider::provider_options(plan) {
+            body.insert("provider".to_owned(), options);
         }
 
         Ok(serde_json::Value::Object(body))

@@ -7,7 +7,7 @@
 //! disturb the agent loop.
 
 use rune_core::config::Effort;
-use rune_core::error::Result;
+use rune_core::error::{Result, RuneError};
 
 use crate::message::{Message, ToolSpec};
 use crate::stream::{Limit, StreamReducer};
@@ -114,10 +114,24 @@ pub trait Provider: Send + Sync {
     /// Returns an error when the plan cannot be expressed in this dialect.
     fn validate(&self, plan: &RequestPlan) -> Result<()> {
         if plan.model.trim().is_empty() {
-            return Err(rune_core::error::RuneError::missing_field("model"));
+            return Err(RuneError::missing_field("model"));
         }
         crate::message::validate(&plan.messages)?;
         crate::message::validate_tool_specs(&plan.tools)?;
+        validate_order(&plan.provider_order)?;
+        // A dialect that cannot express the preference must refuse it, because
+        // accepting a control and dropping it leaves the caller believing
+        // something was applied that was not.
+        if self.routing() == Routing::Unsupported && !plan.provider_order.is_empty() {
+            return Err(RuneError::invalid_field(
+                "provider_order",
+                format!(
+                    "the `{}` dialect cannot express an upstream preference",
+                    self.name()
+                ),
+            )
+            .with_hint("remove the provider order, or use a dialect that supports it"));
+        }
         Ok(())
     }
 
@@ -125,6 +139,111 @@ pub trait Provider: Send + Sync {
     fn limits(&self) -> Limit {
         Limit::default()
     }
+
+    /// Reports whether this dialect can express an upstream preference.
+    ///
+    /// A dialect that cannot must say so rather than accepting the setting and
+    /// dropping it, because a routing control that silently does nothing is
+    /// worse than one that is refused.
+    fn routing(&self) -> Routing {
+        Routing::Unsupported
+    }
+}
+
+/// How a dialect handles an upstream provider preference.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Routing {
+    /// The dialect carries the preference as provider options.
+    Supported,
+    /// The dialect has no way to express it.
+    Unsupported,
+}
+
+/// Largest number of slugs accepted in a provider order.
+pub const MAX_PROVIDER_ORDER: usize = 32;
+
+/// Longest provider slug accepted.
+pub const MAX_SLUG_BYTES: usize = 128;
+
+/// Validates one provider slug.
+///
+/// A slug is a lowercase identifier with optional dotted or dashed segments, as
+/// upstream services name their providers. Anything else would be rejected by
+/// the endpoint after the request had been billed.
+pub fn validate_slug(slug: &str) -> Result<()> {
+    if slug.is_empty() {
+        return Err(
+            RuneError::invalid_field("provider_order", "a provider slug cannot be empty")
+                .with_hint("remove the empty entry, or give it a name"),
+        );
+    }
+    if slug.len() > MAX_SLUG_BYTES {
+        return Err(RuneError::too_large(
+            "provider_order",
+            slug.len(),
+            MAX_SLUG_BYTES,
+        ));
+    }
+    let well_formed = slug.bytes().all(|b| {
+        b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'.' || b == b'/'
+    }) && !slug.starts_with(['-', '.', '/'])
+        && !slug.ends_with(['-', '.', '/']);
+    if !well_formed {
+        return Err(RuneError::invalid_field(
+            "provider_order",
+            format!("`{slug}` is not a provider slug"),
+        )
+        .with_hint("use lowercase letters, digits, hyphens, dots, and slashes"));
+    }
+    Ok(())
+}
+
+/// Validates a whole provider order.
+pub fn validate_order(order: &[String]) -> Result<()> {
+    if order.len() > MAX_PROVIDER_ORDER {
+        return Err(RuneError::too_large(
+            "provider_order",
+            order.len(),
+            MAX_PROVIDER_ORDER,
+        ));
+    }
+    let mut seen = std::collections::HashSet::new();
+    for slug in order {
+        validate_slug(slug)?;
+        if !seen.insert(slug.as_str()) {
+            return Err(RuneError::invalid_field(
+                "provider_order",
+                format!("`{slug}` appears more than once"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Builds the provider options object for a request.
+///
+/// Returns `None` when there is nothing to express, so a dialect emits no
+/// options rather than an empty object an endpoint might reject.
+#[must_use]
+pub fn provider_options(plan: &RequestPlan) -> Option<serde_json::Value> {
+    if plan.provider_order.is_empty() {
+        return None;
+    }
+    let mut options = serde_json::Map::new();
+    // The restrictive form refuses anything off the list; the preference form
+    // falls back to whatever the endpoint would have chosen.
+    if plan.provider_strict {
+        options.insert(
+            "only".to_owned(),
+            serde_json::json!(plan.provider_order.clone()),
+        );
+    } else {
+        options.insert(
+            "order".to_owned(),
+            serde_json::json!(plan.provider_order.clone()),
+        );
+    }
+    Some(serde_json::Value::Object(options))
 }
 
 /// Formats a plan for display in a trace, with the message text summarized.
@@ -145,6 +264,127 @@ pub fn summarize_plan(plan: &RequestPlan) -> serde_json::Value {
         "provider_order": plan.provider_order.len(),
         "provider_strict": plan.provider_strict,
     })
+}
+
+#[cfg(test)]
+mod routing_tests {
+    use super::*;
+
+    fn plan(order: &[&str], strict: bool) -> RequestPlan {
+        RequestPlan {
+            model: "test/model".to_owned(),
+            instructions: String::new(),
+            messages: Vec::new(),
+            tools: Vec::new(),
+            tool_choice: ToolChoice::Auto,
+            parallel_tool_calls: false,
+            effort: Effort::Auto,
+            fast_mode: false,
+            max_output_tokens: None,
+            provider_order: order.iter().map(|s| (*s).to_owned()).collect(),
+            provider_strict: strict,
+        }
+    }
+
+    #[test]
+    fn a_strict_order_emits_the_restrictive_form() {
+        let options = provider_options(&plan(&["a", "b"], true)).expect("options");
+        assert_eq!(options["only"], serde_json::json!(["a", "b"]));
+        assert!(options.get("order").is_none(), "{options}");
+    }
+
+    #[test]
+    fn a_preference_emits_the_order_form() {
+        let options = provider_options(&plan(&["a", "b"], false)).expect("options");
+        assert_eq!(options["order"], serde_json::json!(["a", "b"]));
+        assert!(options.get("only").is_none(), "{options}");
+    }
+
+    #[test]
+    fn an_empty_order_emits_nothing() {
+        // An empty object would be sent to an endpoint that never asked for one.
+        assert!(provider_options(&plan(&[], true)).is_none());
+        assert!(provider_options(&plan(&[], false)).is_none());
+    }
+
+    #[test]
+    fn a_well_formed_slug_passes() {
+        for slug in ["anthropic", "openai/gpt-4", "deep.seek", "a-1"] {
+            validate_slug(slug).unwrap_or_else(|err| panic!("`{slug}` was refused: {err}"));
+        }
+    }
+
+    #[test]
+    fn a_malformed_slug_is_refused() {
+        for slug in [
+            "",
+            "Upper",
+            "has space",
+            "-leading",
+            "trailing-",
+            ".dot",
+            "a_b",
+        ] {
+            assert!(validate_slug(slug).is_err(), "`{slug}` was accepted");
+        }
+    }
+
+    #[test]
+    fn an_oversized_slug_is_refused() {
+        let long = "a".repeat(MAX_SLUG_BYTES + 1);
+        assert!(validate_slug(&long).is_err());
+    }
+
+    #[test]
+    fn a_repeated_slug_is_refused() {
+        let order = vec!["a".to_owned(), "a".to_owned()];
+        let err = validate_order(&order).expect_err("refused");
+        assert!(err.message().contains("more than once"), "{err}");
+    }
+
+    #[test]
+    fn an_empty_entry_is_refused() {
+        assert!(validate_order(&[String::new()]).is_err());
+    }
+
+    #[test]
+    fn an_oversized_order_is_refused() {
+        let order: Vec<String> = (0..=MAX_PROVIDER_ORDER).map(|i| format!("p{i}")).collect();
+        assert!(validate_order(&order).is_err());
+    }
+
+    #[test]
+    fn an_empty_order_is_valid_and_clears_an_inherited_one() {
+        // An empty list is how a higher layer clears a lower layer's list, so
+        // it must be accepted rather than treated as a mistake.
+        validate_order(&[]).expect("accepted");
+    }
+
+    #[test]
+    fn a_dialect_without_routing_refuses_an_order() {
+        // The compatible dialect supports it; the Anthropic one does not, and
+        // must refuse rather than drop the setting.
+        let plan = plan(&["a"], false);
+        let anthropic = crate::anthropic::Anthropic;
+        let err = anthropic.validate(&plan).expect_err("refused");
+        assert!(err.message().contains("cannot express"), "{err}");
+        assert!(err.hint().is_some());
+    }
+
+    #[test]
+    fn a_dialect_with_routing_accepts_an_order() {
+        let plan = plan(&["a", "b"], true);
+        crate::chat_completions::ChatCompletions
+            .validate(&plan)
+            .expect("accepted");
+    }
+
+    #[test]
+    fn a_dialect_without_routing_accepts_an_empty_order() {
+        // Refusing an empty order would break every request on that dialect.
+        let anthropic = crate::anthropic::Anthropic;
+        anthropic.validate(&plan(&[], false)).expect("accepted");
+    }
 }
 
 #[cfg(test)]

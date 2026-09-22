@@ -82,6 +82,10 @@ struct SessionHost {
     workspace: String,
     /// Whether the terminal can render direct color.
     truecolor: bool,
+    /// Ordered upstream provider preference.
+    provider_order: Vec<String>,
+    /// Whether requests are restricted to that preference.
+    provider_strict: bool,
 }
 
 impl Host for SessionHost {
@@ -152,6 +156,14 @@ impl Host for SessionHost {
 
     fn steering(&self) -> &SteeringQueue {
         &self.steering
+    }
+
+    fn provider_order(&self) -> Vec<String> {
+        self.provider_order.clone()
+    }
+
+    fn provider_strict(&self) -> bool {
+        self.provider_strict
     }
 }
 
@@ -240,6 +252,8 @@ pub fn run<R: BufRead, W: std::io::Write>(
         session_id: recorder.id().to_string(),
         workspace: config.workspace.to_string(),
         truecolor: truecolor_supported(),
+        provider_order: config.settings.provider_order.clone(),
+        provider_strict: config.settings.provider_strict,
     };
 
     let out = std::sync::Mutex::new(output);
@@ -860,6 +874,8 @@ mod tests {
             session_id: "sessiontest1".to_owned(),
             workspace: "/tmp".to_owned(),
             truecolor: false,
+            provider_order: Vec::new(),
+            provider_strict: false,
         }
     }
 }
