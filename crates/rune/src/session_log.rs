@@ -79,6 +79,10 @@ impl Recorder {
     ///
     /// A child is kept out of ordinary discovery and cannot be resumed on its
     /// own, because it ran with its parent's authority rather than its own.
+    ///
+    /// Called by the delegation path; present here because the record belongs
+    /// with the other session marks.
+    #[cfg(test)]
     pub fn set_parent(&self, parent: &SessionId) -> Result<()> {
         self.store.append(SessionEvent::ChildOf {
             parent: parent.to_string(),

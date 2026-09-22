@@ -82,6 +82,12 @@ struct SessionHost {
     workspace: String,
     /// Whether the terminal can render direct color.
     truecolor: bool,
+    /// Terminal width the frame is composed for.
+    width: u16,
+    /// Terminal height the frame is composed for.
+    height: u16,
+    /// Holds the diffed screen and commits only what changed.
+    surface: Mutex<rune_term::frame::FrameSurface>,
     /// Ordered upstream provider preference.
     provider_order: Vec<String>,
     /// Whether requests are restricted to that preference.
@@ -229,6 +235,49 @@ impl SessionHost {
         footer::render(&state, &layout, &self.theme, width, self.truecolor).join("\n")
     }
 
+    /// Returns the line the activity line should show for a finished turn.
+    #[must_use]
+    pub fn activity_line(outcome: &turn::TurnOutcome) -> Option<String> {
+        match outcome.stop_reason {
+            StopReason::StepLimit => Some(String::from("reached the step limit")),
+            StopReason::Cancelled => Some(String::from("cancelled")),
+            _ => None,
+        }
+    }
+
+    /// Returns the bytes the current screen requires.
+    ///
+    /// Present so a test drives the same path a run uses: the bytes are what a
+    /// terminal receives, so an assertion here covers the product's render.
+    #[cfg(test)]
+    fn render(&self, transcript: &[String]) -> Result<Vec<u8>> {
+        self.paint(transcript, None)
+    }
+
+    /// Paints one screen and returns the bytes the terminal must receive.
+    ///
+    /// Returns nothing when the screen is already current, which is what makes a
+    /// repaint free rather than a full redraw.
+    fn paint(&self, transcript: &[String], activity: Option<&str>) -> Result<Vec<u8>> {
+        let footer_rows = self.status_rows();
+        let regions =
+            rune_term::frame::Regions::new(transcript, &footer_rows).with_activity(activity);
+        let target = rune_term::frame::compose(&regions, self.width, self.height)?;
+        let mut surface = self
+            .surface
+            .lock()
+            .map_err(|_| RuneError::new(ErrorCode::Internal, "the frame lock was poisoned"))?;
+        Ok(surface.commit(&target)?.bytes)
+    }
+
+    /// Returns the footer rows for the current state.
+    fn status_rows(&self) -> Vec<String> {
+        self.status_line(usize::from(self.width))
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    }
+
     /// Drops the events of the turn that just finished.
     fn clear_events(&self) {
         if let Ok(mut events) = self.events.lock() {
@@ -295,6 +344,11 @@ pub fn run<R: BufRead, W: std::io::Write>(
         session_id: recorder.id().to_string(),
         workspace: config.workspace.to_string(),
         truecolor: truecolor_supported(),
+        // The terminal size is fixed for the run: a resize mid-session would
+        // need a reader on the terminal, which this path does not own.
+        width: 100,
+        height: terminal_height(),
+        surface: Mutex::new(rune_term::frame::FrameSurface::new(100, terminal_height())?),
         provider_order: config.settings.provider_order.clone(),
         provider_strict: config.settings.provider_strict,
         reviewer: crate::auto_review::build(&config.settings, &config.paths)?,
@@ -383,8 +437,16 @@ pub fn run<R: BufRead, W: std::io::Write>(
                         .saturating_add(outcome.usage.output_tokens.unwrap_or(0)),
                 );
                 host.clear_events();
-                report_turn(&outcome, &host, &mut *sink)?;
-                let _ = writeln!(sink, "{}", host.status_line(80));
+                let lines = report_turn(&outcome, &host, &mut *sink)?;
+                // The screen is painted through the frame path, so only what
+                // changed reaches the terminal. A run whose content is
+                // unchanged therefore costs nothing to repaint.
+                let activity = SessionHost::activity_line(&outcome);
+                let painted = host.paint(&lines, activity.as_deref())?;
+                if !painted.is_empty() {
+                    sink.write_all(&painted)?;
+                    sink.flush()?;
+                }
                 Ok(Action::Continue)
             }
             Input::Empty => Ok(Action::Continue),
@@ -408,6 +470,22 @@ fn resolve_theme(config: &SessionConfig) -> Theme {
         true,
         &config.paths.themes_dir(),
     )
+}
+
+/// Returns the terminal height to compose for.
+///
+/// A terminal that does not report a size gets a conventional height rather than
+/// zero, which would compose a frame with no room for anything.
+fn terminal_height() -> u16 {
+    crossterm_height().unwrap_or(24)
+}
+
+/// Reads the terminal height, when one is attached.
+fn crossterm_height() -> Option<u16> {
+    // The size is read through the standard terminal interface rather than an
+    // environment variable, because the latter is not set for every terminal.
+    let size = rune_term::shell::terminal_size()?;
+    Some(size.1)
 }
 
 /// Returns the context window for the configured model.
@@ -554,7 +632,7 @@ fn report_turn<W: std::io::Write>(
     outcome: &turn::TurnOutcome,
     host: &SessionHost,
     output: &mut W,
-) -> Result<()> {
+) -> Result<Vec<String>> {
     let events = host
         .events
         .lock()
@@ -608,7 +686,7 @@ fn report_turn<W: std::io::Write>(
         let _ = writeln!(output, "{rendered}");
     }
     let _ = output.flush();
-    Ok(())
+    Ok(rendered.lines().map(str::to_owned).collect())
 }
 
 /// Builds the prompt for a session.
@@ -680,6 +758,64 @@ pub fn prepare(
 mod tests {
     use super::*;
     use rune_term::shell::{ExitReason, ScriptedSource, Shell};
+
+    #[test]
+    fn a_screen_is_painted_through_the_frame_path() {
+        // The bytes are what a terminal receives, so asserting on them checks
+        // the real render path rather than a string built beside it.
+        let host = test_host();
+        let first = host
+            .render(&["a line".to_owned()])
+            .expect("painted the first screen");
+        assert!(!first.is_empty(), "the first screen wrote nothing");
+        // The bytes carry cursor positioning between cells, so the text is
+        // checked by replaying them into a grid rather than by substring.
+        let mut grid = rune_term::engine::Grid::new(host.width, host.height).expect("grid");
+        grid.feed(&first).expect("fed");
+        assert!(
+            grid.text().contains("a line"),
+            "the text did not reach the screen: {:?}",
+            grid.text()
+        );
+
+        // Repainting the same content writes nothing, which is what makes a
+        // redundant repaint free.
+        let again = host
+            .render(&["a line".to_owned()])
+            .expect("painted the same screen");
+        assert!(
+            again.is_empty(),
+            "an unchanged screen wrote {} bytes",
+            again.len()
+        );
+    }
+
+    #[test]
+    fn a_changed_screen_paints_only_what_changed() {
+        // The measure is the byte count, because cursor positioning splits the
+        // text so a substring search cannot tell a diff from a full redraw. A
+        // diff of one row is smaller than a repaint of the whole screen.
+        let host = test_host();
+        let before = vec!["alpha stays put".to_owned(), "beta changes".to_owned()];
+        host.render(&before).expect("painted");
+
+        let after = vec!["alpha stays put".to_owned(), "gamma changed".to_owned()];
+        let diffed = host.render(&after).expect("painted");
+
+        // The same change through a surface that has seen nothing, which is what
+        // a full repaint costs.
+        let fresh = test_host();
+        let repainted = fresh.render(&after).expect("painted");
+
+        assert!(!diffed.is_empty(), "the change wrote nothing");
+        assert!(
+            diffed.len() < repainted.len(),
+            "the change cost {} bytes against {} for a full repaint, so nothing \
+             was diffed",
+            diffed.len(),
+            repainted.len()
+        );
+    }
 
     #[test]
     fn a_prompt_override_replaces_the_built_in_text() {
@@ -1131,6 +1267,11 @@ mod tests {
             session_id: "sessiontest1".to_owned(),
             workspace: "/tmp".to_owned(),
             truecolor: false,
+            width: 80,
+            height: 24,
+            surface: Mutex::new(
+                rune_term::frame::FrameSurface::new(80, 24).expect("a frame surface"),
+            ),
             provider_order: Vec::new(),
             provider_strict: false,
             reviewer: None,

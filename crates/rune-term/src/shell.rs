@@ -265,6 +265,17 @@ pub fn prompt() -> &'static str {
     "> "
 }
 
+/// Returns the terminal size, when one reports it.
+///
+/// Read through the terminal interface rather than an environment variable,
+/// because the variables are not set for every terminal. A terminal that does
+/// not answer yields `None`, so a caller supplies its own default rather than
+/// composing a frame with no room.
+#[must_use]
+pub fn terminal_size() -> Option<(u16, u16)> {
+    crossterm::terminal::size().ok()
+}
+
 /// Renders the notice shown when a turn is cancelled.
 #[must_use]
 pub fn cancelled_notice() -> &'static str {
