@@ -1,6 +1,6 @@
 [package]
 name = "rune"
-description = "A native coding agent harness."
+description = "A tiny, native coding agent harness."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

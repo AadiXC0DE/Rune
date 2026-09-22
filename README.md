@@ -2,10 +2,11 @@
 
 # Rune
 
-**A native coding agent harness.**
+**A tiny, native coding agent harness.**
 
-One small binary for the terminal, for scripts, and for embedding in other
-systems.
+About 3 MiB and 2 ms to start, written in Rust, with a build that fails if either
+grows. One binary for the terminal, for scripts, and for embedding in other
+systems. Every limit, rule, and setting names the source that set it.
 
 [![CI](https://github.com/AadiXC0DE/Rune/actions/workflows/ci.yml/badge.svg)](https://github.com/AadiXC0DE/Rune/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)

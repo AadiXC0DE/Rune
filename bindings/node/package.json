@@ -1,7 +1,7 @@
 {
   "name": "@rune-sh/node",
   "version": "0.1.0",
-  "description": "Drive the rune coding agent binary from Node.",
+  "description": "Drive the rune coding agent harness from Node.",
   "license": "Apache-2.0",
   "repository": {
     "type": "git",

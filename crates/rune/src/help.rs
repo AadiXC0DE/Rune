@@ -11,7 +11,7 @@ use crate::spec::{self, FlagSpec};
 #[must_use]
 pub fn render_top_level() -> String {
     let mut out = String::new();
-    out.push_str("rune: a native coding agent harness\n\n");
+    out.push_str("rune: a tiny, native coding agent harness\n\n");
     out.push_str("Usage:\n  rune [global flags] [command] [flags] [arguments]\n\n");
     out.push_str("Run `rune` with no command to start an interactive session.\n\n");
 

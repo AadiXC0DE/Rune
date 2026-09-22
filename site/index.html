@@ -4,20 +4,20 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 
-<title>Rune, a native coding agent harness</title>
-<meta name="description" content="A native coding agent harness: one small binary for the terminal, for scripts, and for embedding. Model agnostic, no daemon, no telemetry, no account. Open source, Apache-2.0.">
+<title>Rune, a tiny native coding agent harness</title>
+<meta name="description" content="A tiny, native coding agent harness written in Rust: about 3 MiB and 2 ms to start, with a build that fails if either grows. Every limit, rule, and setting names the source that set it. Sandboxed, offline on request, model agnostic, no account, no telemetry. Open source, Apache-2.0.">
 <link rel="canonical" href="https://runes.dev/">
 <meta name="theme-color" content="#0c0b09">
 <meta name="color-scheme" content="dark">
 
 <meta property="og:type" content="website">
-<meta property="og:title" content="Rune, a native coding agent harness">
-<meta property="og:description" content="One small binary for the terminal, for scripts, and for embedding. Model agnostic, no daemon, no telemetry, no account. Open source.">
+<meta property="og:title" content="Rune, a tiny native coding agent harness">
+<meta property="og:description" content="A tiny, native coding agent harness in Rust: about 3 MiB and 2 ms to start, with a build that fails if either grows. Every setting names the source that set it.">
 <meta property="og:url" content="https://runes.dev/">
 <meta property="og:site_name" content="Rune">
 <meta name="twitter:card" content="summary_large_image">
-<meta name="twitter:title" content="Rune, a native coding agent harness">
-<meta name="twitter:description" content="One small binary for the terminal, for scripts, and for embedding. Model agnostic, no daemon, no telemetry, no account. Open source.">
+<meta name="twitter:title" content="Rune, a tiny native coding agent harness">
+<meta name="twitter:description" content="A tiny, native coding agent harness in Rust: about 3 MiB and 2 ms to start, with a build that fails if either grows. Every setting names the source that set it.">
 
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' fill='%230c0b09'/><path d='M8 8h10a6 6 0 0 1 0 12h-4l6 8' fill='none' stroke='%23ffb454' stroke-width='3'/></svg>">
 
@@ -32,7 +32,7 @@
   "name": "Rune",
   "applicationCategory": "DeveloperApplication",
   "operatingSystem": "macOS, Linux",
-  "description": "A native coding agent harness: one small binary for the terminal, for scripts, and for embedding.",
+  "description": "A tiny, native coding agent harness in Rust. Every limit, rule, and setting names the source that set it.",
   "license": "https://www.apache.org/licenses/LICENSE-2.0",
   "isAccessibleForFree": true,
   "codeRepository": "https://github.com/AadiXC0DE/Rune",
@@ -466,12 +466,11 @@
     <div class="wrap hero-grid">
 
       <div>
-        <p class="eyebrow">Apache-2.0 · open source</p>
-        <h1>A coding agent<br>that is one <em>binary</em>.</h1>
+        <p class="eyebrow">Apache-2.0 · open source · native, no runtime</p>
+        <h1>A tiny coding agent<br>harness in <em>Rust</em>.</h1>
         <p class="lede">
-          Point it at the endpoint you already pay for. <strong>No hosted service</strong>,
-          no daemon, no telemetry, no account. It runs in your terminal, in a script,
-          or embedded in your own program.
+          About <strong>3 MiB</strong> and 2 ms to start, with a build that fails if
+          either grows. Ask where a limit came from and it names the file that set it.
         </p>
 
         <div class="install" id="install">
@@ -527,9 +526,10 @@
       </div>
 
       <dl class="facts">
-        <div><dt>license</dt><dd>Apache-2.0</dd></div>
+        <div><dt>binary</dt><dd>about 3 MiB</dd></div>
+        <div><dt>startup</dt><dd>about 2 ms</dd></div>
         <div><dt>runtime</dt><dd>none, one binary</dd></div>
-        <div><dt>writes</dt><dd>your workspace, nothing else</dd></div>
+        <div><dt>license</dt><dd>Apache-2.0</dd></div>
         <div><dt>telemetry</dt><dd>none</dd></div>
       </dl>
       </div>
@@ -542,8 +542,9 @@
       <h2>what it does differently</h2>
       <div class="grid">
         <div class="cell">
-          <h3>Small and fast, enforced</h3>
-          <p>Binary size and startup are budgets checked in CI, not aspirations. The
+          <h3>Tiny, and held there</h3>
+          <p>About 3 MiB and 2 ms to start, measured on every run against a ceiling
+             of 8 MiB and 5 ms. A build fails when either is crossed, and the
              argument and configuration paths never load the agent runtime.</p>
         </div>
         <div class="cell">
@@ -552,9 +553,10 @@
              name yourself. Connect it once and it is remembered.</p>
         </div>
         <div class="cell">
-          <h3>Permission first</h3>
-          <p>Every sensitive action passes a policy gate, and <code>rune permissions</code>
-             tells you exactly which rule decided it rather than leaving you guessing.</p>
+          <h3>Every decision names its source</h3>
+          <p>A limit, a permission, a setting: each one reports where it came from, so
+             <code>rune permissions</code> and <code>rune config</code> answer the
+             question rather than restating the value.</p>
         </div>
         <div class="cell">
           <h3>Sandboxed execution</h3>
