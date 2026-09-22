@@ -21,3 +21,7 @@ ureq = { workspace = true }
 
 [dev-dependencies]
 tempfile.workspace = true
+
+[[bin]]
+name = "mcp-fixture"
+path = "tests/fixtures/mcp_server.rs"

@@ -30,27 +30,60 @@ use rune_core::budget::{Budget, BudgetSet, LimitName};
 use rune_core::config::Layer;
 use rune_core::error::ErrorCode;
 
-/// A scripted stdio server, written to a temporary script file.
+/// The scripted stdio server the tests drive.
+///
+/// The server is this crate's own fixture binary rather than a shell script: a
+/// shell is a second language to keep in step with the protocol, and it is
+/// absent on some platforms, so every test that needed one was skipped there.
+/// Naming the scenario on the command line keeps the whole protocol in one file.
 struct Fixture {
     directory: tempfile::TempDir,
-    script: std::path::PathBuf,
+    scenario: String,
+    marker: Option<String>,
 }
 
 impl Fixture {
-    /// Writes a shell script that speaks the protocol.
-    fn new(body: &str) -> Self {
-        let directory = tempfile::tempdir().expect("temp dir");
-        let script = directory.path().join("server.sh");
-        std::fs::write(&script, body).expect("write script");
-        Self { directory, script }
+    /// Names a scenario the fixture binary serves.
+    fn new(scenario: &str) -> Self {
+        Self {
+            directory: tempfile::tempdir().expect("temp dir"),
+            scenario: scenario.to_owned(),
+            marker: None,
+        }
+    }
+
+    /// Names a scenario that also starts a marked descendant process.
+    fn grouped(marker: &str) -> Self {
+        Self {
+            directory: tempfile::tempdir().expect("temp dir"),
+            scenario: "grouped".to_owned(),
+            marker: Some(marker.to_owned()),
+        }
+    }
+
+    /// Returns the fixture binary.
+    fn binary() -> std::path::PathBuf {
+        let mut path = std::env::current_exe().expect("test exe path");
+        path.pop();
+        if path.ends_with("deps") {
+            path.pop();
+        }
+        path.join(format!("mcp-fixture{}", std::env::consts::EXE_SUFFIX))
     }
 
     /// Returns a stdio configuration running this fixture.
     fn config(&self, name: &str) -> ServerConfig {
+        let mut command = vec![
+            Self::binary().to_string_lossy().into_owned(),
+            self.scenario.clone(),
+        ];
+        if let Some(marker) = &self.marker {
+            command.push(marker.clone());
+        }
         ServerConfig {
             name: name.to_owned(),
             transport: Transport::Stdio {
-                command: vec!["/bin/sh".to_owned(), self.path().to_owned()],
+                command,
                 environment: BTreeMap::new(),
             },
             enabled: true,
@@ -60,49 +93,6 @@ impl Fixture {
             restart_limit: 1,
         }
     }
-
-    fn path(&self) -> &str {
-        self.script.to_str().expect("script path")
-    }
-}
-
-/// A shell function that answers one request with one result.
-const REPLY: &str = r#"
-reply() {
-  id="$1"; body="$2"
-  printf '{"jsonrpc":"2.0","id":%s,"result":%s}\n' "$id" "$body"
-}
-"#;
-
-/// A shell loop that reads a line and extracts the request identifier.
-const LOOP: &str = r#"
-while IFS= read -r line; do
-  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
-  case "$line" in
-"#;
-
-/// The dispatch used by fixtures that expose two tools.
-const STANDARD_DISPATCH: &str = r#"
-    *'"method":"initialize"'*)
-      reply "$id" '{"protocolVersion":"2025-06-18","capabilities":{"tools":{}},"_meta":{"expires_at_ms":null}}'
-      ;;
-    *'"method":"tools/list"'*)
-      reply "$id" '{"tools":[{"name":"greet","description":"Greets.","inputSchema":{"type":"object","properties":{"who":{"type":"string"}},"required":["who"]}},{"name":"ping","inputSchema":{"type":"object"}}]}'
-      ;;
-    *'"method":"tools/call"'*)
-      reply "$id" '{"content":[{"type":"text","text":"hello from the fixture"}],"isError":false}'
-      ;;
-    *) ;;
-  esac
-"#;
-
-/// Builds a complete script from a dispatch body.
-///
-/// The dispatch closes the `case` and the read loop, so a dispatch is written
-/// as a list of arms and nothing else.
-fn script(dispatch: &str) -> String {
-    let dispatch = dispatch.trim_end();
-    format!("#!/bin/sh\n{REPLY}{LOOP}{dispatch}\ndone\n")
 }
 
 /// Builds a fixed variable set for tests that need credentials.
@@ -148,7 +138,7 @@ fn missing_config(name: &str) -> ServerConfig {
 
 #[test]
 fn a_stdio_server_connects_lists_tools_and_executes_one() {
-    let fixture = Fixture::new(&script(STANDARD_DISPATCH));
+    let fixture = Fixture::new("standard");
     let client = Client::new(&budget());
     let report = client
         .connect_all(&[fixture.config("fixture")])
@@ -188,20 +178,8 @@ fn a_stdio_server_connects_lists_tools_and_executes_one() {
 
 #[test]
 fn a_server_paginating_its_tool_list_is_followed_to_the_end() {
-    let dispatch = r#"
-    *'"method":"initialize"'*)
-      reply "$id" '{"protocolVersion":"2025-11-25"}'
-      ;;
-    *'"cursor":"page2"'*)
-      reply "$id" '{"tools":[{"name":"second","inputSchema":{"type":"object"}}]}'
-      ;;
-    *'"method":"tools/list"'*)
-      reply "$id" '{"tools":[{"name":"first","inputSchema":{"type":"object"}}],"nextCursor":"page2"}'
-      ;;
-    *) ;;
-  esac
-"#;
-    let fixture = Fixture::new(&script(dispatch));
+    let scenario = "paged";
+    let fixture = Fixture::new(scenario);
     let client = Client::new(&budget());
     client
         .connect_all(&[fixture.config("paged")])
@@ -219,17 +197,8 @@ fn a_server_paginating_its_tool_list_is_followed_to_the_end() {
 
 #[test]
 fn a_malformed_tool_entry_is_reported_without_losing_its_siblings() {
-    let dispatch = r#"
-    *'"method":"initialize"'*)
-      reply "$id" '{"protocolVersion":"2025-11-25"}'
-      ;;
-    *'"method":"tools/list"'*)
-      reply "$id" '{"tools":[{"name":"good","inputSchema":{"type":"object"}},{"name":"nameless-schema"},{"name":"","inputSchema":{"type":"object"}},{"name":"good","inputSchema":{"type":"object"}}]}'
-      ;;
-    *) ;;
-  esac
-"#;
-    let fixture = Fixture::new(&script(dispatch));
+    let scenario = "mixed";
+    let fixture = Fixture::new(scenario);
     let client = Client::new(&budget());
     client
         .connect_all(&[fixture.config("mixed")])
@@ -259,17 +228,8 @@ fn a_malformed_tool_entry_is_reported_without_losing_its_siblings() {
 
 #[test]
 fn a_tool_listing_over_the_search_budget_is_refused() {
-    let dispatch = r#"
-    *'"method":"initialize"'*)
-      reply "$id" '{"protocolVersion":"2025-11-25"}'
-      ;;
-    *'"method":"tools/list"'*)
-      reply "$id" '{"tools":[{"name":"big","inputSchema":{"type":"object","properties":{"a":{"type":"string","description":"padding padding padding padding padding padding padding padding"}}}}]}'
-      ;;
-    *) ;;
-  esac
-"#;
-    let fixture = Fixture::new(&script(dispatch));
+    let scenario = "search-budget";
+    let fixture = Fixture::new(scenario);
     let mut limits = budget();
     limits
         .set(
@@ -291,19 +251,8 @@ fn a_tool_listing_over_the_search_budget_is_refused() {
 
 #[test]
 fn a_frame_over_the_cap_is_rejected_with_too_large() {
-    let dispatch = r#"
-    *'"method":"initialize"'*)
-      reply "$id" '{"protocolVersion":"2025-11-25"}'
-      ;;
-    *'"method":"tools/list"'*)
-      printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"huge","inputSchema":{"type":"object","description":"' "$id"
-      head -c 9000000 /dev/zero | tr '\0' 'a'
-      printf '"}}]}}\n'
-      ;;
-    *) ;;
-  esac
-"#;
-    let fixture = Fixture::new(&script(dispatch));
+    let scenario = "huge";
+    let fixture = Fixture::new(scenario);
     let mut limits = budget();
     // The listing budget is raised so the frame cap is what stops the server,
     // not the size of the listing.
@@ -326,15 +275,8 @@ fn a_frame_over_the_cap_is_rejected_with_too_large() {
 
 #[test]
 fn a_server_that_never_answers_times_out() {
-    let dispatch = r#"
-    *'"method":"initialize"'*)
-      sleep 30
-      reply "$id" '{"protocolVersion":"2025-11-25"}'
-      ;;
-    *) ;;
-  esac
-"#;
-    let fixture = Fixture::new(&script(dispatch));
+    let scenario = "silent";
+    let fixture = Fixture::new(scenario);
     let mut config = fixture.config("hung");
     config.startup_timeout_ms = 300;
     let client = Client::new(&budget());
@@ -353,21 +295,8 @@ fn a_server_that_never_answers_times_out() {
 
 #[test]
 fn a_hung_tool_call_times_out_rather_than_blocking() {
-    let dispatch = r#"
-    *'"method":"initialize"'*)
-      reply "$id" '{"protocolVersion":"2025-11-25"}'
-      ;;
-    *'"method":"tools/list"'*)
-      reply "$id" '{"tools":[{"name":"slow","inputSchema":{"type":"object"}}]}'
-      ;;
-    *'"method":"tools/call"'*)
-      sleep 30
-      reply "$id" '{"content":[]}'
-      ;;
-    *) ;;
-  esac
-"#;
-    let fixture = Fixture::new(&script(dispatch));
+    let scenario = "hung-call";
+    let fixture = Fixture::new(scenario);
     let mut config = fixture.config("slow");
     config.operation_timeout_ms = 300;
     let client = Client::new(&budget());
@@ -388,17 +317,8 @@ fn a_hung_tool_call_times_out_rather_than_blocking() {
 
 #[test]
 fn a_tool_that_vanishes_after_listing_fails_closed() {
-    let dispatch = r#"
-    *'"method":"initialize"'*)
-      reply "$id" '{"protocolVersion":"2025-11-25"}'
-      ;;
-    *'"method":"tools/list"'*)
-      reply "$id" '{"tools":[{"name":"gone","inputSchema":{"type":"object"}}]}'
-      ;;
-    *) ;;
-  esac
-"#;
-    let fixture = Fixture::new(&script(dispatch));
+    let scenario = "vanishing";
+    let fixture = Fixture::new(scenario);
     let client = Client::new(&budget());
     client
         .connect_all(&[fixture.config("fixture")])
@@ -414,7 +334,7 @@ fn a_tool_that_vanishes_after_listing_fails_closed() {
 
 #[test]
 fn a_missing_tool_is_refused_without_reaching_the_transport() {
-    let fixture = Fixture::new(&script(STANDARD_DISPATCH));
+    let fixture = Fixture::new("standard");
     let client = Client::new(&budget());
     client
         .connect_all(&[fixture.config("fixture")])
@@ -428,7 +348,7 @@ fn a_missing_tool_is_refused_without_reaching_the_transport() {
 
 #[test]
 fn a_required_server_that_fails_leaves_nothing_connected() {
-    let fixture = Fixture::new(&script(STANDARD_DISPATCH));
+    let fixture = Fixture::new("standard");
     let mut required = missing_config("missing");
     required.required = true;
     let client = Client::new(&budget());
@@ -445,7 +365,7 @@ fn a_required_server_that_fails_leaves_nothing_connected() {
 
 #[test]
 fn an_optional_server_that_fails_leaves_its_siblings_connected() {
-    let fixture = Fixture::new(&script(STANDARD_DISPATCH));
+    let fixture = Fixture::new("standard");
     let client = Client::new(&budget());
     let report = client
         .connect_all(&[fixture.config("fixture"), missing_config("missing")])
@@ -459,28 +379,21 @@ fn an_optional_server_that_fails_leaves_its_siblings_connected() {
 
 #[test]
 fn shutdown_terminates_the_child_process_and_its_descendants() {
-    // The server starts a background child that carries the marker in its own
-    // command line, so a leaked descendant is found by name rather than by
-    // process id.
+    // The server starts a background child, and the child writes a heartbeat to
+    // a file. A heartbeat that stops advancing is what says the descendant is
+    // gone, which avoids asking the platform for a process list that not every
+    // platform provides.
     let marker = format!("mcp-child-marker-{}", std::process::id());
-    let body = format!(
-        "#!/bin/sh\nsh -c ': {marker}; while true; do sleep 1; done' &\n{REPLY}{LOOP}{STANDARD_DISPATCH}\ndone\n"
-    );
-    let fixture = Fixture::new(&body);
+    let heartbeat = fixture_heartbeat(&marker);
+    let _ = std::fs::remove_file(&heartbeat);
+    let fixture = Fixture::grouped(heartbeat.to_str().expect("heartbeat path"));
     let client = Client::new(&budget());
     client
         .connect_all(&[fixture.config("grouped")])
         .expect("connected");
     assert!(client.server("grouped").expect("status").connected);
-    let deadline = Instant::now();
-    while deadline.elapsed() < Duration::from_secs(5) {
-        if processes_naming(&marker) {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
     assert!(
-        processes_naming(&marker),
+        wait_for_heartbeat(&heartbeat),
         "the fixture did not start its descendant; the test would prove nothing"
     );
 
@@ -488,27 +401,40 @@ fn shutdown_terminates_the_child_process_and_its_descendants() {
     assert!(!client.server("grouped").expect("status").connected);
     drop(client);
 
+    // A writer that has stopped leaves the count where it was.
+    let last = read_heartbeat(&heartbeat);
     let deadline = Instant::now();
     while deadline.elapsed() < Duration::from_secs(10) {
-        if !processes_naming(&marker) {
+        std::thread::sleep(Duration::from_millis(200));
+        if read_heartbeat(&heartbeat) == last {
             return;
         }
-        std::thread::sleep(Duration::from_millis(50));
     }
-    panic!("a child process survived shutdown: {marker}");
+    panic!("a child process survived shutdown: {heartbeat:?}");
 }
 
-/// Returns true when a process whose command line names `marker` is running.
-fn processes_naming(marker: &str) -> bool {
-    let Ok(output) = std::process::Command::new("/bin/ps")
-        .args(["-A", "-o", "command"])
-        .output()
-    else {
-        return false;
-    };
-    String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .any(|line| line.contains(marker) && !line.contains("/bin/ps"))
+/// Returns the path the descendant writes its heartbeat to.
+fn fixture_heartbeat(marker: &str) -> std::path::PathBuf {
+    std::env::temp_dir().join(marker)
+}
+
+/// Returns the last count the descendant wrote, or `None` before it starts.
+fn read_heartbeat(path: &std::path::Path) -> Option<u64> {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| text.trim().parse().ok())
+}
+
+/// Waits for the descendant to start writing.
+fn wait_for_heartbeat(path: &std::path::Path) -> bool {
+    let deadline = Instant::now();
+    while deadline.elapsed() < Duration::from_secs(10) {
+        if read_heartbeat(path).is_some() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    false
 }
 
 #[test]
@@ -516,26 +442,8 @@ fn a_rejected_credential_with_an_unstated_expiry_recovers_after_one_reconnect() 
     // The server reports a null expiry on initialize, rejects the first tool
     // call with an auth error, and answers normally from then on. The tools must
     // remain available across the rejection.
-    let dispatch = r#"
-    *'"method":"initialize"'*)
-      reply "$id" '{"protocolVersion":"2025-11-25","_meta":{"expires_at_ms":null}}'
-      ;;
-    *'"method":"tools/list"'*)
-      reply "$id" '{"tools":[{"name":"greet","description":"Greets.","inputSchema":{"type":"object","properties":{"who":{"type":"string"}}}}]}'
-      ;;
-    *'"method":"tools/call"'*)
-      count=$(cat "$MCP_FIXTURE_COUNT" 2>/dev/null || printf 0)
-      if [ "$count" -eq 0 ]; then
-        printf 1 > "$MCP_FIXTURE_COUNT"
-        printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32001,"message":"credential expired"}}\n' "$id"
-      else
-        reply "$id" '{"content":[{"type":"text","text":"hello from the fixture"}],"isError":false}'
-      fi
-      ;;
-    *) ;;
-  esac
-"#;
-    let fixture = Fixture::new(&script(dispatch));
+    let scenario = "flaky-credential";
+    let fixture = Fixture::new(scenario);
     let counter = fixture.directory.path().join("count");
     let mut config = fixture.config("flaky");
     if let Transport::Stdio { environment, .. } = &mut config.transport {
@@ -573,24 +481,8 @@ fn a_server_that_refuses_the_newest_revision_is_negotiated_down() {
     // The server refuses the first two revisions with a rejected-parameter
     // error and accepts the third, naming a revision on the ladder. The client
     // must not give up on the first refusal.
-    let dispatch = r#"
-    *'"method":"initialize"'*)
-      case "$line" in
-        *'2025-11-25'*|*'2025-06-18'*)
-          printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32602,"message":"unsupported protocol revision"}}\n' "$id"
-          ;;
-        *)
-          reply "$id" '{"protocolVersion":"2025-03-26"}'
-          ;;
-      esac
-      ;;
-    *'"method":"tools/list"'*)
-      reply "$id" '{"tools":[{"name":"greet","inputSchema":{"type":"object"}}]}'
-      ;;
-    *) ;;
-  esac
-"#;
-    let fixture = Fixture::new(&script(dispatch));
+    let scenario = "refuse-two";
+    let fixture = Fixture::new(scenario);
     let client = Client::new(&budget());
     let report = client
         .connect_all(&[fixture.config("old")])
@@ -606,14 +498,8 @@ fn a_server_that_refuses_the_newest_revision_is_negotiated_down() {
 fn a_server_that_names_a_revision_outside_the_ladder_is_negotiated_down() {
     // The server answers every revision with one this client does not speak, so
     // the client walks the whole ladder and reports the refusal.
-    let dispatch = r#"
-    *'"method":"initialize"'*)
-      reply "$id" '{"protocolVersion":"2026-07-28"}'
-      ;;
-    *) ;;
-  esac
-"#;
-    let fixture = Fixture::new(&script(dispatch));
+    let scenario = "future";
+    let fixture = Fixture::new(scenario);
     let client = Client::new(&budget());
     let report = client
         .connect_all(&[fixture.config("future")])
@@ -627,14 +513,8 @@ fn a_server_that_names_a_revision_outside_the_ladder_is_negotiated_down() {
 fn a_transport_failure_does_not_walk_the_revision_ladder() {
     // A server that closes its output is not making a statement about the
     // revision, so the ladder stops at the first failure.
-    let dispatch = r#"
-    *'"method":"initialize"'*)
-      exit 0
-      ;;
-    *) ;;
-  esac
-"#;
-    let fixture = Fixture::new(&script(dispatch));
+    let scenario = "dead";
+    let fixture = Fixture::new(scenario);
     let client = Client::new(&budget());
     let report = client
         .connect_all(&[fixture.config("dead")])
@@ -649,20 +529,8 @@ fn a_credential_the_server_reported_as_expired_is_refreshed_before_the_call() {
     // The server reports an expiry in the past, so every call refreshes the
     // credential rather than paying for a rejection first. The tools stay
     // available throughout.
-    let dispatch = r#"
-    *'"method":"initialize"'*)
-      reply "$id" '{"protocolVersion":"2025-11-25","_meta":{"expires_at_ms":1}}'
-      ;;
-    *'"method":"tools/list"'*)
-      reply "$id" '{"tools":[{"name":"greet","inputSchema":{"type":"object"}}]}'
-      ;;
-    *'"method":"tools/call"'*)
-      reply "$id" '{"content":[{"type":"text","text":"ok"}],"isError":false}'
-      ;;
-    *) ;;
-  esac
-"#;
-    let fixture = Fixture::new(&script(dispatch));
+    let scenario = "stale-credential";
+    let fixture = Fixture::new(scenario);
     let client = Client::new(&budget());
     client
         .connect_all(&[fixture.config("stale")])
@@ -691,20 +559,8 @@ fn a_credential_the_server_reported_as_expired_is_refreshed_before_the_call() {
 
 #[test]
 fn a_credential_rejected_past_the_restart_limit_is_reported() {
-    let dispatch = r#"
-    *'"method":"initialize"'*)
-      reply "$id" '{"protocolVersion":"2025-11-25","_meta":{"expires_at_ms":null}}'
-      ;;
-    *'"method":"tools/list"'*)
-      reply "$id" '{"tools":[{"name":"greet","inputSchema":{"type":"object"}}]}'
-      ;;
-    *'"method":"tools/call"'*)
-      printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32001,"message":"credential expired"}}\n' "$id"
-      ;;
-    *) ;;
-  esac
-"#;
-    let fixture = Fixture::new(&script(dispatch));
+    let scenario = "denied-credential";
+    let fixture = Fixture::new(scenario);
     let client = Client::new(&budget());
     client
         .connect_all(&[fixture.config("denied")])
@@ -721,7 +577,7 @@ fn a_credential_rejected_past_the_restart_limit_is_reported() {
 
 #[test]
 fn reload_reconnects_every_server() {
-    let fixture = Fixture::new(&script(STANDARD_DISPATCH));
+    let fixture = Fixture::new("standard");
     let client = Client::new(&budget());
     client
         .connect_all(&[fixture.config("fixture")])
@@ -735,7 +591,7 @@ fn reload_reconnects_every_server() {
 
 #[test]
 fn a_disabled_server_is_not_started() {
-    let fixture = Fixture::new(&script(STANDARD_DISPATCH));
+    let fixture = Fixture::new("standard");
     let mut config = fixture.config("off");
     config.enabled = false;
     let client = Client::new(&budget());

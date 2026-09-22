@@ -935,6 +935,7 @@ impl Drop for StdioSession {
 ///
 /// This crate forbids unsafe code and the standard library exposes no signal
 /// API, so the signal is delivered by running a program that can send one.
+#[cfg(unix)]
 fn signal_group(group: u32, name: &str) {
     let target = format!("-{group}");
     for program in KILL_PROGRAMS {
@@ -949,6 +950,25 @@ fn signal_group(group: u32, name: &str) {
             return;
         }
     }
+}
+
+/// Delivers no signal, on a platform with no process groups to signal.
+///
+/// A tree is ended through the platform's own tool instead, which is the same
+/// approach the signal path takes elsewhere: this crate forbids unsafe code and
+/// the standard library ends one process rather than the tree it started.
+#[cfg(not(unix))]
+fn signal_group(pid: u32, name: &str) {
+    let mut command = Command::new("taskkill");
+    command.args(["/PID", &pid.to_string(), "/T"]);
+    if name == "KILL" {
+        command.arg("/F");
+    }
+    let _ = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
 }
 
 /// Waits up to `limit` for a child to exit.
