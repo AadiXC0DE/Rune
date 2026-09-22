@@ -26,6 +26,8 @@ use camino::Utf8PathBuf;
 use rune_core::config::{self, EnvironmentOverrides, Layer, Provider, Settings};
 use rune_core::error::{ErrorCode, Result, RuneError};
 use rune_core::paths::Paths;
+use rune_session::report::{Period, render_text, summarize, to_json};
+use rune_session::usage::{Ledger, now_ms};
 
 use crate::cli::{Command, Launch};
 
@@ -140,7 +142,7 @@ fn run(launch: &Launch) -> Result<ExitCode> {
         Command::Prompt => run_prompt(&settings, &output_flags),
         Command::Sessions | Command::Tree => run_sessions(&paths, &output_flags),
         Command::Session => Err(not_yet_available("per-session inspection")),
-        Command::Usage => Err(not_yet_available("the usage ledger")),
+        Command::Usage => run_usage(&paths, launch, &output_flags),
         Command::Auth | Command::Connect => Err(not_yet_available("provider connection")),
         Command::Models => Err(not_yet_available("the model catalog")),
         Command::Permissions => run_permissions(&settings, launch, &output_flags),
@@ -270,6 +272,36 @@ fn run_interactive(
     let input = std::io::BufReader::new(stdin.lock());
     let code = session::run(config, input, std::io::stdout())?;
     Ok(ExitCode::from(code))
+}
+
+/// Reads a reporting period from its written name.
+fn period_from(raw: Option<&str>) -> Result<Period> {
+    match raw {
+        None | Some("24h") => Ok(Period::Last24Hours),
+        Some("7d") => Ok(Period::Last7Days),
+        Some("30d") => Ok(Period::Last30Days),
+        Some(other) => Err(RuneError::new(
+            ErrorCode::InvalidField,
+            format!("`{other}` is not a period"),
+        )
+        .with_hint("use 24h, 7d, or 30d")),
+    }
+}
+
+/// Reports token usage over a period.
+fn run_usage(paths: &Paths, launch: &Launch, output: &OutputFlags) -> Result<ExitCode> {
+    let period = period_from(launch.args.first().map(String::as_str))?;
+
+    let ledger = Ledger::from_paths(paths);
+    let read = ledger.read()?;
+    let summary = summarize(&read.records, period, now_ms());
+
+    if output.json {
+        println!("{}", serde_json::to_string_pretty(&to_json(&summary))?);
+    } else {
+        println!("{}", render_text(&summary));
+    }
+    Ok(ExitCode::from(EXIT_OK))
 }
 
 /// Reports the permission rules in force.
@@ -540,6 +572,21 @@ fn report_error(err: &RuneError) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_usage_period_is_recognized_by_name() {
+        assert_eq!(period_from(Some("24h")).expect("24h"), Period::Last24Hours);
+        assert_eq!(period_from(Some("7d")).expect("7d"), Period::Last7Days);
+        assert_eq!(period_from(Some("30d")).expect("30d"), Period::Last30Days);
+        assert_eq!(period_from(None).expect("default"), Period::Last24Hours);
+    }
+
+    #[test]
+    fn an_unknown_usage_period_names_the_accepted_ones() {
+        let err = period_from(Some("99y")).expect_err("refused");
+        assert_eq!(err.code(), ErrorCode::InvalidField);
+        assert_eq!(err.hint(), Some("use 24h, 7d, or 30d"));
+    }
 
     #[test]
     fn runtime_free_commands_are_handled_without_loading() {

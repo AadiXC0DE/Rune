@@ -4,7 +4,7 @@
 //! line typed while a turn is running is queued rather than refused, which is
 //! what makes the shell usable while the model is working.
 
-use std::io::BufRead;
+use std::io::{BufRead, Write as _};
 use std::sync::Arc;
 
 use crate::session_log::{self, Recorder};
@@ -23,6 +23,7 @@ use rune_net::provider::Provider;
 use rune_net::transport::Endpoint;
 use rune_policy::decision::Outcome;
 use rune_policy::rules::RuleSet;
+use rune_session::usage::{HelperKind, Ledger, UsageRecord, now_ms};
 use rune_term::shell::{Action, Input, Shell};
 use rune_tools::contract::{ExecutionContext, ToolOutput};
 use rune_tools::inventory;
@@ -217,6 +218,7 @@ pub fn run<R: BufRead, W: std::io::Write>(
                 // The turn is recorded before it is reported, so a session that
                 // dies while rendering still has its exchange on disk.
                 recorder.turn(&outcome)?;
+                record_usage(&config.paths, &host.model, &outcome);
                 host.clear_events();
                 report_turn(&outcome, &host, &mut *sink)?;
                 Ok(Action::Continue)
@@ -226,6 +228,26 @@ pub fn run<R: BufRead, W: std::io::Write>(
     })?;
 
     Ok(reason.exit_code())
+}
+
+/// Adds a finished turn to the usage ledger.
+///
+/// A ledger write must never end a session, so a failure is reported and the
+/// session continues: losing an accounting record is better than losing the
+/// conversation, which is already on disk.
+fn record_usage(paths: &Paths, model: &str, outcome: &turn::TurnOutcome) {
+    let mut record = UsageRecord::new(now_ms(), model, HelperKind::Main);
+    record.input_tokens = outcome.usage.input_tokens;
+    record.output_tokens = outcome.usage.output_tokens;
+    record.cache_read_tokens = outcome.usage.cache_read_tokens;
+    record.cache_write_tokens = outcome.usage.cache_write_tokens;
+    record.reasoning_tokens = outcome.usage.reasoning_tokens;
+    let ledger = Ledger::from_paths(paths);
+    if let Err(err) = ledger.append(&record) {
+        // Reported on the error stream so a machine consumer reading stdout
+        // still sees a clean conversation.
+        let _ = writeln!(std::io::stderr(), "usage was not recorded: {err}");
+    }
 }
 
 /// Handles a slash command.
