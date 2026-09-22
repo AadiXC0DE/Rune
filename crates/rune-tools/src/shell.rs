@@ -1196,7 +1196,11 @@ mod tests {
     fn a_command_runs_in_a_path_holding_a_space_and_a_non_ascii_name() {
         // The workspace path is passed to the sandbox as a profile rule and to
         // the shell as its working directory, so a space in it must not split
-        // into two arguments and a non-ASCII name must survive both.
+        // into two arguments and a non-ASCII name must survive both. Both halves
+        // need a sandbox to be in play.
+        if !rune_exec::detect().support().is_full() {
+            return;
+        }
         let tool = shell(4, 64 * 1024);
         let dir = tempfile::tempdir().expect("temp");
         let root = Utf8Path::from_path(dir.path()).expect("utf8");
@@ -1226,7 +1230,11 @@ mod tests {
         // The policy grants the resolved workspace while the process starts in
         // the path as written. On a host where those differ, a rule built from
         // one and a working directory set to the other leave the command unable
-        // to write anything, which is what this pins.
+        // to write anything, which is what this pins. It is a property of the
+        // sandbox, so it needs one.
+        if !rune_exec::detect().support().is_full() {
+            return;
+        }
         let tool = shell(4, 64 * 1024);
         let dir = tempfile::tempdir().expect("temp");
         let root = Utf8Path::from_path(dir.path()).expect("utf8");

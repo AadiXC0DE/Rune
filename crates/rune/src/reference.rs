@@ -171,6 +171,9 @@ mod tests {
         let Ok(committed) = std::fs::read_to_string(&path) else {
             panic!("the command reference is missing at {path}");
         };
+        // The generator emits line feeds, and a platform that rewrites them on
+        // read would make an identical document compare unequal.
+        let committed = committed.replace("\r\n", "\n");
         assert_eq!(
             committed,
             render(),
