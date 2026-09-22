@@ -65,6 +65,29 @@ jobs:
       - name: Check size, startup, and dependency duplication
         run: cargo xtask budget
 
+  # Checks that packing the same input twice gives one answer, which is what a
+  # published checksum is for.
+  reproducible:
+    name: reproducible
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the pinned toolchain
+        run: rustup show
+
+      - name: Stage twice and compare
+        run: |
+          cargo xtask release dev
+          first=$(sha256sum target/dist/*/*.tar.gz | cut -d' ' -f1)
+          rm -rf target/dist
+          cargo xtask release dev
+          second=$(sha256sum target/dist/*/*.tar.gz | cut -d' ' -f1)
+          echo "first  $first"
+          echo "second $second"
+          test "$first" = "$second"
+
   cross-platform:
     name: test on ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
