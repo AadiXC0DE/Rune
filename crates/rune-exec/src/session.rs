@@ -505,14 +505,19 @@ mod tests {
         }
     }
 
-    /// Returns a command that copies its standard input to its output.
+    /// Returns a command that reads one line and writes it back.
     ///
-    /// The test is about the write reaching the process, so the command echoes
-    /// what it read without depending on how either shell expands a variable.
+    /// The test is about the write reaching the process, so the command reads a
+    /// line and prints it without depending on how either shell expands a
+    /// variable. It reads one line rather than every line, because the write
+    /// side is never closed and a command that reads to the end of its input
+    /// would wait there forever.
     fn echo_standard_input() -> String {
         if cfg!(windows) {
-            // Prints every line it reads.
-            String::from("findstr \".\"")
+            // Reads a single line and prints it. A search program that reads to
+            // the end of its input would wait there, because the write side is
+            // never closed.
+            String::from("powershell -NoProfile -Command \"[Console]::In.ReadLine()\"")
         } else {
             String::from("read line; echo $line")
         }
