@@ -427,9 +427,19 @@ fn start(
     // the process in a directory the rule does not name, and on a host where a
     // temporary directory resolves elsewhere the command could not write
     // anything at all.
-    let start_in = workspace
-        .canonicalize_utf8()
-        .unwrap_or_else(|_| workspace.to_owned());
+    //
+    // A directory that cannot be resolved is reported as missing here rather
+    // than left to the spawn. A spawn failure for a working directory is
+    // reported by the platform as a generic failure, which loses the fact that
+    // the caller named a directory that is not there.
+    let start_in = workspace.canonicalize_utf8().map_err(|err| {
+        let code = if err.kind() == std::io::ErrorKind::NotFound {
+            ErrorCode::NotFound
+        } else {
+            ErrorCode::InvalidField
+        };
+        RuneError::new(code, format!("`{workspace}` cannot be started in: {err}"))
+    })?;
     Process::start_argv(&wrapped.argv, Some(start_in.as_std_path()), cap).map_err(|err| {
         let hint = match cwd {
             Some(cwd) => format!("the command starts in `{cwd}`"),
@@ -825,6 +835,18 @@ mod tests {
         (id, group)
     }
 
+    /// Returns true when `observed` contains `expected` as a path.
+    ///
+    /// A path is compared after both sides are put in the same spelling. One
+    /// platform resolves a path to a form carrying a prefix that the shell it
+    /// runs does not print, so a comparison of the raw strings fails on the
+    /// directory the test itself created.
+    fn shows_path(observed: &str, expected: &Utf8Path) -> bool {
+        let rendered = expected.as_str();
+        let stripped = rendered.strip_prefix(r"\\?\").unwrap_or(rendered);
+        observed.contains(stripped) || observed.contains(rendered)
+    }
+
     /// Returns a command that prints a marker for each line it reads.
     ///
     /// The fixture writes a line and expects to see it back, so the command
@@ -860,6 +882,17 @@ mod tests {
             String::from("ping -n 60 127.0.0.1 >nul")
         } else {
             String::from("sleep 30")
+        }
+    }
+
+    /// Returns a command that prints far more than the cap and then keeps going.
+    fn flood_then_wait() -> String {
+        if cfg!(windows) {
+            // The lines are emitted by a subshell so the wait that follows is
+            // run once rather than once per line.
+            format!("call {} & {}", numbered_lines(2000), long_sleep())
+        } else {
+            format!("{}; {}", numbered_lines(2000), long_sleep())
         }
     }
 
@@ -1170,7 +1203,7 @@ mod tests {
             &context,
             &serde_json::json!({
                 "action": "run",
-                "command": format!("{} & {}", numbered_lines(2000), long_sleep()),
+                "command": flood_then_wait(),
                 "yield_time_ms": 2_000,
             }),
         );
@@ -1197,7 +1230,10 @@ mod tests {
             "the result is {} bytes",
             observed.len()
         );
-        assert!(observed.starts_with("$ i=0"), "{observed}");
+        assert!(
+            observed.starts_with(&format!("$ {}", numbered_lines(100))),
+            "{observed}"
+        );
         assert!(observed.contains("output truncated"), "{observed}");
         assert!(observed.contains("exited with status 0"), "{observed}");
     }
@@ -1723,10 +1759,8 @@ mod tests {
             .expect("a parent directory")
             .canonicalize()
             .expect("resolved");
-        assert!(
-            observed.contains(&parent.display().to_string()),
-            "{observed}"
-        );
+        let parent = Utf8PathBuf::from_path_buf(parent).expect("utf8");
+        assert!(shows_path(&observed, &parent), "{observed}");
     }
 
     #[test]
@@ -1743,10 +1777,8 @@ mod tests {
         // too: on a host where a temporary directory resolves elsewhere, the
         // unresolved spelling would never appear in the output.
         let expected = dir.path().join("sub").canonicalize().expect("resolved");
-        assert!(
-            observed.contains(&expected.display().to_string()),
-            "{observed}"
-        );
+        let expected = Utf8PathBuf::from_path_buf(expected).expect("utf8");
+        assert!(shows_path(&observed, &expected), "{observed}");
     }
 
     #[test]

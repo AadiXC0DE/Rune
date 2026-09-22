@@ -349,13 +349,24 @@ impl Inner {
     }
 }
 
-/// Delivers no signal, on a platform with no process groups to signal.
+/// Ends a process tree, on a platform with no process groups to signal.
 ///
-/// Callers fall back to the direct child, which is the only process the
-/// standard library can end without a signal.
+/// The platform's own tool walks the tree from the given process, which is what
+/// a group would give on the other side. It is forcible, so a caller that asked
+/// politely is answered by the tree being gone rather than by a refusal.
+///
+/// The standard library can only end the direct child, and the process this is
+/// called on is usually the shell rather than the work it started, so ending
+/// only that would leave the work running under a parent that no longer exists.
 #[cfg(not(unix))]
-fn signal_group(_group: u32, _name: &str) -> bool {
-    false
+fn signal_group(group: u32, _name: &str) -> bool {
+    Command::new("taskkill")
+        .args(["/PID", &group.to_string(), "/T", "/F"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
 }
 
 impl Drop for Process {

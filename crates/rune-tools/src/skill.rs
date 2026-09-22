@@ -403,8 +403,12 @@ impl Tool for InstallSkill {
         // rather than what was submitted.
         let written = std::fs::metadata(&path).map_err(RuneError::from)?;
         let _ = &self.limits;
+        // Reported relative to the directory skills are read from, and in the
+        // spelling every other path is shown in, so a reader sees the location
+        // the catalog names rather than an absolute path of this machine.
+        let shown = crate::workspace::display_in(std::slice::from_ref(&self.root), &path);
         Ok(ToolOutput::success(format!(
-            "installed {name} at {path} ({} bytes)",
+            "installed {name} at {shown} ({} bytes)",
             written.len()
         )))
     }
@@ -582,10 +586,13 @@ mod tests {
 
         let path = managed.join("deploy/SKILL.md");
         assert!(path.exists(), "the skill was not written");
-        // The reported path is a path, so it is shown the way every other path
-        // is, which is not the spelling this host stores it under.
-        let shown = crate::workspace::display_path(&context(&root), &path);
-        assert!(output.text.contains(&shown), "{}", output.text);
+        // The location is reported relative to the managed directory, in the
+        // spelling every other path is shown in.
+        assert!(
+            output.text.contains("at deploy/SKILL.md"),
+            "{}",
+            output.text
+        );
     }
 
     #[test]

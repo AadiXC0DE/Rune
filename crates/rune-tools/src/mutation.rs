@@ -1415,7 +1415,15 @@ mod tests {
         let prepared = prepare(&target, "replacement\n").expect("prepare");
 
         let err = apply(prepared).expect_err("unwritable parent");
-        assert_eq!(err.code(), ErrorCode::InvalidField);
+        // A path whose parent is a file is refused either as a field error or as
+        // a missing directory: one platform answers that the component is not a
+        // directory, the other that the file it would be inside does not exist.
+        // What the test is about is that nothing was written, which is asserted
+        // below.
+        assert!(
+            matches!(err.code(), ErrorCode::InvalidField | ErrorCode::NotFound),
+            "{err}"
+        );
         assert!(err.message().contains("blocker"), "{}", err.message());
         assert_eq!(std::fs::read(&blocker).expect("read"), b"original\n");
         assert!(!target.exists());
