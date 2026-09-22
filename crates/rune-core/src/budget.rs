@@ -13,13 +13,65 @@ use serde::{Deserialize, Serialize};
 use crate::error::{ErrorCode, Result, RuneError};
 
 /// A limit value: either a bounded quantity or an explicit opt-out.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
-#[serde(untagged)]
+///
+/// The opt-out is written as `off`, which is the spelling the command line and
+/// the documentation use. It is not a number, so the encoding cannot be a plain
+/// integer: without this the documented spelling would be unreadable in a
+/// configuration file and a limit could never be switched off from one.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Budget {
     /// A bounded quantity, in the unit the limit is defined in.
     Bounded(u64),
     /// No normal limit. A hard emergency ceiling still applies.
     Unbounded,
+}
+
+impl Serialize for Budget {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        match self {
+            Self::Bounded(value) => serializer.serialize_u64(*value),
+            Self::Unbounded => serializer.serialize_str("off"),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Budget {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visitor;
+
+        impl serde::de::Visitor<'_> for Visitor {
+            type Value = Budget;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a count, or `off` to remove the limit")
+            }
+
+            fn visit_u64<E: serde::de::Error>(self, value: u64) -> Result<Budget, E> {
+                Ok(Budget::Bounded(value))
+            }
+
+            fn visit_i64<E: serde::de::Error>(self, value: i64) -> Result<Budget, E> {
+                u64::try_from(value)
+                    .map(Budget::Bounded)
+                    .map_err(|_| E::custom("a limit cannot be negative"))
+            }
+
+            fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Budget, E> {
+                if value.eq_ignore_ascii_case("off") {
+                    return Ok(Budget::Unbounded);
+                }
+                value
+                    .parse::<u64>()
+                    .map(Budget::Bounded)
+                    .map_err(|_| E::custom(format!("`{value}` is not a count or `off`")))
+            }
+        }
+
+        deserializer.deserialize_any(Visitor)
+    }
 }
 
 impl Budget {
@@ -685,6 +737,56 @@ mod tests {
         );
         assert!("-1".parse::<Budget>().is_err());
         assert!("abc".parse::<Budget>().is_err());
+    }
+
+    use toml::{Table, Value};
+
+    #[test]
+    fn the_opt_out_round_trips_through_its_written_form() {
+        // `off` is the spelling the command line and the documentation use, so
+        // a configuration file must accept it; without that the documented
+        // spelling would be unreadable.
+        let written = toml::to_string(&Table::from_iter([(
+            "limit".to_owned(),
+            Value::try_from(Budget::Unbounded).expect("encoded"),
+        )]))
+        .expect("serialized");
+        assert!(written.contains("\"off\""), "{written}");
+
+        let parsed: Table = toml::from_str(&written).expect("parsed");
+        let value: Budget = parsed["limit"].clone().try_into().expect("decoded");
+        assert_eq!(value, Budget::Unbounded);
+    }
+
+    #[test]
+    fn a_count_round_trips_as_a_number() {
+        // Written as a number rather than a string, so a hand-edited file reads
+        // the way a user would write it.
+        let written = toml::to_string(&Table::from_iter([(
+            "limit".to_owned(),
+            Value::try_from(Budget::Bounded(42)).expect("encoded"),
+        )]))
+        .expect("serialized");
+        assert!(written.contains("42"), "{written}");
+        assert!(!written.contains('"'), "{written}");
+
+        let parsed: Table = toml::from_str(&written).expect("parsed");
+        let value: Budget = parsed["limit"].clone().try_into().expect("decoded");
+        assert_eq!(value, Budget::Bounded(42));
+    }
+
+    #[test]
+    fn a_negative_limit_is_refused_rather_than_wrapping() {
+        let table: Table = toml::from_str("limit = -1").expect("parsed");
+        let result: std::result::Result<Budget, _> = table["limit"].clone().try_into();
+        assert!(result.is_err(), "a negative limit was accepted");
+    }
+
+    #[test]
+    fn an_unrecognized_word_is_refused() {
+        let table: Table = toml::from_str("limit = \"none\"").expect("parsed");
+        let result: std::result::Result<Budget, _> = table["limit"].clone().try_into();
+        assert!(result.is_err(), "an unknown word was accepted as a limit");
     }
 
     #[test]
