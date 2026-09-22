@@ -1077,7 +1077,11 @@ mod tests {
         // failure is reported with what the store said rather than with the
         // identifier-collision message that follows it.
         if let Err(err) = sessions.create(Vec::new()) {
-            panic!("second: {err} (code {:?})", err.code());
+            panic!(
+                "second: {err} (code {:?}, observed {:?})",
+                err.code(),
+                err.detail().observed
+            );
         }
         let error = sessions.create(Vec::new()).expect_err("third");
         assert_eq!(error.code(), ErrorCode::LimitExceeded);
