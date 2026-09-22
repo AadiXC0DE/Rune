@@ -11,7 +11,7 @@ use rune_core::config::{Provider, Settings};
 use rune_core::error::{ErrorCode, Result, RuneError};
 use rune_core::paths::Paths;
 use rune_net::auth::{self, CredentialSource};
-use rune_net::catalog::{Catalog, ModelMetadata};
+use rune_net::catalog::{Catalog, CatalogSource, ModelMetadata};
 
 /// Endpoint used when a provider is connected without one given.
 ///
@@ -224,6 +224,9 @@ pub const fn source_name(source: CredentialSource) -> &'static str {
 pub fn catalog_for(settings: &Settings) -> Catalog {
     let provider = settings.provider.to_string();
     let mut catalog = Catalog::new(provider);
+    // Nothing here contacts an endpoint, so the source says where the entries
+    // actually came from rather than the default the type happens to carry.
+    catalog.source = CatalogSource::Configured;
     if !settings.model.trim().is_empty() {
         catalog
             .models
@@ -611,6 +614,19 @@ mod tests {
         };
         let rendered = render_catalog(&catalog_for(&settings));
         assert!(rendered.contains("claude-test"), "{rendered}");
+    }
+
+    #[test]
+    fn the_catalog_reports_where_its_entries_came_from() {
+        // Reporting an endpoint that was never contacted would misdescribe
+        // where the metadata came from.
+        let settings = Settings {
+            provider: Provider::Anthropic,
+            model: "claude-test".to_owned(),
+            ..Settings::default()
+        };
+        let catalog = catalog_for(&settings);
+        assert_eq!(catalog.source, CatalogSource::Configured);
     }
 
     #[test]
