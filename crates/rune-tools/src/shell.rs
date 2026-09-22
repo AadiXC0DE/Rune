@@ -419,7 +419,15 @@ fn start(
     );
     let wrapped = rune_exec::detect().wrap(&prepared, &policy, context.external_access)?;
 
-    Process::start_argv(&wrapped.argv, cwd.map(Utf8Path::as_std_path), cap).map_err(|err| {
+    // The working directory is the resolved workspace, which is the path the
+    // sandbox rule was built from. Starting in the path as written would leave
+    // the process in a directory the rule does not name, and on a host where a
+    // temporary directory resolves elsewhere the command could not write
+    // anything at all.
+    let start_in = workspace
+        .canonicalize_utf8()
+        .unwrap_or_else(|_| workspace.to_owned());
+    Process::start_argv(&wrapped.argv, Some(start_in.as_std_path()), cap).map_err(|err| {
         let hint = match cwd {
             Some(cwd) => format!("the command starts in `{cwd}`"),
             None => String::from("the command starts in the workspace root"),
@@ -1156,6 +1164,64 @@ mod tests {
         );
         let _ = watcher.join();
         let _ = stop(&tool, &context, &id);
+    }
+
+    #[test]
+    fn a_command_runs_in_a_path_holding_a_space_and_a_non_ascii_name() {
+        // The workspace path is passed to the sandbox as a profile rule and to
+        // the shell as its working directory, so a space in it must not split
+        // into two arguments and a non-ASCII name must survive both.
+        let tool = shell(4, 64 * 1024);
+        let dir = tempfile::tempdir().expect("temp");
+        let root = Utf8Path::from_path(dir.path()).expect("utf8");
+        let awkward = root.join("a dir with spaces/płik.dir.");
+        std::fs::create_dir_all(&awkward).expect("mkdir");
+        let context = ExecutionContext::new(awkward.clone());
+
+        let output = call(
+            &tool,
+            &context,
+            &serde_json::json!({
+                "action": "run",
+                "cwd": awkward.as_str(),
+                "command": "printf ok > 'a file.txt'",
+                "yield_time_ms": 2_000,
+            }),
+        );
+        assert!(
+            awkward.join("a file.txt").exists(),
+            "the command did not write in the workspace: {}",
+            output.text
+        );
+    }
+
+    #[test]
+    fn a_command_without_a_working_directory_writes_in_the_workspace() {
+        // The policy grants the resolved workspace while the process starts in
+        // the path as written. On a host where those differ, a rule built from
+        // one and a working directory set to the other leave the command unable
+        // to write anything, which is what this pins.
+        let tool = shell(4, 64 * 1024);
+        let dir = tempfile::tempdir().expect("temp");
+        let root = Utf8Path::from_path(dir.path()).expect("utf8");
+        let workspace = root.join("plain");
+        std::fs::create_dir_all(&workspace).expect("mkdir");
+        let context = ExecutionContext::new(workspace.clone());
+
+        let output = call(
+            &tool,
+            &context,
+            &serde_json::json!({
+                "action": "run",
+                "command": "printf ok > out.txt",
+                "yield_time_ms": 2_000,
+            }),
+        );
+        assert!(
+            workspace.join("out.txt").exists(),
+            "the command could not write in its own workspace: {}",
+            output.text
+        );
     }
 
     #[test]

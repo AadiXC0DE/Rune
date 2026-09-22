@@ -25,7 +25,24 @@ use rune_core::budget::{BudgetSet, LimitName};
 use rune_core::error::{ErrorCode, Result, RuneError};
 
 /// Program that parses a command string when shell syntax is present.
+///
+/// The platform's own shell, because a command written for this machine is
+/// written for the shell this machine has. A single hard-coded name would fail
+/// everywhere the name does not exist.
+#[cfg(unix)]
 pub const DEFAULT_SHELL: &str = "/bin/sh";
+
+/// Program that parses a command string when shell syntax is present.
+#[cfg(not(unix))]
+pub const DEFAULT_SHELL: &str = "cmd.exe";
+
+/// Flag that hands a shell one string to interpret.
+#[cfg(unix)]
+pub const SHELL_COMMAND_FLAG: &str = "-c";
+
+/// Flag that hands a shell one string to interpret.
+#[cfg(not(unix))]
+pub const SHELL_COMMAND_FLAG: &str = "/C";
 
 /// Tokens that make a command more than a program and its arguments.
 ///
@@ -213,7 +230,11 @@ pub fn prepare_shell(
         .with_hint("a shell resolved through PATH is not the program that was reviewed"));
     }
     Ok(PreparedCommand {
-        argv: vec![shell.to_owned(), String::from("-c"), command.to_owned()],
+        argv: vec![
+            shell.to_owned(),
+            String::from(SHELL_COMMAND_FLAG),
+            command.to_owned(),
+        ],
         cwd: workspace.to_owned(),
         environment,
         reviewed: command.to_owned(),
@@ -248,7 +269,11 @@ pub fn shell_reason(command: &str) -> Option<&'static str> {
 /// Returns the argv a command routes to.
 fn route(command: &str, shell: &str) -> Vec<String> {
     if requires_shell(command) {
-        vec![shell.to_owned(), String::from("-c"), command.to_owned()]
+        vec![
+            shell.to_owned(),
+            String::from(SHELL_COMMAND_FLAG),
+            command.to_owned(),
+        ]
     } else {
         command.split_whitespace().map(str::to_owned).collect()
     }
@@ -293,7 +318,9 @@ pub fn verify_unchanged(prepared: &PreparedCommand) -> Result<()> {
 /// Returns the shell an argv invokes the reviewed string with, if it does.
 fn shell_invocation(prepared: &PreparedCommand) -> Option<&str> {
     match prepared.argv.as_slice() {
-        [shell, flag, command] if flag == "-c" && command == &prepared.reviewed => Some(shell),
+        [shell, flag, command] if flag == SHELL_COMMAND_FLAG && command == &prepared.reviewed => {
+            Some(shell)
+        }
         _ => None,
     }
 }

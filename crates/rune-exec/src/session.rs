@@ -15,7 +15,23 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 /// Program every command is run by.
+///
+/// The platform's own shell: a command string written for this machine is
+/// written for the shell this machine has.
+#[cfg(unix)]
 const SHELL: &str = "/bin/sh";
+
+/// Program every command is run by.
+#[cfg(not(unix))]
+const SHELL: &str = "cmd.exe";
+
+/// Flag that hands a shell one string to interpret.
+#[cfg(unix)]
+const SHELL_FLAG: &str = "-c";
+
+/// Flag that hands a shell one string to interpret.
+#[cfg(not(unix))]
+const SHELL_FLAG: &str = "/C";
 
 /// Bytes read from a pipe in one call.
 const CHUNK_BYTES: usize = 8 * 1024;
@@ -143,7 +159,11 @@ impl Process {
     /// is exactly what the shell parses. At most `capture_bytes` from each
     /// stream are retained.
     pub fn start(command: &str, cwd: Option<&Path>, capture_bytes: usize) -> io::Result<Self> {
-        let argv = [SHELL.to_owned(), String::from("-c"), command.to_owned()];
+        let argv = [
+            SHELL.to_owned(),
+            String::from(SHELL_FLAG),
+            command.to_owned(),
+        ];
         Self::start_argv(&argv, cwd, capture_bytes)
     }
 
