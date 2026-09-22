@@ -903,9 +903,10 @@ mod tests {
     /// Returns a command that prints far more than the cap and then keeps going.
     fn flood_then_wait() -> String {
         if cfg!(windows) {
-            // The loop is a builtin that ends on its own, so the wait after it
-            // is reached once the lines are out.
-            format!("{} & {}", numbered_lines(2000), long_sleep())
+            // The loop is grouped, because the separator that joins it to the
+            // wait binds inside the loop body rather than after the loop, which
+            // would run the wait once per line and emit one line.
+            format!("({}) & {}", numbered_lines(2000), long_sleep())
         } else {
             format!("{}; {}", numbered_lines(2000), long_sleep())
         }
