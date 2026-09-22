@@ -75,6 +75,189 @@ impl Entry {
     }
 }
 
+/// A run of consecutive tool calls, collapsed to one row.
+///
+/// A turn that calls five tools would otherwise push everything else off the
+/// screen. The individual calls stay available for a reader who asks for them.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct ToolGroup {
+    /// Names of the calls, in order.
+    pub names: Vec<String>,
+    /// How many of the calls reported a failure.
+    pub failures: usize,
+    /// Whether the group is shown expanded.
+    pub expanded: bool,
+}
+
+impl ToolGroup {
+    /// Builds a group from the names it covers.
+    #[must_use]
+    pub fn new(names: Vec<String>, failures: usize) -> Self {
+        Self {
+            names,
+            failures,
+            expanded: false,
+        }
+    }
+
+    /// Returns the number of calls in the group.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.names.len()
+    }
+
+    /// Returns true when no calls are in the group.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.names.is_empty()
+    }
+
+    /// Returns the collapsed summary row.
+    #[must_use]
+    pub fn summary(&self) -> String {
+        let count = self.names.len();
+        let names = self.names.join(", ");
+        if self.failures == 0 {
+            format!("{count} tool call(s): {names}")
+        } else {
+            format!("{count} tool call(s): {names} ({} failed)", self.failures)
+        }
+    }
+}
+
+/// Groups consecutive tool entries.
+///
+/// A run of one is left alone: collapsing a single call to a row that names it
+/// would hide the result for no gain.
+#[must_use]
+pub fn group_tools(entries: &[Entry]) -> Vec<Result<Entry, ToolGroup>> {
+    let mut out = Vec::new();
+    let mut pending: Vec<&Entry> = Vec::new();
+
+    let flush = |pending: &mut Vec<&Entry>, out: &mut Vec<Result<Entry, ToolGroup>>| {
+        if pending.is_empty() {
+            return;
+        }
+        if pending.len() == 1 {
+            if let Some(entry) = pending.first() {
+                out.push(Ok((*entry).clone()));
+            }
+        } else {
+            let names: Vec<String> = pending
+                .iter()
+                .map(|entry| first_line(&entry.text))
+                .collect();
+            let failures = pending
+                .iter()
+                .filter(|entry| entry.text.contains("failed") || entry.text.contains("refused"))
+                .count();
+            out.push(Err(ToolGroup::new(names, failures)));
+        }
+        pending.clear();
+    };
+
+    for entry in entries {
+        if entry.speaker == Speaker::Tool && entry.expandable {
+            pending.push(entry);
+            continue;
+        }
+        flush(&mut pending, &mut out);
+        out.push(Ok(entry.clone()));
+    }
+    flush(&mut pending, &mut out);
+    out
+}
+
+/// Returns the first non-empty line of a text.
+fn first_line(text: &str) -> String {
+    text.lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or_default()
+        .to_owned()
+}
+
+/// Renders a grouped transcript.
+///
+/// A group renders as one row unless it is expanded, in which case its entries
+/// render in full. Expanding never loses content: the entries are held whole.
+#[must_use]
+pub fn render_grouped(entries: &[Entry], display: Display) -> String {
+    let mut out = String::new();
+    for item in group_tools(entries) {
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        match item {
+            Ok(entry) => render_entry(&entry, display, &mut out),
+            Err(group) => {
+                let _ = writeln!(out, "  {}", group.summary());
+            }
+        }
+    }
+    out.trim_end().to_owned()
+}
+
+/// Whether content may be promoted into the terminal's own scrollback.
+///
+/// Content is promoted only once it is final. A tool result that is still
+/// arriving would be written above the region the session repaints, and a later
+/// frame could not correct it, so the watermark holds until the turn settles.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Watermark {
+    /// Whether the current turn has finished.
+    settled: bool,
+    /// Entries already promoted, so nothing is promoted twice.
+    promoted: usize,
+}
+
+impl Watermark {
+    /// Builds a watermark for a turn in progress.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            settled: false,
+            promoted: 0,
+        }
+    }
+
+    /// Marks the turn as finished, which releases everything held.
+    pub fn settle(&mut self) {
+        self.settled = true;
+    }
+
+    /// Returns how many entries have been promoted.
+    #[must_use]
+    pub const fn promoted(&self) -> usize {
+        self.promoted
+    }
+
+    /// Returns the entries safe to promote now.
+    ///
+    /// While the turn is running, nothing is final, so nothing is promoted. A
+    /// caller that promotes anyway would be writing content the session can no
+    /// longer correct.
+    pub fn ready<'a>(&self, entries: &'a [Entry]) -> &'a [Entry] {
+        if !self.settled {
+            return &[];
+        }
+        entries.get(self.promoted..).unwrap_or(&[])
+    }
+
+    /// Records that the ready entries were promoted.
+    pub fn advance(&mut self, entries: &[Entry]) {
+        if self.settled {
+            self.promoted = entries.len();
+        }
+    }
+}
+
+impl Default for Watermark {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// How much of a transcript to show.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Display {
@@ -400,6 +583,97 @@ mod tests {
         for line in rendered.lines() {
             assert!(str_width(line) <= MIN_WIDTH, "{line:?}");
         }
+    }
+
+    #[test]
+    fn consecutive_tool_calls_collapse_to_one_summary_row() {
+        let entries: Vec<Entry> = (1..=5)
+            .map(|n| Entry::tool(format!("read_file {n}")))
+            .collect();
+        let rendered = render_grouped(&entries, Display::default());
+        assert_eq!(rendered.lines().count(), 1, "{rendered}");
+        assert!(rendered.contains("5 tool call(s)"), "{rendered}");
+    }
+
+    #[test]
+    fn a_single_tool_call_is_not_collapsed() {
+        // A row naming one call would hide its result for no gain.
+        let rendered = render_grouped(&[Entry::tool("read_file src/main.rs")], Display::default());
+        assert!(rendered.contains("read_file src/main.rs"), "{rendered}");
+        assert!(!rendered.contains("tool call(s)"), "{rendered}");
+    }
+
+    #[test]
+    fn a_non_tool_entry_ends_a_group() {
+        let entries = vec![
+            Entry::tool("first tool"),
+            Entry::tool("second tool"),
+            Entry::assistant("an answer"),
+        ];
+        let grouped = group_tools(&entries);
+        assert_eq!(grouped.len(), 2, "{grouped:#?}");
+        assert!(matches!(&grouped[0], Err(group) if group.len() == 2));
+        assert!(matches!(&grouped[1], Ok(entry) if entry.speaker == Speaker::Assistant));
+    }
+
+    #[test]
+    fn a_group_counts_the_calls_that_failed() {
+        let entries = vec![
+            Entry::tool("read_file ok"),
+            Entry::tool("grep_files refused: no matches"),
+        ];
+        let grouped = group_tools(&entries);
+        let Err(group) = &grouped[0] else {
+            panic!("the calls were not grouped: {grouped:#?}");
+        };
+        assert_eq!(group.failures, 1);
+        assert!(group.summary().contains("1 failed"), "{}", group.summary());
+    }
+
+    #[test]
+    fn expanding_a_group_restores_every_row() {
+        // Expanding must never lose content, so the entries are kept whole.
+        let entries: Vec<Entry> = (1..=3)
+            .map(|n| Entry::tool(format!("line {n}\nmore {n}")))
+            .collect();
+        let collapsed = render_grouped(&entries, Display::default());
+        assert_eq!(collapsed.lines().count(), 1, "{collapsed}");
+
+        let expanded = render(&entries, Display::default());
+        for n in 1..=3 {
+            assert!(expanded.contains(&format!("line {n}")), "{expanded}");
+            assert!(expanded.contains(&format!("more {n}")), "{expanded}");
+        }
+    }
+
+    #[test]
+    fn nothing_is_promoted_while_a_turn_is_running() {
+        // A result still arriving would be written above the region the session
+        // repaints, where no later frame can correct it.
+        let entries = vec![Entry::assistant("partial")];
+        let watermark = Watermark::new();
+        assert!(watermark.ready(&entries).is_empty());
+        assert_eq!(watermark.promoted(), 0);
+    }
+
+    #[test]
+    fn settling_releases_everything_held() {
+        let entries = vec![Entry::assistant("one"), Entry::assistant("two")];
+        let mut watermark = Watermark::new();
+        watermark.settle();
+        assert_eq!(watermark.ready(&entries).len(), 2);
+        watermark.advance(&entries);
+        assert_eq!(watermark.promoted(), 2);
+        // Nothing is promoted twice.
+        assert!(watermark.ready(&entries).is_empty());
+    }
+
+    #[test]
+    fn an_unsettled_watermark_never_advances() {
+        let entries = vec![Entry::assistant("one")];
+        let mut watermark = Watermark::new();
+        watermark.advance(&entries);
+        assert_eq!(watermark.promoted(), 0);
     }
 
     #[test]
