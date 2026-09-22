@@ -164,7 +164,11 @@ impl ServerConfig {
         model: impl Into<String>,
     ) -> Result<Self> {
         let limits = BudgetSet::new();
-        let registry = rune_tools::inventory::builtin(&FileLimits::from_budget(&limits), &limits)?;
+        let registry = rune_tools::inventory::builtin(
+            &FileLimits::from_budget(&limits),
+            &limits,
+            &rune_core::paths::Paths::from_process().managed_skills_dir(),
+        )?;
         let model = model.into();
         let context_window = Catalog::new("acp")
             .metadata_or_default(&model)
@@ -234,7 +238,11 @@ impl ServerConfig {
 
     /// Sets the limits and rebuilds the tool set from them.
     pub fn with_limits(mut self, limits: BudgetSet) -> Result<Self> {
-        self.registry = rune_tools::inventory::builtin(&FileLimits::from_budget(&limits), &limits)?;
+        self.registry = rune_tools::inventory::builtin(
+            &FileLimits::from_budget(&limits),
+            &limits,
+            &rune_core::paths::Paths::from_process().managed_skills_dir(),
+        )?;
         self.limits = limits;
         Ok(self)
     }

@@ -911,6 +911,7 @@ fn run_acp(
     let registry = rune_tools::inventory::builtin(
         &rune_tools::workspace::FileLimits::from_budget(&settings.limits),
         &settings.limits,
+        &paths.managed_skills_dir(),
     )?;
 
     let rules = rune_policy::rules::RuleSet::new();

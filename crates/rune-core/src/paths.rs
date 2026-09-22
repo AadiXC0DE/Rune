@@ -144,6 +144,15 @@ impl Paths {
         self.config_root.join(names::SYSTEM_PROMPT_FILE)
     }
 
+    /// Path of the directory skills are installed into.
+    ///
+    /// This is the directory discovery scans, so a skill written here is visible
+    /// to the catalog without further registration.
+    #[must_use]
+    pub fn managed_skills_dir(&self) -> Utf8PathBuf {
+        self.config_root.join(names::SKILLS_DIR)
+    }
+
     /// Path of the sessions directory.
     #[must_use]
     pub fn sessions_dir(&self) -> Utf8PathBuf {

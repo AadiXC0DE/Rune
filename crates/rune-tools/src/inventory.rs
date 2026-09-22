@@ -14,6 +14,7 @@ use crate::ask_user::AskUserQuestion;
 use crate::contract::{Tool, model_spec};
 use crate::registry::Registry;
 use crate::shell::Shell;
+use crate::skill::{CapabilitySearch, InstallSkill, LoadSkill};
 use crate::vision::Vision;
 use crate::web::{WebFetch, WebSearch};
 use crate::workspace::FileLimits;
@@ -34,6 +35,9 @@ pub const ADVERTISEMENT_ORDER: &[&str] = &[
     "web_fetch",
     "web_search",
     "vision",
+    "skill",
+    "capability_search",
+    "install_skill",
 ];
 
 /// Builds a registry holding every built-in tool.
@@ -43,7 +47,11 @@ pub const ADVERTISEMENT_ORDER: &[&str] = &[
 ///
 /// A tool whose schema is invalid fails here rather than at request time, so an
 /// unreachable provider request is never caused by a malformed description.
-pub fn builtin(limits: &FileLimits, budget: &rune_core::budget::BudgetSet) -> Result<Registry> {
+pub fn builtin(
+    limits: &FileLimits,
+    budget: &rune_core::budget::BudgetSet,
+    skills_root: &camino::Utf8Path,
+) -> Result<Registry> {
     let mut registry = Registry::new();
     registry.insert(Box::new(GlobFiles::with_limits(*limits)))?;
     registry.insert(Box::new(GrepFiles::with_limits(*limits)))?;
@@ -52,6 +60,21 @@ pub fn builtin(limits: &FileLimits, budget: &rune_core::budget::BudgetSet) -> Re
     registry.insert(Box::new(EditFile))?;
     registry.insert(Box::new(Shell::new(budget)))?;
     registry.insert(Box::new(AskUserQuestion::unavailable()))?;
+
+    // The catalog is supplied by the host, so a run with no workspace to scan
+    // reports an empty catalog rather than failing.
+    let catalog: std::sync::Arc<dyn crate::skill::Catalog> =
+        std::sync::Arc::new(crate::skill::Empty);
+    let context_limits = rune_context::limits::Limits::resolve(budget)?;
+    registry.insert(Box::new(LoadSkill::new(
+        std::sync::Arc::clone(&catalog),
+        context_limits.clone(),
+    )))?;
+    registry.insert(Box::new(CapabilitySearch::new(catalog)))?;
+    registry.insert(Box::new(InstallSkill::new(
+        skills_root.to_owned(),
+        context_limits,
+    )))?;
     registry.insert(Box::new(WebFetch::unconfigured(budget)))?;
     registry.insert(Box::new(WebSearch::unconfigured(budget)))?;
     registry.insert(Box::new(Vision::unconfigured(budget)))?;
@@ -61,7 +84,11 @@ pub fn builtin(limits: &FileLimits, budget: &rune_core::budget::BudgetSet) -> Re
 
 /// Builds a registry with the compiled defaults.
 pub fn builtin_default() -> Result<Registry> {
-    builtin(&FileLimits::default(), &rune_core::budget::BudgetSet::new())
+    builtin(
+        &FileLimits::default(),
+        &rune_core::budget::BudgetSet::new(),
+        camino::Utf8Path::new("/skills"),
+    )
 }
 
 /// Returns the advertised schemas in advertisement order.

@@ -661,6 +661,7 @@ pub fn prepare(
     let registry = inventory::builtin(
         &rune_tools::workspace::FileLimits::from_budget(&settings.limits),
         &settings.limits,
+        &paths.managed_skills_dir(),
     )?;
 
     Ok(SessionConfig {

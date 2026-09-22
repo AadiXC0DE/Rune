@@ -14,6 +14,7 @@ pub mod read_file;
 pub mod registry;
 pub mod result_store;
 pub mod shell;
+pub mod skill;
 pub mod vision;
 pub mod web;
 pub mod workspace;

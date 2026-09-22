@@ -175,10 +175,14 @@ fn line(skill: &Skill, cap: usize) -> (String, bool) {
     let mut out = String::new();
     let _ = writeln!(
         out,
-        "- {}: {}{} (location: {})",
+        "- {}: {}{} (location: {}{})",
         escape(&skill.name),
         escape(description.get(..cut).unwrap_or_default()),
         if shortened { "..." } else { "" },
+        // Prefixed, because this is the exact string the skill tool accepts.
+        // Advertising a bare path would give the model a location that every
+        // load rejects.
+        crate::skill_invocation::LOCATION_PREFIX,
         escape(skill.location.as_str())
     );
     (out, shortened)
@@ -267,9 +271,33 @@ mod tests {
 
         assert!(output.text.contains("- alpha: dddd"));
         assert!(output.text.contains("- beta:"));
-        assert!(output.text.contains("location: /skills/alpha/SKILL.md"));
         assert!(output.omitted.is_empty());
         assert!(output.shortened.is_empty());
+
+        // The advertised location must be in the form the skill tool accepts,
+        // or a model that copies it out of the catalog has its call rejected
+        // before the file is ever consulted.
+        let advertised = output
+            .text
+            .lines()
+            .find_map(|line| line.split("location: ").nth(1))
+            .map(|rest| rest.trim_end_matches(')').to_owned())
+            .expect("a location was advertised");
+        assert!(
+            advertised.starts_with(crate::skill_invocation::LOCATION_PREFIX),
+            "the advertised location is not in the accepted form: {advertised}"
+        );
+        let limits =
+            crate::limits::Limits::resolve(&rune_core::budget::BudgetSet::new()).expect("limits");
+        // Resolution succeeds; reading the file is a separate step, and this
+        // fixture names a path that does not exist.
+        let err = crate::skill_invocation::load_by_location(&skills, &advertised, &limits)
+            .expect_err("the fixture has no file to read");
+        assert_eq!(
+            err.code(),
+            ErrorCode::NotFound,
+            "the advertised location was rejected before the file was read: {err}"
+        );
     }
 
     #[test]

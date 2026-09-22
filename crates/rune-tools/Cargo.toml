@@ -14,6 +14,7 @@ workspace = true
 rune-core = { workspace = true }
 rune-policy = { workspace = true }
 rune-exec = { workspace = true }
+rune-context = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
