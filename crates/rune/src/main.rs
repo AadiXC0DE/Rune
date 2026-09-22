@@ -142,7 +142,7 @@ fn run(launch: &Launch) -> Result<ExitCode> {
         Command::Config => run_config(&settings, &output_flags),
         Command::Prompt => run_prompt(&settings, &output_flags),
         Command::Sessions | Command::Tree => run_sessions(&paths, &output_flags),
-        Command::Session => Err(not_yet_available("per-session inspection")),
+        Command::Session => run_session(&paths, launch, &output_flags),
         Command::Usage => run_usage(&paths, launch, &output_flags),
         Command::Auth => run_auth(&settings, &paths, launch, &output_flags),
         Command::Connect => run_connect(&settings, &paths, launch, &output_flags),
@@ -401,6 +401,28 @@ fn period_from(raw: Option<&str>) -> Result<Period> {
         )
         .with_hint("use 24h, 7d, or 30d")),
     }
+}
+
+/// Reports one stored session.
+fn run_session(paths: &Paths, launch: &Launch, output: &OutputFlags) -> Result<ExitCode> {
+    let raw = launch.args.first().ok_or_else(|| {
+        RuneError::missing_field("session").with_hint("name a session, or run `rune sessions`")
+    })?;
+    let id: rune_core::id::SessionId = raw.parse()?;
+    let state = session_log::inspect(paths, &id)?;
+
+    if output.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&session_log::detail_json(&state))?
+        );
+    } else {
+        println!(
+            "{}",
+            session_log::render_detail(&state, &paths.session_dir(&id))
+        );
+    }
+    Ok(ExitCode::from(EXIT_OK))
 }
 
 /// Reports token usage over a period.

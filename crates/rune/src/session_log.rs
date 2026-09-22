@@ -7,7 +7,7 @@
 
 use std::fmt::Write as _;
 
-use camino::Utf8PathBuf;
+use camino::{Utf8Path, Utf8PathBuf};
 use rune_agent::history::History;
 use rune_agent::turn::TurnOutcome;
 use rune_core::error::{ErrorCode, Result, RuneError};
@@ -176,6 +176,88 @@ pub fn list(paths: &Paths) -> Vec<Summary> {
     out.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
     out.truncate(LIST_LIMIT);
     out
+}
+
+/// Renders one session in detail.
+///
+/// Reports the log rather than the conversation, because the log is what is
+/// stored: a count of events, the turns, the tokens, and any damage that was
+/// found when the log was read.
+#[must_use]
+pub fn render_detail(state: &SessionState, dir: &Utf8Path) -> String {
+    let mut out = String::new();
+    let _ = writeln!(out, "session   {}", state.id);
+    let _ = writeln!(out, "directory {dir}");
+    let _ = writeln!(
+        out,
+        "title     {}",
+        state.title.as_deref().unwrap_or("untitled")
+    );
+    let _ = writeln!(out, "turns     {}", state.turns);
+    let _ = writeln!(out, "events    {}", state.events.len());
+    let _ = writeln!(
+        out,
+        "tokens    input {}, output {}",
+        state.usage.input_tokens, state.usage.output_tokens
+    );
+    let _ = writeln!(
+        out,
+        "started   {}",
+        state
+            .events
+            .first()
+            .and_then(|frame| timestamp(frame.timestamp_ms))
+            .as_deref()
+            .unwrap_or("unknown")
+    );
+    let _ = writeln!(
+        out,
+        "updated   {}",
+        state
+            .events
+            .last()
+            .and_then(|frame| timestamp(frame.timestamp_ms))
+            .as_deref()
+            .unwrap_or("unknown")
+    );
+    match state.truncated_at {
+        Some(offset) => {
+            let _ = writeln!(
+                out,
+                "damaged   a torn final frame was dropped at byte {offset}"
+            );
+        }
+        None => out.push_str("damaged   no"),
+    }
+    out.trim_end().to_owned()
+}
+
+/// Reports one session as JSON.
+#[must_use]
+pub fn detail_json(state: &SessionState) -> serde_json::Value {
+    serde_json::json!({
+        "id": state.id.to_string(),
+        "title": state.title,
+        "turns": state.turns,
+        "events": state.events.len(),
+        "usage": {
+            "input_tokens": state.usage.input_tokens,
+            "output_tokens": state.usage.output_tokens,
+        },
+        "truncated": state.truncated_at.is_some(),
+    })
+}
+
+/// Reads one session's state.
+pub fn inspect(paths: &Paths, id: &SessionId) -> Result<SessionState> {
+    let dir = paths.session_dir(id);
+    if !dir.exists() {
+        return Err(
+            RuneError::new(ErrorCode::NotFound, format!("no session `{id}` was found"))
+                .with_hint("run `rune sessions` to see what is stored"),
+        );
+    }
+    load_read_only(&dir)
 }
 
 /// Returns the most recently active session, when there is one.
@@ -618,6 +700,69 @@ mod tests {
         let err = load(&paths, &id("sessionzzzzz")).expect_err("refused");
         assert_eq!(err.code(), ErrorCode::NotFound);
         assert!(err.hint().is_some(), "the failure does not say what to do");
+    }
+
+    #[test]
+    fn inspecting_a_session_reports_its_log() {
+        let dir = tempfile::tempdir().expect("temp");
+        let root = Utf8Path::from_path(dir.path()).expect("utf8");
+        let paths = paths(root);
+        let key = id("sessionnnnnn");
+        let mut recorder = Recorder::create(&paths, &key).expect("created");
+        recorder.user_message("hello").expect("wrote");
+        recorder.turn(&outcome("hi")).expect("wrote");
+        drop(recorder);
+
+        let state = inspect(&paths, &key).expect("inspected");
+        assert_eq!(state.turns, 1);
+        assert_eq!(state.usage.input_tokens, 10);
+
+        let rendered = render_detail(&state, &paths.session_dir(&key));
+        assert!(rendered.contains("sessionnnnnn"), "{rendered}");
+        assert!(rendered.contains("turns     1"), "{rendered}");
+        assert!(rendered.contains("damaged   no"), "{rendered}");
+    }
+
+    #[test]
+    fn inspecting_an_unknown_session_names_the_problem() {
+        let dir = tempfile::tempdir().expect("temp");
+        let root = Utf8Path::from_path(dir.path()).expect("utf8");
+        let paths = paths(root);
+        let err = inspect(&paths, &id("sessionzzzzz")).expect_err("refused");
+        assert_eq!(err.code(), ErrorCode::NotFound);
+        assert!(err.hint().is_some());
+    }
+
+    #[test]
+    fn an_untitled_session_renders_as_untitled() {
+        let dir = tempfile::tempdir().expect("temp");
+        let root = Utf8Path::from_path(dir.path()).expect("utf8");
+        let paths = paths(root);
+        let key = id("sessionooooo");
+        let mut recorder = Recorder::create(&paths, &key).expect("created");
+        recorder.user_message("x").expect("wrote");
+        recorder.turn(&outcome("y")).expect("wrote");
+        drop(recorder);
+
+        let state = inspect(&paths, &key).expect("inspected");
+        assert!(render_detail(&state, &paths.session_dir(&key)).contains("untitled"));
+    }
+
+    #[test]
+    fn the_session_detail_json_carries_the_totals() {
+        let dir = tempfile::tempdir().expect("temp");
+        let root = Utf8Path::from_path(dir.path()).expect("utf8");
+        let paths = paths(root);
+        let key = id("sessionppppp");
+        let mut recorder = Recorder::create(&paths, &key).expect("created");
+        recorder.user_message("x").expect("wrote");
+        recorder.turn(&outcome("y")).expect("wrote");
+        drop(recorder);
+
+        let value = detail_json(&inspect(&paths, &key).expect("inspected"));
+        assert_eq!(value["turns"], 1);
+        assert_eq!(value["usage"]["input_tokens"], 10);
+        assert_eq!(value["truncated"], false);
     }
 
     #[test]
