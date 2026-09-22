@@ -543,6 +543,106 @@ fn period_from(raw: Option<&str>) -> Result<Period> {
     }
 }
 
+/// Copies a damaged session into a new one.
+///
+/// Recovery never writes over the source, so a failed attempt leaves the
+/// damaged log exactly as it was, and the report says what was carried and what
+/// was lost rather than presenting a repaired file as intact.
+fn run_session_recover(paths: &Paths, launch: &Launch, output: &OutputFlags) -> Result<ExitCode> {
+    let raw = launch.args.get(1).ok_or_else(|| {
+        RuneError::missing_field("session").with_hint("name the session to recover")
+    })?;
+    let id: rune_core::id::SessionId = raw.parse()?;
+    let source = paths.session_dir(&id);
+    if !source.exists() {
+        return Err(
+            RuneError::new(ErrorCode::NotFound, format!("no session `{id}` was found"))
+                .with_hint("run `rune sessions` to see what is stored"),
+        );
+    }
+
+    let destination_id = rune_core::id::SessionId::generate();
+    let destination = paths.session_dir(&destination_id);
+    let report = rune_session::recovery::recover(
+        std::path::Path::new(source.as_str()),
+        std::path::Path::new(destination.as_str()),
+    )?;
+
+    if output.json {
+        let value = serde_json::json!({
+            "source": report.source,
+            "id": report.id.to_string(),
+            "salvaged": report.salvaged,
+            "dropped_frames": report.dropped_frames,
+            "dropped_bytes": report.dropped_bytes,
+            "truncated": report.truncated,
+        });
+        println!("{}", serde_json::to_string_pretty(&value)?);
+    } else {
+        println!("recovered into {}", report.id);
+        println!("carried {} event(s)", report.salvaged);
+        if report.dropped_frames > 0 {
+            println!(
+                "dropped {} frame(s), {} byte(s)",
+                report.dropped_frames, report.dropped_bytes
+            );
+        }
+    }
+    Ok(ExitCode::from(EXIT_OK))
+}
+
+/// Reports whether a stored session needs migration.
+///
+/// Only one log schema exists, so nothing is migrated today. The command reports
+/// what it found rather than succeeding silently, so a session written by a
+/// future build is named instead of being read as if it were current.
+fn run_session_migrate(paths: &Paths, launch: &Launch, output: &OutputFlags) -> Result<ExitCode> {
+    let raw = launch.args.get(1).ok_or_else(|| {
+        RuneError::missing_field("session").with_hint("name the session to check")
+    })?;
+    let id: rune_core::id::SessionId = raw.parse()?;
+    let state = session_log::inspect(paths, &id)?;
+
+    let current = rune_session::event::SCHEMA_VERSION;
+    let mut seen: Vec<u32> = state.events.iter().map(|frame| frame.schema).collect();
+    seen.sort_unstable();
+    seen.dedup();
+
+    let behind: Vec<u32> = seen.iter().copied().filter(|v| *v < current).collect();
+    let ahead: Vec<u32> = seen.iter().copied().filter(|v| *v > current).collect();
+
+    if output.json {
+        let value = serde_json::json!({
+            "session": state.id.to_string(),
+            "current": current,
+            "versions": seen,
+            "needs_migration": !behind.is_empty(),
+            "written_by_a_newer_build": !ahead.is_empty(),
+        });
+        println!("{}", serde_json::to_string_pretty(&value)?);
+        return Ok(ExitCode::from(EXIT_OK));
+    }
+
+    if !ahead.is_empty() {
+        // Reading it as current would misread fields a later schema changed.
+        return Err(RuneError::new(
+            ErrorCode::UnsupportedVersion,
+            format!(
+                "`{id}` was written by a newer build: schema {ahead:?}, this build reads {current}"
+            ),
+        )
+        .with_hint("upgrade the binary to read this session"));
+    }
+    if behind.is_empty() {
+        println!("`{id}` is at schema {current}; nothing to migrate");
+    } else {
+        println!(
+            "`{id}` uses schema {behind:?} and this build reads {current};              recovery into a new session is the supported path"
+        );
+    }
+    Ok(ExitCode::from(EXIT_OK))
+}
+
 /// Reports the branch structure of a stored session.
 ///
 /// Without an identifier the most recent session is used, because that is what a
@@ -581,6 +681,12 @@ fn run_tree(
 
 /// Reports one stored session.
 fn run_session(paths: &Paths, launch: &Launch, output: &OutputFlags) -> Result<ExitCode> {
+    match launch.args.first().map(String::as_str) {
+        Some("recover") => return run_session_recover(paths, launch, output),
+        Some("migrate") => return run_session_migrate(paths, launch, output),
+        _ => {}
+    }
+
     let raw = launch.args.first().ok_or_else(|| {
         RuneError::missing_field("session").with_hint("name a session, or run `rune sessions`")
     })?;
@@ -1160,6 +1266,33 @@ fn report_error(err: &RuneError) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_session_subcommands_are_dispatched_before_an_identifier_is_parsed() {
+        // Without dispatch, `recover` is read as a session id and the command
+        // fails with a message about identifier length.
+        let launch = cli::parse(
+            ["session", "recover", "sessionaaaaa"]
+                .map(std::ffi::OsString::from)
+                .to_vec(),
+            false,
+        )
+        .expect("parse");
+        assert_eq!(launch.args.first().map(String::as_str), Some("recover"));
+    }
+
+    #[test]
+    fn recover_and_migrate_require_a_session_argument() {
+        // Both must report a missing argument rather than acting on nothing.
+        for sub in ["recover", "migrate"] {
+            let launch = cli::parse(
+                ["session", sub].map(std::ffi::OsString::from).to_vec(),
+                false,
+            )
+            .expect("parse");
+            assert_eq!(launch.args.len(), 1, "{sub} gained an argument");
+        }
+    }
 
     #[test]
     fn a_project_request_is_described_before_it_is_approved() {
