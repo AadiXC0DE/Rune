@@ -209,6 +209,12 @@ pub fn run<R: BufRead, W: std::io::Write>(
         (Recorder::create(&config.paths, &id)?, History::new())
     };
 
+    // Discovered once, because a command file that changes mid-session would
+    // otherwise make an invocation mean two different things.
+    let commands =
+        rune_context::commands::discover(&config.workspace, &Paths::from_process().config_root)
+            .unwrap_or_default();
+
     // Resolved before the host literal because the registry is moved into it.
     let theme = resolve_theme(&config);
     let host = SessionHost {
@@ -254,7 +260,22 @@ pub fn run<R: BufRead, W: std::io::Write>(
             .lock()
             .map_err(|_| RuneError::new(ErrorCode::Internal, "the output lock was poisoned"))?;
         match input {
-            Input::Command { name, arguments } => handle_command(&name, &arguments, &mut *sink),
+            Input::Command { name, arguments } => {
+                match handle_command(&name, &arguments, &commands, &mut *sink)? {
+                    Handled::Exit => Ok(Action::Exit),
+                    Handled::Continue => Ok(Action::Continue),
+                    // Expanded text goes to the composer for review, never
+                    // straight to the model: a template with a wrong argument
+                    // should be visible before it is sent.
+                    Handled::Expand(prompt) => {
+                        let _ = writeln!(
+                            sink,
+                            "-- /{name} expanded; edit before sending --\n{prompt}"
+                        );
+                        Ok(Action::Continue)
+                    }
+                }
+            }
             Input::Prompt(text) => {
                 if is_first_prompt {
                     recorder.set_title(&session_log::derive_title(&text))?;
@@ -342,27 +363,56 @@ fn record_usage(paths: &Paths, model: &str, outcome: &turn::TurnOutcome) {
     }
 }
 
+/// What handling a slash command decided.
+#[derive(Clone, PartialEq, Eq, Debug)]
+enum Handled {
+    /// Carry on with the session.
+    Continue,
+    /// End the session.
+    Exit,
+    /// Place this text in the composer for review.
+    Expand(String),
+}
+
 /// Handles a slash command.
 ///
-/// Returns the action the loop should take. An unknown command is reported and
-/// the loop continues, because a typo should not end a session.
+/// An unknown command is reported and the loop continues, because a typo should
+/// not end a session.
 fn handle_command<W: std::io::Write>(
     name: &str,
-    _arguments: &str,
+    arguments: &str,
+    commands: &rune_context::commands::Discovery,
     output: &mut W,
-) -> Result<Action> {
+) -> Result<Handled> {
     match name {
-        "quit" | "exit" => Ok(Action::Exit),
+        "quit" | "exit" => Ok(Handled::Exit),
         "help" => {
-            let _ = writeln!(
-                output,
-                "commands: /help /quit\nanything else is sent to the model"
-            );
-            Ok(Action::Continue)
+            let _ = writeln!(output, "commands: /help /quit");
+            let listing = rune_context::commands::render_listing(&commands.commands);
+            let _ = writeln!(output, "{listing}");
+            // A command file that was refused is invisible otherwise, and a
+            // silent skip looks like a file that was never read.
+            for warning in &commands.warnings {
+                let _ = writeln!(output, "skipped {}: {}", warning.path, warning.reason);
+            }
+            Ok(Handled::Continue)
         }
         other => {
-            let _ = writeln!(output, "unknown command `/{other}`; try /help");
-            Ok(Action::Continue)
+            let Some(command) = commands.commands.iter().find(|c| c.name == other) else {
+                let _ = writeln!(output, "unknown command `/{other}`; try /help");
+                return Ok(Handled::Continue);
+            };
+            let parts: Vec<String> = arguments.split_whitespace().map(str::to_owned).collect();
+            match command.expand(&parts) {
+                Ok(text) => Ok(Handled::Expand(text)),
+                Err(err) => {
+                    let _ = writeln!(output, "{err}");
+                    if let Some(hint) = err.hint() {
+                        let _ = writeln!(output, "hint: {hint}");
+                    }
+                    Ok(Handled::Continue)
+                }
+            }
         }
     }
 }
@@ -561,8 +611,8 @@ mod tests {
     #[test]
     fn the_shell_reports_an_unknown_command_without_leaving() {
         let mut output = Vec::new();
-        let action = handle_command("nope", "", &mut output).expect("handled");
-        assert_eq!(action, Action::Continue);
+        let action = handle_command("nope", "", &empty_commands(), &mut output).expect("handled");
+        assert_eq!(action, Handled::Continue);
         let text = String::from_utf8_lossy(&output);
         assert!(text.contains("unknown command"), "{text}");
         assert!(text.contains("/help"), "{text}");
@@ -572,19 +622,70 @@ mod tests {
     fn the_quit_command_leaves_the_shell() {
         let mut output = Vec::new();
         assert_eq!(
-            handle_command("quit", "", &mut output).expect("handled"),
-            Action::Exit
+            handle_command("quit", "", &empty_commands(), &mut output).expect("handled"),
+            Handled::Exit
         );
         assert_eq!(
-            handle_command("exit", "", &mut output).expect("handled"),
-            Action::Exit
+            handle_command("exit", "", &empty_commands(), &mut output).expect("handled"),
+            Handled::Exit
         );
+    }
+
+    #[test]
+    fn a_user_command_expands_for_review_instead_of_running() {
+        let mut discovery = rune_context::commands::Discovery::default();
+        discovery.commands.push(rune_context::commands::Command {
+            name: "fix".to_owned(),
+            description: "Fix it".to_owned(),
+            argument_hint: None,
+            body: "Fix $1 now".to_owned(),
+            origin: rune_context::commands::Origin::Project,
+            source: None,
+        });
+
+        let mut output = Vec::new();
+        let handled = handle_command("fix", "parser", &discovery, &mut output).expect("handled");
+        assert_eq!(handled, Handled::Expand("Fix parser now".to_owned()));
+    }
+
+    #[test]
+    fn a_command_missing_its_argument_reports_instead_of_expanding() {
+        let mut discovery = rune_context::commands::Discovery::default();
+        discovery.commands.push(rune_context::commands::Command {
+            name: "fix".to_owned(),
+            description: "Fix it".to_owned(),
+            argument_hint: None,
+            body: "Fix $1 now".to_owned(),
+            origin: rune_context::commands::Origin::Project,
+            source: None,
+        });
+
+        let mut output = Vec::new();
+        let handled = handle_command("fix", "", &discovery, &mut output).expect("handled");
+        assert_eq!(handled, Handled::Continue);
+        let text = String::from_utf8_lossy(&output);
+        assert!(text.contains("$1"), "{text}");
+    }
+
+    #[test]
+    fn help_reports_a_command_file_that_was_skipped() {
+        let mut discovery = rune_context::commands::Discovery::default();
+        discovery.warnings.push(rune_context::commands::Warning {
+            path: camino::Utf8PathBuf::from("/p/.rune/commands/help.md"),
+            reason: "`/help` is a built-in command, so this file was skipped".to_owned(),
+        });
+
+        let mut output = Vec::new();
+        handle_command("help", "", &discovery, &mut output).expect("handled");
+        let text = String::from_utf8_lossy(&output);
+        assert!(text.contains("skipped"), "{text}");
+        assert!(text.contains("built-in"), "{text}");
     }
 
     #[test]
     fn help_lists_the_commands() {
         let mut output = Vec::new();
-        handle_command("help", "", &mut output).expect("handled");
+        handle_command("help", "", &empty_commands(), &mut output).expect("handled");
         let text = String::from_utf8_lossy(&output);
         assert!(text.contains("/help"));
         assert!(text.contains("/quit"));
@@ -678,6 +779,11 @@ mod tests {
             err.hint().is_some(),
             "the failure does not say how to connect a provider"
         );
+    }
+
+    /// Builds an empty command set.
+    fn empty_commands() -> rune_context::commands::Discovery {
+        rune_context::commands::Discovery::default()
     }
 
     /// Builds a session config whose terminal accepts no color.

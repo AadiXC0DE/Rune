@@ -12,6 +12,7 @@
 #![cfg_attr(test, allow(clippy::expect_used, clippy::unwrap_used, clippy::panic))]
 
 pub mod catalog;
+pub mod commands;
 pub mod instructions;
 pub mod limits;
 pub mod mcp;
