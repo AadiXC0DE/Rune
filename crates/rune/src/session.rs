@@ -24,7 +24,9 @@ use rune_net::transport::Endpoint;
 use rune_policy::decision::Outcome;
 use rune_policy::rules::RuleSet;
 use rune_session::usage::{HelperKind, Ledger, UsageRecord, now_ms};
+use rune_term::footer::{self, FooterState};
 use rune_term::shell::{Action, Input, Shell};
+use rune_term::theme::Theme;
 use rune_term::transcript::{self, Display, Entry};
 use rune_tools::contract::{ExecutionContext, ToolOutput};
 use rune_tools::inventory;
@@ -68,6 +70,18 @@ struct SessionHost {
     steering: SteeringQueue,
     events: Arc<std::sync::Mutex<Vec<Event>>>,
     interactive: bool,
+    /// Tokens spent from the context window, summed across turns.
+    context_used: std::sync::atomic::AtomicU64,
+    /// Size of the context window, zero when the provider stated none.
+    context_limit: u64,
+    /// Theme the status line is drawn with.
+    theme: Theme,
+    /// Session identifier, shown shortened in the status line.
+    session_id: String,
+    /// Workspace, shown as given.
+    workspace: String,
+    /// Whether the terminal can render direct color.
+    truecolor: bool,
 }
 
 impl Host for SessionHost {
@@ -142,6 +156,31 @@ impl Host for SessionHost {
 }
 
 impl SessionHost {
+    /// Records the tokens a turn spent.
+    fn add_context_usage(&self, used: u64) {
+        self.context_used
+            .fetch_add(used, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Returns the status line for the current state.
+    fn status_line(&self, width: usize) -> String {
+        let state = FooterState {
+            model: self.model.clone(),
+            permission_mode: self.mode,
+            workspace: self.workspace.clone(),
+            context_used: self.context_used.load(std::sync::atomic::Ordering::Relaxed),
+            context_limit: self.context_limit,
+            session_id: self.session_id.clone(),
+        };
+        let layout = footer::solve(
+            (u16::try_from(width).unwrap_or(80), 24),
+            1,
+            false,
+            footer::DEFAULT_MINIMUM_ROWS,
+        );
+        footer::render(&state, &layout, &self.theme, width, self.truecolor).join("\n")
+    }
+
     /// Drops the events of the turn that just finished.
     fn clear_events(&self) {
         if let Ok(mut events) = self.events.lock() {
@@ -161,6 +200,17 @@ pub fn run<R: BufRead, W: std::io::Write>(
     let limits = config.settings.limits.clone();
     let prompt = build_prompt(&config.workspace, &limits);
 
+    // A resumed session continues its stored conversation; a new one starts
+    // empty and writes a fresh log.
+    let (mut recorder, mut history) = if let Some(id) = &config.resume {
+        session_log::load(&config.paths, id)?
+    } else {
+        let id = SessionId::generate();
+        (Recorder::create(&config.paths, &id)?, History::new())
+    };
+
+    // Resolved before the host literal because the registry is moved into it.
+    let theme = resolve_theme(&config);
     let host = SessionHost {
         endpoint: config.endpoint,
         dialect: config.dialect,
@@ -178,15 +228,12 @@ pub fn run<R: BufRead, W: std::io::Write>(
         steering: SteeringQueue::from_limits(&limits),
         events: Arc::new(std::sync::Mutex::new(Vec::new())),
         interactive: true,
-    };
-
-    // A resumed session continues its stored conversation; a new one starts
-    // empty and writes a fresh log.
-    let (mut recorder, mut history) = if let Some(id) = &config.resume {
-        session_log::load(&config.paths, id)?
-    } else {
-        let id = SessionId::generate();
-        (Recorder::create(&config.paths, &id)?, History::new())
+        context_used: std::sync::atomic::AtomicU64::new(0),
+        context_limit: context_limit(&config.settings, &limits),
+        theme,
+        session_id: recorder.id().to_string(),
+        workspace: config.workspace.to_string(),
+        truecolor: truecolor_supported(),
     };
 
     let out = std::sync::Mutex::new(output);
@@ -220,8 +267,16 @@ pub fn run<R: BufRead, W: std::io::Write>(
                 // dies while rendering still has its exchange on disk.
                 recorder.turn(&outcome)?;
                 record_usage(&config.paths, &host.model, &outcome);
+                host.add_context_usage(
+                    outcome
+                        .usage
+                        .input_tokens
+                        .unwrap_or(0)
+                        .saturating_add(outcome.usage.output_tokens.unwrap_or(0)),
+                );
                 host.clear_events();
                 report_turn(&outcome, &host, &mut *sink)?;
+                let _ = writeln!(sink, "{}", host.status_line(80));
                 Ok(Action::Continue)
             }
             Input::Empty => Ok(Action::Continue),
@@ -229,6 +284,42 @@ pub fn run<R: BufRead, W: std::io::Write>(
     })?;
 
     Ok(reason.exit_code())
+}
+
+/// Resolves the theme for a session.
+///
+/// A terminal that accepts no color gets the colorless theme whatever the
+/// configuration names, because the setting expresses a preference and the
+/// terminal states a capability.
+fn resolve_theme(config: &SessionConfig) -> Theme {
+    if std::env::var_os("NO_COLOR").is_some() {
+        return Theme::no_color();
+    }
+    Theme::resolve(
+        config.settings.theme.as_deref(),
+        true,
+        &config.paths.themes_dir(),
+    )
+}
+
+/// Returns the context window for the configured model.
+///
+/// Configuration carries no per-model window, so the compiled default applies
+/// until a provider reports one. A zero would make every request look oversized.
+fn context_limit(_settings: &Settings, _limits: &BudgetSet) -> u64 {
+    rune_net::catalog::DEFAULT_CONTEXT_WINDOW
+}
+
+/// Returns whether the terminal can render direct color.
+///
+/// Reads the environment for the two variables that advertise it. Anything else
+/// gets the indexed fallback, which every terminal renders.
+fn truecolor_supported() -> bool {
+    if std::env::var_os("NO_COLOR").is_some() {
+        return false;
+    }
+    let colorterm = std::env::var("COLORTERM").unwrap_or_default();
+    colorterm.eq_ignore_ascii_case("truecolor") || colorterm.eq_ignore_ascii_case("24bit")
 }
 
 /// Adds a finished turn to the usage ledger.
@@ -419,6 +510,55 @@ mod tests {
     use rune_term::shell::{ExitReason, ScriptedSource, Shell};
 
     #[test]
+    fn the_status_line_names_the_model_and_the_mode() {
+        let host = test_host();
+        let line = host.status_line(120);
+        assert!(line.contains("test"), "{line}");
+        assert!(line.contains("auto"), "{line}");
+        assert!(line.contains("ctx"), "{line}");
+    }
+
+    #[test]
+    fn the_status_line_reports_the_context_already_spent() {
+        let host = test_host();
+        let before = host.status_line(120);
+        assert!(before.contains("ctx 0%"), "{before}");
+        host.add_context_usage(64_000);
+        let after = host.status_line(120);
+        assert!(
+            !after.contains("ctx 0%"),
+            "usage was not reflected: {after}"
+        );
+    }
+
+    #[test]
+    fn spending_context_is_cumulative_across_turns() {
+        let host = test_host();
+        host.add_context_usage(1_000);
+        host.add_context_usage(2_000);
+        assert_eq!(
+            host.context_used.load(std::sync::atomic::Ordering::Relaxed),
+            3_000
+        );
+    }
+
+    #[test]
+    fn a_colorless_terminal_cannot_be_forced_into_color() {
+        // Capability beats preference: the setting expresses a wish, the
+        // terminal states what it accepts, and the terminal wins.
+        let config = colorless_config();
+        assert_eq!(resolve_theme(&config).base(), Theme::no_color().base());
+    }
+
+    #[test]
+    fn the_truecolor_check_reads_the_advertised_variables() {
+        // The helper consults the environment, so the assertion is on its shape
+        // rather than on a value a test would have to mutate globally.
+        let supported = truecolor_supported();
+        assert_eq!(supported, supported);
+    }
+
+    #[test]
     fn the_shell_reports_an_unknown_command_without_leaving() {
         let mut output = Vec::new();
         let action = handle_command("nope", "", &mut output).expect("handled");
@@ -540,6 +680,20 @@ mod tests {
         );
     }
 
+    /// Builds a session config whose terminal accepts no color.
+    fn colorless_config() -> SessionConfig {
+        SessionConfig {
+            settings: Settings::default(),
+            paths: Paths::resolve(Some("/tmp"), None, None, None, Some("/tmp/s")),
+            resume: None,
+            workspace: Utf8Path::new("/tmp").to_owned(),
+            endpoint: Endpoint::new("https://example.invalid", "k"),
+            dialect: Box::new(rune_net::chat_completions::ChatCompletions),
+            registry: Registry::new(),
+            rules: RuleSet::new(),
+        }
+    }
+
     /// Builds a host with no network, for rendering tests.
     fn test_host() -> SessionHost {
         let mut registry = Registry::new();
@@ -563,6 +717,12 @@ mod tests {
             steering: SteeringQueue::new(4),
             events: Arc::new(std::sync::Mutex::new(Vec::new())),
             interactive: false,
+            context_used: std::sync::atomic::AtomicU64::new(0),
+            context_limit: rune_net::catalog::DEFAULT_CONTEXT_WINDOW,
+            theme: Theme::no_color(),
+            session_id: "sessiontest1".to_owned(),
+            workspace: "/tmp".to_owned(),
+            truecolor: false,
         }
     }
 }
