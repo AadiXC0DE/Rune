@@ -105,6 +105,8 @@ pub struct SessionState {
     pub usage: UsageTotal,
     /// Session title, when one was set.
     pub title: Option<String>,
+    /// Workspace the session ran in, absent when none was recorded.
+    pub workspace: Option<String>,
     /// Byte offset where a torn final frame was dropped, when one was.
     pub truncated_at: Option<u64>,
 }
@@ -151,6 +153,7 @@ struct Projection {
     turns: u64,
     usage: UsageTotal,
     title: Option<String>,
+    workspace: Option<String>,
 }
 
 /// An open session directory with the writer lock held.
@@ -232,6 +235,7 @@ impl SessionStore {
                 turns: state.turns,
                 usage: state.usage,
                 title: state.title.clone(),
+                workspace: state.workspace.clone(),
             }),
         };
         store.rebuild_metadata()?;
@@ -333,6 +337,9 @@ impl SessionStore {
                 output_tokens,
             } => projection.usage.record(input_tokens, output_tokens),
             SessionEvent::TitleSet { title } => projection.title = Some(title),
+            SessionEvent::WorkspaceSet { workspace } => {
+                projection.workspace = Some(workspace.clone());
+            }
             _ => {}
         }
 
@@ -396,6 +403,7 @@ pub fn load_read_only(dir: &Utf8Path) -> Result<SessionState> {
         turns: 0,
         usage: UsageTotal::default(),
         title: None,
+        workspace: None,
         truncated_at: read.truncated_at,
     };
     for frame in &state.events {
@@ -406,6 +414,9 @@ pub fn load_read_only(dir: &Utf8Path) -> Result<SessionState> {
                 output_tokens,
             } => state.usage.record(*input_tokens, *output_tokens),
             SessionEvent::TitleSet { title } => state.title = Some(title.clone()),
+            SessionEvent::WorkspaceSet { workspace } => {
+                state.workspace = Some(workspace.clone());
+            }
             _ => {}
         }
     }

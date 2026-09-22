@@ -254,7 +254,11 @@ pub fn run<R: BufRead, W: std::io::Write>(
         session_log::load(&config.paths, id)?
     } else {
         let id = SessionId::generate();
-        (Recorder::create(&config.paths, &id)?, History::new())
+        let recorder = Recorder::create(&config.paths, &id)?;
+        // Recorded before the first turn, so the session is attributable to its
+        // workspace even if the run ends immediately.
+        recorder.set_workspace(&config.workspace)?;
+        (recorder, History::new())
     };
 
     // Discovered once, because a command file that changes mid-session would

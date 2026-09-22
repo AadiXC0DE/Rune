@@ -665,7 +665,8 @@ pub fn history_from_events(frames: &[EventFrame]) -> History {
             SessionEvent::TurnStarted { .. }
             | SessionEvent::Compaction { .. }
             | SessionEvent::UsageRecorded { .. }
-            | SessionEvent::TitleSet { .. } => {
+            | SessionEvent::TitleSet { .. }
+            | SessionEvent::WorkspaceSet { .. } => {
                 flush_calls(&mut history, &mut calls);
                 flush_results(&mut history, &mut results);
             }

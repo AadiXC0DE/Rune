@@ -97,6 +97,14 @@ pub enum SessionEvent {
         /// Display title.
         title: String,
     },
+    /// The workspace the session ran in was recorded.
+    ///
+    /// Written once, when the session is created, so a later listing can scope
+    /// itself to a workspace without reading every session's contents.
+    WorkspaceSet {
+        /// Canonical workspace path.
+        workspace: String,
+    },
 }
 
 impl SessionEvent {
@@ -112,6 +120,7 @@ impl SessionEvent {
             Self::Compaction { .. } => "compaction",
             Self::UsageRecorded { .. } => "usage_recorded",
             Self::TitleSet { .. } => "title_set",
+            Self::WorkspaceSet { .. } => "workspace_set",
         }
     }
 }

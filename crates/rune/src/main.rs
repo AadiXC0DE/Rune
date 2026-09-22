@@ -146,8 +146,8 @@ fn run(launch: &Launch) -> Result<ExitCode> {
         Command::Limits => run_limits(&settings, &output_flags),
         Command::Config => run_config(&settings, &output_flags),
         Command::Prompt => run_prompt(&settings, launch, &output_flags),
-        Command::Sessions => run_sessions(&paths, launch, &output_flags),
-        Command::Tree => run_tree(&paths, launch, &output_flags),
+        Command::Sessions => run_sessions(&paths, launch, &workspace, &output_flags),
+        Command::Tree => run_tree(&paths, launch, &workspace, &output_flags),
         Command::Session => run_session(&paths, launch, &output_flags),
         Command::Usage => run_usage(&paths, launch, &output_flags),
         Command::Auth => run_auth(&settings, &paths, launch, &output_flags),
@@ -406,7 +406,7 @@ fn run_interactive(
     launch: &Launch,
 ) -> Result<ExitCode> {
     let resume = match &launch.resume {
-        Some(target) => Some(session_log::resolve_target(target, paths)?),
+        Some(target) => Some(session_log::resolve_target(target, paths, workspace)?),
         None => None,
     };
     let config = session::prepare(settings, paths, workspace, resume)?;
@@ -547,10 +547,15 @@ fn period_from(raw: Option<&str>) -> Result<Period> {
 ///
 /// Without an identifier the most recent session is used, because that is what a
 /// user means by "the current one".
-fn run_tree(paths: &Paths, launch: &Launch, output: &OutputFlags) -> Result<ExitCode> {
+fn run_tree(
+    paths: &Paths,
+    launch: &Launch,
+    workspace: &camino::Utf8Path,
+    output: &OutputFlags,
+) -> Result<ExitCode> {
     let id = match launch.args.first() {
         Some(raw) => raw.parse()?,
-        None => session_log::resolve_target(&ResumeTarget::Latest, paths)?,
+        None => session_log::resolve_target(&ResumeTarget::Latest, paths, workspace)?,
     };
     let state = session_log::inspect(paths, &id)?;
     let tree = session_log::tree_of(&state);
@@ -714,7 +719,12 @@ fn run_permissions(settings: &Settings, launch: &Launch, output: &OutputFlags) -
 }
 
 /// Lists the sessions stored for this workspace.
-fn run_sessions(paths: &Paths, launch: &Launch, output: &OutputFlags) -> Result<ExitCode> {
+fn run_sessions(
+    paths: &Paths,
+    launch: &Launch,
+    workspace: &camino::Utf8Path,
+    output: &OutputFlags,
+) -> Result<ExitCode> {
     let limit = match launch.flag("--limit") {
         Some(raw) => raw.parse::<usize>().map_err(|_| {
             RuneError::invalid_field("limit", format!("`{raw}` is not a number"))
@@ -723,7 +733,10 @@ fn run_sessions(paths: &Paths, launch: &Launch, output: &OutputFlags) -> Result<
         None => session_log::DEFAULT_PAGE,
     };
     let cursor = launch.flag("--cursor");
-    let page = session_log::page(paths, limit, cursor)?;
+    // Without `--all` the listing is scoped to this workspace, so `last` means
+    // the latest session here rather than the latest anywhere.
+    let scope = (!launch.has_flag("--all")).then_some(workspace);
+    let page = session_log::page(paths, scope, limit, cursor)?;
     let rows = &page.rows;
     let entries: Vec<serde_json::Value> = rows
         .iter()

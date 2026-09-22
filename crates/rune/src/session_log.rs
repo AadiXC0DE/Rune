@@ -53,6 +53,8 @@ pub struct Summary {
     pub updated_at: Option<String>,
     /// Session title, when one was set.
     pub title: Option<String>,
+    /// Workspace the session ran in, absent when none was recorded.
+    pub workspace: Option<String>,
     /// Directory holding the log.
     pub dir: Utf8PathBuf,
 }
@@ -69,6 +71,17 @@ impl Recorder {
     pub fn create(paths: &Paths, id: &SessionId) -> Result<Self> {
         let store = SessionStore::create(paths, id)?;
         Ok(Self { store, turn: 0 })
+    }
+
+    /// Records the workspace the session runs in.
+    ///
+    /// Written once at the start, so a later listing can scope itself to a
+    /// workspace without reading every session's contents.
+    pub fn set_workspace(&self, workspace: &Utf8Path) -> Result<()> {
+        self.store.append(SessionEvent::WorkspaceSet {
+            workspace: rune_policy::trust::canonical_workspace(workspace).to_string(),
+        })?;
+        Ok(())
     }
 
     /// Opens an existing session, preparing to append to it.
@@ -172,13 +185,20 @@ pub struct Page {
 
 /// Reads one page of sessions.
 ///
-/// The cursor is the identifier of the last row already returned, and paging
-/// resumes strictly after it. An identifier is used rather than an offset
-/// because a session created between two pages would otherwise shift every later
-/// row, so a session would be skipped or repeated.
-pub fn page(paths: &Paths, limit: usize, cursor: Option<&str>) -> Result<Page> {
+/// `scope` restricts the listing to one workspace, which is what `last` means:
+/// the most recent session in the workspace the command ran in, not the most
+/// recent anywhere. The cursor is the identifier of the last row already
+/// returned, and paging resumes strictly after it. An identifier is used rather
+/// than an offset because a session created between two pages would otherwise
+/// shift every later row, so a session would be skipped or repeated.
+pub fn page(
+    paths: &Paths,
+    scope: Option<&Utf8Path>,
+    limit: usize,
+    cursor: Option<&str>,
+) -> Result<Page> {
     let limit = limit.clamp(1, MAX_PAGE);
-    let all = list(paths);
+    let all = list_scoped(paths, scope);
 
     let start = match cursor {
         None => 0,
@@ -203,8 +223,13 @@ pub fn page(paths: &Paths, limit: usize, cursor: Option<&str>) -> Result<Page> {
     Ok(Page { rows, next })
 }
 
-/// Lists stored sessions for a workspace, most recently active first.
-pub fn list(paths: &Paths) -> Vec<Summary> {
+/// Lists stored sessions, optionally restricted to one workspace.
+///
+/// A session that recorded no workspace is excluded from a scoped listing rather
+/// than assumed to belong to it, because guessing would attribute a session to a
+/// repository it may never have touched.
+pub fn list_scoped(paths: &Paths, scope: Option<&Utf8Path>) -> Vec<Summary> {
+    let wanted = scope.map(rune_policy::trust::canonical_workspace);
     let Ok(entries) = std::fs::read_dir(paths.sessions_dir()) else {
         return Vec::new();
     };
@@ -217,6 +242,11 @@ pub fn list(paths: &Paths) -> Vec<Summary> {
         let Ok(state) = load_read_only(&dir) else {
             continue;
         };
+        if let Some(wanted) = &wanted
+            && state.workspace.as_deref() != Some(wanted.as_str())
+        {
+            continue;
+        }
         out.push(summarize(&state, dir));
     }
 
@@ -301,7 +331,8 @@ pub fn tree_of(state: &SessionState) -> Tree {
             SessionEvent::TurnStarted { .. }
             | SessionEvent::Compaction { .. }
             | SessionEvent::UsageRecorded { .. }
-            | SessionEvent::TitleSet { .. } => continue,
+            | SessionEvent::TitleSet { .. }
+            | SessionEvent::WorkspaceSet { .. } => continue,
         };
         let node = Node::new(
             role,
@@ -419,9 +450,9 @@ pub fn inspect(paths: &Paths, id: &SessionId) -> Result<SessionState> {
     load_read_only(&dir)
 }
 
-/// Returns the most recently active session, when there is one.
-pub fn latest(paths: &Paths) -> Option<Summary> {
-    list(paths).into_iter().next()
+/// Returns the most recent session in a workspace, when there is one.
+pub fn latest_in(paths: &Paths, workspace: &Utf8Path) -> Option<Summary> {
+    list_scoped(paths, Some(workspace)).into_iter().next()
 }
 
 /// Reads a stored session into a conversation.
@@ -494,7 +525,8 @@ pub fn history_from(state: &SessionState) -> History {
             SessionEvent::TurnStarted { .. }
             | SessionEvent::Compaction { .. }
             | SessionEvent::UsageRecorded { .. }
-            | SessionEvent::TitleSet { .. } => {}
+            | SessionEvent::TitleSet { .. }
+            | SessionEvent::WorkspaceSet { .. } => {}
         }
     }
 
@@ -523,6 +555,7 @@ fn summarize(state: &SessionState, dir: Utf8PathBuf) -> Summary {
             .last()
             .and_then(|frame| timestamp(frame.timestamp_ms)),
         title: state.title.clone(),
+        workspace: state.workspace.clone(),
         dir,
     }
 }
@@ -558,16 +591,20 @@ pub fn timestamp(millis: u64) -> Option<String> {
 }
 
 /// Returns the session identifier a resume target names.
-pub fn resolve_target(target: &crate::cli::ResumeTarget, paths: &Paths) -> Result<SessionId> {
+pub fn resolve_target(
+    target: &crate::cli::ResumeTarget,
+    paths: &Paths,
+    workspace: &Utf8Path,
+) -> Result<SessionId> {
     match target {
         crate::cli::ResumeTarget::Exact(raw) => raw.parse(),
-        crate::cli::ResumeTarget::Latest => latest(paths)
+        crate::cli::ResumeTarget::Latest => latest_in(paths, workspace)
             .ok_or_else(|| {
                 RuneError::new(ErrorCode::NotFound, "no session has been saved yet")
                     .with_hint("run a session first, or start a new one")
             })
             .and_then(|row| row.id.parse()),
-        crate::cli::ResumeTarget::Picker => list(paths)
+        crate::cli::ResumeTarget::Picker => list_scoped(paths, Some(workspace))
             .into_iter()
             .next()
             .map(|row| row.id)
@@ -789,7 +826,7 @@ mod tests {
         second.turn(&outcome("new answer")).expect("wrote");
         drop(second);
 
-        let rows = list(&paths);
+        let rows = list_scoped(&paths, None);
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].id, "sessionfffff", "listing is not newest first");
     }
@@ -801,11 +838,12 @@ mod tests {
         let paths = paths(root);
 
         let mut only = Recorder::create(&paths, &id("sessionggggg")).expect("created");
+        only.set_workspace(root).expect("workspace");
         only.user_message("hi").expect("wrote");
         only.turn(&outcome("hello")).expect("wrote");
         drop(only);
 
-        let newest = latest(&paths).expect("a session");
+        let newest = latest_in(&paths, root).expect("a session");
         assert_eq!(newest.id, "sessionggggg");
         assert_eq!(newest.turns, 1);
     }
@@ -834,7 +872,7 @@ mod tests {
         let mut seen = Vec::new();
         let mut cursor: Option<String> = None;
         for _ in 0..10 {
-            let page = page(&paths, 2, cursor.as_deref()).expect("page");
+            let page = page(&paths, None, 2, cursor.as_deref()).expect("page");
             seen.extend(page.rows.iter().map(|row| row.id.clone()));
             match page.next {
                 Some(next) => cursor = Some(next),
@@ -861,7 +899,7 @@ mod tests {
         recorder.turn(&outcome("a")).expect("wrote");
         drop(recorder);
 
-        let page = page(&paths, 10, None).expect("page");
+        let page = page(&paths, None, 10, None).expect("page");
         assert_eq!(page.rows.len(), 1);
         assert!(page.next.is_none(), "a final page offered a cursor");
     }
@@ -873,7 +911,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp");
         let root = Utf8Path::from_path(dir.path()).expect("utf8");
         let paths = paths(root);
-        let err = page(&paths, 2, Some("sessionmissing")).expect_err("refused");
+        let err = page(&paths, None, 2, Some("sessionmissing")).expect_err("refused");
         assert_eq!(err.code(), ErrorCode::InvalidField);
         assert!(err.hint().is_some());
     }
@@ -885,8 +923,8 @@ mod tests {
         let paths = paths(root);
         // A huge request is bounded rather than honoured, and a zero is raised
         // to one so a caller always makes progress.
-        assert!(page(&paths, 0, None).is_ok());
-        assert!(page(&paths, usize::MAX, None).is_ok());
+        assert!(page(&paths, None, 0, None).is_ok());
+        assert!(page(&paths, None, usize::MAX, None).is_ok());
         assert_eq!(MAX_PAGE, 100);
     }
 
@@ -895,8 +933,8 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp");
         let root = Utf8Path::from_path(dir.path()).expect("utf8");
         let paths = paths(root);
-        assert!(list(&paths).is_empty());
-        assert!(latest(&paths).is_none());
+        assert!(list_scoped(&paths, None).is_empty());
+        assert!(latest_in(&paths, root).is_none());
     }
 
     #[test]
@@ -908,6 +946,7 @@ mod tests {
                 events: 9,
                 updated_at: Some("2026-01-02T03:04:05Z".to_owned()),
                 title: Some("parser work".to_owned()),
+                workspace: Some("/tmp/work".to_owned()),
                 dir: Utf8PathBuf::from("/tmp/a"),
             },
             Summary {
@@ -916,6 +955,7 @@ mod tests {
                 events: 0,
                 updated_at: None,
                 title: None,
+                workspace: None,
                 dir: Utf8PathBuf::from("/tmp/b"),
             },
         ];
@@ -1099,12 +1139,59 @@ mod tests {
         let root = Utf8Path::from_path(dir.path()).expect("utf8");
         let paths = paths(root);
         let mut recorder = Recorder::create(&paths, &id("sessionhhhhh")).expect("created");
+        recorder.set_workspace(root).expect("workspace");
         recorder.user_message("hi").expect("wrote");
         recorder.turn(&outcome("yo")).expect("wrote");
         drop(recorder);
 
-        let resolved = resolve_target(&crate::cli::ResumeTarget::Latest, &paths).expect("resolved");
+        let resolved =
+            resolve_target(&crate::cli::ResumeTarget::Latest, &paths, root).expect("resolved");
         assert_eq!(resolved.to_string(), "sessionhhhhh");
+    }
+
+    #[test]
+    fn the_latest_session_is_scoped_to_its_workspace() {
+        // Two repositories each have their own latest session, and `last` means
+        // the one for the workspace the command ran in.
+        let dir = tempfile::tempdir().expect("temp");
+        let root = Utf8Path::from_path(dir.path()).expect("utf8");
+        let paths = paths(root);
+        let first = root.join("one");
+        let second = root.join("two");
+        std::fs::create_dir_all(&first).expect("one");
+        std::fs::create_dir_all(&second).expect("two");
+
+        for (key, where_) in [("sessionws001", &first), ("sessionws002", &second)] {
+            let mut recorder = Recorder::create(&paths, &id(key)).expect("created");
+            recorder.set_workspace(where_).expect("workspace");
+            recorder.user_message("hi").expect("wrote");
+            recorder.turn(&outcome("yo")).expect("wrote");
+            drop(recorder);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        let one = latest_in(&paths, &first).expect("one");
+        let two = latest_in(&paths, &second).expect("two");
+        assert_eq!(one.id, "sessionws001");
+        assert_eq!(two.id, "sessionws002");
+        // An unscoped listing sees both.
+        assert_eq!(list_scoped(&paths, None).len(), 2);
+    }
+
+    #[test]
+    fn a_session_with_no_recorded_workspace_is_not_attributed_to_one() {
+        // Guessing would attribute a session to a repository it may never have
+        // touched, so it is excluded from a scoped listing.
+        let dir = tempfile::tempdir().expect("temp");
+        let root = Utf8Path::from_path(dir.path()).expect("utf8");
+        let paths = paths(root);
+        let mut recorder = Recorder::create(&paths, &id("sessionws003")).expect("created");
+        recorder.user_message("hi").expect("wrote");
+        recorder.turn(&outcome("yo")).expect("wrote");
+        drop(recorder);
+
+        assert_eq!(list_scoped(&paths, None).len(), 1);
+        assert!(latest_in(&paths, root).is_none());
     }
 
     #[test]
@@ -1112,7 +1199,8 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp");
         let root = Utf8Path::from_path(dir.path()).expect("utf8");
         let paths = paths(root);
-        let err = resolve_target(&crate::cli::ResumeTarget::Latest, &paths).expect_err("refused");
+        let err =
+            resolve_target(&crate::cli::ResumeTarget::Latest, &paths, root).expect_err("refused");
         assert_eq!(err.code(), ErrorCode::NotFound);
         assert!(err.hint().is_some());
     }
@@ -1124,7 +1212,7 @@ mod tests {
         let paths = paths(root);
         let target = crate::cli::ResumeTarget::Exact("sessionjjjjj".to_owned());
         assert_eq!(
-            resolve_target(&target, &paths)
+            resolve_target(&target, &paths, Utf8Path::new("/w"))
                 .expect("resolved")
                 .to_string(),
             "sessionjjjjj"
@@ -1137,7 +1225,7 @@ mod tests {
         let root = Utf8Path::from_path(dir.path()).expect("utf8");
         let paths = paths(root);
         let target = crate::cli::ResumeTarget::Exact("not valid!".to_owned());
-        assert!(resolve_target(&target, &paths).is_err());
+        assert!(resolve_target(&target, &paths, Utf8Path::new("/w")).is_err());
     }
 
     #[test]
@@ -1172,7 +1260,7 @@ mod tests {
         assert!(!recorder.title_is_unset());
         drop(recorder);
 
-        let rows = list(&paths);
+        let rows = list_scoped(&paths, None);
         assert_eq!(rows[0].title.as_deref(), Some("cache rewrite"));
     }
 
