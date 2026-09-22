@@ -5,7 +5,7 @@
 //! what makes the shell usable while the model is working.
 
 use std::io::{BufRead, Write as _};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use crate::session_log::{self, Recorder};
 use camino::Utf8Path;
@@ -22,6 +22,7 @@ use rune_net::message::ToolSpec;
 use rune_net::provider::Provider;
 use rune_net::transport::Endpoint;
 use rune_policy::decision::Outcome;
+use rune_policy::review::{ReviewOutcome, ReviewRequest, ReviewSession, Reviewer};
 use rune_policy::rules::RuleSet;
 use rune_session::usage::{HelperKind, Ledger, UsageRecord, now_ms};
 use rune_term::footer::{self, FooterState};
@@ -68,8 +69,7 @@ struct SessionHost {
     registry: Registry,
     cancellation: Cancellation,
     steering: SteeringQueue,
-    events: Arc<std::sync::Mutex<Vec<Event>>>,
-    interactive: bool,
+    events: Arc<Mutex<Vec<Event>>>,
     /// Tokens spent from the context window, summed across turns.
     context_used: std::sync::atomic::AtomicU64,
     /// Size of the context window, zero when the provider stated none.
@@ -86,6 +86,20 @@ struct SessionHost {
     provider_order: Vec<String>,
     /// Whether requests are restricted to that preference.
     provider_strict: bool,
+    /// Reviewer for unresolved actions, absent when none is configured.
+    reviewer: Option<Box<dyn Reviewer>>,
+    /// Review activity for the current turn.
+    review_session: Arc<Mutex<ReviewSession>>,
+}
+
+/// Locks the review session, recovering from a poisoned lock.
+///
+/// A panic while holding this lock must not make every later tool call fail, so
+/// the state is taken as it stands.
+fn lock_review(session: &Mutex<ReviewSession>) -> std::sync::MutexGuard<'_, ReviewSession> {
+    session
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 impl Host for SessionHost {
@@ -129,15 +143,37 @@ impl Host for SessionHost {
 
     fn decide(&self, name: &str, target: Option<&str>) -> (Outcome, String) {
         let (outcome, reason) = turn::decide_call(&self.rules, self.mode, name, target);
-        match outcome {
-            // A noninteractive run cannot collect approval, so an unresolved
-            // call stays unresolved rather than being allowed.
-            Outcome::Ask if self.interactive => (
-                Outcome::Allow,
-                format!("{reason}; approved for this session"),
-            ),
-            other => (other, reason),
+        if outcome != Outcome::Ask {
+            return (outcome, reason);
         }
+
+        // In automatic mode an unresolved action gets one narrow review rather
+        // than a person's attention. The review never opens a prompt and never
+        // ends the turn: a caution or an unreachable reviewer holds the action
+        // and hands the agent guidance.
+        if self.mode == PermissionMode::Auto
+            && let Some(reviewer) = &self.reviewer
+        {
+            let action = target.unwrap_or(name).to_owned();
+            let request = ReviewRequest::new(action.clone(), vec![action.clone()], name, "");
+            let mut session = lock_review(&self.review_session);
+            return match session.review(reviewer.as_ref(), &request) {
+                ReviewOutcome::Clear { .. } => {
+                    (Outcome::Allow, format!("{reason}; cleared by review"))
+                }
+                other => (
+                    Outcome::Deny,
+                    other
+                        .reason()
+                        .map_or_else(|| String::from("review held the action"), str::to_owned),
+                ),
+            };
+        }
+
+        // Nothing has judged the action, so it stays unresolved. Being
+        // interactive is not a judgment: approving here would authorize an
+        // action that no rule allowed and no reviewer saw.
+        (outcome, reason)
     }
 
     fn context(&self) -> ExecutionContext {
@@ -244,8 +280,7 @@ pub fn run<R: BufRead, W: std::io::Write>(
         registry: config.registry,
         cancellation: Cancellation::new(),
         steering: SteeringQueue::from_limits(&limits),
-        events: Arc::new(std::sync::Mutex::new(Vec::new())),
-        interactive: true,
+        events: Arc::new(Mutex::new(Vec::new())),
         context_used: std::sync::atomic::AtomicU64::new(0),
         context_limit: context_limit(&config.settings, &limits),
         theme,
@@ -254,9 +289,11 @@ pub fn run<R: BufRead, W: std::io::Write>(
         truecolor: truecolor_supported(),
         provider_order: config.settings.provider_order.clone(),
         provider_strict: config.settings.provider_strict,
+        reviewer: crate::auto_review::build(&config.settings, &config.paths)?,
+        review_session: Arc::new(Mutex::new(ReviewSession::new(&limits))),
     };
 
-    let out = std::sync::Mutex::new(output);
+    let out = Mutex::new(output);
     // The session identifier is announced up front so a resumed-or-new session
     // can be named later without consulting the listing.
     if let Ok(mut sink) = out.lock() {
@@ -604,6 +641,89 @@ mod tests {
         assert!(prompt.instructions.starts_with(prompt::SYSTEM_PROMPT));
     }
 
+    /// A reviewer that answers with whatever it was given.
+    struct Scripted(ReviewOutcome);
+
+    impl Reviewer for Scripted {
+        fn review(&self, _request: &ReviewRequest) -> ReviewOutcome {
+            self.0.clone()
+        }
+    }
+
+    /// Builds a host in automatic mode with the given reviewer.
+    fn host_with_reviewer(outcome: ReviewOutcome) -> SessionHost {
+        let mut host = test_host();
+        host.mode = PermissionMode::Auto;
+        host.reviewer = Some(Box::new(Scripted(outcome)));
+        host
+    }
+
+    #[test]
+    fn an_unresolved_action_is_cleared_by_review_in_automatic_mode() {
+        // Automatic mode reviews instead of prompting, so an action the rules
+        // do not decide is allowed when the reviewer clears it.
+        let host = host_with_reviewer(ReviewOutcome::Clear {
+            reviewed_action: "rm -rf /tmp/x".to_owned(),
+        });
+        let (outcome, reason) = host.decide("shell", Some("rm -rf /tmp/x"));
+        assert_eq!(outcome, Outcome::Allow, "{reason}");
+        assert!(reason.contains("cleared by review"), "{reason}");
+    }
+
+    #[test]
+    fn a_cautioning_review_holds_the_action_with_its_reason() {
+        let host = host_with_reviewer(ReviewOutcome::Caution {
+            reason: "broader than the request".to_owned(),
+        });
+        let (outcome, reason) = host.decide("shell", Some("rm -rf /tmp/x"));
+        assert_eq!(outcome, Outcome::Deny, "{reason}");
+        assert_eq!(reason, "broader than the request");
+    }
+
+    #[test]
+    fn a_review_that_cannot_complete_holds_the_action_without_ending_the_turn() {
+        // An unavailable reviewer is not a judgment about the action, and it
+        // must not become an approval.
+        let host = host_with_reviewer(ReviewOutcome::Unavailable {
+            reason: "the reviewer could not be reached".to_owned(),
+        });
+        let (outcome, reason) = host.decide("shell", Some("rm -rf /tmp/x"));
+        assert_eq!(outcome, Outcome::Deny, "{reason}");
+        assert!(reason.contains("could not be reached"), "{reason}");
+    }
+
+    #[test]
+    fn an_allowlisted_action_never_reaches_the_reviewer() {
+        // A rule that already decided must not cost a review, or the budget
+        // would be spent on the commands that were never in question.
+        let host = host_with_reviewer(ReviewOutcome::Caution {
+            reason: "should not be consulted".to_owned(),
+        });
+        let (outcome, reason) = host.decide("read_file", Some("src/main.rs"));
+        assert_eq!(outcome, Outcome::Allow, "{reason}");
+        assert!(!reason.contains("should not be consulted"), "{reason}");
+    }
+
+    #[test]
+    fn a_reviewer_is_only_consulted_in_automatic_mode() {
+        let mut host = host_with_reviewer(ReviewOutcome::Caution {
+            reason: "should not be consulted".to_owned(),
+        });
+        host.mode = PermissionMode::FullAccess;
+        let (outcome, _) = host.decide("shell", Some("rm -rf /tmp/x"));
+        assert_eq!(outcome, Outcome::Allow);
+    }
+
+    #[test]
+    fn an_unresolved_action_is_never_approved_without_a_decision() {
+        // Nothing judged it: no rule allowed it and no reviewer saw it. Whether
+        // a person is watching is not a decision, so it stays unresolved.
+        let mut host = test_host();
+        host.mode = PermissionMode::Auto;
+        let (outcome, reason) = host.decide("shell", Some("rm -rf /tmp/x"));
+        assert_eq!(outcome, Outcome::Ask, "{reason}");
+    }
+
     #[test]
     fn the_status_line_names_the_model_and_the_mode() {
         let host = test_host();
@@ -857,7 +977,7 @@ mod tests {
             model: "test".to_owned(),
             instructions: String::new(),
             tools: Vec::new(),
-            rules: RuleSet::new(),
+            rules: crate::permissions::validated(&Settings::default()).expect("rules"),
             mode: PermissionMode::Auto,
             effort: Effort::Auto,
             fast_mode: false,
@@ -866,8 +986,7 @@ mod tests {
             registry,
             cancellation: Cancellation::new(),
             steering: SteeringQueue::new(4),
-            events: Arc::new(std::sync::Mutex::new(Vec::new())),
-            interactive: false,
+            events: Arc::new(Mutex::new(Vec::new())),
             context_used: std::sync::atomic::AtomicU64::new(0),
             context_limit: rune_net::catalog::DEFAULT_CONTEXT_WINDOW,
             theme: Theme::no_color(),
@@ -876,6 +995,8 @@ mod tests {
             truecolor: false,
             provider_order: Vec::new(),
             provider_strict: false,
+            reviewer: None,
+            review_session: Arc::new(Mutex::new(ReviewSession::new(&BudgetSet::new()))),
         }
     }
 }

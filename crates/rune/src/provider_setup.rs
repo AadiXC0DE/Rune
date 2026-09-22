@@ -113,8 +113,18 @@ pub fn save_selection(paths: &Paths, selection: &Selection) -> Result<()> {
         "provider".to_owned(),
         toml::Value::String(selection.provider.clone()),
     );
+    // The model is selected by a table keyed on the provider, not by a bare
+    // key, so writing it anywhere else produces a file the loader refuses.
     if let Some(model) = &selection.model {
-        document.insert("model".to_owned(), toml::Value::String(model.clone()));
+        let table = document
+            .entry("models".to_owned())
+            .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+        if let Some(table) = table.as_table_mut() {
+            table.insert(
+                selection.provider.clone(),
+                toml::Value::String(model.clone()),
+            );
+        }
     }
     if let Some(base_url) = &selection.base_url {
         document.insert("base_url".to_owned(), toml::Value::String(base_url.clone()));
@@ -425,11 +435,49 @@ mod tests {
 
         let written = std::fs::read_to_string(paths.config_file(None)).expect("read");
         assert!(written.contains(r#"provider = "anthropic""#), "{written}");
-        assert!(written.contains(r#"model = "claude-test""#), "{written}");
         assert!(
             written.contains(r#"base_url = "https://api.anthropic.com""#),
             "{written}"
         );
+        // The model lives in a table keyed on the provider, which is where the
+        // loader looks for it.
+        assert!(written.contains("[models]"), "{written}");
+        assert!(
+            written.contains(r#"anthropic = "claude-test""#),
+            "{written}"
+        );
+    }
+
+    #[test]
+    fn a_saved_selection_is_a_configuration_the_loader_accepts() {
+        // The loader rejects an unknown key and selects the model from a table
+        // keyed on the provider, so a bare `model` key would make the file
+        // unreadable and lose every setting in it.
+        let dir = tempfile::tempdir().expect("temp");
+        let root = camino::Utf8Path::from_path(dir.path()).expect("utf8");
+        let paths = paths(root);
+        save_selection(
+            &paths,
+            &Selection {
+                provider: "anthropic".to_owned(),
+                model: Some("claude-test".to_owned()),
+                base_url: Some("https://api.anthropic.com".to_owned()),
+            },
+        )
+        .expect("saved");
+
+        let loaded = rune_core::config::load(
+            None,
+            Some(&paths.config_file(None)),
+            &rune_core::config::EnvironmentOverrides::default(),
+        );
+        assert!(
+            loaded.diagnostics.is_empty(),
+            "the written configuration was refused: {:#?}",
+            loaded.diagnostics
+        );
+        assert_eq!(loaded.provider, Provider::Anthropic);
+        assert_eq!(loaded.model, "claude-test");
     }
 
     #[test]

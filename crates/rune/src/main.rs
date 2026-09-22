@@ -11,6 +11,7 @@
 #![cfg_attr(test, allow(clippy::expect_used, clippy::unwrap_used, clippy::panic))]
 
 mod ask;
+mod auto_review;
 mod cli;
 mod diagnostics;
 mod help;
