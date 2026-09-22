@@ -298,6 +298,15 @@ pub const ACCOUNT: &[CommandSpec] = &[
         supports_json: true,
     },
     CommandSpec {
+        name: "projects",
+        aliases: &[],
+        summary: "Inspect or change workspace trust",
+        usage: "rune projects [status|approve|reject|reset]",
+        flags: &[flag("--json", "Emit JSON.")],
+        requirements: Requirements::NONE,
+        supports_json: true,
+    },
+    CommandSpec {
         name: "config",
         aliases: &[],
         summary: "Show the resolved configuration and where each value came from",

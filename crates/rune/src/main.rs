@@ -31,6 +31,8 @@ use rune_core::paths::Paths;
 use rune_session::report::{Period, render_text, summarize, to_json};
 use rune_session::usage::{Ledger, now_ms};
 
+use rune_policy::trust;
+
 use crate::cli::{Command, Launch, ResumeTarget};
 
 /// Exit code for a successful run.
@@ -152,6 +154,7 @@ fn run(launch: &Launch) -> Result<ExitCode> {
         Command::Connect => run_connect(&settings, &paths, launch, &output_flags),
         Command::Models => run_models(&settings, &output_flags),
         Command::Permissions => run_permissions(&settings, launch, &output_flags),
+        Command::Projects => run_projects(&paths, launch, &workspace, &output_flags),
         Command::Workspace => run_workspace(&settings, &paths, launch, &output_flags),
         Command::Ask => run_ask(&settings, &paths, launch, &output_flags),
         Command::Acp => run_acp(&settings, &paths, &workspace, launch),
@@ -609,6 +612,81 @@ fn run_usage(paths: &Paths, launch: &Launch, output: &OutputFlags) -> Result<Exi
     Ok(ExitCode::from(EXIT_OK))
 }
 
+/// Inspects and changes workspace trust.
+///
+/// A repository can declare servers and directories, and none of them apply
+/// until the user approves them. What is approved is recorded against the
+/// canonical workspace path in user state, so a clone of the repository carries
+/// no approval and a second copy is a separate decision.
+fn run_projects(
+    paths: &Paths,
+    launch: &Launch,
+    workspace: &camino::Utf8Path,
+    output: &OutputFlags,
+) -> Result<ExitCode> {
+    let canonical = trust::canonical_workspace(workspace);
+    let mut store = trust::TrustStore::load(&paths.trust_file())?;
+    let action = launch.args.first().map_or("status", String::as_str);
+
+    match action {
+        "status" | "list" => {}
+        "approve" => {
+            store.approve(&canonical);
+            store.save(&paths.trust_file())?;
+            if !output.json {
+                println!("approved {canonical}");
+            }
+        }
+        "reject" => {
+            store.reject(&canonical);
+            store.save(&paths.trust_file())?;
+            if !output.json {
+                println!("refused {canonical}");
+            }
+        }
+        "reset" => {
+            // Resetting one workspace must not disturb another, so only this
+            // path's record is cleared.
+            store.reset(&canonical);
+            store.save(&paths.trust_file())?;
+            if !output.json {
+                println!("cleared the recorded decision for {canonical}");
+            }
+        }
+        other => {
+            return Err(RuneError::new(
+                ErrorCode::InvalidField,
+                format!("`{other}` is not a projects action"),
+            )
+            .with_hint("use status, approve, reject, or reset"));
+        }
+    }
+
+    let decision = store.decision(&canonical);
+    if output.json {
+        let value = serde_json::json!({
+            "workspace": canonical.to_string(),
+            "decision": decision.map(trust::WorkspaceTrust::as_str),
+        });
+        println!("{}", serde_json::to_string_pretty(&value)?);
+    } else if action == "status" || action == "list" {
+        match decision {
+            Some(t) => println!("{canonical}: {}", t.as_str()),
+            None => println!("{canonical}: no decision recorded"),
+        }
+        let known = store.entries();
+        if known.is_empty() {
+            println!("no workspaces have a recorded decision");
+        } else {
+            println!("\nrecorded decisions:");
+            for (path, decision) in known {
+                println!("  {decision:?}  {path}");
+            }
+        }
+    }
+    Ok(ExitCode::from(EXIT_OK))
+}
+
 /// Reports the permission rules in force.
 fn run_permissions(settings: &Settings, launch: &Launch, output: &OutputFlags) -> Result<ExitCode> {
     let rules = permissions::validated(settings)?;
@@ -1057,6 +1135,44 @@ fn report_error(err: &RuneError) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_project_request_is_described_before_it_is_approved() {
+        // The print must name every server command and directory, because the
+        // approval is only meaningful if the user saw what it covers.
+        let request = trust::ProjectRequest::new(
+            vec!["postgres".to_owned()],
+            vec![Utf8PathBuf::from("/opt/data")],
+            0,
+        );
+        let lines = request.describe();
+        assert!(
+            lines.iter().any(|line| line.contains("postgres")),
+            "{lines:?}"
+        );
+        assert!(
+            lines.iter().any(|line| line.contains("/opt/data")),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn a_project_that_asks_for_nothing_is_trusted() {
+        // Widening nothing needs no approval, so a repository with no requests
+        // must not prompt.
+        let request = trust::ProjectRequest::new(Vec::new(), Vec::new(), 0);
+        let store = trust::TrustStore::new();
+        let decision = trust::decide(&request, &store, camino::Utf8Path::new("/w"));
+        assert_eq!(decision, trust::TrustDecision::Trusted);
+    }
+
+    #[test]
+    fn an_unapproved_project_is_refused_rather_than_allowed_by_default() {
+        let request = trust::ProjectRequest::new(vec!["postgres".to_owned()], Vec::new(), 0);
+        let store = trust::TrustStore::new();
+        let decision = trust::decide(&request, &store, camino::Utf8Path::new("/w"));
+        assert!(matches!(decision, trust::TrustDecision::Untrusted { .. }));
+    }
 
     #[test]
     fn pending_changes_are_empty_outside_a_repository() {

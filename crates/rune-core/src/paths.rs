@@ -37,6 +37,8 @@ pub mod names {
     pub const HISTORY_FILE: &str = "history.jsonl";
     /// Credential file in the state root.
     pub const CREDENTIALS_FILE: &str = "credentials.json";
+    /// Workspace trust records in the state root.
+    pub const TRUST_FILE: &str = "trust.json";
     /// Advisory lock for the credential file.
     pub const CREDENTIALS_LOCK: &str = "credentials.lock";
     /// Theme directory in the data root.
@@ -128,6 +130,12 @@ impl Paths {
             Some(value) => Utf8PathBuf::from(value),
             None => self.config_root.join(names::CONFIG_FILE),
         }
+    }
+
+    /// Path of the workspace trust records.
+    #[must_use]
+    pub fn trust_file(&self) -> Utf8PathBuf {
+        self.state_root.join(names::TRUST_FILE)
     }
 
     /// Path of the optional user system prompt override.

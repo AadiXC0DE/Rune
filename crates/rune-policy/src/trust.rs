@@ -201,6 +201,20 @@ pub enum WorkspaceTrust {
     Rejected,
 }
 
+impl WorkspaceTrust {
+    /// Returns the wire representation.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Approved => "approved",
+            Self::Rejected => "rejected",
+        }
+    }
+}
+
+/// Largest trust file accepted.
+pub const TRUST_FILE_BYTES: u64 = 256 * 1024;
+
 /// One workspace's recorded decision.
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 struct TrustRecord {
@@ -228,6 +242,34 @@ impl TrustStore {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Reads the store from a file.
+    ///
+    /// A missing file is an empty store. A file that cannot be read or parsed is
+    /// reported, because treating damage as "nothing is approved" would silently
+    /// withdraw approvals the user gave, and treating it as "everything is
+    /// approved" would be worse.
+    pub fn load(path: &Utf8Path) -> Result<Self> {
+        let Some(text) = rune_core::paths::read_private(path, TRUST_FILE_BYTES)? else {
+            return Ok(Self::default());
+        };
+        if text.trim().is_empty() {
+            return Ok(Self::default());
+        }
+        serde_json::from_str(&text).map_err(|err| {
+            RuneError::new(
+                ErrorCode::CorruptRecord,
+                format!("the trust records could not be read: {err}"),
+            )
+            .with_hint("move the file aside to start from no approvals")
+        })
+    }
+
+    /// Writes the store to a file, readable only by its owner.
+    pub fn save(&self, path: &Utf8Path) -> Result<()> {
+        let text = serde_json::to_string_pretty(self)?;
+        rune_core::paths::write_private(path, &text)
     }
 
     /// Records approval of a workspace's whole project file.
@@ -458,6 +500,99 @@ mod tests {
 
     fn utf8(path: &Path) -> Utf8PathBuf {
         Utf8PathBuf::from_path_buf(path.to_path_buf()).expect("utf8 path")
+    }
+
+    /// Returns a path inside a fresh temporary directory.
+    fn state_file(dir: &TempDir) -> Utf8PathBuf {
+        utf8(&dir.path().join("trust.json"))
+    }
+
+    #[test]
+    fn a_store_round_trips_through_a_file() {
+        let dir = tempdir();
+        let path = state_file(&dir);
+        let mut store = TrustStore::new();
+        store.approve(Utf8Path::new("/w/one"));
+        store.reject(Utf8Path::new("/w/two"));
+        store.save(&path).expect("saved");
+
+        let back = TrustStore::load(&path).expect("loaded");
+        assert_eq!(
+            back.decision(Utf8Path::new("/w/one")),
+            Some(WorkspaceTrust::Approved)
+        );
+        assert_eq!(
+            back.decision(Utf8Path::new("/w/two")),
+            Some(WorkspaceTrust::Rejected)
+        );
+    }
+
+    #[test]
+    fn a_missing_file_is_an_empty_store_rather_than_an_error() {
+        let dir = tempdir();
+        assert!(
+            TrustStore::load(&state_file(&dir))
+                .expect("loaded")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn an_empty_file_is_an_empty_store() {
+        let dir = tempdir();
+        let path = state_file(&dir);
+        // Written private, because the reader refuses a file others can read.
+        rune_core::paths::write_private(&path, "   \n").expect("write");
+        assert!(TrustStore::load(&path).expect("loaded").is_empty());
+    }
+
+    #[test]
+    fn a_damaged_file_is_reported_rather_than_read_as_no_approvals() {
+        // Treating damage as "nothing is approved" would silently withdraw
+        // approvals the user gave.
+        let dir = tempdir();
+        let path = state_file(&dir);
+        rune_core::paths::write_private(&path, "not json").expect("write");
+        let err = TrustStore::load(&path).expect_err("refused");
+        assert_eq!(err.code(), ErrorCode::CorruptRecord);
+        assert!(err.hint().is_some());
+    }
+
+    #[test]
+    fn the_trust_file_is_private() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempdir();
+        let path = state_file(&dir);
+        let mut store = TrustStore::new();
+        store.approve(Utf8Path::new("/w/one"));
+        store.save(&path).expect("saved");
+
+        let mode = std::fs::metadata(&path)
+            .expect("metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "the trust file is readable by others");
+    }
+
+    #[test]
+    fn approving_one_workspace_does_not_approve_another() {
+        // Two clones of one repository are two workspaces, and an approval for
+        // one says nothing about the other.
+        let mut store = TrustStore::new();
+        store.approve(Utf8Path::new("/w/one"));
+        assert!(store.is_trusted(Utf8Path::new("/w/one")));
+        assert!(!store.is_trusted(Utf8Path::new("/w/two")));
+    }
+
+    #[test]
+    fn resetting_clears_only_the_named_workspace() {
+        let mut store = TrustStore::new();
+        store.approve(Utf8Path::new("/w/one"));
+        store.approve(Utf8Path::new("/w/two"));
+        store.reset(Utf8Path::new("/w/one"));
+        assert!(!store.is_trusted(Utf8Path::new("/w/one")));
+        assert!(store.is_trusted(Utf8Path::new("/w/two")));
     }
 
     /// Builds a workspace holding an `.mcp.json`, returning its canonical path.
