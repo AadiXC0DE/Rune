@@ -323,6 +323,12 @@ impl RuneError {
     pub fn field(&self) -> Option<&str> {
         self.detail.field.as_deref()
     }
+
+    /// Returns what the caller can do about the failure, when known.
+    #[must_use]
+    pub fn hint(&self) -> Option<&str> {
+        self.detail.hint.as_deref()
+    }
 }
 
 impl fmt::Display for RuneError {
@@ -383,6 +389,19 @@ mod tests {
             assert!(seen.insert(code.as_str()), "duplicate wire name: {code:?}");
         }
         assert_eq!(seen.len(), ErrorCode::all().len());
+    }
+
+    #[test]
+    fn a_hint_is_readable_back_out() {
+        let err = RuneError::new(ErrorCode::AuthenticationRequired, "no credential")
+            .with_hint("run `rune connect`");
+        assert_eq!(err.hint(), Some("run `rune connect`"));
+        assert!(err.to_string().contains("run `rune connect`"));
+    }
+
+    #[test]
+    fn an_error_without_a_hint_reports_none() {
+        assert!(RuneError::new(ErrorCode::Internal, "boom").hint().is_none());
     }
 
     #[test]

@@ -14,6 +14,7 @@ pub mod config;
 pub mod error;
 pub mod id;
 pub mod paths;
+pub mod tool;
 
 pub use budget::{Budget, BudgetSet, LimitName};
 pub use error::{ErrorCode, Result, RuneError};

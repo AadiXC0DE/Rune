@@ -117,7 +117,7 @@ pub trait Provider: Send + Sync {
             return Err(rune_core::error::RuneError::missing_field("model"));
         }
         crate::message::validate(&plan.messages)?;
-        crate::message::validate_tools(&plan.tools)?;
+        crate::message::validate_tool_specs(&plan.tools)?;
         Ok(())
     }
 

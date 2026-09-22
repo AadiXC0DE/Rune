@@ -11,6 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use camino::{Utf8Path, Utf8PathBuf};
 use rune_core::error::Result;
+use rune_core::tool::ToolSpec;
 use serde::{Deserialize, Serialize};
 
 /// What a tool does, used for presentation and for choosing a permission target.
@@ -191,6 +192,21 @@ impl ExecutionContext {
         self
     }
 
+    /// Returns a copy sharing this context's cancellation flag.
+    ///
+    /// Used where a host must hand a fresh context to each call while keeping a
+    /// single cancellation signal across the whole turn.
+    #[must_use]
+    pub fn fork(&self) -> Self {
+        Self {
+            workspace: self.workspace.clone(),
+            additional_roots: self.additional_roots.clone(),
+            external_access: self.external_access,
+            max_output_bytes: self.max_output_bytes,
+            cancelled: Arc::clone(&self.cancelled),
+        }
+    }
+
     /// Returns a cancellation handle for this context.
     #[must_use]
     pub fn cancellation(&self) -> Cancellation {
@@ -312,7 +328,7 @@ pub const MAX_DESCRIPTION_BYTES: usize = 1024;
 
 /// Describes a tool for the model.
 #[must_use]
-pub fn model_spec(tool: &dyn Tool) -> rune_net::message::ToolSpec {
+pub fn model_spec(tool: &dyn Tool) -> ToolSpec {
     let mut description = tool.description().to_owned();
     if description.len() > MAX_DESCRIPTION_BYTES {
         // Truncation is explicit rather than silent, because a description cut
@@ -320,7 +336,7 @@ pub fn model_spec(tool: &dyn Tool) -> rune_net::message::ToolSpec {
         description.truncate(MAX_DESCRIPTION_BYTES.saturating_sub(16));
         description.push_str("... [truncated]");
     }
-    rune_net::message::ToolSpec {
+    ToolSpec {
         name: tool.name().to_owned(),
         description,
         input_schema: tool.input_schema(),

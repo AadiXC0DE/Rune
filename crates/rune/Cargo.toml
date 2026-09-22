@@ -17,6 +17,8 @@ workspace = true
 [dependencies]
 rune-core.workspace = true
 rune-net.workspace = true
+rune-agent.workspace = true
+rune-term.workspace = true
 rune-acp.workspace = true
 rune-tools.workspace = true
 rune-policy.workspace = true

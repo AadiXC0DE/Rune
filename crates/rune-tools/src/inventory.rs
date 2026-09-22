@@ -7,7 +7,7 @@
 use std::fmt::Write as _;
 
 use rune_core::error::Result;
-use rune_net::message::ToolSpec;
+use rune_core::tool::ToolSpec;
 use sha2::{Digest as _, Sha256};
 
 use crate::ask_user::AskUserQuestion;
@@ -98,7 +98,7 @@ pub fn validate_all(registry: &Registry) -> Result<()> {
             continue;
         };
         let spec = model_spec(tool);
-        rune_net::message::validate_tool_spec(&spec)?;
+        rune_core::tool::validate_tool_spec(&spec)?;
     }
     Ok(())
 }

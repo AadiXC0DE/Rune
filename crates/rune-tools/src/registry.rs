@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 
 use rune_core::error::{ErrorCode, Result, RuneError};
-use rune_net::message::ToolSpec;
+use rune_core::tool::ToolSpec;
 
 use crate::contract::{Activity, ExecutionContext, Tool, ToolOutput, model_spec};
 

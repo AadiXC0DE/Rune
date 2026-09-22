@@ -12,7 +12,6 @@ workspace = true
 
 [dependencies]
 rune-core = { workspace = true }
-rune-net = { workspace = true }
 rune-policy = { workspace = true }
 rune-exec = { workspace = true }
 serde = { workspace = true }

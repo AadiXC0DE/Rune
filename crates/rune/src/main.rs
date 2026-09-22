@@ -14,6 +14,7 @@ mod ask;
 mod cli;
 mod diagnostics;
 mod help;
+mod session;
 mod spec;
 mod version;
 
@@ -145,9 +146,8 @@ fn run(launch: &Launch) -> Result<ExitCode> {
         Command::Workspace => run_workspace(&settings, launch, &output_flags),
         Command::Ask => run_ask(&settings, &paths, launch, &output_flags),
         Command::Acp => run_acp(&settings, &paths, &workspace, launch),
-        Command::Review | Command::Interactive | Command::Resume => {
-            Err(not_yet_available("the interactive shell"))
-        }
+        Command::Interactive | Command::Resume => run_interactive(&settings, &paths, &workspace),
+        Command::Review => Err(not_yet_available("the review command")),
         Command::Upgrade | Command::Uninstall => Err(not_yet_available("the installer")),
         Command::Help | Command::Version => Ok(ExitCode::from(EXIT_OK)),
     }
@@ -249,6 +249,19 @@ fn run_ask(
             Err(err)
         }
     }
+}
+
+/// Runs the interactive session.
+fn run_interactive(
+    settings: &Settings,
+    paths: &Paths,
+    workspace: &camino::Utf8Path,
+) -> Result<ExitCode> {
+    let config = session::prepare(settings, paths, workspace)?;
+    let stdin = std::io::stdin();
+    let input = std::io::BufReader::new(stdin.lock());
+    let code = session::run(config, input, std::io::stdout())?;
+    Ok(ExitCode::from(code))
 }
 
 /// Runs `acp`.

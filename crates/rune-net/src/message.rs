@@ -10,6 +10,9 @@
 
 use rune_core::error::{ErrorCode, Result, RuneError};
 use rune_core::id::ToolCallId;
+pub use rune_core::tool::{
+    MAX_TOOL_NAME, MAX_TOOLS, ToolSpec, validate_tool_spec, validate_tool_specs,
+};
 use serde::{Deserialize, Serialize};
 
 /// Who produced a message.
@@ -205,76 +208,6 @@ impl Message {
     }
 }
 
-/// A tool advertised to the model.
-#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
-pub struct ToolSpec {
-    /// Tool name, as the model must call it.
-    pub name: String,
-    /// Description shown to the model.
-    pub description: String,
-    /// JSON Schema for the arguments object.
-    pub input_schema: serde_json::Value,
-}
-
-/// Largest number of distinct tools advertised in one request.
-pub const MAX_TOOLS: usize = 256;
-
-/// Largest tool name accepted.
-pub const MAX_TOOL_NAME: usize = 128;
-
-/// Narrowest JSON Schema the input schema may be.
-///
-/// A provider must receive an object schema; anything else is a defect in the
-/// tool definition rather than a user error.
-pub fn validate_tool_spec(spec: &ToolSpec) -> Result<()> {
-    if spec.name.is_empty() {
-        return Err(RuneError::invalid_field("tool.name", "must not be empty"));
-    }
-    if spec.name.len() > MAX_TOOL_NAME {
-        return Err(RuneError::too_large(
-            "tool.name",
-            spec.name.len(),
-            MAX_TOOL_NAME,
-        ));
-    }
-    if !spec
-        .name
-        .bytes()
-        .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
-    {
-        return Err(RuneError::invalid_field(
-            "tool.name",
-            format!(
-                "`{}` contains characters outside the accepted set",
-                spec.name
-            ),
-        ));
-    }
-    if spec.description.is_empty() {
-        return Err(RuneError::invalid_field(
-            "tool.description",
-            format!("`{}` has no description", spec.name),
-        ));
-    }
-    let Some(object) = spec.input_schema.as_object() else {
-        return Err(RuneError::invalid_field(
-            "tool.input_schema",
-            format!("`{}` does not describe an object", spec.name),
-        ));
-    };
-    match object.get("type").and_then(serde_json::Value::as_str) {
-        Some("object") => Ok(()),
-        Some(other) => Err(RuneError::invalid_field(
-            "tool.input_schema",
-            format!("`{}` has type `{other}`, expected `object`", spec.name),
-        )),
-        None => Err(RuneError::invalid_field(
-            "tool.input_schema",
-            format!("`{}` does not declare a type", spec.name),
-        )),
-    }
-}
-
 /// Checks every invariant a provider request depends on.
 ///
 /// Returns an error naming the violated invariant and the offending index, so a
@@ -372,24 +305,6 @@ pub fn validate(messages: &[Message]) -> Result<()> {
         index = cursor;
     }
 
-    Ok(())
-}
-
-/// Returns an error when the tool set exceeds the per-request bound.
-pub fn validate_tools(tools: &[ToolSpec]) -> Result<()> {
-    if tools.len() > MAX_TOOLS {
-        return Err(RuneError::too_large("tools", tools.len(), MAX_TOOLS));
-    }
-    let mut seen = std::collections::HashSet::new();
-    for spec in tools {
-        validate_tool_spec(spec)?;
-        if !seen.insert(spec.name.as_str()) {
-            return Err(RuneError::new(
-                ErrorCode::InvalidField,
-                format!("tool `{}` is advertised twice", spec.name),
-            ));
-        }
-    }
     Ok(())
 }
 
@@ -624,7 +539,7 @@ mod tests {
             description: "d".to_owned(),
             input_schema: serde_json::json!({ "type": "object" }),
         };
-        let err = validate_tools(&[spec.clone(), spec]).expect_err("rejected");
+        let err = validate_tool_specs(&[spec.clone(), spec]).expect_err("rejected");
         assert!(err.message().contains("advertised twice"));
     }
 
@@ -637,7 +552,7 @@ mod tests {
                 input_schema: serde_json::json!({ "type": "object" }),
             })
             .collect();
-        let err = validate_tools(&tools).expect_err("rejected");
+        let err = validate_tool_specs(&tools).expect_err("rejected");
         assert_eq!(err.code(), ErrorCode::TooLarge);
     }
 

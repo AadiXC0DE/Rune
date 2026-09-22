@@ -6,6 +6,7 @@
 #![cfg_attr(test, allow(clippy::expect_used, clippy::unwrap_used, clippy::panic))]
 
 pub mod engine;
+pub mod shell;
 pub mod width;
 
 pub use engine::{Bounds, Cell, Color, Cursor, DiffSpan, FeedStats, Grid, Style, flag};
