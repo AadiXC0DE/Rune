@@ -55,6 +55,8 @@ pub struct Summary {
     pub title: Option<String>,
     /// Workspace the session ran in, absent when none was recorded.
     pub workspace: Option<String>,
+    /// Parent session, when this session is a child of another.
+    pub parent: Option<String>,
     /// Directory holding the log.
     pub dir: Utf8PathBuf,
 }
@@ -71,6 +73,17 @@ impl Recorder {
     pub fn create(paths: &Paths, id: &SessionId) -> Result<Self> {
         let store = SessionStore::create(paths, id)?;
         Ok(Self { store, turn: 0 })
+    }
+
+    /// Marks this session as a child of another.
+    ///
+    /// A child is kept out of ordinary discovery and cannot be resumed on its
+    /// own, because it ran with its parent's authority rather than its own.
+    pub fn set_parent(&self, parent: &SessionId) -> Result<()> {
+        self.store.append(SessionEvent::ChildOf {
+            parent: parent.to_string(),
+        })?;
+        Ok(())
     }
 
     /// Records the workspace the session runs in.
@@ -247,6 +260,12 @@ pub fn list_scoped(paths: &Paths, scope: Option<&Utf8Path>) -> Vec<Summary> {
         {
             continue;
         }
+        // A child session belongs to its parent's turn. Listing it would offer
+        // a conversation the user never started, and resuming it directly would
+        // run it without the authority its parent had.
+        if state.parent.is_some() {
+            continue;
+        }
         out.push(summarize(&state, dir));
     }
 
@@ -332,7 +351,8 @@ pub fn tree_of(state: &SessionState) -> Tree {
             | SessionEvent::Compaction { .. }
             | SessionEvent::UsageRecorded { .. }
             | SessionEvent::TitleSet { .. }
-            | SessionEvent::WorkspaceSet { .. } => continue,
+            | SessionEvent::WorkspaceSet { .. }
+            | SessionEvent::ChildOf { .. } => continue,
         };
         let node = Node::new(
             role,
@@ -456,6 +476,9 @@ pub fn latest_in(paths: &Paths, workspace: &Utf8Path) -> Option<Summary> {
 }
 
 /// Reads a stored session into a conversation.
+///
+/// A child session is refused: it ran with its parent's authority, and resuming
+/// it on its own would run it with whatever authority this process has.
 pub fn load(paths: &Paths, id: &SessionId) -> Result<(Recorder, History)> {
     let dir = paths.session_dir(id);
     if !dir.exists() {
@@ -466,6 +489,13 @@ pub fn load(paths: &Paths, id: &SessionId) -> Result<(Recorder, History)> {
     }
 
     let state = load_read_only(&dir)?;
+    if let Some(parent) = &state.parent {
+        return Err(RuneError::new(
+            ErrorCode::Unsupported,
+            format!("session `{id}` is a child of `{parent}` and cannot be resumed"),
+        )
+        .with_hint("resume the session that created it"));
+    }
     let history = history_from(&state);
     let recorder = Recorder::open(paths, id)?;
     Ok((recorder, history))
@@ -526,7 +556,8 @@ pub fn history_from(state: &SessionState) -> History {
             | SessionEvent::Compaction { .. }
             | SessionEvent::UsageRecorded { .. }
             | SessionEvent::TitleSet { .. }
-            | SessionEvent::WorkspaceSet { .. } => {}
+            | SessionEvent::WorkspaceSet { .. }
+            | SessionEvent::ChildOf { .. } => {}
         }
     }
 
@@ -556,6 +587,7 @@ fn summarize(state: &SessionState, dir: Utf8PathBuf) -> Summary {
             .and_then(|frame| timestamp(frame.timestamp_ms)),
         title: state.title.clone(),
         workspace: state.workspace.clone(),
+        parent: state.parent.clone(),
         dir,
     }
 }
@@ -947,6 +979,7 @@ mod tests {
                 updated_at: Some("2026-01-02T03:04:05Z".to_owned()),
                 title: Some("parser work".to_owned()),
                 workspace: Some("/tmp/work".to_owned()),
+                parent: None,
                 dir: Utf8PathBuf::from("/tmp/a"),
             },
             Summary {
@@ -956,6 +989,7 @@ mod tests {
                 updated_at: None,
                 title: None,
                 workspace: None,
+                parent: None,
                 dir: Utf8PathBuf::from("/tmp/b"),
             },
         ];
@@ -979,6 +1013,68 @@ mod tests {
         let err = load(&paths, &id("sessionzzzzz")).expect_err("refused");
         assert_eq!(err.code(), ErrorCode::NotFound);
         assert!(err.hint().is_some(), "the failure does not say what to do");
+    }
+
+    #[test]
+    fn a_child_session_is_absent_from_the_listing() {
+        let dir = tempfile::tempdir().expect("temp");
+        let root = Utf8Path::from_path(dir.path()).expect("utf8");
+        let paths = paths(root);
+        let parent = id("sessionpar01");
+        let child = id("sessionchi01");
+
+        let mut recorder = Recorder::create(&paths, &parent).expect("created");
+        recorder.set_workspace(root).expect("workspace");
+        recorder.user_message("hi").expect("wrote");
+        recorder.turn(&outcome("yo")).expect("wrote");
+        drop(recorder);
+
+        let recorder = Recorder::create(&paths, &child).expect("created");
+        recorder.set_workspace(root).expect("workspace");
+        recorder.set_parent(&parent).expect("parent");
+        drop(recorder);
+
+        let listed = list_scoped(&paths, None);
+        assert_eq!(listed.len(), 1, "{listed:#?}");
+        assert_eq!(listed[0].id, parent.to_string());
+    }
+
+    #[test]
+    fn a_child_session_cannot_be_resumed_directly() {
+        // It ran with its parent's authority; resuming it alone would run it
+        // with whatever authority this process happens to have.
+        let dir = tempfile::tempdir().expect("temp");
+        let root = Utf8Path::from_path(dir.path()).expect("utf8");
+        let paths = paths(root);
+        let parent = id("sessionpar02");
+        let child = id("sessionchi02");
+
+        let recorder = Recorder::create(&paths, &child).expect("created");
+        recorder.set_workspace(root).expect("workspace");
+        recorder.set_parent(&parent).expect("parent");
+        drop(recorder);
+
+        let err = load(&paths, &child).expect_err("refused");
+        assert_eq!(err.code(), ErrorCode::Unsupported);
+        assert!(err.message().contains("child"), "{}", err.message());
+        assert!(err.hint().is_some());
+    }
+
+    #[test]
+    fn a_child_is_still_inspectable_by_identifier() {
+        // Kept out of discovery, but a caller that names it can read its log.
+        let dir = tempfile::tempdir().expect("temp");
+        let root = Utf8Path::from_path(dir.path()).expect("utf8");
+        let paths = paths(root);
+        let parent = id("sessionpar03");
+        let child = id("sessionchi03");
+        let recorder = Recorder::create(&paths, &child).expect("created");
+        recorder.set_workspace(root).expect("workspace");
+        recorder.set_parent(&parent).expect("parent");
+        drop(recorder);
+
+        let state = inspect(&paths, &child).expect("inspected");
+        assert_eq!(state.parent, Some(parent.to_string()));
     }
 
     #[test]

@@ -97,6 +97,16 @@ pub enum SessionEvent {
         /// Display title.
         title: String,
     },
+    /// The session was created as a child of another.
+    ///
+    /// Recorded so the session can be kept out of ordinary discovery: a child is
+    /// an implementation detail of its parent's turn, not a conversation the
+    /// user started, and resuming one directly would run it without the parent's
+    /// authority.
+    ChildOf {
+        /// Session that created this one.
+        parent: String,
+    },
     /// The workspace the session ran in was recorded.
     ///
     /// Written once, when the session is created, so a later listing can scope
@@ -121,6 +131,7 @@ impl SessionEvent {
             Self::UsageRecorded { .. } => "usage_recorded",
             Self::TitleSet { .. } => "title_set",
             Self::WorkspaceSet { .. } => "workspace_set",
+            Self::ChildOf { .. } => "child_of",
         }
     }
 }

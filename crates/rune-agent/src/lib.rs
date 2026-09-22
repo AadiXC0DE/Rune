@@ -7,6 +7,7 @@ pub mod compaction;
 pub mod history;
 pub mod steering;
 pub mod subagent;
+pub mod subagent_tool;
 pub mod tokens;
 pub mod turn;
 

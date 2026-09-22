@@ -167,7 +167,7 @@ impl ServerConfig {
         let registry = rune_tools::inventory::builtin(
             &FileLimits::from_budget(&limits),
             &limits,
-            &rune_core::paths::Paths::from_process().managed_skills_dir(),
+            &Paths::from_process().managed_skills_dir(),
         )?;
         let model = model.into();
         let context_window = Catalog::new("acp")
@@ -241,7 +241,7 @@ impl ServerConfig {
         self.registry = rune_tools::inventory::builtin(
             &FileLimits::from_budget(&limits),
             &limits,
-            &rune_core::paths::Paths::from_process().managed_skills_dir(),
+            &Paths::from_process().managed_skills_dir(),
         )?;
         self.limits = limits;
         Ok(self)

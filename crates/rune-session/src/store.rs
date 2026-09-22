@@ -107,6 +107,8 @@ pub struct SessionState {
     pub title: Option<String>,
     /// Workspace the session ran in, absent when none was recorded.
     pub workspace: Option<String>,
+    /// Parent session, when this session is a child of another.
+    pub parent: Option<String>,
     /// Byte offset where a torn final frame was dropped, when one was.
     pub truncated_at: Option<u64>,
 }
@@ -154,6 +156,7 @@ struct Projection {
     usage: UsageTotal,
     title: Option<String>,
     workspace: Option<String>,
+    parent: Option<String>,
 }
 
 /// An open session directory with the writer lock held.
@@ -236,6 +239,7 @@ impl SessionStore {
                 usage: state.usage,
                 title: state.title.clone(),
                 workspace: state.workspace.clone(),
+                parent: state.parent.clone(),
             }),
         };
         store.rebuild_metadata()?;
@@ -340,6 +344,7 @@ impl SessionStore {
             SessionEvent::WorkspaceSet { workspace } => {
                 projection.workspace = Some(workspace.clone());
             }
+            SessionEvent::ChildOf { parent } => projection.parent = Some(parent.clone()),
             _ => {}
         }
 
@@ -404,6 +409,7 @@ pub fn load_read_only(dir: &Utf8Path) -> Result<SessionState> {
         usage: UsageTotal::default(),
         title: None,
         workspace: None,
+        parent: None,
         truncated_at: read.truncated_at,
     };
     for frame in &state.events {
@@ -417,6 +423,7 @@ pub fn load_read_only(dir: &Utf8Path) -> Result<SessionState> {
             SessionEvent::WorkspaceSet { workspace } => {
                 state.workspace = Some(workspace.clone());
             }
+            SessionEvent::ChildOf { parent } => state.parent = Some(parent.clone()),
             _ => {}
         }
     }
