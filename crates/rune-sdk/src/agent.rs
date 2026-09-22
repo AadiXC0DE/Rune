@@ -644,7 +644,20 @@ impl Agent {
 
     /// Builds an agent over the conversation a checkpoint carries.
     pub fn restore(options: AgentOptions, checkpoint: &[u8]) -> Result<Self> {
-        let mut agent = Self::new(options)?;
+        Self::restore_with_limits(options, checkpoint, BudgetSet::new())
+    }
+
+    /// Builds an agent over a checkpoint under explicit limits.
+    ///
+    /// The checkpoint size is checked against the history bound, so a host that
+    /// accepts larger conversations restores with the limits it runs under
+    /// rather than a second agent rebuilt afterwards.
+    pub fn restore_with_limits(
+        options: AgentOptions,
+        checkpoint: &[u8],
+        limits: BudgetSet,
+    ) -> Result<Self> {
+        let mut agent = Self::new(options)?.with_limits(limits);
         agent.adopt(checkpoint)?;
         Ok(agent)
     }

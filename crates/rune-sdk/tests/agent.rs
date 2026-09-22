@@ -21,6 +21,8 @@ use std::time::Duration;
 
 use serde_json::json;
 
+use rune_core::budget::{Budget, BudgetSet, LimitName};
+use rune_core::config::Layer;
 use rune_core::error::ErrorCode;
 use rune_sdk::agent::{
     Agent, AgentOptions, Dialect, FetchRequest, FetchResponse, HostFetch, HostImage, HostTool,
@@ -388,6 +390,127 @@ fn an_unknown_tool_name_is_answered_without_calling_anything() {
     let result = turn.result().expect("result");
     assert!(!result.calls[0].executed);
     assert!(result.calls[0].output.text.contains("no tool named"));
+}
+
+/// Builds a limits set with one override.
+fn limit(name: LimitName, value: u64) -> BudgetSet {
+    let mut set = BudgetSet::new();
+    set.set(name, Budget::Bounded(value), Layer::CommandLine)
+        .expect("a valid limit");
+    set
+}
+
+#[test]
+fn a_tool_result_larger_than_its_bound_is_truncated_for_the_model() {
+    let endpoint = MockEndpoint::start(vec![
+        Script::tool_call("call_1", "flood", "{}"),
+        Script::text("that was long"),
+    ]);
+    let fetch = Arc::new(CountingFetch::new());
+    let mut agent_options = options(&endpoint.base_url(), fetch);
+    agent_options.tools.push(HostTool::new(
+        "flood",
+        "Returns more than the bound allows.",
+        json!({"type": "object"}),
+        |_arguments, _context| Ok(rune_sdk::agent::HostToolResult::text("x".repeat(20_000))),
+    ));
+    let mut agent = Agent::new(agent_options)
+        .expect("agent")
+        .with_limits(limit(LimitName::MaxToolResultBytes, 4_096));
+
+    let mut turn = agent
+        .prompt("flood", PromptOptions::default())
+        .expect("turn");
+    let result = turn.result().expect("result");
+    let recorded = &result.calls[0].output;
+    assert!(recorded.text.len() < 20_000, "{}", recorded.text.len());
+    assert!(recorded.text.ends_with("(truncated)"), "{}", recorded.text);
+    // The full size is still reported, so a host accounts for what was produced.
+    assert_eq!(recorded.produced_bytes, 20_000);
+
+    let body = endpoint.last_body().expect("a request body");
+    assert!(
+        !body.to_string().contains(&"x".repeat(8_000)),
+        "the model saw the truncated text"
+    );
+}
+
+#[test]
+fn a_checkpoint_larger_than_the_history_bound_is_refused() {
+    // Two mebibytes, past the one-mebibyte default history bound.
+    let padded = format!(
+        "{{\"version\":1,\"history\":{{\"instructions\":\"\",\"turns\":[],\"next_seq\":1}},\"usage\":{{}},\"pad\":\"{}\"}}",
+        "y".repeat(2 * 1024 * 1024)
+    );
+    let endpoint = MockEndpoint::start(vec![Script::text("hi")]);
+    let base_url = endpoint.base_url();
+    let build = || options(&base_url, Arc::new(CountingFetch::new()));
+
+    let err = Agent::restore(build(), padded.as_bytes()).expect_err("an oversized checkpoint");
+    assert_eq!(err.code(), ErrorCode::TooLarge);
+    assert_eq!(err.field(), Some("checkpoint"));
+
+    // The same payload is accepted once the bound is raised, which is what
+    // shows the refusal is the bound rather than the payload.
+    let raised = limit(LimitName::PromptHistoryBytes, 4 * 1024 * 1024);
+    let mut restored =
+        Agent::restore_with_limits(build(), padded.as_bytes(), raised).expect("a raised bound");
+    let mut turn = restored
+        .prompt("and on", PromptOptions::default())
+        .expect("turn");
+    let _ = turn.result().expect("result");
+}
+
+#[test]
+fn the_event_stream_reports_the_shape_of_the_turn() {
+    let endpoint = MockEndpoint::start(vec![Script::text("answered")]);
+    let fetch = Arc::new(CountingFetch::new());
+    let mut agent = Agent::new(options(&endpoint.base_url(), fetch)).expect("agent");
+
+    let mut turn = agent
+        .prompt("hello", PromptOptions::default())
+        .expect("turn");
+    let mut steps = Vec::new();
+    let mut text = String::new();
+    let mut finished = false;
+    for event in turn.events() {
+        match event {
+            rune_agent::turn::Event::TurnStarted { step } => steps.push(step),
+            rune_agent::turn::Event::TextDelta { delta } => text.push_str(&delta),
+            rune_agent::turn::Event::Finished { .. } => finished = true,
+            _ => {}
+        }
+    }
+    assert_eq!(steps, vec![1]);
+    assert_eq!(text, "answered");
+    assert!(finished);
+
+    // The iterator ends when the turn does, and the result is still readable.
+    let result = turn.result().expect("result");
+    assert_eq!(result.text, "answered");
+}
+
+#[test]
+fn every_request_of_a_multi_step_turn_goes_through_the_host_fetch() {
+    let endpoint = MockEndpoint::start(vec![
+        Script::tool_call("call_1", "lookup", "{}"),
+        Script::text("done"),
+    ]);
+    let fetch = Arc::new(CountingFetch::new());
+    let mut agent_options = options(&endpoint.base_url(), fetch.clone());
+    agent_options.tools.push(HostTool::new(
+        "lookup",
+        "Looks something up.",
+        json!({"type": "object"}),
+        |_arguments, _context| Ok(rune_sdk::agent::HostToolResult::text("value")),
+    ));
+    let mut agent = Agent::new(agent_options).expect("agent");
+
+    let mut turn = agent.prompt("go", PromptOptions::default()).expect("turn");
+    let result = turn.result().expect("result");
+    assert_eq!(result.steps, 2);
+    assert_eq!(fetch.hits(), 2, "both steps used the host fetch");
+    assert_eq!(endpoint.request_count(), 2, "and nothing else reached it");
 }
 
 #[test]

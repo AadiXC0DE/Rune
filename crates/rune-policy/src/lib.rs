@@ -8,7 +8,6 @@ pub mod command;
 pub mod decision;
 pub mod review;
 pub mod rules;
-pub mod sandbox;
 pub mod settings;
 pub mod trust;
 
@@ -20,5 +19,4 @@ pub use review::{
     ReviewerKind, reviewer_for,
 };
 pub use rules::{Rule, RuleSet};
-pub use sandbox::{Enforcement, NullSandbox, Sandbox, Support, detect};
 pub use trust::{ProjectRequest, TrustDecision, TrustStore, WorkspaceTrust, decide};

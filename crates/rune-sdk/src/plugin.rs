@@ -158,6 +158,11 @@ struct Session {
 }
 
 impl Session {
+    /// Returns true when the process has already ended.
+    fn exited(&mut self) -> bool {
+        matches!(self.child.try_wait(), Ok(Some(_)) | Err(_))
+    }
+
     /// Closes the plugin's input and waits for it to exit.
     ///
     /// Returns false when it was still running at the deadline, which the
@@ -411,10 +416,26 @@ impl PluginHost {
         if let Some(reason) = self.disabled.clone() {
             return Err(disabled_error(&self.name, &reason));
         }
+        if let Some(session) = self.session.as_mut()
+            && session.exited()
+        {
+            // The process ended between calls. Its input pipe is gone, so the
+            // next call needs a fresh process, which spends a restart.
+            self.session = None;
+            let cause = RuneError::new(
+                ErrorCode::TransportFailure,
+                format!("plugin `{}` exited between calls", self.name),
+            );
+            self.note_failure(&cause);
+            if self.disabled.is_some() {
+                return Err(self.report(&cause));
+            }
+        }
         if self.session.is_some() {
             return Ok(());
         }
-        match self.connect() {
+        self.launch()?;
+        match self.handshake() {
             Ok(()) => Ok(()),
             Err(cause) => {
                 self.note_failure(&cause);
@@ -424,9 +445,14 @@ impl PluginHost {
     }
 
     /// Starts the plugin, spending the restart budget until it answers.
+    ///
+    /// A process that cannot be started at all is not a crash loop: it is
+    /// reported where it happens rather than retried, because retrying a
+    /// missing program cannot change the answer.
     fn attach(&mut self) -> Result<()> {
         loop {
-            match self.connect() {
+            self.launch()?;
+            match self.handshake() {
                 Ok(()) => return Ok(()),
                 Err(cause) => {
                     self.note_failure(&cause);
@@ -463,9 +489,16 @@ impl PluginHost {
         }
     }
 
-    /// Starts one process and completes the handshake.
-    fn connect(&mut self) -> Result<()> {
-        self.session = Some(self.spawn()?);
+    /// Starts one process, when none is running.
+    fn launch(&mut self) -> Result<()> {
+        if self.session.is_none() {
+            self.session = Some(self.spawn()?);
+        }
+        Ok(())
+    }
+
+    /// Completes the handshake with the running process.
+    fn handshake(&mut self) -> Result<()> {
         let id = self.take_id();
         let frame = request_frame(
             id,
@@ -491,13 +524,7 @@ impl PluginHost {
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
-            .map_err(|err| {
-                RuneError::new(
-                    ErrorCode::TransportFailure,
-                    format!("plugin `{}` could not be started: {err}", self.name),
-                )
-                .with_hint(format!("the manifest names `{program}`"))
-            })?;
+            .map_err(|err| spawn_error(&self.name, &program, &err))?;
 
         let stdin = child.stdin.take();
         let stdout = child.stdout.take().ok_or_else(|| {
@@ -740,6 +767,23 @@ fn borrow(host: &Arc<Mutex<PluginHost>>) -> Result<MutexGuard<'_, PluginHost>> {
         )
         .with_hint("build a new plugin host")
     })
+}
+
+/// Builds the error for a process that could not be started.
+///
+/// A missing program is reported as such rather than as a transport failure:
+/// the two want different repairs, and only one of them is worth retrying.
+fn spawn_error(name: &str, program: &str, err: &std::io::Error) -> RuneError {
+    let code = if err.kind() == std::io::ErrorKind::NotFound {
+        ErrorCode::NotFound
+    } else {
+        ErrorCode::TransportFailure
+    };
+    RuneError::new(
+        code,
+        format!("plugin `{name}` could not start `{program}`: {err}"),
+    )
+    .with_hint("check that the program the manifest names exists and is executable")
 }
 
 /// Refuses a frame larger than the cap, in either direction.

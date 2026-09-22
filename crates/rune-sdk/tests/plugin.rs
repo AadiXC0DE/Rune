@@ -440,6 +440,66 @@ fn an_argument_too_large_for_one_frame_is_refused_without_touching_the_plugin() 
 }
 
 #[test]
+fn a_plugin_result_larger_than_its_bound_is_truncated() {
+    let fixture = Fixture::new(
+        "verbose",
+        &script(
+            r#"
+    *'"method":"tools/call"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":"' "$id"
+      dd if=/dev/zero bs=1024 count=200 2>/dev/null | tr '\0' 'x'
+      printf '"}\n'
+      ;;
+"#,
+        ),
+        TOOLS,
+    );
+    let mut host = PluginHost::start(fixture.path()).expect("start");
+
+    let output = host.call("echo", &json!({})).expect("call");
+    assert!(output.text.len() < 200 * 1024, "{}", output.text.len());
+    assert!(
+        output.text.ends_with("(truncated)"),
+        "{}",
+        output.text.len()
+    );
+    // The full size is still reported, so a host accounts for what was produced.
+    assert_eq!(output.produced_bytes, 200 * 1024);
+}
+
+#[test]
+fn a_plugin_that_died_between_calls_is_restarted_within_the_budget() {
+    // Dies after the first call, so the next call needs a fresh process.
+    let fixture = Fixture::new(
+        "flaky",
+        &script(
+            r#"
+    *'"method":"tools/call"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"text":"echoed"}}
+' "$id"
+      exit 0
+      ;;
+"#,
+        ),
+        TOOLS,
+    );
+    let mut host = PluginHost::start_with_limits(fixture.path(), limits(2_000, 3)).expect("start");
+    assert_eq!(host.restarts(), 0);
+
+    let output = host.call("echo", &json!({})).expect("the first call");
+    assert_eq!(output.text, "echoed");
+    assert_eq!(host.restarts(), 0, "a live plugin costs no restart");
+
+    // The fixture exits as it answers, so the death lands just after the call.
+    std::thread::sleep(Duration::from_millis(100));
+
+    let output = host.call("echo", &json!({})).expect("restarted");
+    assert_eq!(output.text, "echoed");
+    assert!(!host.is_disabled());
+    assert!(host.restarts() > 0, "the death spent a restart");
+}
+
+#[test]
 fn shutdown_is_idempotent_and_refuses_further_calls() {
     let fixture = Fixture::new("echoer", &script(ECHOING_DISPATCH), TOOLS);
     let mut host = PluginHost::start(fixture.path()).expect("start");
@@ -469,6 +529,86 @@ fn a_manifest_without_a_command_is_refused() {
     let err = PluginHost::start(directory.path()).expect_err("no command");
     assert_eq!(err.code(), ErrorCode::MissingField);
     assert_eq!(err.field(), Some("plugin.commands"));
+}
+
+#[test]
+fn a_plugin_program_that_does_not_exist_is_reported_without_retrying() {
+    let directory = tempfile::tempdir().expect("temp dir");
+    std::fs::write(
+        directory.path().join("plugin.json"),
+        serde_json::to_vec(&json!({
+            "protocol_version": 1,
+            "name": "ghost",
+            "tools": serde_json::from_str::<Value>(TOOLS).expect("tools"),
+            "commands": ["/nonexistent/plugin-program"],
+        }))
+        .expect("encode"),
+    )
+    .expect("write manifest");
+
+    let err = PluginHost::start_with_limits(directory.path(), limits(2_000, 3))
+        .expect_err("a missing program");
+    assert_eq!(err.code(), ErrorCode::NotFound);
+    assert!(
+        err.message().contains("/nonexistent/plugin-program"),
+        "{}",
+        err.message()
+    );
+}
+
+#[test]
+fn a_manifest_declaring_more_tools_than_the_cap_is_refused() {
+    let directory = tempfile::tempdir().expect("temp dir");
+    let tools: Vec<Value> = (0..=rune_core::tool::MAX_TOOLS)
+        .map(|index| {
+            json!({
+                "name": format!("tool_{index}"),
+                "description": "A tool.",
+                "input_schema": {"type": "object"},
+            })
+        })
+        .collect();
+    std::fs::write(
+        directory.path().join("plugin.json"),
+        serde_json::to_vec(&json!({
+            "protocol_version": 1,
+            "name": "greedy",
+            "tools": tools,
+            "commands": ["/bin/true"],
+        }))
+        .expect("encode"),
+    )
+    .expect("write manifest");
+
+    let err = PluginHost::start(directory.path()).expect_err("too many tools");
+    assert_eq!(err.code(), ErrorCode::TooLarge);
+    assert_eq!(err.field(), Some("tools"));
+}
+
+#[test]
+fn output_the_plugin_writes_for_itself_does_not_disturb_a_call() {
+    // A plugin that logs to its own output is normal; the host reads past it.
+    let fixture = Fixture::new(
+        "chatty",
+        &script(
+            r#"
+    *'"method":"tools/call"'*)
+      printf 'starting work for %s
+' "$id"
+      printf '{"level":"info","msg":"about to answer"}
+'
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"text":"echoed"}}
+' "$id"
+      ;;
+"#,
+        ),
+        TOOLS,
+    );
+    let mut host = PluginHost::start(fixture.path()).expect("start");
+
+    let output = host.call("echo", &json!({})).expect("call");
+    assert_eq!(output.text, "echoed");
+    host.shutdown().expect("shutdown");
 }
 
 #[test]

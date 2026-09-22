@@ -864,6 +864,7 @@ name = "rune"
 version = "0.1.0"
 dependencies = [
  "camino",
+ "jiff",
  "rune-acp",
  "rune-agent",
  "rune-context",
@@ -949,11 +950,9 @@ dependencies = [
 name = "rune-exec"
 version = "0.1.0"
 dependencies = [
+ "camino",
  "rune-core",
- "serde",
- "serde_json",
  "tempfile",
- "thiserror",
 ]
 
 [[package]]
@@ -991,11 +990,13 @@ version = "0.1.0"
 dependencies = [
  "rune-agent",
  "rune-core",
- "rune-session",
+ "rune-net",
+ "rune-testkit",
+ "rune-tools",
  "serde",
  "serde_json",
  "tempfile",
- "thiserror",
+ "ureq",
 ]
 
 [[package]]

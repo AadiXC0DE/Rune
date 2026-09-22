@@ -1,13 +1,15 @@
 //! A supervised child process and the bytes it produced.
 //!
-//! A command runs in its own process group, so ending a session ends everything
-//! the command started rather than only the process Rune spawned. Signals are
-//! delivered by running `kill` against the negated group id: this crate forbids
-//! unsafe code, and the standard library exposes no signal API.
+//! Where [`crate::command`] runs a command to completion, this module keeps one
+//! running and hands back a handle, which is what a long-lived command needs.
+//! Both share one process-group and exit-status vocabulary, so a caller never
+//! has to learn a second one.
 
 use std::io::{self, Read, Write};
 use std::path::Path;
 use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
+
+use crate::command::{Exit, own_group};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -32,38 +34,6 @@ pub const GRACE_PERIOD: Duration = Duration::from_millis(2_000);
 
 /// Time between checks while waiting for a process to end.
 pub const POLL_INTERVAL: Duration = Duration::from_millis(10);
-
-/// How a process ended.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Exit {
-    /// The process exited with this status code.
-    Code(i32),
-    /// The process was killed by this signal.
-    Signal(i32),
-    /// The wait itself failed, so the outcome is unknown.
-    Unknown,
-}
-
-impl Exit {
-    /// Returns true when the process exited successfully.
-    #[must_use]
-    pub const fn is_success(self) -> bool {
-        matches!(self, Self::Code(0))
-    }
-
-    /// Returns a phrase describing how the process ended.
-    #[must_use]
-    pub fn describe(self) -> String {
-        match self {
-            Self::Code(code) => format!("exited with status {code}"),
-            Self::Signal(signal) => match signal_name(signal) {
-                Some(name) => format!("killed by signal {signal} ({name})"),
-                None => format!("killed by signal {signal}"),
-            },
-            Self::Unknown => String::from("ended with an unknown status"),
-        }
-    }
-}
 
 /// Bytes captured from one stream.
 #[derive(Debug)]
@@ -425,19 +395,6 @@ fn spawn_waiter(inner: Arc<Inner>) -> io::Result<()> {
     Ok(())
 }
 
-/// Starts the child in a process group of its own.
-fn own_group(spec: &mut Command) {
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt as _;
-        spec.process_group(0);
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = spec;
-    }
-}
-
 /// Delivers a signal to a process group.
 ///
 /// Returns whether a signal program ran. A group that has already ended cannot
@@ -474,20 +431,6 @@ fn classify(status: ExitStatus) -> Exit {
 fn terminating_signal(status: ExitStatus) -> Option<i32> {
     use std::os::unix::process::ExitStatusExt as _;
     status.signal()
-}
-
-/// Names the signals a command is likely to be ended by.
-fn signal_name(signal: i32) -> Option<&'static str> {
-    match signal {
-        1 => Some("SIGHUP"),
-        2 => Some("SIGINT"),
-        3 => Some("SIGQUIT"),
-        6 => Some("SIGABRT"),
-        9 => Some("SIGKILL"),
-        13 => Some("SIGPIPE"),
-        15 => Some("SIGTERM"),
-        _ => None,
-    }
 }
 
 /// Locks a mutex, ignoring poisoning.

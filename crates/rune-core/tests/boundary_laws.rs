@@ -165,6 +165,60 @@ fn tools_do_not_depend_on_renderer_or_transport() {
 }
 
 #[test]
+fn process_execution_lives_in_one_crate() {
+    // Two crates spawning process groups means two sets of rules about what a
+    // child inherits and how it is ended, and the pair drifts. Supervision and
+    // sandboxing belong to the crate named for them.
+    for crate_name in INTERNAL_CRATES {
+        if matches!(*crate_name, "rune-exec" | "rune-exec-session") {
+            continue;
+        }
+        let dir = workspace_root().join("crates").join(crate_name).join("src");
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().is_none_or(|ext| ext != "rs") {
+                continue;
+            }
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let shipped = text.split("#[cfg(test)]").next().unwrap_or(&text);
+            assert!(
+                !shipped.contains("process_group(0)"),
+                "{} starts its own process group; process supervision belongs to rune-exec",
+                path.display()
+            );
+        }
+    }
+}
+
+#[test]
+fn policy_does_not_reach_the_operating_system() {
+    // The policy engine decides; it does not probe the host or restrict a
+    // process. Probing belongs to the crate that runs commands.
+    let dir = workspace_root().join("crates/rune-policy/src");
+    let entries = std::fs::read_dir(&dir).expect("read policy src");
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().is_none_or(|ext| ext != "rs") {
+            continue;
+        }
+        let text = std::fs::read_to_string(&path).expect("read");
+        // Tests may launch a process to demonstrate what a shell does with a
+        // string; the shipping code must not.
+        let shipped = text.split("#[cfg(test)]").next().unwrap_or(&text);
+        assert!(
+            !shipped.contains("std::process::Command"),
+            "{} launches a process; the policy engine must only decide",
+            path.display()
+        );
+    }
+}
+
+#[test]
 fn only_the_binary_depends_on_the_renderer() {
     let crates_dir = workspace_root().join("crates");
     let mut offenders = Vec::new();

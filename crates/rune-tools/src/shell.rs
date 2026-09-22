@@ -16,8 +16,9 @@ use rune_core::budget::BudgetSet;
 use rune_core::error::{ErrorCode, Result, RuneError};
 
 use crate::contract::{Activity, ExecutionContext, Tool, ToolOutput};
-use crate::process::{Exit, POLL_INTERVAL, Process};
 use crate::workspace::{FileLimits, bool_arg, resolve, string_arg, truncate_to_bytes, usize_arg};
+use rune_exec::command::Exit;
+use rune_exec::session::{POLL_INTERVAL, Process};
 
 /// Yield window a `run` uses when none is requested.
 pub const DEFAULT_RUN_YIELD_MS: u64 = 30_000;
