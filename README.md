@@ -1,64 +1,116 @@
+<div align="center">
+
 # Rune
 
-A native coding agent harness: one small binary for the terminal, for scripts,
-and for embedding in other systems.
+**A native coding agent harness.**
 
-Rune is model and provider agnostic. It has no hosted service, no background
-daemon, and no telemetry, and it requires no account. You connect the endpoint
-you want to use and it works with that.
+One small binary for the terminal, for scripts, and for embedding in other
+systems.
 
-## Status
+[![CI](https://github.com/AadiXC0DE/Rune/actions/workflows/ci.yml/badge.svg)](https://github.com/AadiXC0DE/Rune/actions/workflows/ci.yml)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![Rust](https://img.shields.io/badge/rust-1.98%2B-orange.svg)](rust-toolchain.toml)
 
-Usable for a real session against the endpoint you connect. The command surface,
-configuration, agent loop, tools, permissions, sessions, and terminal interface
-are in place. `COMMANDS.md` is the generated command reference, and `rune doctor`
-reports what your machine supports.
+</div>
 
-## Building
+Rune is model and provider agnostic. No hosted service, no background daemon, no
+telemetry, and no account. You connect the endpoint you want to use and it works
+with that.
 
-Requires Rust 1.98 or newer.
+## Install
+
+Homebrew:
 
 ```sh
+brew install aadixc0de/tap/rune
+```
+
+From source:
+
+```sh
+git clone https://github.com/AadiXC0DE/Rune
+cd Rune
 cargo build --release
 ./target/release/rune doctor
 ```
 
-## Design
-
-- **Small and fast.** Startup and binary size are budgets enforced in CI, not
-  aspirations. The argument and configuration paths never load the agent runtime.
-- **Shell-like output.** The interactive session renders inline and preserves
-  terminal scrollback rather than taking over the screen.
-- **A small prompt.** The system prompt has a size ceiling and is inspectable.
-- **Permission first.** Every sensitive action passes a policy gate that can
-  explain exactly which rule decided it.
-- **Local.** Sessions, usage, and credentials stay on the machine.
-
-## Commands
+Then connect a provider. There is no default: a fresh install has none, and any
+command that needs one says so and names how to connect it.
 
 ```sh
-rune                    # start an interactive session
-rune ask "..."          # run one request
-rune connect            # connect a model provider
-rune doctor             # check the local setup
-rune status --json      # show resolved configuration and state
-rune limits --json      # list every limit and its source
-rune config --explain   # show where each setting came from
-rune acp                # serve the Agent Client Protocol
+rune connect anthropic      # or chat_completions, or your own endpoint
+rune doctor                 # check what your machine supports
 ```
 
-Run `rune help` for the full list.
+## Use
+
+```sh
+rune                        # interactive session
+rune ask "..."              # one request, prints the answer
+rune review                 # review the pending changes in this repository
+rune resume last            # continue the most recent session here
+```
+
+Sessions are written as they run, so an interrupted session resumes. Prompts are
+remembered and recallable with `/history`. Custom slash commands live in
+`.rune/commands/*.md` in a repository, so a team can ship a workflow with the
+code.
+
+Run `rune help` for everything, or see [COMMANDS.md](COMMANDS.md) for the full
+reference.
+
+## Design
+
+- **Small and fast.** Binary size and startup are budgets enforced in CI, not
+  aspirations. The argument and configuration paths never load the agent runtime.
+- **Shell-like output.** The session renders inline and preserves terminal
+  scrollback rather than taking over the screen.
+- **Permission first.** Every sensitive action passes a policy gate, and
+  `rune permissions` explains exactly which rule decided it.
+- **Sandboxed execution.** Commands run under the platform sandbox where one
+  exists. `rune doctor` reports what your host can enforce.
+- **Offline mode.** `--offline` refuses every outbound request.
+- **Local.** Sessions, usage, and credentials stay on the machine.
 
 ## Configuration
 
-Configuration resolves from five layers, highest wins: command-line flags,
-`RUNE_*` environment variables, the project file `.rune.toml`, the user file at
-`$XDG_CONFIG_HOME/rune/config.toml`, then built-in defaults.
+Five layers, highest first: command-line flags, `RUNE_*` environment variables,
+the project file `.rune.toml`, the user file at `$XDG_CONFIG_HOME/rune/config.toml`,
+then built-in defaults.
 
 Only repository-safe keys are accepted in a project file. A user setting placed
 there is ignored and reported rather than applied, because a repository can be
 changed by anyone who can open a pull request.
 
+```sh
+rune config --explain       # where each setting came from
+rune limits --json          # every limit and its source
+rune prompt --show          # the exact instructions the model receives
+```
+
+## Embedding
+
+`rune-acp` serves the Agent Client Protocol over stdin and stdout, so an editor
+can drive a session. `rune-sdk` is the library an embedder links against: the
+host supplies the credential, the tools, and the network path.
+
+A Node binding lives in [`bindings/node`](bindings/node).
+
+## Status
+
+Early development, and usable for a real session. The command surface,
+configuration, agent loop, tools, permissions, sessions, and terminal interface
+are in place. See [CHANGELOG.md](CHANGELOG.md) for what has landed.
+
+## Contributing
+
+Issues and pull requests are welcome. Before opening a pull request:
+
+```sh
+cargo xtask check      # format, lint, and test
+cargo xtask gate       # the above plus the size and startup budgets
+```
+
 ## License
 
-Apache-2.0.
+Apache-2.0. See [LICENSE](LICENSE).
