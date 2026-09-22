@@ -999,13 +999,15 @@ mod tests {
         let ledger = ledger(&dir);
         ledger.append(&at(1)).expect("append");
 
-        let mut file = OpenOptions::new()
-            .append(true)
-            .open(ledger.path())
-            .expect("open");
-        file.write_all(b"{\"schema_version\":1,\"created_at")
-            .expect("write fragment");
-        file.sync_all().expect("sync");
+        {
+            let mut file = OpenOptions::new()
+                .append(true)
+                .open(ledger.path())
+                .expect("open");
+            file.write_all(b"{\"schema_version\":1,\"created_at")
+                .expect("write fragment");
+            file.sync_all().expect("sync");
+        }
 
         let read = ledger.read().expect("read");
         assert_eq!(timestamps(&read), vec![base.saturating_add(1)]);
@@ -1032,12 +1034,14 @@ mod tests {
         ledger.append(&at(1)).expect("append");
         ledger.append(&at(2)).expect("append");
 
-        let mut file = OpenOptions::new()
-            .append(true)
-            .open(ledger.path())
-            .expect("open");
-        file.write_all(b"{\"schema_version\":1").expect("fragment");
-        file.sync_all().expect("sync");
+        {
+            let mut file = OpenOptions::new()
+                .append(true)
+                .open(ledger.path())
+                .expect("open");
+            file.write_all(b"{\"schema_version\":1").expect("fragment");
+            file.sync_all().expect("sync");
+        }
 
         // The ledger already holds the cap, so this append compacts and the
         // fragment is dropped rather than carried forward.
@@ -1141,7 +1145,8 @@ mod tests {
         // that waits cannot deadlock the suite.
         let holder = OpenOptions::new()
             .create(true)
-            .append(true)
+            .truncate(false)
+            .write(true)
             .open(ledger.lock_path())
             .expect("open lock");
         holder.lock().expect("lock");
