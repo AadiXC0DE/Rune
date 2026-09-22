@@ -9,6 +9,7 @@ pub mod editor;
 pub mod engine;
 pub mod footer;
 pub mod frame;
+pub mod screen;
 pub mod shell;
 pub mod theme;
 pub mod transcript;
