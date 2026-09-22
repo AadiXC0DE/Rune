@@ -135,7 +135,11 @@ fn render_entry(entry: &Entry, display: Display, out: &mut String) {
                 let _ = writeln!(out, "  {line}");
             }
             if keep < body.len() {
-                let _ = writeln!(out, "  ... {} more line(s)", body.len().saturating_sub(keep));
+                let _ = writeln!(
+                    out,
+                    "  ... {} more line(s)",
+                    body.len().saturating_sub(keep)
+                );
             }
         }
         Speaker::Notice => {

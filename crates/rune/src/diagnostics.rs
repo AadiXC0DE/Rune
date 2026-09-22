@@ -149,6 +149,7 @@ pub fn run(settings: &Settings, paths: &Paths, workspace: &Utf8Path) -> Report {
         check_limits(settings),
         check_legacy_layout(),
         check_network(settings),
+        check_sandbox(),
     ];
 
     Report {
@@ -157,6 +158,31 @@ pub fn run(settings: &Settings, paths: &Paths, workspace: &Utf8Path) -> Report {
         config_root: paths.config_root.to_string(),
         state_root: paths.state_root.to_string(),
         checks,
+    }
+}
+
+/// Reports what this host can enforce for a command.
+///
+/// A host with no backend is reported rather than passed over: a command that
+/// cannot be restricted is a fact the user needs before trusting one.
+fn check_sandbox() -> Check {
+    let backend = rune_exec::sandbox::detect();
+    let name = backend.name();
+    match backend.support() {
+        rune_exec::sandbox::Support::Full => Check::ok(
+            "sandbox",
+            format!("{name} restricts every process the command starts"),
+        ),
+        rune_exec::sandbox::Support::Partial { reason } => Check::warn(
+            "sandbox",
+            format!("{name} cannot restrict every thread: {reason}"),
+        )
+        .with_hint("commands run without full enforcement; pass the override to accept that"),
+        rune_exec::sandbox::Support::Unsupported { reason } => Check::warn(
+            "sandbox",
+            format!("{name} cannot restrict commands here: {reason}"),
+        )
+        .with_hint("commands run unrestricted; an explicit override is required to run one"),
     }
 }
 

@@ -21,6 +21,7 @@ rune-agent.workspace = true
 rune-term.workspace = true
 rune-acp.workspace = true
 rune-tools.workspace = true
+rune-exec.workspace = true
 rune-policy.workspace = true
 rune-context.workspace = true
 rune-session.workspace = true

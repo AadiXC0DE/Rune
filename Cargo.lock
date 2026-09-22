@@ -869,6 +869,7 @@ dependencies = [
  "rune-agent",
  "rune-context",
  "rune-core",
+ "rune-exec",
  "rune-net",
  "rune-policy",
  "rune-session",
