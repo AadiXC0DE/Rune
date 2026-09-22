@@ -261,6 +261,10 @@ pub fn run<R: BufRead, W: std::io::Write>(
         (recorder, History::new())
     };
 
+    // Opened once. A history that failed to load is not fatal: recall is a
+    // convenience, and losing it must not cost the session.
+    let mut history_file = crate::prompt_history::History::open(&config.paths).ok();
+
     // Discovered once, because a command file that changes mid-session would
     // otherwise make an invocation mean two different things.
     let commands =
@@ -316,7 +320,13 @@ pub fn run<R: BufRead, W: std::io::Write>(
             .map_err(|_| RuneError::new(ErrorCode::Internal, "the output lock was poisoned"))?;
         match input {
             Input::Command { name, arguments } => {
-                match handle_command(&name, &arguments, &commands, &mut *sink)? {
+                match handle_command(
+                    &name,
+                    &arguments,
+                    &commands,
+                    history_file.as_ref(),
+                    &mut *sink,
+                )? {
                     Handled::Exit => Ok(Action::Exit),
                     Handled::Continue => Ok(Action::Continue),
                     // Expanded text goes to the composer for review, never
@@ -335,6 +345,13 @@ pub fn run<R: BufRead, W: std::io::Write>(
                 if is_first_prompt {
                     recorder.set_title(&session_log::derive_title(&text))?;
                     is_first_prompt = false;
+                }
+                // Recorded before the turn runs, so a prompt that is interrupted
+                // is still recallable.
+                if let Some(history) = history_file.as_mut() {
+                    let entry = crate::prompt_history::Entry::new(text.clone())
+                        .located(&config.workspace, recorder.id().as_str());
+                    let _ = history.record(entry);
                 }
                 recorder.user_message(&text)?;
                 history.push_user(text);
@@ -437,12 +454,32 @@ fn handle_command<W: std::io::Write>(
     name: &str,
     arguments: &str,
     commands: &rune_context::commands::Discovery,
+    history: Option<&crate::prompt_history::History>,
     output: &mut W,
 ) -> Result<Handled> {
     match name {
         "quit" | "exit" => Ok(Handled::Exit),
+        "history" => {
+            let Some(history) = history else {
+                let _ = writeln!(output, "no prompt history is available");
+                return Ok(Handled::Continue);
+            };
+            let entries = match arguments.trim() {
+                "" => history.entries(),
+                // A session identifier scopes the recall, so a caller can see
+                // what was typed in one session rather than across the install.
+                session => history.for_session(session),
+            };
+            if entries.is_empty() {
+                let _ = writeln!(output, "no prompts recorded");
+            }
+            for (index, entry) in entries.iter().enumerate() {
+                let _ = writeln!(output, "{:>4}  {}", index.saturating_add(1), entry.text);
+            }
+            Ok(Handled::Continue)
+        }
         "help" => {
-            let _ = writeln!(output, "commands: /help /quit");
+            let _ = writeln!(output, "commands: /help /quit /history [session]");
             let listing = rune_context::commands::render_listing(&commands.commands);
             let _ = writeln!(output, "{listing}");
             // A command file that was refused is invisible otherwise, and a
@@ -780,7 +817,8 @@ mod tests {
     #[test]
     fn the_shell_reports_an_unknown_command_without_leaving() {
         let mut output = Vec::new();
-        let action = handle_command("nope", "", &empty_commands(), &mut output).expect("handled");
+        let action =
+            handle_command("nope", "", &empty_commands(), None, &mut output).expect("handled");
         assert_eq!(action, Handled::Continue);
         let text = String::from_utf8_lossy(&output);
         assert!(text.contains("unknown command"), "{text}");
@@ -791,11 +829,11 @@ mod tests {
     fn the_quit_command_leaves_the_shell() {
         let mut output = Vec::new();
         assert_eq!(
-            handle_command("quit", "", &empty_commands(), &mut output).expect("handled"),
+            handle_command("quit", "", &empty_commands(), None, &mut output).expect("handled"),
             Handled::Exit
         );
         assert_eq!(
-            handle_command("exit", "", &empty_commands(), &mut output).expect("handled"),
+            handle_command("exit", "", &empty_commands(), None, &mut output).expect("handled"),
             Handled::Exit
         );
     }
@@ -813,7 +851,8 @@ mod tests {
         });
 
         let mut output = Vec::new();
-        let handled = handle_command("fix", "parser", &discovery, &mut output).expect("handled");
+        let handled =
+            handle_command("fix", "parser", &discovery, None, &mut output).expect("handled");
         assert_eq!(handled, Handled::Expand("Fix parser now".to_owned()));
     }
 
@@ -830,7 +869,7 @@ mod tests {
         });
 
         let mut output = Vec::new();
-        let handled = handle_command("fix", "", &discovery, &mut output).expect("handled");
+        let handled = handle_command("fix", "", &discovery, None, &mut output).expect("handled");
         assert_eq!(handled, Handled::Continue);
         let text = String::from_utf8_lossy(&output);
         assert!(text.contains("$1"), "{text}");
@@ -845,7 +884,7 @@ mod tests {
         });
 
         let mut output = Vec::new();
-        handle_command("help", "", &discovery, &mut output).expect("handled");
+        handle_command("help", "", &discovery, None, &mut output).expect("handled");
         let text = String::from_utf8_lossy(&output);
         assert!(text.contains("skipped"), "{text}");
         assert!(text.contains("built-in"), "{text}");
@@ -854,7 +893,7 @@ mod tests {
     #[test]
     fn help_lists_the_commands() {
         let mut output = Vec::new();
-        handle_command("help", "", &empty_commands(), &mut output).expect("handled");
+        handle_command("help", "", &empty_commands(), None, &mut output).expect("handled");
         let text = String::from_utf8_lossy(&output);
         assert!(text.contains("/help"));
         assert!(text.contains("/quit"));

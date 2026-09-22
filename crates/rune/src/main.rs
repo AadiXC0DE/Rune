@@ -16,6 +16,7 @@ mod cli;
 mod diagnostics;
 mod help;
 mod permissions;
+mod prompt_history;
 mod provider_setup;
 mod session;
 mod session_log;
