@@ -16,6 +16,7 @@ use rune_core::paths::Paths;
 use rune_net::message::ContentPart;
 use rune_session::event::SessionEvent;
 use rune_session::store::{SessionState, SessionStore, load_read_only};
+use rune_session::tree::{Node, Tree};
 
 /// Most sessions listed in one command.
 pub const LIST_LIMIT: usize = 50;
@@ -230,6 +231,116 @@ pub fn render_detail(state: &SessionState, dir: &Utf8Path) -> String {
         None => out.push_str("damaged   no"),
     }
     out.trim_end().to_owned()
+}
+
+/// Builds the branch tree of a stored session.
+///
+/// Every stored session is a single chain, so the tree is built by following the
+/// log in order. It exists so the shape is reported from the log rather than
+/// assumed, which is what lets a branch show up here when branching lands.
+#[must_use]
+pub fn tree_of(state: &SessionState) -> Tree {
+    use rune_session::tree::Role;
+
+    let mut tree = Tree::new();
+    let mut parent: Option<u64> = None;
+    for frame in &state.events {
+        let (role, preview) = match &frame.event {
+            SessionEvent::UserMessage { text } => (Role::User, text.as_str()),
+            SessionEvent::AssistantMessage { text, .. } => (Role::Assistant, text.as_str()),
+            SessionEvent::ToolResult { output, .. } => (Role::Tool, output.as_str()),
+            SessionEvent::ToolCall { name, .. } => (Role::Assistant, name.as_str()),
+            SessionEvent::TurnStarted { .. }
+            | SessionEvent::Compaction { .. }
+            | SessionEvent::UsageRecorded { .. }
+            | SessionEvent::TitleSet { .. } => continue,
+        };
+        let node = Node::new(
+            role,
+            preview.chars().take(PREVIEW_CHARS).collect::<String>(),
+            preview.len(),
+            i64::try_from(frame.timestamp_ms).unwrap_or(i64::MAX),
+        );
+        // A node that cannot be placed is skipped rather than failing the whole
+        // report: the shape of the rest is still worth showing.
+        if let Ok(seq) = tree.append(parent, node) {
+            parent = Some(seq);
+        }
+    }
+    tree
+}
+
+/// Characters of a turn shown as its preview.
+pub const PREVIEW_CHARS: usize = 60;
+
+/// Renders a branch tree for a terminal.
+#[must_use]
+pub fn render_tree(tree: &Tree, state: &SessionState) -> String {
+    let mut out = String::new();
+    let _ = writeln!(out, "session {} ({} turns)", state.id, state.turns);
+
+    for branch in tree.branches() {
+        let _ = writeln!(
+            out,
+            "  branch {}  {} turn(s)  {}",
+            branch.name, branch.turn_count, branch.summary
+        );
+    }
+
+    // Nodes are visited by walking from each root through its children, which
+    // is the only order the tree guarantees.
+    let _ = writeln!(out, "\nturn  branch     role       preview");
+    for root in roots(tree) {
+        walk(tree, root, 0, &mut out);
+    }
+    out.trim_end().to_owned()
+}
+
+/// Returns the nodes that begin a path.
+///
+/// A node whose parent is absent is a root; a node whose parent is not in the
+/// tree is treated as one too, so a repaired log still renders.
+fn roots(tree: &Tree) -> Vec<u64> {
+    let mut out: Vec<u64> = tree
+        .path_to(tree.pointer().unwrap_or(1))
+        .first()
+        .copied()
+        .into_iter()
+        .collect();
+    if out.is_empty() && !tree.is_empty() {
+        out.push(1);
+    }
+    out
+}
+
+/// Walks one path, indenting by depth.
+fn walk(tree: &Tree, seq: u64, depth: usize, out: &mut String) {
+    let Some(node) = tree.node(seq) else {
+        return;
+    };
+    let indent = "  ".repeat(depth);
+    let _ = writeln!(
+        out,
+        "{indent}{:>4}  {:<10} {:<10} {}",
+        node.seq,
+        node.branch,
+        role_name(node.role),
+        node.preview
+    );
+    for child in tree.children(seq) {
+        walk(tree, child, depth.saturating_add(1), out);
+    }
+}
+
+/// Names a role for display.
+fn role_name(role: rune_session::tree::Role) -> &'static str {
+    use rune_session::tree::Role;
+    match role {
+        Role::System => "system",
+        Role::User => "user",
+        Role::Assistant => "assistant",
+        Role::Tool => "tool",
+    }
 }
 
 /// Reports one session as JSON.
@@ -700,6 +811,95 @@ mod tests {
         let err = load(&paths, &id("sessionzzzzz")).expect_err("refused");
         assert_eq!(err.code(), ErrorCode::NotFound);
         assert!(err.hint().is_some(), "the failure does not say what to do");
+    }
+
+    #[test]
+    fn a_session_tree_follows_its_log_in_order() {
+        let dir = tempfile::tempdir().expect("temp");
+        let root = Utf8Path::from_path(dir.path()).expect("utf8");
+        let paths = paths(root);
+        let key = id("sessionqqqqq");
+        let mut recorder = Recorder::create(&paths, &key).expect("created");
+        recorder.user_message("first").expect("wrote");
+        recorder.turn(&outcome("answer")).expect("wrote");
+        drop(recorder);
+
+        let state = inspect(&paths, &key).expect("inspected");
+        let tree = tree_of(&state);
+        // The user message and the assistant reply.
+        assert_eq!(tree.len(), 2);
+        assert_eq!(tree.active_branch(), "main");
+        assert_eq!(tree.path_to(2).len(), 2);
+    }
+
+    #[test]
+    fn an_empty_session_has_an_empty_tree() {
+        let dir = tempfile::tempdir().expect("temp");
+        let root = Utf8Path::from_path(dir.path()).expect("utf8");
+        let paths = paths(root);
+        let key = id("sessionrrrrr");
+        let recorder = Recorder::create(&paths, &key).expect("created");
+        drop(recorder);
+
+        let state = inspect(&paths, &key).expect("inspected");
+        assert!(tree_of(&state).is_empty());
+    }
+
+    #[test]
+    fn the_rendered_tree_names_each_turn() {
+        let dir = tempfile::tempdir().expect("temp");
+        let root = Utf8Path::from_path(dir.path()).expect("utf8");
+        let paths = paths(root);
+        let key = id("sessionsssss");
+        let mut recorder = Recorder::create(&paths, &key).expect("created");
+        recorder.user_message("a question").expect("wrote");
+        recorder.turn(&outcome("an answer")).expect("wrote");
+        drop(recorder);
+
+        let state = inspect(&paths, &key).expect("inspected");
+        let rendered = render_tree(&tree_of(&state), &state);
+        assert!(rendered.contains("branch main"), "{rendered}");
+        assert!(rendered.contains("user"), "{rendered}");
+        assert!(rendered.contains("assistant"), "{rendered}");
+        assert!(rendered.contains("a question"), "{rendered}");
+    }
+
+    #[test]
+    fn a_long_preview_is_truncated() {
+        let dir = tempfile::tempdir().expect("temp");
+        let root = Utf8Path::from_path(dir.path()).expect("utf8");
+        let paths = paths(root);
+        let key = id("sessionttttt");
+        let mut recorder = Recorder::create(&paths, &key).expect("created");
+        recorder
+            .user_message(&"x".repeat(PREVIEW_CHARS * 3))
+            .expect("wrote");
+        recorder.turn(&outcome("y")).expect("wrote");
+        drop(recorder);
+
+        let tree = tree_of(&inspect(&paths, &key).expect("inspected"));
+        let node = tree.node(1).expect("a user turn");
+        assert_eq!(node.preview.chars().count(), PREVIEW_CHARS);
+    }
+
+    #[test]
+    fn a_wide_preview_is_truncated_by_characters_not_bytes() {
+        // A byte-based cut would split a character and produce invalid text.
+        let dir = tempfile::tempdir().expect("temp");
+        let root = Utf8Path::from_path(dir.path()).expect("utf8");
+        let paths = paths(root);
+        let key = id("sessionuuuuu");
+        let mut recorder = Recorder::create(&paths, &key).expect("created");
+        recorder
+            .user_message(&"書".repeat(PREVIEW_CHARS * 2))
+            .expect("wrote");
+        recorder.turn(&outcome("y")).expect("wrote");
+        drop(recorder);
+
+        let tree = tree_of(&inspect(&paths, &key).expect("inspected"));
+        let node = tree.node(1).expect("a user turn");
+        assert_eq!(node.preview.chars().count(), PREVIEW_CHARS);
+        assert!(node.preview.is_char_boundary(node.preview.len()));
     }
 
     #[test]

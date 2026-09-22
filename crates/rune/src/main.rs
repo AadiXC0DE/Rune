@@ -30,7 +30,7 @@ use rune_core::paths::Paths;
 use rune_session::report::{Period, render_text, summarize, to_json};
 use rune_session::usage::{Ledger, now_ms};
 
-use crate::cli::{Command, Launch};
+use crate::cli::{Command, Launch, ResumeTarget};
 
 /// Exit code for a successful run.
 const EXIT_OK: u8 = 0;
@@ -143,7 +143,8 @@ fn run(launch: &Launch) -> Result<ExitCode> {
         Command::Limits => run_limits(&settings, &output_flags),
         Command::Config => run_config(&settings, &output_flags),
         Command::Prompt => run_prompt(&settings, &output_flags),
-        Command::Sessions | Command::Tree => run_sessions(&paths, &output_flags),
+        Command::Sessions => run_sessions(&paths, &output_flags),
+        Command::Tree => run_tree(&paths, launch, &output_flags),
         Command::Session => run_session(&paths, launch, &output_flags),
         Command::Usage => run_usage(&paths, launch, &output_flags),
         Command::Auth => run_auth(&settings, &paths, launch, &output_flags),
@@ -536,6 +537,37 @@ fn period_from(raw: Option<&str>) -> Result<Period> {
         )
         .with_hint("use 24h, 7d, or 30d")),
     }
+}
+
+/// Reports the branch structure of a stored session.
+///
+/// Without an identifier the most recent session is used, because that is what a
+/// user means by "the current one".
+fn run_tree(paths: &Paths, launch: &Launch, output: &OutputFlags) -> Result<ExitCode> {
+    let id = match launch.args.first() {
+        Some(raw) => raw.parse()?,
+        None => session_log::resolve_target(&ResumeTarget::Latest, paths)?,
+    };
+    let state = session_log::inspect(paths, &id)?;
+    let tree = session_log::tree_of(&state);
+
+    if output.json {
+        let value = serde_json::json!({
+            "session": state.id.to_string(),
+            "active_branch": tree.active_branch(),
+            "branches": tree.branches().iter().map(|branch| serde_json::json!({
+                "name": branch.name,
+                "turns": branch.turn_count,
+                "head": branch.head_seq,
+                "diverges_at": branch.divergence_seq,
+            })).collect::<Vec<_>>(),
+            "turns": tree.len(),
+        });
+        println!("{}", serde_json::to_string_pretty(&value)?);
+    } else {
+        println!("{}", session_log::render_tree(&tree, &state));
+    }
+    Ok(ExitCode::from(EXIT_OK))
 }
 
 /// Reports one stored session.
