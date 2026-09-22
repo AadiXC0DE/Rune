@@ -141,6 +141,8 @@ pub struct Launch {
     pub provider_strict: Option<bool>,
     /// Whether every outbound request is refused.
     pub offline: bool,
+    /// Whether a command may run where the host has no sandbox backend.
+    pub allow_unsandboxed: bool,
     /// Whether output is machine readable.
     pub json: bool,
     /// Positional arguments after the command.
@@ -223,6 +225,7 @@ pub fn parse(args: Vec<OsString>, benchmark: bool) -> Result<Launch> {
         provider_order: None,
         provider_strict: None,
         offline: false,
+        allow_unsandboxed: false,
         json: false,
         args: Vec::new(),
         flags: Vec::new(),
@@ -305,6 +308,10 @@ pub fn parse(args: Vec<OsString>, benchmark: bool) -> Result<Launch> {
             }
             "--offline" => {
                 launch.offline = true;
+                index = index.saturating_add(1);
+            }
+            "--allow-unsandboxed" => {
+                launch.allow_unsandboxed = true;
                 index = index.saturating_add(1);
             }
             "--json" => {

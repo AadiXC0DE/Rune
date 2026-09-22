@@ -136,6 +136,13 @@ fn run(launch: &Launch) -> Result<ExitCode> {
         json: launch.json || launch.has_flag("--json"),
     };
 
+    if launch.allow_unsandboxed {
+        settings.allow_unsandboxed = true;
+        settings
+            .sources
+            .record("allow_unsandboxed", Layer::CommandLine);
+    }
+
     if launch.offline {
         // Set on the settings rather than only recorded, so every endpoint a
         // command builds carries the refusal rather than just the label.

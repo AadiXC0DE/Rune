@@ -333,7 +333,8 @@ pub fn run<R: BufRead, W: std::io::Write>(
         effort: config.settings.effort,
         fast_mode: config.settings.fast_mode,
         limits: limits.clone(),
-        context: ExecutionContext::new(config.workspace.clone()),
+        context: ExecutionContext::new(config.workspace.clone())
+            .with_allow_unsandboxed(config.settings.allow_unsandboxed),
         registry: config.registry,
         cancellation: Cancellation::new(),
         steering: SteeringQueue::from_limits(&limits),

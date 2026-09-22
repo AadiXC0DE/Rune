@@ -133,6 +133,10 @@ pub const GLOBAL_FLAGS: &[FlagSpec] = &[
         "Ignore saved additional directories for this process.",
     ),
     flag("--offline", "Refuse every outbound network request."),
+    flag(
+        "--allow-unsandboxed",
+        "Run commands where the host has no sandbox backend. Without this, such a host refuses them.",
+    ),
     flag("--json", "Emit machine-readable output where supported."),
     option("--theme", "name", "Override the theme for this process."),
     option(

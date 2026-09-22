@@ -18,6 +18,7 @@ Accepted anywhere on the command line.
 | `--add-dir` | `path` | Add a workspace directory for this process. Repeatable. |
 | `--no-additional-dirs` | - | Ignore saved additional directories for this process. |
 | `--offline` | - | Refuse every outbound network request. |
+| `--allow-unsandboxed` | - | Run commands where the host has no sandbox backend. Without this, such a host refuses them. |
 | `--json` | - | Emit machine-readable output where supported. |
 | `--theme` | `name` | Override the theme for this process. |
 | `--provider-order` | `a,b` | Prefer these upstream providers in order. |

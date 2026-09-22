@@ -152,6 +152,12 @@ pub struct ExecutionContext {
     pub additional_roots: Vec<Utf8PathBuf>,
     /// Whether the tool was permitted to reach outside the roots.
     pub external_access: bool,
+    /// Whether a command may run without a sandbox.
+    ///
+    /// Separate from reaching outside the workspace: a host with no usable
+    /// sandbox backend can still run a command that stays inside the workspace,
+    /// and conflating the two means such a host can run nothing at all.
+    pub allow_unsandboxed: bool,
     /// Per-call byte budget for produced output.
     pub max_output_bytes: usize,
     /// Composite cancellation flag, checked between steps of long work.
@@ -166,6 +172,7 @@ impl ExecutionContext {
             workspace,
             additional_roots: Vec::new(),
             external_access: false,
+            allow_unsandboxed: false,
             max_output_bytes: 64 * 1024,
             cancelled: Arc::new(AtomicBool::new(false)),
         }
@@ -182,6 +189,13 @@ impl ExecutionContext {
     #[must_use]
     pub const fn with_external_access(mut self, allowed: bool) -> Self {
         self.external_access = allowed;
+        self
+    }
+
+    /// Allows a command to run where no sandbox backend is available.
+    #[must_use]
+    pub const fn with_allow_unsandboxed(mut self, allowed: bool) -> Self {
+        self.allow_unsandboxed = allowed;
         self
     }
 
@@ -202,6 +216,7 @@ impl ExecutionContext {
             workspace: self.workspace.clone(),
             additional_roots: self.additional_roots.clone(),
             external_access: self.external_access,
+            allow_unsandboxed: self.allow_unsandboxed,
             max_output_bytes: self.max_output_bytes,
             cancelled: Arc::clone(&self.cancelled),
         }

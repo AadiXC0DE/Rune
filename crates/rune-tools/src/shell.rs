@@ -417,7 +417,10 @@ fn start(
         // context rather than choosing.
         context.external_access,
     );
-    let wrapped = rune_exec::detect().wrap(&prepared, &policy, context.external_access)?;
+    // Reaching outside the workspace and skipping the sandbox are different
+    // questions, so the second is read from its own field rather than borrowed
+    // from the first.
+    let wrapped = rune_exec::detect().wrap(&prepared, &policy, context.allow_unsandboxed)?;
 
     // The working directory is the resolved workspace, which is the path the
     // sandbox rule was built from. Starting in the path as written would leave
@@ -1221,6 +1224,45 @@ mod tests {
             workspace.join("out.txt").exists(),
             "the command could not write in its own workspace: {}",
             output.text
+        );
+    }
+
+    #[test]
+    fn a_command_runs_when_the_override_is_set_and_no_backend_is_available() {
+        // A host with no usable backend refuses every command by default. The
+        // override is what makes such a host usable at all, so it has to reach
+        // the wrapper rather than being read and dropped.
+        let dir = tempfile::tempdir().expect("temp");
+        let root = Utf8Path::from_path(dir.path()).expect("utf8");
+
+        let blocked = ExecutionContext::new(root.to_owned());
+        let allowed = ExecutionContext::new(root.to_owned()).with_allow_unsandboxed(true);
+
+        // Both contexts describe the same workspace; only the override differs.
+        assert!(!blocked.allow_unsandboxed);
+        assert!(allowed.allow_unsandboxed);
+    }
+
+    #[test]
+    fn the_override_is_separate_from_reaching_outside_the_workspace() {
+        // Reaching out and skipping the sandbox are different questions. Tying
+        // them together means a host can only run a command that stays inside
+        // its workspace by also granting it the whole machine.
+        let dir = tempfile::tempdir().expect("temp");
+        let root = Utf8Path::from_path(dir.path()).expect("utf8");
+
+        let outward = ExecutionContext::new(root.to_owned()).with_external_access(true);
+        assert!(outward.external_access);
+        assert!(
+            !outward.allow_unsandboxed,
+            "permitting a path outside the workspace also skipped the sandbox"
+        );
+
+        let unsandboxed = ExecutionContext::new(root.to_owned()).with_allow_unsandboxed(true);
+        assert!(unsandboxed.allow_unsandboxed);
+        assert!(
+            !unsandboxed.external_access,
+            "skipping the sandbox also permitted paths outside the workspace"
         );
     }
 

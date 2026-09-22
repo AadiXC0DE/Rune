@@ -395,6 +395,12 @@ pub struct Settings {
     pub api_key_env: Option<String>,
     /// Effective permission mode.
     pub permission_mode: PermissionMode,
+    /// Whether a command may run without a sandbox.
+    ///
+    /// Off by default. A host with no usable backend refuses commands rather
+    /// than running them unrestricted, so turning this off removes the only way
+    /// to run anything on such a host.
+    pub allow_unsandboxed: bool,
     /// Reasoning effort.
     pub effort: Effort,
     /// Whether fast mode is requested.
@@ -435,6 +441,7 @@ impl Default for Settings {
             base_url: None,
             api_key_env: None,
             permission_mode: PermissionMode::default(),
+            allow_unsandboxed: false,
             effort: Effort::default(),
             fast_mode: false,
             theme: None,
@@ -914,6 +921,20 @@ fn apply_user(settings: &mut Settings, user: &UserConfig, layer: Layer) {
 
 /// Applies a project configuration, ignoring anything not repository safe.
 fn apply_project(settings: &mut Settings, project: &ProjectConfig, layer: Layer) {
+    // A repository may state the sandbox posture, and the only value it may
+    // state is the restrictive one: a repository cannot grant itself the right
+    // to run commands unrestricted on someone else's machine.
+    if let Some(sandbox) = &project.sandbox {
+        match sandbox.trim().to_ascii_lowercase().as_str() {
+            "enforce" | "strict" => {}
+            other => settings.diagnostics.push(Diagnostic::new(
+                layer,
+                ErrorCode::InvalidField,
+                format!("project `sandbox`: `{other}` is not a value a repository may set"),
+            )),
+        }
+    }
+
     // Project limits and step caps sit below user settings only when the user
     // has not already set them, which the layer ordering already handles.
     if let Some(steps) = project
