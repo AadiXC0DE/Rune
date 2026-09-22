@@ -16,3 +16,4 @@ node_modules/
 
 # Local documentation and planning notes
 docs/
+target/dist/

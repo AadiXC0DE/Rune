@@ -42,6 +42,7 @@ fn main() -> ExitCode {
         "test" => cargo(&["test", "--workspace"]),
         "budget" => budget(),
         "gate" => gate(),
+        "release" => release(&extra),
         "help" | "--help" | "-h" => {
             print_help();
             Ok(())
@@ -74,6 +75,9 @@ fn print_help() {
     println!("  test     run the workspace test suite");
     println!("  budget   build the release profile and check size and startup");
     println!("  gate     budget plus the full workspace test suite");
+    println!("  release  stage a release artifact, its checksum, and a manifest");
+    println!();
+    println!("  release takes: cargo xtask release <channel> [version]");
 }
 
 /// The per-commit loop: format, lint, test.
@@ -144,6 +148,171 @@ fn release_binary_path() -> String {
     path.push("release");
     path.push(format!("rune{}", std::env::consts::EXE_SUFFIX));
     path.display().to_string()
+}
+
+/// Stages a release artifact for the host that is building it.
+///
+/// One target is staged at a time: a machine can only build the platform it is
+/// running on without a cross-compilation toolchain, so a matrix is produced by
+/// running this once per machine. The artifact is named after the target, and a
+/// checksum and a manifest are written beside it, because an artifact without a
+/// published checksum cannot be verified by whoever downloads it.
+fn release(extra: &[String]) -> Result<(), String> {
+    let channel = extra.first().map_or("dev", String::as_str);
+    let version = match extra.get(1) {
+        Some(value) => value.clone(),
+        None => manifest_version()?,
+    };
+    let target = env!("TARGET");
+    let directory = format!("target/dist/rune-{target}");
+
+    cargo(&["build", "--release", "--locked", "-p", "rune"])?;
+
+    let binary = release_binary_path();
+    let name = executable_name(target);
+    let archive = format!("rune-{version}-{target}.tar.gz");
+    let archive_path = format!("{directory}/{archive}");
+
+    std::fs::create_dir_all(&directory)
+        .map_err(|err| format!("could not create {directory}: {err}"))?;
+
+    // The archive is what is published, so the checksum is over the archive
+    // rather than over the binary inside it. A checksum naming a file that does
+    // not exist verifies nothing.
+    // The archive is written here rather than by an external tool, because the
+    // tools disagree about how to pin metadata: one accepts a timestamp format
+    // the other rejects, and an unpinned timestamp makes two runs over identical
+    // input produce different archives. Writing it means the bytes depend on the
+    // binary alone.
+    let binary_bytes =
+        std::fs::read(&binary).map_err(|err| format!("could not read {binary}: {err}"))?;
+    std::fs::write(&archive_path, tar_single(&name, &binary_bytes))
+        .map_err(|err| format!("could not write {archive_path}: {err}"))?;
+
+    let bytes = std::fs::read(&archive_path)
+        .map_err(|err| format!("could not read {archive_path}: {err}"))?;
+    let checksum = digest(&bytes);
+
+    // Read back and re-check, so a staging step that wrote something else cannot
+    // publish a digest that does not describe the file.
+    let reread = std::fs::read(&archive_path)
+        .map_err(|err| format!("could not re-read {archive_path}: {err}"))?;
+    if digest(&reread) != checksum {
+        return Err(format!("{archive_path} changed while it was being staged"));
+    }
+
+    write(
+        &format!("{directory}/{archive}.sha256"),
+        &format!("{checksum}  {archive}\n"),
+    )?;
+    write(
+        &format!("{directory}/manifest.json"),
+        &format!(
+            "{{\n  \"name\": \"rune\",\n  \"version\": \"{version}\",\n  \
+             \"channel\": \"{channel}\",\n  \"target\": \"{target}\",\n  \
+             \"archive\": \"{archive}\",\n  \"bytes\": {},\n  \
+             \"sha256\": \"{checksum}\"\n}}\n",
+            bytes.len()
+        ),
+    )?;
+
+    println!("staged   {archive_path}");
+    println!("bytes    {}", bytes.len());
+    println!("sha256   {checksum}");
+    println!("manifest {directory}/manifest.json");
+    Ok(())
+}
+
+/// Builds a tar archive holding one file.
+///
+/// Every header field is fixed, so the same input always produces the same
+/// bytes. The modification time is zero, the owner and group are zero, and the
+/// mode is fixed rather than read from the filesystem, because a build machine's
+/// umask is not part of a release.
+#[must_use]
+pub fn tar_single(name: &str, contents: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(contents.len().saturating_add(2048));
+    out.extend_from_slice(&tar_header(name, contents.len()));
+    out.extend_from_slice(contents);
+    let padding = 512_usize.saturating_sub(contents.len() % 512) % 512;
+    out.resize(out.len().saturating_add(padding), 0);
+    // Two zero blocks end an archive.
+    out.resize(out.len().saturating_add(1024), 0);
+    out
+}
+
+/// Builds one tar header block.
+fn tar_header(name: &str, size: usize) -> [u8; 512] {
+    fn put(header: &mut [u8; 512], offset: usize, bytes: &[u8]) {
+        let end = offset.saturating_add(bytes.len()).min(512);
+        let len = end.saturating_sub(offset);
+        header[offset..end].copy_from_slice(&bytes[..len]);
+    }
+
+    let mut header = [0_u8; 512];
+    put(&mut header, 0, name.as_bytes());
+    put(&mut header, 100, b"0000755\0");
+    put(&mut header, 108, b"0000000\0");
+    put(&mut header, 116, b"0000000\0");
+    put(&mut header, 124, format!("{size:011o}\0").as_bytes());
+    put(&mut header, 136, b"00000000000\0");
+    // Spaces, because the checksum is computed with this field blank.
+    put(&mut header, 148, b"        ");
+    put(&mut header, 156, b"0");
+    put(&mut header, 257, b"ustar");
+    put(&mut header, 263, b"00");
+
+    let sum: u32 = header.iter().map(|byte| u32::from(*byte)).sum();
+    put(&mut header, 148, format!("{sum:06o}\0 ").as_bytes());
+    header
+}
+
+/// Returns the executable name a platform produces.
+///
+/// Derived from the target rather than from the host that happens to be
+/// building, which is what keeps a matrix consistent.
+#[must_use]
+pub fn executable_name(target: &str) -> String {
+    if target.contains("windows") {
+        "rune.exe".to_owned()
+    } else {
+        "rune".to_owned()
+    }
+}
+
+/// Reads the workspace version from the manifest.
+///
+/// The version is read rather than restated, so a release cannot be published
+/// under a version the crate does not declare.
+fn manifest_version() -> Result<String, String> {
+    let text = std::fs::read_to_string("Cargo.toml")
+        .map_err(|err| format!("could not read Cargo.toml: {err}"))?;
+    let mut in_workspace = false;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            in_workspace = trimmed.starts_with("[workspace.package]");
+            continue;
+        }
+        if in_workspace
+            && let Some(value) = trimmed.strip_prefix("version")
+            && let Some(value) = value.trim().strip_prefix('=')
+        {
+            return Ok(value.trim().trim_matches('"').to_owned());
+        }
+    }
+    Err(String::from("the workspace manifest declares no version"))
+}
+
+/// Returns the lowercase hexadecimal SHA-256 digest of some bytes.
+fn digest(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+/// Writes a file, reporting the path on failure.
+fn write(path: &str, contents: &str) -> Result<(), String> {
+    std::fs::write(path, contents).map_err(|err| format!("could not write {path}: {err}"))
 }
 
 /// Measures startup for the help and version paths.
@@ -323,5 +492,128 @@ fn check_duplicate_dependencies() -> Result<(), String> {
             "duplicate dependency versions\n  {}\nresolve by pinning one version, or list an exception with a reason",
             duplicates.join("\n  ")
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
+
+    use super::*;
+
+    /// Returns the tar header of an archive, for assertions about its fields.
+    fn header_of(archive: &[u8]) -> &[u8] {
+        &archive[..512]
+    }
+
+    #[test]
+    fn the_archive_depends_on_nothing_but_its_input() {
+        // A release hash is only useful if packing the same input gives one
+        // answer. Every field that could carry the moment of packing is
+        // asserted separately below, because two calls in the same second would
+        // hide a timestamp and make this comparison pass.
+        let first = tar_single("rune", b"binary contents");
+        assert_eq!(first, tar_single("rune", b"binary contents"));
+        assert_eq!(
+            checksum_of(&first),
+            "f9be084bc343354ce715b3230c912bc878baab25ce3d0d21d6f1a2455ab59692",
+            "the archive bytes changed, so the published digest would change too"
+        );
+    }
+
+    /// Returns the digest of some bytes.
+    fn checksum_of(bytes: &[u8]) -> String {
+        use sha2::{Digest, Sha256};
+        format!("{:x}", Sha256::digest(bytes))
+    }
+
+    #[test]
+    fn different_contents_produce_different_archives() {
+        assert_ne!(
+            tar_single("rune", b"one"),
+            tar_single("rune", b"two"),
+            "different contents packed identically"
+        );
+    }
+
+    #[test]
+    fn the_archive_names_the_file_it_holds() {
+        let archive = tar_single("rune", b"x");
+        assert!(header_of(&archive).starts_with(b"rune\0"));
+    }
+
+    #[test]
+    fn the_archive_records_a_usable_mode() {
+        let archive = tar_single("rune", b"x");
+        let mode = &header_of(&archive)[100..108];
+        assert_eq!(mode, b"0000755\0", "the binary would not be executable");
+    }
+
+    #[test]
+    fn the_archive_carries_no_timestamp_or_owner() {
+        // A build machine's clock and user are not part of a release.
+        let archive = tar_single("rune", b"x");
+        let header = header_of(&archive);
+        assert_eq!(
+            &header[136..148],
+            b"00000000000\0",
+            "a timestamp was recorded"
+        );
+        assert_eq!(&header[108..116], b"0000000\0", "an owner was recorded");
+        assert_eq!(&header[116..124], b"0000000\0", "a group was recorded");
+    }
+
+    #[test]
+    fn the_recorded_size_matches_the_contents() {
+        let archive = tar_single("rune", b"12345");
+        let size = &header_of(&archive)[124..136];
+        let text = std::str::from_utf8(size)
+            .expect("ascii")
+            .trim_end_matches(['\0']);
+        assert_eq!(u64::from_str_radix(text, 8).expect("octal"), 5);
+    }
+
+    #[test]
+    fn the_checksum_field_describes_the_header() {
+        // A reader verifies the archive by recomputing this, so a wrong value
+        // would make every extraction fail on a strict reader.
+        let archive = tar_single("rune", b"x");
+        let mut header = *header_of(&archive).first_chunk::<512>().expect("a header");
+        let recorded = std::str::from_utf8(&header[148..154])
+            .expect("ascii")
+            .to_owned();
+        header[148..156].fill(b' ');
+        let sum: u32 = header.iter().map(|byte| u32::from(*byte)).sum();
+        assert_eq!(
+            u64::from_str_radix(&recorded, 8).expect("octal"),
+            u64::from(sum)
+        );
+    }
+
+    #[test]
+    fn the_archive_is_padded_and_terminated() {
+        // A tar archive ends with two zero blocks, and every entry is padded to
+        // a block boundary.
+        let contents = b"12345";
+        let archive = tar_single("rune", contents);
+        assert_eq!(archive.len() % 512, 0, "the archive is not block aligned");
+        assert_eq!(archive.len(), 512 + 512 + 1024);
+        assert!(
+            archive[1024..].iter().all(|byte| *byte == 0),
+            "the terminator is not zeroed"
+        );
+    }
+
+    #[test]
+    fn a_name_too_long_for_the_field_is_truncated_rather_than_overflowing() {
+        let archive = tar_single(&"n".repeat(200), b"x");
+        assert_eq!(archive.len() % 512, 0);
+    }
+
+    #[test]
+    fn the_executable_name_follows_the_target() {
+        assert_eq!(executable_name("x86_64-pc-windows-msvc"), "rune.exe");
+        assert_eq!(executable_name("aarch64-apple-darwin"), "rune");
+        assert_eq!(executable_name("x86_64-unknown-linux-musl"), "rune");
     }
 }
