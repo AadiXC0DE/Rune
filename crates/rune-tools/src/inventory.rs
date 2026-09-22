@@ -93,7 +93,16 @@ pub fn builtin_default() -> Result<Registry> {
 
 /// Returns the advertised schemas in advertisement order.
 pub fn advertisement(registry: &Registry) -> Vec<ToolSpec> {
-    registry.schemas(ADVERTISEMENT_ORDER)
+    // A tool registered after the built-ins, such as one the caller adds, is
+    // advertised after the fixed list rather than omitted: a registry that holds
+    // a tool the model cannot see is a tool that cannot be called.
+    let mut specs = registry.schemas(ADVERTISEMENT_ORDER);
+    for spec in registry.all_schemas() {
+        if !specs.iter().any(|known| known.name == spec.name) {
+            specs.push(spec);
+        }
+    }
+    specs
 }
 
 /// Returns a digest of the advertised set.

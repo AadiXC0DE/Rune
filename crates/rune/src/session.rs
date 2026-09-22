@@ -736,11 +736,31 @@ pub fn prepare(
         _ => Box::new(rune_net::chat_completions::ChatCompletions),
     };
 
-    let registry = inventory::builtin(
+    let mut registry = inventory::builtin(
         &rune_tools::workspace::FileLimits::from_budget(&settings.limits),
         &settings.limits,
         &paths.managed_skills_dir(),
     )?;
+    // The delegation tool lives with the authority model it enforces, and the
+    // tool registry cannot depend on that crate, so it is added here where both
+    // are visible.
+    registry.insert(Box::new(rune_agent::Subagent::unsupported(
+        rune_agent::Authority {
+            mode: settings.permission_mode,
+            rules: RuleSet::new(),
+            workspace: workspace.to_owned(),
+            roots: std::iter::once(workspace.to_owned())
+                .chain(settings.additional_directories.iter().cloned())
+                .collect(),
+            tools: registry.names().into_iter().map(str::to_owned).collect(),
+            mcp_view: None,
+            generation: 0,
+        },
+    )))?;
+    debug_assert!(
+        registry.contains("subagent"),
+        "the delegation tool was not registered"
+    );
 
     Ok(SessionConfig {
         settings: settings.clone(),

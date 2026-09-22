@@ -20,4 +20,5 @@ pub use subagent::{
     MAX_INSTRUCTIONS_BYTES, MAX_MODEL_BYTES, MAX_PROMPT_BYTES, Registry, SubagentAction,
     SubagentRequest, run_child,
 };
+pub use subagent_tool::{Delegate, Subagent, Unsupported as UnsupportedDelegate};
 pub use turn::{Event, Host, StopReason, TurnOutcome, run_turn};
