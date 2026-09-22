@@ -1,0 +1,30 @@
+{
+  "name": "@rune-sh/node",
+  "version": "0.1.0",
+  "description": "Drive the rune coding agent binary from Node.",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/rune-sh/rune.git",
+    "directory": "bindings/node"
+  },
+  "type": "module",
+  "main": "./index.js",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "default": "./index.js"
+    }
+  },
+  "files": [
+    "index.js",
+    "index.d.ts",
+    "README.md"
+  ],
+  "scripts": {
+    "test": "node --test"
+  }
+}
