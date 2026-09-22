@@ -192,6 +192,8 @@ pub enum LimitName {
     MaxAgentSteps,
     /// Maximum bytes retained from one tool result.
     MaxToolResultBytes,
+    /// Tool-result bytes retained across one turn.
+    MaxTurnResultBytes,
     /// Combined size of the skill catalog placed in the prompt.
     SkillCatalogBytes,
     /// Size of one skill description in the catalog.
@@ -269,6 +271,7 @@ impl LimitName {
         &[
             Self::MaxAgentSteps,
             Self::MaxToolResultBytes,
+            Self::MaxTurnResultBytes,
             Self::SkillCatalogBytes,
             Self::SkillDescriptionBytes,
             Self::SkillFileBytes,
@@ -312,6 +315,7 @@ impl LimitName {
         match self {
             Self::MaxAgentSteps => "max_agent_steps",
             Self::MaxToolResultBytes => "max_tool_result_bytes",
+            Self::MaxTurnResultBytes => "max_turn_result_bytes",
             Self::SkillCatalogBytes => "skill_catalog_bytes",
             Self::SkillDescriptionBytes => "skill_description_bytes",
             Self::SkillFileBytes => "skill_file_bytes",
@@ -356,6 +360,7 @@ impl LimitName {
             // Zero means unlimited steps. Embedded hosts lower this.
             Self::MaxAgentSteps => Budget::Bounded(0),
             Self::MaxToolResultBytes => Budget::Bounded(64 * 1024),
+            Self::MaxTurnResultBytes => Budget::Bounded(8 * 1024 * 1024),
             Self::SkillCatalogBytes => Budget::Bounded(32768),
             Self::SkillDescriptionBytes => Budget::Bounded(1024),
             Self::SkillFileBytes => Budget::Bounded(1024 * 1024),
@@ -478,6 +483,7 @@ impl LimitName {
         match self {
             Self::MaxAgentSteps => "Maximum model tool-loop steps per turn; zero means unlimited.",
             Self::MaxToolResultBytes => "Bytes retained from one tool result before spilling.",
+            Self::MaxTurnResultBytes => "Tool-result bytes one turn retains across its steps.",
             Self::SkillCatalogBytes => "Combined size of the skill catalog placed in the prompt.",
             Self::SkillDescriptionBytes => "Size of one skill description in the catalog.",
             Self::SkillFileBytes => "Largest skill file that may be loaded.",

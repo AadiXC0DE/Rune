@@ -241,6 +241,7 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
     let cancellation = host.cancellation();
     let steering = host.steering();
     let step_limit = limits.get(LimitName::MaxAgentSteps).value().unwrap_or(0);
+    let result_limit = limits.get_usize(LimitName::MaxTurnResultBytes);
     let max_attempts = limits.get_usize(LimitName::ProviderMaxAttempts).max(1);
     let head_timeout = Duration::from_millis(
         limits
@@ -257,6 +258,8 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
     let mut usage = Usage::default();
     let mut calls = Vec::new();
     let mut steps: u32 = 0;
+    // Tool-result bytes this turn has retained, shared across its steps.
+    let mut result_bytes: usize = 0;
 
     loop {
         cancellation.check()?;
@@ -369,7 +372,20 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
 
         // Execute the batch. Policy is resolved per call before anything runs,
         // so a denial never reaches a tool.
-        let results = execute_batch(&pending_calls, host);
+        let mut results = execute_batch(&pending_calls, host);
+
+        // Every result must still be answered, because an unanswered call is an
+        // invalid request. The retained bytes are charged against the turn's
+        // bound, so a turn that runs for many steps cannot accumulate more
+        // result text than the limit allows.
+        for result in &mut results {
+            let remaining = result_limit.saturating_sub(result_bytes);
+            let text = std::mem::take(&mut result.output.text);
+            let bounded = bound_result(text, remaining);
+            result_bytes = result_bytes.saturating_add(bounded.len());
+            result.output.text = bounded;
+        }
+
         let mut result_parts = Vec::new();
         for result in &results {
             result_parts.push(ContentPart::ToolResult {
@@ -632,6 +648,33 @@ fn infer_target(host: &dyn Host, name: &str, arguments: &serde_json::Value) -> O
     }
 }
 
+/// Marker appended to a result cut by the turn's result budget.
+const RESULT_TRUNCATION_MARKER: &str = "\n[tool result truncated at the turn's result limit]";
+
+/// Cuts a rendered tool result to the bytes the turn can still retain.
+///
+/// The retained length is charged against the turn's budget, marker included, so
+/// the bytes the turn accumulates across its steps can never exceed the limit. A
+/// result is therefore whole, or carries the full marker, or is empty: a
+/// fragment with no room for the marker would look like the whole result. An
+/// empty body still records the answer a call must have, because an unanswered
+/// call is an invalid request.
+fn bound_result(content: String, remaining: usize) -> String {
+    if content.len() <= remaining {
+        return content;
+    }
+    if remaining <= RESULT_TRUNCATION_MARKER.len() {
+        return String::new();
+    }
+    let mut end = remaining.saturating_sub(RESULT_TRUNCATION_MARKER.len());
+    while end > 0 && !content.is_char_boundary(end) {
+        end = end.saturating_sub(1);
+    }
+    let mut out = content.get(..end).unwrap_or_default().to_owned();
+    out.push_str(RESULT_TRUNCATION_MARKER);
+    out
+}
+
 /// Merges adjacent text parts into one, so a delta-per-character stream does not
 /// produce one transcript entry per character.
 fn coalesce_text(parts: Vec<ContentPart>) -> Vec<ContentPart> {
@@ -771,6 +814,38 @@ mod tests {
     #[test]
     fn coalescing_an_empty_list_yields_an_empty_list() {
         assert!(coalesce_text(Vec::new()).is_empty());
+    }
+
+    #[test]
+    fn a_result_inside_its_budget_is_kept_whole() {
+        let bounded = bound_result("short".to_owned(), 64);
+        assert_eq!(bounded, "short");
+    }
+
+    #[test]
+    fn a_result_past_its_budget_is_cut_and_charged_in_full() {
+        let content = "x".repeat(1024);
+        let bounded = bound_result(content, 128);
+        assert_eq!(bounded.len(), 128, "the marker was not charged");
+        assert!(bounded.ends_with("result limit]"), "{bounded}");
+    }
+
+    #[test]
+    fn an_exhausted_budget_leaves_no_payload_behind() {
+        // Nothing is left to retain, but the call still needs an answer.
+        assert!(bound_result("x".repeat(1024), 0).is_empty());
+        // A fragment with no room for the marker would look like a whole
+        // result, so the body is empty rather than misleading.
+        assert!(bound_result("x".repeat(1024), 8).is_empty());
+    }
+
+    #[test]
+    fn a_cut_result_never_splits_a_character() {
+        let content = "\u{1f600}".repeat(64);
+        let budget = RESULT_TRUNCATION_MARKER.len() + 6;
+        let bounded = bound_result(content, budget);
+        assert!(bounded.len() <= budget, "{}", bounded.len());
+        assert!(bounded.ends_with(RESULT_TRUNCATION_MARKER), "{bounded}");
     }
 
     #[test]
