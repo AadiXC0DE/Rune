@@ -331,7 +331,15 @@ fn prompt_reports_the_built_in_source() {
 
 #[test]
 fn an_unavailable_surface_says_so_explicitly() {
-    let out = run(&["upgrade"]);
+    // Fetching a release over the network is genuinely unsupported: the
+    // installer only takes an artifact the caller supplies.
+    let out = run(&[
+        "upgrade",
+        "--from",
+        "https://example.test/rune",
+        "--checksum",
+        "00",
+    ]);
     assert_eq!(out.status, Some(1));
     assert!(
         out.stderr.contains("not available in this build"),

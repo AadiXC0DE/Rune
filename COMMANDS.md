@@ -170,21 +170,26 @@ Check the local setup without starting a turn
 | Flag | Description |
 |---|---|
 | `--json` | Emit JSON. |
-### `rune upgrade [--channel <stable|dev>]`
+### `rune upgrade --from <path> --checksum <hex> [--target <path>] [--json]`
 
-Upgrade the installed binary
-
-| Flag | Description |
-|---|---|
-| `--channel <name>` | Release channel. |
-### `rune uninstall [--keep-state] [--yes]`
-
-Remove the installed binary and, with confirmation, local state
+Replace the installed binary with a verified artifact
 
 | Flag | Description |
 |---|---|
+| `--from <path>` | Artifact to install. |
+| `--checksum <hex>` | Published checksum of that artifact. |
+| `--target <path>` | Binary to replace. Defaults to the running one. |
+| `--json` | Emit JSON. |
+### `rune uninstall [--target <path>] [--keep-state] [--yes] [--json]`
+
+Remove the installed binary and, on request, local state
+
+| Flag | Description |
+|---|---|
+| `--target <path>` | Binary to remove. Defaults to the running one. |
 | `--keep-state` | Leave the state directory in place. |
-| `--yes` | Do not prompt for confirmation. |
+| `--yes` | Confirm removal of the state directory. |
+| `--json` | Emit JSON. |
 ### `rune reference [--write <path>]`
 
 Print the generated command reference

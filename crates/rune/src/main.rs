@@ -15,6 +15,7 @@ mod auto_review;
 mod cli;
 mod diagnostics;
 mod help;
+mod install;
 mod permissions;
 mod prompt_history;
 mod provider_setup;
@@ -26,7 +27,7 @@ mod version;
 
 use std::process::ExitCode;
 
-use camino::Utf8PathBuf;
+use camino::{Utf8Path, Utf8PathBuf};
 use rune_core::config::{self, EnvironmentOverrides, Layer, Provider, Settings};
 use rune_core::error::{ErrorCode, Result, RuneError};
 use rune_core::paths::Paths;
@@ -164,7 +165,8 @@ fn run(launch: &Launch) -> Result<ExitCode> {
             run_interactive(&settings, &paths, &workspace, launch)
         }
         Command::Review => run_review(&settings, &paths, launch, &workspace, &output_flags),
-        Command::Upgrade | Command::Uninstall => Err(not_yet_available("the installer")),
+        Command::Upgrade => run_upgrade(launch, &output_flags),
+        Command::Uninstall => run_uninstall(&paths, launch, &output_flags),
         Command::Reference => run_reference(launch),
         Command::Help | Command::Version => Ok(ExitCode::from(EXIT_OK)),
     }
@@ -206,7 +208,7 @@ fn current_workspace() -> Result<Utf8PathBuf> {
 fn run_doctor(
     settings: &Settings,
     paths: &Paths,
-    workspace: &camino::Utf8Path,
+    workspace: &Utf8Path,
     output: &OutputFlags,
 ) -> Result<ExitCode> {
     let report = diagnostics::run(settings, paths, workspace);
@@ -277,7 +279,7 @@ fn run_review(
     settings: &Settings,
     paths: &Paths,
     launch: &Launch,
-    workspace: &camino::Utf8Path,
+    workspace: &Utf8Path,
     output: &OutputFlags,
 ) -> Result<ExitCode> {
     let changes = pending_changes(workspace)?;
@@ -336,7 +338,7 @@ fn run_review(
 ///
 /// Uses `git diff` for tracked files and adds untracked paths by name, so a new
 /// file is not silently absent from a review.
-fn pending_changes(workspace: &camino::Utf8Path) -> Result<String> {
+fn pending_changes(workspace: &Utf8Path) -> Result<String> {
     let tracked = run_git(workspace, &["diff", "HEAD"])?;
     let untracked = run_git(workspace, &["ls-files", "--others", "--exclude-standard"])?;
 
@@ -357,7 +359,7 @@ fn pending_changes(workspace: &camino::Utf8Path) -> Result<String> {
 ///
 /// A repository that is absent or has no commits yet yields no changes rather
 /// than a failure, because there is nothing to review in either case.
-fn run_git(workspace: &camino::Utf8Path, arguments: &[&str]) -> Result<String> {
+fn run_git(workspace: &Utf8Path, arguments: &[&str]) -> Result<String> {
     let output = std::process::Command::new("git")
         .args(arguments)
         .current_dir(workspace)
@@ -405,7 +407,7 @@ fn first_line(text: &str) -> String {
 fn run_interactive(
     settings: &Settings,
     paths: &Paths,
-    workspace: &camino::Utf8Path,
+    workspace: &Utf8Path,
     launch: &Launch,
 ) -> Result<ExitCode> {
     let resume = match &launch.resume {
@@ -653,7 +655,7 @@ fn run_session_migrate(paths: &Paths, launch: &Launch, output: &OutputFlags) -> 
 fn run_tree(
     paths: &Paths,
     launch: &Launch,
-    workspace: &camino::Utf8Path,
+    workspace: &Utf8Path,
     output: &OutputFlags,
 ) -> Result<ExitCode> {
     let id = match launch.args.first() {
@@ -735,7 +737,7 @@ fn run_usage(paths: &Paths, launch: &Launch, output: &OutputFlags) -> Result<Exi
 fn run_projects(
     paths: &Paths,
     launch: &Launch,
-    workspace: &camino::Utf8Path,
+    workspace: &Utf8Path,
     output: &OutputFlags,
 ) -> Result<ExitCode> {
     let canonical = trust::canonical_workspace(workspace);
@@ -801,6 +803,96 @@ fn run_projects(
     Ok(ExitCode::from(EXIT_OK))
 }
 
+/// Replaces the running binary with a verified artifact.
+///
+/// The artifact is named by the caller. Nothing here discovers a release on its
+/// own, so an upgrade never contacts a location the user did not name.
+fn run_upgrade(launch: &Launch, output: &OutputFlags) -> Result<ExitCode> {
+    let Some(source) = launch.flag("--from") else {
+        return Err(RuneError::missing_field("from")
+            .with_hint("name the artifact to install, as `--from <path>` or `--from <url>`"));
+    };
+    let Some(checksum) = launch.flag("--checksum") else {
+        return Err(RuneError::missing_field("checksum")
+            .with_hint("pass the published checksum; an install without one is refused"));
+    };
+
+    let parsed = install::Source::parse(source);
+    let artifact = if parsed.is_remote() {
+        return Err(RuneError::new(
+            ErrorCode::Unsupported,
+            "fetching a release over the network is not available in this build",
+        )
+        .with_hint("download the artifact and pass its path with `--from`"));
+    } else {
+        install::Artifact::from_file(Utf8Path::new(install::local_path(&parsed)))?
+    };
+    // Verified before anything is written, so a tampered artifact cannot even
+    // reach the staging area.
+    artifact.verify(checksum)?;
+
+    let target = match launch.flag("--target") {
+        Some(raw) => Utf8PathBuf::from(raw),
+        None => install::current_binary()?,
+    };
+    install::install(&target, &artifact, checksum)?;
+
+    if output.json {
+        let value = serde_json::json!({
+            "target": target,
+            "checksum": artifact.digest,
+            "bytes": artifact.bytes.len(),
+        });
+        println!("{}", serde_json::to_string_pretty(&value)?);
+    } else {
+        println!("installed {} ({} bytes)", target, artifact.bytes.len());
+    }
+    Ok(ExitCode::from(EXIT_OK))
+}
+
+/// Removes the binary and, with confirmation, the local state.
+fn run_uninstall(paths: &Paths, launch: &Launch, output: &OutputFlags) -> Result<ExitCode> {
+    let target = match launch.flag("--target") {
+        Some(raw) => Utf8PathBuf::from(raw),
+        None => install::current_binary()?,
+    };
+    let removed_binary = install::remove_binary(&target)?;
+
+    // State is only removed when asked for. A user removing the binary has not
+    // necessarily asked to lose their sessions and credentials.
+    let keep_state = launch.has_flag("--keep-state");
+    let removed_state = if keep_state || !launch.has_flag("--yes") {
+        false
+    } else {
+        install::remove_state(&paths.state_root)?
+    };
+
+    if output.json {
+        let value = serde_json::json!({
+            "binary": target,
+            "removed_binary": removed_binary,
+            "removed_state": removed_state,
+            "kept_state": !removed_state,
+        });
+        println!("{}", serde_json::to_string_pretty(&value)?);
+    } else {
+        if removed_binary {
+            println!("removed {target}");
+        } else {
+            println!("no binary was installed at {target}");
+        }
+        if removed_state {
+            println!("removed state at {}", paths.state_root);
+        } else {
+            println!(
+                "kept state at {} (pass --yes and drop --keep-state to remove it)",
+                paths.state_root
+            );
+        }
+    }
+    Ok(ExitCode::from(EXIT_OK))
+}
+
 /// Prints or writes the generated command reference.
 fn run_reference(launch: &Launch) -> Result<ExitCode> {
     let text = reference::render();
@@ -845,7 +937,7 @@ fn run_permissions(settings: &Settings, launch: &Launch, output: &OutputFlags) -
 fn run_sessions(
     paths: &Paths,
     launch: &Launch,
-    workspace: &camino::Utf8Path,
+    workspace: &Utf8Path,
     output: &OutputFlags,
 ) -> Result<ExitCode> {
     let limit = match launch.flag("--limit") {
@@ -894,7 +986,7 @@ fn run_sessions(
 fn run_acp(
     settings: &Settings,
     paths: &Paths,
-    workspace: &camino::Utf8Path,
+    workspace: &Utf8Path,
     launch: &Launch,
 ) -> Result<ExitCode> {
     settings.require_model()?;
@@ -966,7 +1058,7 @@ fn run_acp(
 fn run_status(
     settings: &Settings,
     paths: &Paths,
-    workspace: &camino::Utf8Path,
+    workspace: &Utf8Path,
     output: &OutputFlags,
 ) -> Result<ExitCode> {
     if output.json {
@@ -1262,17 +1354,6 @@ struct OutputFlags {
     json: bool,
 }
 
-/// Builds the error used by a surface that a later phase provides.
-///
-/// Distinct from a generic failure so the message is honest about what exists.
-fn not_yet_available(what: &str) -> RuneError {
-    RuneError::new(
-        ErrorCode::Unsupported,
-        format!("{what} is not available in this build"),
-    )
-    .with_hint("this command lands with a later change")
-}
-
 /// Maps an error to a process exit code.
 fn exit_code_for(err: &RuneError) -> u8 {
     match err.code() {
@@ -1346,7 +1427,7 @@ mod tests {
         // must not prompt.
         let request = trust::ProjectRequest::new(Vec::new(), Vec::new(), 0);
         let store = trust::TrustStore::new();
-        let decision = trust::decide(&request, &store, camino::Utf8Path::new("/w"));
+        let decision = trust::decide(&request, &store, Utf8Path::new("/w"));
         assert_eq!(decision, trust::TrustDecision::Trusted);
     }
 
@@ -1354,7 +1435,7 @@ mod tests {
     fn an_unapproved_project_is_refused_rather_than_allowed_by_default() {
         let request = trust::ProjectRequest::new(vec!["postgres".to_owned()], Vec::new(), 0);
         let store = trust::TrustStore::new();
-        let decision = trust::decide(&request, &store, camino::Utf8Path::new("/w"));
+        let decision = trust::decide(&request, &store, Utf8Path::new("/w"));
         assert!(matches!(decision, trust::TrustDecision::Untrusted { .. }));
     }
 
@@ -1362,7 +1443,7 @@ mod tests {
     fn pending_changes_are_empty_outside_a_repository() {
         // Nothing to compare against is not an error; it is nothing to review.
         let dir = tempfile::tempdir().expect("temp");
-        let root = camino::Utf8Path::from_path(dir.path()).expect("utf8");
+        let root = Utf8Path::from_path(dir.path()).expect("utf8");
         let changes = pending_changes(root).expect("read");
         assert!(changes.trim().is_empty(), "{changes}");
     }
@@ -1370,7 +1451,7 @@ mod tests {
     #[test]
     fn pending_changes_include_a_modified_and_an_untracked_file() {
         let dir = tempfile::tempdir().expect("temp");
-        let root = camino::Utf8Path::from_path(dir.path()).expect("utf8");
+        let root = Utf8Path::from_path(dir.path()).expect("utf8");
         let ok = |arguments: &[&str]| {
             std::process::Command::new("git")
                 .args(arguments)
@@ -1402,7 +1483,7 @@ mod tests {
     #[test]
     fn a_repository_with_no_commits_yields_no_changes() {
         let dir = tempfile::tempdir().expect("temp");
-        let root = camino::Utf8Path::from_path(dir.path()).expect("utf8");
+        let root = Utf8Path::from_path(dir.path()).expect("utf8");
         std::process::Command::new("git")
             .args(["init", "-q", "."])
             .current_dir(root)
@@ -1486,7 +1567,10 @@ mod tests {
 
     #[test]
     fn unimplemented_surfaces_say_so_rather_than_failing_generically() {
-        let err = not_yet_available("the agent runtime");
+        let err = RuneError::new(
+            ErrorCode::Unsupported,
+            "the agent runtime is not available in this build",
+        );
         assert_eq!(err.code(), ErrorCode::Unsupported);
         assert!(err.message().contains("agent runtime"));
     }
