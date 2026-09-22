@@ -564,10 +564,28 @@ fn identity_of(metadata: &std::fs::Metadata) -> FileIdentity {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
 fn identity_of(metadata: &std::fs::Metadata) -> FileIdentity {
-    // Without device and inode numbers the only pair available is length and
-    // modification time, which the preimage hash already covers.
+    use std::os::windows::fs::MetadataExt as _;
+
+    // The volume and file index this platform has are not readable without a
+    // nightly feature, so the times are used instead. They are not an identity
+    // on their own, but together with the preimage hash they tell a file that
+    // was replaced from the one that was read, including when the replacement
+    // carries the same bytes and the same length. Length alone does not: a swap
+    // between two equal-length files leaves it unchanged.
+    FileIdentity {
+        device: metadata.creation_time(),
+        inode: metadata.last_write_time(),
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn identity_of(metadata: &std::fs::Metadata) -> FileIdentity {
+    // No identity is available here, so the preimage length is all there is to
+    // compare. A replacement of the same length is caught by the hash rather
+    // than by the identity, which is a weaker guarantee than the other
+    // platforms give.
     FileIdentity {
         device: 0,
         inode: metadata.len(),

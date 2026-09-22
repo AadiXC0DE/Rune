@@ -582,7 +582,10 @@ mod tests {
 
         let path = managed.join("deploy/SKILL.md");
         assert!(path.exists(), "the skill was not written");
-        assert!(output.text.contains(path.as_str()), "{}", output.text);
+        // The reported path is a path, so it is shown the way every other path
+        // is, which is not the spelling this host stores it under.
+        let shown = crate::workspace::display_path(&context(&root), &path);
+        assert!(output.text.contains(&shown), "{}", output.text);
     }
 
     #[test]

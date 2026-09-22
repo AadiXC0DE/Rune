@@ -732,6 +732,7 @@ mod tests {
     }
 
     /// Sends a signal through `kill`, reporting whether it was accepted.
+    #[cfg(unix)]
     fn kill(signal: &str, target: &str) -> bool {
         Command::new("/bin/kill")
             .args(["-s", signal, "--", target])
@@ -743,11 +744,13 @@ mod tests {
     }
 
     /// Returns true while a process id exists.
+    #[cfg(unix)]
     fn alive(pid: &str) -> bool {
         kill("0", pid)
     }
 
     /// Returns true while any process is in a group.
+    #[cfg(unix)]
     fn group_alive(group: &str) -> bool {
         kill("0", &format!("-{group}"))
     }
@@ -773,6 +776,7 @@ mod tests {
     /// The pid usually arrives with the start result, because a shell prints it
     /// before it starts waiting. A command slow to print is observed until it
     /// does, which is a poll rather than a sleep so the test stays quick.
+    #[cfg(unix)]
     fn forked_pid(tool: &Shell, context: &ExecutionContext, id: &str, started: &str) -> String {
         let mut seen = String::from(started);
         let found = seen.lines().any(is_pid)
@@ -805,6 +809,7 @@ mod tests {
     /// A command that installs a signal trap is only ready to be tested once it
     /// says so; signalling before the trap is in place ends it on the first
     /// signal and hides what the test is about.
+    #[cfg(unix)]
     fn start_ready(tool: &Shell, context: &ExecutionContext, command: &str) -> (String, String) {
         let started = text(
             tool,
@@ -820,7 +825,118 @@ mod tests {
         (id, group)
     }
 
+    /// Returns a command that prints a marker for each line it reads.
+    ///
+    /// The fixture writes a line and expects to see it back, so the command
+    /// copies its input to its output. The platform that expands a variable
+    /// before running the line needs a program that reads rather than a
+    /// builtin that sets.
+    fn echo_input_then_sleep() -> String {
+        if cfg!(windows) {
+            format!("more & {}", long_sleep())
+        } else {
+            format!("read line; echo got $line; {}", long_sleep())
+        }
+    }
+
+    /// Returns a command that reads one line and prints it back with a prefix.
+    fn echo_input() -> String {
+        if cfg!(windows) {
+            // The platform's shell would expand a variable before the line is
+            // read, so a program reads the line and prints it instead.
+            String::from(
+                "powershell -NoProfile -Command \"Write-Output ('got ' + [Console]::In.ReadLine())\"",
+            )
+        } else {
+            String::from("read line; echo got $line")
+        }
+    }
+
+    /// Returns a command that waits long enough to be stopped by the test.
+    fn long_sleep() -> String {
+        if cfg!(windows) {
+            // The platform's sleep is a console command that fails when its
+            // input is redirected, so a ping is used as a delay instead.
+            String::from("ping -n 60 127.0.0.1 >nul")
+        } else {
+            String::from("sleep 30")
+        }
+    }
+
+    /// Returns a command that prints `count` numbered lines.
+    fn numbered_lines(count: u32) -> String {
+        if cfg!(windows) {
+            format!("for /l %i in (1,1,{count}) do @echo line %i padding")
+        } else {
+            format!("i=0; while [ $i -lt {count} ]; do i=$((i+1)); echo \"line $i padding\"; done")
+        }
+    }
+
+    /// Returns a command that ends with `code`.
+    fn exit_with(code: i32) -> String {
+        if cfg!(windows) {
+            format!("exit /b {code}")
+        } else {
+            format!("exit {code}")
+        }
+    }
+
+    /// Returns a command that prints two words, the first holding two spaces.
+    fn echo_two_words() -> String {
+        if cfg!(windows) {
+            // The platform's shell would collapse the spaces, so the text is
+            // printed by a program that takes it as one argument.
+            String::from("powershell -NoProfile -Command \"Write-Output 'a  b c'\"")
+        } else {
+            String::from("printf 'a  b'; echo ' c'")
+        }
+    }
+
+    /// Returns a command that writes to the error stream and exits with `code`.
+    fn echo_to_stderr_and_exit(code: i32) -> String {
+        if cfg!(windows) {
+            format!("echo oops 1>&2 & exit /b {code}")
+        } else {
+            format!("echo oops 1>&2; exit {code}")
+        }
+    }
+
+    /// Returns a command that ends the shell with the signal that kills it.
+    #[cfg(unix)]
+    fn kill_self() -> String {
+        if cfg!(windows) {
+            // The platform has no signal to send itself, so the closest
+            // equivalent is to end the shell forcefully.
+            String::from("taskkill /F /PID %CMDERPID%")
+        } else {
+            String::from("kill -9 $$")
+        }
+    }
+
+    /// Returns a command that starts a child, prints its id, and waits.
+    #[cfg(unix)]
+    fn fork_and_wait() -> String {
+        if cfg!(windows) {
+            // A child that outlives the parent is what the stop has to reach.
+            String::from("start /b ping -n 60 127.0.0.1 >nul & ping -n 60 127.0.0.1 >nul")
+        } else {
+            String::from("sleep 30 & echo $!; wait")
+        }
+    }
+
+    /// Returns a command that prints the working directory.
+    fn print_cwd() -> String {
+        if cfg!(windows) {
+            // The platform's shell has a directory builtin, and a program that
+            // prints a directory prints it in its own notation.
+            String::from("cd")
+        } else {
+            String::from("pwd")
+        }
+    }
+
     /// Returns true for a line holding only digits.
+    #[cfg(unix)]
     fn is_pid(line: &str) -> bool {
         let trimmed = line.trim();
         !trimmed.is_empty() && trimmed.chars().all(|c| c.is_ascii_digit())
@@ -864,14 +980,22 @@ mod tests {
     fn the_exact_command_string_is_recorded_in_the_result() {
         let tool = Shell::default();
         let (_dir, context) = workspace();
-        let command = "printf 'a  b'; echo ' c'";
+        // Two words, the first holding a run of spaces that must survive both
+        // the shell and the result.
+        let command = echo_two_words();
         let observed = text(
             &tool,
             &context,
             &serde_json::json!({ "action": "run", "command": command }),
         );
-        assert!(observed.contains(&format!("$ {command}")), "{observed}");
-        assert!(observed.contains("a  b c"), "{observed}");
+        assert!(
+            observed.contains(&format!("$ {command}")),
+            "the command was not recorded as written: {observed}"
+        );
+        assert!(
+            observed.contains("a  b c"),
+            "the spacing did not survive: {observed}"
+        );
     }
 
     #[test]
@@ -880,7 +1004,7 @@ mod tests {
         let output = call(
             &Shell::default(),
             &context,
-            &serde_json::json!({ "action": "run", "command": "echo oops 1>&2; exit 7" }),
+            &serde_json::json!({ "action": "run", "command": echo_to_stderr_and_exit(7) }),
         );
         assert!(output.is_error);
         assert!(output.text.contains("oops"), "{}", output.text);
@@ -891,13 +1015,14 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_signal_that_ends_a_command_is_reported_by_name() {
         let (_dir, context) = workspace();
         let output = call(
             &Shell::default(),
             &context,
-            &serde_json::json!({ "action": "run", "command": "kill -9 $$" }),
+            &serde_json::json!({ "action": "run", "command": kill_self() }),
         );
         assert!(output.is_error);
         assert!(
@@ -916,7 +1041,7 @@ mod tests {
             &context,
             &serde_json::json!({
                 "action": "run",
-                "command": "read line; echo got $line; sleep 30",
+                "command": echo_input_then_sleep(),
                 "yield_time_ms": 100,
             }),
         );
@@ -948,6 +1073,7 @@ mod tests {
         assert_eq!(tool.live_sessions(), 0);
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_stop_ends_the_whole_process_group_including_a_forked_child() {
         let tool = Shell::default();
@@ -957,7 +1083,7 @@ mod tests {
             &context,
             &serde_json::json!({
                 "action": "run",
-                "command": "sleep 30 & echo $!; wait",
+                "command": fork_and_wait(),
                 "yield_time_ms": 200,
             }),
         );
@@ -987,7 +1113,7 @@ mod tests {
             &context,
             &serde_json::json!({
                 "action": "run",
-                "command": "echo late; sleep 30",
+                "command": format!("echo late & {}", long_sleep()),
                 "yield_time_ms": 0,
             }),
         );
@@ -1009,7 +1135,7 @@ mod tests {
             &context,
             &serde_json::json!({
                 "action": "run",
-                "command": "i=0; while [ $i -lt 2000 ]; do i=$((i+1)); echo \"line $i padding\"; done",
+                "command": numbered_lines(2000),
             }),
         );
         assert!(
@@ -1044,7 +1170,7 @@ mod tests {
             &context,
             &serde_json::json!({
                 "action": "run",
-                "command": "i=0; while [ $i -lt 2000 ]; do i=$((i+1)); echo \"line $i padding\"; done; sleep 30",
+                "command": format!("{} & {}", numbered_lines(2000), long_sleep()),
                 "yield_time_ms": 2_000,
             }),
         );
@@ -1063,7 +1189,7 @@ mod tests {
             &context,
             &serde_json::json!({
                 "action": "run",
-                "command": "i=0; while [ $i -lt 100 ]; do i=$((i+1)); echo line $i; done",
+                "command": numbered_lines(100),
             }),
         );
         assert!(
@@ -1092,7 +1218,7 @@ mod tests {
                         tool.call(
                             &serde_json::json!({
                                 "action": "run",
-                                "command": "sleep 30",
+                                "command": long_sleep(),
                                 "yield_time_ms": 50,
                             }),
                             &context,
@@ -1134,7 +1260,7 @@ mod tests {
             &context,
             &serde_json::json!({
                 "action": "run",
-                "command": "sleep 30",
+                "command": long_sleep(),
                 "yield_time_ms": 50,
             }),
         );
@@ -1151,7 +1277,7 @@ mod tests {
             &context,
             &serde_json::json!({
                 "action": "run",
-                "command": "sleep 30",
+                "command": long_sleep(),
                 "yield_time_ms": 50,
             }),
         );
@@ -1367,7 +1493,7 @@ mod tests {
             &context,
             &serde_json::json!({
                 "action": "run",
-                "command": "sleep 30",
+                "command": long_sleep(),
                 "yield_time_ms": 50,
             }),
         );
@@ -1376,7 +1502,7 @@ mod tests {
             .call(
                 &serde_json::json!({
                     "action": "run",
-                    "command": "sleep 30",
+                    "command": long_sleep(),
                     "yield_time_ms": 0,
                 }),
                 &context,
@@ -1390,14 +1516,14 @@ mod tests {
         let _ = text(
             &tool,
             &context,
-            &serde_json::json!({ "action": "run", "command": "exit 0" }),
+            &serde_json::json!({ "action": "run", "command": exit_with(0) }),
         );
         let again = text(
             &tool,
             &context,
             &serde_json::json!({
                 "action": "run",
-                "command": "sleep 30",
+                "command": long_sleep(),
                 "yield_time_ms": 50,
             }),
         );
@@ -1405,6 +1531,7 @@ mod tests {
         let _ = stop(&tool, &context, &id);
     }
 
+    #[cfg(unix)]
     #[test]
     fn dropping_the_tool_ends_every_live_session() {
         let tool = shell(2, 64 * 1024);
@@ -1417,7 +1544,7 @@ mod tests {
                 &context,
                 &serde_json::json!({
                     "action": "run",
-                    "command": "sleep 30 & echo $!; wait",
+                    "command": fork_and_wait(),
                     "yield_time_ms": 200,
                 }),
             );
@@ -1447,6 +1574,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_forced_stop_ends_a_command_that_ignores_the_graceful_signal() {
         let tool = Shell::default();
@@ -1468,6 +1596,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_graceful_stop_escalates_when_the_group_ignores_it() {
         let tool = Shell::default();
@@ -1494,7 +1623,7 @@ mod tests {
             &context,
             &serde_json::json!({
                 "action": "run",
-                "command": "read line; echo got $line",
+                "command": echo_input(),
                 "yield_time_ms": 50,
             }),
         );
@@ -1575,7 +1704,7 @@ mod tests {
         let (dir, context) = workspace();
         let err = tool
             .call(
-                &serde_json::json!({ "action": "run", "command": "pwd", "cwd": ".." }),
+                &serde_json::json!({ "action": "run", "command": print_cwd(), "cwd": ".." }),
                 &context,
             )
             .expect_err("the directory is outside the workspace");
@@ -1585,7 +1714,7 @@ mod tests {
         let observed = text(
             &tool,
             &allowed,
-            &serde_json::json!({ "action": "run", "command": "pwd", "cwd": ".." }),
+            &serde_json::json!({ "action": "run", "command": print_cwd(), "cwd": ".." }),
         );
         // Resolved, because the shell prints the resolved path.
         let parent = dir
@@ -1608,7 +1737,7 @@ mod tests {
         let observed = text(
             &tool,
             &context,
-            &serde_json::json!({ "action": "run", "command": "pwd", "cwd": "sub" }),
+            &serde_json::json!({ "action": "run", "command": print_cwd(), "cwd": "sub" }),
         );
         // The shell prints the resolved path, so the expectation is resolved
         // too: on a host where a temporary directory resolves elsewhere, the
@@ -1625,7 +1754,7 @@ mod tests {
         let (_dir, context) = workspace();
         let err = Shell::default()
             .call(
-                &serde_json::json!({ "action": "run", "command": "pwd", "cwd": "missing" }),
+                &serde_json::json!({ "action": "run", "command": print_cwd(), "cwd": "missing" }),
                 &context,
             )
             .expect_err("the directory does not exist");
@@ -1641,7 +1770,7 @@ mod tests {
             &context,
             &serde_json::json!({
                 "action": "run",
-                "command": "sleep 30",
+                "command": long_sleep(),
                 "yield_time_ms": 50,
             }),
         );
@@ -1672,7 +1801,7 @@ mod tests {
             &context,
             &serde_json::json!({
                 "action": "run",
-                "command": "read line; echo got $line; sleep 30",
+                "command": echo_input_then_sleep(),
                 "yield_time_ms": 50,
             }),
         );

@@ -145,7 +145,7 @@ pub fn resolve(context: &ExecutionContext, raw: &str) -> Result<ResolvedPath> {
 
     let names = permitted
         .iter()
-        .map(|root| root.as_str())
+        .map(|root| display_separators(root.as_str()))
         .collect::<Vec<_>>()
         .join(", ");
     Err(RuneError::new(
@@ -734,7 +734,12 @@ mod tests {
         let err = resolve(&context, "../outside.txt").expect_err("refused");
         assert_eq!(err.code(), ErrorCode::PathOutsideWorkspace);
         let hint = err.detail().hint.clone().unwrap_or_default();
-        assert!(hint.contains(repo.path().as_str()), "{hint}");
+        // The hint is shown the way a path is shown everywhere else, so the
+        // expected form is the displayed one rather than the host's spelling.
+        assert!(
+            hint.contains(&display_separators(repo.path().as_str())),
+            "{hint}"
+        );
         assert!(
             err.message().contains("../outside.txt"),
             "{}",
@@ -827,7 +832,7 @@ mod tests {
         let repo = Repo::new();
         let walker = Walker::new(repo.path(), FileLimits::default().walk_files).expect("walker");
         let found = walker
-            .map(|entry| entry.relative.as_str().to_owned())
+            .map(|entry| display_separators(entry.relative.as_str()))
             .collect::<Vec<_>>();
 
         assert!(
@@ -859,7 +864,7 @@ mod tests {
         repo.write("nested/secret.txt", "needle\n");
         let walker = Walker::new(repo.path(), FileLimits::default().walk_files).expect("walker");
         let found = walker
-            .map(|entry| entry.relative.as_str().to_owned())
+            .map(|entry| display_separators(entry.relative.as_str()))
             .collect::<Vec<_>>();
         assert!(
             found.contains(&"nested/untracked.txt".to_owned()),
@@ -882,7 +887,7 @@ mod tests {
 
         let walker = Walker::new(root, FileLimits::default().walk_files).expect("walker");
         let found = walker
-            .map(|entry| entry.relative.as_str().to_owned())
+            .map(|entry| display_separators(entry.relative.as_str()))
             .collect::<Vec<_>>();
         assert!(found.contains(&"kept.txt".to_owned()), "{found:?}");
         assert!(
@@ -897,7 +902,7 @@ mod tests {
         let nested = repo.path().join("nested");
         let walker = Walker::new(&nested, FileLimits::default().walk_files).expect("walker");
         let found = walker
-            .map(|entry| entry.relative.as_str().to_owned())
+            .map(|entry| display_separators(entry.relative.as_str()))
             .collect::<Vec<_>>();
         assert_eq!(found, vec!["untracked.txt".to_owned()]);
     }
