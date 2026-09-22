@@ -15,7 +15,7 @@
 
 use std::fmt;
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, Write};
 
 use camino::{Utf8Path, Utf8PathBuf};
 use rune_core::budget::EMERGENCY_CEILING_BYTES;
@@ -522,6 +522,7 @@ impl Ledger {
         if writer.metadata()?.len() != scan.complete_bytes {
             writer.set_len(scan.complete_bytes)?;
         }
+        writer.seek(std::io::SeekFrom::Start(scan.complete_bytes))?;
         writer.write_all(line.as_bytes())?;
         writer.write_all(b"\n")?;
         writer.flush()?;
@@ -617,7 +618,12 @@ impl Ledger {
         }
 
         let mut options = OpenOptions::new();
-        options.create(true).append(true);
+        // Opened for writing rather than appending. An appender has to shorten
+        // the file when it drops a torn record, and on Windows a handle opened
+        // only to append carries no access that can shorten anything, so the
+        // append is refused there whenever a fragment was left behind. The
+        // position is set explicitly instead, which the held lock makes safe.
+        options.create(true).write(true);
         set_creation_mode(&mut options);
         Ok(options.open(&self.path)?)
     }
