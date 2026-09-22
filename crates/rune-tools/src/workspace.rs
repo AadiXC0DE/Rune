@@ -174,7 +174,10 @@ pub fn roots(context: &ExecutionContext) -> Vec<Utf8PathBuf> {
 /// Returns a path as the model should see it, given the normalised roots.
 ///
 /// A path inside a root is shown relative to it, which keeps the output of a
-/// tool independent of where the workspace happens to live.
+/// tool independent of where the workspace happens to live. Separators are
+/// forward slashes on every platform: the model reads these paths and repeats
+/// them as arguments, so one spelling on every platform is what makes a result
+/// portable rather than a transcript that has to be translated.
 #[must_use]
 pub fn display_in(roots: &[Utf8PathBuf], path: &Utf8Path) -> String {
     for root in roots {
@@ -182,11 +185,19 @@ pub fn display_in(roots: &[Utf8PathBuf], path: &Utf8Path) -> String {
             return if relative.as_str().is_empty() {
                 String::from(".")
             } else {
-                relative.as_str().to_owned()
+                display_separators(relative.as_str())
             };
         }
     }
-    path.as_str().to_owned()
+    display_separators(path.as_str())
+}
+
+/// Rewrites a path's separators to the spelling the model is given.
+fn display_separators(path: &str) -> String {
+    if std::path::MAIN_SEPARATOR == '/' {
+        return path.to_owned();
+    }
+    path.replace(std::path::MAIN_SEPARATOR, "/")
 }
 
 /// Returns a path as the model should see it.
