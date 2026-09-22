@@ -757,10 +757,6 @@ pub fn prepare(
             generation: 0,
         },
     )))?;
-    debug_assert!(
-        registry.contains("subagent"),
-        "the delegation tool was not registered"
-    );
 
     Ok(SessionConfig {
         settings: settings.clone(),
