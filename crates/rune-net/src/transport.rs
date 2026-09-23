@@ -305,6 +305,32 @@ pub fn stream_completion(
     head_timeout: Duration,
     cancel: &dyn Fn() -> bool,
 ) -> NetResult<StreamOutcome> {
+    stream_completion_observed(
+        agent,
+        endpoint,
+        provider,
+        plan,
+        head_timeout,
+        cancel,
+        &mut |_| {},
+    )
+}
+
+/// Sends a streaming request and reports each event as it is decoded.
+///
+/// The observer is called while the body is still arriving, which is what makes
+/// a response appear as it is produced rather than once it has finished. It sees
+/// every event the reducer produces, in order, and its return value is ignored:
+/// presenting a delta must never be able to fail a request.
+pub fn stream_completion_observed(
+    agent: &ureq::Agent,
+    endpoint: &Endpoint,
+    provider: &dyn Provider,
+    plan: &RequestPlan,
+    head_timeout: Duration,
+    cancel: &dyn Fn() -> bool,
+    observe: &mut dyn FnMut(&ProviderEvent),
+) -> NetResult<StreamOutcome> {
     if endpoint.offline {
         return Err(
             NetError::new(FailureKind::Network, "outbound requests are disabled")
@@ -362,7 +388,13 @@ pub fn stream_completion(
         return Err(error);
     }
 
-    reduce_stream(response.into_body(), provider, head_timeout, cancel)
+    reduce_stream(
+        response.into_body(),
+        provider,
+        head_timeout,
+        cancel,
+        observe,
+    )
 }
 
 /// Fetches the models an endpoint offers.
@@ -436,12 +468,23 @@ pub fn list_models(
     Ok(text)
 }
 
+/// Reports events a reducer appended since a recorded length.
+///
+/// The reducer owns where an event lands in the vec, so what it appended is
+/// read back rather than predicted.
+fn report_new(events: &[ProviderEvent], before: usize, observe: &mut dyn FnMut(&ProviderEvent)) {
+    for event in events.get(before..).unwrap_or_default() {
+        observe(event);
+    }
+}
+
 /// Reads and reduces a streaming response body.
 fn reduce_stream(
     body: ureq::Body,
     provider: &dyn Provider,
     head_timeout: Duration,
     cancel: &dyn Fn() -> bool,
+    observe: &mut dyn FnMut(&ProviderEvent),
 ) -> NetResult<StreamOutcome> {
     let limits = provider.limits();
     let mut decoder = Decoder::new(limits);
@@ -486,9 +529,11 @@ fn reduce_stream(
             if event.is_empty() && event.name.is_none() {
                 continue;
             }
+            let before = outcome.events.len();
             reducer
                 .apply(Some(&event.data), &mut outcome.events)
                 .map_err(NetError::from)?;
+            report_new(&outcome.events, before, observe);
         }
 
         if decoder.is_done() {
@@ -501,17 +546,21 @@ fn reduce_stream(
         if event.is_empty() && event.name.is_none() {
             continue;
         }
+        let before = outcome.events.len();
         reducer
             .apply(Some(&event.data), &mut outcome.events)
             .map_err(NetError::from)?;
+        report_new(&outcome.events, before, observe);
     }
 
     // Signals end of transport. A reducer that never saw a legal terminator
     // reports an incomplete stream, which is retryable, rather than allowing a
     // truncated response to look like a success.
+    let before = outcome.events.len();
     reducer
         .apply(None, &mut outcome.events)
         .map_err(NetError::from)?;
+    report_new(&outcome.events, before, observe);
 
     outcome.finish = Some(reducer.finish().map_err(NetError::from)?);
     outcome.usage = reducer.usage();

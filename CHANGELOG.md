@@ -26,7 +26,16 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ## Unreleased
 
+### Added
+
+- Responses stream. Text appears as the model produces it rather than after the
+  whole answer has arrived, so a long reply starts showing immediately.
+
 ### Fixed
+
+- The status line sits above the input, where a reader looks for it and where it
+  does not move while an answer arrives. The answer grows downward from the
+  input, so a long reply never pushes the line being typed off the screen.
 
 - The interactive screen no longer garbles. Two components were writing to the
   terminal: finished text was printed in the flow while the live region was

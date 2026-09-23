@@ -405,6 +405,44 @@ fn a_new_session_is_listed_with_its_identifier() {
 }
 
 #[test]
+fn a_streamed_answer_reaches_the_client_once_and_whole() {
+    // The text arrives one delta per chunk as it is produced. A defect here
+    // either loses text between deltas or sends the whole answer a second time
+    // once the turn ends, and an assertion on the chunk count alone sees
+    // neither.
+    let mut harness = Harness::start(
+        vec![Script::Frames(vec![
+            r#"{"choices":[{"index":0,"delta":{"role":"assistant"}}]}"#.to_owned(),
+            r#"{"choices":[{"index":0,"delta":{"content":"alpha "}}]}"#.to_owned(),
+            r#"{"choices":[{"index":0,"delta":{"content":"beta "}}]}"#.to_owned(),
+            r#"{"choices":[{"index":0,"delta":{"content":"gamma"}}]}"#.to_owned(),
+            r#"{"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#.to_owned(),
+            "[DONE]".to_owned(),
+        ])],
+        PermissionMode::Auto,
+    );
+    let session = harness.open_session();
+    harness
+        .client()
+        .request(3, "session/prompt", &prompt(&session, "go"));
+    let answered = harness.client().response(3);
+    assert_eq!(
+        answered["result"]["stopReason"], "end_turn",
+        "{answered:#?}"
+    );
+
+    let chunks = harness.client().updates("agent_message_chunk");
+    let sent: String = chunks
+        .iter()
+        .filter_map(|frame| frame["params"]["update"]["content"]["text"].as_str())
+        .collect();
+    assert_eq!(
+        sent, "alpha beta gamma",
+        "the answer did not arrive whole: {chunks:#?}"
+    );
+}
+
+#[test]
 fn a_prompt_while_a_turn_is_running_is_queued_rather_than_refused() {
     // The first turn retries before it succeeds, which keeps it in flight while
     // the client sends the second prompt.

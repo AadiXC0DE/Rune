@@ -891,14 +891,10 @@ fn run_one<W: Write + Send + 'static>(server: &Arc<Server<W>>, queued: Queued) {
 
     match outcome {
         Ok(outcome) => {
-            // The loop reports the answer once the turn finishes, so the text
-            // reaches the client as one chunk rather than as it is produced.
+            // The text has already reached the client, one delta per chunk as
+            // it was produced. Only the record is written here: sending the
+            // whole answer again would duplicate everything the client saw.
             if !outcome.text.is_empty() {
-                server.send(&Message::Notification(message_chunk(
-                    &session,
-                    "agent_message_chunk",
-                    &outcome.text,
-                )));
                 server.record(
                     &session,
                     SessionEvent::AssistantMessage {

@@ -55,6 +55,54 @@ pub struct SessionConfig {
     pub rules: RuleSet,
 }
 
+/// A writer that locks the shared stream for the length of one write.
+///
+/// Holding the lock across a turn would deadlock: the turn draws streamed text
+/// through the same stream, so it would wait on a lock its own caller holds.
+/// Locking per write keeps the bytes ordered without ever holding it that long.
+struct LockedSink {
+    stream: LiveSink,
+}
+
+impl std::io::Write for LockedSink {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let mut stream = self
+            .stream
+            .lock()
+            .map_err(|_| std::io::Error::other("the output lock was poisoned"))?;
+        stream.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        let mut stream = self
+            .stream
+            .lock()
+            .map_err(|_| std::io::Error::other("the output lock was poisoned"))?;
+        stream.flush()
+    }
+}
+
+/// Text that has streamed in but is not yet a finished line.
+///
+/// Held apart from the transcript because it is redrawn on every delta: the
+/// transcript is printed once, while this is replaced in place until the step
+/// ends and the text becomes final.
+#[derive(Default)]
+struct StreamingText {
+    /// Assistant text so far in the current step.
+    answer: String,
+    /// Reasoning text so far, shown while the model is thinking.
+    reasoning: String,
+}
+
+/// The stream a session draws on.
+///
+/// Shared rather than borrowed because the host draws from inside a turn, where
+/// the caller holds no lock. Every write takes the lock for its own duration
+/// only, so a delta arriving mid-turn can never wait on the turn that is
+/// producing it.
+type LiveSink = Arc<Mutex<dyn std::io::Write + Send>>;
+
 /// Host state for a turn.
 struct SessionHost {
     endpoint: Endpoint,
@@ -98,6 +146,16 @@ struct SessionHost {
     provider_order: Vec<String>,
     /// Whether requests are restricted to that preference.
     provider_strict: bool,
+    /// Text streamed so far in the current step, drawn below the input.
+    ///
+    /// Shared and mutable because a delta arrives on the turn's own thread
+    /// while the renderer needs to read what has accumulated.
+    streaming: Arc<Mutex<StreamingText>>,
+    /// Where the live region is written, so a delta can be shown as it lands.
+    ///
+    /// Absent until a session attaches one, which keeps every other caller of
+    /// this host, including the tests, free of a terminal.
+    live_out: Arc<Mutex<Option<LiveSink>>>,
     /// Reviewer for unresolved actions, absent when none is configured.
     reviewer: Option<Box<dyn Reviewer>>,
     /// Review activity for the current turn.
@@ -144,6 +202,24 @@ impl Host for SessionHost {
     }
 
     fn emit(&self, event: Event) {
+        // Text is accumulated as it arrives and drawn straight away, which is
+        // what makes an answer appear while it is being written rather than
+        // after the whole response has been received.
+        match &event {
+            Event::TextDelta { delta } => {
+                if let Ok(mut streaming) = self.streaming.lock() {
+                    streaming.answer.push_str(delta);
+                }
+                self.draw_stream();
+            }
+            Event::ReasoningDelta { delta } => {
+                if let Ok(mut streaming) = self.streaming.lock() {
+                    streaming.reasoning.push_str(delta);
+                }
+                self.draw_stream();
+            }
+            _ => {}
+        }
         if let Ok(mut events) = self.events.lock() {
             events.push(event);
         }
@@ -290,6 +366,7 @@ impl SessionHost {
         settled: &[String],
         activity: Option<&str>,
         prompt: &[String],
+        below: &[String],
         caret: (u16, u16),
     ) -> Result<Vec<u8>> {
         self.refresh_size();
@@ -298,7 +375,7 @@ impl SessionHost {
             .inline
             .lock()
             .map_err(|_| RuneError::new(ErrorCode::Internal, "the renderer lock was poisoned"))?;
-        Ok(inline.frame(settled, activity, prompt, &footer_rows, caret))
+        Ok(inline.frame(settled, activity, &footer_rows, prompt, below, caret))
     }
 
     /// Removes the live region, for a clean exit.
@@ -318,6 +395,86 @@ impl SessionHost {
             .collect()
     }
 
+    /// Writes bytes to the session's stream.
+    ///
+    /// Silently ignores a failure. Presentation must never be able to end a
+    /// turn, and a closed stream is not a reason to lose a conversation.
+    fn show(&self, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        let Ok(slot) = self.live_out.lock() else {
+            return;
+        };
+        let Some(sink) = slot.as_ref() else {
+            return;
+        };
+        if let Ok(mut sink) = sink.lock() {
+            let _ = sink.write_all(bytes);
+            let _ = sink.flush();
+        }
+    }
+
+    /// Draws the text that has streamed in so far.
+    ///
+    /// A failure is ignored: not being able to present a delta must never end a
+    /// turn or fail a request that is otherwise fine.
+    fn draw_stream(&self) {
+        let rows = self.streaming_rows();
+        if rows.is_empty() {
+            return;
+        }
+        let prompt_row =
+            transcript::render_prompt(rune_term::shell::prompt(), "", usize::from(self.width()));
+        let caret = rune_term::width::str_width(rune_term::shell::prompt());
+        let Ok(painted) = self.paint(
+            &[],
+            None,
+            std::slice::from_ref(&prompt_row),
+            &rows,
+            (0, u16::try_from(caret).unwrap_or(u16::MAX)),
+        ) else {
+            return;
+        };
+        self.show(&painted);
+    }
+
+    /// Returns the rows the streamed text occupies, newest last.
+    fn streaming_rows(&self) -> Vec<String> {
+        let Ok(streaming) = self.streaming.lock() else {
+            return Vec::new();
+        };
+        let width = usize::from(self.width());
+        let mut rows = Vec::new();
+        if !streaming.reasoning.trim().is_empty() {
+            for line in rune_term::width::wrap(&streaming.reasoning, width) {
+                rows.push(line);
+            }
+        }
+        if !streaming.answer.trim().is_empty() {
+            for line in rune_term::width::wrap(&streaming.answer, width) {
+                rows.push(line);
+            }
+        }
+        // The region keeps the newest rows, so a long answer does not push the
+        // input off the screen.
+        let limit = usize::from(self.height.load(std::sync::atomic::Ordering::Relaxed))
+            .saturating_sub(6)
+            .max(1);
+        if rows.len() > limit {
+            rows.drain(..rows.len().saturating_sub(limit));
+        }
+        rows
+    }
+
+    /// Clears the streamed text, which a finished step has taken over.
+    fn clear_streaming(&self) {
+        if let Ok(mut streaming) = self.streaming.lock() {
+            streaming.answer.clear();
+            streaming.reasoning.clear();
+        }
+    }
+
     /// Drops the events of the turn that just finished.
     fn clear_events(&self) {
         if let Ok(mut events) = self.events.lock() {
@@ -329,7 +486,7 @@ impl SessionHost {
 /// Runs an interactive session.
 ///
 /// Returns the exit code the process should use.
-pub fn run<R: BufRead, W: std::io::Write>(
+pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
     config: SessionConfig,
     input: R,
     output: W,
@@ -392,23 +549,31 @@ pub fn run<R: BufRead, W: std::io::Write>(
         inline: Mutex::new(rune_term::inline::Inline::new(terminal_width())),
         provider_order: config.settings.provider_order.clone(),
         provider_strict: config.settings.provider_strict,
+        streaming: Arc::new(Mutex::new(StreamingText::default())),
+        live_out: Arc::new(Mutex::new(None)),
         reviewer: crate::auto_review::build(&config.settings, &config.paths)?,
         review_session: Arc::new(Mutex::new(ReviewSession::new(&limits))),
     };
 
-    let out = Mutex::new(output);
+    // The stream is shared: the loop writes to it, and the host writes to it
+    // while a turn is running so streamed text appears as it arrives. Sharing
+    // one lock rather than nesting two is what keeps those writes ordered.
+    let out: LiveSink = Arc::new(Mutex::new(output));
+    if let Ok(mut slot) = host.live_out.lock() {
+        *slot = Some(Arc::clone(&out));
+    }
+
     // The session identifier is announced up front so a resumed-or-new session
     // can be named later without consulting the listing. It goes through the
     // renderer like everything else, so the rows it occupies are known to the
     // component that later redraws over them.
     {
-        let mut sink = out
-            .lock()
-            .map_err(|_| RuneError::new(ErrorCode::Internal, "the output lock was poisoned"))?;
         let banner = format!("session {}", recorder.id());
-        let painted = host.paint(std::slice::from_ref(&banner), None, &[], (0, 0))?;
-        sink.write_all(&painted)?;
-        sink.flush()?;
+        let painted = host.paint(std::slice::from_ref(&banner), None, &[], &[], (0, 0))?;
+        if let Ok(mut sink) = out.lock() {
+            sink.write_all(&painted)?;
+            sink.flush()?;
+        }
     }
 
     // A resumed session keeps the title it was given.
@@ -426,7 +591,7 @@ pub fn run<R: BufRead, W: std::io::Write>(
 
     // One handler for both input paths, so a keystroke and a piped line mean
     // exactly the same thing.
-    let mut handle_input = |input: Input, mut sink: &mut dyn std::io::Write| -> Result<Action> {
+    let mut handle_input = |input: Input, sink: &mut LockedSink| -> Result<Action> {
         match input {
             Input::Command { name, arguments } => {
                 match handle_command(
@@ -435,7 +600,7 @@ pub fn run<R: BufRead, W: std::io::Write>(
                     &commands,
                     history_file.as_ref(),
                     &config.workspace,
-                    &mut sink,
+                    sink,
                 )? {
                     Handled::Exit => Ok(Action::Exit),
                     Handled::ClearHistory => {
@@ -474,7 +639,7 @@ pub fn run<R: BufRead, W: std::io::Write>(
                     &text,
                     usize::from(host.width()),
                 );
-                let painted = host.paint(std::slice::from_ref(&echo), None, &[], (0, 0))?;
+                let painted = host.paint(std::slice::from_ref(&echo), None, &[], &[], (0, 0))?;
                 sink.write_all(&painted)?;
                 sink.flush()?;
 
@@ -504,6 +669,9 @@ pub fn run<R: BufRead, W: std::io::Write>(
                         .saturating_add(outcome.usage.output_tokens.unwrap_or(0)),
                 );
                 host.clear_events();
+                // The streamed text has been superseded by the finished turn,
+                // so it is dropped before the render that replaces it.
+                host.clear_streaming();
                 // A finished turn is printed once and becomes part of the
                 // terminal's own scrollback, so it stays readable with the
                 // terminal's search and copy. Nothing else writes to the
@@ -523,6 +691,7 @@ pub fn run<R: BufRead, W: std::io::Write>(
                     &lines,
                     activity.as_deref(),
                     std::slice::from_ref(&prompt_row),
+                    &[],
                     (0, u16::try_from(caret).unwrap_or(u16::MAX)),
                 )?;
                 if !painted.is_empty() {
@@ -541,10 +710,10 @@ pub fn run<R: BufRead, W: std::io::Write>(
         // line is finished.
         let mut reason = ExitReason::EndOfInput;
         while let Some(input) = await_submission(&mut reader, &host, &out)? {
-            let mut sink = out
-                .lock()
-                .map_err(|_| RuneError::new(ErrorCode::Internal, "the output lock was poisoned"))?;
-            if handle_input(input, &mut *sink)? == Action::Exit {
+            let mut sink = LockedSink {
+                stream: Arc::clone(&out),
+            };
+            if handle_input(input, &mut sink)? == Action::Exit {
                 reason = ExitReason::Requested;
                 break;
             }
@@ -552,10 +721,10 @@ pub fn run<R: BufRead, W: std::io::Write>(
         reason
     } else {
         shell.run(|input| {
-            let mut sink = out
-                .lock()
-                .map_err(|_| RuneError::new(ErrorCode::Internal, "the output lock was poisoned"))?;
-            handle_input(input, &mut *sink)
+            let mut sink = LockedSink {
+                stream: Arc::clone(&out),
+            };
+            handle_input(input, &mut sink)
         })?
     };
 
@@ -577,10 +746,10 @@ pub fn run<R: BufRead, W: std::io::Write>(
 /// Returns the submitted input, or `None` when the user asked to leave. The
 /// cursor is placed after the text typed so far, which is the whole reason the
 /// line is drawn here rather than by the terminal.
-fn await_submission<W: std::io::Write>(
+fn await_submission(
     reader: &mut rune_term::input::KeyReader,
     host: &SessionHost,
-    out: &Mutex<W>,
+    out: &LiveSink,
 ) -> Result<Option<Input>> {
     use rune_term::width::str_width;
 
@@ -597,6 +766,7 @@ fn await_submission<W: std::io::Write>(
                 &[],
                 None,
                 std::slice::from_ref(&row),
+                &[],
                 (0, u16::try_from(caret).unwrap_or(u16::MAX)),
             )?;
             if !painted.is_empty() {
@@ -971,6 +1141,83 @@ mod tests {
     use super::*;
     use rune_term::shell::{ScriptedSource, Shell};
 
+    /// A writer that appends to a shared buffer, for asserting on what a draw
+    /// actually wrote.
+    struct SharedSink(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for SharedSink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("lock").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_streamed_delta_is_drawn_before_the_turn_ends() {
+        // The point of streaming: text appears while it is being produced. A
+        // delta that only reached the screen once the turn finished would look
+        // identical on the final screen, so the assertion is that a write
+        // happened while the turn was still running.
+        let sink: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+        let host = test_host();
+        if let Ok(mut slot) = host.live_out.lock() {
+            *slot = Some(Arc::new(Mutex::new(SharedSink(Arc::clone(&sink)))));
+        }
+
+        host.emit(Event::TextDelta {
+            delta: "streamed".to_owned(),
+        });
+
+        let written = String::from_utf8_lossy(&sink.lock().expect("lock")).into_owned();
+        assert!(
+            written.contains("streamed"),
+            "the delta was not drawn when it arrived: {written:?}"
+        );
+    }
+
+    #[test]
+    fn streamed_text_is_drawn_below_the_input() {
+        // The answer grows downward from the line being typed, so a long reply
+        // never pushes the input off the screen.
+        let host = test_host();
+        host.emit(Event::TextDelta {
+            delta: "answer".to_owned(),
+        });
+        let prompt_row = transcript::render_prompt(rune_term::shell::prompt(), "", 80);
+        let rows = host.streaming_rows();
+        let bytes = host
+            .paint(&[], None, std::slice::from_ref(&prompt_row), &rows, (0, 2))
+            .expect("painted");
+        let text = String::from_utf8_lossy(&bytes).into_owned();
+        let input = text.find("> ").expect("the input row");
+        let answer = text.find("answer").expect("the streamed answer");
+        assert!(
+            input < answer,
+            "the answer was drawn above the input: {text:?}"
+        );
+    }
+
+    #[test]
+    fn the_status_line_is_drawn_above_the_input() {
+        // Where a reader looks for it, and where it does not move as an answer
+        // arrives.
+        let host = test_host();
+        let bytes = host
+            .paint(&[], None, &["> ".to_owned()], &[], (0, 2))
+            .expect("painted");
+        let text = String::from_utf8_lossy(&bytes).into_owned();
+        let status = text.find("auto").expect("the status line");
+        let input = text.find("> ").expect("the input row");
+        assert!(
+            status < input,
+            "the status line was drawn below the input: {text:?}"
+        );
+    }
+
     #[test]
     fn a_finished_turn_is_printed_once_above_the_live_region() {
         // Finished lines join the terminal's own scrollback, so they are
@@ -979,7 +1226,7 @@ mod tests {
         let host = test_host();
         let lines = vec!["a line".to_owned()];
         let bytes = host
-            .paint(&lines, None, &[], (0, 0))
+            .paint(&lines, None, &[], &[], (0, 0))
             .expect("painted the first screen");
         let text = String::from_utf8_lossy(&bytes).into_owned();
         assert!(
@@ -991,7 +1238,7 @@ mod tests {
     #[test]
     fn the_live_region_carries_the_status_line() {
         let host = test_host();
-        let bytes = host.paint(&[], None, &[], (0, 0)).expect("painted");
+        let bytes = host.paint(&[], None, &[], &[], (0, 0)).expect("painted");
         let text = String::from_utf8_lossy(&bytes).into_owned();
         assert!(
             text.contains("test"),
@@ -1006,7 +1253,7 @@ mod tests {
         // was typed, rather than wherever the terminal would have left it.
         let host = test_host();
         let row = vec!["> hel".to_owned()];
-        let bytes = host.paint(&[], None, &row, (0, 5)).expect("painted");
+        let bytes = host.paint(&[], None, &row, &[], (0, 5)).expect("painted");
         let text = String::from_utf8_lossy(&bytes).into_owned();
         assert!(text.contains("> hel"), "{text:?}");
         // A one-based column, so a caret after five columns is column six.
@@ -1020,7 +1267,7 @@ mod tests {
     fn every_frame_hides_the_cursor_while_it_writes() {
         // A cursor visible mid-frame is seen jumping between rows.
         let host = test_host();
-        let bytes = host.paint(&[], None, &[], (0, 0)).expect("painted");
+        let bytes = host.paint(&[], None, &[], &[], (0, 0)).expect("painted");
         let text = String::from_utf8_lossy(&bytes).into_owned();
         assert!(text.contains(rune_term::inline::HIDE_CURSOR), "{text:?}");
         assert!(text.contains(rune_term::inline::SHOW_CURSOR), "{text:?}");
@@ -1029,7 +1276,7 @@ mod tests {
     #[test]
     fn leaving_removes_the_live_region() {
         let host = test_host();
-        host.paint(&[], None, &[], (0, 0)).expect("painted");
+        host.paint(&[], None, &[], &[], (0, 0)).expect("painted");
         let cleared = host.clear_region().expect("cleared");
         assert!(!cleared.is_empty(), "the region was left on the screen");
     }
@@ -1559,6 +1806,8 @@ mod tests {
             inline: Mutex::new(rune_term::inline::Inline::new(80)),
             provider_order: Vec::new(),
             provider_strict: false,
+            streaming: Arc::new(Mutex::new(StreamingText::default())),
+            live_out: Arc::new(Mutex::new(None)),
             reviewer: None,
             review_session: Arc::new(Mutex::new(ReviewSession::new(&BudgetSet::new()))),
         }

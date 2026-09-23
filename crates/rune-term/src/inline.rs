@@ -84,9 +84,14 @@ impl Inline {
     /// Renders one frame.
     ///
     /// `settled` holds lines that are finished and are printed once above the
-    /// region, in order. `activity`, `prompt`, and `footer` are the rows of the
-    /// live region, top first. `caret` is the column the cursor belongs at
-    /// within the prompt row, counted from the region's top.
+    /// region, in order. `activity` and `footer` are the rows that sit above
+    /// the prompt; `prompt` is the rows of the line being typed, and `below` is
+    /// whatever is still arriving, which grows downward from the input. `caret`
+    /// is the column the cursor belongs at within the prompt row.
+    ///
+    /// The order matters and is deliberate: the status rows sit above the input
+    /// so the place a user types stays put, and text that streams in goes below
+    /// it, where it can lengthen without moving the line being typed.
     ///
     /// Returns the bytes to write. Nothing here reads the terminal, so the same
     /// inputs always produce the same bytes.
@@ -94,20 +99,27 @@ impl Inline {
         &mut self,
         settled: &[String],
         activity: Option<&str>,
-        prompt: &[String],
         footer: &[String],
+        prompt: &[String],
+        below: &[String],
         caret: (u16, u16),
     ) -> Vec<u8> {
         let capacity = usize::from(activity.is_some())
+            .saturating_add(footer.len())
             .saturating_add(prompt.len())
-            .saturating_add(footer.len());
+            .saturating_add(below.len());
         let mut rows: Vec<String> = Vec::with_capacity(capacity);
         if let Some(activity) = activity {
             rows.push(self.clip(activity));
         }
+        // The status rows sit above the input, which is where a reader looks
+        // for them and where they do not move as an answer arrives.
+        rows.extend(footer.iter().map(|row| self.clip(row)));
         let prompt_start = rows.len();
         rows.extend(prompt.iter().map(|row| self.clip(row)));
-        rows.extend(footer.iter().map(|row| self.clip(row)));
+        // Whatever is still arriving goes below the input, so a growing answer
+        // never displaces the line being typed.
+        rows.extend(below.iter().map(|row| self.clip(row)));
         let live_rows = u16::try_from(rows.len()).unwrap_or(u16::MAX).max(1);
 
         // Where the caret sits, as an offset from the top of the region. The
@@ -160,8 +172,9 @@ impl Inline {
             }
         }
 
-        // The cursor is left inside the region the renderer drew, which is the
-        // invariant the next frame's relative move depends on.
+        // The caret is placed after the region is written, which is what lets
+        // the region grow downward without the move being recomputed: the walk
+        // back is measured from the bottom row just written.
         let from_bottom = live_rows.saturating_sub(1).saturating_sub(caret_row);
         up(&mut out, from_bottom);
         column(&mut out, caret.1);
@@ -254,8 +267,9 @@ mod tests {
         let bytes = inline.frame(
             &rows(&["first line"]),
             None,
-            &rows(&["> "]),
             &rows(&["status"]),
+            &rows(&["> "]),
+            &[],
             (0, 2),
         );
         let text = String::from_utf8(bytes).expect("utf8");
@@ -270,7 +284,7 @@ mod tests {
     fn the_cursor_is_hidden_while_a_frame_is_written_and_shown_after() {
         // A cursor visible mid-frame would be seen jumping between rows.
         let mut inline = Inline::new(40);
-        let bytes = inline.frame(&[], None, &rows(&["> "]), &rows(&["s"]), (0, 2));
+        let bytes = inline.frame(&[], None, &rows(&["s"]), &rows(&["> "]), &[], (0, 2));
         let text = String::from_utf8(bytes).expect("utf8");
         let hide = text.find(HIDE_CURSOR).expect("hidden");
         let show = text.find(SHOW_CURSOR).expect("shown");
@@ -286,11 +300,12 @@ mod tests {
         let _ = inline.frame(
             &[],
             None,
-            &rows(&["> "]),
             &rows(&["a long status line"]),
+            &rows(&["> "]),
+            &[],
             (0, 2),
         );
-        let bytes = inline.frame(&[], None, &rows(&["> "]), &rows(&["short"]), (0, 2));
+        let bytes = inline.frame(&[], None, &rows(&["short"]), &rows(&["> "]), &[], (0, 2));
         let seq = escapes(&bytes);
         let erase = seq.iter().position(|s| s == ERASE_BELOW);
         assert!(erase.is_some(), "the region was not cleared: {seq:?}");
@@ -307,8 +322,22 @@ mod tests {
         // The region had three rows, so the next frame must walk back up three
         // from wherever the caret was left inside it.
         let mut inline = Inline::new(40);
-        let _ = inline.frame(&[], Some("working"), &rows(&["> "]), &rows(&["s"]), (0, 0));
-        let bytes = inline.frame(&[], Some("working"), &rows(&["> "]), &rows(&["s"]), (0, 0));
+        let _ = inline.frame(
+            &[],
+            Some("working"),
+            &rows(&["s"]),
+            &rows(&["> "]),
+            &[],
+            (0, 0),
+        );
+        let bytes = inline.frame(
+            &[],
+            Some("working"),
+            &rows(&["s"]),
+            &rows(&["> "]),
+            &[],
+            (0, 0),
+        );
         let seq = escapes(&bytes);
         assert!(
             seq.iter()
@@ -320,7 +349,7 @@ mod tests {
     #[test]
     fn the_caret_is_placed_where_the_caller_asked_within_the_prompt() {
         let mut inline = Inline::new(40);
-        let bytes = inline.frame(&[], None, &rows(&["> hello"]), &rows(&["s"]), (0, 7));
+        let bytes = inline.frame(&[], None, &rows(&["s"]), &rows(&["> hello"]), &[], (0, 7));
         let seq = escapes(&bytes);
         // A one-based column, so seven columns in is column eight.
         assert!(seq.iter().any(|s| s == "\u{1b}[8G"), "{seq:?}");
@@ -332,7 +361,14 @@ mod tests {
         // next frame relies on.
         let mut inline = Inline::new(10);
         let long = "x".repeat(50);
-        let bytes = inline.frame(&[], None, &rows(&["> "]), &rows(&[long.as_str()]), (0, 2));
+        let bytes = inline.frame(
+            &[],
+            None,
+            &rows(&[long.as_str()]),
+            &rows(&["> "]),
+            &[],
+            (0, 2),
+        );
         let text = String::from_utf8_lossy(&bytes).into_owned();
         assert!(!text.contains(&"x".repeat(11)), "{text:?}");
     }
@@ -340,7 +376,7 @@ mod tests {
     #[test]
     fn a_frame_with_no_settled_lines_still_draws_the_region() {
         let mut inline = Inline::new(30);
-        let bytes = inline.frame(&[], None, &rows(&["> "]), &rows(&["status"]), (0, 2));
+        let bytes = inline.frame(&[], None, &rows(&["status"]), &rows(&["> "]), &[], (0, 2));
         assert!(!bytes.is_empty());
         assert!(String::from_utf8_lossy(&bytes).contains("status"));
     }
@@ -351,8 +387,9 @@ mod tests {
         let bytes = inline.frame(
             &[],
             Some("running a command"),
-            &rows(&["> "]),
             &rows(&["s"]),
+            &rows(&["> "]),
+            &[],
             (0, 0),
         );
         let text = String::from_utf8_lossy(&bytes).into_owned();
@@ -366,7 +403,7 @@ mod tests {
         // The screen holds whatever the shell that started the session left.
         // Clearing from an unknown position would erase the user's own prompt.
         let mut inline = Inline::new(40);
-        let bytes = inline.frame(&[], None, &rows(&["> "]), &rows(&["s"]), (0, 2));
+        let bytes = inline.frame(&[], None, &rows(&["s"]), &rows(&["> "]), &[], (0, 2));
         let seq = escapes(&bytes);
         assert!(!seq.iter().any(|s| s == ERASE_BELOW), "{seq:?}");
     }
@@ -374,7 +411,7 @@ mod tests {
     #[test]
     fn clearing_removes_the_region_and_stops_the_next_frame_erasing() {
         let mut inline = Inline::new(40);
-        let _ = inline.frame(&[], None, &rows(&["> "]), &rows(&["s"]), (0, 2));
+        let _ = inline.frame(&[], None, &rows(&["s"]), &rows(&["> "]), &[], (0, 2));
         let cleared = inline.clear();
         assert!(String::from_utf8_lossy(&cleared).contains(ERASE_BELOW));
         assert!(!inline.is_drawn());

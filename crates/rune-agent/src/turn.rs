@@ -310,6 +310,8 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
         let mut pending_calls = Vec::new();
         for event in &outcome.events {
             match event {
+                // The host already received this delta as it arrived; here it is
+                // only assembled into the turn's record.
                 rune_net::stream::ProviderEvent::TextDelta { delta } => {
                     parts.push(ContentPart::Text {
                         text: delta.clone(),
@@ -464,13 +466,32 @@ fn stream_with_retry(
         plan.provider_order = host.provider_order();
         plan.provider_strict = host.provider_strict();
 
-        match transport::stream_completion(
+        // Each event is handed to the host as it is decoded, so text appears
+        // while it is being produced rather than once the response has ended.
+        // A retry re-sends the request, so the host is told the step restarted
+        // and the partial text of the failed attempt is dropped.
+        let mut observe = |event: &rune_net::stream::ProviderEvent| match event {
+            rune_net::stream::ProviderEvent::TextDelta { delta } => {
+                host.emit(Event::TextDelta {
+                    delta: delta.clone(),
+                });
+            }
+            rune_net::stream::ProviderEvent::ReasoningDelta { delta } => {
+                host.emit(Event::ReasoningDelta {
+                    delta: delta.clone(),
+                });
+            }
+            _ => {}
+        };
+
+        match transport::stream_completion_observed(
             agent,
             host.endpoint(),
             host.dialect(),
             &plan,
             head_timeout,
             &|| cancellation.is_cancelled(),
+            &mut observe,
         ) {
             Ok(outcome) => return Ok((outcome, !steering.is_empty())),
             Err(err) => {
