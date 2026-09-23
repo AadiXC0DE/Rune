@@ -93,6 +93,65 @@ struct StreamingText {
     answer: String,
     /// Reasoning text so far, shown while the model is thinking.
     reasoning: String,
+    /// Wrapped rows for each lane, and how much of the source they cover.
+    ///
+    /// Kept so a delta wraps only the text that arrived, rather than the whole
+    /// answer again. Re-wrapping everything per delta is quadratic in the length
+    /// of the response, which is what made a long answer stutter.
+    answer_rows: LazyRows,
+    reasoning_rows: LazyRows,
+}
+
+/// Wrapped rows derived from a growing string.
+///
+/// Every complete line is wrapped once and kept. Only the line being written is
+/// wrapped again on the next delta, so the cost of a delta is bounded by one
+/// line rather than by the whole answer. Rewrapping everything per delta is
+/// quadratic in the length of the response, which is what made a long answer
+/// stutter: a twenty thousand character answer was re-wrapped twenty million
+/// characters' worth.
+///
+/// The boundary is a newline because that is a hard break the wrapper already
+/// respects, so a line that is complete can never be wrapped differently by
+/// later text.
+#[derive(Default)]
+struct LazyRows {
+    /// Rows for every line that is finished, ending in a newline.
+    finished: Vec<String>,
+    /// Bytes of the source those rows cover.
+    covered: usize,
+}
+
+/// Returns the rows for a growing string, wrapping only what is new.
+fn rows_for(lazy: &mut LazyRows, text: &str, width: usize) -> Vec<String> {
+    // Text that shrank means the lane was cleared, so the cached rows describe
+    // a response that is gone.
+    if text.len() < lazy.covered {
+        lazy.finished.clear();
+        lazy.covered = 0;
+    }
+
+    // Everything up to the last newline is final. A newline is a hard break, so
+    // no later text can change how the text before it wraps, and the wrap for
+    // that prefix is computed once no matter how many deltas follow it.
+    let sealed = text.rfind('\n').map_or(0, |at| at.saturating_add(1));
+    if sealed != lazy.covered {
+        lazy.finished = rune_term::width::wrap(text.get(..sealed).unwrap_or_default(), width);
+        lazy.covered = sealed;
+    }
+
+    let tail = text.get(lazy.covered..).unwrap_or_default();
+    if tail.is_empty() {
+        return lazy.finished.clone();
+    }
+
+    // The tail continues the row the sealed prefix ended on. A prefix ending in
+    // a newline wraps to a trailing empty row, which the tail fills rather than
+    // sitting under, so that row is dropped before the tail is appended.
+    let mut rows = lazy.finished.clone();
+    rows.pop();
+    rows.extend(rune_term::width::wrap(tail, width));
+    rows
 }
 
 /// The stream a session draws on.
@@ -294,10 +353,15 @@ impl Host for SessionHost {
 }
 
 impl SessionHost {
-    /// Records the tokens a turn spent.
-    fn add_context_usage(&self, used: u64) {
+    /// Records how large the conversation has become.
+    ///
+    /// Takes the largest reading rather than summing them. Each turn resends
+    /// the whole conversation, so an input count already includes every earlier
+    /// turn: adding them counts the same history once per turn, which is what
+    /// made a session appear to fill its window several times over.
+    fn record_context_size(&self, used: u64) {
         self.context_used
-            .fetch_add(used, std::sync::atomic::Ordering::Relaxed);
+            .fetch_max(used, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Returns the status line for the current state.
@@ -458,27 +522,37 @@ impl SessionHost {
 
     /// Returns the rows the streamed text occupies, newest last.
     fn streaming_rows(&self) -> Vec<String> {
-        let Ok(streaming) = self.streaming.lock() else {
+        let Ok(mut streaming) = self.streaming.lock() else {
             return Vec::new();
         };
         let width = usize::from(self.width());
         let dim = self.theme.sgr(rune_term::theme::Slot::Dim, self.truecolor);
         let reset = rune_term::engine::Style::RESET;
-        let mut rows = Vec::new();
-        // Reasoning comes first and is drawn apart from the answer, in a
-        // secondary colour and indented, so a reader can tell thinking from the
-        // reply at a glance instead of finding them interleaved.
-        if !streaming.reasoning.trim().is_empty() {
-            for line in rune_term::width::wrap(&streaming.reasoning, width) {
+
+        // The fields are borrowed separately, because each lane's text and the
+        // rows derived from it are written together.
+        let StreamingText {
+            answer,
+            reasoning,
+            answer_rows,
+            reasoning_rows,
+        } = &mut *streaming;
+
+        // Reasoning comes first, drawn apart from the answer, in a secondary
+        // colour and indented, so a reader can tell thinking from the reply.
+        let mut rows: Vec<String> = Vec::new();
+        if !reasoning.trim().is_empty() {
+            for line in rows_for(reasoning_rows, reasoning, width) {
                 rows.push(format!("{dim}  {line}{reset}"));
             }
         }
-        if !streaming.answer.trim().is_empty() {
-            for line in rune_term::width::wrap(&streaming.answer, width) {
-                rows.push(line);
+        if !answer.trim().is_empty() {
+            for line in rows_for(answer_rows, answer, width) {
+                rows.push(line.clone());
             }
         }
-        // The region keeps the newest rows, so a long answer does not push the
+
+        // The region keeps the newest rows, so a long answer cannot push the
         // input off the screen.
         let limit = usize::from(self.height.load(std::sync::atomic::Ordering::Relaxed))
             .saturating_sub(6)
@@ -494,6 +568,8 @@ impl SessionHost {
         if let Ok(mut streaming) = self.streaming.lock() {
             streaming.answer.clear();
             streaming.reasoning.clear();
+            streaming.answer_rows = LazyRows::default();
+            streaming.reasoning_rows = LazyRows::default();
         }
     }
 
@@ -693,7 +769,7 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                 // dies while rendering still has its exchange on disk.
                 recorder.turn(&outcome)?;
                 record_usage(&config.paths, &host.model, &outcome);
-                host.add_context_usage(
+                host.record_context_size(
                     outcome
                         .usage
                         .input_tokens
@@ -876,8 +952,14 @@ fn terminal_height() -> u16 {
 ///
 /// Configuration carries no per-model window, so the compiled default applies
 /// until a provider reports one. A zero would make every request look oversized.
-fn context_limit(_settings: &Settings, _limits: &BudgetSet) -> u64 {
-    rune_net::catalog::DEFAULT_CONTEXT_WINDOW
+fn context_limit(settings: &Settings, _limits: &BudgetSet) -> u64 {
+    // The configured window wins, because it describes the model the user
+    // selected. The compiled default is a guess that suits a small model and
+    // understates a large one, which is what made a million-token model report
+    // a hundred and twenty-eight thousand.
+    settings
+        .context_window
+        .unwrap_or(rune_net::catalog::DEFAULT_CONTEXT_WINDOW)
 }
 
 /// Returns whether the terminal can render direct color.
@@ -1226,9 +1308,11 @@ mod tests {
         // The answer grows downward from the line being typed, so a long reply
         // never pushes the input off the screen.
         let host = test_host();
-        host.emit(Event::TextDelta {
-            delta: "answer".to_owned(),
-        });
+        // Accumulated without drawing, so this test sees one frame rather than
+        // the deltas that produced it overlap on the same screen.
+        if let Ok(mut streaming) = host.streaming.lock() {
+            streaming.answer.push_str("answer");
+        }
         let prompt_row = transcript::render_prompt(rune_term::shell::prompt(), "", 80);
         let rows = host.streaming_rows();
         let bytes = host
@@ -1476,7 +1560,7 @@ mod tests {
         let host = test_host();
         let before = host.status_line(120);
         assert!(before.contains("ctx 0%"), "{before}");
-        host.add_context_usage(64_000);
+        host.record_context_size(64_000);
         let after = host.status_line(120);
         assert!(
             !after.contains("ctx 0%"),
@@ -1485,13 +1569,95 @@ mod tests {
     }
 
     #[test]
-    fn spending_context_is_cumulative_across_turns() {
+    fn wrapping_incrementally_matches_wrapping_the_whole_text() {
+        // The cache exists to make a delta cheap, not to change what is drawn.
+        // A word straddling a delta boundary must still break where wrapping the
+        // finished text would break it.
+        let text = "the quick brown fox jumps over the lazy dog again and again";
+        let mut lazy = LazyRows::default();
+        let mut prefix = String::new();
+        for word in text.split_inclusive(' ') {
+            prefix.push_str(word);
+            let incremental = rows_for(&mut lazy, &prefix, 20);
+            let whole = rune_term::width::wrap(&prefix, 20);
+            assert_eq!(
+                incremental, whole,
+                "incremental wrapping diverged at {prefix:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn wrapping_across_several_lines_keeps_every_line() {
+        let mut lazy = LazyRows::default();
+        let mut prefix = String::new();
+        for part in ["first line\n", "second line\n", "third line"] {
+            prefix.push_str(part);
+            let incremental = rows_for(&mut lazy, &prefix, 20);
+            assert_eq!(incremental, rune_term::width::wrap(&prefix, 20));
+        }
+        let rows = rows_for(&mut lazy, &prefix, 20);
+        assert_eq!(rows.len(), 3, "{rows:?}");
+    }
+
+    #[test]
+    fn clearing_a_lane_forgets_its_rows() {
+        // A cleared lane must not redraw the response that was dropped.
+        let mut lazy = LazyRows::default();
+        let rows = rows_for(&mut lazy, "an old answer", 20);
+        assert!(!rows.is_empty());
+        let rows = rows_for(&mut lazy, "", 20);
+        assert!(rows.is_empty(), "stale rows survived: {rows:?}");
+    }
+
+    #[test]
+    fn context_usage_is_the_size_of_the_conversation_not_a_running_sum() {
+        // Every turn resends the whole conversation, so an input count already
+        // contains the earlier turns. Summing them counts the same history once
+        // per turn, which is what made a session appear to fill its window
+        // several times over.
         let host = test_host();
-        host.add_context_usage(1_000);
-        host.add_context_usage(2_000);
+        host.record_context_size(8_000);
+        host.record_context_size(8_400);
+        host.record_context_size(8_900);
         assert_eq!(
             host.context_used.load(std::sync::atomic::Ordering::Relaxed),
-            3_000
+            8_900,
+            "the readings were summed rather than taken as a high-water mark"
+        );
+    }
+
+    #[test]
+    fn a_shrinking_reading_never_lowers_the_reported_size() {
+        // A turn that reports fewer input tokens than the last is not the
+        // conversation getting smaller; taking the smaller value would hide the
+        // history that is still being sent.
+        let host = test_host();
+        host.record_context_size(9_000);
+        host.record_context_size(7_000);
+        assert_eq!(
+            host.context_used.load(std::sync::atomic::Ordering::Relaxed),
+            9_000
+        );
+    }
+
+    #[test]
+    fn a_declared_model_window_overrides_the_compiled_default() {
+        // A model that accepts a million tokens must not be budgeted against a
+        // hundred and twenty-eight thousand, which reports a nearly empty
+        // window as a fifth full.
+        let settings = Settings {
+            context_window: Some(1_000_000),
+            ..Settings::default()
+        };
+        assert_eq!(context_limit(&settings, &BudgetSet::new()), 1_000_000);
+
+        // Without a declaration the compiled default stands, because guessing
+        // high would let a conversation grow past what the model accepts.
+        let undeclared = Settings::default();
+        assert_eq!(
+            context_limit(&undeclared, &BudgetSet::new()),
+            rune_net::catalog::DEFAULT_CONTEXT_WINDOW
         );
     }
 

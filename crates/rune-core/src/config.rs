@@ -264,6 +264,68 @@ pub struct ProjectConfig {
     pub limits: Option<BTreeMap<String, Budget>>,
 }
 
+/// Input capacity assumed when a model does not declare one.
+///
+/// Deliberately modest: an underestimated window triggers compaction early,
+/// which costs a summary request, while an overestimated one produces a
+/// rejected request that costs the whole turn. A model with a larger window
+/// declares it in the `models` table rather than relying on this.
+pub const DEFAULT_CONTEXT_WINDOW: u64 = 128_000;
+
+/// One entry in the `models` table.
+///
+/// Accepts either a bare identifier, which is what most configurations need, or
+/// a table naming the identifier and what the model accepts. The endpoint's own
+/// listing carries no capacity for most compatible servers, so the window a
+/// session budgets against has to be stated somewhere, and a configuration file
+/// is the only place that knows it.
+#[derive(Clone, PartialEq, Eq, Debug, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum ModelEntry {
+    /// Just the identifier.
+    Id(String),
+    /// The identifier with what the model accepts.
+    Detailed(Box<ModelSettings>),
+}
+
+impl ModelEntry {
+    /// Returns the model identifier.
+    #[must_use]
+    pub fn id(&self) -> &str {
+        match self {
+            Self::Id(id) => id.as_str(),
+            Self::Detailed(settings) => settings.id.as_str(),
+        }
+    }
+
+    /// Returns the declared input capacity, when one is stated.
+    #[must_use]
+    pub fn context_window(&self) -> Option<u64> {
+        match self {
+            Self::Id(_) => None,
+            Self::Detailed(settings) => settings.context_window,
+        }
+    }
+}
+
+/// What a model accepts, as declared in a configuration file.
+#[derive(Clone, PartialEq, Eq, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelSettings {
+    /// Identifier sent to the endpoint.
+    pub id: String,
+    /// Input capacity in tokens.
+    ///
+    /// Declared rather than assumed: a wrong window either truncates a
+    /// conversation that would have fit or lets one grow past what the model
+    /// accepts, and both are worse than being told.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u64>,
+    /// Largest answer the model will produce.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<u64>,
+}
+
 /// A user configuration file as parsed.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -272,9 +334,9 @@ pub struct UserConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<Provider>,
 
-    /// Model identifier per provider.
+    /// Model per provider, either a bare identifier or a table describing it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub models: Option<BTreeMap<String, String>>,
+    pub models: Option<BTreeMap<String, ModelEntry>>,
 
     /// Endpoint for the active provider.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -416,6 +478,12 @@ pub struct Settings {
     pub provider: Provider,
     /// Effective model identifier for the active provider.
     pub model: String,
+    /// Input capacity the configured model accepts, when one is declared.
+    ///
+    /// Held here rather than looked up at the point it is needed, because the
+    /// only place that knows it is the configuration file, and the session that
+    /// budgets against it has no access to the raw file.
+    pub context_window: Option<u64>,
     /// Endpoint base URL.
     pub base_url: Option<String>,
     /// Environment variable holding the credential.
@@ -465,6 +533,7 @@ impl Default for Settings {
         Self {
             provider: Provider::default(),
             model: String::new(),
+            context_window: None,
             base_url: None,
             api_key_env: None,
             permission_mode: PermissionMode::default(),
@@ -525,6 +594,12 @@ impl Settings {
         let rows = vec![
             ("provider", self.provider.to_string()),
             ("model", self.model.clone()),
+            (
+                "context_window",
+                self.context_window
+                    .unwrap_or(DEFAULT_CONTEXT_WINDOW)
+                    .to_string(),
+            ),
             (
                 "base_url",
                 self.base_url
@@ -886,8 +961,14 @@ fn apply_user(settings: &mut Settings, user: &UserConfig, layer: Layer) {
     if let Some(models) = &user.models {
         let key = provider_key(&settings.provider);
         if let Some(model) = models.get(&key).or_else(|| models.get("default")) {
-            settings.model.clone_from(model);
+            model.id().clone_into(&mut settings.model);
             settings.sources.record("model", layer);
+            // The declared capacity travels with the model it describes, so a
+            // layer that names a model also names what it accepts.
+            settings.context_window = model.context_window();
+            if settings.context_window.is_some() {
+                settings.sources.record("context_window", layer);
+            }
         }
     }
     if let Some(mode) = user.permission_mode {
@@ -1545,6 +1626,61 @@ theme_unused = "x"
             Layer::User,
         );
         assert_eq!(settings.model, "claude-x");
+    }
+
+    #[test]
+    fn a_model_may_be_a_bare_identifier_or_a_table() {
+        // Most configurations name a model and nothing else, so the bare form
+        // has to keep working. The table form exists for what the endpoint does
+        // not report, which for most compatible servers is the context window.
+        let bare: UserConfig =
+            toml::from_str("[models]\nanthropic = \"claude-x\"\n").expect("bare");
+        let entry = bare
+            .models
+            .expect("models")
+            .remove("anthropic")
+            .expect("entry");
+        assert_eq!(entry.id(), "claude-x");
+        assert_eq!(entry.context_window(), None);
+
+        let detailed: UserConfig =
+            toml::from_str("[models.anthropic]\nid = \"claude-x\"\ncontext_window = 1000000\n")
+                .expect("detailed");
+        let entry = detailed
+            .models
+            .expect("models")
+            .remove("anthropic")
+            .expect("entry");
+        assert_eq!(entry.id(), "claude-x");
+        assert_eq!(entry.context_window(), Some(1_000_000));
+    }
+
+    #[test]
+    fn a_declared_window_reaches_the_settings() {
+        // The key is the provider's own name, and an unconfigured session reads
+        // the `default` entry.
+        let config: UserConfig =
+            toml::from_str("[models.default]\nid = \"m\"\ncontext_window = 200000\n")
+                .expect("config");
+        let mut settings = Settings::default();
+        apply_user(&mut settings, &config, Layer::User);
+        assert_eq!(settings.model, "m");
+        assert_eq!(settings.context_window, Some(200_000));
+        assert_eq!(settings.source_of("context_window"), Layer::User);
+    }
+
+    #[test]
+    fn an_undeclared_window_is_reported_as_the_default() {
+        // The report has to say which is in force, because a window that is
+        // assumed rather than declared is the thing a reader needs to know.
+        let settings = Settings::default();
+        let row = settings
+            .explain()
+            .into_iter()
+            .find(|row| row.key == "context_window")
+            .expect("context_window is reported");
+        assert_eq!(row.value, DEFAULT_CONTEXT_WINDOW.to_string());
+        assert_eq!(row.source, Layer::Default);
     }
 
     #[test]

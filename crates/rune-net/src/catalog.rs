@@ -149,10 +149,9 @@ impl ModelMetadata {
 
 /// Input capacity assumed when a catalog does not report one.
 ///
-/// Deliberately modest: an underestimated window triggers compaction early,
-/// which costs a summary request, while an overestimated one produces a
-/// rejected request that costs the whole turn.
-pub const DEFAULT_CONTEXT_WINDOW: u64 = 128_000;
+/// Re-exported from the configuration crate so the number a report prints and
+/// the number a session budgets against cannot drift apart.
+pub use rune_core::config::DEFAULT_CONTEXT_WINDOW;
 
 /// A loaded catalog for one provider.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]

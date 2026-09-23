@@ -59,6 +59,17 @@ asks the endpoint rather than a table compiled into the binary, so a model
 released after this build still appears. Add `--offline` to report the configured
 model without contacting anything.
 
+A model larger than the default window declares its capacity, which is what
+`rune config` reports and what the status line budgets against:
+
+```toml
+[models.opencode-go]
+id = "grok-4.7"
+context_window = 2000000
+```
+
+A bare identifier still works for a model whose window the endpoint reports.
+
 The providers that ship in the table are:
 
 | Provider | What it is |

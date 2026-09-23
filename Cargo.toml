@@ -18,7 +18,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.6"
+version = "0.1.7"
 edition = "2024"
 rust-version = "1.98"
 license = "Apache-2.0"
@@ -27,18 +27,18 @@ authors = ["Rune contributors"]
 
 [workspace.dependencies]
 # Internal
-rune-core = { path = "crates/rune-core", version = "0.1.6" }
-rune-net = { path = "crates/rune-net", version = "0.1.6" }
-rune-policy = { path = "crates/rune-policy", version = "0.1.6" }
-rune-exec = { path = "crates/rune-exec", version = "0.1.6" }
-rune-tools = { path = "crates/rune-tools", version = "0.1.6" }
-rune-agent = { path = "crates/rune-agent", version = "0.1.6" }
-rune-session = { path = "crates/rune-session", version = "0.1.6" }
-rune-context = { path = "crates/rune-context", version = "0.1.6" }
-rune-term = { path = "crates/rune-term", version = "0.1.6" }
-rune-acp = { path = "crates/rune-acp", version = "0.1.6" }
-rune-sdk = { path = "crates/rune-sdk", version = "0.1.6" }
-rune-testkit = { path = "crates/rune-testkit", version = "0.1.6" }
+rune-core = { path = "crates/rune-core", version = "0.1.7" }
+rune-net = { path = "crates/rune-net", version = "0.1.7" }
+rune-policy = { path = "crates/rune-policy", version = "0.1.7" }
+rune-exec = { path = "crates/rune-exec", version = "0.1.7" }
+rune-tools = { path = "crates/rune-tools", version = "0.1.7" }
+rune-agent = { path = "crates/rune-agent", version = "0.1.7" }
+rune-session = { path = "crates/rune-session", version = "0.1.7" }
+rune-context = { path = "crates/rune-context", version = "0.1.7" }
+rune-term = { path = "crates/rune-term", version = "0.1.7" }
+rune-acp = { path = "crates/rune-acp", version = "0.1.7" }
+rune-sdk = { path = "crates/rune-sdk", version = "0.1.7" }
+rune-testkit = { path = "crates/rune-testkit", version = "0.1.7" }
 
 # Compression
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }

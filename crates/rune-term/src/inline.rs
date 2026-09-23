@@ -51,6 +51,15 @@ pub struct Inline {
     cursor_row: u16,
     /// Whether the region has been drawn at least once.
     drawn: bool,
+    /// Rows of the region as the terminal last received them.
+    ///
+    /// Kept so a frame can rewrite only the rows that changed. A streamed answer
+    /// adds a few characters per delta and touches one row, while redrawing the
+    /// whole region per delta costs every visible row each time, which is what
+    /// made a long response write hundreds of times the size of the answer.
+    shown: Vec<String>,
+    /// Rows of the region that were settled into the flow when last drawn.
+    shown_settled: usize,
 }
 
 impl Inline {
@@ -61,6 +70,8 @@ impl Inline {
             cols,
             cursor_row: 0,
             drawn: false,
+            shown: Vec::new(),
+            shown_settled: 0,
         }
     }
 
@@ -143,17 +154,56 @@ impl Inline {
             .saturating_add(within);
         let caret_row = caret_row.min(live_rows.saturating_sub(1));
 
+        // A frame that changes nothing still has to leave the cursor where the
+        // caller wants it, but it does not have to rewrite the region. Only the
+        // caret move is emitted in that case, which is what makes an idle
+        // interface free to keep up to date.
+        let unchanged = self.drawn
+            && self.shown == rows
+            && self.shown_settled == settled.len()
+            && self.cursor_row == caret_row
+            && settled.is_empty();
+        if unchanged {
+            let mut out = String::new();
+            out.push_str(HIDE_CURSOR);
+            out.push('\r');
+            up(&mut out, self.cursor_row);
+            column(&mut out, caret.1);
+            out.push_str(SHOW_CURSOR);
+            return out.into_bytes();
+        }
+
+        // The region only grows at the bottom while text streams in and the
+        // input row is fixed, so the rows above the change keep their identity.
+        // Rewriting only from the first row that differs is what keeps a delta's
+        // cost proportional to what it changed rather than to the whole region.
+        // A partial repaint is only sound while the region has not moved. A
+        // frame that prints settled lines above the region scrolls it, so the
+        // rows that look unchanged by index are no longer where they were.
+        // Those frames repaint the region whole.
+        let scrolled = !settled.is_empty();
+        let first_changed = if self.drawn && self.shown_settled == settled.len() && !scrolled {
+            self.shown
+                .iter()
+                .zip(rows.iter())
+                .position(|(was, now)| was != now)
+                .unwrap_or_else(|| self.shown.len().min(rows.len()))
+        } else {
+            0
+        };
+
         let mut out = String::new();
         out.push_str(HIDE_CURSOR);
-        // Normalise the column first, because every move below counts rows and
-        // would otherwise inherit the column the caret was left in.
         out.push('\r');
 
         if self.drawn {
-            // Back to the top of the region that is on screen now, so it can be
-            // cleared before anything is written over it.
+            // Back to the top of the region that is on screen, so a write can
+            // begin from a known row. A frame that repaints everything clears
+            // the region first, because it may be shorter than what is there.
             up(&mut out, self.cursor_row);
-            out.push_str(ERASE_BELOW);
+            if first_changed == 0 {
+                out.push_str(ERASE_BELOW);
+            }
         }
 
         for line in settled {
@@ -161,10 +211,19 @@ impl Inline {
             out.push_str("\r\n");
         }
 
-        // The region starts where the settled lines ended. Writing it may scroll,
-        // which is what keeps the newest row against the prompt.
-        for (index, row) in rows.iter().enumerate() {
-            if index > 0 {
+        // The region starts where the settled lines ended. Writing it may
+        // scroll, which is what keeps the newest row against the input.
+        //
+        // Rows before the change were left in place, so the cursor steps down
+        // to the first row that has to be written rather than rewriting them.
+        // Without this step the write lands at the region's top and overwrites
+        // the rows it was meant to leave alone.
+        if first_changed > 0 {
+            down(&mut out, u16::try_from(first_changed).unwrap_or(u16::MAX));
+        }
+
+        for (index, row) in rows.iter().enumerate().skip(first_changed) {
+            if index > first_changed {
                 out.push_str("\r\n");
             }
             out.push_str(row);
@@ -178,14 +237,36 @@ impl Inline {
             }
         }
 
-        // The caret is placed after the region is written, which is what lets
-        // the region grow downward without the move being recomputed: the walk
-        // back is measured from the bottom row just written.
-        let from_bottom = live_rows.saturating_sub(1).saturating_sub(caret_row);
-        up(&mut out, from_bottom);
+        // Rows that were shown but are gone have to be removed, or a shrinking
+        // region leaves its tail on the screen.
+        let removed = self
+            .shown
+            .len()
+            .saturating_sub(rows.len().max(first_changed));
+        if self.drawn && removed > 0 {
+            let written = rows.len().saturating_sub(first_changed);
+            for index in 0..removed {
+                if index > 0 || written > 0 {
+                    out.push_str("\r\n");
+                }
+                out.push_str("\u{1b}[K");
+            }
+        }
+
+        // The caret is placed after the region is written. The walk back is
+        // measured from the last row written, which may be above the region's
+        // bottom when only an early row changed.
+        let last_written = rows
+            .len()
+            .saturating_sub(1)
+            .max(first_changed.min(rows.len().saturating_sub(1)));
+        let from_bottom = last_written.saturating_sub(usize::from(caret_row));
+        up(&mut out, u16::try_from(from_bottom).unwrap_or(u16::MAX));
         column(&mut out, caret.1);
         out.push_str(SHOW_CURSOR);
 
+        self.shown = rows;
+        self.shown_settled = settled.len();
         self.cursor_row = caret_row;
         self.drawn = true;
         out.into_bytes()
@@ -208,6 +289,8 @@ impl Inline {
         out.push_str(SHOW_CURSOR);
         self.drawn = false;
         self.cursor_row = 0;
+        self.shown.clear();
+        self.shown_settled = 0;
         out.into_bytes()
     }
 
@@ -225,6 +308,13 @@ impl Inline {
 fn up(out: &mut String, rows: u16) {
     if rows > 0 {
         let _ = write!(out, "\u{1b}[{rows}A");
+    }
+}
+
+/// Appends a move of `rows` rows towards the bottom of the screen.
+fn down(out: &mut String, rows: u16) {
+    if rows > 0 {
+        let _ = write!(out, "\u{1b}[{rows}B");
     }
 }
 
@@ -469,6 +559,145 @@ mod tests {
         let bytes = inline.frame(&[], None, &rows(&["s"]), &rows(&["> "]), &[], (0, 2));
         let seq = escapes(&bytes);
         assert!(!seq.iter().any(|s| s == ERASE_BELOW), "{seq:?}");
+    }
+
+    #[test]
+    fn a_frame_that_changes_one_row_writes_only_that_row() {
+        // The whole point of tracking what was shown: a streamed answer adds a
+        // few characters per delta, and rewriting the entire region per delta
+        // cost hundreds of times the size of the answer.
+        let mut inline = Inline::new(40);
+        let footer = rows(&["status"]);
+        let _ = inline.frame(
+            &[],
+            None,
+            &footer,
+            &rows(&["> "]),
+            &rows(&["first"]),
+            (0, 2),
+        );
+        let bytes = inline.frame(
+            &[],
+            None,
+            &footer,
+            &rows(&["> "]),
+            &rows(&["first", "second"]),
+            (0, 2),
+        );
+        let text = String::from_utf8_lossy(&bytes).into_owned();
+        assert!(
+            text.contains("second"),
+            "the new row was not drawn: {text:?}"
+        );
+        assert!(
+            !text.contains("status") && !text.contains("> "),
+            "unchanged rows were rewritten: {text:?}"
+        );
+    }
+
+    #[test]
+    fn an_identical_frame_writes_only_a_caret_move() {
+        let mut inline = Inline::new(40);
+        let footer = rows(&["status"]);
+        let _ = inline.frame(&[], None, &footer, &rows(&["> "]), &rows(&["x"]), (0, 2));
+        let bytes = inline.frame(&[], None, &footer, &rows(&["> "]), &rows(&["x"]), (0, 2));
+        let text = String::from_utf8_lossy(&bytes).into_owned();
+        assert!(
+            !text.contains("status"),
+            "the region was rewritten: {text:?}"
+        );
+        assert!(
+            text.contains("\u{1b}[3G"),
+            "the caret did not move: {text:?}"
+        );
+    }
+
+    #[test]
+    fn a_frame_with_settled_lines_paints_the_region_whole() {
+        // Printing a settled line above the region scrolls it, so the rows that
+        // look unchanged by index have moved. Skipping them left stale rows on
+        // the screen, which is what a partial repaint must never do across a
+        // scroll.
+        let mut inline = Inline::new(40);
+        let footer = rows(&["status"]);
+        let _ = inline.frame(&[], None, &footer, &rows(&["> "]), &rows(&["body"]), (0, 2));
+        let bytes = inline.frame(
+            &rows(&["a finished line"]),
+            None,
+            &footer,
+            &rows(&["> "]),
+            &rows(&["body"]),
+            (0, 2),
+        );
+        let text = String::from_utf8_lossy(&bytes).into_owned();
+        assert!(text.contains("a finished line"), "{text:?}");
+        assert!(
+            text.contains("status"),
+            "the region was not repainted after scrolling: {text:?}"
+        );
+    }
+
+    #[test]
+    fn a_shrinking_region_clears_the_rows_it_lost() {
+        let mut inline = Inline::new(40);
+        let footer = rows(&["status"]);
+        let _ = inline.frame(
+            &[],
+            None,
+            &footer,
+            &rows(&["> "]),
+            &rows(&["one", "two", "three"]),
+            (0, 2),
+        );
+        let bytes = inline.frame(&[], None, &footer, &rows(&["> "]), &rows(&["one"]), (0, 2));
+        let text = String::from_utf8_lossy(&bytes).into_owned();
+        // The two rows that are gone are erased rather than left behind.
+        assert!(
+            text.matches("\u{1b}[K").count() >= 2,
+            "lost rows were not erased: {text:?}"
+        );
+    }
+
+    #[test]
+    fn a_partial_repaint_reproduces_the_same_screen_as_a_full_one() {
+        // The rendered result must not depend on how it was reached. This is the
+        // property the byte-saving depends on, so it is asserted directly.
+        let footer = rows(&["status line"]);
+
+        let mut diffed = Inline::new(40);
+        let mut replay = crate::engine::Grid::new(40, 8).expect("grid");
+        // The first frame is captured once and fed, because the renderer keeps
+        // what it drew: asking it for the same frame twice returns only a caret
+        // move on the second call.
+        let first = diffed.frame(&[], None, &footer, &rows(&["> "]), &rows(&["a"]), (0, 2));
+        replay.feed(&first).expect("feed");
+        let step = diffed.frame(
+            &[],
+            None,
+            &footer,
+            &rows(&["> "]),
+            &rows(&["a", "b", "c"]),
+            (0, 2),
+        );
+        replay.feed(&step).expect("feed");
+
+        let mut fresh = Inline::new(40);
+        let whole = fresh.frame(
+            &[],
+            None,
+            &footer,
+            &rows(&["> "]),
+            &rows(&["a", "b", "c"]),
+            (0, 2),
+        );
+        let mut expected = crate::engine::Grid::new(40, 8).expect("grid");
+        expected.feed(&whole).expect("feed");
+
+        assert_eq!(
+            replay.text(),
+            expected.text(),
+            "the incremental screen differs from the one-pass screen"
+        );
     }
 
     #[test]

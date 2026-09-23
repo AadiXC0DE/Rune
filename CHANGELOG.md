@@ -28,6 +28,26 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Added
 
+- A model can declare its context window in the configuration, as either a bare
+  identifier or a table naming the window. `rune config` reports which is in
+  force and where it came from. A model with a larger window used to be budgeted
+  against a compiled default of 128k, so a million-token model showed as nearly
+  a fifth full before anything was said.
+
+### Fixed
+
+- The context meter no longer overstates what has been used. It summed the input
+  count of every turn, but each turn resends the whole conversation, so the same
+  history was counted once per turn and a session appeared to fill its window
+  several times over. It reports the size of the conversation now.
+- Streaming no longer stutters. Every delta re-wrapped the entire answer and
+  rewrote every row of the live region, which is quadratic in the length of the
+  response: a three-thousand character answer wrote six hundred and eighty
+  thousand bytes to the terminal. Only what changed is written, which brings the
+  same answer to sixty-four thousand bytes, and wrapping is done once per line
+  rather than once per delta.
+
+
 - Reasoning streams in its own lane, indented and in a secondary colour, above
   the answer. It used to disappear the moment a turn ended, because it was shown
   while arriving and then dropped rather than kept.
