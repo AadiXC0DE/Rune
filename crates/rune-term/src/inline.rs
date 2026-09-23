@@ -104,6 +104,16 @@ impl Inline {
         below: &[String],
         caret: (u16, u16),
     ) -> Vec<u8> {
+        // The input row is always present, even when nothing is being typed.
+        // Without it the caret has no home of its own and falls back onto the
+        // status row, which is what made the two overlap until streaming
+        // happened to supply a prompt row.
+        let prompt: &[String] = if prompt.is_empty() {
+            &[String::new()]
+        } else {
+            prompt
+        };
+
         let capacity = usize::from(activity.is_some())
             .saturating_add(footer.len())
             .saturating_add(prompt.len())
@@ -123,18 +133,14 @@ impl Inline {
         let live_rows = u16::try_from(rows.len()).unwrap_or(u16::MAX).max(1);
 
         // Where the caret sits, as an offset from the top of the region. The
-        // caller positions it within the prompt; a prompt that is absent leaves
-        // the caret on the last row rather than nowhere.
-        let caret_row = if prompt.is_empty() {
-            live_rows.saturating_sub(1)
-        } else {
-            let within = caret
-                .0
-                .min(u16::try_from(prompt.len()).unwrap_or(1).saturating_sub(1));
-            u16::try_from(prompt_start)
-                .unwrap_or(0)
-                .saturating_add(within)
-        };
+        // input row always exists by this point, so the caret is always placed
+        // inside it and never on a row that belongs to something else.
+        let within = caret
+            .0
+            .min(u16::try_from(prompt.len()).unwrap_or(1).saturating_sub(1));
+        let caret_row = u16::try_from(prompt_start)
+            .unwrap_or(0)
+            .saturating_add(within);
         let caret_row = caret_row.min(live_rows.saturating_sub(1));
 
         let mut out = String::new();
@@ -344,6 +350,63 @@ mod tests {
                 .any(|s| s == "\u{1b}[0A" || s == "\u{1b}[1A" || s == "\u{1b}[2A"),
             "no move back to the region: {seq:?}"
         );
+    }
+
+    #[test]
+    fn the_caret_has_a_row_of_its_own_below_the_status_rows() {
+        // With no prompt row the caret fell back to the last row of the region,
+        // which is a status row, so the two overlapped until something supplied
+        // a prompt. The input row is now always present, which pushes the caret
+        // onto a row of its own below the status.
+        let mut inline = Inline::new(40);
+        let bytes = inline.frame(
+            &[],
+            None,
+            &rows(&["status one", "status two"]),
+            &[],
+            &[],
+            (0, 0),
+        );
+        let text = String::from_utf8_lossy(&bytes).into_owned();
+        assert!(text.contains("status one"), "{text:?}");
+        assert!(text.contains("status two"), "{text:?}");
+
+        // Two status rows and the input row, so the write ends three rows below
+        // where it started and the caret needs no move back: it is already on
+        // the input row.
+        let written = text.matches("\r\n").count();
+        assert_eq!(written, 2, "the input row was not drawn: {text:?}");
+        let seq = escapes(&bytes);
+        assert!(
+            !seq.iter().any(|s| s.ends_with('A')),
+            "the caret was walked back onto a status row: {seq:?}"
+        );
+    }
+
+    #[test]
+    fn text_below_the_input_moves_the_caret_back_up_to_it() {
+        // Streamed text extends below the input, so once it is drawn the caret
+        // has to be walked back up to the line being typed. That walk is what
+        // keeps the cursor on the input rather than on the status line.
+        let mut inline = Inline::new(40);
+        let bytes = inline.frame(
+            &[],
+            None,
+            &rows(&["status"]),
+            &rows(&["> hi"]),
+            &rows(&["an answer"]),
+            (0, 2),
+        );
+        let seq = escapes(&bytes);
+        assert!(
+            seq.iter().any(|s| s == "\u{1b}[1A"),
+            "the caret did not reach the input row: {seq:?}"
+        );
+        // The row it lands on is the input, which is one above the answer.
+        let text = String::from_utf8_lossy(&bytes).into_owned();
+        let input = text.find("> hi").expect("the input row");
+        let answer = text.find("an answer").expect("the answer");
+        assert!(input < answer, "the answer was drawn above the input");
     }
 
     #[test]

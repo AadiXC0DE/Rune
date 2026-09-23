@@ -253,6 +253,18 @@ impl StreamOutcome {
         out
     }
 
+    /// Returns the concatenated reasoning text.
+    #[must_use]
+    pub fn reasoning(&self) -> String {
+        let mut out = String::new();
+        for event in &self.events {
+            if let ProviderEvent::ReasoningDelta { delta } = event {
+                out.push_str(delta);
+            }
+        }
+        out
+    }
+
     /// Returns the completed tool calls.
     #[must_use]
     pub fn tool_calls(&self) -> Vec<(String, String, String)> {

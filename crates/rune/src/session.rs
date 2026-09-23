@@ -146,6 +146,8 @@ struct SessionHost {
     provider_order: Vec<String>,
     /// Whether requests are restricted to that preference.
     provider_strict: bool,
+    /// Escape that opens a reasoning line, resolved from the theme once.
+    reasoning: Mutex<String>,
     /// Text streamed so far in the current step, drawn below the input.
     ///
     /// Shared and mutable because a delta arrives on the turn's own thread
@@ -424,19 +426,34 @@ impl SessionHost {
         if rows.is_empty() {
             return;
         }
-        let prompt_row =
-            transcript::render_prompt(rune_term::shell::prompt(), "", usize::from(self.width()));
-        let caret = rune_term::width::str_width(rune_term::shell::prompt());
-        let Ok(painted) = self.paint(
-            &[],
-            None,
-            std::slice::from_ref(&prompt_row),
-            &rows,
-            (0, u16::try_from(caret).unwrap_or(u16::MAX)),
-        ) else {
+        let (prompt_row, caret) = self.idle_prompt();
+        let Ok(painted) = self.paint(&[], None, &prompt_row, &rows, caret) else {
             return;
         };
         self.show(&painted);
+    }
+
+    /// Returns the empty input row, with the caret at its start.
+    ///
+    /// Every frame draws this, so the region is the same shape whether text is
+    /// arriving or not and the caret always has a row of its own.
+    fn idle_prompt(&self) -> (Vec<String>, (u16, u16)) {
+        let marker = rune_term::shell::prompt();
+        let row = transcript::render_prompt(marker, "", usize::from(self.width()));
+        let caret = rune_term::width::str_width(marker);
+        (vec![row], (0, u16::try_from(caret).unwrap_or(u16::MAX)))
+    }
+
+    /// Returns the escape that opens the reasoning lane.
+    ///
+    /// Resolved from the theme once per call and cached on the host, because
+    /// `Lanes` holds a `&'static str` and the renderer must not allocate per
+    /// line.
+    fn reasoning_style(&self) -> String {
+        self.reasoning
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     /// Returns the rows the streamed text occupies, newest last.
@@ -445,10 +462,15 @@ impl SessionHost {
             return Vec::new();
         };
         let width = usize::from(self.width());
+        let dim = self.theme.sgr(rune_term::theme::Slot::Dim, self.truecolor);
+        let reset = rune_term::engine::Style::RESET;
         let mut rows = Vec::new();
+        // Reasoning comes first and is drawn apart from the answer, in a
+        // secondary colour and indented, so a reader can tell thinking from the
+        // reply at a glance instead of finding them interleaved.
         if !streaming.reasoning.trim().is_empty() {
             for line in rune_term::width::wrap(&streaming.reasoning, width) {
-                rows.push(line);
+                rows.push(format!("{dim}  {line}{reset}"));
             }
         }
         if !streaming.answer.trim().is_empty() {
@@ -517,8 +539,11 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
         rune_context::commands::discover(&config.workspace, &Paths::from_process().config_root)
             .unwrap_or_default();
 
-    // Resolved before the host literal because the registry is moved into it.
+    // Resolved before the host literal because the registry is moved into it,
+    // and because the reasoning lane's colour has to be read off the theme
+    // before the theme itself moves into the host.
     let theme = resolve_theme(&config);
+    let reasoning_escape = theme.sgr(rune_term::theme::Slot::Dim, truecolor_supported());
     let host = SessionHost {
         endpoint: config.endpoint,
         dialect: config.dialect,
@@ -551,6 +576,7 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
         provider_strict: config.settings.provider_strict,
         streaming: Arc::new(Mutex::new(StreamingText::default())),
         live_out: Arc::new(Mutex::new(None)),
+        reasoning: Mutex::new(reasoning_escape),
         reviewer: crate::auto_review::build(&config.settings, &config.paths)?,
         review_session: Arc::new(Mutex::new(ReviewSession::new(&limits))),
     };
@@ -569,7 +595,8 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
     // component that later redraws over them.
     {
         let banner = format!("session {}", recorder.id());
-        let painted = host.paint(std::slice::from_ref(&banner), None, &[], &[], (0, 0))?;
+        let (prompt_row, caret) = host.idle_prompt();
+        let painted = host.paint(std::slice::from_ref(&banner), None, &prompt_row, &[], caret)?;
         if let Ok(mut sink) = out.lock() {
             sink.write_all(&painted)?;
             sink.flush()?;
@@ -639,7 +666,12 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                     &text,
                     usize::from(host.width()),
                 );
-                let painted = host.paint(std::slice::from_ref(&echo), None, &[], &[], (0, 0))?;
+                // The typed line is committed and an empty input row is drawn
+                // under it, so the caret has its own row from the moment the
+                // line is submitted rather than only once streaming starts.
+                let (prompt_row, caret) = host.idle_prompt();
+                let painted =
+                    host.paint(std::slice::from_ref(&echo), None, &prompt_row, &[], caret)?;
                 sink.write_all(&painted)?;
                 sink.flush()?;
 
@@ -1024,6 +1056,12 @@ fn report_turn(outcome: &turn::TurnOutcome, host: &SessionHost) -> Result<Vec<St
         }
     }
 
+    // Reasoning is shown above the answer and in its own lane, so a reader can
+    // tell what the model thought from what it concluded.
+    if !outcome.reasoning.trim().is_empty() {
+        entries.push(Entry::reasoning(outcome.reasoning.clone()));
+    }
+
     if !outcome.text.is_empty() {
         entries.push(Entry::assistant(outcome.text.clone()));
     }
@@ -1041,7 +1079,11 @@ fn report_turn(outcome: &turn::TurnOutcome, host: &SessionHost) -> Result<Vec<St
         width: usize::from(host.width()),
         ..Display::default()
     };
-    let rendered = transcript::render(&entries, display);
+    let lanes = transcript::Lanes {
+        reasoning: host.reasoning_style(),
+        reset: rune_term::engine::Style::RESET.to_owned(),
+    };
+    let rendered = transcript::render_lanes(&entries, display, &lanes);
     Ok(rendered.lines().map(str::to_owned).collect())
 }
 
@@ -1642,6 +1684,7 @@ mod tests {
         let outcome = turn::TurnOutcome {
             stop_reason: StopReason::Completed,
             text: "the answer".to_owned(),
+            reasoning: String::new(),
             usage: rune_net::stream::Usage::default(),
             steps: 1,
             calls: Vec::new(),
@@ -1659,6 +1702,7 @@ mod tests {
         let outcome = turn::TurnOutcome {
             stop_reason: StopReason::StepLimit,
             text: String::new(),
+            reasoning: String::new(),
             usage: rune_net::stream::Usage::default(),
             steps: 40,
             calls: Vec::new(),
@@ -1684,6 +1728,7 @@ mod tests {
         let outcome = turn::TurnOutcome {
             stop_reason: StopReason::Completed,
             text: String::new(),
+            reasoning: String::new(),
             usage: rune_net::stream::Usage::default(),
             steps: 1,
             calls: Vec::new(),
@@ -1808,6 +1853,7 @@ mod tests {
             provider_strict: false,
             streaming: Arc::new(Mutex::new(StreamingText::default())),
             live_out: Arc::new(Mutex::new(None)),
+            reasoning: Mutex::new("\u{1b}[2m".to_owned()),
             reviewer: None,
             review_session: Arc::new(Mutex::new(ReviewSession::new(&BudgetSet::new()))),
         }

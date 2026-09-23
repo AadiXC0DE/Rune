@@ -684,6 +684,7 @@ mod tests {
         TurnOutcome {
             stop_reason: StopReason::Completed,
             text: text.to_owned(),
+            reasoning: String::new(),
             usage: Usage {
                 input_tokens: Some(10),
                 output_tokens: Some(4),

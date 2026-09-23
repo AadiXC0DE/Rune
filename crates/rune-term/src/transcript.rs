@@ -14,6 +14,8 @@ use crate::width::{str_width, truncate_to_width, wrap};
 pub enum Speaker {
     /// The user.
     User,
+    /// The model's reasoning, shown apart from its answer.
+    Reasoning,
     /// The model.
     Assistant,
     /// A tool call or its result.
@@ -61,6 +63,16 @@ impl Entry {
             speaker: Speaker::Tool,
             text: text.into(),
             expandable: true,
+        }
+    }
+
+    /// Builds an entry for the model's reasoning.
+    #[must_use]
+    pub fn reasoning(text: impl Into<String>) -> Self {
+        Self {
+            speaker: Speaker::Reasoning,
+            text: text.into(),
+            expandable: false,
         }
     }
 
@@ -189,7 +201,7 @@ pub fn render_grouped(entries: &[Entry], display: Display) -> String {
             out.push('\n');
         }
         match item {
-            Ok(entry) => render_entry(&entry, display, &mut out),
+            Ok(entry) => render_entry(&entry, display, &Lanes::default(), &mut out),
             Err(group) => {
                 let _ = writeln!(out, "  {}", group.summary());
             }
@@ -285,18 +297,51 @@ impl Default for Display {
 /// for. Tool output is, because it is usually long and rarely read in full.
 #[must_use]
 pub fn render(entries: &[Entry], display: Display) -> String {
+    render_lanes(entries, display, &Lanes::default())
+}
+
+/// How a lane is drawn.
+///
+/// The caller supplies the escapes so the theme decides the colours rather than
+/// the renderer naming them. Owned rather than borrowed because a theme resolves
+/// its slots at run time, and the renderer outlives the value it was called
+/// with. A default renders reasoning in the terminal's own dim attribute, which
+/// every terminal understands.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Lanes {
+    /// Opens a reasoning line.
+    pub reasoning: String,
+    /// Closes a reasoning line.
+    pub reset: String,
+}
+
+impl Default for Lanes {
+    fn default() -> Self {
+        Self {
+            reasoning: "\u{1b}[2m".to_owned(),
+            reset: "\u{1b}[0m".to_owned(),
+        }
+    }
+}
+
+/// Renders a transcript with caller-supplied lane styling.
+///
+/// Separate from [`render`] so a caller with a theme can colour the reasoning
+/// lane without every other caller having to say how it is drawn.
+#[must_use]
+pub fn render_lanes(entries: &[Entry], display: Display, lanes: &Lanes) -> String {
     let mut out = String::new();
     for (index, entry) in entries.iter().enumerate() {
         if index > 0 {
             out.push('\n');
         }
-        render_entry(entry, display, &mut out);
+        render_entry(entry, display, lanes, &mut out);
     }
     out.trim_end().to_owned()
 }
 
 /// Renders one entry into `out`.
-fn render_entry(entry: &Entry, display: Display, out: &mut String) {
+fn render_entry(entry: &Entry, display: Display, lanes: &Lanes, out: &mut String) {
     let width = display.width.max(MIN_WIDTH);
     let body = wrap(&sanitize(&entry.text), width.saturating_sub(2));
 
@@ -310,6 +355,13 @@ fn render_entry(entry: &Entry, display: Display, out: &mut String) {
         Speaker::Assistant => {
             for line in &body {
                 let _ = writeln!(out, "{line}");
+            }
+        }
+        // Reasoning is drawn in a secondary colour and indented, so it is
+        // visually a separate lane from the answer rather than mixed into it.
+        Speaker::Reasoning => {
+            for line in &body {
+                let _ = writeln!(out, "{}  {line}{}", lanes.reasoning, lanes.reset);
             }
         }
         Speaker::Tool => {
@@ -481,6 +533,43 @@ mod tests {
                 "continuation lost its indent: {rendered}"
             );
         }
+    }
+
+    #[test]
+    fn reasoning_is_drawn_in_its_own_lane_before_the_answer() {
+        // Thinking and the answer are separate things, so they are drawn apart
+        // rather than interleaved. The lane also has to survive the turn, which
+        // is why the text is an entry rather than a transient.
+        let entries = vec![
+            Entry::reasoning("weighing the options"),
+            Entry::assistant("the answer"),
+        ];
+        let rendered = render_lanes(
+            &entries,
+            Display::default(),
+            &Lanes {
+                reasoning: "<dim>".to_owned(),
+                reset: "<reset>".to_owned(),
+            },
+        );
+        let thinking = rendered.find("weighing the options").expect("reasoning");
+        let answer = rendered.find("the answer").expect("the answer");
+        assert!(thinking < answer, "reasoning was drawn after the answer");
+        assert!(
+            rendered.contains("<dim>"),
+            "the lane was not styled: {rendered:?}"
+        );
+        assert!(rendered.contains("<reset>"), "{rendered:?}");
+    }
+
+    #[test]
+    fn a_default_lane_still_marks_reasoning_apart() {
+        // A caller with no theme still gets reasoning distinguished, rather
+        // than mixed into the answer.
+        let entries = vec![Entry::reasoning("thinking")];
+        let rendered = render(&entries, Display::default());
+        assert_ne!(rendered, "thinking", "reasoning was not set apart");
+        assert!(rendered.contains("thinking"), "{rendered:?}");
     }
 
     #[test]

@@ -28,6 +28,21 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Added
 
+- Reasoning streams in its own lane, indented and in a secondary colour, above
+  the answer. It used to disappear the moment a turn ended, because it was shown
+  while arriving and then dropped rather than kept.
+
+### Fixed
+
+- The cursor no longer overlaps the status line. After a prompt was submitted the
+  frame carried no input row, so the cursor fell back to the last row of the
+  region, which is a status row, and stayed there until streaming happened to
+  supply a row of its own. Every frame now draws the input row.
+
+## 0.1.5
+
+### Added
+
 - Responses stream. Text appears as the model produces it rather than after the
   whole answer has arrived, so a long reply starts showing immediately.
 
@@ -36,6 +51,22 @@ Notable changes, newest first. Each entry describes what a user can observe.
 - The status line sits above the input, where a reader looks for it and where it
   does not move while an answer arrives. The answer grows downward from the
   input, so a long reply never pushes the line being typed off the screen.
+- A protocol client no longer receives the answer twice. The server sent the
+  finished text as one chunk because there was nothing to stream; with the
+  deltas arriving as they are produced, sending the whole answer again
+  duplicated what the client had already seen.
+
+## 0.1.4
+
+### Added
+
+- Text wraps between words instead of at the column, so model output no longer
+  breaks a word in half. A single word longer than the line is still split,
+  because the alternative is overflowing the terminal.
+
+## 0.1.3
+
+### Fixed
 
 - The interactive screen no longer garbles. Two components were writing to the
   terminal: finished text was printed in the flow while the live region was
@@ -53,10 +84,10 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 - The prompt is a full line editor: cursor movement by character and by word,
   home and end, delete by character and by word, kill to either end, and paste.
-- Text wraps between words instead of at the column, so model output no longer
-  breaks a word in half. A single word longer than the line is still split,
-  because the alternative is overflowing the terminal.
 
+## 0.1.2
+
+### Added
 
 - `rune models` lists the models the configured endpoint serves, read from the
   endpoint itself. A model released after this build appears, which a compiled

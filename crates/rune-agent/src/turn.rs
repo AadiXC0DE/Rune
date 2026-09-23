@@ -224,6 +224,11 @@ pub struct TurnOutcome {
     pub stop_reason: StopReason,
     /// Assistant text produced across every step.
     pub text: String,
+    /// Reasoning the model produced, kept apart from its answer.
+    ///
+    /// Held separately so a reader can tell thinking from the reply, and so the
+    /// two are never interleaved in one blob.
+    pub reasoning: String,
     /// Usage across every step.
     pub usage: Usage,
     /// Steps taken.
@@ -257,6 +262,8 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
     let agent = transport::agent();
     let mut usage = Usage::default();
     let mut calls = Vec::new();
+    // Reasoning accumulated across steps, so a multi-step turn keeps all of it.
+    let mut reasoning = String::new();
     let mut steps: u32 = 0;
     // Tool-result bytes this turn has retained, shared across its steps.
     let mut result_bytes: usize = 0;
@@ -269,6 +276,7 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
             let outcome = TurnOutcome {
                 stop_reason: StopReason::StepLimit,
                 text: String::new(),
+                reasoning,
                 usage,
                 steps,
                 calls,
@@ -301,6 +309,15 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
         usage = usage.merge_max(outcome.usage);
 
         let text = outcome.text();
+        // Reasoning is accumulated across steps, so a turn that used several
+        // ends up with all of its thinking rather than only the last step's.
+        let step_reasoning = outcome.reasoning();
+        if !step_reasoning.trim().is_empty() {
+            if !reasoning.is_empty() {
+                reasoning.push('\n');
+            }
+            reasoning.push_str(&step_reasoning);
+        }
         let tool_calls = outcome.tool_calls();
         let finish = outcome.finish.unwrap_or(FinishReason::Stop);
 
@@ -314,6 +331,14 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
                 // only assembled into the turn's record.
                 rune_net::stream::ProviderEvent::TextDelta { delta } => {
                     parts.push(ContentPart::Text {
+                        text: delta.clone(),
+                    });
+                }
+                // Reasoning is assembled too, so it outlives the turn. A
+                // provider that requires its own reasoning replayed would
+                // otherwise be sent a conversation with the thinking removed.
+                rune_net::stream::ProviderEvent::ReasoningDelta { delta } => {
+                    parts.push(ContentPart::Reasoning {
                         text: delta.clone(),
                     });
                 }
@@ -366,6 +391,7 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
             return Ok(TurnOutcome {
                 stop_reason: reason,
                 text,
+                reasoning,
                 usage,
                 steps,
                 calls,
@@ -411,6 +437,7 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
             return Ok(TurnOutcome {
                 stop_reason: StopReason::ProviderFailure,
                 text,
+                reasoning,
                 usage,
                 steps,
                 calls,
@@ -703,6 +730,11 @@ fn coalesce_text(parts: Vec<ContentPart>) -> Vec<ContentPart> {
     for part in parts {
         match (out.last_mut(), &part) {
             (Some(ContentPart::Text { text }), ContentPart::Text { text: next }) => {
+                text.push_str(next);
+            }
+            // Reasoning arrives one delta at a time like text, so it is merged
+            // the same way rather than kept as a part per token.
+            (Some(ContentPart::Reasoning { text }), ContentPart::Reasoning { text: next }) => {
                 text.push_str(next);
             }
             _ => out.push(part),

@@ -920,42 +920,43 @@ impl TurnContext {
     }
 }
 
+/// What a turn has accumulated so far.
+///
+/// Grouped rather than passed as separate arguments, because the pieces travel
+/// together through every exit from the loop and a positional list of them is
+/// easy to get wrong in a way the compiler cannot catch.
+#[derive(Default)]
+struct Accumulated {
+    /// Answer text produced so far.
+    text: String,
+    /// Reasoning produced so far, kept apart from the answer.
+    reasoning: String,
+    /// Usage across steps.
+    usage: Usage,
+    /// Steps taken.
+    steps: u32,
+    /// Tool calls made, in order.
+    calls: Vec<CallResult>,
+    /// Images the turn produced.
+    images: Vec<HostImage>,
+}
+
 /// Runs one turn to completion.
 fn run_turn(context: &TurnContext) -> Result<TurnProduct> {
     let provider = context.dialect.provider();
-    let mut steps: u32 = 0;
-    let mut usage = Usage::default();
-    let mut calls: Vec<CallResult> = Vec::new();
-    let mut images: Vec<HostImage> = Vec::new();
-    let mut text = String::new();
+    let mut acc = Accumulated::default();
 
     loop {
         if context.cancel.is_cancelled() {
-            return Ok(settle(
-                context,
-                StopReason::Cancelled,
-                text,
-                usage,
-                steps,
-                calls,
-                images,
-            ));
+            return Ok(settle(context, StopReason::Cancelled, acc));
         }
         // Zero means unlimited steps, which is the documented default.
-        if context.max_steps > 0 && u64::from(steps) >= context.max_steps {
-            return Ok(settle(
-                context,
-                StopReason::StepLimit,
-                text,
-                usage,
-                steps,
-                calls,
-                images,
-            ));
+        if context.max_steps > 0 && u64::from(acc.steps) >= context.max_steps {
+            return Ok(settle(context, StopReason::StepLimit, acc));
         }
 
-        steps = steps.saturating_add(1);
-        context.emit(Event::TurnStarted { step: steps });
+        acc.steps = acc.steps.saturating_add(1);
+        context.emit(Event::TurnStarted { step: acc.steps });
 
         let plan = context.plan()?;
         let response = match request(context, provider.as_ref(), &plan) {
@@ -963,27 +964,19 @@ fn run_turn(context: &TurnContext) -> Result<TurnProduct> {
             // A cancellation during the request settles the turn rather than
             // failing it: the caller asked for it, so it is not an error.
             Err(err) if err.code() == ErrorCode::Cancelled => {
-                return Ok(settle(
-                    context,
-                    StopReason::Cancelled,
-                    text,
-                    usage,
-                    steps,
-                    calls,
-                    images,
-                ));
+                return Ok(settle(context, StopReason::Cancelled, acc));
             }
             Err(err) => return Err(err),
         };
-        usage = usage.merge_max(response.usage);
-        context.store_usage(usage);
+        acc.usage = acc.usage.merge_max(response.usage);
+        context.store_usage(acc.usage);
 
         let mut parts: Vec<ContentPart> = Vec::new();
         let mut pending: Vec<PreparedCall> = Vec::new();
         for event in &response.events {
             match event {
                 ProviderEvent::TextDelta { delta } => {
-                    text.push_str(delta);
+                    acc.text.push_str(delta);
                     context.emit(Event::TextDelta {
                         delta: delta.clone(),
                     });
@@ -992,6 +985,7 @@ fn run_turn(context: &TurnContext) -> Result<TurnProduct> {
                     });
                 }
                 ProviderEvent::ReasoningDelta { delta } => {
+                    acc.reasoning.push_str(delta);
                     context.emit(Event::ReasoningDelta {
                         delta: delta.clone(),
                     });
@@ -1035,26 +1029,10 @@ fn run_turn(context: &TurnContext) -> Result<TurnProduct> {
         // the turn before any tool runs, which is what a caller that closed the
         // agent while the model was thinking expects.
         if context.cancel.is_cancelled() {
-            return Ok(settle(
-                context,
-                StopReason::Cancelled,
-                text,
-                usage,
-                steps,
-                calls,
-                images,
-            ));
+            return Ok(settle(context, StopReason::Cancelled, acc));
         }
         if pending.is_empty() {
-            return Ok(settle(
-                context,
-                stop_reason(finish),
-                text,
-                usage,
-                steps,
-                calls,
-                images,
-            ));
+            return Ok(settle(context, stop_reason(finish), acc));
         }
 
         let (results, cancelled) = execute(context, &pending);
@@ -1071,34 +1049,19 @@ fn run_turn(context: &TurnContext) -> Result<TurnProduct> {
                     image: context.register_image(image),
                 });
             }
-            images.extend(executed.images.iter().cloned());
+            acc.images.extend(executed.images.iter().cloned());
         }
         lock(&context.conversation.history).push_tool_results(result_parts);
-        calls.extend(results.into_iter().map(|executed| executed.result));
+        acc.calls
+            .extend(results.into_iter().map(|executed| executed.result));
 
         if cancelled {
-            return Ok(settle(
-                context,
-                StopReason::Cancelled,
-                text,
-                usage,
-                steps,
-                calls,
-                images,
-            ));
+            return Ok(settle(context, StopReason::Cancelled, acc));
         }
         // A provider error with calls in flight still ends the turn, after their
         // results are recorded, so nothing the model asked for is lost.
         if finish == FinishReason::ProviderError {
-            return Ok(settle(
-                context,
-                StopReason::ProviderFailure,
-                text,
-                usage,
-                steps,
-                calls,
-                images,
-            ));
+            return Ok(settle(context, StopReason::ProviderFailure, acc));
         }
     }
 }
@@ -1339,15 +1302,15 @@ fn stop_reason(finish: FinishReason) -> StopReason {
 }
 
 /// Records the end of a turn and hands its product back.
-fn settle(
-    context: &TurnContext,
-    stop_reason: StopReason,
-    text: String,
-    usage: Usage,
-    steps: u32,
-    calls: Vec<CallResult>,
-    images: Vec<HostImage>,
-) -> TurnProduct {
+fn settle(context: &TurnContext, stop_reason: StopReason, acc: Accumulated) -> TurnProduct {
+    let Accumulated {
+        text,
+        reasoning,
+        usage,
+        steps,
+        calls,
+        images,
+    } = acc;
     context.emit(Event::Finished {
         reason: stop_reason,
         usage,
@@ -1357,6 +1320,7 @@ fn settle(
         outcome: TurnOutcome {
             stop_reason,
             text,
+            reasoning,
             usage,
             steps,
             calls,
