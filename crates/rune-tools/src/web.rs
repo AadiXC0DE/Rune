@@ -1326,6 +1326,181 @@ fn domain_arg(arguments: &serde_json::Value, name: &str) -> Result<Vec<String>> 
     Ok(out)
 }
 
+/// One result row of a search page./// One result row of a search page.
+///
+/// Extracted by pattern rather than by a full HTML parse, because the only
+/// markup this reads is the search engine's own result table. A tag is stripped
+/// from the text so a snippet carrying emphasis does not arrive with it.
+fn strip_tags(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut inside = false;
+    for ch in text.chars() {
+        match ch {
+            '<' => inside = true,
+            '>' => inside = false,
+            _ if !inside => out.push(ch),
+            _ => {}
+        }
+    }
+    // The entity set a search result actually uses.
+    out.replace("&amp;", "&")
+        .replace("&quot;", "\"")
+        .replace("&#x27;", "'")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&nbsp;", " ")
+        .trim()
+        .to_owned()
+}
+
+/// Recovers the destination from a search engine's redirect link.
+///
+/// DuckDuckGo wraps results as `/l/?uddg=<encoded>`, so the URL a reader would
+/// use is a query parameter rather than the link itself. A link that is already
+/// absolute is returned unchanged.
+fn unwrap_redirect(url: &str) -> String {
+    let absolute = if let Some(rest) = url.strip_prefix("//") {
+        format!("https://{rest}")
+    } else if url.starts_with("http") {
+        url.to_owned()
+    } else {
+        return String::new();
+    };
+    let Some((_, query)) = absolute.split_once("uddg=") else {
+        return absolute;
+    };
+    let encoded = query.split('&').next().unwrap_or(query);
+    percent_decode(encoded)
+}
+
+/// Decodes a percent-encoded string.
+///
+/// Only the escapes a URL uses: the search engine does not double-encode, so a
+/// full decoder would be more machinery than the case needs.
+fn percent_decode(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' && index.saturating_add(3) <= bytes.len() {
+            let start = index.saturating_add(1);
+            let end = index.saturating_add(3);
+            let hex = std::str::from_utf8(&bytes[start..end]).unwrap_or("");
+            if let Ok(byte) = u8::from_str_radix(hex, 16) {
+                out.push(byte);
+                index = index.saturating_add(3);
+                continue;
+            }
+        }
+        out.push(bytes[index]);
+        index = index.saturating_add(1);
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Longest a search request may take.
+pub const SEARCH_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Extracts results from a search page.
+///
+/// Public because the caller that owns the transport fetches the page: this
+/// crate says what a result is, and the caller says how to get one.
+///
+/// Walks the rows in document order, so each link is paired with the snippet
+/// that follows it. Pairing by index instead breaks the moment the page carries
+/// a row without a snippet, which is what sponsored results do: every later
+/// snippet then belongs to the wrong link.
+pub fn parse_results(page: &str, filters: &SearchFilters, max: usize) -> Vec<SearchResult> {
+    let row = LazyLock::new(|| {
+        // Compiling a literal pattern cannot fail, and a failure here would be
+        // found by the tests rather than by a user.
+        regex::Regex::new(r"(?is)<tr[^>]*>(.*?)</tr>")
+            .unwrap_or_else(|_| unreachable!("the row pattern is a valid literal"))
+    });
+    let anchor = LazyLock::new(|| {
+        regex::Regex::new(r#"(?is)<a\s([^>]*class=['"]result-link['"][^>]*)>(.*?)</a>"#)
+            .unwrap_or_else(|_| unreachable!("the link pattern is a valid literal"))
+    });
+    let href_of = LazyLock::new(|| {
+        regex::Regex::new(r#"(?is)href=['"]([^'"]+)['"]"#)
+            .unwrap_or_else(|_| unreachable!("the href pattern is a valid literal"))
+    });
+    let snippet = LazyLock::new(|| {
+        regex::Regex::new(r#"(?is)class=['"]result-snippet['"][^>]*>(.*?)</td>"#)
+            .unwrap_or_else(|_| unreachable!("the snippet pattern is a valid literal"))
+    });
+
+    let mut results: Vec<SearchResult> = Vec::new();
+    // The result waiting for its snippet. A page puts the snippet on the row
+    // after the link, so the link is held until the next row is read.
+    let mut pending: Option<SearchResult> = None;
+
+    for group in row.captures_iter(page) {
+        let Some(content) = group.get(1).map(|m| m.as_str()) else {
+            continue;
+        };
+
+        if let Some(found) = anchor.captures(content) {
+            // A new link closes whatever was waiting, with no snippet.
+            if let Some(previous) = pending.take()
+                && filters.accepts(&previous.url)
+                && !previous.title.is_empty()
+            {
+                results.push(previous);
+            }
+            let attributes = found.get(1).map_or("", |m| m.as_str());
+            let title = strip_tags(found.get(2).map_or("", |m| m.as_str()));
+            let href = href_of
+                .captures(attributes)
+                .and_then(|found| found.get(1))
+                .map_or("", |m| m.as_str());
+            let url = unwrap_redirect(href);
+            // A link that resolves back to the engine is an advertisement or a
+            // help page rather than a result, and is not passed on as a source.
+            if !url.is_empty() && !is_engine_url(&url) {
+                pending = Some(SearchResult {
+                    title,
+                    url,
+                    snippet: String::new(),
+                });
+            }
+            continue;
+        }
+
+        // A snippet row completes the result the previous row opened.
+        if let Some(found) = snippet.captures(content)
+            && let Some(result) = pending.as_mut()
+            && result.snippet.is_empty()
+        {
+            result.snippet = strip_tags(found.get(1).map_or("", |m| m.as_str()));
+        }
+    }
+
+    if let Some(last) = pending
+        && filters.accepts(&last.url)
+        && !last.title.is_empty()
+    {
+        results.push(last);
+    }
+
+    results.retain(|result| filters.accepts(&result.url));
+    results.truncate(max);
+    results
+}
+
+/// Returns true when a URL points back at the search engine itself.
+///
+/// Sponsored results and the engine's own help pages arrive in the same markup
+/// as an organic result, so they are told apart by where they lead.
+fn is_engine_url(url: &str) -> bool {
+    let host = host_of_url(url).to_ascii_lowercase();
+    if host == "duckduckgo.com" || host.ends_with(".duckduckgo.com") {
+        return true;
+    }
+    // A redirector that failed to unwrap still carries the engine's host.
+    host.ends_with("bing.com") && url.contains("aclick")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1354,6 +1529,110 @@ mod tests {
 
     fn call(tool: &WebFetch, arguments: &serde_json::Value) -> Result<ToolOutput> {
         tool.call(arguments, &context())
+    }
+
+    #[test]
+    fn a_search_page_yields_its_results() {
+        // The shape a results page is built from: a link row, then a snippet
+        // row. The attribute order is the engine's own, which is what the
+        // matcher has to accept: requiring the other order found nothing at all
+        // against the real endpoint while passing against a fixture that
+        // happened to be written that way.
+        let page = r#"
+        <tr><td>1.&nbsp;</td><td>
+          <a rel="nofollow" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Frust-lang.org%2F&amp;rut=x" class='result-link'>Rust Programming Language</a></td></tr>
+        <tr><td class='result-snippet'>A <b>language</b> empowering everyone.</td></tr>
+        <tr><td>2.&nbsp;</td><td>
+          <a rel="nofollow" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2Fa%3Fb%3D1" class='result-link'>An Example</a></td></tr>
+        <tr><td class='result-snippet'>Second snippet.</td></tr>
+        "#;
+        let results = parse_results(page, &SearchFilters::default(), 10);
+        assert_eq!(results.len(), 2, "{results:#?}");
+        assert_eq!(results[0].title, "Rust Programming Language");
+        assert_eq!(results[0].url, "https://rust-lang.org/");
+        assert_eq!(results[0].snippet, "A language empowering everyone.");
+        assert_eq!(results[1].url, "https://example.com/a?b=1");
+    }
+
+    #[test]
+    fn a_search_result_honours_the_domain_filters() {
+        let page = r#"
+        <tr><a href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fkeep.example%2F" class='result-link'>Keep</a></tr>
+        <tr><td class='result-snippet'>wanted</td></tr>
+        <tr><a href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fdrop.example%2F" class='result-link'>Drop</a></tr>
+        <tr><td class='result-snippet'>unwanted</td></tr>
+        "#;
+        let filters = SearchFilters {
+            blocked_domains: vec!["drop.example".to_owned()],
+            ..SearchFilters::default()
+        };
+        let results = parse_results(page, &filters, 10);
+        assert_eq!(results.len(), 1, "{results:#?}");
+        assert_eq!(results[0].title, "Keep");
+    }
+
+    #[test]
+    fn a_search_result_count_is_capped() {
+        let mut page = String::new();
+        for n in 0..10 {
+            let _ = write!(
+                page,
+                "<tr><a href=\"//duckduckgo.com/l/?uddg=https%3A%2F%2Fe{n}.example%2F\" class='result-link'>T{n}</a></tr>"
+            );
+        }
+        assert_eq!(parse_results(&page, &SearchFilters::default(), 3).len(), 3);
+    }
+
+    #[test]
+    fn markup_inside_a_snippet_is_stripped() {
+        // A snippet arrives with emphasis around the matched terms and an entity
+        // for an ampersand.
+        let page = r#"
+        <tr><a href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fx.example%2F" class='result-link'>T</a></tr>
+        <tr><td class='result-snippet'>A &amp; B with <b>bold</b> text</td></tr>
+        "#;
+        let results = parse_results(page, &SearchFilters::default(), 5);
+        assert_eq!(results[0].snippet, "A & B with bold text");
+    }
+
+    #[test]
+    fn a_search_page_with_no_results_is_empty() {
+        assert!(parse_results("<html>nothing</html>", &SearchFilters::default(), 5).is_empty());
+    }
+
+    #[test]
+    fn a_sponsored_result_does_not_shift_the_snippets() {
+        // A sponsored row carries a link but no snippet of its own. Pairing the
+        // two lists by index then gives every later result the snippet of the
+        // one before it, which is what the live endpoint produced.
+        let page = r#"
+        <tr><a href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fad.example%2F" class='result-link'>Sponsored</a></tr>
+        <tr><a href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fone.example%2F" class='result-link'>One</a></tr>
+        <tr><td class='result-snippet'>first snippet</td></tr>
+        <tr><a href="//duckduckgo.com/l/?uddg=https%3A%2F%2Ftwo.example%2F" class='result-link'>Two</a></tr>
+        <tr><td class='result-snippet'>second snippet</td></tr>
+        "#;
+        let results = parse_results(page, &SearchFilters::default(), 10);
+        assert_eq!(results.len(), 3, "{results:#?}");
+        assert_eq!(results[0].title, "Sponsored");
+        assert_eq!(results[0].snippet, "", "a sponsored row has no snippet");
+        assert_eq!(results[1].snippet, "first snippet");
+        assert_eq!(results[2].snippet, "second snippet");
+    }
+
+    #[test]
+    fn a_result_leading_back_to_the_engine_is_not_a_source() {
+        // Sponsored results and the engine's own pages arrive in the same
+        // markup as an organic result, and a source that leads back to the
+        // engine is not a source.
+        let page = r#"
+        <tr><a href="//duckduckgo.com/y.js?ad_domain=x" class='result-link'>Ad</a></tr>
+        <tr><a href="https://duckduckgo.com/help" class='result-link'>Help</a></tr>
+        <tr><a href="//duckduckgo.com/l/?uddg=https%3A%2F%2Freal.example%2F" class='result-link'>Real</a></tr>
+        "#;
+        let results = parse_results(page, &SearchFilters::default(), 10);
+        assert_eq!(results.len(), 1, "{results:#?}");
+        assert_eq!(results[0].title, "Real");
     }
 
     #[test]

@@ -409,6 +409,118 @@ pub fn stream_completion_observed(
     )
 }
 
+/// One response to an outbound request that is not a model completion.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Fetched {
+    /// HTTP status of the final response.
+    pub status: u16,
+    /// Media type as reported, parameters included.
+    pub content_type: String,
+    /// Response body.
+    pub body: Vec<u8>,
+}
+
+/// Largest body any outbound tool request will hold.
+pub const MAX_FETCH_BYTES: u64 = 16 * 1024 * 1024;
+
+/// A user agent used by the tool-facing client.
+///
+/// Names the program and its version so a server that rate limits or blocks can
+/// see who is asking, rather than receiving an unnamed scraper.
+pub const TOOL_USER_AGENT: &str = concat!(
+    "Mozilla/5.0 (compatible; rune/",
+    env!("CARGO_PKG_VERSION"),
+    "; +https://github.com/AadiXC0DE/Rune)"
+);
+
+/// Fetches a URL for a tool.
+///
+/// Lives here rather than with the tool because every outbound request has to
+/// pass through this module: it is the one place where the address, scheme, and
+/// credential refusals are enforced, and a second client elsewhere would be a
+/// way around them.
+pub fn fetch_url(url: &str, accept: &str, timeout: Duration) -> NetResult<Fetched> {
+    let response = agent()
+        .get(url)
+        .header("user-agent", TOOL_USER_AGENT)
+        .header("accept", accept)
+        .config()
+        .timeout_global(Some(timeout))
+        .build()
+        .call()
+        .map_err(|err| classify_transport_error(&err))?;
+
+    let status = response.status().as_u16();
+    let content_type = response
+        .headers()
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("application/octet-stream")
+        .to_owned();
+
+    let mut body = Vec::new();
+    response
+        .into_body()
+        .into_reader()
+        .take(MAX_FETCH_BYTES)
+        .read_to_end(&mut body)
+        .map_err(NetError::from)?;
+
+    Ok(Fetched {
+        status,
+        content_type,
+        body,
+    })
+}
+
+/// Searches the web through an HTML results endpoint.
+///
+/// Returns the page rather than parsed results, because parsing belongs with the
+/// tool that defines what a result is. What lives here is the request, so this
+/// module remains the only place that opens a connection.
+pub fn search_html(query: &str, endpoint: &str, timeout: Duration) -> NetResult<String> {
+    let escaped = percent_encode_query(query);
+    let separator = if endpoint.contains('?') { '&' } else { '?' };
+    let url = format!("{endpoint}{separator}q={escaped}");
+    let fetched = fetch_url(
+        &url,
+        "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8",
+        timeout,
+    )?;
+    if fetched.status >= 400 {
+        return Err(NetError::new(
+            FailureKind::Network,
+            format!("the search endpoint returned HTTP {}", fetched.status),
+        )
+        .with_status(fetched.status)
+        .with_hint("the endpoint may be rate limiting or refusing this client"));
+    }
+    Ok(String::from_utf8_lossy(&fetched.body).into_owned())
+}
+
+/// Escapes a query for a URL.
+///
+/// A space becomes `+`, which a search endpoint reads as a space, and every
+/// other reserved byte is percent-encoded so a term carrying an ampersand or a
+/// hash reaches the endpoint as one term rather than as several parameters.
+#[must_use]
+pub fn percent_encode_query(query: &str) -> String {
+    let mut out = String::with_capacity(query.len());
+    for byte in query.as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(char::from(*byte));
+            }
+            b' ' => out.push('+'),
+            other => {
+                use std::fmt::Write as _;
+                let _ = write!(out, "%{other:02X}");
+            }
+        }
+    }
+    out
+}
+
 /// Fetches the models an endpoint offers.
 ///
 /// This is the one non-streaming request in this module. It exists because a

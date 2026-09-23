@@ -25,6 +25,7 @@ mod session;
 mod session_log;
 mod spec;
 mod version;
+mod web_client;
 
 use std::process::ExitCode;
 
@@ -1071,10 +1072,11 @@ fn run_acp(
         _ => rune_acp::Dialect::ChatCompletions,
     };
 
-    let registry = rune_tools::inventory::builtin(
+    let registry = rune_tools::inventory::builtin_with_web(
         &rune_tools::workspace::FileLimits::from_budget(&settings.limits),
         &settings.limits,
         &paths.managed_skills_dir(),
+        web_client::backends(settings),
     )?;
 
     let rules = rune_policy::rules::RuleSet::new();

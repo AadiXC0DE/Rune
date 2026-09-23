@@ -59,6 +59,17 @@ asks the endpoint rather than a table compiled into the binary, so a model
 released after this build still appears. Add `--offline` to report the configured
 model without contacting anything.
 
+The web tools are off until asked for. `rune doctor` reports what this machine
+supports, and turning them on is one setting:
+
+```toml
+web_tools = true
+```
+
+They are refused by default because they send your queries to a search engine,
+which is your call rather than a repository's, so a project file cannot enable
+them. `offline = true` refuses every outbound request including the model.
+
 A model larger than the default window declares its capacity, which is what
 `rune config` reports and what the status line budgets against:
 

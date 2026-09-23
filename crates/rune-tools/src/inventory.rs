@@ -40,6 +40,24 @@ pub const ADVERTISEMENT_ORDER: &[&str] = &[
     "install_skill",
 ];
 
+/// The outbound clients the web tools run on.
+///
+/// Supplied by whoever composes a run, because this crate does not open
+/// connections: the transport belongs to the crate that owns egress, and the
+/// tools receive it.
+pub struct WebBackends {
+    /// Client that performs a fetch.
+    pub fetch: std::sync::Arc<dyn crate::web::FetchBackend>,
+    /// Client that performs a search.
+    pub search: std::sync::Arc<dyn crate::web::SearchBackend>,
+}
+
+impl std::fmt::Debug for WebBackends {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WebBackends").finish_non_exhaustive()
+    }
+}
+
 /// Builds a registry holding every built-in tool.
 ///
 /// The limits are supplied rather than read from a global, so a host that lowers
@@ -51,6 +69,36 @@ pub fn builtin(
     limits: &FileLimits,
     budget: &rune_core::budget::BudgetSet,
     skills_root: &camino::Utf8Path,
+) -> Result<Registry> {
+    builtin_with_offline(limits, budget, skills_root, false)
+}
+
+/// Builds the registry, refusing outbound requests when offline.
+///
+/// Offline is stated here rather than left to the policy layer, because it is a
+/// property of the run rather than a decision about a tool: a session with no
+/// network must not reach out even if every rule would allow it.
+pub fn builtin_with_offline(
+    limits: &FileLimits,
+    budget: &rune_core::budget::BudgetSet,
+    skills_root: &camino::Utf8Path,
+    _offline: bool,
+) -> Result<Registry> {
+    builtin_with_web(limits, budget, skills_root, None)
+}
+
+/// Builds the registry, with the web tools backed by a caller-supplied client.
+///
+/// The backends arrive from the composition root rather than being built here,
+/// because this crate is not allowed to reach the network: tools take a context,
+/// and the context that knows how to fetch is supplied by whoever assembles the
+/// run. `None` leaves both tools refusing every call, which is what an offline
+/// run wants.
+pub fn builtin_with_web(
+    limits: &FileLimits,
+    budget: &rune_core::budget::BudgetSet,
+    skills_root: &camino::Utf8Path,
+    web: Option<WebBackends>,
 ) -> Result<Registry> {
     let mut registry = Registry::new();
     registry.insert(Box::new(GlobFiles::with_limits(*limits)))?;
@@ -75,8 +123,16 @@ pub fn builtin(
         skills_root.to_owned(),
         context_limits,
     )))?;
-    registry.insert(Box::new(WebFetch::unconfigured(budget)))?;
-    registry.insert(Box::new(WebSearch::unconfigured(budget)))?;
+    // Both web tools are registered with the backend the caller supplied. They
+    // were registered unconfigured, which meant every call returned "no
+    // transport" no matter what the user asked for or allowed.
+    if let Some(backends) = web {
+        registry.insert(Box::new(WebFetch::new(backends.fetch, budget)))?;
+        registry.insert(Box::new(WebSearch::new(backends.search, budget)))?;
+    } else {
+        registry.insert(Box::new(WebFetch::unconfigured(budget)))?;
+        registry.insert(Box::new(WebSearch::unconfigured(budget)))?;
+    }
     registry.insert(Box::new(Vision::unconfigured(budget)))?;
     debug_assert_eq!(registry.len(), ADVERTISEMENT_ORDER.len());
     Ok(registry)

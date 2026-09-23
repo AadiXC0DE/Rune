@@ -30,6 +30,14 @@ pub struct Row {
 #[must_use]
 pub fn rules_for(settings: &Settings, extra: &RuleSet) -> RuleSet {
     let mut rules = builtin_rules(&settings.permission_mode);
+    // The web tools are refused by default and allowed when the configuration
+    // says so. A blanket deny had no way past it, so the tools could not be used
+    // at all however the run was configured.
+    if settings.web_tools {
+        for tool in ["web_fetch", "web_search"] {
+            rules.push(Rule::allow(tool, "*", Layer::User));
+        }
+    }
     for rule in extra.rules() {
         rules.push(rule.clone());
     }

@@ -28,6 +28,20 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Added
 
+- The web tools work. Both were registered with a backend that refused every
+  request and were then denied by a built-in rule that nothing could override,
+  so `web_search` and `web_fetch` failed whatever the user asked for. They now
+  reach the network through the one module that is allowed to, and
+  `web_tools = true` enables them.
+
+### Fixed
+
+- A finished tool call shows one line in the conversation instead of its whole
+  result. Reading a four-hundred-line file used to print all four hundred lines
+  into the chat, burying the answer under the material it was drawn from. The
+  result still reaches the model and the session log in full.
+
+
 - A model can declare its context window in the configuration, as either a bare
   identifier or a table naming the window. `rune config` reports which is in
   force and where it came from. A model with a larger window used to be budgeted

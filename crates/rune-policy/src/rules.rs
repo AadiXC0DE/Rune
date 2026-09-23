@@ -232,17 +232,27 @@ impl RuleSet {
             best = match best {
                 None => Some((rule, specificity)),
                 Some((current, current_specificity)) => {
-                    // More specific wins. On a tie, a deny wins, then the
-                    // higher layer, which is what makes "deny everything, then
-                    // allow this" behave as written.
+                    // More specific wins. A tie is settled by layer first, then
+                    // by deny, which is what makes "deny everything, then allow
+                    // this" mean the written allow rather than the default one:
+                    // a rule a user wrote has to be able to overrule a rule
+                    // this build shipped, or the shipped one is absolute and the
+                    // action it names is unreachable.
                     let better = match specificity.cmp(&current_specificity) {
                         std::cmp::Ordering::Greater => true,
                         std::cmp::Ordering::Less => false,
-                        std::cmp::Ordering::Equal => match (rule.outcome, current.outcome) {
-                            (Outcome::Deny, _) => true,
-                            (_, Outcome::Deny) => false,
-                            _ => rule.layer > current.layer,
-                        },
+                        std::cmp::Ordering::Equal => {
+                            match rule.layer.cmp(&current.layer) {
+                                std::cmp::Ordering::Greater => true,
+                                std::cmp::Ordering::Less => false,
+                                // Within one layer a deny still wins, so two
+                                // rules from the same place resolve the safe way.
+                                std::cmp::Ordering::Equal => {
+                                    matches!((rule.outcome, current.outcome), (Outcome::Deny, _))
+                                        && !matches!(current.outcome, Outcome::Deny)
+                                }
+                            }
+                        }
                     };
                     if better {
                         Some((rule, specificity))

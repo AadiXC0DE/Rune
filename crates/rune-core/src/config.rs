@@ -334,6 +334,15 @@ pub struct UserConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<Provider>,
 
+    /// Whether the web tools may reach the network.
+    ///
+    /// Off by default, and separate from `offline`: offline stops every request
+    /// including the model, while this allows the model and the web tools
+    /// without allowing anything else. A coding agent that searches needs a way
+    /// to say so that does not also mean turning off the network.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub web_tools: Option<bool>,
+
     /// Model per provider, either a bare identifier or a table describing it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub models: Option<BTreeMap<String, ModelEntry>>,
@@ -478,6 +487,8 @@ pub struct Settings {
     pub provider: Provider,
     /// Effective model identifier for the active provider.
     pub model: String,
+    /// Whether the web tools may reach the network.
+    pub web_tools: bool,
     /// Input capacity the configured model accepts, when one is declared.
     ///
     /// Held here rather than looked up at the point it is needed, because the
@@ -533,6 +544,7 @@ impl Default for Settings {
         Self {
             provider: Provider::default(),
             model: String::new(),
+            web_tools: false,
             context_window: None,
             base_url: None,
             api_key_env: None,
@@ -619,6 +631,7 @@ impl Settings {
                 "theme",
                 self.theme.clone().unwrap_or_else(|| "auto".to_owned()),
             ),
+            ("web_tools", self.web_tools.to_string()),
             ("auto_upgrade", self.auto_upgrade.to_string()),
             ("collapse_tool_calls", self.collapse_tool_calls.to_string()),
             ("session_titles", self.session_titles.to_string()),
@@ -691,6 +704,8 @@ pub struct EnvironmentOverrides {
     pub review_model: Option<String>,
     /// Offline mode.
     pub offline: Option<bool>,
+    /// Whether the web tools may reach the network.
+    pub web_tools: Option<bool>,
 }
 
 impl EnvironmentOverrides {
@@ -726,6 +741,7 @@ impl EnvironmentOverrides {
             provider_strict: boolean(&mut lookup, "RUNE_PROVIDER_STRICT"),
             review_model: lookup("RUNE_REVIEW_MODEL"),
             offline: boolean(&mut lookup, "RUNE_OFFLINE"),
+            web_tools: boolean(&mut lookup, "RUNE_WEB_TOOLS"),
         };
 
         if let Some(list) = lookup("RUNE_ADDITIONAL_DIRS") {
@@ -946,6 +962,13 @@ fn read_bounded(path: &Utf8Path, layer: Layer) -> std::result::Result<Option<Str
 
 /// Applies a user configuration to the settings.
 fn apply_user(settings: &mut Settings, user: &UserConfig, layer: Layer) {
+    if let Some(web_tools) = user.web_tools {
+        // A project file cannot set this: it decides whether a repository can
+        // send the user's queries to a search engine, which is the profile
+        // owner's call rather than the repository's.
+        settings.web_tools = web_tools;
+        settings.sources.record("web_tools", layer);
+    }
     if let Some(provider) = &user.provider {
         settings.provider = provider.clone();
         settings.sources.record("provider", layer);
@@ -1200,6 +1223,10 @@ fn apply_environment(settings: &mut Settings, env: &EnvironmentOverrides) {
     if let Some(auto) = env.auto_upgrade {
         settings.auto_upgrade = auto;
         settings.sources.record("auto_upgrade", layer);
+    }
+    if let Some(web_tools) = env.web_tools {
+        settings.web_tools = web_tools;
+        settings.sources.record("web_tools", layer);
     }
     if let Some(offline) = env.offline {
         settings.offline = offline;

@@ -1093,6 +1093,30 @@ fn handle_command<W: std::io::Write>(
     }
 }
 
+/// Returns the one line that stands for a finished tool call.
+///
+/// A tool result already opens with a headline naming what it found, because
+/// that is what the model reads first. That line is the whole of what a reader
+/// needs while skimming, and the body stays available to the model and in the
+/// session log.
+fn tool_summary(name: &str, output: &ToolOutput) -> String {
+    let headline = output
+        .text
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or("")
+        .trim();
+    // A failure is stated in full, because the reason is the result and a
+    // reader needs it to act.
+    if output.is_error {
+        return format!("{name}: {headline}");
+    }
+    if headline.is_empty() {
+        return format!("{name}: done");
+    }
+    format!("{name}: {headline}")
+}
+
 /// Renders what a turn produced, as the lines to print.
 ///
 /// Returns the lines rather than writing them, because the renderer is the only
@@ -1131,10 +1155,10 @@ fn report_turn(outcome: &turn::TurnOutcome, host: &SessionHost) -> Result<Vec<St
 
     for call in &outcome.calls {
         if call.executed {
-            entries.push(Entry::tool(format!(
-                "{}: {}",
-                call.call.name, call.output.text
-            )));
+            // Only the result's headline reaches the conversation. The body is
+            // what the model asked for and what it already has; printing it
+            // again buries the answer under the material it was drawn from.
+            entries.push(Entry::tool(tool_summary(&call.call.name, &call.output)));
         }
     }
 
@@ -1216,10 +1240,11 @@ pub fn prepare(
         _ => Box::new(rune_net::chat_completions::ChatCompletions),
     };
 
-    let mut registry = inventory::builtin(
+    let mut registry = inventory::builtin_with_web(
         &rune_tools::workspace::FileLimits::from_budget(&settings.limits),
         &settings.limits,
         &paths.managed_skills_dir(),
+        crate::web_client::backends(settings),
     )?;
     // The delegation tool lives with the authority model it enforces, and the
     // tool registry cannot depend on that crate, so it is added here where both
