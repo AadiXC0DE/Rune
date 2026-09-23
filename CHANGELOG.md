@@ -2,6 +2,28 @@
 
 Notable changes, newest first. Each entry describes what a user can observe.
 
+## 0.1.1
+
+### Added
+
+- `rune connect` with no argument lists the providers, takes a choice, and asks
+  for what that provider needs, so a first connection needs nothing looked up.
+- OpenCode is available in both of its tiers, as `opencode` and `opencode-go`.
+  They share a key and differ in endpoint; the subscription requires the header
+  that names its conversation.
+
+### Fixed
+
+- A provider connected by name could not be read back, so a self-hosted endpoint
+  appeared to connect and then had no effect.
+- Connecting a second provider reused the first one's endpoint, sending requests
+  to a host the user never named.
+- The published download is compressed. It was named `.tar.gz` and contained an
+  uncompressed tar, which `tar` opened by sniffing the format while other
+  readers refused it.
+- Session identifiers are generated through the same randomness crate the TLS
+  stack uses, removing the second copy from the binary.
+
 ## Unreleased
 
 ### Added
