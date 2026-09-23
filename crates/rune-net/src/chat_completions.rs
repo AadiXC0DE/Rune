@@ -20,6 +20,9 @@ pub const NAME: &str = "chat_completions";
 /// Path appended to the endpoint base URL.
 pub const PATH: &str = "/chat/completions";
 
+/// Path listing the served models, a sibling of the completion path.
+pub const MODELS_PATH: &str = "/models";
+
 /// Largest error body retained for diagnostics.
 pub const MAX_ERROR_BODY: usize = 64 * 1024;
 
@@ -48,6 +51,10 @@ impl Provider for ChatCompletions {
         PATH
     }
 
+    fn models_path(&self) -> Option<&'static str> {
+        Some(MODELS_PATH)
+    }
+
     fn reducer(&self) -> Box<dyn StreamReducer> {
         Box::new(Reducer::new())
     }
@@ -65,6 +72,13 @@ impl Provider for ChatCompletions {
         }
 
         for message in &plan.messages {
+            if message.role == Role::Tool {
+                // One tool message can carry a whole batch of results, because
+                // the history groups them, so it expands to one wire message per
+                // result rather than being collapsed to its first.
+                messages.extend(encode_tool_messages(message));
+                continue;
+            }
             messages.push(encode_message(message)?);
         }
 
@@ -127,7 +141,12 @@ fn encode_message(message: &Message) -> Result<serde_json::Value> {
         )),
         Role::User => Ok(encode_user(message)),
         Role::Assistant => Ok(encode_assistant(message)),
-        Role::Tool => Ok(encode_tool(message)),
+        // Tool results are expanded before this point, because one message can
+        // carry several of them and this returns a single message.
+        Role::Tool => Err(RuneError::invariant(
+            "tool_result_encoding",
+            "a tool result message reached the single-message encoder",
+        )),
     }
 }
 
@@ -203,28 +222,34 @@ fn encode_assistant(message: &Message) -> serde_json::Value {
     serde_json::Value::Object(value)
 }
 
-/// Encodes a tool result message.
-fn encode_tool(message: &Message) -> serde_json::Value {
-    let mut content = String::new();
-    let mut id = String::new();
-    for part in &message.parts {
-        if let ContentPart::ToolResult {
-            id: call_id,
-            content: body,
-            ..
-        } = part
-        {
-            call_id.as_str().clone_into(&mut id);
-            content.clone_from(body);
-            break;
-        }
-    }
-
-    serde_json::json!({
-        "role": "tool",
-        "content": content,
-        "tool_call_id": id,
-    })
+/// Encodes one tool result message.
+///
+/// Every result in the message becomes its own wire message, in the order the
+/// calls were made. A message holding several results is the shape a batch
+/// produces, and emitting only the first leaves the other calls unanswered,
+/// which an endpoint rejects as a malformed conversation.
+fn encode_tool_messages(message: &Message) -> Vec<serde_json::Value> {
+    message
+        .parts
+        .iter()
+        .filter_map(|part| match part {
+            ContentPart::ToolResult {
+                id,
+                content,
+                is_error,
+                ..
+            } => Some(serde_json::json!({
+                "role": "tool",
+                "content": content,
+                "tool_call_id": id.as_str(),
+                // The compatible-server ecosystem reads a failure from this
+                // field rather than from the text, and the text is still sent
+                // so a server that ignores the field loses nothing.
+                "is_error": is_error,
+            })),
+            _ => None,
+        })
+        .collect()
 }
 
 /// Maps a reasoning effort onto the dialect's spelling.
@@ -785,6 +810,91 @@ mod tests {
         assert_eq!(tool["role"], "tool");
         assert_eq!(tool["content"], "contents");
         assert_eq!(tool["tool_call_id"], "call_1");
+    }
+
+    #[test]
+    fn every_tool_result_in_a_batch_reaches_the_wire() {
+        // The history groups a batch of results into one message, and a request
+        // that answers only the first call of several is rejected by the
+        // endpoint as a malformed conversation. The failure is invisible in the
+        // body, so it surfaces as a bare status with nothing to act on.
+        let mut plan = RequestPlan::new("m");
+        plan.messages = vec![
+            Message::assistant(vec![
+                ContentPart::ToolCall {
+                    id: ToolCallId::new("call_1").expect("id"),
+                    name: "shell".to_owned(),
+                    arguments: "{}".to_owned(),
+                },
+                ContentPart::ToolCall {
+                    id: ToolCallId::new("call_2").expect("id"),
+                    name: "glob_files".to_owned(),
+                    arguments: "{}".to_owned(),
+                },
+            ]),
+            Message {
+                role: Role::Tool,
+                parts: vec![
+                    ContentPart::ToolResult {
+                        id: ToolCallId::new("call_1").expect("id"),
+                        name: "shell".to_owned(),
+                        content: "first".to_owned(),
+                        is_error: false,
+                    },
+                    ContentPart::ToolResult {
+                        id: ToolCallId::new("call_2").expect("id"),
+                        name: "glob_files".to_owned(),
+                        content: "second".to_owned(),
+                        is_error: false,
+                    },
+                ],
+                replay: None,
+            },
+        ];
+        let body = ChatCompletions.build_request(&plan).expect("build");
+        let messages = body["messages"].as_array().expect("array");
+
+        let answered: Vec<&str> = messages
+            .iter()
+            .filter(|message| message["role"] == "tool")
+            .filter_map(|message| message["tool_call_id"].as_str())
+            .collect();
+        assert_eq!(
+            answered,
+            vec!["call_1", "call_2"],
+            "a tool result was dropped, leaving its call unanswered"
+        );
+    }
+
+    #[test]
+    fn a_single_tool_result_still_encodes_alone() {
+        let mut plan = RequestPlan::new("m");
+        plan.messages = vec![Message {
+            role: Role::Tool,
+            parts: vec![ContentPart::ToolResult {
+                id: ToolCallId::new("call_1").expect("id"),
+                name: "read_file".to_owned(),
+                content: "contents".to_owned(),
+                is_error: false,
+            }],
+            replay: None,
+        }];
+        let body = ChatCompletions.build_request(&plan).expect("build");
+        assert_eq!(body["messages"].as_array().expect("array").len(), 1);
+        assert_eq!(body["messages"][0]["content"], "contents");
+        assert_eq!(body["messages"][0]["tool_call_id"], "call_1");
+    }
+
+    #[test]
+    fn a_tool_result_message_with_no_results_encodes_to_nothing() {
+        let mut plan = RequestPlan::new("m");
+        plan.messages = vec![Message {
+            role: Role::Tool,
+            parts: Vec::new(),
+            replay: None,
+        }];
+        let body = ChatCompletions.build_request(&plan).expect("build");
+        assert!(body["messages"].as_array().expect("array").is_empty());
     }
 
     #[test]

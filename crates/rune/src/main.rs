@@ -163,7 +163,7 @@ fn run(launch: &Launch) -> Result<ExitCode> {
         Command::Usage => run_usage(&paths, launch, &output_flags),
         Command::Auth => run_auth(&settings, &paths, launch, &output_flags),
         Command::Connect => run_connect(&settings, &paths, launch, &output_flags),
-        Command::Models => run_models(&settings, &output_flags),
+        Command::Models => run_models(&settings, &paths, launch, &output_flags),
         Command::Permissions => run_permissions(&settings, launch, &output_flags),
         Command::Projects => run_projects(&paths, launch, &workspace, &output_flags),
         Command::Workspace => run_workspace(&settings, &paths, launch, &output_flags),
@@ -555,9 +555,29 @@ fn run_connect(
     Ok(ExitCode::from(EXIT_OK))
 }
 
-/// Lists the models the configured provider offers.
-fn run_models(settings: &Settings, output: &OutputFlags) -> Result<ExitCode> {
-    let catalog = provider_setup::catalog_for(settings);
+/// Lists the models the configured endpoint offers.
+///
+/// The list is fetched from the endpoint, because a model identifier is only
+/// meaningful to the host that serves it. `--offline` reports the configured
+/// model without contacting anything, which is the answer a machine with no
+/// network needs rather than a failure.
+fn run_models(
+    settings: &Settings,
+    paths: &Paths,
+    launch: &Launch,
+    output: &OutputFlags,
+) -> Result<ExitCode> {
+    if launch.has_flag("--offline") {
+        let catalog = provider_setup::catalog_for(settings);
+        if output.json {
+            println!("{}", serde_json::to_string_pretty(&catalog.to_json())?);
+        } else {
+            println!("{}", provider_setup::render_catalog(&catalog));
+        }
+        return Ok(ExitCode::from(EXIT_OK));
+    }
+
+    let catalog = provider_setup::fetch_catalog(settings, paths, MODELS_TIMEOUT)?;
     if output.json {
         println!("{}", serde_json::to_string_pretty(&catalog.to_json())?);
     } else {
@@ -565,6 +585,9 @@ fn run_models(settings: &Settings, output: &OutputFlags) -> Result<ExitCode> {
     }
     Ok(ExitCode::from(EXIT_OK))
 }
+
+/// Time allowed for fetching a model list.
+const MODELS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Reads a reporting period from its written name.
 fn period_from(raw: Option<&str>) -> Result<Period> {

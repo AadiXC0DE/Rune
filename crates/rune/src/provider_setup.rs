@@ -244,6 +244,62 @@ pub fn catalog_for(settings: &Settings) -> Catalog {
     catalog
 }
 
+/// Fetches the models the configured endpoint serves.
+///
+/// The list comes from the endpoint rather than a compiled table, because the
+/// identifier has to be one the endpoint will accept and no table this build
+/// ships can name models released after it. A provider whose dialect has no
+/// listing path reports that instead of being asked for one.
+pub fn fetch_catalog(
+    settings: &Settings,
+    paths: &Paths,
+    timeout: std::time::Duration,
+) -> Result<Catalog> {
+    let provider_name = settings.provider.to_string();
+    let base_url = settings.base_url.clone().ok_or_else(|| {
+        RuneError::new(
+            ErrorCode::InvalidConfiguration,
+            format!("no endpoint is configured for provider `{provider_name}`"),
+        )
+        .with_hint("set `base_url` in the user config, or run `rune connect`")
+    })?;
+
+    let credential = auth::resolve(paths, &provider_name, settings.api_key_env.as_deref())?
+        .ok_or_else(|| {
+            auth::missing_credential_error(&provider_name, settings.api_key_env.as_deref())
+        })?;
+
+    let dialect: Box<dyn rune_net::provider::Provider> = match settings.provider {
+        Provider::Anthropic => Box::new(rune_net::anthropic::Anthropic),
+        Provider::Responses => Box::new(rune_net::responses::Responses),
+        _ => Box::new(rune_net::chat_completions::ChatCompletions),
+    };
+
+    let endpoint = endpoint(
+        &settings.provider,
+        &base_url,
+        credential.expose(),
+        rune_net::transport::AuthStyle::Bearer,
+        settings.offline,
+    );
+
+    let body = rune_net::transport::list_models(
+        &rune_net::transport::agent(),
+        &endpoint,
+        dialect.as_ref(),
+        timeout,
+    )
+    .map_err(|err| err.to_rune_error())?;
+
+    rune_net::catalog::from_endpoint_listing(&provider_name, &body).ok_or_else(|| {
+        RuneError::new(
+            ErrorCode::ProtocolViolation,
+            "the endpoint's model list was not in a shape this build reads",
+        )
+        .with_hint("the configured model is used as given")
+    })
+}
+
 /// Renders a catalog for a terminal.
 #[must_use]
 pub fn render_catalog(catalog: &Catalog) -> String {

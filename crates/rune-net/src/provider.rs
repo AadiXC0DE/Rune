@@ -101,6 +101,14 @@ pub trait Provider: Send + Sync {
     /// Returns the path appended to the endpoint base URL.
     fn request_path(&self) -> &'static str;
 
+    /// Returns the path that lists the models this endpoint serves.
+    ///
+    /// A dialect whose endpoint has no such path answers `None`, and the caller
+    /// reports that rather than sending a request that cannot succeed.
+    fn models_path(&self) -> Option<&'static str> {
+        None
+    }
+
     /// Creates a reducer for one response.
     fn reducer(&self) -> Box<dyn StreamReducer>;
 

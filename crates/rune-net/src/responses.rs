@@ -20,6 +20,9 @@ pub const NAME: &str = "responses";
 /// Path appended to the endpoint base URL.
 pub const PATH: &str = "/responses";
 
+/// Path listing the served models, a sibling of the responses path.
+pub const MODELS_PATH: &str = "/models";
+
 /// Default instructions when a plan carries none.
 ///
 /// The endpoint requires the field, so an empty plan still produces a valid
@@ -37,6 +40,10 @@ impl Provider for Responses {
 
     fn request_path(&self) -> &'static str {
         PATH
+    }
+
+    fn models_path(&self) -> Option<&'static str> {
+        Some(MODELS_PATH)
     }
 
     fn reducer(&self) -> Box<dyn StreamReducer> {

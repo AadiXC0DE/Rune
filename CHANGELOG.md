@@ -28,8 +28,26 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Added
 
+- `rune models` lists the models the configured endpoint serves, read from the
+  endpoint itself. A model released after this build appears, which a compiled
+  table cannot offer. `rune models --offline` reports the configured model alone.
 - Interactive session with a prompt, slash commands, and a status line showing
   the model, the permission mode, and the context left.
+
+### Fixed
+
+- A turn that called several tools at once sent only the first result back, so
+  the conversation had two calls and one answer. The endpoint refuses that, and
+  since it says so in an empty body the failure was reported as a bare status
+  with nothing to act on. Every tool result now reaches the endpoint, the
+  provider's own explanation appears in the error, and a rule written as `*`
+  matches a tool that takes a glob, which it previously did not.
+- An interactive session ran with no permission rules, so every action fell to
+  the mode default. In automatic mode that refused every tool call rather than
+  allowing the reads and in-workspace edits a fresh install is meant to permit.
+
+### Added
+
 - `rune ask` for one request, with a JSON result object.
 - Session persistence: every turn is written to a log, sessions can be listed,
   inspected, resumed, paged, and shown as a branch tree.

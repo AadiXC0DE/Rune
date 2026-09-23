@@ -353,6 +353,39 @@ pub fn from_configured_models(
     catalog
 }
 
+/// Builds a catalog from an endpoint's model listing.
+///
+/// The OpenAI-shaped listing, which the compatible-server ecosystem shares, is
+/// an object with a `data` array whose entries carry an `id`. Only the
+/// identifier is taken: the rest of an entry is vendor decoration, and reading
+/// a capability out of it that the vendor did not state would be a guess
+/// presented as a fact. An entry without an identifier is skipped rather than
+/// listed as an empty name.
+#[must_use]
+pub fn from_endpoint_listing(provider: &str, body: &str) -> Option<Catalog> {
+    let parsed: serde_json::Value = serde_json::from_str(body).ok()?;
+    let entries = parsed
+        .get("data")
+        .or_else(|| parsed.get("models"))
+        .and_then(serde_json::Value::as_array)?;
+
+    let mut catalog = Catalog::new(provider);
+    catalog.source = CatalogSource::Endpoint;
+    for entry in entries {
+        let id = entry
+            .get("id")
+            .or_else(|| entry.get("name"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .trim();
+        if id.is_empty() {
+            continue;
+        }
+        catalog.models.push(ModelMetadata::new(id));
+    }
+    Some(catalog)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -381,6 +414,59 @@ mod tests {
                 cache_reporting: true,
             },
         }
+    }
+
+    #[test]
+    fn an_endpoint_listing_becomes_a_catalog() {
+        let body = r#"{"object":"list","data":[
+            {"id":"alpha","object":"model","owned_by":"vendor"},
+            {"id":"beta","object":"model","owned_by":"vendor"}
+        ]}"#;
+        let catalog = from_endpoint_listing("zen", body).expect("parsed");
+        assert_eq!(catalog.provider, "zen");
+        assert_eq!(catalog.source, CatalogSource::Endpoint);
+        assert_eq!(
+            catalog
+                .models
+                .iter()
+                .map(|m| m.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["alpha", "beta"]
+        );
+    }
+
+    #[test]
+    fn an_entry_without_an_identifier_is_skipped() {
+        // A nameless entry would be listed as a blank model, which a user
+        // cannot select and which would be sent as an empty identifier.
+        let body = r#"{"data":[{"id":"real"},{"object":"model"},{"id":"  "}]}"#;
+        let catalog = from_endpoint_listing("p", body).expect("parsed");
+        assert_eq!(
+            catalog
+                .models
+                .iter()
+                .map(|m| m.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["real"]
+        );
+    }
+
+    #[test]
+    fn a_listing_under_models_is_also_read() {
+        // Some compatible servers name the array `models` rather than `data`.
+        let body = r#"{"models":[{"name":"gamma"}]}"#;
+        let catalog = from_endpoint_listing("p", body).expect("parsed");
+        assert_eq!(catalog.models.len(), 1);
+        assert_eq!(catalog.models[0].id, "gamma");
+    }
+
+    #[test]
+    fn an_unrecognized_body_is_not_a_catalog() {
+        // A failure and an empty list are different answers, so a body that is
+        // not a listing returns nothing rather than an empty catalog.
+        assert!(from_endpoint_listing("p", "<html>error</html>").is_none());
+        assert!(from_endpoint_listing("p", "{}").is_none());
+        assert!(from_endpoint_listing("p", "").is_none());
     }
 
     #[test]

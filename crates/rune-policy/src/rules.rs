@@ -127,16 +127,19 @@ pub fn glob_match(pattern: &str, target: &str) -> bool {
                 p = p.saturating_add(1);
                 t = t.saturating_add(1);
             }
-            Some(character) if *character == target[t] => {
-                p = p.saturating_add(1);
-                t = t.saturating_add(1);
-            }
-            // A star matches nothing for now, remembering where it started so
-            // it can consume more if the remainder fails.
+            // A star is tested before literal equality, so a target that itself
+            // contains `*` is matched by the wildcard rather than having the
+            // star consume that character. Targets are glob patterns whenever a
+            // rule covers a tool that takes one, so `*` against `*.md` is an
+            // ordinary case and not an exotic one.
             Some('*') => {
                 star = Some(p);
                 star_target = t;
                 p = p.saturating_add(1);
+            }
+            Some(character) if *character == target[t] => {
+                p = p.saturating_add(1);
+                t = t.saturating_add(1);
             }
             _ => {
                 // Mismatch. Let the last star consume one more character.
@@ -307,6 +310,25 @@ impl RuleSet {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_star_matches_a_target_that_contains_a_star() {
+        // Targets are glob patterns whenever a rule covers a tool that takes
+        // one, so a rule written as `*` has to match `*.md`. Testing literal
+        // equality first made the pattern star consume the target star and the
+        // rule silently failed to apply.
+        assert!(glob_match("*", "*.md"));
+        assert!(glob_match("*", "**/*.rs"));
+        assert!(glob_match("*", "src/*.rs"));
+        assert!(glob_match("*", "*"));
+    }
+
+    #[test]
+    fn a_literal_star_in_a_pattern_still_matches_a_literal_star() {
+        assert!(glob_match("*.md", "*.md"));
+        assert!(glob_match("src/*.rs", "src/*.rs"));
+        assert!(!glob_match("*.md", "*.rs"));
+    }
 
     #[test]
     fn a_star_matches_anything() {

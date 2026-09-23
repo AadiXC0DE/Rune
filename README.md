@@ -54,7 +54,12 @@ rune connect chat_completions
 ```
 
 It runs again for each provider you add, and what you have connected is reported
-by `rune auth`. The providers that ship in the table are:
+by `rune auth`. The models the endpoint serves are listed by `rune models`, which
+asks the endpoint rather than a table compiled into the binary, so a model
+released after this build still appears. Add `--offline` to report the configured
+model without contacting anything.
+
+The providers that ship in the table are:
 
 | Provider | What it is |
 |---|---|

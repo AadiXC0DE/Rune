@@ -365,6 +365,77 @@ pub fn stream_completion(
     reduce_stream(response.into_body(), provider, head_timeout, cancel)
 }
 
+/// Fetches the models an endpoint offers.
+///
+/// This is the one non-streaming request in this module. It exists because a
+/// user cannot choose a model they cannot see: the identifier has to come from
+/// the endpoint that will serve it, since the same name means different things
+/// at different hosts and no compiled table can be complete.
+///
+/// A failure is returned rather than swallowed, because an empty list and an
+/// unreachable endpoint are different answers and only one of them means the
+/// provider has no models.
+pub fn list_models(
+    agent: &ureq::Agent,
+    endpoint: &Endpoint,
+    provider: &dyn Provider,
+    timeout: Duration,
+) -> NetResult<String> {
+    if endpoint.offline {
+        return Err(
+            NetError::new(FailureKind::Network, "outbound requests are disabled")
+                .with_hint("remove the offline setting to reach a provider"),
+        );
+    }
+
+    let path = provider.models_path().ok_or_else(|| {
+        NetError::new(
+            FailureKind::InvalidRequest,
+            format!(
+                "provider `{}` does not expose a model list",
+                provider.name()
+            ),
+        )
+        .with_hint("the model is used as given; check the provider's documentation")
+    })?;
+
+    let url = endpoint.url_for(path);
+    let mut request = agent.get(&url).header("accept", "application/json").header(
+        endpoint.auth.header(),
+        &endpoint.auth.value(&endpoint.credential),
+    );
+    for (name, value) in provider
+        .extra_headers()
+        .into_iter()
+        .map(|(name, value)| (name.to_owned(), value))
+        .chain(endpoint.headers.iter().cloned())
+    {
+        request = request.header(&name, &value);
+    }
+
+    // The agent carries no overall timeout, because a streaming generation is
+    // expected to be long. A listing is a small document, so it is bounded here
+    // rather than leaving a stalled endpoint to hold the command open.
+    let response = request
+        .config()
+        .timeout_global(Some(timeout))
+        .build()
+        .call()
+        .map_err(|err| classify_transport_error(&err))?;
+
+    let status = response.status().as_u16();
+    let text = read_bounded_text(response.into_body(), 1024 * 1024);
+    if status >= 400 {
+        return Err(
+            NetError::classify_status(status, &redact::redact(&text)).with_hint(format!(
+                "provider `{}` refused to list its models",
+                provider.name()
+            )),
+        );
+    }
+    Ok(text)
+}
+
 /// Reads and reduces a streaming response body.
 fn reduce_stream(
     body: ureq::Body,

@@ -782,7 +782,11 @@ pub fn prepare(
         ),
         dialect,
         registry,
-        rules: RuleSet::new(),
+        // The rules that ship with the harness, so a fresh install has a usable
+        // starting point: reads and in-workspace edits proceed, outbound traffic
+        // is refused, and an unknown command resolves to the mode's default
+        // rather than to nothing.
+        rules: crate::permissions::validated(settings)?,
     })
 }
 
@@ -1256,6 +1260,52 @@ mod tests {
         assert!(
             err.hint().is_some(),
             "the failure does not say how to connect a provider"
+        );
+    }
+
+    #[test]
+    fn a_session_runs_with_the_rules_that_ship_with_it() {
+        // A session built with an empty rule set resolves every action to the
+        // mode default, so in automatic mode nothing is ever allowed and each
+        // call comes back as an uncollected approval. The rules a session runs
+        // with must be the ones a fresh install describes.
+        let dir = tempfile::tempdir().expect("temp");
+        let root = Utf8Path::from_path(dir.path()).expect("utf8");
+        let paths = Paths::resolve(Some(root.as_str()), None, None, None, None);
+        paths.ensure_roots().expect("roots");
+
+        let provider = rune_core::config::parse_provider("chat_completions");
+        crate::provider_setup::connect(&paths, provider.as_str(), "sk-test").expect("credential");
+
+        let settings = Settings {
+            provider,
+            base_url: Some("https://example.invalid/v1".to_owned()),
+            model: "test-model".to_owned(),
+            ..Settings::default()
+        };
+
+        let config =
+            prepare(&settings, &paths, Utf8Path::new("/tmp"), None).expect("a session prepares");
+
+        assert!(
+            !config.rules.rules().is_empty(),
+            "the session runs without any rules, so every action falls to the mode default"
+        );
+        assert_eq!(
+            config
+                .rules
+                .evaluate("glob_files", "*.md", Outcome::Ask)
+                .outcome,
+            Outcome::Allow,
+            "a read tool would ask for approval it never gets"
+        );
+        assert_eq!(
+            config
+                .rules
+                .evaluate("web_fetch", "https://example.com", Outcome::Allow)
+                .outcome,
+            Outcome::Deny,
+            "outbound traffic is not refused"
         );
     }
 

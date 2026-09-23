@@ -233,8 +233,11 @@ impl NetError {
 
     /// Maps an HTTP status and body to a failure kind.
     ///
-    /// The body is inspected only for a provider code or a hint about length,
-    /// because endpoints do not agree on a machine-readable error shape.
+    /// The body is inspected for a provider code or a hint about length,
+    /// because endpoints do not agree on a machine-readable error shape, and
+    /// what it says is kept. A status alone says a request was refused without
+    /// saying which field was wrong, and the endpoint is the only party that
+    /// knows: discarding its explanation leaves the user with nothing to act on.
     #[must_use]
     pub fn classify_status(status: u16, body: &str) -> Self {
         let lower = body.to_ascii_lowercase();
@@ -263,6 +266,17 @@ impl NetError {
         let mut error =
             Self::new(kind, format!("the endpoint returned HTTP {status}")).with_status(status);
 
+        // The endpoint is the only party that knows which field it refused, so
+        // whatever it said is carried into the message rather than dropped.
+        if let Some((code, explanation)) = describe_body(body) {
+            if !explanation.is_empty() {
+                error.message = format!("the endpoint returned HTTP {status}: {explanation}");
+            }
+            if let Some(code) = code {
+                error = error.with_provider_code(code);
+            }
+        }
+
         if kind == FailureKind::ContextTooLong {
             error = error.with_hint("reduce the conversation or start a new session");
         }
@@ -271,6 +285,58 @@ impl NetError {
         }
         error
     }
+}
+
+/// Extracts an error code and a readable explanation from a response body.
+///
+/// Endpoints disagree on the shape: OpenAI and its imitators nest the message
+/// under `error`, some put a bare code in `error`, and a proxy in front of an
+/// endpoint can answer with HTML instead of JSON. A body that is not one of the
+/// recognized shapes still contributes its opening text, because an unexplained
+/// status is the least useful thing to hand back and any clue beats none.
+#[must_use]
+fn describe_body(body: &str) -> Option<(Option<String>, String)> {
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) {
+        let error = value.get("error").unwrap_or(&value);
+        let code = ["code", "type"]
+            .iter()
+            .find_map(|key| error.get(*key).and_then(serde_json::Value::as_str))
+            .map(str::to_owned);
+
+        let message = error
+            .get("message")
+            .and_then(serde_json::Value::as_str)
+            .or_else(|| error.as_str())
+            .or_else(|| value.get("message").and_then(serde_json::Value::as_str));
+
+        if let Some(message) = message {
+            return Some((code, collapse(message)));
+        }
+    }
+
+    // Not a shape that is understood. The opening of the body is still more
+    // use than nothing, and the limit keeps an HTML error page from filling
+    // the terminal.
+    Some((None, collapse(&truncate_chars(trimmed, 300))))
+}
+
+/// Collapses whitespace so an explanation stays on one line.
+fn collapse(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Truncates to a character count, marking that it was cut.
+fn truncate_chars(text: &str, limit: usize) -> String {
+    if text.chars().count() <= limit {
+        return text.to_owned();
+    }
+    let kept: String = text.chars().take(limit).collect();
+    format!("{kept}...")
 }
 
 impl std::fmt::Display for FailureKind {
