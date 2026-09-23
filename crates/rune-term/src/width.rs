@@ -197,9 +197,24 @@ pub fn wrap_styled(s: &str, width: usize) -> Vec<WrappedLine> {
                 }
                 let cluster = grapheme_width(text);
                 if line_width > 0 && line_width.saturating_add(cluster) > width {
-                    out.push(open.close(&mut line, line_width));
-                    line_width = 0;
-                    open.reopen(&mut line);
+                    // Break on the last space that fits, so a word is moved to
+                    // the next line rather than cut in half. A run longer than
+                    // the width has no space to break on and is split, which is
+                    // the only option that keeps it inside the terminal.
+                    if let Some(at) = last_break(&line, width) {
+                        let carried = line.split_off(at);
+                        let carried = carried.trim_start_matches(' ');
+                        let carried_width = str_width(carried);
+                        out.push(open.close(&mut line, line_width));
+                        line_width = 0;
+                        open.reopen(&mut line);
+                        line.push_str(carried);
+                        line_width = line_width.saturating_add(carried_width);
+                    } else {
+                        out.push(open.close(&mut line, line_width));
+                        line_width = 0;
+                        open.reopen(&mut line);
+                    }
                 }
                 line.push_str(text);
                 line_width = line_width.saturating_add(cluster);
@@ -208,6 +223,28 @@ pub fn wrap_styled(s: &str, width: usize) -> Vec<WrappedLine> {
     }
     out.push(open.close(&mut line, line_width));
     out
+}
+
+/// Returns the byte offset to break a line at, keeping the word whole.
+///
+/// The last space that fits is the break, and the space itself is dropped: it
+/// sat at the end of the line, so keeping it would leave a trailing blank the
+/// reader cannot see. Returns `None` when no space fits, which is the case for
+/// a single run longer than the line.
+fn last_break(line: &str, width: usize) -> Option<usize> {
+    let mut best: Option<usize> = None;
+    let mut consumed = 0usize;
+    for (offset, ch) in line.char_indices() {
+        let next = consumed.saturating_add(char_width(ch).into());
+        if next > width {
+            break;
+        }
+        if ch == ' ' && offset > 0 {
+            best = Some(offset);
+        }
+        consumed = next;
+    }
+    best
 }
 
 /// The style state a wrapped line is currently in.
@@ -419,6 +456,38 @@ mod tests {
     #[test]
     fn wrapping_splits_on_columns() {
         assert_eq!(wrap("abcdef", 3), vec!["abc", "def"]);
+    }
+
+    #[test]
+    fn wrapping_breaks_between_words_rather_than_inside_one() {
+        // A break at the column leaves half a word on each line, which is what
+        // makes model output look mangled: `you` becomes `yo` and `u`.
+        let lines = wrap("hello world again", 12);
+        assert_eq!(lines, vec!["hello world", "again"]);
+        for line in &lines {
+            assert!(str_width(line) <= 12, "{line:?} overflowed");
+        }
+        // No line starts or ends in the middle of a word.
+        assert!(!lines[1].starts_with('u'), "{lines:?}");
+    }
+
+    #[test]
+    fn a_word_longer_than_the_line_is_still_split() {
+        // There is no space to break on, and leaving it whole would overflow the
+        // terminal. Splitting is the only option that keeps the row inside.
+        assert_eq!(wrap("abcdefghij", 4), vec!["abcd", "efgh", "ij"]);
+    }
+
+    #[test]
+    fn a_break_drops_the_space_it_lands_on() {
+        // Keeping it would leave an invisible trailing blank on the line.
+        let lines = wrap("ab cd", 3);
+        assert_eq!(lines, vec!["ab", "cd"]);
+    }
+
+    #[test]
+    fn wrapping_a_single_word_shorter_than_the_line_leaves_it_alone() {
+        assert_eq!(wrap("hello", 10), vec!["hello"]);
     }
 
     #[test]

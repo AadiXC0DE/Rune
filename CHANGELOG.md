@@ -44,6 +44,9 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 - The prompt is a full line editor: cursor movement by character and by word,
   home and end, delete by character and by word, kill to either end, and paste.
+- Text wraps between words instead of at the column, so model output no longer
+  breaks a word in half. A single word longer than the line is still split,
+  because the alternative is overflowing the terminal.
 
 
 - `rune models` lists the models the configured endpoint serves, read from the
