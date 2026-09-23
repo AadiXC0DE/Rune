@@ -184,6 +184,23 @@ impl Composer {
         moved
     }
 
+    /// Removes the word before the cursor, and the space before that.
+    ///
+    /// Trailing whitespace goes first, so the word being removed is the one the
+    /// user is looking at rather than the gap after it.
+    pub fn delete_word(&mut self) -> bool {
+        let start = self.word_start();
+        if start == self.cursor {
+            return false;
+        }
+        self.record();
+        let from = self.byte_of(start);
+        let to = self.byte_of(self.cursor);
+        self.text.replace_range(from..to, "");
+        self.cursor = start;
+        true
+    }
+
     /// Moves the cursor to the start of the word before it.
     pub fn move_word_left(&mut self) -> bool {
         let mut count = 0usize;
@@ -477,6 +494,26 @@ impl Composer {
         self.text
             .get(self.byte_of(self.cursor)..)
             .unwrap_or_default()
+    }
+
+    /// Returns the index where the word before the cursor begins.
+    ///
+    /// Whitespace immediately before the cursor is skipped, matching what a
+    /// reader sees as the word to remove.
+    fn word_start(&self) -> usize {
+        let mut count = 0usize;
+        let mut word = false;
+        for c in self.head().chars().rev() {
+            if c.is_whitespace() {
+                if word {
+                    break;
+                }
+            } else {
+                word = true;
+            }
+            count = count.saturating_add(1);
+        }
+        self.floor(self.cursor.saturating_sub(count))
     }
 
     /// Keeps the cursor inside the line and off the interior of a cluster.

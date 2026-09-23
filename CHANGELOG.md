@@ -26,7 +26,25 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ## Unreleased
 
+### Fixed
+
+- The interactive screen no longer garbles. Two components were writing to the
+  terminal: finished text was printed in the flow while the live region was
+  drawn at absolute rows, so the printed text moved the rows the region was
+  placed at and characters were overwritten. There is now one writer.
+- The width comes from the terminal rather than a fixed 100 columns, so a line
+  no longer wraps onto a row the renderer did not count. The transcript wraps at
+  the width the reader actually has instead of mid-word at 80.
+- The cursor is visible where it is typing. The line being edited is drawn by the
+  program with the cursor placed inside it, rather than relying on the
+  terminal's echo, and the line is committed to the screen when it is submitted
+  instead of being erased with the region it was typed in.
+
 ### Added
+
+- The prompt is a full line editor: cursor movement by character and by word,
+  home and end, delete by character and by word, kill to either end, and paste.
+
 
 - `rune models` lists the models the configured endpoint serves, read from the
   endpoint itself. A model released after this build appears, which a compiled

@@ -26,6 +26,8 @@ use rune_policy::review::{ReviewOutcome, ReviewRequest, ReviewSession, Reviewer}
 use rune_policy::rules::RuleSet;
 use rune_session::usage::{HelperKind, Ledger, UsageRecord, now_ms};
 use rune_term::footer::{self, FooterState};
+use rune_term::input::KeyAction;
+use rune_term::shell::ExitReason;
 use rune_term::shell::{Action, Input, Shell};
 use rune_term::theme::Theme;
 use rune_term::transcript::{self, Display, Entry};
@@ -82,12 +84,16 @@ struct SessionHost {
     workspace: String,
     /// Whether the terminal can render direct color.
     truecolor: bool,
-    /// Terminal width the frame is composed for.
-    width: u16,
-    /// Terminal height the frame is composed for.
-    height: u16,
-    /// Holds the diffed screen and commits only what changed.
-    surface: Mutex<rune_term::frame::FrameSurface>,
+    /// Terminal width the live region is drawn for.
+    ///
+    /// Held behind an atomic because a resize is noticed while the region is
+    /// being drawn, and the width the status line was measured against has to
+    /// move with it.
+    width: std::sync::atomic::AtomicU16,
+    /// Terminal height, kept for the layout the status line is solved in.
+    height: std::sync::atomic::AtomicU16,
+    /// Draws the live region and owns every write to the terminal.
+    inline: Mutex<rune_term::inline::Inline>,
     /// Ordered upstream provider preference.
     provider_order: Vec<String>,
     /// Whether requests are restricted to that preference.
@@ -227,7 +233,10 @@ impl SessionHost {
             session_id: self.session_id.clone(),
         };
         let layout = footer::solve(
-            (u16::try_from(width).unwrap_or(80), 24),
+            (
+                u16::try_from(width).unwrap_or(80),
+                self.height.load(std::sync::atomic::Ordering::Relaxed),
+            ),
             1,
             false,
             footer::DEFAULT_MINIMUM_ROWS,
@@ -245,34 +254,65 @@ impl SessionHost {
         }
     }
 
-    /// Returns the bytes the current screen requires.
-    ///
-    /// Present so a test drives the same path a run uses: the bytes are what a
-    /// terminal receives, so an assertion here covers the product's render.
-    #[cfg(test)]
-    fn render(&self, transcript: &[String]) -> Result<Vec<u8>> {
-        self.paint(transcript, None)
+    /// Returns the current terminal width.
+    fn width(&self) -> u16 {
+        self.width.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// Paints one screen and returns the bytes the terminal must receive.
+    /// Takes the terminal's current size, keeping the last known one when the
+    /// terminal cannot report it.
     ///
-    /// Returns nothing when the screen is already current, which is what makes a
-    /// repaint free rather than a full redraw.
-    fn paint(&self, transcript: &[String], activity: Option<&str>) -> Result<Vec<u8>> {
+    /// Read every frame rather than once, because a resized window would
+    /// otherwise keep a layout measured for the old width.
+    fn refresh_size(&self) {
+        let Some((cols, rows)) = rune_term::shell::terminal_size() else {
+            return;
+        };
+        if cols == 0 || rows == 0 {
+            return;
+        }
+        self.width.store(cols, std::sync::atomic::Ordering::Relaxed);
+        self.height
+            .store(rows, std::sync::atomic::Ordering::Relaxed);
+        if let Ok(mut inline) = self.inline.lock() {
+            inline.set_width(cols);
+        }
+    }
+
+    /// Draws the live region and returns the bytes the terminal must receive.
+    ///
+    /// This is the only method that produces output for the interactive path. A
+    /// line printed beside it would move the rows the region is drawn at, so
+    /// there is exactly one writer: finished lines are handed here and printed
+    /// once, and everything after them is redrawn in place.
+    fn paint(
+        &self,
+        settled: &[String],
+        activity: Option<&str>,
+        prompt: &[String],
+        caret: (u16, u16),
+    ) -> Result<Vec<u8>> {
+        self.refresh_size();
         let footer_rows = self.status_rows();
-        let regions =
-            rune_term::frame::Regions::new(transcript, &footer_rows).with_activity(activity);
-        let target = rune_term::frame::compose(&regions, self.width, self.height)?;
-        let mut surface = self
-            .surface
+        let mut inline = self
+            .inline
             .lock()
-            .map_err(|_| RuneError::new(ErrorCode::Internal, "the frame lock was poisoned"))?;
-        Ok(surface.commit(&target)?.bytes)
+            .map_err(|_| RuneError::new(ErrorCode::Internal, "the renderer lock was poisoned"))?;
+        Ok(inline.frame(settled, activity, prompt, &footer_rows, caret))
+    }
+
+    /// Removes the live region, for a clean exit.
+    fn clear_region(&self) -> Result<Vec<u8>> {
+        let mut inline = self
+            .inline
+            .lock()
+            .map_err(|_| RuneError::new(ErrorCode::Internal, "the renderer lock was poisoned"))?;
+        Ok(inline.clear())
     }
 
     /// Returns the footer rows for the current state.
     fn status_rows(&self) -> Vec<String> {
-        self.status_line(usize::from(self.width))
+        self.status_line(usize::from(self.width()))
             .lines()
             .map(str::to_owned)
             .collect()
@@ -345,11 +385,11 @@ pub fn run<R: BufRead, W: std::io::Write>(
         session_id: recorder.id().to_string(),
         workspace: config.workspace.to_string(),
         truecolor: truecolor_supported(),
-        // The terminal size is fixed for the run: a resize mid-session would
-        // need a reader on the terminal, which this path does not own.
-        width: 100,
-        height: terminal_height(),
-        surface: Mutex::new(rune_term::frame::FrameSurface::new(100, terminal_height())?),
+        // Seeded from the terminal and refreshed on every frame, so a window
+        // resized while the session runs is picked up.
+        width: std::sync::atomic::AtomicU16::new(terminal_width()),
+        height: std::sync::atomic::AtomicU16::new(terminal_height()),
+        inline: Mutex::new(rune_term::inline::Inline::new(terminal_width())),
         provider_order: config.settings.provider_order.clone(),
         provider_strict: config.settings.provider_strict,
         reviewer: crate::auto_review::build(&config.settings, &config.paths)?,
@@ -358,21 +398,35 @@ pub fn run<R: BufRead, W: std::io::Write>(
 
     let out = Mutex::new(output);
     // The session identifier is announced up front so a resumed-or-new session
-    // can be named later without consulting the listing.
-    if let Ok(mut sink) = out.lock() {
-        let _ = writeln!(sink, "session {}", recorder.id());
+    // can be named later without consulting the listing. It goes through the
+    // renderer like everything else, so the rows it occupies are known to the
+    // component that later redraws over them.
+    {
+        let mut sink = out
+            .lock()
+            .map_err(|_| RuneError::new(ErrorCode::Internal, "the output lock was poisoned"))?;
+        let banner = format!("session {}", recorder.id());
+        let painted = host.paint(std::slice::from_ref(&banner), None, &[], (0, 0))?;
+        sink.write_all(&painted)?;
+        sink.flush()?;
     }
 
     // A resumed session keeps the title it was given.
     let mut is_first_prompt = config.resume.is_none() && recorder.title_is_unset();
 
+    // Keys are read directly when a terminal is attached, so the line being
+    // typed is drawn by this program with a cursor placed where it belongs.
+    // Without that, the terminal echoes each key at a position this program
+    // does not know, and the two disagree about what is on the line.
+    let mut reader = rune_term::input::KeyReader::new();
+    let keyed = reader.is_active();
+
     let mut source = rune_term::shell::StdinSource::new(input);
     let mut shell = Shell::new(&mut source);
 
-    let reason = shell.run(|input| {
-        let mut sink = out
-            .lock()
-            .map_err(|_| RuneError::new(ErrorCode::Internal, "the output lock was poisoned"))?;
+    // One handler for both input paths, so a keystroke and a piped line mean
+    // exactly the same thing.
+    let mut handle_input = |input: Input, mut sink: &mut dyn std::io::Write| -> Result<Action> {
         match input {
             Input::Command { name, arguments } => {
                 match handle_command(
@@ -381,7 +435,7 @@ pub fn run<R: BufRead, W: std::io::Write>(
                     &commands,
                     history_file.as_ref(),
                     &config.workspace,
-                    &mut *sink,
+                    &mut sink,
                 )? {
                     Handled::Exit => Ok(Action::Exit),
                     Handled::ClearHistory => {
@@ -412,6 +466,18 @@ pub fn run<R: BufRead, W: std::io::Write>(
                 }
             }
             Input::Prompt(text) => {
+                // The submitted line is committed to the flow before the turn
+                // runs, so what the user typed stays on screen once the reply
+                // replaces the region it was typed in.
+                let echo = transcript::render_prompt(
+                    rune_term::shell::prompt(),
+                    &text,
+                    usize::from(host.width()),
+                );
+                let painted = host.paint(std::slice::from_ref(&echo), None, &[], (0, 0))?;
+                sink.write_all(&painted)?;
+                sink.flush()?;
+
                 if is_first_prompt {
                     recorder.set_title(&session_log::derive_title(&text))?;
                     is_first_prompt = false;
@@ -438,12 +504,27 @@ pub fn run<R: BufRead, W: std::io::Write>(
                         .saturating_add(outcome.usage.output_tokens.unwrap_or(0)),
                 );
                 host.clear_events();
-                let lines = report_turn(&outcome, &host, &mut *sink)?;
-                // The screen is painted through the frame path, so only what
-                // changed reaches the terminal. A run whose content is
-                // unchanged therefore costs nothing to repaint.
+                // A finished turn is printed once and becomes part of the
+                // terminal's own scrollback, so it stays readable with the
+                // terminal's search and copy. Nothing else writes to the
+                // terminal: the region below is redrawn in place.
+                let lines = report_turn(&outcome, &host)?;
                 let activity = SessionHost::activity_line(&outcome);
-                let painted = host.paint(&lines, activity.as_deref())?;
+                // The prompt row is included even though it is empty, so the
+                // region the next keystroke redraws is the same shape as this
+                // one and nothing has to be drawn twice.
+                let prompt_row = transcript::render_prompt(
+                    rune_term::shell::prompt(),
+                    "",
+                    usize::from(host.width()),
+                );
+                let caret = rune_term::width::str_width(rune_term::shell::prompt());
+                let painted = host.paint(
+                    &lines,
+                    activity.as_deref(),
+                    std::slice::from_ref(&prompt_row),
+                    (0, u16::try_from(caret).unwrap_or(u16::MAX)),
+                )?;
                 if !painted.is_empty() {
                     sink.write_all(&painted)?;
                     sink.flush()?;
@@ -452,9 +533,99 @@ pub fn run<R: BufRead, W: std::io::Write>(
             }
             Input::Empty => Ok(Action::Continue),
         }
-    })?;
+    };
+
+    let reason = if keyed {
+        // Each keystroke redraws the prompt, so the line and the cursor follow
+        // what was typed rather than waiting for the terminal to decide the
+        // line is finished.
+        let mut reason = ExitReason::EndOfInput;
+        while let Some(input) = await_submission(&mut reader, &host, &out)? {
+            let mut sink = out
+                .lock()
+                .map_err(|_| RuneError::new(ErrorCode::Internal, "the output lock was poisoned"))?;
+            if handle_input(input, &mut *sink)? == Action::Exit {
+                reason = ExitReason::Requested;
+                break;
+            }
+        }
+        reason
+    } else {
+        shell.run(|input| {
+            let mut sink = out
+                .lock()
+                .map_err(|_| RuneError::new(ErrorCode::Internal, "the output lock was poisoned"))?;
+            handle_input(input, &mut *sink)
+        })?
+    };
+
+    // The region is removed before the session ends, so the shell that started
+    // it continues on a screen that is not half a frame.
+    let cleared = host.clear_region()?;
+    if !cleared.is_empty()
+        && let Ok(mut sink) = out.lock()
+    {
+        let _ = sink.write_all(&cleared);
+        let _ = sink.flush();
+    }
 
     Ok(reason.exit_code())
+}
+
+/// Waits for a line to be submitted, drawing the prompt as it is typed.
+///
+/// Returns the submitted input, or `None` when the user asked to leave. The
+/// cursor is placed after the text typed so far, which is the whole reason the
+/// line is drawn here rather than by the terminal.
+fn await_submission<W: std::io::Write>(
+    reader: &mut rune_term::input::KeyReader,
+    host: &SessionHost,
+    out: &Mutex<W>,
+) -> Result<Option<Input>> {
+    use rune_term::width::str_width;
+
+    let marker = rune_term::shell::prompt();
+
+    loop {
+        {
+            let mut sink = out
+                .lock()
+                .map_err(|_| RuneError::new(ErrorCode::Internal, "the output lock was poisoned"))?;
+            let row = transcript::render_prompt(marker, reader.line(), usize::from(host.width()));
+            let caret = str_width(marker).saturating_add(reader.column());
+            let painted = host.paint(
+                &[],
+                None,
+                std::slice::from_ref(&row),
+                (0, u16::try_from(caret).unwrap_or(u16::MAX)),
+            )?;
+            if !painted.is_empty() {
+                sink.write_all(&painted)?;
+                sink.flush()?;
+            }
+        }
+
+        match reader.read_key() {
+            KeyAction::Submit => {
+                let text = reader.line().trim().to_owned();
+                reader.clear();
+                if text.is_empty() {
+                    continue;
+                }
+                return Ok(Some(Input::parse(&text)));
+            }
+            // An empty line is the only thing there is to leave behind, so
+            // interrupting it means leaving the session.
+            KeyAction::Interrupt => return Ok(None),
+            KeyAction::Cancel => {
+                if reader.line().is_empty() {
+                    return Ok(None);
+                }
+                reader.clear();
+            }
+            KeyAction::Ignored => {}
+        }
+    }
 }
 
 /// Resolves the theme for a session.
@@ -482,20 +653,21 @@ fn resolve_theme_for(config: &SessionConfig, accepts_no_color: bool) -> Theme {
     )
 }
 
+/// Returns the terminal width to compose for.
+///
+/// Read from the terminal rather than assumed. A width that disagrees with the
+/// real one makes every row either wrap onto a row the renderer did not count,
+/// or leave a gap, and both put later content in the wrong place.
+fn terminal_width() -> u16 {
+    rune_term::shell::terminal_size().map_or(80, |size| size.0)
+}
+
 /// Returns the terminal height to compose for.
 ///
 /// A terminal that does not report a size gets a conventional height rather than
 /// zero, which would compose a frame with no room for anything.
 fn terminal_height() -> u16 {
-    crossterm_height().unwrap_or(24)
-}
-
-/// Reads the terminal height, when one is attached.
-fn crossterm_height() -> Option<u16> {
-    // The size is read through the standard terminal interface rather than an
-    // environment variable, because the latter is not set for every terminal.
-    let size = rune_term::shell::terminal_size()?;
-    Some(size.1)
+    rune_term::shell::terminal_size().map_or(24, |size| size.1)
 }
 
 /// Returns the context window for the configured model.
@@ -637,12 +809,13 @@ fn handle_command<W: std::io::Write>(
     }
 }
 
-/// Reports what a turn produced.
-fn report_turn<W: std::io::Write>(
-    outcome: &turn::TurnOutcome,
-    host: &SessionHost,
-    output: &mut W,
-) -> Result<Vec<String>> {
+/// Renders what a turn produced, as the lines to print.
+///
+/// Returns the lines rather than writing them, because the renderer is the only
+/// component that writes to the terminal. A line printed beside it would move
+/// the rows the live region is drawn at, and in raw mode a bare newline moves
+/// down without returning to the first column.
+fn report_turn(outcome: &turn::TurnOutcome, host: &SessionHost) -> Result<Vec<String>> {
     let events = host
         .events
         .lock()
@@ -691,11 +864,14 @@ fn report_turn<W: std::io::Write>(
         _ => {}
     }
 
-    let rendered = transcript::render(&entries, Display::default());
-    if !rendered.is_empty() {
-        let _ = writeln!(output, "{rendered}");
-    }
-    let _ = output.flush();
+    // Measured against the terminal rather than a fixed width, so a line is
+    // wrapped where the reader's own window wraps it instead of mid-word at a
+    // column that has nothing to do with this terminal.
+    let display = Display {
+        width: usize::from(host.width()),
+        ..Display::default()
+    };
+    let rendered = transcript::render(&entries, display);
     Ok(rendered.lines().map(str::to_owned).collect())
 }
 
@@ -793,64 +969,83 @@ pub fn prepare(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rune_term::shell::{ExitReason, ScriptedSource, Shell};
+    use rune_term::shell::{ScriptedSource, Shell};
 
     #[test]
-    fn a_screen_is_painted_through_the_frame_path() {
-        // The bytes are what a terminal receives, so asserting on them checks
-        // the real render path rather than a string built beside it.
+    fn a_finished_turn_is_printed_once_above_the_live_region() {
+        // Finished lines join the terminal's own scrollback, so they are
+        // written in the flow rather than positioned. Everything after them is
+        // the region that gets redrawn in place.
         let host = test_host();
-        let first = host
-            .render(&["a line".to_owned()])
+        let lines = vec!["a line".to_owned()];
+        let bytes = host
+            .paint(&lines, None, &[], (0, 0))
             .expect("painted the first screen");
-        assert!(!first.is_empty(), "the first screen wrote nothing");
-        // The bytes carry cursor positioning between cells, so the text is
-        // checked by replaying them into a grid rather than by substring.
-        let mut grid = rune_term::engine::Grid::new(host.width, host.height).expect("grid");
-        grid.feed(&first).expect("fed");
+        let text = String::from_utf8_lossy(&bytes).into_owned();
         assert!(
-            grid.text().contains("a line"),
-            "the text did not reach the screen: {:?}",
-            grid.text()
-        );
-
-        // Repainting the same content writes nothing, which is what makes a
-        // redundant repaint free.
-        let again = host
-            .render(&["a line".to_owned()])
-            .expect("painted the same screen");
-        assert!(
-            again.is_empty(),
-            "an unchanged screen wrote {} bytes",
-            again.len()
+            text.contains("a line\r\n"),
+            "the finished line was not printed in the flow: {text:?}"
         );
     }
 
     #[test]
-    fn a_changed_screen_paints_only_what_changed() {
-        // The measure is the byte count, because cursor positioning splits the
-        // text so a substring search cannot tell a diff from a full redraw. A
-        // diff of one row is smaller than a repaint of the whole screen.
+    fn the_live_region_carries_the_status_line() {
         let host = test_host();
-        let before = vec!["alpha stays put".to_owned(), "beta changes".to_owned()];
-        host.render(&before).expect("painted");
-
-        let after = vec!["alpha stays put".to_owned(), "gamma changed".to_owned()];
-        let diffed = host.render(&after).expect("painted");
-
-        // The same change through a surface that has seen nothing, which is what
-        // a full repaint costs.
-        let fresh = test_host();
-        let repainted = fresh.render(&after).expect("painted");
-
-        assert!(!diffed.is_empty(), "the change wrote nothing");
+        let bytes = host.paint(&[], None, &[], (0, 0)).expect("painted");
+        let text = String::from_utf8_lossy(&bytes).into_owned();
         assert!(
-            diffed.len() < repainted.len(),
-            "the change cost {} bytes against {} for a full repaint, so nothing \
-             was diffed",
-            diffed.len(),
-            repainted.len()
+            text.contains("test"),
+            "the status line was not drawn: {text:?}"
         );
+        assert!(text.contains("auto"), "{text:?}");
+    }
+
+    #[test]
+    fn the_prompt_and_its_cursor_are_drawn_where_the_caret_is() {
+        // This is the whole point of the composer: the caret sits inside what
+        // was typed, rather than wherever the terminal would have left it.
+        let host = test_host();
+        let row = vec!["> hel".to_owned()];
+        let bytes = host.paint(&[], None, &row, (0, 5)).expect("painted");
+        let text = String::from_utf8_lossy(&bytes).into_owned();
+        assert!(text.contains("> hel"), "{text:?}");
+        // A one-based column, so a caret after five columns is column six.
+        assert!(
+            text.contains("\u{1b}[6G"),
+            "the caret was not placed at the end of the line: {text:?}"
+        );
+    }
+
+    #[test]
+    fn every_frame_hides_the_cursor_while_it_writes() {
+        // A cursor visible mid-frame is seen jumping between rows.
+        let host = test_host();
+        let bytes = host.paint(&[], None, &[], (0, 0)).expect("painted");
+        let text = String::from_utf8_lossy(&bytes).into_owned();
+        assert!(text.contains(rune_term::inline::HIDE_CURSOR), "{text:?}");
+        assert!(text.contains(rune_term::inline::SHOW_CURSOR), "{text:?}");
+    }
+
+    #[test]
+    fn leaving_removes_the_live_region() {
+        let host = test_host();
+        host.paint(&[], None, &[], (0, 0)).expect("painted");
+        let cleared = host.clear_region().expect("cleared");
+        assert!(!cleared.is_empty(), "the region was left on the screen");
+    }
+
+    #[test]
+    fn the_width_comes_from_the_terminal_rather_than_a_constant() {
+        // A width that disagrees with the real one makes every row wrap or
+        // leave a gap, and both put later content in the wrong place.
+        let host = test_host();
+        let before = host.width();
+        host.width.store(132, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(host.width(), 132);
+        assert_ne!(before, 132, "the test did not change the width");
+        // The status line is measured against the width it now reports.
+        let line = host.status_line(usize::from(host.width()));
+        assert!(!line.is_empty());
     }
 
     #[test]
@@ -1195,7 +1390,7 @@ mod tests {
     }
 
     #[test]
-    fn reporting_a_turn_writes_its_text() {
+    fn a_reported_turn_yields_its_text_as_lines() {
         let host = test_host();
         let outcome = turn::TurnOutcome {
             stop_reason: StopReason::Completed,
@@ -1204,9 +1399,11 @@ mod tests {
             steps: 1,
             calls: Vec::new(),
         };
-        let mut output = Vec::new();
-        report_turn(&outcome, &host, &mut output).expect("reported");
-        assert!(String::from_utf8_lossy(&output).contains("the answer"));
+        let lines = report_turn(&outcome, &host).expect("reported");
+        assert!(
+            lines.iter().any(|line| line.contains("the answer")),
+            "{lines:?}"
+        );
     }
 
     #[test]
@@ -1219,9 +1416,11 @@ mod tests {
             steps: 40,
             calls: Vec::new(),
         };
-        let mut output = Vec::new();
-        report_turn(&outcome, &host, &mut output).expect("reported");
-        assert!(String::from_utf8_lossy(&output).contains("step limit"));
+        let lines = report_turn(&outcome, &host).expect("reported");
+        assert!(
+            lines.iter().any(|line| line.contains("step limit")),
+            "{lines:?}"
+        );
     }
 
     #[test]
@@ -1242,9 +1441,8 @@ mod tests {
             steps: 1,
             calls: Vec::new(),
         };
-        let mut output = Vec::new();
-        report_turn(&outcome, &host, &mut output).expect("reported");
-        let text = String::from_utf8_lossy(&output);
+        let lines = report_turn(&outcome, &host).expect("reported");
+        let text = lines.join("\n");
         assert!(text.contains("refused shell"), "{text}");
     }
 
@@ -1356,11 +1554,9 @@ mod tests {
             session_id: "sessiontest1".to_owned(),
             workspace: "/tmp".to_owned(),
             truecolor: false,
-            width: 80,
-            height: 24,
-            surface: Mutex::new(
-                rune_term::frame::FrameSurface::new(80, 24).expect("a frame surface"),
-            ),
+            width: std::sync::atomic::AtomicU16::new(80),
+            height: std::sync::atomic::AtomicU16::new(24),
+            inline: Mutex::new(rune_term::inline::Inline::new(80)),
             provider_order: Vec::new(),
             provider_strict: false,
             reviewer: None,
