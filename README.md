@@ -39,9 +39,36 @@ Then connect a provider. There is no default: a fresh install has none, and any
 command that needs one says so and names how to connect it.
 
 ```sh
-rune connect anthropic      # or chat_completions, or your own endpoint
+rune connect                # lists the providers and asks for what it needs
 rune doctor                 # check what your machine supports
 ```
+
+Running `connect` with no argument lists the providers and takes a choice, then
+asks for the credential, so nothing has to be looked up first. Name one to skip
+the list:
+
+```sh
+rune connect anthropic
+rune connect opencode-go    # a subscription over the OpenAI-compatible route
+rune connect chat_completions
+```
+
+It runs again for each provider you add, and what you have connected is reported
+by `rune auth`. The providers that ship in the table are:
+
+| Provider | What it is |
+|---|---|
+| `anthropic` | Anthropic Messages API |
+| `openai` | OpenAI Responses API |
+| `opencode` | OpenCode Zen, pay-per-use |
+| `opencode-go` | OpenCode Go, a subscription |
+| `chat_completions` | Any OpenAI-compatible endpoint, with the URL you give |
+
+Anything else is reachable by naming it and giving its endpoint, which is what
+`chat_completions` does with a URL and what a self-hosted gateway needs. A
+credential is read from the provider's own variable when it is already exported
+(`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `OPENCODE_API_KEY`), and pasted
+otherwise.
 
 ## Use
 

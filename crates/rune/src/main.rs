@@ -13,6 +13,7 @@
 mod ask;
 mod auto_review;
 mod cli;
+mod connect_flow;
 mod diagnostics;
 mod help;
 mod install;
@@ -472,21 +473,32 @@ fn run_auth(
     Ok(ExitCode::from(EXIT_OK))
 }
 
-/// Stores a credential for the configured provider.
+/// Connects a provider, guiding the choice when none is named.
 ///
-/// The provider is the positional argument. The credential comes from the
-/// environment when it is already exported, and from standard input otherwise,
-/// so it never has to appear in a shell history or a process listing.
+/// The provider is the positional argument. Without one, the providers this
+/// build knows are listed and one is chosen from them, because a user who has
+/// just installed the harness cannot be expected to already know the name. The
+/// credential comes from the environment when it is already exported, and from
+/// standard input otherwise, so it never has to appear in a shell history or a
+/// process listing.
+///
+/// The flow asks when a terminal can answer and never otherwise, so a caller
+/// that pipes its answer in, or a machine caller that supplies none, is not
+/// blocked waiting for input that will not come.
 fn run_connect(
     settings: &Settings,
     paths: &Paths,
     launch: &Launch,
     output: &OutputFlags,
 ) -> Result<ExitCode> {
-    let name = launch.args.first().map_or_else(
-        || settings.provider.to_string(),
-        |value| value.trim().to_owned(),
-    );
+    let named = launch.args.first().map(|value| value.trim().to_owned());
+    if named.is_none() && !output.json {
+        let entry = connect_flow::choose_provider()?;
+        connect_flow::run(paths, entry)?;
+        return Ok(ExitCode::from(EXIT_OK));
+    }
+
+    let name = named.unwrap_or_else(|| settings.provider.to_string());
     if name.is_empty() || name == "unconfigured" {
         return Err(
             RuneError::new(ErrorCode::InvalidConfiguration, "no provider was named")
@@ -495,7 +507,20 @@ fn run_connect(
     }
 
     let parsed = config::parse_provider(&name);
-    let base_url = provider_setup::resolve_endpoint(&parsed, settings.base_url.as_deref())?;
+    // The configured endpoint belongs to the provider that was configured, so
+    // it is only reused when this connection is for that same provider.
+    // Reusing it otherwise would point a second provider at the first one's
+    // endpoint, which succeeds and then sends every request to the wrong host.
+    let configured =
+        provider_setup::inherited_endpoint(&settings.provider, settings.base_url.as_deref(), &name);
+    let base_url = match provider_setup::resolve_endpoint(&parsed, configured.as_deref()) {
+        Ok(url) => url,
+        // A provider with no default needs an endpoint. Interactively there is
+        // someone to ask, which is the difference between connecting a
+        // self-hosted endpoint and being told to go and edit a file.
+        Err(err) if output.json => return Err(err),
+        Err(_) => connect_flow::ask_endpoint(&name)?,
+    };
 
     let from_environment =
         provider_setup::environment_credential(&name, settings.api_key_env.as_deref());
@@ -1036,8 +1061,13 @@ fn run_acp(
     let config = rune_acp::ServerConfig {
         paths: paths.clone(),
         workspace: workspace.to_owned(),
-        endpoint: rune_net::transport::Endpoint::new(base_url, credential.expose().to_owned())
-            .offline(settings.offline),
+        endpoint: provider_setup::endpoint(
+            &settings.provider,
+            &base_url,
+            credential.expose(),
+            rune_net::transport::AuthStyle::Bearer,
+            settings.offline,
+        ),
         dialect,
         model: settings.model.clone(),
         instructions: rune_context::prompt::instructions_for(

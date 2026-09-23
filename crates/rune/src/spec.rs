@@ -198,11 +198,11 @@ pub const RUN: &[CommandSpec] = &[
     CommandSpec {
         name: "connect",
         aliases: &[],
-        summary: "Connect a model provider",
-        usage: "rune connect [<name>]",
-        flags: &[],
+        summary: "Connect a model provider, choosing from a list",
+        usage: "rune connect [<name>] [--json]",
+        flags: &[flag("--json", "Emit JSON.")],
         requirements: Requirements::CONFIG,
-        supports_json: false,
+        supports_json: true,
     },
 ];
 

@@ -12,6 +12,7 @@ use rune_core::error::{ErrorCode, Result, RuneError};
 use rune_core::paths::Paths;
 use rune_net::auth::{self, CredentialSource};
 use rune_net::catalog::{Catalog, CatalogSource, ModelMetadata};
+use rune_net::providers;
 
 /// Endpoint used when a provider is connected without one given.
 ///
@@ -20,13 +21,11 @@ use rune_net::catalog::{Catalog, CatalogSource, ModelMetadata};
 /// somewhere the user never named.
 #[must_use]
 pub fn default_base_url(provider: &Provider) -> Option<&'static str> {
-    match provider {
-        Provider::Anthropic => Some("https://api.anthropic.com"),
-        Provider::Responses => Some("https://api.openai.com/v1"),
-        // A compatible or named endpoint has no single home, so it must be
-        // given rather than guessed.
-        Provider::Unconfigured | Provider::ChatCompletions | Provider::Named(_) => None,
-    }
+    // Read from the provider table rather than restated, so the endpoint the
+    // connection command offers and the one the transport uses cannot drift.
+    // A compatible or named endpoint has no single home and returns `None`,
+    // because guessing one would send a request somewhere never named.
+    providers::base_url(provider.as_str())
 }
 
 /// Reads a credential from the environment for a provider.
@@ -293,6 +292,52 @@ fn capability_names(model: &ModelMetadata) -> Vec<&'static str> {
     names
 }
 
+/// Returns the endpoint already configured for a provider, when there is one.
+///
+/// The configured endpoint belongs to the provider that was configured, so it
+/// is only reused for a connection to that same provider. Reusing it for
+/// another one would point the new provider at the old provider's host, which
+/// succeeds and then sends every request somewhere the user never named.
+#[must_use]
+pub fn inherited_endpoint(
+    configured_provider: &Provider,
+    configured_url: Option<&str>,
+    connecting: &str,
+) -> Option<String> {
+    if configured_provider.as_str() != connecting {
+        return None;
+    }
+    configured_url.map(str::to_owned)
+}
+
+/// Builds the endpoint a request is sent to, with the headers its provider needs.
+///
+/// A provider that routes by conversation or asks its clients to identify
+/// themselves states that in the provider table, so the headers are applied here
+/// rather than at each call site. A caller that builds its own endpoint would
+/// otherwise reach the provider without them and be refused.
+#[must_use]
+pub fn endpoint(
+    provider: &Provider,
+    base_url: &str,
+    credential: &str,
+    auth: rune_net::transport::AuthStyle,
+    offline: bool,
+) -> rune_net::transport::Endpoint {
+    let name = provider.as_str();
+    let mut endpoint =
+        rune_net::transport::Endpoint::new(base_url.to_owned(), credential.to_owned())
+            .with_auth(auth)
+            .offline(offline);
+    for (header, value) in providers::lookup(name)
+        .map(|entry| entry.required_headers)
+        .unwrap_or_default()
+    {
+        endpoint = endpoint.with_header(*header, *value);
+    }
+    endpoint
+}
+
 /// Resolves the endpoint a connection should use.
 pub fn resolve_endpoint(provider: &Provider, configured: Option<&str>) -> Result<String> {
     let url = configured
@@ -322,6 +367,32 @@ pub fn environment_credential(provider: &str, configured: Option<&str>) -> Optio
 mod tests {
     use super::*;
     use rune_core::config::Provider;
+
+    #[test]
+    fn a_second_provider_does_not_inherit_the_first_endpoint() {
+        // Connecting another provider while one is configured used to carry the
+        // configured endpoint over, so the new provider pointed at the old
+        // provider's host and every request went somewhere never named.
+        let configured = rune_core::config::parse_provider("anthropic");
+        let url = Some("https://api.anthropic.com");
+
+        assert_eq!(
+            inherited_endpoint(&configured, url, "anthropic").as_deref(),
+            Some("https://api.anthropic.com"),
+            "the same provider should reuse its endpoint"
+        );
+        assert_eq!(
+            inherited_endpoint(&configured, url, "chat_completions"),
+            None,
+            "a different provider must not inherit another one's endpoint"
+        );
+    }
+
+    #[test]
+    fn a_provider_with_no_configured_endpoint_inherits_nothing() {
+        let configured = rune_core::config::parse_provider("anthropic");
+        assert_eq!(inherited_endpoint(&configured, None, "anthropic"), None);
+    }
 
     fn paths(root: &camino::Utf8Path) -> Paths {
         let resolved = Paths::resolve(

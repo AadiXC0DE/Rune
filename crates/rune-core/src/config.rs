@@ -168,8 +168,14 @@ impl fmt::Display for Effort {
 /// A fresh install has no provider. Every command that needs one fails with
 /// `authentication_required` naming how to connect one, rather than silently
 /// selecting an endpoint and implying an account the product does not require.
-#[derive(Clone, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+/// Serialized as a bare name, and read back from any name.
+///
+/// The named variant holds a string, so the derived representation would be a
+/// table that no hand-written configuration uses and that a provider connected
+/// by name could not be read back from. This is a plain string in both
+/// directions: a name that is not one of the built-ins is the named variant,
+/// which is what connecting a provider by name writes.
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub enum Provider {
     /// No provider has been connected.
     #[default]
@@ -182,6 +188,27 @@ pub enum Provider {
     Anthropic,
     /// A named endpoint declared in the user configuration.
     Named(String),
+}
+
+impl Serialize for Provider {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for Provider {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        // Every name is accepted, because a provider the user named themselves
+        // is a legitimate value. Refusing an unknown name here would mean a
+        // connection could be written and never read back.
+        let raw = String::deserialize(deserializer)?;
+        Ok(parse_provider(&raw))
+    }
 }
 
 impl Provider {

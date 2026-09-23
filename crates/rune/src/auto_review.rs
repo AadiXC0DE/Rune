@@ -63,7 +63,13 @@ pub fn build(settings: &Settings, paths: &Paths) -> Result<Option<Box<dyn Review
     Ok(Some(Box::new(ModelReviewer {
         model,
         dialect,
-        endpoint: Endpoint::new(base_url, credential.expose().to_owned()).offline(settings.offline),
+        endpoint: crate::provider_setup::endpoint(
+            &settings.provider,
+            &base_url,
+            credential.expose(),
+            rune_net::transport::AuthStyle::Bearer,
+            settings.offline,
+        ),
         timeout: Duration::from_millis(
             settings
                 .limits

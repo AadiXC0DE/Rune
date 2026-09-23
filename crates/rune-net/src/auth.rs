@@ -235,6 +235,7 @@ pub fn default_variables(provider: &str) -> &'static [&'static str] {
         "anthropic" => &["ANTHROPIC_API_KEY"],
         "chat_completions" | "openai" => &["OPENAI_API_KEY"],
         "responses" => &["OPENAI_API_KEY"],
+        "opencode" | "opencode-go" => &["OPENCODE_API_KEY"],
         _ => &[],
     }
 }

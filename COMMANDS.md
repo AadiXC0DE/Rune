@@ -51,10 +51,13 @@ Serve the Agent Client Protocol over standard input and output
 
 Review the pending changes in the workspace
 
-### `rune connect [<name>]`
+### `rune connect [<name>] [--json]`
 
-Connect a model provider
+Connect a model provider, choosing from a list
 
+| Flag | Description |
+|---|---|
+| `--json` | Emit JSON. |
 
 ## Sessions and local records
 

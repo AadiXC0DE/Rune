@@ -75,6 +75,13 @@ pub struct Endpoint {
     pub credential: String,
     /// How the credential is presented.
     pub auth: AuthStyle,
+    /// Headers sent with every request, after the authentication header.
+    ///
+    /// A gateway that routes by conversation needs a header naming the
+    /// conversation, and one that expects a client to identify itself needs a
+    /// user agent. Both are facts about the endpoint rather than about a
+    /// dialect, so they live here rather than in the request builder.
+    pub headers: Vec<(String, String)>,
     /// Whether outbound requests are refused entirely.
     pub offline: bool,
 }
@@ -87,7 +94,24 @@ impl Endpoint {
             base_url: base_url.into(),
             credential: credential.into(),
             auth: AuthStyle::Bearer,
+            headers: Vec::new(),
             offline: false,
+        }
+    }
+
+    /// Adds a header sent with every request.
+    #[must_use]
+    pub fn with_header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.headers.push((name.into(), value.into()));
+        self
+    }
+
+    /// Adds a header only when a value is present.
+    #[must_use]
+    pub fn with_header_when(self, name: &str, value: Option<impl Into<String>>) -> Self {
+        match value {
+            Some(value) => self.with_header(name, value),
+            None => self,
         }
     }
 
@@ -308,8 +332,15 @@ pub fn stream_completion(
             &endpoint.auth.value(&endpoint.credential),
         );
 
-    for (name, value) in provider.extra_headers() {
-        request = request.header(name, &value);
+    // The endpoint's own headers come after the dialect's, so an endpoint that
+    // names a header the dialect also sets wins rather than being overwritten.
+    for (name, value) in provider
+        .extra_headers()
+        .into_iter()
+        .map(|(name, value)| (name.to_owned(), value))
+        .chain(endpoint.headers.iter().cloned())
+    {
+        request = request.header(&name, &value);
     }
 
     let response = request
