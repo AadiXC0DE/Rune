@@ -280,7 +280,7 @@ fn validate_id_charset(raw: &str, field: &'static str) -> crate::error::Result<(
 /// on the platform where the device is missing. A failure is returned instead, so
 /// the caller is told rather than handed a predictable value.
 fn fill_random(out: &mut [u8]) -> std::io::Result<()> {
-    getrandom::fill(out).map_err(|err| std::io::Error::other(err.to_string()))
+    getrandom::getrandom(out).map_err(|err| std::io::Error::other(err.to_string()))
 }
 
 /// Encodes bytes into the unpadded URL-safe base64 alphabet.

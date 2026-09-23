@@ -204,7 +204,7 @@ fn release(extra: &[String]) -> Result<(), String> {
     // binary alone.
     let binary_bytes =
         std::fs::read(&binary).map_err(|err| format!("could not read {binary}: {err}"))?;
-    std::fs::write(&archive_path, tar_single(&name, &binary_bytes))
+    std::fs::write(&archive_path, archive_bytes(&name, &binary_bytes)?)
         .map_err(|err| format!("could not write {archive_path}: {err}"))?;
 
     let bytes = std::fs::read(&archive_path)
@@ -257,6 +257,37 @@ pub fn tar_single(name: &str, contents: &[u8]) -> Vec<u8> {
     // Two zero blocks end an archive.
     out.resize(out.len().saturating_add(1024), 0);
     out
+}
+
+/// Builds the bytes that are published for one binary.
+///
+/// Packing and compressing are one step here rather than two at the call site,
+/// because the name the release uses says the result is gzipped and a caller
+/// that forgot the compression would still produce a file that opens on a
+/// machine which sniffs the format.
+fn archive_bytes(name: &str, binary: &[u8]) -> Result<Vec<u8>, String> {
+    gzip(&tar_single(name, binary))
+}
+
+/// Compresses an archive, as the `.tar.gz` name promises.
+///
+/// The name is part of the contract: a downloader picks its decompressor from
+/// it, and a file that is not gzip refuses to open in anything but a tar program
+/// that sniffs the format. The gzip header carries a modification time, so it is
+/// pinned the way the tar fields are, or the same input would produce different
+/// bytes on a different machine.
+fn gzip(contents: &[u8]) -> Result<Vec<u8>, String> {
+    use flate2::Compression;
+    use flate2::write::GzEncoder;
+    use std::io::Write;
+
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::new(9));
+    encoder
+        .write_all(contents)
+        .map_err(|err| format!("could not compress the archive: {err}"))?;
+    encoder
+        .finish()
+        .map_err(|err| format!("could not finish the archive: {err}"))
 }
 
 /// Builds one tar header block.
@@ -553,10 +584,56 @@ mod tests {
         );
     }
 
+    /// Decompresses a gzipped archive, for assertions about its contents.
+    fn decompress(archive: &[u8]) -> Vec<u8> {
+        use flate2::read::GzDecoder;
+        use std::io::Read;
+
+        let mut out = Vec::new();
+        GzDecoder::new(archive)
+            .read_to_end(&mut out)
+            .expect("the archive is not readable as gzip");
+        out
+    }
+
     /// Returns the digest of some bytes.
     fn checksum_of(bytes: &[u8]) -> String {
         use sha2::{Digest, Sha256};
         format!("{:x}", Sha256::digest(bytes))
+    }
+
+    #[test]
+    fn the_archive_is_gzip_as_its_name_promises() {
+        // A downloader chooses its decompressor from the file name, and a
+        // decompressor reads the magic bytes rather than the name. An archive
+        // that is really a plain tar opens with `tar` on some systems and fails
+        // everywhere the name is taken at its word.
+        let archive = archive_bytes("rune", b"x").expect("compression failed");
+        assert_eq!(
+            archive.get(..2),
+            Some([0x1f, 0x8b].as_slice()),
+            "the archive does not start with the gzip magic bytes"
+        );
+        assert!(!archive.is_empty());
+    }
+
+    #[test]
+    fn compression_survives_a_round_trip() {
+        let contents = b"a binary with some length to it".repeat(64);
+        let archive = archive_bytes("rune", &contents).expect("compression failed");
+        let decoded = decompress(&archive);
+        assert_eq!(decoded, tar_single("rune", &contents));
+        assert!(archive.len() < decoded.len(), "compression did not shrink");
+    }
+
+    #[test]
+    fn the_compressed_archive_is_reproducible() {
+        let first = archive_bytes("rune", b"binary contents").expect("compression failed");
+        let second = archive_bytes("rune", b"binary contents").expect("compression failed");
+        assert_eq!(
+            first, second,
+            "the same input compressed differently, so the digest would not describe it"
+        );
     }
 
     #[test]

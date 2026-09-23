@@ -40,6 +40,9 @@ rune-acp = { path = "crates/rune-acp", version = "0.1.1" }
 rune-sdk = { path = "crates/rune-sdk", version = "0.1.1" }
 rune-testkit = { path = "crates/rune-testkit", version = "0.1.1" }
 
+# Compression
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order", "raw_value"] }
@@ -76,7 +79,7 @@ jiff = { version = "0.2", default-features = false }
 
 # Hashing
 sha2 = "0.10"
-getrandom = "0.3"
+getrandom = "0.2"
 
 # Dev
 insta = { version = "1", features = ["json"] }

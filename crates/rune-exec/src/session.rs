@@ -570,11 +570,17 @@ mod tests {
     }
 
     /// Waits for the process to end and returns its exit.
+    ///
+    /// The readers are drained first, because a reaped child says nothing about
+    /// whether its last bytes have been copied out of the pipe yet. A caller
+    /// that reads immediately after this sees whatever the reader thread has
+    /// managed to move so far, which is a race a loaded machine can win.
     fn exit_of(process: &Process) -> Exit {
         assert!(
             wait_until(|| process.exit().is_some(), Duration::from_secs(10)),
             "the process did not end"
         );
+        process.drain_output(Duration::from_secs(5));
         process.exit().expect("an exit status")
     }
 
