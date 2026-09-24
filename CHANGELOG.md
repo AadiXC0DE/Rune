@@ -2,6 +2,17 @@
 
 Notable changes, newest first. Each entry describes what a user can observe.
 
+## 0.1.12
+
+### Fixed
+
+- The context window is resolved before the first frame is drawn. The session
+  announced itself and corrected the figure once the endpoint answered, so the
+  status line showed the compiled default for as long as the lookup took and
+  changed under the reader. A number that corrects itself is worse than one
+  that arrives late, because while it is on screen it is indistinguishable from
+  a right one.
+
 ## 0.1.11
 
 ### Fixed
