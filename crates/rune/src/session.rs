@@ -418,6 +418,24 @@ impl SessionHost {
         lock_model(&self.model).clone()
     }
 
+    /// Adopts a model's real context window, when the endpoint reports one.
+    ///
+    /// The configured window wins, because a user who declared one is describing
+    /// the model they selected and the endpoint may advertise a number that
+    /// counts only part of the conversation. When nothing is configured the
+    /// endpoint's figure is far better than the compiled default, which
+    /// understates a large model so badly that a session looks nearly full
+    /// before it has said anything.
+    fn adopt_context_window(&self, reported: Option<u64>, configured: bool) {
+        if configured {
+            return;
+        }
+        if let Some(window) = reported.filter(|window| *window > 0) {
+            self.context_limit
+                .store(window, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
     /// Reports the running state for the read-only commands.
     ///
     /// Borrowed from live state rather than collected at the start, so a status
@@ -621,6 +639,10 @@ impl SessionHost {
             .store(rows, std::sync::atomic::Ordering::Relaxed);
         if let Ok(mut inline) = self.inline.lock() {
             inline.set_width(cols);
+            // One row of slack, so a region that fills the screen still has
+            // somewhere to move the caret and never writes into the terminal's
+            // last row, which is what makes it scroll.
+            inline.set_max_rows(rows.saturating_sub(1));
         }
     }
 
@@ -755,14 +777,11 @@ impl SessionHost {
             }
         }
 
-        // The region keeps the newest rows, so a long answer cannot push the
-        // input off the screen.
-        let limit = usize::from(self.height.load(std::sync::atomic::Ordering::Relaxed))
-            .saturating_sub(6)
-            .max(1);
-        if rows.len() > limit {
-            rows.drain(..rows.len().saturating_sub(limit));
-        }
+        // Every row of the answer is handed over. The renderer owns the region
+        // height, because only it knows how tall the region it drew was and
+        // therefore which rows it can paint over. Trimming here as well would
+        // mean two components each holding a different idea of the limit, and
+        // the rows dropped here could not be erased by the frame that follows.
         rows
     }
 
@@ -905,6 +924,24 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
     // input closure borrows the config and a model chosen mid-session has to be
     // able to build a catalog from the same settings the session started with.
     let settings = config.settings.clone();
+
+    // The endpoint is asked what the selected model's window actually is. This
+    // runs before the first turn, because a session that budgets against the
+    // compiled default reports a window the model does not have until the
+    // figure arrives. A failure is not reported: it is not a reason to refuse
+    // the session, and the configured or compiled figure still applies.
+    if !settings.offline
+        && let Ok(catalog) =
+            crate::provider_setup::fetch_catalog(&settings, &config.paths, CONTEXT_LOOKUP_TIMEOUT)
+    {
+        let current = host.model_name();
+        let reported = catalog
+            .models
+            .iter()
+            .find(|model| model.id == current)
+            .and_then(|model| model.context_window);
+        host.adopt_context_window(reported, config.settings.context_window.is_some());
+    }
 
     // The prompts already recorded in this workspace, oldest first, which is
     // the order the up arrow walks backwards through. Refreshed after each
@@ -1743,6 +1780,12 @@ fn render_settings(info: &SessionInfo<'_>) -> String {
     out.trim_end().to_owned()
 }
 
+/// How long the session waits for the endpoint's model list at startup.
+///
+/// Short, because a user is waiting for a prompt: the figure is an improvement
+/// on the compiled default rather than something the session cannot run without.
+const CONTEXT_LOOKUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
 /// How long the model picker waits for the endpoint's list.
 ///
 /// Shorter than the command line's wait, because a user is watching a list
@@ -1988,7 +2031,10 @@ fn handle_command<W: std::io::Write>(
         // A model named inline is taken as given rather than checked against a
         // catalog, because an endpoint may serve a model it does not advertise
         // and a typo is visible in the status line right after.
-        "model" => {
+        // `/models` is accepted as a spelling of `/model`, because reaching for
+        // the plural is what most people do first and refusing it teaches
+        // nothing.
+        "model" | "models" => {
             let requested = arguments.trim();
             if requested.is_empty() {
                 return Ok(Handled::PickModel);
@@ -2069,6 +2115,7 @@ fn handle_command<W: std::io::Write>(
                 output,
                 "commands: /help /quit
 /model [id]  choose a model, or switch to one named here
+/models  same as /model
 /status  show the model, provider, context, and session
 /cost  show what this session has spent
 /compact  summarize older turns to free the context window
@@ -2761,6 +2808,37 @@ mod tests {
     }
 
     #[test]
+    fn the_plural_models_spelling_means_the_same_thing() {
+        // Reaching for the plural is what most people do first, and refusing it
+        // would teach nothing.
+        let mut output = Vec::new();
+        let action = handle_command(
+            "models",
+            "",
+            &empty_commands(),
+            None,
+            Utf8Path::new("/w"),
+            &test_info(),
+            &mut output,
+        )
+        .expect("handled");
+        assert_eq!(action, Handled::PickModel);
+
+        let mut output = Vec::new();
+        let action = handle_command(
+            "models",
+            "beta-1",
+            &empty_commands(),
+            None,
+            Utf8Path::new("/w"),
+            &test_info(),
+            &mut output,
+        )
+        .expect("handled");
+        assert_eq!(action, Handled::SetModel("beta-1".to_owned()));
+    }
+
+    #[test]
     fn a_bare_model_command_asks_for_the_picker() {
         // The whole point of the command without an argument is the list, so a
         // bare invocation must not be read as switching to the empty model.
@@ -2784,6 +2862,57 @@ mod tests {
         assert_eq!(host.model(), "test");
         host.set_model("other/model", None);
         assert_eq!(host.model(), "other/model");
+    }
+
+    #[test]
+    fn a_reported_window_is_adopted_when_none_was_configured() {
+        // Without this the session budgets against the compiled default, which
+        // understates a large model so badly that it looks nearly full before
+        // anything has been said.
+        let host = test_host();
+        assert_eq!(
+            host.context_limit
+                .load(std::sync::atomic::Ordering::Relaxed),
+            rune_net::catalog::DEFAULT_CONTEXT_WINDOW
+        );
+        host.adopt_context_window(Some(1_000_000), false);
+        assert_eq!(
+            host.context_limit
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1_000_000
+        );
+    }
+
+    #[test]
+    fn a_configured_window_is_not_overridden_by_the_endpoint() {
+        // A user who declared a window is describing the model they selected,
+        // and an endpoint may advertise a figure that counts only part of the
+        // conversation, so their choice wins.
+        let host = test_host();
+        let before = host
+            .context_limit
+            .load(std::sync::atomic::Ordering::Relaxed);
+        host.adopt_context_window(Some(9_999_999), true);
+        assert_eq!(
+            host.context_limit
+                .load(std::sync::atomic::Ordering::Relaxed),
+            before
+        );
+    }
+
+    #[test]
+    fn an_absent_or_zero_reported_window_leaves_the_limit_alone() {
+        let host = test_host();
+        let before = host
+            .context_limit
+            .load(std::sync::atomic::Ordering::Relaxed);
+        host.adopt_context_window(None, false);
+        host.adopt_context_window(Some(0), false);
+        assert_eq!(
+            host.context_limit
+                .load(std::sync::atomic::Ordering::Relaxed),
+            before
+        );
     }
 
     #[test]
@@ -3184,7 +3313,8 @@ mod tests {
         .expect("handled");
         let text = String::from_utf8_lossy(&output);
         for command in [
-            "/model", "/status", "/cost", "/compact", "/undo", "/copy", "/new", "/rename",
+            "/model", "/models", "/status", "/cost", "/compact", "/undo", "/copy", "/new", "/rename",
+            "/tree",
         ] {
             assert!(text.contains(command), "{command} is missing from: {text}");
         }

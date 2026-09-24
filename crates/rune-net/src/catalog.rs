@@ -380,9 +380,35 @@ pub fn from_endpoint_listing(provider: &str, body: &str) -> Option<Catalog> {
         if id.is_empty() {
             continue;
         }
-        catalog.models.push(ModelMetadata::new(id));
+        let mut model = ModelMetadata::new(id);
+        // An endpoint that states a capacity is believed. Discarding it left
+        // every session budgeting against a compiled default, which understates
+        // a large model so badly that a million-token model reported as nearly
+        // full before anything had been said.
+        model.context_window = number(entry, &["context_window", "context_length", "context"]);
+        model.max_output_tokens =
+            number(entry, &["max_output_tokens", "max_tokens", "output_tokens"]);
+        model.display_name = entry
+            .get("display_name")
+            .or_else(|| entry.get("name"))
+            .and_then(serde_json::Value::as_str)
+            .filter(|name| *name != id)
+            .map(str::to_owned);
+        catalog.models.push(model);
     }
     Some(catalog)
+}
+
+/// Reads the first present numeric field among `keys`.
+///
+/// A provider is free to name its capacity field, so the shapes seen in the
+/// wild are all accepted rather than only the one this program would have
+/// chosen. A value of zero is treated as absent, because a window of nothing
+/// would make every request look oversized.
+fn number(entry: &serde_json::Value, keys: &[&str]) -> Option<u64> {
+    keys.iter()
+        .find_map(|key| entry.get(*key).and_then(serde_json::Value::as_u64))
+        .filter(|value| *value > 0)
 }
 
 #[cfg(test)]
@@ -466,6 +492,75 @@ mod tests {
         assert!(from_endpoint_listing("p", "<html>error</html>").is_none());
         assert!(from_endpoint_listing("p", "{}").is_none());
         assert!(from_endpoint_listing("p", "").is_none());
+    }
+
+    #[test]
+    fn a_reported_context_window_is_kept() {
+        // The figure is what a session budgets against. Reading the identifier
+        // and dropping everything beside it left every session against the
+        // compiled default, so a model that serves a million tokens looked as
+        // though it held a hundred and twenty-eight thousand.
+        let body = r#"{"data":[
+            {"id":"big","context_window":1000000},
+            {"id":"small","context_window":200000}
+        ]}"#;
+        let catalog = from_endpoint_listing("p", body).expect("parsed");
+        assert_eq!(catalog.models[0].context_window, Some(1_000_000));
+        assert_eq!(catalog.models[1].context_window, Some(200_000));
+    }
+
+    #[test]
+    fn the_capacity_field_is_read_under_any_of_its_usual_names() {
+        // Providers disagree about the key, so the shapes seen in the wild are
+        // all accepted rather than only the one this program would have picked.
+        for body in [
+            r#"{"data":[{"id":"m","context_window":4096}]}"#,
+            r#"{"data":[{"id":"m","context_length":4096}]}"#,
+            r#"{"data":[{"id":"m","context":4096}]}"#,
+        ] {
+            let catalog = from_endpoint_listing("p", body).expect("parsed");
+            assert_eq!(catalog.models[0].context_window, Some(4096), "{body}");
+        }
+    }
+
+    #[test]
+    fn a_zero_or_absent_capacity_is_unknown_rather_than_zero() {
+        // A window of nothing would make every request look oversized, so a
+        // missing or zero figure stays absent and the compiled default applies.
+        let body = r#"{"data":[{"id":"a","context_window":0},{"id":"b"}]}"#;
+        let catalog = from_endpoint_listing("p", body).expect("parsed");
+        assert_eq!(catalog.models[0].context_window, None);
+        assert_eq!(catalog.models[1].context_window, None);
+        assert_eq!(catalog.models[0].usable_context(), DEFAULT_CONTEXT_WINDOW);
+    }
+
+    #[test]
+    fn an_output_ceiling_is_kept_under_its_usual_names() {
+        for body in [
+            r#"{"data":[{"id":"m","max_output_tokens":8192}]}"#,
+            r#"{"data":[{"id":"m","max_tokens":8192}]}"#,
+        ] {
+            let catalog = from_endpoint_listing("p", body).expect("parsed");
+            assert_eq!(catalog.models[0].max_output_tokens, Some(8192), "{body}");
+        }
+    }
+
+    #[test]
+    fn a_display_name_is_kept_but_an_id_repeated_as_a_name_is_not() {
+        // A picker shows the friendlier name when there is one, and showing the
+        // identifier twice would be noise.
+        let body = r#"{"data":[
+            {"id":"m","name":"A Friendlier Name"},
+            {"id":"plain","name":"plain"}
+        ]}"#;
+        let catalog = from_endpoint_listing("p", body).expect("parsed");
+        assert_eq!(
+            catalog.models[0].display_name.as_deref(),
+            Some("A Friendlier Name")
+        );
+        assert_eq!(catalog.models[0].label(), "A Friendlier Name");
+        assert_eq!(catalog.models[1].display_name, None);
+        assert_eq!(catalog.models[1].label(), "plain");
     }
 
     #[test]

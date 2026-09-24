@@ -47,6 +47,13 @@ const RESET: &str = "\u{1b}[0m";
 #[derive(Clone, Debug)]
 pub struct Inline {
     cols: u16,
+    /// Tallest the region may grow.
+    ///
+    /// A region taller than the screen cannot be repainted in place: writing it
+    /// scrolls the terminal, which moves the rows the renderer believes it owns
+    /// and leaves a copy of the status block behind. Capping the region means
+    /// every frame it draws is one it can also erase.
+    max_rows: u16,
     /// Where the cursor was left inside the region, counted from its top.
     cursor_row: u16,
     /// Whether the region has been drawn at least once.
@@ -68,6 +75,7 @@ impl Inline {
     pub const fn new(cols: u16) -> Self {
         Self {
             cols,
+            max_rows: u16::MAX,
             cursor_row: 0,
             drawn: false,
             shown: Vec::new(),
@@ -78,6 +86,26 @@ impl Inline {
     /// Changes the width, which invalidates nothing because every row is redrawn.
     pub const fn set_width(&mut self, cols: u16) {
         self.cols = cols;
+    }
+
+    /// Changes how many rows the region may occupy.
+    ///
+    /// A terminal that reports its height should be told to the renderer, so a
+    /// region that would fill the screen is trimmed rather than scrolled. A
+    /// limit of zero would leave nothing drawable, so it is raised to one.
+    pub fn set_max_rows(&mut self, rows: u16) {
+        let limit = rows.max(1);
+        if limit == self.max_rows {
+            return;
+        }
+        self.max_rows = limit;
+        // The rows that were drawn are no longer the rows this renderer would
+        // draw, so the next frame must repaint from the top rather than diff
+        // against a region of a different size.
+        self.shown.clear();
+        self.shown_settled = 0;
+        self.cursor_row = 0;
+        self.drawn = false;
     }
 
     /// Returns the width.
@@ -138,9 +166,22 @@ impl Inline {
         rows.extend(footer.iter().map(|row| self.clip(row)));
         let prompt_start = rows.len();
         rows.extend(prompt.iter().map(|row| self.clip(row)));
-        // Whatever is still arriving goes below the input, so a growing answer
-        // never displaces the line being typed.
-        rows.extend(below.iter().map(|row| self.clip(row)));
+
+        // A region taller than the screen cannot be repainted in place: writing
+        // it scrolls the terminal, which moves the rows this renderer believes
+        // it owns and leaves a copy of the status block behind. Only the rows
+        // still arriving are trimmed, and the newest are the ones kept, because
+        // the status and the input line are what must stay put.
+        let reserved = rows.len();
+        let room = usize::from(self.max_rows).saturating_sub(reserved).max(1);
+        let arriving = if below.len() > room {
+            below
+                .get(below.len().saturating_sub(room)..)
+                .unwrap_or(below)
+        } else {
+            below
+        };
+        rows.extend(arriving.iter().map(|row| self.clip(row)));
         let live_rows = u16::try_from(rows.len()).unwrap_or(u16::MAX).max(1);
 
         // Where the caret sits, as an offset from the top of the region. The
@@ -238,19 +279,13 @@ impl Inline {
         }
 
         // Rows that were shown but are gone have to be removed, or a shrinking
-        // region leaves its tail on the screen.
-        let removed = self
-            .shown
-            .len()
-            .saturating_sub(rows.len().max(first_changed));
-        if self.drawn && removed > 0 {
-            let written = rows.len().saturating_sub(first_changed);
-            for index in 0..removed {
-                if index > 0 || written > 0 {
-                    out.push_str("\r\n");
-                }
-                out.push_str("\u{1b}[K");
-            }
+        // region leaves its tail on the screen. The region is always the
+        // bottom-most thing drawn, so everything below the last row written is
+        // stale and is erased in one sequence. Walking down row by row would
+        // write a newline at the bottom of the screen, which scrolls, pushing
+        // the rows just written off the top.
+        if self.drawn && self.shown.len() > rows.len().max(first_changed) {
+            out.push_str(ERASE_BELOW);
         }
 
         // The caret is placed after the region is written. The walk back is
@@ -639,9 +674,11 @@ mod tests {
 
     #[test]
     fn a_shrinking_region_clears_the_rows_it_lost() {
+        // Asserted against the screen rather than the escapes: the point is that
+        // the gone rows are not left behind, not which sequence erased them.
         let mut inline = Inline::new(40);
         let footer = rows(&["status"]);
-        let _ = inline.frame(
+        let first = inline.frame(
             &[],
             None,
             &footer,
@@ -649,12 +686,17 @@ mod tests {
             &rows(&["one", "two", "three"]),
             (0, 2),
         );
-        let bytes = inline.frame(&[], None, &footer, &rows(&["> "]), &rows(&["one"]), (0, 2));
-        let text = String::from_utf8_lossy(&bytes).into_owned();
-        // The two rows that are gone are erased rather than left behind.
+        let mut grid = crate::engine::Grid::new(40, 10).expect("grid");
+        grid.feed(&first).expect("feed");
+        assert!(grid.text().contains("three"), "{}", grid.text());
+
+        let second = inline.frame(&[], None, &footer, &rows(&["> "]), &rows(&["one"]), (0, 2));
+        grid.feed(&second).expect("feed");
+        let screen = grid.text();
+        assert!(screen.contains("one"), "{screen}");
         assert!(
-            text.matches("\u{1b}[K").count() >= 2,
-            "lost rows were not erased: {text:?}"
+            !screen.contains("three"),
+            "a row that is gone was left on the screen:\n{screen}"
         );
     }
 
@@ -709,5 +751,95 @@ mod tests {
         assert!(!inline.is_drawn());
         // Nothing left to clear, so a second clear writes nothing.
         assert!(inline.clear().is_empty());
+    }
+
+    /// Feeds frames into a grid the size of a real terminal and returns the
+    /// screen, which is what a reader would see.
+    fn screen_of(rows_high: u16, cols: u16, frames: &[Vec<u8>]) -> String {
+        let mut grid = crate::engine::Grid::new(cols, rows_high).expect("grid");
+        for frame in frames {
+            grid.feed(frame).expect("feed");
+        }
+        grid.text()
+    }
+
+    #[test]
+    fn a_region_taller_than_the_terminal_does_not_leave_a_stale_copy_behind() {
+        // A live region that fills the screen scrolls the terminal as it is
+        // written, which moves the rows the renderer believes it owns. Tracking
+        // the cursor by row offset then lands on rows belonging to the previous
+        // frame, so the status block is drawn twice and the output is written
+        // over in the middle.
+        const HEIGHT: u16 = 10;
+        let footer = rows(&["status", "prompt"]);
+        let answer = rows(&[
+            "one", "two", "three", "four", "five", "six", "seven", "eight",
+        ]);
+
+        let mut inline = Inline::new(40);
+        // The session tells the renderer how tall the terminal is, which is what
+        // lets it keep the region inside the screen.
+        inline.set_max_rows(HEIGHT.saturating_sub(1));
+        let frames = vec![
+            inline.frame(&[], None, &footer, &rows(&["> "]), &answer[..4], (0, 2)),
+            inline.frame(&[], None, &footer, &rows(&["> "]), &answer[..6], (0, 2)),
+            inline.frame(&[], None, &footer, &rows(&["> "]), &answer, (0, 2)),
+        ];
+        let screen = screen_of(HEIGHT, 40, &frames);
+
+        assert_eq!(
+            screen.matches("status").count(),
+            1,
+            "the status block was drawn more than once:\n{screen}"
+        );
+        // The newest rows are the ones kept, because that is where a reader is
+        // looking while text arrives.
+        for line in ["five", "six", "seven", "eight"] {
+            assert!(
+                screen.contains(line),
+                "row {line:?} is missing from the screen:\n{screen}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_region_is_kept_inside_the_terminal_it_is_drawn_in() {
+        // Whatever the caller passes, the region never exceeds the height the
+        // renderer was told, because a taller one cannot be repainted in place.
+        let mut inline = Inline::new(40);
+        inline.set_max_rows(4);
+        let many: Vec<String> = (0..40).map(|i| format!("row {i}")).collect();
+        let bytes = inline.frame(&[], None, &rows(&["s"]), &rows(&["> "]), &many, (0, 2));
+        let text = String::from_utf8_lossy(&bytes).into_owned();
+        let drawn = text.matches("\r\n").count().saturating_add(1);
+        assert!(drawn <= 4, "the region drew {drawn} rows:\n{text}");
+    }
+
+    #[test]
+    fn a_shrinking_region_never_scrolls_the_screen() {
+        // Erasing rows that are gone must not write a newline past the region's
+        // last row: at the bottom of the screen that scrolls, which pushes the
+        // rows just written off the top and leaves the region untracked.
+        let mut inline = Inline::new(40);
+        // The same height the session would report for an eight-row terminal.
+        inline.set_max_rows(7);
+        let tall: Vec<String> = (0..10).map(|i| format!("row {i}")).collect();
+        let first = inline.frame(&[], None, &rows(&["s"]), &rows(&["> "]), &tall, (0, 2));
+        let mut grid = crate::engine::Grid::new(40, 8).expect("grid");
+        grid.feed(&first).expect("feed");
+        let before = grid.text();
+        assert!(
+            before.contains('>'),
+            "the prompt is not on screen:\n{before}"
+        );
+
+        let second = inline.frame(&[], None, &rows(&["s"]), &rows(&["> "]), &tall[..2], (0, 2));
+        grid.feed(&second).expect("feed");
+        // The prompt is below the region's rows and must still be on screen.
+        assert!(
+            grid.text().contains('>'),
+            "erasing the region's tail scrolled the prompt off:\nbefore:\n{before}\nafter:\n{}",
+            grid.text()
+        );
     }
 }
