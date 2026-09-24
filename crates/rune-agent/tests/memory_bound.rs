@@ -75,8 +75,8 @@ impl Host for BoundHost {
         &self.endpoint
     }
 
-    fn model(&self) -> &'static str {
-        "test/model"
+    fn model(&self) -> String {
+        "test/model".to_owned()
     }
 
     fn instructions(&self) -> String {

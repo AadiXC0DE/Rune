@@ -1065,8 +1065,8 @@ impl<W: Write + Send + 'static> Host for TurnHost<W> {
         &self.server.config.endpoint
     }
 
-    fn model(&self) -> &str {
-        &self.config.model
+    fn model(&self) -> String {
+        self.config.model.clone()
     }
 
     fn instructions(&self) -> String {

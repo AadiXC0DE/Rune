@@ -142,8 +142,8 @@ impl Host for TestHost {
         &self.endpoint
     }
 
-    fn model(&self) -> &str {
-        &self.model
+    fn model(&self) -> String {
+        self.model.clone()
     }
 
     fn instructions(&self) -> String {

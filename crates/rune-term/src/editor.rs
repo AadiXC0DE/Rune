@@ -327,6 +327,16 @@ impl Composer {
         }
     }
 
+    /// Replaces the line with `text`, placing the cursor after it.
+    ///
+    /// Recall state is dropped, because text put on the line by a caller is
+    /// not part of any history walk and stepping from it would be meaningless.
+    pub fn set(&mut self, text: &str) {
+        self.show(text);
+        self.recall = None;
+        self.draft.clear();
+    }
+
     /// Recalls the previous entry of a history.
     ///
     /// The entry nearest the cursor is the most recent one. At the oldest entry

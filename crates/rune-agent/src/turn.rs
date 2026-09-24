@@ -163,7 +163,11 @@ pub trait Host {
     fn endpoint(&self) -> &Endpoint;
 
     /// Returns the model identifier.
-    fn model(&self) -> &str;
+    ///
+    /// Owned rather than borrowed because the model can be changed while a
+    /// session is running, so it lives behind a lock and cannot be handed out
+    /// as a reference. It is read once per request attempt, not per token.
+    fn model(&self) -> String;
 
     /// Returns the system instructions.
     fn instructions(&self) -> String;

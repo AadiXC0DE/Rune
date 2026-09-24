@@ -26,6 +26,10 @@ pub enum KeyAction {
     Interrupt,
     /// The user asked to cancel what is running.
     Cancel,
+    /// The user moved the selection up.
+    Up,
+    /// The user moved the selection down.
+    Down,
 }
 
 /// Reads keys and drives a composer.
@@ -74,6 +78,27 @@ impl KeyReader {
     /// Empties the line.
     pub fn clear(&mut self) {
         self.composer.clear();
+    }
+
+    /// Replaces the line with the previous entry of a prompt history.
+    ///
+    /// The entries are supplied by the caller rather than held here, because
+    /// which prompts are worth recalling depends on the session, not on the
+    /// line editor. Returns whether the line changed.
+    pub fn recall_previous(&mut self, entries: &[String]) -> bool {
+        self.composer.history_previous(entries)
+    }
+
+    /// Walks back toward the line that was being edited when recall started.
+    ///
+    /// Returns whether the line changed.
+    pub fn recall_next(&mut self, entries: &[String]) -> bool {
+        self.composer.history_next(entries)
+    }
+
+    /// Puts text on the line, replacing whatever is there.
+    pub fn replace(&mut self, text: &str) {
+        self.composer.set(text);
     }
 
     /// Waits for one key and applies it.
@@ -163,6 +188,11 @@ impl KeyReader {
                 self.composer.move_right();
                 KeyAction::Ignored
             }
+            // The vertical arrows are reported rather than applied, because
+            // what they mean depends on what is on screen: a picker moves its
+            // selection, and a plain line recalls an earlier prompt.
+            (KeyCode::Up, _, _) => KeyAction::Up,
+            (KeyCode::Down, _, _) => KeyAction::Down,
             (KeyCode::Home, _, _) => {
                 self.composer.move_home();
                 KeyAction::Ignored
@@ -270,6 +300,53 @@ mod tests {
         assert_eq!(reader.column(), 0);
         reader.apply(key(KeyCode::End));
         assert_eq!(reader.column(), 3);
+    }
+
+    #[test]
+    fn the_vertical_arrows_are_reported_rather_than_applied() {
+        // They move a picker or recall a prompt, both of which the caller owns,
+        // so the reader must not consume them as cursor movement.
+        let mut reader = reader();
+        typed(&mut reader, "abc");
+        assert_eq!(reader.apply(key(KeyCode::Up)), KeyAction::Up);
+        assert_eq!(reader.apply(key(KeyCode::Down)), KeyAction::Down);
+        assert_eq!(reader.line(), "abc");
+        assert_eq!(reader.column(), 3);
+    }
+
+    #[test]
+    fn recalling_walks_the_history_and_stops_at_the_newest() {
+        let history = vec!["first".to_owned(), "second".to_owned()];
+        let mut reader = reader();
+        assert!(reader.recall_previous(&history));
+        assert_eq!(reader.line(), "second");
+        assert!(reader.recall_previous(&history));
+        assert_eq!(reader.line(), "first");
+        // At the oldest entry the walk stops rather than wrapping.
+        assert!(!reader.recall_previous(&history));
+        assert_eq!(reader.line(), "first");
+        assert!(reader.recall_next(&history));
+        assert_eq!(reader.line(), "second");
+    }
+
+    #[test]
+    fn recalling_restores_the_draft_when_it_walks_past_the_newest() {
+        // A half-typed line must survive a look back through the history.
+        let history = vec!["earlier".to_owned()];
+        let mut reader = reader();
+        typed(&mut reader, "half typed");
+        reader.recall_previous(&history);
+        assert_eq!(reader.line(), "earlier");
+        reader.recall_next(&history);
+        assert_eq!(reader.line(), "half typed");
+    }
+
+    #[test]
+    fn an_empty_history_recalls_nothing() {
+        let mut reader = reader();
+        typed(&mut reader, "kept");
+        assert!(!reader.recall_previous(&[]));
+        assert_eq!(reader.line(), "kept");
     }
 
     #[test]

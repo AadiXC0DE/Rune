@@ -4,11 +4,13 @@
 //! line typed while a turn is running is queued rather than refused, which is
 //! what makes the shell usable while the model is working.
 
+use std::collections::BTreeMap;
+use std::fmt::Write as _;
 use std::io::{BufRead, Write as _};
 use std::sync::{Arc, Mutex};
 
 use crate::session_log::{self, Recorder};
-use camino::Utf8Path;
+use camino::{Utf8Path, Utf8PathBuf};
 use rune_agent::history::History;
 use rune_agent::steering::{Cancellation, SteeringQueue};
 use rune_agent::turn::{self, Event, Host, StopReason};
@@ -44,7 +46,7 @@ pub struct SessionConfig {
     /// Session to resume, when the launch asked to resume one.
     pub resume: Option<SessionId>,
     /// Primary workspace.
-    pub workspace: camino::Utf8PathBuf,
+    pub workspace: Utf8PathBuf,
     /// Endpoint for model requests.
     pub endpoint: Endpoint,
     /// Dialect the endpoint speaks.
@@ -166,7 +168,12 @@ type LiveSink = Arc<Mutex<dyn std::io::Write + Send>>;
 struct SessionHost {
     endpoint: Endpoint,
     dialect: Box<dyn Provider>,
-    model: String,
+    /// Model the session sends to, changeable while the session runs.
+    ///
+    /// Behind a lock because a slash command changes it from the input loop
+    /// while a turn reads it on the turn's own thread. It is read once per
+    /// request attempt, so the lock is not on the streaming path.
+    model: Mutex<String>,
     instructions: String,
     tools: Vec<ToolSpec>,
     rules: RuleSet,
@@ -182,11 +189,17 @@ struct SessionHost {
     /// Tokens spent from the context window, summed across turns.
     context_used: std::sync::atomic::AtomicU64,
     /// Size of the context window, zero when the provider stated none.
-    context_limit: u64,
+    ///
+    /// Atomic because choosing another model mid-session changes the window the
+    /// status line is measured against, and the status line only has `&self`.
+    context_limit: std::sync::atomic::AtomicU64,
     /// Theme the status line is drawn with.
     theme: Theme,
     /// Session identifier, shown shortened in the status line.
-    session_id: String,
+    ///
+    /// Behind a lock because `/new` replaces it while the session runs, and the
+    /// status line reads it through `&self`.
+    session_id: Mutex<String>,
     /// Workspace, shown as given.
     workspace: String,
     /// Whether the terminal can render direct color.
@@ -219,8 +232,29 @@ struct SessionHost {
     live_out: Arc<Mutex<Option<LiveSink>>>,
     /// Reviewer for unresolved actions, absent when none is configured.
     reviewer: Option<Box<dyn Reviewer>>,
+    /// What this session has spent, for `/cost`.
+    totals: Mutex<Totals>,
+    /// The bytes each file held before this session first wrote to it, for
+    /// `/undo`.
+    ///
+    /// Keyed by path and written once per file, so the entry is the state
+    /// before the session's first change rather than before its latest: putting
+    /// a file back to where a chain of edits began is what a single undo
+    /// command can honestly do. A file the session created is held as absent,
+    /// so undoing removes it.
+    undo: Mutex<BTreeMap<Utf8PathBuf, Option<Vec<u8>>>>,
     /// Review activity for the current turn.
     review_session: Arc<Mutex<ReviewSession>>,
+}
+
+/// Locks the model, recovering from a poisoned lock.
+///
+/// A panic elsewhere must not make the session unable to name its own model,
+/// so the value is taken as it stands.
+fn lock_model(model: &Mutex<String>) -> std::sync::MutexGuard<'_, String> {
+    model
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// Locks the review session, recovering from a poisoned lock.
@@ -242,8 +276,8 @@ impl Host for SessionHost {
         &self.endpoint
     }
 
-    fn model(&self) -> &str {
-        &self.model
+    fn model(&self) -> String {
+        lock_model(&self.model).clone()
     }
 
     fn instructions(&self) -> String {
@@ -287,6 +321,12 @@ impl Host for SessionHost {
     }
 
     fn execute(&self, name: &str, arguments: &serde_json::Value) -> Result<ToolOutput> {
+        // Captured before the call so the bytes that were there can be put
+        // back. A capture failure is not fatal: the call still runs, and `/undo`
+        // reports that it had nothing to restore for this file.
+        if let Some(path) = mutating_path(name, arguments) {
+            self.remember(path);
+        }
         self.registry.call(name, arguments, &self.context)
     }
 
@@ -353,6 +393,140 @@ impl Host for SessionHost {
 }
 
 impl SessionHost {
+    /// Points the session at another model.
+    ///
+    /// The next request uses it. A turn already running keeps the model it
+    /// started with, because its request has already been sent.
+    ///
+    /// The context window moves with the model only when it is known: a window
+    /// left over from a larger model would understate how full the smaller one
+    /// is, and a window invented for a model nothing describes would be a guess
+    /// presented as a fact.
+    fn set_model(&self, model: &str, context_window: Option<u64>) {
+        {
+            let mut current = lock_model(&self.model);
+            model.clone_into(&mut current);
+        }
+        if let Some(window) = context_window.filter(|window| *window > 0) {
+            self.context_limit
+                .store(window, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Returns the model the session is sending to.
+    fn model_name(&self) -> String {
+        lock_model(&self.model).clone()
+    }
+
+    /// Reports the running state for the read-only commands.
+    ///
+    /// Borrowed from live state rather than collected at the start, so a status
+    /// line read after `/model` names the model now in effect.
+    fn info<'a>(&'a self, provider: &'a str, endpoint: &'a str) -> SessionInfo<'a> {
+        SessionInfo {
+            model: self.model_name(),
+            provider,
+            endpoint,
+            mode: self.mode,
+            effort: self.effort,
+            session_id: self.session_id_name(),
+            workspace: &self.workspace,
+            context_used: self.context_used.load(std::sync::atomic::Ordering::Relaxed),
+            context_limit: self
+                .context_limit
+                .load(std::sync::atomic::Ordering::Relaxed),
+            totals: self
+                .totals
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone(),
+        }
+    }
+
+    /// Adds one turn's usage to the session total.
+    fn record_usage(&self, usage: &rune_net::stream::Usage) {
+        self.totals
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .record(usage);
+    }
+
+    /// Remembers a file's contents before this session changes it.
+    ///
+    /// Only the first capture for a path is kept, so an undo returns the file
+    /// to the state it was in before the session touched it rather than to some
+    /// intermediate state that only makes sense in the middle of a chain.
+    fn remember(&self, path: &Utf8Path) {
+        let mut undo = self
+            .undo
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if undo.contains_key(path) {
+            return;
+        }
+        // A file that is absent or unreadable is recorded as absent, so undoing
+        // a creation removes the file and an unreadable file is not silently
+        // reported as restored.
+        undo.insert(path.to_owned(), std::fs::read(path).ok());
+    }
+
+    /// Returns whether anything is available to undo.
+    fn can_undo(&self) -> bool {
+        !self
+            .undo
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty()
+    }
+
+    /// Puts every changed file back and forgets the record.
+    ///
+    /// Returns one line per file, describing what was done, or a failure
+    /// naming the file that could not be restored. Files are restored before
+    /// the record is cleared, so a failure leaves the rest still undoable.
+    fn undo(&self) -> Result<Vec<String>> {
+        let mut undo = self
+            .undo
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut report = Vec::with_capacity(undo.len());
+        let mut done: Vec<Utf8PathBuf> = Vec::with_capacity(undo.len());
+        for (path, before) in undo.iter() {
+            match before {
+                Some(bytes) => {
+                    std::fs::write(path, bytes).map_err(|err| {
+                        RuneError::new(
+                            ErrorCode::Internal,
+                            format!("`{path}` could not be restored: {err}"),
+                        )
+                    })?;
+                    report.push(format!("restored {path}"));
+                }
+                None => {
+                    // A file that did not exist before is removed, which is what
+                    // undoing its creation means.
+                    match std::fs::remove_file(path) {
+                        Ok(()) => report.push(format!("removed {path}")),
+                        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                            report.push(format!("{path} was already gone"));
+                        }
+                        Err(err) => {
+                            return Err(RuneError::new(
+                                ErrorCode::Internal,
+                                format!("`{path}` could not be removed: {err}"),
+                            ));
+                        }
+                    }
+                }
+            }
+            done.push(path.clone());
+        }
+        for path in done {
+            undo.remove(&path);
+        }
+        Ok(report)
+    }
+
     /// Records how large the conversation has become.
     ///
     /// Takes the largest reading rather than summing them. Each turn resends
@@ -364,15 +538,44 @@ impl SessionHost {
             .fetch_max(used, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// Forgets the context reading, for a conversation that has been replaced.
+    fn forget_context(&self) {
+        self.context_used
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Returns the identifier of the session now running.
+    fn session_id_name(&self) -> String {
+        self.session_id
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Points the status line at a new session.
+    fn set_session_id(&self, id: &str) {
+        let mut slot = self
+            .session_id
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        id.clone_into(&mut slot);
+    }
+
     /// Returns the status line for the current state.
     fn status_line(&self, width: usize) -> String {
         let state = FooterState {
-            model: self.model.clone(),
+            model: lock_model(&self.model).clone(),
             permission_mode: self.mode,
             workspace: self.workspace.clone(),
             context_used: self.context_used.load(std::sync::atomic::Ordering::Relaxed),
-            context_limit: self.context_limit,
-            session_id: self.session_id.clone(),
+            context_limit: self
+                .context_limit
+                .load(std::sync::atomic::Ordering::Relaxed),
+            session_id: self
+                .session_id
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone(),
         };
         let layout = footer::solve(
             (
@@ -620,10 +823,17 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
     // before the theme itself moves into the host.
     let theme = resolve_theme(&config);
     let reasoning_escape = theme.sgr(rune_term::theme::Slot::Dim, truecolor_supported());
+
+    // Copied before the endpoint moves into the host, so `/status` and the
+    // picker can name the address and the provider without the credential that
+    // travels beside the endpoint.
+    let endpoint_url = config.endpoint.base_url.clone();
+    let provider_name = config.settings.provider.to_string();
+
     let host = SessionHost {
         endpoint: config.endpoint,
         dialect: config.dialect,
-        model: config.settings.model.clone(),
+        model: Mutex::new(config.settings.model.clone()),
         instructions: prompt.instructions,
         tools: inventory::advertisement(&config.registry),
         rules: config.rules,
@@ -638,9 +848,9 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
         steering: SteeringQueue::from_limits(&limits),
         events: Arc::new(Mutex::new(Vec::new())),
         context_used: std::sync::atomic::AtomicU64::new(0),
-        context_limit: context_limit(&config.settings, &limits),
+        context_limit: std::sync::atomic::AtomicU64::new(context_limit(&config.settings, &limits)),
         theme,
-        session_id: recorder.id().to_string(),
+        session_id: Mutex::new(recorder.id().to_string()),
         workspace: config.workspace.to_string(),
         truecolor: truecolor_supported(),
         // Seeded from the terminal and refreshed on every frame, so a window
@@ -654,6 +864,8 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
         live_out: Arc::new(Mutex::new(None)),
         reasoning: Mutex::new(reasoning_escape),
         reviewer: crate::auto_review::build(&config.settings, &config.paths)?,
+        totals: Mutex::new(Totals::default()),
+        undo: Mutex::new(BTreeMap::new()),
         review_session: Arc::new(Mutex::new(ReviewSession::new(&limits))),
     };
 
@@ -689,49 +901,131 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
     let mut reader = rune_term::input::KeyReader::new();
     let keyed = reader.is_active();
 
+    // Held rather than read off the config at the point of use, because the
+    // input closure borrows the config and a model chosen mid-session has to be
+    // able to build a catalog from the same settings the session started with.
+    let settings = config.settings.clone();
+
+    // The prompts already recorded in this workspace, oldest first, which is
+    // the order the up arrow walks backwards through. Refreshed after each
+    // turn so a prompt typed now is recallable next, and read from the file
+    // rather than kept beside it so there is one source of truth.
+    let mut recall = recorded_prompts(history_file.as_ref(), &config.workspace);
+
     let mut source = rune_term::shell::StdinSource::new(input);
     let mut shell = Shell::new(&mut source);
 
     // One handler for both input paths, so a keystroke and a piped line mean
     // exactly the same thing.
-    let mut handle_input = |input: Input, sink: &mut LockedSink| -> Result<Action> {
+    //
+    // The model commands are reported to the caller rather than acted on here,
+    // because choosing one needs the input reader to run a picker and the
+    // status line to be redrawn, both of which live outside this closure.
+    //
+    // The recorded prompts are passed in rather than captured, so the loop that
+    // owns them can re-read them between submissions for the up arrow.
+    let mut handle_input = |input: Input,
+                            sink: &mut LockedSink,
+                            history_file: &mut Option<crate::prompt_history::History>|
+     -> Result<Step> {
         match input {
             Input::Command { name, arguments } => {
-                match handle_command(
+                // Built here rather than captured, so the status a command
+                // reports is the state at the moment it runs.
+                let info = host.info(&provider_name, &endpoint_url);
+                // Command output is buffered rather than written straight out,
+                // because it has to be committed through the renderer: text
+                // written directly lands at the caret, inside the region the
+                // session repaints, and the screen then shows a mix of the two.
+                let mut captured: Vec<u8> = Vec::new();
+                let handled = handle_command(
                     &name,
                     &arguments,
                     &commands,
                     history_file.as_ref(),
                     &config.workspace,
-                    sink,
-                )? {
-                    Handled::Exit => Ok(Action::Exit),
+                    &info,
+                    &mut captured,
+                )?;
+                let mut note = |text: String| captured.extend_from_slice(text.as_bytes());
+                match handled {
+                    Handled::Exit => return Ok(Step::Exit),
+                    Handled::PickModel => return Ok(Step::PickModel),
+                    Handled::Copy => {
+                        // The reply is read from the conversation rather than
+                        // from the screen, because what is on screen has been
+                        // wrapped and styled and is no longer the text.
+                        match last_reply(&history) {
+                            Some(reply) => match copy_to_clipboard(&reply) {
+                                Ok(()) => note(format!(
+                                    "copied {} character(s) to the clipboard",
+                                    reply.chars().count()
+                                )),
+                                Err(err) => note(format!("could not copy: {err}")),
+                            },
+                            None => note("there is no reply to copy yet".to_owned()),
+                        }
+                    }
+                    Handled::NewSession => {
+                        // Handled here because the recorder and the conversation
+                        // both live in this closure, and starting a fresh
+                        // conversation means replacing both together.
+                        let id = SessionId::generate();
+                        let fresh = Recorder::create(&config.paths, &id)?;
+                        fresh.set_workspace(&config.workspace)?;
+                        recorder = fresh;
+                        history = History::new();
+                        host.set_session_id(id.as_str());
+                        // The context reading belongs to the conversation that
+                        // just ended, so it is cleared rather than carried into
+                        // a session that has sent nothing.
+                        host.forget_context();
+                        note(format!("started session {id}"));
+                    }
+                    Handled::Undo => return Ok(Step::Undo),
+                    Handled::Compact => {
+                        // Handled here because this closure already mutably
+                        // borrows the conversation, and a second borrower would
+                        // not compile for the right reason.
+                        return compact_history(&host, &mut history, sink);
+                    }
+                    Handled::Rename(title) => {
+                        // Handled here because this closure already holds the
+                        // recorder, and giving the loop a second way to reach
+                        // it would be two writers for one file.
+                        recorder.set_title(&session_log::derive_title(&title))?;
+                        note(format!("renamed this session to {title}"));
+                    }
+                    Handled::SetModel(model) => {
+                        // Named inline, so no catalog entry describes it and the
+                        // window already in force is kept rather than guessed.
+                        host.set_model(&model, None);
+                        note(format!("model set to {}", host.model_name()));
+                    }
                     Handled::ClearHistory => {
                         // Forgetting is reported, because a silent success would
                         // leave the user unsure whether anything was removed.
                         match history_file.as_mut() {
                             Some(history) => {
                                 let _ = history.clear();
-                                let _ = writeln!(sink, "forgot every recorded prompt");
+                                note("forgot every recorded prompt".to_owned());
                             }
-                            None => {
-                                let _ = writeln!(sink, "no prompt history is available");
-                            }
+                            None => note("no prompt history is available".to_owned()),
                         }
-                        Ok(Action::Continue)
                     }
-                    Handled::Continue => Ok(Action::Continue),
                     // Expanded text goes to the composer for review, never
                     // straight to the model: a template with a wrong argument
                     // should be visible before it is sent.
                     Handled::Expand(prompt) => {
-                        let _ = writeln!(
-                            sink,
+                        note(format!(
                             "-- /{name} expanded; edit before sending --\n{prompt}"
-                        );
-                        Ok(Action::Continue)
+                        ));
                     }
+                    Handled::Continue => {}
                 }
+                let lines = output_lines(&captured);
+                flush_lines(&host, sink, &lines)?;
+                Ok(Step::Continue)
             }
             Input::Prompt(text) => {
                 // The submitted line is committed to the flow before the turn
@@ -768,7 +1062,10 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                 // The turn is recorded before it is reported, so a session that
                 // dies while rendering still has its exchange on disk.
                 recorder.turn(&outcome)?;
-                record_usage(&config.paths, &host.model, &outcome);
+                // The model is read back rather than captured at start, so a
+                // turn that ran after `/model` is billed to the model that ran.
+                record_usage(&config.paths, &host.model(), &outcome);
+                host.record_usage(&outcome.usage);
                 host.record_context_size(
                     outcome
                         .usage
@@ -806,9 +1103,9 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                     sink.write_all(&painted)?;
                     sink.flush()?;
                 }
-                Ok(Action::Continue)
+                Ok(Step::Continue)
             }
-            Input::Empty => Ok(Action::Continue),
+            Input::Empty => Ok(Step::Continue),
         }
     };
 
@@ -817,22 +1114,51 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
         // what was typed rather than waiting for the terminal to decide the
         // line is finished.
         let mut reason = ExitReason::EndOfInput;
-        while let Some(input) = await_submission(&mut reader, &host, &out)? {
+        while let Some(input) = await_submission(&mut reader, &host, &out, &recall)? {
             let mut sink = LockedSink {
                 stream: Arc::clone(&out),
             };
-            if handle_input(input, &mut sink)? == Action::Exit {
-                reason = ExitReason::Requested;
-                break;
+            match handle_input(input, &mut sink, &mut history_file)? {
+                Step::Exit => {
+                    reason = ExitReason::Requested;
+                    break;
+                }
+                Step::PickModel => {
+                    choose_model(&mut reader, &host, &out, &settings, &config.paths)?;
+                }
+                Step::Undo => {
+                    report_undo(&host, &mut sink)?;
+                }
+                Step::Continue => {}
             }
+            // Re-read so a prompt submitted above is recallable with the up
+            // arrow. The file is the source of truth, so it is read rather than
+            // appended to a copy that could drift from it.
+            recall = recorded_prompts(history_file.as_ref(), &config.workspace);
         }
         reason
     } else {
+        // A pipe has no keystrokes to drive a picker, so a model change is
+        // reported instead of silently doing nothing.
         shell.run(|input| {
             let mut sink = LockedSink {
                 stream: Arc::clone(&out),
             };
-            handle_input(input, &mut sink)
+            match handle_input(input, &mut sink, &mut history_file)? {
+                Step::Exit => Ok(Action::Exit),
+                Step::Continue => Ok(Action::Continue),
+                Step::Undo => {
+                    report_undo(&host, &mut sink)?;
+                    Ok(Action::Continue)
+                }
+                Step::PickModel => {
+                    let _ = writeln!(
+                        sink,
+                        "a model picker needs a terminal; use /model <id> and run `rune models` to list ids"
+                    );
+                    Ok(Action::Continue)
+                }
+            }
         })?
     };
 
@@ -854,34 +1180,20 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
 /// Returns the submitted input, or `None` when the user asked to leave. The
 /// cursor is placed after the text typed so far, which is the whole reason the
 /// line is drawn here rather than by the terminal.
+///
+/// `recall` supplies earlier prompts for the up and down arrows. Passing an
+/// empty slice leaves those keys doing nothing, which is what a session with no
+/// recorded history wants.
 fn await_submission(
     reader: &mut rune_term::input::KeyReader,
     host: &SessionHost,
     out: &LiveSink,
+    recall: &[String],
 ) -> Result<Option<Input>> {
-    use rune_term::width::str_width;
-
     let marker = rune_term::shell::prompt();
 
     loop {
-        {
-            let mut sink = out
-                .lock()
-                .map_err(|_| RuneError::new(ErrorCode::Internal, "the output lock was poisoned"))?;
-            let row = transcript::render_prompt(marker, reader.line(), usize::from(host.width()));
-            let caret = str_width(marker).saturating_add(reader.column());
-            let painted = host.paint(
-                &[],
-                None,
-                std::slice::from_ref(&row),
-                &[],
-                (0, u16::try_from(caret).unwrap_or(u16::MAX)),
-            )?;
-            if !painted.is_empty() {
-                sink.write_all(&painted)?;
-                sink.flush()?;
-            }
-        }
+        draw_prompt(reader, host, out, &[], marker)?;
 
         match reader.read_key() {
             KeyAction::Submit => {
@@ -901,10 +1213,541 @@ fn await_submission(
                 }
                 reader.clear();
             }
+            // A key that moved the line is redrawn at the top of the loop,
+            // which is the only place a frame is written.
+            response @ (KeyAction::Up | KeyAction::Down) => {
+                if response == KeyAction::Up {
+                    reader.recall_previous(recall);
+                } else {
+                    reader.recall_next(recall);
+                }
+            }
             KeyAction::Ignored => {}
         }
     }
 }
+
+/// Draws the prompt row, with any rows that belong below it.
+///
+/// A caret is placed at the end of the typed text so the terminal's cursor is
+/// where the next character will go.
+fn draw_prompt(
+    reader: &rune_term::input::KeyReader,
+    host: &SessionHost,
+    out: &LiveSink,
+    below: &[String],
+    marker: &str,
+) -> Result<()> {
+    use rune_term::width::str_width;
+
+    let mut sink = out
+        .lock()
+        .map_err(|_| RuneError::new(ErrorCode::Internal, "the output lock was poisoned"))?;
+    let row = transcript::render_prompt(marker, reader.line(), usize::from(host.width()));
+    let caret = str_width(marker).saturating_add(reader.column());
+    let painted = host.paint(
+        &[],
+        None,
+        std::slice::from_ref(&row),
+        below,
+        (0, u16::try_from(caret).unwrap_or(u16::MAX)),
+    )?;
+    if !painted.is_empty() {
+        sink.write_all(&painted)?;
+        sink.flush()?;
+    }
+    Ok(())
+}
+
+/// Runs an inline picker and returns the chosen entry.
+///
+/// The list is drawn under the input line, so the transcript above stays
+/// readable while a choice is made. Typing narrows the list, the vertical
+/// arrows move the highlight, Enter accepts, and Escape abandons the choice
+/// without changing anything.
+///
+/// Returns `None` when the user cancelled or asked to leave.
+fn run_picker(
+    reader: &mut rune_term::input::KeyReader,
+    host: &SessionHost,
+    out: &LiveSink,
+    mut picker: rune_term::picker::Picker,
+) -> Result<Option<String>> {
+    let marker = rune_term::shell::prompt();
+    // Whatever was on the line is put back afterwards, so a half-typed prompt
+    // is not lost to a look at the model list.
+    let draft = reader.line().to_owned();
+    reader.clear();
+
+    let chosen = loop {
+        let mut below = vec![picker.title().to_owned()];
+        below.extend(picker.rows(&host.theme, host.truecolor));
+        below.push(rune_term::picker::Picker::hint().to_owned());
+        draw_prompt(reader, host, out, &below, marker)?;
+
+        match reader.read_key() {
+            KeyAction::Submit => break picker.selected().map(str::to_owned),
+            KeyAction::Interrupt | KeyAction::Cancel => break None,
+            // Both branches fall through to the redraw at the top of the loop.
+            response @ (KeyAction::Up | KeyAction::Down) => {
+                if response == KeyAction::Up {
+                    picker.up();
+                } else {
+                    picker.down();
+                }
+            }
+            KeyAction::Ignored => {
+                picker.set_query(reader.line());
+            }
+        }
+    };
+
+    reader.replace(&draft);
+    Ok(chosen)
+}
+
+/// Summarizes older turns and installs the summary.
+///
+/// The summary is produced by the model, because nothing else can compress a
+/// conversation without discarding what makes it useful. When the request fails
+/// the history is left exactly as it was, so a failed compaction costs nothing
+/// but the attempt.
+fn compact_history(
+    host: &SessionHost,
+    history: &mut History,
+    sink: &mut LockedSink,
+) -> Result<Step> {
+    let Some(plan) = rune_agent::compaction::plan(history, &host.limits) else {
+        return report(
+            host,
+            sink,
+            "nothing to compact: the conversation is short enough to leave as it is",
+        );
+    };
+
+    if host.endpoint.offline {
+        return report(
+            host,
+            sink,
+            "cannot compact while outbound requests are disabled",
+        );
+    }
+
+    let request = rune_agent::compaction::render_summary_request(history, &plan);
+    let mut request_plan = rune_net::provider::RequestPlan::new(host.model());
+    rune_agent::compaction::SUMMARY_INSTRUCTIONS.clone_into(&mut request_plan.instructions);
+    request_plan.messages = rune_net::transport::one_shot_messages(&request);
+
+    let outcome = match rune_net::transport::stream_completion(
+        &rune_net::transport::agent(),
+        &host.endpoint,
+        host.dialect.as_ref(),
+        &request_plan,
+        compaction_timeout(host),
+        &|| false,
+    ) {
+        Ok(outcome) => outcome,
+        Err(err) => {
+            return report(
+                host,
+                sink,
+                &format!("compaction failed, nothing was changed: {err}"),
+            );
+        }
+    };
+
+    let summary = outcome.text();
+    // A summary that is empty or trivial would replace the conversation it was
+    // meant to compress with nothing, so it is refused and the history stands.
+    if let Err(err) = rune_agent::compaction::validate_summary(&summary) {
+        return report(
+            host,
+            sink,
+            &format!("compaction produced nothing usable: {err}"),
+        );
+    }
+
+    let removed = rune_agent::compaction::apply(
+        history,
+        &plan,
+        rune_agent::compaction::wrap_summary(&summary),
+    );
+    host.record_usage(&outcome.usage);
+    report(
+        host,
+        sink,
+        &format!(
+            "compacted {removed} earlier turn(s); {} turn(s) remain",
+            history.len()
+        ),
+    )
+}
+
+/// Commits one line of command output through the renderer.
+fn report(host: &SessionHost, sink: &mut LockedSink, line: &str) -> Result<Step> {
+    flush_lines(host, sink, &output_lines(line.as_bytes()))?;
+    Ok(Step::Continue)
+}
+
+/// How long a compaction request waits.
+///
+/// Taken from the configured head timeout, so a slow endpoint that has been
+/// given more room to answer is not cut off here at a smaller number.
+fn compaction_timeout(host: &SessionHost) -> std::time::Duration {
+    host.limits
+        .get_usize(rune_core::budget::LimitName::ProviderHeadTimeoutMs)
+        .try_into()
+        .map_or(DEFAULT_COMPACTION_TIMEOUT, std::time::Duration::from_millis)
+}
+
+/// How long a compaction request waits when no limit is configured.
+const DEFAULT_COMPACTION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Puts back what the session changed and reports each file.
+///
+/// A file that could not be restored is reported and the rest are still
+/// attempted, because leaving the user with half their files back and no
+/// explanation is worse than a partial undo they can see.
+fn report_undo(host: &SessionHost, sink: &mut LockedSink) -> Result<()> {
+    if !host.can_undo() {
+        flush_lines(
+            host,
+            sink,
+            &["nothing to undo: this session has not changed any file".to_owned()],
+        )?;
+        return Ok(());
+    }
+    match host.undo() {
+        Ok(lines) => flush_lines(host, sink, &lines)?,
+        Err(err) => {
+            let mut lines = vec![err.to_string()];
+            if let Some(hint) = err.hint() {
+                lines.push(format!("hint: {hint}"));
+            }
+            flush_lines(host, sink, &lines)?;
+        }
+    }
+    Ok(())
+}
+
+/// Returns the model's most recent reply, as plain text.
+///
+/// Read from the conversation rather than from the screen: what is on screen has
+/// been wrapped, indented, and styled, so copying it would paste back the
+/// renderer's layout rather than what the model said.
+#[must_use]
+fn last_reply(history: &History) -> Option<String> {
+    history
+        .turns()
+        .iter()
+        .rev()
+        .find(|turn| turn.role == rune_net::message::Role::Assistant)
+        .map(|turn| {
+            // Only text parts are copied. A tool call carries arguments the user
+            // did not write and cannot use, so including it would paste JSON
+            // into whatever they are working on.
+            turn.parts
+                .iter()
+                .filter_map(|part| match part {
+                    rune_net::message::ContentPart::Text { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<&str>>()
+                .join("")
+        })
+        .filter(|reply| !reply.trim().is_empty())
+}
+
+/// Copies text to the terminal's clipboard.
+///
+/// Uses OSC 52, which the terminal emulator handles itself. Shelling out to a
+/// platform clipboard tool would work on a desktop and fail over SSH, where the
+/// terminal is the only thing that can reach the user's clipboard. A terminal
+/// that does not implement OSC 52 ignores it rather than showing it, so the
+/// escape never becomes visible text.
+fn copy_to_clipboard(text: &str) -> std::io::Result<()> {
+    use std::io::Write as _;
+
+    let encoded = base64_encode(text.as_bytes());
+    let mut stdout = std::io::stdout();
+    write!(stdout, "\u{1b}]52;c;{encoded}\u{7}")?;
+    stdout.flush()
+}
+
+/// Encodes bytes as standard base64 with padding.
+///
+/// Written here rather than pulled from a crate: OSC 52 is the only base64 this
+/// program needs, and a dependency to replace twelve lines is not worth the
+/// build time or the supply chain.
+#[must_use]
+fn base64_encode(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3).saturating_mul(4));
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk.first().copied().unwrap_or(0);
+        let b1 = chunk.get(1).copied().unwrap_or(0);
+        let b2 = chunk.get(2).copied().unwrap_or(0);
+        let triple = (u32::from(b0) << 16) | (u32::from(b1) << 8) | u32::from(b2);
+        let indexes = [
+            (triple >> 18) & 0x3f,
+            (triple >> 12) & 0x3f,
+            (triple >> 6) & 0x3f,
+            triple & 0x3f,
+        ];
+        for (position, index) in indexes.iter().enumerate() {
+            // A short final chunk emits padding instead of the bytes it does
+            // not have, which is what makes the encoding decodable.
+            if position > chunk.len() {
+                out.push('=');
+            } else {
+                out.push(char::from(ALPHABET[*index as usize]));
+            }
+        }
+    }
+    out
+}
+
+/// Prints finished lines and leaves the prompt under them.
+///
+/// Every writer must go through the renderer: text written straight to the
+/// stream lands at the caret, which is inside the region the session repaints,
+/// and the two then disagree about what is on screen. Lines committed here
+/// become part of the terminal's own scrollback.
+fn flush_lines(host: &SessionHost, sink: &mut LockedSink, lines: &[String]) -> Result<()> {
+    if lines.is_empty() {
+        return Ok(());
+    }
+    let (prompt_row, caret) = host.idle_prompt();
+    let painted = host.paint(lines, None, &prompt_row, &[], caret)?;
+    if !painted.is_empty() {
+        sink.write_all(&painted)?;
+        sink.flush()?;
+    }
+    Ok(())
+}
+
+/// Splits captured command output into the lines the renderer commits.
+///
+/// A trailing newline produces an empty final line, which would commit a blank
+/// row and move the prompt down for no reason, so it is dropped.
+fn output_lines(bytes: &[u8]) -> Vec<String> {
+    let text = String::from_utf8_lossy(bytes);
+    let trimmed = text.strip_suffix('\n').unwrap_or(&text);
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+    trimmed.lines().map(str::to_owned).collect()
+}
+
+/// Runs the model picker and applies the choice.
+///
+/// The list comes from the endpoint when it can be reached and from
+/// configuration when it cannot, so a picker still offers something on an
+/// offline machine. A chosen model is written back to the configuration, so the
+/// next session starts on it, and is applied to this session immediately.
+fn choose_model(
+    reader: &mut rune_term::input::KeyReader,
+    host: &SessionHost,
+    out: &LiveSink,
+    settings: &Settings,
+    paths: &Paths,
+) -> Result<()> {
+    let catalog = match crate::provider_setup::fetch_catalog(settings, paths, MODEL_PICKER_TIMEOUT)
+    {
+        Ok(catalog) => catalog,
+        // A picker that refuses to open because the endpoint is unreachable
+        // leaves the user with nothing to do, so the configured model is
+        // offered instead and the reason is shown.
+        Err(err) => {
+            let mut sink = LockedSink {
+                stream: Arc::clone(out),
+            };
+            let _ = writeln!(sink, "could not list models: {}", err.message());
+            if let Some(hint) = err.hint() {
+                let _ = writeln!(sink, "hint: {hint}");
+            }
+            crate::provider_setup::catalog_for(settings)
+        }
+    };
+
+    let items: Vec<String> = catalog
+        .models
+        .iter()
+        .map(|model| model.id.clone())
+        .collect();
+    let current = host.model_name();
+    let picker = rune_term::picker::Picker::new(
+        format!("models from {}", catalog.provider),
+        items,
+        rune_term::picker::DEFAULT_WINDOW,
+    )
+    .with_current(Some(current.as_str()));
+
+    let Some(chosen) = run_picker(reader, host, out, picker)? else {
+        // Cancelling reports nothing: the status line still names the model in
+        // effect, which is the answer to the question that was asked.
+        return Ok(());
+    };
+
+    // The catalog is where a model's capacity is declared, so the window that
+    // travels with the choice is the one the endpoint reported for it rather
+    // than a number invented for it.
+    let window = catalog
+        .models
+        .iter()
+        .find(|model| model.id == chosen)
+        .and_then(|model| model.context_window);
+    host.set_model(&chosen, window);
+    // Written after the change takes effect, so a failed write cannot leave the
+    // session on a model the file does not name.
+    let selection = crate::provider_setup::Selection {
+        provider: rune_core::config::provider_key(&settings.provider),
+        model: Some(chosen.clone()),
+        base_url: None,
+    };
+    let mut sink = LockedSink {
+        stream: Arc::clone(out),
+    };
+    match crate::provider_setup::save_selection(paths, &selection) {
+        Ok(()) => {
+            let _ = writeln!(sink, "model set to {chosen}");
+        }
+        Err(err) => {
+            let _ = writeln!(
+                sink,
+                "model set to {chosen} for this session; it could not be saved: {}",
+                err.message()
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Returns the prompts recorded for a workspace, oldest first.
+///
+/// A missing history is not an error: recall is a convenience, and a session
+/// without it is still usable.
+fn recorded_prompts(
+    history: Option<&crate::prompt_history::History>,
+    workspace: &Utf8Path,
+) -> Vec<String> {
+    history
+        .map(|history| {
+            history
+                .for_workspace(workspace)
+                .iter()
+                .map(|entry| entry.text.clone())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Renders the session's current state.
+///
+/// Reads nothing from disk, because the point of the command is to answer
+/// questions about the running session rather than about the machine.
+#[must_use]
+fn render_status(info: &SessionInfo<'_>) -> String {
+    let mut out = String::new();
+    let _ = writeln!(out, "model          {}", info.model);
+    let _ = writeln!(out, "provider       {}", info.provider);
+    let _ = writeln!(out, "endpoint       {}", info.endpoint);
+    let _ = writeln!(out, "permissions    {}", info.mode.label());
+    let _ = writeln!(out, "effort         {}", info.effort);
+    let _ = writeln!(out, "session        {}", info.session_id);
+    let _ = writeln!(out, "workspace      {}", info.workspace);
+    let _ = write!(
+        out,
+        "context        {}",
+        footer::format_tokens(info.context_used)
+    );
+    if info.context_limit == 0 {
+        // A window that is not known is left unnamed rather than shown as a
+        // share of a number this program does not have.
+        let _ = writeln!(out, " (window unknown)");
+    } else {
+        let percent = info
+            .context_used
+            .saturating_mul(100)
+            .checked_div(info.context_limit)
+            .unwrap_or(0)
+            .min(100);
+        let _ = writeln!(
+            out,
+            " of {} ({percent}%)",
+            footer::format_tokens(info.context_limit)
+        );
+    }
+    out.trim_end().to_owned()
+}
+
+/// Renders what this session has spent.
+///
+/// Counted from the turns this session has run rather than read back from the
+/// ledger, because the ledger records which model served a request but not
+/// which session asked for it, and a command that reported the machine's whole
+/// spend would be answering a different question.
+///
+/// Only tokens are reported. No provider in this build reports a monetary cost,
+/// so a currency figure here would be one this program invented.
+#[must_use]
+fn render_cost(info: &SessionInfo<'_>) -> String {
+    let totals = &info.totals;
+    if totals.requests == 0 {
+        return "no requests have been made in this session yet".to_owned();
+    }
+    let mut out = String::new();
+    let _ = writeln!(out, "Requests: {}", totals.requests);
+    let _ = writeln!(
+        out,
+        "Tokens:   {} in, {} out",
+        footer::format_tokens(totals.input_tokens),
+        footer::format_tokens(totals.output_tokens)
+    );
+    if totals.cache_read_tokens > 0 || totals.cache_write_tokens > 0 {
+        let _ = writeln!(
+            out,
+            "Cache:    {} read, {} written",
+            footer::format_tokens(totals.cache_read_tokens),
+            footer::format_tokens(totals.cache_write_tokens)
+        );
+    }
+    if totals.reasoning_tokens > 0 {
+        let _ = writeln!(
+            out,
+            "Reasoning: {}",
+            footer::format_tokens(totals.reasoning_tokens)
+        );
+    }
+    out.trim_end().to_owned()
+}
+
+/// Renders the settings that govern the running session.
+#[must_use]
+fn render_settings(info: &SessionInfo<'_>) -> String {
+    let mut out = String::new();
+    let _ = writeln!(out, "model          {}", info.model);
+    let _ = writeln!(out, "provider       {}", info.provider);
+    let _ = writeln!(out, "permissions    {}", info.mode.label());
+    let _ = writeln!(out, "effort         {}", info.effort);
+    let _ = write!(
+        out,
+        "context window {}",
+        if info.context_limit == 0 {
+            "unknown".to_owned()
+        } else {
+            footer::format_tokens(info.context_limit)
+        }
+    );
+    let _ = writeln!(out);
+    out.trim_end().to_owned()
+}
+
+/// How long the model picker waits for the endpoint's list.
+///
+/// Shorter than the command line's wait, because a user is watching a list
+/// that has not appeared yet and configuration already offers a usable entry.
+const MODEL_PICKER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Resolves the theme for a session.
 ///
@@ -1005,6 +1848,126 @@ enum Handled {
     Expand(String),
     /// Forget every recorded prompt.
     ClearHistory,
+    /// Send later turns to this model.
+    SetModel(String),
+    /// Ask the user to choose a model from a list.
+    PickModel,
+    /// Put back the files the session changed.
+    Undo,
+    /// Summarize older turns to free the context window.
+    Compact,
+    /// Put the last reply on the terminal's clipboard.
+    Copy,
+    /// Start a fresh conversation in this terminal.
+    NewSession,
+    /// Give the session a new title.
+    Rename(String),
+}
+
+/// Token and request totals for one session.
+///
+/// Summed here rather than read back from the ledger, which does not record
+/// which session a request belonged to.
+#[derive(Clone, Default, PartialEq, Eq, Debug)]
+struct Totals {
+    /// Requests the session has made.
+    requests: u64,
+    /// Input tokens reported across those requests.
+    input_tokens: u64,
+    /// Output tokens reported across those requests.
+    output_tokens: u64,
+    /// Prompt-cache reads reported across those requests.
+    cache_read_tokens: u64,
+    /// Prompt-cache writes reported across those requests.
+    cache_write_tokens: u64,
+    /// Reasoning tokens reported across those requests.
+    reasoning_tokens: u64,
+}
+
+impl Totals {
+    /// Adds one turn's usage.
+    ///
+    /// A provider that reports no count leaves that field as it was rather than
+    /// adding zero, so an absent figure does not look like a measured zero.
+    fn record(&mut self, usage: &rune_net::stream::Usage) {
+        self.requests = self.requests.saturating_add(1);
+        if let Some(value) = usage.input_tokens {
+            self.input_tokens = self.input_tokens.saturating_add(value);
+        }
+        if let Some(value) = usage.output_tokens {
+            self.output_tokens = self.output_tokens.saturating_add(value);
+        }
+        if let Some(value) = usage.cache_read_tokens {
+            self.cache_read_tokens = self.cache_read_tokens.saturating_add(value);
+        }
+        if let Some(value) = usage.cache_write_tokens {
+            self.cache_write_tokens = self.cache_write_tokens.saturating_add(value);
+        }
+        if let Some(value) = usage.reasoning_tokens {
+            self.reasoning_tokens = self.reasoning_tokens.saturating_add(value);
+        }
+    }
+}
+
+/// Returns the file a tool call will change, when it changes one.
+///
+/// Only the two tools that rewrite a file wholesale are treated as mutations.
+/// A tool that changes something else, such as the shell, is not tracked: what
+/// a shell command changed is not knowable from its arguments, and pretending
+/// otherwise would offer an undo that does not undo.
+fn mutating_path<'a>(name: &str, arguments: &'a serde_json::Value) -> Option<&'a Utf8Path> {
+    if name != "write_file" && name != "edit_file" {
+        return None;
+    }
+    arguments
+        .get("path")
+        .and_then(serde_json::Value::as_str)
+        .map(Utf8Path::new)
+}
+
+/// What the read-only commands report about the running session.
+///
+/// A struct rather than a list of arguments so adding a field does not change
+/// every call site, and so a test can build one without a session.
+struct SessionInfo<'a> {
+    /// Model the session is sending to.
+    ///
+    /// Owned because it lives behind a lock that can change while the session
+    /// runs, so it cannot be handed out as a reference.
+    model: String,
+    /// Provider name as written in configuration.
+    provider: &'a str,
+    /// Endpoint requests are sent to.
+    endpoint: &'a str,
+    /// Permission mode in force.
+    mode: PermissionMode,
+    /// Reasoning effort in force.
+    effort: Effort,
+    /// Session identifier.
+    ///
+    /// Owned because `/new` replaces it while the session runs, so it cannot be
+    /// handed out as a reference.
+    session_id: String,
+    /// Workspace the session runs in.
+    workspace: &'a str,
+    /// Tokens spent from the context window.
+    context_used: u64,
+    /// Size of the context window, zero when none is known.
+    context_limit: u64,
+    /// What this session has spent so far.
+    totals: Totals,
+}
+
+/// What the input loop does after handling one line.
+enum Step {
+    /// Carry on reading input.
+    Continue,
+    /// Leave the session.
+    Exit,
+    /// Ask the user to choose a model before continuing.
+    PickModel,
+    /// Put back the files the session changed.
+    Undo,
 }
 
 /// Handles a slash command.
@@ -1017,10 +1980,54 @@ fn handle_command<W: std::io::Write>(
     commands: &rune_context::commands::Discovery,
     history: Option<&crate::prompt_history::History>,
     self_workspace: &Utf8Path,
+    info: &SessionInfo<'_>,
     output: &mut W,
 ) -> Result<Handled> {
     match name {
         "quit" | "exit" => Ok(Handled::Exit),
+        // A model named inline is taken as given rather than checked against a
+        // catalog, because an endpoint may serve a model it does not advertise
+        // and a typo is visible in the status line right after.
+        "model" => {
+            let requested = arguments.trim();
+            if requested.is_empty() {
+                return Ok(Handled::PickModel);
+            }
+            Ok(Handled::SetModel(requested.to_owned()))
+        }
+        "compact" => Ok(Handled::Compact),
+        // Read-only: the session log has no branch concept, so there is nothing
+        // to fork or switch to. Reporting the shape is what can be done
+        // truthfully.
+        "tree" => {
+            let state = session_log::inspect(&Paths::from_process(), &info.session_id.parse()?)?;
+            let tree = session_log::tree_of(&state);
+            let _ = writeln!(output, "{}", session_log::render_tree(&tree, &state));
+            Ok(Handled::Continue)
+        }
+        "copy" => Ok(Handled::Copy),
+        "new" => Ok(Handled::NewSession),
+        "undo" => Ok(Handled::Undo),
+        "rename" => {
+            let title = arguments.trim();
+            if title.is_empty() {
+                let _ = writeln!(output, "usage: /rename <title>");
+                return Ok(Handled::Continue);
+            }
+            Ok(Handled::Rename(title.to_owned()))
+        }
+        "status" => {
+            let _ = writeln!(output, "{}", render_status(info));
+            Ok(Handled::Continue)
+        }
+        "cost" => {
+            let _ = writeln!(output, "{}", render_cost(info));
+            Ok(Handled::Continue)
+        }
+        "settings" => {
+            let _ = writeln!(output, "{}", render_settings(info));
+            Ok(Handled::Continue)
+        }
         "history" => {
             let Some(history) = history else {
                 let _ = writeln!(output, "no prompt history is available");
@@ -1061,6 +2068,15 @@ fn handle_command<W: std::io::Write>(
             let _ = writeln!(
                 output,
                 "commands: /help /quit
+/model [id]  choose a model, or switch to one named here
+/status  show the model, provider, context, and session
+/cost  show what this session has spent
+/compact  summarize older turns to free the context window
+/undo  put back the files the last turn changed
+/tree  show the turns recorded in this session
+/copy  put the last reply on the clipboard
+/new  start a fresh conversation
+/rename <title>  name this session
 /history [here|session-id]  show recorded prompts
 /history clear  forget every recorded prompt"
             );
@@ -1718,6 +2734,7 @@ mod tests {
             &empty_commands(),
             None,
             Utf8Path::new("/w"),
+            &test_info(),
             &mut output,
         )
         .expect("handled");
@@ -1725,6 +2742,452 @@ mod tests {
         let text = String::from_utf8_lossy(&output);
         assert!(text.contains("unknown command"), "{text}");
         assert!(text.contains("/help"), "{text}");
+    }
+
+    #[test]
+    fn naming_a_model_inline_asks_for_a_switch() {
+        let mut output = Vec::new();
+        let action = handle_command(
+            "model",
+            "vendor/name",
+            &empty_commands(),
+            None,
+            Utf8Path::new("/w"),
+            &test_info(),
+            &mut output,
+        )
+        .expect("handled");
+        assert_eq!(action, Handled::SetModel("vendor/name".to_owned()));
+    }
+
+    #[test]
+    fn a_bare_model_command_asks_for_the_picker() {
+        // The whole point of the command without an argument is the list, so a
+        // bare invocation must not be read as switching to the empty model.
+        let mut output = Vec::new();
+        let action = handle_command(
+            "model",
+            "   ",
+            &empty_commands(),
+            None,
+            Utf8Path::new("/w"),
+            &test_info(),
+            &mut output,
+        )
+        .expect("handled");
+        assert_eq!(action, Handled::PickModel);
+    }
+
+    #[test]
+    fn switching_the_model_changes_what_the_session_sends() {
+        let host = test_host();
+        assert_eq!(host.model(), "test");
+        host.set_model("other/model", None);
+        assert_eq!(host.model(), "other/model");
+    }
+
+    #[test]
+    fn switching_the_model_moves_the_context_window_only_when_one_is_known() {
+        // A window carried over from a larger model understates how full a
+        // smaller one is, but inventing one is worse, so an unknown window is
+        // left as it stands.
+        let host = test_host();
+        let before = host
+            .context_limit
+            .load(std::sync::atomic::Ordering::Relaxed);
+        host.set_model("small", None);
+        assert_eq!(
+            host.context_limit
+                .load(std::sync::atomic::Ordering::Relaxed),
+            before
+        );
+        host.set_model("large", Some(1_000_000));
+        assert_eq!(
+            host.context_limit
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1_000_000
+        );
+        // A zero means nothing is known, not a window of nothing.
+        host.set_model("zero", Some(0));
+        assert_eq!(
+            host.context_limit
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1_000_000
+        );
+    }
+
+    #[test]
+    fn the_status_command_names_the_model_in_effect() {
+        let host = test_host();
+        host.set_model("picked/model", None);
+        let info = host.info("chat_completions", "https://example.invalid/v1");
+        let rendered = render_status(&info);
+        assert!(rendered.contains("picked/model"), "{rendered}");
+        assert!(rendered.contains("chat_completions"), "{rendered}");
+        assert!(rendered.contains("sessiontest1"), "{rendered}");
+    }
+
+    #[test]
+    fn a_status_line_never_prints_the_credential() {
+        // The endpoint carries the credential beside its address, so a status
+        // row built from the wrong field would leak the key to the screen.
+        let host = test_host();
+        let info = host.info("chat_completions", "https://example.invalid/v1");
+        let rendered = render_status(&info);
+        assert!(!rendered.contains("sk-"), "{rendered}");
+    }
+
+    #[test]
+    fn the_status_command_names_an_unknown_window_rather_than_a_share_of_it() {
+        let mut info = test_info();
+        info.context_limit = 0;
+        info.context_used = 500;
+        let rendered = render_status(&info);
+        assert!(rendered.contains("window unknown"), "{rendered}");
+        assert!(!rendered.contains('%'), "{rendered}");
+    }
+
+    #[test]
+    fn the_cost_command_counts_only_what_was_reported() {
+        // An absent count must not be added as zero, or a provider that reports
+        // nothing looks like a provider that charged nothing.
+        let mut totals = Totals::default();
+        assert_eq!(
+            render_cost(&test_info_with(totals.clone())),
+            "no requests have been made in this session yet"
+        );
+        totals.record(&rune_net::stream::Usage {
+            input_tokens: Some(1200),
+            output_tokens: Some(450),
+            ..rune_net::stream::Usage::default()
+        });
+        totals.record(&rune_net::stream::Usage {
+            input_tokens: None,
+            output_tokens: Some(50),
+            ..rune_net::stream::Usage::default()
+        });
+        let rendered = render_cost(&test_info_with(totals));
+        assert!(rendered.contains("Requests: 2"), "{rendered}");
+        assert!(rendered.contains("1.2k in"), "{rendered}");
+        assert!(rendered.contains("500 out"), "{rendered}");
+    }
+
+    #[test]
+    fn usage_from_a_turn_is_added_to_the_session_total() {
+        let host = test_host();
+        host.record_usage(&rune_net::stream::Usage {
+            input_tokens: Some(10),
+            output_tokens: Some(4),
+            ..rune_net::stream::Usage::default()
+        });
+        host.record_usage(&rune_net::stream::Usage {
+            input_tokens: Some(5),
+            output_tokens: Some(1),
+            cache_read_tokens: Some(3),
+            ..rune_net::stream::Usage::default()
+        });
+        let info = host.info("p", "e");
+        assert_eq!(info.totals.requests, 2);
+        assert_eq!(info.totals.input_tokens, 15);
+        assert_eq!(info.totals.output_tokens, 5);
+        assert_eq!(info.totals.cache_read_tokens, 3);
+    }
+
+    #[test]
+    fn the_settings_command_reports_what_is_in_force() {
+        let rendered = render_settings(&test_info());
+        assert!(rendered.contains("permissions    auto"), "{rendered}");
+        assert!(rendered.contains("context window 128.0k"), "{rendered}");
+    }
+
+    #[test]
+    fn the_undo_command_is_recognized_rather_than_unknown() {
+        let mut output = Vec::new();
+        let action = handle_command(
+            "undo",
+            "",
+            &empty_commands(),
+            None,
+            Utf8Path::new("/w"),
+            &test_info(),
+            &mut output,
+        )
+        .expect("handled");
+        assert_eq!(action, Handled::Undo);
+    }
+
+    #[test]
+    fn a_bare_rename_asks_for_a_title() {
+        // A rename with no title would set the session title to nothing, which
+        // is not something the user can undo from the interface.
+        let mut output = Vec::new();
+        let action = handle_command(
+            "rename",
+            "  ",
+            &empty_commands(),
+            None,
+            Utf8Path::new("/w"),
+            &test_info(),
+            &mut output,
+        )
+        .expect("handled");
+        assert_eq!(action, Handled::Continue);
+        let text = String::from_utf8_lossy(&output);
+        assert!(text.contains("/rename <title>"), "{text}");
+    }
+
+    #[test]
+    fn renaming_a_session_asks_for_a_new_title() {
+        let mut output = Vec::new();
+        let action = handle_command(
+            "rename",
+            "fix the parser",
+            &empty_commands(),
+            None,
+            Utf8Path::new("/w"),
+            &test_info(),
+            &mut output,
+        )
+        .expect("handled");
+        assert_eq!(action, Handled::Rename("fix the parser".to_owned()));
+    }
+
+    #[test]
+    fn only_the_two_file_rewriting_tools_are_treated_as_mutations() {
+        // A shell command changes something, but what it changed cannot be read
+        // off its arguments, so offering an undo for it would be a lie.
+        let write = serde_json::json!({ "path": "a.txt", "content": "x" });
+        assert_eq!(
+            mutating_path("write_file", &write).map(Utf8Path::to_owned),
+            Some(Utf8PathBuf::from("a.txt"))
+        );
+        assert_eq!(
+            mutating_path("edit_file", &write).map(Utf8Path::to_owned),
+            Some(Utf8PathBuf::from("a.txt"))
+        );
+        assert_eq!(mutating_path("shell", &write), None);
+        assert_eq!(mutating_path("read_file", &write), None);
+        // A call missing its path is not a mutation this can track.
+        assert_eq!(mutating_path("write_file", &serde_json::json!({})), None);
+    }
+
+    #[test]
+    fn undoing_a_creation_removes_the_file() {
+        let dir = tempfile::tempdir().expect("temp");
+        let root = Utf8Path::from_path(dir.path()).expect("utf8");
+        let host = test_host();
+        let created = root.join("made.txt");
+
+        // Captured before the file exists, which is what the tool boundary does
+        // on the call that creates it.
+        host.remember(&created);
+        std::fs::write(&created, "created by the session").expect("write");
+        host.undo().expect("undo");
+        assert!(!created.exists(), "the created file was left behind");
+    }
+
+    #[test]
+    fn undoing_a_change_restores_the_original_bytes() {
+        let dir = tempfile::tempdir().expect("temp");
+        let root = Utf8Path::from_path(dir.path()).expect("utf8");
+        let host = test_host();
+        let changed = root.join("kept.txt");
+        std::fs::write(&changed, "original\n").expect("write");
+
+        host.remember(&changed);
+        std::fs::write(&changed, "replaced\n").expect("write");
+        host.undo().expect("undo");
+        assert_eq!(
+            std::fs::read_to_string(&changed).expect("read"),
+            "original\n"
+        );
+    }
+
+    #[test]
+    fn the_first_state_of_a_file_is_what_undo_returns_to() {
+        // A chain of edits must come back to where the session found the file,
+        // not to the middle of the chain.
+        let dir = tempfile::tempdir().expect("temp");
+        let root = Utf8Path::from_path(dir.path()).expect("utf8");
+        let host = test_host();
+        let path = root.join("chain.txt");
+        std::fs::write(&path, "one\n").expect("write");
+
+        host.remember(&path);
+        std::fs::write(&path, "two\n").expect("write");
+        host.remember(&path);
+        std::fs::write(&path, "three\n").expect("write");
+        host.undo().expect("undo");
+        assert_eq!(std::fs::read_to_string(&path).expect("read"), "one\n");
+    }
+
+    #[test]
+    fn undoing_twice_reports_nothing_left_rather_than_doing_it_again() {
+        let dir = tempfile::tempdir().expect("temp");
+        let root = Utf8Path::from_path(dir.path()).expect("utf8");
+        let host = test_host();
+        let path = root.join("once.txt");
+        assert!(!host.can_undo());
+        std::fs::write(&path, "body\n").expect("write");
+        host.remember(&path);
+        assert!(host.can_undo());
+        host.undo().expect("undo");
+        assert!(!host.can_undo());
+    }
+
+    #[test]
+    fn compacting_a_short_conversation_says_so_rather_than_failing() {
+        let host = test_host();
+        let mut history = History::new();
+        history.push_user("hello");
+        let captured: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+        let mut sink = LockedSink {
+            stream: Arc::new(Mutex::new(SharedBuffer(Arc::clone(&captured)))),
+        };
+        compact_history(&host, &mut history, &mut sink).expect("compacted");
+        let text = String::from_utf8(captured.lock().expect("lock").clone()).expect("utf8");
+        assert!(text.contains("nothing to compact"), "{text}");
+        assert_eq!(history.len(), 1, "the conversation was changed anyway");
+    }
+
+    /// A sink that appends to a buffer the test can read back.
+    struct SharedBuffer(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for SharedBuffer {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("lock").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn the_last_reply_is_read_from_the_conversation_not_the_screen() {
+        let mut history = History::new();
+        history.push_user("do a thing");
+        assert_eq!(last_reply(&history), None, "a user turn is not a reply");
+        history.push_assistant(vec![rune_net::message::ContentPart::Text {
+            text: "done".to_owned(),
+        }]);
+        assert_eq!(last_reply(&history).as_deref(), Some("done"));
+    }
+
+    #[test]
+    fn the_last_reply_is_the_most_recent_one() {
+        let mut history = History::new();
+        for text in ["first", "second"] {
+            history.push_assistant(vec![rune_net::message::ContentPart::Text {
+                text: text.to_owned(),
+            }]);
+        }
+        assert_eq!(last_reply(&history).as_deref(), Some("second"));
+    }
+
+    #[test]
+    fn a_reply_holds_no_tool_call_arguments() {
+        // A tool call carries JSON the user never wrote, so copying it would
+        // paste an argument list into whatever they are working on.
+        let mut history = History::new();
+        history.push_assistant(vec![
+            rune_net::message::ContentPart::Text {
+                text: "looking".to_owned(),
+            },
+            rune_net::message::ContentPart::ToolCall {
+                id: rune_core::id::ToolCallId::new("c1").expect("id"),
+                name: "shell".to_owned(),
+                arguments: "{\"command\":\"rm -rf /\"}".to_owned(),
+            },
+        ]);
+        let reply = last_reply(&history).expect("a reply");
+        assert_eq!(reply, "looking");
+        assert!(!reply.contains("rm -rf"), "{reply}");
+    }
+
+    #[test]
+    fn base64_matches_the_standard_encoding() {
+        // The clipboard is decoded by the terminal, so the alphabet and padding
+        // have to be exactly the standard ones.
+        for (input, expected) in [
+            ("", ""),
+            ("f", "Zg=="),
+            ("fo", "Zm8="),
+            ("foo", "Zm9v"),
+            ("foob", "Zm9vYg=="),
+            ("fooba", "Zm9vYmE="),
+            ("foobar", "Zm9vYmFy"),
+        ] {
+            assert_eq!(base64_encode(input.as_bytes()), expected, "{input:?}");
+        }
+    }
+
+    #[test]
+    fn base64_encodes_multibyte_text_by_its_bytes() {
+        // The text is UTF-8 on the wire, so an emoji is four bytes and must not
+        // be encoded as one character.
+        assert_eq!(base64_encode("é".as_bytes()), "w6k=");
+    }
+
+    #[test]
+    fn the_copy_and_new_commands_are_recognized() {
+        for (name, expected) in [("copy", Handled::Copy), ("new", Handled::NewSession)] {
+            let mut output = Vec::new();
+            let action = handle_command(
+                name,
+                "",
+                &empty_commands(),
+                None,
+                Utf8Path::new("/w"),
+                &test_info(),
+                &mut output,
+            )
+            .expect("handled");
+            assert_eq!(action, expected, "/{name}");
+        }
+    }
+
+    #[test]
+    fn starting_a_new_session_repoints_the_status_line() {
+        let host = test_host();
+        assert_eq!(host.session_id_name(), "sessiontest1");
+        host.set_session_id("another0session");
+        assert_eq!(host.session_id_name(), "another0session");
+        let info = host.info("p", "e");
+        assert_eq!(info.session_id, "another0session");
+    }
+
+    #[test]
+    fn starting_a_new_session_forgets_the_old_context_reading() {
+        let host = test_host();
+        host.record_context_size(4_000);
+        let info = host.info("p", "e");
+        assert_eq!(info.context_used, 4_000);
+        host.forget_context();
+        let info = host.info("p", "e");
+        assert_eq!(info.context_used, 0);
+    }
+
+    #[test]
+    fn the_help_text_names_the_commands_that_exist() {
+        // A command that is handled but unlisted is one nobody finds.
+        let mut output = Vec::new();
+        handle_command(
+            "help",
+            "",
+            &empty_commands(),
+            None,
+            Utf8Path::new("/w"),
+            &test_info(),
+            &mut output,
+        )
+        .expect("handled");
+        let text = String::from_utf8_lossy(&output);
+        for command in [
+            "/model", "/status", "/cost", "/compact", "/undo", "/copy", "/new", "/rename",
+        ] {
+            assert!(text.contains(command), "{command} is missing from: {text}");
+        }
     }
 
     #[test]
@@ -1737,6 +3200,7 @@ mod tests {
                 &empty_commands(),
                 None,
                 Utf8Path::new("/w"),
+                &test_info(),
                 &mut output
             )
             .expect("handled"),
@@ -1749,6 +3213,7 @@ mod tests {
                 &empty_commands(),
                 None,
                 Utf8Path::new("/w"),
+                &test_info(),
                 &mut output
             )
             .expect("handled"),
@@ -1775,6 +3240,7 @@ mod tests {
             &discovery,
             None,
             Utf8Path::new("/w"),
+            &test_info(),
             &mut output,
         )
         .expect("handled");
@@ -1800,6 +3266,7 @@ mod tests {
             &discovery,
             None,
             Utf8Path::new("/w"),
+            &test_info(),
             &mut output,
         )
         .expect("handled");
@@ -1812,7 +3279,7 @@ mod tests {
     fn help_reports_a_command_file_that_was_skipped() {
         let mut discovery = rune_context::commands::Discovery::default();
         discovery.warnings.push(rune_context::commands::Warning {
-            path: camino::Utf8PathBuf::from("/p/.rune/commands/help.md"),
+            path: Utf8PathBuf::from("/p/.rune/commands/help.md"),
             reason: "`/help` is a built-in command, so this file was skipped".to_owned(),
         });
 
@@ -1823,6 +3290,7 @@ mod tests {
             &discovery,
             None,
             Utf8Path::new("/w"),
+            &test_info(),
             &mut output,
         )
         .expect("handled");
@@ -1840,6 +3308,7 @@ mod tests {
             &empty_commands(),
             None,
             Utf8Path::new("/w"),
+            &test_info(),
             &mut output,
         )
         .expect("handled");
@@ -2010,6 +3479,26 @@ mod tests {
     }
 
     /// Builds a host with no network, for rendering tests.
+    fn test_info() -> SessionInfo<'static> {
+        test_info_with(Totals::default())
+    }
+
+    /// Builds the same report with a chosen spend, for the cost assertions.
+    fn test_info_with(totals: Totals) -> SessionInfo<'static> {
+        SessionInfo {
+            model: "test".to_owned(),
+            provider: "chat_completions",
+            endpoint: "https://example.invalid/v1",
+            mode: PermissionMode::Auto,
+            effort: Effort::Auto,
+            session_id: "sessiontest1".to_owned(),
+            workspace: "/w",
+            context_used: 0,
+            context_limit: rune_net::catalog::DEFAULT_CONTEXT_WINDOW,
+            totals,
+        }
+    }
+
     fn test_host() -> SessionHost {
         let mut registry = Registry::new();
         registry
@@ -2018,7 +3507,7 @@ mod tests {
         SessionHost {
             endpoint: Endpoint::new("https://example.invalid", "k"),
             dialect: Box::new(rune_net::chat_completions::ChatCompletions),
-            model: "test".to_owned(),
+            model: Mutex::new("test".to_owned()),
             instructions: String::new(),
             tools: Vec::new(),
             rules: crate::permissions::validated(&Settings::default()).expect("rules"),
@@ -2026,15 +3515,17 @@ mod tests {
             effort: Effort::Auto,
             fast_mode: false,
             limits: BudgetSet::new(),
-            context: ExecutionContext::new(camino::Utf8PathBuf::from("/tmp")),
+            context: ExecutionContext::new(Utf8PathBuf::from("/tmp")),
             registry,
             cancellation: Cancellation::new(),
             steering: SteeringQueue::new(4),
             events: Arc::new(Mutex::new(Vec::new())),
             context_used: std::sync::atomic::AtomicU64::new(0),
-            context_limit: rune_net::catalog::DEFAULT_CONTEXT_WINDOW,
+            context_limit: std::sync::atomic::AtomicU64::new(
+                rune_net::catalog::DEFAULT_CONTEXT_WINDOW,
+            ),
             theme: Theme::no_color(),
-            session_id: "sessiontest1".to_owned(),
+            session_id: Mutex::new("sessiontest1".to_owned()),
             workspace: "/tmp".to_owned(),
             truecolor: false,
             width: std::sync::atomic::AtomicU16::new(80),
@@ -2046,6 +3537,8 @@ mod tests {
             live_out: Arc::new(Mutex::new(None)),
             reasoning: Mutex::new("\u{1b}[2m".to_owned()),
             reviewer: None,
+            totals: Mutex::new(Totals::default()),
+            undo: Mutex::new(BTreeMap::new()),
             review_session: Arc::new(Mutex::new(ReviewSession::new(&BudgetSet::new()))),
         }
     }
