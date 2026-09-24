@@ -901,6 +901,16 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
         *slot = Some(Arc::clone(&out));
     }
 
+    // The context window is resolved before anything is drawn. The session used
+    // to announce itself first and correct the figure a moment later, which
+    // meant the status line showed the compiled default for as long as the
+    // lookup took and then changed under the reader. A wrong number that
+    // corrects itself is worse than a number that arrives late: it is
+    // indistinguishable from a right one while it is on screen.
+    if !config.settings.offline {
+        resolve_context_window(&host, &config.settings, &config.paths);
+    }
+
     // The session identifier is announced up front so a resumed-or-new session
     // can be named later without consulting the listing. It goes through the
     // renderer like everything else, so the rows it occupies are known to the
@@ -944,24 +954,6 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
     // input closure borrows the config and a model chosen mid-session has to be
     // able to build a catalog from the same settings the session started with.
     let settings = config.settings.clone();
-
-    // The endpoint is asked what the selected model's window actually is. This
-    // runs before the first turn, because a session that budgets against the
-    // compiled default reports a window the model does not have until the
-    // figure arrives. A failure is not reported: it is not a reason to refuse
-    // the session, and the configured or compiled figure still applies.
-    if !settings.offline
-        && let Ok(catalog) =
-            crate::provider_setup::fetch_catalog(&settings, &config.paths, CONTEXT_LOOKUP_TIMEOUT)
-    {
-        let current = host.model_name();
-        let reported = catalog
-            .models
-            .iter()
-            .find(|model| model.id == current)
-            .and_then(|model| model.context_window);
-        host.adopt_context_window(reported, config.settings.context_window.is_some());
-    }
 
     // The prompts already recorded in this workspace, oldest first, which is
     // the order the up arrow walks backwards through. Refreshed after each
@@ -1801,6 +1793,27 @@ fn render_settings(info: &SessionInfo<'_>) -> String {
     );
     let _ = writeln!(out);
     out.trim_end().to_owned()
+}
+
+/// Adopts the selected model's real context window.
+///
+/// The endpoint is asked what it serves and the published catalog fills in the
+/// capacity it does not state. A failure is not reported and does not stop the
+/// session: the window already in force, from the configuration or the compiled
+/// default, is what applies, and reminding a user of a lookup they cannot act
+/// on would only be noise at startup.
+fn resolve_context_window(host: &SessionHost, settings: &Settings, paths: &Paths) {
+    let Ok(catalog) = crate::provider_setup::fetch_catalog(settings, paths, CONTEXT_LOOKUP_TIMEOUT)
+    else {
+        return;
+    };
+    let current = host.model_name();
+    let reported = catalog
+        .models
+        .iter()
+        .find(|model| model.id == current)
+        .and_then(|model| model.context_window);
+    host.adopt_context_window(reported, settings.context_window.is_some());
 }
 
 /// How long the session waits for the endpoint's model list at startup.
