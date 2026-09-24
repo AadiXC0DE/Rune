@@ -2,29 +2,33 @@
 
 Notable changes, newest first. Each entry describes what a user can observe.
 
-## 0.1.1
+## 0.1.9
 
 ### Added
 
-- `rune connect` with no argument lists the providers, takes a choice, and asks
-  for what that provider needs, so a first connection needs nothing looked up.
-- OpenCode is available in both of its tiers, as `opencode` and `opencode-go`.
-  They share a key and differ in endpoint; the subscription requires the header
-  that names its conversation.
+- Choose a model from inside a session with `/model`. It lists what the endpoint
+  serves, narrows as you type, and is driven with the up and down arrows. The
+  choice applies to the next turn and is written to the configuration, so the
+  next session starts on it. Naming one directly, `/model <id>`, still works.
+- `/status` reports the model, provider, endpoint, permission mode, effort,
+  session, workspace, and how much of the context window is in use. `/cost`
+  reports what this session has spent.
+- `/compact` summarizes older turns to free the context window, `/undo` puts
+  back the files the session changed, `/copy` puts the last reply on the
+  clipboard, `/new` starts a fresh conversation, `/rename` titles the session,
+  and `/tree` shows the turns it holds.
+- The up and down arrows recall earlier prompts and move a selection. Neither key
+  did anything before: the line editor had a history walk that nothing called.
 
 ### Fixed
 
-- A provider connected by name could not be read back, so a self-hosted endpoint
-  appeared to connect and then had no effect.
-- Connecting a second provider reused the first one's endpoint, sending requests
-  to a host the user never named.
-- The published download is compressed. It was named `.tar.gz` and contained an
-  uncompressed tar, which `tar` opened by sniffing the format while other
-  readers refused it.
-- Session identifiers are generated through the same randomness crate the TLS
-  stack uses, removing the second copy from the binary.
+- Command output is drawn where it belongs. Every command wrote straight to the
+  terminal, which put its output at the cursor position inside the region the
+  renderer repaints, so the next frame drew over it and the screen showed a
+  mixture of the two. Output is now committed through the renderer like any
+  other finished text.
 
-## Unreleased
+## 0.1.8
 
 ### Added
 
@@ -41,6 +45,9 @@ Notable changes, newest first. Each entry describes what a user can observe.
   into the chat, burying the answer under the material it was drawn from. The
   result still reaches the model and the session log in full.
 
+## 0.1.7
+
+### Added
 
 - A model can declare its context window in the configuration, as either a bare
   identifier or a table naming the window. `rune config` reports which is in
@@ -61,6 +68,9 @@ Notable changes, newest first. Each entry describes what a user can observe.
   same answer to sixty-four thousand bytes, and wrapping is done once per line
   rather than once per delta.
 
+## 0.1.6
+
+### Added
 
 - Reasoning streams in its own lane, indented and in a secondary colour, above
   the answer. It used to disappear the moment a turn ended, because it was shown
@@ -186,3 +196,25 @@ Notable changes, newest first. Each entry describes what a user can observe.
 - A sandboxed command could not write in its own workspace when no working
   directory was given.
 - A tool result was retained across a turn without a bound on the total.
+
+## 0.1.1
+
+### Added
+
+- `rune connect` with no argument lists the providers, takes a choice, and asks
+  for what that provider needs, so a first connection needs nothing looked up.
+- OpenCode is available in both of its tiers, as `opencode` and `opencode-go`.
+  They share a key and differ in endpoint; the subscription requires the header
+  that names its conversation.
+
+### Fixed
+
+- A provider connected by name could not be read back, so a self-hosted endpoint
+  appeared to connect and then had no effect.
+- Connecting a second provider reused the first one's endpoint, sending requests
+  to a host the user never named.
+- The published download is compressed. It was named `.tar.gz` and contained an
+  uncompressed tar, which `tar` opened by sniffing the format while other
+  readers refused it.
+- Session identifiers are generated through the same randomness crate the TLS
+  stack uses, removing the second copy from the binary.
