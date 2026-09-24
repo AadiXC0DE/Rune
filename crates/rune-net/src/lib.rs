@@ -9,6 +9,7 @@ pub mod catalog;
 pub mod chat_completions;
 pub mod error;
 pub mod message;
+pub mod models_dev;
 pub mod provider;
 pub mod providers;
 pub mod redact;

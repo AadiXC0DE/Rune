@@ -291,14 +291,125 @@ pub fn fetch_catalog(
     )
     .map_err(|err| err.to_rune_error())?;
 
-    rune_net::catalog::from_endpoint_listing(&provider_name, &body).ok_or_else(|| {
-        RuneError::new(
-            ErrorCode::ProtocolViolation,
-            "the endpoint's model list was not in a shape this build reads",
-        )
-        .with_hint("the configured model is used as given")
-    })
+    let mut catalog =
+        rune_net::catalog::from_endpoint_listing(&provider_name, &body).ok_or_else(|| {
+            RuneError::new(
+                ErrorCode::ProtocolViolation,
+                "the endpoint's model list was not in a shape this build reads",
+            )
+            .with_hint("the configured model is used as given")
+        })?;
+    // An endpoint listing carries identifiers and little else, so the capacity
+    // of each model is filled in from the published catalog. Doing it here means
+    // every caller sees the same catalogue, rather than each having to remember.
+    enrich_with_capacity(settings, paths, &mut catalog);
+    Ok(catalog)
 }
+
+/// Fills in the capacity of each model from the published catalog.
+///
+/// An OpenAI-compatible listing carries an identifier and nothing else, so
+/// without this every model is budgeted against the compiled default and a
+/// model serving a million tokens reports as though it held a hundred and
+/// twenty-eight thousand. A figure the listing already stated is kept, because
+/// the endpoint describing its own model is the better authority.
+///
+/// Nothing here fails a listing: an unreachable catalog, an unreadable cache,
+/// and a provider the catalog does not describe all leave the models exactly as
+/// the endpoint listed them.
+pub fn enrich_with_capacity(settings: &Settings, paths: &Paths, catalog: &mut Catalog) {
+    let provider_name = settings.provider.to_string();
+    let Some(key) = rune_net::models_dev::catalog_key(&provider_name) else {
+        return;
+    };
+    let Some(limits) = fetch_provider_limits(settings, paths, key) else {
+        return;
+    };
+    for model in &mut catalog.models {
+        let Some(limit) = limits.get(&model.id) else {
+            continue;
+        };
+        if model.context_window.is_none() {
+            model.context_window = limit.context;
+        }
+        if model.max_output_tokens.is_none() {
+            model.max_output_tokens = limit.output;
+        }
+    }
+}
+
+/// URL the published catalog is served from.
+const MODELS_DEV_URL: &str = "https://models.dev/api.json";
+
+/// How long the catalog fetch waits.
+const MODELS_DEV_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Returns the published capacity for one provider.
+///
+/// The cache is read first, so a session does not pay a multi-megabyte download
+/// every time it starts, and the fetch happens only when there is no cache. A
+/// cached document is used whatever its age: a model's window does not change,
+/// and a stale entry for a model that has been retired costs nothing.
+fn fetch_provider_limits(
+    settings: &Settings,
+    paths: &Paths,
+    key: &str,
+) -> Option<rune_net::models_dev::ProviderLimits> {
+    let cache = paths.models_cache_file();
+    if let Some(limits) = read_cached_limits(&cache, key) {
+        return Some(limits);
+    }
+    // Nothing cached and no network permitted means nothing to add, which the
+    // caller treats as an unenriched listing rather than a failure.
+    if settings.offline {
+        return None;
+    }
+
+    let fetched =
+        rune_net::transport::fetch_url(MODELS_DEV_URL, "application/json", MODELS_DEV_TIMEOUT)
+            .ok()?;
+    if fetched.status != 200 {
+        return None;
+    }
+    let body = String::from_utf8(fetched.body).ok()?;
+    let limits = rune_net::models_dev::parse(&body, key)?;
+    // Written after it parses, so a partial or error body is never cached and
+    // the next run tries again rather than reading a failure forever.
+    let _ = write_cached_catalog(paths, &body);
+    Some(limits)
+}
+
+/// Reads a provider's capacity out of the cache.
+fn read_cached_limits(
+    path: &camino::Utf8Path,
+    key: &str,
+) -> Option<rune_net::models_dev::ProviderLimits> {
+    let text = rune_core::paths::read_private(path, MAX_CACHED_CATALOG_BYTES as u64).ok()??;
+    rune_net::models_dev::parse(&text, key)
+}
+
+/// Writes the catalog to the cache.
+fn write_cached_catalog(paths: &Paths, body: &str) -> Result<()> {
+    if body.len() > MAX_CACHED_CATALOG_BYTES {
+        return Err(RuneError::too_large(
+            "models-dev.json",
+            body.len(),
+            MAX_CACHED_CATALOG_BYTES,
+        ));
+    }
+    let path = paths.models_cache_file();
+    if let Some(parent) = path.parent() {
+        rune_core::paths::create_dir_private(parent)?;
+    }
+    rune_core::paths::write_private(&path, body)
+}
+
+/// Largest cached catalog accepted.
+///
+/// The published document is a few megabytes and grows as models are added. The
+/// ceiling is generous enough to survive that and tight enough that a wrong
+/// address or a corrupt file cannot fill memory on the next start.
+const MAX_CACHED_CATALOG_BYTES: usize = rune_net::models_dev::MAX_CATALOG_BYTES;
 
 /// Renders a catalog for a terminal.
 #[must_use]
@@ -423,6 +534,126 @@ pub fn environment_credential(provider: &str, configured: Option<&str>) -> Optio
 mod tests {
     use super::*;
     use rune_core::config::Provider;
+
+    /// A settings value for a provider, with no network permitted.
+    fn offline_settings(provider: &str) -> Settings {
+        Settings {
+            provider: rune_core::config::parse_provider(provider),
+            offline: true,
+            ..Settings::default()
+        }
+    }
+
+    fn temp_paths(root: &camino::Utf8Path) -> Paths {
+        // The state root must be private, and a tempdir is created world
+        // readable, so it is tightened before anything writes beneath it.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(
+                root,
+                std::fs::Permissions::from_mode(rune_core::paths::DIR_MODE),
+            );
+        }
+        Paths::resolve(Some(root.as_str()), None, None, None, Some(root.as_str()))
+    }
+
+    #[test]
+    fn a_cached_catalog_supplies_the_capacity_the_listing_omitted() {
+        // An OpenAI-compatible listing carries identifiers and little else, so
+        // without this every model is budgeted against the compiled default.
+        let dir = tempfile::tempdir().expect("temp");
+        let root = camino::Utf8Path::from_path(dir.path()).expect("utf8");
+        let paths = temp_paths(root);
+        paths.ensure_roots().expect("roots");
+        let doc = r#"{"opencode-go":{"models":{
+            "grok-4.7":{"limit":{"context":500000,"output":500000}}}}}"#;
+        write_cached_catalog(&paths, doc).expect("cached");
+
+        let settings = offline_settings("opencode-go");
+        let mut catalog = Catalog::new("opencode-go".to_owned());
+        catalog.models.push(ModelMetadata::new("grok-4.7"));
+        catalog.models.push(ModelMetadata::new("unknown-model"));
+        enrich_with_capacity(&settings, &paths, &mut catalog);
+
+        assert_eq!(catalog.models[0].context_window, Some(500_000));
+        assert_eq!(catalog.models[0].max_output_tokens, Some(500_000));
+        // A model the catalog does not describe is left as it was rather than
+        // given a made-up figure.
+        assert_eq!(catalog.models[1].context_window, None);
+    }
+
+    #[test]
+    fn a_figure_the_endpoint_stated_is_not_replaced() {
+        // The endpoint describing its own model is the better authority, so a
+        // figure it stated survives enrichment.
+        let dir = tempfile::tempdir().expect("temp");
+        let root = camino::Utf8Path::from_path(dir.path()).expect("utf8");
+        let paths = temp_paths(root);
+        paths.ensure_roots().expect("roots");
+        let doc = r#"{"opencode-go":{"models":{
+            "m":{"limit":{"context":111,"output":222}}}}}"#;
+        write_cached_catalog(&paths, doc).expect("cached");
+
+        let settings = offline_settings("opencode-go");
+        let mut catalog = Catalog::new("opencode-go".to_owned());
+        let mut entry = ModelMetadata::new("m");
+        entry.context_window = Some(4096);
+        catalog.models.push(entry);
+        enrich_with_capacity(&settings, &paths, &mut catalog);
+
+        assert_eq!(catalog.models[0].context_window, Some(4096));
+        // The output ceiling was not stated, so it is filled in.
+        assert_eq!(catalog.models[0].max_output_tokens, Some(222));
+    }
+
+    #[test]
+    fn an_offline_run_with_no_cache_adds_nothing_and_does_not_fail() {
+        // No network permitted and nothing cached means nothing to add, which
+        // is an unenriched listing rather than an error.
+        let dir = tempfile::tempdir().expect("temp");
+        let root = camino::Utf8Path::from_path(dir.path()).expect("utf8");
+        let paths = temp_paths(root);
+        paths.ensure_roots().expect("roots");
+
+        let settings = offline_settings("opencode-go");
+        let mut catalog = Catalog::new("opencode-go".to_owned());
+        catalog.models.push(ModelMetadata::new("grok-4.7"));
+        enrich_with_capacity(&settings, &paths, &mut catalog);
+        assert_eq!(catalog.models[0].context_window, None);
+    }
+
+    #[test]
+    fn a_provider_the_catalog_does_not_describe_is_left_alone() {
+        let dir = tempfile::tempdir().expect("temp");
+        let root = camino::Utf8Path::from_path(dir.path()).expect("utf8");
+        let paths = temp_paths(root);
+        paths.ensure_roots().expect("roots");
+        let doc = r#"{"opencode-go":{"models":{"m":{"limit":{"context":9}}}}}"#;
+        write_cached_catalog(&paths, doc).expect("cached");
+
+        // A self-hosted endpoint is not described by any published catalog.
+        let settings = offline_settings("chat_completions");
+        let mut catalog = Catalog::new("chat_completions".to_owned());
+        catalog.models.push(ModelMetadata::new("m"));
+        enrich_with_capacity(&settings, &paths, &mut catalog);
+        assert_eq!(catalog.models[0].context_window, None);
+    }
+
+    #[test]
+    fn a_corrupt_cache_is_ignored_rather_than_fatal() {
+        let dir = tempfile::tempdir().expect("temp");
+        let root = camino::Utf8Path::from_path(dir.path()).expect("utf8");
+        let paths = temp_paths(root);
+        paths.ensure_roots().expect("roots");
+        write_cached_catalog(&paths, "not json at all").expect("cached");
+
+        let settings = offline_settings("opencode-go");
+        let mut catalog = Catalog::new("opencode-go".to_owned());
+        catalog.models.push(ModelMetadata::new("grok-4.7"));
+        enrich_with_capacity(&settings, &paths, &mut catalog);
+        assert_eq!(catalog.models[0].context_window, None);
+    }
 
     #[test]
     fn a_second_provider_does_not_inherit_the_first_endpoint() {

@@ -587,9 +587,7 @@ impl Settings {
     /// Checked before any network call so the failure is immediate and names
     /// exactly what is missing, rather than surfacing as a transport error.
     pub fn require_model(&self) -> Result<()> {
-        if !self.provider.is_configured() {
-            return Err(unconfigured_provider_error());
-        }
+        self.require_provider()?;
         if self.model.trim().is_empty() {
             return Err(RuneError::new(
                 ErrorCode::InvalidConfiguration,
@@ -598,6 +596,24 @@ impl Settings {
             .with_hint("set `model` in the user config, or pass `--model <id>`"));
         }
         Ok(())
+    }
+
+    /// Refuses a run with no provider connected.
+    ///
+    /// Split from [`Settings::require_model`] because a session with a terminal
+    /// can ask for a model before its first turn, while a caller that cannot be
+    /// asked still has to refuse rather than send an empty identifier.
+    pub fn require_provider(&self) -> Result<()> {
+        if !self.provider.is_configured() {
+            return Err(unconfigured_provider_error());
+        }
+        Ok(())
+    }
+
+    /// Returns whether a model has been selected.
+    #[must_use]
+    pub fn has_model(&self) -> bool {
+        !self.model.trim().is_empty()
     }
 
     /// Returns every key with its effective value and source, for `--explain`.
@@ -1358,6 +1374,19 @@ pub fn unconfigured_provider_error() -> RuneError {
     .with_hint("run `rune connect` to choose an endpoint and store a credential")
 }
 
+/// The error for a run that has a provider but no model chosen.
+///
+/// Reached only by a caller that cannot be asked, because a session with a
+/// terminal picks one before its first turn.
+#[must_use]
+pub fn unconfigured_model_error() -> RuneError {
+    RuneError::new(
+        ErrorCode::InvalidConfiguration,
+        "no model is selected",
+    )
+    .with_hint("run `rune models` to list the ones the endpoint serves, and `rune connect <provider> <model>` to set one")
+}
+
 /// Renders the project configuration keys, for documentation consistency tests.
 #[must_use]
 pub const fn project_safe_keys() -> &'static [&'static str] {
@@ -1787,6 +1816,52 @@ theme_unused = "x"
         let err = settings.require_model().expect_err("no model");
         assert_eq!(err.code(), ErrorCode::InvalidConfiguration);
         assert!(err.detail().hint.is_some());
+    }
+
+    #[test]
+    fn a_provider_without_a_model_is_enough_for_a_session_to_start() {
+        // A session with a terminal asks for a model before its first turn, so
+        // requiring one up front is what stopped `rune` alone from starting on
+        // a connection that was made without naming a model.
+        let dir = TempDir::new().expect("tempdir");
+        let user = write(&dir, "config.toml", "provider = \"opencode-go\"\n");
+        let settings = load(None, Some(&user), &empty_env());
+        assert!(settings.require_provider().is_ok());
+        assert!(!settings.has_model());
+        // A caller that cannot be asked still refuses, because a turn with an
+        // empty identifier fails at the endpoint with nothing to act on.
+        let err = settings.require_model().expect_err("no model");
+        assert_eq!(err.code(), ErrorCode::InvalidConfiguration);
+    }
+
+    #[test]
+    fn no_provider_is_refused_by_both_checks() {
+        let settings = load(None, None, &empty_env());
+        assert!(!settings.has_model());
+        let err = settings.require_provider().expect_err("unconfigured");
+        assert_eq!(err.code(), ErrorCode::AuthenticationRequired);
+    }
+
+    #[test]
+    fn a_selected_model_is_reported_as_present() {
+        let settings = Settings {
+            model: "grok-4.7".to_owned(),
+            ..Settings::default()
+        };
+        assert!(settings.has_model());
+        // Whitespace is not a model.
+        let blank = Settings {
+            model: "   ".to_owned(),
+            ..Settings::default()
+        };
+        assert!(!blank.has_model());
+    }
+
+    #[test]
+    fn the_no_model_error_names_how_to_choose_one() {
+        let err = unconfigured_model_error();
+        let hint = err.detail().hint.as_deref().expect("hint");
+        assert!(hint.contains("rune models"), "hint was `{hint}`");
     }
 
     #[test]

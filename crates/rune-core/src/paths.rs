@@ -47,6 +47,13 @@ pub mod names {
     pub const SKILLS_DIR: &str = "skills";
     /// Log directory in the state root.
     pub const LOGS_DIR: &str = "logs";
+    /// Cached models.dev catalog in the state root.
+    ///
+    /// A cache rather than a fixture, because the capacity of a model is a fact
+    /// about the model and changes when a new one is released. Holding it on
+    /// disk means a session started without a network still knows the window of
+    /// the model it is talking to.
+    pub const MODELS_CACHE_FILE: &str = "models-dev.json";
     /// Trace file in the log directory.
     pub const TRACE_FILE: &str = "trace.log";
     /// Project instructions file name.
@@ -205,6 +212,12 @@ impl Paths {
     #[must_use]
     pub fn logs_dir(&self) -> Utf8PathBuf {
         self.state_root.join(names::LOGS_DIR)
+    }
+
+    /// Path of the cached model catalog.
+    #[must_use]
+    pub fn models_cache_file(&self) -> Utf8PathBuf {
+        self.state_root.join(names::MODELS_CACHE_FILE)
     }
 
     /// Path of the default trace file.

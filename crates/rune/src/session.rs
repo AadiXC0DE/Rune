@@ -418,6 +418,11 @@ impl SessionHost {
         lock_model(&self.model).clone()
     }
 
+    /// Returns whether a model has been chosen.
+    fn has_model(&self) -> bool {
+        !lock_model(&self.model).trim().is_empty()
+    }
+
     /// Adopts a model's real context window, when the endpoint reports one.
     ///
     /// The configured window wins, because a user who declared one is describing
@@ -919,6 +924,21 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
     // does not know, and the two disagree about what is on the line.
     let mut reader = rune_term::input::KeyReader::new();
     let keyed = reader.is_active();
+
+    // A session with no model asks for one now, before the first turn, because
+    // a turn cannot be sent without an identifier. A terminal drives the picker,
+    // and a caller that cannot answer is refused here rather than at the
+    // endpoint, where an empty model comes back as an opaque protocol error.
+    if !config.settings.has_model() {
+        if !keyed {
+            return Err(rune_core::config::unconfigured_model_error());
+        }
+        choose_model(&mut reader, &host, &out, &config.settings, &config.paths)?;
+        if !host.has_model() {
+            // The picker was cancelled, so there is still nothing to send to.
+            return Err(rune_core::config::unconfigured_model_error());
+        }
+    }
 
     // Held rather than read off the config at the point of use, because the
     // input closure borrows the config and a model chosen mid-session has to be
@@ -1594,7 +1614,8 @@ fn choose_model(
         Ok(catalog) => catalog,
         // A picker that refuses to open because the endpoint is unreachable
         // leaves the user with nothing to do, so the configured model is
-        // offered instead and the reason is shown.
+        // offered instead and the reason is shown. It is still enriched from the
+        // cached catalog, so the window it reports is the model's own.
         Err(err) => {
             let mut sink = LockedSink {
                 stream: Arc::clone(out),
@@ -1603,7 +1624,9 @@ fn choose_model(
             if let Some(hint) = err.hint() {
                 let _ = writeln!(sink, "hint: {hint}");
             }
-            crate::provider_setup::catalog_for(settings)
+            let mut catalog = crate::provider_setup::catalog_for(settings);
+            crate::provider_setup::enrich_with_capacity(settings, paths, &mut catalog);
+            catalog
         }
     };
 
@@ -2276,7 +2299,12 @@ pub fn prepare(
     workspace: &Utf8Path,
     resume: Option<SessionId>,
 ) -> Result<SessionConfig> {
-    settings.require_model()?;
+    // A model is not required here. A session that has a terminal can ask for
+    // one before its first turn, which is what makes `rune` alone work on a
+    // connection that was made without naming a model. The refusal still
+    // happens for a caller that cannot be asked, because a turn sent with an
+    // empty identifier fails at the endpoint with nothing to act on.
+    settings.require_provider()?;
 
     let provider_name = settings.provider.to_string();
     let base_url = settings.base_url.clone().ok_or_else(|| {
