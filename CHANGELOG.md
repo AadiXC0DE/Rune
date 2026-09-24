@@ -2,6 +2,35 @@
 
 Notable changes, newest first. Each entry describes what a user can observe.
 
+## 0.1.10
+
+### Fixed
+
+- The interface no longer writes over itself. When the live region grew taller
+  than the space below the cursor, the rows that were gone were erased a row at
+  a time with a newline, and a newline at the bottom of the screen scrolls: the
+  rows just written were pushed off the top. Nothing capped the region to the
+  terminal either, so a long answer could be taller than the screen. The status
+  block was drawn a second time from the previous frame and the answer was
+  written over in the middle. Erasing is now one erase-to-end-of-screen, which
+  never moves the cursor, and the renderer is told the terminal height so the
+  region it draws is one it can also repaint.
+- The context meter reads the model's real window. The session never asked the
+  endpoint what the selected model serves, and the reader that parses an
+  endpoint listing kept only each model's identifier while discarding the
+  capacity beside it. A model serving a million tokens was budgeted against a
+  compiled default of 128k and reported as nearly full before anything had been
+  said. The listing now keeps the capacity under any of its usual names, and a
+  window declared in the configuration still wins over the endpoint's figure.
+
+### Added
+
+- `rune` with no argument starts a session on a fresh install. There is no
+  provider yet, so the connection flow runs first and the session starts on what
+  it chose. A piped or machine invocation is still not asked anything.
+- `/models` is accepted as a spelling of `/model`. `/model` with no argument
+  opens the picker, and choosing a model adopts that model's own window.
+
 ## 0.1.9
 
 ### Added
