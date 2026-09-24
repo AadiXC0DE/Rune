@@ -413,21 +413,56 @@ fn first_line(text: &str) -> String {
 }
 
 /// Runs the interactive session.
+///
+/// A fresh install has no provider, and refusing to start would leave a user
+/// with a hint and no way forward from the command they just ran. When there is
+/// a terminal to answer, the connection flow runs first, so `rune` alone reaches
+/// a working session. A piped or machine invocation is not asked anything: the
+/// error it already gets names what to do.
 fn run_interactive(
     settings: &Settings,
     paths: &Paths,
     workspace: &Utf8Path,
     launch: &Launch,
 ) -> Result<ExitCode> {
+    // A fresh install has no provider, and refusing to start would leave a user
+    // with a hint and no way forward from the command they just ran. When there
+    // is a terminal to answer, the connection flow runs first, so `rune` alone
+    // reaches a working session. A piped or machine invocation is not asked
+    // anything: the error it already gets names what to do.
+    let mut settings = settings.clone();
+    if settings.provider == Provider::Unconfigured && interactive_stdin() {
+        let entry = connect_flow::choose_provider()?;
+        // The flow writes the selection itself, so the only thing left is to
+        // read it back rather than patch the values in by hand: the session then
+        // runs on exactly what a later run would load.
+        connect_flow::run(paths, entry)?;
+        settings = config::load(
+            Some(&workspace.join(".rune.toml")),
+            Some(&paths.config_file(std::env::var("RUNE_CONFIG").ok().as_deref())),
+            &EnvironmentOverrides::from_process(),
+        );
+        cli::apply_to_settings(launch, &mut settings);
+        // The connection flow has already named what it connected, so the
+        // session says only what it is doing next.
+        println!("starting a session");
+    }
+
     let resume = match &launch.resume {
         Some(target) => Some(session_log::resolve_target(target, paths, workspace)?),
         None => None,
     };
-    let config = session::prepare(settings, paths, workspace, resume)?;
+    let config = session::prepare(&settings, paths, workspace, resume)?;
     let stdin = std::io::stdin();
     let input = std::io::BufReader::new(stdin.lock());
     let code = session::run(config, input, std::io::stdout())?;
     Ok(ExitCode::from(code))
+}
+
+/// Returns whether a person is waiting at the terminal.
+fn interactive_stdin() -> bool {
+    use std::io::IsTerminal;
+    std::io::stdin().is_terminal()
 }
 
 /// Reports the provider connection, or removes a stored credential.

@@ -3313,8 +3313,8 @@ mod tests {
         .expect("handled");
         let text = String::from_utf8_lossy(&output);
         for command in [
-            "/model", "/models", "/status", "/cost", "/compact", "/undo", "/copy", "/new", "/rename",
-            "/tree",
+            "/model", "/models", "/status", "/cost", "/compact", "/undo", "/copy", "/new",
+            "/rename", "/tree",
         ] {
             assert!(text.contains(command), "{command} is missing from: {text}");
         }
