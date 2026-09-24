@@ -2,6 +2,25 @@
 
 Notable changes, newest first. Each entry describes what a user can observe.
 
+## 0.1.11
+
+### Fixed
+
+- `rune` with no argument starts. Connecting a provider writes the provider and
+  the endpoint and no model, and a session then required one before it would
+  open a terminal, so the only way in was to pass `--model`. A session now asks
+  for the model before its first turn, which is what the picker is for.
+- Every model reported a hundred and twenty-eight thousand tokens. The opencode
+  endpoint returns an identifier and no capacity at all, and the reader that
+  parsed the listing kept only the identifier while discarding any capacity
+  beside it. The capacity now comes from the published models.dev catalog, which
+  is keyed by the same model identifiers the endpoint lists: `grok-4.7` reports
+  five hundred thousand, `kimi-k3` a million and forty-eight thousand, `glm-5.3`
+  a million. A figure the endpoint states is kept, because the endpoint
+  describing its own model is the better authority.
+- The catalog is cached under the state root, so a session pays the download
+  once, and an offline run still knows the window of the model it is talking to.
+
 ## 0.1.10
 
 ### Fixed
