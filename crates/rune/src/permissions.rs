@@ -30,10 +30,14 @@ pub struct Row {
 #[must_use]
 pub fn rules_for(settings: &Settings, extra: &RuleSet) -> RuleSet {
     let mut rules = builtin_rules(&settings.permission_mode);
-    // The web tools are refused by default and allowed when the configuration
-    // says so. A blanket deny had no way past it, so the tools could not be used
-    // at all however the run was configured.
-    if settings.web_tools {
+    // The web tools are refused by the built-in set, because that set is built
+    // without the configuration and a refusal is the safe thing for it to say.
+    // Enabling them is the configuration's decision, so the allow is written
+    // here, at a layer above the default, which is what lets it overrule the
+    // built-in denial. `offline` refuses everything, so it wins over the
+    // setting: there is no point allowing a tool whose transport will refuse
+    // the request.
+    if settings.web_tools && !settings.offline {
         for tool in ["web_fetch", "web_search"] {
             rules.push(Rule::allow(tool, "*", Layer::User));
         }
@@ -63,7 +67,9 @@ pub fn builtin_rules(mode: &PermissionMode) -> RuleSet {
     rules.push(Rule::allow("write_file", "*", Layer::Default));
     rules.push(Rule::allow("edit_file", "*", Layer::Default));
 
-    // Anything that leaves the machine is refused outright, regardless of mode.
+    // Refused by default, so a caller that never consults the configuration
+    // cannot reach the network by omission. Whether the run may use them is
+    // settled in `rules_for`, which knows the settings.
     rules.push(Rule::deny("web_fetch", "*", Layer::Default));
     rules.push(Rule::deny("web_search", "*", Layer::Default));
 
@@ -357,8 +363,42 @@ mod tests {
     }
 
     #[test]
-    fn the_validated_ruleset_matches_the_reported_one() {
+    fn the_validated_ruleset_carries_the_builtins_and_the_web_setting() {
+        // The built-in set refuses the web tools, because it is built without
+        // the configuration. Enabling them adds an allow above that refusal, so
+        // the reported set is the built-ins plus one rule per web tool.
         let settings = default_settings();
+        let rules = validated(&settings).expect("valid");
+        let builtins = builtin_rules(&settings.permission_mode).len();
+        let expected = builtins.saturating_add(2);
+        assert_eq!(rules.len(), expected);
+        assert!(
+            settings.web_tools,
+            "web tools should be on unless the run says otherwise"
+        );
+    }
+
+    #[test]
+    fn the_web_tools_are_refused_when_the_setting_is_off() {
+        // Turning the setting off must leave the refusal in place, so the tools
+        // cannot be used by a run that asked not to reach the network.
+        let settings = Settings {
+            web_tools: false,
+            ..default_settings()
+        };
+        let rules = validated(&settings).expect("valid");
+        assert_eq!(rules.len(), builtin_rules(&settings.permission_mode).len());
+    }
+
+    #[test]
+    fn an_offline_run_does_not_enable_the_web_tools() {
+        // Offline refuses every request, so allowing the tools would only make
+        // them fail later with a different message.
+        let settings = Settings {
+            web_tools: true,
+            offline: true,
+            ..default_settings()
+        };
         let rules = validated(&settings).expect("valid");
         assert_eq!(rules.len(), builtin_rules(&settings.permission_mode).len());
     }

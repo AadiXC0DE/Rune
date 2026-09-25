@@ -336,10 +336,12 @@ pub struct UserConfig {
 
     /// Whether the web tools may reach the network.
     ///
-    /// Off by default, and separate from `offline`: offline stops every request
-    /// including the model, while this allows the model and the web tools
-    /// without allowing anything else. A coding agent that searches needs a way
-    /// to say so that does not also mean turning off the network.
+    /// On by default, because a coding agent that cannot look something up is
+    /// the odd one out: every comparable harness reaches the network unless told
+    /// not to. `offline = true` is the switch that refuses everything, including
+    /// the model, and it overrules this. Setting this to false allows the model
+    /// while refusing the web tools, which is what a run that must not send a
+    /// query to a third party wants.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub web_tools: Option<bool>,
 
@@ -544,7 +546,7 @@ impl Default for Settings {
         Self {
             provider: Provider::default(),
             model: String::new(),
-            web_tools: false,
+            web_tools: true,
             context_window: None,
             base_url: None,
             api_key_env: None,

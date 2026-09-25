@@ -3859,13 +3859,30 @@ mod tests {
             Outcome::Allow,
             "a read tool would ask for approval it never gets"
         );
+        // The web tools are on unless the run says otherwise, so a fresh session
+        // can look something up rather than reporting that it was refused.
         assert_eq!(
             config
+                .rules
+                .evaluate("web_fetch", "https://example.com", Outcome::Deny)
+                .outcome,
+            Outcome::Allow,
+            "the web tools are refused on a default configuration"
+        );
+        // And turning them off still refuses, so the setting is a real switch.
+        let off = Settings {
+            web_tools: false,
+            ..settings.clone()
+        };
+        let off_config =
+            prepare(&off, &paths, Utf8Path::new("/tmp"), None).expect("a session prepares");
+        assert_eq!(
+            off_config
                 .rules
                 .evaluate("web_fetch", "https://example.com", Outcome::Allow)
                 .outcome,
             Outcome::Deny,
-            "outbound traffic is not refused"
+            "turning the web tools off did not refuse them"
         );
     }
 

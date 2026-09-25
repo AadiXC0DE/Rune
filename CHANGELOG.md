@@ -2,6 +2,19 @@
 
 Notable changes, newest first. Each entry describes what a user can observe.
 
+## 0.1.14
+
+### Changed
+
+- The web tools are on by default. `web_search` and `web_fetch` were registered
+  with a backend that refused every call and were then denied by a built-in rule
+  that nothing could overrule, so both reported that the session had refused them
+  whatever the configuration said. A coding agent that cannot look something up
+  is the odd one out, so reaching the network is now the default and
+  `web_tools = false` turns it off. `offline = true` still refuses everything,
+  including the model.
+- The site's canonical and Open Graph URLs name `rune.heyaadi.com`.
+
 ## 0.1.13
 
 ### Added
