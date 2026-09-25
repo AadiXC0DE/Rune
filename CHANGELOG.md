@@ -2,6 +2,22 @@
 
 Notable changes, newest first. Each entry describes what a user can observe.
 
+## 0.1.15
+
+### Fixed
+
+- The completions for a slash command, and the model picker, are drawn under the
+  line being typed. Both were drawn above it, between the input and the answer
+  arriving, which is the opposite of where a list opened by typing belongs and of
+  what every comparable harness does. An answer growing upward and a list opening
+  downward now have their own places, so neither moves the other.
+- The list shows six rows at a time with a row saying how far through it is,
+  rather than every match: a bare slash matches every command, and drawing all of
+  them swallowed the screen.
+- Every command in the list is reachable. The arrows were bounded by the number
+  of drawn rows rather than the number of matches, so the position row counted as
+  a command and everything past the first screenful could not be selected.
+
 ## 0.1.14
 
 ### Changed
