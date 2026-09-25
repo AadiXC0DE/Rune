@@ -31,7 +31,7 @@ use rune_term::footer::{self, FooterState};
 use rune_term::input::KeyAction;
 use rune_term::shell::ExitReason;
 use rune_term::shell::{Action, Input, Shell};
-use rune_term::theme::Theme;
+use rune_term::theme::{Slot, Theme};
 use rune_term::transcript::{self, Display, Entry};
 use rune_tools::contract::{ExecutionContext, ToolOutput};
 use rune_tools::inventory;
@@ -413,6 +413,16 @@ impl SessionHost {
         }
     }
 
+    /// Returns the theme the interface is drawn with.
+    fn theme(&self) -> &Theme {
+        &self.theme
+    }
+
+    /// Returns whether the terminal renders direct color.
+    const fn truecolor(&self) -> bool {
+        self.truecolor
+    }
+
     /// Returns the model the session is sending to.
     fn model_name(&self) -> String {
         lock_model(&self.model).clone()
@@ -756,7 +766,7 @@ impl SessionHost {
             return Vec::new();
         };
         let width = usize::from(self.width());
-        let dim = self.theme.sgr(rune_term::theme::Slot::Dim, self.truecolor);
+        let dim = self.theme.sgr(Slot::Dim, self.truecolor);
         let reset = rune_term::engine::Style::RESET;
 
         // The fields are borrowed separately, because each lane's text and the
@@ -846,7 +856,7 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
     // and because the reasoning lane's colour has to be read off the theme
     // before the theme itself moves into the host.
     let theme = resolve_theme(&config);
-    let reasoning_escape = theme.sgr(rune_term::theme::Slot::Dim, truecolor_supported());
+    let reasoning_escape = theme.sgr(Slot::Dim, truecolor_supported());
 
     // Copied before the endpoint moves into the host, so `/status` and the
     // picker can name the address and the provider without the credential that
@@ -1240,12 +1250,27 @@ fn await_submission(
     recall: &[String],
 ) -> Result<Option<Input>> {
     let marker = rune_term::shell::prompt();
+    // Which completion row is highlighted. While the dropdown is open the
+    // arrows move it rather than walking the prompt history, because the list is
+    // what the user is looking at.
+    let mut selected = 0_usize;
 
     loop {
-        draw_prompt(reader, host, out, &[], marker)?;
+        let rows = completion_rows(reader.line(), selected, host.theme(), host.truecolor());
+        draw_prompt(reader, host, out, &rows, marker)?;
 
         match reader.read_key() {
             KeyAction::Submit => {
+                // Enter takes the highlighted completion when the list is open
+                // and the command is not yet complete, so a half-typed name is
+                // never run. Once the name is complete, Enter runs it.
+                if let Some(chosen) = open_completion(reader.line(), &rows, selected)
+                    && chosen.name != reader.line().trim_start_matches('/')
+                {
+                    reader.replace(&format!("/{}", chosen.name));
+                    selected = 0;
+                    continue;
+                }
                 let text = reader.line().trim().to_owned();
                 reader.clear();
                 if text.is_empty() {
@@ -1257,23 +1282,65 @@ fn await_submission(
             // interrupting it means leaving the session.
             KeyAction::Interrupt => return Ok(None),
             KeyAction::Cancel => {
+                // Escape clears a partly typed line first, which is what a
+                // reader expects of a key that also leaves.
                 if reader.line().is_empty() {
                     return Ok(None);
                 }
                 reader.clear();
+                selected = 0;
             }
-            // A key that moved the line is redrawn at the top of the loop,
-            // which is the only place a frame is written.
             response @ (KeyAction::Up | KeyAction::Down) => {
-                if response == KeyAction::Up {
+                // The dropdown owns the arrows while it is open.
+                if !rows.is_empty() {
+                    let count =
+                        completion_rows(reader.line(), selected, host.theme(), host.truecolor())
+                            .len()
+                            .max(1);
+                    selected = if response == KeyAction::Up {
+                        selected.saturating_sub(1)
+                    } else {
+                        selected.saturating_add(1).min(count.saturating_sub(1))
+                    };
+                } else if response == KeyAction::Up {
                     reader.recall_previous(recall);
                 } else {
                     reader.recall_next(recall);
                 }
             }
-            KeyAction::Ignored => {}
+            // Tab completes the highlighted command, which is what every other
+            // shell does and what a reader reaches for first.
+            KeyAction::Complete => {
+                if let Some(chosen) = open_completion(reader.line(), &rows, selected) {
+                    reader.replace(&format!("/{}", chosen.name));
+                    selected = 0;
+                }
+            }
+            KeyAction::Ignored => {
+                // Typing narrows the list, so the highlight returns to the top
+                // rather than pointing at a row that may no longer exist.
+                selected = 0;
+            }
         }
     }
+}
+
+/// Returns the command the dropdown is offering, when it is open.
+///
+/// The rows are already rendered, so the count comes from the table rather than
+/// from the text of a row: a row carries styling and a description, and parsing
+/// either back out would be the wrong way round.
+fn open_completion(
+    line: &str,
+    rows: &[String],
+    selected: usize,
+) -> Option<&'static rune_term::commands::Builtin> {
+    if rows.is_empty() {
+        return None;
+    }
+    let word = line.strip_prefix('/').unwrap_or_default();
+    let matches = rune_term::commands::matching(word);
+    matches.get(selected).copied()
 }
 
 /// Draws the prompt row, with any rows that belong below it.
@@ -1335,7 +1402,11 @@ fn run_picker(
         draw_prompt(reader, host, out, &below, marker)?;
 
         match reader.read_key() {
-            KeyAction::Submit => break picker.selected().map(str::to_owned),
+            // Tab and Enter both accept: the picker is the only thing on
+            // screen, so there is no typed argument for Enter to mean.
+            KeyAction::Submit | KeyAction::Complete => {
+                break picker.selected().map(str::to_owned);
+            }
             KeyAction::Interrupt | KeyAction::Cancel => break None,
             // Both branches fall through to the redraw at the top of the loop.
             response @ (KeyAction::Up | KeyAction::Down) => {
@@ -1554,6 +1625,86 @@ fn base64_encode(bytes: &[u8]) -> String {
         }
     }
     out
+}
+
+/// Closes a styled row.
+const RESET: &str = "\u{1b}[0m";
+
+/// Returns the rows showing what can be typed next.
+///
+/// Drawn while a slash command is being typed, from the same table the help
+/// text and the dispatcher use, so a command that is offered is one that works.
+/// The row under the cursor is marked and coloured; every row carries the line
+/// that describes the command, which is what makes the list usable without
+/// trying each name.
+///
+/// Returns an empty list when the line is not a command being typed, so a
+/// caller can pass every keystroke without checking first.
+#[must_use]
+pub fn completion_rows(line: &str, selected: usize, theme: &Theme, truecolor: bool) -> Vec<String> {
+    let Some(word) = slash_word(line) else {
+        return Vec::new();
+    };
+    let matches = rune_term::commands::matching(word);
+    if matches.is_empty() {
+        return Vec::new();
+    }
+
+    let accent = theme.sgr(Slot::Accent, truecolor);
+    let dim = theme.sgr(Slot::Dim, truecolor);
+    // Wide enough for the longest name in the list, so the descriptions line up.
+    let width = matches
+        .iter()
+        .map(|entry| {
+            entry
+                .name
+                .len()
+                .saturating_add(entry.arguments.len())
+                .saturating_add(if entry.arguments.is_empty() { 1 } else { 2 })
+        })
+        .max()
+        .unwrap_or(0);
+
+    matches
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| {
+            let left = if entry.arguments.is_empty() {
+                format!("/{}", entry.name)
+            } else {
+                format!("/{} {}", entry.name, entry.arguments)
+            };
+            let body = format!("{left:<width$}  {}", entry.summary);
+            if index == selected {
+                styled(&accent, &format!("> {body}"))
+            } else {
+                styled(&dim, &format!("  {body}"))
+            }
+        })
+        .collect()
+}
+
+/// Returns the word after a leading slash, when the line is one.
+///
+/// A line with a space in it is a command already being given its arguments, so
+/// there is nothing left to complete.
+fn slash_word(line: &str) -> Option<&str> {
+    let rest = line.strip_prefix('/')?;
+    if rest.chars().any(char::is_whitespace) {
+        return None;
+    }
+    Some(rest)
+}
+
+/// Wraps `text` in `open`, closing it again.
+///
+/// A theme without color yields an empty sequence, and a row surrounded by two
+/// empty strings would carry escapes the terminal has nothing to do with.
+fn styled(open: &str, text: &str) -> String {
+    if open.is_empty() {
+        return text.to_owned();
+    }
+    format!("{open}{text}{RESET}")
 }
 
 /// Prints finished lines and leaves the prompt under them.
@@ -2147,22 +2298,14 @@ fn handle_command<W: std::io::Write>(
             Ok(Handled::Continue)
         }
         "help" => {
-            let _ = writeln!(
-                output,
-                "commands: /help /quit
-/model [id]  choose a model, or switch to one named here
-/models  same as /model
-/status  show the model, provider, context, and session
-/cost  show what this session has spent
-/compact  summarize older turns to free the context window
-/undo  put back the files the last turn changed
-/tree  show the turns recorded in this session
-/copy  put the last reply on the clipboard
-/new  start a fresh conversation
-/rename <title>  name this session
-/history [here|session-id]  show recorded prompts
-/history clear  forget every recorded prompt"
-            );
+            // Read from the same table the dropdown offers, so a command that is
+            // listed is one that works and the two cannot drift apart. The table
+            // is longer than the summary the dropdown shows, so it is printed as
+            // a whole rather than as one line.
+            let _ = writeln!(output, "{}", rune_term::commands::render_help());
+            // `clear` and the session argument are forms of `/history`, which
+            // the table lists once; they are named here so they are findable.
+            let _ = writeln!(output, "/history clear  forget every recorded prompt");
             let listing = rune_context::commands::render_listing(&commands.commands);
             let _ = writeln!(output, "{listing}");
             // A command file that was refused is invisible otherwise, and a
@@ -2433,9 +2576,11 @@ mod tests {
     }
 
     #[test]
-    fn streamed_text_is_drawn_below_the_input() {
-        // The answer grows downward from the line being typed, so a long reply
-        // never pushes the input off the screen.
+    fn streamed_text_is_drawn_above_the_status_and_input() {
+        // The answer sits directly above the status block, under the question it
+        // answers, and the input stays at the bottom. Putting it below the input
+        // made the input rise as the answer grew, because the region is anchored
+        // at the bottom of the screen.
         let host = test_host();
         // Accumulated without drawing, so this test sees one frame rather than
         // the deltas that produced it overlap on the same screen.
@@ -2451,8 +2596,8 @@ mod tests {
         let input = text.find("> ").expect("the input row");
         let answer = text.find("answer").expect("the streamed answer");
         assert!(
-            input < answer,
-            "the answer was drawn above the input: {text:?}"
+            answer < input,
+            "the answer was not drawn above the input: {text:?}"
         );
     }
 
@@ -3336,6 +3481,100 @@ mod tests {
         host.forget_context();
         let info = host.info("p", "e");
         assert_eq!(info.context_used, 0);
+    }
+
+    #[test]
+    fn the_dropdown_offers_a_command_being_typed() {
+        let theme = Theme::no_color();
+        let rows = completion_rows("/mod", 0, &theme, false);
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert!(rows[0].starts_with("> /model"), "{rows:?}");
+        assert!(rows[1].starts_with("  /models"), "{rows:?}");
+        // Each row carries what the command does, which is what makes the list
+        // usable without trying every name.
+        assert!(rows[0].contains("choose a model"), "{rows:?}");
+        assert!(rows[1].contains("same as"), "{rows:?}");
+    }
+
+    #[test]
+    fn a_bare_slash_offers_every_command() {
+        let theme = Theme::no_color();
+        let rows = completion_rows("/", 0, &theme, false);
+        assert_eq!(rows.len(), rune_term::commands::BUILTINS.len(), "{rows:?}");
+    }
+
+    #[test]
+    fn the_dropdown_is_absent_unless_a_command_is_being_typed() {
+        let theme = Theme::no_color();
+        for line in ["", "hello", "/help me", "/model x", "a/b", "/zzz"] {
+            assert!(
+                completion_rows(line, 0, &theme, false).is_empty(),
+                "{line:?} offered rows"
+            );
+        }
+        // A whole command name is still offered, so the row does not vanish as
+        // the last letter is typed.
+        assert!(!completion_rows("/help", 0, &theme, false).is_empty());
+    }
+
+    #[test]
+    fn the_highlighted_row_is_the_one_the_arrows_moved_to() {
+        let theme = Theme::no_color();
+        let first = completion_rows("/mod", 0, &theme, false);
+        assert!(first[0].starts_with('>'), "{first:?}");
+        let second = completion_rows("/mod", 1, &theme, false);
+        assert!(second[1].starts_with('>'), "{second:?}");
+        assert!(second[0].starts_with("  "), "{second:?}");
+    }
+
+    #[test]
+    fn the_rows_line_up_their_descriptions() {
+        let theme = Theme::no_color();
+        let rows = completion_rows("/mod", 0, &theme, false);
+        let summaries = rune_term::commands::matching("mod");
+        let columns: Vec<usize> = rows
+            .iter()
+            .zip(summaries.iter())
+            .map(|(row, entry)| {
+                row.find(entry.summary)
+                    .unwrap_or_else(|| panic!("no summary in {row:?}"))
+            })
+            .collect();
+        assert_eq!(columns.len(), rows.len(), "{rows:?}");
+        for column in &columns {
+            assert_eq!(*column, columns[0], "the rows are ragged: {rows:?}");
+        }
+    }
+
+    #[test]
+    fn accepting_the_highlighted_row_names_it() {
+        // Tab completes to the highlighted command, and Enter takes it too when
+        // the name is not yet whole, so a half-typed command is never run.
+        let theme = Theme::no_color();
+        let rows = completion_rows("/mod", 0, &theme, false);
+        let chosen = open_completion("/mod", &rows, 0).expect("a completion");
+        assert_eq!(chosen.name, "model");
+        let rows = completion_rows("/mod", 1, &theme, false);
+        let chosen = open_completion("/mod", &rows, 1).expect("a completion");
+        assert_eq!(chosen.name, "models");
+        // With no dropdown there is nothing to accept.
+        assert!(open_completion("hello", &[], 0).is_none());
+    }
+
+    #[test]
+    fn a_colorless_theme_emits_no_escapes_in_the_dropdown() {
+        let theme = Theme::no_color();
+        let plain = completion_rows("/mod", 0, &theme, false);
+        assert!(!plain.is_empty(), "nothing matched");
+        for row in plain {
+            assert!(!row.contains('\u{1b}'), "{row:?}");
+        }
+        // A colored theme does style them.
+        let styled_rows = completion_rows("/mod", 0, &Theme::fx_dark(), true);
+        assert!(
+            styled_rows.iter().any(|r| r.contains('\u{1b}')),
+            "{styled_rows:?}"
+        );
     }
 
     #[test]

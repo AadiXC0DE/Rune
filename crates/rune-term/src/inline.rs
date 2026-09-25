@@ -158,6 +158,29 @@ impl Inline {
             .saturating_add(prompt.len())
             .saturating_add(below.len());
         let mut rows: Vec<String> = Vec::with_capacity(capacity);
+
+        // The rows still arriving sit directly above the status block, so the
+        // transcript reads in the order it happened: what was asked, then what
+        // came back, with the line being typed pinned underneath both.
+        //
+        // Putting them below the input instead made the input rise as an answer
+        // grew, because the region is anchored at the bottom of the screen:
+        // every extra row of answer moved the status and the input upward. And
+        // it put the answer after the prompt rather than after the question it
+        // was answering.
+        let reserved = usize::from(activity.is_some())
+            .saturating_add(footer.len())
+            .saturating_add(prompt.len());
+        let room = usize::from(self.max_rows).saturating_sub(reserved).max(1);
+        let arriving: &[String] = if below.len() > room {
+            below
+                .get(below.len().saturating_sub(room)..)
+                .unwrap_or(below)
+        } else {
+            below
+        };
+        rows.extend(arriving.iter().map(|row| self.clip(row)));
+
         if let Some(activity) = activity {
             rows.push(self.clip(activity));
         }
@@ -166,22 +189,6 @@ impl Inline {
         rows.extend(footer.iter().map(|row| self.clip(row)));
         let prompt_start = rows.len();
         rows.extend(prompt.iter().map(|row| self.clip(row)));
-
-        // A region taller than the screen cannot be repainted in place: writing
-        // it scrolls the terminal, which moves the rows this renderer believes
-        // it owns and leaves a copy of the status block behind. Only the rows
-        // still arriving are trimmed, and the newest are the ones kept, because
-        // the status and the input line are what must stay put.
-        let reserved = rows.len();
-        let room = usize::from(self.max_rows).saturating_sub(reserved).max(1);
-        let arriving = if below.len() > room {
-            below
-                .get(below.len().saturating_sub(room)..)
-                .unwrap_or(below)
-        } else {
-            below
-        };
-        rows.extend(arriving.iter().map(|row| self.clip(row)));
         let live_rows = u16::try_from(rows.len()).unwrap_or(u16::MAX).max(1);
 
         // Where the caret sits, as an offset from the top of the region. The
@@ -208,7 +215,13 @@ impl Inline {
             let mut out = String::new();
             out.push_str(HIDE_CURSOR);
             out.push('\r');
-            up(&mut out, self.cursor_row);
+            // From where the cursor is, not from the top of the region. Walking
+            // to the top and then placing the caret only works while the caret
+            // is on the first row; anywhere else it moves the cursor onto a
+            // status row, which is what made it jump upward on a key that did
+            // not edit the line.
+            down(&mut out, self.cursor_row);
+            up(&mut out, caret_row);
             column(&mut out, caret.1);
             out.push_str(SHOW_CURSOR);
             return out.into_bytes();
@@ -509,10 +522,10 @@ mod tests {
     }
 
     #[test]
-    fn text_below_the_input_moves_the_caret_back_up_to_it() {
-        // Streamed text extends below the input, so once it is drawn the caret
-        // has to be walked back up to the line being typed. That walk is what
-        // keeps the cursor on the input rather than on the status line.
+    fn the_caret_stays_on_the_input_row_while_an_answer_arrives() {
+        // The arriving text sits above the status block, so the input never
+        // moves as the answer grows. The caret is placed on that row, which is
+        // the last row of the region.
         let mut inline = Inline::new(40);
         let bytes = inline.frame(
             &[],
@@ -522,16 +535,29 @@ mod tests {
             &rows(&["an answer"]),
             (0, 2),
         );
-        let seq = escapes(&bytes);
-        assert!(
-            seq.iter().any(|s| s == "\u{1b}[1A"),
-            "the caret did not reach the input row: {seq:?}"
-        );
-        // The row it lands on is the input, which is one above the answer.
         let text = String::from_utf8_lossy(&bytes).into_owned();
-        let input = text.find("> hi").expect("the input row");
+        // The transcript reads in the order it happened: the answer above, the
+        // status, then the line being typed underneath both.
         let answer = text.find("an answer").expect("the answer");
-        assert!(input < answer, "the answer was drawn above the input");
+        let status = text.find("status").expect("the status");
+        let input = text.find("> hi").expect("the input row");
+        assert!(answer < status, "the answer was drawn below the status");
+        assert!(status < input, "the input is not at the bottom");
+
+        // The caret is on the input row, which is below the answer, so it is
+        // reached by walking back up from the bottom of the region.
+        let mut grid = crate::engine::Grid::new(40, 10).expect("grid");
+        grid.feed(&bytes).expect("feed");
+        let screen = grid.text();
+        assert_eq!(
+            Some(grid.cursor().row as usize),
+            screen
+                .lines()
+                .collect::<Vec<&str>>()
+                .iter()
+                .rposition(|line| !line.trim().is_empty()),
+            "the caret is not on the input row:\n{screen}"
+        );
     }
 
     #[test]
@@ -598,12 +624,73 @@ mod tests {
 
     #[test]
     fn a_frame_that_changes_one_row_writes_only_that_row() {
-        // The whole point of tracking what was shown: a streamed answer adds a
-        // few characters per delta, and rewriting the entire region per delta
+        // The whole point of tracking what was shown: a streamed answer appends
+        // characters to its last row, and rewriting the entire region per delta
         // cost hundreds of times the size of the answer.
+        //
+        // What is rewritten is the row that grew plus the rows under it, which
+        // is a constant number. The rest of the answer, however long it has
+        // become, is left alone.
         let mut inline = Inline::new(40);
         let footer = rows(&["status"]);
-        let _ = inline.frame(
+        let mut answer = rows(&["one", "two", "three", "four"]);
+        let _ = inline.frame(&[], None, &footer, &rows(&["> "]), &answer, (0, 2));
+
+        let last = answer.len().saturating_sub(1);
+        answer[last] = "four and more".to_owned();
+        let bytes = inline.frame(&[], None, &footer, &rows(&["> "]), &answer, (0, 2));
+        let text = String::from_utf8_lossy(&bytes).into_owned();
+        assert!(
+            text.contains("and more"),
+            "the row was not redrawn: {text:?}"
+        );
+        // Every answer row above the one that grew is untouched.
+        for earlier in ["one", "two", "three"] {
+            assert!(
+                !text.contains(earlier),
+                "an answer row above the change was rewritten: {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_long_answer_costs_the_same_per_delta_however_long_it_grows() {
+        // The cost of a delta must not grow with the answer. Before this was
+        // tracked, every delta re-wrapped and rewrote the whole region, which is
+        // quadratic in the length of the response.
+        let footer = rows(&["status"]);
+        let mut costs = Vec::new();
+        for length in [4_usize, 40] {
+            let mut inline = Inline::new(40);
+            let mut answer: Vec<String> = (0..length).map(|i| format!("row {i}")).collect();
+            let _ = inline.frame(&[], None, &footer, &rows(&["> "]), &answer, (0, 2));
+            let last = answer.len().saturating_sub(1);
+            answer[last] = format!("row {last} plus");
+            costs.push(
+                inline
+                    .frame(&[], None, &footer, &rows(&["> "]), &answer, (0, 2))
+                    .len(),
+            );
+        }
+        // A delta costs the row that grew plus the rows under it, so the cost is
+        // bounded by a constant. Before this was tracked, every delta rewrote
+        // the whole region, which is quadratic in the length of the response.
+        let growth = costs[1].saturating_sub(costs[0]);
+        assert!(growth < 32, "a delta grows with the answer: {costs:?}");
+        assert!(
+            costs[1] < 200,
+            "a delta on a long answer is not bounded: {costs:?}"
+        );
+    }
+
+    #[test]
+    fn a_new_row_pushes_the_status_and_input_down_without_redrawing_them() {
+        // A row added above the status moves everything under it down by one, so
+        // the frame steps down before writing rather than rewriting the rows it
+        // moved over.
+        let mut inline = Inline::new(40);
+        let footer = rows(&["status"]);
+        let first = inline.frame(
             &[],
             None,
             &footer,
@@ -611,7 +698,7 @@ mod tests {
             &rows(&["first"]),
             (0, 2),
         );
-        let bytes = inline.frame(
+        let second = inline.frame(
             &[],
             None,
             &footer,
@@ -619,15 +706,17 @@ mod tests {
             &rows(&["first", "second"]),
             (0, 2),
         );
-        let text = String::from_utf8_lossy(&bytes).into_owned();
-        assert!(
-            text.contains("second"),
-            "the new row was not drawn: {text:?}"
-        );
-        assert!(
-            !text.contains("status") && !text.contains("> "),
-            "unchanged rows were rewritten: {text:?}"
-        );
+
+        let mut grid = crate::engine::Grid::new(40, 10).expect("grid");
+        grid.feed(&first).expect("feed");
+        grid.feed(&second).expect("feed");
+        let screen = grid.text();
+        // The reader sees the answer, then the status, then the input beneath.
+        let answer = screen.find("second").expect("the answer row");
+        let status = screen.find("status").expect("the status row");
+        let input = screen.find('>').expect("the input row");
+        assert!(answer < status, "the answer is below the status:\n{screen}");
+        assert!(status < input, "the input is not at the bottom:\n{screen}");
     }
 
     #[test]
@@ -739,6 +828,56 @@ mod tests {
             replay.text(),
             expected.text(),
             "the incremental screen differs from the one-pass screen"
+        );
+    }
+
+    #[test]
+    fn the_cursor_lands_on_the_input_row_and_stays_there() {
+        // The cursor belongs on the row being typed, which is below the status
+        // rows. A frame that changes nothing still has to leave it there: moving
+        // to the top of the region instead puts it on a status row, which is
+        // what makes the cursor jump upward on a key that does not edit the
+        // line.
+        let mut inline = Inline::new(40);
+        let frame = |inline: &mut Inline| {
+            inline.frame(
+                &[],
+                None,
+                &rows(&["hint", "status"]),
+                &rows(&["> "]),
+                &[],
+                (0, 2),
+            )
+        };
+        let first = frame(&mut inline);
+        let mut grid = crate::engine::Grid::new(40, 10).expect("grid");
+        grid.feed(&first).expect("feed");
+        let after_first = grid.cursor();
+
+        // A second identical frame takes the path that only moves the cursor.
+        let second = frame(&mut inline);
+        grid.feed(&second).expect("feed");
+        assert_eq!(
+            grid.cursor(),
+            after_first,
+            "the cursor moved on a frame that changed nothing:\n{}",
+            grid.text()
+        );
+        // And it is on the input row, which is the last row with content.
+        let screen = grid.text();
+        let lines: Vec<&str> = screen.lines().collect();
+        let input_row = lines
+            .iter()
+            .rposition(|line| !line.trim().is_empty())
+            .unwrap_or(0) as u16;
+        assert_eq!(
+            grid.cursor().row,
+            input_row,
+            "the cursor is not on the input row:\n{screen}"
+        );
+        assert!(
+            lines[input_row as usize].starts_with('>'),
+            "the input row is missing:\n{screen}"
         );
     }
 

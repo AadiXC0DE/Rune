@@ -30,6 +30,8 @@ pub enum KeyAction {
     Up,
     /// The user moved the selection down.
     Down,
+    /// The user asked to complete what is being typed.
+    Complete,
 }
 
 /// Reads keys and drives a composer.
@@ -171,6 +173,9 @@ impl KeyReader {
                 KeyAction::Ignored
             }
             (KeyCode::Enter, _, _) => KeyAction::Submit,
+            // Tab completes rather than inserting a tab: a prompt is a single
+            // line, so a tab character has nothing to align.
+            (KeyCode::Tab, _, _) => KeyAction::Complete,
             (KeyCode::Esc, _, _) => KeyAction::Cancel,
             (KeyCode::Backspace, _, _) => {
                 self.composer.delete_back();
