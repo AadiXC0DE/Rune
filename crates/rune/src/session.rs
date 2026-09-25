@@ -672,7 +672,23 @@ impl SessionHost {
         settled: &[String],
         activity: Option<&str>,
         prompt: &[String],
-        below: &[String],
+        arriving: &[String],
+        caret: (u16, u16),
+    ) -> Result<Vec<u8>> {
+        self.paint_with_menu(settled, activity, prompt, arriving, &[], caret)
+    }
+
+    /// Draws the live region with a list opened under the input.
+    ///
+    /// Separate from [`SessionHost::paint`] so the many callers that draw no
+    /// menu do not have to pass an empty slice for one.
+    fn paint_with_menu(
+        &self,
+        settled: &[String],
+        activity: Option<&str>,
+        prompt: &[String],
+        arriving: &[String],
+        menu: &[String],
         caret: (u16, u16),
     ) -> Result<Vec<u8>> {
         self.refresh_size();
@@ -681,7 +697,15 @@ impl SessionHost {
             .inline
             .lock()
             .map_err(|_| RuneError::new(ErrorCode::Internal, "the renderer lock was poisoned"))?;
-        Ok(inline.frame(settled, activity, &footer_rows, prompt, below, caret))
+        Ok(inline.frame(&rune_term::inline::Frame {
+            settled,
+            arriving,
+            activity,
+            footer: &footer_rows,
+            prompt,
+            menu,
+            caret,
+        }))
     }
 
     /// Removes the live region, for a clean exit.
@@ -1291,16 +1315,16 @@ fn await_submission(
                 selected = 0;
             }
             response @ (KeyAction::Up | KeyAction::Down) => {
-                // The dropdown owns the arrows while it is open.
-                if !rows.is_empty() {
-                    let count =
-                        completion_rows(reader.line(), selected, host.theme(), host.truecolor())
-                            .len()
-                            .max(1);
+                // The dropdown owns the arrows while it is open. The bound is
+                // the number of matches, not the number of rows drawn: the rows
+                // include a position line, so clamping on them would strand
+                // every command past the first window.
+                let matches = completion_matches(reader.line());
+                if matches > 0 {
                     selected = if response == KeyAction::Up {
                         selected.saturating_sub(1)
                     } else {
-                        selected.saturating_add(1).min(count.saturating_sub(1))
+                        selected.saturating_add(1).min(matches.saturating_sub(1))
                     };
                 } else if response == KeyAction::Up {
                     reader.recall_previous(recall);
@@ -1351,7 +1375,7 @@ fn draw_prompt(
     reader: &rune_term::input::KeyReader,
     host: &SessionHost,
     out: &LiveSink,
-    below: &[String],
+    menu: &[String],
     marker: &str,
 ) -> Result<()> {
     use rune_term::width::str_width;
@@ -1361,11 +1385,12 @@ fn draw_prompt(
         .map_err(|_| RuneError::new(ErrorCode::Internal, "the output lock was poisoned"))?;
     let row = transcript::render_prompt(marker, reader.line(), usize::from(host.width()));
     let caret = str_width(marker).saturating_add(reader.column());
-    let painted = host.paint(
+    let painted = host.paint_with_menu(
         &[],
         None,
         std::slice::from_ref(&row),
-        below,
+        &[],
+        menu,
         (0, u16::try_from(caret).unwrap_or(u16::MAX)),
     )?;
     if !painted.is_empty() {
@@ -1630,6 +1655,36 @@ fn base64_encode(bytes: &[u8]) -> String {
 /// Closes a styled row.
 const RESET: &str = "\u{1b}[0m";
 
+/// How many completions are shown at once.
+///
+/// A short window keeps the list from swallowing the screen: a bare slash
+/// matches every command, and drawing all of them would push the transcript
+/// away for a list a reader only ever takes the top few rows of.
+pub const COMPLETION_WINDOW: usize = 6;
+
+/// Returns the range of matches on screen for a selection.
+///
+/// The window scrolls only once the selection reaches its edge and then follows
+/// the selection, so growing the selection moves the highlight down a fixed
+/// screen until the window has to move, rather than the list jumping on every
+/// key.
+#[must_use]
+pub fn completion_window(count: usize, selected: usize) -> std::ops::Range<usize> {
+    if count <= COMPLETION_WINDOW {
+        return 0..count;
+    }
+    // The last screenful is the floor, so the list can scroll to its end.
+    let last_start = count.saturating_sub(COMPLETION_WINDOW);
+    let selected = selected.min(count.saturating_sub(1));
+    // Start far enough back that the selection sits on the last row of the
+    // window once it has moved past the first screenful.
+    let start = selected
+        .saturating_add(1)
+        .saturating_sub(COMPLETION_WINDOW)
+        .min(last_start);
+    start..start.saturating_add(COMPLETION_WINDOW)
+}
+
 /// Returns the rows showing what can be typed next.
 ///
 /// Drawn while a slash command is being typed, from the same table the help
@@ -1638,9 +1693,12 @@ const RESET: &str = "\u{1b}[0m";
 /// that describes the command, which is what makes the list usable without
 /// trying each name.
 ///
+/// Only a window of the matches is drawn, and a row saying how far through the
+/// list the window is sits under it, so a reader can tell a short list from the
+/// top of a long one.
+///
 /// Returns an empty list when the line is not a command being typed, so a
 /// caller can pass every keystroke without checking first.
-#[must_use]
 pub fn completion_rows(line: &str, selected: usize, theme: &Theme, truecolor: bool) -> Vec<String> {
     let Some(word) = slash_word(line) else {
         return Vec::new();
@@ -1652,7 +1710,8 @@ pub fn completion_rows(line: &str, selected: usize, theme: &Theme, truecolor: bo
 
     let accent = theme.sgr(Slot::Accent, truecolor);
     let dim = theme.sgr(Slot::Dim, truecolor);
-    // Wide enough for the longest name in the list, so the descriptions line up.
+    // Wide enough for every match rather than only the visible ones, so the
+    // descriptions do not shift sideways as the window scrolls.
     let width = matches
         .iter()
         .map(|entry| {
@@ -1665,23 +1724,45 @@ pub fn completion_rows(line: &str, selected: usize, theme: &Theme, truecolor: bo
         .max()
         .unwrap_or(0);
 
-    matches
-        .iter()
-        .enumerate()
-        .map(|(index, entry)| {
-            let left = if entry.arguments.is_empty() {
-                format!("/{}", entry.name)
-            } else {
-                format!("/{} {}", entry.name, entry.arguments)
-            };
-            let body = format!("{left:<width$}  {}", entry.summary);
-            if index == selected {
-                styled(&accent, &format!("> {body}"))
-            } else {
-                styled(&dim, &format!("  {body}"))
-            }
-        })
-        .collect()
+    let window = completion_window(matches.len(), selected);
+    let mut rows: Vec<String> = Vec::with_capacity(COMPLETION_WINDOW.saturating_add(1));
+    for index in window.clone() {
+        let Some(entry) = matches.get(index) else {
+            continue;
+        };
+        let left = if entry.arguments.is_empty() {
+            format!("/{}", entry.name)
+        } else {
+            format!("/{} {}", entry.name, entry.arguments)
+        };
+        let body = format!("{left:<width$}  {}", entry.summary);
+        if index == selected {
+            rows.push(styled(&accent, &format!("> {body}")));
+        } else {
+            rows.push(styled(&dim, &format!("  {body}")));
+        }
+    }
+
+    // How far through the list this window is, so a reader can tell a list that
+    // ends here from one that continues. Shown only when there is more to see.
+    if matches.len() > COMPLETION_WINDOW {
+        let first = window.start.saturating_add(1);
+        let last = window.end;
+        rows.push(styled(
+            &dim,
+            &format!("  {first}-{last} of {}", matches.len()),
+        ));
+    }
+    rows
+}
+
+/// Returns how many completions the line offers.
+///
+/// Counted from the table rather than from the rendered rows, because the rows
+/// carry a position line that is not a command.
+#[must_use]
+fn completion_matches(line: &str) -> usize {
+    slash_word(line).map_or(0, |word| rune_term::commands::matching(word).len())
 }
 
 /// Returns the word after a leading slash, when the line is one.
@@ -3497,10 +3578,90 @@ mod tests {
     }
 
     #[test]
-    fn a_bare_slash_offers_every_command() {
+    fn a_bare_slash_offers_a_window_and_says_how_many_there_are() {
+        // Every command matches a bare slash. Drawing all of them would swallow
+        // the screen for a list a reader only ever takes the top few rows of, so
+        // a window is shown with a row saying how far through it is.
         let theme = Theme::no_color();
         let rows = completion_rows("/", 0, &theme, false);
-        assert_eq!(rows.len(), rune_term::commands::BUILTINS.len(), "{rows:?}");
+        let total = rune_term::commands::BUILTINS.len();
+        assert_eq!(rows.len(), COMPLETION_WINDOW.saturating_add(1), "{rows:?}");
+        assert!(rows[0].starts_with("> /model"), "{rows:?}");
+        assert!(
+            rows.last().is_some_and(|r| r.contains("1-6 of")),
+            "{rows:?}"
+        );
+        assert!(
+            rows.last().is_some_and(|r| r.contains(&total.to_string())),
+            "{rows:?}"
+        );
+    }
+
+    #[test]
+    fn a_list_that_fits_carries_no_position_row() {
+        let theme = Theme::no_color();
+        let rows = completion_rows("/mod", 0, &theme, false);
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert!(!rows.iter().any(|r| r.contains(" of ")), "{rows:?}");
+    }
+
+    #[test]
+    fn the_window_follows_the_selection_without_the_input_moving() {
+        // The highlight moves down a fixed screen until it reaches the last row,
+        // and only then does the window scroll. That is what keeps the list from
+        // jumping on every key.
+        let count = rune_term::commands::BUILTINS.len();
+        // Inside the first screenful the window does not move.
+        assert_eq!(completion_window(count, 0), 0..COMPLETION_WINDOW);
+        assert_eq!(
+            completion_window(count, COMPLETION_WINDOW - 1),
+            0..COMPLETION_WINDOW
+        );
+        // Past it, the selection stays on the last visible row.
+        let scrolled = completion_window(count, COMPLETION_WINDOW);
+        assert_eq!(scrolled, 1..COMPLETION_WINDOW.saturating_add(1));
+        // And the end of the list is reachable rather than cut off.
+        let last = completion_window(count, count.saturating_sub(1));
+        assert_eq!(last.end, count);
+    }
+
+    #[test]
+    fn a_window_never_looks_past_the_end_of_a_short_list() {
+        assert_eq!(completion_window(2, 0), 0..2);
+        assert_eq!(completion_window(0, 0), 0..0);
+        // A selection past the end is clamped rather than panicking.
+        let count = rune_term::commands::BUILTINS.len();
+        assert!(completion_window(count, 999).end <= count);
+    }
+
+    #[test]
+    fn the_highlight_is_always_inside_the_window() {
+        // A highlight scrolled out of view would make the list unusable: the
+        // user is moving something they cannot see.
+        let theme = Theme::no_color();
+        let count = rune_term::commands::BUILTINS.len();
+        for selected in 0..count {
+            let rows = completion_rows("/", selected, &theme, false);
+            let marked = rows.iter().filter(|r| r.starts_with('>')).count();
+            assert_eq!(marked, 1, "selection {selected} marked {marked} rows");
+        }
+    }
+
+    #[test]
+    fn accepting_uses_the_selection_the_window_is_showing() {
+        // The position row must not be mistaken for a command.
+        let theme = Theme::no_color();
+        let rows = completion_rows("/", 0, &theme, false);
+        let chosen = open_completion("/", &rows, 0).expect("a completion");
+        assert_eq!(chosen.name, "model");
+        // Every command is reachable, including the ones past the first window:
+        // clamping on the drawn rows instead of the matches left the tail of the
+        // list unselectable.
+        let last = rune_term::commands::BUILTINS.len().saturating_sub(1);
+        let rows = completion_rows("/", last, &theme, false);
+        assert!(rows.iter().any(|r| r.starts_with('>')), "{rows:?}");
+        let chosen = open_completion("/", &rows, last).expect("a completion");
+        assert_eq!(chosen.name, "quit");
     }
 
     #[test]

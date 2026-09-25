@@ -38,6 +38,29 @@ const ERASE_BELOW: &str = "\u{1b}[J";
 /// Resets every attribute.
 const RESET: &str = "\u{1b}[0m";
 
+/// The rows one frame is made of, in the order they are drawn.
+///
+/// Grouped rather than passed as separate arguments, because the order is the
+/// whole point and a caller that gets the argument order wrong would move the
+/// status bar under the input without any of it failing to compile.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Frame<'a> {
+    /// Lines that are finished and printed once above the region.
+    pub settled: &'a [String],
+    /// Text still being produced, drawn above the status rows.
+    pub arriving: &'a [String],
+    /// The activity line, when there is one.
+    pub activity: Option<&'a str>,
+    /// The status rows.
+    pub footer: &'a [String],
+    /// The line being typed.
+    pub prompt: &'a [String],
+    /// A list opened under the input, such as the completions for a command.
+    pub menu: &'a [String],
+    /// Where the caret belongs, as a row within `prompt` and a column.
+    pub caret: (u16, u16),
+}
+
 /// The region repainted in place at the bottom of the screen.
 ///
 /// Rows are supplied in display order, top first: the activity line, then the
@@ -123,26 +146,38 @@ impl Inline {
     /// Renders one frame.
     ///
     /// `settled` holds lines that are finished and are printed once above the
-    /// region, in order. `activity` and `footer` are the rows that sit above
-    /// the prompt; `prompt` is the rows of the line being typed, and `below` is
-    /// whatever is still arriving, which grows downward from the input. `caret`
-    /// is the column the cursor belongs at within the prompt row.
+    /// region, in order. `arriving` is text still being produced, `footer` is
+    /// the status rows, `prompt` is the line being typed, and `menu` is a list
+    /// opened under the input such as the completions for a command. `caret` is
+    /// the column the cursor belongs at within the prompt row.
     ///
-    /// The order matters and is deliberate: the status rows sit above the input
-    /// so the place a user types stays put, and text that streams in goes below
-    /// it, where it can lengthen without moving the line being typed.
+    /// The order is deliberate and is what a reader expects:
+    ///
+    /// ```text
+    ///   an answer still arriving
+    ///   the activity line
+    ///   the status rows
+    ///   the line being typed
+    ///   a list opened under it
+    /// ```
+    ///
+    /// The answer grows upward from directly under the question it answers, so
+    /// the status and the input never move while text arrives. A list opened by
+    /// typing sits under the line being typed, where a reader looks for it and
+    /// where it does not push the answer around.
     ///
     /// Returns the bytes to write. Nothing here reads the terminal, so the same
     /// inputs always produce the same bytes.
-    pub fn frame(
-        &mut self,
-        settled: &[String],
-        activity: Option<&str>,
-        footer: &[String],
-        prompt: &[String],
-        below: &[String],
-        caret: (u16, u16),
-    ) -> Vec<u8> {
+    pub fn frame(&mut self, frame: &Frame<'_>) -> Vec<u8> {
+        let Frame {
+            settled,
+            arriving,
+            activity,
+            footer,
+            prompt,
+            menu,
+            caret,
+        } = *frame;
         // The input row is always present, even when nothing is being typed.
         // Without it the caret has no home of its own and falls back onto the
         // status row, which is what made the two overlap until streaming
@@ -156,7 +191,8 @@ impl Inline {
         let capacity = usize::from(activity.is_some())
             .saturating_add(footer.len())
             .saturating_add(prompt.len())
-            .saturating_add(below.len());
+            .saturating_add(arriving.len())
+            .saturating_add(menu.len());
         let mut rows: Vec<String> = Vec::with_capacity(capacity);
 
         // The rows still arriving sit directly above the status block, so the
@@ -168,18 +204,24 @@ impl Inline {
         // every extra row of answer moved the status and the input upward. And
         // it put the answer after the prompt rather than after the question it
         // was answering.
+        //
+        // The menu is part of what is reserved rather than part of what is
+        // trimmed, because it belongs to the input: a list opened under the line
+        // being typed is what the reader is looking at, so it is never the part
+        // that gets dropped.
         let reserved = usize::from(activity.is_some())
             .saturating_add(footer.len())
-            .saturating_add(prompt.len());
+            .saturating_add(prompt.len())
+            .saturating_add(menu.len());
         let room = usize::from(self.max_rows).saturating_sub(reserved).max(1);
-        let arriving: &[String] = if below.len() > room {
-            below
-                .get(below.len().saturating_sub(room)..)
-                .unwrap_or(below)
+        let visible: &[String] = if arriving.len() > room {
+            arriving
+                .get(arriving.len().saturating_sub(room)..)
+                .unwrap_or(arriving)
         } else {
-            below
+            arriving
         };
-        rows.extend(arriving.iter().map(|row| self.clip(row)));
+        rows.extend(visible.iter().map(|row| self.clip(row)));
 
         if let Some(activity) = activity {
             rows.push(self.clip(activity));
@@ -189,6 +231,9 @@ impl Inline {
         rows.extend(footer.iter().map(|row| self.clip(row)));
         let prompt_start = rows.len();
         rows.extend(prompt.iter().map(|row| self.clip(row)));
+        // A list opened by typing goes under the line being typed, which is
+        // where a reader looks for it and where it does not disturb the answer.
+        rows.extend(menu.iter().map(|row| self.clip(row)));
         let live_rows = u16::try_from(rows.len()).unwrap_or(u16::MAX).max(1);
 
         // Where the caret sits, as an offset from the top of the region. The
@@ -401,6 +446,46 @@ mod tests {
         out
     }
 
+    /// One frame with no list under the input, which is what most tests mean.
+    fn frame(
+        inline: &mut Inline,
+        settled: &[String],
+        activity: Option<&str>,
+        footer: &[String],
+        prompt: &[String],
+        arriving: &[String],
+        caret: (u16, u16),
+    ) -> Vec<u8> {
+        inline.frame(&Frame {
+            settled,
+            arriving,
+            activity,
+            footer,
+            prompt,
+            menu: &[],
+            caret,
+        })
+    }
+
+    /// One frame with a list under the input.
+    fn frame_with_menu(
+        inline: &mut Inline,
+        footer: &[String],
+        prompt: &[String],
+        menu: &[String],
+        caret: (u16, u16),
+    ) -> Vec<u8> {
+        inline.frame(&Frame {
+            settled: &[],
+            arriving: &[],
+            activity: None,
+            footer,
+            prompt,
+            menu,
+            caret,
+        })
+    }
+
     fn rows(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_owned()).collect()
     }
@@ -408,7 +493,8 @@ mod tests {
     #[test]
     fn a_settled_line_is_printed_once_and_kept_in_the_flow() {
         let mut inline = Inline::new(40);
-        let bytes = inline.frame(
+        let bytes = frame(
+            &mut inline,
             &rows(&["first line"]),
             None,
             &rows(&["status"]),
@@ -428,7 +514,15 @@ mod tests {
     fn the_cursor_is_hidden_while_a_frame_is_written_and_shown_after() {
         // A cursor visible mid-frame would be seen jumping between rows.
         let mut inline = Inline::new(40);
-        let bytes = inline.frame(&[], None, &rows(&["s"]), &rows(&["> "]), &[], (0, 2));
+        let bytes = frame(
+            &mut inline,
+            &[],
+            None,
+            &rows(&["s"]),
+            &rows(&["> "]),
+            &[],
+            (0, 2),
+        );
         let text = String::from_utf8(bytes).expect("utf8");
         let hide = text.find(HIDE_CURSOR).expect("hidden");
         let show = text.find(SHOW_CURSOR).expect("shown");
@@ -441,7 +535,8 @@ mod tests {
         // Without the clear, a row that shrinks leaves the tail of the row it
         // replaced, which is what makes an interface look like it is smearing.
         let mut inline = Inline::new(40);
-        let _ = inline.frame(
+        let _ = frame(
+            &mut inline,
             &[],
             None,
             &rows(&["a long status line"]),
@@ -449,7 +544,15 @@ mod tests {
             &[],
             (0, 2),
         );
-        let bytes = inline.frame(&[], None, &rows(&["short"]), &rows(&["> "]), &[], (0, 2));
+        let bytes = frame(
+            &mut inline,
+            &[],
+            None,
+            &rows(&["short"]),
+            &rows(&["> "]),
+            &[],
+            (0, 2),
+        );
         let seq = escapes(&bytes);
         let erase = seq.iter().position(|s| s == ERASE_BELOW);
         assert!(erase.is_some(), "the region was not cleared: {seq:?}");
@@ -466,7 +569,8 @@ mod tests {
         // The region had three rows, so the next frame must walk back up three
         // from wherever the caret was left inside it.
         let mut inline = Inline::new(40);
-        let _ = inline.frame(
+        let _ = frame(
+            &mut inline,
             &[],
             Some("working"),
             &rows(&["s"]),
@@ -474,7 +578,8 @@ mod tests {
             &[],
             (0, 0),
         );
-        let bytes = inline.frame(
+        let bytes = frame(
+            &mut inline,
             &[],
             Some("working"),
             &rows(&["s"]),
@@ -497,7 +602,8 @@ mod tests {
         // a prompt. The input row is now always present, which pushes the caret
         // onto a row of its own below the status.
         let mut inline = Inline::new(40);
-        let bytes = inline.frame(
+        let bytes = frame(
+            &mut inline,
             &[],
             None,
             &rows(&["status one", "status two"]),
@@ -527,7 +633,8 @@ mod tests {
         // moves as the answer grows. The caret is placed on that row, which is
         // the last row of the region.
         let mut inline = Inline::new(40);
-        let bytes = inline.frame(
+        let bytes = frame(
+            &mut inline,
             &[],
             None,
             &rows(&["status"]),
@@ -563,7 +670,15 @@ mod tests {
     #[test]
     fn the_caret_is_placed_where_the_caller_asked_within_the_prompt() {
         let mut inline = Inline::new(40);
-        let bytes = inline.frame(&[], None, &rows(&["s"]), &rows(&["> hello"]), &[], (0, 7));
+        let bytes = frame(
+            &mut inline,
+            &[],
+            None,
+            &rows(&["s"]),
+            &rows(&["> hello"]),
+            &[],
+            (0, 7),
+        );
         let seq = escapes(&bytes);
         // A one-based column, so seven columns in is column eight.
         assert!(seq.iter().any(|s| s == "\u{1b}[8G"), "{seq:?}");
@@ -575,7 +690,8 @@ mod tests {
         // next frame relies on.
         let mut inline = Inline::new(10);
         let long = "x".repeat(50);
-        let bytes = inline.frame(
+        let bytes = frame(
+            &mut inline,
             &[],
             None,
             &rows(&[long.as_str()]),
@@ -590,7 +706,15 @@ mod tests {
     #[test]
     fn a_frame_with_no_settled_lines_still_draws_the_region() {
         let mut inline = Inline::new(30);
-        let bytes = inline.frame(&[], None, &rows(&["status"]), &rows(&["> "]), &[], (0, 2));
+        let bytes = frame(
+            &mut inline,
+            &[],
+            None,
+            &rows(&["status"]),
+            &rows(&["> "]),
+            &[],
+            (0, 2),
+        );
         assert!(!bytes.is_empty());
         assert!(String::from_utf8_lossy(&bytes).contains("status"));
     }
@@ -598,7 +722,8 @@ mod tests {
     #[test]
     fn an_activity_row_sits_above_the_prompt() {
         let mut inline = Inline::new(40);
-        let bytes = inline.frame(
+        let bytes = frame(
+            &mut inline,
             &[],
             Some("running a command"),
             &rows(&["s"]),
@@ -617,7 +742,15 @@ mod tests {
         // The screen holds whatever the shell that started the session left.
         // Clearing from an unknown position would erase the user's own prompt.
         let mut inline = Inline::new(40);
-        let bytes = inline.frame(&[], None, &rows(&["s"]), &rows(&["> "]), &[], (0, 2));
+        let bytes = frame(
+            &mut inline,
+            &[],
+            None,
+            &rows(&["s"]),
+            &rows(&["> "]),
+            &[],
+            (0, 2),
+        );
         let seq = escapes(&bytes);
         assert!(!seq.iter().any(|s| s == ERASE_BELOW), "{seq:?}");
     }
@@ -634,11 +767,27 @@ mod tests {
         let mut inline = Inline::new(40);
         let footer = rows(&["status"]);
         let mut answer = rows(&["one", "two", "three", "four"]);
-        let _ = inline.frame(&[], None, &footer, &rows(&["> "]), &answer, (0, 2));
+        let _ = frame(
+            &mut inline,
+            &[],
+            None,
+            &footer,
+            &rows(&["> "]),
+            &answer,
+            (0, 2),
+        );
 
         let last = answer.len().saturating_sub(1);
         answer[last] = "four and more".to_owned();
-        let bytes = inline.frame(&[], None, &footer, &rows(&["> "]), &answer, (0, 2));
+        let bytes = frame(
+            &mut inline,
+            &[],
+            None,
+            &footer,
+            &rows(&["> "]),
+            &answer,
+            (0, 2),
+        );
         let text = String::from_utf8_lossy(&bytes).into_owned();
         assert!(
             text.contains("and more"),
@@ -663,13 +812,28 @@ mod tests {
         for length in [4_usize, 40] {
             let mut inline = Inline::new(40);
             let mut answer: Vec<String> = (0..length).map(|i| format!("row {i}")).collect();
-            let _ = inline.frame(&[], None, &footer, &rows(&["> "]), &answer, (0, 2));
+            let _ = frame(
+                &mut inline,
+                &[],
+                None,
+                &footer,
+                &rows(&["> "]),
+                &answer,
+                (0, 2),
+            );
             let last = answer.len().saturating_sub(1);
             answer[last] = format!("row {last} plus");
             costs.push(
-                inline
-                    .frame(&[], None, &footer, &rows(&["> "]), &answer, (0, 2))
-                    .len(),
+                frame(
+                    &mut inline,
+                    &[],
+                    None,
+                    &footer,
+                    &rows(&["> "]),
+                    &answer,
+                    (0, 2),
+                )
+                .len(),
             );
         }
         // A delta costs the row that grew plus the rows under it, so the cost is
@@ -690,7 +854,8 @@ mod tests {
         // moved over.
         let mut inline = Inline::new(40);
         let footer = rows(&["status"]);
-        let first = inline.frame(
+        let first = frame(
+            &mut inline,
             &[],
             None,
             &footer,
@@ -698,7 +863,8 @@ mod tests {
             &rows(&["first"]),
             (0, 2),
         );
-        let second = inline.frame(
+        let second = frame(
+            &mut inline,
             &[],
             None,
             &footer,
@@ -723,8 +889,24 @@ mod tests {
     fn an_identical_frame_writes_only_a_caret_move() {
         let mut inline = Inline::new(40);
         let footer = rows(&["status"]);
-        let _ = inline.frame(&[], None, &footer, &rows(&["> "]), &rows(&["x"]), (0, 2));
-        let bytes = inline.frame(&[], None, &footer, &rows(&["> "]), &rows(&["x"]), (0, 2));
+        let _ = frame(
+            &mut inline,
+            &[],
+            None,
+            &footer,
+            &rows(&["> "]),
+            &rows(&["x"]),
+            (0, 2),
+        );
+        let bytes = frame(
+            &mut inline,
+            &[],
+            None,
+            &footer,
+            &rows(&["> "]),
+            &rows(&["x"]),
+            (0, 2),
+        );
         let text = String::from_utf8_lossy(&bytes).into_owned();
         assert!(
             !text.contains("status"),
@@ -744,8 +926,17 @@ mod tests {
         // scroll.
         let mut inline = Inline::new(40);
         let footer = rows(&["status"]);
-        let _ = inline.frame(&[], None, &footer, &rows(&["> "]), &rows(&["body"]), (0, 2));
-        let bytes = inline.frame(
+        let _ = frame(
+            &mut inline,
+            &[],
+            None,
+            &footer,
+            &rows(&["> "]),
+            &rows(&["body"]),
+            (0, 2),
+        );
+        let bytes = frame(
+            &mut inline,
             &rows(&["a finished line"]),
             None,
             &footer,
@@ -767,7 +958,8 @@ mod tests {
         // the gone rows are not left behind, not which sequence erased them.
         let mut inline = Inline::new(40);
         let footer = rows(&["status"]);
-        let first = inline.frame(
+        let first = frame(
+            &mut inline,
             &[],
             None,
             &footer,
@@ -779,7 +971,15 @@ mod tests {
         grid.feed(&first).expect("feed");
         assert!(grid.text().contains("three"), "{}", grid.text());
 
-        let second = inline.frame(&[], None, &footer, &rows(&["> "]), &rows(&["one"]), (0, 2));
+        let second = frame(
+            &mut inline,
+            &[],
+            None,
+            &footer,
+            &rows(&["> "]),
+            &rows(&["one"]),
+            (0, 2),
+        );
         grid.feed(&second).expect("feed");
         let screen = grid.text();
         assert!(screen.contains("one"), "{screen}");
@@ -800,9 +1000,18 @@ mod tests {
         // The first frame is captured once and fed, because the renderer keeps
         // what it drew: asking it for the same frame twice returns only a caret
         // move on the second call.
-        let first = diffed.frame(&[], None, &footer, &rows(&["> "]), &rows(&["a"]), (0, 2));
+        let first = frame(
+            &mut diffed,
+            &[],
+            None,
+            &footer,
+            &rows(&["> "]),
+            &rows(&["a"]),
+            (0, 2),
+        );
         replay.feed(&first).expect("feed");
-        let step = diffed.frame(
+        let step = frame(
+            &mut diffed,
             &[],
             None,
             &footer,
@@ -813,7 +1022,8 @@ mod tests {
         replay.feed(&step).expect("feed");
 
         let mut fresh = Inline::new(40);
-        let whole = fresh.frame(
+        let whole = frame(
+            &mut fresh,
             &[],
             None,
             &footer,
@@ -839,8 +1049,9 @@ mod tests {
         // what makes the cursor jump upward on a key that does not edit the
         // line.
         let mut inline = Inline::new(40);
-        let frame = |inline: &mut Inline| {
-            inline.frame(
+        let draw = |inline: &mut Inline| {
+            frame(
+                inline,
                 &[],
                 None,
                 &rows(&["hint", "status"]),
@@ -849,13 +1060,13 @@ mod tests {
                 (0, 2),
             )
         };
-        let first = frame(&mut inline);
+        let first = draw(&mut inline);
         let mut grid = crate::engine::Grid::new(40, 10).expect("grid");
         grid.feed(&first).expect("feed");
         let after_first = grid.cursor();
 
         // A second identical frame takes the path that only moves the cursor.
-        let second = frame(&mut inline);
+        let second = draw(&mut inline);
         grid.feed(&second).expect("feed");
         assert_eq!(
             grid.cursor(),
@@ -882,9 +1093,121 @@ mod tests {
     }
 
     #[test]
+    fn a_menu_is_drawn_under_the_input_and_moves_nothing_above_it() {
+        // A list opened by typing belongs under the line being typed, which is
+        // where a reader looks for it. Drawing it above the input put two rows
+        // between the command and the list it described.
+        let mut inline = Inline::new(40);
+        let mut grid = crate::engine::Grid::new(40, 20).expect("grid");
+
+        // An answer arriving, with no list open.
+        let without = inline.frame(&Frame {
+            settled: &[],
+            arriving: &rows(&["an answer"]),
+            activity: None,
+            footer: &rows(&["status"]),
+            prompt: &rows(&["> /mod"]),
+            menu: &[],
+            caret: (0, 6),
+        });
+        grid.feed(&without).expect("feed");
+        let before = grid.text();
+
+        // The same, with the completions open.
+        let with = inline.frame(&Frame {
+            settled: &[],
+            arriving: &rows(&["an answer"]),
+            activity: None,
+            footer: &rows(&["status"]),
+            prompt: &rows(&["> /mod"]),
+            menu: &rows(&["  /model", "  /models"]),
+            caret: (0, 6),
+        });
+        grid.feed(&with).expect("feed");
+        let after = grid.text();
+
+        // The answer and the status are where they were: opening a list under
+        // the input must not shift what is above it.
+        assert_eq!(
+            before.find("an answer"),
+            after.find("an answer"),
+            "the answer moved:\n{after}"
+        );
+        assert_eq!(
+            before.find("status"),
+            after.find("status"),
+            "the status moved:\n{after}"
+        );
+
+        // The order a reader sees: the answer, the status, the line being typed,
+        // then the list under it.
+        let answer = after.find("an answer").expect("the answer");
+        let status = after.find("status").expect("the status");
+        let prompt = after.find("> /mod").expect("the input row");
+        let menu = after.find("/model").expect("the menu");
+        assert!(answer < status, "the status is above the answer:\n{after}");
+        assert!(
+            status < prompt,
+            "the input is not under the status:\n{after}"
+        );
+        assert!(prompt < menu, "the menu is not under the input:\n{after}");
+    }
+
+    #[test]
+    fn a_menu_does_not_move_the_line_being_typed() {
+        // The input is what a reader is looking at while a list is open, so it
+        // stays where it is when the list appears and disappears.
+        let mut inline = Inline::new(40);
+        let mut grid = crate::engine::Grid::new(40, 20).expect("grid");
+        // The first frame of this renderer is the one that draws the region; a
+        // second identical frame would only move the caret.
+        let plain = inline.frame(&Frame {
+            settled: &[],
+            arriving: &[],
+            activity: None,
+            footer: &rows(&["status"]),
+            prompt: &rows(&["> "]),
+            menu: &[],
+            caret: (0, 2),
+        });
+        grid.feed(&plain).expect("feed");
+        assert!(grid.text().contains('>'), "{}", grid.text());
+
+        let opened = frame_with_menu(
+            &mut inline,
+            &rows(&["status"]),
+            &rows(&["> "]),
+            &rows(&["  /model", "  /models"]),
+            (0, 2),
+        );
+        grid.feed(&opened).expect("feed");
+        // The caret is on the input row, which is the row carrying the marker,
+        // not on the first row of the list that opened under it.
+        let screen = grid.text();
+        let lines: Vec<&str> = screen.lines().collect();
+        let marker = lines
+            .iter()
+            .position(|line| line.starts_with('>'))
+            .unwrap_or_else(|| panic!("no input row in:\n{screen}"));
+        assert_eq!(
+            grid.cursor().row as usize,
+            marker,
+            "the caret is not on the input row:\n{screen}"
+        );
+    }
+
+    #[test]
     fn clearing_removes_the_region_and_stops_the_next_frame_erasing() {
         let mut inline = Inline::new(40);
-        let _ = inline.frame(&[], None, &rows(&["s"]), &rows(&["> "]), &[], (0, 2));
+        let _ = frame(
+            &mut inline,
+            &[],
+            None,
+            &rows(&["s"]),
+            &rows(&["> "]),
+            &[],
+            (0, 2),
+        );
         let cleared = inline.clear();
         assert!(String::from_utf8_lossy(&cleared).contains(ERASE_BELOW));
         assert!(!inline.is_drawn());
@@ -920,9 +1243,33 @@ mod tests {
         // lets it keep the region inside the screen.
         inline.set_max_rows(HEIGHT.saturating_sub(1));
         let frames = vec![
-            inline.frame(&[], None, &footer, &rows(&["> "]), &answer[..4], (0, 2)),
-            inline.frame(&[], None, &footer, &rows(&["> "]), &answer[..6], (0, 2)),
-            inline.frame(&[], None, &footer, &rows(&["> "]), &answer, (0, 2)),
+            frame(
+                &mut inline,
+                &[],
+                None,
+                &footer,
+                &rows(&["> "]),
+                &answer[..4],
+                (0, 2),
+            ),
+            frame(
+                &mut inline,
+                &[],
+                None,
+                &footer,
+                &rows(&["> "]),
+                &answer[..6],
+                (0, 2),
+            ),
+            frame(
+                &mut inline,
+                &[],
+                None,
+                &footer,
+                &rows(&["> "]),
+                &answer,
+                (0, 2),
+            ),
         ];
         let screen = screen_of(HEIGHT, 40, &frames);
 
@@ -948,7 +1295,15 @@ mod tests {
         let mut inline = Inline::new(40);
         inline.set_max_rows(4);
         let many: Vec<String> = (0..40).map(|i| format!("row {i}")).collect();
-        let bytes = inline.frame(&[], None, &rows(&["s"]), &rows(&["> "]), &many, (0, 2));
+        let bytes = frame(
+            &mut inline,
+            &[],
+            None,
+            &rows(&["s"]),
+            &rows(&["> "]),
+            &many,
+            (0, 2),
+        );
         let text = String::from_utf8_lossy(&bytes).into_owned();
         let drawn = text.matches("\r\n").count().saturating_add(1);
         assert!(drawn <= 4, "the region drew {drawn} rows:\n{text}");
@@ -963,7 +1318,15 @@ mod tests {
         // The same height the session would report for an eight-row terminal.
         inline.set_max_rows(7);
         let tall: Vec<String> = (0..10).map(|i| format!("row {i}")).collect();
-        let first = inline.frame(&[], None, &rows(&["s"]), &rows(&["> "]), &tall, (0, 2));
+        let first = frame(
+            &mut inline,
+            &[],
+            None,
+            &rows(&["s"]),
+            &rows(&["> "]),
+            &tall,
+            (0, 2),
+        );
         let mut grid = crate::engine::Grid::new(40, 8).expect("grid");
         grid.feed(&first).expect("feed");
         let before = grid.text();
@@ -972,7 +1335,15 @@ mod tests {
             "the prompt is not on screen:\n{before}"
         );
 
-        let second = inline.frame(&[], None, &rows(&["s"]), &rows(&["> "]), &tall[..2], (0, 2));
+        let second = frame(
+            &mut inline,
+            &[],
+            None,
+            &rows(&["s"]),
+            &rows(&["> "]),
+            &tall[..2],
+            (0, 2),
+        );
         grid.feed(&second).expect("feed");
         // The prompt is below the region's rows and must still be on screen.
         assert!(
