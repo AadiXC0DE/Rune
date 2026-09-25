@@ -4,7 +4,7 @@
 ///
 /// This is the single source of truth. The build script and the release
 /// pipeline read it from here rather than restating it.
-pub const VERSION: &str = "0.1.12";
+pub const VERSION: &str = "0.1.13";
 
 /// The release channel this build came from.
 pub const CHANNEL: &str = "dev";

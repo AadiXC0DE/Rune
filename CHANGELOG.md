@@ -2,6 +2,28 @@
 
 Notable changes, newest first. Each entry describes what a user can observe.
 
+## 0.1.13
+
+### Added
+
+- A slash command shows what can be typed next. Typing `/` lists every command
+  with the line describing it, typing narrows the list, the arrows move the
+  highlight, and tab or enter accepts it. The list comes from the same table the
+  help text and the dispatcher use, so a command that is offered is one that
+  works.
+
+### Fixed
+
+- The cursor no longer jumps upward. A frame that changed nothing placed the
+  cursor by walking to the top of the region first, which only works while the
+  caret is on the first row; anywhere else it landed on a status row, so pressing
+  down at an empty prompt moved the cursor up.
+- An answer is drawn under the question it answers, above the status block, with
+  the line being typed pinned underneath. It previously grew downward from the
+  input, and because the region is anchored at the bottom of the screen every
+  extra row pushed the input upward: the transcript read as question, status bar,
+  empty input, then answer, and the input crept up as the reply arrived.
+
 ## 0.1.12
 
 ### Fixed
