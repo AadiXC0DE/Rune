@@ -23,7 +23,7 @@
 //! - Every wait is bounded: startup, each call, and each frame.
 
 use std::io::{BufRead, BufReader, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -86,6 +86,8 @@ pub struct PluginManifest {
     #[serde(default)]
     pub tools: Vec<PluginTool>,
     /// Program and arguments that start the plugin.
+    ///
+    /// A program given as a relative path is found in the manifest's directory.
     #[serde(default)]
     pub commands: Vec<String>,
 }
@@ -256,6 +258,8 @@ pub struct PluginHost {
     name: String,
     tools: Vec<PluginTool>,
     command: Vec<String>,
+    /// Directory holding the manifest, which a relative program is found in.
+    directory: PathBuf,
     limits: BudgetSet,
     session: Option<Session>,
     restarts: u32,
@@ -276,11 +280,18 @@ impl PluginHost {
 
     /// Starts the plugin with explicit limits.
     pub fn start_with_limits(path: impl AsRef<Path>, limits: BudgetSet) -> Result<Self> {
-        let manifest = PluginManifest::load(path.as_ref())?;
+        let path = path.as_ref();
+        let manifest = PluginManifest::load(path)?;
+        let directory = if path.is_dir() {
+            path.to_path_buf()
+        } else {
+            path.parent().map(Path::to_path_buf).unwrap_or_default()
+        };
         let mut host = Self {
             name: manifest.name,
             tools: manifest.tools,
             command: manifest.commands,
+            directory,
             limits,
             session: None,
             restarts: 0,
@@ -560,9 +571,24 @@ impl PluginHost {
         outcome
     }
 
+    /// Returns the program to start.
+    ///
+    /// A relative path that names a directory is taken from the manifest's
+    /// directory, where a plugin ships its own executable, rather than from
+    /// whatever directory the host runs in. A bare name is left to the search
+    /// path.
+    fn program(&self) -> PathBuf {
+        let named = Path::new(self.command.first().map_or("", String::as_str));
+        if named.is_relative() && named.components().count() > 1 {
+            self.directory.join(named)
+        } else {
+            named.to_path_buf()
+        }
+    }
+
     /// Launches the plugin process and its reader.
     fn spawn(&self) -> Result<Session> {
-        let program = self.command.first().cloned().unwrap_or_default();
+        let program = self.program();
         // Nothing from the parent environment is inherited: this process holds
         // the provider credential, and a plugin must not be able to read it back
         // out of its own environment.
@@ -580,7 +606,7 @@ impl PluginHost {
         rune_exec::own_group(&mut command);
         let mut child = command
             .spawn()
-            .map_err(|err| spawn_error(&self.name, &program, &err))?;
+            .map_err(|err| spawn_error(&self.name, &program.display().to_string(), &err))?;
 
         let stdin = child.stdin.take();
         let stdout = child.stdout.take().ok_or_else(|| {

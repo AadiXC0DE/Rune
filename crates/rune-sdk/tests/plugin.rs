@@ -379,6 +379,33 @@ fn a_plugin_that_died_between_calls_is_restarted_within_the_budget() {
     assert!(host.restarts() > 0, "the death spent a restart");
 }
 
+#[test]
+fn a_relative_program_is_found_beside_the_manifest() {
+    // The test runs from the crate directory, which holds no such program, so
+    // the plugin starts only if the path is taken from the manifest.
+    let directory = tempfile::tempdir().expect("temp dir");
+    let relative =
+        PathBuf::from("bin").join(format!("plugin-fixture{}", std::env::consts::EXE_SUFFIX));
+    std::fs::create_dir_all(directory.path().join("bin")).expect("create bin");
+    std::fs::copy(Fixture::binary(), directory.path().join(&relative)).expect("copy fixture");
+    std::fs::write(
+        directory.path().join("plugin.json"),
+        serde_json::to_vec(&json!({
+            "protocol_version": 1,
+            "name": "shipped",
+            "tools": serde_json::from_str::<Value>(TOOLS).expect("tools"),
+            "commands": [relative.to_string_lossy(), "echoer", ""],
+        }))
+        .expect("encode"),
+    )
+    .expect("write manifest");
+
+    let mut host = PluginHost::start(directory.path()).expect("start");
+    let output = host.call("echo", &json!({"text": "hello"})).expect("call");
+    assert_eq!(output.text, "echoed");
+    host.shutdown().expect("shutdown");
+}
+
 /// Returns true while a process with this identifier exists.
 #[cfg(unix)]
 fn alive(pid: &str) -> bool {
