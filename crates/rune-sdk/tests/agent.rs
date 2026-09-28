@@ -218,6 +218,27 @@ fn a_second_prompt_while_one_runs_is_refused() {
 }
 
 #[test]
+fn replacing_a_finished_turn_handle_leaves_the_new_turn_running() {
+    let endpoint = MockEndpoint::start(vec![Script::text("unused")]);
+    let fetch = Arc::new(SlowFetch {
+        delay: Duration::from_millis(200),
+        hits: AtomicUsize::new(0),
+    });
+    let mut agent = Agent::new(options(&endpoint.base_url(), fetch)).expect("agent");
+
+    let mut turn = agent.prompt("one", PromptOptions::default()).expect("turn");
+    let first = turn.result().expect("result");
+    assert_eq!(first.stop_reason, rune_agent::turn::StopReason::Completed);
+
+    // The assignment drops the finished handle while the new turn is waiting
+    // on its request, which must cancel only the turn the handle belonged to.
+    turn = agent.prompt("two", PromptOptions::default()).expect("turn");
+    let second = turn.result().expect("result");
+    assert_eq!(second.stop_reason, rune_agent::turn::StopReason::Completed);
+    assert!(second.text.contains("late"), "{}", second.text);
+}
+
+#[test]
 fn closing_during_a_turn_resolves_a_cancelled_result() {
     let endpoint = MockEndpoint::start(vec![Script::text("slow")]);
     let fetch = Arc::new(SlowFetch {

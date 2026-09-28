@@ -572,6 +572,8 @@ pub struct Agent {
     specs: Arc<Vec<ToolSpec>>,
     limits: BudgetSet,
     conversation: Arc<Conversation>,
+    /// Cancellation for the turn started last, which is the only one that can
+    /// still be running.
     cancel: Cancellation,
     claim: Arc<AtomicBool>,
     current: Option<Arc<Completion>>,
@@ -727,7 +729,11 @@ impl Agent {
                     .with_hint("wait for the running turn, or drop its handle to cancel it"),
             );
         }
-        self.cancel.reset();
+        // Each turn gets a flag of its own. Dropping a handle cancels its turn,
+        // and the handle of a finished turn is routinely dropped after the next
+        // one has started, as in `turn = agent.prompt(..)`, so a flag shared
+        // between turns would cancel the new one.
+        self.cancel = Cancellation::new();
         let completion = Arc::new(Completion::default());
         self.current = Some(Arc::clone(&completion));
 
