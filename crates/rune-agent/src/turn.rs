@@ -754,28 +754,18 @@ fn infer_activity(name: &str) -> Activity {
 }
 
 /// Returns the permission target for a call, when the tool names one.
+///
+/// Each tool declares its own target, so the loop asks the registry rather than
+/// keeping a second table that can drift from it. The host does not hand the
+/// loop its registry, so the built-in one answers, and it gives the same
+/// target: a tool's target depends only on its arguments and on state every
+/// instance reads, such as the command a shell session runs.
 fn infer_target(host: &dyn Host, name: &str, arguments: &serde_json::Value) -> Option<String> {
+    static BUILTIN: std::sync::OnceLock<Option<Registry>> = std::sync::OnceLock::new();
     let _ = host;
-    match name {
-        "read_file" | "write_file" | "edit_file" | "glob_files" | "grep_files" => arguments
-            .get("path")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_owned)
-            .or_else(|| {
-                arguments
-                    .get("pattern")
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::to_owned)
-            }),
-        "shell" => arguments
-            .get("command")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_owned),
-        "web_fetch" => arguments
-            .get("url")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_owned),
-        _ => None,
+    match BUILTIN.get_or_init(|| rune_tools::inventory::builtin_default().ok()) {
+        Some(registry) => permission_target_for(registry, name, arguments),
+        None => infer_target_standalone(name, arguments),
     }
 }
 

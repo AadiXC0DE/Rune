@@ -930,3 +930,37 @@ fn a_long_conversation_stays_valid_across_many_turns() {
     // Memory must not grow with the number of turns beyond what was sent.
     assert!(history.byte_len() < 100_000, "history grew unexpectedly");
 }
+
+#[test]
+fn input_sent_to_a_shell_session_is_judged_by_the_rules() {
+    // The `command` argument is not what an interaction runs, so a rule that
+    // allows it must not carry the input that follows.
+    let arguments = serde_json::json!({
+        "action": "interact",
+        "session_id": "shell-0-0",
+        "command": "ls",
+        "chars": "rm -rf .git\n",
+    });
+    let endpoint = MockEndpoint::start(vec![
+        Script::tool_call("call_1", "shell", &arguments.to_string()),
+        Script::text("I will not."),
+    ]);
+    let mut rules = RuleSet::new();
+    rules.push(Rule::allow("shell", "ls*", Layer::User));
+    rules.push(Rule::deny("shell", "rm *", Layer::User));
+    let host = TestHost::new(endpoint).with_rules(rules);
+
+    let mut history = rune_agent::History::new();
+    history.push_user("clean up");
+
+    let outcome = run_turn(&mut history, &host).expect("turn");
+    assert_eq!(outcome.calls.len(), 1);
+    assert!(!outcome.calls[0].executed, "the input reached the session");
+    assert!(host.executed_calls().is_empty());
+    assert!(
+        host.events()
+            .iter()
+            .any(|event| matches!(event, Event::ToolDenied { .. })),
+        "no denial was reported"
+    );
+}

@@ -7,6 +7,7 @@
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -35,6 +36,26 @@ pub const MAX_YIELD_MS: u64 = 600_000;
 /// Time spent collecting the last bytes a command writes as it exits.
 const DRAIN_WINDOW: Duration = Duration::from_millis(250);
 
+/// Permission target of a `stop`.
+///
+/// Ending a session changes nothing the command did not already start, so the
+/// target names the action rather than the command, and one rule can answer
+/// for every stop.
+pub const STOP_TARGET: &str = "stop";
+
+/// The command each live session runs, by session id, across every instance
+/// of the tool in this process.
+///
+/// A permission target is read from a call's arguments by whichever view of the
+/// tool the caller holds, which need not be the instance that owns the session.
+/// Input sent to a session is judged together with the command it goes to, so
+/// that command is kept where every view can read it.
+static COMMANDS: Mutex<BTreeMap<String, String>> = Mutex::new(BTreeMap::new());
+
+/// Sessions started in this process, counted across every instance so that no
+/// two sessions share an id.
+static STARTED: AtomicU64 = AtomicU64::new(0);
+
 /// Runs commands and holds the ones that outlive their call.
 #[derive(Debug)]
 pub struct Shell {
@@ -62,7 +83,6 @@ struct State {
     sessions: BTreeMap<String, Arc<Session>>,
     /// Commands that are starting but do not yet have a session entry.
     starting: usize,
-    started: u64,
 }
 
 /// A slot in the session bound, held while a command starts.
@@ -96,9 +116,8 @@ impl<'a> Slot<'a> {
             .with_hint("stop a session before starting another"));
         }
         state.starting = state.starting.saturating_add(1);
-        state.started = state.started.saturating_add(1);
-        let id = session_id(state.started);
-        Ok((Self { shell, held: true }, id))
+        let started = STARTED.fetch_add(1, Ordering::Relaxed).saturating_add(1);
+        Ok((Self { shell, held: true }, session_id(started)))
     }
 
     /// Hands the slot to the session that now occupies it.
@@ -128,9 +147,34 @@ impl Drop for Slot<'_> {
 /// so a call that waits out its window never blocks another call's work.
 #[derive(Debug)]
 struct Session {
+    id: String,
     command: String,
     process: Process,
     seen: Mutex<(usize, usize)>,
+}
+
+impl Session {
+    /// Builds a session and records the command it runs under its id.
+    fn new(id: String, command: String, process: Process, seen: (usize, usize)) -> Self {
+        let _ = lock(&COMMANDS).insert(id.clone(), command.clone());
+        Self {
+            id,
+            command,
+            process,
+            seen: Mutex::new(seen),
+        }
+    }
+}
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        let _ = lock(&COMMANDS).remove(&self.id);
+    }
+}
+
+/// Returns the command a live session runs.
+fn session_command(id: &str) -> Option<String> {
+    lock(&COMMANDS).get(id).cloned()
 }
 
 /// The action one call performs.
@@ -204,11 +248,7 @@ impl Shell {
         let state = format!("session {id} running, {}", ended_by(process.id()));
         let mut seen = (0, 0);
         let text = observe(&process, &command, &state, &mut seen, cap);
-        let session = Arc::new(Session {
-            command,
-            seen: Mutex::new(seen),
-            process,
-        });
+        let session = Arc::new(Session::new(id.clone(), command, process, seen));
         slot.hand_over(id, session);
         Ok(ToolOutput::success(text))
     }
@@ -373,11 +413,30 @@ impl Tool for Shell {
         Activity::Execute
     }
 
+    /// Returns what a call is judged by.
+    ///
+    /// A `run` is judged by its command. Input sent by `interact` is judged
+    /// with the command it goes to, one line after it, so a rule that refuses a
+    /// command also refuses typing it into a running shell; a `command`
+    /// argument passed with it is not what the session runs and is ignored. A
+    /// `stop` only ends what was already started, so every stop shares one
+    /// target.
     fn permission_target(&self, arguments: &serde_json::Value) -> Option<String> {
-        arguments
-            .get("command")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_owned)
+        let text = |name: &str| arguments.get(name).and_then(serde_json::Value::as_str);
+        match text("action") {
+            Some("interact") => {
+                let id = text("session_id").unwrap_or_default();
+                // A session this process does not hold refuses the call, so its
+                // id stands in for the command it would have named.
+                let command = session_command(id).unwrap_or_else(|| id.to_owned());
+                Some(match text("chars").filter(|chars| !chars.is_empty()) {
+                    Some(chars) => format!("{command}\n{chars}"),
+                    None => command,
+                })
+            }
+            Some("stop") => Some(STOP_TARGET.to_owned()),
+            _ => text("command").map(str::to_owned),
+        }
     }
 
     fn call(
@@ -1019,6 +1078,68 @@ mod tests {
             .expect("an action enum");
         assert_eq!(actions.len(), 3);
         assert_eq!(schema["required"][0], "action");
+    }
+
+    #[test]
+    fn input_to_a_session_is_judged_with_the_command_it_goes_to() {
+        let tool = Shell::default();
+        let (_dir, context) = workspace();
+        let started = text(
+            &tool,
+            &context,
+            &serde_json::json!({
+                "action": "run",
+                "command": long_sleep(),
+                "yield_time_ms": 0,
+            }),
+        );
+        let (id, _group) = running(&started);
+
+        // Any view of the tool names the same target, including one that does
+        // not hold the session, which is what the loop consults.
+        for view in [&tool, &Shell::default()] {
+            let sending = view.permission_target(&serde_json::json!({
+                "action": "interact",
+                "session_id": id,
+                "command": "ls",
+                "chars": "rm -rf .git\n",
+            }));
+            assert_eq!(
+                sending.as_deref(),
+                Some(format!("{}\nrm -rf .git\n", long_sleep()).as_str())
+            );
+            let reading = view.permission_target(&serde_json::json!({
+                "action": "interact",
+                "session_id": id,
+            }));
+            assert_eq!(reading.as_deref(), Some(long_sleep().as_str()));
+        }
+
+        let stopping = tool.permission_target(&serde_json::json!({
+            "action": "stop",
+            "session_id": id,
+            "command": "ls",
+        }));
+        assert_eq!(stopping.as_deref(), Some(STOP_TARGET));
+        let _ = stop(&tool, &context, &id);
+
+        // A session that has gone is named by its id, so the input is still
+        // judged rather than dropped.
+        let gone = tool.permission_target(&serde_json::json!({
+            "action": "interact",
+            "session_id": id,
+            "chars": "rm -rf .git\n",
+        }));
+        assert_eq!(gone, Some(format!("{id}\nrm -rf .git\n")));
+    }
+
+    #[test]
+    fn a_run_is_judged_by_its_command() {
+        let target = Shell::default().permission_target(&serde_json::json!({
+            "action": "run",
+            "command": "git status",
+        }));
+        assert_eq!(target.as_deref(), Some("git status"));
     }
 
     #[test]
