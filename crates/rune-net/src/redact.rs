@@ -7,6 +7,13 @@
 /// Shortest run of credential-looking characters replaced wholesale.
 const MIN_SECRET_RUN: usize = 16;
 
+/// Shortest stretch between separators that marks a run as a key.
+///
+/// A model name or a version joins short words and numbers with hyphens and
+/// dots, while a key without a known prefix is one long stretch of mixed
+/// letters and digits, so the stretch is what tells them apart.
+const MIN_SECRET_SEGMENT: usize = 12;
+
 /// Environment variable names whose values must never be printed.
 const SECRET_NAMES: &[&str] = &[
     "api_key",
@@ -144,11 +151,28 @@ fn looks_like_token(token: &str) -> bool {
     {
         return true;
     }
+    // Some services issue keys shaped as a UUID, whose groups are too short
+    // to be judged as a stretch.
+    if is_uuid(token) {
+        return true;
+    }
     // A long unbroken run mixing letters and digits with no word structure is
     // the shape of an opaque key.
     token.len() >= MIN_SECRET_RUN
-        && token.bytes().any(|byte| byte.is_ascii_digit())
-        && token.bytes().any(|byte| byte.is_ascii_alphabetic())
+        && token.split(['-', '_', '.', '+']).any(|segment| {
+            segment.len() >= MIN_SECRET_SEGMENT
+                && segment.bytes().any(|byte| byte.is_ascii_digit())
+                && segment.bytes().any(|byte| byte.is_ascii_alphabetic())
+        })
+}
+
+/// Returns true for the hyphenated hexadecimal form of a UUID.
+fn is_uuid(token: &str) -> bool {
+    let groups: Vec<&str> = token.split('-').collect();
+    groups.len() == 5
+        && groups.iter().zip([8, 4, 4, 4, 12]).all(|(group, len)| {
+            group.len() == len && group.bytes().all(|byte| byte.is_ascii_hexdigit())
+        })
 }
 
 /// Returns true when a field name suggests its value is a secret.
@@ -246,6 +270,38 @@ mod tests {
     fn ordinary_words_with_digits_survive() {
         let input = "HTTP 429 means rate limited";
         assert_eq!(redact(input), input);
+    }
+
+    #[test]
+    fn a_model_identifier_survives() {
+        // The identifier is the one detail that explains a refused model, so
+        // hiding it leaves nothing to act on.
+        for model in [
+            "claude-sonnet-4-5-20250929",
+            "gpt-4o-mini-2024-07-18",
+            "gemini-2.5-pro-preview-05-06",
+            "meta-llama/Llama-3.3-70B-Instruct-Turbo",
+            "Qwen2.5-Coder-32B-Instruct",
+            "us.anthropic.claude-sonnet-4-20250514-v1:0",
+            "starcoder2-15b-instruct-v0.1",
+        ] {
+            let input = format!("model {model} not found");
+            assert_eq!(redact(&input), input);
+        }
+    }
+
+    #[test]
+    fn an_opaque_key_without_a_known_prefix_is_still_redacted() {
+        for key in [
+            "abcdef1234567890",
+            "3f8a9c2e1b7d4f6a8c0e2b4d6f8a0c2e",
+            "gsk_8Kd02jfLq9ZxP4mW7vT1bN6rY3cH5sA0",
+            "fw_3ZkQ9pXr7Lm2Nv8Wb4Tc6Yd1",
+            "550e8400-e29b-41d4-a716-446655440000",
+        ] {
+            let redacted = redact(&format!("rejected {key} here"));
+            assert!(!redacted.contains(key), "leaked {key}: {redacted}");
+        }
     }
 
     #[test]
