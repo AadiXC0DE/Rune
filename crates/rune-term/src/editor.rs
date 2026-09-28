@@ -133,7 +133,13 @@ impl Composer {
     }
 
     /// Empties the line.
+    ///
+    /// Recall starts over as well. A line is cleared when it is submitted or
+    /// abandoned, and a walk that carried on from the old position would skip
+    /// the newest entry and bring back a draft that was already let go.
     pub fn clear(&mut self) {
+        self.recall = None;
+        self.draft.clear();
         if self.text.is_empty() {
             return;
         }
@@ -800,6 +806,26 @@ mod tests {
         assert_eq!(composer.text(), "draft");
         assert!(!composer.history_next(&entries));
         assert_eq!(composer.text(), "draft");
+    }
+
+    #[test]
+    fn clearing_the_line_starts_recall_over() {
+        // Sending a recalled entry clears the line. Recall used to carry on
+        // from where it was, so the next Up skipped an entry and a Down past
+        // the newest brought back the draft that had been abandoned.
+        let entries: Vec<String> = ["one", "two", "three"].map(str::to_owned).to_vec();
+        let mut composer = Composer::new();
+        composer.insert("abandoned draft");
+        assert!(composer.history_previous(&entries));
+        assert!(composer.history_previous(&entries));
+        assert_eq!(composer.text(), "two");
+
+        composer.clear();
+        assert!(composer.history_previous(&entries));
+        assert_eq!(composer.text(), "three", "the newest entry was skipped");
+        assert!(composer.history_next(&entries));
+        assert_eq!(composer.text(), "", "an abandoned draft came back");
+        assert!(!composer.history_next(&entries));
     }
 
     #[test]
