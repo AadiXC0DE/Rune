@@ -10,7 +10,8 @@
 //! A prepared command runs in a process group of its own, so ending it ends
 //! everything it started rather than only the process Rune spawned. Signals are
 //! delivered by running `kill` against the negated group id: the standard
-//! library exposes no signal API, and this crate forbids unsafe code.
+//! library exposes no signal API, and this crate keeps unsafe code to the one
+//! call that sets a child's resource limits.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -273,16 +274,79 @@ pub fn prepare_shell(
 
 /// Environment variables a command may receive.
 ///
-/// A command needs a `PATH` to resolve a program by name, and a `HOME` because
-/// most programs that read a config file look there and misbehave when it is
-/// absent. Nothing else from this process is passed: it holds provider
-/// credentials and session state, and a command that reaches the network would
-/// otherwise be able to read them.
+/// An allowlist rather than a denylist, because a credential can sit in a
+/// variable of any name: `api_key_env` lets a user keep their key under a name
+/// no pattern would recognize. Everything not named here is withheld, including
+/// the provider credentials and session state this process holds.
+///
+/// What is named is what ordinary work breaks without. A program is resolved
+/// through `PATH`, most tools find their configuration through `HOME` or the XDG
+/// variables, a toolchain installed outside the default location is found
+/// through its own home variable, and a machine behind a proxy or a private
+/// certificate authority reaches nothing without those settings.
 ///
 /// The names are a constant so the check that no other variable reaches a
 /// command cannot drift from the list that decides it.
 #[cfg(not(windows))]
-pub const ALLOWED_ENVIRONMENT: [&str; 5] = ["PATH", "HOME", "TERM", "LANG", "TMPDIR"];
+pub const ALLOWED_ENVIRONMENT: &[&str] = &[
+    // The process itself.
+    "PATH",
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "SHELL",
+    "TMPDIR",
+    "TZ",
+    // The terminal and the locale.
+    "TERM",
+    "COLORTERM",
+    "NO_COLOR",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "LC_MESSAGES",
+    "__CF_USER_TEXT_ENCODING",
+    // Where configuration and caches live.
+    "XDG_CONFIG_HOME",
+    "XDG_CACHE_HOME",
+    "XDG_DATA_HOME",
+    "XDG_STATE_HOME",
+    "XDG_RUNTIME_DIR",
+    // Toolchains installed outside their default location.
+    "CARGO_HOME",
+    "RUSTUP_HOME",
+    "RUSTUP_TOOLCHAIN",
+    "GOPATH",
+    "GOROOT",
+    "GOBIN",
+    "JAVA_HOME",
+    "NVM_DIR",
+    "PNPM_HOME",
+    "BUN_INSTALL",
+    "DENO_DIR",
+    "PYENV_ROOT",
+    "VIRTUAL_ENV",
+    "CONDA_PREFIX",
+    "PKG_CONFIG_PATH",
+    "DEVELOPER_DIR",
+    "SDKROOT",
+    "ANDROID_HOME",
+    "ANDROID_SDK_ROOT",
+    // The network path a machine is configured to use.
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "NO_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+    "no_proxy",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+    "NODE_EXTRA_CA_CERTS",
+    "REQUESTS_CA_BUNDLE",
+    "CURL_CA_BUNDLE",
+];
 
 /// Environment variables a command may receive.
 ///
@@ -291,21 +355,51 @@ pub const ALLOWED_ENVIRONMENT: [&str; 5] = ["PATH", "HOME", "TERM", "LANG", "TMP
 /// libraries it links against. Omitting it fails in a way that names neither
 /// the variable nor the cause.
 #[cfg(windows)]
-pub const ALLOWED_ENVIRONMENT: [&str; 14] = [
+pub const ALLOWED_ENVIRONMENT: &[&str] = &[
     "PATH",
     "SystemRoot",
     "SystemDrive",
+    "windir",
     "ComSpec",
     "PATHEXT",
     "TEMP",
     "TMP",
+    "USERNAME",
+    "USERDOMAIN",
     "USERPROFILE",
     "HOMEDRIVE",
     "HOMEPATH",
     "APPDATA",
     "LOCALAPPDATA",
+    "ProgramData",
+    "ProgramFiles",
+    "ProgramFiles(x86)",
+    "CommonProgramFiles",
     "NUMBER_OF_PROCESSORS",
     "PROCESSOR_ARCHITECTURE",
+    "OS",
+    "PSModulePath",
+    "TERM",
+    "LANG",
+    "CARGO_HOME",
+    "RUSTUP_HOME",
+    "RUSTUP_TOOLCHAIN",
+    "GOPATH",
+    "GOROOT",
+    "JAVA_HOME",
+    "NVM_HOME",
+    "NVM_SYMLINK",
+    "VIRTUAL_ENV",
+    "CONDA_PREFIX",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "NO_PROXY",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+    "NODE_EXTRA_CA_CERTS",
+    "REQUESTS_CA_BUNDLE",
+    "CURL_CA_BUNDLE",
 ];
 
 /// Returns the environment a command is given when the caller names none.
@@ -315,7 +409,7 @@ pub const ALLOWED_ENVIRONMENT: [&str; 14] = [
 #[must_use]
 pub fn minimal_environment() -> BTreeMap<String, String> {
     let mut environment = BTreeMap::new();
-    for name in ALLOWED_ENVIRONMENT {
+    for &name in ALLOWED_ENVIRONMENT {
         // A value this process holds that is not valid UTF-8 is left out
         // rather than lossily converted: a mangled path is worse than none.
         if let Some(value) = std::env::var_os(name)
@@ -693,13 +787,19 @@ pub struct ResourceLimits {
 impl Default for ResourceLimits {
     /// The ceiling a command runs under unless a caller says otherwise.
     ///
-    /// Chosen to be generous for real work and still bounded: a build that
-    /// wants more than sixteen gigabytes of address space, or four hours of
-    /// CPU, is not a build this program should be running unattended.
+    /// Chosen to be generous for real work and still bounded: four hours of CPU
+    /// or an eight gigabyte file is not something this program should be doing
+    /// unattended.
+    ///
+    /// Address space is left unbounded. It is reserved, not used: a JavaScript
+    /// engine, a WebAssembly runtime, a JVM, and an address sanitizer each
+    /// reserve many times the memory they touch, so any ceiling low enough to
+    /// matter refuses ordinary test suites while bounding nothing real. A caller
+    /// that wants one can still name it.
     fn default() -> Self {
         Self {
             cpu_seconds: Some(DEFAULT_CPU_SECONDS),
-            address_space_bytes: Some(DEFAULT_ADDRESS_SPACE_BYTES),
+            address_space_bytes: None,
             processes: Some(DEFAULT_PROCESSES),
             file_bytes: Some(DEFAULT_FILE_BYTES),
         }
@@ -708,9 +808,9 @@ impl Default for ResourceLimits {
 
 /// Longest a command may run, in seconds of CPU time.
 pub const DEFAULT_CPU_SECONDS: u64 = 4 * 60 * 60;
-/// Largest address space a command may claim.
+/// Largest address space a command may claim, for a caller that asks for one.
 pub const DEFAULT_ADDRESS_SPACE_BYTES: u64 = 16 * 1024 * 1024 * 1024;
-/// Most processes and threads a command may create.
+/// Most processes and threads a command may add to what is already running.
 pub const DEFAULT_PROCESSES: u64 = 4096;
 /// Largest file a command may create.
 pub const DEFAULT_FILE_BYTES: u64 = 8 * 1024 * 1024 * 1024;
@@ -743,7 +843,7 @@ impl ResourceLimits {
         // macOS has no address space limit worth setting: it rejects a value
         // below its own reservation, which is far larger than any ceiling a
         // command should have, so asking would fail the spawn rather than bound
-        // the command. The Linux namespace sandbox bounds memory there instead.
+        // the command.
         #[cfg(not(target_os = "linux"))]
         let wanted = [
             (Resource::Cpu, self.cpu_seconds),
@@ -783,9 +883,41 @@ impl ResourceLimits {
 ///
 /// A caller may name stricter ones; there is no way to name looser ones, because
 /// a limit that can be raised by the thing it constrains is not a limit.
+///
+/// The process ceiling is headroom over what is already running. Linux counts
+/// it against every task the user owns, threads included, so a fixed number
+/// would refuse the first `fork` of a command started on a desktop that already
+/// runs a browser and an editor. Adding the tasks on the host keeps a fork bomb
+/// bounded while leaving ordinary work its full allowance.
 #[must_use]
 pub fn resource_limits() -> ResourceLimits {
-    ResourceLimits::default()
+    let mut limits = ResourceLimits::default();
+    limits.processes = limits
+        .processes
+        .map(|headroom| headroom.saturating_add(tasks_on_host()));
+    limits
+}
+
+/// Returns how many tasks the host is running, or zero where that is not known.
+///
+/// On Linux the fourth field of `/proc/loadavg` is `running/total`, where the
+/// total counts every thread on the system. That is an upper bound on what the
+/// user owns, which is the count the process ceiling is measured against.
+fn tasks_on_host() -> u64 {
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read_to_string("/proc/loadavg")
+            .ok()
+            .and_then(|text| {
+                let field = text.split_whitespace().nth(3)?;
+                field.split('/').nth(1)?.parse::<u64>().ok()
+            })
+            .unwrap_or(0)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        0
+    }
 }
 
 /// Delivers no signal, on a platform with no process group to signal.
@@ -1333,7 +1465,7 @@ mod tests {
         // holds. It is asserted directly, because the leak it prevents is
         // invisible in normal output.
         let environment = minimal_environment();
-        for name in ALLOWED_ENVIRONMENT {
+        for &name in ALLOWED_ENVIRONMENT {
             // A name on the list may only be absent when the parent lacked it.
             assert!(
                 environment.contains_key(name) || std::env::var_os(name).is_none(),
@@ -1473,6 +1605,26 @@ mod tests {
         let prepared = prepare("echo hello", dir.as_path(), None, environment()).expect("prepare");
         let outcome = run(&prepared, Duration::from_secs(10), &never).expect("run");
         assert_eq!(outcome.stdout.trim(), "hello");
+    }
+
+    #[test]
+    fn the_default_ceiling_leaves_address_space_alone() {
+        // Runtimes reserve far more address space than they touch, so a
+        // ceiling here refuses ordinary test suites and bounds nothing real.
+        assert_eq!(resource_limits().address_space_bytes, None);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn the_process_ceiling_is_headroom_over_what_is_running() {
+        // The kernel counts every task the user owns against this limit, so a
+        // fixed number would refuse the first fork on a busy desktop.
+        let running = tasks_on_host();
+        assert!(running > 0, "the host reported no tasks");
+        assert!(
+            resource_limits().processes.unwrap_or(0) >= running + DEFAULT_PROCESSES,
+            "a command would start with less than its full allowance"
+        );
     }
 
     #[test]
