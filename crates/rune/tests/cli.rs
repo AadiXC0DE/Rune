@@ -399,3 +399,152 @@ fn benchmark_does_not_suppress_help_or_version() {
         assert!(!output.stdout.is_empty(), "{args:?} printed nothing");
     }
 }
+
+/// A listener that counts the connections it accepts and answers none.
+struct Listener {
+    port: u16,
+    accepts: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl Listener {
+    fn start() -> Self {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let accepts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = std::sync::Arc::clone(&accepts);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                if stream.is_err() {
+                    break;
+                }
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        });
+        Self { port, accepts }
+    }
+
+    fn count(&self) -> usize {
+        self.accepts.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+/// Runs the binary against a provider served at the listener's port.
+fn run_against(
+    listener: &Listener,
+    model: Option<&str>,
+    extra: &[(&str, &str)],
+    args: &[&str],
+) -> Output {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let mut command = Command::new(binary());
+    command
+        .args(args)
+        .env("RUNE_HOME", dir.path().join("state"))
+        .env("XDG_CONFIG_HOME", dir.path().join("config"))
+        .env("XDG_DATA_HOME", dir.path().join("data"))
+        .env("RUNE_PROVIDER", "chat_completions")
+        .env(
+            "RUNE_BASE_URL",
+            format!("http://127.0.0.1:{}/v1", listener.port),
+        )
+        .env("RUNE_API_KEY_ENV", "RUNE_CLI_TEST_KEY")
+        .env("RUNE_CLI_TEST_KEY", "sk-test")
+        .env_remove("RUNE_MODEL")
+        .env_remove("RUNE_OFFLINE");
+    if let Some(model) = model {
+        command.env("RUNE_MODEL", model);
+    }
+    for (key, value) in extra {
+        command.env(key, value);
+    }
+    let output = command.output().expect("run binary");
+    Output {
+        status: output.status.code(),
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+    }
+}
+
+#[test]
+fn offline_after_the_command_refuses_the_request() {
+    // `rune --offline ask hi` refused while `rune ask --offline hi` went out.
+    let listener = Listener::start();
+    for args in [
+        vec!["ask", "--offline", "hi"],
+        vec!["ask", "hi", "--offline"],
+    ] {
+        let out = run_against(&listener, Some("m"), &[], &args);
+        assert_eq!(out.status, Some(1), "{args:?}: {}", out.stderr);
+        assert!(out.stderr.contains("disabled"), "{args:?}: {}", out.stderr);
+    }
+    assert_eq!(listener.count(), 0, "an offline run reached the endpoint");
+}
+
+#[test]
+fn a_model_named_after_the_command_is_used() {
+    let listener = Listener::start();
+    let out = run_against(
+        &listener,
+        None,
+        &[],
+        &["ask", "--model", "m", "--offline", "hi"],
+    );
+    assert!(
+        !out.stderr.contains("no model is selected"),
+        "the model after the command was ignored: {}",
+        out.stderr
+    );
+}
+
+#[test]
+fn a_limit_after_the_command_is_applied() {
+    let out = run(&["limits", "--limit", "max_agent_steps=5", "--json"]);
+    assert_eq!(out.status, Some(0), "stderr: {}", out.stderr);
+    let value: serde_json::Value = serde_json::from_str(&out.stdout).expect("valid json");
+    let row = value["limits"]
+        .as_array()
+        .expect("limits array")
+        .iter()
+        .find(|row| row["name"] == "max_agent_steps")
+        .cloned()
+        .expect("max_agent_steps");
+    assert_eq!(row["value"], 5);
+    assert_eq!(row["source"], "command_line");
+}
+
+#[test]
+fn listing_models_offline_reports_the_configured_model_without_a_request() {
+    // Only the flag after the command was honoured, so the global flag and the
+    // environment both ended in a network error.
+    let listener = Listener::start();
+    for (env, args) in [
+        (vec![], vec!["--offline", "models"]),
+        (vec![], vec!["models", "--offline"]),
+        (vec![("RUNE_OFFLINE", "1")], vec!["models"]),
+    ] {
+        let out = run_against(&listener, Some("configured-model"), &env, &args);
+        assert_eq!(out.status, Some(0), "{args:?} {env:?}: {}", out.stderr);
+        assert!(
+            out.stdout.contains("configured-model"),
+            "{args:?} {env:?}: {}",
+            out.stdout
+        );
+    }
+    assert_eq!(
+        listener.count(),
+        0,
+        "an offline listing reached the endpoint"
+    );
+}
+
+#[test]
+fn a_flag_the_command_does_not_take_is_refused() {
+    let out = run(&["models", "--nonsense"]);
+    assert_eq!(out.status, Some(1));
+    assert!(
+        out.stderr.contains("not a flag of `rune models`"),
+        "{}",
+        out.stderr
+    );
+    assert!(out.stderr.contains("hint:"), "{}", out.stderr);
+}

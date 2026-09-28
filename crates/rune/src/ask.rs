@@ -11,7 +11,7 @@
 
 use std::io::Write;
 
-use rune_core::config::{Effort, Settings};
+use rune_core::config::Settings;
 use rune_core::error::{ErrorCode, Result, RuneError};
 use rune_core::paths::Paths;
 use rune_net::message::Message;
@@ -38,10 +38,6 @@ pub struct Options {
     pub json: bool,
     /// Do not create or update a session.
     pub no_save: bool,
-    /// Model override for this run.
-    pub model: Option<String>,
-    /// Reasoning effort override.
-    pub effort: Option<String>,
 }
 
 /// One tool call as reported in the JSON result.
@@ -158,10 +154,6 @@ pub fn run(
     // unselected model is reported immediately and names the remedy.
     settings.require_model()?;
 
-    if settings.model.trim().is_empty() && options.model.is_none() {
-        return Err(rune_core::config::unconfigured_provider_error());
-    }
-
     // Configuration is validated before a credential is looked up, so a user
     // who has not set an endpoint is told that rather than being told about a
     // credential for an endpoint that does not exist.
@@ -190,19 +182,13 @@ pub fn run(
         _ => Box::new(rune_net::chat_completions::ChatCompletions),
     };
 
-    let model = options
-        .model
-        .clone()
-        .unwrap_or_else(|| settings.model.clone());
-    if model.trim().is_empty() {
-        return Err(RuneError::missing_field("model"));
-    }
+    let model = settings.model.clone();
 
     // An image attachment is not wired into this path yet, so a run that
     // reaches here has no images to send.
     let mut plan = RequestPlan::new(model.clone());
     plan.messages = vec![Message::user(options.prompt.clone())];
-    plan.effort = parse_effort(options.effort.as_deref()).unwrap_or(settings.effort);
+    plan.effort = settings.effort;
     plan.fast_mode = settings.fast_mode;
     plan.provider_order.clone_from(&settings.provider_order);
     plan.provider_strict = settings.provider_strict;
@@ -272,21 +258,6 @@ pub fn run(
         error: None,
         error_code: None,
     })
-}
-
-/// Parses an effort name given on the command line.
-fn parse_effort(raw: Option<&str>) -> Option<Effort> {
-    match raw?.trim().to_ascii_lowercase().as_str() {
-        "auto" => Some(Effort::Auto),
-        "none" => Some(Effort::None),
-        "minimal" => Some(Effort::Minimal),
-        "low" => Some(Effort::Low),
-        "medium" => Some(Effort::Medium),
-        "high" => Some(Effort::High),
-        "xhigh" => Some(Effort::Xhigh),
-        "max" => Some(Effort::Max),
-        _ => None,
-    }
 }
 
 /// Writes a result to the two output streams.
@@ -479,15 +450,6 @@ mod tests {
         let json = serde_json::to_value(&report).expect("serialize");
         assert_eq!(json["name"], "read_file");
         assert_eq!(json["status"], "success");
-    }
-
-    #[test]
-    fn effort_parsing_accepts_every_documented_name() {
-        assert_eq!(parse_effort(Some("high")), Some(Effort::High));
-        assert_eq!(parse_effort(Some("XHIGH")), Some(Effort::Xhigh));
-        assert_eq!(parse_effort(Some("auto")), Some(Effort::Auto));
-        assert_eq!(parse_effort(Some("sideways")), None);
-        assert_eq!(parse_effort(None), None);
     }
 
     #[test]

@@ -164,7 +164,7 @@ fn run(launch: &Launch) -> Result<ExitCode> {
         Command::Usage => run_usage(&paths, launch, &output_flags),
         Command::Auth => run_auth(&settings, &paths, launch, &output_flags),
         Command::Connect => run_connect(&settings, &paths, launch, &output_flags),
-        Command::Models => run_models(&settings, &paths, launch, &output_flags),
+        Command::Models => run_models(&settings, &paths, &output_flags),
         Command::Permissions => run_permissions(&settings, launch, &output_flags),
         Command::Projects => run_projects(&paths, launch, &workspace, &output_flags),
         Command::Workspace => run_workspace(&settings, &paths, launch, &output_flags),
@@ -259,8 +259,6 @@ fn run_ask(
         prompt,
         json: output.json,
         no_save: launch.has_flag("--no-save"),
-        model: launch.flag("--model").map(str::to_owned),
-        effort: launch.flag("--effort").map(str::to_owned),
     };
 
     match ask::run(settings, paths, &options) {
@@ -325,9 +323,7 @@ fn run_review(
     let options = ask::Options {
         prompt,
         json: output.json,
-        no_save: launch.has_flag("--no-save"),
-        model: launch.flag("--model").map(str::to_owned),
-        effort: launch.flag("--effort").map(str::to_owned),
+        no_save: false,
     };
 
     match ask::run(settings, paths, &options) {
@@ -594,16 +590,12 @@ fn run_connect(
 /// Lists the models the configured endpoint offers.
 ///
 /// The list is fetched from the endpoint, because a model identifier is only
-/// meaningful to the host that serves it. `--offline` reports the configured
-/// model without contacting anything, which is the answer a machine with no
-/// network needs rather than a failure.
-fn run_models(
-    settings: &Settings,
-    paths: &Paths,
-    launch: &Launch,
-    output: &OutputFlags,
-) -> Result<ExitCode> {
-    if launch.has_flag("--offline") {
+/// meaningful to the host that serves it. Offline, whether from the flag, the
+/// environment, or the configuration, reports the configured model without
+/// contacting anything, which is the answer a machine with no network needs
+/// rather than a failure.
+fn run_models(settings: &Settings, paths: &Paths, output: &OutputFlags) -> Result<ExitCode> {
+    if settings.offline {
         let catalog = provider_setup::catalog_for(settings);
         if output.json {
             println!("{}", serde_json::to_string_pretty(&catalog.to_json())?);

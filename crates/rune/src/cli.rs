@@ -1,9 +1,11 @@
 //! Argument parsing.
 //!
-//! Leading global flags are parsed first, then the subcommand. Parsing is done
-//! with a small hand-rolled parser rather than a derive-based framework so that
-//! the argument path adds no measurable startup cost; the specification table in
-//! [`crate::spec`] is the single source of truth for what exists.
+//! Leading global flags are parsed first, then the subcommand, then whatever
+//! follows it. A global flag means the same thing on either side of the command,
+//! and a flag after the command must be one the command declares. Parsing is
+//! done with a small hand-rolled parser rather than a derive-based framework so
+//! that the argument path adds no measurable startup cost; the specification
+//! table in [`crate::spec`] is the single source of truth for what exists.
 
 use std::ffi::OsString;
 
@@ -147,7 +149,7 @@ pub struct Launch {
     pub json: bool,
     /// Positional arguments after the command.
     pub args: Vec<String>,
-    /// Flags given after the command, as `name` or `name=value`.
+    /// Flags the command declares, given after it, with their values.
     pub flags: Vec<(String, Option<String>)>,
     /// Session resume target, when the launch resumes.
     pub resume: Option<ResumeTarget>,
@@ -206,7 +208,8 @@ pub fn parse_process() -> Result<Launch> {
 /// Parses a command line.
 ///
 /// Splits the input at the first non-flag token: everything before it is a
-/// leading global flag, everything after belongs to the command.
+/// leading global flag, and everything after belongs to the command, apart from
+/// global flags, which apply wherever they are written.
 #[allow(clippy::too_many_lines)]
 pub fn parse(args: Vec<OsString>, benchmark: bool) -> Result<Launch> {
     let tokens = to_strings(args)?;
@@ -243,81 +246,11 @@ pub fn parse(args: Vec<OsString>, benchmark: bool) -> Result<Launch> {
         if !token.starts_with('-') || token == "-" {
             break;
         }
+        if take_global(&mut launch, &tokens, &mut index)? {
+            continue;
+        }
 
         match token.as_str() {
-            "--model" => {
-                launch.model = Some(take_value(&tokens, &mut index, "--model")?);
-            }
-            "--provider" => {
-                launch.provider = Some(take_value(&tokens, &mut index, "--provider")?);
-            }
-            "--effort" => {
-                launch.effort = Some(take_value(&tokens, &mut index, "--effort")?);
-            }
-            "--permission-mode" | "--permissions" => {
-                launch.permission_mode =
-                    Some(take_value(&tokens, &mut index, "--permission-mode")?);
-            }
-            "--limit" | "--context-limit" => {
-                let raw = take_value(&tokens, &mut index, "--limit")?;
-                match raw.split_once('=') {
-                    Some((key, value)) if !key.is_empty() => {
-                        launch
-                            .limit_overrides
-                            .push((key.to_owned(), value.to_owned()));
-                    }
-                    _ => {
-                        return Err(RuneError::invalid_field(
-                            "--limit",
-                            format!("`{raw}` is not in name=value form"),
-                        )
-                        .with_hint("for example `--limit list_entries=50`"));
-                    }
-                }
-            }
-            "--add-dir" => {
-                launch
-                    .add_dirs
-                    .push(take_value(&tokens, &mut index, "--add-dir")?);
-            }
-            "--theme" => {
-                launch.theme = Some(take_value(&tokens, &mut index, "--theme")?);
-            }
-            "--provider-order" => {
-                launch.provider_order = Some(take_value(&tokens, &mut index, "--provider-order")?);
-            }
-            "--fast" => {
-                launch.fast_mode = Some(true);
-                index = index.saturating_add(1);
-            }
-            "--no-fast" => {
-                launch.fast_mode = Some(false);
-                index = index.saturating_add(1);
-            }
-            "--no-additional-dirs" => {
-                launch.no_additional_dirs = true;
-                index = index.saturating_add(1);
-            }
-            "--provider-strict" => {
-                launch.provider_strict = Some(true);
-                index = index.saturating_add(1);
-            }
-            "--no-provider-strict" => {
-                launch.provider_strict = Some(false);
-                index = index.saturating_add(1);
-            }
-            "--offline" => {
-                launch.offline = true;
-                index = index.saturating_add(1);
-            }
-            "--allow-unsandboxed" => {
-                launch.allow_unsandboxed = true;
-                index = index.saturating_add(1);
-            }
-            "--json" => {
-                launch.json = true;
-                index = index.saturating_add(1);
-            }
             "-r" | "--resume-picker" => {
                 launch.resume = Some(ResumeTarget::Picker);
                 resume_requested = true;
@@ -347,12 +280,12 @@ pub fn parse(args: Vec<OsString>, benchmark: bool) -> Result<Launch> {
             "-h" | "--help" => {
                 launch.command = Command::Help;
                 index = index.saturating_add(1);
-                return Ok(finish(launch, &tokens, index));
+                return finish(launch, &tokens, index);
             }
             "-v" | "--version" => {
                 launch.command = Command::Version;
                 index = index.saturating_add(1);
-                return Ok(finish(launch, &tokens, index));
+                return finish(launch, &tokens, index);
             }
             other if other.starts_with("--resume-") => {
                 let id = other.trim_start_matches("--resume-");
@@ -420,51 +353,195 @@ pub fn parse(args: Vec<OsString>, benchmark: bool) -> Result<Launch> {
     // `resume_requested` distinguishes an explicit resume from the default
     // interactive launch, which is used by the resume handling in a later phase.
     let _ = resume_requested;
-    Ok(finish(launch, &tokens, index))
+    finish(launch, &tokens, index)
 }
 
-/// Finishes parsing, collecting trailing flags and positionals.
-fn finish(mut launch: Launch, tokens: &[String], mut index: usize) -> Launch {
+/// Applies one flag that changes a setting for the whole process.
+///
+/// Shared by the flags before the command and the flags after it, so a flag
+/// means the same thing wherever it is written. Returns false, consuming
+/// nothing, when the token is not one of these flags. A value may follow as
+/// the next token or after an equals sign.
+fn take_global(launch: &mut Launch, tokens: &[String], index: &mut usize) -> Result<bool> {
+    let token = tokens.get(*index).cloned().unwrap_or_default();
+    let (name, inline) = match token.split_once('=') {
+        Some((name, value)) if name.starts_with("--") => (name.to_owned(), Some(value.to_owned())),
+        _ => (token.clone(), None),
+    };
+    let canonical = match name.as_str() {
+        "--permissions" => "--permission-mode",
+        "--context-limit" => "--limit",
+        other => other,
+    };
+
+    if matches!(
+        canonical,
+        "--fast"
+            | "--no-fast"
+            | "--no-additional-dirs"
+            | "--provider-strict"
+            | "--no-provider-strict"
+            | "--offline"
+            | "--allow-unsandboxed"
+            | "--json"
+    ) {
+        if inline.is_some() {
+            return Err(RuneError::invalid_field(
+                canonical,
+                format!("`{canonical}` takes no value"),
+            ));
+        }
+        match canonical {
+            "--fast" => launch.fast_mode = Some(true),
+            "--no-fast" => launch.fast_mode = Some(false),
+            "--no-additional-dirs" => launch.no_additional_dirs = true,
+            "--provider-strict" => launch.provider_strict = Some(true),
+            "--no-provider-strict" => launch.provider_strict = Some(false),
+            "--offline" => launch.offline = true,
+            "--allow-unsandboxed" => launch.allow_unsandboxed = true,
+            _ => launch.json = true,
+        }
+        *index = (*index).saturating_add(1);
+        return Ok(true);
+    }
+
+    if !matches!(
+        canonical,
+        "--model"
+            | "--provider"
+            | "--effort"
+            | "--permission-mode"
+            | "--limit"
+            | "--add-dir"
+            | "--theme"
+            | "--provider-order"
+    ) {
+        return Ok(false);
+    }
+    let value = match inline {
+        Some(value) => {
+            *index = (*index).saturating_add(1);
+            value
+        }
+        None => take_value(tokens, index, canonical)?,
+    };
+    match canonical {
+        "--model" => launch.model = Some(value),
+        "--provider" => launch.provider = Some(value),
+        "--effort" => launch.effort = Some(value),
+        "--permission-mode" => launch.permission_mode = Some(value),
+        "--add-dir" => launch.add_dirs.push(value),
+        "--theme" => launch.theme = Some(value),
+        "--provider-order" => launch.provider_order = Some(value),
+        _ => match value.split_once('=') {
+            Some((key, limit)) if !key.is_empty() => {
+                launch
+                    .limit_overrides
+                    .push((key.to_owned(), limit.to_owned()));
+            }
+            _ => {
+                return Err(RuneError::invalid_field(
+                    "--limit",
+                    format!("`{value}` is not in name=value form"),
+                )
+                .with_hint("for example `--limit list_entries=50`"));
+            }
+        },
+    }
+    Ok(true)
+}
+
+/// Finishes parsing, collecting the flags and arguments after the command.
+///
+/// A flag the command declares is kept for it, and a flag that changes a
+/// setting is applied as if it had been written before the command. Anything
+/// else is refused, because a flag that is silently ignored reads as one that
+/// worked. A bare `--` ends the flags.
+///
+/// The prompt of `ask` and the context of `review` are free text. Once that
+/// text has begun, a word that is not a flag either of them takes is part of
+/// it, so `rune ask why does ls -la fail` keeps `-la`.
+fn finish(mut launch: Launch, tokens: &[String], mut index: usize) -> Result<Launch> {
+    // Help and version print and exit, and whatever follows them is only read
+    // as the name of a command to describe.
+    let lenient = matches!(launch.command, Command::Help | Command::Version);
+    let free_text = matches!(launch.command, Command::Ask | Command::Review);
+    let declared: &[spec::FlagSpec] = spec::spec_for(launch.command).map_or(&[], |spec| spec.flags);
+    let mut text_started = false;
+
     while index < tokens.len() {
         let token = tokens.get(index).cloned().unwrap_or_default();
         if token == "--" {
             // Everything after a bare double dash is a positional argument,
             // even when it looks like a flag.
-            index = index.saturating_add(1);
-            while index < tokens.len() {
-                if let Some(value) = tokens.get(index) {
-                    launch.args.push(value.clone());
-                }
-                index = index.saturating_add(1);
-            }
+            launch
+                .args
+                .extend(tokens.iter().skip(index.saturating_add(1)).cloned());
             break;
         }
-        if let Some(rest) = token.strip_prefix("--") {
-            if let Some((key, value)) = rest.split_once('=') {
-                launch
-                    .flags
-                    .push((format!("--{key}"), Some(value.to_owned())));
-            } else {
-                // A flag whose value is a separate token is resolved here only
-                // for flags known to take a value.
-                let known_value = spec::takes_value(&format!("--{rest}"));
-                if known_value && let Some(value) = tokens.get(index.saturating_add(1)) {
-                    launch
-                        .flags
-                        .push((format!("--{rest}"), Some(value.clone())));
-                    index = index.saturating_add(2);
-                    continue;
-                }
-                launch.flags.push((format!("--{rest}"), None));
-            }
-        } else if token.starts_with('-') && token.len() > 1 {
-            launch.flags.push((token, None));
-        } else {
+        if !token.starts_with('-') || token.len() == 1 {
             launch.args.push(token);
+            text_started = free_text;
+            index = index.saturating_add(1);
+            continue;
         }
-        index = index.saturating_add(1);
+
+        let (name, inline) = match token.split_once('=') {
+            Some((name, value)) => (name.to_owned(), Some(value.to_owned())),
+            None => (token.clone(), None),
+        };
+        if let Some(flag) = declared.iter().find(|flag| flag.name == name) {
+            let mut value = inline;
+            if flag.value.is_some() && value.is_none() {
+                // The next token is the value whatever it looks like, because
+                // an identifier may itself begin with a dash.
+                index = index.saturating_add(1);
+                value = Some(tokens.get(index).cloned().ok_or_else(|| {
+                    RuneError::new(
+                        ErrorCode::MissingField,
+                        format!("`{name}` requires a value"),
+                    )
+                })?);
+            }
+            launch.flags.push((name, value));
+            index = index.saturating_add(1);
+            continue;
+        }
+        if take_global(&mut launch, tokens, &mut index)? {
+            continue;
+        }
+        if text_started || lenient {
+            launch.args.push(token);
+            index = index.saturating_add(1);
+            continue;
+        }
+        if matches!(name.as_str(), "-h" | "--help") {
+            launch.args = vec![launch.command.as_str().to_owned()];
+            launch.command = Command::Help;
+            return Ok(launch);
+        }
+        return Err(undeclared_flag(&token, launch.command));
     }
-    launch
+    Ok(launch)
+}
+
+/// Builds the error for a flag the command does not take.
+fn undeclared_flag(raw: &str, command: Command) -> RuneError {
+    let Some(spec) = spec::spec_for(command) else {
+        return unknown_flag(raw);
+    };
+    let name = spec.name;
+    let err = RuneError::new(
+        ErrorCode::InvalidField,
+        format!("`{raw}` is not a flag of `rune {name}`"),
+    );
+    if matches!(command, Command::Ask | Command::Review) {
+        err.with_hint(format!(
+            "run `rune help {name}` for its flags, or put `--` before text that starts with a dash"
+        ))
+    } else {
+        err.with_hint(format!("run `rune help {name}` for its flags"))
+    }
 }
 
 /// Classifies a resume argument as the latest session or an exact identifier.
@@ -801,6 +878,98 @@ mod tests {
     fn double_dash_stops_flag_parsing() {
         let launch = parse_list(&["ask", "--", "--not-a-flag"]).expect("parse");
         assert_eq!(launch.args, vec!["--not-a-flag".to_owned()]);
+    }
+
+    #[test]
+    fn global_flags_after_the_command_are_applied() {
+        // These used to be collected for the command and never read, so
+        // `rune ask --offline hi` went to the network and `--model` after the
+        // command was reported as no model selected.
+        let launch = parse_list(&["ask", "--offline", "--model", "m", "--effort=high", "hi"])
+            .expect("parse");
+        assert_eq!(launch.command, Command::Ask);
+        assert!(launch.offline);
+        assert_eq!(launch.model.as_deref(), Some("m"));
+        assert_eq!(launch.effort.as_deref(), Some("high"));
+        assert_eq!(launch.args, vec!["hi".to_owned()]);
+
+        let launch = parse_list(&["limits", "--limit", "max_agent_steps=5"]).expect("parse");
+        assert_eq!(
+            launch.limit_overrides,
+            vec![("max_agent_steps".to_owned(), "5".to_owned())]
+        );
+        assert!(parse_list(&["models", "--offline"]).expect("parse").offline);
+    }
+
+    #[test]
+    fn every_global_setting_flag_is_accepted_after_a_command() {
+        for flag in spec::GLOBAL_FLAGS {
+            if flag.name.starts_with("-h") || flag.name.starts_with("-v") {
+                continue;
+            }
+            let mut list = vec!["status", flag.name];
+            if flag.value.is_some() {
+                list.push(if flag.name == "--limit" {
+                    "list_entries=5"
+                } else {
+                    "value"
+                });
+            }
+            let parsed = parse_list(&list);
+            assert!(parsed.is_ok(), "{} was refused: {parsed:?}", flag.name);
+        }
+    }
+
+    #[test]
+    fn a_flag_the_command_does_not_take_is_refused() {
+        let err = parse_list(&["models", "--nonsense"]).expect_err("refused");
+        assert_eq!(err.code(), ErrorCode::InvalidField);
+        assert!(err.message().contains("--nonsense"), "{}", err.message());
+        assert!(err.message().contains("rune models"), "{}", err.message());
+        assert!(
+            err.hint()
+                .is_some_and(|hint| hint.contains("rune help models")),
+            "{:?}",
+            err.hint()
+        );
+    }
+
+    #[test]
+    fn a_command_flag_is_not_taken_for_a_global_one() {
+        // `sessions` has its own `--limit`, a page size, which is not the
+        // global limit override.
+        let launch = parse_list(&["sessions", "--limit", "20"]).expect("parse");
+        assert_eq!(launch.flag("--limit"), Some("20"));
+        assert!(launch.limit_overrides.is_empty());
+    }
+
+    #[test]
+    fn a_prompt_keeps_words_that_start_with_a_dash() {
+        let launch = parse_list(&["ask", "why", "does", "ls", "-la", "fail"]).expect("parse");
+        assert_eq!(launch.args.join(" "), "why does ls -la fail");
+        // A flag written after the prompt is still a flag.
+        let launch = parse_list(&["ask", "hi", "--offline"]).expect("parse");
+        assert!(launch.offline);
+        assert_eq!(launch.args, vec!["hi".to_owned()]);
+    }
+
+    #[test]
+    fn a_dash_before_the_prompt_is_refused_unless_flags_are_ended() {
+        let err = parse_list(&["ask", "-la", "is", "a", "flag"]).expect_err("refused");
+        assert!(
+            err.hint().is_some_and(|hint| hint.contains("--")),
+            "{:?}",
+            err.hint()
+        );
+        let launch = parse_list(&["ask", "--", "-la", "is", "a", "flag"]).expect("parse");
+        assert_eq!(launch.args.join(" "), "-la is a flag");
+    }
+
+    #[test]
+    fn help_after_a_command_describes_that_command() {
+        let launch = parse_list(&["ask", "--help"]).expect("parse");
+        assert_eq!(launch.command, Command::Help);
+        assert_eq!(launch.args, vec!["ask".to_owned()]);
     }
 
     #[test]

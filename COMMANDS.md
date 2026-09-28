@@ -36,10 +36,6 @@ Run one request without an interactive session
 |---|---|
 | `--json` | Print one JSON object instead of Markdown. |
 | `--no-save` | Do not create a session. |
-| `--image <path>` | Attach an image. Repeatable. |
-| `--max-steps <n>` | Limit model steps for this run. |
-| `--timeout <secs>` | Fail the run after this long. |
-| `--prompt-permissions` | Prompt for approval. Requires a terminal. |
 ### `rune acp [--log-file <path>]`
 
 Serve the Agent Client Protocol over standard input and output

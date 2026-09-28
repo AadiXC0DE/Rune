@@ -95,7 +95,7 @@ const fn option(name: &'static str, value: &'static str, description: &'static s
     }
 }
 
-/// Global flags accepted before any command.
+/// Global flags, accepted before or after the command.
 pub const GLOBAL_FLAGS: &[FlagSpec] = &[
     option("--model", "id", "Override the model for this process."),
     option(
@@ -162,13 +162,6 @@ pub const RUN: &[CommandSpec] = &[
         flags: &[
             flag("--json", "Print one JSON object instead of Markdown."),
             flag("--no-save", "Do not create a session."),
-            option("--image", "path", "Attach an image. Repeatable."),
-            option("--max-steps", "n", "Limit model steps for this run."),
-            option("--timeout", "secs", "Fail the run after this long."),
-            flag(
-                "--prompt-permissions",
-                "Prompt for approval. Requires a terminal.",
-            ),
         ],
         requirements: Requirements::FULL,
         supports_json: true,
@@ -462,20 +455,6 @@ pub fn find(name: &str) -> Option<&'static CommandSpec> {
 #[must_use]
 pub fn spec_for(command: Command) -> Option<&'static CommandSpec> {
     find(command.as_str())
-}
-
-/// Returns true when a flag takes a value.
-///
-/// Read from the same table the parser and the reference use, so a flag declared
-/// to take a value cannot be parsed as a boolean and silently swallow nothing.
-/// A flag that is genuine but undeclared here is treated as a boolean, which is
-/// the safe reading: it consumes no argument that belongs to the command.
-#[must_use]
-pub fn takes_value(name: &str) -> bool {
-    GLOBAL_FLAGS
-        .iter()
-        .chain(all_commands().iter().flat_map(|spec| spec.flags.iter()))
-        .any(|flag| flag.name == name && flag.value.is_some())
 }
 
 #[cfg(test)]
