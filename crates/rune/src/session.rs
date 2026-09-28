@@ -221,12 +221,14 @@ struct SessionHost {
     /// covering both steps, one frame's bytes can land inside another's and the
     /// screen shows a mix of two.
     frame: Mutex<()>,
-    /// The line being typed while a turn runs.
+    /// The line being typed while a turn runs, with the caret's display column.
     ///
     /// Held on the host because the streaming thread redraws the whole frame
     /// for every token, and a frame drawn without this would put an empty
-    /// prompt over the correction the user is halfway through typing.
-    typed: Mutex<String>,
+    /// prompt over the correction the user is halfway through typing. The
+    /// column is the reader's rather than one worked out from the text, because
+    /// the caret may be mid-line and a wide character takes two columns.
+    typed: Mutex<(String, usize)>,
     /// Ordered upstream provider preference.
     provider_order: Vec<String>,
     /// Whether requests are restricted to that preference.
@@ -767,10 +769,9 @@ impl SessionHost {
 
     /// Returns the line being typed and the caret's column within it.
     fn typed_line(&self) -> (String, usize) {
-        self.typed.lock().map_or_else(
-            |_| (String::new(), 0),
-            |line| (line.clone(), line.chars().count()),
-        )
+        self.typed
+            .lock()
+            .map_or_else(|_| (String::new(), 0), |typed| typed.clone())
     }
 
     /// Draws one frame: the arriving text, a notice, and the line being typed.
@@ -783,7 +784,8 @@ impl SessionHost {
     /// `notice` is drawn as the activity line, above the input.
     fn draw_frame(&self, notice: Option<&str>, line: &str, column: usize) {
         if let Ok(mut typed) = self.typed.lock() {
-            line.clone_into(&mut typed);
+            line.clone_into(&mut typed.0);
+            typed.1 = column;
         }
         let rows = self.streaming_rows();
         // One lock across painting and writing, so a frame from one thread
@@ -791,9 +793,9 @@ impl SessionHost {
         let Ok(_frame) = self.frame.lock() else {
             return;
         };
-        if rows.is_empty() && line.is_empty() && notice.is_none() {
-            return;
-        }
+        // Even a frame with nothing in it is painted, because the one before it
+        // may have shown a line or a notice that has to be taken off the screen.
+        // A frame that changes nothing costs only a caret move.
         let marker = rune_term::shell::prompt();
         let width = usize::from(self.width());
         let prompt_row = transcript::render_prompt(marker, line, width);
@@ -992,7 +994,7 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
         height: std::sync::atomic::AtomicU16::new(terminal_height()),
         inline: Mutex::new(rune_term::inline::Inline::new(terminal_width())),
         frame: Mutex::new(()),
-        typed: Mutex::new(String::new()),
+        typed: Mutex::new((String::new(), 0)),
         provider_order: config.settings.provider_order.clone(),
         provider_strict: config.settings.provider_strict,
         streaming: Arc::new(Mutex::new(StreamingText::default())),
@@ -1391,7 +1393,7 @@ fn run_turn_steerable(
     // The host's copy of the typed line is what every streamed frame draws, so
     // it starts from the reader's line rather than whatever the last turn left.
     if let Ok(mut typed) = host.typed.lock() {
-        reader.line().clone_into(&mut typed);
+        *typed = (reader.line().to_owned(), reader.column());
     }
     let mut submitted: Vec<String> = Vec::new();
 
@@ -1557,7 +1559,7 @@ fn close_turn(
     let prompt_row = transcript::render_prompt(marker, reader.line(), usize::from(host.width()));
     let caret = rune_term::width::str_width(marker).saturating_add(reader.column());
     if let Ok(mut typed) = host.typed.lock() {
-        reader.line().clone_into(&mut typed);
+        *typed = (reader.line().to_owned(), reader.column());
     }
     let painted = host.paint(
         lines,
@@ -3050,6 +3052,63 @@ mod tests {
         assert!(
             written.contains("streamed"),
             "the delta was not drawn when it arrived: {written:?}"
+        );
+    }
+
+    /// Returns the one-based column of the last caret move in a frame.
+    fn last_caret_column(bytes: &[u8]) -> Option<usize> {
+        let text = String::from_utf8_lossy(bytes);
+        let end = text.rfind('G')?;
+        let start = text.get(..end)?.rfind("\u{1b}[")?.saturating_add(2);
+        text.get(start..end)?.parse().ok()
+    }
+
+    #[test]
+    fn a_delta_keeps_the_caret_where_the_reader_left_it() {
+        // The streaming path placed the caret at the character count of the
+        // line, so a caret moved back into the line, or after a wide character,
+        // jumped on every token.
+        let sink: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+        let host = test_host();
+        if let Ok(mut slot) = host.live_out.lock() {
+            *slot = Some(Arc::new(Mutex::new(SharedSink(Arc::clone(&sink)))));
+        }
+        let marker = rune_term::width::str_width(rune_term::shell::prompt());
+
+        for (line, column) in [("abcd", 1), ("書書", 4)] {
+            host.draw_stream_with(line, column);
+            sink.lock().expect("lock").clear();
+            host.emit(Event::TextDelta {
+                delta: "token ".to_owned(),
+            });
+            let drawn = sink.lock().expect("lock").clone();
+            assert_eq!(
+                last_caret_column(&drawn),
+                Some(marker + column + 1),
+                "the caret moved for {line:?}: {:?}",
+                String::from_utf8_lossy(&drawn)
+            );
+        }
+    }
+
+    #[test]
+    fn clearing_the_line_before_anything_streams_takes_it_off_the_screen() {
+        // With nothing streamed yet and no notice, the frame for an emptied
+        // line was skipped, so the text that was cleared stayed on screen.
+        let sink: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+        let host = test_host();
+        if let Ok(mut slot) = host.live_out.lock() {
+            *slot = Some(Arc::new(Mutex::new(SharedSink(Arc::clone(&sink)))));
+        }
+        host.draw_stream_with("half a correction", 17);
+        host.draw_stream_with("", 0);
+
+        let mut grid = rune_term::Grid::new(80, 24).expect("grid");
+        grid.feed(&sink.lock().expect("lock")).expect("feed");
+        let screen = grid.text();
+        assert!(
+            !screen.contains("half a correction"),
+            "the cleared line is still on screen:\n{screen}"
         );
     }
 
@@ -4755,7 +4814,7 @@ mod tests {
             height: std::sync::atomic::AtomicU16::new(24),
             inline: Mutex::new(rune_term::inline::Inline::new(80)),
             frame: Mutex::new(()),
-            typed: Mutex::new(String::new()),
+            typed: Mutex::new((String::new(), 0)),
             provider_order: Vec::new(),
             provider_strict: false,
             streaming: Arc::new(Mutex::new(StreamingText::default())),
