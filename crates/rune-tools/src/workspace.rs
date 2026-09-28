@@ -103,6 +103,12 @@ impl Default for FileLimits {
 /// directory, and a relative escape such as `../sibling`. A relative path is
 /// resolved against the primary workspace root, never against the process
 /// working directory, so a call means the same thing in every process.
+///
+/// Containment is decided on where the path leads rather than on how it is
+/// spelled. A tool opens the path and the file system follows every link in
+/// it, so `link/secret` is outside the workspace when `link` points outside,
+/// however the name reads. The path returned is still the spelled one, which
+/// is what a result shows the model.
 pub fn resolve(context: &ExecutionContext, raw: &str) -> Result<ResolvedPath> {
     if raw.is_empty() {
         return Err(RuneError::invalid_field("path", "path is empty"));
@@ -130,7 +136,23 @@ pub fn resolve(context: &ExecutionContext, raw: &str) -> Result<ResolvedPath> {
         normalize(&absolute(context.workspace()).join(candidate))
     };
     let permitted = roots(context);
-    if permitted.iter().any(|root| contains(root, &path)) {
+    let real = match real_path(&path) {
+        Ok(real) => real,
+        Err(_) if context.external_access => {
+            return Ok(ResolvedPath {
+                path,
+                external: true,
+            });
+        }
+        Err(err) => return Err(err.with_observed(raw)),
+    };
+    let inside = permitted.iter().any(|root| {
+        // A root that cannot be resolved is compared as spelled, which can
+        // only narrow what it admits.
+        let root = real_path(root).unwrap_or_else(|_| root.clone());
+        contains(&root, &real)
+    });
+    if inside {
         return Ok(ResolvedPath {
             path,
             external: false,
@@ -148,13 +170,60 @@ pub fn resolve(context: &ExecutionContext, raw: &str) -> Result<ResolvedPath> {
         .map(|root| display_separators(root.as_str()))
         .collect::<Vec<_>>()
         .join(", ");
-    Err(RuneError::new(
-        ErrorCode::PathOutsideWorkspace,
-        format!("`{raw}` resolves to `{path}`, outside every permitted root"),
-    )
-    .with_observed(raw)
-    .with_invariant("path_inside_roots")
-    .with_hint(format!("permitted roots are {names}")))
+    let message = if permitted.iter().any(|root| contains(root, &path)) {
+        format!("`{raw}` leads through a link to `{real}`, outside every permitted root")
+    } else {
+        format!("`{raw}` resolves to `{path}`, outside every permitted root")
+    };
+    Err(RuneError::new(ErrorCode::PathOutsideWorkspace, message)
+        .with_observed(raw)
+        .with_invariant("path_inside_roots")
+        .with_hint(format!("permitted roots are {names}")))
+}
+
+/// Returns where a normalised path leads once every link in it is followed.
+///
+/// The nearest ancestor that exists is resolved by the file system and the
+/// rest is appended as written. The rest holds no `..`, because the path was
+/// normalised first, and a name that does not exist cannot be a link, so the
+/// result is where a file created at the path would land.
+///
+/// A platform that cannot resolve links has none to follow, so the path is
+/// already where it leads. That is the case on WASI, whose file system reports
+/// resolution as unsupported rather than answering it.
+fn real_path(path: &Utf8Path) -> Result<Utf8PathBuf> {
+    if cfg!(target_os = "wasi") {
+        return Ok(path.to_owned());
+    }
+    for ancestor in path.ancestors() {
+        match ancestor.canonicalize_utf8() {
+            Ok(real) => {
+                let rest = path.strip_prefix(ancestor).unwrap_or(Utf8Path::new(""));
+                return Ok(if rest.as_str().is_empty() {
+                    real
+                } else {
+                    real.join(rest)
+                });
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::Unsupported => {
+                return Ok(path.to_owned());
+            }
+            // A link whose target is missing still decides where a file
+            // created through it lands, and that place cannot be checked.
+            Err(_)
+                if std::fs::symlink_metadata(ancestor)
+                    .is_ok_and(|metadata| metadata.file_type().is_symlink()) =>
+            {
+                return Err(RuneError::new(
+                    ErrorCode::UnsafePath,
+                    format!("`{ancestor}` is a link whose target cannot be resolved"),
+                )
+                .with_invariant("path_inside_roots"));
+            }
+            Err(_) => {}
+        }
+    }
+    Ok(path.to_owned())
 }
 
 /// Returns the primary workspace root as a resolved path.
@@ -766,6 +835,106 @@ mod tests {
         let context = repo.context().with_root(extra.clone());
         let resolved = resolve(&context, extra.join("untracked.txt").as_str()).expect("resolve");
         assert!(!resolved.external);
+    }
+
+    /// Returns a directory outside the fixture holding `secret.txt`.
+    #[cfg(unix)]
+    fn outside() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("temp dir");
+        std::fs::write(dir.path().join("secret.txt"), "needle outside\n").expect("write");
+        dir
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_link_that_leads_outside_every_root_is_refused() {
+        let repo = Repo::new();
+        let elsewhere = outside();
+        std::os::unix::fs::symlink(elsewhere.path(), repo.path().join("link")).expect("symlink");
+        let context = repo.context();
+
+        for raw in [
+            "link",
+            "link/secret.txt",
+            "link/new.txt",
+            "link/deeper/new.txt",
+        ] {
+            let err = resolve(&context, raw).expect_err("refused");
+            assert_eq!(err.code(), ErrorCode::PathOutsideWorkspace, "{raw}");
+            assert!(err.message().contains("link"), "{}", err.message());
+        }
+
+        let granted = context.with_external_access(true);
+        let resolved = resolve(&granted, "link/secret.txt").expect("resolve");
+        assert!(resolved.external);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_link_that_stays_inside_the_workspace_is_permitted() {
+        let repo = Repo::new();
+        std::os::unix::fs::symlink(repo.path().join("src"), repo.path().join("alias"))
+            .expect("symlink");
+        let resolved = resolve(&repo.context(), "alias/main.rs").expect("resolve");
+        assert!(!resolved.external);
+        assert_eq!(resolved.path, repo.path().join("alias/main.rs"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_root_named_through_a_link_admits_the_place_it_leads_to() {
+        let repo = Repo::new();
+        let holder = tempfile::tempdir().expect("temp dir");
+        let named = Utf8Path::from_path(holder.path())
+            .expect("a UTF-8 temporary path")
+            .join("named");
+        std::os::unix::fs::symlink(repo.path(), &named).expect("symlink");
+        let context = ExecutionContext::new(named);
+
+        let real = repo
+            .path()
+            .canonicalize_utf8()
+            .expect("resolved")
+            .join("README.md");
+        let resolved = resolve(&context, real.as_str()).expect("resolve");
+        assert!(!resolved.external);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_link_whose_target_is_missing_is_refused() {
+        let repo = Repo::new();
+        std::os::unix::fs::symlink(
+            "/nonexistent-rune-link-target/dir",
+            repo.path().join("dangling"),
+        )
+        .expect("symlink");
+        let err = resolve(&repo.context(), "dangling/new.txt").expect_err("refused");
+        assert_eq!(err.code(), ErrorCode::UnsafePath);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_walk_does_not_follow_a_link_that_leads_outside() {
+        let repo = Repo::new();
+        let elsewhere = outside();
+        std::os::unix::fs::symlink(elsewhere.path(), repo.path().join("up")).expect("symlink");
+        std::os::unix::fs::symlink(
+            elsewhere.path().join("secret.txt"),
+            repo.path().join("secret-link.txt"),
+        )
+        .expect("symlink");
+
+        let walker = Walker::new(repo.path(), FileLimits::default().walk_files).expect("walker");
+        let found = walker
+            .map(|entry| display_separators(entry.relative.as_str()))
+            .collect::<Vec<_>>();
+        assert!(found.contains(&"README.md".to_owned()), "{found:?}");
+        assert!(
+            !found.iter().any(|path| path.starts_with("up")),
+            "{found:?}"
+        );
+        assert!(!found.contains(&"secret-link.txt".to_owned()), "{found:?}");
     }
 
     #[test]

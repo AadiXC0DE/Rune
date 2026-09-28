@@ -402,6 +402,24 @@ mod tests {
         bytes
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn a_file_reached_through_a_link_that_leads_outside_is_refused() {
+        let repo = Repo::new();
+        let elsewhere = tempfile::tempdir().expect("temp dir");
+        std::fs::write(elsewhere.path().join("secret.txt"), "confidential\n").expect("write");
+        std::os::unix::fs::symlink(elsewhere.path(), repo.path().join("link")).expect("symlink");
+
+        let err = ReadFile::default()
+            .call(
+                &serde_json::json!({ "path": "link/secret.txt" }),
+                &repo.context(),
+            )
+            .expect_err("refused");
+        assert_eq!(err.code(), ErrorCode::PathOutsideWorkspace);
+        assert!(!err.message().contains("confidential"), "{}", err.message());
+    }
+
     #[test]
     fn lines_are_numbered_from_one() {
         let repo = Repo::new();

@@ -1792,6 +1792,23 @@ mod tests {
         assert!(shows_path(&observed, &parent), "{observed}");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn a_cwd_reached_through_a_link_that_leads_outside_is_refused() {
+        let tool = Shell::default();
+        let (dir, context) = workspace();
+        let elsewhere = tempfile::tempdir().expect("a temporary directory");
+        std::os::unix::fs::symlink(elsewhere.path(), dir.path().join("link")).expect("a link");
+        let err = tool
+            .call(
+                &serde_json::json!({ "action": "run", "command": print_cwd(), "cwd": "link" }),
+                &context,
+            )
+            .expect_err("the directory is outside the workspace");
+        assert_eq!(err.code(), ErrorCode::PathOutsideWorkspace);
+        assert_eq!(tool.live_sessions(), 0);
+    }
+
     #[test]
     fn a_cwd_inside_the_workspace_is_used() {
         let tool = Shell::default();

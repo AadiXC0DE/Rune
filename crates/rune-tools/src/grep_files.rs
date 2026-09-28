@@ -575,6 +575,29 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn a_search_never_reaches_through_a_link_that_leads_outside() {
+        let repo = Repo::new();
+        let elsewhere = tempfile::tempdir().expect("temp dir");
+        std::fs::write(elsewhere.path().join("secret.txt"), "needle outside\n").expect("write");
+        std::os::unix::fs::symlink(elsewhere.path(), repo.path().join("up")).expect("symlink");
+
+        let err = GrepFiles::default()
+            .call(
+                &serde_json::json!({ "pattern": "needle", "path": "up" }),
+                &repo.context(),
+            )
+            .expect_err("refused");
+        assert_eq!(err.code(), ErrorCode::PathOutsideWorkspace);
+
+        let whole = GrepFiles::default()
+            .call(&serde_json::json!({ "pattern": "needle" }), &repo.context())
+            .expect("call");
+        assert!(!whole.text.contains("needle outside"), "{}", whole.text);
+        assert!(whole.text.contains("README.md"), "{}", whole.text);
+    }
+
     #[test]
     fn the_pattern_is_literal_and_the_result_says_so() {
         let repo = Repo::new();
