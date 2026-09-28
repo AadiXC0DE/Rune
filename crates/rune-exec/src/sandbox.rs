@@ -1054,6 +1054,7 @@ mod tests {
     /// file, which exercises both the subpath and the literal rule without the
     /// test restating which credential is which. The exact kinds are not what is
     /// under test; the rule that is emitted for each is.
+    #[cfg(target_os = "macos")]
     fn credential_home() -> (TempDir, Utf8PathBuf) {
         let (dir, home) = tempdir();
         for relative in CREDENTIAL_PATHS {
@@ -1070,11 +1071,13 @@ mod tests {
     }
 
     /// Returns a profile over a fixture home rather than this process's own.
+    #[cfg(target_os = "macos")]
     fn profile_for(home: &Utf8Path, workspace: &Utf8Path) -> String {
         MacSandbox::profile_with(&policy(workspace), &credential_paths_under(home))
             .expect("profile")
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn a_profile_denies_reads_of_the_credential_locations() {
         let (_home_guard, home) = credential_home();
@@ -1115,6 +1118,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn a_credential_rule_names_the_resolved_path() {
         // A Seatbelt rule matches the path the kernel evaluates, so a rule about
