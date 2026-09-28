@@ -3205,9 +3205,16 @@ mod tests {
         .expect("write");
 
         let prompt = build_prompt(root, root, &BudgetSet::new());
-        assert_eq!(prompt.instructions, "You are a terse reviewer.");
+        // The skills installed for this user may follow the override, so the
+        // check is on what the prompt opens with rather than on all of it.
         assert!(
-            !prompt.instructions.contains("coding agent"),
+            prompt.instructions.starts_with("You are a terse reviewer."),
+            "{}",
+            prompt.instructions
+        );
+        let built_in = prompt::SYSTEM_PROMPT.lines().next().unwrap_or_default();
+        assert!(
+            !prompt.instructions.contains(built_in),
             "the built-in text was kept alongside the override"
         );
     }

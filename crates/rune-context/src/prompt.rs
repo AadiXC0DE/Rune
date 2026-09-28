@@ -290,8 +290,24 @@ pub fn instructions_for(
     config_root: &Utf8Path,
     limits: &BudgetSet,
 ) -> String {
-    let skills = crate::skills::discover(workspace, None, config_root).unwrap_or_default();
-    let project = crate::instructions::discover(workspace, None).unwrap_or_default();
+    let home = rune_core::paths::home_directory();
+    instructions_under(workspace, home.as_deref(), config_root, limits)
+}
+
+/// Builds the system instructions with an explicit home directory.
+///
+/// The home directory bounds the upward walk for ancestor instruction files and
+/// skill roots, and holds the user skill roots, so without it neither is read.
+fn instructions_under(
+    workspace: &Utf8Path,
+    home: Option<&Utf8Path>,
+    config_root: &Utf8Path,
+    limits: &BudgetSet,
+) -> String {
+    let skills = crate::skills::discover(workspace, home, config_root).unwrap_or_default();
+    let project = crate::instructions::Options::new(workspace, home, config_root)
+        .discover()
+        .unwrap_or_default();
     let override_text = read_override(config_root);
     let system = override_text.as_deref().unwrap_or(SYSTEM_PROMPT);
 
@@ -624,6 +640,40 @@ mod tests {
             prompt.byte_len(),
             "system text".len() + 2 + "guidance text".len()
         );
+    }
+
+    #[test]
+    fn ancestor_instructions_and_user_skills_below_the_home_directory_are_read() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).expect("utf8 tempdir");
+        let home = root.join("home");
+        let repository = home.join("repo");
+        let workspace = repository.join("src");
+        let skill = home.join(".claude").join("skills").join("user-skill");
+        std::fs::create_dir_all(&workspace).expect("create workspace");
+        std::fs::create_dir_all(&skill).expect("create skill");
+        std::fs::write(repository.join("AGENTS.md"), "repository rules\n").expect("write");
+        std::fs::write(home.join("AGENTS.md"), "home rules\n").expect("write");
+        std::fs::write(root.join("AGENTS.md"), "rules above home\n").expect("write");
+        std::fs::write(
+            skill.join("SKILL.md"),
+            "---\nname: user-skill\ndescription: from the home directory\n---\n",
+        )
+        .expect("write");
+
+        let text = instructions_under(
+            &workspace,
+            Some(&home),
+            &root.join("config"),
+            &BudgetSet::new(),
+        );
+
+        assert!(text.contains("repository rules"), "{text}");
+        assert!(text.contains("user-skill"), "{text}");
+        // The walk stops below the home directory, so neither the home
+        // directory nor anything above it contributes.
+        assert!(!text.contains("home rules"), "{text}");
+        assert!(!text.contains("rules above home"), "{text}");
     }
 
     #[test]
