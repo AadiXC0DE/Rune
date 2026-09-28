@@ -437,8 +437,14 @@ pub fn apply(prepared: Prepared) -> Result<Applied> {
     let (staged, mut file) = create_stage(&directory)?;
     let mut guard = StageGuard::new(staged.clone());
     if let Some(permissions) = permissions {
-        file.set_permissions(permissions)
-            .map_err(|err| io_error(&staged, &err))?;
+        // A filesystem with no permission bits, such as WASI's, has nothing to
+        // carry over, and refusing the write for that would refuse every one.
+        match file.set_permissions(permissions) {
+            Err(err) if err.kind() != ErrorKind::Unsupported => {
+                return Err(io_error(&staged, &err));
+            }
+            _ => {}
+        }
     }
     file.write_all(&postimage)
         .map_err(|err| io_error(&staged, &err))?;
@@ -618,11 +624,24 @@ fn stage_name(directory: &Utf8Path) -> Utf8PathBuf {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_nanos());
-    let name = format!(
-        "{STAGE_PREFIX}{:x}-{nanos:x}-{sequence:x}",
-        std::process::id()
-    );
+    let name = format!("{STAGE_PREFIX}{:x}-{nanos:x}-{sequence:x}", process_id());
     directory.join(name)
+}
+
+/// Returns this process's identifier, or zero where there are no processes.
+///
+/// WebAssembly has no process to name and the standard library panics when
+/// asked for one. The counter and the clock still keep names apart there, and
+/// only one module writes to its filesystem.
+fn process_id() -> u32 {
+    #[cfg(target_family = "wasm")]
+    {
+        0
+    }
+    #[cfg(not(target_family = "wasm"))]
+    {
+        std::process::id()
+    }
 }
 
 /// Flushes the directory entry so the rename survives a crash.

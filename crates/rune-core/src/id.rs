@@ -54,6 +54,8 @@ impl SessionId {
     fn fallback() -> Self {
         use std::hash::{Hash as _, Hasher as _};
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        // WebAssembly has no process identifier, and asking for one panics.
+        #[cfg(not(target_family = "wasm"))]
         std::process::id().hash(&mut hasher);
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
