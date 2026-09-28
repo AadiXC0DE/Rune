@@ -471,6 +471,7 @@ mod tests {
                 handle,
                 status: 200,
                 content_type: String::from("text/event-stream"),
+                retry_after: None,
             })
         }
 

@@ -27,6 +27,9 @@ pub struct Head {
     /// Media type, parameters included.
     #[serde(default)]
     pub content_type: String,
+    /// The `retry-after` header, when the page could read it.
+    #[serde(default)]
+    pub retry_after: Option<String>,
 }
 
 /// What a command produced in the page's shell.
@@ -100,6 +103,7 @@ impl Fetch for BridgeFetch {
             } else {
                 head.content_type
             },
+            retry_after: head.retry_after,
             body: Box::new(BridgeBody {
                 bridge: Arc::clone(&self.bridge),
                 handle: head.handle,
