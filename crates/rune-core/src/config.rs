@@ -739,8 +739,14 @@ impl EnvironmentOverrides {
     ///
     /// Exists so tests can exercise the mapping without touching the process
     /// environment, which is not thread safe to mutate.
+    ///
+    /// A variable set to nothing, or to only whitespace, is read as unset, which
+    /// is how a shell user clears one with `NAME=`. Read as a value, an empty
+    /// `RUNE_PROVIDER` would select a provider with no name that counts as
+    /// connected.
     #[must_use]
     pub fn from_lookup(mut lookup: impl FnMut(&str) -> Option<String>) -> Self {
+        let mut lookup = move |key: &str| lookup(key).filter(|value| !value.trim().is_empty());
         let boolean = |lookup: &mut dyn FnMut(&str) -> Option<String>, key: &str| {
             lookup(key).and_then(|value| parse_bool(&value))
         };
@@ -1775,6 +1781,28 @@ theme_unused = "x"
         assert_eq!(env.fast_mode, Some(true));
         assert_eq!(env.additional_directories.len(), 2);
         assert_eq!(env.limits.len(), 2);
+    }
+
+    #[test]
+    fn an_empty_variable_is_read_as_unset() {
+        let vars = std::collections::HashMap::from([
+            ("RUNE_PROVIDER", ""),
+            ("RUNE_MODEL", "  "),
+            ("RUNE_BASE_URL", ""),
+            ("RUNE_THEME", ""),
+            ("RUNE_REVIEW_MODEL", ""),
+        ]);
+        let env = EnvironmentOverrides::from_lookup(|key| vars.get(key).map(|v| (*v).to_owned()));
+        assert!(env.provider.is_none());
+        assert!(env.model.is_none());
+        assert!(env.base_url.is_none());
+
+        let settings = load(None, None, &env);
+        assert!(!settings.provider.is_configured(), "{}", settings.provider);
+        assert_eq!(settings.source_of("provider"), Layer::Default);
+        assert!(settings.base_url.is_none());
+        assert!(settings.theme.is_none());
+        assert!(settings.review_model.is_none());
     }
 
     #[test]
