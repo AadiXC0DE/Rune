@@ -517,7 +517,8 @@ impl Drop for Process {
     fn drop(&mut self) {
         // A dropped handle has nobody left to read a graceful exit, and a
         // leaked handle would leave a command running forever, so the group is
-        // ended outright rather than asked politely.
+        // ended outright rather than asked politely. A leader that has already
+        // exited took its group with it, so only a running one is left here.
         if self.is_running() {
             self.terminate(true);
         }
@@ -584,6 +585,14 @@ fn spawn_waiter(inner: Arc<Inner>) -> io::Result<()> {
                 return;
             };
             let exit = child.wait().map_or(Exit::Unknown, classify);
+            // What the command left behind, such as `server &`, has nothing
+            // left to stop it once the leader is gone, so the group is ended
+            // now rather than at some later drop. Now is also when the id is
+            // safe to signal: a group id stays taken while any member lives,
+            // and a process id stays taken while its handle is open, which is
+            // why the child is released only afterwards.
+            signal_group(inner.group, FORCE_SIGNAL);
+            drop(child);
             *lock(&inner.exit) = Some(exit);
         })?;
     Ok(())
@@ -932,6 +941,27 @@ mod tests {
             Process::start(&exit_with(0), None, CAPTURE_BYTES, Input::Closed).expect("start");
         let _ = exit_of(&process);
         assert!(process.terminate(false));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_background_child_ends_when_its_shell_exits() {
+        let child;
+        {
+            let process = Process::start("sleep 30 & echo $!", None, CAPTURE_BYTES, Input::Closed)
+                .expect("start");
+            assert!(
+                wait_until(|| forked_child(&process).is_some(), Duration::from_secs(10)),
+                "the shell did not report the child it forked"
+            );
+            child = forked_child(&process).expect("a forked pid");
+            assert_eq!(exit_of(&process), Exit::Code(0));
+            assert!(
+                wait_until(|| !alive(&child), Duration::from_secs(10)),
+                "the background child outlived the shell that started it"
+            );
+        }
+        assert!(!alive(&child));
     }
 
     #[cfg(unix)]
