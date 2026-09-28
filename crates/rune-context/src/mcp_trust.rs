@@ -430,7 +430,10 @@ pub fn parse_project_file(text: &str, path: &Utf8Path) -> Result<Vec<ProjectServ
         let object = entry.as_object().ok_or_else(|| {
             RuneError::invalid_field("mcpServers", format!("`{name}` in {path} is not an object"))
         })?;
+        // Collected apart and joined afterwards, because the object keeps the
+        // order the file wrote its keys in, and `args` may come first.
         let mut command = Vec::new();
+        let mut args = Vec::new();
         let mut environment = std::collections::BTreeMap::new();
         let mut headers = std::collections::BTreeMap::new();
         let (mut has_command, mut has_url) = (false, false);
@@ -441,7 +444,7 @@ pub fn parse_project_file(text: &str, path: &Utf8Path) -> Result<Vec<ProjectServ
                     command = string_list(value, path, name)?;
                 }
                 "args" => {
-                    command.extend(string_list(value, path, name)?);
+                    args = string_list(value, path, name)?;
                 }
                 "env" | "environment" => {
                     environment = string_map(value, path, name)?;
@@ -466,6 +469,7 @@ pub fn parse_project_file(text: &str, path: &Utf8Path) -> Result<Vec<ProjectServ
                 format!("`{name}` in {path} declares neither `command` nor `url`"),
             ));
         }
+        command.extend(args);
         out.push(ProjectServer {
             name: name.clone(),
             command,
@@ -973,6 +977,20 @@ mod tests {
             ["npx", "-y", "@example/server", "${PROJECT_ROOT:-.}"]
         );
         assert_eq!(servers[1].headers["X-Workspace"], "${WORKSPACE_ID}");
+    }
+
+    #[test]
+    fn arguments_written_before_the_command_still_follow_it() {
+        let text = r#"{
+            "mcpServers": {
+                "local": {
+                    "args": ["-y", "@example/server"],
+                    "command": "npx"
+                }
+            }
+        }"#;
+        let servers = parse_project_file(text, Utf8Path::new("/w/.mcp.json")).expect("parse");
+        assert_eq!(servers[0].command, ["npx", "-y", "@example/server"]);
     }
 
     #[test]
