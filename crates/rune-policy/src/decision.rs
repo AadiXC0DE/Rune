@@ -101,6 +101,14 @@ pub struct Decision {
     /// Every rule considered, most specific first, for `--explain`.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub considered: Vec<ConsideredRule>,
+    /// Whether a rule decided, rather than the mode's default.
+    #[serde(default = "matched_by_default", skip_serializing)]
+    pub from_rule: bool,
+}
+
+/// A decision read back from storage came from a rule unless it says not.
+const fn matched_by_default() -> bool {
+    true
 }
 
 /// One rule that was evaluated.
@@ -128,6 +136,7 @@ impl Decision {
             layer,
             rule: description.into(),
             considered: Vec::new(),
+            from_rule: false,
         }
     }
 
@@ -139,6 +148,7 @@ impl Decision {
             layer,
             rule: rule.into(),
             considered: Vec::new(),
+            from_rule: true,
         }
     }
 
@@ -164,6 +174,14 @@ impl Decision {
     /// Returns the single-line explanation used by `--explain`.
     #[must_use]
     pub fn explain(&self) -> String {
+        if !self.from_rule {
+            // A default has no rule to quote, so it says where the answer came
+            // from instead of presenting its description as a matched pattern.
+            return format!(
+                "{}: {}, so the mode's default applies",
+                self.outcome, self.rule
+            );
+        }
         format!(
             "{}: matched `{}` at the {} layer",
             self.outcome, self.rule, self.layer
@@ -223,6 +241,14 @@ mod tests {
         let deny = Decision::matched(Outcome::Deny, Layer::User, "*");
         assert!(deny.is_denied());
         assert!(!deny.is_allowed());
+    }
+
+    #[test]
+    fn a_default_is_not_explained_as_a_matched_rule() {
+        let decision = Decision::default_for(Outcome::Ask, Layer::Default, "no rule matched");
+        let text = decision.explain();
+        assert_eq!(text, "ask: no rule matched, so the mode's default applies");
+        assert!(!text.contains("matched `"), "{text}");
     }
 
     #[test]
