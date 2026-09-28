@@ -1609,77 +1609,109 @@ fn await_submission(
         let rows = completion_rows(reader.line(), selected, host.theme(), host.truecolor());
         draw_prompt(reader, host, out, &rows, marker)?;
 
-        match reader.read_key() {
-            KeyAction::Submit => {
-                // Enter takes the highlighted completion when the list is open
-                // and the command is not yet complete, so a half-typed name is
-                // never run. Once the name is complete, Enter runs it.
-                if let Some(chosen) = open_completion(reader.line(), &rows, selected)
-                    && chosen.name != reader.line().trim_start_matches('/')
-                {
-                    reader.replace(&format!("/{}", chosen.name));
-                    selected = 0;
-                    continue;
-                }
-                let text = reader.line().trim().to_owned();
-                reader.clear();
-                if text.is_empty() {
-                    continue;
-                }
-                return Ok(Some(Input::parse(&text)));
+        match idle_key(reader.read_key(), reader, &mut selected, &rows, recall) {
+            Idle::Stay => {}
+            Idle::Leave => return Ok(None),
+            Idle::Submit(input) => return Ok(Some(input)),
+        }
+    }
+}
+
+/// What a key pressed at the idle prompt leads to.
+enum Idle {
+    /// Keep reading keys.
+    Stay,
+    /// Leave the session.
+    Leave,
+    /// Hand this input to the session.
+    Submit(Input),
+}
+
+/// Applies one key read at the idle prompt.
+///
+/// `selected` is the highlighted completion row, and `rows` are the rows drawn
+/// for the completions, empty when none are open.
+fn idle_key(
+    key: KeyAction,
+    reader: &mut rune_term::input::KeyReader,
+    selected: &mut usize,
+    rows: &[String],
+    recall: &[String],
+) -> Idle {
+    match key {
+        KeyAction::Submit => {
+            // Enter takes the highlighted completion when the list is open
+            // and the command is not yet complete, so a half-typed name is
+            // never run. Once the name is complete, Enter runs it.
+            if let Some(chosen) = open_completion(reader.line(), rows, *selected)
+                && chosen.name != reader.line().trim_start_matches('/')
+            {
+                reader.replace(&format!("/{}", chosen.name));
+                *selected = 0;
+                return Idle::Stay;
             }
-            // An empty line is the only thing there is to leave behind, so
-            // interrupting it means leaving the session.
-            KeyAction::Interrupt => return Ok(None),
-            // Escape clears a partly typed line first, which is what a reader
-            // expects of a key that also leaves.
-            KeyAction::Escape => {
-                if reader.line().is_empty() {
-                    return Ok(None);
-                }
-                reader.clear();
-                selected = 0;
+            let text = reader.line().trim().to_owned();
+            reader.clear();
+            if text.is_empty() {
+                return Idle::Stay;
             }
-            KeyAction::Cancel => {
-                // Control-C on a partly typed line abandons the line rather
-                // than the session, matching what the key does elsewhere.
-                if reader.line().is_empty() {
-                    return Ok(None);
-                }
-                reader.clear();
-                selected = 0;
+            Idle::Submit(Input::parse(&text))
+        }
+        // An empty line is the only thing there is to leave behind, so
+        // interrupting it means leaving the session.
+        KeyAction::Interrupt => Idle::Leave,
+        // Escape only clears the line. While a turn runs, a first Escape
+        // asks for a second to cancel, and a turn that ends between the two
+        // hands that second press to this prompt, where leaving would end the
+        // session the user only meant to stop a turn in.
+        KeyAction::Escape => {
+            reader.clear();
+            *selected = 0;
+            Idle::Stay
+        }
+        KeyAction::Cancel => {
+            // Control-C on a partly typed line abandons the line rather
+            // than the session, matching what the key does elsewhere.
+            if reader.line().is_empty() {
+                return Idle::Leave;
             }
-            response @ (KeyAction::Up | KeyAction::Down) => {
-                // The dropdown owns the arrows while it is open. The bound is
-                // the number of matches, not the number of rows drawn: the rows
-                // include a position line, so clamping on them would strand
-                // every command past the first window.
-                let matches = completion_matches(reader.line());
-                if matches > 0 {
-                    selected = if response == KeyAction::Up {
-                        selected.saturating_sub(1)
-                    } else {
-                        selected.saturating_add(1).min(matches.saturating_sub(1))
-                    };
-                } else if response == KeyAction::Up {
-                    reader.recall_previous(recall);
+            reader.clear();
+            *selected = 0;
+            Idle::Stay
+        }
+        response @ (KeyAction::Up | KeyAction::Down) => {
+            // The dropdown owns the arrows while it is open. The bound is
+            // the number of matches, not the number of rows drawn: the rows
+            // include a position line, so clamping on them would strand
+            // every command past the first window.
+            let matches = completion_matches(reader.line());
+            if matches > 0 {
+                *selected = if response == KeyAction::Up {
+                    selected.saturating_sub(1)
                 } else {
-                    reader.recall_next(recall);
-                }
+                    selected.saturating_add(1).min(matches.saturating_sub(1))
+                };
+            } else if response == KeyAction::Up {
+                reader.recall_previous(recall);
+            } else {
+                reader.recall_next(recall);
             }
-            // Tab completes the highlighted command, which is what every other
-            // shell does and what a reader reaches for first.
-            KeyAction::Complete => {
-                if let Some(chosen) = open_completion(reader.line(), &rows, selected) {
-                    reader.replace(&format!("/{}", chosen.name));
-                    selected = 0;
-                }
+            Idle::Stay
+        }
+        // Tab completes the highlighted command, which is what every other
+        // shell does and what a reader reaches for first.
+        KeyAction::Complete => {
+            if let Some(chosen) = open_completion(reader.line(), rows, *selected) {
+                reader.replace(&format!("/{}", chosen.name));
+                *selected = 0;
             }
-            KeyAction::Ignored => {
-                // Typing narrows the list, so the highlight returns to the top
-                // rather than pointing at a row that may no longer exist.
-                selected = 0;
-            }
+            Idle::Stay
+        }
+        KeyAction::Ignored => {
+            // Typing narrows the list, so the highlight returns to the top
+            // rather than pointing at a row that may no longer exist.
+            *selected = 0;
+            Idle::Stay
         }
     }
 }
@@ -3202,6 +3234,32 @@ mod tests {
             answer < input,
             "the answer was not drawn above the input: {text:?}"
         );
+    }
+
+    #[test]
+    fn escape_at_the_prompt_clears_the_line_and_never_leaves() {
+        // While a turn runs, Escape asks for a second press to cancel. A turn
+        // that ended between the two presses handed the second to this prompt,
+        // where an empty line meant leaving the session.
+        let mut reader = rune_term::input::KeyReader::new();
+        let mut selected = 3;
+        reader.replace("a draft");
+        let step = idle_key(KeyAction::Escape, &mut reader, &mut selected, &[], &[]);
+        assert!(matches!(step, Idle::Stay));
+        assert_eq!(reader.line(), "");
+        assert_eq!(selected, 0);
+
+        let step = idle_key(KeyAction::Escape, &mut reader, &mut selected, &[], &[]);
+        assert!(
+            matches!(step, Idle::Stay),
+            "escape on an empty line ended the session"
+        );
+
+        // Control-C and Control-D on an empty line are still the way out.
+        let step = idle_key(KeyAction::Cancel, &mut reader, &mut selected, &[], &[]);
+        assert!(matches!(step, Idle::Leave));
+        let step = idle_key(KeyAction::Interrupt, &mut reader, &mut selected, &[], &[]);
+        assert!(matches!(step, Idle::Leave));
     }
 
     #[test]
