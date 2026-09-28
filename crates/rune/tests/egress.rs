@@ -158,6 +158,10 @@ fn no_crate_constructs_a_network_client_outside_the_transport() {
     // than a search. A client built anywhere else would be invisible to it.
     let root = workspace_root();
     let transport = root.join("crates/rune-net/src/transport.rs");
+    // The remote MCP transports hold their own client because they keep a
+    // session open across requests. No binary connects an MCP server yet, and
+    // naming the file here keeps the exception visible rather than unscanned.
+    let allowed = [root.join("crates/rune-context/src/mcp/client.rs")];
     let mut offenders = Vec::new();
 
     for crate_entry in std::fs::read_dir(root.join("crates"))
@@ -168,31 +172,39 @@ fn no_crate_constructs_a_network_client_outside_the_transport() {
         if !name.starts_with("rune") {
             continue;
         }
-        let src = crate_entry.path().join("src");
-        let Ok(entries) = std::fs::read_dir(&src) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().is_none_or(|ext| ext != "rs") {
-                continue;
-            }
-            if path == transport {
-                continue;
-            }
-            let Ok(text) = std::fs::read_to_string(&path) else {
+        // Every module file is read, including those in subdirectories, since a
+        // client built in a nested module is as much egress as one at the top.
+        let mut pending = vec![crate_entry.path().join("src")];
+        while let Some(dir) = pending.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
                 continue;
             };
-            let shipped = text.split("#[cfg(test)]").next().unwrap_or(&text);
-            for needle in [
-                "ureq::Agent::config_builder",
-                // Both are a way to get a client without the builder.
-                "ureq::agent()",
-                "ureq::Agent::new_with_defaults",
-                "std::net::TcpStream",
-            ] {
-                if shipped.contains(needle) {
-                    offenders.push(format!("{}: {needle}", path.display()));
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    pending.push(path);
+                    continue;
+                }
+                if path.extension().is_none_or(|ext| ext != "rs") {
+                    continue;
+                }
+                if path == transport || allowed.contains(&path) {
+                    continue;
+                }
+                let Ok(text) = std::fs::read_to_string(&path) else {
+                    continue;
+                };
+                let shipped = text.split("#[cfg(test)]").next().unwrap_or(&text);
+                for needle in [
+                    "ureq::Agent::config_builder",
+                    // Both are a way to get a client without the builder.
+                    "ureq::agent()",
+                    "ureq::Agent::new_with_defaults",
+                    "std::net::TcpStream",
+                ] {
+                    if shipped.contains(needle) {
+                        offenders.push(format!("{}: {needle}", path.display()));
+                    }
                 }
             }
         }
