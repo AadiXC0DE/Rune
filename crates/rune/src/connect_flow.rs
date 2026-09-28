@@ -76,37 +76,30 @@ pub fn choose_provider() -> Result<&'static KnownProvider> {
     })
 }
 
-/// Asks for the credential, explaining where it comes from.
+/// Asks for the credential of a provider, explaining where it comes from.
 ///
-/// The variable is named when one exists, so a user who already has it exported
-/// knows they can stop and export it instead of pasting a secret into a shell.
-pub fn ask_credential(entry: &KnownProvider) -> Result<String> {
-    if let Some(variable) = entry.key_variable {
-        println!();
-        println!(
-            "Paste your {} for {}.",
-            entry.credential_label(),
-            entry.name
-        );
-        println!("It is stored privately and never printed again.");
-        println!("If ${variable} is already exported, press enter to use that instead.");
-    } else {
-        println!();
-        println!(
-            "Paste your {} for {}.",
-            entry.credential_label(),
-            entry.name
-        );
-        println!("It is stored privately and never printed again.");
+/// Only asked when the environment holds no credential, so the variable is
+/// named as the other way to connect rather than as something to fall back on.
+/// A provider the table does not describe is asked for an API key.
+pub fn ask_credential(name: &str) -> Result<String> {
+    let entry = providers::lookup(name);
+    let label = entry.map_or("API key", |entry| entry.credential_label());
+    let variable = entry.and_then(|entry| entry.key_variable);
+
+    println!();
+    println!("Paste your {label} for {name}.");
+    println!("It is stored privately and never printed again.");
+    if let Some(variable) = variable {
+        println!("To read it from ${variable} instead, export it and run this again.");
     }
     println!();
 
-    let value = read_line(&format!("{}: ", entry.credential_label()))?;
+    let value = read_credential(&format!("{label}: "))?;
     if value.is_empty() {
         // An empty answer is only an answer when a variable can supply the
         // credential; otherwise there is nothing to store and the caller is
         // told rather than left with a connection that fails later.
-        if let Some(variable) = entry.key_variable {
+        if let Some(variable) = variable {
             return Err(RuneError::new(
                 ErrorCode::AuthenticationRequired,
                 format!("no credential was given, and ${variable} is not set in this shell"),
@@ -121,6 +114,35 @@ pub fn ask_credential(entry: &KnownProvider) -> Result<String> {
         );
     }
     Ok(value)
+}
+
+/// Reads a credential after a prompt, without echo when a terminal is attached.
+///
+/// An echoed key stays on screen and in the terminal's scrollback. Piped input
+/// is read as one line, as every other answer in the flow is.
+fn read_credential(prompt: &str) -> Result<String> {
+    use std::io::IsTerminal as _;
+
+    if !std::io::stdin().is_terminal() {
+        return read_line(prompt);
+    }
+    let mut out = std::io::stdout();
+    let _ = write!(out, "{prompt}");
+    let _ = out.flush();
+    let read = rune_term::input::read_secret();
+    // Enter was not echoed either, so the line the prompt is on is ended here.
+    println!();
+    match read {
+        Ok(value) => Ok(value.unwrap_or_default().trim().to_owned()),
+        Err(err) if err.kind() == std::io::ErrorKind::Interrupted => Err(RuneError::new(
+            ErrorCode::Cancelled,
+            "the connection was cancelled",
+        )),
+        Err(err) => Err(RuneError::new(
+            ErrorCode::Internal,
+            format!("could not read input: {err}"),
+        )),
+    }
 }
 
 /// Asks for the endpoint a provider needs when it has no default.
@@ -158,12 +180,11 @@ pub fn run(paths: &Paths, entry: &KnownProvider) -> Result<String> {
     };
 
     // The environment is consulted first, so a user with the key already
-    // exported is not asked to paste it. The prompt explains this too, so the
-    // empty answer is a choice rather than a dead end.
+    // exported is not asked to paste it.
     let from_environment = provider_setup::environment_credential(&name, None);
     let credential = match from_environment {
         Some(value) => value,
-        None => ask_credential(entry)?,
+        None => ask_credential(&name)?,
     };
     provider_setup::connect(paths, &name, &credential)?;
 

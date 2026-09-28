@@ -512,11 +512,11 @@ fn run_auth(
 /// just installed the harness cannot be expected to already know the name. The
 /// credential comes from the environment when it is already exported, and from
 /// standard input otherwise, so it never has to appear in a shell history or a
-/// process listing.
+/// process listing. At a terminal it is read without being echoed.
 ///
-/// The flow asks when a terminal can answer and never otherwise, so a caller
-/// that pipes its answer in, or a machine caller that supplies none, is not
-/// blocked waiting for input that will not come.
+/// A machine caller is never asked, so it is not blocked waiting for input that
+/// will not come: it supplies the variable, or relies on a credential already
+/// stored, and is refused when it has neither.
 fn run_connect(
     settings: &Settings,
     paths: &Paths,
@@ -558,11 +558,20 @@ fn run_connect(
         provider_setup::environment_credential(&name, settings.api_key_env.as_deref());
     match from_environment {
         Some(value) => provider_setup::connect(paths, &name, &value)?,
-        // Only prompt when no answer can be waiting: a machine caller supplies
-        // the variable rather than blocking on a terminal that will not answer.
-        None if output.json => {}
+        // A machine caller supplies the variable rather than blocking on a
+        // terminal that will not answer. Without it, a credential this provider
+        // already has is kept; with neither, the connection is refused rather
+        // than reported as made when no request could succeed.
+        None if output.json => {
+            if rune_net::auth::resolve(paths, &name, settings.api_key_env.as_deref())?.is_none() {
+                return Err(rune_net::auth::missing_credential_error(
+                    &name,
+                    settings.api_key_env.as_deref(),
+                ));
+            }
+        }
         None => {
-            let value = ask::read_stdin_prompt()?;
+            let value = connect_flow::ask_credential(&name)?;
             provider_setup::connect(paths, &name, &value)?;
         }
     }

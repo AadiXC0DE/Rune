@@ -537,6 +537,59 @@ fn listing_models_offline_reports_the_configured_model_without_a_request() {
     );
 }
 
+/// Runs `rune connect` for a machine caller, with or without the key exported.
+fn connect_json(key: Option<&str>) -> (Output, tempfile::TempDir) {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let mut command = Command::new(binary());
+    command
+        .args(["connect", "anthropic", "--json"])
+        .env("RUNE_HOME", dir.path().join("state"))
+        .env("XDG_CONFIG_HOME", dir.path().join("config"))
+        .env("XDG_DATA_HOME", dir.path().join("data"))
+        .env_remove("ANTHROPIC_API_KEY")
+        .env_remove("RUNE_API_KEY_ENV")
+        .env_remove("RUNE_PROVIDER")
+        .env_remove("RUNE_BASE_URL")
+        .env_remove("RUNE_MODEL");
+    if let Some(key) = key {
+        command.env("ANTHROPIC_API_KEY", key);
+    }
+    let output = command.output().expect("run binary");
+    let out = Output {
+        status: output.status.code(),
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+    };
+    (out, dir)
+}
+
+#[test]
+fn connecting_without_a_credential_fails_and_saves_nothing() {
+    // A machine caller with no key exported was told the connection was made,
+    // with a selection saved that no request could use.
+    let (out, dir) = connect_json(None);
+    assert_eq!(out.status, Some(1), "stdout: {}", out.stdout);
+    assert!(out.stderr.contains("no credential"), "{}", out.stderr);
+    assert!(out.stdout.is_empty(), "{}", out.stdout);
+    assert!(
+        !dir.path()
+            .join("config")
+            .join("rune")
+            .join("config.toml")
+            .exists(),
+        "the selection was saved without a credential"
+    );
+}
+
+#[test]
+fn connecting_with_the_key_exported_succeeds() {
+    let (out, _dir) = connect_json(Some("sk-ant-test"));
+    assert_eq!(out.status, Some(0), "stderr: {}", out.stderr);
+    let value: serde_json::Value = serde_json::from_str(&out.stdout).expect("valid json");
+    assert_eq!(value["provider"], "anthropic");
+    assert!(!out.stdout.contains("sk-ant-test"), "{}", out.stdout);
+}
+
 #[test]
 fn a_flag_the_command_does_not_take_is_refused() {
     let out = run(&["models", "--nonsense"]);

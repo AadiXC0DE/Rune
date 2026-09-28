@@ -296,6 +296,89 @@ impl Drop for KeyReader {
     }
 }
 
+/// What one key or paste does to a secret being read.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SecretStep {
+    /// Keep reading.
+    Continue,
+    /// Enter was pressed and the secret is complete.
+    Submit,
+    /// Input ended before anything was typed.
+    End,
+    /// Control-C was pressed.
+    Interrupt,
+}
+
+/// Applies one terminal event to a secret being read.
+///
+/// A paste is taken whole with its line breaks dropped, because a key copied
+/// with the end of its line is still one key, and it is Enter that finishes it.
+pub fn secret_event(secret: &mut String, event: Event) -> SecretStep {
+    let key = match event {
+        Event::Paste(text) => {
+            secret.extend(text.chars().filter(|c| !c.is_control()));
+            return SecretStep::Continue;
+        }
+        Event::Key(key) if key.kind != KeyEventKind::Release => key,
+        _ => return SecretStep::Continue,
+    };
+    let control = key.modifiers.contains(KeyModifiers::CONTROL);
+    match (key.code, control) {
+        (KeyCode::Enter, _) => SecretStep::Submit,
+        (KeyCode::Char('c'), true) => SecretStep::Interrupt,
+        (KeyCode::Char('d'), true) if secret.is_empty() => SecretStep::End,
+        (KeyCode::Char('u'), true) => {
+            secret.clear();
+            SecretStep::Continue
+        }
+        (KeyCode::Backspace, _) => {
+            secret.pop();
+            SecretStep::Continue
+        }
+        (KeyCode::Char(c), false) => {
+            secret.push(c);
+            SecretStep::Continue
+        }
+        _ => SecretStep::Continue,
+    }
+}
+
+/// Reads one line from the terminal without showing it.
+///
+/// A credential that is echoed stays on screen and in the terminal's
+/// scrollback. Raw mode keeps the terminal from echoing, and bracketed paste
+/// keeps a pasted key that ends in a line break from being submitted before it
+/// can be checked. Returns `None` when input ends before anything is typed, and
+/// an interrupted error for Control-C.
+pub fn read_secret() -> std::io::Result<Option<String>> {
+    /// Puts the terminal back however the read ends.
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            restore_terminal();
+        }
+    }
+
+    crossterm::terminal::enable_raw_mode()?;
+    let _restore = Restore;
+    install_panic_hook();
+    let _ = crossterm::ExecutableCommand::execute(
+        &mut std::io::stdout(),
+        crossterm::event::EnableBracketedPaste,
+    );
+    let mut secret = String::new();
+    loop {
+        match secret_event(&mut secret, crossterm::event::read()?) {
+            SecretStep::Continue => {}
+            SecretStep::Submit => return Ok(Some(secret)),
+            SecretStep::End => return Ok(None),
+            SecretStep::Interrupt => {
+                return Err(std::io::Error::from(std::io::ErrorKind::Interrupted));
+            }
+        }
+    }
+}
+
 /// Undoes what the reader and the renderer change about the terminal.
 ///
 /// The reader turns on raw mode and bracketed paste, and the renderer hides the
@@ -577,6 +660,45 @@ mod tests {
             crate::width::str_width(&row),
             2 + reader.column(),
             "the caret is not after the drawn text: {row:?}"
+        );
+    }
+
+    #[test]
+    fn a_secret_is_built_from_keys_and_pastes_and_ends_at_enter() {
+        let mut secret = String::new();
+        for c in "sk-ab".chars() {
+            assert_eq!(
+                secret_event(&mut secret, Event::Key(key(KeyCode::Char(c)))),
+                SecretStep::Continue
+            );
+        }
+        secret_event(&mut secret, Event::Key(key(KeyCode::Backspace)));
+        secret_event(&mut secret, Event::Paste("cd\r\n".to_owned()));
+        assert_eq!(
+            secret_event(&mut secret, Event::Key(key(KeyCode::Enter))),
+            SecretStep::Submit
+        );
+        assert_eq!(secret, "sk-acd");
+    }
+
+    #[test]
+    fn a_secret_read_stops_at_control_c_and_at_the_end_of_input() {
+        let mut secret = String::new();
+        assert_eq!(
+            secret_event(&mut secret, Event::Key(control('d'))),
+            SecretStep::End
+        );
+        secret.push_str("typed");
+        // With text on the line, Control-D is not the end of input.
+        assert_eq!(
+            secret_event(&mut secret, Event::Key(control('d'))),
+            SecretStep::Continue
+        );
+        secret_event(&mut secret, Event::Key(control('u')));
+        assert_eq!(secret, "");
+        assert_eq!(
+            secret_event(&mut secret, Event::Key(control('c'))),
+            SecretStep::Interrupt
         );
     }
 
