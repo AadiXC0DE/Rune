@@ -104,6 +104,8 @@ impl Fetch for BridgeFetch {
                 head.content_type
             },
             retry_after: head.retry_after,
+            // The page's fetch follows redirects itself, so none reaches here.
+            location: None,
             body: Box::new(BridgeBody {
                 bridge: Arc::clone(&self.bridge),
                 handle: head.handle,

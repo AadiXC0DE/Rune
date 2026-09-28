@@ -29,7 +29,9 @@ pub struct NetworkFetch;
 
 impl FetchBackend for NetworkFetch {
     fn get(&self, url: &str, timeout: Duration) -> Result<Fetched> {
-        let fetched = rune_net::transport::fetch_url(
+        // One hop only: the tool follows a redirect itself, after checking
+        // where it points.
+        let fetched = rune_net::transport::fetch_hop(
             url,
             "text/html,application/json,text/plain;q=0.9,*/*;q=0.8",
             timeout,
@@ -39,9 +41,7 @@ impl FetchBackend for NetworkFetch {
             status: fetched.status,
             content_type: fetched.content_type,
             body: fetched.body,
-            // The transport follows redirects itself, so the chain is not
-            // observable from here and is reported as empty rather than made up.
-            redirects: Vec::new(),
+            location: fetched.location,
         })
     }
 }
