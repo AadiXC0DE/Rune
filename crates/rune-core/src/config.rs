@@ -726,6 +726,12 @@ pub struct EnvironmentOverrides {
     pub offline: Option<bool>,
     /// Whether the web tools may reach the network.
     pub web_tools: Option<bool>,
+    /// Boolean variables whose value was not a boolean, with that value.
+    ///
+    /// Kept so the value is reported rather than silently ignored: an
+    /// unreadable `RUNE_OFFLINE` would otherwise leave the network on with
+    /// nothing to say so.
+    pub invalid_booleans: Vec<(&'static str, String)>,
 }
 
 impl EnvironmentOverrides {
@@ -747,8 +753,14 @@ impl EnvironmentOverrides {
     #[must_use]
     pub fn from_lookup(mut lookup: impl FnMut(&str) -> Option<String>) -> Self {
         let mut lookup = move |key: &str| lookup(key).filter(|value| !value.trim().is_empty());
-        let boolean = |lookup: &mut dyn FnMut(&str) -> Option<String>, key: &str| {
-            lookup(key).and_then(|value| parse_bool(&value))
+        let mut invalid_booleans = Vec::new();
+        let mut boolean = |lookup: &mut dyn FnMut(&str) -> Option<String>, key: &'static str| {
+            let raw = lookup(key)?;
+            let parsed = parse_bool(&raw);
+            if parsed.is_none() {
+                invalid_booleans.push((key, raw));
+            }
+            parsed
         };
 
         let mut out = Self {
@@ -768,7 +780,9 @@ impl EnvironmentOverrides {
             review_model: lookup("RUNE_REVIEW_MODEL"),
             offline: boolean(&mut lookup, "RUNE_OFFLINE"),
             web_tools: boolean(&mut lookup, "RUNE_WEB_TOOLS"),
+            invalid_booleans: Vec::new(),
         };
+        out.invalid_booleans = invalid_booleans;
 
         // The list is split the way the platform writes a search path, because a
         // colon is part of every absolute path on Windows.
@@ -791,6 +805,9 @@ impl EnvironmentOverrides {
         out
     }
 }
+
+/// The spellings [`parse_bool`] accepts, as a hint lists them.
+const BOOLEAN_SPELLINGS: &str = "1, true, on, yes, 0, false, off, and no";
 
 /// Interpretations accepted for a boolean environment variable.
 fn parse_bool(raw: &str) -> Option<bool> {
@@ -1315,6 +1332,17 @@ fn apply_environment(settings: &mut Settings, env: &EnvironmentOverrides) {
         settings.review_model = Some(review.clone());
         settings.sources.record("review_model", layer);
     }
+    for (variable, raw) in &env.invalid_booleans {
+        settings.diagnostics.push(
+            Diagnostic::new(
+                layer,
+                ErrorCode::InvalidField,
+                format!("{variable} is `{raw}`, which is not a boolean"),
+            )
+            .with_key(variable.trim_start_matches("RUNE_").to_ascii_lowercase())
+            .with_hint(format!("accepted values are {BOOLEAN_SPELLINGS}")),
+        );
+    }
 
     for entry in &env.limits {
         let Some((key, value)) = entry.split_once('=') else {
@@ -1765,6 +1793,37 @@ theme_unused = "x"
             assert_eq!(parse_bool(raw), Some(false), "{raw}");
         }
         assert_eq!(parse_bool("maybe"), None);
+    }
+
+    #[test]
+    fn an_invalid_boolean_is_reported_with_the_accepted_values() {
+        let env = EnvironmentOverrides::from_lookup(|key| {
+            (key == "RUNE_OFFLINE").then(|| "enabled".to_owned())
+        });
+        assert_eq!(env.offline, None);
+
+        let settings = load(None, None, &env);
+        assert_eq!(settings.diagnostics.len(), 1, "{:?}", settings.diagnostics);
+        let diagnostic = &settings.diagnostics[0];
+        assert_eq!(diagnostic.layer, Layer::Environment);
+        assert_eq!(diagnostic.code, ErrorCode::InvalidField);
+        assert_eq!(diagnostic.key.as_deref(), Some("offline"));
+        assert!(
+            diagnostic.message.contains("RUNE_OFFLINE") && diagnostic.message.contains("enabled"),
+            "{}",
+            diagnostic.message
+        );
+        let hint = diagnostic.hint.as_deref().expect("hint");
+        for spelling in hint
+            .trim_start_matches("accepted values are ")
+            .split(", ")
+            .map(|word| word.trim_start_matches("and "))
+        {
+            assert!(
+                parse_bool(spelling).is_some(),
+                "the hint offers `{spelling}`"
+            );
+        }
     }
 
     #[test]
