@@ -511,6 +511,9 @@ pub fn load(paths: &Paths, id: &SessionId) -> Result<(Recorder, History)> {
     Ok((recorder, history))
 }
 
+/// The result a replayed call is given when the log holds none for it.
+const INTERRUPTED_CALL: &str = "the session stopped before this call returned, so it has no result";
+
 /// Builds a conversation from a stored log.
 #[must_use]
 pub fn history_from(state: &SessionState) -> History {
@@ -576,8 +579,29 @@ pub fn history_from(state: &SessionState) -> History {
 }
 
 /// Appends the pending calls, then the pending results.
+///
+/// A call with no result is given one saying it was interrupted. A turn's calls
+/// are all written before any of its results, so a process that stopped between
+/// the two leaves calls that were never answered, and a conversation holding
+/// one is refused by every request that follows.
 fn flush(history: &mut History, calls: &mut Vec<ContentPart>, results: &mut Vec<ContentPart>) {
     if !calls.is_empty() {
+        for call in calls.iter() {
+            let ContentPart::ToolCall { id, name, .. } = call else {
+                continue;
+            };
+            let answered = results.iter().any(
+                |result| matches!(result, ContentPart::ToolResult { id: answered, .. } if answered == id),
+            );
+            if !answered {
+                results.push(ContentPart::ToolResult {
+                    id: id.clone(),
+                    name: name.clone(),
+                    content: INTERRUPTED_CALL.to_owned(),
+                    is_error: true,
+                });
+            }
+        }
         history.push_assistant(std::mem::take(calls));
     }
     if !results.is_empty() {
@@ -716,6 +740,73 @@ mod tests {
         assert_eq!(history.turns().len(), 2);
         assert_eq!(history.turns()[0].text(), "what changed?");
         assert_eq!(history.turns()[1].text(), "two files");
+    }
+
+    #[test]
+    fn a_call_the_log_never_answered_is_replayed_as_interrupted() {
+        // The recorder writes a turn's calls before its results, so a crash
+        // between them leaves calls with no result. Replaying that log made
+        // every later turn fail validation.
+        let dir = tempfile::tempdir().expect("temp");
+        let root = Utf8Path::from_path(dir.path()).expect("utf8");
+        let paths = paths(root);
+        let key = id("sessionccccc");
+
+        let recorder = Recorder::create(&paths, &key).expect("created");
+        recorder.user_message("read both").expect("wrote");
+        recorder
+            .store
+            .append(SessionEvent::TurnStarted { turn: 1 })
+            .expect("wrote");
+        for call_id in ["call_one", "call_two"] {
+            recorder
+                .store
+                .append(SessionEvent::ToolCall {
+                    call_id: call_id.to_owned(),
+                    name: "read_file".to_owned(),
+                    arguments: "{}".to_owned(),
+                })
+                .expect("wrote");
+        }
+        recorder
+            .store
+            .append(SessionEvent::ToolResult {
+                call_id: "call_one".to_owned(),
+                ok: true,
+                output: "file text".to_owned(),
+            })
+            .expect("wrote");
+        drop(recorder);
+
+        let (resumed, history) = load(&paths, &key).expect("loaded");
+        history
+            .validate()
+            .expect("the replayed conversation is sendable");
+        resumed.user_message("carry on").expect("wrote");
+        drop(resumed);
+
+        let (_, history) = load(&paths, &key).expect("loaded again");
+        history.validate().expect("later turns are still sendable");
+        let results: Vec<(String, &str, bool)> = history.turns()[2]
+            .parts
+            .iter()
+            .filter_map(|part| match part {
+                ContentPart::ToolResult {
+                    id,
+                    content,
+                    is_error,
+                    ..
+                } => Some((id.to_string(), content.as_str(), *is_error)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            results,
+            vec![
+                ("call_one".to_owned(), "file text", false),
+                ("call_two".to_owned(), INTERRUPTED_CALL, true),
+            ]
+        );
     }
 
     #[test]
