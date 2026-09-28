@@ -252,19 +252,110 @@ fn from_system_store(provider: &str) -> Option<Credential> {
     Some(Credential::new(value, CredentialSource::SystemStore))
 }
 
+/// The keychain service every stored credential is filed under.
+#[cfg(target_os = "macos")]
+const KEYCHAIN_SERVICE: &str = "rune";
+
+/// Longest command line written to the keychain tool's interactive mode.
+#[cfg(target_os = "macos")]
+const MAX_INTERACTIVE_COMMAND: usize = 4_000;
+
 /// Reads a value from the platform keychain, where one is available.
 #[cfg(target_os = "macos")]
 fn keychain_lookup(provider: &str) -> Option<String> {
+    keychain_read(KEYCHAIN_SERVICE, provider)
+}
+
+/// Reads one keychain entry.
+#[cfg(target_os = "macos")]
+fn keychain_read(service: &str, account: &str) -> Option<String> {
     // The `security` tool ships with the operating system, so no dependency is
     // needed for a lookup that happens at most once per process.
     let output = std::process::Command::new("/usr/bin/security")
-        .args(["find-generic-password", "-s", "rune", "-a", provider, "-w"])
+        .args(["find-generic-password", "-s", service, "-a", account, "-w"])
         .output()
         .ok()?;
     if !output.status.success() {
         return None;
     }
     Some(String::from_utf8(output.stdout).ok()?.trim().to_owned())
+}
+
+/// Writes one keychain entry, replacing any existing value.
+///
+/// The value never appears in the tool's arguments, which every local user can
+/// read from the process list while it runs. The command is written to the
+/// tool's interactive mode on standard input instead, with each argument
+/// quoted in the syntax that mode reads.
+#[cfg(target_os = "macos")]
+fn keychain_write(service: &str, account: &str, value: &str) -> bool {
+    use std::io::Write as _;
+    use std::process::{Command, Stdio};
+
+    // A line break would end the command early and start another, so a value
+    // or name carrying a control character is refused rather than escaped.
+    if [service, account, value]
+        .iter()
+        .any(|text| text.chars().any(char::is_control))
+    {
+        return false;
+    }
+    let command = format!(
+        "add-generic-password -U -s {} -a {} -w {}\n",
+        interactive_quote(service),
+        interactive_quote(account),
+        interactive_quote(value)
+    );
+    // The interactive mode reads a command into a buffer of about 4 KiB and
+    // cuts a longer one without failing, which would store part of the value.
+    if command.len() > MAX_INTERACTIVE_COMMAND {
+        return false;
+    }
+
+    let Ok(mut child) = Command::new("/usr/bin/security")
+        .arg("-i")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+    else {
+        return false;
+    };
+    // Dropping standard input after the command ends the session.
+    let written = child
+        .stdin
+        .take()
+        .is_some_and(|mut stdin| stdin.write_all(command.as_bytes()).is_ok());
+    let Ok(output) = child.wait_with_output() else {
+        return false;
+    };
+    // The session reports success even when its command failed, and says so
+    // only on standard error.
+    written && output.status.success() && output.stderr.is_empty()
+}
+
+/// Quotes one argument for the interactive mode of the `security` tool.
+#[cfg(target_os = "macos")]
+fn interactive_quote(text: &str) -> String {
+    let mut quoted = String::with_capacity(text.len().saturating_add(2));
+    quoted.push('"');
+    for character in text.chars() {
+        if matches!(character, '"' | '\\') {
+            quoted.push('\\');
+        }
+        quoted.push(character);
+    }
+    quoted.push('"');
+    quoted
+}
+
+/// Deletes one keychain entry.
+#[cfg(target_os = "macos")]
+fn keychain_delete(service: &str, account: &str) -> bool {
+    let output = std::process::Command::new("/usr/bin/security")
+        .args(["delete-generic-password", "-s", service, "-a", account])
+        .output();
+    matches!(output, Ok(output) if output.status.success())
 }
 
 /// Reads a value from the platform keychain, where one is available.
@@ -278,19 +369,7 @@ fn keychain_lookup(_provider: &str) -> Option<String> {
 /// Returns false when no store is available, so the caller can fall back.
 #[cfg(target_os = "macos")]
 pub fn store_in_system_store(provider: &str, value: &str) -> bool {
-    let output = std::process::Command::new("/usr/bin/security")
-        .args([
-            "add-generic-password",
-            "-s",
-            "rune",
-            "-a",
-            provider,
-            "-w",
-            value,
-            "-U",
-        ])
-        .output();
-    matches!(output, Ok(output) if output.status.success())
+    keychain_write(KEYCHAIN_SERVICE, provider, value)
 }
 
 /// Stores a credential in the platform secret store.
@@ -302,10 +381,7 @@ pub fn store_in_system_store(_provider: &str, _value: &str) -> bool {
 /// Removes a credential from the platform secret store.
 #[cfg(target_os = "macos")]
 pub fn remove_from_system_store(provider: &str) -> bool {
-    let output = std::process::Command::new("/usr/bin/security")
-        .args(["delete-generic-password", "-s", "rune", "-a", provider])
-        .output();
-    matches!(output, Ok(output) if output.status.success())
+    keychain_delete(KEYCHAIN_SERVICE, provider)
 }
 
 /// Removes a credential from the platform secret store.
@@ -577,5 +653,83 @@ mod tests {
         let err = missing_credential_error("anthropic", Some("MY_KEY"));
         let rendered = err.to_string();
         assert!(!rendered.contains("secret"));
+    }
+
+    /// A keychain service used by one test and deleted when it ends.
+    #[cfg(target_os = "macos")]
+    struct ThrowawayService(String);
+
+    #[cfg(target_os = "macos")]
+    impl ThrowawayService {
+        fn new() -> Self {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_nanos())
+                .unwrap_or_default();
+            Self(format!("rune-test-{}-{nanos}", std::process::id()))
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    impl Drop for ThrowawayService {
+        fn drop(&mut self) {
+            let _ = keychain_delete(&self.0, "probe");
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_keychain_value_written_through_standard_input_reads_back_unchanged() {
+        let service = ThrowawayService::new();
+        let value = r#"sk-test "quoted" back\slash 'single' $HOME ; # end"#;
+        assert!(
+            keychain_write(&service.0, "probe", value),
+            "the write failed"
+        );
+        assert_eq!(keychain_read(&service.0, "probe").as_deref(), Some(value));
+
+        // A second write replaces the value rather than failing on a duplicate.
+        assert!(keychain_write(&service.0, "probe", "replacement"));
+        assert_eq!(
+            keychain_read(&service.0, "probe").as_deref(),
+            Some("replacement")
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_keychain_value_that_could_start_another_command_is_refused() {
+        let service = ThrowawayService::new();
+        let smuggled = "value\ndelete-generic-password -s rune";
+        assert!(!keychain_write(&service.0, "probe", smuggled));
+        assert_eq!(keychain_read(&service.0, "probe"), None);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_keychain_value_too_long_for_one_command_is_refused_whole() {
+        // The tool would cut the line and store a truncated credential.
+        let service = ThrowawayService::new();
+        let fits = "k".repeat(3_000);
+        assert!(keychain_write(&service.0, "probe", &fits));
+        assert_eq!(
+            keychain_read(&service.0, "probe").as_deref(),
+            Some(fits.as_str())
+        );
+
+        let long = "k".repeat(5_000);
+        assert!(!keychain_write(&service.0, "probe", &long));
+        assert_eq!(
+            keychain_read(&service.0, "probe").map(|value| value.len()),
+            Some(fits.len()),
+            "a refused write must leave the entry as it was"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn an_interactive_argument_escapes_its_quotes_and_backslashes() {
+        assert_eq!(interactive_quote("plain"), "\"plain\"");
+        assert_eq!(interactive_quote(r#"a"b\c"#), r#""a\"b\\c""#);
     }
 }
