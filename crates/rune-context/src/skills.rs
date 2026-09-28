@@ -284,6 +284,9 @@ impl Frontmatter {
     /// indented one belongs to a mapping nested under the key above it, such as
     /// a `name` inside `metadata`, and is not the skill's own.
     fn parse(text: &str) -> std::result::Result<Self, String> {
+        // A byte order mark, which some editors write, would otherwise hide the
+        // opening delimiter, and the skill would load without its frontmatter.
+        let text = text.strip_prefix('\u{feff}').unwrap_or(text);
         let mut lines = text.lines().map(strip_carriage_return).peekable();
         if lines.next() != Some("---") {
             return Ok(Self::default());
@@ -567,6 +570,22 @@ mod tests {
         .expect("parse");
         assert_eq!(parsed.name.as_deref(), Some("alpha"));
         assert_eq!(parsed.description.as_deref(), Some("kept"));
+    }
+
+    #[test]
+    fn a_byte_order_mark_does_not_hide_the_frontmatter() {
+        for text in [
+            "\u{feff}---\nname: marked\ndescription: from an editor\n---\nbody\n",
+            "\u{feff}---\r\nname: marked\r\ndescription: from an editor\r\n---\r\nbody\r\n",
+        ] {
+            let parsed = Frontmatter::parse(text).expect("parse");
+            assert_eq!(parsed.name.as_deref(), Some("marked"), "{text:?}");
+            assert_eq!(
+                parsed.description.as_deref(),
+                Some("from an editor"),
+                "{text:?}"
+            );
+        }
     }
 
     #[test]
