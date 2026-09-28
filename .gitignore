@@ -5,6 +5,9 @@
 # Distribution artifacts
 /dist
 
+# Site and demo build output
+build/
+
 # Node bindings
 node_modules/
 

@@ -1017,6 +1017,7 @@ version = "0.1.15"
 dependencies = [
  "camino",
  "rune-core",
+ "rustix",
  "tempfile",
 ]
 

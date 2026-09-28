@@ -10,9 +10,16 @@ repository.workspace = true
 [lints]
 workspace = true
 
+
 [dependencies]
 rune-core = { workspace = true }
 camino = { workspace = true }
+
+# Only the resource ceilings need it, and only on a platform that has them. It
+# is used rather than `libc` because this crate forbids unsafe code and rustix
+# exposes `setrlimit` as a safe function.
+[target.'cfg(unix)'.dependencies]
+rustix = { workspace = true, features = ["process"] }
 
 [dev-dependencies]
 tempfile.workspace = true

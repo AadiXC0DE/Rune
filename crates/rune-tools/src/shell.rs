@@ -421,7 +421,12 @@ fn start(
     // The shell tool exists to run shell commands, so its input always goes to a
     // shell: routing a bare word to direct argv would break builtins such as
     // `exit`.
-    let prepared = rune_exec::command::prepare_shell(command, workspace, None, BTreeMap::new())?;
+    // The environment is built here rather than inherited: this process holds
+    // the provider credential, and a command that reaches the network must not
+    // be able to read it back out of its own environment.
+    let environment = rune_exec::minimal_environment();
+    let prepared =
+        rune_exec::command::prepare_shell(command, workspace, None, environment.clone())?;
     let policy = rune_exec::SandboxPolicy::new(
         context.workspace.clone(),
         context.additional_roots.clone(),
@@ -453,7 +458,13 @@ fn start(
         };
         RuneError::new(code, format!("`{workspace}` cannot be started in: {err}"))
     })?;
-    Process::start_argv(&wrapped.argv, Some(start_in.as_std_path()), cap).map_err(|err| {
+    Process::start_argv(
+        &wrapped.argv,
+        Some(start_in.as_std_path()),
+        cap,
+        &environment,
+    )
+    .map_err(|err| {
         let hint = match cwd {
             Some(cwd) => format!("the command starts in `{cwd}`"),
             None => String::from("the command starts in the workspace root"),

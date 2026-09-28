@@ -80,13 +80,17 @@ jiff = { version = "0.2", default-features = false }
 # Hashing
 sha2 = "0.10"
 getrandom = "0.2"
+rustix = { version = "1", default-features = false, features = ["std"] }
 
 # Dev
 insta = { version = "1", features = ["json"] }
 tempfile = "3"
 
 [workspace.lints.rust]
-unsafe_code = "forbid"
+# Denied rather than forbidden, so a crate can permit it in one place and say
+# why. Exactly one call site does: setting a child's resource limits, which is
+# only possible between fork and exec.
+unsafe_code = "deny"
 unused_qualifications = "warn"
 elided_lifetimes_in_paths = "warn"
 single_use_lifetimes = "warn"

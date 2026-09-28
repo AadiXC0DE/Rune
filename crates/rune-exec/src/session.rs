@@ -5,11 +5,12 @@
 //! Both share one process-group and exit-status vocabulary, so a caller never
 //! has to learn a second one.
 
+use std::collections::BTreeMap;
 use std::io::{self, Read, Write};
 use std::path::Path;
 use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
 
-use crate::command::{Exit, own_group};
+use crate::command::{Exit, apply_limits, own_group, resource_limits};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -164,7 +165,12 @@ impl Process {
             String::from(SHELL_FLAG),
             command.to_owned(),
         ];
-        Self::start_argv(&argv, cwd, capture_bytes)
+        Self::start_argv(
+            &argv,
+            cwd,
+            capture_bytes,
+            &crate::command::minimal_environment(),
+        )
     }
 
     /// Starts a command from an explicit argv.
@@ -172,10 +178,16 @@ impl Process {
     /// Exists so a caller can run an argv that a sandbox produced, which is the
     /// only way a restricted command and the command that was reviewed can be
     /// the same thing. The argv is passed as given: nothing here re-parses it.
+    ///
+    /// Nothing from the parent environment is inherited. A long-lived session
+    /// outlives the single command path, so a variable the caller did not pass
+    /// would otherwise be visible to every command it runs, including the
+    /// provider credentials this process holds.
     pub fn start_argv(
         argv: &[String],
         cwd: Option<&Path>,
         capture_bytes: usize,
+        environment: &BTreeMap<String, String>,
     ) -> io::Result<Self> {
         let Some((program, arguments)) = argv.split_first() else {
             return Err(io::Error::new(
@@ -185,6 +197,8 @@ impl Process {
         };
         let mut spec = Command::new(program);
         spec.args(arguments)
+            .env_clear()
+            .envs(environment)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -192,6 +206,10 @@ impl Process {
             spec.current_dir(cwd);
         }
         own_group(&mut spec);
+        // A long-lived process is subject to the same ceiling as a one-shot
+        // command: it is the one that runs longest, so it is the one most able
+        // to exhaust a resource before the supervisor notices.
+        apply_limits(&mut spec, resource_limits());
         let mut child = spec.spawn()?;
         let group = child.id();
         let stdout = child.stdout.take();
@@ -611,8 +629,13 @@ mod tests {
 
     #[test]
     fn a_process_takes_input_from_its_standard_input() {
-        let process =
-            Process::start_argv(&echo_standard_input(), None, CAPTURE_BYTES).expect("start");
+        let process = Process::start_argv(
+            &echo_standard_input(),
+            None,
+            CAPTURE_BYTES,
+            &BTreeMap::new(),
+        )
+        .expect("start");
         process.write(b"hello\n").expect("write");
         assert_eq!(exit_of(&process), Exit::Code(0));
         assert!(

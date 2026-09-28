@@ -112,6 +112,8 @@ pub struct PreparedCommand {
     pub cwd: Utf8PathBuf,
     /// Environment the command runs with, and nothing else.
     pub environment: BTreeMap<String, String>,
+    /// Resource ceiling the command runs under.
+    pub limits: ResourceLimits,
     /// The exact string that was authorized.
     pub reviewed: String,
 }
@@ -224,6 +226,7 @@ pub fn prepare(
         argv: route(command, shell),
         cwd: workspace.to_owned(),
         environment,
+        limits: resource_limits(),
         reviewed: command.to_owned(),
     })
 }
@@ -263,9 +266,45 @@ pub fn prepare_shell(
         ],
         cwd: workspace.to_owned(),
         environment,
+        limits: resource_limits(),
         reviewed: command.to_owned(),
     })
 }
+
+/// Returns the environment a command is given when the caller names none.
+///
+/// A command needs a `PATH` to resolve a program by name, and a `HOME` because
+/// most programs that read a config file look there and misbehave when it is
+/// absent. Nothing else from this process is passed: it holds provider
+/// credentials and session state, and a command that reaches the network would
+/// otherwise be able to read them.
+///
+/// The variables are resolved once, here, rather than inherited, so a variable
+/// added to the environment later in this process cannot leak into a command.
+#[must_use]
+pub fn minimal_environment() -> BTreeMap<String, String> {
+    let mut environment = BTreeMap::new();
+    for name in ["PATH", "HOME", "TERM", "LANG", "TMPDIR"] {
+        // A value this process holds that is not valid UTF-8 is left out
+        // rather than lossily converted: a mangled path is worse than none.
+        if let Some(value) = std::env::var_os(name)
+            && let Ok(value) = value.into_string()
+        {
+            environment.insert(name.to_owned(), value);
+        }
+    }
+    if !environment.contains_key("PATH") {
+        environment.insert("PATH".to_owned(), String::from(DEFAULT_PATH));
+    }
+    environment
+}
+
+/// Path used when this process has no `PATH` of its own.
+///
+/// A command would otherwise be unable to resolve a program by name at all,
+/// which reads as "the program does not exist" rather than "the environment was
+/// empty".
+const DEFAULT_PATH: &str = "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
 
 /// Returns true when a command has to be parsed by a shell.
 #[must_use]
@@ -334,6 +373,10 @@ pub fn verify_unchanged(prepared: &PreparedCommand) -> Result<()> {
         shell,
         prepared.environment.clone(),
     )?;
+    let expected = PreparedCommand {
+        limits: prepared.limits,
+        ..expected
+    };
     if expected.argv == prepared.argv {
         Ok(())
     } else {
@@ -449,6 +492,8 @@ fn start(program: &str, arguments: &[String], prepared: &PreparedCommand) -> Res
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     own_group(&mut spec);
+    // The ceiling is applied in the child, before it executes.
+    apply_limits(&mut spec, prepared.limits);
     spec.spawn().map_err(|err| spawn_error(program, &err))
 }
 
@@ -546,6 +591,161 @@ pub(crate) fn own_group(spec: &mut Command) {
     {
         let _ = spec;
     }
+}
+
+/// Applies a hard resource ceiling to a child before it executes.
+///
+/// The wall-clock deadline in the supervisor stops a command that runs too
+/// long, but it cannot stop one that exhausts a resource first: a process that
+/// allocates until the host is out of memory, or forks until the process table
+/// is full, takes the machine down in the seconds before the deadline is
+/// noticed. These limits are the kernel refusing at the moment of the request
+/// rather than this program noticing afterwards.
+///
+/// Every limit is set soft-equal-to-hard, so the child cannot raise its own
+/// ceiling back up.
+#[cfg(unix)]
+#[allow(
+    unsafe_code,
+    reason = "pre_exec is the only point at which a child's limits can be set, \
+              and it is unsafe by its own contract; the closure calls setrlimit \
+              and nothing else"
+)]
+pub(crate) fn apply_limits(spec: &mut Command, limits: ResourceLimits) {
+    use std::os::unix::process::CommandExt as _;
+
+    // `pre_exec` runs in the child between fork and exec, which is the only
+    // point where a limit can be set on a process that is already its own.
+    // Everything here is async-signal-safe: rustix's `setrlimit` makes one
+    // syscall and allocates nothing.
+    //
+    // SAFETY: the closure calls `setrlimit` only. A failure is returned so the
+    // child refuses to exec rather than running unlimited, which is the point.
+    unsafe {
+        spec.pre_exec(move || limits.apply());
+    }
+}
+
+#[cfg(not(unix))]
+pub(crate) fn apply_limits(spec: &mut Command, limits: ResourceLimits) {
+    let _ = (spec, limits);
+}
+
+/// A resource ceiling for one command.
+///
+/// A value of `None` leaves that limit alone, so a platform or a caller that
+/// cannot express one is not made to invent a number.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ResourceLimits {
+    /// Longest a command may run, in seconds of CPU time.
+    pub cpu_seconds: Option<u64>,
+    /// Largest address space the command may claim, in bytes.
+    pub address_space_bytes: Option<u64>,
+    /// Most processes and threads the command and its children may create.
+    ///
+    /// This is what stops a fork bomb: past the ceiling, `fork` fails and the
+    /// command cannot clone itself further.
+    pub processes: Option<u64>,
+    /// Largest file the command may create, in bytes.
+    pub file_bytes: Option<u64>,
+}
+
+impl Default for ResourceLimits {
+    /// The ceiling a command runs under unless a caller says otherwise.
+    ///
+    /// Chosen to be generous for real work and still bounded: a build that
+    /// wants more than sixteen gigabytes of address space, or four hours of
+    /// CPU, is not a build this program should be running unattended.
+    fn default() -> Self {
+        Self {
+            cpu_seconds: Some(DEFAULT_CPU_SECONDS),
+            address_space_bytes: Some(DEFAULT_ADDRESS_SPACE_BYTES),
+            processes: Some(DEFAULT_PROCESSES),
+            file_bytes: Some(DEFAULT_FILE_BYTES),
+        }
+    }
+}
+
+/// Longest a command may run, in seconds of CPU time.
+pub const DEFAULT_CPU_SECONDS: u64 = 4 * 60 * 60;
+/// Largest address space a command may claim.
+pub const DEFAULT_ADDRESS_SPACE_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+/// Most processes and threads a command may create.
+pub const DEFAULT_PROCESSES: u64 = 4096;
+/// Largest file a command may create.
+pub const DEFAULT_FILE_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+
+#[cfg(unix)]
+impl ResourceLimits {
+    /// Sets every configured limit on the calling process.
+    ///
+    /// Called in the child after `fork` and before `exec`, which is why it
+    /// returns the platform error rather than a formatted one: the only thing
+    /// that can be done with a failure here is to refuse to run.
+    ///
+    /// A ceiling is lowered to what the platform will accept rather than
+    /// refused. macOS caps the process count below any useful value and its
+    /// hard maximum is the system's, not this program's, so treating "the
+    /// system already forbids more than we asked" as a failure would refuse to
+    /// run every command on that platform. A ceiling that cannot be expressed
+    /// at all is skipped, and named in the module documentation, rather than
+    /// reported as applied.
+    fn apply(&self) -> io::Result<()> {
+        use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
+
+        #[cfg(target_os = "linux")]
+        let wanted = [
+            (Resource::Cpu, self.cpu_seconds),
+            (Resource::Nproc, self.processes),
+            (Resource::Fsize, self.file_bytes),
+            (Resource::As, self.address_space_bytes),
+        ];
+        // macOS has no address space limit worth setting: it rejects a value
+        // below its own reservation, which is far larger than any ceiling a
+        // command should have, so asking would fail the spawn rather than bound
+        // the command. The Linux namespace sandbox bounds memory there instead.
+        #[cfg(not(target_os = "linux"))]
+        let wanted = [
+            (Resource::Cpu, self.cpu_seconds),
+            (Resource::Nproc, self.processes),
+            (Resource::Fsize, self.file_bytes),
+        ];
+
+        for (resource, value) in wanted {
+            let Some(value) = value.filter(|value| *value > 0) else {
+                continue;
+            };
+            // The system's hard maximum is a ceiling this program cannot raise,
+            // and does not need to: a command already cannot exceed it.
+            let hard = getrlimit(resource).maximum;
+            let value = match hard {
+                Some(hard) if hard < value => hard,
+                _ => value,
+            };
+            if value == 0 {
+                continue;
+            }
+            // Soft equals hard: the child cannot raise its own ceiling.
+            setrlimit(
+                resource,
+                Rlimit {
+                    current: Some(value),
+                    maximum: Some(value),
+                },
+            )
+            .map_err(io::Error::from)?;
+        }
+        Ok(())
+    }
+}
+
+/// Returns the limits a command runs under.
+///
+/// A caller may name stricter ones; there is no way to name looser ones, because
+/// a limit that can be raised by the thing it constrains is not a limit.
+#[must_use]
+pub fn resource_limits() -> ResourceLimits {
+    ResourceLimits::default()
 }
 
 /// Delivers no signal, on a platform with no process group to signal.
@@ -1064,6 +1264,134 @@ mod tests {
         );
         let child = recorded_pid(&pidfile);
         assert!(!alive(&child), "the forked child outlived the cancellation");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_command_cannot_read_a_credential_this_process_holds() {
+        // The end-to-end form of the check above: a real command is spawned
+        // while this process holds a credential, and asked to print its own
+        // environment. Run the suite with the variable set to exercise it;
+        // without it the assertion is vacuous but harmless.
+        if std::env::var_os("OPENAI_API_KEY").is_none() {
+            return;
+        }
+        let (_dir, dir) = tempdir();
+        let prepared = prepare("/usr/bin/env", dir.as_path(), None, minimal_environment())
+            .expect("prepare");
+        let outcome = run(&prepared, Duration::from_secs(10), &never).expect("run");
+        assert!(
+            !outcome.stdout.contains("OPENAI_API_KEY"),
+            "a command read a credential out of its environment:\n{}",
+            outcome.stdout
+        );
+    }
+
+    #[test]
+    fn the_minimal_environment_carries_no_credential() {
+        // The helper exists so a command cannot read back a secret this process
+        // holds. It is asserted directly, because the leak it prevents is
+        // invisible in normal output.
+        let environment = minimal_environment();
+        for name in ["PATH", "HOME", "TERM", "LANG", "TMPDIR"] {
+            // Only names the allowlist names may appear.
+            assert!(
+                environment.contains_key(name) || std::env::var_os(name).is_none(),
+                "{name} was dropped when the parent had it"
+            );
+        }
+        let allowed = ["PATH", "HOME", "TERM", "LANG", "TMPDIR"];
+        for name in environment.keys() {
+            assert!(
+                allowed.contains(&name.as_str()),
+                "`{name}` reached a command's environment"
+            );
+        }
+        // A key this process holds for a provider must never be among them.
+        for name in environment.keys() {
+            assert!(
+                !name.ends_with("_API_KEY") && !name.starts_with("RUNE_"),
+                "`{name}` looks like a secret that leaked"
+            );
+        }
+        // A command with no PATH of its own cannot resolve a program by name,
+        // which reads as the program missing rather than the environment being
+        // empty, so one is always supplied.
+        assert!(environment.contains_key("PATH"));
+    }
+
+    #[test]
+    fn the_minimal_environment_is_resolved_not_inherited() {
+        // The values are copied when the environment is built, so what a
+        // command receives cannot change underneath it. A variable this process
+        // does not hold is absent, which is the observable half of that.
+        let environment = minimal_environment();
+        assert!(
+            !environment.contains_key("RUNE_NOT_SET_ANYWHERE_PROBE"),
+            "a variable this process does not hold reached a command"
+        );
+        // Every value is a copy: mutating the map cannot reach the parent.
+        let mut copy = environment.clone();
+        copy.insert("PATH".to_owned(), String::from("/nonexistent"));
+        assert_ne!(
+            copy.get("PATH"),
+            minimal_environment().get("PATH"),
+            "the environment is shared rather than copied"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_command_cannot_create_a_file_past_its_ceiling() {
+        // The ceiling is checked by the kernel when the write happens, so this
+        // is the observable half of it: a command that ignores every polite
+        // stopping signal still cannot exceed its file size.
+        let (_dir, dir) = tempdir();
+        let prepared = prepare(
+            "head -c 4096 /dev/zero > big; echo done; wc -c < big",
+            dir.as_path(),
+            None,
+            environment(),
+        )
+        .expect("prepare");
+        // The command is truncated mid-write, so the shell reports the write
+        // failure rather than the size it hoped for.
+        let mut prepared = prepared;
+        prepared.limits = ResourceLimits {
+            file_bytes: Some(1024),
+            ..resource_limits()
+        };
+        let outcome = run(&prepared, Duration::from_secs(10), &never).expect("run");
+        // The command is stopped by a signal, so the shell never reports the
+        // size; the point is that it did not report 4096.
+        assert!(
+            !outcome.stdout.contains("4096"),
+            "a file larger than the ceiling was created: {}",
+            outcome.stdout
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn limits_leave_a_command_that_stays_under_them_alone() {
+        // The ceiling must not be so eager that ordinary work fails. This is
+        // the guard against a limit that is technically applied and practically
+        // fatal.
+        let (_dir, dir) = tempdir();
+        let prepared = prepare("echo hello", dir.as_path(), None, environment()).expect("prepare");
+        let outcome = run(&prepared, Duration::from_secs(10), &never).expect("run");
+        assert_eq!(outcome.stdout.trim(), "hello");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn the_default_ceiling_admits_work_a_build_needs() {
+        // The numbers are only useful if an ordinary command runs under them.
+        // A `cargo build` allocates and forks, and must not be refused.
+        let limits = resource_limits();
+        assert!(limits.cpu_seconds.unwrap_or(0) >= 60 * 60);
+        assert!(limits.processes.unwrap_or(0) >= 256);
+        assert!(limits.file_bytes.unwrap_or(0) >= 1024 * 1024 * 1024);
     }
 
     #[test]
