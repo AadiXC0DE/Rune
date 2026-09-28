@@ -158,13 +158,7 @@ pub fn run(
     // who has not set an endpoint is told that rather than being told about a
     // credential for an endpoint that does not exist.
     let provider_name = settings.provider.to_string();
-    let base_url = settings.base_url.clone().ok_or_else(|| {
-        RuneError::new(
-            ErrorCode::InvalidConfiguration,
-            format!("no endpoint is configured for provider `{provider_name}`"),
-        )
-        .with_hint("set `base_url` in the user config, or run `rune connect`")
-    })?;
+    let base_url = crate::provider_setup::require_base_url(settings)?;
     transport::validate_url(&base_url)?;
 
     let credential =
@@ -339,7 +333,9 @@ mod tests {
 
     #[test]
     fn a_missing_endpoint_is_reported_with_a_remedy() {
-        let mut settings = settings_with(Provider::Anthropic, "claude-test");
+        // A compatible endpoint has no published address, so it is the one
+        // provider that still has to be told where to send the request.
+        let mut settings = settings_with(Provider::ChatCompletions, "claude-test");
         settings.base_url = None;
         let dir = tempfile::TempDir::new().expect("tempdir");
         let paths = Paths::resolve(

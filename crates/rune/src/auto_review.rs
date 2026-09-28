@@ -45,7 +45,7 @@ pub fn build(settings: &Settings, paths: &Paths) -> Result<Option<Box<dyn Review
     }
 
     let provider_name = settings.provider.to_string();
-    let Some(base_url) = settings.base_url.clone() else {
+    let Some(base_url) = crate::provider_setup::configured_base_url(settings) else {
         return Ok(None);
     };
     let Some(credential) =

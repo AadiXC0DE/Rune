@@ -1084,13 +1084,7 @@ fn run_acp(
     settings.require_model()?;
 
     let provider_name = settings.provider.to_string();
-    let base_url = settings.base_url.clone().ok_or_else(|| {
-        RuneError::new(
-            ErrorCode::InvalidConfiguration,
-            format!("no endpoint is configured for provider `{provider_name}`"),
-        )
-        .with_hint("set `base_url` in the user config, or run `rune connect`")
-    })?;
+    let base_url = provider_setup::require_base_url(settings)?;
     rune_net::transport::validate_url(&base_url)?;
 
     let credential =

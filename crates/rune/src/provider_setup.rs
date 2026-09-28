@@ -28,6 +28,35 @@ pub fn default_base_url(provider: &Provider) -> Option<&'static str> {
     providers::base_url(provider.as_str())
 }
 
+/// Returns the endpoint a configured provider is reached at.
+///
+/// A configured `base_url` wins. A provider the table knows falls back to its
+/// published endpoint, so naming the provider in a flag, a variable, or a
+/// hand-written configuration is enough, and `rune connect` writing the URL
+/// down is a convenience rather than a requirement.
+#[must_use]
+pub fn configured_base_url(settings: &Settings) -> Option<String> {
+    settings
+        .base_url
+        .clone()
+        .or_else(|| default_base_url(&settings.provider).map(str::to_owned))
+}
+
+/// Returns the endpoint a configured provider is reached at, or why there is
+/// none.
+pub fn require_base_url(settings: &Settings) -> Result<String> {
+    configured_base_url(settings).ok_or_else(|| {
+        RuneError::new(
+            ErrorCode::InvalidConfiguration,
+            format!(
+                "no endpoint is configured for provider `{}`",
+                settings.provider
+            ),
+        )
+        .with_hint("set `base_url` in the user config, or run `rune connect`")
+    })
+}
+
 /// Reads a credential from the environment for a provider.
 ///
 /// Only the variables a provider actually uses are consulted, so a stray
@@ -183,7 +212,7 @@ pub fn render_connection(settings: &Settings, paths: &Paths) -> String {
     let _ = writeln!(out, "provider  {provider}");
     let _ = writeln!(out, "model     {}", settings.model);
 
-    match &settings.base_url {
+    match &configured_base_url(settings) {
         Some(url) => {
             let _ = writeln!(out, "endpoint  {url}");
         }
@@ -256,13 +285,7 @@ pub fn fetch_catalog(
     timeout: std::time::Duration,
 ) -> Result<Catalog> {
     let provider_name = settings.provider.to_string();
-    let base_url = settings.base_url.clone().ok_or_else(|| {
-        RuneError::new(
-            ErrorCode::InvalidConfiguration,
-            format!("no endpoint is configured for provider `{provider_name}`"),
-        )
-        .with_hint("set `base_url` in the user config, or run `rune connect`")
-    })?;
+    let base_url = require_base_url(settings)?;
 
     let credential = auth::resolve(paths, &provider_name, settings.api_key_env.as_deref())?
         .ok_or_else(|| {
@@ -1148,5 +1171,44 @@ mod tests {
         // Nothing declared a window, so the compiled default applies rather
         // than a zero that would make every request look too large.
         assert!(model.usable_context() > 0);
+    }
+
+    #[test]
+    fn a_known_provider_is_reached_at_its_published_endpoint() {
+        // Naming the provider is enough: an unset `base_url` falls back to the
+        // table rather than refusing a session the table can already describe.
+        let settings = Settings {
+            provider: Provider::Named(String::from("opencode-go")),
+            ..Settings::default()
+        };
+        assert_eq!(
+            require_base_url(&settings).expect("resolved"),
+            "https://opencode.ai/zen/go/v1"
+        );
+    }
+
+    #[test]
+    fn a_configured_endpoint_wins_over_the_published_one() {
+        let settings = Settings {
+            provider: Provider::Anthropic,
+            base_url: Some(String::from("http://127.0.0.1:9000/v1")),
+            ..Settings::default()
+        };
+        assert_eq!(
+            configured_base_url(&settings).as_deref(),
+            Some("http://127.0.0.1:9000/v1")
+        );
+    }
+
+    #[test]
+    fn a_compatible_endpoint_still_has_to_be_named() {
+        // An OpenAI-compatible provider has no single home, so guessing one
+        // would send the request somewhere the user never named.
+        let settings = Settings {
+            provider: Provider::ChatCompletions,
+            ..Settings::default()
+        };
+        let err = require_base_url(&settings).expect_err("refused");
+        assert_eq!(err.code(), ErrorCode::InvalidConfiguration);
     }
 }
