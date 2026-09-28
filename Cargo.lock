@@ -987,6 +987,7 @@ version = "0.1.15"
 dependencies = [
  "camino",
  "rune-core",
+ "rune-exec",
  "serde",
  "serde_json",
  "sha2",
@@ -1056,6 +1057,7 @@ version = "0.1.15"
 dependencies = [
  "rune-agent",
  "rune-core",
+ "rune-exec",
  "rune-net",
  "rune-testkit",
  "rune-tools",

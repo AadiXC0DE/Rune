@@ -98,6 +98,59 @@ pub const POLL_INTERVAL: Duration = Duration::from_millis(8);
 /// leaves the shell, which is what a user reaching for Ctrl-C twice expects.
 pub const INTERRUPT_WINDOW: Duration = Duration::from_millis(1000);
 
+/// The window in which a second Escape is treated as a request to cancel.
+///
+/// Escape is also the key that clears a typed line, so the first press only
+/// arms: cancelling a turn on a single press would make a stray Escape in the
+/// composer stop the work the user was about to steer.
+pub const ESCAPE_CANCEL_WINDOW: Duration = Duration::from_millis(1000);
+
+/// The window in which Escape clears the composer rather than arming.
+///
+/// A press inside this window of the previous one is a repeated press, which
+/// means the user is reaching for the cancel gesture rather than clearing.
+pub const ESCAPE_CLEAR_WINDOW: Duration = Duration::from_millis(500);
+
+/// Tracks the Escape gesture across presses.
+///
+/// The gesture is armed by the first press and confirmed by a second one inside
+/// [`ESCAPE_CANCEL_WINDOW`]. Any other key disarms it, so a press followed by
+/// typing is an edit rather than half of a cancel.
+#[derive(Debug, Default)]
+pub struct EscapeGesture {
+    armed_at: Option<std::time::Instant>,
+}
+
+impl EscapeGesture {
+    /// Records an Escape and reports whether it cancels.
+    ///
+    /// The first press arms and returns false; a confirming press inside the
+    /// window returns true.
+    pub fn record(&mut self) -> bool {
+        self.record_at(std::time::Instant::now())
+    }
+
+    /// Records an Escape at a given time, for tests.
+    pub fn record_at(&mut self, now: std::time::Instant) -> bool {
+        let confirmed = self
+            .armed_at
+            .is_some_and(|armed| now.duration_since(armed) <= ESCAPE_CANCEL_WINDOW);
+        self.armed_at = if confirmed { None } else { Some(now) };
+        confirmed
+    }
+
+    /// Forgets the gesture, used when anything other than Escape arrives.
+    pub fn disarm(&mut self) {
+        self.armed_at = None;
+    }
+
+    /// Returns whether the gesture is armed and awaiting a second press.
+    #[must_use]
+    pub fn is_armed(&self) -> bool {
+        self.armed_at.is_some()
+    }
+}
+
 /// Tracks repeated interrupts.
 #[derive(Debug, Default)]
 pub struct Interrupts {
@@ -404,6 +457,45 @@ mod tests {
         assert!(!interrupts.record_at(start));
         interrupts.clear();
         assert!(!interrupts.record_at(start + Duration::from_millis(10)));
+    }
+
+    #[test]
+    fn one_escape_only_arms_the_cancel() {
+        // Escape is also the key that clears a typed line, so a single press
+        // must not cancel the work the user was about to steer.
+        let mut gesture = EscapeGesture::default();
+        assert!(!gesture.record());
+        assert!(gesture.is_armed());
+    }
+
+    #[test]
+    fn a_second_escape_inside_the_window_cancels() {
+        let mut gesture = EscapeGesture::default();
+        let start = std::time::Instant::now();
+        assert!(!gesture.record_at(start));
+        assert!(gesture.record_at(start + Duration::from_millis(200)));
+        assert!(
+            !gesture.is_armed(),
+            "the gesture survives its own completion"
+        );
+    }
+
+    #[test]
+    fn a_second_escape_outside_the_window_only_arms_again() {
+        let mut gesture = EscapeGesture::default();
+        let start = std::time::Instant::now();
+        assert!(!gesture.record_at(start));
+        assert!(!gesture.record_at(start + ESCAPE_CANCEL_WINDOW + Duration::from_millis(1)));
+    }
+
+    #[test]
+    fn typing_between_two_escapes_disarms_the_cancel() {
+        // A press followed by an edit is an edit, not half of a cancel.
+        let mut gesture = EscapeGesture::default();
+        let start = std::time::Instant::now();
+        assert!(!gesture.record_at(start));
+        gesture.disarm();
+        assert!(!gesture.record_at(start + Duration::from_millis(50)));
     }
 
     #[test]

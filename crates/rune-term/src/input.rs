@@ -10,6 +10,7 @@
 //! it rather than where the editor thinks it is.
 
 use std::io::IsTerminal;
+use std::time::Duration;
 
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
@@ -25,7 +26,17 @@ pub enum KeyAction {
     /// The user asked to leave.
     Interrupt,
     /// The user asked to cancel what is running.
+    ///
+    /// Control-C. It clears a partly typed line first, because that is what the
+    /// key does in every other shell, and only then reaches the work.
     Cancel,
+    /// The user pressed Escape.
+    ///
+    /// Kept apart from [`KeyAction::Cancel`] because the two carry different
+    /// gestures: Escape is also the key that clears a line, so cancelling on a
+    /// single press would make a stray Escape stop the work the user was about
+    /// to steer.
+    Escape,
     /// The user moved the selection up.
     Up,
     /// The user moved the selection down.
@@ -127,6 +138,27 @@ impl KeyReader {
         self.apply(key)
     }
 
+    /// Returns the next key if one is already waiting, without blocking.
+    ///
+    /// Used while a turn runs, where the reader cannot afford to wait for a key
+    /// that may never come: the turn's own progress still has to be drawn.
+    /// Returns `None` when nothing is ready.
+    pub fn poll_key(&mut self, timeout: Duration) -> Option<KeyAction> {
+        if !self.active || !crossterm::event::poll(timeout).unwrap_or(false) {
+            return None;
+        }
+        let Ok(event) = crossterm::event::read() else {
+            return None;
+        };
+        let Event::Key(key) = event else {
+            return None;
+        };
+        if key.kind == KeyEventKind::Release {
+            return None;
+        }
+        Some(self.apply(key))
+    }
+
     /// Applies one key to the line.
     ///
     /// Split from reading so a test drives the same mapping a terminal does.
@@ -176,7 +208,7 @@ impl KeyReader {
             // Tab completes rather than inserting a tab: a prompt is a single
             // line, so a tab character has nothing to align.
             (KeyCode::Tab, _, _) => KeyAction::Complete,
-            (KeyCode::Esc, _, _) => KeyAction::Cancel,
+            (KeyCode::Esc, _, _) => KeyAction::Escape,
             (KeyCode::Backspace, _, _) => {
                 self.composer.delete_back();
                 KeyAction::Ignored
@@ -268,10 +300,18 @@ mod tests {
     }
 
     #[test]
-    fn enter_submits_and_escape_cancels() {
+    fn enter_submits_and_escape_is_its_own_gesture() {
+        // Escape is reported apart from Control-C because the two mean
+        // different things while a turn runs: Escape arms a cancel that a
+        // second press confirms, while Control-C cancels at once.
         let mut reader = reader();
         assert_eq!(reader.apply(key(KeyCode::Enter)), KeyAction::Submit);
-        assert_eq!(reader.apply(key(KeyCode::Esc)), KeyAction::Cancel);
+        assert_eq!(reader.apply(key(KeyCode::Esc)), KeyAction::Escape);
+        assert_ne!(
+            reader.apply(key(KeyCode::Esc)),
+            reader.apply(control('c')),
+            "escape and control-c must be told apart"
+        );
     }
 
     #[test]

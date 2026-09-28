@@ -299,7 +299,7 @@ impl ReviewOutcome {
 /// against a provider in production. An implementation returns
 /// [`ReviewOutcome::Unavailable`] when the request could not be completed, and
 /// [`ReviewOutcome::Invalid`] when the reply carried no single decision.
-pub trait Reviewer {
+pub trait Reviewer: Send + Sync {
     /// Reviews one action.
     fn review(&self, request: &ReviewRequest) -> ReviewOutcome;
 }
@@ -576,37 +576,45 @@ fn invalid(problem: &str) -> RuneError {
 
 #[cfg(test)]
 mod tests {
-    use std::cell::RefCell;
+    use std::sync::Mutex;
 
     use super::*;
 
     /// A reviewer that answers from a script and counts its requests.
     struct Scripted {
-        answers: RefCell<Vec<ReviewOutcome>>,
-        calls: RefCell<Vec<String>>,
+        answers: Mutex<Vec<ReviewOutcome>>,
+        calls: Mutex<Vec<String>>,
     }
 
     impl Scripted {
         fn new(answers: Vec<ReviewOutcome>) -> Self {
             Self {
-                answers: RefCell::new(answers),
-                calls: RefCell::new(Vec::new()),
+                answers: Mutex::new(answers),
+                calls: Mutex::new(Vec::new()),
             }
         }
 
         fn calls(&self) -> usize {
-            self.calls.borrow().len()
+            self.calls.lock().map_or(0, |calls| calls.len())
         }
 
         fn reviewed(&self, index: usize) -> String {
-            self.calls.borrow()[index].clone()
+            self.calls
+                .lock()
+                .map_or_else(|_| String::new(), |calls| calls[index].clone())
         }
     }
 
     impl Reviewer for Scripted {
         fn review(&self, request: &ReviewRequest) -> ReviewOutcome {
-            self.calls.borrow_mut().push(request.action.clone());
-            let mut answers = self.answers.borrow_mut();
+            if let Ok(mut calls) = self.calls.lock() {
+                calls.push(request.action.clone());
+            }
+            let Ok(mut answers) = self.answers.lock() else {
+                return ReviewOutcome::Unavailable {
+                    reason: "the script could not be read".to_owned(),
+                };
+            };
             if answers.is_empty() {
                 return ReviewOutcome::Unavailable {
                     reason: "the script is spent".to_owned(),

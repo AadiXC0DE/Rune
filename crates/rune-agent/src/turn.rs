@@ -377,6 +377,18 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
         }
 
         if pending_calls.is_empty() {
+            // Steering that arrived while the last request was streaming gets a
+            // response in this turn rather than the next one. Ending here would
+            // drop it: the loop returns without reaching another drain, and a
+            // correction typed against the answer being written would never be
+            // seen. Continuing is what makes the correction feel delivered.
+            if !steering.is_empty() {
+                host.emit(Event::SteeringApplied {
+                    boundary: Boundary::Finalizing,
+                    count: steering.len(),
+                });
+                continue;
+            }
             let reason = match finish {
                 FinishReason::Stop => StopReason::Completed,
                 FinishReason::MaxTokens => StopReason::OutputLimit,

@@ -51,6 +51,9 @@ struct TestHost {
     /// it and, when nothing is concerning, allow it. A host that cannot review
     /// leaves the call unresolved, which the loop reports rather than running.
     resolve_ask: bool,
+    /// Text submitted as steering the first time a delta arrives, which is when
+    /// a user typing during a stream would reach the queue.
+    submit_on_first_delta: Mutex<Option<String>>,
 }
 
 impl TestHost {
@@ -72,7 +75,14 @@ impl TestHost {
             workspace: Utf8PathBuf::from("/tmp/rune-test"),
             limits: BudgetSet::new(),
             resolve_ask: true,
+            submit_on_first_delta: Mutex::new(None),
         }
+    }
+
+    /// Submits steering as soon as the first token of a reply arrives.
+    fn with_steering_mid_stream(self, text: &str) -> Self {
+        *self.submit_on_first_delta.lock().expect("lock") = Some(text.to_owned());
+        self
     }
 
     /// Leaves an unresolved call unresolved, as a noninteractive host without a
@@ -159,6 +169,16 @@ impl Host for TestHost {
     }
 
     fn emit(&self, event: Event) {
+        // Steering is submitted from inside the stream, which is the only way
+        // to exercise the path a user typing mid-turn takes. Doing it here
+        // rather than before the turn is the whole point of the test that uses
+        // it: text submitted before the turn is drained at the model boundary,
+        // while text submitted during it has to survive to the finalizing one.
+        if matches!(event, Event::TextDelta { .. })
+            && let Some(text) = self.submit_on_first_delta.lock().expect("lock").take()
+        {
+            self.steering.submit(text).expect("queued");
+        }
         self.events.lock().expect("lock").push(event);
     }
 
@@ -507,6 +527,52 @@ fn cancellation_stops_the_turn() {
 
     let err = run_turn(&mut history, &host).expect_err("cancelled");
     assert_eq!(err.code(), rune_core::error::ErrorCode::Cancelled);
+}
+
+#[test]
+fn steering_submitted_mid_stream_gets_a_response_in_the_same_turn() {
+    // Text typed while the answer is streaming arrives after the last request
+    // was built. Ending the turn there dropped it: no further boundary was
+    // reached, so the correction was never sent and the user was told nothing.
+    // It must instead continue the turn so the model answers it.
+    let endpoint = MockEndpoint::start(vec![
+        Script::text("first reply"),
+        Script::text("second reply"),
+    ]);
+    let host = TestHost::new(endpoint).with_steering_mid_stream("actually do this instead");
+
+    let mut history = rune_agent::History::new();
+    history.push_user("original request");
+
+    run_turn(&mut history, &host).expect("turn");
+
+    let applied = host.events().into_iter().any(|event| {
+        matches!(
+            event,
+            Event::SteeringApplied {
+                boundary: rune_agent::Boundary::Finalizing,
+                count: 1
+            }
+        )
+    });
+    assert!(applied, "steering submitted mid-stream was dropped");
+
+    // The model was asked again with the steering in the conversation, which is
+    // what makes the correction delivered rather than merely queued.
+    let rendered = history
+        .turns()
+        .iter()
+        .map(rune_agent::Turn::text)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        rendered.contains("actually do this instead"),
+        "the steering never reached the conversation: {rendered}"
+    );
+    assert!(
+        rendered.contains("second reply"),
+        "the turn ended without answering the steering: {rendered}"
+    );
 }
 
 #[test]

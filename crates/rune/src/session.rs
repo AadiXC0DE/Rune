@@ -214,6 +214,13 @@ struct SessionHost {
     height: std::sync::atomic::AtomicU16,
     /// Draws the live region and owns every write to the terminal.
     inline: Mutex<rune_term::inline::Inline>,
+    /// Held across a whole frame, paint and write together.
+    ///
+    /// Two threads draw once a turn runs on its own thread: the turn draws the
+    /// text arriving, and the loop draws the line being typed. Without one lock
+    /// covering both steps, one frame's bytes can land inside another's and the
+    /// screen shows a mix of two.
+    frame: Mutex<()>,
     /// Ordered upstream provider preference.
     provider_order: Vec<String>,
     /// Whether requests are restricted to that preference.
@@ -750,12 +757,53 @@ impl SessionHost {
     /// A failure is ignored: not being able to present a delta must never end a
     /// turn or fail a request that is otherwise fine.
     fn draw_stream(&self) {
+        self.draw_stream_with("", 0);
+    }
+
+    /// Draws the arriving text with the line being typed under it.
+    ///
+    /// The line is drawn here rather than by the loop because during a turn the
+    /// loop is the thread that draws it, and both writers must agree on one
+    /// frame or the screen shows a mixture of two.
+    fn draw_stream_with(&self, line: &str, column: usize) {
         let rows = self.streaming_rows();
-        if rows.is_empty() {
+        let Ok(_frame) = self.frame.lock() else {
+            return;
+        };
+        if rows.is_empty() && line.is_empty() {
             return;
         }
-        let (prompt_row, caret) = self.idle_prompt();
-        let Ok(painted) = self.paint(&[], None, &prompt_row, &rows, caret) else {
+        let marker = rune_term::shell::prompt();
+        let prompt_row = transcript::render_prompt(marker, line, usize::from(self.width()));
+        let caret = rune_term::width::str_width(marker).saturating_add(column);
+        let Ok(painted) = self.paint(
+            &[],
+            None,
+            std::slice::from_ref(&prompt_row),
+            &rows,
+            (0, u16::try_from(caret).unwrap_or(u16::MAX)),
+        ) else {
+            return;
+        };
+        self.show(&painted);
+    }
+
+    /// Draws one notice line with the line being typed, as one frame.
+    fn draw_notice_with(&self, notice: &str, line: &str, column: usize) {
+        let rows = self.streaming_rows();
+        let Ok(_frame) = self.frame.lock() else {
+            return;
+        };
+        let marker = rune_term::shell::prompt();
+        let prompt_row = transcript::render_prompt(marker, line, usize::from(self.width()));
+        let caret = rune_term::width::str_width(marker).saturating_add(column);
+        let Ok(painted) = self.paint(
+            &[],
+            Some(notice),
+            std::slice::from_ref(&prompt_row),
+            &rows,
+            (0, u16::try_from(caret).unwrap_or(u16::MAX)),
+        ) else {
             return;
         };
         self.show(&painted);
@@ -916,6 +964,7 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
         width: std::sync::atomic::AtomicU16::new(terminal_width()),
         height: std::sync::atomic::AtomicU16::new(terminal_height()),
         inline: Mutex::new(rune_term::inline::Inline::new(terminal_width())),
+        frame: Mutex::new(()),
         provider_order: config.settings.provider_order.clone(),
         provider_strict: config.settings.provider_strict,
         streaming: Arc::new(Mutex::new(StreamingText::default())),
@@ -968,6 +1017,8 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
     // does not know, and the two disagree about what is on the line.
     let mut reader = rune_term::input::KeyReader::new();
     let keyed = reader.is_active();
+    // The Escape gesture spans presses, so it outlives a single read.
+    let mut cancellation_gesture = rune_term::shell::EscapeGesture::default();
 
     // A session with no model asks for one now, before the first turn, because
     // a turn cannot be sent without an identifier. A terminal drives the picker,
@@ -1009,7 +1060,9 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
     // owns them can re-read them between submissions for the up arrow.
     let mut handle_input = |input: Input,
                             sink: &mut LockedSink,
-                            history_file: &mut Option<crate::prompt_history::History>|
+                            history_file: &mut Option<crate::prompt_history::History>,
+                            reader: &mut rune_term::input::KeyReader,
+                            gesture: &mut rune_term::shell::EscapeGesture|
      -> Result<Step> {
         match input {
             Input::Command { name, arguments } => {
@@ -1141,7 +1194,11 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                 }
                 recorder.user_message(&text)?;
                 history.push_user(text);
-                let outcome = turn::run_turn(&mut history, &host)?;
+                // The turn runs on its own thread so this one keeps reading
+                // keys. A turn that ran inline made the keyboard dead for as
+                // long as the model took, which is the difference between
+                // correcting a long turn and waiting it out.
+                let outcome = run_turn_steerable(&mut history, &host, reader, gesture)?;
                 // The turn is recorded before it is reported, so a session that
                 // dies while rendering still has its exchange on disk.
                 recorder.turn(&outcome)?;
@@ -1201,7 +1258,13 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
             let mut sink = LockedSink {
                 stream: Arc::clone(&out),
             };
-            match handle_input(input, &mut sink, &mut history_file)? {
+            match handle_input(
+                input,
+                &mut sink,
+                &mut history_file,
+                &mut reader,
+                &mut cancellation_gesture,
+            )? {
                 Step::Exit => {
                     reason = ExitReason::Requested;
                     break;
@@ -1227,7 +1290,7 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
             let mut sink = LockedSink {
                 stream: Arc::clone(&out),
             };
-            match handle_input(input, &mut sink, &mut history_file)? {
+            match handle_input(input, &mut sink, &mut history_file, &mut reader, &mut cancellation_gesture)? {
                 Step::Exit => Ok(Action::Exit),
                 Step::Continue => Ok(Action::Continue),
                 Step::Undo => {
@@ -1256,6 +1319,128 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
     }
 
     Ok(reason.exit_code())
+}
+
+/// Runs one turn while keeping the keyboard live.
+///
+/// The turn runs on its own thread because a turn that ran here would block
+/// every keystroke until the model finished. What the user types meanwhile is
+/// submitted to the steering queue, which the turn drains at the boundaries it
+/// already computes; Escape and Control-C reach the cancellation flag the turn
+/// already checks.
+///
+/// Returns the turn's outcome. Cancellation is reported by the turn itself
+/// rather than by abandoning it, so the conversation keeps whatever the turn
+/// had already recorded.
+fn run_turn_steerable(
+    history: &mut History,
+    host: &SessionHost,
+    reader: &mut rune_term::input::KeyReader,
+    gesture: &mut rune_term::shell::EscapeGesture,
+) -> Result<turn::TurnOutcome> {
+    if !reader.is_active() {
+        // Without a terminal there are no keys to read, so the turn runs here
+        // and the steering path is simply unused.
+        return turn::run_turn(history, host);
+    }
+
+    // Cleared before the turn rather than after, so a cancel that arrived as
+    // the previous turn ended cannot stop this one before it starts.
+    host.cancellation.reset();
+
+    // The conversation is moved in and handed back: a turn pushes what it
+    // learned into the history, and the next turn must see it. Moving it is
+    // what lets the worker own it outright rather than sharing it behind a
+    // lock the loop would then have to hold.
+    let mut taken = std::mem::take(history);
+    let (returned, result) = std::thread::scope(|scope| {
+        let worker = scope.spawn(|| {
+            let result = turn::run_turn(&mut taken, host);
+            (taken, result)
+        });
+
+        let mut interrupts = rune_term::shell::Interrupts::default();
+        while !worker.is_finished() {
+            let Some(key) = reader.poll_key(rune_term::shell::POLL_INTERVAL) else {
+                continue;
+            };
+            match key {
+                // Enter submits what has been typed as steering rather than as
+                // a new turn, so a correction reaches the running turn instead
+                // of queueing behind it.
+                KeyAction::Submit => {
+                    let text = reader.line().trim().to_owned();
+                    reader.clear();
+                    gesture.disarm();
+                    if text.is_empty() {
+                        continue;
+                    }
+                    let notice = match host.steering.submit(text) {
+                        Ok(()) => String::from("steering queued for the next boundary"),
+                        Err(err) => err.message().to_owned(),
+                    };
+                    host.draw_notice_with(&notice, "", 0);
+                }
+                // Escape arms on the first press and cancels on the second.
+                // The first press also clears a partly typed correction, which
+                // is what the key does everywhere else.
+                KeyAction::Escape => {
+                    if gesture.record() {
+                        host.cancellation.cancel();
+                        host.draw_notice_with("cancelling the turn", "", 0);
+                    } else if reader.line().is_empty() {
+                        host.draw_notice_with("press Escape again to cancel", "", 0);
+                    } else {
+                        reader.clear();
+                        host.draw_stream_with("", 0);
+                    }
+                }
+                // Control-C clears a typed correction first, then cancels, then
+                // leaves on the next press, which is the order the key is
+                // reached for in.
+                KeyAction::Cancel => {
+                    gesture.disarm();
+                    if !reader.line().is_empty() {
+                        reader.clear();
+                        host.draw_stream_with("", 0);
+                    } else if interrupts.record() {
+                        // A second Control-C asks to leave. The turn is
+                        // cancelled and awaited first, because a session that
+                        // ended while its turn was still writing would leave a
+                        // half-drawn frame behind.
+                        host.cancellation.cancel();
+                    } else {
+                        host.cancellation.cancel();
+                        host.draw_notice_with("cancelling the turn", "", 0);
+                    }
+                }
+                // Anything else is an edit, so a half-finished cancel gesture
+                // is abandoned rather than left armed, and the line is redrawn
+                // with the text that has been typed so far.
+                _ => {
+                    gesture.disarm();
+                    host.draw_stream_with(reader.line(), reader.column());
+                }
+            }
+        }
+
+        let (returned, result) = worker
+            .join()
+            .unwrap_or_else(|_| (History::new(), Err(turn_interrupted())));
+        (returned, result)
+    });
+
+    *history = returned;
+    result
+}
+
+/// Returns the error an interrupted turn is reported with.
+///
+/// A worker that panics is reported as an interruption rather than as a panic:
+/// a panic inside a turn is not a reason to end the session, and the only other
+/// thing the caller could do with it is stop.
+fn turn_interrupted() -> RuneError {
+    RuneError::new(ErrorCode::Cancelled, "the turn was interrupted")
 }
 
 /// Waits for a line to be submitted, drawing the prompt as it is typed.
@@ -1305,9 +1490,18 @@ fn await_submission(
             // An empty line is the only thing there is to leave behind, so
             // interrupting it means leaving the session.
             KeyAction::Interrupt => return Ok(None),
+            // Escape clears a partly typed line first, which is what a reader
+            // expects of a key that also leaves.
+            KeyAction::Escape => {
+                if reader.line().is_empty() {
+                    return Ok(None);
+                }
+                reader.clear();
+                selected = 0;
+            }
             KeyAction::Cancel => {
-                // Escape clears a partly typed line first, which is what a
-                // reader expects of a key that also leaves.
+                // Control-C on a partly typed line abandons the line rather
+                // than the session, matching what the key does elsewhere.
                 if reader.line().is_empty() {
                     return Ok(None);
                 }
@@ -1432,7 +1626,7 @@ fn run_picker(
             KeyAction::Submit | KeyAction::Complete => {
                 break picker.selected().map(str::to_owned);
             }
-            KeyAction::Interrupt | KeyAction::Cancel => break None,
+            KeyAction::Interrupt | KeyAction::Cancel | KeyAction::Escape => break None,
             // Both branches fall through to the redraw at the top of the loop.
             response @ (KeyAction::Up | KeyAction::Down) => {
                 if response == KeyAction::Up {
@@ -4119,6 +4313,7 @@ mod tests {
             width: std::sync::atomic::AtomicU16::new(80),
             height: std::sync::atomic::AtomicU16::new(24),
             inline: Mutex::new(rune_term::inline::Inline::new(80)),
+            frame: Mutex::new(()),
             provider_order: Vec::new(),
             provider_strict: false,
             streaming: Arc::new(Mutex::new(StreamingText::default())),
@@ -4129,5 +4324,15 @@ mod tests {
             undo: Mutex::new(BTreeMap::new()),
             review_session: Arc::new(Mutex::new(ReviewSession::new(&BudgetSet::new()))),
         }
+    }
+}
+
+#[cfg(test)]
+mod send_probe {
+    use super::SessionHost;
+    #[test]
+    fn session_host_can_cross_a_thread() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<SessionHost>();
     }
 }
