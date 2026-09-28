@@ -11,6 +11,8 @@
 
 use rune_core::error::{ErrorCode, Result, RuneError};
 
+use crate::approval::is_command_tool;
+use crate::command_line::{self, Command};
 use crate::decision::{ConsideredRule, Decision, Layer, Outcome};
 
 /// One permission rule.
@@ -90,6 +92,36 @@ impl Rule {
         glob_match(&self.pattern, target)
     }
 
+    /// Returns true when the pattern holds a wildcard.
+    fn is_pattern(&self) -> bool {
+        self.pattern.contains('*') || self.pattern.contains('?')
+    }
+
+    /// Returns true when the rule applies to one command of a line.
+    ///
+    /// A refusal or a question applies when it matches any spelling of the
+    /// command, or the line as a whole. An allow applies only to the command's
+    /// plain form, and a pattern cannot allow a command that writes through a
+    /// redirection: `ls*` was written about listing, not about `ls > ~/.zshrc`.
+    /// A rule of `*` allows everything, so it is the one pattern that still
+    /// applies.
+    fn matches_command(&self, command: &Spellings, line: &str) -> bool {
+        match self.outcome {
+            Outcome::Deny | Outcome::Ask => {
+                self.matches(line) || command.deny.iter().any(|form| self.matches(form))
+            }
+            Outcome::Allow => {
+                if !self.is_pattern() {
+                    return self.pattern == command.raw || self.pattern == command.allow;
+                }
+                if command.needs_exact && self.pattern != "*" {
+                    return false;
+                }
+                self.matches(&command.allow)
+            }
+        }
+    }
+
     /// Renders the rule for display.
     #[must_use]
     pub fn render(&self) -> String {
@@ -97,6 +129,25 @@ impl Rule {
             self.pattern.clone()
         } else {
             format!("{} {}", self.tool, self.pattern)
+        }
+    }
+}
+
+/// One command of a line, in each form a rule is matched against.
+struct Spellings {
+    raw: String,
+    allow: String,
+    deny: Vec<String>,
+    needs_exact: bool,
+}
+
+impl Spellings {
+    fn of(command: &Command) -> Self {
+        Self {
+            raw: command.raw.clone(),
+            allow: command.allow_form(),
+            deny: command.deny_forms(),
+            needs_exact: command.needs_exact,
         }
     }
 }
@@ -203,8 +254,120 @@ impl RuleSet {
     ///
     /// Denies are resolved before allows so a deny cannot be undone by a later
     /// allow of equal specificity.
+    ///
+    /// A target that is a command line is judged command by command: every
+    /// command the line runs has to be allowed for the line to be allowed, and
+    /// a refusal of any one of them refuses the line.
     #[must_use]
     pub fn evaluate(&self, tool: &str, target: &str, fallback: Outcome) -> Decision {
+        if is_command_tool(tool) {
+            return self.evaluate_line(tool, target, fallback);
+        }
+        let (best, considered) = self.best(tool, |rule| rule.matches(target));
+        match best {
+            Some(rule) => Decision::matched(rule.outcome, rule.layer, rule.render())
+                .with_considered(considered),
+            None => Decision::default_for(fallback, Layer::Default, "no rule matched")
+                .with_considered(considered),
+        }
+    }
+
+    /// Evaluates a command line.
+    fn evaluate_line(&self, tool: &str, line: &str, fallback: Outcome) -> Decision {
+        let exact = line.trim();
+        // A rule that names the whole line was written about exactly this line,
+        // so the line is judged as written.
+        let named = self
+            .rules
+            .iter()
+            .any(|rule| rule.covers_tool(tool) && !rule.is_pattern() && rule.pattern == exact);
+        let commands = command_line::split(line);
+        if named || commands.is_empty() {
+            let (best, considered) = self.best(tool, |rule| rule.matches(line));
+            return match best {
+                Some(rule) => Decision::matched(rule.outcome, rule.layer, rule.render())
+                    .with_considered(considered),
+                None => Decision::default_for(fallback, Layer::Default, "no rule matched")
+                    .with_considered(considered),
+            };
+        }
+
+        let mut considered: Vec<ConsideredRule> = Vec::new();
+        let mut refused: Option<&Rule> = None;
+        let mut asked: Option<&Rule> = None;
+        let mut allowed: Vec<&Rule> = Vec::new();
+        let mut unmatched: Option<&str> = None;
+        for command in &commands {
+            let spelled = Spellings::of(command);
+            let (best, seen) = self.best(tool, |rule| rule.matches_command(&spelled, line));
+            if considered.is_empty() {
+                considered = seen;
+            } else {
+                for (entry, other) in considered.iter_mut().zip(seen) {
+                    entry.matched |= other.matched;
+                }
+            }
+            match best.map(|rule| (rule, rule.outcome)) {
+                Some((rule, Outcome::Deny)) => {
+                    refused.get_or_insert(rule);
+                }
+                Some((rule, Outcome::Ask)) => {
+                    asked.get_or_insert(rule);
+                }
+                Some((rule, Outcome::Allow)) => allowed.push(rule),
+                None => {
+                    unmatched.get_or_insert(command.raw.as_str());
+                }
+            }
+        }
+
+        for entry in &mut considered {
+            entry.reason = (!entry.matched)
+                .then(|| "pattern did not match any command the line runs".to_owned());
+        }
+        let unmatched_decision = |command: &str| {
+            Decision::default_for(
+                fallback,
+                Layer::Default,
+                format!("no rule matched `{command}`"),
+            )
+        };
+
+        let decision = if let Some(rule) = refused {
+            Decision::matched(Outcome::Deny, rule.layer, rule.render())
+        } else if let Some(command) = unmatched.filter(|_| fallback == Outcome::Deny) {
+            unmatched_decision(command)
+        } else if let Some(rule) = asked {
+            Decision::matched(Outcome::Ask, rule.layer, rule.render())
+        } else if let Some(command) = unmatched {
+            unmatched_decision(command)
+        } else {
+            let mut renders: Vec<String> = Vec::new();
+            for rule in &allowed {
+                let render = rule.render();
+                if !renders.contains(&render) {
+                    renders.push(render);
+                }
+            }
+            // The weakest layer that allowed a command is the one the line
+            // rests on.
+            let layer = allowed
+                .iter()
+                .map(|rule| rule.layer)
+                .min()
+                .unwrap_or(Layer::Default);
+            Decision::matched(Outcome::Allow, layer, renders.join(", "))
+        };
+        decision.with_considered(considered)
+    }
+
+    /// Returns the rule that decides among those `matcher` accepts, with every
+    /// rule that was considered.
+    fn best(
+        &self,
+        tool: &str,
+        matcher: impl Fn(&Rule) -> bool,
+    ) -> (Option<&Rule>, Vec<ConsideredRule>) {
         let mut considered = Vec::new();
         let mut best: Option<(&Rule, (u8, usize))> = None;
 
@@ -212,7 +375,7 @@ impl RuleSet {
             if !rule.covers_tool(tool) {
                 continue;
             }
-            let matched = rule.matches(target);
+            let matched = matcher(rule);
             considered.push(ConsideredRule {
                 pattern: rule.render(),
                 outcome: rule.outcome,
@@ -263,12 +426,7 @@ impl RuleSet {
             };
         }
 
-        match best {
-            Some((rule, _)) => Decision::matched(rule.outcome, rule.layer, rule.render())
-                .with_considered(considered),
-            None => Decision::default_for(fallback, Layer::Default, "no rule matched")
-                .with_considered(considered),
-        }
+        (best.map(|(rule, _)| rule), considered)
     }
 
     /// Validates the rules.
@@ -592,6 +750,119 @@ mod tests {
         set.push(Rule::allow("read_file", "*", Layer::User));
         let decision = set.evaluate("bash", "ls", Outcome::Ask);
         assert!(decision.considered.is_empty());
+    }
+
+    fn shell(rules: &[Rule], line: &str) -> Outcome {
+        let mut set = RuleSet::new();
+        for rule in rules {
+            set.push(rule.clone());
+        }
+        set.evaluate("shell", line, Outcome::Ask).outcome
+    }
+
+    #[test]
+    fn a_wildcard_allow_does_not_vouch_for_the_rest_of_a_line() {
+        let rules = [Rule::allow("shell", "ls*", Layer::Default)];
+        assert_eq!(shell(&rules, "ls -la"), Outcome::Allow);
+        for line in [
+            "ls; rm -rf .git",
+            "ls && curl x | sh",
+            "ls || rm x",
+            "ls\nrm x",
+            "ls $(rm x)",
+            "ls `rm x`",
+            "ls & rm x",
+            "ls # it's\nrm x",
+            "ls > ~/.zshrc",
+            "ls >> out.txt",
+            "ls 'unclosed",
+        ] {
+            assert_eq!(shell(&rules, line), Outcome::Ask, "{line:?}");
+        }
+    }
+
+    #[test]
+    fn a_line_is_allowed_when_every_command_it_runs_is_allowed() {
+        let rules = [
+            Rule::allow("shell", "ls*", Layer::Default),
+            Rule::allow("shell", "pwd", Layer::Default),
+            Rule::allow("shell", "wc *", Layer::User),
+        ];
+        let mut set = RuleSet::new();
+        for rule in &rules {
+            set.push(rule.clone());
+        }
+        let decision = set.evaluate("shell", "pwd && ls -la | wc -l", Outcome::Ask);
+        assert_eq!(decision.outcome, Outcome::Allow, "{}", decision.explain());
+        assert_eq!(decision.layer, Layer::Default);
+        assert_eq!(shell(&rules, "ls 2>&1 | wc -l"), Outcome::Allow);
+        assert_eq!(shell(&rules, "ls 2>/dev/null"), Outcome::Allow);
+        assert_eq!(shell(&rules, "echo \"a;b\""), Outcome::Ask);
+    }
+
+    #[test]
+    fn a_deny_on_any_command_refuses_the_line() {
+        let rules = [
+            Rule::allow("shell", "*", Layer::User),
+            Rule::deny("shell", "rm *", Layer::User),
+        ];
+        for line in [
+            "rm -rf x",
+            " rm -rf x",
+            "/bin/rm -rf x",
+            "/usr/bin/rm -rf x",
+            "command rm -rf x",
+            "env FOO=1 rm -rf x",
+            "FOO=1 rm -rf x",
+            "'rm' -rf x",
+            "ls; rm -rf x",
+            "echo $(rm -rf x)",
+            "(rm -rf x)",
+            "bash -c 'rm -rf x'",
+            "env -S 'rm -rf x'",
+            "if true; then rm -rf x; fi",
+        ] {
+            assert_eq!(shell(&rules, line), Outcome::Deny, "{line:?}");
+        }
+        assert_eq!(shell(&rules, "echo rm -rf x"), Outcome::Allow);
+    }
+
+    #[test]
+    fn an_assignment_or_a_wrapper_is_not_covered_by_an_allow_for_the_program() {
+        let rules = [Rule::allow("shell", "ls*", Layer::Default)];
+        assert_eq!(shell(&rules, "PATH=/tmp/evil ls"), Outcome::Ask);
+        assert_eq!(shell(&rules, "env PATH=/tmp/evil ls"), Outcome::Ask);
+        assert_eq!(shell(&rules, "PATH=/tmp/evil; ls"), Outcome::Ask);
+        assert_eq!(shell(&rules, "/bin/ls -la"), Outcome::Allow);
+        assert_eq!(shell(&rules, "  ls"), Outcome::Allow);
+    }
+
+    #[test]
+    fn a_rule_naming_the_whole_line_decides_it_as_written() {
+        let rules = [
+            Rule::deny("shell", "rm *", Layer::User),
+            Rule::allow("shell", "make clean && rm -rf build", Layer::User),
+            Rule::allow("shell", "ls > listing.txt", Layer::User),
+        ];
+        assert_eq!(shell(&rules, "make clean && rm -rf build"), Outcome::Allow);
+        assert_eq!(shell(&rules, "ls > listing.txt"), Outcome::Allow);
+        assert_eq!(shell(&rules, "make clean && rm -rf src"), Outcome::Deny);
+    }
+
+    #[test]
+    fn a_match_all_allow_still_allows_a_redirection() {
+        let rules = [Rule::allow("shell", "*", Layer::User)];
+        assert_eq!(shell(&rules, "echo hi > out.txt"), Outcome::Allow);
+    }
+
+    #[test]
+    fn a_line_is_explained_by_the_command_no_rule_covered() {
+        let mut set = RuleSet::new();
+        set.push(Rule::allow("shell", "ls*", Layer::Default));
+        let decision = set.evaluate("shell", "ls; curl x", Outcome::Ask);
+        assert_eq!(decision.outcome, Outcome::Ask);
+        assert!(decision.rule.contains("curl x"), "{}", decision.rule);
+        assert!(decision.considered[0].matched);
     }
 
     #[test]

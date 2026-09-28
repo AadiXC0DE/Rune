@@ -305,7 +305,7 @@ const WRITING_FLAGS: &[(&str, &[&str])] = &[
 ];
 
 /// Interpreters that run a script string given to `-c`.
-const SHELLS: &[&str] = &["bash", "dash", "fish", "ksh", "sh", "zsh"];
+pub(crate) const SHELLS: &[&str] = &["bash", "dash", "fish", "ksh", "sh", "zsh"];
 
 /// Directories whose contents are the system's own programs.
 const SYSTEM_BIN_DIRS: &[&str] = &[
@@ -581,7 +581,7 @@ fn shell_script(args: &[String]) -> Option<Classification> {
 ///
 /// Only `-c` and its combined short forms take a string. Anything else, such as
 /// a script path, is not a command line this module can read.
-fn script_argument(args: &[String]) -> Option<&str> {
+pub(crate) fn script_argument(args: &[String]) -> Option<&str> {
     let mut index = 0_usize;
     while let Some(argument) = args.get(index) {
         let inline =
@@ -641,7 +641,7 @@ fn skip_wrapper<'a>(program: &str, args: &'a [String]) -> Option<&'a [String]> {
 }
 
 /// Returns true for an `env` style `NAME=value` argument.
-fn is_assignment(argument: &str) -> bool {
+pub(crate) fn is_assignment(argument: &str) -> bool {
     match argument.split_once('=') {
         Some((name, _)) => {
             !name.is_empty()
@@ -713,7 +713,7 @@ fn is_filesystem_root(argument: &str) -> bool {
 /// A path is reduced to its base name only inside a system binary directory.
 /// `./ls` and `/tmp/ls` stay as written, so a file in the workspace cannot
 /// borrow the name of an allowlisted program.
-fn program_name(argument: &str) -> &str {
+pub(crate) fn program_name(argument: &str) -> &str {
     for prefix in SYSTEM_BIN_DIRS {
         if let Some(base) = argument.strip_prefix(prefix) {
             return base;

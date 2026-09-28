@@ -5,6 +5,7 @@
 
 pub mod approval;
 pub mod command;
+pub mod command_line;
 pub mod decision;
 pub mod review;
 pub mod rules;
