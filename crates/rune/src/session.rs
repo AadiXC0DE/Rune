@@ -2211,10 +2211,11 @@ fn choose_model(
             let mut sink = LockedSink {
                 stream: Arc::clone(out),
             };
-            let _ = writeln!(sink, "could not list models: {}", err.message());
+            let mut lines = vec![format!("could not list models: {}", err.message())];
             if let Some(hint) = err.hint() {
-                let _ = writeln!(sink, "hint: {hint}");
+                lines.push(format!("hint: {hint}"));
             }
+            flush_lines(host, &mut sink, &lines)?;
             let mut catalog = crate::provider_setup::catalog_for(settings);
             crate::provider_setup::enrich_with_capacity(settings, paths, &mut catalog);
             catalog
@@ -2256,22 +2257,33 @@ fn choose_model(
         model: Some(chosen.clone()),
         base_url: None,
     };
+    let saved = crate::provider_setup::save_selection(paths, &selection);
     let mut sink = LockedSink {
         stream: Arc::clone(out),
     };
-    match crate::provider_setup::save_selection(paths, &selection) {
-        Ok(()) => {
-            let _ = writeln!(sink, "model set to {chosen}");
-        }
-        Err(err) => {
-            let _ = writeln!(
-                sink,
-                "model set to {chosen} for this session; it could not be saved: {}",
-                err.message()
-            );
-        }
-    }
-    Ok(())
+    report_model_choice(host, &mut sink, &chosen, saved.err().as_ref())
+}
+
+/// Reports a model choice through the renderer.
+///
+/// The picker runs with the terminal in raw mode, where a line written straight
+/// to the stream lands at the caret inside the live region: the next frame
+/// paints over it, and the status block it pushed down is left behind as a
+/// second copy.
+fn report_model_choice(
+    host: &SessionHost,
+    sink: &mut LockedSink,
+    chosen: &str,
+    unsaved: Option<&RuneError>,
+) -> Result<()> {
+    let line = match unsaved {
+        None => format!("model set to {chosen}"),
+        Some(err) => format!(
+            "model set to {chosen} for this session; it could not be saved: {}",
+            err.message()
+        ),
+    };
+    flush_lines(host, sink, &[line])
 }
 
 /// Returns the prompts recorded for a workspace, oldest first.
@@ -3233,6 +3245,62 @@ mod tests {
         assert!(
             answer < input,
             "the answer was not drawn above the input: {text:?}"
+        );
+    }
+
+    #[test]
+    fn a_model_choice_is_reported_above_the_input_and_stays_there() {
+        // The picker runs in raw mode, where a line written straight to the
+        // stream lands at the caret inside the live region. The next frame
+        // paints over it and leaves a second status block behind.
+        let bytes: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+        let out: LiveSink = Arc::new(Mutex::new(SharedSink(Arc::clone(&bytes))));
+        let host = test_host();
+        let (prompt_row, caret) = host.idle_prompt();
+        let draw = |host: &SessionHost| {
+            let painted = host
+                .paint(&[], None, &prompt_row, &[], caret)
+                .expect("painted");
+            out.lock()
+                .expect("lock")
+                .write_all(&painted)
+                .expect("wrote");
+        };
+
+        draw(&host);
+        let mut sink = LockedSink {
+            stream: Arc::clone(&out),
+        };
+        report_model_choice(&host, &mut sink, "next-model", None).expect("reported");
+        // The prompt the session draws next, as the loop does after the picker,
+        // then the frame that commits the next prompt the user sends.
+        draw(&host);
+        let echo = transcript::render_prompt(rune_term::shell::prompt(), "hi", 80);
+        let sent = host
+            .paint(std::slice::from_ref(&echo), None, &prompt_row, &[], caret)
+            .expect("painted");
+        out.lock().expect("lock").write_all(&sent).expect("wrote");
+
+        let mut grid = rune_term::Grid::new(80, 24).expect("grid");
+        grid.feed(&bytes.lock().expect("lock")).expect("feed");
+        let screen = grid.text();
+        assert_eq!(
+            screen.matches("model set to next-model").count(),
+            1,
+            "the report was not kept on screen:\n{screen}"
+        );
+        for row in ["ctrl-c cancel", "| auto |"] {
+            assert_eq!(
+                screen.matches(row).count(),
+                1,
+                "a second status block was left behind:\n{screen}"
+            );
+        }
+        let report = screen.find("model set to").expect("the report");
+        let sent = screen.find("> hi").expect("the sent prompt");
+        assert!(
+            report < sent,
+            "the report is not above the prompt:\n{screen}"
         );
     }
 
