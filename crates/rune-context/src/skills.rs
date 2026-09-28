@@ -249,7 +249,10 @@ fn is_symlink(path: &Utf8Path) -> bool {
 }
 
 /// Returns true when a link resolves to a location inside `root`.
-fn resolves_inside(path: &Utf8Path, root: &Utf8Path) -> bool {
+///
+/// Shared with instruction discovery, which holds a linked file to the same
+/// containment.
+pub(crate) fn resolves_inside(path: &Utf8Path, root: &Utf8Path) -> bool {
     let Ok(resolved) = std::fs::canonicalize(path) else {
         return false;
     };

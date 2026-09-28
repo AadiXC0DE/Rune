@@ -15,6 +15,12 @@
 //! known when a tool call arrives. The walk is capped at `list_entries`
 //! directories, skips hidden directories, and never follows a symlinked
 //! directory, so a large or hostile tree cannot make it unbounded.
+//!
+//! An instruction file that is a symlink is followed only when its resolved
+//! target stays inside the directory the file was found under: the workspace
+//! for a file in the workspace, the ancestor itself for a file above it, and the
+//! configuration root for the user file. A link that leaves it would put a file
+//! from elsewhere, such as a private key, into the prompt sent to the provider.
 
 use std::collections::VecDeque;
 use std::fmt::Write as _;
@@ -26,6 +32,7 @@ use rune_core::error::Result;
 use rune_core::paths::{Paths, names};
 
 use crate::resolve_limit;
+use crate::skills::resolves_inside;
 
 /// One instruction file, together with the directory it governs.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -81,16 +88,28 @@ impl Options {
             return Ok(Vec::new());
         }
         let mut files = Vec::new();
-        Self::push_file(&mut files, &self.config_root, &self.workspace);
+        Self::push_file(
+            &mut files,
+            &self.config_root,
+            &self.workspace,
+            &self.config_root,
+        );
         self.push_ancestors(&mut files);
         self.push_tree(&mut files);
         Ok(files)
     }
 
     /// Reads one candidate, recording it when it exists and is usable.
-    fn push_file(out: &mut Vec<InstructionFile>, directory: &Utf8Path, scope: &Utf8Path) {
+    ///
+    /// `root` is the directory a symlinked file must resolve inside.
+    fn push_file(
+        out: &mut Vec<InstructionFile>,
+        directory: &Utf8Path,
+        scope: &Utf8Path,
+        root: &Utf8Path,
+    ) {
         let path = directory.join(names::INSTRUCTIONS_FILE);
-        let Some((content, declared_bytes)) = read_candidate(&path) else {
+        let Some((content, declared_bytes)) = read_candidate(&path, root) else {
             return;
         };
         out.push(InstructionFile {
@@ -114,7 +133,7 @@ impl Options {
             if !below(home, directory) {
                 break;
             }
-            Self::push_file(out, directory, directory);
+            Self::push_file(out, directory, directory, directory);
             current = directory.parent();
         }
     }
@@ -127,7 +146,7 @@ impl Options {
         let mut visited = 0_usize;
         while let Some(directory) = queue.pop_front() {
             visited = visited.saturating_add(1);
-            Self::push_file(out, &directory, &directory);
+            Self::push_file(out, &directory, &directory, &self.workspace);
             for child in child_directories(&directory) {
                 if visited.saturating_add(queue.len()) >= cap {
                     break;
@@ -324,8 +343,13 @@ fn escape(value: &str) -> String {
 /// failing the turn: a broken instruction file must not stop work in a
 /// repository that merely contains one. A read cut by the bound can end inside
 /// a character, and only then is a partial character at the tail dropped rather
-/// than taken for invalid text.
-fn read_candidate(path: &Utf8Path) -> Option<(String, u64)> {
+/// than taken for invalid text. A symlink whose target leaves `root` is skipped
+/// the same way.
+fn read_candidate(path: &Utf8Path, root: &Utf8Path) -> Option<(String, u64)> {
+    let link = std::fs::symlink_metadata(path).ok()?;
+    if link.is_symlink() && !resolves_inside(path, root) {
+        return None;
+    }
     let meta = std::fs::metadata(path).ok()?;
     if !meta.is_file() {
         return None;
@@ -634,6 +658,63 @@ mod tests {
         std::fs::write(workspace.join("AGENTS.md"), b"rules \xc3").expect("write");
 
         assert!(files_of(&workspace, &home, &root.join("config")).is_empty());
+    }
+
+    /// Returns the paths of every discovered file.
+    fn paths_of(files: &[InstructionFile]) -> Vec<Utf8PathBuf> {
+        files.iter().map(|file| file.path.clone()).collect()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_leaving_the_workspace_is_not_read() {
+        let (_dir, root) = tree();
+        let home = root.join("home");
+        let workspace = home.join("proj");
+        write(&home.join("secret"), "private key material\n");
+        std::fs::create_dir_all(workspace.join("pkg")).expect("create dir");
+        std::os::unix::fs::symlink("../../secret", under(&workspace, "pkg/AGENTS.md"))
+            .expect("symlink");
+        write(&workspace.join("AGENTS.md"), "root rules\n");
+
+        let files = files_of(&workspace, &home, &root.join("config"));
+
+        assert_eq!(paths_of(&files), vec![workspace.join("AGENTS.md")]);
+        assert!(render(&files.iter().collect::<Vec<_>>()).contains("root rules"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_that_stays_inside_the_workspace_is_read() {
+        let (_dir, root) = tree();
+        let home = root.join("home");
+        let workspace = home.join("proj");
+        write(&under(&workspace, "shared/rules.md"), "shared rules\n");
+        std::fs::create_dir_all(workspace.join("pkg")).expect("create dir");
+        std::os::unix::fs::symlink("../shared/rules.md", under(&workspace, "pkg/AGENTS.md"))
+            .expect("symlink");
+
+        let files = files_of(&workspace, &home, &root.join("config"));
+
+        assert_eq!(paths_of(&files), vec![under(&workspace, "pkg/AGENTS.md")]);
+        assert_eq!(files[0].content, "shared rules\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_ancestor_or_user_file_linking_out_of_its_directory_is_not_read() {
+        let (_dir, root) = tree();
+        let home = root.join("home");
+        let work = home.join("work");
+        let workspace = work.join("proj");
+        let config = root.join("config");
+        write(&home.join("secret"), "private key material\n");
+        std::fs::create_dir_all(&workspace).expect("create dir");
+        std::fs::create_dir_all(&config).expect("create dir");
+        std::os::unix::fs::symlink("../secret", work.join("AGENTS.md")).expect("symlink");
+        std::os::unix::fs::symlink(home.join("secret"), config.join("AGENTS.md")).expect("symlink");
+
+        assert!(files_of(&workspace, &home, &config).is_empty());
     }
 
     #[test]
