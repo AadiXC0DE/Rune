@@ -803,20 +803,22 @@ impl StdioSession {
         let program = command
             .first()
             .ok_or_else(|| RuneError::missing_field("command"))?;
+        // Nothing from the parent environment is inherited: this process holds
+        // the provider credential, and a server must not be able to read it back
+        // out of its own environment. What the profile declares for this server
+        // is added on top of the resolved set.
         let mut builder = Command::new(program);
         builder
             .args(command.iter().skip(1))
+            .env_clear()
+            .envs(rune_exec::minimal_environment())
             .envs(environment)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         // The child leads its own process group, so a server that starts helpers
         // is ended as a tree rather than one process at a time.
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::CommandExt as _;
-            builder.process_group(0);
-        }
+        rune_exec::own_group(&mut builder);
         let mut child = builder.spawn().map_err(|err| {
             RuneError::new(
                 ErrorCode::TransportFailure,

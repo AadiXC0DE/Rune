@@ -581,7 +581,7 @@ fn spawn_error(program: &str, err: &io::Error) -> RuneError {
 }
 
 /// Starts a child in a process group of its own.
-pub(crate) fn own_group(spec: &mut Command) {
+pub fn own_group(spec: &mut Command) {
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt as _;
@@ -1277,8 +1277,8 @@ mod tests {
             return;
         }
         let (_dir, dir) = tempdir();
-        let prepared = prepare("/usr/bin/env", dir.as_path(), None, minimal_environment())
-            .expect("prepare");
+        let prepared =
+            prepare("/usr/bin/env", dir.as_path(), None, minimal_environment()).expect("prepare");
         let outcome = run(&prepared, Duration::from_secs(10), &never).expect("run");
         assert!(
             !outcome.stdout.contains("OPENAI_API_KEY"),

@@ -518,11 +518,22 @@ impl PluginHost {
     /// Launches the plugin process and its reader.
     fn spawn(&self) -> Result<Session> {
         let program = self.command.first().cloned().unwrap_or_default();
-        let mut child = Command::new(&program)
+        // Nothing from the parent environment is inherited: this process holds
+        // the provider credential, and a plugin must not be able to read it back
+        // out of its own environment.
+        let mut command = Command::new(&program);
+        command
             .args(self.command.iter().skip(1))
+            .env_clear()
+            .envs(rune_exec::minimal_environment())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::null());
+        // The plugin leads its own process group, so a signal aimed at this
+        // process's group does not reach it and its own group can be signalled
+        // as a whole.
+        rune_exec::own_group(&mut command);
+        let mut child = command
             .spawn()
             .map_err(|err| spawn_error(&self.name, &program, &err))?;
 

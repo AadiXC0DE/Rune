@@ -12,6 +12,9 @@ workspace = true
 
 [dependencies]
 rune-core = { workspace = true }
+# A spawned helper is isolated the same way a command is: it gets a resolved
+# environment rather than this process's, and its own process group.
+rune-exec = { workspace = true }
 rune-agent = { workspace = true }
 rune-net = { workspace = true }
 rune-tools = { workspace = true }

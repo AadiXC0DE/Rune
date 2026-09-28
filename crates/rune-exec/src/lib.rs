@@ -21,7 +21,7 @@ pub mod session;
 pub use command::{
     CommandOutcome, DEFAULT_ADDRESS_SPACE_BYTES, DEFAULT_CPU_SECONDS, DEFAULT_FILE_BYTES,
     DEFAULT_PROCESSES, DEFAULT_SHELL, Exit, PreparedCommand, ResourceLimits, TRUNCATION_MARKER,
-    minimal_environment, prepare, prepare_shell, requires_shell, resource_limits, run,
+    minimal_environment, own_group, prepare, prepare_shell, requires_shell, resource_limits, run,
     run_with_limits, shell_reason, verify_unchanged,
 };
 pub use sandbox::{
