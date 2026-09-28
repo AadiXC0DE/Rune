@@ -484,9 +484,7 @@
   .act-top { display: block; font-weight: 500; }
   .act-sub { display: block; color: var(--faint); font-size: .76rem; margin-top: .2rem; }
   .act[hidden] { display: none; }
-  /* The escape hatch is deliberately quieter than the one thing to press. */
-  .act-quiet { border-color: var(--rule); }
-  .act-quiet .act-top { font-weight: 400; color: var(--dim); }
+
 
   progress.meter {
     display: block;
@@ -706,8 +704,8 @@
       <h2>run the harness in this tab</h2>
 
       <p class="lede demo-lede" style="margin-bottom:2rem">
-        The loop, the tools and the permission gate, running for real in this
-        page. No model, no download, nothing sent anywhere.
+        A real model driving the real loop, in this page. Nothing is sent
+        anywhere: the weights and the inference both stay on your machine.
       </p>
 
       <div class="demo-cols">
@@ -737,7 +735,7 @@
               </p>
             </noscript>
             <p class="demo-status" id="demo-status">
-              Nothing has run yet.
+              Nothing has run yet. The model is fetched only when you press run.
             </p>
 
             <progress class="meter" id="demo-bar" max="1" value="0" hidden></progress>
@@ -745,11 +743,7 @@
             <div class="actions" id="demo-actions">
               <button class="act" type="button" id="act-run">
                 <span class="act-top">Run the demo</span>
-                <span class="act-sub">Instant. Nothing downloads.</span>
-              </button>
-              <button class="act act-quiet" type="button" id="act-smol">
-                <span class="act-top">Run it on a real model instead</span>
-                <span class="act-sub">105 MB, one time, kept by your browser.</span>
+                <span class="act-sub">Downloads 398 MB once, then your browser keeps it. Nothing is sent anywhere.</span>
               </button>
             </div>
 
@@ -761,13 +755,14 @@
 
       <div class="demo-note">
         <p>
-          The planner here is scripted, so the run is instant and transfers
-          nothing. Everything around it is the harness doing the real work: each
-          step picks one tool, every call passes a permission gate before it
-          runs, and the result is fed back as the next step's input. One step
-          asks for a shell and is refused, which is the gate working.
-        </p>
-      </div>
+          The model runs in this tab. Every step asks it for one tool call, and
+          every call passes a permission gate before it runs, the same table the
+          binary reads. One step asks for a shell and is refused, which is the
+          gate working. A model this size is a weak assistant: expect it to
+          wander, repeat itself, or miss the answer. That is the honest result
+          of running a harness on the smallest model that fits, and it is why
+          the gate is there.
+        </p>      </div>
     </div>
   </section>
 
@@ -910,19 +905,10 @@
   const detail = document.getElementById('demo-detail');
   const bar = document.getElementById('demo-bar');
   const runBtn = document.getElementById('act-run');
-  const realBtn = document.getElementById('act-smol');
 
-  const MAX_STEPS = 6;
+  // How many identical calls a model may make before the turn is called off.
+  const MAX_REPEATS = 2;
 
-  // How long each scripted step waits, so the loop is watched rather than
-  // dumped. Long enough to read a line, short enough that the run is instant.
-  const STEP_PAUSE_MS = 520;
-
-  function wait(ms) {
-    return new Promise((resolve) => {
-      setTimeout(resolve, ms);
-    });
-  }
   const MAX_RESULT_BYTES = 2048;
   const MAX_GREP_MATCHES = 20;
   const MAX_READ_LINES = 40;
@@ -930,58 +916,78 @@
   const WLLAMA_MODULE = 'https://cdn.jsdelivr.net/npm/@wllama/wllama@3.6.1/esm/index.min.js';
   const WLLAMA_WASM = 'https://cdn.jsdelivr.net/npm/@wllama/wllama@3.6.1/esm/wasm/wllama.wasm';
 
-  // Byte counts are the exact sizes published by each repository, shown here so
-  // the labels below can be checked: 105454144 and 397808192 bytes. Each label
-  // is that figure rounded to the nearest megabyte. Nothing on this page states
-  // a size for the model Chrome ships, because Google does not publish one.
-  const MODELS = {
-    smol: {
-      repo: 'QuantFactory/SmolLM2-135M-Instruct-GGUF',
-      file: 'SmolLM2-135M-Instruct.Q4_K_M.gguf',
-      label: '105 MB'
-    },
-    qwen: {
-      repo: 'bartowski/Qwen2.5-0.5B-Instruct-GGUF',
-      file: 'Qwen2.5-0.5B-Instruct-Q4_K_M.gguf',
-      label: '398 MB'
-    }
+  // SmolLM2-135M is smaller but cannot choose a tool, so it is not offered:
+  // a demo that cannot finish teaches nothing about the harness. This is the
+  // smallest model with real tool-call training in its chat template, and the
+  // count is the exact published size, 397808192 bytes, rounded.
+  const MODEL = {
+    repo: 'bartowski/Qwen2.5-0.5B-Instruct-GGUF',
+    file: 'Qwen2.5-0.5B-Instruct-Q4_K_M.gguf',
+    name: 'Qwen2.5-0.5B-Instruct',
+    label: '398 MB'
   };
 
-  const MODEL_NAME = {
-    smol: 'SmolLM2-135M-Instruct',
-    qwen: 'Qwen2.5-0.5B-Instruct'
-  };
+  // The tool definitions the model chooses between. A small model selects far
+  // more reliably from a trained tool-call template than from a prose contract
+  // asking it to emit JSON, which is the failure this demo used to show.
+  const TOOLS = [
+    {
+      type: 'function',
+      function: {
+        name: 'glob_files',
+        description: 'List workspace files matching a glob pattern.',
+        parameters: {
+          type: 'object',
+          properties: { pattern: { type: 'string', description: 'e.g. **/*.rs' } },
+          required: ['pattern']
+        }
+      }
+    },
+    {
+      type: 'function',
+      function: {
+        name: 'grep_files',
+        description: 'Search every workspace file for a regular expression, returning file, line and text.',
+        parameters: {
+          type: 'object',
+          properties: { pattern: { type: 'string', description: 'a regular expression' } },
+          required: ['pattern']
+        }
+      }
+    },
+    {
+      type: 'function',
+      function: {
+        name: 'read_file',
+        description: 'Read one workspace file.',
+        parameters: {
+          type: 'object',
+          properties: { path: { type: 'string', description: 'e.g. src/tools.rs' } },
+          required: ['path']
+        }
+      }
+    },
+    {
+      type: 'function',
+      function: {
+        name: 'answer',
+        description: 'Answer the question and end the turn. Call this once you know the answer.',
+        parameters: {
+          type: 'object',
+          properties: { text: { type: 'string', description: 'a short sentence' } },
+          required: ['text']
+        }
+      }
+    }
+  ];
 
   const SYSTEM_PROMPT = [
     'You are the step planner inside a coding agent.',
-    'You reply with one JSON object and nothing else.',
-    'Every step is one tool call, or the final answer.',
-    'The tools are read_file(path), glob_files(pattern), grep_files(pattern), and answer(text).',
-    'The workspace holds these files: README.md, src/main.rs, src/registry.rs, src/tools.rs, tests/tools.rs.',
-    'There is no shell tool. Asking for shell is refused.',
-    'Example of a good run:',
-    '{"tool":"grep_files","arg":"fn shell"}',
-    '{"tool":"read_file","arg":"src/tools.rs"}',
-    '{"tool":"answer","arg":"","text":"src/tools.rs line 7, in pub fn shell."}',
-    'Use the exact file names above as the arg for read_file, and a regular expression as the arg for grep_files.',
+    'Use the tools to answer the question, then call answer to finish.',
     'Question: which file defines the shell function, and on what line?'
   ].join(' ');
 
-  // The schema is what makes every step structurally valid, and that is what
-  // lets a small model drive a loop at all.
-  const STEP_SCHEMA = {
-    type: 'object',
-    properties: {
-      tool: {
-        type: 'string',
-        enum: ['read_file', 'glob_files', 'grep_files', 'shell', 'answer']
-      },
-      arg: { type: 'string', maxLength: 120 },
-      text: { type: 'string', maxLength: 240 }
-    },
-    required: ['tool', 'arg'],
-    additionalProperties: false
-  };
+
 
   const WORKSPACE = {
     'README.md': [
@@ -1106,7 +1112,6 @@
   // that start a run are disabled instead of removed.
   function busy(on) {
     runBtn.disabled = on;
-    realBtn.disabled = on;
   }
 
   // ---------- the workspace the tools read ----------
@@ -1199,6 +1204,9 @@
 
   // `step` is the only part that differs between backends: it takes the
   // conversation so far and returns one JSON step as text.
+  // The loop asks the model for one tool call per step, runs it through the
+  // same gate the binary uses, and feeds the result back. `step` is the only
+  // part that differs between the scripted planner and a real model.
   async function runLoop(step, modelLabel) {
     const question = 'which file defines the shell function, and on what line?';
     const messages = [
@@ -1206,95 +1214,106 @@
       { role: 'user', content: 'Question: ' + question }
     ];
     const seen = new Set();
+    let repeats = 0;
 
     statusRow('ok', 'model', modelLabel);
     line(['$ ', 'c-faint'], ['rune ', 'c-accent'], ['"' + question + '"', 'c-dim']);
     blank();
 
     for (let step_index = 1; step_index <= MAX_STEPS; step_index++) {
-      let raw;
+      let calls;
       try {
-        raw = await step(messages);
+        calls = await step(messages);
       } catch (err) {
         statusRow('x', 'step ' + step_index, 'the model stopped responding: ' + err.message, 'c-warn');
         return;
       }
 
-      let decision;
-      try {
-        decision = JSON.parse(raw);
-      } catch (err) {
-        statusRow('x', 'step ' + step_index, 'the step was not JSON, so the turn ends', 'c-warn');
+      if (!calls || calls.length === 0) {
+        statusRow('x', 'step ' + step_index, 'the model asked for no tool, so the turn ends', 'c-warn');
         return;
       }
 
-      if (!decision || typeof decision.tool !== 'string') {
-        statusRow('x', 'step ' + step_index, 'the step named no tool, so the turn ends', 'c-warn');
-        return;
-      }
+      const call = calls[0];
+      const name = call.name;
+      const args = call.args || {};
 
-      if (decision.tool === 'answer') {
+      if (name === 'answer') {
         statusRow('ok', 'step ' + step_index, 'the model answered');
         blank();
-        line([decision.text || '(the model returned no text)', '']);
+        line([args.text || '(the model returned no text)', '']);
         blank();
         statusRow('ok', 'turn', 'ended after ' + step_index + (step_index === 1 ? ' step' : ' steps'));
         return;
       }
 
-      const policy = POLICY[decision.tool];
-      const call = decision.tool + ' ' + (decision.arg || '');
-      statusRow('ok', 'step ' + step_index, 'the model asked for ' + decision.tool);
+      const policy = POLICY[name];
+      const shown = name + ' ' + (args.path || args.pattern || '');
+      statusRow('ok', 'step ' + step_index, 'the model asked for ' + name);
       line(
         ['     ', ''],
-        [pad('  ' + call, 46), 'c-dim'],
+        [pad('  ' + shown, 46), 'c-dim'],
         [policy ? 'gate: ' + policy.effect + ' (' + policy.source + ')' : 'gate: no rule', 'c-faint']
       );
 
       let result;
       if (!policy) {
-        result = 'unknown tool: ' + decision.tool;
-        statusRow('x', 'refused', decision.tool + ' is not in the registry', 'c-warn');
+        result = 'unknown tool: ' + name;
+        statusRow('x', 'refused', name + ' is not in the registry', 'c-warn');
       } else if (policy.effect !== 'allow') {
-        result = 'refused by policy: ' + decision.tool + ' is ' + policy.effect + ' by ' + policy.source;
-        statusRow('x', 'refused', decision.tool + ', ' + policy.effect + ' by ' + policy.source, 'c-warn');
+        result = 'refused by policy: ' + name + ' is ' + policy.effect + ' by ' + policy.source;
+        statusRow('x', 'refused', name + ', ' + policy.effect + ' by ' + policy.source, 'c-warn');
       } else {
-        result = clipped(execute(decision.tool, decision.arg));
+        result = clipped(execute(name, args.path || args.pattern || args.text || ''));
         const lines = result.split('\n');
-        statusRow(
-          'ok',
-          'result',
-          lines[0] + (lines.length === 1 ? '' : ' (+' + (lines.length - 1) + ' more lines)')
-        );
+        statusRow('ok', 'result', lines[0] + (lines.length === 1 ? '' : ' (+' + (lines.length - 1) + ' more lines)'));
       }
 
-      messages.push({ role: 'assistant', content: raw });
+      // The assistant turn carrying the calls is recorded as the model sent it,
+      // because the next request has to replay it unchanged.
+      messages.push({ role: 'assistant', content: '', tool_calls: calls.raw });
 
-      // The same call twice is the failure this demo has to survive, so the
-      // result is replaced with a signal rather than fed back unchanged.
-      const key = decision.tool + ' ' + (decision.arg || '');
+      const key = name + ' ' + JSON.stringify(args);
       if (seen.has(key)) {
-        statusRow('x', 'repeat', 'the same call again, so the result is marked as a repeat', 'c-warn');
-        messages.push({
-          role: 'user',
-          content: 'You already called ' + key + ' and the result did not change. Call a different tool, or answer with what you have.'
-        });
+        repeats += 1;
+        statusRow('x', 'repeat', 'the same call again, so its result is marked a repeat', 'c-warn');
+        if (repeats >= MAX_REPEATS) {
+          blank();
+          statusRow('x', 'turn', 'the model kept repeating itself, so the turn ends', 'c-warn');
+          line(['That is the honest result of a half-billion-parameter model', 'c-faint']);
+          line(['driving a loop, and why every call passes a gate first.', 'c-faint']);
+          return;
+        }
       } else {
+        repeats = 0;
         seen.add(key);
-        messages.push({ role: 'user', content: 'tool result: ' + result });
       }
+
+      messages.push({ role: 'tool', tool_call_id: call.id, content: result });
       blank();
     }
 
     statusRow('x', 'turn', 'stopped at the ' + MAX_STEPS + ' step limit', 'c-warn');
   }
 
-  // ---------- backend: a model you download, through wllama ----------
 
-  async function loadDownloaded(which) {
-    const model = MODELS[which];
-    const name = MODEL_NAME[which];
+  // ---------- the planner this page ships with ----------
+  //
+  // The harness under it is real: the tools read a real workspace, the policy
+  // table gates every call, and a refused call is never executed. Only the
+  // decisions are scripted, which is what makes the demo instant and lets it
+  // spend its budget on the loop rather than on a model that fits in a tab.
 
+  // What a planner would decide, in order. The shell step is deliberate: it is
+  // refused by policy, and the loop has to carry on without it.
+  const MAX_STEPS = 6;
+
+
+
+
+  // ---------- backend: a real model, through wllama ----------
+
+  async function loadDownloaded() {
     statusRow('?', 'runtime', 'fetching the WebAssembly runtime, about 9 MB');
     setStatus('Fetching the inference runtime, then the model. Your browser caches both afterwards.');
     showBar(1, 0);
@@ -1305,11 +1324,11 @@
     const instance = new module.Wllama({ default: WLLAMA_WASM });
     statusRow('ok', 'runtime', 'llama.cpp in WebAssembly, fetched on click');
     blank();
-    statusRow('?', 'model', name + ' ' + model.label + ', Apache-2.0');
+    statusRow('?', 'model', MODEL.name + ' ' + MODEL.label + ', Apache-2.0');
     blank();
-    setStatus('Downloading ' + model.label + '. One time only, and your browser keeps it, so a later visit transfers nothing.');
+    setStatus('Downloading ' + MODEL.label + '. One time only, and your browser keeps it, so a later visit transfers nothing.');
 
-    const url = 'https://huggingface.co/' + model.repo + '/resolve/main/' + model.file;
+    const url = 'https://huggingface.co/' + MODEL.repo + '/resolve/main/' + MODEL.file;
     let loaded = 0;
     await instance.loadModelFromUrl(url, {
       n_ctx: 2048,
@@ -1323,7 +1342,7 @@
         }
         showBar(progress.total, progress.loaded);
         const percent = Math.round((progress.loaded / progress.total) * 100);
-        setStatus('Downloading ' + model.label + ': ' + percent + ' percent. Cached after this, so a second visit reads it from disk.');
+        setStatus('Downloading ' + MODEL.label + ': ' + percent + ' percent. Cached after this, so a second visit reads it from disk.');
       }
     });
 
@@ -1333,7 +1352,33 @@
     return instance;
   }
 
-  async function runDownloaded(which) {
+  // One step: ask for a tool call, and hand the loop whatever it asked for.
+  function realPlanner(instance) {
+    return async (messages) => {
+      const reply = await instance.createChatCompletion({
+        messages,
+        tools: TOOLS,
+        tool_choice: 'auto',
+        max_tokens: 160,
+        temperature: 0
+      });
+      const choice = reply.choices[0];
+      const raw = choice.message.tool_calls;
+      if (!raw || raw.length === 0) return [];
+
+      return raw.map((call) => {
+        let args = {};
+        try {
+          args = JSON.parse(call.function.arguments || '{}');
+        } catch (err) {
+          args = {};
+        }
+        return { id: call.id, name: call.function.name, args, raw };
+      });
+    };
+  }
+
+  async function runDownloaded() {
     busy(true);
     detail.textContent = '';
     clear();
@@ -1341,7 +1386,7 @@
 
     let instance;
     try {
-      instance = await loadDownloaded(which);
+      instance = await loadDownloaded();
     } catch (err) {
       hideBar();
       statusRow('x', 'runtime', err.message, 'c-warn');
@@ -1350,77 +1395,21 @@
       return;
     }
 
-    const name = MODEL_NAME[which];
-    setStatus('Running on ' + name + '. Nothing you type or read leaves this machine.');
+    setStatus('Running on ' + MODEL.name + '. Nothing you type or read leaves this machine.');
 
     try {
-      await runLoop(async (messages) => {
-        const reply = await instance.createChatCompletion({
-          messages,
-          max_tokens: 120,
-          temperature: 0,
-          response_format: {
-            type: 'json_schema',
-            json_schema: { name: 'step', schema: STEP_SCHEMA, strict: true }
-          }
-        });
-        return reply.choices[0].message.content;
-      }, name + ' ' + MODELS[which].label + ', downloaded by you');
+      await runLoop(realPlanner(instance), MODEL.name + ' ' + MODEL.label + ', downloaded by you');
     } catch (err) {
       statusRow('x', 'model', 'generation failed: ' + err.message, 'c-warn');
     }
 
-    setStatus('Done. Press a button to run it again.');
+    setStatus('Done. Press run again.');
     busy(false);
   }
-
-  // ---------- the planner this page ships with ----------
-  //
-  // The harness under it is real: the tools read a real workspace, the policy
-  // table gates every call, and a refused call is never executed. Only the
-  // decisions are scripted, which is what makes the demo instant and lets it
-  // spend its budget on the loop rather than on a model that fits in a tab.
-
-  // What a planner would decide, in order. The shell step is deliberate: it is
-  // refused by policy, and the loop has to carry on without it.
-  const SCRIPT = [
-    { tool: 'glob_files', arg: '**/*.rs' },
-    { tool: 'grep_files', arg: 'fn shell' },
-    { tool: 'read_file', arg: 'src/tools.rs' },
-    { tool: 'shell', arg: 'git log --oneline' },
-    { tool: 'answer', arg: '', text: 'src/tools.rs line 7, in pub fn shell.' }
-  ];
-
-  function scriptedPlanner() {
-    let index = 0;
-    return async () => {
-      const step = SCRIPT[Math.min(index, SCRIPT.length - 1)];
-      index += 1;
-      // The pause is what makes the loop watchable: each step lands, then the
-      // gate and the result follow it. Long enough to read, short enough that
-      // the whole run is over in a couple of seconds.
-      await wait(index === 1 ? 0 : STEP_PAUSE_MS);
-      return JSON.stringify(step);
-    };
-  }
-
 
   // ---------- wiring ----------
 
-  runBtn.addEventListener('click', async () => {
-    busy(true);
-    detail.textContent = '';
-    clear();
-    opening();
-    setStatus('Running in this page. Nothing leaves the machine, nothing downloads.');
-    await runLoop(scriptedPlanner(), 'scripted planner, instant');
-    setStatus('Done. Press run again.');
-    busy(false);
-  });
-
-  // One quiet escape hatch, not a menu. Offered only after someone asks for a
-  // real model, because the scripted run is the honest demo of the harness.
-  realBtn.addEventListener('click', () => runDownloaded('smol'));
+  runBtn.addEventListener('click', runDownloaded);
 
 })();
 </script>
