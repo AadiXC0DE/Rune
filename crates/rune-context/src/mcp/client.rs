@@ -54,6 +54,7 @@ const TERMINATE_GRACE: Duration = Duration::from_millis(500);
 const POLL_INTERVAL: Duration = Duration::from_millis(5);
 
 /// Programs that deliver a signal to a process group, tried in order.
+#[cfg(unix)]
 const KILL_PROGRAMS: [&str; 2] = ["/bin/kill", "kill"];
 
 /// What a server contributed, or why it did not.
@@ -705,19 +706,24 @@ enum Session {
     /// A child process speaking JSON-RPC on its pipes.
     Stdio(StdioSession),
     /// A streamable HTTP endpoint.
+    #[cfg(not(target_family = "wasm"))]
     Http(HttpSession),
     /// The legacy event stream plus message endpoint pair.
+    #[cfg(not(target_family = "wasm"))]
     Sse(SseSession),
 }
 
 impl Session {
     /// Opens a session for a configured transport.
+    // The remote transports that read `variables` are absent on wasm.
+    #[cfg_attr(target_family = "wasm", allow(unused_variables))]
     fn open(config: &ServerConfig, variables: &Arc<dyn Variables>) -> Result<Self> {
         match &config.transport {
             Transport::Stdio {
                 command,
                 environment,
             } => StdioSession::open(&config.name, command, environment).map(Self::Stdio),
+            #[cfg(not(target_family = "wasm"))]
             Transport::Http {
                 url,
                 headers,
@@ -732,6 +738,13 @@ impl Session {
                 bearer_token_env.as_deref(),
             )
             .map(Self::Http),
+            // A target with no socket reaches nothing over HTTP or SSE, and
+            // saying so at connect time is the only honest answer.
+            #[cfg(target_family = "wasm")]
+            Transport::Http { .. } | Transport::Sse { .. } => {
+                Err(no_socket(&config.name, config.transport.kind()))
+            }
+            #[cfg(not(target_family = "wasm"))]
             Transport::Sse { url } => SseSession::open(&config.name, url).map(Self::Sse),
         }
     }
@@ -745,24 +758,34 @@ impl Session {
     ) -> Result<Value> {
         match self {
             Self::Stdio(session) => session.request(method, params, timeout),
+            #[cfg(not(target_family = "wasm"))]
             Self::Http(session) => session.request(method, params, timeout),
+            #[cfg(not(target_family = "wasm"))]
             Self::Sse(session) => session.request(method, params, timeout),
         }
     }
 
     /// Sends a notification, which has no result.
+    // The stdio transport takes no timeout, so the parameter is unread when it
+    // is the only variant.
+    #[cfg_attr(target_family = "wasm", allow(unused_variables))]
     fn notify(&mut self, method: &str, params: Option<&Value>, timeout: Duration) -> Result<()> {
         match self {
             Self::Stdio(session) => session.notify(method, params),
+            #[cfg(not(target_family = "wasm"))]
             Self::Http(session) => session.notify(method, params, timeout),
+            #[cfg(not(target_family = "wasm"))]
             Self::Sse(session) => session.notify(method, params, timeout),
         }
     }
 
     /// Ends the session, terminating any child process.
     fn shutdown(&mut self) {
-        if let Self::Stdio(session) = self {
-            session.terminate();
+        match self {
+            Self::Stdio(session) => session.terminate(),
+            // A remote session holds no process, so there is nothing to end.
+            #[cfg(not(target_family = "wasm"))]
+            Self::Http(_) | Self::Sse(_) => {}
         }
     }
 }
@@ -1027,6 +1050,10 @@ fn drain(stderr: std::process::ChildStderr) {
 }
 
 /// A server reached over streamable HTTP.
+///
+/// Absent on a target with no socket, where the transport is refused at
+/// connect time rather than compiled.
+#[cfg(not(target_family = "wasm"))]
 #[derive(Debug)]
 struct HttpSession {
     /// Name of the server, for error messages.
@@ -1047,6 +1074,7 @@ struct HttpSession {
     next_id: u64,
 }
 
+#[cfg(not(target_family = "wasm"))]
 impl HttpSession {
     /// Builds a session for an HTTP endpoint.
     fn open(
@@ -1152,6 +1180,10 @@ impl HttpSession {
 /// cancelled from another thread without unsafe code, and a hung stream would
 /// then outlive the call that opened it. Opening per request keeps every
 /// operation inside its own timeout.
+///
+/// Absent on a target with no socket, where the transport is refused at
+/// connect time rather than compiled.
+#[cfg(not(target_family = "wasm"))]
 #[derive(Debug)]
 struct SseSession {
     /// Name of the server, for error messages.
@@ -1164,6 +1196,7 @@ struct SseSession {
     next_id: u64,
 }
 
+#[cfg(not(target_family = "wasm"))]
 impl SseSession {
     /// Builds a session for an event stream endpoint.
     fn open(server: &str, url: &str) -> Result<Self> {
@@ -1300,6 +1333,9 @@ impl SseSession {
 }
 
 /// An event stream, read one frame at a time.
+///
+/// Only the legacy SSE transport reads one, so this goes with it.
+#[cfg(not(target_family = "wasm"))]
 struct SseStream {
     /// Lines of the stream.
     reader: BufReader<ureq::BodyReader<'static>>,
@@ -1309,6 +1345,7 @@ struct SseStream {
     server: String,
 }
 
+#[cfg(not(target_family = "wasm"))]
 impl std::fmt::Debug for SseStream {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SseStream")
@@ -1317,6 +1354,7 @@ impl std::fmt::Debug for SseStream {
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
 impl SseStream {
     /// Reads the next `(event name, payload)` pair.
     fn next_pair(&mut self) -> Result<Option<(String, String)>> {
@@ -1350,6 +1388,7 @@ impl SseStream {
 }
 
 /// Reads the next message payload from a stream, skipping bookkeeping events.
+#[cfg(not(target_family = "wasm"))]
 fn next_event(stream: &mut SseStream) -> Result<Option<String>> {
     loop {
         let Some((name, payload)) = stream.next_pair()? else {
@@ -1365,6 +1404,10 @@ fn next_event(stream: &mut SseStream) -> Result<Option<String>> {
 }
 
 /// Resolves an endpoint a server named relative to its stream URL.
+///
+/// Pure string handling with no transport dependency, and the unit tests cover
+/// it on every target.
+#[cfg_attr(target_family = "wasm", allow(dead_code))]
 fn resolve_endpoint(base: &str, endpoint: &str) -> String {
     if endpoint.starts_with("http://") || endpoint.starts_with("https://") {
         return endpoint.to_owned();
@@ -1378,6 +1421,7 @@ fn resolve_endpoint(base: &str, endpoint: &str) -> String {
 }
 
 /// Builds the HTTP agent shared by the remote transports.
+#[cfg(not(target_family = "wasm"))]
 fn http_agent() -> ureq::Agent {
     ureq::Agent::config_builder()
         .http_status_as_error(false)
@@ -1386,6 +1430,7 @@ fn http_agent() -> ureq::Agent {
 }
 
 /// Copies a string map into request order.
+#[cfg(not(target_family = "wasm"))]
 fn pairs(map: &BTreeMap<String, String>) -> Vec<(String, String)> {
     map.iter()
         .map(|(name, value)| (name.clone(), value.clone()))
@@ -1393,6 +1438,10 @@ fn pairs(map: &BTreeMap<String, String>) -> Vec<(String, String)> {
 }
 
 /// Encodes a request or notification frame.
+///
+/// Only the remote transports build frames by hand; the stdio transport encodes
+/// each one where it writes it. The unit tests cover it on every target.
+#[cfg_attr(target_family = "wasm", allow(dead_code))]
 fn encode(id: Option<u64>, method: &str, params: Option<&Value>) -> String {
     match id {
         Some(id) => protocol::request(id, method, params),
@@ -1408,6 +1457,7 @@ fn remaining(deadline: Option<Instant>) -> Duration {
 }
 
 /// Reads a reply body, refusing one past the frame cap.
+#[cfg(not(target_family = "wasm"))]
 fn read_body(response: ureq::http::Response<ureq::Body>, cap: usize) -> Result<String> {
     let limit = u64::try_from(cap.saturating_add(1)).unwrap_or(u64::MAX);
     let mut reader = response.into_body().into_reader().take(limit);
@@ -1434,6 +1484,7 @@ fn response_error(error: protocol::RpcError) -> RuneError {
 }
 
 /// Maps a transport failure onto the taxonomy.
+#[cfg(not(target_family = "wasm"))]
 fn transport_error(server: &str, err: &ureq::Error) -> RuneError {
     let code = match err {
         ureq::Error::Timeout(_) => ErrorCode::Timeout,
@@ -1443,6 +1494,7 @@ fn transport_error(server: &str, err: &ureq::Error) -> RuneError {
 }
 
 /// The error used when a credential is rejected.
+#[cfg(not(target_family = "wasm"))]
 fn unauthorized(server: &str) -> RuneError {
     RuneError::new(
         ErrorCode::AuthenticationRequired,
@@ -1452,12 +1504,26 @@ fn unauthorized(server: &str) -> RuneError {
 }
 
 /// The error used when a configured credential variable is unset.
+#[cfg(not(target_family = "wasm"))]
 fn credential_missing(server: &str, variable: &str) -> RuneError {
     RuneError::new(
         ErrorCode::AuthenticationRequired,
         format!("`{variable}` is not set for server `{server}`"),
     )
     .with_hint("export the variable before starting Rune")
+}
+
+/// The error used when a transport needs a socket the target does not have.
+///
+/// Returned at connect time so the server lands in the failure report with a
+/// reason rather than appearing connected and then failing on first use.
+#[cfg(target_family = "wasm")]
+fn no_socket(server: &str, kind: &str) -> RuneError {
+    RuneError::new(
+        ErrorCode::Unsupported,
+        format!("server `{server}` uses the `{kind}` transport, which this build cannot reach"),
+    )
+    .with_hint("use a stdio transport, or run a build with a socket")
 }
 
 /// The error used when an operation outlives its timeout.

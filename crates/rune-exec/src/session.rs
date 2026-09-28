@@ -38,6 +38,7 @@ const SHELL_FLAG: &str = "/C";
 const CHUNK_BYTES: usize = 8 * 1024;
 
 /// Programs that deliver a signal, tried in order.
+#[cfg(unix)]
 const KILL_PROGRAMS: [&str; 2] = ["/bin/kill", "kill"];
 
 /// Signal sent first when a session is stopped.

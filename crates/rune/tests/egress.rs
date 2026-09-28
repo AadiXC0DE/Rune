@@ -186,7 +186,9 @@ fn no_crate_constructs_a_network_client_outside_the_transport() {
             let shipped = text.split("#[cfg(test)]").next().unwrap_or(&text);
             for needle in [
                 "ureq::Agent::config_builder",
+                // Both are a way to get a client without the builder.
                 "ureq::agent()",
+                "ureq::Agent::new_with_defaults",
                 "std::net::TcpStream",
             ] {
                 if shipped.contains(needle) {

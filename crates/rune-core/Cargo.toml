@@ -20,6 +20,11 @@ jiff.workspace = true
 sha2.workspace = true
 getrandom = { workspace = true }
 
+# `getrandom` refuses to pick a source on wasm without this feature, and a
+# workspace dependency cannot carry a per-target feature.
+[target.'cfg(target_family = "wasm")'.dependencies]
+getrandom = { workspace = true, features = ["js"] }
+
 [dev-dependencies]
 proptest = "1"
 tempfile.workspace = true

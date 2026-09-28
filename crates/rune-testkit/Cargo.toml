@@ -12,9 +12,13 @@ workspace = true
 
 [dependencies]
 rune-core = { workspace = true }
-ureq = { workspace = true }
 serde_json = { workspace = true }
 serde = { workspace = true }
+
+# Only the mock provider's own tests reach an endpoint, so the client is a test
+# dependency rather than a shipped one.
+[target.'cfg(not(target_family = "wasm"))'.dev-dependencies]
+ureq = { workspace = true }
 
 [dev-dependencies]
 tempfile.workspace = true

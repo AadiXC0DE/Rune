@@ -14,7 +14,6 @@
     clippy::indexing_slicing
 )]
 
-use std::io::Read;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -66,13 +65,12 @@ impl HostFetch for CountingFetch {
                 )
             })?;
         let status = response.status().as_u16();
-        let mut body = Vec::new();
-        response
-            .into_body()
-            .into_reader()
-            .read_to_end(&mut body)
-            .expect("read the response body");
-        Ok(FetchResponse::new(status, body))
+        // The live reader, not a buffered copy: the turn must see each event as
+        // the endpoint produces it.
+        Ok(FetchResponse {
+            status,
+            body: Box::new(response.into_body().into_reader()),
+        })
     }
 }
 

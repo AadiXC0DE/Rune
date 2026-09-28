@@ -181,6 +181,23 @@ pub trait Host {
         Effort::Auto
     }
 
+    /// Returns the client this turn sends through.
+    ///
+    /// A native build defaults to the workspace transport, one per turn, which
+    /// is what gives every step of that turn one connection pool.
+    #[cfg(not(target_family = "wasm"))]
+    fn fetch(&self) -> Box<dyn Fetch> {
+        Box::new(transport::UreqFetch::new())
+    }
+
+    /// Returns the client this turn sends through.
+    ///
+    /// A target where the built-in client cannot exist has no default, so a
+    /// host there supplies its own rather than the loop inventing one that
+    /// cannot open a socket.
+    #[cfg(target_family = "wasm")]
+    fn fetch(&self) -> Box<dyn Fetch>;
+
     /// Returns whether fast mode is requested.
     fn fast_mode(&self) -> bool {
         false
@@ -264,7 +281,7 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
     history.set_instructions(instructions);
     history.validate()?;
 
-    let client = transport::UreqFetch::new();
+    let client = host.fetch();
     let mut usage = Usage::default();
     let mut calls = Vec::new();
     // Reasoning accumulated across steps, so a multi-step turn keeps all of it.
@@ -302,7 +319,7 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
         host.emit(Event::TurnStarted { step: steps });
 
         let (outcome, steering_arrived) = stream_with_retry(
-            &client,
+            client.as_ref(),
             host,
             history,
             head_timeout,

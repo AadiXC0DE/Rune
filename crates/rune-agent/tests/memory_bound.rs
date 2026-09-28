@@ -5,6 +5,9 @@
     clippy::panic,
     clippy::indexing_slicing
 )]
+// Every case drives a real listening endpoint, so these run only where a socket
+// can be opened.
+#![cfg(not(target_family = "wasm"))]
 
 //! Bounds on what one turn accumulates.
 //!

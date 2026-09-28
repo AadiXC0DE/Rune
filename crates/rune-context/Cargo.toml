@@ -20,6 +20,10 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 camino = { workspace = true }
 sha2 = { workspace = true }
+
+# The blocking client the remote MCP transports speak through. Absent where a
+# socket cannot be opened, because nothing there compiles it.
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
 ureq = { workspace = true }
 
 [dev-dependencies]

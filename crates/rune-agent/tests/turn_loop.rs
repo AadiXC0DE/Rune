@@ -5,6 +5,9 @@
     clippy::panic,
     clippy::indexing_slicing
 )]
+// The loop is driven against a real listening endpoint, so these run only where
+// a socket can be opened.
+#![cfg(not(target_family = "wasm"))]
 
 //! End-to-end tests for the turn loop.
 //!

@@ -17,6 +17,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
+use std::time::Duration;
 
 use rune_agent::History;
 use rune_agent::steering::Cancellation;
@@ -28,9 +29,8 @@ use rune_net::error::NetError;
 use rune_net::message::{ContentPart, ImageRef, validate_tool_specs};
 use rune_net::provider::{Provider, RequestPlan, ToolChoice};
 use rune_net::redact;
-use rune_net::sse::{Decoder, Event as SseEvent};
 use rune_net::stream::{FinishReason, ProviderEvent, Usage};
-use rune_net::transport::{AuthStyle, Endpoint, MAX_RESPONSE_BYTES, StreamOutcome};
+use rune_net::transport::{AuthStyle, Endpoint, StreamOutcome};
 use rune_tools::contract::{Activity, ToolOutput};
 
 /// Version of the checkpoint format written by [`Agent::checkpoint`].
@@ -92,21 +92,33 @@ impl FetchRequest {
 }
 
 /// What a host fetch returns.
-#[derive(Clone, PartialEq, Eq, Debug)]
+///
+/// The body is a reader rather than a buffer. A model answers one token at a
+/// time and the agent renders each one as it arrives, so collecting the body
+/// first would hold the answer back until the response had finished.
 pub struct FetchResponse {
     /// HTTP status.
     pub status: u16,
     /// Response body, which is a server-sent event stream for a model request.
-    pub body: Vec<u8>,
+    pub body: Box<dyn Read + Send>,
+}
+
+impl fmt::Debug for FetchResponse {
+    /// Reports the head only. Reading the body here would consume it.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FetchResponse")
+            .field("status", &self.status)
+            .finish_non_exhaustive()
+    }
 }
 
 impl FetchResponse {
-    /// Builds a successful response.
+    /// Builds a response over a body held in memory.
     #[must_use]
     pub fn new(status: u16, body: impl Into<Vec<u8>>) -> Self {
         Self {
             status,
-            body: body.into(),
+            body: Box::new(std::io::Cursor::new(body.into())),
         }
     }
 }
@@ -118,56 +130,57 @@ impl FetchResponse {
 /// implements it, and no other client is constructed.
 pub trait HostFetch: Send + Sync {
     /// Performs one request.
+    ///
+    /// Returns as soon as the response head is known; the body is read from the
+    /// returned reader, which is what keeps a streamed answer incremental.
     fn post(&self, request: FetchRequest) -> Result<FetchResponse>;
 }
 
+/// Performs one request over the workspace transport.
+///
+/// This is the agent's routing of a request onto the shared [`rune_net`] fetch,
+/// which is the only place a client is constructed. Routing here rather than
+/// building a client keeps the two paths from drifting apart.
+fn dispatch(
+    client: &rune_net::transport::UreqFetch,
+    request: FetchRequest,
+) -> Result<FetchResponse> {
+    let parsed = rune_net::fetch::FetchRequest {
+        method: rune_net::fetch::Method::Post,
+        url: request.url,
+        headers: request.headers,
+        body: request.body.into_bytes(),
+        timeout: None,
+    };
+    let response =
+        rune_net::fetch::Fetch::send(client, parsed).map_err(|err| err.to_rune_error())?;
+    Ok(FetchResponse {
+        status: response.status,
+        body: response.body,
+    })
+}
+
 /// The fetch used when the embedder supplies none.
+///
+/// Holds one transport for the life of the agent, so its connection pool is
+/// reused across every request the conversation makes.
 #[derive(Debug)]
 struct DefaultFetch {
-    client: ureq::Agent,
+    client: rune_net::transport::UreqFetch,
 }
 
 impl DefaultFetch {
-    /// Builds a fetch over the workspace HTTP client.
+    /// Builds a fetch over the workspace transport.
     fn new() -> Self {
         Self {
-            client: rune_net::transport::agent(),
+            client: rune_net::transport::UreqFetch::new(),
         }
     }
 }
 
 impl HostFetch for DefaultFetch {
     fn post(&self, request: FetchRequest) -> Result<FetchResponse> {
-        let mut builder = self.client.post(&request.url);
-        for (name, value) in &request.headers {
-            builder = builder.header(name, value);
-        }
-
-        let response = builder.send(&request.body).map_err(|err| {
-            let kind = match err {
-                ureq::Error::Timeout(_) => rune_net::error::FailureKind::Timeout,
-                _ => rune_net::error::FailureKind::Network,
-            };
-            NetError::new(kind, redact::redact(&err.to_string())).to_rune_error()
-        })?;
-
-        let status = response.status().as_u16();
-        let mut body = Vec::new();
-        // One byte past the bound, so an oversized body is refused rather than
-        // silently truncated into a decode failure.
-        let cap = usize::try_from(MAX_RESPONSE_BYTES).unwrap_or(usize::MAX);
-        let limit = u64::try_from(cap).unwrap_or(u64::MAX);
-        response
-            .into_body()
-            .into_reader()
-            .take(limit.saturating_add(1))
-            .read_to_end(&mut body)?;
-        if body.len() > cap {
-            return Err(RuneError::too_large("fetch.body", body.len(), cap)
-                .with_hint("the endpoint returned more than one response may hold"));
-        }
-
-        Ok(FetchResponse { status, body })
+        dispatch(&self.client, request)
     }
 }
 
@@ -973,22 +986,18 @@ fn run_turn(context: &TurnContext) -> Result<TurnProduct> {
 
         let mut parts: Vec<ContentPart> = Vec::new();
         let mut pending: Vec<PreparedCall> = Vec::new();
+        // Text and reasoning were already emitted as they arrived; here they
+        // are only assembled into the turn's record.
         for event in &response.events {
             match event {
                 ProviderEvent::TextDelta { delta } => {
                     acc.text.push_str(delta);
-                    context.emit(Event::TextDelta {
-                        delta: delta.clone(),
-                    });
                     parts.push(ContentPart::Text {
                         text: delta.clone(),
                     });
                 }
                 ProviderEvent::ReasoningDelta { delta } => {
                     acc.reasoning.push_str(delta);
-                    context.emit(Event::ReasoningDelta {
-                        delta: delta.clone(),
-                    });
                     parts.push(ContentPart::Reasoning {
                         text: delta.clone(),
                     });
@@ -1114,7 +1123,11 @@ fn request(
     let response = context.fetch.post(request)?;
 
     if response.status >= 400 {
-        let text = String::from_utf8_lossy(&response.body);
+        // Only enough of the body to explain the rejection; an endpoint that
+        // answers with an error page must not be able to exhaust memory here.
+        let mut raw = Vec::new();
+        let _ = response.body.take(64 * 1024).read_to_end(&mut raw);
+        let text = String::from_utf8_lossy(&raw);
         let sanitized = redact::redact(&text);
         return Err(NetError::classify_status(response.status, &sanitized)
             .with_hint(format!(
@@ -1124,33 +1137,33 @@ fn request(
             .to_rune_error());
     }
 
-    reduce(&response.body, provider, &context.cancel)
-}
+    // Each event is handed back as it is decoded, so a host rendering the turn
+    // sees text while it is produced rather than once the response has ended.
+    let mut observe = |event: &ProviderEvent| match event {
+        ProviderEvent::TextDelta { delta } => context.emit(Event::TextDelta {
+            delta: delta.clone(),
+        }),
+        ProviderEvent::ReasoningDelta { delta } => context.emit(Event::ReasoningDelta {
+            delta: delta.clone(),
+        }),
+        _ => {}
+    };
 
-/// Reduces a complete response body into normalized events.
-fn reduce(body: &[u8], provider: &dyn Provider, cancel: &Cancellation) -> Result<StreamOutcome> {
-    let mut decoder = Decoder::new(provider.limits());
-    let mut reducer = provider.reducer();
-    let mut frames: Vec<SseEvent> = Vec::new();
-    decoder.push(body, &mut frames)?;
-    decoder.finish(&mut frames)?;
-
-    let mut outcome = StreamOutcome::default();
-    for frame in &frames {
-        if frame.is_empty() && frame.name.is_none() {
-            continue;
-        }
-        reducer.apply(Some(&frame.data), &mut outcome.events)?;
-    }
-
-    cancel.check()?;
-    // A reducer that never saw a terminal payload fails here, so a truncated
-    // response can never be mistaken for a complete one.
-    reducer.apply(None, &mut outcome.events)?;
-    outcome.finish = Some(reducer.finish()?);
-    outcome.usage = reducer.usage();
-    outcome.replay = reducer.replay();
-    Ok(outcome)
+    let head_timeout = Duration::from_millis(
+        context
+            .limits
+            .get(LimitName::ProviderHeadTimeoutMs)
+            .value()
+            .unwrap_or(120_000),
+    );
+    rune_net::transport::read_stream(
+        response.body,
+        provider,
+        head_timeout,
+        &|| context.cancel.is_cancelled(),
+        &mut observe,
+    )
+    .map_err(|err| err.to_rune_error())
 }
 
 /// One executed call, with the images it produced.

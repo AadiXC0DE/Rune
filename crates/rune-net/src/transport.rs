@@ -858,6 +858,18 @@ pub fn diagnostic_for(plan: &RequestPlan, error: &NetError) -> serde_json::Value
 mod tests {
     use super::*;
 
+    /// A client that fails the test if a request reaches it.
+    ///
+    /// Used where the point of the test is that no request is attempted, so a
+    /// transport is needed to call the function but none may be touched.
+    struct NoFetch;
+
+    impl Fetch for NoFetch {
+        fn send(&self, _request: FetchRequest) -> NetResult<crate::fetch::FetchResponse> {
+            unreachable!("the request should have been refused before any client call")
+        }
+    }
+
     #[test]
     fn https_is_accepted() {
         validate_url("https://api.example.com").expect("accepted");
@@ -970,9 +982,8 @@ mod tests {
         let endpoint = Endpoint::new("https://api.example.com", "k").offline(true);
         let provider = crate::chat_completions::ChatCompletions;
         let plan = RequestPlan::new("m");
-        let agent = agent();
         let err = stream_completion(
-            &agent,
+            &NoFetch,
             &endpoint,
             &provider,
             &plan,

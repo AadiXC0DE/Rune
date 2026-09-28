@@ -20,6 +20,8 @@ rune-net = { workspace = true }
 rune-tools = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
 ureq = { workspace = true }
 
 [dev-dependencies]
