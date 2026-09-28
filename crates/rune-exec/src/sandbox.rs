@@ -29,6 +29,7 @@ use std::process::{Command, Output, Stdio};
 
 use camino::{Utf8Path, Utf8PathBuf};
 use rune_core::error::{ErrorCode, Result, RuneError};
+use rune_core::paths::Paths;
 
 use crate::command::PreparedCommand;
 
@@ -51,23 +52,28 @@ const NULL_DEVICE: &str = "/dev/null";
 /// Locations under the home directory that hold credentials.
 ///
 /// A sandboxed command has no business reading any of these, so each backend
-/// hides them from the command it starts. The state directory Rune keeps its own
-/// credentials in is named directly rather than resolved from the environment,
-/// because a variable that moves it would otherwise move what is hidden.
+/// hides them from the command it starts. Rune's own configuration and state
+/// directories are named at their default locations, and the locations this
+/// process actually resolves are added to them, so a variable that moves the
+/// credential file widens what is hidden without ever narrowing it.
 ///
 /// The entries are relative: the home directory is resolved once and each is
 /// joined onto it, and an entry that is not present is skipped, since a rule
 /// about a path that does not exist is noise in a Seatbelt profile and an error
 /// in a `bwrap` mount.
-pub const CREDENTIAL_PATHS: [&str; 8] = [
+pub const CREDENTIAL_PATHS: [&str; 12] = [
     ".ssh",
     ".aws",
+    ".azure",
+    ".config/gcloud",
     ".config/gh",
+    ".git-credentials",
     ".netrc",
     ".gnupg",
     ".docker/config.json",
     ".kube/config",
     ".config/rune",
+    ".local/state/rune",
 ];
 
 /// Profile the macOS probe runs: it denies every write and nothing else.
@@ -141,11 +147,14 @@ impl SandboxPolicy {
         std::iter::once(&self.workspace).chain(self.writable_roots.iter())
     }
 
-    /// Returns the credential locations this host has, for a caller to assert
-    /// against without repeating the list.
-    #[must_use]
-    pub fn credential_paths() -> Vec<Utf8PathBuf> {
-        existing_credential_paths()
+    /// Returns the credential locations a command under this policy has
+    /// hidden, for a caller to assert against without repeating the list.
+    pub fn credential_paths(&self) -> Result<Vec<Utf8PathBuf>> {
+        let writable = self
+            .writable()
+            .map(|path| resolve(path, "a writable path"))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(masked_paths(&existing_credential_paths(), &writable))
     }
 }
 
@@ -252,8 +261,52 @@ fn credential_paths_under(home: &Utf8Path) -> Vec<Utf8PathBuf> {
 }
 
 /// Returns the credential paths that exist on this host.
+///
+/// The fixed locations are joined to the home directory. Rune's own roots are
+/// added where this process resolves them, because `RUNE_HOME` and the XDG
+/// variables move the credential file, and a mask that stayed at the default
+/// would leave the moved file readable. The credential file is named on its own
+/// as well, so it stays hidden even when its directory cannot be.
 fn existing_credential_paths() -> Vec<Utf8PathBuf> {
-    home_directory().map_or_else(Vec::new, |home| credential_paths_under(&home))
+    let mut paths = home_directory().map_or_else(Vec::new, |home| credential_paths_under(&home));
+    let own = Paths::from_process();
+    let credentials_file = own.credentials_file();
+    for path in [own.config_root, own.state_root, credentials_file] {
+        // A root built from an unset home is relative, and would resolve
+        // against whatever directory this process happens to be in.
+        if !path.is_absolute() {
+            continue;
+        }
+        if let Ok(resolved) = path.canonicalize_utf8()
+            && !paths.contains(&resolved)
+        {
+            paths.push(resolved);
+        }
+    }
+    paths
+}
+
+/// Returns the credential paths a command under a policy has hidden.
+///
+/// A location that contains a writable root is left out, because covering it
+/// would hide the directory the command was started to work in; a narrower
+/// entry for the same secret still applies. A location inside another masked
+/// directory is left out too, since the directory already hides it and a
+/// second mount inside an emptied directory has nothing to cover.
+fn masked_paths(credentials: &[Utf8PathBuf], writable: &[Utf8PathBuf]) -> Vec<Utf8PathBuf> {
+    let reachable: Vec<&Utf8PathBuf> = credentials
+        .iter()
+        .filter(|credential| !writable.iter().any(|root| root.starts_with(credential)))
+        .collect();
+    reachable
+        .iter()
+        .filter(|credential| {
+            !reachable.iter().any(|other| {
+                other != *credential && other.is_dir() && credential.starts_with(other.as_path())
+            })
+        })
+        .map(|credential| (*credential).clone())
+        .collect()
 }
 
 /// Returns the Seatbelt rule that covers a resolved path.
@@ -385,13 +438,16 @@ impl MacSandbox {
     /// can build a profile over a fixture home without moving this process's own
     /// home directory.
     fn profile_with(policy: &SandboxPolicy, credentials: &[Utf8PathBuf]) -> Result<String> {
+        let writable = policy
+            .writable()
+            .map(|path| resolve(path, "a writable path"))
+            .collect::<Result<Vec<_>>>()?;
         let mut profile = String::new();
         let _ = writeln!(profile, "(version 1)");
         let _ = writeln!(profile, "(allow default)");
         let _ = writeln!(profile, "(deny file-write*)");
-        for path in policy.writable() {
-            let resolved = resolve(path, "a writable path")?;
-            let _ = writeln!(profile, "(allow file-write* {})", operand(&resolved)?);
+        for resolved in &writable {
+            let _ = writeln!(profile, "(allow file-write* {})", operand(resolved)?);
         }
         // Redirection to these is not a way to change the machine, and denying
         // them breaks almost every command that prints.
@@ -406,12 +462,11 @@ impl MacSandbox {
         //
         // The readable roots and the writable ones are the same paths, so the
         // loop is shared.
-        for path in policy.writable() {
-            let resolved = resolve(path, "a readable path")?;
-            let _ = writeln!(profile, "(allow file-read* {})", operand(&resolved)?);
+        for resolved in &writable {
+            let _ = writeln!(profile, "(allow file-read* {})", operand(resolved)?);
         }
-        for credential in credentials {
-            let _ = writeln!(profile, "(deny file-read* {})", operand(credential)?);
+        for credential in masked_paths(credentials, &writable) {
+            let _ = writeln!(profile, "(deny file-read* {})", operand(&credential)?);
         }
         if !policy.network {
             let _ = writeln!(profile, "(deny network*)");
@@ -555,8 +610,11 @@ impl LinuxSandbox {
             String::from("--tmpfs"),
             String::from("/tmp"),
         ]);
-        for path in policy.writable() {
-            let resolved = resolve(path, "a writable path")?;
+        let writable = policy
+            .writable()
+            .map(|path| resolve(path, "a writable path"))
+            .collect::<Result<Vec<_>>>()?;
+        for resolved in &writable {
             argv.push(String::from("--bind"));
             argv.push(resolved.as_str().to_owned());
             argv.push(resolved.as_str().to_owned());
@@ -564,7 +622,7 @@ impl LinuxSandbox {
         // The credential locations are covered last, so the mask is the rule
         // that applies to a path a writable bind would otherwise expose, which
         // is the case when the home directory is itself the workspace.
-        for credential in existing_credential_paths() {
+        for credential in masked_paths(&existing_credential_paths(), &writable) {
             if credential.is_dir() {
                 // A directory is covered by an empty filesystem, which hides
                 // everything under it in one operation.
@@ -1171,7 +1229,10 @@ mod tests {
         let wrapped = sandbox
             .wrap(&prepared, &policy(dir.as_path()), false)
             .expect("wrap");
-        for credential in SandboxPolicy::credential_paths() {
+        for credential in policy(dir.as_path())
+            .credential_paths()
+            .expect("credential paths")
+        {
             let path = credential.as_str();
             // A directory mask is a two-token operation and a file mask is a
             // three-token one, so each is matched as the exact sequence rather
@@ -1236,5 +1297,57 @@ mod tests {
                 "reading {path} produced {outcome:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_credential_that_holds_the_workspace_is_left_readable() {
+        // Masking a directory that contains the workspace would hide the
+        // workspace itself, so the command could not do the work it was run for.
+        let (_guard, home) = tempdir();
+        let state = home.join("state");
+        let workspace = state.join("project");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        let secret = state.join("credentials.json");
+        std::fs::write(&secret, "{}").expect("secret");
+        let state = state.canonicalize_utf8().expect("state");
+        let secret = secret.canonicalize_utf8().expect("secret");
+        let workspace = workspace.canonicalize_utf8().expect("workspace");
+
+        let masked = masked_paths(&[state, secret.clone()], &[workspace]);
+        assert_eq!(masked, vec![secret], "the narrower entry must still apply");
+    }
+
+    #[test]
+    fn a_path_inside_a_masked_directory_is_not_masked_twice() {
+        // The directory already hides what is inside it, and a second mount
+        // inside an emptied directory has nothing to cover.
+        let (_guard, home) = tempdir();
+        let state = home.join("state");
+        std::fs::create_dir_all(&state).expect("state");
+        let secret = state.join("credentials.json");
+        std::fs::write(&secret, "{}").expect("secret");
+        let (_other, workspace) = tempdir();
+        let state = state.canonicalize_utf8().expect("state");
+        let secret = secret.canonicalize_utf8().expect("secret");
+        let workspace = workspace.canonicalize_utf8().expect("workspace");
+
+        let masked = masked_paths(&[state.clone(), secret], &[workspace]);
+        assert_eq!(masked, vec![state]);
+    }
+
+    #[test]
+    fn the_credential_list_names_where_rune_keeps_its_own_credential() {
+        // The credential file lives in the state root, not beside the
+        // configuration, so a list that only named the configuration directory
+        // left this program's own key readable to every command it ran.
+        let own = Paths::resolve(Some("/home/u"), None, None, None, None);
+        let state = own
+            .state_root
+            .strip_prefix("/home/u")
+            .expect("the default state root is under the home directory");
+        assert!(
+            CREDENTIAL_PATHS.contains(&state.as_str()),
+            "`{state}` holds the credential file and is not masked"
+        );
     }
 }
