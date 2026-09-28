@@ -42,6 +42,11 @@ pub struct FetchRequest {
     /// needs: a generation legitimately runs for minutes, and the head timeout
     /// bounds the part that can hang.
     pub timeout: Option<Duration>,
+    /// Time allowed for the response head to arrive once the request is sent.
+    ///
+    /// Bounds an endpoint that accepts a request and never answers, without
+    /// bounding the body that follows the head. `None` sets no bound.
+    pub head_timeout: Option<Duration>,
 }
 
 impl FetchRequest {
@@ -54,6 +59,7 @@ impl FetchRequest {
             headers: Vec::new(),
             body: Vec::new(),
             timeout: None,
+            head_timeout: None,
         }
     }
 
@@ -66,6 +72,7 @@ impl FetchRequest {
             headers: Vec::new(),
             body,
             timeout: None,
+            head_timeout: None,
         }
     }
 
@@ -80,6 +87,13 @@ impl FetchRequest {
     #[must_use]
     pub const fn with_timeout(mut self, timeout: Option<Duration>) -> Self {
         self.timeout = timeout;
+        self
+    }
+
+    /// Sets the time allowed for the response head.
+    #[must_use]
+    pub const fn with_head_timeout(mut self, head_timeout: Option<Duration>) -> Self {
+        self.head_timeout = head_timeout;
         self
     }
 }
