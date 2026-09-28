@@ -3109,9 +3109,9 @@ mod tests {
 
     #[test]
     fn a_delta_keeps_the_caret_where_the_reader_left_it() {
-        // The streaming path placed the caret at the character count of the
-        // line, so a caret moved back into the line, or after a wide character,
-        // jumped on every token.
+        // The caret is placed at the reader's display column. The character
+        // count of the line is wrong for a caret moved back into the line or
+        // after a wide character, and the caret would jump on every token.
         let sink: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
         let host = test_host();
         if let Ok(mut slot) = host.live_out.lock() {
@@ -3138,7 +3138,7 @@ mod tests {
     #[test]
     fn clearing_the_line_before_anything_streams_takes_it_off_the_screen() {
         // With nothing streamed yet and no notice, the frame for an emptied
-        // line was skipped, so the text that was cleared stayed on screen.
+        // line still has to be painted, or the cleared text stays on screen.
         let sink: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
         let host = test_host();
         if let Ok(mut slot) = host.live_out.lock() {
@@ -3307,8 +3307,8 @@ mod tests {
     #[test]
     fn escape_at_the_prompt_clears_the_line_and_never_leaves() {
         // While a turn runs, Escape asks for a second press to cancel. A turn
-        // that ended between the two presses handed the second to this prompt,
-        // where an empty line meant leaving the session.
+        // that ends between the two presses hands the second to this prompt,
+        // where it must not end the session.
         let mut reader = rune_term::input::KeyReader::new();
         let mut selected = 3;
         reader.replace("a draft");
@@ -3332,8 +3332,8 @@ mod tests {
 
     #[test]
     fn a_turn_that_panics_keeps_the_conversation_it_started_with() {
-        // The fallback for a worker that panicked used to be an empty history,
-        // so one defect inside a turn silently threw away every earlier turn.
+        // A panic inside a turn ends that exchange and nothing more: falling
+        // back to an empty history would throw away every earlier turn.
         let mut history = History::new();
         history.push_user("first question");
         history.push_assistant(vec![rune_net::message::ContentPart::Text {
@@ -4782,8 +4782,8 @@ mod tests {
 
     #[test]
     fn an_anthropic_session_presents_its_key_the_way_anthropic_reads_it() {
-        // A session that sent a bearer token failed against the real endpoint,
-        // while the one-shot runner, which sent the key header, worked.
+        // Anthropic refuses a bearer token, so the session has to present its
+        // key the way the one-shot runner does.
         let dir = tempfile::tempdir().expect("temp");
         let root = Utf8Path::from_path(dir.path()).expect("utf8");
         let paths = Paths::resolve(Some(root.as_str()), None, None, None, None);

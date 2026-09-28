@@ -882,9 +882,9 @@ mod tests {
 
     #[test]
     fn global_flags_after_the_command_are_applied() {
-        // These used to be collected for the command and never read, so
-        // `rune ask --offline hi` went to the network and `--model` after the
-        // command was reported as no model selected.
+        // A global flag means the same after the command as before it, so
+        // `rune ask --offline hi` stays off the network and `--model` after the
+        // command selects the model.
         let launch = parse_list(&["ask", "--offline", "--model", "m", "--effort=high", "hi"])
             .expect("parse");
         assert_eq!(launch.command, Command::Ask);

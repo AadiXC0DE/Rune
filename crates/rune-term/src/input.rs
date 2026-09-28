@@ -70,8 +70,8 @@ impl KeyReader {
             std::io::stdin().is_terminal() && crossterm::terminal::enable_raw_mode().is_ok();
         if active {
             install_panic_hook();
-            // A terminal that cannot bracket a paste still delivers it as
-            // keystrokes, which is no worse than before, so a failure is ignored.
+            // A terminal that cannot bracket a paste delivers it as keystrokes,
+            // which still works, so a failure is ignored.
             let _ = crossterm::ExecutableCommand::execute(
                 &mut std::io::stdout(),
                 crossterm::event::EnableBracketedPaste,
@@ -347,8 +347,8 @@ pub fn secret_event(secret: &mut String, event: Event) -> SecretStep {
 ///
 /// A credential that is echoed stays on screen and in the terminal's
 /// scrollback. Raw mode keeps the terminal from echoing, and bracketed paste
-/// keeps a pasted key that ends in a line break from being submitted before it
-/// can be checked. Returns `None` when input ends before anything is typed, and
+/// delivers a pasted key in one piece, so a line break copied with it does not
+/// end the read. Returns `None` when input ends before anything is typed, and
 /// an interrupted error for Control-C.
 pub fn read_secret() -> std::io::Result<Option<String>> {
     /// Puts the terminal back however the read ends.
@@ -613,8 +613,8 @@ mod tests {
 
     #[test]
     fn a_pasted_block_stays_on_the_line_rather_than_submitting_it() {
-        // Without bracketed paste every line break in a pasted stack trace was
-        // an Enter, so the first line started a turn and each later line was
+        // Without bracketed paste every line break in a pasted stack trace is
+        // an Enter, so the first line starts a turn and each later line is
         // sent on its own.
         let mut reader = reader();
         typed(&mut reader, "why: ");

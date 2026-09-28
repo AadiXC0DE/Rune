@@ -625,9 +625,8 @@ mod tests {
 
     #[test]
     fn a_request_to_anthropic_carries_the_key_in_its_own_header() {
-        // Anthropic refuses a bearer token, so every path that built its
-        // endpoint with one failed against the real service while `rune ask`,
-        // which sent the key header, worked.
+        // Anthropic refuses a bearer token, so every path that builds its
+        // endpoint here has to send the key in the header Anthropic reads.
         let (port, captured) = capture_one_request();
         let built = endpoint(
             &Provider::Anthropic,

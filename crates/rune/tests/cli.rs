@@ -467,7 +467,7 @@ fn run_against(
 
 #[test]
 fn offline_after_the_command_refuses_the_request() {
-    // `rune --offline ask hi` refused while `rune ask --offline hi` went out.
+    // Offline after the command refuses the request just as it does before it.
     let listener = Listener::start();
     for args in [
         vec!["ask", "--offline", "hi"],
@@ -514,8 +514,8 @@ fn a_limit_after_the_command_is_applied() {
 
 #[test]
 fn listing_models_offline_reports_the_configured_model_without_a_request() {
-    // Only the flag after the command was honoured, so the global flag and the
-    // environment both ended in a network error.
+    // Offline is honoured however it is given: the global flag, the flag after
+    // the command, or the environment.
     let listener = Listener::start();
     for (env, args) in [
         (vec![], vec!["--offline", "models"]),
@@ -565,8 +565,8 @@ fn connect_json(key: Option<&str>) -> (Output, tempfile::TempDir) {
 
 #[test]
 fn connecting_without_a_credential_fails_and_saves_nothing() {
-    // A machine caller with no key exported was told the connection was made,
-    // with a selection saved that no request could use.
+    // A machine caller with no key is refused, rather than told it connected
+    // and left with a selection that no request can use.
     let (out, dir) = connect_json(None);
     assert_eq!(out.status, Some(1), "stdout: {}", out.stdout);
     assert!(out.stderr.contains("no credential"), "{}", out.stderr);

@@ -810,9 +810,9 @@ mod tests {
 
     #[test]
     fn clearing_the_line_starts_recall_over() {
-        // Sending a recalled entry clears the line. Recall used to carry on
-        // from where it was, so the next Up skipped an entry and a Down past
-        // the newest brought back the draft that had been abandoned.
+        // Sending a recalled entry clears the line, and recall starts over from
+        // there. Carrying on from the old position skips an entry on the next
+        // Up, and a Down past the newest brings back a draft that was let go.
         let entries: Vec<String> = ["one", "two", "three"].map(str::to_owned).to_vec();
         let mut composer = Composer::new();
         composer.insert("abandoned draft");

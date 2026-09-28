@@ -261,8 +261,8 @@ impl Inline {
             out.push_str(HIDE_CURSOR);
             // The caret is already on its row, so only the column moves. Any
             // vertical move here is a round trip, and on the screen's last row
-            // the downward half is clamped, which left the caret on the status
-            // row for the next frame to write over.
+            // the downward half is clamped, which would leave the caret on the
+            // status row for the next frame to write over.
             out.push('\r');
             column(&mut out, caret.1);
             out.push_str(SHOW_CURSOR);
@@ -1289,8 +1289,8 @@ mod tests {
     #[test]
     fn moving_the_caret_on_the_bottom_row_keeps_it_on_the_input_row() {
         // At the bottom of the screen a downward move is clamped, so a caret
-        // move that went down and back up left the cursor one row too high and
-        // the next edit was written over the status row.
+        // move that goes down and back up leaves the cursor one row too high,
+        // and the next edit is written over the status row.
         const HEIGHT: u16 = 10;
         let mut inline = Inline::new(40);
         inline.set_max_rows(HEIGHT.saturating_sub(1));
@@ -1370,9 +1370,9 @@ mod tests {
 
     #[test]
     fn a_height_change_erases_the_region_before_drawing_it_again() {
-        // A new height used to reset the renderer as if nothing were on screen,
-        // so the next frame was drawn from the caret down and the whole region
-        // it had drawn before was left above it.
+        // The region is still on screen when the height changes. A frame drawn
+        // from the caret down as if nothing were there leaves a whole copy of
+        // the region above the new one.
         let mut inline = Inline::new(40);
         inline.set_max_rows(19);
         let mut grid = crate::engine::Grid::new(40, 20).expect("grid");

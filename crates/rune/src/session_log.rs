@@ -745,8 +745,8 @@ mod tests {
     #[test]
     fn a_call_the_log_never_answered_is_replayed_as_interrupted() {
         // The recorder writes a turn's calls before its results, so a crash
-        // between them leaves calls with no result. Replaying that log made
-        // every later turn fail validation.
+        // between them leaves calls with no result. The replayed conversation
+        // has to answer them, or every later turn fails validation.
         let dir = tempfile::tempdir().expect("temp");
         let root = Utf8Path::from_path(dir.path()).expect("utf8");
         let paths = paths(root);
