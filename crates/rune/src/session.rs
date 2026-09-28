@@ -1219,7 +1219,28 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                 // keys. A turn that ran inline made the keyboard dead for as
                 // long as the model took, which is the difference between
                 // correcting a long turn and waiting it out.
-                let outcome = run_turn_steerable(&mut history, &host, reader, gesture)?;
+                let steered = run_turn_steerable(&mut history, &host, reader, gesture);
+                // A correction the turn took in is part of the conversation the
+                // model saw, so a resumed session must see it too.
+                for correction in &steered.applied {
+                    recorder.user_message(correction)?;
+                }
+                let outcome = match steered.outcome {
+                    Ok(outcome) => outcome,
+                    // A cancelled or failed turn ends that exchange, not the
+                    // session. Cancelling is something the keyboard offers while
+                    // a turn runs, so ending the session for it would make the
+                    // gesture indistinguishable from quitting. A pipe keeps the
+                    // failure, because a script reads it from the exit status.
+                    Err(err) if reader.is_active() => {
+                        let lines = report_failed_turn(&err, &host);
+                        host.clear_events();
+                        host.clear_streaming();
+                        close_turn(&host, sink, reader, &lines, None, &steered.unsent)?;
+                        return Ok(Step::Continue);
+                    }
+                    Err(err) => return Err(err),
+                };
                 // The turn is recorded before it is reported, so a session that
                 // dies while rendering still has its exchange on disk.
                 recorder.turn(&outcome)?;
@@ -1244,26 +1265,14 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                 // terminal: the region below is redrawn in place.
                 let lines = report_turn(&outcome, &host)?;
                 let activity = SessionHost::activity_line(&outcome);
-                // The prompt row is included even though it is empty, so the
-                // region the next keystroke redraws is the same shape as this
-                // one and nothing has to be drawn twice.
-                let prompt_row = transcript::render_prompt(
-                    rune_term::shell::prompt(),
-                    "",
-                    usize::from(host.width()),
-                );
-                let caret = rune_term::width::str_width(rune_term::shell::prompt());
-                let painted = host.paint(
+                close_turn(
+                    &host,
+                    sink,
+                    reader,
                     &lines,
                     activity.as_deref(),
-                    std::slice::from_ref(&prompt_row),
-                    &[],
-                    (0, u16::try_from(caret).unwrap_or(u16::MAX)),
+                    &steered.unsent,
                 )?;
-                if !painted.is_empty() {
-                    sink.write_all(&painted)?;
-                    sink.flush()?;
-                }
                 Ok(Step::Continue)
             }
             Input::Empty => Ok(Step::Continue),
@@ -1358,16 +1367,26 @@ fn run_turn_steerable(
     host: &SessionHost,
     reader: &mut rune_term::input::KeyReader,
     gesture: &mut rune_term::shell::EscapeGesture,
-) -> Result<turn::TurnOutcome> {
+) -> SteeredTurn {
     if !reader.is_active() {
         // Without a terminal there are no keys to read, so the turn runs here
         // and the steering path is simply unused.
-        return turn::run_turn(history, host);
+        return SteeredTurn {
+            outcome: turn::run_turn(history, host),
+            applied: Vec::new(),
+            unsent: Vec::new(),
+        };
     }
 
     // Cleared before the turn rather than after, so a cancel that arrived as
     // the previous turn ended cannot stop this one before it starts.
     host.cancellation.reset();
+    // The host's copy of the typed line is what every streamed frame draws, so
+    // it starts from the reader's line rather than whatever the last turn left.
+    if let Ok(mut typed) = host.typed.lock() {
+        reader.line().clone_into(&mut typed);
+    }
+    let mut submitted: Vec<String> = Vec::new();
 
     // The conversation is moved in and handed back: a turn pushes what it
     // learned into the history, and the next turn must see it. Moving it is
@@ -1380,7 +1399,6 @@ fn run_turn_steerable(
             (taken, result)
         });
 
-        let mut interrupts = rune_term::shell::Interrupts::default();
         while !worker.is_finished() {
             let Some(key) = reader.poll_key(rune_term::shell::POLL_INTERVAL) else {
                 continue;
@@ -1397,8 +1415,11 @@ fn run_turn_steerable(
                         host.draw_stream_with("", 0);
                         continue;
                     }
-                    let notice = match host.steering.submit(text) {
-                        Ok(()) => String::from("steering queued for the next boundary"),
+                    let notice = match host.steering.submit(text.clone()) {
+                        Ok(()) => {
+                            submitted.push(text);
+                            String::from("steering queued for the next boundary")
+                        }
                         Err(err) => err.message().to_owned(),
                     };
                     // Drawn with the emptied line, so the submitted text does
@@ -1419,23 +1440,17 @@ fn run_turn_steerable(
                         host.draw_stream_with("", 0);
                     }
                 }
-                // Control-C clears a typed correction first, then cancels, then
-                // leaves on the next press, which is the order the key is
-                // reached for in.
+                // Control-C clears a typed correction first, then cancels. The
+                // session is left from the prompt the cancelled turn returns
+                // to, so a press here never abandons a turn still writing.
                 KeyAction::Cancel => {
                     gesture.disarm();
-                    if !reader.line().is_empty() {
-                        reader.clear();
-                        host.draw_stream_with("", 0);
-                    } else if interrupts.record() {
-                        // A second Control-C asks to leave. The turn is
-                        // cancelled and awaited first, because a session that
-                        // ended while its turn was still writing would leave a
-                        // half-drawn frame behind.
-                        host.cancellation.cancel();
-                    } else {
+                    if reader.line().is_empty() {
                         host.cancellation.cancel();
                         host.draw_notice("cancelling the turn");
+                    } else {
+                        reader.clear();
+                        host.draw_stream_with("", 0);
                     }
                 }
                 // Anything else is an edit, so a half-finished cancel gesture
@@ -1458,7 +1473,77 @@ fn run_turn_steerable(
     });
 
     *history = returned;
-    result
+    // Anything still queued was typed after the turn's last boundary, so the
+    // turn never saw it. The queue is drained in one piece, which makes what is
+    // left the newest submissions and everything before them what was applied.
+    let unsent: Vec<String> = host
+        .steering
+        .drain(rune_agent::Boundary::Finalizing)
+        .into_iter()
+        .map(|message| message.text)
+        .collect();
+    let applied_count = submitted.len().saturating_sub(unsent.len());
+    submitted.truncate(applied_count);
+    SteeredTurn {
+        outcome: result,
+        applied: submitted,
+        unsent,
+    }
+}
+
+/// What a steerable turn produced beside its outcome.
+struct SteeredTurn {
+    /// The turn's own result.
+    outcome: Result<turn::TurnOutcome>,
+    /// Corrections the turn took in, in the order they were typed.
+    applied: Vec<String>,
+    /// Corrections typed after the turn's last boundary, which it never saw.
+    unsent: Vec<String>,
+}
+
+/// Draws the frame that closes a turn: its settled lines, then the input row.
+///
+/// The input row shows whatever the reader holds, because a user who typed
+/// during the turn is still typing. A correction the turn ended before taking
+/// is put back on the line rather than dropped, where one more Enter sends it.
+fn close_turn(
+    host: &SessionHost,
+    sink: &mut LockedSink,
+    reader: &mut rune_term::input::KeyReader,
+    lines: &[String],
+    activity: Option<&str>,
+    unsent: &[String],
+) -> Result<()> {
+    let mut notice = activity.map(str::to_owned);
+    if !unsent.is_empty() {
+        let mut restored = unsent.join(" ");
+        if !reader.line().trim().is_empty() {
+            restored.push(' ');
+            restored.push_str(reader.line());
+        }
+        reader.replace(&restored);
+        notice = Some(String::from(
+            "the turn ended before this was sent; press Enter to send it",
+        ));
+    }
+    let marker = rune_term::shell::prompt();
+    let prompt_row = transcript::render_prompt(marker, reader.line(), usize::from(host.width()));
+    let caret = rune_term::width::str_width(marker).saturating_add(reader.column());
+    if let Ok(mut typed) = host.typed.lock() {
+        reader.line().clone_into(&mut typed);
+    }
+    let painted = host.paint(
+        lines,
+        notice.as_deref(),
+        std::slice::from_ref(&prompt_row),
+        &[],
+        (0, u16::try_from(caret).unwrap_or(u16::MAX)),
+    )?;
+    if !painted.is_empty() {
+        sink.write_all(&painted)?;
+        sink.flush()?;
+    }
+    Ok(())
 }
 
 /// Returns the error an interrupted turn is reported with.
@@ -2696,6 +2781,64 @@ fn tool_summary(name: &str, output: &ToolOutput) -> String {
 /// the rows the live region is drawn at, and in raw mode a bare newline moves
 /// down without returning to the first column.
 fn report_turn(outcome: &turn::TurnOutcome, host: &SessionHost) -> Result<Vec<String>> {
+    let mut entries = event_entries(host);
+
+    for call in &outcome.calls {
+        if call.executed {
+            // Only the result's headline reaches the conversation. The body is
+            // what the model asked for and what it already has; printing it
+            // again buries the answer under the material it was drawn from.
+            entries.push(Entry::tool(tool_summary(&call.call.name, &call.output)));
+        }
+    }
+
+    // Reasoning is shown above the answer and in its own lane, so a reader can
+    // tell what the model thought from what it concluded.
+    if !outcome.reasoning.trim().is_empty() {
+        entries.push(Entry::reasoning(outcome.reasoning.clone()));
+    }
+
+    if !outcome.text.is_empty() {
+        entries.push(Entry::assistant(outcome.text.clone()));
+    }
+
+    match outcome.stop_reason {
+        StopReason::StepLimit => entries.push(Entry::notice("reached the model step limit")),
+        StopReason::Cancelled => entries.push(Entry::notice("cancelled")),
+        _ => {}
+    }
+
+    Ok(render_entries(&entries, host))
+}
+
+/// Renders a turn that ended in an error rather than an outcome.
+///
+/// What streamed before the failure is kept, because the reader watched it
+/// arrive and a transcript that dropped it would disagree with the screen. It
+/// is not part of the conversation the model will see next.
+fn report_failed_turn(err: &RuneError, host: &SessionHost) -> Vec<String> {
+    let mut entries = event_entries(host);
+    let partial = host
+        .streaming
+        .lock()
+        .map(|streaming| streaming.answer.clone())
+        .unwrap_or_default();
+    if !partial.trim().is_empty() {
+        entries.push(Entry::assistant(partial));
+    }
+    if err.code() == ErrorCode::Cancelled {
+        entries.push(Entry::notice("cancelled"));
+    } else {
+        entries.push(Entry::notice(format!("the turn failed: {}", err.message())));
+        if let Some(hint) = err.hint() {
+            entries.push(Entry::notice(hint.to_owned()));
+        }
+    }
+    render_entries(&entries, host)
+}
+
+/// Returns the transcript entries for the events the running turn reported.
+fn event_entries(host: &SessionHost) -> Vec<Entry> {
     let events = host
         .events
         .lock()
@@ -2724,32 +2867,11 @@ fn report_turn(outcome: &turn::TurnOutcome, host: &SessionHost) -> Result<Vec<St
             _ => {}
         }
     }
+    entries
+}
 
-    for call in &outcome.calls {
-        if call.executed {
-            // Only the result's headline reaches the conversation. The body is
-            // what the model asked for and what it already has; printing it
-            // again buries the answer under the material it was drawn from.
-            entries.push(Entry::tool(tool_summary(&call.call.name, &call.output)));
-        }
-    }
-
-    // Reasoning is shown above the answer and in its own lane, so a reader can
-    // tell what the model thought from what it concluded.
-    if !outcome.reasoning.trim().is_empty() {
-        entries.push(Entry::reasoning(outcome.reasoning.clone()));
-    }
-
-    if !outcome.text.is_empty() {
-        entries.push(Entry::assistant(outcome.text.clone()));
-    }
-
-    match outcome.stop_reason {
-        StopReason::StepLimit => entries.push(Entry::notice("reached the model step limit")),
-        StopReason::Cancelled => entries.push(Entry::notice("cancelled")),
-        _ => {}
-    }
-
+/// Renders transcript entries into terminal lines.
+fn render_entries(entries: &[Entry], host: &SessionHost) -> Vec<String> {
     // Measured against the terminal rather than a fixed width, so a line is
     // wrapped where the reader's own window wraps it instead of mid-word at a
     // column that has nothing to do with this terminal.
@@ -2761,8 +2883,8 @@ fn report_turn(outcome: &turn::TurnOutcome, host: &SessionHost) -> Result<Vec<St
         reasoning: host.reasoning_style(),
         reset: rune_term::engine::Style::RESET.to_owned(),
     };
-    let rendered = transcript::render_lanes(&entries, display, &lanes);
-    Ok(rendered.lines().map(str::to_owned).collect())
+    let rendered = transcript::render_lanes(entries, display, &lanes);
+    rendered.lines().map(str::to_owned).collect()
 }
 
 /// Builds the prompt for a session.
@@ -2929,6 +3051,36 @@ mod tests {
             answer < input,
             "the answer was not drawn above the input: {text:?}"
         );
+    }
+
+    #[test]
+    fn a_cancelled_turn_keeps_what_streamed_and_says_it_was_cancelled() {
+        // The reader watched the partial answer arrive, so a transcript that
+        // dropped it would disagree with the screen they just saw.
+        let host = test_host();
+        if let Ok(mut streaming) = host.streaming.lock() {
+            streaming.answer.push_str("half an answer");
+        }
+        let lines = report_failed_turn(&rune_agent::steering::cancelled_error(), &host).join("\n");
+        assert!(lines.contains("half an answer"), "{lines}");
+        assert!(lines.contains("cancelled"), "{lines}");
+        assert!(
+            !lines.contains("failed"),
+            "a cancel is not a failure: {lines}"
+        );
+    }
+
+    #[test]
+    fn a_failed_turn_names_the_failure_and_what_to_do() {
+        let host = test_host();
+        let err = RuneError::new(
+            ErrorCode::TransportFailure,
+            "the endpoint closed the stream",
+        )
+        .with_hint("check the provider status");
+        let lines = report_failed_turn(&err, &host).join("\n");
+        assert!(lines.contains("the endpoint closed the stream"), "{lines}");
+        assert!(lines.contains("check the provider status"), "{lines}");
     }
 
     #[test]
