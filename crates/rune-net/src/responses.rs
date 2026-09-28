@@ -5,13 +5,14 @@
 //! items, and reasoning is carried as an opaque item that must be replayed
 //! verbatim rather than reconstructed.
 
-use rune_core::error::{ErrorCode, Result, RuneError};
+use rune_core::error::{Result, RuneError};
 use rune_core::id::ToolCallId;
 
 use crate::message::{ContentPart, Message, Role};
 use crate::provider::{Provider, RequestPlan};
 use crate::stream::{
     FinishReason, Limit, StreamReducer, Usage, incomplete_stream, protocol_violation,
+    stream_failure,
 };
 
 /// Dialect name.
@@ -267,7 +268,7 @@ pub struct Reducer {
     completed: bool,
     event_count: usize,
     /// Set when a `response.failed` or `error` event was seen.
-    failure: Option<String>,
+    failure: Option<RuneError>,
 }
 
 impl Default for Reducer {
@@ -324,28 +325,20 @@ impl Reducer {
             "response.output_item.done" => self.apply_item_done(&value, out),
             "response.completed" | "response.incomplete" => self.apply_terminal(&value, kind),
             "response.failed" => {
-                let message = value
+                let error = value
                     .get("response")
                     .and_then(|response| response.get("error"))
-                    .and_then(|error| error.get("message"))
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("the provider reported a failure");
-                self.failure = Some(message.to_owned());
-                Err(RuneError::new(
-                    ErrorCode::RequestRejected,
-                    message.to_owned(),
-                ))
+                    .unwrap_or(&serde_json::Value::Null);
+                Err(self.fail(stream_failure(error, "the provider reported a failure")))
             }
             "error" => {
-                let message = value
-                    .get("message")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("the provider reported an error");
-                self.failure = Some(message.to_owned());
-                Err(RuneError::new(
-                    ErrorCode::RequestRejected,
-                    message.to_owned(),
-                ))
+                // Routes differ on whether the failure is described inline or
+                // under its own `error` object.
+                let error = value
+                    .get("error")
+                    .filter(|error| error.is_object())
+                    .unwrap_or(&value);
+                Err(self.fail(stream_failure(error, "the provider reported an error")))
             }
             // Usage may arrive as its own event on some routes.
             "response.usage" => {
@@ -572,6 +565,13 @@ impl Reducer {
         Ok(())
     }
 
+    /// Records a failure the provider reported, so the stream cannot finish as
+    /// a success afterwards.
+    fn fail(&mut self, error: RuneError) -> RuneError {
+        self.failure = Some(error.clone());
+        error
+    }
+
     /// Retains a reasoning item verbatim for replay.
     ///
     /// The same item is reported when it finishes and again in the completed
@@ -635,10 +635,13 @@ impl Reducer {
             {
                 Some("incomplete") => FinishReason::MaxTokens,
                 Some("failed") => {
-                    return Err(RuneError::new(
-                        ErrorCode::RequestRejected,
+                    let error = response
+                        .and_then(|response| response.get("error"))
+                        .unwrap_or(&serde_json::Value::Null);
+                    return Err(self.fail(stream_failure(
+                        error,
                         "the provider reported a failed response",
-                    ));
+                    )));
                 }
                 _ => {
                     // A completion whose output contains a function call is a
@@ -721,8 +724,8 @@ impl StreamReducer for Reducer {
     }
 
     fn finish(&self) -> Result<FinishReason> {
-        if let Some(message) = &self.failure {
-            return Err(RuneError::new(ErrorCode::RequestRejected, message.clone()));
+        if let Some(error) = &self.failure {
+            return Err(error.clone());
         }
         if !self.completed {
             return Err(incomplete_stream());
@@ -758,6 +761,7 @@ mod tests {
     use super::*;
     use crate::message::ToolSpec;
     use crate::stream::ProviderEvent;
+    use rune_core::error::ErrorCode;
 
     fn plan_with_user(text: &str) -> RequestPlan {
         let mut plan = RequestPlan::new("test/model");
@@ -1075,31 +1079,62 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_failed_response_is_a_provider_failure() {
+    /// Applies one frame that must fail, returning the failure as the
+    /// transport sees it along with the reducer.
+    fn fail_with(frame: &str) -> (crate::error::NetError, Reducer) {
         let mut reducer = Reducer::new();
         let mut events = Vec::new();
         let err = reducer
-            .apply(
-                Some(r#"{"type":"response.failed","response":{"status":"failed","error":{"message":"bad"}}}"#),
-                &mut events,
-            )
+            .apply(Some(frame), &mut events)
             .expect_err("rejected");
-        assert_eq!(err.code(), ErrorCode::RequestRejected);
+        (crate::error::NetError::from(err), reducer)
+    }
+
+    #[test]
+    fn a_failed_response_is_a_provider_failure() {
+        let (err, reducer) = fail_with(
+            r#"{"type":"response.failed","response":{"status":"failed","error":{"code":"invalid_prompt","message":"bad"}}}"#,
+        );
+        assert!(!err.is_retryable());
         assert!(err.message().contains("bad"));
+        assert!(reducer.finish().is_err(), "a failed stream finished");
+    }
+
+    #[test]
+    fn a_response_failed_by_the_server_is_retried() {
+        let (err, reducer) = fail_with(
+            r#"{"type":"response.failed","response":{"status":"failed","error":{"code":"server_error","message":"try again"}}}"#,
+        );
+        assert!(err.is_retryable(), "{err}");
+        let finished = crate::error::NetError::from(reducer.finish().expect_err("failed"));
+        assert!(finished.is_retryable());
     }
 
     #[test]
     fn an_error_event_is_a_provider_failure() {
-        let mut reducer = Reducer::new();
-        let mut events = Vec::new();
-        let err = reducer
-            .apply(
-                Some(r#"{"type":"error","message":"unavailable"}"#),
-                &mut events,
-            )
-            .expect_err("rejected");
-        assert_eq!(err.code(), ErrorCode::RequestRejected);
+        let (err, _) = fail_with(r#"{"type":"error","message":"unavailable"}"#);
+        assert!(err.message().contains("unavailable"));
+    }
+
+    #[test]
+    fn a_rate_limit_error_event_is_retried() {
+        let (inline, _) = fail_with(
+            r#"{"type":"error","code":"rate_limit_exceeded","message":"slow down","param":null}"#,
+        );
+        assert!(inline.is_retryable(), "{inline}");
+        let (nested, _) = fail_with(
+            r#"{"type":"error","error":{"type":"server_error","code":"server_error","message":"busy"}}"#,
+        );
+        assert!(nested.is_retryable(), "{nested}");
+        assert_eq!(nested.message(), "busy");
+    }
+
+    #[test]
+    fn a_completion_reporting_failure_is_classified_by_its_error() {
+        let (err, _) = fail_with(
+            r#"{"type":"response.completed","response":{"status":"failed","output":[],"error":{"code":"server_error","message":"lost"}}}"#,
+        );
+        assert!(err.is_retryable(), "{err}");
     }
 
     #[test]
