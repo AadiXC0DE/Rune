@@ -423,10 +423,98 @@
   .credit a { color: var(--dim); border-bottom: 1px solid var(--rule-lit); }
   .credit a:hover { color: var(--accent); border-color: var(--accent); }
 
+  /* ---------- browser demo ---------- */
+
+  .demo-lede { max-width: 60ch; }
+
+  .demo-cols {
+    display: grid;
+    gap: clamp(1.5rem, 3vw, 2.5rem);
+    grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr);
+    align-items: start;
+  }
+
+  /* The console reuses the hero terminal's body, so it is given a fixed height
+     for the controls beside it and a pinned basis: that body's `flex: 1` would
+     otherwise set a zero basis and override the height. */
+  #demo-out {
+    flex: none;
+    height: clamp(18rem, 42vh, 26rem);
+    overflow-y: auto;
+    padding-right: 1.1rem;
+  }
+  #demo-out p { margin: 0 0 .1rem; }
+
+  .panel-head {
+    border-bottom: 1px solid var(--rule);
+    padding: .55rem 1rem;
+    font-size: .72rem;
+    letter-spacing: .1em;
+    color: var(--faint);
+  }
+  .panel-body { padding: 1rem; }
+
+  .demo-status {
+    margin: 0 0 .9rem;
+    font-size: .82rem;
+    line-height: 1.6;
+    color: var(--dim);
+  }
+
+  .actions { display: flex; flex-direction: column; gap: .6rem; }
+
+  /* Square corners, one accent, and the whole button is the target. */
+  .act {
+    appearance: none;
+    display: block;
+    width: 100%;
+    text-align: left;
+    background: none;
+    border: 1px solid var(--rule-lit);
+    color: var(--text);
+    font: inherit;
+    font-size: .84rem;
+    line-height: 1.5;
+    padding: .7rem .8rem;
+    cursor: pointer;
+  }
+  .act:hover:enabled { border-color: var(--accent); }
+  .act:hover:enabled .act-top { color: var(--accent); }
+  .act:disabled { color: var(--faint); border-color: var(--rule); cursor: default; }
+  .act-top { display: block; font-weight: 500; }
+  .act-sub { display: block; color: var(--faint); font-size: .76rem; margin-top: .2rem; }
+  .act[hidden] { display: none; }
+
+  progress.meter {
+    display: block;
+    width: 100%;
+    height: 6px;
+    appearance: none;
+    border: 0;
+    background: var(--rule);
+    margin: 0 0 .9rem;
+  }
+  progress.meter[hidden] { display: none; }
+  progress.meter::-webkit-progress-bar { background: var(--rule); }
+  progress.meter::-webkit-progress-value { background: var(--accent); }
+  progress.meter::-moz-progress-bar { background: var(--accent); }
+
+  .demo-note {
+    border-top: 1px solid var(--rule);
+    margin: 1.5rem 0 0;
+    padding: 1rem 0 0;
+    color: var(--faint);
+    font-size: .78rem;
+  }
+  .demo-note p { margin: 0 0 .6rem; }
+  .demo-note p:last-child { margin-bottom: 0; }
+  .demo-note b { color: var(--dim); font-weight: 500; }
+
   /* ---------- responsive ---------- */
 
   @media (max-width: 860px) {
     .hero-grid { grid-template-columns: minmax(0, 1fr); }
+    .demo-cols { grid-template-columns: minmax(0, 1fr); }
     .grid { grid-template-columns: minmax(0, 1fr); }
     .cell, .cell:nth-child(even) {
       padding: 1.25rem 0;
@@ -452,6 +540,7 @@
       rune
     </span>
     <nav>
+      <a class="keep" href="#demo">demo</a>
       <a href="#install">install</a>
       <a href="#why">why</a>
       <a href="#commands">commands</a>
@@ -472,6 +561,10 @@
           About <strong>3 MiB</strong> and 2 ms to start. Every limit, rule, and
           setting names the file it came from, so nothing is a surprise you have
           to go looking for.
+        </p>
+        <p class="lede demo-lede">
+          This page loads none of that. The demo below is opt-in, runs in your
+          browser, and nothing downloads until you press the button.
         </p>
 
         <div class="install" id="install">
@@ -605,6 +698,117 @@
     </div>
   </section>
 
+  <section id="demo">
+    <div class="wrap">
+      <h2>run it here, if this machine allows</h2>
+
+      <p class="lede demo-lede" style="margin-bottom:2rem">
+        The harness is small enough to run in a browser. This page ships with the
+        demo, not the model: nothing here is fetched until you press a button. Two
+        of the options below run the loop on your machine, and one is a recording
+        of it, labelled as such, for when neither model can run here.
+      </p>
+
+      <div class="demo-cols">
+
+        <div class="term">
+          <div class="term-head">
+            <span class="dot"></span><span class="dot"></span><span class="dot"></span>
+            <span style="margin-left:.5rem">rune, in this tab</span>
+          </div>
+          <div class="term-body" id="demo-out" aria-live="polite" aria-label="Demo output">
+            <p><span class="c-faint">$</span> <span class="c-accent">rune doctor</span> <span class="c-dim">--browser</span></p>
+            <p> </p>
+            <p><span class="c-faint">?</span>    <span class="c-dim">device</span>       not checked yet</p>
+            <p><span class="c-faint">?</span>    <span class="c-dim">model</span>        not chosen yet</p>
+            <p> </p>
+            <p><span class="c-dim">pick an option on the right to start</span><span class="caret"></span></p>
+          </div>
+        </div>
+
+        <div class="install">
+          <div class="panel-head">this machine</div>
+          <div class="panel-body">
+            <noscript>
+              <p class="demo-status">
+                The demo needs JavaScript, because both models run inside this
+                page. Without it nothing here runs, and nothing is downloaded
+                either. Install rune from the section above instead.
+              </p>
+            </noscript>
+            <p class="demo-status" id="demo-status">
+              Nothing has been checked. The probe runs when you press a button, so
+              a visitor who is only reading the page never starts a download.
+            </p>
+
+            <progress class="meter" id="demo-bar" max="1" value="0" hidden></progress>
+
+            <div class="actions" id="demo-actions">
+              <button class="act" type="button" id="act-chrome">
+                <span class="act-top">Start the demo with Chrome's built-in model</span>
+                <span class="act-sub">Chrome's own model, fetched by Chrome, not by this site</span>
+              </button>
+              <button class="act" type="button" id="act-sample">
+                <span class="act-top">Watch a recorded run instead</span>
+                <span class="act-sub">Nothing downloads</span>
+              </button>
+
+              <button class="act" type="button" id="act-smol" hidden>
+                <span class="act-top">Download 105 MB and try Rune in your browser</span>
+                <span class="act-sub">One time. SmolLM2-135M-Instruct. Apache-2.0. Stays on your device. A chatbot, not an agent: expect the loop to wander.</span>
+              </button>
+              <button class="act" type="button" id="act-qwen" hidden>
+                <span class="act-top">Download 398 MB for the full agent demo</span>
+                <span class="act-sub">One time. Qwen2.5-0.5B-Instruct. Apache-2.0. Stays on your device. The smallest model that advertises tool calling.</span>
+              </button>
+            </div>
+
+            <p class="demo-status" id="demo-detail" style="margin:1rem 0 0"></p>
+          </div>
+        </div>
+
+      </div>
+
+      <div class="demo-note">
+        <p>
+          <b>What this demonstrates.</b> The shape of the harness around the model:
+          each step picks one tool, every call passes a permission gate before it
+          runs, and the result goes back to the model as the next step's input. It
+          does not demonstrate model quality. The smallest models that run in a tab
+          are weak assistants, and the transcript will look like it.
+        </p>
+        <p>
+          <b>Chrome's built-in model.</b> Chrome downloads the model itself, once
+          per profile, and keeps it. This page never transfers it. Google does not
+          publish its size and it differs per platform, so this page shows the
+          progress the browser reports rather than a number. It runs on desktop
+          only: Windows, macOS, Linux, or a Chromebook Plus, with at least 22 GB
+          free on the disk holding your Chrome profile, and either a GPU with more
+          than 4 GB of VRAM or 16 GB of RAM with 4 or more CPU cores.
+        </p>
+        <p>
+          <b>The downloaded fallback.</b> Where the built-in model cannot run, the
+          page offers <code>@wllama/wllama</code>, a WebAssembly build of
+          llama.cpp, loaded from a CDN on click only, plus one quantized model
+          served by Hugging Face. Your browser caches both, so a second visit
+          reads them from disk rather than the network. The 105 MB model is a
+          chatbot, and its own model card scopes function calling to a larger
+          variant. The 398 MB model is the smallest that advertises tool calling.
+          Both are offered because they are what fits, not because either is a
+          good assistant; expect the loop to repeat itself or miss the answer,
+          which is the honest result of running a harness on a model this small.
+        </p>
+        <p>
+          <b>Nothing is sent anywhere.</b> The prompt runs on your device. This page
+          has no analytics, no account, and no server of its own. It fetches
+          nothing at all until you press a button, which you can check in the
+          network panel.
+        </p>
+      </div>
+
+    </div>
+  </section>
+
 </main>
 
 <footer>
@@ -661,6 +865,687 @@
       }, 1600);
     });
   });
+</script>
+
+<script>
+// The browser demo. Nothing here runs at load time: no model, no runtime, and
+// no network request happens until a button is pressed. Both runtimes this page
+// can use are reached through import() inside a click handler, so a visitor who
+// only reads the page downloads neither.
+(() => {
+  'use strict';
+
+  const out = document.getElementById('demo-out');
+  const status = document.getElementById('demo-status');
+  const detail = document.getElementById('demo-detail');
+  const bar = document.getElementById('demo-bar');
+  const chromeBtn = document.getElementById('act-chrome');
+  const sampleBtn = document.getElementById('act-sample');
+  const downloadButtons = {
+    smol: document.getElementById('act-smol'),
+    qwen: document.getElementById('act-qwen')
+  };
+
+  const MAX_STEPS = 4;
+  const MAX_RESULT_BYTES = 2048;
+  const MAX_GREP_MATCHES = 20;
+  const MAX_READ_LINES = 40;
+
+  const WLLAMA_MODULE = 'https://cdn.jsdelivr.net/npm/@wllama/wllama@3.6.1/esm/index.min.js';
+  const WLLAMA_WASM = 'https://cdn.jsdelivr.net/npm/@wllama/wllama@3.6.1/esm/wasm/wllama.wasm';
+
+  // Byte counts are the exact sizes published by each repository, shown here so
+  // the labels below can be checked: 105454144 and 397808192 bytes. Each label
+  // is that figure rounded to the nearest megabyte. Nothing on this page states
+  // a size for the model Chrome ships, because Google does not publish one.
+  const MODELS = {
+    smol: {
+      repo: 'QuantFactory/SmolLM2-135M-Instruct-GGUF',
+      file: 'SmolLM2-135M-Instruct.Q4_K_M.gguf',
+      label: '105 MB'
+    },
+    qwen: {
+      repo: 'bartowski/Qwen2.5-0.5B-Instruct-GGUF',
+      file: 'Qwen2.5-0.5B-Instruct-Q4_K_M.gguf',
+      label: '398 MB'
+    }
+  };
+
+  const MODEL_NAME = {
+    smol: 'SmolLM2-135M-Instruct',
+    qwen: 'Qwen2.5-0.5B-Instruct'
+  };
+
+  const SYSTEM_PROMPT = [
+    'You are the step planner inside a coding agent.',
+    'You reply with one JSON object and nothing else.',
+    'Every step is one tool call, or the final answer.',
+    'The tools are read_file(path), glob_files(pattern), grep_files(pattern), and answer(text).',
+    'The workspace holds these files: README.md, src/main.rs, src/registry.rs, src/tools.rs, tests/tools.rs.',
+    'There is no shell tool. Asking for shell is refused.',
+    'Example of a good run:',
+    '{"tool":"grep_files","arg":"fn shell"}',
+    '{"tool":"read_file","arg":"src/tools.rs"}',
+    '{"tool":"answer","arg":"","text":"src/tools.rs line 7, in pub fn shell."}',
+    'Use the exact file names above as the arg for read_file, and a regular expression as the arg for grep_files.',
+    'Question: which file defines the shell function, and on what line?'
+  ].join(' ');
+
+  // The schema is what makes every step structurally valid, and that is what
+  // lets a small model drive a loop at all.
+  const STEP_SCHEMA = {
+    type: 'object',
+    properties: {
+      tool: {
+        type: 'string',
+        enum: ['read_file', 'glob_files', 'grep_files', 'shell', 'answer']
+      },
+      arg: { type: 'string', maxLength: 120 },
+      text: { type: 'string', maxLength: 240 }
+    },
+    required: ['tool', 'arg'],
+    additionalProperties: false
+  };
+
+  const WORKSPACE = {
+    'README.md': [
+      '# rune-lite',
+      '',
+      'A stand-in workspace for this demo: five files and one question.',
+      'The question is which file defines the shell function, and on what line.'
+    ].join('\n'),
+    'src/main.rs': [
+      'mod registry;',
+      'mod tools;',
+      '',
+      'fn main() {',
+      '    let out = tools::shell("git status");',
+      '    println!("{out}");',
+      '    println!("{} tools", registry::COUNT);',
+      '}'
+    ].join('\n'),
+    'src/registry.rs': [
+      'pub const COUNT: usize = 6;',
+      '',
+      'pub fn read(path: &str) -> String {',
+      '    format!("read {path}")',
+      '}',
+      '',
+      'pub fn run(command: &str) -> String {',
+      '    format!("ran {command}")',
+      '}'
+    ].join('\n'),
+    'src/tools.rs': [
+      'use crate::registry;',
+      '',
+      'pub fn read_file(path: &str) -> String {',
+      '    registry::read(path)',
+      '}',
+      '',
+      'pub fn shell(command: &str) -> String {',
+      '    registry::run(command)',
+      '}',
+      '',
+      'pub fn count() -> usize {',
+      '    registry::COUNT',
+      '}'
+    ].join('\n'),
+    'tests/tools.rs': [
+      '#[test]',
+      'fn every_tool_is_counted() {',
+      '    assert_eq!(rune_lite::tools::count(), 6);',
+      '}'
+    ].join('\n')
+  };
+
+  // The policy table this demo evaluates, in the three columns `rune
+  // permissions` prints. The real binary reads the same columns from its own
+  // defaults and your configuration.
+  const POLICY = {
+    read_file: { effect: 'allow', source: 'default' },
+    glob_files: { effect: 'allow', source: 'default' },
+    grep_files: { effect: 'allow', source: 'default' },
+    answer: { effect: 'allow', source: 'default' },
+    shell: { effect: 'deny', source: 'default' }
+  };
+
+  // ---------- terminal rendering ----------
+
+  function clear() {
+    out.textContent = '';
+  }
+
+  function line(...parts) {
+    const row = document.createElement('p');
+    for (const part of parts) {
+      if (typeof part === 'string') {
+        row.append(part);
+        continue;
+      }
+      const span = document.createElement('span');
+      span.className = part[1];
+      span.textContent = part[0];
+      row.append(span);
+    }
+    out.append(row);
+    out.scrollTop = out.scrollHeight;
+  }
+
+  function blank() {
+    line(' ');
+  }
+
+  function pad(text, width) {
+    const value = String(text);
+    return value + ' '.repeat(Math.max(0, width - value.length));
+  }
+
+  function clipped(text) {
+    if (text.length <= MAX_RESULT_BYTES) return text;
+    return text.slice(0, MAX_RESULT_BYTES) + '\n[truncated at ' + MAX_RESULT_BYTES + ' bytes]';
+  }
+
+  function statusRow(mark, label, value, colour) {
+    const ink = mark === 'ok' ? 'c-ok' : mark === 'x' ? 'c-warn' : 'c-faint';
+    line([pad(mark, 5), ink], [pad(label, 13), 'c-dim'], [value, colour || '']);
+  }
+
+  function setStatus(text) {
+    status.textContent = text;
+  }
+
+  function showBar(max, value) {
+    bar.hidden = false;
+    bar.max = max;
+    bar.value = value;
+  }
+
+  function hideBar() {
+    bar.hidden = true;
+    bar.max = 1;
+    bar.value = 0;
+  }
+
+  // The download buttons are the only ones that stay live, so the two controls
+  // that start a run are disabled instead of removed.
+  function busy(on) {
+    chromeBtn.disabled = on;
+    sampleBtn.disabled = on;
+    Object.values(downloadButtons).forEach((button) => {
+      button.disabled = on;
+    });
+  }
+
+  // ---------- the workspace the tools read ----------
+
+  function globToRegExp(pattern) {
+    let source = '';
+    for (let i = 0; i < pattern.length; i++) {
+      const c = pattern[i];
+      if (c === '*') {
+        if (pattern[i + 1] === '*') {
+          i++;
+          if (pattern[i + 1] === '/') i++;
+          source += '.*';
+        } else {
+          source += '[^/]*';
+        }
+      } else if (c === '?') {
+        source += '[^/]';
+      } else {
+        source += c.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      }
+    }
+    return new RegExp('^' + source + '$');
+  }
+
+  function globFiles(pattern) {
+    const test = globToRegExp(pattern);
+    const names = Object.keys(WORKSPACE).filter((name) => test.test(name));
+    if (names.length === 0) return 'no file matches ' + pattern;
+    return names.join('\n');
+  }
+
+  function grepFiles(pattern) {
+    let test;
+    try {
+      test = new RegExp(pattern);
+    } catch (err) {
+      return 'bad pattern: ' + err.message;
+    }
+    const hits = [];
+    for (const name of Object.keys(WORKSPACE)) {
+      WORKSPACE[name].split('\n').forEach((text, index) => {
+        if (test.test(text)) hits.push(name + ':' + (index + 1) + ': ' + text);
+      });
+    }
+    if (hits.length === 0) return 'no match for ' + pattern;
+    const shown = hits.slice(0, MAX_GREP_MATCHES);
+    if (hits.length > shown.length) {
+      shown.push('[' + (hits.length - shown.length) + ' more matches]');
+    }
+    return shown.join('\n');
+  }
+
+  function readFile(path) {
+    if (!Object.prototype.hasOwnProperty.call(WORKSPACE, path)) {
+      return 'no such file: ' + path;
+    }
+    const lines = WORKSPACE[path].split('\n');
+    const shown = lines
+      .slice(0, MAX_READ_LINES)
+      .map((text, index) => pad(index + 1, 4) + text);
+    if (lines.length > shown.length) {
+      shown.push('[' + (lines.length - shown.length) + ' more lines]');
+    }
+    return shown.join('\n');
+  }
+
+  function execute(tool, arg) {
+    if (tool === 'glob_files') return globFiles(arg || '*');
+    if (tool === 'grep_files') return grepFiles(arg || '.');
+    if (tool === 'read_file') return readFile(arg);
+    return 'no implementation for ' + tool + ' in this demo';
+  }
+
+  // ---------- the loop ----------
+
+  function renderPrompt(messages) {
+    return messages
+      .map((message) => message.role + ': ' + message.content)
+      .join('\n\n');
+  }
+
+  function opening() {
+    line(['$ ', 'c-faint'], ['rune doctor', 'c-accent'], [' --browser', 'c-dim']);
+    blank();
+    statusRow('ok', 'device', browserLabel());
+    statusRow('ok', 'built-in', 'LanguageModel ' + ('LanguageModel' in self ? 'is in this browser' : 'is not in this browser'));
+    statusRow('?', 'model', 'not chosen yet');
+    blank();
+    statusRow('ok', 'workspace', '5 files, read only');
+    statusRow('ok', 'tools', 'read_file, glob_files, grep_files, answer');
+    statusRow('ok', 'sandbox', 'shell is denied, and no write tool is advertised');
+    blank();
+  }
+
+  // `step` is the only part that differs between backends: it takes the
+  // conversation so far and returns one JSON step as text.
+  async function runLoop(step, modelLabel) {
+    const question = 'which file defines the shell function, and on what line?';
+    const messages = [
+      { role: 'system', content: SYSTEM_PROMPT },
+      { role: 'user', content: 'Question: ' + question }
+    ];
+    const seen = new Set();
+
+    statusRow('ok', 'model', modelLabel);
+    blank();
+    line(['$ ', 'c-faint'], ['rune ', 'c-accent'], ['"' + question + '"', 'c-dim']);
+    blank();
+
+    for (let step_index = 1; step_index <= MAX_STEPS; step_index++) {
+      let raw;
+      try {
+        raw = await step(messages);
+      } catch (err) {
+        statusRow('x', 'step ' + step_index, 'the model stopped responding: ' + err.message, 'c-warn');
+        return;
+      }
+
+      let decision;
+      try {
+        decision = JSON.parse(raw);
+      } catch (err) {
+        statusRow('x', 'step ' + step_index, 'the step was not JSON, so the turn ends', 'c-warn');
+        return;
+      }
+
+      if (!decision || typeof decision.tool !== 'string') {
+        statusRow('x', 'step ' + step_index, 'the step named no tool, so the turn ends', 'c-warn');
+        return;
+      }
+
+      if (decision.tool === 'answer') {
+        statusRow('ok', 'step ' + step_index, 'the model answered');
+        blank();
+        line([decision.text || '(the model returned no text)', '']);
+        blank();
+        statusRow('ok', 'turn', 'ended after ' + step_index + (step_index === 1 ? ' step' : ' steps'));
+        return;
+      }
+
+      const policy = POLICY[decision.tool];
+      const call = decision.tool + ' ' + (decision.arg || '');
+      statusRow('ok', 'step ' + step_index, 'the model asked for ' + decision.tool);
+      line(
+        ['     ', ''],
+        [pad('  ' + call, 46), 'c-dim'],
+        [policy ? 'gate: ' + policy.effect + ' (' + policy.source + ')' : 'gate: no rule', 'c-faint']
+      );
+
+      let result;
+      if (!policy) {
+        result = 'unknown tool: ' + decision.tool;
+        statusRow('x', 'refused', decision.tool + ' is not in the registry', 'c-warn');
+      } else if (policy.effect !== 'allow') {
+        result = 'refused by policy: ' + decision.tool + ' is ' + policy.effect + ' by ' + policy.source;
+        statusRow('x', 'refused', decision.tool + ', ' + policy.effect + ' by ' + policy.source, 'c-warn');
+      } else {
+        result = clipped(execute(decision.tool, decision.arg));
+        const lines = result.split('\n');
+        statusRow(
+          'ok',
+          'result',
+          lines[0] + (lines.length === 1 ? '' : ' (+' + (lines.length - 1) + ' more lines)')
+        );
+      }
+
+      messages.push({ role: 'assistant', content: raw });
+
+      // The same call twice is the failure this demo has to survive, so the
+      // result is replaced with a signal rather than fed back unchanged.
+      const key = decision.tool + ' ' + (decision.arg || '');
+      if (seen.has(key)) {
+        statusRow('x', 'repeat', 'the same call again, so the result is marked as a repeat', 'c-warn');
+        messages.push({
+          role: 'user',
+          content: 'You already called ' + key + ' and the result did not change. Call a different tool, or answer with what you have.'
+        });
+      } else {
+        seen.add(key);
+        messages.push({ role: 'user', content: 'tool result: ' + result });
+      }
+      blank();
+    }
+
+    statusRow('x', 'turn', 'stopped at the ' + MAX_STEPS + ' step limit', 'c-warn');
+  }
+
+  // ---------- backend: Chrome's built-in model ----------
+
+  const BUILT_IN_OPTIONS = {
+    expectedInputs: [{ type: 'text', languages: ['en'] }],
+    expectedOutputs: [{ type: 'text', languages: ['en'] }]
+  };
+
+  async function runBuiltIn(api) {
+    let availability;
+    try {
+      // Re-probed on every run. The browser can drop its model between visits
+      // and does not fetch it again by itself, so no answer is cached here.
+      availability = await api.availability(BUILT_IN_OPTIONS);
+    } catch (err) {
+      return false;
+    }
+
+    if (availability === 'unavailable') return false;
+
+    const already = availability === 'available';
+    const inFlight = availability === 'downloading';
+    hideBar();
+
+    if (already) {
+      statusRow('ok', 'model', "Chrome's built-in model is already on this machine");
+      blank();
+      setStatus("Chrome's built-in model is ready, so there is nothing to download. Running now.");
+    } else {
+      statusRow('?', 'model', inFlight
+        ? 'Chrome is already fetching its own model for this browser'
+        : 'Chrome has not fetched its model for this browser yet');
+      statusRow('?', 'download', 'Chrome fetches it once and keeps it; this page fetches none of it');
+      blank();
+      showBar(1, 0);
+      setStatus(inFlight
+        ? 'Chrome is partway through fetching its own model, a few GB managed by Chrome. The bar below reports what is left. Nothing is coming from this site.'
+        : 'Chrome is fetching its own model, which is a few GB and managed by Chrome. It reports the progress below. Nothing is coming from this site.');
+    }
+
+    const monitor = already
+      ? undefined
+      : (target) => {
+          target.addEventListener('downloadprogress', (event) => {
+            if (event.loaded === 1) {
+              // Fetched. Chrome now unpacks and loads it into memory, which has
+              // no measurable progress, so the bar becomes indeterminate.
+              bar.removeAttribute('value');
+              setStatus('Chrome fetched the model and is loading it into memory. This can take a moment.');
+              return;
+            }
+            showBar(1, event.loaded);
+            setStatus('Chrome is fetching its own model: ' + Math.round(event.loaded * 100) + ' percent. Nothing is coming from this site.');
+          });
+        };
+
+    let session;
+    try {
+      session = await api.create(monitor ? Object.assign({}, BUILT_IN_OPTIONS, { monitor }) : BUILT_IN_OPTIONS);
+    } catch (err) {
+      hideBar();
+      statusRow('x', 'model', 'the session could not start: ' + err.message, 'c-warn');
+      return false;
+    }
+
+    hideBar();
+    setStatus('Running on the model Chrome ships. Nothing you type or read leaves this machine.');
+    blank();
+
+    // A Chrome session keeps its own context, so only what is new since the
+    // last step is sent. Re-sending the transcript would duplicate it.
+    let sent = 0;
+    try {
+      await runLoop(async (messages) => {
+        const delta = renderPrompt(messages.slice(sent));
+        sent = messages.length;
+        const reply = await session.prompt(delta, { responseConstraint: STEP_SCHEMA });
+        return typeof reply === 'string' ? reply : JSON.stringify(reply);
+      }, "Chrome's built-in model, Gemini Nano");
+    } finally {
+      if (session.destroy) session.destroy();
+    }
+    setStatus('Done. Press a button to run it again.');
+    return true;
+  }
+
+  // ---------- backend: a model you download, through wllama ----------
+
+  async function loadDownloaded(which) {
+    const model = MODELS[which];
+    const name = MODEL_NAME[which];
+
+    statusRow('?', 'runtime', 'fetching the WebAssembly runtime, about 9 MB');
+    setStatus('Fetching the inference runtime, then the model. Your browser caches both afterwards.');
+    showBar(1, 0);
+
+    // Dynamic only. A static import would put the runtime on the page load
+    // path, which is the one thing this page is built to avoid.
+    const module = await import(WLLAMA_MODULE);
+    const instance = new module.Wllama({ default: WLLAMA_WASM });
+    statusRow('ok', 'runtime', 'llama.cpp in WebAssembly, fetched on click');
+    blank();
+    statusRow('?', 'model', name + ' ' + model.label + ', Apache-2.0');
+    blank();
+    setStatus('Downloading ' + model.label + '. One time only, and your browser keeps it, so a later visit transfers nothing.');
+
+    const url = 'https://huggingface.co/' + model.repo + '/resolve/main/' + model.file;
+    let loaded = 0;
+    await instance.loadModelFromUrl(url, {
+      n_ctx: 2048,
+      progressCallback: (progress) => {
+        if (!progress.total) return;
+        loaded = progress.loaded;
+        if (progress.loaded >= progress.total) {
+          bar.removeAttribute('value');
+          setStatus('Downloaded. Loading the model into memory now.');
+          return;
+        }
+        showBar(progress.total, progress.loaded);
+        const percent = Math.round((progress.loaded / progress.total) * 100);
+        setStatus('Downloading ' + model.label + ': ' + percent + ' percent. Cached after this, so a second visit reads it from disk.');
+      }
+    });
+
+    hideBar();
+    statusRow('ok', 'model', 'loaded, ' + loaded.toLocaleString('en-US') + ' bytes');
+    blank();
+    return instance;
+  }
+
+  async function runDownloaded(which) {
+    busy(true);
+    detail.textContent = '';
+    clear();
+    opening();
+
+    let instance;
+    try {
+      instance = await loadDownloaded(which);
+    } catch (err) {
+      hideBar();
+      statusRow('x', 'runtime', err.message, 'c-warn');
+      setStatus('The runtime or the model could not be loaded. Nothing else was downloaded.');
+      busy(false);
+      return;
+    }
+
+    const name = MODEL_NAME[which];
+    setStatus('Running on ' + name + '. Nothing you type or read leaves this machine.');
+
+    try {
+      await runLoop(async (messages) => {
+        const reply = await instance.createChatCompletion({
+          messages,
+          max_tokens: 120,
+          temperature: 0,
+          response_format: {
+            type: 'json_schema',
+            json_schema: { name: 'step', schema: STEP_SCHEMA, strict: true }
+          }
+        });
+        return reply.choices[0].message.content;
+      }, name + ' ' + MODELS[which].label + ', downloaded by you');
+    } catch (err) {
+      statusRow('x', 'model', 'generation failed: ' + err.message, 'c-warn');
+    }
+
+    setStatus('Done. Press a button to run it again.');
+    busy(false);
+  }
+
+  // ---------- recorded run, for when no model can run here ----------
+
+  function browserLabel() {
+    const match = navigator.userAgent.match(/Chrome\/(\d+)/);
+    const brand = match ? 'Chrome ' + match[1] : 'a browser without Chrome in its user agent';
+    const platform = (navigator.userAgentData && navigator.userAgentData.platform) || navigator.platform || 'an unknown platform';
+    return brand + ' on ' + platform;
+  }
+
+  function wait(ms) {
+    return new Promise((resolve) => {
+      setTimeout(resolve, ms);
+    });
+  }
+
+  async function runRecorded() {
+    busy(true);
+    detail.textContent = '';
+    clear();
+    opening();
+    line(['recorded ', 'c-faint'], ['the same loop on a sample workspace, stage by stage. No model runs for this part.', 'c-faint']);
+    blank();
+
+    const stages = [
+      ['step 1  the model asks for grep_files', 'gate: allow (default)'],
+      ['          grep_files("fn shell")', 'src/tools.rs:7'],
+      ['step 2  the model asks for read_file', 'gate: allow (default)'],
+      ['          read_file("src/tools.rs")', '12 lines'],
+      ['step 3  the model asks for shell', 'gate: deny (default), no command runs'],
+      ['step 4  the model answers', 'src/tools.rs, line 7']
+    ];
+
+    for (let i = 0; i < stages.length; i++) {
+      const [label, note] = stages[i];
+      const refused = label.includes('asks for shell');
+      line([pad(label, 46), refused ? 'c-warn' : 'c-dim'], [note, 'c-faint']);
+      await wait(240);
+    }
+
+    blank();
+    line(['The shell call is refused before anything executes, then the loop', '']);
+    line(['continues with what the model already read.', 'c-faint']);
+    blank();
+    line([clipped(WORKSPACE['src/tools.rs']).split('\n')[6], 'c-ok']);
+    blank();
+    statusRow('ok', 'answer', 'src/tools.rs, line 7: pub fn shell.');
+    statusRow('ok', 'turn', 'ended after 4 steps');
+    blank();
+    line(['That is the shape of every run: a step, a gate, a result. Switch to a real', 'c-faint']);
+    line(['model above to watch it decide for itself.', 'c-faint']);
+    setStatus('Recorded run finished. Nothing was downloaded and no model ran.');
+    busy(false);
+  }
+
+  // ---------- wiring ----------
+
+  function offerDownloads(reason) {
+    detail.textContent = '';
+
+    // Nothing is hidden until the built-in model has been ruled out, so the
+    // page never offers a download to someone who did not need one.
+    statusRow('x', 'built-in', reason, 'c-warn');
+    blank();
+    statusRow('ok', 'fallback', 'the same loop can run on a model you download');
+    blank();
+
+    downloadButtons.smol.hidden = false;
+    downloadButtons.qwen.hidden = false;
+
+    const note = document.createElement('p');
+    note.className = 'act-sub';
+    note.style.margin = '0.7rem 0 0';
+    note.textContent = 'Each option also fetches the inference runtime from a CDN, about 9 MB, once. Your browser caches the runtime and the model, so a second visit downloads neither. Nothing downloads until you choose one.';
+    detail.append(note);
+
+    setStatus("Chrome's built-in model cannot run here, so the loop needs a model you download. The recorded run needs nothing.");
+  }
+
+  chromeBtn.addEventListener('click', async () => {
+    busy(true);
+    detail.textContent = '';
+    clear();
+    opening();
+    setStatus('Checking this machine.');
+
+    let api = null;
+    try {
+      api = self.LanguageModel || null;
+    } catch (err) {
+      api = null;
+    }
+
+    if (!api) {
+      offerDownloads('LanguageModel is not in this browser');
+      busy(false);
+      return;
+    }
+
+    let ran = false;
+    try {
+      ran = await runBuiltIn(api);
+    } catch (err) {
+      statusRow('x', 'model', err.message, 'c-warn');
+    }
+
+    if (!ran) offerDownloads("Chrome's built-in model is unavailable on this device");
+    busy(false);
+  });
+
+  sampleBtn.addEventListener('click', runRecorded);
+
+  downloadButtons.smol.addEventListener('click', () => runDownloaded('smol'));
+  downloadButtons.qwen.addEventListener('click', () => runDownloaded('qwen'));
+})();
 </script>
 
 </body>
