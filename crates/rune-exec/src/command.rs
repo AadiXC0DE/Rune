@@ -1373,6 +1373,49 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
+    fn a_command_sees_the_ceiling_it_was_given() {
+        // The ceiling is only real if the child inherits it. Asserting the
+        // numbers on the struct proves nothing about the spawn: a limit that is
+        // computed and never applied reads as protection that is not there.
+        //
+        // The file limit is compared against the default rather than against a
+        // block count, because the unit `ulimit -f` reports in is the shell's
+        // business and differs between platforms.
+        let (_dir, dir) = tempdir();
+        let ceiling = 4096;
+        let mut prepared =
+            prepare("ulimit -f; ulimit -t", dir.as_path(), None, environment()).expect("prepare");
+        prepared.limits = ResourceLimits {
+            cpu_seconds: Some(1234),
+            file_bytes: Some(ceiling),
+            ..resource_limits()
+        };
+        let bounded = run(&prepared, Duration::from_secs(10), &never).expect("run");
+
+        let mut free =
+            prepare("ulimit -f; ulimit -t", dir.as_path(), None, environment()).expect("prepare");
+        free.limits = ResourceLimits {
+            cpu_seconds: None,
+            file_bytes: None,
+            ..resource_limits()
+        };
+        let unbounded = run(&free, Duration::from_secs(10), &never).expect("run");
+
+        assert!(
+            bounded.stdout.contains("1234"),
+            "the cpu ceiling did not reach the command: {}",
+            bounded.stdout
+        );
+        assert_ne!(
+            bounded.stdout.lines().next(),
+            unbounded.stdout.lines().next(),
+            "the file ceiling did not reach the command: {}",
+            bounded.stdout
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn limits_leave_a_command_that_stays_under_them_alone() {
         // The ceiling must not be so eager that ordinary work fails. This is
         // the guard against a limit that is technically applied and practically
