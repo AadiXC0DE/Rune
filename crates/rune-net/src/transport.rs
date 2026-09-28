@@ -749,13 +749,7 @@ pub fn read_stream(
         }
 
         let line = line.map_err(NetError::from)?;
-        if line.is_empty() && !saw_any_event && started.elapsed() > head_deadline {
-            return Err(NetError::new(
-                FailureKind::Timeout,
-                "the endpoint produced no output within the head timeout",
-            )
-            .with_hint("raise provider_head_timeout_ms for a slow local model"));
-        }
+        let blank = line.is_empty();
 
         let mut chunk = line;
         chunk.push(b'\n');
@@ -777,6 +771,16 @@ pub fn read_stream(
                 .apply(Some(&event.data), &mut outcome.events)
                 .map_err(NetError::from)?;
             report_new(&outcome.events, before, observe);
+        }
+
+        // Judged after the line is decoded, because the blank line that
+        // completes the first event is that event arriving, not more waiting.
+        if blank && !saw_any_event && started.elapsed() > head_deadline {
+            return Err(NetError::new(
+                FailureKind::Timeout,
+                "the endpoint produced no output within the head timeout",
+            )
+            .with_hint("raise provider_head_timeout_ms for a slow local model"));
         }
 
         if decoder.is_done() {
@@ -868,6 +872,62 @@ mod tests {
         fn send(&self, _request: FetchRequest) -> NetResult<crate::fetch::FetchResponse> {
             unreachable!("the request should have been refused before any client call")
         }
+    }
+
+    /// A response body that serves scripted parts, each after its own delay.
+    struct PacedBody {
+        parts: std::collections::VecDeque<(Duration, Vec<u8>)>,
+    }
+
+    impl PacedBody {
+        fn body(parts: Vec<(Duration, &[u8])>) -> Box<dyn Read + Send> {
+            Box::new(Self {
+                parts: parts
+                    .into_iter()
+                    .map(|(delay, bytes)| (delay, bytes.to_vec()))
+                    .collect(),
+            })
+        }
+    }
+
+    impl Read for PacedBody {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let Some((delay, bytes)) = self.parts.front_mut() else {
+                return Ok(0);
+            };
+            std::thread::sleep(std::mem::take(delay));
+            let count = bytes.len().min(buf.len());
+            buf[..count].copy_from_slice(&bytes[..count]);
+            bytes.drain(..count);
+            if bytes.is_empty() {
+                self.parts.pop_front();
+            }
+            Ok(count)
+        }
+    }
+
+    /// One complete chat answer, split before the blank line that ends its
+    /// first event.
+    const ANSWER_HEAD: &[u8] = b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"late\"},\"finish_reason\":\"stop\"}]}\n";
+    const ANSWER_TAIL: &[u8] = b"\ndata: [DONE]\n\n";
+
+    #[test]
+    fn a_first_event_completed_after_the_head_timeout_is_kept() {
+        // The endpoint answered, and only the line that closes its first
+        // event arrived after the head timeout.
+        let body = PacedBody::body(vec![
+            (Duration::ZERO, ANSWER_HEAD),
+            (Duration::from_millis(150), ANSWER_TAIL),
+        ]);
+        let outcome = read_stream(
+            body,
+            &crate::chat_completions::ChatCompletions,
+            Duration::from_millis(50),
+            &|| false,
+            &mut |_| {},
+        )
+        .expect("the delivered answer is kept");
+        assert_eq!(outcome.text(), "late");
     }
 
     #[test]
