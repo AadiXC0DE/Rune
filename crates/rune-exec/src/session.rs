@@ -11,7 +11,7 @@ use std::path::Path;
 use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
 
 use crate::command::{Exit, apply_limits, own_group, resource_limits};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, mpsc};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -146,13 +146,24 @@ pub struct Process {
     inner: Arc<Inner>,
 }
 
+/// The write side of a child's standard input.
+#[derive(Debug)]
+enum Stdin {
+    /// Open and free for the next write.
+    Ready(ChildStdin),
+    /// Held by a write the process has not finished reading.
+    Writing,
+    /// Never opened, or closed by a failed write.
+    Closed,
+}
+
 /// State shared with the threads that watch one child.
 #[derive(Debug)]
 struct Inner {
     /// The child, until the waiter claims it.
     child: Mutex<Option<Child>>,
     /// Standard input, until the pipe closes.
-    stdin: Mutex<Option<ChildStdin>>,
+    stdin: Mutex<Stdin>,
     /// Set by the waiter once the child has been reaped.
     exit: Mutex<Option<Exit>>,
     /// Threads reading standard output and standard error.
@@ -237,7 +248,7 @@ impl Process {
         let group = child.id();
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
-        let stdin = child.stdin.take();
+        let stdin = child.stdin.take().map_or(Stdin::Closed, Stdin::Ready);
         let inner = Arc::new(Inner {
             child: Mutex::new(Some(child)),
             stdin: Mutex::new(stdin),
@@ -290,14 +301,63 @@ impl Process {
         &self.inner.stderr
     }
 
-    /// Writes bytes to the child's standard input.
-    pub fn write(&self, bytes: &[u8]) -> io::Result<()> {
-        let mut slot = lock(&self.inner.stdin);
-        let Some(stdin) = slot.as_mut() else {
-            return Err(io::Error::other("the process is not taking input"));
+    /// Writes bytes to the child's standard input, waiting at most `limit`.
+    ///
+    /// A pipe holds only so much, and a process that is not reading leaves a
+    /// larger write blocked for as long as it runs, so the write happens on a
+    /// thread of its own and the caller waits a bounded time for it. A write
+    /// that outlives the wait carries on as the process reads, and the pipe
+    /// refuses more input until it is done. Ending the process ends the write.
+    pub fn write(&self, bytes: &[u8], limit: Duration) -> io::Result<()> {
+        let mut stdin = {
+            let mut slot = lock(&self.inner.stdin);
+            match std::mem::replace(&mut *slot, Stdin::Writing) {
+                Stdin::Ready(stdin) => stdin,
+                Stdin::Writing => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WouldBlock,
+                        "earlier input is still waiting for the process to read it",
+                    ));
+                }
+                Stdin::Closed => {
+                    *slot = Stdin::Closed;
+                    return Err(io::Error::other("the process is not taking input"));
+                }
+            }
         };
-        stdin.write_all(bytes)?;
-        stdin.flush()
+        let (sender, receiver) = mpsc::channel();
+        let inner = Arc::clone(&self.inner);
+        let bytes = bytes.to_vec();
+        let spawned = std::thread::Builder::new()
+            .name(String::from("rune-shell-stdin"))
+            .spawn(move || {
+                let written = stdin.write_all(&bytes).and_then(|()| stdin.flush());
+                *lock(&inner.stdin) = if written.is_ok() {
+                    Stdin::Ready(stdin)
+                } else {
+                    Stdin::Closed
+                };
+                let _ = sender.send(written);
+            });
+        if let Err(err) = spawned {
+            // The pipe went down with the thread that was to write it.
+            *lock(&self.inner.stdin) = Stdin::Closed;
+            return Err(err);
+        }
+        match receiver.recv_timeout(limit) {
+            Ok(written) => written,
+            Err(mpsc::RecvTimeoutError::Timeout) => Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "the process did not read its input within {} ms; the rest is written as \
+                     it reads",
+                    limit.as_millis()
+                ),
+            )),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                Err(io::Error::other("the input writer stopped"))
+            }
+        }
     }
 
     /// Waits a bounded time for the readers to reach end of file.
@@ -539,6 +599,9 @@ mod tests {
     /// Bytes retained by the tests.
     const CAPTURE_BYTES: usize = 64 * 1024;
 
+    /// Time a test gives a process to take its input.
+    const WRITE_LIMIT: Duration = Duration::from_secs(10);
+
     /// Returns a command that writes to both streams and exits with `code`.
     fn echo_both_and_exit(code: i32) -> String {
         if cfg!(windows) {
@@ -662,7 +725,7 @@ mod tests {
             Input::Piped,
         )
         .expect("start");
-        process.write(b"hello\n").expect("write");
+        process.write(b"hello\n", WRITE_LIMIT).expect("write");
         assert_eq!(exit_of(&process), Exit::Code(0));
         assert!(
             text(process.stdout()).contains("hello"),
@@ -676,14 +739,45 @@ mod tests {
         let process =
             Process::start(&exit_with(0), None, CAPTURE_BYTES, Input::Piped).expect("start");
         let _ = exit_of(&process);
-        assert!(process.write(b"hello\n").is_err());
+        assert!(process.write(b"hello\n", WRITE_LIMIT).is_err());
+    }
+
+    #[test]
+    fn a_write_the_process_never_reads_returns_within_its_limit() {
+        // Far more than any pipe holds, to a process that reads nothing.
+        let command = if cfg!(windows) {
+            "ping -n 60 127.0.0.1 >nul"
+        } else {
+            "sleep 30"
+        };
+        let process = Process::start(command, None, CAPTURE_BYTES, Input::Piped).expect("start");
+        let bytes = vec![b'x'; 8 * 1024 * 1024];
+
+        let began = Instant::now();
+        let err = process
+            .write(&bytes, Duration::from_millis(200))
+            .expect_err("the write cannot complete");
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        assert!(
+            began.elapsed() < Duration::from_secs(5),
+            "the write waited {:?}",
+            began.elapsed()
+        );
+
+        // The pipe is still held by the first write, so a second one is refused
+        // rather than interleaved with it.
+        let busy = process
+            .write(b"more\n", WRITE_LIMIT)
+            .expect_err("the pipe is busy");
+        assert_eq!(busy.kind(), io::ErrorKind::WouldBlock);
+        assert!(process.terminate(true));
     }
 
     #[test]
     fn input_to_a_process_started_without_it_is_refused() {
         let process =
             Process::start(&exit_with(0), None, CAPTURE_BYTES, Input::Closed).expect("start");
-        assert!(process.write(b"hello\n").is_err());
+        assert!(process.write(b"hello\n", WRITE_LIMIT).is_err());
         let _ = exit_of(&process);
     }
 

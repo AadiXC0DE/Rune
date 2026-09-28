@@ -36,6 +36,14 @@ pub const MAX_YIELD_MS: u64 = 600_000;
 /// Time spent collecting the last bytes a command writes as it exits.
 const DRAIN_WINDOW: Duration = Duration::from_millis(250);
 
+/// Bounds on the time an `interact` waits for a session to take its input.
+///
+/// The wait follows the call's own window, so a caller that asked to return at
+/// once still gives a small write the moment it needs, and one that asked to
+/// wait long cannot be held past the bound by a command that never reads.
+const MIN_INPUT_WINDOW: Duration = Duration::from_millis(500);
+const MAX_INPUT_WINDOW: Duration = Duration::from_secs(10);
+
 /// Permission target of a `stop`.
 ///
 /// Ending a session changes nothing the command did not already start, so the
@@ -300,12 +308,16 @@ impl Shell {
                 )
                 .with_hint("start the command with `interactive` set to send it input"));
             }
-            session.process.write(chars.as_bytes()).map_err(|err| {
-                RuneError::new(
-                    ErrorCode::InvalidState,
-                    format!("session `{id}` did not accept input: {err}"),
-                )
-            })?;
+            let limit = window.clamp(MIN_INPUT_WINDOW, MAX_INPUT_WINDOW);
+            session
+                .process
+                .write(chars.as_bytes(), limit)
+                .map_err(|err| {
+                    RuneError::new(
+                        ErrorCode::InvalidState,
+                        format!("session `{id}` did not accept input: {err}"),
+                    )
+                })?;
         }
 
         if session.process.exit().is_none() {
@@ -1209,6 +1221,42 @@ mod tests {
                 .as_deref()
                 .is_some_and(|hint| hint.contains("interactive")),
             "{err}"
+        );
+        let _ = stop(&tool, &context, &id);
+    }
+
+    #[test]
+    fn input_a_session_never_reads_does_not_hold_the_call() {
+        let tool = Shell::default();
+        let (_dir, context) = workspace();
+        let started = text(
+            &tool,
+            &context,
+            &serde_json::json!({
+                "action": "run",
+                "command": long_sleep(),
+                "interactive": true,
+                "yield_time_ms": 0,
+            }),
+        );
+        let (id, _group) = running(&started);
+        let began = Instant::now();
+        let err = tool
+            .call(
+                &serde_json::json!({
+                    "action": "interact",
+                    "session_id": id,
+                    "chars": "x".repeat(8 * 1024 * 1024),
+                    "yield_time_ms": 0,
+                }),
+                &context,
+            )
+            .expect_err("the session never read its input");
+        assert_eq!(err.code(), ErrorCode::InvalidState);
+        assert!(
+            began.elapsed() < MAX_INPUT_WINDOW,
+            "the call waited {:?}",
+            began.elapsed()
         );
         let _ = stop(&tool, &context, &id);
     }
