@@ -461,11 +461,13 @@ fn consume_escape(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
 /// Renders a single line of a prompt being typed.
 ///
 /// Used where the caller echoes input itself rather than letting the terminal
-/// do it.
+/// do it. A pasted line break is drawn as a visible mark, so the input stays on
+/// one row.
 #[must_use]
 pub fn render_prompt(prompt: &str, input: &str, width: usize) -> String {
     let room = width.saturating_sub(str_width(prompt));
-    let (shown, _) = truncate_to_width(input, room.max(1));
+    let input = crate::editor::displayed(input);
+    let (shown, _) = truncate_to_width(&input, room.max(1));
     format!("{prompt}{shown}")
 }
 

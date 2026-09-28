@@ -60,10 +60,22 @@ impl KeyReader {
     ///
     /// A terminal that cannot report keys keeps the terminal's own line
     /// collection, so a session over a pipe still works rather than hanging.
+    ///
+    /// Bracketed paste is turned on with raw mode. Without it a paste arrives
+    /// as keystrokes, so each line break in it is an Enter that submits the
+    /// line so far and each tab asks for a completion.
     #[must_use]
     pub fn new() -> Self {
         let active =
             std::io::stdin().is_terminal() && crossterm::terminal::enable_raw_mode().is_ok();
+        if active {
+            // A terminal that cannot bracket a paste still delivers it as
+            // keystrokes, which is no worse than before, so a failure is ignored.
+            let _ = crossterm::ExecutableCommand::execute(
+                &mut std::io::stdout(),
+                crossterm::event::EnableBracketedPaste,
+            );
+        }
         Self {
             composer: Composer::new(),
             active,
@@ -127,15 +139,7 @@ impl KeyReader {
         let Ok(event) = crossterm::event::read() else {
             return KeyAction::Ignored;
         };
-        let Event::Key(key) = event else {
-            return KeyAction::Ignored;
-        };
-        // A release also arrives on some terminals, and acting on it would
-        // insert every character twice.
-        if key.kind == KeyEventKind::Release {
-            return KeyAction::Ignored;
-        }
-        self.apply(key)
+        self.handle(event).unwrap_or(KeyAction::Ignored)
     }
 
     /// Returns the next key if one is already waiting, without blocking.
@@ -150,13 +154,39 @@ impl KeyReader {
         let Ok(event) = crossterm::event::read() else {
             return None;
         };
-        let Event::Key(key) = event else {
-            return None;
-        };
-        if key.kind == KeyEventKind::Release {
-            return None;
+        self.handle(event)
+    }
+
+    /// Applies one terminal event, returning `None` for one that is not input.
+    ///
+    /// Shared by both ways of reading, so a paste means the same thing whether
+    /// it arrives at the prompt or while a turn runs.
+    pub fn handle(&mut self, event: Event) -> Option<KeyAction> {
+        match event {
+            // A release also arrives on some terminals, and acting on it would
+            // insert every character twice.
+            Event::Key(key) if key.kind != KeyEventKind::Release => Some(self.apply(key)),
+            Event::Paste(text) => {
+                self.paste(&text);
+                Some(KeyAction::Ignored)
+            }
+            _ => None,
         }
-        Some(self.apply(key))
+    }
+
+    /// Inserts pasted text at the cursor, line breaks included.
+    ///
+    /// A terminal sends a pasted line break as a carriage return, so both
+    /// spellings become a newline that stays part of the line. Escapes and
+    /// other control characters are dropped, because the line is drawn back to
+    /// the terminal and a pasted sequence would act on it.
+    pub fn paste(&mut self, text: &str) {
+        let text = text.replace("\r\n", "\n").replace('\r', "\n");
+        // Nothing is withheld: the line is what is submitted, and a marker in
+        // place of the text would send the marker. The drawn row is cut to the
+        // window whatever its length.
+        self.composer
+            .paste(&crate::transcript::sanitize(&text), usize::MAX);
     }
 
     /// Applies one key to the line.
@@ -259,6 +289,10 @@ impl Default for KeyReader {
 impl Drop for KeyReader {
     fn drop(&mut self) {
         if self.active {
+            let _ = crossterm::ExecutableCommand::execute(
+                &mut std::io::stdout(),
+                crossterm::event::DisableBracketedPaste,
+            );
             let _ = crossterm::terminal::disable_raw_mode();
             self.active = false;
         }
@@ -457,6 +491,65 @@ mod tests {
         reader.clear();
         assert_eq!(reader.line(), "");
         assert_eq!(reader.column(), 0);
+    }
+
+    #[test]
+    fn a_pasted_block_stays_on_the_line_rather_than_submitting_it() {
+        // Without bracketed paste every line break in a pasted stack trace was
+        // an Enter, so the first line started a turn and each later line was
+        // sent on its own.
+        let mut reader = reader();
+        typed(&mut reader, "why: ");
+        let action = reader.handle(Event::Paste(
+            "first line\r\n\tsecond line\rthird line".to_owned(),
+        ));
+        assert_eq!(action, Some(KeyAction::Ignored));
+        assert_eq!(
+            reader.line(),
+            "why: first line\n\tsecond line\nthird line",
+            "the pasted text was not kept whole"
+        );
+        // The pasted tab is text, not a request to complete.
+        assert!(reader.line().contains('\t'));
+    }
+
+    #[test]
+    fn a_paste_is_inserted_at_the_cursor() {
+        let mut reader = reader();
+        typed(&mut reader, "ac");
+        reader.apply(key(KeyCode::Left));
+        reader.handle(Event::Paste("b\nb".to_owned()));
+        assert_eq!(reader.line(), "ab\nbc");
+    }
+
+    #[test]
+    fn a_pasted_escape_sequence_does_not_reach_the_line() {
+        // The line is drawn back to the terminal, so a sequence in it would act.
+        let mut reader = reader();
+        reader.handle(Event::Paste("a\u{1b}]52;c;eA==\u{7}b\u{1b}[2Jc".to_owned()));
+        assert_eq!(reader.line(), "abc");
+    }
+
+    #[test]
+    fn a_pasted_line_is_drawn_on_one_row_with_the_caret_after_it() {
+        // A raw line break written to a terminal in raw mode moves down without
+        // returning, so the row would spill into the rows below it.
+        let mut reader = reader();
+        reader.handle(Event::Paste("one\ntwo".to_owned()));
+        let row = crate::transcript::render_prompt("> ", reader.line(), 80);
+        assert!(!row.contains('\n'), "{row:?}");
+        assert_eq!(
+            crate::width::str_width(&row),
+            2 + reader.column(),
+            "the caret is not after the drawn text: {row:?}"
+        );
+    }
+
+    #[test]
+    fn a_resize_is_not_input() {
+        let mut reader = reader();
+        assert_eq!(reader.handle(Event::Resize(80, 24)), None);
+        assert_eq!(reader.line(), "");
     }
 
     #[test]

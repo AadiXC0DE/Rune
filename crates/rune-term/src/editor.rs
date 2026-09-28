@@ -113,10 +113,11 @@ impl Composer {
     /// Returns the columns before the cursor.
     ///
     /// This is where a renderer places the cursor, which is not the same as the
-    /// character count: a wide character advances two columns.
+    /// character count: a wide character advances two columns, and a pasted line
+    /// break or tab is drawn as one column.
     #[must_use]
     pub fn cursor_column(&self) -> usize {
-        str_width(self.head())
+        str_width(&displayed(self.head()))
     }
 
     /// Inserts text at the cursor.
@@ -531,6 +532,31 @@ impl Composer {
         let total = self.text.chars().count();
         self.cursor = self.floor(self.cursor.min(total));
     }
+}
+
+/// Drawn in place of a line break inside the line being edited.
+pub const LINE_BREAK: char = '\u{23ce}';
+
+/// Returns the line as it is drawn on its single row.
+///
+/// A pasted line break or tab is part of the text, but written to the terminal
+/// as it is it would move the cursor to another row or column. Each is drawn as
+/// one visible column instead, so the row stays one row and a caret column
+/// measured from it is the column the terminal uses.
+#[must_use]
+pub fn displayed(text: &str) -> std::borrow::Cow<'_, str> {
+    if !text.contains(['\n', '\t']) {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    std::borrow::Cow::Owned(
+        text.chars()
+            .map(|c| match c {
+                '\n' => LINE_BREAK,
+                '\t' => ' ',
+                c => c,
+            })
+            .collect(),
+    )
 }
 
 /// Returns a candidate without its leading slash.
