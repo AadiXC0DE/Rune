@@ -19,7 +19,7 @@ use rune_core::error::{ErrorCode, Result, RuneError};
 use crate::contract::{Activity, ExecutionContext, Tool, ToolOutput};
 use crate::workspace::{FileLimits, bool_arg, resolve, string_arg, truncate_to_bytes, usize_arg};
 use rune_exec::command::Exit;
-use rune_exec::session::{POLL_INTERVAL, Process};
+use rune_exec::session::{Input, POLL_INTERVAL, Process};
 
 /// Yield window a `run` uses when none is requested.
 pub const DEFAULT_RUN_YIELD_MS: u64 = 30_000;
@@ -151,17 +151,25 @@ struct Session {
     command: String,
     process: Process,
     seen: Mutex<(usize, usize)>,
+    input: Input,
 }
 
 impl Session {
     /// Builds a session and records the command it runs under its id.
-    fn new(id: String, command: String, process: Process, seen: (usize, usize)) -> Self {
+    fn new(
+        id: String,
+        command: String,
+        process: Process,
+        seen: (usize, usize),
+        input: Input,
+    ) -> Self {
         let _ = lock(&COMMANDS).insert(id.clone(), command.clone());
         Self {
             id,
             command,
             process,
             seen: Mutex::new(seen),
+            input,
         }
     }
 }
@@ -230,6 +238,11 @@ impl Shell {
             Some(raw) => Some(resolve(context, raw)?.path),
             None => None,
         };
+        let input = if bool_arg(arguments, "interactive")?.unwrap_or(false) {
+            Input::Piped
+        } else {
+            Input::Closed
+        };
         let cap = self.limits.output_cap(context);
         // The slot is reserved before the command is spawned, so two starts
         // racing for the last one cannot both win it, and a start that fails or
@@ -238,7 +251,7 @@ impl Shell {
 
         // The start happens outside the map lock, because a command that runs
         // for its whole yield window would otherwise hold every other call up.
-        let process = start(&command, cwd.as_deref(), cap, context)?;
+        let process = start(&command, cwd.as_deref(), cap, context, input)?;
         if let Some(exit) = wait_for_exit(&process, window, context)? {
             process.drain_output(DRAIN_WINDOW);
             let text = observe(&process, &command, &exit.describe(), &mut (0, 0), cap);
@@ -248,7 +261,7 @@ impl Shell {
         let state = format!("session {id} running, {}", ended_by(process.id()));
         let mut seen = (0, 0);
         let text = observe(&process, &command, &state, &mut seen, cap);
-        let session = Arc::new(Session::new(id.clone(), command, process, seen));
+        let session = Arc::new(Session::new(id.clone(), command, process, seen, input));
         slot.hand_over(id, session);
         Ok(ToolOutput::success(text))
     }
@@ -280,6 +293,13 @@ impl Shell {
         // for the whole window.
         let baseline = produced(&session.process);
         if let Some(chars) = chars {
+            if session.input == Input::Closed {
+                return Err(RuneError::new(
+                    ErrorCode::InvalidState,
+                    format!("session `{id}` was started without input"),
+                )
+                .with_hint("start the command with `interactive` set to send it input"));
+            }
             session.process.write(chars.as_bytes()).map_err(|err| {
                 RuneError::new(
                     ErrorCode::InvalidState,
@@ -364,8 +384,8 @@ impl Tool for Shell {
     fn description(&self) -> &'static str {
         "Run a command under a shell. `run` starts it and returns either the finished output and \
          its exit status, or a session for a command that is still working. `interact` then reads \
-         what a session produced since the last read, and sends input when chars is given. `stop` \
-         ends a session and everything it started."
+         what a session produced since the last read, and sends input when chars is given to a \
+         session started with `interactive`. `stop` ends a session and everything it started."
     }
 
     fn input_schema(&self) -> serde_json::Value {
@@ -384,6 +404,10 @@ impl Tool for Shell {
                 "cwd": {
                     "type": "string",
                     "description": "Directory the command starts in. Defaults to the workspace root.",
+                },
+                "interactive": {
+                    "type": "boolean",
+                    "description": "Keep standard input open so `interact` can send chars. Otherwise the command reads end of input at once, so one that reads standard input finishes instead of waiting.",
                 },
                 "session_id": {
                     "type": "string",
@@ -475,6 +499,7 @@ fn start(
     cwd: Option<&Utf8Path>,
     cap: usize,
     context: &ExecutionContext,
+    input: Input,
 ) -> Result<Process> {
     let workspace = cwd.unwrap_or(&context.workspace);
     // The shell tool exists to run shell commands, so its input always goes to a
@@ -522,6 +547,7 @@ fn start(
         Some(start_in.as_std_path()),
         cap,
         &environment,
+        input,
     )
     .map_err(|err| {
         let hint = match cwd {
@@ -1134,6 +1160,60 @@ mod tests {
     }
 
     #[test]
+    fn a_command_that_reads_its_input_finishes_when_it_is_not_interactive() {
+        let tool = Shell::default();
+        let (_dir, context) = workspace();
+        // Each program reads standard input when it is given no file.
+        let command = if cfg!(windows) { "findstr x" } else { "cat" };
+        let observed = call(
+            &tool,
+            &context,
+            &serde_json::json!({
+                "action": "run",
+                "command": command,
+                "yield_time_ms": 10_000,
+            }),
+        );
+        assert!(
+            observed.text.contains("exited with status"),
+            "{}",
+            observed.text
+        );
+        assert_eq!(tool.live_sessions(), 0);
+    }
+
+    #[test]
+    fn input_to_a_session_started_without_it_is_refused_with_a_remedy() {
+        let tool = Shell::default();
+        let (_dir, context) = workspace();
+        let started = text(
+            &tool,
+            &context,
+            &serde_json::json!({
+                "action": "run",
+                "command": long_sleep(),
+                "yield_time_ms": 0,
+            }),
+        );
+        let (id, _group) = running(&started);
+        let err = tool
+            .call(
+                &serde_json::json!({ "action": "interact", "session_id": id, "chars": "x\n" }),
+                &context,
+            )
+            .expect_err("the session takes no input");
+        assert_eq!(err.code(), ErrorCode::InvalidState);
+        assert!(
+            err.detail()
+                .hint
+                .as_deref()
+                .is_some_and(|hint| hint.contains("interactive")),
+            "{err}"
+        );
+        let _ = stop(&tool, &context, &id);
+    }
+
+    #[test]
     fn a_run_is_judged_by_its_command() {
         let target = Shell::default().permission_target(&serde_json::json!({
             "action": "run",
@@ -1224,6 +1304,7 @@ mod tests {
             &serde_json::json!({
                 "action": "run",
                 "command": echo_input_then_sleep(),
+                "interactive": true,
                 "yield_time_ms": 100,
             }),
         );
@@ -1810,6 +1891,7 @@ mod tests {
             &serde_json::json!({
                 "action": "run",
                 "command": echo_input(),
+                "interactive": true,
                 "yield_time_ms": 50,
             }),
         );
@@ -2002,6 +2084,7 @@ mod tests {
             &serde_json::json!({
                 "action": "run",
                 "command": echo_input_then_sleep(),
+                "interactive": true,
                 "yield_time_ms": 50,
             }),
         );

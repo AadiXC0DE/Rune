@@ -129,6 +129,17 @@ pub struct Reading {
     pub produced: u64,
 }
 
+/// What a process reads from its standard input.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Input {
+    /// Nothing: a read sees the end of input at once, so a program that falls
+    /// back to reading its input, such as `cat` or `rg pattern` given no file,
+    /// finishes instead of waiting for bytes nobody will send.
+    Closed,
+    /// A pipe that [`Process::write`] feeds.
+    Piped,
+}
+
 /// A child process in its own group, with the bytes it produced.
 #[derive(Debug)]
 pub struct Process {
@@ -160,7 +171,12 @@ impl Process {
     /// The command string is passed as one argument, so what a caller reviewed
     /// is exactly what the shell parses. At most `capture_bytes` from each
     /// stream are retained.
-    pub fn start(command: &str, cwd: Option<&Path>, capture_bytes: usize) -> io::Result<Self> {
+    pub fn start(
+        command: &str,
+        cwd: Option<&Path>,
+        capture_bytes: usize,
+        input: Input,
+    ) -> io::Result<Self> {
         let argv = [
             SHELL.to_owned(),
             String::from(SHELL_FLAG),
@@ -171,6 +187,7 @@ impl Process {
             cwd,
             capture_bytes,
             &crate::command::minimal_environment(),
+            input,
         )
     }
 
@@ -189,6 +206,7 @@ impl Process {
         cwd: Option<&Path>,
         capture_bytes: usize,
         environment: &BTreeMap<String, String>,
+        input: Input,
     ) -> io::Result<Self> {
         let Some((program, arguments)) = argv.split_first() else {
             return Err(io::Error::new(
@@ -196,11 +214,15 @@ impl Process {
                 "an argv needs a program to run",
             ));
         };
+        let stdin = match input {
+            Input::Closed => Stdio::null(),
+            Input::Piped => Stdio::piped(),
+        };
         let mut spec = Command::new(program);
         spec.args(arguments)
             .env_clear()
             .envs(environment)
-            .stdin(Stdio::piped())
+            .stdin(stdin)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         if let Some(cwd) = cwd {
@@ -615,7 +637,8 @@ mod tests {
 
     #[test]
     fn both_streams_are_captured_and_the_status_is_reported() {
-        let process = Process::start(&echo_both_and_exit(3), None, CAPTURE_BYTES).expect("start");
+        let process = Process::start(&echo_both_and_exit(3), None, CAPTURE_BYTES, Input::Closed)
+            .expect("start");
         let exit = exit_of(&process);
         assert_eq!(exit, Exit::Code(3));
         assert!(text(process.stdout()).contains("out"));
@@ -624,7 +647,8 @@ mod tests {
 
     #[test]
     fn a_successful_command_reports_success() {
-        let process = Process::start(&exit_with(0), None, CAPTURE_BYTES).expect("start");
+        let process =
+            Process::start(&exit_with(0), None, CAPTURE_BYTES, Input::Closed).expect("start");
         assert!(exit_of(&process).is_success());
     }
 
@@ -635,6 +659,7 @@ mod tests {
             None,
             CAPTURE_BYTES,
             &BTreeMap::new(),
+            Input::Piped,
         )
         .expect("start");
         process.write(b"hello\n").expect("write");
@@ -648,9 +673,30 @@ mod tests {
 
     #[test]
     fn input_to_an_exited_process_is_refused() {
-        let process = Process::start(&exit_with(0), None, CAPTURE_BYTES).expect("start");
+        let process =
+            Process::start(&exit_with(0), None, CAPTURE_BYTES, Input::Piped).expect("start");
         let _ = exit_of(&process);
         assert!(process.write(b"hello\n").is_err());
+    }
+
+    #[test]
+    fn input_to_a_process_started_without_it_is_refused() {
+        let process =
+            Process::start(&exit_with(0), None, CAPTURE_BYTES, Input::Closed).expect("start");
+        assert!(process.write(b"hello\n").is_err());
+        let _ = exit_of(&process);
+    }
+
+    #[test]
+    fn a_process_started_without_input_reads_the_end_of_it() {
+        // Each program reads its input when given no file, and would wait for
+        // the whole bound below if its input were a pipe nobody closes.
+        let command = if cfg!(windows) { "findstr x" } else { "cat" };
+        let process = Process::start(command, None, CAPTURE_BYTES, Input::Closed).expect("start");
+        assert!(
+            wait_until(|| process.exit().is_some(), Duration::from_secs(10)),
+            "a process with no input waited for some"
+        );
     }
 
     #[test]
@@ -669,8 +715,13 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn terminating_a_session_ends_a_forked_child() {
-        let process =
-            Process::start("sleep 30 & echo $!; wait", None, CAPTURE_BYTES).expect("start");
+        let process = Process::start(
+            "sleep 30 & echo $!; wait",
+            None,
+            CAPTURE_BYTES,
+            Input::Closed,
+        )
+        .expect("start");
         assert!(
             wait_until(|| forked_child(&process).is_some(), Duration::from_secs(10)),
             "the shell did not report the child it forked"
@@ -700,6 +751,7 @@ mod tests {
             "trap '' TERM; echo ready; while true; do sleep 0.1; done",
             None,
             CAPTURE_BYTES,
+            Input::Closed,
         )
         .expect("start");
         assert!(
@@ -716,7 +768,8 @@ mod tests {
 
     #[test]
     fn terminating_a_finished_process_reports_it_as_ended() {
-        let process = Process::start(&exit_with(0), None, CAPTURE_BYTES).expect("start");
+        let process =
+            Process::start(&exit_with(0), None, CAPTURE_BYTES, Input::Closed).expect("start");
         let _ = exit_of(&process);
         assert!(process.terminate(false));
     }
@@ -727,8 +780,13 @@ mod tests {
         let child;
         let leader;
         {
-            let process =
-                Process::start("sleep 30 & echo $!; wait", None, CAPTURE_BYTES).expect("start");
+            let process = Process::start(
+                "sleep 30 & echo $!; wait",
+                None,
+                CAPTURE_BYTES,
+                Input::Closed,
+            )
+            .expect("start");
             assert!(wait_until(
                 || forked_child(&process).is_some(),
                 Duration::from_secs(10)
