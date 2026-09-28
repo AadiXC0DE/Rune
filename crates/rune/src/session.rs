@@ -1395,20 +1395,12 @@ fn run_turn_steerable(
     }
     let mut submitted: Vec<String> = Vec::new();
 
-    // The conversation is moved in and handed back: a turn pushes what it
-    // learned into the history, and the next turn must see it. Moving it is
-    // what lets the worker own it outright rather than sharing it behind a
-    // lock the loop would then have to hold.
-    let mut taken = std::mem::take(history);
-    let (returned, result) = std::thread::scope(|scope| {
-        let worker = scope.spawn(|| {
-            let result = turn::run_turn(&mut taken, host);
-            (taken, result)
-        });
-
-        while !worker.is_finished() {
+    let result = run_on_worker(
+        history,
+        |taken| turn::run_turn(taken, host),
+        || {
             let Some(key) = reader.poll_key(rune_term::shell::POLL_INTERVAL) else {
-                continue;
+                return;
             };
             match key {
                 // Enter submits what has been typed as steering rather than as
@@ -1420,7 +1412,7 @@ fn run_turn_steerable(
                     gesture.disarm();
                     if text.is_empty() {
                         host.draw_stream_with("", 0);
-                        continue;
+                        return;
                     }
                     let notice = match host.steering.submit(text.clone()) {
                         Ok(()) => {
@@ -1471,15 +1463,8 @@ fn run_turn_steerable(
                     host.draw_stream_with(reader.line(), reader.column());
                 }
             }
-        }
-
-        let (returned, result) = worker
-            .join()
-            .unwrap_or_else(|_| (History::new(), Err(turn_interrupted())));
-        (returned, result)
-    });
-
-    *history = returned;
+        },
+    );
     // Anything still queued was typed after the turn's last boundary, so the
     // turn never saw it. The queue is drained in one piece, which makes what is
     // left the newest submissions and everything before them what was applied.
@@ -1496,6 +1481,41 @@ fn run_turn_steerable(
         applied: submitted,
         unsent,
     }
+}
+
+/// Runs a turn on its own thread, calling `between` until it finishes.
+///
+/// The conversation is moved in and handed back: a turn pushes what it learned
+/// into the history, and the next turn must see it. Moving it is what lets the
+/// worker own it outright rather than sharing it behind a lock the loop would
+/// then have to hold.
+///
+/// A worker that panics hands back the conversation as it stood before the
+/// turn. The panic ends that exchange; losing every earlier one with it would
+/// turn one defect into the loss of the session. What the worker held is not
+/// used, because a turn stopped partway can hold a tool call with no result,
+/// and every later request would then be refused.
+fn run_on_worker<T, B>(history: &mut History, turn: T, mut between: B) -> Result<turn::TurnOutcome>
+where
+    T: FnOnce(&mut History) -> Result<turn::TurnOutcome> + Send,
+    B: FnMut(),
+{
+    let before = history.clone();
+    let mut taken = std::mem::take(history);
+    let (returned, result) = std::thread::scope(|scope| {
+        let worker = scope.spawn(move || {
+            let result = turn(&mut taken);
+            (taken, result)
+        });
+        while !worker.is_finished() {
+            between();
+        }
+        worker
+            .join()
+            .unwrap_or_else(|_| (before, Err(turn_interrupted())))
+    });
+    *history = returned;
+    result
 }
 
 /// What a steerable turn produced beside its outcome.
@@ -3123,6 +3143,63 @@ mod tests {
             answer < input,
             "the answer was not drawn above the input: {text:?}"
         );
+    }
+
+    #[test]
+    fn a_turn_that_panics_keeps_the_conversation_it_started_with() {
+        // The fallback for a worker that panicked used to be an empty history,
+        // so one defect inside a turn silently threw away every earlier turn.
+        let mut history = History::new();
+        history.push_user("first question");
+        history.push_assistant(vec![rune_net::message::ContentPart::Text {
+            text: "first answer".to_owned(),
+        }]);
+        history.push_user("second question");
+
+        let result = run_on_worker(
+            &mut history,
+            |taken| {
+                // Stopped partway: an assistant turn holding a call with no
+                // result, which every later request would be refused for.
+                taken.push_assistant(vec![rune_net::message::ContentPart::ToolCall {
+                    id: rune_core::id::ToolCallId::new("call-1").expect("id"),
+                    name: "read_file".to_owned(),
+                    arguments: "{}".to_owned(),
+                }]);
+                panic!("the turn failed");
+            },
+            || std::thread::sleep(std::time::Duration::from_millis(1)),
+        );
+
+        assert_eq!(
+            result.err().map(|err| err.code()),
+            Some(ErrorCode::Cancelled)
+        );
+        assert_eq!(history.len(), 3, "the conversation was not kept");
+        assert_eq!(history.turns()[0].text(), "first question");
+        assert_eq!(history.turns()[2].text(), "second question");
+        history
+            .validate()
+            .expect("the kept conversation can still be sent");
+    }
+
+    #[test]
+    fn a_finished_turn_hands_back_what_it_added() {
+        let mut history = History::new();
+        history.push_user("question");
+        let result = run_on_worker(
+            &mut history,
+            |taken| {
+                taken.push_assistant(vec![rune_net::message::ContentPart::Text {
+                    text: "answer".to_owned(),
+                }]);
+                Err(turn_interrupted())
+            },
+            || {},
+        );
+        assert!(result.is_err());
+        assert_eq!(history.len(), 2);
+        assert_eq!(history.turns()[1].text(), "answer");
     }
 
     #[test]
