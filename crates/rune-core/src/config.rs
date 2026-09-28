@@ -942,38 +942,62 @@ fn read_project(
 }
 
 /// Reads a file with a size bound, returning `None` when it does not exist.
+///
+/// Only a regular file is read, and the type is checked before the file is
+/// opened: a device reports a length of zero and has no end, so a repository
+/// linking `.rune.toml` to `/dev/zero` would fill memory and one linking it to
+/// `/dev/stdin` would stall startup. The read itself stops one byte past the
+/// cap, so a file that grows after it is checked is still refused.
 fn read_bounded(path: &Utf8Path, layer: Layer) -> std::result::Result<Option<String>, Diagnostic> {
-    let meta = match std::fs::metadata(path) {
-        Ok(meta) => meta,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(err) => {
-            return Err(Diagnostic::new(
-                layer,
-                ErrorCode::UnsafePath,
-                format!("could not read: {err}"),
-            )
-            .with_path(path));
-        }
-    };
+    use std::io::Read as _;
 
-    if meta.len() > MAX_CONFIG_BYTES {
-        return Err(Diagnostic::new(
-            layer,
-            ErrorCode::TooLarge,
-            format!("file holds {} bytes", meta.len()),
-        )
-        .with_path(path)
-        .with_hint(format!("the limit is {MAX_CONFIG_BYTES} bytes")));
-    }
-
-    let text = std::fs::read_to_string(path).map_err(|err| {
+    let unreadable = |err: std::io::Error| {
         Diagnostic::new(
             layer,
             ErrorCode::UnsafePath,
             format!("could not read: {err}"),
         )
         .with_path(path)
-    })?;
+    };
+    let too_large = |observed: u64| {
+        Diagnostic::new(
+            layer,
+            ErrorCode::TooLarge,
+            format!("file holds {observed} bytes"),
+        )
+        .with_path(path)
+        .with_hint(format!("the limit is {MAX_CONFIG_BYTES} bytes"))
+    };
+
+    let meta = match std::fs::metadata(path) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(unreadable(err)),
+    };
+    if !meta.is_file() {
+        return Err(Diagnostic::new(
+            layer,
+            ErrorCode::UnsafePath,
+            "is not a regular file, so it was not read",
+        )
+        .with_path(path)
+        .with_hint("replace it with a regular file"));
+    }
+    if meta.len() > MAX_CONFIG_BYTES {
+        return Err(too_large(meta.len()));
+    }
+
+    let file = std::fs::File::open(path).map_err(unreadable)?;
+    let mut bytes = Vec::new();
+    file.take(MAX_CONFIG_BYTES.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(unreadable)?;
+    let read = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    if read > MAX_CONFIG_BYTES {
+        return Err(too_large(read));
+    }
+    let text = String::from_utf8(bytes)
+        .map_err(|err| unreadable(std::io::Error::new(std::io::ErrorKind::InvalidData, err)))?;
 
     Ok(Some(text))
 }
@@ -1565,6 +1589,30 @@ theme_unused = "x"
         assert_eq!(settings.diagnostics.len(), 1);
         assert_eq!(settings.diagnostics[0].code, ErrorCode::TooLarge);
         assert!(settings.diagnostics[0].hint.is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_config_file_linked_to_a_device_is_refused_without_reading_it() {
+        // A device reports a length of zero, so the size check alone let an
+        // endless one through to a read that never finished.
+        let dir = TempDir::new().expect("tempdir");
+        let project = Utf8PathBuf::from_path_buf(dir.path().join(".rune.toml")).expect("utf8");
+        let user = Utf8PathBuf::from_path_buf(dir.path().join("config.toml")).expect("utf8");
+        std::os::unix::fs::symlink("/dev/zero", &project).expect("symlink");
+        std::os::unix::fs::symlink("/dev/null", &user).expect("symlink");
+
+        let settings = load(Some(&project), Some(&user), &empty_env());
+
+        assert_eq!(settings.diagnostics.len(), 2, "{:?}", settings.diagnostics);
+        for diagnostic in &settings.diagnostics {
+            assert_eq!(diagnostic.code, ErrorCode::UnsafePath);
+            assert!(
+                diagnostic.message.contains("not a regular file"),
+                "{}",
+                diagnostic.message
+            );
+        }
     }
 
     #[test]
