@@ -11,8 +11,9 @@ use serde::{Deserialize, Serialize};
 /// Why the model stopped.
 ///
 /// Normalized across dialects. A dialect maps its own terminal label onto one of
-/// these, and a label it does not recognize is a protocol violation rather than
-/// a silent success.
+/// these. A label it does not recognize arrives after a complete answer, so it
+/// is read as a natural stop, while a stream that ends without any label is
+/// still incomplete.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FinishReason {

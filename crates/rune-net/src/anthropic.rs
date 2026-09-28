@@ -349,7 +349,7 @@ impl Reducer {
                     .and_then(|delta| delta.get("stop_reason"))
                     .and_then(serde_json::Value::as_str)
                 {
-                    self.stop_reason = Some(map_stop_reason(reason)?);
+                    self.stop_reason = Some(map_stop_reason(reason));
                 }
                 Ok(())
             }
@@ -632,15 +632,16 @@ fn parse_usage(value: &serde_json::Value) -> Usage {
 }
 
 /// Maps a stop reason onto the normalized one.
-fn map_stop_reason(raw: &str) -> Result<FinishReason> {
+///
+/// The reason arrives after the answer has streamed in full, so a reason this
+/// build does not know is taken as a natural stop rather than a failure that
+/// would discard the answer.
+fn map_stop_reason(raw: &str) -> FinishReason {
     match raw {
-        "end_turn" | "stop_sequence" => Ok(FinishReason::Stop),
-        "tool_use" => Ok(FinishReason::ToolCalls),
-        "max_tokens" => Ok(FinishReason::MaxTokens),
-        "refusal" => Ok(FinishReason::Refused),
-        other => Err(protocol_violation(format!(
-            "the stream reported an unknown stop reason `{other}`"
-        ))),
+        "tool_use" => FinishReason::ToolCalls,
+        "max_tokens" | "model_context_window_exceeded" => FinishReason::MaxTokens,
+        "refusal" => FinishReason::Refused,
+        _ => FinishReason::Stop,
     }
 }
 
@@ -1061,16 +1062,26 @@ mod tests {
     }
 
     #[test]
-    fn an_unknown_stop_reason_is_rejected() {
-        let mut reducer = Reducer::new();
-        let mut events = Vec::new();
-        let err = reducer
-            .apply(
-                Some(r#"{"type":"message_delta","delta":{"stop_reason":"sideways"}}"#),
-                &mut events,
-            )
-            .expect_err("rejected");
-        assert!(err.message().contains("sideways"));
+    fn an_unknown_stop_reason_keeps_the_answer() {
+        let (events, reducer) = reduce(&[
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":"done"}}"#,
+            r#"{"type":"content_block_stop","index":0}"#,
+            r#"{"type":"message_delta","delta":{"stop_reason":"sideways"}}"#,
+            r#"{"type":"message_stop"}"#,
+        ]);
+        assert_eq!(reducer.finish().expect("finished"), FinishReason::Stop);
+        assert!(events.contains(&ProviderEvent::TextDelta {
+            delta: "done".to_owned()
+        }));
+    }
+
+    #[test]
+    fn a_full_context_window_stops_at_the_token_limit() {
+        let (_, reducer) = reduce(&[
+            r#"{"type":"message_delta","delta":{"stop_reason":"model_context_window_exceeded"}}"#,
+            r#"{"type":"message_stop"}"#,
+        ]);
+        assert_eq!(reducer.finish().expect("finished"), FinishReason::MaxTokens);
     }
 
     #[test]
