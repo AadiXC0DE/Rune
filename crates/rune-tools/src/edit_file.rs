@@ -5,6 +5,7 @@ use serde_json::json;
 
 use crate::contract::{Activity, ExecutionContext, Tool, ToolOutput};
 use crate::mutation::{self, Occurrence};
+use crate::workspace::resolve;
 
 /// Replaces an exact run of text inside a file.
 #[derive(Clone, Copy, Debug, Default)]
@@ -84,7 +85,7 @@ impl Tool for EditFile {
         let old = mutation::required_string(tool, arguments, "old_string")?;
         let new = mutation::required_string(tool, arguments, "new_string")?;
         let occurrence = selector(tool, arguments)?;
-        let path = mutation::resolve(context, raw)?;
+        let path = resolve(context, raw)?.path;
         let prepared = mutation::prepare_edit(&path, old, new, occurrence)?;
         context.check_cancelled()?;
         let applied = mutation::apply(prepared)?;
@@ -394,6 +395,25 @@ mod tests {
             )
             .expect("call");
         assert_eq!(std::fs::read(&path).expect("read"), b"beta\n");
+    }
+
+    #[test]
+    fn a_file_outside_every_root_is_refused_and_left_alone() {
+        let (_dir, context) = workspace();
+        let outside = tempfile::TempDir::new().expect("temp dir");
+        let target = seed(&outside, "config.txt", "alpha\n");
+        let err = EditFile
+            .call(
+                &json!({
+                    "path": target.to_str().expect("utf8"),
+                    "old_string": "alpha",
+                    "new_string": "beta"
+                }),
+                &context,
+            )
+            .expect_err("refused");
+        assert_eq!(err.code(), ErrorCode::PathOutsideWorkspace);
+        assert_eq!(std::fs::read(&target).expect("read"), b"alpha\n");
     }
 
     #[test]

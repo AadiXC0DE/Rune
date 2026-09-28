@@ -20,8 +20,6 @@ use camino::{Utf8Path, Utf8PathBuf};
 use rune_core::error::{ErrorCode, Result, RuneError};
 use sha2::{Digest, Sha256};
 
-use crate::contract::ExecutionContext;
-
 /// Largest postimage accepted by one mutation.
 pub const MAX_WRITE_BYTES: usize = 4 * 1024 * 1024;
 /// Largest combined preimage and postimage accepted by one mutation.
@@ -244,28 +242,6 @@ pub(crate) fn detail(applied: &Applied) -> String {
         }
         Some(span) => format!("{size}, lines {}-{}", span.first_line, span.last_line),
     }
-}
-
-/// Resolves a tool-supplied path against the workspace.
-///
-/// Whether the path may be reached at all is a policy decision the caller has
-/// already made, so this only turns a relative path into an absolute one and
-/// rejects input that cannot name a file.
-pub(crate) fn resolve(context: &ExecutionContext, raw: &str) -> Result<Utf8PathBuf> {
-    if raw.is_empty() {
-        return Err(RuneError::invalid_field("path", "must not be empty"));
-    }
-    if raw.contains('\0') {
-        return Err(RuneError::invalid_field(
-            "path",
-            "must not contain a NUL byte",
-        ));
-    }
-    let path = Utf8Path::new(raw);
-    if path.is_absolute() {
-        return Ok(path.to_owned());
-    }
-    Ok(context.workspace().join(path))
 }
 
 /// Reads a required string argument.
@@ -1348,19 +1324,6 @@ mod tests {
             std::fs::read(&path).expect("read"),
             [0xffu8, 0xfe, 0x00, 0x01]
         );
-    }
-
-    #[test]
-    fn a_relative_path_resolves_against_the_workspace() {
-        let dir = dir();
-        let workspace = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).expect("utf8");
-        let context = ExecutionContext::new(workspace);
-        let resolved = resolve(&context, "nested/note.txt").expect("resolve");
-        assert_eq!(
-            resolved,
-            Utf8PathBuf::from_path_buf(dir.path().join("nested/note.txt")).expect("utf8")
-        );
-        assert!(resolve(&context, "").is_err());
     }
 
     #[test]

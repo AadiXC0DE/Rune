@@ -5,6 +5,7 @@ use serde_json::json;
 
 use crate::contract::{Activity, ExecutionContext, Tool, ToolOutput};
 use crate::mutation;
+use crate::workspace::resolve;
 
 /// Replaces a whole file, creating it when it does not exist.
 #[derive(Clone, Copy, Debug, Default)]
@@ -66,7 +67,9 @@ impl Tool for WriteFile {
         context.check_cancelled()?;
         let raw = mutation::required_string(self.name(), arguments, "path")?;
         let content = mutation::required_string(self.name(), arguments, "content")?;
-        let path = mutation::resolve(context, raw)?;
+        // Resolved the way a read is, so a write cannot reach where a read of
+        // the same path would be refused.
+        let path = resolve(context, raw)?.path;
         let prepared = mutation::prepare(&path, content)?;
         context.check_cancelled()?;
         let applied = mutation::apply(prepared)?;
@@ -82,6 +85,7 @@ impl Tool for WriteFile {
 mod tests {
     use super::*;
     use camino::Utf8PathBuf;
+    use rune_core::error::ErrorCode;
 
     fn workspace() -> (tempfile::TempDir, ExecutionContext) {
         let dir = tempfile::TempDir::new().expect("temp dir");
@@ -162,7 +166,7 @@ mod tests {
         let err = WriteFile
             .call(&json!({ "path": "one.txt" }), &context)
             .expect_err("missing");
-        assert_eq!(err.code(), rune_core::error::ErrorCode::MissingField);
+        assert_eq!(err.code(), ErrorCode::MissingField);
         assert!(err.message().contains("write_file arguments.content"));
         WriteFile
             .validate(&json!({ "path": "one.txt" }))
@@ -175,11 +179,11 @@ mod tests {
         let err = WriteFile
             .call(&json!({ "path": "one.txt", "content": 7 }), &context)
             .expect_err("invalid");
-        assert_eq!(err.code(), rune_core::error::ErrorCode::InvalidField);
+        assert_eq!(err.code(), ErrorCode::InvalidField);
     }
 
     #[test]
-    fn a_path_outside_the_workspace_absolute_form_is_used_as_written() {
+    fn an_absolute_path_inside_the_workspace_is_used_as_written() {
         let (dir, context) = workspace();
         let other = dir.path().join("elsewhere.txt");
         let raw = other.to_str().expect("utf8").to_owned();
@@ -187,6 +191,60 @@ mod tests {
             .call(&json!({ "path": raw, "content": "x" }), &context)
             .expect("call");
         assert_eq!(std::fs::read(&other).expect("read"), b"x");
+    }
+
+    #[test]
+    fn a_path_outside_every_root_is_refused_and_nothing_is_written() {
+        let (dir, context) = workspace();
+        let outside = tempfile::TempDir::new().expect("temp dir");
+        let absolute = outside.path().join("dotfile");
+        let escape = format!(
+            "../{}/escaped.txt",
+            outside
+                .path()
+                .file_name()
+                .and_then(|name| name.to_str())
+                .expect("a name")
+        );
+        for raw in [absolute.to_str().expect("utf8").to_owned(), escape] {
+            let err = WriteFile
+                .call(&json!({ "path": raw, "content": "x" }), &context)
+                .expect_err("refused");
+            assert_eq!(err.code(), ErrorCode::PathOutsideWorkspace, "{raw}");
+        }
+        assert!(!absolute.exists());
+        assert!(!outside.path().join("escaped.txt").exists());
+        assert!(dir.path().exists());
+    }
+
+    #[test]
+    fn a_path_outside_every_root_is_written_when_external_access_is_granted() {
+        let (_dir, context) = workspace();
+        let outside = tempfile::TempDir::new().expect("temp dir");
+        let target = outside.path().join("granted.txt");
+        WriteFile
+            .call(
+                &json!({ "path": target.to_str().expect("utf8"), "content": "x" }),
+                &context.with_external_access(true),
+            )
+            .expect("call");
+        assert_eq!(std::fs::read(&target).expect("read"), b"x");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_write_through_a_linked_directory_that_leads_outside_is_refused() {
+        let (dir, context) = workspace();
+        let outside = tempfile::TempDir::new().expect("temp dir");
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("link")).expect("symlink");
+        for raw in ["link/new.txt", "link/nested/new.txt"] {
+            let err = WriteFile
+                .call(&json!({ "path": raw, "content": "x" }), &context)
+                .expect_err("refused");
+            assert_eq!(err.code(), ErrorCode::PathOutsideWorkspace, "{raw}");
+        }
+        assert!(!outside.path().join("new.txt").exists());
+        assert!(!outside.path().join("nested").exists());
     }
 
     #[test]
@@ -204,7 +262,7 @@ mod tests {
         let err = WriteFile
             .call(&json!({ "path": "one.txt", "content": "x" }), &context)
             .expect_err("cancelled");
-        assert_eq!(err.code(), rune_core::error::ErrorCode::Cancelled);
+        assert_eq!(err.code(), ErrorCode::Cancelled);
         assert!(!path_of(&dir, "one.txt").exists());
     }
 }
