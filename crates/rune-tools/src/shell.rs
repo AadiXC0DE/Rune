@@ -1739,14 +1739,19 @@ mod tests {
 
     #[test]
     fn a_command_cannot_write_outside_the_workspace() {
-        // The workspace is the temporary directory, so a write elsewhere is
-        // outside it. Without the sandbox in the command path this succeeds,
-        // which is what makes the assertion meaningful rather than decorative.
+        // The probe is written under the build's output directory, which no
+        // sandbox grant covers. The temporary directory would not do: a
+        // command may write there, because compilers and test runners need to.
+        // Without the sandbox in the command path this succeeds, which is what
+        // makes the assertion meaningful rather than decorative.
         let Some((_dir, context)) = sandboxed_workspace() else {
             return;
         };
         let tool = shell(4, 64 * 1024);
-        let outside = std::env::temp_dir().join("rune-sandbox-escape-probe.txt");
+        let parent =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/sandbox-tests");
+        std::fs::create_dir_all(&parent).expect("probe directory");
+        let outside = parent.join("rune-sandbox-escape-probe.txt");
         let _ = std::fs::remove_file(&outside);
 
         // The command itself fails, so this asserts on the call rather than
