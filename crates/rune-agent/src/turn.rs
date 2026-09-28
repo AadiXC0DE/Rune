@@ -289,6 +289,9 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
     let mut steps: u32 = 0;
     // Tool-result bytes this turn has retained, shared across its steps.
     let mut result_bytes: usize = 0;
+    // The latest step's answer, kept so a turn stopped at the step limit still
+    // returns what the model said in its last step.
+    let mut text = String::new();
 
     loop {
         cancellation.check()?;
@@ -297,7 +300,7 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
         if step_limit > 0 && u64::from(steps) >= step_limit {
             let outcome = TurnOutcome {
                 stop_reason: StopReason::StepLimit,
-                text: String::new(),
+                text,
                 reasoning,
                 usage,
                 steps,
@@ -330,7 +333,7 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
 
         usage = usage.merge_max(outcome.usage);
 
-        let text = outcome.text();
+        text = outcome.text();
         // Reasoning is accumulated across steps, so a turn that used several
         // ends up with all of its thinking rather than only the last step's.
         let step_reasoning = outcome.reasoning();

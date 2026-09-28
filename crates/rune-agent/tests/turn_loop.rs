@@ -505,6 +505,41 @@ fn the_step_limit_stops_a_loop_that_never_finishes() {
 }
 
 #[test]
+fn a_turn_stopped_at_the_step_limit_keeps_its_last_words() {
+    // The last step both answered and asked for another tool. The limit stops
+    // the turn before that tool's result is seen, but what the model already
+    // said is still the turn's answer.
+    let call = serde_json::json!({
+        "choices": [{
+            "index": 0,
+            "delta": {
+                "tool_calls": [{
+                    "index": 0,
+                    "id": "call_1",
+                    "function": { "name": "read_file", "arguments": "{\"path\":\"a.rs\"}" },
+                }],
+            },
+        }],
+    });
+    let endpoint = MockEndpoint::start(vec![Script::Frames(vec![
+        r#"{"choices":[{"index":0,"delta":{"content":"Halfway there."}}]}"#.to_owned(),
+        call.to_string(),
+        r#"{"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#.to_owned(),
+        "[DONE]".to_owned(),
+    ])]);
+    let host = TestHost::new(endpoint)
+        .with_tools(vec![read_tool()])
+        .with_step_limit(1);
+
+    let mut history = rune_agent::History::new();
+    history.push_user("keep going");
+
+    let outcome = run_turn(&mut history, &host).expect("turn");
+    assert_eq!(outcome.stop_reason, StopReason::StepLimit);
+    assert_eq!(outcome.text, "Halfway there.");
+}
+
+#[test]
 fn a_transient_failure_is_retried_and_the_turn_completes() {
     let endpoint = MockEndpoint::start(vec![Script::text("recovered")]);
     endpoint.fail_first(1);
