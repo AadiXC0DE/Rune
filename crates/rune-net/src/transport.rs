@@ -13,7 +13,7 @@
 //! Every request is bounded in time, every response body is bounded in bytes,
 //! and every failure maps onto the taxonomy the retry policy reads.
 
-use std::io::{BufRead, BufReader, Read};
+use std::io::Read;
 use std::time::{Duration, Instant};
 
 use rune_core::error::Result;
@@ -712,11 +712,28 @@ fn report_new(events: &[ProviderEvent], before: usize, observe: &mut dyn FnMut(&
     }
 }
 
+/// Largest piece of a streamed body read at once.
+///
+/// The decoder accepts any chunk boundary, so the body is read in pieces of a
+/// fixed size rather than by line: a body that never sends a line break then
+/// meets the decoder's bounds instead of growing one line without end.
+const STREAM_CHUNK_BYTES: usize = 16 * 1024;
+
+/// Chunks read ahead of the decoder before the reading thread waits.
+#[cfg(not(target_family = "wasm"))]
+const STREAM_CHUNKS_AHEAD: usize = 8;
+
+/// How often a silent stream is checked for cancellation.
+#[cfg(not(target_family = "wasm"))]
+const STREAM_POLL: Duration = Duration::from_millis(50);
+
 /// Reads and reduces a streaming response body.
 ///
-/// The body is read a line at a time, so each frame is reduced and reported as
-/// it arrives. Collecting the body first would hold the whole answer back until
-/// the response ended, which is the behavior this path exists to avoid.
+/// The body is read as it arrives, so each frame is reduced and reported as
+/// soon as it is complete. Collecting the body first would hold the whole
+/// answer back until the response ended, which is the behavior this path
+/// exists to avoid. A cancellation is noticed while the endpoint is silent,
+/// not only when it next sends something.
 ///
 /// Public because a host that reaches an endpoint through its own [`Fetch`],
 /// including one that runs where the built-in client cannot compile, reduces
@@ -729,36 +746,162 @@ pub fn read_stream(
     cancel: &dyn Fn() -> bool,
     observe: &mut dyn FnMut(&ProviderEvent),
 ) -> NetResult<StreamOutcome> {
-    let limits = provider.limits();
-    let mut decoder = Decoder::new(limits);
-    let mut reducer = provider.reducer();
-    let mut outcome = StreamOutcome::default();
-    let mut frame_buffer: Vec<Event> = Vec::new();
+    let mut state = StreamState::new(provider, observe, head_timeout);
+    feed(body, &mut state, cancel)?;
+    state.finish()
+}
 
-    let reader = BufReader::new(body);
-    let started = Instant::now();
-    let head_deadline = head_timeout;
-    let mut saw_any_event = false;
+/// Feeds a body to the decoder on a thread of its own.
+///
+/// A blocking read cannot be interrupted, so the body is read on a helper
+/// thread and this one waits on the handover in short slices, checking for a
+/// cancellation between them. The handover is bounded, so the helper reads
+/// only a few chunks ahead of the decoder. Once nothing is listening the
+/// helper ends at its next chunk; a read that never returns holds it until the
+/// connection closes.
+#[cfg(not(target_family = "wasm"))]
+fn feed(
+    mut body: Box<dyn Read + Send>,
+    state: &mut StreamState<'_>,
+    cancel: &dyn Fn() -> bool,
+) -> NetResult<()> {
+    use std::sync::mpsc::{RecvTimeoutError, sync_channel};
 
-    for line in reader.split(b'\n') {
+    let (sender, chunks) = sync_channel::<std::io::Result<Vec<u8>>>(STREAM_CHUNKS_AHEAD);
+    std::thread::Builder::new()
+        .name("rune-stream-read".to_owned())
+        .spawn(move || {
+            let mut buffer = vec![0_u8; STREAM_CHUNK_BYTES];
+            loop {
+                let chunk = match body.read(&mut buffer) {
+                    Ok(0) => break,
+                    Ok(count) => Ok(buffer.get(..count).unwrap_or_default().to_vec()),
+                    Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(err) => Err(err),
+                };
+                let failed = chunk.is_err();
+                if sender.send(chunk).is_err() || failed {
+                    break;
+                }
+            }
+        })
+        .map_err(NetError::from)?;
+
+    loop {
         if cancel() {
-            return Err(NetError::new(
-                FailureKind::Cancelled,
-                "the request was cancelled",
-            ));
+            return Err(cancelled());
         }
+        match chunks.recv_timeout(STREAM_POLL) {
+            Ok(chunk) => {
+                state.push(&chunk.map_err(NetError::from)?)?;
+                if state.is_done() {
+                    return Ok(());
+                }
+            }
+            Err(RecvTimeoutError::Timeout) => {}
+            // The helper has reached the end of the body.
+            Err(RecvTimeoutError::Disconnected) => return Ok(()),
+        }
+    }
+}
 
-        let line = line.map_err(NetError::from)?;
-        let blank = line.is_empty();
+/// Feeds a body to the decoder where there are no threads to read it on.
+///
+/// Each read blocks until the endpoint sends something, so a cancellation is
+/// noticed between reads rather than during one.
+#[cfg(target_family = "wasm")]
+fn feed(
+    mut body: Box<dyn Read + Send>,
+    state: &mut StreamState<'_>,
+    cancel: &dyn Fn() -> bool,
+) -> NetResult<()> {
+    let mut buffer = vec![0_u8; STREAM_CHUNK_BYTES];
+    loop {
+        if cancel() {
+            return Err(cancelled());
+        }
+        let count = match body.read(&mut buffer) {
+            Ok(0) => return Ok(()),
+            Ok(count) => count,
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(err) => return Err(NetError::from(err)),
+        };
+        state.push(buffer.get(..count).unwrap_or_default())?;
+        if state.is_done() {
+            return Ok(());
+        }
+    }
+}
 
-        let mut chunk = line;
-        chunk.push(b'\n');
-        decoder
-            .push(&chunk, &mut frame_buffer)
+/// The error for a request the caller cancelled.
+fn cancelled() -> NetError {
+    NetError::new(FailureKind::Cancelled, "the request was cancelled")
+}
+
+/// The decoding half of a streamed read.
+///
+/// Kept apart from the reading so the threaded and the plain read loops share
+/// one set of framing, limits, and termination rules.
+struct StreamState<'a> {
+    decoder: Decoder,
+    reducer: Box<dyn crate::stream::StreamReducer>,
+    outcome: StreamOutcome,
+    frames: Vec<Event>,
+    observe: &'a mut dyn FnMut(&ProviderEvent),
+    head_timeout: Duration,
+    started: Instant,
+    /// Whether any event has been decoded, which ends the wait for output.
+    saw_event: bool,
+}
+
+impl<'a> StreamState<'a> {
+    fn new(
+        provider: &dyn Provider,
+        observe: &'a mut dyn FnMut(&ProviderEvent),
+        head_timeout: Duration,
+    ) -> Self {
+        Self {
+            decoder: Decoder::new(provider.limits()),
+            reducer: provider.reducer(),
+            outcome: StreamOutcome::default(),
+            frames: Vec::new(),
+            observe,
+            head_timeout,
+            started: Instant::now(),
+            saw_event: false,
+        }
+    }
+
+    /// Decodes one chunk, reducing and reporting every event it completes.
+    fn push(&mut self, chunk: &[u8]) -> NetResult<()> {
+        self.decoder
+            .push(chunk, &mut self.frames)
             .map_err(NetError::from)?;
+        self.reduce_frames()?;
 
-        for event in frame_buffer.drain(..) {
-            saw_any_event = true;
+        // Judged after the chunk is decoded, because the line that completes
+        // the first event is that event arriving, not more waiting. What
+        // remains is an endpoint holding the connection open with keep-alive
+        // lines and nothing else.
+        if !self.saw_event && self.decoder.is_idle() && self.started.elapsed() > self.head_timeout {
+            return Err(NetError::new(
+                FailureKind::Timeout,
+                "the endpoint produced no output within the head timeout",
+            )
+            .with_hint("raise provider_head_timeout_ms for a slow local model"));
+        }
+        Ok(())
+    }
+
+    /// Returns true once the stream has said it is done.
+    fn is_done(&self) -> bool {
+        self.decoder.is_done()
+    }
+
+    /// Hands every decoded event to the reducer.
+    fn reduce_frames(&mut self) -> NetResult<()> {
+        for event in self.frames.drain(..) {
+            self.saw_event = true;
             // Every payload reaches the reducer, including the terminator,
             // because the reducer is the authority on what a terminal payload
             // means for its dialect and it is the one that checks the stream
@@ -766,53 +909,36 @@ pub fn read_stream(
             if event.is_empty() && event.name.is_none() {
                 continue;
             }
-            let before = outcome.events.len();
-            reducer
-                .apply(Some(&event.data), &mut outcome.events)
+            let before = self.outcome.events.len();
+            self.reducer
+                .apply(Some(&event.data), &mut self.outcome.events)
                 .map_err(NetError::from)?;
-            report_new(&outcome.events, before, observe);
+            report_new(&self.outcome.events, before, &mut *self.observe);
         }
-
-        // Judged after the line is decoded, because the blank line that
-        // completes the first event is that event arriving, not more waiting.
-        if blank && !saw_any_event && started.elapsed() > head_deadline {
-            return Err(NetError::new(
-                FailureKind::Timeout,
-                "the endpoint produced no output within the head timeout",
-            )
-            .with_hint("raise provider_head_timeout_ms for a slow local model"));
-        }
-
-        if decoder.is_done() {
-            break;
-        }
+        Ok(())
     }
 
-    decoder.finish(&mut frame_buffer).map_err(NetError::from)?;
-    for event in frame_buffer.drain(..) {
-        if event.is_empty() && event.name.is_none() {
-            continue;
-        }
-        let before = outcome.events.len();
-        reducer
-            .apply(Some(&event.data), &mut outcome.events)
+    /// Ends the stream and returns what it produced.
+    fn finish(mut self) -> NetResult<StreamOutcome> {
+        self.decoder
+            .finish(&mut self.frames)
             .map_err(NetError::from)?;
-        report_new(&outcome.events, before, observe);
+        self.reduce_frames()?;
+
+        // Signals end of transport. A reducer that never saw a legal terminator
+        // reports an incomplete stream, which is retryable, rather than allowing
+        // a truncated response to look like a success.
+        let before = self.outcome.events.len();
+        self.reducer
+            .apply(None, &mut self.outcome.events)
+            .map_err(NetError::from)?;
+        report_new(&self.outcome.events, before, &mut *self.observe);
+
+        self.outcome.finish = Some(self.reducer.finish().map_err(NetError::from)?);
+        self.outcome.usage = self.reducer.usage();
+        self.outcome.replay = self.reducer.replay();
+        Ok(self.outcome)
     }
-
-    // Signals end of transport. A reducer that never saw a legal terminator
-    // reports an incomplete stream, which is retryable, rather than allowing a
-    // truncated response to look like a success.
-    let before = outcome.events.len();
-    reducer
-        .apply(None, &mut outcome.events)
-        .map_err(NetError::from)?;
-    report_new(&outcome.events, before, observe);
-
-    outcome.finish = Some(reducer.finish().map_err(NetError::from)?);
-    outcome.usage = reducer.usage();
-    outcome.replay = reducer.replay();
-    Ok(outcome)
 }
 
 /// Reads a body up to a byte limit, lossily decoding it.
@@ -928,6 +1054,99 @@ mod tests {
         )
         .expect("the delivered answer is kept");
         assert_eq!(outcome.text(), "late");
+    }
+
+    #[test]
+    fn an_endpoint_sending_only_keep_alives_past_the_head_timeout_times_out() {
+        let body = PacedBody::body(vec![
+            (Duration::ZERO, b": keep-alive\n\n"),
+            (Duration::from_millis(150), b": keep-alive\n\n"),
+            (Duration::ZERO, ANSWER_HEAD),
+            (Duration::ZERO, ANSWER_TAIL),
+        ]);
+        let err = read_stream(
+            body,
+            &crate::chat_completions::ChatCompletions,
+            Duration::from_millis(50),
+            &|| false,
+            &mut |_| {},
+        )
+        .expect_err("timed out");
+        assert_eq!(err.kind(), FailureKind::Timeout);
+    }
+
+    /// A response body that sends nothing until the test releases it.
+    struct SilentBody(std::sync::mpsc::Receiver<()>);
+
+    impl Read for SilentBody {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            let _ = self.0.recv();
+            Ok(0)
+        }
+    }
+
+    #[test]
+    fn a_silent_stream_can_be_cancelled() {
+        // A reasoning model that is thinking, or a stalled proxy, sends
+        // nothing at all, and the user must still be able to stop it.
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let (report, reported) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let started = Instant::now();
+            let result = read_stream(
+                Box::new(SilentBody(released)),
+                &crate::chat_completions::ChatCompletions,
+                DEFAULT_HEAD_TIMEOUT,
+                &|| started.elapsed() > Duration::from_millis(100),
+                &mut |_| {},
+            );
+            let _ = report.send(result.map(|_| ()));
+        });
+
+        let result = reported.recv_timeout(Duration::from_secs(10));
+        drop(release);
+        let err = result
+            .expect("the read returned while the endpoint was silent")
+            .expect_err("cancelled");
+        assert_eq!(err.kind(), FailureKind::Cancelled);
+    }
+
+    /// A body of one repeated byte with no line break, counting what it served.
+    struct EndlessLine {
+        served: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        limit: usize,
+    }
+
+    impl Read for EndlessLine {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            use std::sync::atomic::Ordering;
+            let served = self.served.load(Ordering::SeqCst);
+            let count = buf.len().min(self.limit.saturating_sub(served));
+            buf[..count].fill(b'a');
+            self.served.fetch_add(count, Ordering::SeqCst);
+            Ok(count)
+        }
+    }
+
+    #[test]
+    fn a_body_without_a_line_break_is_refused_without_reading_it_all() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let served = std::sync::Arc::new(AtomicUsize::new(0));
+        let body = Box::new(EndlessLine {
+            served: std::sync::Arc::clone(&served),
+            limit: 64 * 1024 * 1024,
+        });
+        let err = read_stream(
+            body,
+            &crate::chat_completions::ChatCompletions,
+            DEFAULT_HEAD_TIMEOUT,
+            &|| false,
+            &mut |_| {},
+        )
+        .expect_err("refused");
+        assert_eq!(err.kind(), FailureKind::InvalidRequest, "{err}");
+        let read = served.load(Ordering::SeqCst);
+        assert!(read < 4 * 1024 * 1024, "read {read} bytes before refusing");
     }
 
     #[test]

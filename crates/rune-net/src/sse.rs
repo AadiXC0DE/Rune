@@ -89,6 +89,16 @@ impl Decoder {
         self.done
     }
 
+    /// Returns true when no part of an event is waiting to be completed.
+    ///
+    /// A stream that has sent bytes and is still idle has sent only blank or
+    /// comment lines, which is how an endpoint holds a connection open while
+    /// it has nothing to say.
+    #[must_use]
+    pub fn is_idle(&self) -> bool {
+        self.line.is_empty() && !self.saw_field
+    }
+
     /// Returns the number of events emitted so far.
     #[must_use]
     pub const fn event_count(&self) -> usize {
@@ -132,6 +142,10 @@ impl Decoder {
                     self.total_bytes = self.total_bytes.saturating_add(1);
                     self.limits.check_total(self.total_bytes)?;
                     self.line.push(other);
+                    // Checked as the line grows rather than when it ends, so a
+                    // body that never sends a line break is refused at the
+                    // event bound instead of the stream bound.
+                    self.limits.check_event(self.line.len())?;
                 }
             }
 
@@ -414,6 +428,36 @@ mod tests {
             .expect_err("rejected");
         assert_eq!(err.code(), ErrorCode::TooLarge);
         assert_eq!(err.field(), Some("stream.event"));
+    }
+
+    #[test]
+    fn a_line_that_never_ends_is_rejected_at_the_event_bound() {
+        let mut decoder = Decoder::new(Limit {
+            max_event_bytes: 8,
+            ..Limit::default()
+        });
+        let mut out = Vec::new();
+        decoder
+            .push(b"data: ab", &mut out)
+            .expect("within the bound");
+        let err = decoder.push(b"c", &mut out).expect_err("rejected");
+        assert_eq!(err.field(), Some("stream.event"));
+    }
+
+    #[test]
+    fn only_keep_alive_lines_leave_the_decoder_idle() {
+        let mut decoder = Decoder::new(Limit::default());
+        let mut out = Vec::new();
+        assert!(decoder.is_idle());
+        decoder.push(b": keep-alive\n\n\n", &mut out).expect("push");
+        assert!(decoder.is_idle());
+        decoder.push(b"data: par", &mut out).expect("push");
+        assert!(!decoder.is_idle(), "a partial line is output arriving");
+        decoder.push(b"tial\n", &mut out).expect("push");
+        assert!(!decoder.is_idle(), "a field awaits its blank line");
+        decoder.push(b"\n", &mut out).expect("push");
+        assert!(decoder.is_idle());
+        assert_eq!(payloads(&out), vec!["partial"]);
     }
 
     #[test]
