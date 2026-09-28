@@ -276,17 +276,13 @@ fn load_one(
         return;
     }
 
-    let Ok(text) = std::fs::read_to_string(path) else {
-        warn(String::from("the file could not be read"), out);
-        return;
+    let text = match read_command(path) {
+        Ok(text) => text,
+        Err(reason) => {
+            warn(reason, out);
+            return;
+        }
     };
-    if text.len() > MAX_COMMAND_BYTES {
-        warn(
-            format!("the file is larger than {MAX_COMMAND_BYTES} bytes"),
-            out,
-        );
-        return;
-    }
 
     let (frontmatter, body) = match split_frontmatter(&text) {
         Ok(parts) => parts,
@@ -327,6 +323,34 @@ fn load_one(
         origin,
         source: Some(path.to_owned()),
     });
+}
+
+/// Reads a command file, refusing anything but a regular file within the cap.
+///
+/// The type is checked before the file is opened, because a device or a pipe
+/// has no end: a repository linking a command to `/dev/zero` would fill memory,
+/// and one linking to `/dev/stdin` would stall startup. At most one byte past
+/// the cap is read, which is what makes an oversized file detectable.
+fn read_command(path: &Utf8Path) -> std::result::Result<String, String> {
+    use std::io::Read as _;
+
+    let unreadable = |_| String::from("the file could not be read");
+    let meta = std::fs::metadata(path).map_err(unreadable)?;
+    if !meta.is_file() {
+        return Err(String::from("the file is not a regular file"));
+    }
+    let file = std::fs::File::open(path).map_err(unreadable)?;
+    let bound = u64::try_from(MAX_COMMAND_BYTES)
+        .unwrap_or(u64::MAX)
+        .saturating_add(1);
+    let mut bytes = Vec::new();
+    file.take(bound)
+        .read_to_end(&mut bytes)
+        .map_err(unreadable)?;
+    if bytes.len() > MAX_COMMAND_BYTES {
+        return Err(format!("the file is larger than {MAX_COMMAND_BYTES} bytes"));
+    }
+    String::from_utf8(bytes).map_err(|_| String::from("the file is not UTF-8 text"))
 }
 
 /// Frontmatter fields a command file may declare.
@@ -712,6 +736,49 @@ mod tests {
         assert_eq!(discovery.commands.len(), 1);
         assert_eq!(discovery.commands[0].name, "good");
         assert_eq!(discovery.warnings.len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_command_linked_to_a_device_is_refused_without_reading_it() {
+        let dir = tempfile::tempdir().expect("temp");
+        let root = Utf8Path::from_path(dir.path()).expect("utf8");
+        let commands = root.join(".rune/commands");
+        std::fs::create_dir_all(&commands).expect("mkdir");
+        // An endless device would fill memory if it were read, and an empty one
+        // would load as a command with nothing in it.
+        std::os::unix::fs::symlink("/dev/zero", commands.join("zero.md")).expect("symlink");
+        std::os::unix::fs::symlink("/dev/null", commands.join("null.md")).expect("symlink");
+
+        let discovery = discover(root, root).expect("discovered");
+        assert!(discovery.commands.is_empty(), "{:#?}", discovery.commands);
+        assert_eq!(discovery.warnings.len(), 2);
+        for warning in &discovery.warnings {
+            assert!(
+                warning.reason.contains("not a regular file"),
+                "{}",
+                warning.reason
+            );
+        }
+    }
+
+    #[test]
+    fn a_command_file_over_the_cap_is_refused() {
+        let dir = tempfile::tempdir().expect("temp");
+        let root = Utf8Path::from_path(dir.path()).expect("utf8");
+        let body = format!(
+            "---\ndescription: Big\n---\n{}",
+            "x".repeat(MAX_COMMAND_BYTES)
+        );
+        write(root, ".rune/commands/big.md", &body);
+
+        let discovery = discover(root, root).expect("discovered");
+        assert!(discovery.commands.is_empty());
+        assert!(
+            discovery.warnings[0].reason.contains("larger than"),
+            "{}",
+            discovery.warnings[0].reason
+        );
     }
 
     #[test]
