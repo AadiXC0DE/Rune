@@ -10,8 +10,10 @@
 //!
 //! Project files are committed to version control, so they accept only keys that
 //! are safe for a repository to set. A profile-owned key found in a project file
-//! is ignored and reported, never applied. Every resolution records which layer
-//! supplied the value so `rune config --explain` can show it.
+//! is ignored and reported, never applied. A limit in a project file applies
+//! only where the user file sets none, so a repository cannot lift a cap the
+//! user chose. Every resolution records which layer supplied the value so
+//! `rune config --explain` can show it.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -1108,11 +1110,9 @@ fn apply_project(settings: &mut Settings, project: &ProjectConfig, layer: Layer)
         }
     }
 
-    // Project limits and step caps sit below user settings only when the user
-    // has not already set them, which the layer ordering already handles.
     if let Some(steps) = project
         .max_agent_steps
-        .filter(|_| settings.source_of("max_agent_steps") == Layer::Default)
+        .filter(|_| !user_set(&settings.limits, LimitName::MaxAgentSteps))
     {
         let _ = settings
             .limits
@@ -1120,7 +1120,7 @@ fn apply_project(settings: &mut Settings, project: &ProjectConfig, layer: Layer)
     }
     if let Some(bytes) = project
         .max_tool_result_bytes
-        .filter(|_| settings.source_of("max_tool_result_bytes") == Layer::Default)
+        .filter(|_| !user_set(&settings.limits, LimitName::MaxToolResultBytes))
     {
         let _ = settings
             .limits
@@ -1156,6 +1156,15 @@ fn apply_project(settings: &mut Settings, project: &ProjectConfig, layer: Layer)
     );
 }
 
+/// Returns true when the user file set a limit.
+///
+/// A project file supplies a limit only where the user has not chosen one, so a
+/// repository cannot lift a cap the user set, such as by setting
+/// `max_agent_steps = 0`, which means unlimited.
+fn user_set(limits: &BudgetSet, name: LimitName) -> bool {
+    limits.source(name) == Some(Layer::User)
+}
+
 /// Applies a `limits` table from any layer.
 fn apply_limit_table(
     budgets: &mut BudgetSet,
@@ -1169,6 +1178,9 @@ fn apply_limit_table(
     for (key, value) in table {
         match key.parse::<LimitName>() {
             Ok(name) => {
+                if layer == Layer::Project && user_set(budgets, name) {
+                    continue;
+                }
                 if let Err(err) = budgets.set(name, *value, layer) {
                     diagnostics.push(
                         Diagnostic::new(layer, err.code(), err.message().to_owned())
@@ -1634,6 +1646,57 @@ theme_unused = "x"
         );
         assert_eq!(
             settings.limits.source(LimitName::MaxAgentSteps),
+            Some(Layer::Project)
+        );
+    }
+
+    #[test]
+    fn project_cannot_lift_a_step_cap_the_user_set() {
+        // Zero means unlimited, so a repository that could replace the user's
+        // cap with it would remove the cap entirely.
+        let dir = TempDir::new().expect("tempdir");
+        let user = write(&dir, "config.toml", "[limits]\nmax_agent_steps = 50\n");
+        for body in ["max_agent_steps = 0\n", "[limits]\nmax_agent_steps = 0\n"] {
+            let project = write(&dir, ".rune.toml", body);
+            let settings = load(Some(&project), Some(&user), &empty_env());
+            assert_eq!(
+                settings.limits.get(LimitName::MaxAgentSteps),
+                Budget::Bounded(50),
+                "{body}"
+            );
+            assert_eq!(
+                settings.limits.source(LimitName::MaxAgentSteps),
+                Some(Layer::User),
+                "{body}"
+            );
+        }
+    }
+
+    #[test]
+    fn project_cannot_replace_a_limit_the_user_set() {
+        let dir = TempDir::new().expect("tempdir");
+        let user = write(
+            &dir,
+            "config.toml",
+            "[limits]\nmax_tool_result_bytes = 1000\n",
+        );
+        let project = write(
+            &dir,
+            ".rune.toml",
+            "max_tool_result_bytes = 900000\n[limits]\nmax_tool_result_bytes = \"off\"\nlist_entries = 20\n",
+        );
+        let settings = load(Some(&project), Some(&user), &empty_env());
+        assert_eq!(
+            settings.limits.get(LimitName::MaxToolResultBytes),
+            Budget::Bounded(1000)
+        );
+        // A limit the user left alone is still the repository's to set.
+        assert_eq!(
+            settings.limits.get(LimitName::ListEntries),
+            Budget::Bounded(20)
+        );
+        assert_eq!(
+            settings.limits.source(LimitName::ListEntries),
             Some(Layer::Project)
         );
     }
