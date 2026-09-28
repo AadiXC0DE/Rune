@@ -123,12 +123,12 @@ impl Inline {
         }
         self.max_rows = limit;
         // The rows that were drawn are no longer the rows this renderer would
-        // draw, so the next frame must repaint from the top rather than diff
-        // against a region of a different size.
+        // draw, so the next frame must repaint rather than diff against a
+        // region of a different size. The region is still on screen, though, so
+        // where it is stays known: the next frame walks up to its top and
+        // erases it before painting, rather than leaving it above the new one.
         self.shown.clear();
         self.shown_settled = 0;
-        self.cursor_row = 0;
-        self.drawn = false;
     }
 
     /// Returns the width.
@@ -1366,6 +1366,54 @@ mod tests {
             "the status row was written over:\n{screen}"
         );
         assert_eq!(grid.cursor().row, bottom, "{screen}");
+    }
+
+    #[test]
+    fn a_height_change_erases_the_region_before_drawing_it_again() {
+        // A new height used to reset the renderer as if nothing were on screen,
+        // so the next frame was drawn from the caret down and the whole region
+        // it had drawn before was left above it.
+        let mut inline = Inline::new(40);
+        inline.set_max_rows(19);
+        let mut grid = crate::engine::Grid::new(40, 20).expect("grid");
+        let footer = rows(&["status"]);
+        let answer = rows(&["one", "two", "three", "four"]);
+
+        let first = frame(
+            &mut inline,
+            &[],
+            None,
+            &footer,
+            &rows(&["> "]),
+            &answer,
+            (0, 2),
+        );
+        grid.feed(&first).expect("feed");
+
+        inline.set_max_rows(14);
+        let second = frame(
+            &mut inline,
+            &[],
+            None,
+            &footer,
+            &rows(&["> "]),
+            &answer,
+            (0, 2),
+        );
+        grid.feed(&second).expect("feed");
+
+        let screen = grid.text();
+        assert_eq!(
+            screen.matches("status").count(),
+            1,
+            "a stale copy of the region was left on screen:\n{screen}"
+        );
+        assert_eq!(screen.matches("one").count(), 1, "{screen}");
+        let lines: Vec<&str> = screen.lines().collect();
+        assert!(
+            lines[usize::from(grid.cursor().row)].starts_with('>'),
+            "the caret is not on the input row:\n{screen}"
+        );
     }
 
     #[test]
