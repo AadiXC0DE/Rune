@@ -83,9 +83,15 @@ impl Provider for Anthropic {
                 .collect();
             body.insert("tools".to_owned(), serde_json::Value::Array(tools));
             if plan.tool_choice != ToolChoice::Auto {
+                // The endpoint spells a required tool call `any`, not the
+                // `required` the OpenAI shapes use.
+                let choice = match plan.tool_choice {
+                    ToolChoice::Required => "any",
+                    other => other.as_str(),
+                };
                 body.insert(
                     "tool_choice".to_owned(),
-                    serde_json::json!({ "type": plan.tool_choice.as_str() }),
+                    serde_json::json!({ "type": choice }),
                 );
             }
         }
@@ -730,7 +736,11 @@ mod tests {
         }];
         plan.tool_choice = ToolChoice::Required;
         let body = Anthropic.build_request(&plan).expect("build");
-        assert_eq!(body["tool_choice"]["type"], "required");
+        assert_eq!(body["tool_choice"], serde_json::json!({ "type": "any" }));
+
+        plan.tool_choice = ToolChoice::None;
+        let body = Anthropic.build_request(&plan).expect("build");
+        assert_eq!(body["tool_choice"], serde_json::json!({ "type": "none" }));
     }
 
     #[test]
