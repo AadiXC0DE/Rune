@@ -8,8 +8,8 @@ use rune_core::error::{ErrorCode, Result, RuneError};
 
 use crate::contract::{Activity, ExecutionContext, Tool, ToolOutput};
 use crate::workspace::{
-    FileLimits, SUMMARY_RESERVE_BYTES, display_path, join_capped, resolve, string_arg,
-    truncate_line, usize_arg,
+    FileLimits, SUMMARY_RESERVE_BYTES, display_path, join_capped, read_line_bounded, resolve,
+    string_arg, truncate_line, usize_arg,
 };
 
 /// Bytes read to classify a file before any content is returned.
@@ -219,16 +219,13 @@ fn collect<R: BufRead>(
     let mut bytes = 0_usize;
 
     loop {
-        buffer.clear();
-        let read = reader
-            .read_until(b'\n', &mut buffer)
-            .map_err(RuneError::from)?;
-        if read == 0 {
+        let line = read_line_bounded(reader, &mut buffer, line_bytes).map_err(RuneError::from)?;
+        if line.consumed == 0 {
             break;
         }
         // Only the leading bytes were classified, so every line is checked
         // before it can reach the result as mojibake.
-        if buffer.contains(&0) {
+        if line.has_nul {
             window.binary = true;
             break;
         }
@@ -241,10 +238,10 @@ fn collect<R: BufRead>(
 
         let text = String::from_utf8_lossy(&buffer);
         let text = text.trim_end_matches(['\n', '\r']);
-        if text.len() > line_bytes {
+        if line.length > line_bytes {
             window.line_capped = true;
         }
-        let shown = truncate_line(text, line_bytes);
+        let shown = truncate_line(text, line.length, line_bytes);
         bytes = bytes
             .saturating_add(shown.len())
             .saturating_add(NUMBER_WIDTH + 1);
@@ -630,6 +627,45 @@ mod tests {
         assert!(output.is_error);
         assert!(output.text.contains("is binary"), "{}", output.text);
         assert!(!output.text.contains("needle"), "{}", output.text);
+    }
+
+    #[test]
+    fn one_enormous_line_is_cut_and_named_by_its_true_length() {
+        let repo = Repo::new();
+        let mut body = "y".repeat(3 * 1024 * 1024);
+        body.push_str("\nsecond\n");
+        repo.write("long/huge.txt", &body);
+        let output = ReadFile::default()
+            .call(
+                &serde_json::json!({ "path": "long/huge.txt" }),
+                &repo.context(),
+            )
+            .expect("call");
+        assert!(
+            output
+                .text
+                .contains(&format!("the line is {} bytes", 3 * 1024 * 1024)),
+            "{}",
+            &output.text[output.text.len().saturating_sub(400)..]
+        );
+        assert!(output.text.contains("     2\tsecond"));
+    }
+
+    #[test]
+    fn a_nul_past_the_kept_part_of_a_long_line_is_still_refused() {
+        let repo = Repo::new();
+        let mut bytes = b"text\n".to_vec();
+        bytes.extend(std::iter::repeat_n(b'z', 64 * 1024));
+        bytes.push(0);
+        bytes.extend_from_slice(b"\n");
+        repo.write_bytes("data/long.bin", &bytes);
+        let output = ReadFile::default()
+            .call(
+                &serde_json::json!({ "path": "data/long.bin" }),
+                &repo.context(),
+            )
+            .expect("call");
+        assert!(output.is_error, "{}", output.text);
     }
 
     #[test]

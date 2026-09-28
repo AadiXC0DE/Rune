@@ -8,6 +8,7 @@
 
 use std::ffi::OsStr;
 use std::fmt::Write as _;
+use std::io::BufRead;
 
 use camino::{Utf8Component, Utf8Path, Utf8PathBuf};
 use globset::{Glob, GlobBuilder, GlobSet, GlobSetBuilder};
@@ -325,16 +326,80 @@ pub fn truncate_to_bytes(text: &str, limit: usize) -> &str {
 }
 
 /// Returns one line of file content, cut to `limit` bytes with a marker.
+///
+/// `length` is the line's true length, which is more than `line` holds when
+/// the read kept only the head of it.
 #[must_use]
-pub fn truncate_line(line: &str, limit: usize) -> String {
-    if line.len() <= limit {
+pub fn truncate_line(line: &str, length: usize, limit: usize) -> String {
+    if line.len() <= limit && length <= limit {
         return line.to_owned();
     }
     let head = truncate_to_bytes(line, limit);
-    format!(
-        "{head}... [line truncated, the line is {bytes} bytes]",
-        bytes = line.len()
-    )
+    format!("{head}... [line truncated, the line is {length} bytes]")
+}
+
+/// What one bounded line read found.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct LineRead {
+    /// Bytes the line occupied, terminator included. Zero at the end of input.
+    pub consumed: usize,
+    /// Length of the line without its terminator, whatever part was kept.
+    pub length: usize,
+    /// True when a NUL byte appeared anywhere in the line.
+    pub has_nul: bool,
+}
+
+/// Reads one line into `buffer`, keeping at most `keep` bytes of it.
+///
+/// The rest of a longer line is read and discarded rather than collected, so a
+/// single line of any size costs `keep` bytes of memory. The true length and
+/// whether the line held a NUL byte are still reported, because both describe
+/// the whole line rather than the part that was kept.
+pub fn read_line_bounded<R: BufRead>(
+    reader: &mut R,
+    buffer: &mut Vec<u8>,
+    keep: usize,
+) -> std::io::Result<LineRead> {
+    buffer.clear();
+    let mut read = LineRead::default();
+    // Line terminators at the end of what has been seen so far, which are not
+    // part of the line's length.
+    let mut terminators = 0_usize;
+    loop {
+        let available = match reader.fill_buf() {
+            Ok(available) => available,
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(err) => return Err(err),
+        };
+        if available.is_empty() {
+            break;
+        }
+        let (chunk, ends) = match available.iter().position(|byte| *byte == b'\n') {
+            Some(index) => (&available[..=index], true),
+            None => (available, false),
+        };
+        let room = keep.saturating_sub(buffer.len()).min(chunk.len());
+        buffer.extend_from_slice(&chunk[..room]);
+        read.has_nul |= chunk.contains(&0);
+        let tail = chunk
+            .iter()
+            .rev()
+            .take_while(|byte| matches!(byte, b'\n' | b'\r'))
+            .count();
+        terminators = if tail == chunk.len() {
+            terminators.saturating_add(tail)
+        } else {
+            tail
+        };
+        let used = chunk.len();
+        read.consumed = read.consumed.saturating_add(used);
+        reader.consume(used);
+        if ends {
+            break;
+        }
+    }
+    read.length = read.consumed.saturating_sub(terminators);
+    Ok(read)
 }
 
 /// Appends a footer to a body, cutting the body when the pair exceeds `cap`.
@@ -1144,10 +1209,49 @@ mod tests {
     #[test]
     fn a_truncated_line_names_its_true_length() {
         let line = "x".repeat(3000);
-        let cut = truncate_line(&line, 2000);
+        let cut = truncate_line(&line, line.len(), 2000);
         assert!(cut.len() < line.len());
         assert!(cut.contains("3000 bytes"), "{cut}");
-        assert_eq!(truncate_line("short", 2000), "short");
+        assert_eq!(truncate_line("short", 5, 2000), "short");
+        // A head kept by a bounded read still names the whole line.
+        let head = truncate_line(&line[..2000], 3000, 2000);
+        assert!(head.contains("3000 bytes"), "{head}");
+    }
+
+    #[test]
+    fn a_bounded_read_keeps_the_head_of_a_long_line_and_counts_all_of_it() {
+        let mut long = vec![b'x'; 5 * 1024 * 1024];
+        long.extend_from_slice(b"\r\nnext\n");
+        let mut reader = std::io::BufReader::with_capacity(8 * 1024, long.as_slice());
+        let mut buffer = Vec::new();
+
+        let first = read_line_bounded(&mut reader, &mut buffer, 16).expect("read");
+        assert_eq!(buffer, vec![b'x'; 16]);
+        assert!(buffer.capacity() < 64 * 1024, "{}", buffer.capacity());
+        assert_eq!(first.length, 5 * 1024 * 1024);
+        assert_eq!(first.consumed, 5 * 1024 * 1024 + 2);
+        assert!(!first.has_nul);
+
+        let second = read_line_bounded(&mut reader, &mut buffer, 16).expect("read");
+        assert_eq!(buffer, b"next\n");
+        assert_eq!(second.length, 4);
+
+        let end = read_line_bounded(&mut reader, &mut buffer, 16).expect("read");
+        assert_eq!(end.consumed, 0);
+        assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn a_bounded_read_sees_a_nul_past_the_kept_bytes() {
+        let mut line = vec![b'a'; 100];
+        line.push(0);
+        line.extend_from_slice(b"tail");
+        let mut reader = std::io::BufReader::new(line.as_slice());
+        let mut buffer = Vec::new();
+        let read = read_line_bounded(&mut reader, &mut buffer, 10).expect("read");
+        assert!(read.has_nul);
+        assert_eq!(read.length, 105);
+        assert_eq!(buffer.len(), 10);
     }
 
     #[test]

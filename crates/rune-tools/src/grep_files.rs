@@ -10,7 +10,8 @@ use rune_core::error::{Result, RuneError};
 use crate::contract::{Activity, ExecutionContext, Tool, ToolOutput};
 use crate::workspace::{
     FileLimits, MAX_MATCH_LINE_BYTES, Walker, bool_arg, compile_glob_as, default_root, display_in,
-    join_capped, resolve, roots, string_arg, summarize, truncate_line, usize_arg, walk_notes,
+    join_capped, read_line_bounded, resolve, roots, string_arg, summarize, truncate_line,
+    usize_arg, walk_notes,
 };
 
 /// How often a long search checks for cancellation.
@@ -336,22 +337,22 @@ fn scan(
     let mut buffer = Vec::new();
 
     loop {
-        buffer.clear();
-        let read = reader.read_until(b'\n', &mut buffer).map_err(|err| {
-            ScanError::Unreadable(format!("`{display}` could not be read: {err}"))
-        })?;
-        if read == 0 {
+        let line =
+            read_line_bounded(&mut reader, &mut buffer, MAX_MATCH_LINE_BYTES).map_err(|err| {
+                ScanError::Unreadable(format!("`{display}` could not be read: {err}"))
+            })?;
+        if line.consumed == 0 {
             break;
         }
         // Only the leading bytes were classified, so a NUL anywhere later still
         // skips the file rather than emitting mojibake or a false match.
-        if buffer.contains(&0) {
+        if line.has_nul {
             return Err(ScanError::Binary);
         }
         number = number.saturating_add(1);
         let text = String::from_utf8_lossy(&buffer);
         let text = text.trim_end_matches(['\n', '\r']);
-        let shown = truncate_line(text, MAX_MATCH_LINE_BYTES);
+        let shown = truncate_line(text, line.length, MAX_MATCH_LINE_BYTES);
         let haystack = if query.case_insensitive {
             shown.to_lowercase()
         } else {
