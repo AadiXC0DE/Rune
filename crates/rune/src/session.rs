@@ -1412,7 +1412,7 @@ fn run_turn_steerable(
                         host.draw_notice("press Escape again to cancel");
                     } else {
                         reader.clear();
-                        host.draw_stream();
+                        host.draw_stream_with("", 0);
                     }
                 }
                 // Control-C clears a typed correction first, then cancels, then
