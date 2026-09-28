@@ -45,14 +45,20 @@ pub const WORKSPACE_ROOTS: &[&str] = &[
     ".codex/skills",
     ".claude/skills",
     ".agents/skills",
+    ".claw/skills",
 ];
 
 /// User-relative directories holding skills, in precedence order.
+///
+/// The product's own directory comes first, ahead of the compatibility roots
+/// that belong to other agents.
 pub const USER_ROOTS: &[&str] = &[
+    ".rune/skills",
     ".config/opencode/skills",
     ".codex/skills",
     ".claude/skills",
     ".agents/skills",
+    ".claw/skills",
 ];
 
 /// One discovered skill.
@@ -605,11 +611,16 @@ mod tests {
                 &format!("---\nname: s{index}\n---\n"),
             );
         }
+        // Derived from the constant rather than restated, so adding a root
+        // cannot leave this asserting the previous set.
+        let expected: Vec<String> = (0..WORKSPACE_ROOTS.len())
+            .map(|index| format!("s{index}"))
+            .collect();
 
         let discovery = scan_of(&workspace, &home, &root.join("config"));
         assert_eq!(
             names(&discovery),
-            vec!["s0", "s1", "s2", "s3", "s4"],
+            expected,
             "roots are scanned in declared order"
         );
     }
@@ -651,6 +662,7 @@ mod tests {
             "managed",
             "---\nname: managed\n---\n",
         );
+        skill(&home.join(".rune/skills"), "own", "---\nname: own\n---\n");
         skill(
             &home.join(".config/opencode/skills"),
             "opencode",
@@ -661,13 +673,29 @@ mod tests {
             "claude",
             "---\nname: claude\n---\n",
         );
+        skill(&home.join(".claw/skills"), "claw", "---\nname: claw\n---\n");
 
         let discovery = scan_of(&workspace, &home, &config);
         assert_eq!(
             names(&discovery),
-            vec!["project", "managed", "opencode", "claude"]
+            vec!["project", "managed", "own", "opencode", "claude", "claw"]
         );
         assert_eq!(discovery.skills[1].root, config.join("skills"));
+    }
+
+    #[test]
+    fn the_claw_root_is_scanned_in_the_workspace() {
+        let (_dir, root) = tree();
+        let workspace = root.join("proj");
+        let home = root.join("home");
+        skill(
+            &workspace.join(".claw/skills"),
+            "claw",
+            "---\nname: claw\n---\n",
+        );
+
+        let discovery = scan_of(&workspace, &home, &root.join("config"));
+        assert_eq!(names(&discovery), vec!["claw"]);
     }
 
     #[test]

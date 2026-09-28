@@ -556,6 +556,68 @@ impl FromStr for LimitName {
 /// make a hostile or broken input able to exhaust memory.
 pub const EMERGENCY_CEILING_BYTES: u64 = 64 * 1024 * 1024;
 
+/// Share of a model's context window the skill catalog may occupy, as a percent.
+const SKILL_CATALOG_WINDOW_PERCENT: u64 = 2;
+
+/// Multiple of that share the catalog is granted.
+///
+/// The catalog is reference material a turn reads once, so it is worth several
+/// times the share a single section of the conversation would be.
+const SKILL_CATALOG_WINDOW_GROWTH: u64 = 4;
+
+/// Smallest catalog granted to a model with a small window.
+///
+/// Without a floor a narrow window derives less than the catalog's own framing,
+/// which would leave room for no skill at all.
+const SKILL_CATALOG_MIN_BYTES: u64 = 4 * 1024;
+
+/// Characters the catalog budget admits when the context window is unknown.
+///
+/// The documented fallback is 8 000 characters. At the working ratio below that
+/// is close to the 32 768-byte default this derivation replaces, so a window that
+/// cannot be discovered keeps about the budget it had before.
+const SKILL_CATALOG_FALLBACK_CHARACTERS: u64 = 8_000;
+
+/// Working ratio of bytes to one character of prompt text.
+///
+/// Four is the figure the token estimator divides by, so the two agree on how
+/// much text a budget represents.
+const BYTES_PER_CHARACTER: u64 = 4;
+
+/// Catalog budget used when the model's context window is unknown, in bytes.
+///
+/// The limit is expressed in bytes and the fallback is documented in characters,
+/// so the two are reconciled at the working ratio rather than left to disagree.
+/// An unknown window therefore keeps roughly the budget the fixed default gave.
+pub const SKILL_CATALOG_FALLBACK_BYTES: u64 =
+    SKILL_CATALOG_FALLBACK_CHARACTERS * BYTES_PER_CHARACTER;
+
+/// Derives the skill catalog budget from a model's context window.
+///
+/// A fixed catalog size is both too small for a long context, which wastes the
+/// room available, and too large for a short one, where it crowds out the
+/// conversation. `None` and a window of zero both mean the capacity is unknown,
+/// which takes [`SKILL_CATALOG_FALLBACK_BYTES`].
+#[must_use]
+pub const fn skill_catalog_bytes(context_window: Option<u64>) -> u64 {
+    match context_window {
+        None | Some(0) => SKILL_CATALOG_FALLBACK_BYTES,
+        Some(window) => {
+            let share = window
+                .saturating_mul(SKILL_CATALOG_WINDOW_PERCENT)
+                .saturating_div(100)
+                .saturating_mul(SKILL_CATALOG_WINDOW_GROWTH);
+            if share < SKILL_CATALOG_MIN_BYTES {
+                SKILL_CATALOG_MIN_BYTES
+            } else if share > EMERGENCY_CEILING_BYTES {
+                EMERGENCY_CEILING_BYTES
+            } else {
+                share
+            }
+        }
+    }
+}
+
 /// A resolved set of limits with the source of each value.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct BudgetSet {
@@ -880,5 +942,35 @@ mod tests {
         assert!(bounded.contains(5));
         assert!(bounded.contains(10));
         assert!(!bounded.contains(11));
+    }
+
+    #[test]
+    fn the_catalog_budget_follows_the_context_window() {
+        // A short window would derive less than the catalog's own framing, so
+        // the floor applies rather than a budget nothing can fit inside.
+        assert_eq!(skill_catalog_bytes(Some(2_000)), SKILL_CATALOG_MIN_BYTES);
+        // A window wide enough to matter scales with it: two percent, times
+        // four.
+        assert_eq!(skill_catalog_bytes(Some(200_000)), 16_000);
+        // A window beyond the ceiling is clamped rather than granted in full.
+        assert_eq!(
+            skill_catalog_bytes(Some(1_000_000_000)),
+            EMERGENCY_CEILING_BYTES
+        );
+    }
+
+    #[test]
+    fn an_unknown_window_takes_the_character_fallback() {
+        let fallback = skill_catalog_bytes(None);
+        assert_eq!(fallback, SKILL_CATALOG_FALLBACK_BYTES);
+        // Zero is the sentinel a provider that states no window reports, so it
+        // takes the same path rather than deriving an empty budget.
+        assert_eq!(skill_catalog_bytes(Some(0)), fallback);
+        // The fallback is a byte figure, so it stays inside the clamp the
+        // derived value obeys.
+        assert!(
+            (SKILL_CATALOG_MIN_BYTES..=EMERGENCY_CEILING_BYTES).contains(&fallback),
+            "the fallback escapes the clamp: {fallback}"
+        );
     }
 }

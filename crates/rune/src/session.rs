@@ -914,7 +914,9 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
     input: R,
     output: W,
 ) -> Result<u8> {
-    let limits = config.settings.limits.clone();
+    let mut limits = config.settings.limits.clone();
+    let window = context_limit(&config.settings, &limits);
+    adopt_skill_catalog_budget(&mut limits, window);
     let prompt = build_prompt(&config.workspace, &config.paths.config_root, &limits);
 
     // A resumed session continues its stored conversation; a new one starts
@@ -2323,6 +2325,30 @@ fn terminal_height() -> u16 {
 ///
 /// Configuration carries no per-model window, so the compiled default applies
 /// until a provider reports one. A zero would make every request look oversized.
+/// Sizes the skill catalog budget from the model's context window.
+///
+/// A fixed budget is wrong at both ends: too small for a model with a large
+/// window, wasting budget it has, and too large for a small one, crowding out
+/// the conversation. A caller that named its own value keeps it, because a
+/// limit someone set deliberately is not this program's to overwrite.
+fn adopt_skill_catalog_budget(limits: &mut BudgetSet, context_window: u64) {
+    use rune_core::budget::LimitName;
+    use rune_core::config::Layer;
+
+    if limits.source(LimitName::SkillCatalogBytes).is_some() {
+        return;
+    }
+    let derived = rune_core::budget::skill_catalog_bytes(Some(context_window));
+    // A failure here would mean the derived value is outside the limit's own
+    // range, which the derivation already clamps for, so the compiled default
+    // stands rather than the session refusing to start.
+    let _ = limits.set(
+        LimitName::SkillCatalogBytes,
+        rune_core::budget::Budget::Bounded(derived),
+        Layer::User,
+    );
+}
+
 fn context_limit(settings: &Settings, _limits: &BudgetSet) -> u64 {
     // The configured window wins, because it describes the model the user
     // selected. The compiled default is a guess that suits a small model and
@@ -3231,6 +3257,43 @@ mod tests {
             context_limit(&undeclared, &BudgetSet::new()),
             rune_net::catalog::DEFAULT_CONTEXT_WINDOW
         );
+    }
+
+    #[test]
+    fn the_catalog_budget_follows_the_window_it_is_given() {
+        // A fixed budget is wrong at both ends, so the session sizes it from
+        // the window the model reports.
+        use rune_core::budget::LimitName;
+
+        let mut small = BudgetSet::new();
+        adopt_skill_catalog_budget(&mut small, 8_000);
+        let mut large = BudgetSet::new();
+        adopt_skill_catalog_budget(&mut large, 2_000_000);
+
+        assert!(
+            small.get_bytes(LimitName::SkillCatalogBytes)
+                < large.get_bytes(LimitName::SkillCatalogBytes),
+            "a larger window did not earn a larger catalog budget"
+        );
+    }
+
+    #[test]
+    fn a_named_catalog_budget_survives_the_derivation() {
+        // A limit someone set on purpose is not this program's to overwrite.
+        use rune_core::budget::{Budget, LimitName};
+        use rune_core::config::Layer;
+
+        let mut limits = BudgetSet::new();
+        limits
+            .set(
+                LimitName::SkillCatalogBytes,
+                Budget::Bounded(1234),
+                Layer::User,
+            )
+            .expect("set");
+        adopt_skill_catalog_budget(&mut limits, 2_000_000);
+
+        assert_eq!(limits.get_bytes(LimitName::SkillCatalogBytes), 1234);
     }
 
     #[test]
