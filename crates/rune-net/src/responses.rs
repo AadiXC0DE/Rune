@@ -416,11 +416,6 @@ impl Reducer {
         let item_type = item.get("type").and_then(serde_json::Value::as_str);
 
         match item_type {
-            Some("reasoning") => {
-                // Retained verbatim so it can be replayed exactly.
-                self.reasoning.push(item.clone());
-                Ok(())
-            }
             Some("function_call") => {
                 let Some(call_id) = item.get("call_id").and_then(serde_json::Value::as_str) else {
                     return Err(protocol_violation(
@@ -545,6 +540,13 @@ impl Reducer {
         let Some(item) = value.get("item") else {
             return Ok(());
         };
+        if item.get("type").and_then(serde_json::Value::as_str) == Some("reasoning") {
+            // Taken when it finishes rather than when it is announced, because
+            // only the finished item carries the encrypted content a replay
+            // needs.
+            self.keep_reasoning(item);
+            return Ok(());
+        }
         let call_id = match item.get("call_id").and_then(serde_json::Value::as_str) {
             Some(call_id) => call_id.to_owned(),
             None => match item.get("id").and_then(serde_json::Value::as_str) {
@@ -568,6 +570,23 @@ impl Reducer {
             arguments: slot.arguments.clone(),
         });
         Ok(())
+    }
+
+    /// Retains a reasoning item verbatim for replay.
+    ///
+    /// The same item is reported when it finishes and again in the completed
+    /// response, and a replay that carries it twice is rejected, so a later
+    /// copy replaces the earlier one rather than being added beside it.
+    fn keep_reasoning(&mut self, item: &serde_json::Value) {
+        let id = item.get("id").and_then(serde_json::Value::as_str);
+        let existing = self.reasoning.iter_mut().find(|kept| match id {
+            Some(id) => kept.get("id").and_then(serde_json::Value::as_str) == Some(id),
+            None => *kept == item,
+        });
+        match existing {
+            Some(existing) => existing.clone_from(item),
+            None => self.reasoning.push(item.clone()),
+        }
     }
 
     /// Records usage from a value.
@@ -602,7 +621,7 @@ impl Reducer {
                     .and_then(serde_json::Value::as_str)
                     .is_some_and(|kind| kind == "reasoning")
                 {
-                    self.reasoning.push(item.clone());
+                    self.keep_reasoning(item);
                 }
             }
         }
@@ -987,11 +1006,27 @@ mod tests {
     #[test]
     fn a_reasoning_item_is_retained_for_replay() {
         let (_, reducer) = reduce(&[
-            r#"{"type":"response.output_item.added","item":{"type":"reasoning","id":"rs_1","encrypted_content":"opaque"}}"#,
+            r#"{"type":"response.output_item.done","item":{"type":"reasoning","id":"rs_1","encrypted_content":"opaque"}}"#,
             r#"{"type":"response.completed","response":{"status":"completed","output":[]}}"#,
         ]);
         let replay = reducer.replay().expect("replay");
         assert!(replay.contains("opaque"));
+    }
+
+    #[test]
+    fn a_reasoning_item_reported_several_times_is_replayed_once() {
+        // Announced without its content, finished with it, and restated by
+        // the completion: the endpoint rejects a replay carrying it twice.
+        let (_, reducer) = reduce(&[
+            r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"reasoning","id":"rs_1","summary":[]}}"#,
+            r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"reasoning","id":"rs_1","summary":[],"encrypted_content":"opaque"}}"#,
+            r#"{"type":"response.completed","response":{"status":"completed","output":[{"type":"reasoning","id":"rs_1","summary":[],"encrypted_content":"opaque"}]}}"#,
+        ]);
+        let replay: Vec<serde_json::Value> =
+            serde_json::from_str(&reducer.replay().expect("replay")).expect("an array");
+        assert_eq!(replay.len(), 1, "{replay:?}");
+        assert_eq!(replay[0]["id"], "rs_1");
+        assert_eq!(replay[0]["encrypted_content"], "opaque");
     }
 
     #[test]
