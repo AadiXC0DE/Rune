@@ -617,6 +617,55 @@ fn a_truncated_stream_is_retried_rather_than_accepted() {
 }
 
 #[test]
+fn a_retried_step_tells_the_host_to_drop_what_it_streamed() {
+    // The failed attempt's text already reached the host, and the retry
+    // streams the answer again from the start. Without a restart between them
+    // a host shows the partial answer followed by the whole one.
+    let endpoint = MockEndpoint::start(vec![
+        Script::truncated("partial answer"),
+        Script::text("complete answer"),
+    ]);
+    let host = TestHost::new(endpoint);
+    let mut history = rune_agent::History::new();
+    history.push_user("hello");
+
+    let outcome = run_turn(&mut history, &host).expect("turn");
+
+    let events = host.events();
+    let restart = events
+        .iter()
+        .position(|event| matches!(event, Event::StepRestarted { step: 1 }))
+        .expect("the host was told the step restarted");
+    let streamed = |events: &[Event]| -> String {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                Event::TextDelta { delta } => Some(delta.as_str()),
+                _ => None,
+            })
+            .collect()
+    };
+    assert_eq!(streamed(&events[..restart]), "partial answer");
+    assert_eq!(streamed(&events[restart..]), outcome.text);
+}
+
+#[test]
+fn a_step_that_succeeds_first_time_is_never_restarted() {
+    let endpoint = MockEndpoint::start(vec![Script::text("done")]);
+    let host = TestHost::new(endpoint);
+    let mut history = rune_agent::History::new();
+    history.push_user("hello");
+
+    run_turn(&mut history, &host).expect("turn");
+    assert!(
+        !host
+            .events()
+            .iter()
+            .any(|event| matches!(event, Event::StepRestarted { .. }))
+    );
+}
+
+#[test]
 fn a_provider_rejection_is_not_retried() {
     let endpoint = MockEndpoint::start(vec![Script::Status {
         code: 401,

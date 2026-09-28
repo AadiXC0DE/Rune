@@ -273,9 +273,7 @@ impl Host for Session {
     }
 
     fn emit(&self, event: Event) {
-        if let Some(encoded) = encode(&event) {
-            self.bridge.emit(&encoded.to_string());
-        }
+        self.bridge.emit(&encode(&event).to_string());
     }
 
     fn execute(&self, name: &str, arguments: &serde_json::Value) -> Result<ToolOutput> {
@@ -353,9 +351,9 @@ impl Host for Session {
     }
 }
 
-/// Encodes an event for the page, or `None` for one the page does not draw.
-fn encode(event: &Event) -> Option<serde_json::Value> {
-    Some(match event {
+/// Encodes an event for the page.
+fn encode(event: &Event) -> serde_json::Value {
+    match event {
         Event::TurnStarted { step } => json!({ "kind": "step", "step": step }),
         Event::TextDelta { delta } => json!({ "kind": "text", "delta": delta }),
         Event::ReasoningDelta { delta } => json!({ "kind": "reasoning", "delta": delta }),
@@ -395,12 +393,9 @@ fn encode(event: &Event) -> Option<serde_json::Value> {
             // How full the context is, which the status line reports.
             "context_tokens": last_request.input_tokens,
         }),
-        #[allow(
-            unreachable_patterns,
-            reason = "the loop may report more than the page draws"
-        )]
-        _ => return None,
-    })
+        // The page drops what the failed attempt streamed, as the terminal does.
+        Event::StepRestarted { step } => json!({ "kind": "restarted", "step": step }),
+    }
 }
 
 /// Encodes a failed turn for the page.

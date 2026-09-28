@@ -878,6 +878,8 @@ fn run_one<W: Write + Send + 'static>(server: &Arc<Server<W>>, queued: Queued) {
         cancellation: cancellation.clone(),
         steering: snapshot.steering,
         tools: server.config.registry.all_schemas(),
+        answer: Mutex::default(),
+        thought: Mutex::default(),
     };
 
     let mut history = snapshot.history;
@@ -987,9 +989,28 @@ struct TurnHost<W: Write + Send + 'static> {
     cancellation: Cancellation,
     steering: SteeringQueue,
     tools: Vec<ToolSpec>,
+    /// Answer text of the running step, as the client has been sent it.
+    answer: Mutex<StreamedStep>,
+    /// Reasoning of the running step, as the client has been sent it.
+    thought: Mutex<StreamedStep>,
 }
 
 impl<W: Write + Send + 'static> TurnHost<W> {
+    /// Sends a streamed delta, leaving out what a restarted step repeats.
+    fn stream(&self, text: &Mutex<StreamedStep>, kind: &str, delta: &str) {
+        let chunk = match text.lock() {
+            Ok(mut text) => text.accept(delta),
+            Err(_) => Some(delta.to_owned()),
+        };
+        if let Some(chunk) = chunk {
+            self.server.send(&Message::Notification(message_chunk(
+                &self.session,
+                kind,
+                &chunk,
+            )));
+        }
+    }
+
     /// Reports a tool call to the client.
     fn announce(&self, call: &rune_agent::turn::PreparedCall) {
         let arguments: Value = serde_json::from_str(&call.arguments).unwrap_or(Value::Null);
@@ -1083,19 +1104,23 @@ impl<W: Write + Send + 'static> Host for TurnHost<W> {
 
     fn emit(&self, event: Event) {
         match event {
-            Event::TextDelta { delta } => {
-                self.server.send(&Message::Notification(message_chunk(
-                    &self.session,
-                    "agent_message_chunk",
-                    &delta,
-                )));
-            }
+            Event::TextDelta { delta } => self.stream(&self.answer, "agent_message_chunk", &delta),
             Event::ReasoningDelta { delta } => {
-                self.server.send(&Message::Notification(message_chunk(
-                    &self.session,
-                    "agent_thought_chunk",
-                    &delta,
-                )));
+                self.stream(&self.thought, "agent_thought_chunk", &delta);
+            }
+            Event::TurnStarted { .. } => {
+                for text in [&self.answer, &self.thought] {
+                    if let Ok(mut text) = text.lock() {
+                        text.begin();
+                    }
+                }
+            }
+            Event::StepRestarted { .. } => {
+                for text in [&self.answer, &self.thought] {
+                    if let Ok(mut text) = text.lock() {
+                        text.restart();
+                    }
+                }
             }
             Event::ToolStarted { call, .. } => self.announce(&call),
             Event::ToolFinished { call, is_error } => {
@@ -1124,7 +1149,7 @@ impl<W: Write + Send + 'static> Host for TurnHost<W> {
                     self.server.config.context_window,
                 )));
             }
-            Event::TurnStarted { .. } | Event::SteeringApplied { .. } => {}
+            Event::SteeringApplied { .. } => {}
         }
     }
 
@@ -1165,6 +1190,54 @@ impl<W: Write + Send + 'static> Host for TurnHost<W> {
 
     fn steering(&self) -> &SteeringQueue {
         &self.steering
+    }
+}
+
+/// The streamed text of one step, as the client has been sent it.
+///
+/// A client appends every chunk and cannot take one back. A step that restarts
+/// after a failed attempt streams its text again from the beginning, so the
+/// part of the retry the client already has is not sent a second time. A retry
+/// worded differently cannot remove the failed attempt's words either, so it is
+/// sent whole after a paragraph break, where it reads as a fresh start rather
+/// than being spliced into a sentence it never wrote.
+#[derive(Debug, Default)]
+struct StreamedStep {
+    /// Text sent to the client during this step.
+    sent: String,
+    /// Text of a retried attempt, while it still repeats `sent`.
+    retry: Option<String>,
+}
+
+impl StreamedStep {
+    /// Starts a new step.
+    fn begin(&mut self) {
+        self.sent.clear();
+        self.retry = None;
+    }
+
+    /// Starts another attempt at the current step.
+    fn restart(&mut self) {
+        self.retry = Some(String::new());
+    }
+
+    /// Takes a delta and returns what, if anything, to send for it.
+    fn accept(&mut self, delta: &str) -> Option<String> {
+        let Some(retry) = self.retry.as_mut() else {
+            self.sent.push_str(delta);
+            return Some(delta.to_owned());
+        };
+        retry.push_str(delta);
+        if self.sent.starts_with(retry.as_str()) {
+            return None;
+        }
+        let fresh = match retry.strip_prefix(self.sent.as_str()) {
+            Some(beyond) => beyond.to_owned(),
+            None => format!("\n\n{retry}"),
+        };
+        self.sent.push_str(&fresh);
+        self.retry = None;
+        Some(fresh)
     }
 }
 
@@ -1393,5 +1466,42 @@ mod tests {
         };
         assert_eq!(reported_tokens(usage), 15);
         assert_eq!(reported_tokens(Usage::default()), 0);
+    }
+
+    #[test]
+    fn a_retry_that_repeats_the_failed_attempt_sends_only_what_is_new() {
+        let mut step = StreamedStep::default();
+        assert_eq!(step.accept("Hello ").as_deref(), Some("Hello "));
+        assert_eq!(step.accept("wor").as_deref(), Some("wor"));
+        step.restart();
+        assert_eq!(step.accept("Hello "), None);
+        assert_eq!(step.accept("world").as_deref(), Some("ld"));
+        assert_eq!(step.accept("!").as_deref(), Some("!"));
+    }
+
+    #[test]
+    fn a_retry_worded_differently_starts_a_new_paragraph() {
+        let mut step = StreamedStep::default();
+        step.accept("the file has");
+        step.restart();
+        assert_eq!(step.accept("the file "), None);
+        assert_eq!(step.accept("holds").as_deref(), Some("\n\nthe file holds"));
+        assert_eq!(step.accept(" two").as_deref(), Some(" two"));
+    }
+
+    #[test]
+    fn a_retry_after_a_failure_that_sent_nothing_is_sent_as_it_arrives() {
+        let mut step = StreamedStep::default();
+        step.restart();
+        assert_eq!(step.accept("first").as_deref(), Some("first"));
+        assert_eq!(step.accept(" words").as_deref(), Some(" words"));
+    }
+
+    #[test]
+    fn a_new_step_is_sent_whole() {
+        let mut step = StreamedStep::default();
+        step.accept("same words");
+        step.begin();
+        assert_eq!(step.accept("same words").as_deref(), Some("same words"));
     }
 }

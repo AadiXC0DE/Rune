@@ -102,6 +102,15 @@ pub enum Event {
         /// Step index, starting at one.
         step: u32,
     },
+    /// A step's request failed and is being sent again.
+    ///
+    /// The retry streams its answer from the beginning, so the text and
+    /// reasoning already reported for this step belong to the failed attempt
+    /// and should be dropped.
+    StepRestarted {
+        /// Step index, starting at one.
+        step: u32,
+    },
     /// Assistant text arrived.
     TextDelta {
         /// The appended text.
@@ -337,10 +346,10 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
             client.as_ref(),
             host,
             history,
+            steps,
             head_timeout,
             max_attempts,
             &cancellation,
-            steering,
         )?;
 
         usage = usage.merge_sum(outcome.usage);
@@ -516,11 +525,12 @@ fn stream_with_retry(
     client: &dyn Fetch,
     host: &dyn Host,
     history: &History,
+    step: u32,
     head_timeout: Duration,
     max_attempts: usize,
     cancellation: &Cancellation,
-    steering: &SteeringQueue,
 ) -> Result<(StreamOutcome, bool)> {
+    let steering = host.steering();
     let mut attempt = 0_usize;
     let mut last: Option<RuneError> = None;
 
@@ -531,6 +541,9 @@ fn stream_with_retry(
             return Err(last.unwrap_or_else(|| {
                 RuneError::new(ErrorCode::TransportFailure, "the request did not succeed")
             }));
+        }
+        if attempt > 0 {
+            host.emit(Event::StepRestarted { step });
         }
         attempt = attempt.saturating_add(1);
 

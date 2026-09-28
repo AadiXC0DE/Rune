@@ -326,6 +326,7 @@ impl Host for SessionHost {
                 }
                 self.draw_stream();
             }
+            Event::StepRestarted { .. } => self.clear_streaming(),
             _ => {}
         }
         if let Ok(mut events) = self.events.lock() {
@@ -3025,6 +3026,22 @@ mod tests {
             written.contains("streamed"),
             "the delta was not drawn when it arrived: {written:?}"
         );
+    }
+
+    #[test]
+    fn a_restarted_step_drops_the_text_of_the_failed_attempt() {
+        // The retry streams the answer again from the start, so keeping the
+        // failed attempt's text would show the answer's opening twice.
+        let host = test_host();
+        host.emit(Event::TextDelta {
+            delta: "partial".to_owned(),
+        });
+        host.emit(Event::StepRestarted { step: 1 });
+        host.emit(Event::TextDelta {
+            delta: "complete".to_owned(),
+        });
+        let answer = host.streaming.lock().expect("lock").answer.clone();
+        assert_eq!(answer, "complete");
     }
 
     #[test]
