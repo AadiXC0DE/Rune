@@ -377,8 +377,7 @@ impl Reducer {
             .get("finish_reason")
             .and_then(serde_json::Value::as_str)
         {
-            let mapped = map_finish_reason(reason)?;
-            self.finish_reason = Some(mapped);
+            self.finish_reason = Some(map_finish_reason(reason));
             self.saw_terminal = true;
         }
 
@@ -690,15 +689,21 @@ fn parse_usage(value: &serde_json::Value) -> Usage {
 }
 
 /// Maps a dialect finish reason onto the normalized one.
-fn map_finish_reason(raw: &str) -> Result<FinishReason> {
+///
+/// Compatible servers extend the vocabulary, and the reason arrives after the
+/// answer has streamed in full, so a reason this build does not know is taken
+/// as a natural stop rather than a failure that would discard the answer.
+fn map_finish_reason(raw: &str) -> FinishReason {
     match raw {
-        "stop" => Ok(FinishReason::Stop),
-        "tool_calls" | "function_call" => Ok(FinishReason::ToolCalls),
-        "length" => Ok(FinishReason::MaxTokens),
-        "content_filter" => Ok(FinishReason::ContentFilter),
-        other => Err(protocol_violation(format!(
-            "the stream reported an unknown finish reason `{other}`"
-        ))),
+        "tool_calls" | "function_call" => FinishReason::ToolCalls,
+        "length" | "model_length" | "max_tokens" | "model_context_window_exceeded" => {
+            FinishReason::MaxTokens
+        }
+        "content_filter" => FinishReason::ContentFilter,
+        // A gateway that loses its upstream mid-answer says so here, and the
+        // answer it ended is not a complete one.
+        "error" => FinishReason::ProviderError,
+        _ => FinishReason::Stop,
     }
 }
 
@@ -1208,16 +1213,37 @@ mod tests {
     }
 
     #[test]
-    fn an_unknown_finish_reason_is_rejected() {
-        let mut reducer = Reducer::new();
-        let mut events = Vec::new();
-        let err = reducer
-            .apply(
-                Some(r#"{"choices":[{"index":0,"delta":{},"finish_reason":"sideways"}]}"#),
-                &mut events,
-            )
-            .expect_err("rejected");
-        assert!(err.message().contains("sideways"));
+    fn an_unknown_finish_reason_keeps_the_answer() {
+        let (events, reducer) = reduce(&[
+            r#"{"choices":[{"index":0,"delta":{"content":"done"}}]}"#,
+            r#"{"choices":[{"index":0,"delta":{},"finish_reason":"sideways"}]}"#,
+            "[DONE]",
+        ]);
+        assert_eq!(reducer.finish().expect("finished"), FinishReason::Stop);
+        assert!(events.contains(&ProviderEvent::TextDelta {
+            delta: "done".to_owned()
+        }));
+    }
+
+    #[test]
+    fn a_model_length_finish_reason_maps_to_the_token_limit() {
+        let (_, reducer) = reduce(&[
+            r#"{"choices":[{"index":0,"delta":{"content":"x"},"finish_reason":"model_length"}]}"#,
+            "[DONE]",
+        ]);
+        assert_eq!(reducer.finish().expect("finished"), FinishReason::MaxTokens);
+    }
+
+    #[test]
+    fn an_error_finish_reason_is_not_a_success() {
+        let (_, reducer) = reduce(&[
+            r#"{"choices":[{"index":0,"delta":{"content":"par"},"finish_reason":"error"}]}"#,
+            "[DONE]",
+        ]);
+        assert_eq!(
+            reducer.finish().expect("finished"),
+            FinishReason::ProviderError
+        );
     }
 
     #[test]
