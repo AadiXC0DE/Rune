@@ -313,6 +313,61 @@ pub fn protocol_violation(detail: impl Into<String>) -> RuneError {
     RuneError::new(ErrorCode::ProtocolViolation, detail)
 }
 
+/// Names a provider gives a transient failure, matched within its error type.
+const TRANSIENT_FAILURES: &[&str] = &[
+    "overloaded",
+    "rate_limit",
+    "api_error",
+    "server_error",
+    "internal",
+    "unavailable",
+    "timeout",
+];
+
+/// Builds the error for a failure the provider reported inside a stream.
+///
+/// An overloaded endpoint, a server fault, or a rate limit is as transient
+/// when it arrives mid-stream as when it arrives as a status, so it is reported
+/// as a rejection the transport retries. Anything else, such as a request the
+/// endpoint refused, fails the same way when repeated and is reported as an
+/// invalid request.
+#[must_use]
+pub fn stream_failure(error: &serde_json::Value, fallback: &str) -> RuneError {
+    let message = error
+        .get("message")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| error.as_str())
+        .unwrap_or(fallback);
+    let code = if is_transient_failure(error) {
+        ErrorCode::RequestRejected
+    } else {
+        ErrorCode::InvalidField
+    };
+    RuneError::new(code, message.to_owned())
+}
+
+/// Returns true when a reported failure names a transient condition.
+///
+/// Endpoints put the name under `type`, `code`, or `status`, and some give an
+/// HTTP status there instead, so every one of them is read.
+fn is_transient_failure(error: &serde_json::Value) -> bool {
+    let transient_status = |status: u64| status == 429 || (500..600).contains(&status);
+    ["type", "code", "status"]
+        .iter()
+        .filter_map(|key| error.get(*key))
+        .any(|value| match value {
+            serde_json::Value::Number(number) => number.as_u64().is_some_and(transient_status),
+            serde_json::Value::String(name) => {
+                let lower = name.to_ascii_lowercase();
+                lower.parse::<u64>().is_ok_and(transient_status)
+                    || TRANSIENT_FAILURES
+                        .iter()
+                        .any(|transient| lower.contains(transient))
+            }
+            _ => false,
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -461,5 +516,46 @@ mod tests {
         let err = incomplete_stream();
         assert_eq!(err.code(), ErrorCode::IncompleteStream);
         assert!(err.detail().hint.is_some());
+    }
+
+    #[test]
+    fn a_transient_stream_failure_is_retried() {
+        for error in [
+            serde_json::json!({ "type": "overloaded_error", "message": "Overloaded" }),
+            serde_json::json!({ "type": "api_error", "message": "Internal server error" }),
+            serde_json::json!({ "type": "rate_limit_error", "message": "slow down" }),
+            serde_json::json!({ "code": "server_error", "message": "try again" }),
+            serde_json::json!({ "code": 502, "message": "Provider disconnected" }),
+            serde_json::json!({ "code": 503, "status": "UNAVAILABLE", "message": "busy" }),
+        ] {
+            let err = crate::error::NetError::from(stream_failure(&error, "failed"));
+            assert!(err.is_retryable(), "{error} was not retried");
+            assert_eq!(err.kind(), crate::error::FailureKind::ProviderError);
+        }
+    }
+
+    #[test]
+    fn a_refused_stream_request_is_not_retried() {
+        for error in [
+            serde_json::json!({ "type": "invalid_request_error", "message": "bad field" }),
+            serde_json::json!({ "code": "invalid_prompt", "message": "refused" }),
+            serde_json::json!({ "code": 400, "message": "bad" }),
+            serde_json::json!({ "message": "no type given" }),
+            serde_json::json!("a bare explanation"),
+        ] {
+            let err = crate::error::NetError::from(stream_failure(&error, "failed"));
+            assert!(!err.is_retryable(), "{error} was retried");
+            assert_eq!(err.kind(), crate::error::FailureKind::InvalidRequest);
+        }
+    }
+
+    #[test]
+    fn a_stream_failure_keeps_the_provider_explanation() {
+        let explained = stream_failure(&serde_json::json!({ "message": "why" }), "fallback");
+        assert_eq!(explained.message(), "why");
+        let bare = stream_failure(&serde_json::json!("plain text"), "fallback");
+        assert_eq!(bare.message(), "plain text");
+        let silent = stream_failure(&serde_json::Value::Null, "fallback");
+        assert_eq!(silent.message(), "fallback");
     }
 }

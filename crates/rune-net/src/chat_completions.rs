@@ -5,13 +5,14 @@
 //! endpoint, credential, and HTTP client are supplied by the caller.
 
 use rune_core::config::Effort;
-use rune_core::error::{ErrorCode, Result, RuneError};
+use rune_core::error::{Result, RuneError};
 use rune_core::id::ToolCallId;
 
 use crate::message::{ContentPart, Message, Role};
 use crate::provider::{Provider, RequestPlan};
 use crate::stream::{
     FinishReason, Limit, StreamReducer, Usage, incomplete_stream, protocol_violation,
+    stream_failure,
 };
 
 /// Dialect name.
@@ -333,14 +334,7 @@ impl Reducer {
 
         // An explicit error frame is a provider failure, not a decode problem.
         if let Some(error) = value.get("error") {
-            let message = error
-                .get("message")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("the provider reported an error");
-            return Err(RuneError::new(
-                ErrorCode::RequestRejected,
-                message.to_owned(),
-            ));
+            return Err(stream_failure(error, "the provider reported an error"));
         }
 
         if let Some(usage) = value.get("usage").filter(|usage| !usage.is_null()) {
@@ -714,6 +708,7 @@ mod tests {
     use crate::message::ToolSpec;
     use crate::provider::ToolChoice;
     use crate::stream::ProviderEvent;
+    use rune_core::error::ErrorCode;
 
     fn plan_with_user(text: &str) -> RequestPlan {
         let mut plan = RequestPlan::new("test/model");
@@ -1258,6 +1253,42 @@ mod tests {
             .expect_err("rejected");
         assert_eq!(err.code(), ErrorCode::RequestRejected);
         assert!(err.message().contains("rate limited"));
+    }
+
+    #[test]
+    fn a_mid_stream_upstream_failure_is_retried() {
+        // A gateway reports an upstream that dropped mid-answer with a status
+        // number in place of a type, alongside an error finish.
+        let mut reducer = Reducer::new();
+        let mut events = Vec::new();
+        reducer
+            .apply(
+                Some(r#"{"choices":[{"index":0,"delta":{"content":"par"}}]}"#),
+                &mut events,
+            )
+            .expect("content");
+        let err = reducer
+            .apply(
+                Some(r#"{"error":{"code":502,"message":"Provider disconnected"},"choices":[{"index":0,"delta":{"content":""},"finish_reason":"error"}]}"#),
+                &mut events,
+            )
+            .expect_err("rejected");
+        let err = crate::error::NetError::from(err);
+        assert!(err.is_retryable(), "{err}");
+        assert!(err.message().contains("Provider disconnected"));
+    }
+
+    #[test]
+    fn an_invalid_request_error_frame_is_not_retried() {
+        let mut reducer = Reducer::new();
+        let mut events = Vec::new();
+        let err = reducer
+            .apply(
+                Some(r#"{"error":{"message":"unknown parameter","type":"invalid_request_error"}}"#),
+                &mut events,
+            )
+            .expect_err("rejected");
+        assert!(!crate::error::NetError::from(err).is_retryable());
     }
 
     #[test]

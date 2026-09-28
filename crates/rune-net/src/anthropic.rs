@@ -6,13 +6,14 @@
 //! field, tool calls and results are content blocks, and a response may carry
 //! thinking blocks that must be replayed with the assistant turn.
 
-use rune_core::error::{ErrorCode, Result, RuneError};
+use rune_core::error::{Result, RuneError};
 use rune_core::id::ToolCallId;
 
 use crate::message::{ContentPart, Message, Role};
 use crate::provider::{Provider, RequestPlan, ToolChoice};
 use crate::stream::{
     FinishReason, Limit, StreamReducer, Usage, incomplete_stream, protocol_violation,
+    stream_failure,
 };
 
 /// Dialect name.
@@ -356,17 +357,10 @@ impl Reducer {
                 self.finished = true;
                 Ok(())
             }
-            "error" => {
-                let message = value
-                    .get("error")
-                    .and_then(|error| error.get("message"))
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("the provider reported an error");
-                Err(RuneError::new(
-                    ErrorCode::RequestRejected,
-                    message.to_owned(),
-                ))
-            }
+            "error" => Err(stream_failure(
+                value.get("error").unwrap_or(&serde_json::Value::Null),
+                "the provider reported an error",
+            )),
             "ping" => Ok(()),
             // Unknown events are ignored so a new one does not break an old client.
             _ => Ok(()),
@@ -655,6 +649,7 @@ mod tests {
     use super::*;
     use crate::message::ToolSpec;
     use crate::stream::ProviderEvent;
+    use rune_core::error::ErrorCode;
 
     fn plan_with_user(text: &str) -> RequestPlan {
         let mut plan = RequestPlan::new("claude-test");
@@ -1090,6 +1085,37 @@ mod tests {
             .expect_err("rejected");
         assert_eq!(err.code(), ErrorCode::RequestRejected);
         assert!(err.message().contains("overloaded"));
+    }
+
+    #[test]
+    fn an_overloaded_or_failing_endpoint_is_retried() {
+        for kind in ["overloaded_error", "api_error", "rate_limit_error"] {
+            let mut reducer = Reducer::new();
+            let mut events = Vec::new();
+            let frame = format!(r#"{{"type":"error","error":{{"type":"{kind}","message":"m"}}}}"#);
+            let err = reducer
+                .apply(Some(&frame), &mut events)
+                .expect_err("rejected");
+            let err = crate::error::NetError::from(err);
+            assert!(err.is_retryable(), "{kind} was not retried");
+        }
+    }
+
+    #[test]
+    fn an_invalid_request_reported_in_the_stream_is_not_retried() {
+        let mut reducer = Reducer::new();
+        let mut events = Vec::new();
+        let err = reducer
+            .apply(
+                Some(
+                    r#"{"type":"error","error":{"type":"invalid_request_error","message":"bad"}}"#,
+                ),
+                &mut events,
+            )
+            .expect_err("rejected");
+        let err = crate::error::NetError::from(err);
+        assert!(!err.is_retryable());
+        assert_eq!(err.message(), "bad");
     }
 
     #[test]

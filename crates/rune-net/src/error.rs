@@ -388,12 +388,15 @@ impl From<serde_json::Error> for NetError {
 
 impl From<RuneError> for NetError {
     fn from(err: RuneError) -> Self {
+        // Each code maps back onto the kind whose `code` it is, so a failure a
+        // reducer reports keeps the retry decision its kind carries.
         let kind = match err.code() {
             ErrorCode::IncompleteStream => FailureKind::IncompleteStream,
             ErrorCode::ProtocolViolation => FailureKind::ProtocolViolation,
             ErrorCode::Timeout => FailureKind::Timeout,
             ErrorCode::Cancelled => FailureKind::Cancelled,
-            ErrorCode::TooLarge => FailureKind::InvalidRequest,
+            ErrorCode::TooLarge | ErrorCode::InvalidField => FailureKind::InvalidRequest,
+            ErrorCode::RequestRejected => FailureKind::ProviderError,
             _ => FailureKind::Decode,
         };
         Self::new(kind, err.message().to_owned())
@@ -577,5 +580,20 @@ mod tests {
             NetError::from(incomplete_error()).kind(),
             FailureKind::IncompleteStream
         );
+    }
+
+    #[test]
+    fn a_workspace_error_maps_back_onto_the_kind_it_came_from() {
+        for kind in [
+            FailureKind::InvalidRequest,
+            FailureKind::IncompleteStream,
+            FailureKind::ProtocolViolation,
+            FailureKind::ProviderError,
+            FailureKind::Timeout,
+            FailureKind::Cancelled,
+        ] {
+            let converted = NetError::from(RuneError::new(kind.code(), "failed"));
+            assert_eq!(converted.kind(), kind);
+        }
     }
 }
