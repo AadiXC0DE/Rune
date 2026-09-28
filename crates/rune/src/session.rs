@@ -313,16 +313,22 @@ impl Host for SessionHost {
         // Text is accumulated as it arrives and drawn straight away, which is
         // what makes an answer appear while it is being written rather than
         // after the whole response has been received.
+        //
+        // Each delta is sanitized on its own before it is kept. Model output can
+        // carry sequences a terminal acts on, such as a clipboard write or a
+        // screen clear, and the rows drawn from this text reach the terminal
+        // as they are. A sequence split across two deltas loses its introducer
+        // in the first, so what arrives in the second is plain text.
         match &event {
             Event::TextDelta { delta } => {
                 if let Ok(mut streaming) = self.streaming.lock() {
-                    streaming.answer.push_str(delta);
+                    streaming.answer.push_str(&transcript::sanitize(delta));
                 }
                 self.draw_stream();
             }
             Event::ReasoningDelta { delta } => {
                 if let Ok(mut streaming) = self.streaming.lock() {
-                    streaming.reasoning.push_str(delta);
+                    streaming.reasoning.push_str(&transcript::sanitize(delta));
                 }
                 self.draw_stream();
             }
@@ -3042,6 +3048,56 @@ mod tests {
         });
         let answer = host.streaming.lock().expect("lock").answer.clone();
         assert_eq!(answer, "complete");
+    }
+
+    #[test]
+    fn a_streamed_delta_cannot_drive_the_terminal() {
+        // Streamed rows reach the terminal as they are, so a clipboard write, a
+        // screen clear, or a switch to the alternate screen in model output
+        // would act on the reader's terminal mid-answer. Both lanes are checked,
+        // including a sequence whose introducer arrives in an earlier delta.
+        let sink: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+        let host = test_host();
+        if let Ok(mut slot) = host.live_out.lock() {
+            *slot = Some(Arc::new(Mutex::new(SharedSink(Arc::clone(&sink)))));
+        }
+
+        let deltas = [
+            "before \u{1b}]52;c;SGVsbG8=\u{7} after",
+            "wiped\u{1b}[2J",
+            "\u{1b}[?1049h alternate",
+            "split \u{1b}",
+            "]52;c;c3BsaXQ=\u{7} tail",
+            "\u{9d}52;c;YzE=\u{9c} c1",
+        ];
+        for delta in deltas {
+            host.emit(Event::ReasoningDelta {
+                delta: delta.to_owned(),
+            });
+            host.emit(Event::TextDelta {
+                delta: delta.to_owned(),
+            });
+        }
+
+        let written = String::from_utf8_lossy(&sink.lock().expect("lock")).into_owned();
+        for forbidden in ["\u{1b}]", "\u{1b}[2J", "\u{1b}[?1049", "\u{9d}", "\u{9c}"] {
+            assert!(
+                !written.contains(forbidden),
+                "{forbidden:?} reached the terminal: {written:?}"
+            );
+        }
+        let streaming = host.streaming.lock().expect("lock");
+        for lane in [&streaming.answer, &streaming.reasoning] {
+            assert!(!lane.contains('\u{1b}'), "an escape was kept: {lane:?}");
+            assert!(
+                lane.contains("after"),
+                "the text around it was lost: {lane:?}"
+            );
+            assert!(
+                lane.contains("tail"),
+                "the text around it was lost: {lane:?}"
+            );
+        }
     }
 
     #[test]
