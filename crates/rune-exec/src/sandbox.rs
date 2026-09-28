@@ -1,8 +1,8 @@
 //! Capability restriction for command execution.
 //!
 //! An approved command still gets to write, so the sandbox is what keeps it
-//! inside the workspace and away from the credential locations under the home
-//! directory. Each backend turns a prepared command into the argv that actually
+//! inside the workspace, away from the credential locations under the home
+//! directory, and out of the repository files git later runs unsandboxed. Each backend turns a prepared command into the argv that actually
 //! runs, and reports whether it can enforce the restriction on this host.
 //!
 //! The module never degrades quietly. A backend that is absent, or that cannot
@@ -75,6 +75,14 @@ pub const CREDENTIAL_PATHS: [&str; 12] = [
     ".config/rune",
     ".local/state/rune",
 ];
+
+/// Paths inside a writable root that stay read-only.
+///
+/// Git runs a repository's hooks and configured helpers outside any sandbox: a
+/// hook on the next commit, a diff driver or file system monitor on the next
+/// `git status`. A command able to write either would reach past the sandbox
+/// the next time anyone used git in that repository.
+pub const PROTECTED_REPOSITORY_PATHS: [&str; 2] = [".git/config", ".git/hooks"];
 
 /// Profile the macOS probe runs: it denies every write and nothing else.
 const PROBE_PROFILE: &str = "(version 1)(allow default)(deny file-write*)";
@@ -309,6 +317,55 @@ fn masked_paths(credentials: &[Utf8PathBuf], writable: &[Utf8PathBuf]) -> Vec<Ut
         .collect()
 }
 
+/// Returns the repository paths under the writable roots that stay read-only.
+///
+/// Only paths that exist are named, resolved the same way the roots are, since
+/// a rule about a missing path matches nothing and a `bwrap` bind of one fails.
+fn protected_paths(writable: &[Utf8PathBuf]) -> Vec<Utf8PathBuf> {
+    let mut paths = Vec::new();
+    for root in writable {
+        for relative in PROTECTED_REPOSITORY_PATHS {
+            let path = root.join(relative);
+            if let Ok(resolved) = path.canonicalize_utf8()
+                && !paths.contains(&resolved)
+            {
+                paths.push(resolved);
+            }
+        }
+    }
+    paths
+}
+
+/// Returns the temporary directories a command on macOS may write.
+///
+/// A compiler, `mktemp`, and most test runners write a scratch file before
+/// anything else, so refusing it fails the command before it does any work.
+/// Linux gives a command a private `/tmp` instead, which is why only the
+/// Seatbelt profile names these.
+fn temporary_roots() -> Vec<Utf8PathBuf> {
+    let mut roots: Vec<Utf8PathBuf> = Vec::new();
+    // `temp_dir` is named as well as `TMPDIR`: with the variable unset, a
+    // program asks the system for its per-user directory under /var/folders,
+    // which is where a compiler's scratch files land regardless.
+    let candidates = [
+        std::env::var("TMPDIR").ok(),
+        std::env::temp_dir().to_str().map(str::to_owned),
+        Some(String::from("/tmp")),
+    ];
+    for candidate in candidates.into_iter().flatten() {
+        if candidate.is_empty() {
+            continue;
+        }
+        if let Ok(resolved) = Utf8Path::new(&candidate).canonicalize_utf8()
+            && resolved.is_dir()
+            && !roots.contains(&resolved)
+        {
+            roots.push(resolved);
+        }
+    }
+    roots
+}
+
 /// Returns the Seatbelt rule that covers a resolved path.
 ///
 /// A file is named literally, where a subpath rule would also cover a directory
@@ -446,13 +503,17 @@ impl MacSandbox {
         let _ = writeln!(profile, "(version 1)");
         let _ = writeln!(profile, "(allow default)");
         let _ = writeln!(profile, "(deny file-write*)");
-        for resolved in &writable {
+        for resolved in writable.iter().chain(temporary_roots().iter()) {
             let _ = writeln!(profile, "(allow file-write* {})", operand(resolved)?);
         }
         // Redirection to these is not a way to change the machine, and denying
         // them breaks almost every command that prints.
         for device in ["/dev/null", "/dev/stdout", "/dev/stderr", "/dev/tty"] {
             let _ = writeln!(profile, "(allow file-write* (literal \"{device}\"))");
+        }
+        // After the grants, so the deny is the rule that decides for these.
+        for protected in protected_paths(&writable) {
+            let _ = writeln!(profile, "(deny file-write* {})", operand(&protected)?);
         }
         // Reading stays open everywhere else, so a command still reads its own
         // libraries and the files it was pointed at. The roots it works in are
@@ -465,8 +526,13 @@ impl MacSandbox {
         for resolved in &writable {
             let _ = writeln!(profile, "(allow file-read* {})", operand(resolved)?);
         }
+        // Writes are denied as well as reads. When the home directory is the
+        // workspace, a credential location sits under a writable grant, and a
+        // command could otherwise add a key to `authorized_keys` or a
+        // `ProxyCommand` to the SSH configuration without reading either.
         for credential in masked_paths(credentials, &writable) {
             let _ = writeln!(profile, "(deny file-read* {})", operand(&credential)?);
+            let _ = writeln!(profile, "(deny file-write* {})", operand(&credential)?);
         }
         if !policy.network {
             let _ = writeln!(profile, "(deny network*)");
@@ -619,6 +685,13 @@ impl LinuxSandbox {
             argv.push(resolved.as_str().to_owned());
             argv.push(resolved.as_str().to_owned());
         }
+        // Bound again read-only after the writable binds, so the later mount is
+        // the one a command sees at these paths.
+        for protected in protected_paths(&writable) {
+            argv.push(String::from("--ro-bind"));
+            argv.push(protected.as_str().to_owned());
+            argv.push(protected.as_str().to_owned());
+        }
         // The credential locations are covered last, so the mask is the rule
         // that applies to a path a writable bind would otherwise expose, which
         // is the case when the home directory is itself the workspace.
@@ -761,6 +834,20 @@ mod tests {
         let path = std::env::var("PATH").unwrap_or_else(|_| String::from("/usr/bin:/bin"));
         environment.insert(String::from("PATH"), path);
         environment
+    }
+
+    /// Returns a directory outside the temporary roots a command may write,
+    /// under the build's own output directory.
+    #[cfg(target_os = "macos")]
+    fn outside_temporary_roots() -> (TempDir, Utf8PathBuf) {
+        let parent = Utf8Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/sandbox-tests");
+        std::fs::create_dir_all(&parent).expect("test parent");
+        let dir = tempfile::tempdir_in(&parent).expect("tempdir");
+        let path = Utf8PathBuf::from_path_buf(dir.path().to_path_buf())
+            .expect("utf8")
+            .canonicalize_utf8()
+            .expect("resolved");
+        (dir, path)
     }
 
     /// Returns a policy over one workspace.
@@ -1033,7 +1120,8 @@ mod tests {
             return;
         }
         let (_dir, dir) = tempdir();
-        let (_outside, outside) = tempdir();
+        // Not under the temporary directory, which a command may write.
+        let (_outside, outside) = outside_temporary_roots();
         let outside_file = outside.join("escaped.txt");
         let command = format!("/bin/sh -c 'echo escaped > {outside_file}'");
         let prepared = prepare(&command, dir.as_path(), None, environment()).expect("prepare");
@@ -1349,5 +1437,139 @@ mod tests {
             CREDENTIAL_PATHS.contains(&state.as_str()),
             "`{state}` holds the credential file and is not masked"
         );
+    }
+
+    #[test]
+    fn a_repository_keeps_its_configuration_and_hooks_read_only() {
+        let (_guard, workspace) = tempdir();
+        std::fs::create_dir_all(workspace.join(".git/hooks")).expect("hooks");
+        std::fs::write(workspace.join(".git/config"), "[core]\n").expect("config");
+        let resolved = workspace.canonicalize_utf8().expect("workspace");
+        let protected = protected_paths(std::slice::from_ref(&resolved));
+        assert_eq!(
+            protected,
+            vec![resolved.join(".git/config"), resolved.join(".git/hooks")]
+        );
+        // A workspace that is not a repository has nothing to protect.
+        let (_other, plain) = tempdir();
+        let plain = plain.canonicalize_utf8().expect("plain");
+        assert!(protected_paths(&[plain]).is_empty());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_sandboxed_command_can_write_a_temporary_file_but_not_git_hooks() {
+        // A compiler and `mktemp` write to the temporary directory before they
+        // do anything else, so refusing it fails ordinary work. The hooks
+        // directory stays closed, because git runs what is in it unsandboxed.
+        let sandbox = MacSandbox::detect();
+        if !sandbox.support().is_full() {
+            return;
+        }
+        let (_guard, workspace) = tempdir();
+        std::fs::create_dir_all(workspace.join(".git/hooks")).expect("hooks");
+        std::fs::write(workspace.join(".git/config"), "[core]\n").expect("config");
+        let policy = policy(workspace.as_path());
+        for (command, permitted) in [
+            ("mktemp", true),
+            ("echo x > .git/hooks/pre-commit", false),
+            ("echo x >> .git/config", false),
+            ("echo x > kept.txt", true),
+        ] {
+            let prepared = prepare(
+                command,
+                workspace.as_path(),
+                None,
+                environment_with_tmpdir(),
+            )
+            .expect("prepare");
+            let wrapped = sandbox.wrap(&prepared, &policy, false).expect("wrap");
+            let outcome = run(&wrapped, Duration::from_secs(20), &never).expect("run");
+            assert_eq!(
+                outcome.exit.is_success(),
+                permitted,
+                "`{command}` produced {outcome:?}"
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_credential_under_a_writable_home_cannot_be_written() {
+        // When the home directory is the workspace, the credential locations
+        // sit under a writable grant. A command must still not be able to add
+        // a key to them.
+        let sandbox = MacSandbox::detect();
+        if !sandbox.support().is_full() {
+            return;
+        }
+        let (_home_guard, home) = credential_home();
+        let profile = profile_for(&home, &home);
+        let target = home.join(".ssh/authorized_keys");
+        let prepared = prepare(
+            &format!("echo planted >> {target}"),
+            home.as_path(),
+            None,
+            environment(),
+        )
+        .expect("prepare");
+        let mut argv = vec![String::from(SEATBELT_TOOL), String::from("-p"), profile];
+        argv.extend(prepared.argv.iter().cloned());
+        let wrapped = PreparedCommand {
+            argv,
+            ..prepared.clone()
+        };
+        let outcome = run(&wrapped, Duration::from_secs(20), &never).expect("run");
+        assert!(!outcome.exit.is_success(), "{outcome:?}");
+        assert!(
+            !target.exists(),
+            "a key was planted under the credential path"
+        );
+    }
+
+    /// Returns the test environment with this process's temporary directory,
+    /// which is where `mktemp` writes.
+    #[cfg(target_os = "macos")]
+    fn environment_with_tmpdir() -> BTreeMap<String, String> {
+        let mut environment = environment();
+        if let Ok(tmpdir) = std::env::var("TMPDIR") {
+            environment.insert(String::from("TMPDIR"), tmpdir);
+        }
+        environment
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_linux_argv_binds_repository_hooks_read_only_after_the_workspace() {
+        let (_dir, dir) = tempdir();
+        std::fs::create_dir_all(dir.join(".git/hooks")).expect("hooks");
+        std::fs::write(dir.join(".git/config"), "[core]\n").expect("config");
+        let sandbox = LinuxSandbox::with_helper(Utf8PathBuf::from("/usr/bin/bwrap"));
+        let prepared = prepare("echo hello", dir.as_path(), None, environment()).expect("prepare");
+        let wrapped = sandbox
+            .wrap(&prepared, &policy(dir.as_path()), false)
+            .expect("wrap");
+        let resolved = dir.canonicalize_utf8().expect("resolved");
+        let bind = wrapped
+            .argv
+            .windows(3)
+            .position(|window| window[0] == "--bind" && window[1] == resolved.as_str())
+            .expect("the workspace bind");
+        for relative in PROTECTED_REPOSITORY_PATHS {
+            let path = resolved.join(relative);
+            let read_only = wrapped
+                .argv
+                .windows(3)
+                .position(|window| {
+                    window[0] == "--ro-bind"
+                        && window[1] == path.as_str()
+                        && window[2] == path.as_str()
+                })
+                .unwrap_or_else(|| panic!("no read-only bind for {path}: {:?}", wrapped.argv));
+            assert!(
+                read_only > bind,
+                "{path} is bound before the workspace, so it is writable"
+            );
+        }
     }
 }
