@@ -13,7 +13,7 @@
 use std::collections::VecDeque;
 use std::fmt::Write as _;
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rune_core::budget::{BudgetSet, LimitName};
 use rune_core::error::{ErrorCode, Result, RuneError};
@@ -80,25 +80,27 @@ fn no_transport(tool: &str) -> RuneError {
 /// One response from a fetch backend.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Fetched {
-    /// HTTP status the final response carried.
+    /// HTTP status the response carried.
     pub status: u16,
     /// Media type as reported, parameters included.
     pub content_type: String,
     /// Response body.
     pub body: Vec<u8>,
-    /// Every URL the backend followed, in order, excluding the requested one.
-    pub redirects: Vec<String>,
+    /// The `Location` header, when the response carried one.
+    pub location: Option<String>,
 }
 
 /// Fetches one URL.
 ///
-/// The implementation owns the connection, the TLS configuration, and the
-/// redirect policy; the tool owns the bounds and the refusals. That split is
-/// what lets a test drive the tool without a socket.
+/// The implementation owns the connection and the TLS configuration; the tool
+/// owns the bounds, the refusals, and the redirects. A backend returns a
+/// redirect as it is rather than following it, so the tool can refuse an
+/// address on the chain before it is requested. That split is also what lets
+/// a test drive the tool without a socket.
 pub trait FetchBackend: Send + Sync {
-    /// Performs one request.
+    /// Performs one request, without following a redirect.
     ///
-    /// Returns the final response, or a failure the tool reports to the model.
+    /// Returns the response, or a failure the tool reports to the model.
     fn get(&self, url: &str, timeout: Duration) -> Result<Fetched>;
 }
 
@@ -337,6 +339,55 @@ fn check_target(raw: &str, allow_private: bool) -> Result<Target> {
         url: trimmed.to_owned(),
         host,
     })
+}
+
+/// Returns where a redirect response points, when it is one to follow.
+fn redirect_location(fetched: &Fetched) -> Option<&str> {
+    if !matches!(fetched.status, 301 | 302 | 303 | 307 | 308) {
+        return None;
+    }
+    fetched
+        .location
+        .as_deref()
+        .map(str::trim)
+        .filter(|location| !location.is_empty())
+}
+
+/// Resolves a `Location` value against the URL that answered with it.
+///
+/// A location may be absolute, scheme relative, absolute on the same host, or
+/// relative to the current path, and each is turned into an absolute URL so
+/// the result can be checked like the one the caller asked for.
+fn resolve_location(base: &str, location: &str) -> String {
+    let has_scheme = location.split_once(':').is_some_and(|(scheme, _)| {
+        scheme.starts_with(|first: char| first.is_ascii_alphabetic())
+            && scheme
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.'))
+    });
+    if has_scheme {
+        return location.to_owned();
+    }
+
+    let (scheme, rest) = base.split_once("://").unwrap_or(("https", base));
+    if let Some(authority_relative) = location.strip_prefix("//") {
+        return format!("{scheme}://{authority_relative}");
+    }
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (authority, tail) = rest.split_at_checked(authority_end).unwrap_or((rest, ""));
+    let path = tail.split(['?', '#']).next().unwrap_or_default();
+
+    if location.starts_with('/') {
+        return format!("{scheme}://{authority}{location}");
+    }
+    if location.starts_with('?') {
+        let path = if path.is_empty() { "/" } else { path };
+        return format!("{scheme}://{authority}{path}{location}");
+    }
+    let directory = path
+        .rfind('/')
+        .map_or("/", |end| path.get(..=end).unwrap_or("/"));
+    format!("{scheme}://{authority}{directory}{location}")
 }
 
 /// Extracts the host from a URL authority, dropping user info and port.
@@ -1034,33 +1085,48 @@ impl Tool for WebFetch {
         let allow_private = bool_arg(arguments, "allow_private")?.unwrap_or(false);
         let target = check_target(raw, allow_private)?;
 
-        let fetched = match self.backend.get(&target.url, self.timeout) {
-            Ok(fetched) => fetched,
-            Err(error) => {
-                return Ok(backend_failure(
-                    &format!("`{}` could not be fetched", target.url),
-                    &error,
-                ));
+        // The chain is followed here rather than by the backend, and every hop
+        // passes the same refusals as the requested URL before it is
+        // requested, so a public page cannot redirect onto the local network.
+        // The timeout covers the whole chain.
+        let mut current = target.url.clone();
+        let mut redirects = 0_usize;
+        let mut remaining = self.timeout;
+        let fetched = loop {
+            let started = Instant::now();
+            let fetched = match self.backend.get(&current, remaining) {
+                Ok(fetched) => fetched,
+                Err(error) => {
+                    return Ok(backend_failure(
+                        &format!("`{current}` could not be fetched"),
+                        &error,
+                    ));
+                }
+            };
+            let Some(location) = redirect_location(&fetched) else {
+                break fetched;
+            };
+            if redirects >= self.redirects {
+                return Err(RuneError::new(
+                    ErrorCode::LimitExceeded,
+                    format!(
+                        "`{}` redirected more than the limit of {} times",
+                        target.url, self.redirects
+                    ),
+                )
+                .with_hint("raise the web fetch redirect limit to follow a longer chain"));
             }
+            current = check_target(&resolve_location(&current, location), allow_private)?.url;
+            redirects = redirects.saturating_add(1);
+            remaining = remaining.saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                return Ok(ToolOutput::failure(format!(
+                    "`{}` was still redirecting when the fetch timeout ran out",
+                    target.url
+                )));
+            }
+            context.check_cancelled()?;
         };
-
-        if fetched.redirects.len() > self.redirects {
-            return Err(RuneError::new(
-                ErrorCode::LimitExceeded,
-                format!(
-                    "`{}` followed {} redirects, the limit is {}",
-                    target.url,
-                    fetched.redirects.len(),
-                    self.redirects
-                ),
-            )
-            .with_hint("raise the web fetch redirect limit to follow a longer chain"));
-        }
-        // Every hop passes the same refusals as the requested URL, so a chain
-        // cannot walk onto the local network after the first check.
-        for hop in &fetched.redirects {
-            check_target(hop, allow_private)?;
-        }
 
         let Ok(text) = String::from_utf8(fetched.body) else {
             return Ok(ToolOutput::failure(format!(
@@ -1088,7 +1154,7 @@ impl Tool for WebFetch {
                 fetched.content_type.as_str()
             },
             total,
-            fetched.redirects.len(),
+            redirects,
             format.label()
         );
         if looks_like_instructions(&body) {
@@ -1519,7 +1585,7 @@ mod tests {
             status,
             content_type: content_type.to_owned(),
             body: body.as_bytes().to_vec(),
-            redirects: Vec::new(),
+            location: None,
         }
     }
 
@@ -1746,8 +1812,16 @@ mod tests {
         assert!(err.message().contains("credentials"), "{err}");
     }
 
-    #[test]
-    fn a_redirect_chain_past_the_cap_names_the_length() {
+    /// A redirect response pointing at a location.
+    fn redirect(status: u16, location: &str) -> Fetched {
+        Fetched {
+            location: Some(location.to_owned()),
+            ..fetched(status, "text/html", "")
+        }
+    }
+
+    /// Limits allowing at most two redirects.
+    fn two_redirects() -> BudgetSet {
         let mut limits = budget();
         limits
             .set(
@@ -1756,47 +1830,89 @@ mod tests {
                 rune_core::config::Layer::CommandLine,
             )
             .expect("in range");
+        limits
+    }
+
+    /// Returns the URLs a recorder was asked for, in order.
+    fn requested(backend: &RecordingBackend) -> Vec<String> {
+        backend.requests().into_iter().map(|(url, _)| url).collect()
+    }
+
+    #[test]
+    fn a_redirect_chain_past_the_cap_names_the_limit() {
         let backend = Arc::new(RecordingBackend::new());
-        let mut response = fetched(200, "text/plain", "landed");
-        response.redirects = vec![
-            "https://example.com/1".to_owned(),
-            "https://example.com/2".to_owned(),
-            "https://example.com/3".to_owned(),
-            "https://example.com/4".to_owned(),
-        ];
-        backend.push(response);
-        let tool = fetch_with(backend, &limits);
+        backend.push(redirect(302, "https://example.com/1"));
+        backend.push(redirect(302, "https://example.com/2"));
+        backend.push(redirect(302, "https://example.com/3"));
+        backend.push(fetched(200, "text/plain", "landed"));
+        let tool = fetch_with(backend.clone(), &two_redirects());
 
         let err = call(&tool, &serde_json::json!({ "url": "https://example.com/" }))
             .expect_err("refused");
         assert_eq!(err.code(), ErrorCode::LimitExceeded);
-        assert!(err.message().contains('4'), "{err}");
         assert!(err.message().contains('2'), "{err}");
+        assert_eq!(
+            requested(&backend),
+            vec![
+                "https://example.com/",
+                "https://example.com/1",
+                "https://example.com/2"
+            ],
+            "the hop past the limit was requested"
+        );
     }
 
     #[test]
     fn a_redirect_chain_at_the_cap_is_accepted() {
-        let mut limits = budget();
-        limits
-            .set(
-                LimitName::WebFetchRedirects,
-                Budget::Bounded(2),
-                rune_core::config::Layer::CommandLine,
-            )
-            .expect("in range");
         let backend = Arc::new(RecordingBackend::new());
-        let mut response = fetched(200, "text/plain", "landed");
-        response.redirects = vec![
-            "https://example.com/1".to_owned(),
-            "https://example.com/2".to_owned(),
-        ];
-        backend.push(response);
-        let tool = fetch_with(backend, &limits);
+        backend.push(redirect(301, "https://example.com/1"));
+        backend.push(redirect(308, "https://example.com/2"));
+        backend.push(fetched(200, "text/plain", "landed"));
+        let tool = fetch_with(backend.clone(), &two_redirects());
 
         let output = call(&tool, &serde_json::json!({ "url": "https://example.com/" }))
             .expect("the call ran");
         assert!(!output.is_error, "{}", output.text);
         assert!(output.text.contains("2 redirects"), "{}", output.text);
+        assert!(output.text.contains("landed"), "{}", output.text);
+        assert_eq!(requested(&backend).len(), 3);
+    }
+
+    #[test]
+    fn a_relative_redirect_is_resolved_against_the_url_that_sent_it() {
+        let backend = Arc::new(RecordingBackend::new());
+        backend.push(redirect(302, "/docs/intro"));
+        backend.push(redirect(302, "next?page=2"));
+        backend.push(redirect(302, "//mirror.example.org/copy"));
+        backend.push(fetched(200, "text/plain", "landed"));
+        let tool = fetch_with(backend.clone(), &budget());
+
+        call(
+            &tool,
+            &serde_json::json!({ "url": "https://example.com/start?x=1" }),
+        )
+        .expect("the call ran");
+        assert_eq!(
+            requested(&backend),
+            vec![
+                "https://example.com/start?x=1",
+                "https://example.com/docs/intro",
+                "https://example.com/docs/next?page=2",
+                "https://mirror.example.org/copy",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_redirect_without_a_location_is_the_answer() {
+        let backend = Arc::new(RecordingBackend::new());
+        backend.push(fetched(302, "text/plain", "moved somewhere"));
+        let tool = fetch_with(backend.clone(), &budget());
+
+        let output = call(&tool, &serde_json::json!({ "url": "https://example.com/" }))
+            .expect("the call ran");
+        assert!(output.text.contains("status 302"), "{}", output.text);
+        assert_eq!(requested(&backend).len(), 1);
     }
 
     #[test]
@@ -1820,17 +1936,33 @@ mod tests {
     }
 
     #[test]
-    fn a_redirect_onto_a_local_address_is_refused() {
+    fn a_redirect_onto_a_local_address_is_refused_before_it_is_requested() {
         let backend = Arc::new(RecordingBackend::new());
-        let mut response = fetched(200, "text/plain", "metadata");
-        response.redirects = vec!["http://169.254.169.254/latest/meta-data/".to_owned()];
-        backend.push(response);
-        let tool = fetch_with(backend, &budget());
+        backend.push(redirect(302, "http://169.254.169.254/latest/meta-data/"));
+        backend.push(fetched(200, "text/plain", "metadata"));
+        let tool = fetch_with(backend.clone(), &budget());
 
         let err = call(&tool, &serde_json::json!({ "url": "https://example.com/" }))
             .expect_err("refused");
         assert_eq!(err.code(), ErrorCode::PermissionDenied);
         assert!(err.message().contains("169.254.169.254"), "{err}");
+        assert_eq!(
+            requested(&backend),
+            vec!["https://example.com/"],
+            "the local address was requested"
+        );
+    }
+
+    #[test]
+    fn a_redirect_onto_another_scheme_is_refused() {
+        let backend = Arc::new(RecordingBackend::new());
+        backend.push(redirect(302, "file:///etc/passwd"));
+        let tool = fetch_with(backend.clone(), &budget());
+
+        let err = call(&tool, &serde_json::json!({ "url": "https://example.com/" }))
+            .expect_err("refused");
+        assert_eq!(err.code(), ErrorCode::Unsupported);
+        assert_eq!(requested(&backend).len(), 1);
     }
 
     #[test]

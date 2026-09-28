@@ -47,6 +47,12 @@ pub struct FetchRequest {
     /// Bounds an endpoint that accepts a request and never answers, without
     /// bounding the body that follows the head. `None` sets no bound.
     pub head_timeout: Option<Duration>,
+    /// Whether the client follows a redirect itself.
+    ///
+    /// When false, a redirect is returned as it is, with its `Location`, so a
+    /// caller that must vet every address a chain visits can do so before the
+    /// next request is made rather than after.
+    pub follow_redirects: bool,
 }
 
 impl FetchRequest {
@@ -60,6 +66,7 @@ impl FetchRequest {
             body: Vec::new(),
             timeout: None,
             head_timeout: None,
+            follow_redirects: true,
         }
     }
 
@@ -73,6 +80,7 @@ impl FetchRequest {
             body,
             timeout: None,
             head_timeout: None,
+            follow_redirects: true,
         }
     }
 
@@ -96,6 +104,13 @@ impl FetchRequest {
         self.head_timeout = head_timeout;
         self
     }
+
+    /// Sets whether the client follows a redirect itself.
+    #[must_use]
+    pub const fn with_redirects(mut self, follow: bool) -> Self {
+        self.follow_redirects = follow;
+        self
+    }
 }
 
 /// What a transport returns.
@@ -110,6 +125,8 @@ pub struct FetchResponse {
     /// A rate limited or unavailable endpoint uses it to say when a retry can
     /// succeed, which is better than any delay the caller would guess.
     pub retry_after: Option<String>,
+    /// The `Location` header as sent, when the server sent one.
+    pub location: Option<String>,
     /// Body, read by the caller as it arrives.
     pub body: Box<dyn Read + Send>,
 }
@@ -121,6 +138,7 @@ impl fmt::Debug for FetchResponse {
             .field("status", &self.status)
             .field("content_type", &self.content_type)
             .field("retry_after", &self.retry_after)
+            .field("location", &self.location)
             .finish_non_exhaustive()
     }
 }

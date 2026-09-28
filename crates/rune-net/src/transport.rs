@@ -327,7 +327,8 @@ fn with_headers<Any>(
     builder
 }
 
-/// Applies a request's own time bounds to a request of either typestate.
+/// Applies a request's own bounds and redirect policy to a request of either
+/// typestate.
 ///
 /// A whole-request timeout bounds the exchange; leaving it unset keeps a
 /// streamed generation open, and the head timeout bounds the wait for the
@@ -344,6 +345,10 @@ fn with_bounds<Any>(
     }
     if let Some(head_timeout) = request.head_timeout {
         config = config.timeout_recv_response(Some(head_timeout));
+    }
+    if !request.follow_redirects {
+        // No redirect is followed, and the redirect response is returned.
+        config = config.max_redirects(0);
     }
     config.build()
 }
@@ -385,10 +390,12 @@ fn send_over(
     let content_type =
         header("content-type").unwrap_or_else(|| "application/octet-stream".to_owned());
     let retry_after = header("retry-after");
+    let location = header("location");
     Ok(FetchResponse {
         status,
         content_type,
         retry_after,
+        location,
         body: Box::new(response.into_body().into_reader()),
     })
 }
@@ -548,6 +555,8 @@ pub struct Fetched {
     pub status: u16,
     /// Media type as reported, parameters included.
     pub content_type: String,
+    /// The `Location` header, when the response carried one.
+    pub location: Option<String>,
     /// Response body.
     pub body: Vec<u8>,
 }
@@ -565,23 +574,45 @@ pub const TOOL_USER_AGENT: &str = concat!(
     "; +https://github.com/AadiXC0DE/Rune)"
 );
 
-/// Fetches a URL for a tool.
+/// Fetches a URL this build chose, following any redirect.
 ///
-/// Lives here rather than with the tool because every outbound request has to
-/// pass through this module: it is the one place where the address, scheme, and
-/// credential refusals are enforced, and a second client elsewhere would be a
-/// way around them.
+/// Lives here rather than with its callers because every outbound request has
+/// to pass through this module: it is the one place where the address, scheme,
+/// and credential refusals are enforced, and a second client elsewhere would be
+/// a way around them.
+///
+/// The chain is followed without being seen, so an address a model or a user
+/// supplied goes through [`fetch_hop`] instead, whose caller vets every hop.
 ///
 /// Absent on a target where the built-in client cannot build. Such a target
 /// reaches the endpoint through [`stream_completion`] and its own [`Fetch`], or
 /// not at all.
 #[cfg(not(target_family = "wasm"))]
 pub fn fetch_url(url: &str, accept: &str, timeout: Duration) -> NetResult<Fetched> {
+    fetch(url, accept, timeout, true)
+}
+
+/// Fetches one URL for a tool, without following a redirect.
+///
+/// A redirect comes back as it is, with its status and `Location`. A client
+/// that followed the chain itself would have requested every address on it
+/// before the tool could check one, so a public page redirecting to a private
+/// address would be fetched; the tool follows the chain instead, checking each
+/// address before it is requested.
+#[cfg(not(target_family = "wasm"))]
+pub fn fetch_hop(url: &str, accept: &str, timeout: Duration) -> NetResult<Fetched> {
+    fetch(url, accept, timeout, false)
+}
+
+/// Performs one bounded GET and holds its body.
+#[cfg(not(target_family = "wasm"))]
+fn fetch(url: &str, accept: &str, timeout: Duration, follow_redirects: bool) -> NetResult<Fetched> {
     let response = UreqFetch::new().send(
         FetchRequest::get(url)
             .with_header("user-agent", TOOL_USER_AGENT)
             .with_header("accept", accept)
-            .with_timeout(Some(timeout)),
+            .with_timeout(Some(timeout))
+            .with_redirects(follow_redirects),
     )?;
 
     let mut body = Vec::new();
@@ -601,6 +632,7 @@ pub fn fetch_url(url: &str, accept: &str, timeout: Duration) -> NetResult<Fetche
     Ok(Fetched {
         status: response.status,
         content_type: response.content_type,
+        location: response.location,
         body,
     })
 }
@@ -1223,6 +1255,7 @@ mod tests {
                 status: self.status,
                 content_type: "application/json".to_owned(),
                 retry_after: self.retry_after.map(str::to_owned),
+                location: None,
                 body: Box::new(std::io::Cursor::new(b"{}".to_vec())),
             })
         }
@@ -1319,6 +1352,48 @@ mod tests {
             .expect("answered");
         assert_eq!(response.status, 429);
         assert_eq!(response.retry_after.as_deref(), Some("3"));
+    }
+
+    /// A local endpoint that counts the requests it receives and answers none.
+    #[cfg(not(target_family = "wasm"))]
+    fn counting_endpoint() -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = std::sync::Arc::clone(&hits);
+        std::thread::spawn(move || {
+            for connection in listener.incoming() {
+                if connection.is_err() {
+                    break;
+                }
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        });
+        (format!("http://127.0.0.1:{port}"), hits)
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn a_tool_fetch_returns_a_redirect_instead_of_following_it() {
+        let (target, hits) = counting_endpoint();
+        let base = answering_endpoint(format!(
+            "HTTP/1.1 302 Found\r\nlocation: {target}/latest/meta-data/\r\n\
+             content-length: 0\r\nconnection: close\r\n\r\n"
+        ));
+        let fetched =
+            fetch_hop(&format!("{base}/page"), "*/*", Duration::from_secs(5)).expect("answered");
+        assert_eq!(fetched.status, 302);
+        assert_eq!(
+            fetched.location.as_deref(),
+            Some(format!("{target}/latest/meta-data/").as_str())
+        );
+        // Give a followed redirect time to land before counting.
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the redirect target was requested"
+        );
     }
 
     #[test]
