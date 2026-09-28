@@ -221,6 +221,12 @@ struct SessionHost {
     /// covering both steps, one frame's bytes can land inside another's and the
     /// screen shows a mix of two.
     frame: Mutex<()>,
+    /// The line being typed while a turn runs.
+    ///
+    /// Held on the host because the streaming thread redraws the whole frame
+    /// for every token, and a frame drawn without this would put an empty
+    /// prompt over the correction the user is halfway through typing.
+    typed: Mutex<String>,
     /// Ordered upstream provider preference.
     provider_order: Vec<String>,
     /// Whether requests are restricted to that preference.
@@ -752,33 +758,42 @@ impl SessionHost {
         }
     }
 
-    /// Draws the text that has streamed in so far.
-    ///
-    /// A failure is ignored: not being able to present a delta must never end a
-    /// turn or fail a request that is otherwise fine.
-    fn draw_stream(&self) {
-        self.draw_stream_with("", 0);
+    /// Returns the line being typed and the caret's column within it.
+    fn typed_line(&self) -> (String, usize) {
+        self.typed.lock().map_or_else(
+            |_| (String::new(), 0),
+            |line| (line.clone(), line.chars().count()),
+        )
     }
 
-    /// Draws the arriving text with the line being typed under it.
+    /// Draws one frame: the arriving text, a notice, and the line being typed.
     ///
-    /// The line is drawn here rather than by the loop because during a turn the
-    /// loop is the thread that draws it, and both writers must agree on one
-    /// frame or the screen shows a mixture of two.
-    fn draw_stream_with(&self, line: &str, column: usize) {
+    /// Every writer funnels through here so the line being typed is recorded
+    /// once, in one place. Two threads draw during a turn, and a frame drawn
+    /// without the current line would put an empty prompt over the correction
+    /// the user is halfway through typing.
+    ///
+    /// `notice` is drawn as the activity line, above the input.
+    fn draw_frame(&self, notice: Option<&str>, line: &str, column: usize) {
+        if let Ok(mut typed) = self.typed.lock() {
+            line.clone_into(&mut typed);
+        }
         let rows = self.streaming_rows();
+        // One lock across painting and writing, so a frame from one thread
+        // cannot land inside a frame from the other.
         let Ok(_frame) = self.frame.lock() else {
             return;
         };
-        if rows.is_empty() && line.is_empty() {
+        if rows.is_empty() && line.is_empty() && notice.is_none() {
             return;
         }
         let marker = rune_term::shell::prompt();
-        let prompt_row = transcript::render_prompt(marker, line, usize::from(self.width()));
+        let width = usize::from(self.width());
+        let prompt_row = transcript::render_prompt(marker, line, width);
         let caret = rune_term::width::str_width(marker).saturating_add(column);
         let Ok(painted) = self.paint(
             &[],
-            None,
+            notice,
             std::slice::from_ref(&prompt_row),
             &rows,
             (0, u16::try_from(caret).unwrap_or(u16::MAX)),
@@ -788,25 +803,26 @@ impl SessionHost {
         self.show(&painted);
     }
 
-    /// Draws one notice line with the line being typed, as one frame.
+    /// Draws the arriving text with the line being typed.
+    fn draw_stream_with(&self, line: &str, column: usize) {
+        self.draw_frame(None, line, column);
+    }
+
+    /// Draws the arriving text with the line the user has typed so far.
+    fn draw_stream(&self) {
+        let (line, column) = self.typed_line();
+        self.draw_frame(None, &line, column);
+    }
+
+    /// Draws one notice above the input, keeping the line being typed.
+    fn draw_notice(&self, notice: &str) {
+        let (line, column) = self.typed_line();
+        self.draw_frame(Some(notice), &line, column);
+    }
+
+    /// Draws one notice, with the line being typed given explicitly.
     fn draw_notice_with(&self, notice: &str, line: &str, column: usize) {
-        let rows = self.streaming_rows();
-        let Ok(_frame) = self.frame.lock() else {
-            return;
-        };
-        let marker = rune_term::shell::prompt();
-        let prompt_row = transcript::render_prompt(marker, line, usize::from(self.width()));
-        let caret = rune_term::width::str_width(marker).saturating_add(column);
-        let Ok(painted) = self.paint(
-            &[],
-            Some(notice),
-            std::slice::from_ref(&prompt_row),
-            &rows,
-            (0, u16::try_from(caret).unwrap_or(u16::MAX)),
-        ) else {
-            return;
-        };
-        self.show(&painted);
+        self.draw_frame(Some(notice), line, column);
     }
 
     /// Returns the empty input row, with the caret at its start.
@@ -965,6 +981,7 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
         height: std::sync::atomic::AtomicU16::new(terminal_height()),
         inline: Mutex::new(rune_term::inline::Inline::new(terminal_width())),
         frame: Mutex::new(()),
+        typed: Mutex::new(String::new()),
         provider_order: config.settings.provider_order.clone(),
         provider_strict: config.settings.provider_strict,
         streaming: Arc::new(Mutex::new(StreamingText::default())),
@@ -1373,12 +1390,15 @@ fn run_turn_steerable(
                     reader.clear();
                     gesture.disarm();
                     if text.is_empty() {
+                        host.draw_stream_with("", 0);
                         continue;
                     }
                     let notice = match host.steering.submit(text) {
                         Ok(()) => String::from("steering queued for the next boundary"),
                         Err(err) => err.message().to_owned(),
                     };
+                    // Drawn with the emptied line, so the submitted text does
+                    // not stay on screen as though it were still being typed.
                     host.draw_notice_with(&notice, "", 0);
                 }
                 // Escape arms on the first press and cancels on the second.
@@ -1387,12 +1407,12 @@ fn run_turn_steerable(
                 KeyAction::Escape => {
                     if gesture.record() {
                         host.cancellation.cancel();
-                        host.draw_notice_with("cancelling the turn", "", 0);
+                        host.draw_notice("cancelling the turn");
                     } else if reader.line().is_empty() {
-                        host.draw_notice_with("press Escape again to cancel", "", 0);
+                        host.draw_notice("press Escape again to cancel");
                     } else {
                         reader.clear();
-                        host.draw_stream_with("", 0);
+                        host.draw_stream();
                     }
                 }
                 // Control-C clears a typed correction first, then cancels, then
@@ -1411,7 +1431,7 @@ fn run_turn_steerable(
                         host.cancellation.cancel();
                     } else {
                         host.cancellation.cancel();
-                        host.draw_notice_with("cancelling the turn", "", 0);
+                        host.draw_notice("cancelling the turn");
                     }
                 }
                 // Anything else is an edit, so a half-finished cancel gesture
@@ -1419,6 +1439,9 @@ fn run_turn_steerable(
                 // with the text that has been typed so far.
                 _ => {
                     gesture.disarm();
+                    // The reader's line is passed rather than read back from
+                    // the host, so the keystroke that just landed is drawn and
+                    // not the state before it.
                     host.draw_stream_with(reader.line(), reader.column());
                 }
             }
@@ -4314,6 +4337,7 @@ mod tests {
             height: std::sync::atomic::AtomicU16::new(24),
             inline: Mutex::new(rune_term::inline::Inline::new(80)),
             frame: Mutex::new(()),
+            typed: Mutex::new(String::new()),
             provider_order: Vec::new(),
             provider_strict: false,
             streaming: Arc::new(Mutex::new(StreamingText::default())),

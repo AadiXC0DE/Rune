@@ -1,9 +1,9 @@
 //! Capability restriction for command execution.
 //!
 //! An approved command still gets to write, so the sandbox is what keeps it
-//! inside the workspace. Each backend turns a prepared command into the argv
-//! that actually runs, and reports whether it can enforce the restriction on
-//! this host.
+//! inside the workspace and away from the credential locations under the home
+//! directory. Each backend turns a prepared command into the argv that actually
+//! runs, and reports whether it can enforce the restriction on this host.
 //!
 //! The module never degrades quietly. A backend that is absent, or that cannot
 //! restrict the process tree it starts, returns an error, and the only way past
@@ -16,7 +16,10 @@
 //! - macOS uses `sandbox-exec` with a generated Seatbelt profile. Apple
 //!   deprecated the tool but has not removed it, and it is the only option for
 //!   a non-bundled CLI, so the backend probes it by running it rather than
-//!   assuming it works.
+//!   assuming it works. The profile denies whole categories of operation and
+//!   then grants the paths a command legitimately needs, so a rule for a
+//!   credential path has to be narrowed by a later grant rather than by a
+//!   narrower deny, because the last rule that matches decides.
 //! - Linux builds a mount and network namespace through the `bwrap` helper. The
 //!   helper restricts the process tree as a whole, which is the every-thread
 //!   guarantee an in-process restriction would have to ask for explicitly.
@@ -37,6 +40,28 @@ pub const SEATBELT_TOOL: &str = "/usr/bin/sandbox-exec";
 
 /// The Linux helper that builds the namespaces.
 pub const NAMESPACE_HELPER: &str = "bwrap";
+
+/// Locations under the home directory that hold credentials.
+///
+/// A sandboxed command has no business reading any of these, so each backend
+/// hides them from the command it starts. The state directory Rune keeps its own
+/// credentials in is named directly rather than resolved from the environment,
+/// because a variable that moves it would otherwise move what is hidden.
+///
+/// The entries are relative: the home directory is resolved once and each is
+/// joined onto it, and an entry that is not present is skipped, since a rule
+/// about a path that does not exist is noise in a Seatbelt profile and an error
+/// in a `bwrap` mount.
+pub const CREDENTIAL_PATHS: [&str; 8] = [
+    ".ssh",
+    ".aws",
+    ".config/gh",
+    ".netrc",
+    ".gnupg",
+    ".docker/config.json",
+    ".kube/config",
+    ".config/rune",
+];
 
 /// Profile the macOS probe runs: it denies every write and nothing else.
 const PROBE_PROFILE: &str = "(version 1)(allow default)(deny file-write*)";
@@ -107,6 +132,23 @@ impl SandboxPolicy {
     /// Returns every writable path, the workspace first.
     fn writable(&self) -> impl Iterator<Item = &Utf8PathBuf> {
         std::iter::once(&self.workspace).chain(self.writable_roots.iter())
+    }
+
+    /// Returns every path whose reads are re-granted after the credential deny.
+    ///
+    /// A deny for a credential path can cover a path a command needs when the
+    /// two share a parent, so the grants that follow it name the same paths the
+    /// write rules do. The workspace is first, because a workspace that lives in
+    /// an unusual place has to stay usable.
+    fn readable(&self) -> impl Iterator<Item = &Utf8PathBuf> {
+        self.writable()
+    }
+
+    /// Returns the credential locations this host has, for a caller to assert
+    /// against without repeating the list.
+    #[must_use]
+    pub fn credential_paths() -> Vec<Utf8PathBuf> {
+        existing_credential_paths()
     }
 }
 
@@ -180,6 +222,35 @@ fn unresolved(path: &Utf8Path, what: &str) -> RuneError {
 /// allow.
 fn resolve(path: &Utf8Path, what: &str) -> Result<Utf8PathBuf> {
     path.canonicalize_utf8().map_err(|_| unresolved(path, what))
+}
+
+/// Returns the home directory, resolved once.
+///
+/// A sandbox rule is a fact about this host, so the location is resolved at the
+/// point the profile is built rather than being carried on the policy. A policy
+/// that named its own home would let a caller move what is hidden.
+fn home_directory() -> Option<Utf8PathBuf> {
+    let home = std::env::var("HOME").ok().filter(|value| !value.is_empty())?;
+    let path = Utf8PathBuf::from(home);
+    path.is_dir().then_some(path)
+}
+
+/// Returns the credential paths that exist on this host.
+///
+/// Each is resolved to the location the kernel sees, so a rule about it covers
+/// the same bytes a command would open. A path that is not present is skipped:
+/// it holds nothing to protect, and a rule about it is either dead weight or, on
+/// Linux, a mount that cannot be created.
+fn existing_credential_paths() -> Vec<Utf8PathBuf> {
+    let Some(home) = home_directory() else {
+        return Vec::new();
+    };
+    CREDENTIAL_PATHS
+        .iter()
+        .map(|relative| home.join(relative))
+        .filter(|path| path.exists())
+        .filter_map(|path| path.canonicalize_utf8().ok())
+        .collect()
 }
 
 /// Quotes a path for a Seatbelt profile.
