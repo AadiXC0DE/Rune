@@ -325,8 +325,13 @@ fn scan(
     };
     let mut found = Found::default();
     // The context window is a ring, so only context_lines lines are ever held.
-    let mut pending: VecDeque<String> = VecDeque::with_capacity(context_lines);
+    // Every line enters it, a match included, because a match can be the line
+    // before the next one.
+    let mut recent: VecDeque<(usize, String)> = VecDeque::with_capacity(context_lines);
+    // Lines still owed as context after the last hit on this page.
     let mut trailing = 0_usize;
+    // The last line already shown, so overlapping context is shown once.
+    let mut shown_through = 0_usize;
     let mut number = 0_usize;
     let mut buffer = Vec::new();
 
@@ -353,39 +358,48 @@ fn scan(
             shown.clone()
         };
 
-        if haystack.contains(&needle) {
+        let matched = haystack.contains(&needle);
+        let mut recorded = false;
+        if matched {
             found.matches = found.matches.saturating_add(1);
             // The index is this match's place in the whole result, which is
             // what offset and head_limit select on.
             let index = base.saturating_add(found.matches).saturating_sub(1);
-            if query.mode == Mode::Matches
+            recorded = query.mode == Mode::Matches
                 && index >= query.offset
-                && found.hits.len() < query.head_limit
-            {
-                found.hits.push(Hit {
-                    file: display.to_owned(),
-                    number,
-                    text: shown,
-                    leading: pending.iter().cloned().collect(),
-                    trailing: Vec::new(),
-                });
-            }
+                && found.hits.len() < query.head_limit;
+        }
+        if recorded {
+            let leading = recent
+                .iter()
+                .filter(|(line, _)| *line > shown_through)
+                .map(|(line, text)| format!("{line:>6}-{text}"))
+                .collect();
+            found.hits.push(Hit {
+                file: display.to_owned(),
+                number,
+                text: shown.clone(),
+                leading,
+                trailing: Vec::new(),
+            });
+            shown_through = number;
             trailing = context_lines;
-            continue;
-        }
-
-        if context_lines == 0 {
-            continue;
-        }
-        if trailing > 0 {
+        } else if trailing > 0 {
+            // A line after the last hit is its context whether or not it
+            // matches. A match left off the page opens no window of its own,
+            // so nothing after it is shown as some earlier hit's context.
             if let Some(hit) = found.hits.last_mut() {
                 hit.trailing.push(format!("{number:>6}-{shown}"));
+                shown_through = number;
             }
             trailing = trailing.saturating_sub(1);
         }
-        pending.push_back(format!("{number:>6}-{shown}"));
-        if pending.len() > context_lines {
-            let _ = pending.pop_front();
+
+        if context_lines > 0 {
+            recent.push_back((number, shown));
+            if recent.len() > context_lines {
+                let _ = recent.pop_front();
+            }
         }
     }
 
@@ -844,6 +858,84 @@ mod tests {
         assert!(output.text.contains("-before"), "{}", output.text);
         assert!(output.text.contains("-after"), "{}", output.text);
         assert!(output.text.contains(":needle here"), "{}", output.text);
+    }
+
+    /// Returns the lines a search printed for one file, in order.
+    fn lines_for(text: &str, file: &str) -> Vec<String> {
+        let prefix = format!("{file}:");
+        text.lines()
+            .filter_map(|line| line.strip_prefix(&prefix))
+            .map(str::to_owned)
+            .collect()
+    }
+
+    #[test]
+    fn overlapping_context_is_shown_once_and_in_order() {
+        let repo = Repo::new();
+        repo.write("ctx/two.txt", "x\ny\nneedle A\nz\nneedle B\n");
+        let output = GrepFiles::default()
+            .call(
+                &serde_json::json!({
+                    "pattern": "needle",
+                    "path": "ctx/two.txt",
+                    "context_lines": 2,
+                }),
+                &repo.context(),
+            )
+            .expect("call");
+        assert_eq!(
+            lines_for(&output.text, "ctx/two.txt"),
+            vec![
+                "     1-x",
+                "     2-y",
+                "     3:needle A",
+                "     4-z",
+                "     5:needle B",
+            ],
+            "{}",
+            output.text
+        );
+    }
+
+    #[test]
+    fn a_match_left_off_the_page_lends_no_context_to_an_earlier_hit() {
+        let repo = Repo::new();
+        repo.write("ctx/far.txt", "needle 1\na\nb\nc\nd\nneedle 2\ne\nf\n");
+        let output = GrepFiles::default()
+            .call(
+                &serde_json::json!({
+                    "pattern": "needle",
+                    "path": "ctx/far.txt",
+                    "context_lines": 1,
+                    "head_limit": 1,
+                }),
+                &repo.context(),
+            )
+            .expect("call");
+        assert_eq!(
+            lines_for(&output.text, "ctx/far.txt"),
+            vec!["     1:needle 1", "     2-a"],
+            "{}",
+            output.text
+        );
+
+        let later = GrepFiles::default()
+            .call(
+                &serde_json::json!({
+                    "pattern": "needle",
+                    "path": "ctx/far.txt",
+                    "context_lines": 1,
+                    "offset": 1,
+                }),
+                &repo.context(),
+            )
+            .expect("call");
+        assert_eq!(
+            lines_for(&later.text, "ctx/far.txt"),
+            vec!["     5-d", "     6:needle 2", "     7-e"],
+            "{}",
+            later.text
+        );
     }
 
     #[test]
