@@ -4,8 +4,9 @@
 //! replaced by a summary and the turn continues in a fresh window. Two
 //! properties matter:
 //!
-//! - The cut lands on a user turn. Cutting anywhere else leaves a tool call
-//!   without its result, which no provider accepts.
+//! - The cut never separates a tool call from its result, which no provider
+//!   accepts. It lands on a user turn where one is in reach, and on an
+//!   assistant turn otherwise.
 //! - A failed or cancelled compaction leaves the history exactly as it was, so
 //!   a summary is never partially installed.
 
@@ -310,6 +311,37 @@ mod tests {
             }]);
         }
         history
+    }
+
+    #[test]
+    fn a_conversation_of_multi_step_prompts_can_be_compacted() {
+        // Every prompt took two tool steps, so no user turn falls among the
+        // few most recent turns. The cut must still be found.
+        let mut history = History::new();
+        for index in 0..30 {
+            history.push_user(format!("question {index}"));
+            for step in 0..2 {
+                let id = format!("c{index}-{step}");
+                history.push_assistant(vec![call(&id)]);
+                history.push_tool_results(vec![result(&id)]);
+            }
+            history.push_assistant(vec![ContentPart::Text {
+                text: format!("answer {index}"),
+            }]);
+        }
+        let limits = BudgetSet::new();
+
+        let plan = plan(&history, &limits).expect("a plan");
+        let cut = history
+            .turns()
+            .iter()
+            .find(|turn| turn.seq == plan.cut_at)
+            .expect("present");
+        assert_eq!(cut.role, Role::User);
+        assert!(plan.kept_turns >= recent_target_turns(&limits));
+
+        apply(&mut history, &plan, wrap_summary("what happened so far"));
+        history.validate().expect("still valid");
     }
 
     #[test]

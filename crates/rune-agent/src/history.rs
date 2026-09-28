@@ -326,19 +326,29 @@ impl History {
 
     /// Returns the sequence number where a summary should cut.
     ///
-    /// Keeps at least `keep_turns` recent turns and always cuts at a user turn,
-    /// because a summary that begins mid-exchange leaves an orphaned tool result.
+    /// Keeps at least `keep_turns` recent turns. The cut is the latest user turn
+    /// that still keeps them, so the retained tail opens with a request. When
+    /// every recent prompt ran several tool steps there may be no such turn in
+    /// reach, and the cut falls on an assistant turn instead, which keeps each
+    /// call with its results. It never falls on a tool result, because a
+    /// summary followed by an orphaned result cannot form a request.
     #[must_use]
     pub fn compaction_cut(&self, keep_turns: usize) -> Option<u64> {
         if self.turns.len() <= keep_turns {
             return None;
         }
         let target = self.turns.len().saturating_sub(keep_turns);
-        // Walk forward to the next user turn so the cut is at a boundary.
-        self.turns
-            .iter()
-            .skip(target)
+        // The first turn is out of reach, because a cut there removes nothing.
+        let reach = || {
+            self.turns
+                .iter()
+                .take(target.saturating_add(1))
+                .skip(1)
+                .rev()
+        };
+        reach()
             .find(|turn| turn.role == Role::User)
+            .or_else(|| reach().find(|turn| turn.role == Role::Assistant))
             .map(|turn| turn.seq)
     }
 
@@ -612,8 +622,8 @@ mod tests {
             text: "answer".to_owned(),
         }]);
 
-        // Cutting mid-exchange would orphan a tool result, so the cut walks
-        // forward to the next user turn.
+        // Cutting mid-exchange would orphan a tool result, so the cut lands on
+        // a user turn.
         let cut = history.compaction_cut(2).expect("a cut");
         let turn = history
             .turns()
@@ -622,6 +632,37 @@ mod tests {
             .expect("present");
         assert_eq!(turn.role, Role::User);
         assert_eq!(turn.text(), "two");
+    }
+
+    #[test]
+    fn one_long_prompt_is_cut_where_no_call_loses_its_result() {
+        // The only user turn opens the conversation, so there is none to cut
+        // at. The cut falls on an assistant turn, which keeps its calls and
+        // their results together.
+        let mut history = History::new();
+        history.push_user("do everything");
+        for index in 0..10 {
+            let id = format!("c{index}");
+            history.push_assistant(vec![call(&id, "a")]);
+            history.push_tool_results(vec![result(&id, "a")]);
+        }
+        history.push_assistant(vec![ContentPart::Text {
+            text: "done".to_owned(),
+        }]);
+
+        let cut = history.compaction_cut(4).expect("a cut");
+        let turn = history
+            .turns()
+            .iter()
+            .find(|candidate| candidate.seq == cut)
+            .expect("present");
+        assert_eq!(turn.role, Role::Assistant);
+
+        let before = history.len();
+        history.replace_with_summary("summary", cut);
+        assert!(history.len() > 4, "fewer than the recent turns were kept");
+        assert!(history.len() < before, "nothing was removed");
+        history.validate().expect("still valid");
     }
 
     #[test]
