@@ -375,15 +375,20 @@ fn send_over(
     .map_err(|err| classify_transport_error(&err))?;
 
     let status = response.status().as_u16();
-    let content_type = response
-        .headers()
-        .get("content-type")
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or("application/octet-stream")
-        .to_owned();
+    let header = |name: &str| {
+        response
+            .headers()
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned)
+    };
+    let content_type =
+        header("content-type").unwrap_or_else(|| "application/octet-stream".to_owned());
+    let retry_after = header("retry-after");
     Ok(FetchResponse {
         status,
         content_type,
+        retry_after,
         body: Box::new(response.into_body().into_reader()),
     })
 }
@@ -515,15 +520,20 @@ pub fn stream_completion_observed(
     let response = client.send(request)?;
 
     if response.status >= 400 {
+        let retry_after = response
+            .retry_after
+            .as_deref()
+            .and_then(crate::error::parse_retry_after);
         let text = read_bounded_text(response.body, 64 * 1024);
         let sanitized = redact::redact(&text);
         let mut error = NetError::classify_status(response.status, &sanitized).with_hint(format!(
             "provider `{}` rejected the request",
             provider.name()
         ));
-        if response.status == 429 {
-            // A rate limit is retryable, and the endpoint may have said when.
-            error = error.with_retry_after(1000);
+        // The endpoint's own delay is used when it named one. Otherwise none is
+        // attached, and the caller's backoff decides.
+        if let Some(millis) = retry_after {
+            error = error.with_retry_after(millis);
         }
         return Err(error);
     }
@@ -1199,6 +1209,116 @@ mod tests {
             .expect("the request gave up on the endpoint")
             .expect_err("timed out");
         assert_eq!(err.kind(), FailureKind::Timeout, "{err}");
+    }
+
+    /// A client that answers every request with one canned status.
+    struct CannedFetch {
+        status: u16,
+        retry_after: Option<&'static str>,
+    }
+
+    impl Fetch for CannedFetch {
+        fn send(&self, _request: FetchRequest) -> NetResult<crate::fetch::FetchResponse> {
+            Ok(crate::fetch::FetchResponse {
+                status: self.status,
+                content_type: "application/json".to_owned(),
+                retry_after: self.retry_after.map(str::to_owned),
+                body: Box::new(std::io::Cursor::new(b"{}".to_vec())),
+            })
+        }
+    }
+
+    /// Streams one completion over a canned client.
+    fn complete_over(client: &dyn Fetch) -> NetResult<StreamOutcome> {
+        let mut plan = RequestPlan::new("m");
+        plan.messages = vec![Message::user("hi")];
+        stream_completion(
+            client,
+            &Endpoint::new("https://api.example.com", "k"),
+            &crate::chat_completions::ChatCompletions,
+            &plan,
+            DEFAULT_HEAD_TIMEOUT,
+            &|| false,
+        )
+    }
+
+    #[test]
+    fn a_rate_limit_waits_as_long_as_the_endpoint_asked() {
+        let err = complete_over(&CannedFetch {
+            status: 429,
+            retry_after: Some("7"),
+        })
+        .expect_err("rate limited");
+        assert_eq!(err.kind(), FailureKind::RateLimited);
+        assert_eq!(err.retry_after_ms(), Some(7_000));
+    }
+
+    #[test]
+    fn a_rate_limit_without_a_delay_leaves_the_backoff_to_the_caller() {
+        for retry_after in [None, Some("Wed, 21 Oct 2026 07:28:00 GMT")] {
+            let err = complete_over(&CannedFetch {
+                status: 429,
+                retry_after,
+            })
+            .expect_err("rate limited");
+            assert_eq!(err.retry_after_ms(), None, "{retry_after:?}");
+        }
+    }
+
+    #[test]
+    fn an_unavailable_endpoint_that_names_a_delay_is_honored() {
+        let err = complete_over(&CannedFetch {
+            status: 503,
+            retry_after: Some("2"),
+        })
+        .expect_err("unavailable");
+        assert_eq!(err.retry_after_ms(), Some(2_000));
+    }
+
+    /// A local endpoint that reads one request and sends one raw response.
+    #[cfg(not(target_family = "wasm"))]
+    fn answering_endpoint(response: String) -> String {
+        use std::io::{BufRead as _, Write as _};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        std::thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut reader = std::io::BufReader::new(stream.try_clone().expect("clone"));
+            let mut length = 0_usize;
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 || line.trim().is_empty() {
+                    break;
+                }
+                if let Some((name, value)) = line.split_once(':')
+                    && name.eq_ignore_ascii_case("content-length")
+                {
+                    length = value.trim().parse().unwrap_or(0);
+                }
+            }
+            let mut body = vec![0_u8; length];
+            let _ = reader.read_exact(&mut body);
+            let _ = stream.write_all(response.as_bytes());
+        });
+        format!("http://127.0.0.1:{port}")
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn the_retry_after_header_reaches_the_response() {
+        let base = answering_endpoint(
+            "HTTP/1.1 429 Too Many Requests\r\nretry-after: 3\r\ncontent-length: 0\r\n\
+             connection: close\r\n\r\n"
+                .to_owned(),
+        );
+        let response = UreqFetch::new()
+            .send(FetchRequest::get(format!("{base}/v1/models")))
+            .expect("answered");
+        assert_eq!(response.status, 429);
+        assert_eq!(response.retry_after.as_deref(), Some("3"));
     }
 
     #[test]

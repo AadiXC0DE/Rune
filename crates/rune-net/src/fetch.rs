@@ -105,6 +105,11 @@ pub struct FetchResponse {
     /// Media type as reported, parameters included, or
     /// `application/octet-stream` when the server named none.
     pub content_type: String,
+    /// The `Retry-After` header as sent, when the server sent one.
+    ///
+    /// A rate limited or unavailable endpoint uses it to say when a retry can
+    /// succeed, which is better than any delay the caller would guess.
+    pub retry_after: Option<String>,
     /// Body, read by the caller as it arrives.
     pub body: Box<dyn Read + Send>,
 }
@@ -115,6 +120,7 @@ impl fmt::Debug for FetchResponse {
         f.debug_struct("FetchResponse")
             .field("status", &self.status)
             .field("content_type", &self.content_type)
+            .field("retry_after", &self.retry_after)
             .finish_non_exhaustive()
     }
 }
