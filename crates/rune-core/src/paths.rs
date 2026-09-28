@@ -79,10 +79,17 @@ pub struct Paths {
 
 impl Paths {
     /// Resolves paths from the process environment.
+    ///
+    /// A root that no variable places is built from [`home_directory`], and is
+    /// left relative when there is none. A relative root resolves against the
+    /// working directory, which is usually a repository, so a process that reads
+    /// or writes through these paths confirms them with
+    /// [`Paths::require_absolute`] first.
     #[must_use]
     pub fn from_process() -> Self {
+        let home = home_directory();
         Self::resolve(
-            std::env::var("HOME").ok().as_deref(),
+            home.as_deref().map(Utf8Path::as_str),
             std::env::var("XDG_CONFIG_HOME").ok().as_deref(),
             std::env::var("XDG_STATE_HOME").ok().as_deref(),
             std::env::var("XDG_DATA_HOME").ok().as_deref(),
@@ -128,6 +135,31 @@ impl Paths {
             state_root,
             data_root,
         }
+    }
+
+    /// Returns the paths when every root is absolute.
+    ///
+    /// A relative root would place the user configuration and the credential
+    /// file inside whatever directory the process runs from, so a cloned
+    /// repository could supply the user layer and receive the credentials.
+    pub fn require_absolute(self) -> Result<Self> {
+        for (name, root) in [
+            ("configuration", &self.config_root),
+            ("state", &self.state_root),
+            ("data", &self.data_root),
+        ] {
+            if !root.is_absolute() {
+                return Err(RuneError::new(
+                    ErrorCode::UnsafePath,
+                    format!("the {name} directory `{root}` is not an absolute path"),
+                )
+                .with_hint(
+                    "set HOME (USERPROFILE on Windows) to the home directory, \
+                     or set the XDG base directory variables to absolute paths",
+                ));
+            }
+        }
+        Ok(self)
     }
 
     /// Path of the configuration file, honoring `RUNE_CONFIG`.
@@ -263,6 +295,28 @@ impl fmt::Display for Paths {
             self.config_root, self.state_root, self.data_root
         )
     }
+}
+
+/// Returns the current user's home directory, when it is an absolute path.
+///
+/// The variable differs by platform: `HOME` is normally unset in a Windows
+/// shell, which sets `USERPROFILE`, or `HOMEDRIVE` and `HOMEPATH`, instead.
+/// A value that is not absolute is passed over, because a path built on it
+/// would resolve against the working directory.
+#[must_use]
+pub fn home_directory() -> Option<Utf8PathBuf> {
+    home_from(|name| std::env::var(name).ok())
+}
+
+/// Resolves the home directory from an arbitrary lookup.
+fn home_from(lookup: impl Fn(&str) -> Option<String>) -> Option<Utf8PathBuf> {
+    let read = |name: &str| lookup(name).filter(|value| !value.is_empty());
+    let split = || Some(format!("{}{}", read("HOMEDRIVE")?, read("HOMEPATH")?));
+    [read("HOME"), read("USERPROFILE"), split()]
+        .into_iter()
+        .flatten()
+        .map(Utf8PathBuf::from)
+        .find(|path| path.is_absolute())
 }
 
 /// Returns the value when it is present and not empty.
@@ -517,6 +571,89 @@ mod tests {
         let paths = Paths::resolve(None, None, None, None, None);
         assert_eq!(paths.config_root, ".config/rune");
         assert_eq!(paths.state_root, ".local/state/rune");
+    }
+
+    /// Returns a directory that is absolute on the platform running the test.
+    fn absolute() -> String {
+        let dir = std::env::temp_dir();
+        assert!(dir.is_absolute(), "{}", dir.display());
+        dir.to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn a_root_built_without_a_home_is_refused() {
+        // Relative roots resolve against the working directory, which would let
+        // a repository commit the user configuration and receive the
+        // credential file.
+        let err = Paths::resolve(None, None, None, None, None)
+            .require_absolute()
+            .expect_err("refused");
+        assert_eq!(err.code(), ErrorCode::UnsafePath);
+        assert!(err.message().contains(".config"), "{}", err.message());
+        assert!(err.detail().hint.is_some());
+    }
+
+    #[test]
+    fn roots_under_an_absolute_home_are_accepted() {
+        let home = absolute();
+        let paths = Paths::resolve(Some(&home), None, None, None, None)
+            .require_absolute()
+            .expect("accepted");
+        assert!(paths.config_root.starts_with(&home));
+    }
+
+    #[test]
+    fn roots_placed_by_variables_need_no_home() {
+        let base = absolute();
+        let paths = Paths::resolve(None, Some(&base), Some(&base), Some(&base), None);
+        assert!(paths.require_absolute().is_ok());
+    }
+
+    #[test]
+    fn the_home_directory_falls_back_to_the_windows_profile() {
+        let profile = absolute();
+        let found = home_from(|name| (name == "USERPROFILE").then(|| profile.clone()));
+        assert_eq!(found.as_deref(), Some(Utf8Path::new(&profile)));
+    }
+
+    #[test]
+    fn the_home_directory_joins_the_windows_drive_and_path() {
+        let full = absolute();
+        let found = home_from(|name| match name {
+            "HOMEDRIVE" => Some(String::new()),
+            "HOMEPATH" => Some(full.clone()),
+            _ => None,
+        });
+        // An empty drive is not a drive, so nothing is joined.
+        assert_eq!(found, None);
+
+        let (drive, path) = full.split_at(1);
+        let found = home_from(|name| match name {
+            "HOMEDRIVE" => Some(drive.to_owned()),
+            "HOMEPATH" => Some(path.to_owned()),
+            _ => None,
+        });
+        assert_eq!(found.as_deref(), Some(Utf8Path::new(&full)));
+    }
+
+    #[test]
+    fn a_relative_home_is_passed_over() {
+        let profile = absolute();
+        let found = home_from(|name| match name {
+            "HOME" => Some("relative/home".to_owned()),
+            "USERPROFILE" => Some(profile.clone()),
+            _ => None,
+        });
+        assert_eq!(found.as_deref(), Some(Utf8Path::new(&profile)));
+        assert_eq!(
+            home_from(|name| (name == "HOME").then(|| "relative".to_owned())),
+            None
+        );
+    }
+
+    #[test]
+    fn a_home_directory_is_found_whatever_the_platform_calls_it() {
+        assert!(home_directory().is_some(), "no home directory was found");
     }
 
     #[test]
