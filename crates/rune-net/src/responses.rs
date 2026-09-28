@@ -252,7 +252,13 @@ struct PartialCall {
 #[derive(Debug)]
 pub struct Reducer {
     limits: Limit,
+    /// Function calls, keyed by the call identifier a result answers.
     calls: std::collections::BTreeMap<String, PartialCall>,
+    /// The call identifier of each function call item, keyed by item.
+    ///
+    /// Argument deltas name the output item, whose identifier differs from the
+    /// call's own, so a delta is resolved through this map.
+    item_calls: std::collections::BTreeMap<String, String>,
     /// Opaque reasoning items, in arrival order.
     reasoning: Vec<serde_json::Value>,
     content: String,
@@ -277,6 +283,7 @@ impl Reducer {
         Self {
             limits: Limit::default(),
             calls: std::collections::BTreeMap::new(),
+            item_calls: std::collections::BTreeMap::new(),
             reasoning: Vec::new(),
             content: String::new(),
             usage: Usage::default(),
@@ -446,6 +453,10 @@ impl Reducer {
                         ended: false,
                     },
                 );
+                if let Some(item_id) = item.get("id").and_then(serde_json::Value::as_str) {
+                    self.item_calls
+                        .insert(item_id.to_owned(), call_id.to_owned());
+                }
                 out.push(crate::stream::ProviderEvent::ToolCallStart {
                     id,
                     name: name.to_owned(),
@@ -471,7 +482,7 @@ impl Reducer {
         value: &serde_json::Value,
         out: &mut Vec<crate::stream::ProviderEvent>,
     ) -> Result<()> {
-        let Some(call_id) = value.get("item_id").and_then(serde_json::Value::as_str) else {
+        let Some(item_id) = value.get("item_id").and_then(serde_json::Value::as_str) else {
             return Ok(());
         };
         let Some(delta) = value.get("delta").and_then(serde_json::Value::as_str) else {
@@ -480,7 +491,18 @@ impl Reducer {
         if delta.is_empty() {
             return Ok(());
         }
-        self.append_arguments(call_id, delta, out)
+        let call_id = self.call_for_item(item_id);
+        self.append_arguments(&call_id, delta, out)
+    }
+
+    /// Returns the call identifier for an output item.
+    ///
+    /// An item announced without an identifier of its own can only be
+    /// addressed by its call identifier, so an unmapped item is taken as one.
+    fn call_for_item(&self, item_id: &str) -> String {
+        self.item_calls
+            .get(item_id)
+            .map_or_else(|| item_id.to_owned(), Clone::clone)
     }
 
     /// Appends an argument fragment to a call, checking the bound.
@@ -523,10 +545,14 @@ impl Reducer {
         let Some(item) = value.get("item") else {
             return Ok(());
         };
-        let Some(call_id) = item.get("call_id").and_then(serde_json::Value::as_str) else {
-            return Ok(());
+        let call_id = match item.get("call_id").and_then(serde_json::Value::as_str) {
+            Some(call_id) => call_id.to_owned(),
+            None => match item.get("id").and_then(serde_json::Value::as_str) {
+                Some(item_id) => self.call_for_item(item_id),
+                None => return Ok(()),
+            },
         };
-        let Some(slot) = self.calls.get_mut(call_id) else {
+        let Some(slot) = self.calls.get_mut(&call_id) else {
             return Ok(());
         };
         if slot.ended {
@@ -913,6 +939,35 @@ mod tests {
             })
             .expect("completed call");
         assert_eq!(end, "{\"path\":\"a.rs\"}");
+    }
+
+    #[test]
+    fn argument_deltas_addressed_by_item_reach_their_call() {
+        // The endpoint names a function call item `fc_...` and its call
+        // `call_...`, and an argument delta carries only the item identifier.
+        let (events, reducer) = reduce(&[
+            r#"{"type":"response.output_item.added","output_index":0,"item":{"id":"fc_1","type":"function_call","status":"in_progress","call_id":"call_1","name":"read_file","arguments":""}}"#,
+            r#"{"type":"response.function_call_arguments.delta","item_id":"fc_1","output_index":0,"delta":"{\"path\":"}"#,
+            r#"{"type":"response.function_call_arguments.delta","item_id":"fc_1","output_index":0,"delta":"\"a.rs\"}"}"#,
+            r#"{"type":"response.function_call_arguments.done","item_id":"fc_1","output_index":0,"arguments":"{\"path\":\"a.rs\"}"}"#,
+            r#"{"type":"response.output_item.done","output_index":0,"item":{"id":"fc_1","type":"function_call","status":"completed","call_id":"call_1","name":"read_file","arguments":"{\"path\":\"a.rs\"}"}}"#,
+            r#"{"type":"response.completed","response":{"status":"completed","output":[]}}"#,
+        ]);
+        assert_eq!(reducer.finish().expect("finished"), FinishReason::ToolCalls);
+        let ends: Vec<(String, String)> = events
+            .iter()
+            .filter_map(|event| match event {
+                ProviderEvent::ToolCallEnd { id, arguments } => {
+                    Some((id.as_str().to_owned(), arguments.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            ends,
+            vec![("call_1".to_owned(), "{\"path\":\"a.rs\"}".to_owned())],
+            "the call is completed once, under the identifier its result answers"
+        );
     }
 
     #[test]
