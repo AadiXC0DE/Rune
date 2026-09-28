@@ -280,7 +280,9 @@ impl Frontmatter {
     ///
     /// Recognized keys are read; every other key is skipped, including any
     /// indented block it introduces, so a skill carrying fields another tool
-    /// defines still loads here.
+    /// defines still loads here. Only a key at the left margin is read: an
+    /// indented one belongs to a mapping nested under the key above it, such as
+    /// a `name` inside `metadata`, and is not the skill's own.
     fn parse(text: &str) -> std::result::Result<Self, String> {
         let mut lines = text.lines().map(strip_carriage_return).peekable();
         if lines.next() != Some("---") {
@@ -293,6 +295,9 @@ impl Frontmatter {
             };
             if line == "---" {
                 break;
+            }
+            if line.starts_with([' ', '\t']) {
+                continue;
             }
             let Some((key, value)) = line.split_once(':') else {
                 continue;
@@ -562,6 +567,16 @@ mod tests {
         .expect("parse");
         assert_eq!(parsed.name.as_deref(), Some("alpha"));
         assert_eq!(parsed.description.as_deref(), Some("kept"));
+    }
+
+    #[test]
+    fn keys_nested_under_another_key_are_not_the_skills_own() {
+        let parsed = Frontmatter::parse(
+            "---\nname: alpha\nmetadata:\n  name: nested\n  description: nested text\ndescription: real\nother:\n\tdescription: tabbed\n---\n",
+        )
+        .expect("a nested name is not a second declaration");
+        assert_eq!(parsed.name.as_deref(), Some("alpha"));
+        assert_eq!(parsed.description.as_deref(), Some("real"));
     }
 
     #[test]
