@@ -686,11 +686,21 @@ fn execute_batch(calls: &[PreparedCall], host: &dyn Host) -> Vec<CallResult> {
             }
             Outcome::Ask => {
                 // The host resolves an ask before reaching this point, so an
-                // ask that arrives here means the decision was not collected.
+                // ask that arrives here means nothing could approve the call.
+                // It is reported like a refusal, so the person watching sees
+                // it, and the model is told why and not to retry, because the
+                // same call will be held the same way every time.
+                let action = target.as_deref().unwrap_or(&call.name);
+                host.emit(Event::ToolDenied {
+                    call: call.clone(),
+                    reason: format!("{reason}; nothing in this session could approve it"),
+                });
                 results.push(CallResult {
                     call: call.clone(),
                     output: ToolOutput::failure(format!(
-                        "`{}` requires approval that was not collected",
+                        "`{}` was not run: no rule allows `{action}`, and this session has no \
+                         way to ask for approval. Do not retry it or a variation of it. Continue \
+                         without it, or tell the user what to run or which rule to add.",
                         call.name
                     )),
                     executed: false,

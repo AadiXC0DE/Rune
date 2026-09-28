@@ -491,6 +491,17 @@ fn an_unresolved_call_is_refused_rather_than_run() {
         "an unresolved call must not run without approval"
     );
     assert!(host.executed_calls().is_empty());
+    // The person watching is told, and the model is told why and not to try
+    // again, since the same call would be held the same way every time.
+    assert!(
+        host.events()
+            .iter()
+            .any(|event| matches!(event, Event::ToolDenied { .. })),
+        "a held call was not reported to the host"
+    );
+    let told = &outcome.calls[0].output.text;
+    assert!(told.contains("no rule allows"), "{told}");
+    assert!(told.contains("Do not retry"), "{told}");
 }
 
 #[test]
