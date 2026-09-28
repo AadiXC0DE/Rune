@@ -271,7 +271,7 @@ pub fn prepare_shell(
     })
 }
 
-/// Returns the environment a command is given when the caller names none.
+/// Environment variables a command may receive.
 ///
 /// A command needs a `PATH` to resolve a program by name, and a `HOME` because
 /// most programs that read a config file look there and misbehave when it is
@@ -279,12 +279,43 @@ pub fn prepare_shell(
 /// credentials and session state, and a command that reaches the network would
 /// otherwise be able to read them.
 ///
+/// The names are a constant so the check that no other variable reaches a
+/// command cannot drift from the list that decides it.
+#[cfg(not(windows))]
+pub const ALLOWED_ENVIRONMENT: [&str; 5] = ["PATH", "HOME", "TERM", "LANG", "TMPDIR"];
+
+/// Environment variables a command may receive.
+///
+/// Windows spells several of these differently and cannot start a system
+/// program without `SystemRoot`, which is what a process needs to load the
+/// libraries it links against. Omitting it fails in a way that names neither
+/// the variable nor the cause.
+#[cfg(windows)]
+pub const ALLOWED_ENVIRONMENT: [&str; 14] = [
+    "PATH",
+    "SystemRoot",
+    "SystemDrive",
+    "ComSpec",
+    "PATHEXT",
+    "TEMP",
+    "TMP",
+    "USERPROFILE",
+    "HOMEDRIVE",
+    "HOMEPATH",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "NUMBER_OF_PROCESSORS",
+    "PROCESSOR_ARCHITECTURE",
+];
+
+/// Returns the environment a command is given when the caller names none.
+///
 /// The variables are resolved once, here, rather than inherited, so a variable
 /// added to the environment later in this process cannot leak into a command.
 #[must_use]
 pub fn minimal_environment() -> BTreeMap<String, String> {
     let mut environment = BTreeMap::new();
-    for name in ["PATH", "HOME", "TERM", "LANG", "TMPDIR"] {
+    for name in ALLOWED_ENVIRONMENT {
         // A value this process holds that is not valid UTF-8 is left out
         // rather than lossily converted: a mangled path is worse than none.
         if let Some(value) = std::env::var_os(name)
@@ -294,17 +325,26 @@ pub fn minimal_environment() -> BTreeMap<String, String> {
         }
     }
     if !environment.contains_key("PATH") {
-        environment.insert("PATH".to_owned(), String::from(DEFAULT_PATH));
+        environment.insert("PATH".to_owned(), default_path());
     }
     environment
 }
 
-/// Path used when this process has no `PATH` of its own.
+/// Returns a search path for a process that has none of its own.
 ///
-/// A command would otherwise be unable to resolve a program by name at all,
-/// which reads as "the program does not exist" rather than "the environment was
-/// empty".
-const DEFAULT_PATH: &str = "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
+/// A command with no `PATH` cannot resolve a program by name at all, which
+/// reads as "the program does not exist" rather than "the environment was
+/// empty", so each platform gets a path that could actually work.
+fn default_path() -> String {
+    #[cfg(windows)]
+    {
+        String::from(r"C:\Windows\system32;C:\Windows")
+    }
+    #[cfg(not(windows))]
+    {
+        String::from("/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin")
+    }
+}
 
 /// Returns true when a command has to be parsed by a shell.
 #[must_use]
@@ -1293,22 +1333,19 @@ mod tests {
         // holds. It is asserted directly, because the leak it prevents is
         // invisible in normal output.
         let environment = minimal_environment();
-        for name in ["PATH", "HOME", "TERM", "LANG", "TMPDIR"] {
-            // Only names the allowlist names may appear.
+        for name in ALLOWED_ENVIRONMENT {
+            // A name on the list may only be absent when the parent lacked it.
             assert!(
                 environment.contains_key(name) || std::env::var_os(name).is_none(),
                 "{name} was dropped when the parent had it"
             );
         }
-        let allowed = ["PATH", "HOME", "TERM", "LANG", "TMPDIR"];
         for name in environment.keys() {
             assert!(
-                allowed.contains(&name.as_str()),
+                ALLOWED_ENVIRONMENT.contains(&name.as_str()),
                 "`{name}` reached a command's environment"
             );
-        }
-        // A key this process holds for a provider must never be among them.
-        for name in environment.keys() {
+            // A key this process holds for a provider must never be among them.
             assert!(
                 !name.ends_with("_API_KEY") && !name.starts_with("RUNE_"),
                 "`{name}` looks like a secret that leaked"
@@ -1318,6 +1355,18 @@ mod tests {
         // which reads as the program missing rather than the environment being
         // empty, so one is always supplied.
         assert!(environment.contains_key("PATH"));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn a_command_on_windows_can_load_its_system_libraries() {
+        // A process without SystemRoot cannot load the libraries it is linked
+        // against. PowerShell fails with "Loading managed Windows PowerShell
+        // failed", which names neither the variable nor the cause.
+        assert!(
+            minimal_environment().contains_key("SystemRoot"),
+            "a command would be unable to start a system program"
+        );
     }
 
     #[test]
