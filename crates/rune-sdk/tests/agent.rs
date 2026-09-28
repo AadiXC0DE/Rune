@@ -523,9 +523,10 @@ fn usage_accumulates_across_the_conversation() {
             .expect("turn");
         let _ = turn.result().expect("result");
     }
+    // Each turn reports ten in and five out, and each was billed separately.
     let usage = agent.usage();
-    assert_eq!(usage.input_tokens, Some(10));
-    assert_eq!(usage.output_tokens, Some(5));
+    assert_eq!(usage.input_tokens, Some(20));
+    assert_eq!(usage.output_tokens, Some(10));
 }
 
 #[test]

@@ -916,10 +916,10 @@ impl TurnContext {
         let _ = self.events.send(event);
     }
 
-    /// Records usage accumulated so far.
+    /// Adds one request's usage to the conversation's total.
     fn store_usage(&self, usage: Usage) {
         let mut shared = lock(&self.conversation.usage);
-        *shared = shared.merge_max(usage);
+        *shared = shared.merge_sum(usage);
     }
 
     /// Registers an image and returns the reference recorded in the history.
@@ -944,8 +944,10 @@ struct Accumulated {
     text: String,
     /// Reasoning produced so far, kept apart from the answer.
     reasoning: String,
-    /// Usage across steps.
+    /// Usage summed across steps.
     usage: Usage,
+    /// Usage of the latest request alone.
+    last_request: Usage,
     /// Steps taken.
     steps: u32,
     /// Tool calls made, in order.
@@ -981,8 +983,9 @@ fn run_turn(context: &TurnContext) -> Result<TurnProduct> {
             }
             Err(err) => return Err(err),
         };
-        acc.usage = acc.usage.merge_max(response.usage);
-        context.store_usage(acc.usage);
+        acc.usage = acc.usage.merge_sum(response.usage);
+        acc.last_request = response.usage;
+        context.store_usage(response.usage);
 
         let mut parts: Vec<ContentPart> = Vec::new();
         let mut pending: Vec<PreparedCall> = Vec::new();
@@ -1320,6 +1323,7 @@ fn settle(context: &TurnContext, stop_reason: StopReason, acc: Accumulated) -> T
         text,
         reasoning,
         usage,
+        last_request,
         steps,
         calls,
         images,
@@ -1327,6 +1331,7 @@ fn settle(context: &TurnContext, stop_reason: StopReason, acc: Accumulated) -> T
     context.emit(Event::Finished {
         reason: stop_reason,
         usage,
+        last_request,
         steps,
     });
     TurnProduct {
@@ -1335,6 +1340,7 @@ fn settle(context: &TurnContext, stop_reason: StopReason, acc: Accumulated) -> T
             text,
             reasoning,
             usage,
+            last_request,
             steps,
             calls,
         },

@@ -310,6 +310,54 @@ fn usage_from_the_stream_is_reported() {
 }
 
 #[test]
+fn usage_is_summed_across_steps_and_the_last_request_is_kept_apart() {
+    // Each step is a request billed on its own, so the turn costs their sum.
+    // How full the context is, though, is the last request's size alone.
+    let usage = |input: u64, output: u64| {
+        serde_json::json!({
+            "choices": [],
+            "usage": { "prompt_tokens": input, "completion_tokens": output },
+        })
+        .to_string()
+    };
+    let Script::Frames(mut first) = Script::tool_call("call_1", "read_file", "{\"path\":\"a.rs\"}")
+    else {
+        panic!("frames");
+    };
+    first.insert(first.len() - 1, usage(100, 20));
+    let second = Script::Frames(vec![
+        r#"{"choices":[{"index":0,"delta":{"content":"read it"}}]}"#.to_owned(),
+        r#"{"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#.to_owned(),
+        usage(150, 30),
+        "[DONE]".to_owned(),
+    ]);
+    let endpoint = MockEndpoint::start(vec![Script::Frames(first), second]);
+    let host = TestHost::new(endpoint).with_tools(vec![read_tool()]);
+
+    let mut history = rune_agent::History::new();
+    history.push_user("read a.rs");
+
+    let outcome = run_turn(&mut history, &host).expect("turn");
+    assert_eq!(outcome.steps, 2);
+    assert_eq!(outcome.usage.input_tokens, Some(250));
+    assert_eq!(outcome.usage.output_tokens, Some(50));
+    assert_eq!(outcome.last_request.input_tokens, Some(150));
+    assert_eq!(outcome.last_request.output_tokens, Some(30));
+
+    let finished = host.events().into_iter().find_map(|event| match event {
+        Event::Finished {
+            usage,
+            last_request,
+            ..
+        } => Some((usage, last_request)),
+        _ => None,
+    });
+    let (usage, last_request) = finished.expect("a finished event");
+    assert_eq!(usage, outcome.usage);
+    assert_eq!(last_request, outcome.last_request);
+}
+
+#[test]
 fn the_history_records_both_turns() {
     let endpoint = MockEndpoint::start(vec![Script::text("reply")]);
     let host = TestHost::new(endpoint);

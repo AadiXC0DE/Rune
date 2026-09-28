@@ -690,6 +690,11 @@ mod tests {
                 output_tokens: Some(4),
                 ..Usage::default()
             },
+            last_request: Usage {
+                input_tokens: Some(10),
+                output_tokens: Some(4),
+                ..Usage::default()
+            },
             steps: 1,
             calls: Vec::new(),
         }

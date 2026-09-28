@@ -1250,10 +1250,10 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                 host.record_usage(&outcome.usage);
                 host.record_context_size(
                     outcome
-                        .usage
+                        .last_request
                         .input_tokens
                         .unwrap_or(0)
-                        .saturating_add(outcome.usage.output_tokens.unwrap_or(0)),
+                        .saturating_add(outcome.last_request.output_tokens.unwrap_or(0)),
                 );
                 host.clear_events();
                 // The streamed text has been superseded by the finished turn,
@@ -4369,6 +4369,7 @@ mod tests {
             text: "the answer".to_owned(),
             reasoning: String::new(),
             usage: rune_net::stream::Usage::default(),
+            last_request: rune_net::stream::Usage::default(),
             steps: 1,
             calls: Vec::new(),
         };
@@ -4387,6 +4388,7 @@ mod tests {
             text: String::new(),
             reasoning: String::new(),
             usage: rune_net::stream::Usage::default(),
+            last_request: rune_net::stream::Usage::default(),
             steps: 40,
             calls: Vec::new(),
         };
@@ -4413,6 +4415,7 @@ mod tests {
             text: String::new(),
             reasoning: String::new(),
             usage: rune_net::stream::Usage::default(),
+            last_request: rune_net::stream::Usage::default(),
             steps: 1,
             calls: Vec::new(),
         };

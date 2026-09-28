@@ -95,7 +95,8 @@ impl Usage {
     /// Combines two reports by taking the larger value per field.
     ///
     /// Streaming providers may restate running totals. Taking the larger value
-    /// is correct for a monotonic counter and avoids double counting.
+    /// is correct for a monotonic counter and avoids double counting. It is
+    /// only correct within one response: separate requests are summed.
     #[must_use]
     pub fn merge_max(self, other: Self) -> Self {
         fn max(a: Option<u64>, b: Option<u64>) -> Option<u64> {
@@ -111,6 +112,28 @@ impl Usage {
             cache_read_tokens: max(self.cache_read_tokens, other.cache_read_tokens),
             cache_write_tokens: max(self.cache_write_tokens, other.cache_write_tokens),
             reasoning_tokens: max(self.reasoning_tokens, other.reasoning_tokens),
+        }
+    }
+
+    /// Combines the reports of two separate requests by adding each field.
+    ///
+    /// Every request is billed on its own, so a turn of several steps costs the
+    /// sum of them. A count neither side reported stays absent.
+    #[must_use]
+    pub fn merge_sum(self, other: Self) -> Self {
+        fn sum(a: Option<u64>, b: Option<u64>) -> Option<u64> {
+            match (a, b) {
+                (Some(a), Some(b)) => Some(a.saturating_add(b)),
+                (Some(a), None) | (None, Some(a)) => Some(a),
+                (None, None) => None,
+            }
+        }
+        Self {
+            input_tokens: sum(self.input_tokens, other.input_tokens),
+            output_tokens: sum(self.output_tokens, other.output_tokens),
+            cache_read_tokens: sum(self.cache_read_tokens, other.cache_read_tokens),
+            cache_write_tokens: sum(self.cache_write_tokens, other.cache_write_tokens),
+            reasoning_tokens: sum(self.reasoning_tokens, other.reasoning_tokens),
         }
     }
 }
@@ -378,6 +401,29 @@ mod tests {
         let merged = first.merge_max(second);
         assert_eq!(merged.input_tokens, Some(1));
         assert_eq!(merged.reasoning_tokens, Some(7));
+    }
+
+    #[test]
+    fn summing_usage_adds_every_request() {
+        let first = Usage {
+            input_tokens: Some(100),
+            output_tokens: Some(10),
+            cache_read_tokens: Some(40),
+            ..Usage::default()
+        };
+        let second = Usage {
+            input_tokens: Some(150),
+            output_tokens: Some(5),
+            reasoning_tokens: Some(7),
+            ..Usage::default()
+        };
+        let summed = first.merge_sum(second);
+        assert_eq!(summed.input_tokens, Some(250));
+        assert_eq!(summed.output_tokens, Some(15));
+        assert_eq!(summed.cache_read_tokens, Some(40));
+        assert_eq!(summed.reasoning_tokens, Some(7));
+        // A count neither request reported is still absent, not zero.
+        assert_eq!(summed.cache_write_tokens, None);
     }
 
     #[test]

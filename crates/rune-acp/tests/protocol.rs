@@ -695,6 +695,46 @@ fn a_refused_tool_call_is_reported_as_failed_and_the_turn_continues() {
 }
 
 #[test]
+fn the_usage_update_reports_the_last_request_rather_than_the_turn_total() {
+    // Two requests are billed 300 tokens between them, but the context holds
+    // only what the last one sent and received.
+    let usage = |input: u64, output: u64| {
+        json!({
+            "choices": [],
+            "usage": { "prompt_tokens": input, "completion_tokens": output },
+        })
+        .to_string()
+    };
+    let Script::Frames(mut first) = Script::tool_call("c1", "read_file", r#"{"path":"notes.txt"}"#)
+    else {
+        panic!("frames");
+    };
+    first.insert(first.len() - 1, usage(100, 20));
+    let second = Script::Frames(vec![
+        r#"{"choices":[{"index":0,"delta":{"content":"read it"}}]}"#.to_owned(),
+        r#"{"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#.to_owned(),
+        usage(150, 30),
+        "[DONE]".to_owned(),
+    ]);
+    let mut harness = Harness::start_with(
+        vec![Script::Frames(first), second],
+        PermissionMode::Ask,
+        BudgetSet::new(),
+        vec![("notes.txt", "hello\n")],
+    );
+    let session = harness.open_session();
+    harness
+        .client()
+        .request(3, "session/prompt", &prompt(&session, "read it"));
+    let answered = harness.client().response(3);
+    assert_eq!(answered["result"]["stopReason"], "end_turn");
+
+    let updates = harness.client().updates("usage_update");
+    let last = updates.last().expect("a usage update");
+    assert_eq!(last["params"]["update"]["used"], 180, "{updates:#?}");
+}
+
+#[test]
 fn an_unknown_method_is_reported_and_the_connection_survives() {
     let mut harness = Harness::start(vec![Script::text("unused")], PermissionMode::Auto);
     let refused =

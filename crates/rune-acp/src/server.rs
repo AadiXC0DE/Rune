@@ -1115,10 +1115,12 @@ impl<W: Write + Send + 'static> Host for TurnHost<W> {
                     Some(&reason),
                 )));
             }
-            Event::Finished { usage, .. } => {
+            // The update reports how full the context window is, which is the
+            // last request's size rather than the turn's billed total.
+            Event::Finished { last_request, .. } => {
                 self.server.send(&Message::Notification(usage_update(
                     &self.session,
-                    reported_tokens(usage),
+                    reported_tokens(last_request),
                     self.server.config.context_window,
                 )));
             }

@@ -384,6 +384,7 @@ fn encode(event: &Event) -> Option<serde_json::Value> {
             reason,
             usage,
             steps,
+            last_request,
         } => json!({
             "kind": "finished",
             "reason": reason.as_str(),
@@ -391,6 +392,8 @@ fn encode(event: &Event) -> Option<serde_json::Value> {
             "steps": steps,
             "input_tokens": usage.input_tokens,
             "output_tokens": usage.output_tokens,
+            // How full the context is, which the status line reports.
+            "context_tokens": last_request.input_tokens,
         }),
         #[allow(
             unreachable_patterns,

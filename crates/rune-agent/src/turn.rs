@@ -144,8 +144,10 @@ pub enum Event {
     Finished {
         /// How it ended.
         reason: StopReason,
-        /// Token usage for the whole turn.
+        /// Token usage billed across every step of the turn.
         usage: Usage,
+        /// Token usage of the turn's last request alone.
+        last_request: Usage,
         /// Steps taken.
         steps: u32,
     },
@@ -251,8 +253,15 @@ pub struct TurnOutcome {
     /// Held separately so a reader can tell thinking from the reply, and so the
     /// two are never interleaved in one blob.
     pub reasoning: String,
-    /// Usage across every step.
+    /// Usage billed across every step, summed because each step is a request
+    /// of its own.
     pub usage: Usage,
+    /// Usage of the last request alone.
+    ///
+    /// Its input is the whole conversation as last sent, which is how full the
+    /// context window is. The summed usage counts that conversation once per
+    /// step, so it cannot answer that question.
+    pub last_request: Usage,
     /// Steps taken.
     pub steps: u32,
     /// Tool calls made, in order.
@@ -283,6 +292,7 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
 
     let client = host.fetch();
     let mut usage = Usage::default();
+    let mut last_request = Usage::default();
     let mut calls = Vec::new();
     // Reasoning accumulated across steps, so a multi-step turn keeps all of it.
     let mut reasoning = String::new();
@@ -303,12 +313,14 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
                 text,
                 reasoning,
                 usage,
+                last_request,
                 steps,
                 calls,
             };
             host.emit(Event::Finished {
                 reason: StopReason::StepLimit,
                 usage,
+                last_request,
                 steps,
             });
             return Ok(outcome);
@@ -331,7 +343,8 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
             steering,
         )?;
 
-        usage = usage.merge_max(outcome.usage);
+        usage = usage.merge_sum(outcome.usage);
+        last_request = outcome.usage;
 
         text = outcome.text();
         // Reasoning is accumulated across steps, so a turn that used several
@@ -424,6 +437,7 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
             host.emit(Event::Finished {
                 reason,
                 usage,
+                last_request,
                 steps,
             });
             return Ok(TurnOutcome {
@@ -431,6 +445,7 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
                 text,
                 reasoning,
                 usage,
+                last_request,
                 steps,
                 calls,
             });
@@ -470,6 +485,7 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
             host.emit(Event::Finished {
                 reason: StopReason::ProviderFailure,
                 usage,
+                last_request,
                 steps,
             });
             return Ok(TurnOutcome {
@@ -477,6 +493,7 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
                 text,
                 reasoning,
                 usage,
+                last_request,
                 steps,
                 calls,
             });
