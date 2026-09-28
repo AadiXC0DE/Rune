@@ -770,12 +770,12 @@ impl EnvironmentOverrides {
             web_tools: boolean(&mut lookup, "RUNE_WEB_TOOLS"),
         };
 
+        // The list is split the way the platform writes a search path, because a
+        // colon is part of every absolute path on Windows.
         if let Some(list) = lookup("RUNE_ADDITIONAL_DIRS") {
-            out.additional_directories = list
-                .split(':')
-                .map(str::trim)
-                .filter(|part| !part.is_empty())
-                .map(Utf8PathBuf::from)
+            out.additional_directories = std::env::split_paths(&list)
+                .filter_map(|part| part.to_str().map(str::trim).map(Utf8PathBuf::from))
+                .filter(|part| !part.as_str().is_empty())
                 .collect();
         }
 
@@ -1769,11 +1769,15 @@ theme_unused = "x"
 
     #[test]
     fn environment_overrides_read_from_a_lookup() {
+        let directories = std::env::join_paths(["/a", "/b"])
+            .expect("join")
+            .into_string()
+            .expect("utf8");
         let vars = std::collections::HashMap::from([
             ("RUNE_MODEL", "test/model"),
             ("RUNE_PERMISSION_MODE", "ask"),
             ("RUNE_FAST_MODE", "on"),
-            ("RUNE_ADDITIONAL_DIRS", "/a:/b"),
+            ("RUNE_ADDITIONAL_DIRS", directories.as_str()),
             ("RUNE_LIMITS", "list_entries=5, read_file_lines=10"),
         ]);
         let env = EnvironmentOverrides::from_lookup(|key| vars.get(key).map(|v| (*v).to_owned()));
@@ -1781,6 +1785,41 @@ theme_unused = "x"
         assert_eq!(env.fast_mode, Some(true));
         assert_eq!(env.additional_directories.len(), 2);
         assert_eq!(env.limits.len(), 2);
+    }
+
+    #[test]
+    fn additional_directories_are_split_the_way_the_platform_joins_them() {
+        // An absolute path on Windows carries a colon after its drive letter,
+        // so this list holds one there on every run.
+        let base = std::env::temp_dir();
+        let expected: Vec<Utf8PathBuf> = [base.join("first"), base.join("second")]
+            .into_iter()
+            .map(|path| Utf8PathBuf::from_path_buf(path).expect("utf8"))
+            .collect();
+        let joined = std::env::join_paths(&expected)
+            .expect("join")
+            .into_string()
+            .expect("utf8");
+
+        let env = EnvironmentOverrides::from_lookup(|key| {
+            (key == "RUNE_ADDITIONAL_DIRS").then(|| joined.clone())
+        });
+        assert_eq!(env.additional_directories, expected);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn additional_directories_keep_their_drive_letters() {
+        let env = EnvironmentOverrides::from_lookup(|key| {
+            (key == "RUNE_ADDITIONAL_DIRS").then(|| r"C:\work;D:\other".to_owned())
+        });
+        assert_eq!(
+            env.additional_directories,
+            vec![
+                Utf8PathBuf::from(r"C:\work"),
+                Utf8PathBuf::from(r"D:\other")
+            ]
+        );
     }
 
     #[test]
