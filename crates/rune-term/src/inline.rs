@@ -259,14 +259,11 @@ impl Inline {
         if unchanged {
             let mut out = String::new();
             out.push_str(HIDE_CURSOR);
+            // The caret is already on its row, so only the column moves. Any
+            // vertical move here is a round trip, and on the screen's last row
+            // the downward half is clamped, which left the caret on the status
+            // row for the next frame to write over.
             out.push('\r');
-            // From where the cursor is, not from the top of the region. Walking
-            // to the top and then placing the caret only works while the caret
-            // is on the first row; anywhere else it moves the cursor onto a
-            // status row, which is what made it jump upward on a key that did
-            // not edit the line.
-            down(&mut out, self.cursor_row);
-            up(&mut out, caret_row);
             column(&mut out, caret.1);
             out.push_str(SHOW_CURSOR);
             return out.into_bytes();
@@ -567,7 +564,8 @@ mod tests {
     #[test]
     fn the_move_back_to_the_region_counts_the_rows_that_were_drawn() {
         // The region had three rows, so the next frame must walk back up three
-        // from wherever the caret was left inside it.
+        // from wherever the caret was left inside it. The first row changes, so
+        // the frame repaints rather than only placing the caret.
         let mut inline = Inline::new(40);
         let _ = frame(
             &mut inline,
@@ -581,7 +579,7 @@ mod tests {
         let bytes = frame(
             &mut inline,
             &[],
-            Some("working"),
+            Some("still working"),
             &rows(&["s"]),
             &rows(&["> "]),
             &[],
@@ -1286,6 +1284,88 @@ mod tests {
                 "row {line:?} is missing from the screen:\n{screen}"
             );
         }
+    }
+
+    #[test]
+    fn moving_the_caret_on_the_bottom_row_keeps_it_on_the_input_row() {
+        // At the bottom of the screen a downward move is clamped, so a caret
+        // move that went down and back up left the cursor one row too high and
+        // the next edit was written over the status row.
+        const HEIGHT: u16 = 10;
+        let mut inline = Inline::new(40);
+        inline.set_max_rows(HEIGHT.saturating_sub(1));
+        let mut grid = crate::engine::Grid::new(40, HEIGHT).expect("grid");
+        let footer = rows(&["status"]);
+        let history: Vec<String> = (0..12).map(|i| format!("line {i}")).collect();
+
+        // Enough settled lines to push the region against the bottom.
+        let first = frame(
+            &mut inline,
+            &history,
+            None,
+            &footer,
+            &rows(&["> abc"]),
+            &[],
+            (0, 5),
+        );
+        grid.feed(&first).expect("feed");
+        // The idle redraw that follows, as the session draws between keys.
+        let idle = frame(
+            &mut inline,
+            &[],
+            None,
+            &footer,
+            &rows(&["> abc"]),
+            &[],
+            (0, 5),
+        );
+        grid.feed(&idle).expect("feed");
+        let bottom = HEIGHT.saturating_sub(1);
+        assert_eq!(grid.cursor().row, bottom, "{}", grid.text());
+
+        // Left: nothing on screen changes, only the caret column.
+        let left = frame(
+            &mut inline,
+            &[],
+            None,
+            &footer,
+            &rows(&["> abc"]),
+            &[],
+            (0, 4),
+        );
+        grid.feed(&left).expect("feed");
+        assert_eq!(
+            grid.cursor().row,
+            bottom,
+            "the caret left the input row:\n{}",
+            grid.text()
+        );
+        assert_eq!(grid.cursor().col, 4);
+
+        // Typing at the caret rewrites the input row, and only the input row.
+        let typed = frame(
+            &mut inline,
+            &[],
+            None,
+            &footer,
+            &rows(&["> abXc"]),
+            &[],
+            (0, 5),
+        );
+        grid.feed(&typed).expect("feed");
+        let screen = grid.text();
+        let lines: Vec<&str> = screen.lines().collect();
+        assert_eq!(
+            lines[usize::from(bottom)].trim_end(),
+            "> abXc",
+            "the edit did not land on the input row:\n{screen}"
+        );
+        assert_eq!(
+            lines[usize::from(bottom.saturating_sub(1))].trim_end(),
+            "status",
+            "the status row was written over:\n{screen}"
+        );
+        assert_eq!(grid.cursor().row, bottom, "{screen}");
     }
 
     #[test]
