@@ -18,8 +18,24 @@ use rune_core::paths::Paths;
 /// Most entries kept after compaction.
 pub const MAX_ENTRIES: usize = 1_000;
 
-/// Largest file accepted before compaction, in bytes.
+/// Largest the file is allowed to grow, in bytes.
+///
+/// It is also what [`History::open`] reads a file at, so recording drops the
+/// oldest entries to stay under it. Without that, a thousand long prompts
+/// outgrow the read and recall stops working for good.
 pub const MAX_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Most a file past [`MAX_BYTES`] can hold.
+///
+/// Only the entry count bounds such a file, and each entry is bounded by
+/// [`MAX_PROMPT_BYTES`], which JSON can expand six times over, plus its
+/// location. It is read at this size so its prompts are kept, and the next
+/// write brings it back under [`MAX_BYTES`].
+const OVERSIZED_BYTES: u64 = (MAX_ENTRIES as u64).saturating_mul(
+    (MAX_PROMPT_BYTES as u64)
+        .saturating_mul(6)
+        .saturating_add(4096),
+);
 
 /// Longest single prompt recorded.
 ///
@@ -94,7 +110,12 @@ impl History {
     /// earlier prompt unreachable.
     pub fn open(paths: &Paths) -> Result<Self> {
         let path = paths.history_file();
-        let text = rune_core::paths::read_private(&path, MAX_BYTES)?;
+        let text = match rune_core::paths::read_private(&path, MAX_BYTES) {
+            Err(err) if err.code() == ErrorCode::TooLarge => {
+                rune_core::paths::read_private(&path, OVERSIZED_BYTES)?
+            }
+            other => other?,
+        };
         let mut entries = VecDeque::new();
         if let Some(text) = text {
             for line in text.lines() {
@@ -180,20 +201,49 @@ impl History {
         self.rewrite()
     }
 
-    /// Writes the whole file.
+    /// Writes the whole file, dropping the oldest entries past the byte cap.
     ///
     /// Written whole rather than appended: the file is bounded and small, and a
-    /// rewrite is what makes compaction and removal atomic.
-    fn rewrite(&self) -> Result<()> {
+    /// rewrite is what makes compaction and removal atomic. The text goes to a
+    /// file beside it that is then renamed over it, so a write cut short leaves
+    /// the previous history in place rather than a truncated one.
+    fn rewrite(&mut self) -> Result<()> {
         if let Some(parent) = self.path.parent() {
             rune_core::paths::create_dir_private(parent)?;
         }
-        let mut out = String::new();
+        let mut lines: VecDeque<String> = VecDeque::with_capacity(self.entries.len());
+        let mut total: usize = 0;
         for entry in &self.entries {
-            out.push_str(&entry.encode()?);
+            let line = entry.encode()?;
+            total = total.saturating_add(line.len()).saturating_add(1);
+            lines.push_back(line);
+        }
+        let budget = usize::try_from(MAX_BYTES).unwrap_or(usize::MAX);
+        while total > budget {
+            let Some(oldest) = lines.pop_front() else {
+                break;
+            };
+            total = total.saturating_sub(oldest.len().saturating_add(1));
+            self.entries.pop_front();
+        }
+
+        let mut out = String::with_capacity(total);
+        for line in &lines {
+            out.push_str(line);
             out.push('\n');
         }
-        rune_core::paths::write_private(&self.path, &out)
+        let staged = Utf8PathBuf::from(format!("{}.{}.tmp", self.path, std::process::id()));
+        if let Err(err) = rune_core::paths::write_private(&staged, &out) {
+            let _ = std::fs::remove_file(&staged);
+            return Err(err);
+        }
+        std::fs::rename(&staged, &self.path).map_err(|err| {
+            let _ = std::fs::remove_file(&staged);
+            RuneError::new(
+                ErrorCode::Internal,
+                format!("the history could not be replaced: {err}"),
+            )
+        })
     }
 }
 
@@ -324,6 +374,86 @@ mod tests {
             reopened.entries().last().map(|e| e.text.as_str()),
             Some(format!("prompt {last}").as_str())
         );
+    }
+
+    /// Returns a line of history holding one prompt of the largest size kept.
+    fn large_line(index: usize) -> String {
+        let text = format!(
+            "{index:04} {}",
+            "x".repeat(MAX_PROMPT_BYTES.saturating_sub(5))
+        );
+        Entry::new(text).encode().expect("encoded")
+    }
+
+    #[test]
+    fn recording_keeps_the_file_small_enough_to_open_again() {
+        // A thousand entries of up to eight kilobytes each is more than the
+        // read cap, and a file past it would have to be read at the larger
+        // size on every start.
+        let dir = tempfile::tempdir().expect("temp");
+        let root = Utf8Path::from_path(dir.path()).expect("utf8");
+        let paths = paths(root);
+        let mut history = History::open(&paths).expect("open");
+        for index in 0..600 {
+            let line = large_line(index);
+            history
+                .entries
+                .push_back(Entry::decode(&line).expect("decoded"));
+        }
+        history.record(Entry::new("the newest")).expect("recorded");
+
+        let size = std::fs::metadata(paths.history_file())
+            .expect("metadata")
+            .len();
+        assert!(size <= MAX_BYTES, "the file grew to {size} bytes");
+        let reopened = History::open(&paths).expect("the history opens again");
+        assert_eq!(
+            reopened.entries().last().map(|entry| entry.text.as_str()),
+            Some("the newest")
+        );
+        assert!(reopened.len() < 601, "nothing old was dropped");
+        assert_eq!(reopened.len(), history.len());
+    }
+
+    #[test]
+    fn a_file_that_outgrew_the_cap_is_opened_and_brought_back_under_it() {
+        // A file already past the cap is read in full and brought back under
+        // it, rather than failing to open and taking recall with it.
+        let dir = tempfile::tempdir().expect("temp");
+        let root = Utf8Path::from_path(dir.path()).expect("utf8");
+        let paths = paths(root);
+        let mut text = String::new();
+        for index in 0..600 {
+            text.push_str(&large_line(index));
+            text.push('\n');
+        }
+        assert!(text.len() as u64 > MAX_BYTES);
+        rune_core::paths::write_private(&paths.history_file(), &text).expect("write");
+
+        let mut history = History::open(&paths).expect("an oversized history opens");
+        assert_eq!(history.len(), 600);
+        history.record(Entry::new("after")).expect("recorded");
+        let size = std::fs::metadata(paths.history_file())
+            .expect("metadata")
+            .len();
+        assert!(size <= MAX_BYTES, "the file is still {size} bytes");
+    }
+
+    #[test]
+    fn a_rewrite_leaves_no_staging_file_behind() {
+        let dir = tempfile::tempdir().expect("temp");
+        let root = Utf8Path::from_path(dir.path()).expect("utf8");
+        let paths = paths(root);
+        let mut history = History::open(&paths).expect("open");
+        history.record(Entry::new("one")).expect("recorded");
+        history.record(Entry::new("two")).expect("recorded");
+
+        let staged = format!("{}.{}.tmp", paths.history_file(), std::process::id());
+        assert!(
+            !Utf8Path::new(&staged).exists(),
+            "the staging file was left at {staged}"
+        );
+        assert_eq!(History::open(&paths).expect("reopen").len(), 2);
     }
 
     #[test]
