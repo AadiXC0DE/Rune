@@ -400,11 +400,12 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
             // drop it: the loop returns without reaching another drain, and a
             // correction typed against the answer being written would never be
             // seen. Continuing is what makes the correction feel delivered.
+            //
+            // It is drained here rather than left for the next model boundary,
+            // so it is recorded and reported once, at the boundary it actually
+            // arrived at.
             if !steering.is_empty() {
-                host.emit(Event::SteeringApplied {
-                    boundary: Boundary::Finalizing,
-                    count: steering.len(),
-                });
+                apply_steering(history, steering, Boundary::Finalizing, host);
                 continue;
             }
             let reason = match finish {

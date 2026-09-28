@@ -559,6 +559,17 @@ fn steering_submitted_mid_stream_gets_a_response_in_the_same_turn() {
         )
     });
     assert!(applied, "steering submitted mid-stream was dropped");
+    // Reported once: a second report at the next model boundary would tell the
+    // user two messages were applied when one was.
+    let reports = host
+        .events()
+        .into_iter()
+        .filter(|event| matches!(event, Event::SteeringApplied { .. }))
+        .count();
+    assert_eq!(
+        reports, 1,
+        "one steering message was reported {reports} times"
+    );
 
     // The model was asked again with the steering in the conversation, which is
     // what makes the correction delivered rather than merely queued.
