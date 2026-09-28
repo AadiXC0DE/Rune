@@ -67,7 +67,6 @@ pub fn build(settings: &Settings, paths: &Paths) -> Result<Option<Box<dyn Review
             &settings.provider,
             &base_url,
             credential.expose(),
-            rune_net::transport::AuthStyle::Bearer,
             settings.offline,
         ),
         timeout: Duration::from_millis(

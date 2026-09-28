@@ -1125,7 +1125,6 @@ fn run_acp(
             &settings.provider,
             &base_url,
             credential.expose(),
-            rune_net::transport::AuthStyle::Bearer,
             settings.offline,
         ),
         dialect,

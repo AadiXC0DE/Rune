@@ -2978,7 +2978,6 @@ pub fn prepare(
             &settings.provider,
             &base_url,
             credential.expose(),
-            rune_net::transport::AuthStyle::Bearer,
             settings.offline,
         ),
         dialect,
@@ -4516,6 +4515,30 @@ mod tests {
         assert!(
             err.hint().is_some(),
             "the failure does not say how to connect a provider"
+        );
+    }
+
+    #[test]
+    fn an_anthropic_session_presents_its_key_the_way_anthropic_reads_it() {
+        // A session that sent a bearer token failed against the real endpoint,
+        // while the one-shot runner, which sent the key header, worked.
+        let dir = tempfile::tempdir().expect("temp");
+        let root = Utf8Path::from_path(dir.path()).expect("utf8");
+        let paths = Paths::resolve(Some(root.as_str()), None, None, None, None);
+        paths.ensure_roots().expect("roots");
+        crate::provider_setup::connect(&paths, "anthropic", "sk-ant-test").expect("credential");
+
+        let settings = Settings {
+            provider: rune_core::config::Provider::Anthropic,
+            base_url: Some("https://example.invalid".to_owned()),
+            model: "claude-test".to_owned(),
+            ..Settings::default()
+        };
+        let config =
+            prepare(&settings, &paths, Utf8Path::new("/tmp"), None).expect("a session prepares");
+        assert_eq!(
+            config.endpoint.auth,
+            rune_net::transport::AuthStyle::ApiKeyHeader
         );
     }
 

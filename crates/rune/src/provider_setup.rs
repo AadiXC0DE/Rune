@@ -279,7 +279,6 @@ pub fn fetch_catalog(
         &settings.provider,
         &base_url,
         credential.expose(),
-        rune_net::transport::AuthStyle::Bearer,
         settings.offline,
     );
 
@@ -477,24 +476,36 @@ pub fn inherited_endpoint(
     configured_url.map(str::to_owned)
 }
 
+/// Returns how a provider expects its credential to be presented.
+///
+/// Anthropic reads the key from its own header and refuses a bearer token for
+/// it, while every other dialect this build speaks takes a bearer token.
+#[must_use]
+pub const fn auth_style(provider: &Provider) -> rune_net::transport::AuthStyle {
+    match provider {
+        Provider::Anthropic => rune_net::transport::AuthStyle::ApiKeyHeader,
+        _ => rune_net::transport::AuthStyle::Bearer,
+    }
+}
+
 /// Builds the endpoint a request is sent to, with the headers its provider needs.
 ///
 /// A provider that routes by conversation or asks its clients to identify
 /// themselves states that in the provider table, so the headers are applied here
 /// rather than at each call site. A caller that builds its own endpoint would
-/// otherwise reach the provider without them and be refused.
+/// otherwise reach the provider without them and be refused. The credential is
+/// presented the way [`auth_style`] says, for the same reason.
 #[must_use]
 pub fn endpoint(
     provider: &Provider,
     base_url: &str,
     credential: &str,
-    auth: rune_net::transport::AuthStyle,
     offline: bool,
 ) -> rune_net::transport::Endpoint {
     let name = provider.as_str();
     let mut endpoint =
         rune_net::transport::Endpoint::new(base_url.to_owned(), credential.to_owned())
-            .with_auth(auth)
+            .with_auth(auth_style(provider))
             .offline(offline);
     for (header, value) in providers::lookup(name)
         .map(|entry| entry.required_headers)
@@ -556,6 +567,95 @@ mod tests {
             );
         }
         Paths::resolve(Some(root.as_str()), None, None, None, Some(root.as_str()))
+    }
+
+    /// Accepts one request on a free port and hands back its head, lowercased.
+    ///
+    /// The answer is an empty object rather than a stream, so the caller stops
+    /// after the one request. A request that never arrives yields an empty head
+    /// rather than a hang.
+    fn capture_one_request() -> (u16, std::thread::JoinHandle<String>) {
+        use std::io::{Read as _, Write as _};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        listener.set_nonblocking(true).expect("nonblocking");
+        let port = listener.local_addr().expect("addr").port();
+        let handle = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now()
+                .checked_add(std::time::Duration::from_secs(10))
+                .expect("deadline");
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(_) if std::time::Instant::now() < deadline => {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    Err(_) => return String::new(),
+                }
+            };
+            stream.set_nonblocking(false).expect("blocking");
+            let mut head = Vec::new();
+            let mut byte = [0_u8; 1];
+            while !head.ends_with(b"\r\n\r\n") && stream.read(&mut byte).expect("read") == 1 {
+                head.push(byte[0]);
+            }
+            let _ = stream.write_all(
+                b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}",
+            );
+            String::from_utf8_lossy(&head).to_lowercase()
+        });
+        (port, handle)
+    }
+
+    #[test]
+    fn every_provider_presents_its_credential_the_way_it_expects() {
+        use rune_net::transport::AuthStyle;
+
+        assert_eq!(auth_style(&Provider::Anthropic), AuthStyle::ApiKeyHeader);
+        for provider in [
+            Provider::ChatCompletions,
+            Provider::Responses,
+            rune_core::config::parse_provider("openrouter"),
+        ] {
+            assert_eq!(auth_style(&provider), AuthStyle::Bearer, "{provider}");
+        }
+        let built = endpoint(&Provider::Anthropic, "https://example.invalid", "k", false);
+        assert_eq!(built.auth, AuthStyle::ApiKeyHeader);
+    }
+
+    #[test]
+    fn a_request_to_anthropic_carries_the_key_in_its_own_header() {
+        // Anthropic refuses a bearer token, so every path that built its
+        // endpoint with one failed against the real service while `rune ask`,
+        // which sent the key header, worked.
+        let (port, captured) = capture_one_request();
+        let built = endpoint(
+            &Provider::Anthropic,
+            &format!("http://127.0.0.1:{port}"),
+            "sk-ant-captured",
+            false,
+        );
+        let mut plan = rune_net::provider::RequestPlan::new("claude-test");
+        plan.messages = rune_net::transport::one_shot_messages("hello");
+        let sent = rune_net::transport::stream_completion(
+            &rune_net::transport::agent(),
+            &built,
+            &rune_net::anthropic::Anthropic,
+            &plan,
+            std::time::Duration::from_secs(5),
+            &|| false,
+        );
+
+        let head = captured.join().expect("captured");
+        assert!(
+            head.contains("\r\nx-api-key: sk-ant-captured\r\n"),
+            "the key was not sent in x-api-key ({:?}):\n{head}",
+            sent.err()
+        );
+        assert!(
+            !head.contains("\r\nauthorization:"),
+            "a bearer token was sent to anthropic:\n{head}"
+        );
     }
 
     #[test]

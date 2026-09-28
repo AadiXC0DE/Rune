@@ -17,7 +17,7 @@ use rune_core::paths::Paths;
 use rune_net::message::Message;
 use rune_net::provider::{Provider, RequestPlan};
 use rune_net::stream::FinishReason;
-use rune_net::transport::{self, AuthStyle};
+use rune_net::transport;
 use serde::Serialize;
 
 /// Exit code for a successful run.
@@ -184,18 +184,10 @@ pub fn run(
                 )
             })?;
 
-    let (dialect, auth): (Box<dyn Provider>, AuthStyle) = match settings.provider {
-        rune_core::config::Provider::Anthropic => (
-            Box::new(rune_net::anthropic::Anthropic),
-            AuthStyle::ApiKeyHeader,
-        ),
-        rune_core::config::Provider::Responses => {
-            (Box::new(rune_net::responses::Responses), AuthStyle::Bearer)
-        }
-        _ => (
-            Box::new(rune_net::chat_completions::ChatCompletions),
-            AuthStyle::Bearer,
-        ),
+    let dialect: Box<dyn Provider> = match settings.provider {
+        rune_core::config::Provider::Anthropic => Box::new(rune_net::anthropic::Anthropic),
+        rune_core::config::Provider::Responses => Box::new(rune_net::responses::Responses),
+        _ => Box::new(rune_net::chat_completions::ChatCompletions),
     };
 
     let model = options
@@ -219,7 +211,6 @@ pub fn run(
         &settings.provider,
         &base_url,
         credential.expose(),
-        auth,
         settings.offline,
     );
 
