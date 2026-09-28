@@ -322,7 +322,9 @@ fn escape(value: &str) -> String {
 ///
 /// A missing, unreadable, non-regular, or non-UTF-8 file is skipped rather than
 /// failing the turn: a broken instruction file must not stop work in a
-/// repository that merely contains one.
+/// repository that merely contains one. A read cut by the bound can end inside
+/// a character, and only then is a partial character at the tail dropped rather
+/// than taken for invalid text.
 fn read_candidate(path: &Utf8Path) -> Option<(String, u64)> {
     let meta = std::fs::metadata(path).ok()?;
     if !meta.is_file() {
@@ -333,7 +335,17 @@ fn read_candidate(path: &Utf8Path) -> Option<(String, u64)> {
     let mut bytes = Vec::new();
     let mut handle = std::io::Read::take(file, u64::try_from(bound).unwrap_or(u64::MAX));
     std::io::Read::read_to_end(&mut handle, &mut bytes).ok()?;
-    let content = String::from_utf8(bytes).ok()?;
+    let cut = meta.len() > u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    let content = match String::from_utf8(bytes) {
+        Ok(text) => text,
+        Err(err) if cut && err.utf8_error().error_len().is_none() => {
+            let valid = err.utf8_error().valid_up_to();
+            let mut bytes = err.into_bytes();
+            bytes.truncate(valid);
+            String::from_utf8(bytes).ok()?
+        }
+        Err(_) => return None,
+    };
     Some((content, meta.len()))
 }
 
@@ -590,6 +602,38 @@ mod tests {
 
         let rendered = render(&[file]);
         assert!(rendered.contains(&format!("observed_bytes=\"{declared}\"")));
+    }
+
+    #[test]
+    fn a_bound_that_cuts_a_character_keeps_the_text_before_it() {
+        let (_dir, root) = tree();
+        let home = root.join("home");
+        let workspace = home.join("proj");
+        let cap = resolve_limit(LimitName::ProjectInstructionFileBytes);
+        // Two-byte characters from the first byte, so a read of one byte past
+        // an even cap stops inside one.
+        assert_eq!(cap % 2, 0);
+        let content = "\u{e9}".repeat(cap);
+        write(&workspace.join("AGENTS.md"), &content);
+
+        let files = files_of(&workspace, &home, &root.join("config"));
+        let file = files.first().expect("the file is kept");
+
+        assert_eq!(file.content.len(), cap);
+        assert!(file.content.chars().all(|character| character == '\u{e9}'));
+        assert_eq!(file.declared_bytes, content.len() as u64);
+        assert!(render(&[file]).contains("<instructions-truncated"));
+    }
+
+    #[test]
+    fn a_short_file_ending_inside_a_character_is_skipped() {
+        let (_dir, root) = tree();
+        let home = root.join("home");
+        let workspace = home.join("proj");
+        std::fs::create_dir_all(&workspace).expect("create dir");
+        std::fs::write(workspace.join("AGENTS.md"), b"rules \xc3").expect("write");
+
+        assert!(files_of(&workspace, &home, &root.join("config")).is_empty());
     }
 
     #[test]
