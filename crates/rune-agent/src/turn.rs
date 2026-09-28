@@ -18,6 +18,7 @@ use std::time::Duration;
 use rune_core::budget::{BudgetSet, LimitName};
 use rune_core::config::{Effort, PermissionMode};
 use rune_core::error::{ErrorCode, Result, RuneError};
+use rune_net::fetch::Fetch;
 use rune_net::message::{ContentPart, ToolSpec};
 use rune_net::provider::{Provider, RequestPlan, ToolChoice};
 use rune_net::stream::{FinishReason, Usage};
@@ -263,7 +264,7 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
     history.set_instructions(instructions);
     history.validate()?;
 
-    let agent = transport::agent();
+    let client = transport::UreqFetch::new();
     let mut usage = Usage::default();
     let mut calls = Vec::new();
     // Reasoning accumulated across steps, so a multi-step turn keeps all of it.
@@ -301,7 +302,7 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
         host.emit(Event::TurnStarted { step: steps });
 
         let (outcome, steering_arrived) = stream_with_retry(
-            &agent,
+            &client,
             host,
             history,
             head_timeout,
@@ -474,7 +475,7 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
 /// while the request was failing. The caller applies it, because the history is
 /// borrowed here to build each attempt.
 fn stream_with_retry(
-    agent: &ureq::Agent,
+    client: &dyn Fetch,
     host: &dyn Host,
     history: &History,
     head_timeout: Duration,
@@ -528,7 +529,7 @@ fn stream_with_retry(
         };
 
         match transport::stream_completion_observed(
-            agent,
+            client,
             host.endpoint(),
             host.dialect(),
             &plan,

@@ -18,6 +18,11 @@ thiserror = { workspace = true }
 sha2 = { workspace = true }
 jiff = { workspace = true }
 camino = { workspace = true }
+
+# The blocking client, and with it the streaming and tool transport. It cannot
+# build where a socket cannot, so a target without one reaches the transport
+# through `fetch::Fetch` with its own implementation.
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
 ureq = { workspace = true }
 
 [dev-dependencies]

@@ -18,7 +18,6 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 rune-tools = { workspace = true }
-ureq = { workspace = true }
 jiff = { workspace = true }
 camino = { workspace = true }
 sha2 = { workspace = true }

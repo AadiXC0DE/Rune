@@ -5,15 +5,21 @@
 //! executor, and keeping one out of the process means command dispatch and
 //! configuration never link an async runtime.
 //!
+//! The client itself sits behind [`Fetch`], and every request path here takes
+//! `&dyn Fetch` rather than a concrete client. This module is the only one that
+//! names the blocking client, so a target where it cannot compile supplies its
+//! own implementation of the trait instead of a second request path.
+//!
 //! Every request is bounded in time, every response body is bounded in bytes,
 //! and every failure maps onto the taxonomy the retry policy reads.
 
 use std::io::{BufRead, BufReader, Read};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rune_core::error::Result;
 
 use crate::error::{FailureKind, NetError, NetResult};
+use crate::fetch::{Fetch, FetchRequest};
 use crate::message::Message;
 use crate::provider::{Provider, RequestPlan, summarize_plan};
 use crate::redact;
@@ -293,6 +299,7 @@ impl StreamOutcome {
 /// Builds the HTTP agent used for every request.
 ///
 /// One agent per process, so connections are reused rather than re-established.
+#[cfg(not(target_family = "wasm"))]
 #[must_use]
 pub fn agent() -> ureq::Agent {
     ureq::Agent::config_builder()
@@ -305,12 +312,129 @@ pub fn agent() -> ureq::Agent {
         .into()
 }
 
+/// Adds headers to a request of either typestate.
+///
+/// `get` and `post` produce different builder types, so the headers are applied
+/// through a generic helper rather than a value both branches could share.
+#[cfg(not(target_family = "wasm"))]
+fn with_headers<Any>(
+    mut builder: ureq::RequestBuilder<Any>,
+    headers: &[(String, String)],
+) -> ureq::RequestBuilder<Any> {
+    for (name, value) in headers {
+        builder = builder.header(name, value);
+    }
+    builder
+}
+
+/// Performs one request over a client.
+///
+/// The single place a request becomes a client call, so the pooled transport
+/// and the plain client cannot drift apart in how they set headers, apply a
+/// timeout, or read the media type.
+#[cfg(not(target_family = "wasm"))]
+fn send_over(
+    client: &ureq::Agent,
+    request: &FetchRequest,
+) -> NetResult<crate::fetch::FetchResponse> {
+    use crate::fetch::{FetchResponse, Method};
+
+    // A request level timeout bounds the whole exchange; leaving it unset keeps
+    // a streamed generation open, which the head timeout bounds instead.
+    let response = match request.method {
+        Method::Get => {
+            let builder = with_headers(client.get(&request.url), &request.headers);
+            match request.timeout {
+                Some(timeout) => builder
+                    .config()
+                    .timeout_global(Some(timeout))
+                    .build()
+                    .call(),
+                None => builder.call(),
+            }
+        }
+        Method::Post => {
+            let builder = with_headers(client.post(&request.url), &request.headers);
+            match request.timeout {
+                Some(timeout) => builder
+                    .config()
+                    .timeout_global(Some(timeout))
+                    .build()
+                    .send(&request.body),
+                None => builder.send(&request.body),
+            }
+        }
+    }
+    .map_err(|err| classify_transport_error(&err))?;
+
+    let status = response.status().as_u16();
+    let content_type = response
+        .headers()
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("application/octet-stream")
+        .to_owned();
+    Ok(FetchResponse {
+        status,
+        content_type,
+        body: Box::new(response.into_body().into_reader()),
+    })
+}
+
+/// The built-in [`Fetch`], over a pooled blocking client.
+///
+/// One instance per process keeps the connection pool alive across requests.
+/// Created with [`UreqFetch::new`] and passed by reference, so every request
+/// reuses the same pool.
+///
+/// Absent on a target where the client cannot build. Such a target supplies its
+/// own [`Fetch`] and reaches every function here through the trait.
+#[cfg(not(target_family = "wasm"))]
+#[derive(Debug)]
+pub struct UreqFetch {
+    client: ureq::Agent,
+}
+
+#[cfg(not(target_family = "wasm"))]
+impl UreqFetch {
+    /// Builds the transport over its own pooled client.
+    #[must_use]
+    pub fn new() -> Self {
+        Self { client: agent() }
+    }
+}
+
+#[cfg(not(target_family = "wasm"))]
+impl Default for UreqFetch {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(not(target_family = "wasm"))]
+impl Fetch for UreqFetch {
+    fn send(&self, request: FetchRequest) -> NetResult<crate::fetch::FetchResponse> {
+        send_over(&self.client, &request)
+    }
+}
+
+#[cfg(not(target_family = "wasm"))]
+impl Fetch for ureq::Agent {
+    /// Sends over a client the caller already holds.
+    ///
+    /// A client built per request reuses no connection, so this is for a caller
+    /// holding one already. A caller with none uses [`UreqFetch`].
+    fn send(&self, request: FetchRequest) -> NetResult<crate::fetch::FetchResponse> {
+        send_over(self, &request)
+    }
+}
+
 /// Sends a streaming request and reduces the response.
 ///
 /// Returns a retryable error for a transient failure and a permanent one for a
 /// rejected request, which is the distinction the caller acts on.
 pub fn stream_completion(
-    agent: &ureq::Agent,
+    client: &dyn Fetch,
     endpoint: &Endpoint,
     provider: &dyn Provider,
     plan: &RequestPlan,
@@ -318,7 +442,7 @@ pub fn stream_completion(
     cancel: &dyn Fn() -> bool,
 ) -> NetResult<StreamOutcome> {
     stream_completion_observed(
-        agent,
+        client,
         endpoint,
         provider,
         plan,
@@ -335,7 +459,7 @@ pub fn stream_completion(
 /// every event the reducer produces, in order, and its return value is ignored:
 /// presenting a delta must never be able to fail a request.
 pub fn stream_completion_observed(
-    agent: &ureq::Agent,
+    client: &dyn Fetch,
     endpoint: &Endpoint,
     provider: &dyn Provider,
     plan: &RequestPlan,
@@ -361,13 +485,12 @@ pub fn stream_completion_observed(
     let url = endpoint.url_for(provider.request_path());
     let encoded = serde_json::to_string(&body)?;
 
-    let mut request = agent
-        .post(&url)
-        .header("content-type", "application/json")
-        .header("accept", "text/event-stream")
-        .header(
+    let mut request = FetchRequest::post(url, encoded.into_bytes())
+        .with_header("content-type", "application/json")
+        .with_header("accept", "text/event-stream")
+        .with_header(
             endpoint.auth.header(),
-            &endpoint.auth.value(&endpoint.credential),
+            endpoint.auth.value(&endpoint.credential),
         );
 
     // The endpoint's own headers come after the dialect's, so an endpoint that
@@ -378,35 +501,26 @@ pub fn stream_completion_observed(
         .map(|(name, value)| (name.to_owned(), value))
         .chain(endpoint.headers.iter().cloned())
     {
-        request = request.header(&name, &value);
+        request = request.with_header(name, value);
     }
 
-    let response = request
-        .send(&encoded)
-        .map_err(|err| classify_transport_error(&err))?;
+    let response = client.send(request)?;
 
-    let status = response.status().as_u16();
-    if status >= 400 {
-        let text = read_bounded_text(response.into_body(), 64 * 1024);
+    if response.status >= 400 {
+        let text = read_bounded_text(response.body, 64 * 1024);
         let sanitized = redact::redact(&text);
-        let mut error = NetError::classify_status(status, &sanitized).with_hint(format!(
+        let mut error = NetError::classify_status(response.status, &sanitized).with_hint(format!(
             "provider `{}` rejected the request",
             provider.name()
         ));
-        if status == 429 {
+        if response.status == 429 {
             // A rate limit is retryable, and the endpoint may have said when.
             error = error.with_retry_after(1000);
         }
         return Err(error);
     }
 
-    reduce_stream(
-        response.into_body(),
-        provider,
-        head_timeout,
-        cancel,
-        observe,
-    )
+    read_stream(response.body, provider, head_timeout, cancel, observe)
 }
 
 /// One response to an outbound request that is not a model completion.
@@ -439,36 +553,36 @@ pub const TOOL_USER_AGENT: &str = concat!(
 /// pass through this module: it is the one place where the address, scheme, and
 /// credential refusals are enforced, and a second client elsewhere would be a
 /// way around them.
+///
+/// Absent on a target where the built-in client cannot build. Such a target
+/// reaches the endpoint through [`stream_completion`] and its own [`Fetch`], or
+/// not at all.
+#[cfg(not(target_family = "wasm"))]
 pub fn fetch_url(url: &str, accept: &str, timeout: Duration) -> NetResult<Fetched> {
-    let response = agent()
-        .get(url)
-        .header("user-agent", TOOL_USER_AGENT)
-        .header("accept", accept)
-        .config()
-        .timeout_global(Some(timeout))
-        .build()
-        .call()
-        .map_err(|err| classify_transport_error(&err))?;
-
-    let status = response.status().as_u16();
-    let content_type = response
-        .headers()
-        .get("content-type")
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or("application/octet-stream")
-        .to_owned();
+    let response = UreqFetch::new().send(
+        FetchRequest::get(url)
+            .with_header("user-agent", TOOL_USER_AGENT)
+            .with_header("accept", accept)
+            .with_timeout(Some(timeout)),
+    )?;
 
     let mut body = Vec::new();
-    response
-        .into_body()
-        .into_reader()
-        .take(MAX_FETCH_BYTES)
-        .read_to_end(&mut body)
-        .map_err(NetError::from)?;
+    // One byte past the bound, so an oversized body is refused rather than
+    // silently truncated into a decode failure.
+    let limit = MAX_FETCH_BYTES.saturating_add(1);
+    let mut reader = response.body.take(limit);
+    reader.read_to_end(&mut body).map_err(NetError::from)?;
+    if u64::try_from(body.len()).unwrap_or(u64::MAX) > MAX_FETCH_BYTES {
+        return Err(NetError::new(
+            FailureKind::InvalidRequest,
+            "the response body is too large",
+        )
+        .with_hint("the tool refused to hold more than its body bound"));
+    }
 
     Ok(Fetched {
-        status,
-        content_type,
+        status: response.status,
+        content_type: response.content_type,
         body,
     })
 }
@@ -478,6 +592,7 @@ pub fn fetch_url(url: &str, accept: &str, timeout: Duration) -> NetResult<Fetche
 /// Returns the page rather than parsed results, because parsing belongs with the
 /// tool that defines what a result is. What lives here is the request, so this
 /// module remains the only place that opens a connection.
+#[cfg(not(target_family = "wasm"))]
 pub fn search_html(query: &str, endpoint: &str, timeout: Duration) -> NetResult<String> {
     let escaped = percent_encode_query(query);
     let separator = if endpoint.contains('?') { '&' } else { '?' };
@@ -532,7 +647,7 @@ pub fn percent_encode_query(query: &str) -> String {
 /// unreachable endpoint are different answers and only one of them means the
 /// provider has no models.
 pub fn list_models(
-    agent: &ureq::Agent,
+    client: &dyn Fetch,
     endpoint: &Endpoint,
     provider: &dyn Provider,
     timeout: Duration,
@@ -555,35 +670,30 @@ pub fn list_models(
         .with_hint("the model is used as given; check the provider's documentation")
     })?;
 
-    let url = endpoint.url_for(path);
-    let mut request = agent.get(&url).header("accept", "application/json").header(
-        endpoint.auth.header(),
-        &endpoint.auth.value(&endpoint.credential),
-    );
+    let mut request = FetchRequest::get(endpoint.url_for(path))
+        .with_header("accept", "application/json")
+        .with_header(
+            endpoint.auth.header(),
+            endpoint.auth.value(&endpoint.credential),
+        );
     for (name, value) in provider
         .extra_headers()
         .into_iter()
         .map(|(name, value)| (name.to_owned(), value))
         .chain(endpoint.headers.iter().cloned())
     {
-        request = request.header(&name, &value);
+        request = request.with_header(name, value);
     }
 
-    // The agent carries no overall timeout, because a streaming generation is
+    // The client carries no overall timeout, because a streaming generation is
     // expected to be long. A listing is a small document, so it is bounded here
     // rather than leaving a stalled endpoint to hold the command open.
-    let response = request
-        .config()
-        .timeout_global(Some(timeout))
-        .build()
-        .call()
-        .map_err(|err| classify_transport_error(&err))?;
+    let response = client.send(request.with_timeout(Some(timeout)))?;
 
-    let status = response.status().as_u16();
-    let text = read_bounded_text(response.into_body(), 1024 * 1024);
-    if status >= 400 {
+    let text = read_bounded_text(response.body, 1024 * 1024);
+    if response.status >= 400 {
         return Err(
-            NetError::classify_status(status, &redact::redact(&text)).with_hint(format!(
+            NetError::classify_status(response.status, &redact::redact(&text)).with_hint(format!(
                 "provider `{}` refused to list its models",
                 provider.name()
             )),
@@ -603,8 +713,17 @@ fn report_new(events: &[ProviderEvent], before: usize, observe: &mut dyn FnMut(&
 }
 
 /// Reads and reduces a streaming response body.
-fn reduce_stream(
-    body: ureq::Body,
+///
+/// The body is read a line at a time, so each frame is reduced and reported as
+/// it arrives. Collecting the body first would hold the whole answer back until
+/// the response ended, which is the behavior this path exists to avoid.
+///
+/// Public because a host that reaches an endpoint through its own [`Fetch`],
+/// including one that runs where the built-in client cannot compile, reduces
+/// the body with the same decoder, limits, and head timeout rather than a
+/// second implementation that can disagree with this one.
+pub fn read_stream(
+    body: Box<dyn Read + Send>,
     provider: &dyn Provider,
     head_timeout: Duration,
     cancel: &dyn Fn() -> bool,
@@ -616,8 +735,8 @@ fn reduce_stream(
     let mut outcome = StreamOutcome::default();
     let mut frame_buffer: Vec<Event> = Vec::new();
 
-    let reader = BufReader::new(body.into_reader());
-    let started = std::time::Instant::now();
+    let reader = BufReader::new(body);
+    let started = Instant::now();
     let head_deadline = head_timeout;
     let mut saw_any_event = false;
 
@@ -693,14 +812,15 @@ fn reduce_stream(
 }
 
 /// Reads a body up to a byte limit, lossily decoding it.
-fn read_bounded_text(body: ureq::Body, limit: u64) -> String {
-    let mut reader = body.into_reader().take(limit);
+fn read_bounded_text(body: Box<dyn Read + Send>, limit: u64) -> String {
+    let mut reader = body.take(limit);
     let mut buffer = Vec::new();
     let _ = reader.read_to_end(&mut buffer);
     String::from_utf8_lossy(&buffer).into_owned()
 }
 
 /// Maps a transport failure onto the taxonomy.
+#[cfg(not(target_family = "wasm"))]
 fn classify_transport_error(err: &ureq::Error) -> NetError {
     let message = redact::redact(&err.to_string());
     let kind = match err {
