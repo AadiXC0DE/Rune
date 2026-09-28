@@ -43,6 +43,7 @@ fn main() -> ExitCode {
         "budget" => budget(),
         "gate" => gate(),
         "release" => release(&extra),
+        "web" => web(),
         "help" | "--help" | "-h" => {
             print_help();
             Ok(())
@@ -76,6 +77,7 @@ fn print_help() {
     println!("  budget   build the release profile and check size and startup");
     println!("  gate     budget plus the full workspace test suite");
     println!("  release  stage a release artifact, its checksum, and a manifest");
+    println!("  web      build the harness for the landing page into site/demo/rune.wasm");
     println!();
     println!("  release takes: cargo xtask release <channel> [version] [target]");
 }
@@ -97,6 +99,35 @@ fn check() -> Result<(), String> {
 /// Runs cargo with the given arguments, inheriting stdio.
 fn cargo(args: &[&str]) -> Result<(), String> {
     run("cargo", args)
+}
+
+/// Builds the harness for the browser and places it where the page loads it.
+///
+/// The page is served as static files with no build step of its own, so the
+/// module is committed beside it, and this is the one command that makes it.
+fn web() -> Result<(), String> {
+    const TARGET: &str = "wasm32-wasip1";
+    cargo(&["build", "--release", "-p", "rune-web", "--target", TARGET])?;
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .ok_or("the xtask crate has no parent directory")?
+        .to_path_buf();
+    let target = std::env::var_os("CARGO_TARGET_DIR")
+        .map_or_else(|| root.join("target"), std::path::PathBuf::from);
+    let built = target.join(TARGET).join("release").join("rune_web.wasm");
+    let placed = root.join("site").join("demo").join("rune.wasm");
+    std::fs::copy(&built, &placed).map_err(|err| {
+        format!(
+            "could not copy {} to {}: {err}",
+            built.display(),
+            placed.display()
+        )
+    })?;
+    let bytes = std::fs::metadata(&placed)
+        .map_err(|err| err.to_string())?
+        .len();
+    println!("site/demo/rune.wasm: {bytes} bytes");
+    Ok(())
 }
 
 /// Runs a program with the given arguments, inheriting stdio.

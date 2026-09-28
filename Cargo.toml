@@ -13,6 +13,7 @@ members = [
     "crates/rune-acp",
     "crates/rune-sdk",
     "crates/rune-testkit",
+    "crates/rune-web",
     "crates/rune",
     "xtask",
 ]

@@ -1,0 +1,31 @@
+[package]
+name = "rune-web"
+description = "The agent harness built for a browser tab, over WebAssembly and WASI."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[lib]
+# The dynamic library is what the page loads; the library form is what the
+# tests link against.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+rune-core = { workspace = true }
+rune-net = { workspace = true }
+rune-policy = { workspace = true }
+rune-tools = { workspace = true }
+rune-agent = { workspace = true }
+rune-context = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+camino = { workspace = true }
+
+[dev-dependencies]
+tempfile.workspace = true
