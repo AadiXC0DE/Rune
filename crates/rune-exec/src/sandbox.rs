@@ -41,6 +41,13 @@ pub const SEATBELT_TOOL: &str = "/usr/bin/sandbox-exec";
 /// The Linux helper that builds the namespaces.
 pub const NAMESPACE_HELPER: &str = "bwrap";
 
+/// Device a masked credential file is replaced with.
+///
+/// A file is masked by covering it with a node of the same kind, and the null
+/// device is always present, always readable to the end of nothing, and never
+/// carries anything.
+const NULL_DEVICE: &str = "/dev/null";
+
 /// Locations under the home directory that hold credentials.
 ///
 /// A sandboxed command has no business reading any of these, so each backend
@@ -134,16 +141,6 @@ impl SandboxPolicy {
         std::iter::once(&self.workspace).chain(self.writable_roots.iter())
     }
 
-    /// Returns every path whose reads are re-granted after the credential deny.
-    ///
-    /// A deny for a credential path can cover a path a command needs when the
-    /// two share a parent, so the grants that follow it name the same paths the
-    /// write rules do. The workspace is first, because a workspace that lives in
-    /// an unusual place has to stay usable.
-    fn readable(&self) -> impl Iterator<Item = &Utf8PathBuf> {
-        self.writable()
-    }
-
     /// Returns the credential locations this host has, for a caller to assert
     /// against without repeating the list.
     #[must_use]
@@ -230,27 +227,50 @@ fn resolve(path: &Utf8Path, what: &str) -> Result<Utf8PathBuf> {
 /// point the profile is built rather than being carried on the policy. A policy
 /// that named its own home would let a caller move what is hidden.
 fn home_directory() -> Option<Utf8PathBuf> {
-    let home = std::env::var("HOME").ok().filter(|value| !value.is_empty())?;
+    let home = std::env::var("HOME")
+        .ok()
+        .filter(|value| !value.is_empty())?;
     let path = Utf8PathBuf::from(home);
     path.is_dir().then_some(path)
 }
 
-/// Returns the credential paths that exist on this host.
+/// Returns the credential paths that exist under a home directory.
 ///
 /// Each is resolved to the location the kernel sees, so a rule about it covers
-/// the same bytes a command would open. A path that is not present is skipped:
-/// it holds nothing to protect, and a rule about it is either dead weight or, on
-/// Linux, a mount that cannot be created.
-fn existing_credential_paths() -> Vec<Utf8PathBuf> {
-    let Some(home) = home_directory() else {
-        return Vec::new();
-    };
+/// the same bytes a command would open. That resolution is what makes the rule
+/// match: a sandbox rule names a resolved path, and a rule about the spelling a
+/// path was built from matches nothing. A path that is not present is skipped,
+/// since it holds nothing to protect, and a rule about it is either dead weight
+/// or, on Linux, a mount that cannot be created.
+fn credential_paths_under(home: &Utf8Path) -> Vec<Utf8PathBuf> {
     CREDENTIAL_PATHS
         .iter()
         .map(|relative| home.join(relative))
         .filter(|path| path.exists())
         .filter_map(|path| path.canonicalize_utf8().ok())
         .collect()
+}
+
+/// Returns the credential paths that exist on this host.
+fn existing_credential_paths() -> Vec<Utf8PathBuf> {
+    home_directory().map_or_else(Vec::new, |home| credential_paths_under(&home))
+}
+
+/// Returns the Seatbelt rule that covers a resolved path.
+///
+/// A file is named literally, where a subpath rule would also cover a directory
+/// that happened to share its name.
+fn rule_for(resolved: &Utf8Path) -> &'static str {
+    if resolved.is_dir() {
+        "subpath"
+    } else {
+        "literal"
+    }
+}
+
+/// Returns a path as a Seatbelt rule operand.
+fn operand(path: &Utf8Path) -> Result<String> {
+    Ok(format!("({} {})", rule_for(path), quote(path)?))
 }
 
 /// Quotes a path for a Seatbelt profile.
@@ -339,32 +359,59 @@ impl MacSandbox {
     ///
     /// The profile denies every write and then re-allows the workspace and each
     /// writable root, so an action is granted deliberately rather than being
-    /// permitted because no rule mentioned it. Reading stays open, and network
+    /// permitted because no rule mentioned it. Reads are open except for the
+    /// credential locations under the home directory, which are denied. Network
     /// is denied unless the policy grants it.
+    ///
+    /// Two details of the rule language decide the shape of this profile, both
+    /// measured against `sandbox-exec` on macOS rather than assumed:
+    ///
+    /// - A rule matches the path the kernel evaluates, so every path is
+    ///   canonicalized before it is named. A rule about the unresolved spelling
+    ///   of a path matches nothing, which on macOS is the difference between
+    ///   `/tmp/x` and `/private/tmp/x`.
+    /// - The last rule that matches decides, so the credential deny is emitted
+    ///   after the grant for the readable roots. Otherwise a workspace that
+    ///   contains a credential path, which is the case when the home directory
+    ///   itself is the workspace, would re-grant the very path that was denied.
     pub fn profile(policy: &SandboxPolicy) -> Result<String> {
+        Self::profile_with(policy, &existing_credential_paths())
+    }
+
+    /// Returns the generated profile for a policy and an explicit credential
+    /// list.
+    ///
+    /// The credential paths are an input rather than resolved inside, so a test
+    /// can build a profile over a fixture home without moving this process's own
+    /// home directory.
+    fn profile_with(policy: &SandboxPolicy, credentials: &[Utf8PathBuf]) -> Result<String> {
         let mut profile = String::new();
         let _ = writeln!(profile, "(version 1)");
         let _ = writeln!(profile, "(allow default)");
         let _ = writeln!(profile, "(deny file-write*)");
         for path in policy.writable() {
             let resolved = resolve(path, "a writable path")?;
-            let rule = if resolved.is_dir() {
-                "subpath"
-            } else {
-                // A file grant covers the file, where a subpath rule would also
-                // cover a directory that happened to share its name.
-                "literal"
-            };
-            let _ = writeln!(
-                profile,
-                "(allow file-write* ({rule} {}))",
-                quote(&resolved)?
-            );
+            let _ = writeln!(profile, "(allow file-write* {})", operand(&resolved)?);
         }
         // Redirection to these is not a way to change the machine, and denying
         // them breaks almost every command that prints.
         for device in ["/dev/null", "/dev/stdout", "/dev/stderr", "/dev/tty"] {
             let _ = writeln!(profile, "(allow file-write* (literal \"{device}\"))");
+        }
+        // Reading stays open everywhere else, so a command still reads its own
+        // libraries and the files it was pointed at. The roots it works in are
+        // named before the deny below, never after it: Seatbelt applies the last
+        // matching rule, so a grant emitted after a deny would reopen it, which
+        // is what happens when the home directory itself is the workspace.
+        //
+        // The readable roots and the writable ones are the same paths, so the
+        // loop is shared.
+        for path in policy.writable() {
+            let resolved = resolve(path, "a readable path")?;
+            let _ = writeln!(profile, "(allow file-read* {})", operand(&resolved)?);
+        }
+        for credential in credentials {
+            let _ = writeln!(profile, "(deny file-read* {})", operand(credential)?);
         }
         if !policy.network {
             let _ = writeln!(profile, "(deny network*)");
@@ -513,6 +560,26 @@ impl LinuxSandbox {
             argv.push(String::from("--bind"));
             argv.push(resolved.as_str().to_owned());
             argv.push(resolved.as_str().to_owned());
+        }
+        // The credential locations are covered last, so the mask is the rule
+        // that applies to a path a writable bind would otherwise expose, which
+        // is the case when the home directory is itself the workspace.
+        for credential in existing_credential_paths() {
+            if credential.is_dir() {
+                // A directory is covered by an empty filesystem, which hides
+                // everything under it in one operation.
+                argv.push(String::from("--tmpfs"));
+                argv.push(credential.as_str().to_owned());
+            } else {
+                // A single file cannot take a tmpfs, because that would turn it
+                // into a directory and change what the path is. It is covered
+                // by the null device instead, which is the same kind of node and
+                // carries no data. Read-only, so the mask cannot be replaced by
+                // a write.
+                argv.push(String::from("--ro-bind"));
+                argv.push(String::from(NULL_DEVICE));
+                argv.push(credential.as_str().to_owned());
+            }
         }
         argv.push(String::from("--"));
         argv.extend(prepared.argv.iter().cloned());
@@ -978,5 +1045,192 @@ mod tests {
             outcome.stdout.contains("contents"),
             "the read produced nothing: {outcome:?}"
         );
+    }
+
+    /// Returns a home fixture holding one readable path at each credential
+    /// location, so a profile can be built over a real directory tree.
+    ///
+    /// An entry with no separator is made a directory and one with a separator a
+    /// file, which exercises both the subpath and the literal rule without the
+    /// test restating which credential is which. The exact kinds are not what is
+    /// under test; the rule that is emitted for each is.
+    fn credential_home() -> (TempDir, Utf8PathBuf) {
+        let (dir, home) = tempdir();
+        for relative in CREDENTIAL_PATHS {
+            let path = home.join(relative);
+            if let Some((parent, _)) = relative.rsplit_once('/') {
+                std::fs::create_dir_all(home.join(parent)).expect("credential parent");
+                std::fs::write(&path, "credential").expect("credential file");
+            } else {
+                std::fs::create_dir(&path).expect("credential directory");
+                std::fs::write(path.join("id_rsa"), "credential").expect("credential file");
+            }
+        }
+        (dir, home)
+    }
+
+    /// Returns a profile over a fixture home rather than this process's own.
+    fn profile_for(home: &Utf8Path, workspace: &Utf8Path) -> String {
+        MacSandbox::profile_with(&policy(workspace), &credential_paths_under(home))
+            .expect("profile")
+    }
+
+    #[test]
+    fn a_profile_denies_reads_of_the_credential_locations() {
+        let (_home_guard, home) = credential_home();
+        let (_workspace_guard, workspace) = tempdir();
+        let credentials = credential_paths_under(&home);
+        assert_eq!(
+            credentials.len(),
+            CREDENTIAL_PATHS.len(),
+            "the fixture did not produce every credential path: {credentials:?}"
+        );
+        let policy = policy(workspace.as_path());
+        let profile = MacSandbox::profile_with(&policy, &credentials).expect("profile");
+        for credential in &credentials {
+            let resolved = std::fs::canonicalize(credential)
+                .expect("a resolved credential")
+                .to_string_lossy()
+                .into_owned();
+            let rule = if credential.is_dir() {
+                format!("(deny file-read* (subpath \"{resolved}\"))")
+            } else {
+                format!("(deny file-read* (literal \"{resolved}\"))")
+            };
+            assert!(
+                profile.contains(&rule),
+                "no rule for {credential}:\n{profile}"
+            );
+        }
+        // The workspace grant survives the deny, so ordinary work still reads.
+        let resolved_workspace = std::fs::canonicalize(workspace.as_path())
+            .expect("a resolved workspace")
+            .to_string_lossy()
+            .into_owned();
+        assert!(
+            profile.contains(&format!(
+                "(allow file-read* (subpath \"{resolved_workspace}\"))"
+            )),
+            "{profile}"
+        );
+    }
+
+    #[test]
+    fn a_credential_rule_names_the_resolved_path() {
+        // A Seatbelt rule matches the path the kernel evaluates, so a rule about
+        // the spelling a path was built from matches nothing.
+        let (_home_guard, home) = credential_home();
+        let (_workspace_guard, workspace) = tempdir();
+        let joined = home.join(".ssh");
+        let resolved = std::fs::canonicalize(&joined).expect("a canonical credential");
+        assert_ne!(
+            joined.as_std_path(),
+            resolved.as_path(),
+            "the fixture is already resolved, so this test would prove nothing"
+        );
+
+        let profile = profile_for(&home, workspace.as_path());
+        let rule = format!(
+            "(deny file-read* (subpath \"{}\"))",
+            resolved.to_string_lossy()
+        );
+        assert!(
+            profile.contains(&rule),
+            "the profile does not name the resolved credential path:\n{profile}"
+        );
+        // The unresolved spelling is what a rule that never matched would carry.
+        // It is a prefix of the resolved path on this host, so the check is for
+        // the rule operand rather than for the substring.
+        assert!(
+            !profile.contains(&format!(
+                "(deny file-read* (subpath \"{}\"))",
+                joined.as_str()
+            )),
+            "the profile names the unresolved credential path:\n{profile}"
+        );
+    }
+
+    #[test]
+    fn a_credential_path_that_is_absent_is_not_named() {
+        let (_guard, home) = tempdir();
+        std::fs::create_dir(home.join(".ssh")).expect("ssh directory");
+        let expected = home.join(".ssh").canonicalize_utf8().expect("resolved");
+        assert_eq!(credential_paths_under(&home), vec![expected]);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_linux_argv_masks_the_credential_locations() {
+        let (_dir, dir) = tempdir();
+        let sandbox = LinuxSandbox::with_helper(Utf8PathBuf::from("/usr/bin/bwrap"));
+        let prepared = prepare("echo hello", dir.as_path(), None, environment()).expect("prepare");
+        let wrapped = sandbox
+            .wrap(&prepared, &policy(dir.as_path()), false)
+            .expect("wrap");
+        for credential in SandboxPolicy::credential_paths() {
+            let path = credential.as_str();
+            // A directory mask is a two-token operation and a file mask is a
+            // three-token one, so each is matched as the exact sequence rather
+            // than by finding the path and looking backwards, which would also
+            // match a writable bind when the home directory is the workspace.
+            let masked = if credential.is_dir() {
+                wrapped
+                    .argv
+                    .windows(2)
+                    .any(|window| window[0] == "--tmpfs" && window[1] == path)
+            } else {
+                wrapped.argv.windows(3).any(|window| {
+                    window[0] == "--ro-bind" && window[1] == NULL_DEVICE && window[2] == path
+                })
+            };
+            assert!(masked, "no mask for {credential}: {:?}", wrapped.argv);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_seatbelt_profile_denies_a_credential_read_and_allows_the_workspace() {
+        // The profile text is what the other tests assert on. This one runs the
+        // tool against a profile built over a fixture home, which is the only
+        // evidence that the rule is enforced rather than merely present, and it
+        // pairs a refused read with a permitted one so a profile that denied
+        // every read would not pass.
+        let sandbox = MacSandbox::detect();
+        if !sandbox.support().is_full() {
+            return;
+        }
+        let home = credential_home();
+        let workspace = tempdir();
+        let private = home.1.join(".ssh/id_rsa");
+        let public = workspace.1.join("input.txt");
+        std::fs::write(&public, "contents").expect("workspace file");
+
+        let profile = profile_for(&home.1, workspace.1.as_path());
+
+        for (path, permitted) in [(&private, false), (&public, true)] {
+            let prepared = prepare(
+                &format!("/bin/cat {path}"),
+                workspace.1.as_path(),
+                None,
+                environment(),
+            )
+            .expect("prepare");
+            let mut argv = vec![
+                String::from(SEATBELT_TOOL),
+                String::from("-p"),
+                profile.clone(),
+            ];
+            argv.extend(prepared.argv.iter().cloned());
+            let wrapped = PreparedCommand {
+                argv,
+                ..prepared.clone()
+            };
+            let outcome = run(&wrapped, Duration::from_secs(20), &never).expect("run");
+            assert_eq!(
+                outcome.exit.is_success(),
+                permitted,
+                "reading {path} produced {outcome:?}"
+            );
+        }
     }
 }
