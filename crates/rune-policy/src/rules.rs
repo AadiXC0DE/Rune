@@ -12,6 +12,7 @@
 use rune_core::error::{ErrorCode, Result, RuneError};
 
 use crate::approval::is_command_tool;
+use crate::command::known_to_write;
 use crate::command_line::{self, Command};
 use crate::decision::{ConsideredRule, Decision, Layer, Outcome};
 
@@ -105,12 +106,20 @@ impl Rule {
     /// redirection: `ls*` was written about listing, not about `ls > ~/.zshrc`.
     /// A rule of `*` allows everything, so it is the one pattern that still
     /// applies.
+    ///
+    /// A rule this build ships is written about what a program usually does,
+    /// so it does not vouch for a command the classifier knows writes, destroys,
+    /// or runs something else: `git diff*` covers a diff, not `git diff
+    /// --output=file`.
     fn matches_command(&self, command: &Spellings, line: &str) -> bool {
         match self.outcome {
             Outcome::Deny | Outcome::Ask => {
                 self.matches(line) || command.deny.iter().any(|form| self.matches(form))
             }
             Outcome::Allow => {
+                if self.layer == Layer::Default && command.known_to_write {
+                    return false;
+                }
                 if !self.is_pattern() {
                     return self.pattern == command.raw || self.pattern == command.allow;
                 }
@@ -139,6 +148,7 @@ struct Spellings {
     allow: String,
     deny: Vec<String>,
     needs_exact: bool,
+    known_to_write: bool,
 }
 
 impl Spellings {
@@ -148,6 +158,7 @@ impl Spellings {
             allow: command.allow_form(),
             deny: command.deny_forms(),
             needs_exact: command.needs_exact,
+            known_to_write: known_to_write(command.argv()),
         }
     }
 }

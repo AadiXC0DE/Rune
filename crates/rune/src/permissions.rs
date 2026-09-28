@@ -272,6 +272,42 @@ mod tests {
     }
 
     #[test]
+    fn a_built_in_allow_does_not_cover_a_command_known_to_write() {
+        let rules = builtin_rules(&PermissionMode::Auto);
+        for line in [
+            "git diff --output=/tmp/out.patch",
+            "git diff --ext-diff",
+            "git log -p --output=notes.txt",
+        ] {
+            assert_eq!(
+                rules.evaluate("shell", line, Outcome::Ask).outcome,
+                Outcome::Ask,
+                "{line}"
+            );
+        }
+        for line in ["git diff --stat", "git log --oneline", "cargo test -p rune"] {
+            assert_eq!(
+                rules.evaluate("shell", line, Outcome::Ask).outcome,
+                Outcome::Allow,
+                "{line}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_user_allow_still_covers_what_its_author_wrote() {
+        let mut extra = RuleSet::new();
+        extra.push(Rule::allow("shell", "git *", Layer::User));
+        let rules = rules_for(&default_settings(), &extra);
+        assert_eq!(
+            rules
+                .evaluate("shell", "git diff --output=x.patch", Outcome::Ask)
+                .outcome,
+            Outcome::Allow
+        );
+    }
+
+    #[test]
     fn a_user_refusal_holds_however_the_program_is_spelled() {
         let mut extra = RuleSet::new();
         extra.push(Rule::deny("shell", "rm *", Layer::User));

@@ -84,6 +84,9 @@ const REASON_DESTRUCTIVE_SUBCOMMAND: &str =
     "the subcommand destroys state or publishes an artifact";
 const REASON_FILESYSTEM_ROOT: &str = "an argument names a filesystem root";
 const REASON_SHELL_SCRIPT: &str = "the shell script names a destructive program";
+const REASON_SPLIT_STRING: &str = "the command splits a string into a command of its own";
+const REASON_GIT_OPTION: &str = "a git option can run a configured program";
+const REASON_CREATES_BRANCH: &str = "a name without a listing option creates a branch";
 const REASON_DEFAULT: &str = "no rule matched, so the command is treated as reversible";
 
 /// Programs that only read, when they appear on the path or by bare name.
@@ -258,6 +261,24 @@ const GIT_BRANCH_WRITES: &[&str] = &[
     "--unset-upstream",
 ];
 
+/// Short `git branch` flags that write, as they appear inside a cluster.
+const GIT_BRANCH_WRITE_LETTERS: &[char] = &['C', 'D', 'M', 'c', 'd', 'f', 'm', 'u'];
+
+/// Options that make `git branch` list, so a name after them is a pattern.
+const GIT_BRANCH_LISTS: &[&str] = &[
+    "--all",
+    "--contains",
+    "--list",
+    "--merged",
+    "--no-contains",
+    "--no-merged",
+    "--points-at",
+    "--remotes",
+];
+
+/// Short `git branch` flags that list, as they appear inside a cluster.
+const GIT_BRANCH_LIST_LETTERS: &[char] = &['a', 'l', 'r'];
+
 /// Git global options that consume the argument after them.
 const GIT_VALUE_OPTIONS: &[&str] = &[
     "-C",
@@ -354,6 +375,11 @@ pub fn classify(argv: &[String]) -> Classification {
     if let Some(classification) = consequential(argv) {
         return classification;
     }
+    if split_string(argv).is_some() {
+        // The string is split into a command of its own, so the program named
+        // in front of it is not what runs.
+        return Classification::new(CommandKind::Reversible, REASON_SPLIT_STRING);
+    }
     match shell_operator(argv) {
         // The visible program is not the whole command line, so the read-only
         // allowlist does not apply to what the shell would do with it.
@@ -419,6 +445,25 @@ fn shell_operator(argv: &[String]) -> Option<&'static str> {
     None
 }
 
+/// Returns true when the classifier knows a command writes, destroys, or runs
+/// something other than the program it names.
+///
+/// This answers a narrower question than [`classify`]: an unknown program and
+/// a mere root argument are not counted, because the question is whether a
+/// command does more than a rule written for its program would expect. `git
+/// diff --output=file` writes a file, `git -c core.pager=... log` runs a
+/// configured program, and `env -S '...'` runs a command line of its own.
+#[must_use]
+pub fn known_to_write(argv: &[String]) -> bool {
+    if destructive(argv).is_some() || split_string(argv).is_some() {
+        return true;
+    }
+    matches!(
+        read_only_verdict(argv),
+        Err(REASON_WRITING_FLAG | REASON_GIT_OPTION | REASON_CREATES_BRANCH)
+    )
+}
+
 /// Returns the destructive classification, when one applies.
 fn consequential(argv: &[String]) -> Option<Classification> {
     // A root argument is destructive wherever it appears: `rm -rf /` and
@@ -428,6 +473,15 @@ fn consequential(argv: &[String]) -> Option<Classification> {
             CommandKind::Consequential,
             REASON_FILESYSTEM_ROOT,
         ));
+    }
+    destructive(argv)
+}
+
+/// Returns the classification for a program that destroys data or publishes,
+/// whatever its arguments name.
+fn destructive(argv: &[String]) -> Option<Classification> {
+    if let Some(script) = split_string(argv) {
+        return script_verdict(script);
     }
 
     let effective = effective_argv(argv);
@@ -507,18 +561,88 @@ fn git_destructive(args: &[String]) -> Option<Classification> {
 
 /// Returns the read-only git cases.
 fn git_read_only(args: &[String]) -> Result<Classification, &'static str> {
+    if runs_configured_program(args) {
+        return Err(REASON_GIT_OPTION);
+    }
     let Some((subcommand, arguments)) = git_subcommand(args) else {
         return Err(REASON_DEFAULT);
     };
     if !GIT_READ_ONLY.contains(&subcommand) {
         return Err(REASON_DEFAULT);
     }
-    if subcommand == "branch"
-        && arguments
-            .iter()
-            .any(|argument| GIT_BRANCH_WRITES.contains(&argument.as_str()))
-    {
+    if arguments.iter().any(|argument| {
+        argument == "--ext-diff" || argument == "--output" || argument.starts_with("--output=")
+    }) {
         return Err(REASON_WRITING_FLAG);
+    }
+    if subcommand == "branch" {
+        return git_branch_verdict(arguments);
+    }
+    Ok(Classification::new(
+        CommandKind::ReadOnly,
+        REASON_READ_ONLY_GIT,
+    ))
+}
+
+/// Returns true when a git global option can run a program of its own.
+///
+/// `-c` and `--config-env` set any configuration value, a pager or a hook
+/// among them, and `--exec-path` chooses where git's own programs are found.
+fn runs_configured_program(args: &[String]) -> bool {
+    let mut index = 0_usize;
+    while let Some(argument) = args.get(index) {
+        if argument == "--" || !argument.starts_with('-') {
+            return false;
+        }
+        if (argument.starts_with("-c") && !argument.starts_with("--"))
+            || argument.starts_with("--config-env")
+            || argument.starts_with("--exec-path")
+        {
+            return true;
+        }
+        let glued = argument.starts_with("--") && argument.contains('=');
+        let step = if glued || !GIT_VALUE_OPTIONS.contains(&argument.as_str()) {
+            1
+        } else {
+            2
+        };
+        index = index.saturating_add(step);
+    }
+    false
+}
+
+/// Returns the verdict for `git branch`, which lists unless told to write.
+///
+/// A name with no listing option creates a branch, and a short cluster such
+/// as `-df` carries a writing flag as surely as `-d` alone.
+fn git_branch_verdict(arguments: &[String]) -> Result<Classification, &'static str> {
+    let short_cluster = |argument: &str, letters: &[char]| {
+        argument.starts_with('-')
+            && !argument.starts_with("--")
+            && argument
+                .chars()
+                .skip(1)
+                .any(|letter| letters.contains(&letter))
+    };
+    let writes = arguments.iter().any(|argument| {
+        GIT_BRANCH_WRITES.contains(&argument.as_str())
+            || GIT_BRANCH_WRITES
+                .iter()
+                .any(|flag| flag.starts_with("--") && argument.starts_with(&format!("{flag}=")))
+            || short_cluster(argument, GIT_BRANCH_WRITE_LETTERS)
+    });
+    if writes {
+        return Err(REASON_WRITING_FLAG);
+    }
+    let lists = arguments.iter().any(|argument| {
+        GIT_BRANCH_LISTS
+            .iter()
+            .any(|flag| argument == flag || argument.starts_with(&format!("{flag}=")))
+            || short_cluster(argument, GIT_BRANCH_LIST_LETTERS)
+    });
+    let names = arguments.iter().any(|argument| !argument.starts_with('-'));
+    if names && !lists {
+        return Err(REASON_CREATES_BRANCH);
     }
     Ok(Classification::new(
         CommandKind::ReadOnly,
@@ -559,7 +683,11 @@ fn git_subcommand(args: &[String]) -> Option<(&str, &[String])> {
 /// command more restricted, never more trusted. The read-only path never looks
 /// inside it.
 fn shell_script(args: &[String]) -> Option<Classification> {
-    let script = script_argument(args)?;
+    script_verdict(script_argument(args)?)
+}
+
+/// Returns the destructive classification for a command line in one string.
+fn script_verdict(script: &str) -> Option<Classification> {
     let mut tokens = script.split_whitespace();
     let first = tokens.next()?;
     let program = program_name(first);
@@ -593,6 +721,54 @@ pub(crate) fn script_argument(args: &[String]) -> Option<&str> {
             return None;
         }
         index = index.saturating_add(1);
+    }
+    None
+}
+
+/// Returns the string `env -S` or `env --split-string` splits into a command.
+///
+/// The string is a command line in its own right, so whatever `env` appears to
+/// run after it is not the whole of what runs.
+fn split_string(argv: &[String]) -> Option<&str> {
+    let mut args = argv;
+    while let Some(program) = args.first() {
+        let name = program_name(program);
+        if !WRAPPERS.contains(&name) {
+            return None;
+        }
+        let rest = args.get(1..).unwrap_or_default();
+        if name == "env" {
+            let mut index = 0_usize;
+            while let Some(argument) = rest.get(index) {
+                if argument == "--" || !argument.starts_with('-') {
+                    break;
+                }
+                let next = || rest.get(index.saturating_add(1)).map_or("", String::as_str);
+                if argument == "--split-string" {
+                    return Some(next());
+                }
+                if let Some(value) = argument.strip_prefix("--split-string=") {
+                    return Some(value);
+                }
+                if !argument.starts_with("--")
+                    && let Some(offset) = argument.find('S')
+                {
+                    let value = &argument[offset.saturating_add(1)..];
+                    return Some(if value.is_empty() { next() } else { value });
+                }
+                let step = if WRAPPER_VALUE_FLAGS.contains(&argument.as_str()) {
+                    2
+                } else {
+                    1
+                };
+                index = index.saturating_add(step);
+            }
+        }
+        let next = skip_wrapper(name, rest)?;
+        if next.is_empty() || next.len() == args.len() {
+            return None;
+        }
+        args = next;
     }
     None
 }
@@ -926,6 +1102,117 @@ mod tests {
         assert_eq!(kind(&["git", "branch", "--list"]), CommandKind::ReadOnly);
         // A file argument that merely starts with the same letters is not a flag.
         assert_eq!(kind(&["cat", "-output.txt"]), CommandKind::ReadOnly);
+    }
+
+    #[test]
+    fn a_string_split_by_env_is_run_like_a_shell_script() {
+        for parts in [
+            vec!["env", "-S", "rm -rf build"],
+            vec!["env", "--split-string=rm -rf build"],
+            vec!["env", "-iS", "rm -rf build"],
+            vec!["/usr/bin/env", "-S", "sudo ls"],
+        ] {
+            let classification = classify(&argv(&parts));
+            assert_eq!(
+                classification.kind,
+                CommandKind::Consequential,
+                "{parts:?}: {}",
+                classification.reason
+            );
+        }
+        for parts in [
+            vec!["env", "-S", "ls -la"],
+            vec!["env", "--split-string", "cat x"],
+            vec!["nice", "env", "-S", "ls"],
+        ] {
+            let classification = classify(&argv(&parts));
+            assert_eq!(classification.kind, CommandKind::Reversible, "{parts:?}");
+            assert_eq!(classification.reason, REASON_SPLIT_STRING, "{parts:?}");
+        }
+    }
+
+    #[test]
+    fn a_git_option_that_runs_a_configured_program_is_not_read_only() {
+        for parts in [
+            vec!["git", "-c", "core.pager=sh", "log"],
+            vec!["git", "-C", "/repo", "-c", "core.pager=sh", "log"],
+            vec!["git", "--config-env=core.pager=PAGER", "status"],
+            vec!["git", "--exec-path=/tmp/bin", "status"],
+            vec!["git", "--exec-path", "status"],
+        ] {
+            let classification = classify(&argv(&parts));
+            assert_eq!(classification.kind, CommandKind::Reversible, "{parts:?}");
+            assert_eq!(classification.reason, REASON_GIT_OPTION, "{parts:?}");
+        }
+        assert_eq!(
+            kind(&["git", "-C", "/repo", "status"]),
+            CommandKind::ReadOnly
+        );
+    }
+
+    #[test]
+    fn a_git_diff_that_writes_a_file_or_runs_a_program_is_not_read_only() {
+        for parts in [
+            vec!["git", "diff", "--output=out.patch"],
+            vec!["git", "diff", "--output", "out.patch"],
+            vec!["git", "log", "-p", "--output=out.patch"],
+            vec!["git", "show", "--output=out.patch", "HEAD"],
+            vec!["git", "diff", "--ext-diff"],
+        ] {
+            let classification = classify(&argv(&parts));
+            assert_eq!(classification.kind, CommandKind::Reversible, "{parts:?}");
+            assert_eq!(classification.reason, REASON_WRITING_FLAG, "{parts:?}");
+        }
+        assert_eq!(kind(&["git", "diff", "--stat"]), CommandKind::ReadOnly);
+    }
+
+    #[test]
+    fn git_branch_with_a_name_creates_a_branch() {
+        for parts in [
+            vec!["git", "branch", "feature"],
+            vec!["git", "branch", "feature", "main"],
+            vec!["git", "branch", "-df", "feature"],
+            vec!["git", "branch", "--set-upstream-to=origin/main"],
+        ] {
+            assert_ne!(kind(&parts), CommandKind::ReadOnly, "{parts:?}");
+        }
+        assert_eq!(
+            classify(&argv(&["git", "branch", "feature"])).reason,
+            REASON_CREATES_BRANCH
+        );
+        for parts in [
+            vec!["git", "branch"],
+            vec!["git", "branch", "--list", "feat*"],
+            vec!["git", "branch", "-a"],
+            vec!["git", "branch", "-av"],
+            vec!["git", "branch", "--contains", "abc123"],
+            vec!["git", "branch", "--merged=main"],
+        ] {
+            assert_eq!(kind(&parts), CommandKind::ReadOnly, "{parts:?}");
+        }
+    }
+
+    #[test]
+    fn a_command_known_to_write_is_told_apart_from_an_unknown_one() {
+        for parts in [
+            vec!["git", "diff", "--output=x"],
+            vec!["git", "-c", "core.pager=sh", "log"],
+            vec!["git", "branch", "feature"],
+            vec!["env", "-S", "ls"],
+            vec!["rm", "-rf", "build"],
+            vec!["git", "push"],
+            vec!["sort", "-o", "out", "in"],
+        ] {
+            assert!(known_to_write(&argv(&parts)), "{parts:?}");
+        }
+        for parts in [
+            vec!["ls", "/"],
+            vec!["cargo", "test"],
+            vec!["git", "status"],
+            vec!["npm", "run", "build"],
+        ] {
+            assert!(!known_to_write(&argv(&parts)), "{parts:?}");
+        }
     }
 
     #[test]

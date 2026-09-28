@@ -66,38 +66,34 @@ pub struct Command {
 }
 
 impl Command {
-    /// Returns the words from the program on, past the keywords of a compound
-    /// command.
+    /// Returns the words an allow rule reads, from the program on.
+    ///
+    /// Only spellings that cannot change which program runs are passed over:
+    /// the keywords of a compound command, and `command` or `time` in front of
+    /// the program.
     #[must_use]
     pub fn argv(&self) -> &[String] {
         let mut words = self.words.as_slice();
         while let Some((first, rest)) = words.split_first() {
-            if !LEADING_KEYWORDS.contains(&first.as_str()) {
+            if LEADING_KEYWORDS.contains(&first.as_str()) {
+                words = rest;
+            } else if first == "command" || first == "time" {
+                words = match rest.split_first() {
+                    Some((flag, after)) if flag == "-p" => after,
+                    _ => rest,
+                };
+            } else {
                 break;
             }
-            words = rest;
         }
         words
     }
 
-    /// Returns the form an allow rule is matched against.
-    ///
-    /// Only spellings that cannot change which program runs are removed: the
-    /// keywords of a compound command, `command` and `time` in front of the
-    /// program, and a system directory the program is named from.
+    /// Returns the form an allow rule is matched against, with a program named
+    /// from a system directory reduced to its name.
     #[must_use]
     pub fn allow_form(&self) -> String {
-        let mut words = self.argv();
-        while let Some((first, rest)) = words.split_first() {
-            if first != "command" && first != "time" {
-                break;
-            }
-            words = match rest.split_first() {
-                Some((flag, after)) if flag == "-p" => after,
-                _ => rest,
-            };
-        }
-        join(words, program_name)
+        join(self.argv(), program_name)
     }
 
     /// Returns every form a deny or ask rule is matched against.
