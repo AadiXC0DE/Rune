@@ -608,8 +608,14 @@ impl StreamReducer for Reducer {
                     "the stream ended without a finish reason",
                 ));
             }
-            if self.finish_reason == Some(FinishReason::ToolCalls) {
-                self.close_tool_calls(out)?;
+            // Several compatible servers end a tool turn with `stop`, so every
+            // call that started is closed whatever the reason, and a turn that
+            // made calls is reported as one.
+            self.close_tool_calls(out)?;
+            if self.finish_reason == Some(FinishReason::Stop)
+                && self.calls.iter().any(|call| call.started)
+            {
+                self.finish_reason = Some(FinishReason::ToolCalls);
             }
             return Ok(());
         }
@@ -647,9 +653,14 @@ impl StreamReducer for Reducer {
             return Err(incomplete_stream());
         }
         if let Some(reason) = self.finish_reason {
-            // Tool calls that never reported a name cannot be executed.
+            // Tool calls that never reported a name cannot be executed. A slot
+            // that never started is a gap in the indices the server chose, not
+            // a call.
             if reason == FinishReason::ToolCalls
-                && self.calls.iter().any(|call| call.name.is_none())
+                && self
+                    .calls
+                    .iter()
+                    .any(|call| call.started && call.name.is_none())
             {
                 return Err(protocol_violation(
                     "the stream ended with an incomplete tool call",
@@ -1055,6 +1066,45 @@ mod tests {
             .filter(|event| matches!(event, ProviderEvent::ToolCallEnd { .. }))
             .count();
         assert_eq!(ends, 2);
+    }
+
+    #[test]
+    fn tool_calls_finished_with_stop_are_still_completed() {
+        // Gemini's compatible endpoint and several local servers end a tool
+        // turn with `stop` rather than `tool_calls`.
+        let (events, reducer) = reduce(&[
+            r#"{"choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"a.rs\"}"}}]}}]}"#,
+            r#"{"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#,
+            "[DONE]",
+        ]);
+        assert_eq!(reducer.finish().expect("finished"), FinishReason::ToolCalls);
+        let ends: Vec<&str> = events
+            .iter()
+            .filter_map(|event| match event {
+                ProviderEvent::ToolCallEnd { arguments, .. } => Some(arguments.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ends, vec!["{\"path\":\"a.rs\"}"]);
+    }
+
+    #[test]
+    fn a_tool_call_index_that_skips_a_slot_still_finishes() {
+        let (events, reducer) = reduce(&[
+            r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"id":"call_1","function":{"name":"read_file","arguments":"{}"}}]}}]}"#,
+            r#"{"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#,
+            "[DONE]",
+        ]);
+        assert_eq!(reducer.finish().expect("finished"), FinishReason::ToolCalls);
+        let ends = events
+            .iter()
+            .filter(|event| matches!(event, ProviderEvent::ToolCallEnd { .. }))
+            .count();
+        assert_eq!(ends, 1);
+        assert_eq!(
+            reducer.replay().expect("replay"),
+            r#"{"_tool_call_ids":["call_1"]}"#
+        );
     }
 
     #[test]
