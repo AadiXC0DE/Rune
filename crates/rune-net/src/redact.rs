@@ -164,12 +164,15 @@ fn looks_secret_name(name: &str) -> bool {
 }
 
 /// Removes a case-insensitive prefix.
+///
+/// Compares bytes, because the prefix length need not fall on a character
+/// boundary of the value, and splitting a string there panics.
 fn strip_prefix_ci<'a>(value: &'a str, prefix: &str) -> Option<&'a str> {
-    if value.len() < prefix.len() {
+    let head = value.as_bytes().get(..prefix.len())?;
+    if !head.eq_ignore_ascii_case(prefix.as_bytes()) {
         return None;
     }
-    let (head, tail) = value.split_at(prefix.len());
-    head.eq_ignore_ascii_case(prefix).then_some(tail)
+    value.get(prefix.len()..)
 }
 
 /// The text substituted for a secret.
@@ -289,6 +292,26 @@ mod tests {
     fn redaction_is_idempotent() {
         let once = redact("api_key=abcdef1234567890");
         assert_eq!(redact(&once), once);
+    }
+
+    #[test]
+    fn a_header_like_line_in_another_script_is_redacted_without_panicking() {
+        // The release build aborts on a panic, which would take the process
+        // down with the terminal still in raw mode.
+        for line in [
+            "Authorization failed: トークンが無効です",
+            "authorization: é",
+            "api_key: ключ недействителен",
+        ] {
+            let redacted = redact(line);
+            assert!(redacted.contains("[redacted]"), "{redacted}");
+        }
+    }
+
+    #[test]
+    fn a_bearer_scheme_is_still_recognized_after_the_byte_comparison() {
+        let redacted = redact("Authorization: bEaReR abcdef1234567890");
+        assert_eq!(redacted.trim_end(), "Authorization: Bearer [redacted]");
     }
 
     #[test]
