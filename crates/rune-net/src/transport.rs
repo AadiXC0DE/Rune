@@ -327,6 +327,27 @@ fn with_headers<Any>(
     builder
 }
 
+/// Applies a request's own time bounds to a request of either typestate.
+///
+/// A whole-request timeout bounds the exchange; leaving it unset keeps a
+/// streamed generation open, and the head timeout bounds the wait for the
+/// endpoint to start answering instead. Each is applied only when given, so a
+/// client that carries its own bound keeps it.
+#[cfg(not(target_family = "wasm"))]
+fn with_bounds<Any>(
+    builder: ureq::RequestBuilder<Any>,
+    request: &FetchRequest,
+) -> ureq::RequestBuilder<Any> {
+    let mut config = builder.config();
+    if let Some(timeout) = request.timeout {
+        config = config.timeout_global(Some(timeout));
+    }
+    if let Some(head_timeout) = request.head_timeout {
+        config = config.timeout_recv_response(Some(head_timeout));
+    }
+    config.build()
+}
+
 /// Performs one request over a client.
 ///
 /// The single place a request becomes a client call, so the pooled transport
@@ -339,31 +360,17 @@ fn send_over(
 ) -> NetResult<crate::fetch::FetchResponse> {
     use crate::fetch::{FetchResponse, Method};
 
-    // A request level timeout bounds the whole exchange; leaving it unset keeps
-    // a streamed generation open, which the head timeout bounds instead.
     let response = match request.method {
-        Method::Get => {
-            let builder = with_headers(client.get(&request.url), &request.headers);
-            match request.timeout {
-                Some(timeout) => builder
-                    .config()
-                    .timeout_global(Some(timeout))
-                    .build()
-                    .call(),
-                None => builder.call(),
-            }
-        }
-        Method::Post => {
-            let builder = with_headers(client.post(&request.url), &request.headers);
-            match request.timeout {
-                Some(timeout) => builder
-                    .config()
-                    .timeout_global(Some(timeout))
-                    .build()
-                    .send(&request.body),
-                None => builder.send(&request.body),
-            }
-        }
+        Method::Get => with_bounds(
+            with_headers(client.get(&request.url), &request.headers),
+            request,
+        )
+        .call(),
+        Method::Post => with_bounds(
+            with_headers(client.post(&request.url), &request.headers),
+            request,
+        )
+        .send(&request.body),
     }
     .map_err(|err| classify_transport_error(&err))?;
 
@@ -486,6 +493,7 @@ pub fn stream_completion_observed(
     let encoded = serde_json::to_string(&body)?;
 
     let mut request = FetchRequest::post(url, encoded.into_bytes())
+        .with_head_timeout(Some(head_timeout))
         .with_header("content-type", "application/json")
         .with_header("accept", "text/event-stream")
         .with_header(
@@ -1147,6 +1155,50 @@ mod tests {
         assert_eq!(err.kind(), FailureKind::InvalidRequest, "{err}");
         let read = served.load(Ordering::SeqCst);
         assert!(read < 4 * 1024 * 1024, "read {read} bytes before refusing");
+    }
+
+    /// A local endpoint that accepts one connection and never answers it.
+    ///
+    /// The connection stays open until the returned sender is dropped, so a
+    /// client waits on it rather than seeing it close.
+    #[cfg(not(target_family = "wasm"))]
+    fn mute_endpoint() -> (String, std::sync::mpsc::Sender<()>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let (hold, held) = std::sync::mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            let connection = listener.accept();
+            let _ = held.recv();
+            drop(connection);
+        });
+        (format!("http://127.0.0.1:{port}"), hold)
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn an_endpoint_that_never_answers_times_out_at_the_head_timeout() {
+        let (base, hold) = mute_endpoint();
+        let (report, reported) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut plan = RequestPlan::new("m");
+            plan.messages = vec![Message::user("hi")];
+            let result = stream_completion(
+                &UreqFetch::new(),
+                &Endpoint::new(base, "k"),
+                &crate::chat_completions::ChatCompletions,
+                &plan,
+                Duration::from_millis(200),
+                &|| false,
+            );
+            let _ = report.send(result.map(|_| ()));
+        });
+
+        let result = reported.recv_timeout(Duration::from_secs(10));
+        drop(hold);
+        let err = result
+            .expect("the request gave up on the endpoint")
+            .expect_err("timed out");
+        assert_eq!(err.kind(), FailureKind::Timeout, "{err}");
     }
 
     #[test]

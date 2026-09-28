@@ -151,6 +151,7 @@ fn dispatch(
         headers: request.headers,
         body: request.body.into_bytes(),
         timeout: None,
+        head_timeout: None,
     };
     let response =
         rune_net::fetch::Fetch::send(client, parsed).map_err(|err| err.to_rune_error())?;
