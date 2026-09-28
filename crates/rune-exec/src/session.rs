@@ -230,8 +230,8 @@ impl Process {
             Input::Piped => Stdio::piped(),
         };
         let mut spec = Command::new(program);
-        spec.args(arguments)
-            .env_clear()
+        add_arguments(&mut spec, program, arguments);
+        spec.env_clear()
             .envs(environment)
             .stdin(stdin)
             .stdout(Stdio::piped())
@@ -448,6 +448,49 @@ impl Inner {
             let _ = child.wait();
         }
     }
+}
+
+/// Adds the arguments to a command, handing a command string to `cmd.exe` as
+/// it was written.
+///
+/// `cmd.exe` does not read arguments the way the standard library quotes them:
+/// a `"` escaped as `\"` reaches the command as a backslash and a quote, so
+/// `git commit -m "fix bug"` would arrive broken. The string after `/C` is
+/// passed unescaped inside one pair of quotes, and `/S` tells the shell to
+/// strip exactly that pair, which leaves the string the caller reviewed.
+#[cfg(windows)]
+fn add_arguments(spec: &mut Command, program: &str, arguments: &[String]) {
+    use std::os::windows::process::CommandExt as _;
+
+    let name = Path::new(program)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(program);
+    let is_cmd = name.eq_ignore_ascii_case("cmd.exe") || name.eq_ignore_ascii_case("cmd");
+    if is_cmd
+        && let Some(flag) = arguments
+            .iter()
+            .position(|argument| argument.eq_ignore_ascii_case("/C"))
+        && flag.saturating_add(2) == arguments.len()
+        && let (Some(before), Some(switch), Some(command)) = (
+            arguments.get(..flag),
+            arguments.get(flag),
+            arguments.get(flag.saturating_add(1)),
+        )
+    {
+        spec.args(before);
+        spec.raw_arg("/S");
+        spec.raw_arg(switch);
+        spec.raw_arg(format!("\"{command}\""));
+        return;
+    }
+    spec.args(arguments);
+}
+
+/// Adds the arguments to a command.
+#[cfg(not(windows))]
+fn add_arguments(spec: &mut Command, _program: &str, arguments: &[String]) {
+    spec.args(arguments);
 }
 
 /// Ends a process tree, on a platform with no process groups to signal.
@@ -740,6 +783,29 @@ mod tests {
             Process::start(&exit_with(0), None, CAPTURE_BYTES, Input::Piped).expect("start");
         let _ = exit_of(&process);
         assert!(process.write(b"hello\n", WRITE_LIMIT).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_quoted_argument_reaches_the_command_as_written() {
+        let process =
+            Process::start("echo \"fix bug\"", None, CAPTURE_BYTES, Input::Closed).expect("start");
+        assert!(exit_of(&process).is_success());
+        assert_eq!(text(process.stdout()).trim(), "\"fix bug\"");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_command_that_begins_with_a_quote_keeps_every_quote() {
+        let process = Process::start(
+            "\"%SystemRoot%\\System32\\cmd.exe\" /C echo \"a b\"",
+            None,
+            CAPTURE_BYTES,
+            Input::Closed,
+        )
+        .expect("start");
+        assert!(exit_of(&process).is_success());
+        assert_eq!(text(process.stdout()).trim(), "\"a b\"");
     }
 
     #[test]
