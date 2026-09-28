@@ -69,6 +69,7 @@ impl KeyReader {
         let active =
             std::io::stdin().is_terminal() && crossterm::terminal::enable_raw_mode().is_ok();
         if active {
+            install_panic_hook();
             // A terminal that cannot bracket a paste still delivers it as
             // keystrokes, which is no worse than before, so a failure is ignored.
             let _ = crossterm::ExecutableCommand::execute(
@@ -289,14 +290,48 @@ impl Default for KeyReader {
 impl Drop for KeyReader {
     fn drop(&mut self) {
         if self.active {
-            let _ = crossterm::ExecutableCommand::execute(
-                &mut std::io::stdout(),
-                crossterm::event::DisableBracketedPaste,
-            );
-            let _ = crossterm::terminal::disable_raw_mode();
+            restore_terminal();
             self.active = false;
         }
     }
+}
+
+/// Undoes what the reader and the renderer change about the terminal.
+///
+/// The reader turns on raw mode and bracketed paste, and the renderer hides the
+/// cursor while it writes a frame, so a process that stops partway through one
+/// would otherwise leave the cursor hidden as well.
+fn restore_terminal() {
+    write_restore(&mut std::io::stdout());
+    let _ = crossterm::terminal::disable_raw_mode();
+}
+
+/// Writes the sequences that turn bracketed paste off and show the cursor.
+fn write_restore(out: &mut impl std::io::Write) {
+    let _ = crossterm::QueueableCommand::queue(out, crossterm::event::DisableBracketedPaste);
+    let _ = crossterm::QueueableCommand::queue(out, crossterm::cursor::Show);
+    let _ = out.flush();
+}
+
+/// Restores the terminal before a panic ends the process.
+///
+/// The release build aborts on a panic, so nothing unwinds and the reader's
+/// drop never runs: without this a panic leaves the shell in raw mode, with no
+/// echo and a hidden cursor. A build that unwinds is left to the drop, because
+/// a panic there can be caught, as a turn's worker's is, and the session then
+/// goes on in the mode it needs. The previous hook still runs, after the
+/// terminal is back, so its report is printed with ordinary line endings.
+fn install_panic_hook() {
+    static INSTALLED: std::sync::Once = std::sync::Once::new();
+    INSTALLED.call_once(|| {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            if cfg!(panic = "abort") {
+                restore_terminal();
+            }
+            previous(info);
+        }));
+    });
 }
 
 #[cfg(test)]
@@ -543,6 +578,17 @@ mod tests {
             2 + reader.column(),
             "the caret is not after the drawn text: {row:?}"
         );
+    }
+
+    #[test]
+    fn restoring_turns_paste_off_and_shows_the_cursor() {
+        // What a panic hook writes before an aborting build ends the process;
+        // raw mode is restored beside it through the terminal settings.
+        let mut out: Vec<u8> = Vec::new();
+        write_restore(&mut out);
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(text.contains("\u{1b}[?2004l"), "{text:?}");
+        assert!(text.contains("\u{1b}[?25h"), "{text:?}");
     }
 
     #[test]
