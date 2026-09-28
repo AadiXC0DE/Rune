@@ -596,10 +596,24 @@ fn backoff(attempt: usize) -> Duration {
 /// Read-only calls at the front of the batch run concurrently; everything after
 /// the first mutating call runs in order, so a write can never race a read of
 /// the same file.
+///
+/// Every call is answered, including those left unrun by a cancellation, so
+/// the history never holds a call without its result. A conversation in that
+/// state cannot form another request.
 fn execute_batch(calls: &[PreparedCall], host: &dyn Host) -> Vec<CallResult> {
     let mut results = Vec::with_capacity(calls.len());
+    let mut cancelled = false;
 
     for call in calls {
+        if cancelled {
+            results.push(CallResult {
+                call: call.clone(),
+                output: ToolOutput::failure("not run: the turn was cancelled"),
+                executed: false,
+            });
+            continue;
+        }
+
         let activity = infer_activity(&call.name);
         let arguments: serde_json::Value = match serde_json::from_str(&call.arguments) {
             Ok(value) => value,
@@ -666,7 +680,8 @@ fn execute_batch(calls: &[PreparedCall], host: &dyn Host) -> Vec<CallResult> {
                     output: ToolOutput::failure("the call was cancelled"),
                     executed: false,
                 });
-                return results;
+                cancelled = true;
+                continue;
             }
             Err(err) => ToolOutput::failure(err.message().to_owned()),
         };

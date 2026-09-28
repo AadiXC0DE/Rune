@@ -57,6 +57,9 @@ struct TestHost {
     /// Text submitted as steering the first time a delta arrives, which is when
     /// a user typing during a stream would reach the queue.
     submit_on_first_delta: Mutex<Option<String>>,
+    /// Cancels the turn from inside the next tool call, as a user pressing
+    /// Escape while a tool runs would.
+    cancel_on_execute: Mutex<bool>,
 }
 
 impl TestHost {
@@ -79,7 +82,14 @@ impl TestHost {
             limits: BudgetSet::new(),
             resolve_ask: true,
             submit_on_first_delta: Mutex::new(None),
+            cancel_on_execute: Mutex::new(false),
         }
+    }
+
+    /// Cancels the turn while the next tool call is running.
+    fn cancelling_the_next_call(self) -> Self {
+        *self.cancel_on_execute.lock().expect("lock") = true;
+        self
     }
 
     /// Submits steering as soon as the first token of a reply arrives.
@@ -190,6 +200,10 @@ impl Host for TestHost {
             .lock()
             .expect("lock")
             .push((name.to_owned(), arguments.clone()));
+        if std::mem::take(&mut *self.cancel_on_execute.lock().expect("lock")) {
+            self.cancellation.cancel();
+            return Err(rune_agent::steering::cancelled_error());
+        }
         Ok(self
             .tool_response
             .lock()
@@ -239,6 +253,34 @@ fn read_tool() -> ToolSpec {
             "required": ["path"],
         }),
     }
+}
+
+/// Builds a script that asks for two reads in one assistant message.
+fn two_reads(first: &str, second: &str) -> Script {
+    let call = |index: usize, id: &str, path: &str| {
+        serde_json::json!({
+            "choices": [{
+                "index": 0,
+                "delta": {
+                    "tool_calls": [{
+                        "index": index,
+                        "id": id,
+                        "function": {
+                            "name": "read_file",
+                            "arguments": serde_json::json!({ "path": path }).to_string(),
+                        },
+                    }],
+                },
+            }],
+        })
+        .to_string()
+    };
+    Script::Frames(vec![
+        call(0, first, "a.rs"),
+        call(1, second, "b.rs"),
+        r#"{"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#.to_owned(),
+        "[DONE]".to_owned(),
+    ])
 }
 
 #[test]
@@ -530,6 +572,48 @@ fn cancellation_stops_the_turn() {
 
     let err = run_turn(&mut history, &host).expect_err("cancelled");
     assert_eq!(err.code(), rune_core::error::ErrorCode::Cancelled);
+}
+
+#[test]
+fn a_call_left_unrun_by_a_cancellation_is_still_answered() {
+    // The second call of the batch never runs, but the model asked for it, so
+    // the conversation must record an answer. Without one the history holds an
+    // unanswered call and every later turn fails before it is sent.
+    let endpoint = MockEndpoint::start(vec![two_reads("call_1", "call_2"), Script::text("done")]);
+    let host = TestHost::new(endpoint)
+        .with_tools(vec![read_tool()])
+        .cancelling_the_next_call();
+
+    let mut history = rune_agent::History::new();
+    history.push_user("read two files");
+
+    let err = run_turn(&mut history, &host).expect_err("cancelled");
+    assert_eq!(err.code(), rune_core::error::ErrorCode::Cancelled);
+    assert_eq!(
+        host.executed_calls().len(),
+        1,
+        "a call ran after the turn was cancelled"
+    );
+    history.validate().expect("every call has an answer");
+
+    let answers: Vec<String> = history
+        .last()
+        .expect("a turn")
+        .parts
+        .iter()
+        .filter_map(|part| match part {
+            rune_net::message::ContentPart::ToolResult { content, .. } => Some(content.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(answers.len(), 2, "{answers:?}");
+    assert!(answers[1].contains("not run"), "{answers:?}");
+
+    // The conversation carries on from the cancelled turn.
+    host.cancellation.reset();
+    history.push_user("carry on");
+    let outcome = run_turn(&mut history, &host).expect("the next turn runs");
+    assert_eq!(outcome.text, "done");
 }
 
 #[test]
