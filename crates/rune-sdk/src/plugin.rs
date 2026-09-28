@@ -189,9 +189,54 @@ impl Drop for Session {
         // The reader handle is dropped rather than joined: a grandchild holding
         // the pipe open would otherwise block here forever.
         self.stdin = None;
+        // The whole group is ended, not only its leader, so a helper the
+        // plugin started does not outlive it. This runs after a clean exit
+        // too, because a helper can outlive a leader that exited on request.
+        end_group(self.child.id());
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
+}
+
+/// Programs that deliver a signal to a process group, tried in order.
+#[cfg(unix)]
+const KILL_PROGRAMS: [&str; 2] = ["/bin/kill", "kill"];
+
+/// Ends the process group a plugin leads.
+///
+/// This crate forbids unsafe code and the standard library has no signal API,
+/// so the signal is delivered by running a program that can send one. A group
+/// that has already ended cannot be signalled, and there is nothing left to
+/// stop, so a failed delivery is not reported.
+#[cfg(unix)]
+fn end_group(group: u32) {
+    let target = format!("-{group}");
+    for program in KILL_PROGRAMS {
+        let ran = Command::new(program)
+            .args(["-s", "KILL", "--", target.as_str()])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok();
+        if ran {
+            return;
+        }
+    }
+}
+
+/// Ends the process tree a plugin started, on a platform without groups.
+///
+/// The tree is ended through the platform's own tool, because the standard
+/// library stops one process rather than the tree it started.
+#[cfg(not(unix))]
+fn end_group(pid: u32) {
+    let _ = Command::new("taskkill")
+        .args(["/PID", &pid.to_string(), "/T", "/F"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
 }
 
 /// One frame from the plugin, or the reason there will be no more.

@@ -51,6 +51,31 @@ fn main() {
         std::process::exit(3);
     }
 
+    // Outlives whatever started it, unless it is ended with its group.
+    if scenario == "sleeper" {
+        std::thread::sleep(std::time::Duration::from_secs(60));
+        return;
+    }
+
+    // Starts a helper that shares its process group and records the helper's
+    // process identifier, then serves calls like the echoer.
+    if scenario == "spawner" {
+        #[allow(
+            clippy::zombie_processes,
+            reason = "the helper is meant to outlive this process unless its group is ended"
+        )]
+        let helper = std::process::Command::new(std::env::current_exe().expect("fixture path"))
+            .arg("sleeper")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("start the helper");
+        if let Some(path) = journal.as_deref() {
+            record(path, &helper.id().to_string());
+        }
+    }
+
     let mut input = BufReader::new(std::io::stdin().lock());
     let mut output = std::io::stdout();
 
@@ -110,7 +135,7 @@ fn respond(scenario: &str, method: &str, request: &Value) -> Reply {
 
     match scenario {
         // Answers both tools and writes back what it was sent.
-        "echoer" | "journaler" => Reply::Result(json!({ "text": "echoed" })),
+        "echoer" | "journaler" | "spawner" => Reply::Result(json!({ "text": "echoed" })),
         "refuser" => Reply::Failure {
             code: -32601,
             message: "no such tool".to_owned(),

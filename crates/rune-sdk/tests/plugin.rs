@@ -379,6 +379,40 @@ fn a_plugin_that_died_between_calls_is_restarted_within_the_budget() {
     assert!(host.restarts() > 0, "the death spent a restart");
 }
 
+/// Returns true while a process with this identifier exists.
+#[cfg(unix)]
+fn alive(pid: &str) -> bool {
+    std::process::Command::new("kill")
+        .args(["-0", pid])
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+#[cfg(unix)]
+#[test]
+fn dropping_the_host_ends_the_helpers_a_plugin_started() {
+    let fixture = Fixture::recording("spawner", "spawner", TOOLS);
+    let host = PluginHost::start(fixture.path()).expect("start");
+    let recorded = std::fs::read_to_string(fixture.journal()).expect("journal");
+    let helper = recorded.lines().next().expect("the helper pid").to_owned();
+    assert!(alive(&helper), "the helper did not start");
+
+    drop(host);
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while alive(&helper) && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let survived = alive(&helper);
+    if survived {
+        let _ = std::process::Command::new("kill")
+            .args(["-9", &helper])
+            .status();
+    }
+    assert!(!survived, "the helper outlived its plugin");
+}
+
 #[test]
 fn shutdown_is_idempotent_and_refuses_further_calls() {
     let fixture = Fixture::new("echoer", "echoer", TOOLS);
