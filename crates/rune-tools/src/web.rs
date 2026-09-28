@@ -942,7 +942,10 @@ fn decode_entities(text: &str) -> std::borrow::Cow<'_, str> {
     while let Some(open) = rest.find('&') {
         out.push_str(rest.get(..open).unwrap_or_default());
         let candidate = rest.get(open..).unwrap_or_default();
-        let Some(close) = candidate.get(..10).and_then(|head| head.find(';')) else {
+        // The terminator is sought within the longest entity this decodes. The
+        // search is by byte, because the text may end, or a character may
+        // straddle the window, before that length.
+        let Some(close) = candidate.bytes().take(10).position(|byte| byte == b';') else {
             out.push('&');
             rest = rest.get(open.saturating_add(1)..).unwrap_or_default();
             continue;
@@ -1963,6 +1966,36 @@ mod tests {
             .expect_err("refused");
         assert_eq!(err.code(), ErrorCode::Unsupported);
         assert_eq!(requested(&backend).len(), 1);
+    }
+
+    #[test]
+    fn an_entity_near_the_end_of_the_text_is_decoded() {
+        assert_eq!(decode_entities("R&amp;D"), "R&D");
+        assert_eq!(decode_entities("a &gt;"), "a >");
+        assert_eq!(decode_entities("&lt;"), "<");
+    }
+
+    #[test]
+    fn an_entity_followed_by_a_multibyte_character_is_decoded() {
+        assert_eq!(decode_entities("&amp;ééé"), "&ééé");
+        assert_eq!(decode_entities("x&#233;日本語"), "xé日本語");
+    }
+
+    #[test]
+    fn an_ampersand_that_opens_no_entity_is_kept() {
+        assert_eq!(decode_entities("fish & chips"), "fish & chips");
+        assert_eq!(decode_entities("a&b"), "a&b");
+        assert_eq!(decode_entities("&unknown;"), "&unknown;");
+        assert_eq!(decode_entities("&"), "&");
+    }
+
+    #[test]
+    fn a_page_ending_in_an_entity_reads_as_text() {
+        let markdown = html_to_markdown("<p>Research &amp; development at R&amp;D</p>");
+        assert!(
+            markdown.contains("Research & development at R&D"),
+            "{markdown}"
+        );
     }
 
     #[test]
