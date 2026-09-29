@@ -2,6 +2,51 @@
 
 Notable changes, newest first. Each entry describes what a user can observe.
 
+## 0.1.16
+
+### Added
+
+- A running turn can be steered from the keyboard. Enter sends what was typed to
+  the turn at its next step, Escape twice cancels it, and Control-C clears a
+  typed line before cancelling. A cancelled or failed turn ends that exchange
+  and returns to the prompt instead of ending the session.
+- The landing page runs the harness itself, compiled to WebAssembly, against
+  files held in the page: with a scripted model, a model running in the browser,
+  or an endpoint the visitor names.
+- A known provider is reached at its published endpoint when no `base_url` is
+  configured, so `RUNE_PROVIDER=opencode-go` is enough on its own.
+
+### Security
+
+- Commands receive an allowlisted environment and no longer inherit the
+  provider credential. They run with CPU, process, and file size ceilings.
+- A sandboxed command can no longer read or write the credential stores under
+  the home directory, including the state directory that holds Rune's own
+  credential and transcripts, or write a repository's `.git/config` and hooks.
+- Path containment is checked where links lead, and `write_file` and
+  `edit_file` are held to the same roots as reads.
+- A shell rule is judged against every command a line runs, so `ls; rm -rf .git`
+  no longer matches an allow for `ls*`.
+- Web fetch checks every redirect hop before following it.
+- Model output is stripped of terminal control sequences while it streams.
+
+### Fixed
+
+- Anthropic sessions send the key in the header Anthropic reads.
+- Streamed tool calls on the Responses API, reasoning replay, retries of
+  errors reported mid-stream, `Retry-After`, unrecognized stop reasons, and
+  tool calls ended by a `stop` finish all behave correctly.
+- Token usage is summed across the requests of a turn rather than taking the
+  largest.
+- A paste arrives as text, the terminal is restored after a crash, and the live
+  region survives a resize and the bottom row.
+- The macOS sandbox lets a command write its temporary directory, so compilers
+  and test runners work inside it.
+- `/compact` finds a cut when recent prompts took several tool steps.
+- A call to a tool that does not exist, or one no rule allows, is answered with
+  the reason instead of retried blindly.
+- Global flags after the command apply, and `rune connect` hides the key.
+
 ## 0.1.15
 
 ### Fixed

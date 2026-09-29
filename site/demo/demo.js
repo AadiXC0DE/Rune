@@ -207,7 +207,7 @@ export async function mount(root) {
     }
     screen.replaceChildren();
     const ms = Math.round(performance.now() - started);
-    row('', ['rune', 'accent'], ' ', ['0.1.15', 'dim'], '  ', ['/help for commands', 'faint']);
+    row('', ['rune', 'accent'], ' ', ['0.1.16', 'dim'], '  ', ['/help for commands', 'faint']);
     row('faint', `loaded in ${ms} ms. workspace: ~/tally, a word counter with one failing test.`);
     gap();
     configure();
