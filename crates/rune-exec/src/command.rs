@@ -1384,7 +1384,12 @@ mod tests {
             "the timeout did not end the command"
         );
         let child = recorded_pid(&pidfile);
-        assert!(!alive(&child), "the forked child outlived the timeout");
+        // An ended process can stay visible as a zombie until whoever
+        // inherited it reaps it, and a signal probe succeeds on a zombie.
+        assert!(
+            wait_until(|| !alive(&child), Duration::from_secs(3)),
+            "the forked child outlived the timeout"
+        );
     }
 
     #[test]
@@ -1435,7 +1440,12 @@ mod tests {
             outcome.exit.describe()
         );
         let child = recorded_pid(&pidfile);
-        assert!(!alive(&child), "the forked child outlived the cancellation");
+        // An ended process can stay visible as a zombie until whoever
+        // inherited it reaps it, and a signal probe succeeds on a zombie.
+        assert!(
+            wait_until(|| !alive(&child), Duration::from_secs(3)),
+            "the forked child outlived the cancellation"
+        );
     }
 
     #[test]
