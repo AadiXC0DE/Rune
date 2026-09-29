@@ -1,90 +1,82 @@
 # Landing page
 
-One static page: `index.html`, no build step and no dependencies. Open it
-directly, or serve the directory:
+Static files with no build step for the page itself. Serve the directory:
 
 ```sh
-python3 -m http.server 8099
+python3 -m http.server 8099 --directory site
 ```
 
-## What it says
-
-Every command, flag, and claim on the page was run before it was written down.
-The install line matches the formula in `aadixc0de/homebrew-tap`, and the three
-install paths it offers are each verified:
-
-| Path | Verified by |
+| Path | What it is |
 |---|---|
-| `brew install aadixc0de/tap/rune` | Installing, uninstalling, and reinstalling from the pushed tap |
-| clone and `cargo build --release` | The release artifacts are built this way |
-| `cargo install --git ... rune` | Resolving every workspace crate from the repository |
+| `index.html` | The page: markup, styles, and the small scripts for the install tabs and the mark |
+| `fonts/` | IBM Plex Mono, three weights, latin subset, self-hosted (SIL OFL, see `fonts/OFL.txt`) |
+| `demo/rune.wasm` | The harness, compiled to WebAssembly by `cargo xtask web` |
+| `demo/harness.js` | Loads the module and gives it a filesystem, a transport, a shell, and a prompt |
+| `demo/demo.js` | The terminal: draws events, reads keys, and holds the model picker |
+| `demo/models.js` | The scripted model and the transport for an endpoint the visitor names |
+| `demo/local-engine.js` | A model running in the tab, answering as an OpenAI-compatible endpoint |
+| `demo/local.js` | Loads that model on request |
+| `demo/workspace.js` | The project the demo works on |
+| `demo/wasi.js` | `@bjorn3/browser_wasi_shim` 0.4.2, vendored (MIT OR Apache-2.0) |
 
-`rune` is already the name of an unrelated language in Homebrew core, and core
-wins a bare name, so the page gives the qualified tap name and says why.
+## The demo is the harness
 
-## The browser demo
+`crates/rune-web` builds the turn loop, the file tools, the permission rules,
+and the provider dialects for `wasm32-wasip1`. The page mounts an in-memory
+workspace through WASI, so `read_file`, `grep_files`, `glob_files`,
+`edit_file`, and `write_file` are the binary's own tools reading and writing
+real (in-memory) files.
 
-The demo is a second, optional layer on the same page. It is built so that a
-visitor who only reads never pays for it:
+What a tab cannot provide, the page supplies through the crate's bridge:
 
-- **No model and no runtime at load.** Nothing is imported, prefetched, or
-  preloaded. Both runtimes are reached with a dynamic `import()` inside a click
-  handler. The only requests a load makes are this file and the fonts the page
-  already asked for.
-- **The probe runs on click.** The built-in check is `LanguageModel.availability()`,
-  called from the page and never cached, because the browser can drop its own
-  model between visits.
-- **The browser owns its own download.** Chrome fetches its model itself, once
-  per profile, and the page wires `downloadprogress` to the `<progress>`
-  element. At `e.loaded === 1` the element loses its `value` attribute so the bar
-  goes indeterminate while Chrome loads the weights into memory, which is
-  Chrome's own documented guidance.
-- **The fallback is a real download, offered honestly.** The button labels name
-  the model, the exact size, that it is one time, and that it stays on the
-  device. Nothing is hidden until the built-in model has been ruled out.
+- **Requests.** The harness builds the same request it sends from the
+  terminal; the page sends it with `fetch` and hands the body back chunk by
+  chunk, so the harness's own stream reducer reads it.
+- **A shell.** A tab cannot start a process, so `shell` runs in a small shell
+  over the same files (`ls`, `cat`, `grep`, `find`, `head`, `tail`, `wc`,
+  `tree`). Anything else says it cannot run in a tab.
+- **The person watching.** When no rule decides an action, the harness asks,
+  and the turn is suspended until the answer arrives.
 
-### Sizes on the page
+The waiting imports are wrapped with `WebAssembly.Suspending` and the prompt
+export with `WebAssembly.promising` (JavaScript Promise Integration), which is
+what lets blocking Rust drive an asynchronous tab. Chrome and Edge 137+,
+Firefox 153+, and Safari 27+ have it; the page says so where it is missing.
 
-Every size is the byte count the repository publishes, rounded to the megabyte
-in the label:
+Rebuild the module after changing any crate it links:
 
-| Model | Bytes | Label | License |
-|---|---|---|---|
-| `QuantFactory/SmolLM2-135M-Instruct-GGUF` `Q4_K_M` | 105454144 | 105 MB | Apache-2.0 |
-| `bartowski/Qwen2.5-0.5B-Instruct-GGUF` `Q4_K_M` | 397808192 | 398 MB | Apache-2.0 |
+```sh
+cargo xtask web
+```
 
-The page states no size for Chrome's built-in model, because Google does not
-publish one and the variant differs per platform.
+## Models
 
-### Caching
+- **Scripted** (the default): fixed replies for one task, so the page plays
+  with no download and no key. Every tool call it makes is carried out by the
+  real tools and passes the real rules; a request off the script gets a reply
+  saying so.
+- **In this browser**: Qwen3.5 0.8B through Transformers.js, on WebGPU where
+  the browser has it and on the CPU otherwise. The runtime and about 470 MB of
+  weights are fetched only when the visitor presses load, and the browser keeps
+  them. The adapter renders the request in the model's own chat template,
+  reads its tool calls back in the format it was trained to write, and keeps
+  one call per step, which a model this small needs.
+- **Your endpoint**: OpenRouter, Anthropic, OpenAI, or a server on the
+  visitor's machine. The key stays in the tab's memory and is sent only to the
+  URL shown. An endpoint that does not answer a browser's CORS preflight
+  cannot be reached from a page; the terminal says so.
 
-wllama 3.6.1 stores weights in the Origin Private File System through its cache
-manager, not in the Cache Storage API. Both the runtime and the model are served
-with long-lived immutable cache headers, and the second run of the demo was
-observed transferring zero model bytes, so the one-time claim on the labels holds.
+## What loads when
 
-### What the demo does not claim
-
-The loop runs on a five-file sample workspace written into the page, not on your
-files. The tools and the policy table in the script mirror the shape of the real
-ones, including that a denied call comes back to the model as information rather
-than ending the turn. The page says plainly that it demonstrates the harness,
-not model quality, because a 105 MB or 398 MB model is a weak assistant and the
-run will look like it.
+Page load fetches the document and the fonts, about 60 KB. The harness (1.7 MB,
+about 400 KB with brotli) is fetched when the demo section comes near the viewport,
+and plays when it is mostly in view. Nothing else is fetched unless the
+visitor picks a model that needs it.
 
 ## Editing
 
-The colours, the type scale, and the spacing are custom properties at the top of
-the stylesheet. Everything else is derived from them.
-
-One accent colour is used across the whole page, every corner is square, and the
-page is dark only. Changing any of those means changing the corresponding
-property rather than a value in one section.
-
-## Accessibility
-
-- Every text colour passes WCAG AA against its own background.
-- The install tabs are real buttons with `aria-selected` state.
-- Text is readable with motion disabled; the only animation is the caret, which
-  stops under `prefers-reduced-motion`.
-- The layout is a single column below 860px with no horizontal overflow.
+Colours are custom properties at the top of the stylesheet, with a light set
+under `prefers-color-scheme`. The terminal stays dark in both. One accent,
+square corners throughout, and motion that stops under
+`prefers-reduced-motion`: the mark is drawn once and left still, and sections
+appear without rising.

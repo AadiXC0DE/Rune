@@ -2,28 +2,32 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 
-<title>Rune, a tiny native coding agent harness</title>
-<meta name="description" content="A tiny, native coding agent harness written in Rust: about 3 MiB and 2 ms to start. Sandboxed, offline on request, model agnostic, no account, no telemetry. Open source, Apache-2.0.">
+<title>Rune, a tiny coding agent in Rust</title>
+<meta name="description" content="A coding agent in one 3 MiB native binary. Sandboxed commands, permission rules that name their source, any model, no account and no telemetry. Try it in the page: the harness runs as WebAssembly.">
 <link rel="canonical" href="https://rune.heyaadi.com/">
-<meta name="theme-color" content="#0c0b09">
-<meta name="color-scheme" content="dark">
+<meta name="color-scheme" content="dark light">
+<meta name="theme-color" content="#0b0b0a" media="(prefers-color-scheme: dark)">
+<meta name="theme-color" content="#f6f6f3" media="(prefers-color-scheme: light)">
 
 <meta property="og:type" content="website">
-<meta property="og:title" content="Rune, a tiny native coding agent harness">
-<meta property="og:description" content="A tiny, native coding agent harness in Rust: about 3 MiB and 2 ms to start, sandboxed, offline on request, and free of accounts and telemetry.">
+<meta property="og:title" content="Rune, a tiny coding agent in Rust">
+<meta property="og:description" content="One 3 MiB binary, sandboxed, model agnostic. The page runs the real harness as WebAssembly.">
 <meta property="og:url" content="https://rune.heyaadi.com/">
 <meta property="og:site_name" content="Rune">
+<meta property="og:image" content="https://rune.heyaadi.com/og.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="A coding agent in one 3 MiB binary, beside the Rune mark drawn in dots.">
 <meta name="twitter:card" content="summary_large_image">
-<meta name="twitter:title" content="Rune, a tiny native coding agent harness">
-<meta name="twitter:description" content="A tiny, native coding agent harness in Rust: about 3 MiB and 2 ms to start, sandboxed, offline on request, and free of accounts and telemetry.">
+<meta name="twitter:image" content="https://rune.heyaadi.com/og.png">
+<meta name="twitter:title" content="Rune, a tiny coding agent in Rust">
+<meta name="twitter:description" content="One 3 MiB binary, sandboxed, model agnostic. The page runs the real harness as WebAssembly.">
 
-<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' fill='%230c0b09'/><path d='M8 8h10a6 6 0 0 1 0 12h-4l6 8' fill='none' stroke='%23ffb454' stroke-width='3'/></svg>">
-
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' fill='%230b0b0a'/><path d='M8 8h10a6 6 0 0 1 0 12h-4l6 8' fill='none' stroke='%23ffb454' stroke-width='3'/></svg>">
+<link rel="preload" href="fonts/plex-mono-400.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="preload" href="fonts/plex-mono-600.woff2" as="font" type="font/woff2" crossorigin>
 
 <script type="application/ld+json">
 {
@@ -37,1381 +41,769 @@
   "isAccessibleForFree": true,
   "codeRepository": "https://github.com/AadiXC0DE/Rune",
   "downloadUrl": "https://github.com/AadiXC0DE/Rune/releases",
-  "author": {
-    "@type": "Person",
-    "name": "Aaditya",
-    "url": "https://github.com/AadiXC0DE"
-  },
-  "offers": {
-    "@type": "Offer",
-    "price": "0",
-    "priceCurrency": "USD"
-  }
+  "author": { "@type": "Person", "name": "Aaditya", "url": "https://github.com/AadiXC0DE" },
+  "offers": { "@type": "Offer", "price": "0", "priceCurrency": "USD" }
 }
 </script>
 
 <style>
-  :root {
-    --ink:        #0c0b09;
-    --ink-raised: #131210;
-    --rule:       #26231e;
-    --rule-lit:   #3a352c;
-    --text:       #e8e3d9;
-    --dim:        #8f887a;
-    /* The quietest tier still has to be readable, so this clears the contrast
-       floor against the page background while staying below `--dim`, which is
-       what keeps three tiers distinguishable. */
-    --faint:      #867f73;
-    --accent:     #ffb454;
-    --warn:       #d98a5f;
-    --ok:         #9ece6a;
+  @font-face { font-family: "Plex Mono"; font-style: normal; font-weight: 400; font-display: swap; src: url(fonts/plex-mono-400.woff2) format("woff2"); }
+  @font-face { font-family: "Plex Mono"; font-style: normal; font-weight: 500; font-display: swap; src: url(fonts/plex-mono-500.woff2) format("woff2"); }
+  @font-face { font-family: "Plex Mono"; font-style: normal; font-weight: 600; font-display: swap; src: url(fonts/plex-mono-600.woff2) format("woff2"); }
 
-    --step: 1.6rem;
-    --gutter: clamp(1.25rem, 4vw, 4rem);
-    --measure: 68ch;
+  :root {
+    --bg: #0b0b0a;
+    --bg-raised: #121210;
+    --line: #23221e;
+    --line-lit: #3a372f;
+    --text: #ece8df;
+    --dim: #a39d90;
+    --faint: #858073;
+    --accent: #ffb454;
+    --accent-ink: #ffb454;
+    --warn: #e58a5c;
+    --ok: #9ece6a;
+
+    /* The terminal is dark in both themes, as a terminal is. */
+    --term-bg: #0d0d0b;
+    --term-line: #26241f;
+    --term-text: #ece8df;
+    --term-dim: #a39d90;
+    --term-faint: #7f7a6e;
+
+    --gutter: clamp(1.25rem, 4vw, 3rem);
+    --width: 1120px;
+    color-scheme: dark;
+  }
+
+  @media (prefers-color-scheme: light) {
+    :root {
+      --bg: #f6f6f3;
+      --bg-raised: #ffffff;
+      --line: #e3e2dc;
+      --line-lit: #c9c7bd;
+      --text: #1a1916;
+      --dim: #57544c;
+      --faint: #6e6a60;
+      /* Amber is too light to read on a light page, so text takes a darker
+         shade of it and the glyph keeps the brand colour. */
+      --accent-ink: #9a5b00;
+      --warn: #b4461d;
+      --ok: #3f7a1c;
+      color-scheme: light;
+    }
   }
 
   *, *::before, *::after { box-sizing: border-box; }
-
-  html { -webkit-text-size-adjust: 100%; }
-
+  html { -webkit-text-size-adjust: 100%; scroll-padding-top: 5rem; }
   body {
     margin: 0;
-    background: var(--ink);
+    background: var(--bg);
     color: var(--text);
-    font-family: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-family: "Plex Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
     font-size: 15px;
-    line-height: 1.7;
-    font-feature-settings: "liga" 0;
+    line-height: 1.65;
     -webkit-font-smoothing: antialiased;
+    font-feature-settings: "calt" 0;
   }
+  a { color: inherit; text-decoration: none; }
+  a:hover { color: var(--accent-ink); }
+  :focus-visible { outline: 2px solid var(--accent-ink); outline-offset: 3px; }
+  ::selection { background: var(--accent); color: #0b0b0a; }
+  code { font-family: inherit; }
 
-  /* A faint scanline wash. Kept very low contrast so it reads as a surface
-     texture rather than as a pattern competing with the text. */
-  body::before {
-    content: "";
-    position: fixed;
-    inset: 0;
-    pointer-events: none;
-    z-index: 1;
-    background: repeating-linear-gradient(
-      to bottom,
-      rgb(255 255 255 / .014) 0 1px,
-      transparent 1px 3px
-    );
-  }
+  .wrap { max-width: var(--width); margin: 0 auto; padding: 0 var(--gutter); }
 
-  a { color: var(--accent); text-decoration: none; }
-  a:hover { text-decoration: underline; text-underline-offset: 3px; }
-  a:focus-visible, button:focus-visible {
-    outline: 2px solid var(--accent);
-    outline-offset: 3px;
-  }
+  /* ---------- top ---------- */
 
-  /* Selection is the terminal's own reversed video rather than the browser's
-     default highlight. */
-  ::selection { background: var(--accent); color: var(--ink); }
-
-  .wrap {
-    max-width: 1080px;
-    margin: 0 auto;
-    padding: 0 var(--gutter);
-    position: relative;
-    z-index: 2;
-  }
-
-  /* ---------- top bar ---------- */
-
-  .bar {
-    border-bottom: 1px solid var(--rule);
-    font-size: .82rem;
-    color: var(--dim);
-  }
-  .bar .wrap {
+  .top .wrap {
     display: flex;
     align-items: center;
     justify-content: space-between;
-    gap: 1rem;
-    height: 56px;
+    height: 64px;
+    font-size: .86rem;
   }
-  .mark {
-    display: flex;
-    align-items: center;
-    gap: .6rem;
-    color: var(--text);
-    font-weight: 600;
-    letter-spacing: .02em;
-  }
-  .mark svg { display: block; }
-  .bar nav { display: flex; gap: 1.25rem; }
-  .bar nav a { color: var(--dim); }
-  .bar nav a:hover { color: var(--text); }
+  .brand { display: flex; align-items: center; gap: .6rem; font-weight: 600; letter-spacing: .01em; }
+  .brand svg { display: block; }
+  .top nav { display: flex; gap: 1.6rem; color: var(--dim); }
 
   /* ---------- hero ---------- */
 
-  .hero { padding: clamp(3.5rem, 9vw, 7rem) 0 clamp(2.5rem, 6vw, 4rem); }
-
-  .hero-grid {
+  .hero .wrap {
     display: grid;
-    gap: clamp(2rem, 5vw, 3.5rem);
-    grid-template-columns: minmax(0, 1.4fr) minmax(0, 1fr);
-    align-items: stretch;
+    grid-template-columns: minmax(0, 1.1fr) minmax(0, .9fr);
+    gap: clamp(2rem, 5vw, 4.5rem);
+    align-items: center;
+    padding-top: clamp(2.5rem, 7vw, 5.5rem);
+    padding-bottom: clamp(1rem, 3vw, 2rem);
   }
-
-  .eyebrow {
-    font-size: .74rem;
-    letter-spacing: .22em;
-    text-transform: uppercase;
-    color: var(--accent);
-    margin: 0 0 1.4rem;
-  }
-  .eyebrow::before { content: "// "; color: var(--faint); }
-
   h1 {
-    font-size: clamp(1.75rem, 3.2vw, 2.7rem);
-    line-height: 1.15;
-    letter-spacing: -.02em;
+    font-size: clamp(2.05rem, 4.4vw, 3.55rem);
+    line-height: 1.08;
+    letter-spacing: -.035em;
     font-weight: 600;
-    margin: 0 0 1.5rem;
+    margin: 0 0 1.4rem;
+    text-wrap: balance;
   }
-  h1 em { font-style: normal; color: var(--accent); }
+  h1 em { font-style: normal; color: var(--accent-ink); }
+  .lede { color: var(--dim); font-size: 1.02rem; max-width: 46ch; margin: 0 0 2rem; text-wrap: pretty; }
 
-  .lede {
-    font-size: 1.02rem;
-    color: var(--dim);
-    max-width: 42ch;
-    margin: 0 0 2.2rem;
+  .install {
+    border: 1px solid var(--line-lit);
+    background: var(--bg-raised);
+    max-width: 34rem;
   }
-  .lede strong { color: var(--text); font-weight: 500; }
-
-  /* ---------- install ---------- */
-
-  .install { border: 1px solid var(--rule-lit); background: var(--ink-raised); }
-
-  .tabs {
+  .install [role="tablist"] {
     display: flex;
-    border-bottom: 1px solid var(--rule);
+    border-bottom: 1px solid var(--line);
     font-size: .74rem;
-    letter-spacing: .14em;
-    text-transform: uppercase;
+    letter-spacing: .08em;
   }
-  .tabs button {
+  .install [role="tab"] {
     appearance: none;
     background: none;
     border: 0;
-    border-right: 1px solid var(--rule);
+    border-right: 1px solid var(--line);
     color: var(--faint);
     font: inherit;
     letter-spacing: inherit;
-    text-transform: inherit;
-    padding: .7rem 1rem;
+    padding: .55rem .95rem;
     cursor: pointer;
   }
-  .tabs button:hover { color: var(--dim); }
-  .tabs button[aria-selected="true"] {
-    color: var(--accent);
-    background: rgb(255 180 84 / .05);
-  }
-
-  .cmd {
+  .install [role="tab"]:hover { color: var(--text); }
+  .install [role="tab"][aria-selected="true"] { color: var(--accent-ink); }
+  .line {
     display: flex;
-    align-items: baseline;
-    gap: .9rem;
-    padding: 1rem 1rem;
-    font-size: .92rem;
-    overflow-x: auto;
+    align-items: center;
+    gap: .75rem;
+    padding: .9rem .95rem;
+    font-size: .93rem;
   }
-  /* `hidden` is how a tab panel is taken out of the layout, and a display
-     declaration beats it, so the attribute is honored explicitly. Without this
-     every panel renders at once. */
-  .cmd[hidden] { display: none; }
-  .cmd span.ps { color: var(--faint); user-select: none; }
-  /* A terminal wraps a long line rather than pushing it off the edge, so a
-     command that does not fit continues on the next line and the pane needs no
-     horizontal scrolling. */
-  .cmd code {
-    color: var(--text);
-    white-space: pre-wrap;
-    overflow-wrap: anywhere;
-  }
-
-  /* ---------- scrollbars ----------
-     The two inner panes can scroll, and a default scrollbar reads as a browser
-     control dropped into a terminal. They are drawn as a thin trough with a
-     quiet thumb instead, and the horizontal one only appears when the content
-     actually overflows. */
-  .cmd, .term-body {
-    scrollbar-width: thin;
-    scrollbar-color: var(--rule-lit) transparent;
-    overscroll-behavior-x: contain;
-  }
-  .cmd::-webkit-scrollbar, .term-body::-webkit-scrollbar {
-    height: 6px;
-    width: 6px;
-  }
-  .cmd::-webkit-scrollbar-track, .term-body::-webkit-scrollbar-track {
-    background: transparent;
-  }
-  .cmd::-webkit-scrollbar-thumb, .term-body::-webkit-scrollbar-thumb {
-    background: var(--rule-lit);
-  }
-  .cmd::-webkit-scrollbar-thumb:hover, .term-body::-webkit-scrollbar-thumb:hover {
-    background: var(--faint);
-  }
-  /* The corner where the two bars meet has nothing to draw. */
-  .cmd::-webkit-scrollbar-corner, .term-body::-webkit-scrollbar-corner {
-    background: transparent;
-  }
-
+  .line[hidden] { display: none; }
+  .line .ps { color: var(--faint); user-select: none; }
+  .line code { flex: 1; min-width: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
   .copy {
     appearance: none;
     background: none;
-    border: 1px solid var(--rule);
-    color: var(--faint);
+    border: 1px solid var(--line-lit);
+    color: var(--dim);
     font: inherit;
     font-size: .72rem;
-    letter-spacing: .12em;
-    text-transform: uppercase;
-    padding: .35rem .6rem;
-    margin-left: auto;
+    letter-spacing: .08em;
+    padding: .3rem .6rem;
     cursor: pointer;
+    flex: none;
+    transition: color .15s, border-color .15s, transform .1s;
   }
-  .copy:hover { color: var(--accent); border-color: var(--rule-lit); }
-  .copy[data-done="true"] { color: var(--ok); border-color: var(--ok); }
+  .copy:hover { color: var(--accent-ink); border-color: var(--accent-ink); }
+  .copy:active { transform: translateY(1px); }
+  .copy[data-done] { color: var(--ok); border-color: var(--ok); }
+  .meta { margin: 1rem 0 0; font-size: .8rem; color: var(--faint); }
+  .meta b { color: var(--dim); font-weight: 500; }
 
-  .note {
-    border-top: 1px solid var(--rule);
-    padding: .8rem 1rem;
-    font-size: .8rem;
-    color: var(--dim);
+  .glyph { position: relative; aspect-ratio: 1; width: 100%; max-width: 440px; justify-self: end; }
+  .glyph canvas { position: absolute; inset: 0; width: 100%; height: 100%; touch-action: pan-y; }
+
+  /* ---------- demo ---------- */
+
+  section { padding: clamp(2.75rem, 6vw, 4.75rem) 0; }
+  h2 {
+    font-size: clamp(1.35rem, 2.3vw, 1.8rem);
+    line-height: 1.2;
+    letter-spacing: -.02em;
+    font-weight: 600;
+    margin: 0 0 .8rem;
+    text-wrap: balance;
   }
-  .note strong { color: var(--dim); font-weight: 500; }
-
-  /* ---------- terminal panel ---------- */
-
-  .right { display: flex; flex-direction: column; gap: 1.5rem; }
+  .sub { color: var(--dim); max-width: 64ch; margin: 0 0 2rem; text-wrap: pretty; }
 
   .term {
-    border: 1px solid var(--rule-lit);
-    background: #0a0908;
-    font-size: .8rem;
-    line-height: 1.75;
-    flex: 1;
-    display: flex;
-    flex-direction: column;
+    position: relative;
+    background: var(--term-bg);
+    color: var(--term-text);
+    border: 1px solid var(--term-line);
+    font-size: 13.5px;
+    line-height: 1.6;
+    box-shadow: 0 30px 80px -40px rgb(0 0 0 / .55);
   }
-  .term-body { flex: 1; }
-  .term-head {
+  .term-bar {
     display: flex;
     align-items: center;
-    gap: .45rem;
-    padding: .55rem .8rem;
-    border-bottom: 1px solid var(--rule);
-    color: var(--faint);
-    font-size: .72rem;
-    letter-spacing: .1em;
+    gap: .8rem;
+    height: 40px;
+    padding: 0 .75rem 0 .9rem;
+    border-bottom: 1px solid var(--term-line);
+    color: var(--term-faint);
+    font-size: .78rem;
   }
-  .dot { width: 9px; height: 9px; border: 1px solid var(--rule-lit); }
-  .term-body {
-    padding: 1rem .9rem;
+  .lights { display: flex; gap: 6px; }
+  .lights i { width: 10px; height: 10px; border: 1px solid #3b3830; display: block; }
+  .term-title { flex: 1; color: var(--term-dim); }
+  .chip {
+    appearance: none;
+    background: none;
+    border: 1px solid #3b3830;
+    color: var(--term-text);
+    font: inherit;
+    padding: .2rem .6rem;
+    cursor: pointer;
+    max-width: 16rem;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .chip::after { content: " \25BE"; color: var(--term-faint); }
+  .chip:hover { border-color: var(--accent); }
+
+  .screen {
+    height: clamp(20rem, 52vh, 30rem);
+    overflow-y: auto;
+    padding: .9rem 1rem .4rem;
+    scrollbar-width: thin;
+    scrollbar-color: #3b3830 transparent;
+    overscroll-behavior: contain;
+  }
+  .row { white-space: pre-wrap; overflow-wrap: anywhere; min-height: 1.6em; }
+  .row.gap { min-height: .8em; }
+  .answer { color: var(--term-text); }
+  .reasoning { color: var(--term-faint); padding-left: 2ch; }
+  .accent { color: var(--accent); }
+  .dim { color: var(--term-dim); }
+  .faint, .row.faint { color: var(--term-faint); }
+  .warn, .row.warn { color: #e58a5c; }
+  .ok { color: #9ece6a; }
+  .strong { color: var(--term-text); }
+  .tool-name { color: var(--term-text); }
+  .notice { color: var(--term-dim); }
+  .notice.faint { color: var(--term-faint); }
+  .notice.warn { color: #e58a5c; }
+  .code { color: var(--term-dim); }
+  .running::after {
+    content: "";
+    display: inline-block;
+    width: .5em;
+    height: .5em;
+    margin-left: .7em;
+    background: var(--accent);
+    animation: pulse .9s steps(2, jump-none) infinite;
+  }
+  @keyframes pulse { from { opacity: 1 } to { opacity: .15 } }
+
+  .choices { display: inline-flex; gap: .5rem; margin-left: .2rem; }
+  .choices button {
+    appearance: none;
+    background: none;
+    border: 1px solid #3b3830;
+    color: var(--term-text);
+    font: inherit;
+    padding: 0 .5rem;
+    cursor: pointer;
+  }
+  .choices button:first-child { border-color: var(--accent); color: var(--accent); }
+
+  .term-foot { border-top: 1px solid var(--term-line); padding: .45rem 1rem .6rem; }
+  .input-row { display: flex; align-items: center; gap: .6rem; }
+  .input-row .prompt { color: var(--accent); }
+  .input-row input {
+    flex: 1;
+    min-width: 0;
+    background: none;
+    border: 0;
+    outline: none;
+    color: var(--term-text);
+    caret-color: var(--accent);
+    font: inherit;
+    padding: .3rem 0;
+  }
+  .input-row input::placeholder { color: var(--term-faint); }
+  .hint, .status { font-size: .76rem; color: var(--term-faint); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .status { color: var(--term-dim); }
+
+  .term-panel {
+    position: absolute;
+    z-index: 2;
+    top: 40px;
+    right: 0;
+    width: min(31rem, 100%);
+    background: #12110f;
+    border: 1px solid var(--term-line);
+    border-top: 0;
+    font-size: .8rem;
+    box-shadow: 0 24px 60px -20px rgb(0 0 0 / .7);
+  }
+  .term-panel[hidden] { display: none; }
+  .opt { display: grid; grid-template-columns: 1fr auto; gap: .5rem 1rem; align-items: start; padding: .85rem 1rem; border-bottom: 1px solid var(--term-line); }
+  .opt:last-child { border-bottom: 0; }
+  .opt b { display: block; color: var(--term-text); font-weight: 600; margin-bottom: .15rem; }
+  .opt span { color: var(--term-faint); }
+  .opt button, .endpoint button {
+    appearance: none;
+    background: none;
+    border: 1px solid var(--accent);
+    color: var(--accent);
+    font: inherit;
+    padding: .25rem .7rem;
+    cursor: pointer;
+  }
+  .opt button:disabled { border-color: #3b3830; color: var(--term-faint); cursor: default; }
+  .opt progress { display: block; width: 100%; height: 4px; margin-top: .5rem; appearance: none; border: 0; background: #26241f; }
+  .opt progress[hidden] { display: none; }
+  .opt progress::-webkit-progress-bar { background: #26241f; }
+  .opt progress::-webkit-progress-value { background: var(--accent); }
+  .opt progress::-moz-progress-bar { background: var(--accent); }
+  .endpoint { grid-template-columns: 1fr 1fr; }
+  .endpoint b, .endpoint .note, .endpoint .full { grid-column: 1 / -1; }
+  .endpoint label { display: grid; gap: .2rem; color: var(--term-faint); }
+  .endpoint input, .endpoint select {
+    background: #0b0b0a;
+    border: 1px solid #3b3830;
+    color: var(--term-text);
+    font: inherit;
+    padding: .35rem .5rem;
+    min-width: 0;
+  }
+  .endpoint input:focus, .endpoint select:focus { border-color: var(--accent); outline: none; }
+  .endpoint .note { color: var(--term-faint); }
+  .endpoint button { justify-self: start; }
+
+  .demo-foot { margin: 1rem 0 0; font-size: .8rem; color: var(--faint); max-width: 80ch; }
+
+  /* ---------- principles ---------- */
+
+  .points {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 2.6rem clamp(2rem, 6vw, 5rem);
+    margin: 0;
+  }
+  .points div { max-width: 46ch; }
+  .points dt { font-weight: 600; margin: 0 0 .35rem; }
+  .points dd { margin: 0; color: var(--dim); font-size: .92rem; }
+  .points code { color: var(--text); }
+
+  /* ---------- start ---------- */
+
+  .steps {
+    margin: 0;
+    padding: 1.1rem 1.2rem;
+    border: 1px solid var(--line);
+    background: var(--bg-raised);
+    font-size: .9rem;
+    line-height: 2;
     overflow-x: auto;
   }
-  /* A terminal wraps a line at the column edge rather than running it off the
-     pane, so a long line continues on the next row. Leading spaces are part of
-     the output and are preserved. */
-  .term-body p {
-    margin: 0;
-    white-space: pre-wrap;
-    overflow-wrap: anywhere;
-  }
-  .c-accent { color: var(--accent); }
-  .c-dim { color: var(--dim); }
-  .c-faint { color: var(--faint); }
-  .c-ok { color: var(--ok); }
-  .c-warn { color: var(--warn); }
-
-  .caret {
-    display: inline-block;
-    width: .55em;
-    height: 1em;
-    background: var(--accent);
-    vertical-align: -.16em;
-    animation: blink 1.1s steps(1) infinite;
-  }
-  @keyframes blink { 0%, 50% { opacity: 1 } 50.01%, 100% { opacity: 0 } }
-
-  .facts { margin: 0; font-size: .78rem; }
-  .facts > div {
-    display: flex;
-    gap: 1rem;
-    justify-content: space-between;
-    padding: .55rem 0;
-    border-top: 1px solid var(--rule);
-  }
-  .facts dt { color: var(--faint); }
-  .facts dd { margin: 0; color: var(--dim); text-align: right; }
-
-  /* ---------- sections ---------- */
-
-  section { border-top: 1px solid var(--rule); padding: clamp(2.5rem, 6vw, 4rem) 0; }
-
-  h2 {
-    font-size: .74rem;
-    letter-spacing: .22em;
-    text-transform: uppercase;
-    color: var(--faint);
-    font-weight: 500;
-    margin: 0 0 2rem;
-  }
-  /* Sections are announced the way a document is written in a terminal. */
-  h2::before { content: "## "; color: var(--rule-lit); letter-spacing: 0; }
-
-  .grid { display: grid; gap: 0; grid-template-columns: repeat(2, minmax(0, 1fr)); }
-  .cell {
-    padding: 1.5rem 2rem 1.5rem 0;
-    border-top: 1px solid var(--rule);
-  }
-  .cell:nth-child(-n+2) { border-top: 0; padding-top: 0; }
-  .cell:nth-child(even) { padding-left: 2rem; border-left: 1px solid var(--rule); }
-  .cell h3 {
-    font-size: .95rem;
-    font-weight: 600;
-    margin: 0 0 .5rem;
-    color: var(--text);
-  }
-  .cell h3::before { content: "→ "; color: var(--accent); font-weight: 400; }
-  .cell p { margin: 0; color: var(--dim); font-size: .88rem; max-width: 46ch; }
-
-  /* ---------- commands ---------- */
-
-  table { width: 100%; border-collapse: collapse; font-size: .86rem; }
-  th, td { text-align: left; padding: .7rem 1rem .7rem 0; vertical-align: top; }
-  th {
-    font-size: .72rem;
-    letter-spacing: .14em;
-    text-transform: uppercase;
-    color: var(--faint);
-    font-weight: 500;
-    border-bottom: 1px solid var(--rule-lit);
-  }
-  td:first-child { color: var(--accent); white-space: nowrap; }
-  /* Each row is a command as it would be typed, so it carries the prompt a
-     terminal shows. */
-  td:first-child::before { content: "$ "; color: var(--faint); }
-  td:last-child { color: var(--dim); padding-right: 0; }
-  tbody tr + tr td { border-top: 1px solid var(--rule); }
+  .steps .ps { color: var(--faint); user-select: none; }
+  .steps .c { color: var(--faint); }
 
   /* ---------- footer ---------- */
 
-  footer {
-    border-top: 1px solid var(--rule);
-    padding: 2rem 0 3rem;
-    font-size: .82rem;
-    color: var(--faint);
-  }
-  .foot-grid {
+  footer { border-top: 1px solid var(--line); }
+  footer .wrap {
     display: flex;
     flex-wrap: wrap;
-    gap: 1rem 2rem;
     justify-content: space-between;
-    align-items: baseline;
-  }
-  .foot-links { display: flex; flex-wrap: wrap; gap: 1.25rem; }
-  .foot-links a { color: var(--dim); }
-
-  .credit { color: var(--faint); }
-  .credit a { color: var(--dim); border-bottom: 1px solid var(--rule-lit); }
-  .credit a:hover { color: var(--accent); border-color: var(--accent); }
-
-  /* ---------- browser demo ---------- */
-
-  .demo-lede { max-width: 60ch; }
-
-  .demo-cols {
-    display: grid;
-    gap: clamp(1.5rem, 3vw, 2.5rem);
-    grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr);
-    align-items: start;
-  }
-
-  /* The console reuses the hero terminal's body, so it is given a fixed height
-     for the controls beside it and a pinned basis: that body's `flex: 1` would
-     otherwise set a zero basis and override the height. */
-  #demo-out {
-    flex: none;
-    height: clamp(18rem, 42vh, 26rem);
-    overflow-y: auto;
-    padding-right: 1.1rem;
-  }
-  #demo-out p { margin: 0 0 .1rem; }
-
-  .panel-head {
-    border-bottom: 1px solid var(--rule);
-    padding: .55rem 1rem;
-    font-size: .72rem;
-    letter-spacing: .1em;
+    gap: 1rem 2rem;
+    padding-top: 1.8rem;
+    padding-bottom: 2.6rem;
+    font-size: .8rem;
     color: var(--faint);
   }
-  .panel-body { padding: 1rem; }
+  footer nav { display: flex; flex-wrap: wrap; gap: 1.4rem; color: var(--dim); }
 
-  .demo-status {
-    margin: 0 0 .9rem;
-    font-size: .82rem;
-    line-height: 1.6;
-    color: var(--dim);
+  /* ---------- entrance ---------- */
+
+  /* The hero rises once as the page opens. Later sections rise as they are
+     scrolled into view where the browser can tie an animation to scrolling,
+     and are simply present where it cannot, so nothing waits on a script. */
+  @keyframes rise { from { opacity: 0; transform: translateY(14px); } }
+  @media (prefers-reduced-motion: no-preference) {
+    .hero .rise { animation: rise .8s cubic-bezier(.16, 1, .3, 1) both; }
+    .hero .rise:nth-child(2) { animation-delay: .07s; }
+    .hero .rise:nth-child(3) { animation-delay: .14s; }
+    .hero .rise:nth-child(4) { animation-delay: .21s; }
+    @supports (animation-timeline: view()) {
+      section:not(.hero) .rise {
+        animation: rise linear both;
+        animation-timeline: view();
+        animation-range: entry 0% entry 35%;
+      }
+    }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .running::after { animation: none; }
   }
 
-  .actions { display: flex; flex-direction: column; gap: .6rem; }
-
-  /* Square corners, one accent, and the whole button is the target. */
-  .act {
-    appearance: none;
-    display: block;
-    width: 100%;
-    text-align: left;
-    background: none;
-    border: 1px solid var(--rule-lit);
-    color: var(--text);
-    font: inherit;
-    font-size: .84rem;
-    line-height: 1.5;
-    padding: .7rem .8rem;
-    cursor: pointer;
-  }
-  .act:hover:enabled { border-color: var(--accent); }
-  .act:hover:enabled .act-top { color: var(--accent); }
-  .act:disabled { color: var(--faint); border-color: var(--rule); cursor: default; }
-  .act-top { display: block; font-weight: 500; }
-  .act-sub { display: block; color: var(--faint); font-size: .76rem; margin-top: .2rem; }
-  .act[hidden] { display: none; }
-
-
-  progress.meter {
-    display: block;
-    width: 100%;
-    height: 6px;
-    appearance: none;
-    border: 0;
-    background: var(--rule);
-    margin: 0 0 .9rem;
-  }
-  progress.meter[hidden] { display: none; }
-  progress.meter::-webkit-progress-bar { background: var(--rule); }
-  progress.meter::-webkit-progress-value { background: var(--accent); }
-  progress.meter::-moz-progress-bar { background: var(--accent); }
-
-  .demo-note {
-    border-top: 1px solid var(--rule);
-    margin: 1.5rem 0 0;
-    padding: 1rem 0 0;
-    color: var(--faint);
-    font-size: .78rem;
-  }
-  .demo-note p { margin: 0 0 .6rem; }
-  .demo-note p:last-child { margin-bottom: 0; }
-  .demo-note b { color: var(--dim); font-weight: 500; }
-
-  /* ---------- responsive ---------- */
+  /* ---------- small screens ---------- */
 
   @media (max-width: 860px) {
-    .hero-grid { grid-template-columns: minmax(0, 1fr); }
-    .demo-cols { grid-template-columns: minmax(0, 1fr); }
-    .grid { grid-template-columns: minmax(0, 1fr); }
-    .cell, .cell:nth-child(even) {
-      padding: 1.25rem 0;
-      border-left: 0;
-    }
-    .cell:nth-child(2) { border-top: 1px solid var(--rule); padding-top: 1.25rem; }
-    .bar nav { gap: .9rem; }
-    .bar nav a:not(.keep) { display: none; }
-  }
-
-  @media (prefers-reduced-motion: reduce) {
-    .caret { animation: none; opacity: 1; }
-    html { scroll-behavior: auto; }
+    .hero .wrap { grid-template-columns: minmax(0, 1fr); }
+    .glyph { justify-self: center; max-width: 300px; order: -1; margin-bottom: -1rem; }
+    .points { grid-template-columns: minmax(0, 1fr); }
+    .top nav a.optional { display: none; }
+    .term { margin: 0 calc(var(--gutter) * -1); border-left: 0; border-right: 0; }
+    .endpoint { grid-template-columns: minmax(0, 1fr); }
   }
 </style>
 </head>
 <body>
 
-<header class="bar">
+<header class="top">
   <div class="wrap">
-    <span class="mark">
+    <a class="brand" href="/" aria-label="Rune home">
       <svg width="18" height="18" viewBox="0 0 32 32" aria-hidden="true"><path d="M8 8h10a6 6 0 0 1 0 12h-4l6 8" fill="none" stroke="#ffb454" stroke-width="3"/></svg>
       rune
-    </span>
+    </a>
     <nav>
-      <a class="keep" href="#demo">demo</a>
-      <a href="#install">install</a>
-      <a href="#why">why</a>
-      <a href="#commands">commands</a>
-      <a class="keep" href="https://github.com/AadiXC0DE/Rune">github</a>
+      <a href="#demo">demo</a>
+      <a class="optional" href="#start">install</a>
+      <a class="optional" href="https://github.com/AadiXC0DE/Rune/blob/main/COMMANDS.md">commands</a>
+      <a href="https://github.com/AadiXC0DE/Rune">source</a>
     </nav>
   </div>
 </header>
 
 <main>
 
-  <section class="hero" style="border-top:0">
-    <div class="wrap hero-grid">
-
+  <section class="hero" style="padding:0">
+    <div class="wrap">
       <div>
-        <p class="eyebrow">Apache-2.0 · open source · native, no runtime</p>
-        <h1>A tiny coding agent<br>harness in <em>Rust</em>.</h1>
-        <p class="lede">
-          About <strong>3 MiB</strong> and 2 ms to start. Every limit, rule, and
-          setting names the file it came from, so nothing is a surprise you have
-          to go looking for.
-        </p>
-        <p class="lede demo-lede">
-          This page loads none of that. The demo below is opt-in, runs in your
-          browser, and nothing downloads until you press the button.
-        </p>
-
-        <div class="install" id="install">
-          <div class="tabs" role="tablist">
-            <button role="tab" aria-selected="true" data-target="brew">homebrew</button>
-            <button role="tab" aria-selected="false" data-target="source">from source</button>
+        <h1 class="rise">A coding agent in one <em>3&nbsp;MiB</em> binary.</h1>
+        <p class="lede rise">Native Rust, sandboxed, and model agnostic. It starts in about 2 ms, and every rule it applies names the file that set it.</p>
+        <div class="install rise">
+          <div role="tablist" aria-label="Install with">
+            <button role="tab" aria-selected="true" data-target="brew">brew</button>
             <button role="tab" aria-selected="false" data-target="cargo">cargo</button>
+            <button role="tab" aria-selected="false" data-target="source">source</button>
           </div>
-
-          <div class="cmd" data-panel="brew">
-            <span class="ps">$</span>
-            <code id="cmd-brew">brew install aadixc0de/tap/rune</code>
+          <div class="line" data-panel-name="brew">
+            <span class="ps">$</span><code id="cmd-brew">brew install aadixc0de/tap/rune</code>
             <button class="copy" data-copy="cmd-brew">copy</button>
           </div>
-          <div class="cmd" data-panel="source" hidden>
-            <span class="ps">$</span>
-            <code id="cmd-source">git clone https://github.com/AadiXC0DE/Rune &amp;&amp; cd Rune &amp;&amp; cargo build --release</code>
-            <button class="copy" data-copy="cmd-source">copy</button>
-          </div>
-          <div class="cmd" data-panel="cargo" hidden>
-            <span class="ps">$</span>
-            <code id="cmd-cargo">cargo install --git https://github.com/AadiXC0DE/Rune rune</code>
+          <div class="line" data-panel-name="cargo" hidden>
+            <span class="ps">$</span><code id="cmd-cargo">cargo install --git https://github.com/AadiXC0DE/Rune rune</code>
             <button class="copy" data-copy="cmd-cargo">copy</button>
           </div>
-
-          <p class="note">
-            <strong>rune</strong> is taken in Homebrew core by an unrelated language,
-            so the tap is named explicitly. Then connect a provider, because a fresh
-            install has none.
-          </p>
+          <div class="line" data-panel-name="source" hidden>
+            <span class="ps">$</span><code id="cmd-source">git clone https://github.com/AadiXC0DE/Rune &amp;&amp; cd Rune &amp;&amp; cargo build --release</code>
+            <button class="copy" data-copy="cmd-source">copy</button>
+          </div>
         </div>
+        <p class="meta rise"><b>3.1 MiB</b> binary &nbsp;/&nbsp; <b>~2 ms</b> to start &nbsp;/&nbsp; Apache-2.0</p>
       </div>
-
-      <div class="right">
-      <div class="term">
-        <div class="term-head">
-          <span class="dot"></span><span class="dot"></span><span class="dot"></span>
-          <span style="margin-left:.5rem">rune doctor</span>
-        </div>
-        <div class="term-body">
-          <p><span class="c-faint">$</span> <span class="c-accent">rune doctor</span></p>
-          <p>rune <span class="c-dim">0.1.1</span></p>
-          <p> </p>
-          <p><span class="c-ok">ok</span>   <span class="c-dim">workspace</span>      /Users/you/project</p>
-          <p><span class="c-ok">ok</span>   <span class="c-dim">state root</span>     ~/.local/state/rune</p>
-          <p><span class="c-ok">ok</span>   <span class="c-dim">configuration</span>  every layer parsed</p>
-          <p><span class="c-warn">?</span>    <span class="c-dim">provider</span>       no provider connected</p>
-          <p>                    <span class="c-faint">run 'rune connect' to choose one</span></p>
-          <p>                    <span class="c-faint">anthropic, openai, opencode, opencode-go, or any endpoint</span></p>
-          <p><span class="c-ok">ok</span>   <span class="c-dim">sandbox</span>        seatbelt restricts every command</p>
-          <p> </p>
-          <p><span class="c-faint">$</span> <span class="c-accent">rune</span> <span class="c-dim">"why does the build fail on CI?"</span><span class="caret"></span></p>
-        </div>
-      </div>
-
-      <dl class="facts">
-        <div><dt>binary</dt><dd>about 3 MiB</dd></div>
-        <div><dt>startup</dt><dd>about 2 ms</dd></div>
-        <div><dt>runtime</dt><dd>none, one binary</dd></div>
-        <div><dt>license</dt><dd>Apache-2.0</dd></div>
-        <div><dt>telemetry</dt><dd>none</dd></div>
-      </dl>
-      </div>
-
-    </div>
-  </section>
-
-  <section id="why">
-    <div class="wrap">
-      <h2>what it does differently</h2>
-      <div class="grid">
-        <div class="cell">
-          <h3>Tiny, and held there</h3>
-          <p>About 3 MiB and 2 ms to start, measured on every run against a ceiling
-             of 8 MiB and 5 ms. A build fails when either is crossed, and the
-             argument and configuration paths never load the agent runtime.</p>
-        </div>
-        <div class="cell">
-          <h3>Model and provider agnostic</h3>
-          <p>Any OpenAI-compatible endpoint, the Responses API, Anthropic, or one you
-             name yourself. Connect it once and it is remembered.</p>
-        </div>
-        <div class="cell">
-          <h3>Every decision names its source</h3>
-          <p>A limit, a permission, a setting: each one reports where it came from, so
-             <code>rune permissions</code> and <code>rune config</code> answer the
-             question rather than restating the value.</p>
-        </div>
-        <div class="cell">
-          <h3>Sandboxed execution</h3>
-          <p>Commands run under the platform sandbox where one exists, so an agent
-             cannot write outside your workspace. <code>rune doctor</code> reports what
-             your host can enforce.</p>
-        </div>
-        <div class="cell">
-          <h3>Sessions you can resume</h3>
-          <p>Every turn is written as it runs. Interrupt anything and pick the session
-             back up, or copy a damaged one into a new one rather than losing it.</p>
-        </div>
-        <div class="cell">
-          <h3>Local by default</h3>
-          <p>Sessions, usage, and credentials stay on your machine. <code>--offline</code>
-             refuses every outbound request, and a test proves it makes none.</p>
-        </div>
-      </div>
-    </div>
-  </section>
-
-  <section id="commands">
-    <div class="wrap">
-      <h2>the surface</h2>
-      <table>
-        <thead>
-          <tr><th>Command</th><th>What it does</th></tr>
-        </thead>
-        <tbody>
-          <tr><td>rune</td><td>Start an interactive session.</td></tr>
-          <tr><td>rune ask "..."</td><td>One request, prints the answer. Pipe it, script it, read it as JSON.</td></tr>
-          <tr><td>rune review</td><td>Review the pending changes in this repository.</td></tr>
-          <tr><td>rune resume last</td><td>Continue the most recent session in this workspace.</td></tr>
-          <tr><td>rune connect</td><td>Choose from a list of providers, then paste a key. Run it again to add more.</td></tr>
-          <tr><td>rune permissions</td><td>See the rules, and why one of them decided what it did.</td></tr>
-          <tr><td>rune doctor</td><td>Check what this machine supports.</td></tr>
-          <tr><td>rune acp</td><td>Serve the Agent Client Protocol so an editor can drive a session.</td></tr>
-        </tbody>
-      </table>
-      <p class="note" style="border:0;padding-left:0;margin-top:1.5rem">
-        Custom slash commands live in <code>.rune/commands/*.md</code> in a repository,
-        so a team can ship a workflow alongside the code.
-      </p>
+      <div class="glyph" aria-hidden="true"><canvas id="glyph"></canvas></div>
     </div>
   </section>
 
   <section id="demo">
     <div class="wrap">
-      <h2>run the harness in this tab</h2>
+      <h2>This is Rune, running in the page.</h2>
+      <p class="sub">The same Rust as the binary, compiled to WebAssembly: the turn loop, the tools, and the permission rules, in <span data-harness-size>about 400 KB</span>. The files live in the tab. Watch it fix a bug, then type your own request.</p>
 
-      <p class="lede demo-lede" style="margin-bottom:2rem">
-        A real model driving the real loop, in this page. Nothing is sent
-        anywhere: the weights and the inference both stay on your machine.
-      </p>
-
-      <div class="demo-cols">
-
-        <div class="term">
-          <div class="term-head">
-            <span class="dot"></span><span class="dot"></span><span class="dot"></span>
-            <span style="margin-left:.5rem">rune, in this tab</span>
-          </div>
-          <div class="term-body" id="demo-out" aria-live="polite" aria-label="Demo output">
-            <p><span class="c-faint">$</span> <span class="c-accent">rune doctor</span> <span class="c-dim">--browser</span></p>
-            <p> </p>
-            <p><span class="c-faint">?</span>    <span class="c-dim">device</span>       not checked yet</p>
-            <p><span class="c-faint">?</span>    <span class="c-dim">model</span>        not chosen yet</p>
-            <p> </p>
-            <p><span class="c-dim">press run</span><span class="caret"></span></p>
-          </div>
+      <div class="term" id="term">
+        <div class="term-bar">
+          <span class="lights" aria-hidden="true"><i></i><i></i><i></i></span>
+          <span class="term-title">rune <span class="faint">~/tally</span></span>
+          <button class="chip" type="button" data-model aria-haspopup="true" aria-expanded="false" aria-label="Choose the model">scripted</button>
         </div>
 
-        <div class="install">
-          <div class="panel-head">this machine</div>
-          <div class="panel-body">
-            <noscript>
-              <p class="demo-status">
-                The demo runs in this page, so it needs JavaScript. Install rune
-                from the section above instead.
-              </p>
-            </noscript>
-            <p class="demo-status" id="demo-status">
-              Nothing has run yet. The model is fetched only when you press run.
-            </p>
-
-            <progress class="meter" id="demo-bar" max="1" value="0" hidden></progress>
-
-            <div class="actions" id="demo-actions">
-              <button class="act" type="button" id="act-run">
-                <span class="act-top">Run the demo</span>
-                <span class="act-sub">Downloads 398 MB once, then your browser keeps it. Nothing is sent anywhere.</span>
-              </button>
+        <div class="term-panel" data-panel hidden>
+          <div class="opt">
+            <div><b>Scripted</b><span>One task with fixed replies, no download and no key. The tools, the rules and the loop still run for real.</span></div>
+            <button type="button" data-use-scripted>use</button>
+          </div>
+          <div class="opt">
+            <div>
+              <b>In this browser</b>
+              <span data-local-status>Qwen3.5 0.8B on your GPU. 470 MB, downloaded once and kept by the browser, and nothing leaves the tab. A model this small makes mistakes; the rules still hold.</span>
+              <progress data-local-progress max="1" value="0" hidden></progress>
             </div>
-
-            <p class="demo-status" id="demo-detail" style="margin:1rem 0 0"></p>
+            <button type="button" data-use-local>load</button>
           </div>
+          <form class="opt endpoint" data-endpoint autocomplete="off">
+            <b>Your endpoint</b>
+            <label class="full">provider
+              <select name="provider">
+                <option value="openrouter">OpenRouter</option>
+                <option value="anthropic">Anthropic</option>
+                <option value="openai">OpenAI</option>
+                <option value="local">A server on this machine</option>
+              </select>
+            </label>
+            <label>model <input name="model" spellcheck="false"></label>
+            <label>key <input name="key" type="password" autocomplete="off" spellcheck="false"></label>
+            <label class="full">url <input name="base_url" spellcheck="false"></label>
+            <span class="note">The key stays in this tab's memory and is sent only to the URL above.</span>
+            <button type="submit">connect</button>
+          </form>
         </div>
 
+        <div class="screen" data-screen role="log" aria-live="polite" aria-label="Rune output"></div>
+
+        <div class="term-foot">
+          <label class="input-row" data-input-row>
+            <span class="prompt" aria-hidden="true">&gt;</span>
+            <input data-input type="text" aria-label="Message rune" placeholder="ask for a change, or /help" autocomplete="off" autocapitalize="off" spellcheck="false" disabled>
+          </label>
+          <div class="hint" data-hint>/help commands</div>
+          <div class="status" data-status>scripted | ask | ctx 0% | ~/tally</div>
+        </div>
       </div>
 
-      <div class="demo-note">
-        <p>
-          The model runs in this tab. Every step asks it for one tool call, and
-          every call passes a permission gate before it runs, the same table the
-          binary reads. One step asks for a shell and is refused, which is the
-          gate working. A model this size is a weak assistant: expect it to
-          wander, repeat itself, or miss the answer. That is the honest result
-          of running a harness on the smallest model that fits, and it is why
-          the gate is there.
-        </p>      </div>
+      <p class="demo-foot">The binary runs commands in a real sandboxed shell; a tab cannot start programs, so here commands run in a small shell over the same files. The permission prompt is the harness asking, and the turn waits for your answer.</p>
     </div>
   </section>
 
   <section id="why">
     <div class="wrap">
-      <h2>what it does differently</h2>
-      <div class="grid">
-        <div class="cell">
-          <h3>Tiny, and held there</h3>
-          <p>About 3 MiB and 2 ms to start, measured on every run against a ceiling
-             of 8 MiB and 5 ms. A build fails when either is crossed, and the
-             argument and configuration paths never load the agent runtime.</p>
-        </div>
-        <div class="cell">
-          <h3>Model and provider agnostic</h3>
-          <p>Any OpenAI-compatible endpoint, the Responses API, Anthropic, or one you
-             name yourself. Connect it once and it is remembered.</p>
-        </div>
-        <div class="cell">
-          <h3>Every decision names its source</h3>
-          <p>A limit, a permission, a setting: each one reports where it came from, so
-             <code>rune permissions</code> and <code>rune config</code> answer the
-             question rather than restating the value.</p>
-        </div>
-        <div class="cell">
-          <h3>Sandboxed execution</h3>
-          <p>Commands run under the platform sandbox where one exists, so an agent
-             cannot write outside your workspace. <code>rune doctor</code> reports what
-             your host can enforce.</p>
-        </div>
-        <div class="cell">
-          <h3>Sessions you can resume</h3>
-          <p>Every turn is written as it runs. Interrupt anything and pick the session
-             back up, or copy a damaged one into a new one rather than losing it.</p>
-        </div>
-        <div class="cell">
-          <h3>Local by default</h3>
-          <p>Sessions, usage, and credentials stay on your machine. <code>--offline</code>
-             refuses every outbound request, and a test proves it makes none.</p>
-        </div>
-      </div>
+      <h2 class="rise">Small on purpose, and held there.</h2>
+      <p class="sub rise">Each of these is enforced by a test or a build step, not a promise.</p>
+      <dl class="points">
+        <div class="rise"><dt>A budget, not an aspiration</dt><dd>Binary size and startup are measured on every pull request against a ceiling of 8 MiB and 5 ms. The build fails when either is crossed.</dd></div>
+        <div class="rise"><dt>Commands run in a sandbox</dt><dd>Seatbelt on macOS, bubblewrap on Linux. Writes stay in the workspace, credential files cannot be read, and <code>rune doctor</code> says what your machine enforces.</dd></div>
+        <div class="rise"><dt>Every decision names its source</dt><dd>A limit, a rule, a setting: <code>rune permissions</code> and <code>rune config --explain</code> answer which file decided, rather than restating the value.</dd></div>
+        <div class="rise"><dt>Steer a turn while it runs</dt><dd>Type while the model works and the correction reaches it at the next step. Escape twice cancels, and the session carries on.</dd></div>
+        <div class="rise"><dt>Any model, no account</dt><dd>Anthropic, OpenAI, OpenCode, or any OpenAI-compatible endpoint, hosted or on your machine. No telemetry, and <code>--offline</code> refuses every request.</dd></div>
+        <div class="rise"><dt>One harness, several hosts</dt><dd>The terminal, <code>rune ask</code> in a script, an editor over the Agent Client Protocol, a Rust library, and the tab above.</dd></div>
+      </dl>
     </div>
   </section>
 
-  <section id="commands">
+  <section id="start">
     <div class="wrap">
-      <h2>the surface</h2>
-      <table>
-        <thead>
-          <tr><th>Command</th><th>What it does</th></tr>
-        </thead>
-        <tbody>
-          <tr><td>rune</td><td>Start an interactive session.</td></tr>
-          <tr><td>rune ask "..."</td><td>One request, prints the answer. Pipe it, script it, read it as JSON.</td></tr>
-          <tr><td>rune review</td><td>Review the pending changes in this repository.</td></tr>
-          <tr><td>rune resume last</td><td>Continue the most recent session in this workspace.</td></tr>
-          <tr><td>rune connect</td><td>Choose from a list of providers, then paste a key. Run it again to add more.</td></tr>
-          <tr><td>rune permissions</td><td>See the rules, and why one of them decided what it did.</td></tr>
-          <tr><td>rune doctor</td><td>Check what this machine supports.</td></tr>
-          <tr><td>rune acp</td><td>Serve the Agent Client Protocol so an editor can drive a session.</td></tr>
-        </tbody>
-      </table>
-      <p class="note" style="border:0;padding-left:0;margin-top:1.5rem">
-        Custom slash commands live in <code>.rune/commands/*.md</code> in a repository,
-        so a team can ship a workflow alongside the code.
-      </p>
+      <h2 class="rise">Start in three commands.</h2>
+      <p class="sub rise">A fresh install has no provider, so <code>connect</code> lists them and asks for what it needs.</p>
+<pre class="steps rise"><span class="ps">$ </span>brew install aadixc0de/tap/rune   <span class="c"># or cargo install, see above</span>
+<span class="ps">$ </span>rune connect                      <span class="c"># choose a provider and paste its key</span>
+<span class="ps">$ </span>rune                              <span class="c"># start a session in this directory</span></pre>
     </div>
   </section>
-
-
 
 </main>
 
 <footer>
-  <div class="wrap foot-grid">
-    <div class="foot-links">
+  <div class="wrap">
+    <nav>
       <a href="https://github.com/AadiXC0DE/Rune">source</a>
       <a href="https://github.com/AadiXC0DE/Rune/releases">releases</a>
       <a href="https://github.com/AadiXC0DE/Rune/blob/main/COMMANDS.md">commands</a>
       <a href="https://github.com/AadiXC0DE/Rune/blob/main/LICENSE">apache-2.0</a>
-    </div>
-    <p class="credit">
-      made by
-      <a href="https://github.com/AadiXC0DE" rel="author">aaditya</a>
-    </p>
+    </nav>
+    <span data-weight>made by <a href="https://github.com/AadiXC0DE" rel="author">aaditya</a></span>
   </div>
 </footer>
 
 <script>
-  // Tabs swap one panel at a time; the command panel is the only state on the
-  // page, so this stays a handful of lines rather than a framework.
-  const tabs = document.querySelectorAll('.tabs button');
-  const panels = document.querySelectorAll('[data-panel]');
-
-  function select(name) {
-    tabs.forEach((tab) => {
-      tab.setAttribute('aria-selected', String(tab.dataset.target === name));
+  // Install tabs and copy buttons: the only state the page itself holds.
+  const tabs = document.querySelectorAll('.install [role="tab"]');
+  tabs.forEach((tab) => tab.addEventListener('click', () => {
+    tabs.forEach((other) => other.setAttribute('aria-selected', String(other === tab)));
+    document.querySelectorAll('.install .line').forEach((line) => {
+      line.hidden = line.dataset.panelName !== tab.dataset.target;
     });
-    panels.forEach((panel) => {
-      panel.hidden = panel.dataset.panel !== name;
-    });
-  }
+  }));
+  document.querySelectorAll('.copy').forEach((button) => button.addEventListener('click', async () => {
+    const source = document.getElementById(button.dataset.copy);
+    try {
+      await navigator.clipboard.writeText(source.textContent.trim());
+      button.textContent = 'copied';
+      button.dataset.done = '';
+    } catch {
+      getSelection().selectAllChildren(source);
+      button.textContent = 'selected';
+    }
+    setTimeout(() => { button.textContent = 'copy'; delete button.dataset.done; }, 1600);
+  }));
 
-  tabs.forEach((tab) => {
-    tab.addEventListener('click', () => select(tab.dataset.target));
-  });
-
-  // Copy is the one action a visitor takes here, so the button reports what
-  // happened rather than leaving them unsure whether it worked.
-  document.querySelectorAll('.copy').forEach((button) => {
-    button.addEventListener('click', async () => {
-      const source = document.getElementById(button.dataset.copy);
-      if (!source) return;
-      try {
-        await navigator.clipboard.writeText(source.textContent.trim());
-        button.textContent = 'copied';
-        button.dataset.done = 'true';
-      } catch {
-        // A browser without clipboard access still lets the text be selected.
-        button.textContent = 'select it';
-      }
-      setTimeout(() => {
-        button.textContent = 'copy';
-        button.dataset.done = 'false';
-      }, 1600);
-    });
-  });
 </script>
 
 <script>
-// The browser demo. Nothing here runs at load time: no model, no runtime, and
-// no network request happens until a button is pressed. Both runtimes this page
-// can use are reached through import() inside a click handler, so a visitor who
-// only reads the page downloads neither.
+// The mark, drawn as a field of dots. Dots on the glyph light up along the
+// stroke when the page opens, drift gently while it is open, and part around
+// the pointer. Under reduced motion it is drawn once and left still.
 (() => {
-  'use strict';
+  const canvas = document.getElementById('glyph');
+  if (!canvas || !canvas.getContext) return;
+  const context = canvas.getContext('2d');
+  const reduce = matchMedia('(prefers-reduced-motion: reduce)').matches;
+  const N = 37;
+  const PATH = 'M8 8h10a6 6 0 0 1 0 12h-4l6 8';
 
-  const out = document.getElementById('demo-out');
-  const status = document.getElementById('demo-status');
-  const detail = document.getElementById('demo-detail');
-  const bar = document.getElementById('demo-bar');
-  const runBtn = document.getElementById('act-run');
-
-  // How many identical calls a model may make before the turn is called off.
-  const MAX_REPEATS = 2;
-
-  const MAX_RESULT_BYTES = 2048;
-  const MAX_GREP_MATCHES = 20;
-  const MAX_READ_LINES = 40;
-
-  const WLLAMA_MODULE = 'https://cdn.jsdelivr.net/npm/@wllama/wllama@3.6.1/esm/index.min.js';
-  const WLLAMA_WASM = 'https://cdn.jsdelivr.net/npm/@wllama/wllama@3.6.1/esm/wasm/wllama.wasm';
-
-  // SmolLM2-135M is smaller but cannot choose a tool, so it is not offered:
-  // a demo that cannot finish teaches nothing about the harness. This is the
-  // smallest model with real tool-call training in its chat template, and the
-  // count is the exact published size, 397808192 bytes, rounded.
-  const MODEL = {
-    repo: 'bartowski/Qwen2.5-0.5B-Instruct-GGUF',
-    file: 'Qwen2.5-0.5B-Instruct-Q4_K_M.gguf',
-    name: 'Qwen2.5-0.5B-Instruct',
-    label: '398 MB'
-  };
-
-  // The tool definitions the model chooses between. A small model selects far
-  // more reliably from a trained tool-call template than from a prose contract
-  // asking it to emit JSON, which is the failure this demo used to show.
-  const TOOLS = [
-    {
-      type: 'function',
-      function: {
-        name: 'glob_files',
-        description: 'List workspace files matching a glob pattern.',
-        parameters: {
-          type: 'object',
-          properties: { pattern: { type: 'string', description: 'e.g. **/*.rs' } },
-          required: ['pattern']
+  // Ink per dot, sampled by drawing the mark once at grid resolution, and the
+  // position along the stroke where each lit dot sits, for the reveal.
+  const ink = new Float32Array(N * N);
+  const along = new Float32Array(N * N).fill(1);
+  (() => {
+    const scale = 4;
+    const off = document.createElement('canvas');
+    off.width = off.height = N * scale;
+    const ctx = off.getContext('2d');
+    const unit = (N * scale) / 32;
+    ctx.scale(unit, unit);
+    ctx.lineWidth = 3.1;
+    ctx.lineJoin = 'miter';
+    ctx.strokeStyle = '#fff';
+    ctx.stroke(new Path2D(PATH));
+    const data = ctx.getImageData(0, 0, off.width, off.height).data;
+    for (let y = 0; y < N; y++) {
+      for (let x = 0; x < N; x++) {
+        let sum = 0;
+        for (let sy = 0; sy < scale; sy++) {
+          for (let sx = 0; sx < scale; sx++) {
+            sum += data[((y * scale + sy) * off.width + (x * scale + sx)) * 4 + 3];
+          }
         }
-      }
-    },
-    {
-      type: 'function',
-      function: {
-        name: 'grep_files',
-        description: 'Search every workspace file for a regular expression, returning file, line and text.',
-        parameters: {
-          type: 'object',
-          properties: { pattern: { type: 'string', description: 'a regular expression' } },
-          required: ['pattern']
-        }
-      }
-    },
-    {
-      type: 'function',
-      function: {
-        name: 'read_file',
-        description: 'Read one workspace file.',
-        parameters: {
-          type: 'object',
-          properties: { path: { type: 'string', description: 'e.g. src/tools.rs' } },
-          required: ['path']
-        }
-      }
-    },
-    {
-      type: 'function',
-      function: {
-        name: 'answer',
-        description: 'Answer the question and end the turn. Call this once you know the answer.',
-        parameters: {
-          type: 'object',
-          properties: { text: { type: 'string', description: 'a short sentence' } },
-          required: ['text']
-        }
+        ink[y * N + x] = sum / (255 * scale * scale);
       }
     }
-  ];
-
-  const SYSTEM_PROMPT = [
-    'You are the step planner inside a coding agent.',
-    'Use the tools to answer the question, then call answer to finish.',
-    'Question: which file defines the shell function, and on what line?'
-  ].join(' ');
-
-
-
-  const WORKSPACE = {
-    'README.md': [
-      '# rune-lite',
-      '',
-      'A stand-in workspace for this demo: five files and one question.',
-      'The question is which file defines the shell function, and on what line.'
-    ].join('\n'),
-    'src/main.rs': [
-      'mod registry;',
-      'mod tools;',
-      '',
-      'fn main() {',
-      '    let out = tools::shell("git status");',
-      '    println!("{out}");',
-      '    println!("{} tools", registry::COUNT);',
-      '}'
-    ].join('\n'),
-    'src/registry.rs': [
-      'pub const COUNT: usize = 6;',
-      '',
-      'pub fn read(path: &str) -> String {',
-      '    format!("read {path}")',
-      '}',
-      '',
-      'pub fn run(command: &str) -> String {',
-      '    format!("ran {command}")',
-      '}'
-    ].join('\n'),
-    'src/tools.rs': [
-      'use crate::registry;',
-      '',
-      'pub fn read_file(path: &str) -> String {',
-      '    registry::read(path)',
-      '}',
-      '',
-      'pub fn shell(command: &str) -> String {',
-      '    registry::run(command)',
-      '}',
-      '',
-      'pub fn count() -> usize {',
-      '    registry::COUNT',
-      '}'
-    ].join('\n'),
-    'tests/tools.rs': [
-      '#[test]',
-      'fn every_tool_is_counted() {',
-      '    assert_eq!(rune_lite::tools::count(), 6);',
-      '}'
-    ].join('\n')
-  };
-
-  // The policy table this demo evaluates, in the three columns `rune
-  // permissions` prints. The real binary reads the same columns from its own
-  // defaults and your configuration.
-  const POLICY = {
-    read_file: { effect: 'allow', source: 'default' },
-    glob_files: { effect: 'allow', source: 'default' },
-    grep_files: { effect: 'allow', source: 'default' },
-    answer: { effect: 'allow', source: 'default' },
-    shell: { effect: 'deny', source: 'default' }
-  };
-
-  // ---------- terminal rendering ----------
-
-  function clear() {
-    out.textContent = '';
-  }
-
-  function line(...parts) {
-    const row = document.createElement('p');
-    for (const part of parts) {
-      if (typeof part === 'string') {
-        row.append(part);
-        continue;
-      }
-      const span = document.createElement('span');
-      span.className = part[1];
-      span.textContent = part[0];
-      row.append(span);
+    const svg = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+    svg.setAttribute('d', PATH);
+    const total = svg.getTotalLength();
+    const samples = [];
+    for (let i = 0; i <= 160; i++) {
+      const point = svg.getPointAtLength((total * i) / 160);
+      samples.push([point.x, point.y, i / 160]);
     }
-    out.append(row);
-    out.scrollTop = out.scrollHeight;
-  }
+    for (let i = 0; i < N * N; i++) {
+      if (ink[i] < 0.08) continue;
+      const px = ((i % N) + 0.5) * (32 / N);
+      const py = (Math.floor(i / N) + 0.5) * (32 / N);
+      let best = Infinity;
+      for (const [sx, sy, t] of samples) {
+        const d = (sx - px) ** 2 + (sy - py) ** 2;
+        if (d < best) { best = d; along[i] = t; }
+      }
+    }
+  })();
 
-  function blank() {
-    line(' ');
-  }
+  let size = 0;
+  let ratio = 1;
+  const resize = () => {
+    const rect = canvas.getBoundingClientRect();
+    ratio = Math.min(2, devicePixelRatio || 1);
+    size = rect.width;
+    canvas.width = Math.round(rect.width * ratio);
+    canvas.height = Math.round(rect.height * ratio);
+  };
+  resize();
+  new ResizeObserver(() => { resize(); if (!running) draw(performance.now()); }).observe(canvas);
 
-  function pad(text, width) {
-    const value = String(text);
-    return value + ' '.repeat(Math.max(0, width - value.length));
-  }
+  const pointer = { x: -1e4, y: -1e4, tx: -1e4, ty: -1e4 };
+  const place = (event) => {
+    const rect = canvas.getBoundingClientRect();
+    pointer.tx = event.clientX - rect.left;
+    pointer.ty = event.clientY - rect.top;
+    wake();
+  };
+  canvas.addEventListener('pointermove', place);
+  canvas.addEventListener('pointerdown', place);
+  canvas.addEventListener('pointerleave', () => { pointer.tx = pointer.ty = -1e4; });
 
-  function clipped(text) {
-    if (text.length <= MAX_RESULT_BYTES) return text;
-    return text.slice(0, MAX_RESULT_BYTES) + '\n[truncated at ' + MAX_RESULT_BYTES + ' bytes]';
-  }
+  const accent = [255, 180, 84];
+  const dark = matchMedia('(prefers-color-scheme: dark)');
+  const start = performance.now();
 
-  function statusRow(mark, label, value, colour) {
-    const ink = mark === 'ok' ? 'c-ok' : mark === 'x' ? 'c-warn' : 'c-faint';
-    line([pad(mark, 5), ink], [pad(label, 13), 'c-dim'], [value, colour || '']);
-  }
-
-  function setStatus(text) {
-    status.textContent = text;
-  }
-
-  function showBar(max, value) {
-    bar.hidden = false;
-    bar.max = max;
-    bar.value = value;
-  }
-
-  function hideBar() {
-    bar.hidden = true;
-    bar.max = 1;
-    bar.value = 0;
-  }
-
-  // The download buttons are the only ones that stay live, so the two controls
-  // that start a run are disabled instead of removed.
-  function busy(on) {
-    runBtn.disabled = on;
-  }
-
-  // ---------- the workspace the tools read ----------
-
-  function globToRegExp(pattern) {
-    let source = '';
-    for (let i = 0; i < pattern.length; i++) {
-      const c = pattern[i];
-      if (c === '*') {
-        if (pattern[i + 1] === '*') {
-          i++;
-          if (pattern[i + 1] === '/') i++;
-          source += '.*';
+  function draw(now) {
+    const t = (now - start) / 1000;
+    const pitch = size / N;
+    pointer.x += (pointer.tx - pointer.x) * 0.18;
+    pointer.y += (pointer.ty - pointer.y) * 0.18;
+    const reach = pitch * 7;
+    const base = dark.matches ? [236, 232, 223] : [26, 25, 22];
+    context.setTransform(ratio, 0, 0, ratio, 0, 0);
+    context.clearRect(0, 0, size, size);
+    for (let y = 0; y < N; y++) {
+      for (let x = 0; x < N; x++) {
+        const i = y * N + x;
+        let cx = (x + 0.5) * pitch;
+        let cy = (y + 0.5) * pitch;
+        const dx = cx - pointer.x;
+        const dy = cy - pointer.y;
+        const distance = Math.hypot(dx, dy);
+        const near = distance < reach ? (1 - distance / reach) ** 2 : 0;
+        if (near > 0 && distance > 0.01) {
+          cx += (dx / distance) * near * pitch * 0.9;
+          cy += (dy / distance) * near * pitch * 0.9;
+        }
+        const reveal = reduce ? 1 : Math.min(1, Math.max(0, (t - 0.15 - along[i] * 0.9) / 0.35));
+        const lit = ink[i] * reveal;
+        const drift = reduce ? 0 : Math.sin(t * 1.1 + x * 0.42 + y * 0.27) * 0.12;
+        if (lit > 0.04) {
+          const a = Math.min(1, lit * (0.88 + drift) + near * 0.3);
+          context.fillStyle = `rgba(${accent[0]},${accent[1]},${accent[2]},${a})`;
+          const r = pitch * (0.2 + 0.16 * lit + near * 0.08);
+          context.fillRect(cx - r, cy - r, r * 2, r * 2);
         } else {
-          source += '[^/]*';
+          const a = (dark.matches ? 0.13 : 0.16) + drift * 0.25 + near * 0.55;
+          context.fillStyle = near > 0.05
+            ? `rgba(${accent[0]},${accent[1]},${accent[2]},${Math.min(0.9, a)})`
+            : `rgba(${base[0]},${base[1]},${base[2]},${Math.max(0.05, a)})`;
+          const r = pitch * (0.07 + near * 0.12);
+          context.fillRect(cx - r, cy - r, r * 2, r * 2);
         }
-      } else if (c === '?') {
-        source += '[^/]';
-      } else {
-        source += c.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
       }
     }
-    return new RegExp('^' + source + '$');
   }
 
-  function globFiles(pattern) {
-    const test = globToRegExp(pattern);
-    const names = Object.keys(WORKSPACE).filter((name) => test.test(name));
-    if (names.length === 0) return 'no file matches ' + pattern;
-    return names.join('\n');
+  let running = false;
+  let visible = true;
+  let idleSince = performance.now();
+  function frame(now) {
+    draw(now);
+    const settled = Math.abs(pointer.tx - pointer.x) < 0.5 && Math.abs(pointer.ty - pointer.y) < 0.5;
+    if (settled && now - idleSince > 20000 && pointer.tx < 0) { running = false; return; }
+    if (!settled) idleSince = now;
+    if (visible) requestAnimationFrame(frame);
+    else running = false;
   }
-
-  function grepFiles(pattern) {
-    let test;
-    try {
-      test = new RegExp(pattern);
-    } catch (err) {
-      return 'bad pattern: ' + err.message;
-    }
-    const hits = [];
-    for (const name of Object.keys(WORKSPACE)) {
-      WORKSPACE[name].split('\n').forEach((text, index) => {
-        if (test.test(text)) hits.push(name + ':' + (index + 1) + ': ' + text);
-      });
-    }
-    if (hits.length === 0) return 'no match for ' + pattern;
-    const shown = hits.slice(0, MAX_GREP_MATCHES);
-    if (hits.length > shown.length) {
-      shown.push('[' + (hits.length - shown.length) + ' more matches]');
-    }
-    return shown.join('\n');
+  function wake() {
+    idleSince = performance.now();
+    if (reduce) { draw(performance.now()); return; }
+    if (!running && visible) { running = true; requestAnimationFrame(frame); }
   }
-
-  function readFile(path) {
-    if (!Object.prototype.hasOwnProperty.call(WORKSPACE, path)) {
-      return 'no such file: ' + path;
-    }
-    const lines = WORKSPACE[path].split('\n');
-    const shown = lines
-      .slice(0, MAX_READ_LINES)
-      .map((text, index) => pad(index + 1, 4) + text);
-    if (lines.length > shown.length) {
-      shown.push('[' + (lines.length - shown.length) + ' more lines]');
-    }
-    return shown.join('\n');
-  }
-
-  function execute(tool, arg) {
-    if (tool === 'glob_files') return globFiles(arg || '*');
-    if (tool === 'grep_files') return grepFiles(arg || '.');
-    if (tool === 'read_file') return readFile(arg);
-    return 'no implementation for ' + tool + ' in this demo';
-  }
-
-  // ---------- the loop ----------
-
-  function renderPrompt(messages) {
-    return messages
-      .map((message) => message.role + ': ' + message.content)
-      .join('\n\n');
-  }
-
-  function opening() {
-    line(['$ ', 'c-faint'], ['rune doctor', 'c-accent'], [' --browser', 'c-dim']);
-    blank();
-    statusRow('ok', 'workspace', '5 files, read only');
-    statusRow('ok', 'gate', 'shell is denied before it runs');
-    blank();
-  }
-
-  // `step` is the only part that differs between backends: it takes the
-  // conversation so far and returns one JSON step as text.
-  // The loop asks the model for one tool call per step, runs it through the
-  // same gate the binary uses, and feeds the result back. `step` is the only
-  // part that differs between the scripted planner and a real model.
-  async function runLoop(step, modelLabel) {
-    const question = 'which file defines the shell function, and on what line?';
-    const messages = [
-      { role: 'system', content: SYSTEM_PROMPT },
-      { role: 'user', content: 'Question: ' + question }
-    ];
-    const seen = new Set();
-    let repeats = 0;
-
-    statusRow('ok', 'model', modelLabel);
-    line(['$ ', 'c-faint'], ['rune ', 'c-accent'], ['"' + question + '"', 'c-dim']);
-    blank();
-
-    for (let step_index = 1; step_index <= MAX_STEPS; step_index++) {
-      let calls;
-      try {
-        calls = await step(messages);
-      } catch (err) {
-        statusRow('x', 'step ' + step_index, 'the model stopped responding: ' + err.message, 'c-warn');
-        return;
-      }
-
-      if (!calls || calls.length === 0) {
-        statusRow('x', 'step ' + step_index, 'the model asked for no tool, so the turn ends', 'c-warn');
-        return;
-      }
-
-      const call = calls[0];
-      const name = call.name;
-      const args = call.args || {};
-
-      if (name === 'answer') {
-        statusRow('ok', 'step ' + step_index, 'the model answered');
-        blank();
-        line([args.text || '(the model returned no text)', '']);
-        blank();
-        statusRow('ok', 'turn', 'ended after ' + step_index + (step_index === 1 ? ' step' : ' steps'));
-        return;
-      }
-
-      const policy = POLICY[name];
-      const shown = name + ' ' + (args.path || args.pattern || '');
-      statusRow('ok', 'step ' + step_index, 'the model asked for ' + name);
-      line(
-        ['     ', ''],
-        [pad('  ' + shown, 46), 'c-dim'],
-        [policy ? 'gate: ' + policy.effect + ' (' + policy.source + ')' : 'gate: no rule', 'c-faint']
-      );
-
-      let result;
-      if (!policy) {
-        result = 'unknown tool: ' + name;
-        statusRow('x', 'refused', name + ' is not in the registry', 'c-warn');
-      } else if (policy.effect !== 'allow') {
-        result = 'refused by policy: ' + name + ' is ' + policy.effect + ' by ' + policy.source;
-        statusRow('x', 'refused', name + ', ' + policy.effect + ' by ' + policy.source, 'c-warn');
-      } else {
-        result = clipped(execute(name, args.path || args.pattern || args.text || ''));
-        const lines = result.split('\n');
-        statusRow('ok', 'result', lines[0] + (lines.length === 1 ? '' : ' (+' + (lines.length - 1) + ' more lines)'));
-      }
-
-      // The assistant turn carrying the calls is recorded as the model sent it,
-      // because the next request has to replay it unchanged.
-      messages.push({ role: 'assistant', content: '', tool_calls: calls.raw });
-
-      const key = name + ' ' + JSON.stringify(args);
-      if (seen.has(key)) {
-        repeats += 1;
-        statusRow('x', 'repeat', 'the same call again, so its result is marked a repeat', 'c-warn');
-        if (repeats >= MAX_REPEATS) {
-          blank();
-          statusRow('x', 'turn', 'the model kept repeating itself, so the turn ends', 'c-warn');
-          line(['That is the honest result of a half-billion-parameter model', 'c-faint']);
-          line(['driving a loop, and why every call passes a gate first.', 'c-faint']);
-          return;
-        }
-      } else {
-        repeats = 0;
-        seen.add(key);
-      }
-
-      messages.push({ role: 'tool', tool_call_id: call.id, content: result });
-      blank();
-    }
-
-    statusRow('x', 'turn', 'stopped at the ' + MAX_STEPS + ' step limit', 'c-warn');
-  }
-
-
-  // ---------- the planner this page ships with ----------
-  //
-  // The harness under it is real: the tools read a real workspace, the policy
-  // table gates every call, and a refused call is never executed. Only the
-  // decisions are scripted, which is what makes the demo instant and lets it
-  // spend its budget on the loop rather than on a model that fits in a tab.
-
-  // What a planner would decide, in order. The shell step is deliberate: it is
-  // refused by policy, and the loop has to carry on without it.
-  const MAX_STEPS = 6;
-
-
-
-
-  // ---------- backend: a real model, through wllama ----------
-
-  async function loadDownloaded() {
-    statusRow('?', 'runtime', 'fetching the WebAssembly runtime, about 9 MB');
-    setStatus('Fetching the inference runtime, then the model. Your browser caches both afterwards.');
-    showBar(1, 0);
-
-    // Dynamic only. A static import would put the runtime on the page load
-    // path, which is the one thing this page is built to avoid.
-    const module = await import(WLLAMA_MODULE);
-    const instance = new module.Wllama({ default: WLLAMA_WASM });
-    statusRow('ok', 'runtime', 'llama.cpp in WebAssembly, fetched on click');
-    blank();
-    statusRow('?', 'model', MODEL.name + ' ' + MODEL.label + ', Apache-2.0');
-    blank();
-    setStatus('Downloading ' + MODEL.label + '. One time only, and your browser keeps it, so a later visit transfers nothing.');
-
-    const url = 'https://huggingface.co/' + MODEL.repo + '/resolve/main/' + MODEL.file;
-    let loaded = 0;
-    await instance.loadModelFromUrl(url, {
-      n_ctx: 2048,
-      progressCallback: (progress) => {
-        if (!progress.total) return;
-        loaded = progress.loaded;
-        if (progress.loaded >= progress.total) {
-          bar.removeAttribute('value');
-          setStatus('Downloaded. Loading the model into memory now.');
-          return;
-        }
-        showBar(progress.total, progress.loaded);
-        const percent = Math.round((progress.loaded / progress.total) * 100);
-        setStatus('Downloading ' + MODEL.label + ': ' + percent + ' percent. Cached after this, so a second visit reads it from disk.');
-      }
-    });
-
-    hideBar();
-    statusRow('ok', 'model', 'loaded, ' + loaded.toLocaleString('en-US') + ' bytes');
-    blank();
-    return instance;
-  }
-
-  // One step: ask for a tool call, and hand the loop whatever it asked for.
-  function realPlanner(instance) {
-    return async (messages) => {
-      const reply = await instance.createChatCompletion({
-        messages,
-        tools: TOOLS,
-        tool_choice: 'auto',
-        max_tokens: 160,
-        temperature: 0
-      });
-      const choice = reply.choices[0];
-      const raw = choice.message.tool_calls;
-      if (!raw || raw.length === 0) return [];
-
-      return raw.map((call) => {
-        let args = {};
-        try {
-          args = JSON.parse(call.function.arguments || '{}');
-        } catch (err) {
-          args = {};
-        }
-        return { id: call.id, name: call.function.name, args, raw };
-      });
-    };
-  }
-
-  async function runDownloaded() {
-    busy(true);
-    detail.textContent = '';
-    clear();
-    opening();
-
-    let instance;
-    try {
-      instance = await loadDownloaded();
-    } catch (err) {
-      hideBar();
-      statusRow('x', 'runtime', err.message, 'c-warn');
-      setStatus('The runtime or the model could not be loaded. Nothing else was downloaded.');
-      busy(false);
-      return;
-    }
-
-    setStatus('Running on ' + MODEL.name + '. Nothing you type or read leaves this machine.');
-
-    try {
-      await runLoop(realPlanner(instance), MODEL.name + ' ' + MODEL.label + ', downloaded by you');
-    } catch (err) {
-      statusRow('x', 'model', 'generation failed: ' + err.message, 'c-warn');
-    }
-
-    setStatus('Done. Press run again.');
-    busy(false);
-  }
-
-  // ---------- wiring ----------
-
-  runBtn.addEventListener('click', runDownloaded);
-
+  new IntersectionObserver(([entry]) => {
+    visible = entry.isIntersecting;
+    if (visible) wake();
+  }).observe(canvas);
+  wake();
 })();
+</script>
+
+<script type="module">
+  // The demo loads as its section comes near, so a reader who never scrolls
+  // there downloads none of it, and plays once it is mostly in view.
+  const section = document.getElementById('term');
+  let demo = null;
+  const load = new IntersectionObserver(async ([entry]) => {
+    if (!entry.isIntersecting || demo) return;
+    load.disconnect();
+    const { mount } = await import('./demo/demo.js');
+    demo = await mount(section);
+    const size = performance.getEntriesByType('resource').find((entry) => entry.name.endsWith('rune.wasm'));
+    if (size && size.encodedBodySize) {
+      document.querySelector('[data-harness-size]').textContent = Math.round(size.encodedBodySize / 1024) + ' KB';
+    }
+    play.observe(section);
+  }, { rootMargin: '400px 0px' });
+  const play = new IntersectionObserver(([entry]) => {
+    if (entry.intersectionRatio < 0.5) return;
+    play.disconnect();
+    demo.autoplay();
+  }, { threshold: [0.5] });
+  load.observe(section);
+
+  // What this page cost to load, measured rather than claimed.
+  addEventListener('load', () => {
+    setTimeout(() => {
+      const entries = [...performance.getEntriesByType('navigation'), ...performance.getEntriesByType('resource')]
+        .filter((entry) => !/\.wasm$|\/demo\//.test(entry.name));
+      const bytes = entries.reduce((sum, entry) => sum + (entry.encodedBodySize || 0), 0);
+      if (bytes > 0) {
+        const note = document.createElement('span');
+        note.textContent = `this page: ${Math.round(bytes / 1024)} KB, no framework  /  `;
+        document.querySelector('[data-weight]').prepend(note);
+      }
+    }, 0);
+  });
 </script>
 
 </body>
