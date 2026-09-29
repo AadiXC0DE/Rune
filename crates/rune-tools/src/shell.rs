@@ -1949,7 +1949,7 @@ mod tests {
             }),
         );
         let (id, _group) = running(&started);
-        let ended = text(
+        let mut ended = text(
             &tool,
             &context,
             &serde_json::json!({
@@ -1959,6 +1959,20 @@ mod tests {
                 "yield_time_ms": 10_000,
             }),
         );
+        // A read returns as soon as output arrives, and the exit can follow
+        // the output by a moment on a loaded machine, so the next read is the
+        // one that reports it.
+        if !ended.contains("exited with status") {
+            ended.push_str(&text(
+                &tool,
+                &context,
+                &serde_json::json!({
+                    "action": "interact",
+                    "session_id": id,
+                    "yield_time_ms": 10_000,
+                }),
+            ));
+        }
         assert!(ended.contains("got bye"), "{ended}");
         assert!(ended.contains("exited with status 0"), "{ended}");
         assert_eq!(tool.live_sessions(), 0);
