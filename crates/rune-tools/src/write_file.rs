@@ -120,7 +120,13 @@ mod tests {
             )
             .expect("call");
         assert!(!output.is_error);
-        assert!(output.text.contains("notes/one.txt"), "{}", output.text);
+        // The path is reported as resolved, so Windows spells it with its own
+        // separator.
+        assert!(
+            output.text.replace('\\', "/").contains("notes/one.txt"),
+            "{}",
+            output.text
+        );
         assert!(output.text.contains("6 bytes"), "{}", output.text);
         assert_eq!(
             std::fs::read(path_of(&dir, "notes/one.txt")).expect("read"),
