@@ -505,6 +505,38 @@ fn an_unresolved_call_is_refused_rather_than_run() {
 }
 
 #[test]
+fn a_call_to_a_tool_that_was_not_offered_is_answered_without_asking() {
+    // A small model invents tool names. Asking whether an invented tool may
+    // run has no useful answer, so the call is answered with the tools that do
+    // exist, and the turn goes on.
+    let endpoint = MockEndpoint::start(vec![
+        Script::tool_call("call_1", "run_shell", "{\"command\":\"ls\"}"),
+        Script::text("Understood."),
+    ]);
+    let host = TestHost::new(endpoint).with_tools(vec![read_tool()]);
+
+    let mut history = rune_agent::History::new();
+    history.push_user("list the files");
+
+    let outcome = run_turn(&mut history, &host).expect("the turn continues");
+    assert_eq!(outcome.stop_reason, StopReason::Completed);
+    assert!(!outcome.calls[0].executed);
+    assert!(host.executed_calls().is_empty());
+    let told = &outcome.calls[0].output.text;
+    assert!(told.contains("no tool named `run_shell`"), "{told}");
+    assert!(
+        told.contains("read_file"),
+        "the offered tools were not named: {told}"
+    );
+    assert!(
+        host.events()
+            .iter()
+            .any(|event| matches!(event, Event::ToolDenied { .. })),
+        "the refusal was not reported to the host"
+    );
+}
+
+#[test]
 fn a_tool_failure_does_not_end_the_turn() {
     let endpoint = MockEndpoint::start(vec![
         Script::tool_call("call_1", "read_file", "{\"path\":\"missing.rs\"}"),

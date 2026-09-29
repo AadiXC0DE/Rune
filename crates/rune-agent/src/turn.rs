@@ -636,12 +636,34 @@ fn backoff(attempt: usize) -> Duration {
 fn execute_batch(calls: &[PreparedCall], host: &dyn Host) -> Vec<CallResult> {
     let mut results = Vec::with_capacity(calls.len());
     let mut cancelled = false;
+    // The names the model was offered. A call to anything else is answered
+    // before policy is consulted: asking whether a tool that does not exist
+    // may run puts a question to the person that has no useful answer.
+    let offered: Vec<String> = host.tools().into_iter().map(|spec| spec.name).collect();
 
     for call in calls {
         if cancelled {
             results.push(CallResult {
                 call: call.clone(),
                 output: ToolOutput::failure("not run: the turn was cancelled"),
+                executed: false,
+            });
+            continue;
+        }
+
+        if !offered.iter().any(|name| name == &call.name) {
+            let reason = format!(
+                "there is no tool named `{}`; the tools are {}",
+                call.name,
+                offered.join(", ")
+            );
+            host.emit(Event::ToolDenied {
+                call: call.clone(),
+                reason: reason.clone(),
+            });
+            results.push(CallResult {
+                call: call.clone(),
+                output: ToolOutput::failure(reason),
                 executed: false,
             });
             continue;
@@ -726,7 +748,12 @@ fn execute_batch(calls: &[PreparedCall], host: &dyn Host) -> Vec<CallResult> {
                 cancelled = true;
                 continue;
             }
-            Err(err) => ToolOutput::failure(err.message().to_owned()),
+            // The hint is part of the answer: it is what tells the model how
+            // to correct the call.
+            Err(err) => ToolOutput::failure(match err.hint() {
+                Some(hint) => format!("{}; {hint}", err.message()),
+                None => err.message().to_owned(),
+            }),
         };
 
         host.emit(Event::ToolFinished {
