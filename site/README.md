@@ -69,7 +69,7 @@ cargo xtask web
 ## What loads when
 
 Page load fetches the document and the fonts, about 60 KB. The harness (1.7 MB,
-about 400 KB with brotli) is fetched when the demo section comes near the viewport,
+about 540 KB as served) is fetched when the demo section comes near the viewport,
 and plays when it is mostly in view. Nothing else is fetched unless the
 visitor picks a model that needs it.
 
