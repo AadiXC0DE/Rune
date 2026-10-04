@@ -2,7 +2,8 @@
 //!
 //! Runs a single request, prints the assistant output to standard output and
 //! every diagnostic to standard error, and exits. With `--json` it prints one
-//! object instead, which is the contract scripts depend on.
+//! object instead, which is the contract scripts depend on. This path supports
+//! text only; a returned tool call fails because no tool can be executed here.
 //!
 //! The key set and its order are fixed. `output` is the text produced during the
 //! request; `final_output` is the completed final response. A usage count the
@@ -71,7 +72,7 @@ pub struct JsonResult {
     pub steps: u32,
     /// Token counts. A count the provider did not report is absent.
     pub usage: UsageReport,
-    /// Tool calls made, in order.
+    /// Tool calls requested by the provider, in order.
     pub tool_calls: Vec<ToolCallReport>,
     /// Failure detail, present only when the run failed.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -219,19 +220,36 @@ pub fn run(
         .into_iter()
         .map(|(_, name, _)| ToolCallReport {
             name,
-            status: "success",
+            status: "error",
         })
         .collect();
 
     let finish = outcome.finish.unwrap_or(FinishReason::Stop);
-    let exit_code = if matches!(finish, FinishReason::Stop | FinishReason::ToolCalls) {
+    let error = (!tool_calls.is_empty() || finish == FinishReason::ToolCalls).then(|| {
+        let names = tool_calls
+            .iter()
+            .map(|call| call.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let message = if names.is_empty() {
+            "tool calls are unsupported in the text-only ask path".to_owned()
+        } else {
+            format!("tool calls are unsupported in the text-only ask path: {names}")
+        };
+        RuneError::new(ErrorCode::UnsupportedToolCall, message)
+    });
+    let exit_code = if error.is_none() && finish == FinishReason::Stop {
         i32::from(EXIT_OK)
     } else {
         i32::from(EXIT_FAILURE)
     };
 
     Ok(JsonResult {
-        final_output: text.clone(),
+        final_output: if error.is_none() {
+            text.clone()
+        } else {
+            String::new()
+        },
         output: text,
         exit_code,
         model,
@@ -249,8 +267,8 @@ pub fn run(
             output_tokens: outcome.usage.output_tokens,
         },
         tool_calls,
-        error: None,
-        error_code: None,
+        error: error.as_ref().map(|error| error.message().to_owned()),
+        error_code: error.as_ref().map(RuneError::code),
     })
 }
 

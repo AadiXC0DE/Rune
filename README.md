@@ -106,6 +106,11 @@ rune review                 # review the pending changes in this repository
 rune resume last            # continue the most recent session here
 ```
 
+`rune ask` sends one text-only request. If the model requests tools, it exits 1
+and names the unsupported calls. With `--json`, `error_code` is
+`unsupported_tool_call`, each requested tool has status `error`, and
+`final_output` is empty. Any accompanying text remains in `output`.
+
 Sessions are written as they run, so an interrupted session resumes. Prompts are
 remembered and recallable with `/history`. Custom slash commands live in
 `.rune/commands/*.md` in a repository, so a team can ship a workflow with the

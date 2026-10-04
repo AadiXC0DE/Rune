@@ -32,6 +32,9 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Fixed
 
+- `rune ask` fails with `unsupported_tool_call` when the model requests tools
+  that its text-only path cannot execute. JSON lists those calls with status
+  `error` instead of reporting them as successful.
 - File permission rules also match normalized absolute and workspace-relative
   paths, so denying `.env` also denies `./.env` and its absolute workspace path.
 - Long drafts scroll horizontally to keep the caret and the text being edited
