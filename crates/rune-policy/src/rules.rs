@@ -9,6 +9,7 @@
 //! Ties are broken by layer, from most specific to least: a session rule beats
 //! a user rule beats a project rule beats the default.
 
+use camino::{Utf8Component, Utf8Path, Utf8PathBuf};
 use rune_core::error::{ErrorCode, Result, RuneError};
 
 use crate::approval::is_command_tool;
@@ -225,6 +226,82 @@ pub fn glob_match(pattern: &str, target: &str) -> bool {
     p == pattern.len()
 }
 
+/// Tools whose targets name a filesystem path. `glob_files` names a search
+/// pattern, so its target is kept as written.
+fn is_file_path_tool(tool: &str) -> bool {
+    matches!(
+        tool,
+        "read_file" | "write_file" | "edit_file" | "grep_files"
+    )
+}
+
+/// Equivalent lexical spellings of a file target, using the same resolution
+/// as the file tools. No filesystem lookup is needed, including for new files.
+struct FileTargets {
+    absolute: Utf8PathBuf,
+    relative: Option<Utf8PathBuf>,
+}
+
+impl FileTargets {
+    fn new(workspace: &Utf8Path, target: &str) -> Option<Self> {
+        if target.is_empty() {
+            return None;
+        }
+        let candidate = if target == "~" || target.starts_with("~/") {
+            let home = ["HOME", "USERPROFILE"]
+                .into_iter()
+                .filter_map(|key| std::env::var(key).ok())
+                .find(|value| !value.is_empty())?;
+            Utf8PathBuf::from(home).join(target.strip_prefix("~/").unwrap_or(""))
+        } else {
+            Utf8PathBuf::from(target)
+        };
+        let workspace = if workspace.is_absolute() {
+            normalize_file_path(workspace)
+        } else {
+            normalize_file_path(&current_workspace()?.join(workspace))
+        };
+        let absolute = normalize_file_path(&workspace.join(candidate));
+        let relative = absolute.strip_prefix(&workspace).ok().map(|path| {
+            if path.as_str().is_empty() {
+                Utf8PathBuf::from(".")
+            } else {
+                path.to_owned()
+            }
+        });
+        Some(Self { absolute, relative })
+    }
+
+    fn matches(&self, rule: &Rule) -> bool {
+        rule.matches(self.absolute.as_str())
+            || self
+                .relative
+                .as_ref()
+                .is_some_and(|path| rule.matches(path.as_str()))
+    }
+}
+
+fn current_workspace() -> Option<Utf8PathBuf> {
+    Utf8PathBuf::from_path_buf(std::env::current_dir().ok()?).ok()
+}
+
+/// Mirrors the lexical normalization used before a file tool opens a path.
+fn normalize_file_path(path: &Utf8Path) -> Utf8PathBuf {
+    let mut out = Utf8PathBuf::new();
+    for component in path.components() {
+        match component {
+            Utf8Component::Prefix(prefix) => out.push(prefix.as_str()),
+            Utf8Component::RootDir => out.push("/"),
+            Utf8Component::CurDir => {}
+            Utf8Component::ParentDir => {
+                let _ = out.pop();
+            }
+            Utf8Component::Normal(part) => out.push(part),
+        }
+    }
+    out
+}
+
 /// An ordered set of rules.
 #[derive(Clone, Debug, Default)]
 pub struct RuleSet {
@@ -269,12 +346,48 @@ impl RuleSet {
     /// A target that is a command line is judged command by command: every
     /// command the line runs has to be allowed for the line to be allowed, and
     /// a refusal of any one of them refuses the line.
+    ///
+    /// File paths are also matched in normalized absolute and workspace-relative
+    /// forms. This entry point uses the process working directory as the
+    /// workspace; tool hosts use [`Self::evaluate_in_workspace`] instead.
     #[must_use]
     pub fn evaluate(&self, tool: &str, target: &str, fallback: Outcome) -> Decision {
+        let workspace = is_file_path_tool(tool).then(current_workspace).flatten();
+        self.evaluate_target(tool, target, fallback, workspace.as_deref())
+    }
+
+    /// Evaluates an action relative to the workspace used by its file tools.
+    ///
+    /// Original target spellings still match, so existing absolute patterns and
+    /// patterns containing `./` keep their meaning. All matches participate in
+    /// the same specificity and layer comparison.
+    #[must_use]
+    pub fn evaluate_in_workspace(
+        &self,
+        tool: &str,
+        target: &str,
+        fallback: Outcome,
+        workspace: &Utf8Path,
+    ) -> Decision {
+        self.evaluate_target(tool, target, fallback, Some(workspace))
+    }
+
+    fn evaluate_target(
+        &self,
+        tool: &str,
+        target: &str,
+        fallback: Outcome,
+        workspace: Option<&Utf8Path>,
+    ) -> Decision {
         if is_command_tool(tool) {
             return self.evaluate_line(tool, target, fallback);
         }
-        let (best, considered) = self.best(tool, |rule| rule.matches(target));
+        let paths = workspace
+            .filter(|_| is_file_path_tool(tool))
+            .and_then(|workspace| FileTargets::new(workspace, target));
+        let (best, considered) = self.best(tool, |rule| {
+            rule.matches(target) || paths.as_ref().is_some_and(|paths| paths.matches(rule))
+        });
         match best {
             Some(rule) => Decision::matched(rule.outcome, rule.layer, rule.render())
                 .with_considered(considered),
@@ -658,6 +771,124 @@ mod tests {
         set.push(deny("git push *"));
         let decision = set.evaluate("bash", "git push origin main", Outcome::Allow);
         assert_eq!(decision.outcome, Outcome::Deny);
+    }
+
+    #[test]
+    fn a_file_denial_covers_equivalent_paths_in_the_current_workspace() {
+        let workspace = std::env::current_dir().expect("workspace");
+        let absolute = workspace.join(".env");
+        let mut set = RuleSet::new();
+        set.push(Rule::allow("read_file", "*", Layer::Default));
+        set.push(Rule::deny("read_file", ".env", Layer::User));
+
+        for target in [".env", "./.env", absolute.to_str().expect("UTF-8 path")] {
+            let decision = set.evaluate("read_file", target, Outcome::Allow);
+            assert_eq!(decision.outcome, Outcome::Deny, "{target}");
+            assert_eq!(decision.rule, "read_file .env");
+        }
+        assert_eq!(
+            set.evaluate("read_file", "unrelated.txt", Outcome::Ask)
+                .outcome,
+            Outcome::Allow
+        );
+    }
+
+    #[test]
+    fn file_path_rules_use_the_explicit_workspace_without_requiring_a_file() {
+        let base = current_workspace().expect("workspace");
+        let workspace = base.join("rule-workspace");
+        let absolute = workspace.join(".env");
+        let outside = base.join("rule-workspace-other/.env");
+        let mut set = RuleSet::new();
+        set.push(allow("*"));
+        set.push(deny(".env"));
+
+        for tool in ["read_file", "write_file", "edit_file", "grep_files"] {
+            for target in [
+                ".env",
+                "./.env",
+                "nested/../.env",
+                "./nested//.././.env",
+                absolute.as_str(),
+            ] {
+                let decision = set.evaluate_in_workspace(tool, target, Outcome::Allow, &workspace);
+                assert_eq!(decision.outcome, Outcome::Deny, "{tool}: {target}");
+                assert!(decision.considered.iter().any(|rule| {
+                    rule.pattern == ".env" && rule.matched && rule.outcome == Outcome::Deny
+                }));
+            }
+            for target in [
+                "unrelated.txt",
+                "./unrelated.txt",
+                "nested/.env",
+                "../.env",
+                outside.as_str(),
+            ] {
+                let decision = set.evaluate_in_workspace(tool, target, Outcome::Ask, &workspace);
+                assert_eq!(decision.outcome, Outcome::Allow, "{tool}: {target}");
+            }
+        }
+    }
+
+    #[test]
+    fn absolute_file_rules_cover_relative_targets_and_keep_their_explanation() {
+        let workspace = current_workspace()
+            .expect("workspace")
+            .join("rule-workspace");
+        let absolute = workspace.join(".env");
+        let mut set = RuleSet::new();
+        set.push(allow("*"));
+        set.push(Rule::deny("read_file", absolute.as_str(), Layer::User));
+
+        for target in [".env", "./.env", "nested/../.env", absolute.as_str()] {
+            let decision =
+                set.evaluate_in_workspace("read_file", target, Outcome::Allow, &workspace);
+            assert_eq!(decision.outcome, Outcome::Deny, "{target}");
+            assert_eq!(decision.rule, format!("read_file {absolute}"));
+        }
+    }
+
+    #[test]
+    fn normalized_file_targets_keep_globs_and_original_spellings() {
+        let workspace = current_workspace()
+            .expect("workspace")
+            .join("rule-workspace");
+        let absolute = workspace.join("secret/key.txt");
+        let mut set = RuleSet::new();
+        set.push(allow("*"));
+        set.push(deny("secret/*.txt"));
+        set.push(Rule::ask("read_file", "./other.txt", Layer::User));
+
+        for target in ["./secret/key.txt", "secret/./key.txt", absolute.as_str()] {
+            assert_eq!(
+                set.evaluate_in_workspace("read_file", target, Outcome::Allow, &workspace)
+                    .outcome,
+                Outcome::Deny,
+                "{target}"
+            );
+        }
+        assert_eq!(
+            set.evaluate_in_workspace("read_file", "./other.txt", Outcome::Allow, &workspace)
+                .outcome,
+            Outcome::Ask
+        );
+    }
+
+    #[test]
+    fn targets_that_are_not_file_paths_are_kept_as_written() {
+        let workspace = current_workspace().expect("workspace");
+        let mut set = RuleSet::new();
+        set.push(allow("*"));
+        set.push(deny(".env"));
+
+        for tool in ["web_search", "web_fetch", "glob_files", "custom_tool"] {
+            assert_eq!(
+                set.evaluate_in_workspace(tool, "./.env", Outcome::Ask, &workspace)
+                    .outcome,
+                Outcome::Allow,
+                "{tool}"
+            );
+        }
     }
 
     #[test]

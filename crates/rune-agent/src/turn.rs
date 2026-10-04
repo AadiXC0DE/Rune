@@ -15,6 +15,7 @@
 
 use std::time::Duration;
 
+use camino::Utf8Path;
 use rune_core::budget::{BudgetSet, LimitName};
 use rune_core::config::{Effort, PermissionMode};
 use rune_core::error::{ErrorCode, Result, RuneError};
@@ -930,6 +931,21 @@ pub fn decide_call(
     let fallback = rune_policy::decision::mode_default(mode);
     let target = target.unwrap_or("");
     let decision = rules.evaluate(name, target, fallback);
+    let outcome = effective_outcome(mode, decision.outcome);
+    (outcome, decision.explain())
+}
+
+/// Evaluates a call using the workspace its file tools resolve paths against.
+#[must_use]
+pub fn decide_call_in_workspace(
+    rules: &RuleSet,
+    mode: PermissionMode,
+    name: &str,
+    target: Option<&str>,
+    workspace: &Utf8Path,
+) -> (Outcome, String) {
+    let fallback = rune_policy::decision::mode_default(mode);
+    let decision = rules.evaluate_in_workspace(name, target.unwrap_or(""), fallback, workspace);
     let outcome = effective_outcome(mode, decision.outcome);
     (outcome, decision.explain())
 }

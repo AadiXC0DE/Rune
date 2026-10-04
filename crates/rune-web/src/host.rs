@@ -318,7 +318,13 @@ impl Host for Session {
     }
 
     fn decide(&self, name: &str, target: Option<&str>) -> (Outcome, String) {
-        let (outcome, reason) = turn::decide_call(&self.rules, PermissionMode::Ask, name, target);
+        let (outcome, reason) = turn::decide_call_in_workspace(
+            &self.rules,
+            PermissionMode::Ask,
+            name,
+            target,
+            self.context.workspace(),
+        );
         if outcome != Outcome::Ask {
             return (outcome, reason);
         }

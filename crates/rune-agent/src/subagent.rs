@@ -629,8 +629,13 @@ impl Child {
     /// at admission and nothing more.
     #[must_use]
     pub fn decide(&self, name: &str, target: Option<&str>) -> ChildPermission {
-        let (outcome, reason) =
-            crate::turn::decide_call(&self.rules, self.admission.permission_mode, name, target);
+        let (outcome, reason) = crate::turn::decide_call_in_workspace(
+            &self.rules,
+            self.admission.permission_mode,
+            name,
+            target,
+            &self.admission.workspace,
+        );
         match outcome {
             Outcome::Allow => ChildPermission::Allowed,
             Outcome::Deny => ChildPermission::Denied { reason },

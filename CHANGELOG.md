@@ -32,6 +32,8 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Fixed
 
+- File permission rules also match normalized absolute and workspace-relative
+  paths, so denying `.env` also denies `./.env` and its absolute workspace path.
 - Long drafts scroll horizontally to keep the caret and the text being edited
   visible, both at the prompt and while a turn is running.
 - Interactive permission requests display their complete scope and offer Run

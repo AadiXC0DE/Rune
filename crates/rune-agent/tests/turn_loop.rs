@@ -220,7 +220,13 @@ impl Host for TestHost {
     }
 
     fn decide(&self, name: &str, target: Option<&str>) -> (Outcome, String) {
-        let (outcome, reason) = rune_agent::turn::decide_call(&self.rules, self.mode, name, target);
+        let (outcome, reason) = rune_agent::turn::decide_call_in_workspace(
+            &self.rules,
+            self.mode,
+            name,
+            target,
+            &self.workspace,
+        );
         match outcome {
             // A host resolves an ask before the loop sees it. Allowing here
             // models a review that found nothing concerning; the test that
@@ -454,6 +460,54 @@ fn a_denied_tool_call_is_not_executed_and_tells_the_model() {
         .into_iter()
         .any(|event| matches!(event, Event::ToolDenied { .. }));
     assert!(denied, "no denial was reported");
+}
+
+#[test]
+fn a_file_denial_blocks_equivalent_paths_but_allows_an_unrelated_read() {
+    let directory = tempfile::tempdir().expect("workspace");
+    std::fs::write(directory.path().join(".env"), "PRIVATE_SENTINEL\n").expect("secret");
+    std::fs::write(directory.path().join("unrelated.txt"), "PUBLIC_SENTINEL\n")
+        .expect("unrelated file");
+    let workspace = Utf8PathBuf::from_path_buf(directory.path().to_owned()).expect("UTF-8 path");
+    let absolute = workspace.join(".env");
+
+    for target in [".env", "./.env", absolute.as_str()] {
+        let endpoint = MockEndpoint::start(vec![
+            Script::tool_call(
+                "blocked",
+                "read_file",
+                &serde_json::json!({ "path": target }).to_string(),
+            ),
+            Script::tool_call("unrelated", "read_file", r#"{"path":"unrelated.txt"}"#),
+            Script::text("done"),
+        ]);
+        let mut rules = RuleSet::new();
+        rules.push(Rule::allow("read_file", "*", Layer::Default));
+        rules.push(Rule::deny("read_file", ".env", Layer::User));
+        let mut registry = Registry::new();
+        registry
+            .insert(Box::new(rune_tools::ReadFile::new()))
+            .expect("registered");
+        let mut host = TestHost::new(endpoint)
+            .with_tools(registry.all_schemas())
+            .with_rules(rules);
+        host.workspace = workspace.clone();
+        host.registry = Some(registry);
+        let mut history = rune_agent::History::new();
+        history.push_user("read both files");
+
+        let outcome = run_turn(&mut history, &host).expect("turn");
+        assert_eq!(outcome.calls.len(), 2);
+        assert!(!outcome.calls[0].executed, "{target} reached the tool");
+        assert!(outcome.calls[0].output.is_error);
+        assert!(!outcome.calls[0].output.text.contains("PRIVATE_SENTINEL"));
+        assert!(outcome.calls[1].executed);
+        assert!(!outcome.calls[1].output.is_error);
+        assert!(outcome.calls[1].output.text.contains("PUBLIC_SENTINEL"));
+        let executed = host.executed_calls();
+        assert_eq!(executed.len(), 1);
+        assert_eq!(executed[0].1["path"], "unrelated.txt");
+    }
 }
 
 #[test]

@@ -1166,8 +1166,13 @@ impl<W: Write + Send + 'static> Host for TurnHost<W> {
             .lock()
             .map(|guard| guard.clone())
             .unwrap_or_default();
-        let (outcome, reason) =
-            rune_agent::turn::decide_call(&rules, self.config.mode, name, target);
+        let (outcome, reason) = rune_agent::turn::decide_call_in_workspace(
+            &rules,
+            self.config.mode,
+            name,
+            target,
+            self.context.workspace(),
+        );
         match outcome {
             // This server has no reviewer of its own, so the client is the
             // reviewer for a call the rules left open.

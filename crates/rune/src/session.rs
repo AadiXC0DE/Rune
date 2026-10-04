@@ -363,7 +363,13 @@ impl Host for SessionHost {
     }
 
     fn decide(&self, name: &str, target: Option<&str>) -> (Outcome, String) {
-        let (outcome, reason) = turn::decide_call(&self.rules, self.mode, name, target);
+        let (outcome, reason) = turn::decide_call_in_workspace(
+            &self.rules,
+            self.mode,
+            name,
+            target,
+            self.context.workspace(),
+        );
         if outcome != Outcome::Ask {
             return (outcome, reason);
         }
