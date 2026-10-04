@@ -122,6 +122,9 @@ reference.
   scrollback rather than taking over the screen.
 - **Permission first.** Every sensitive action passes a policy gate, and
   `rune permissions` explains exactly which rule decided it.
+  Interactive requests show the complete scope with Run once and Deny choices.
+  Use Up/Down and Enter to answer; Escape, Control-C, or Control-D cancels the
+  turn. Run once approves only the displayed call.
 - **Sandboxed execution.** Commands run under the platform sandbox where one
   exists. `rune doctor` reports what your host can enforce.
 - **Offline mode.** `--offline` refuses every outbound request.

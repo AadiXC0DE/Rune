@@ -158,6 +158,17 @@ impl KeyReader {
         self.handle(event)
     }
 
+    /// Polls a choice without changing the draft, caret, or editing history.
+    ///
+    /// Used by permission prompts, where typing and pasting must never become
+    /// steering input or replace the correction being edited.
+    pub fn poll_choice(&mut self, timeout: Duration) -> Option<KeyAction> {
+        let draft = std::mem::take(&mut self.composer);
+        let action = self.poll_key(timeout);
+        self.composer = draft;
+        action
+    }
+
     /// Applies one terminal event, returning `None` for one that is not input.
     ///
     /// Shared by both ways of reading, so a paste means the same thing whether

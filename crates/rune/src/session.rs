@@ -7,7 +7,7 @@
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::io::{BufRead, Write as _};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 
 use crate::session_log::{self, Recorder};
 use camino::{Utf8Path, Utf8PathBuf};
@@ -164,6 +164,14 @@ fn rows_for(lazy: &mut LazyRows, text: &str, width: usize) -> Vec<String> {
 /// producing it.
 type LiveSink = Arc<Mutex<dyn std::io::Write + Send>>;
 
+/// One call waiting for the input thread's answer. No answer creates a grant.
+struct ApprovalRequest {
+    tool: String,
+    target: String,
+    reason: String,
+    answer: mpsc::SyncSender<Outcome>,
+}
+
 /// Host state for a turn.
 struct SessionHost {
     endpoint: Endpoint,
@@ -260,6 +268,8 @@ struct SessionHost {
     undo: Mutex<BTreeMap<Utf8PathBuf, Option<Vec<u8>>>>,
     /// Review activity for the current turn.
     review_session: Arc<Mutex<ReviewSession>>,
+    /// Attached only while a terminal input loop can collect an answer.
+    approval_requests: Mutex<Option<mpsc::Sender<ApprovalRequest>>>,
 }
 
 /// Locks the model, recovering from a poisoned lock.
@@ -381,10 +391,7 @@ impl Host for SessionHost {
             };
         }
 
-        // Nothing has judged the action, so it stays unresolved. Being
-        // interactive is not a judgment: approving here would authorize an
-        // action that no rule allowed and no reviewer saw.
-        (outcome, reason)
+        self.request_approval(name, target.unwrap_or(name), reason)
     }
 
     fn context(&self) -> ExecutionContext {
@@ -415,6 +422,49 @@ impl Host for SessionHost {
 }
 
 impl SessionHost {
+    /// Waits for a terminal answer while allowing cancellation to wake us.
+    fn request_approval(&self, tool: &str, target: &str, reason: String) -> (Outcome, String) {
+        let Some(requests) = self
+            .approval_requests
+            .lock()
+            .ok()
+            .and_then(|slot| slot.clone())
+        else {
+            return (Outcome::Ask, reason);
+        };
+        let (answer, response) = mpsc::sync_channel(1);
+        let request = ApprovalRequest {
+            tool: tool.to_owned(),
+            target: target.to_owned(),
+            reason: reason.clone(),
+            answer,
+        };
+        if requests.send(request).is_err() {
+            return (
+                Outcome::Deny,
+                format!("{reason}; approval input is unavailable"),
+            );
+        }
+        loop {
+            if self.cancellation.is_cancelled() {
+                return (Outcome::Deny, format!("{reason}; approval was cancelled"));
+            }
+            match response.recv_timeout(rune_term::shell::POLL_INTERVAL) {
+                Ok(Outcome::Allow) if !self.cancellation.is_cancelled() => {
+                    return (Outcome::Allow, format!("{reason}; approved for this call"));
+                }
+                Ok(_) => return (Outcome::Deny, format!("{reason}; approval was denied")),
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return (
+                        Outcome::Deny,
+                        format!("{reason}; approval input was closed"),
+                    );
+                }
+            }
+        }
+    }
+
     /// Points the session at another model.
     ///
     /// The next request uses it. A turn already running keeps the model it
@@ -1004,6 +1054,7 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
         totals: Mutex::new(Totals::default()),
         undo: Mutex::new(BTreeMap::new()),
         review_session: Arc::new(Mutex::new(ReviewSession::new(&limits))),
+        approval_requests: Mutex::new(None),
     };
 
     // The stream is shared: the loop writes to it, and the host writes to it
@@ -1397,10 +1448,22 @@ fn run_turn_steerable(
     }
     let mut submitted: Vec<String> = Vec::new();
 
+    let (requests, pending) = mpsc::channel();
+    if let Ok(mut slot) = host.approval_requests.lock() {
+        *slot = Some(requests);
+    }
+
     let result = run_on_worker(
         history,
         |taken| turn::run_turn(taken, host),
         || {
+            if let Ok(request) = pending.try_recv() {
+                gesture.disarm();
+                let answer = collect_approval(&request, host, reader);
+                let _ = request.answer.send(answer);
+                host.draw_stream_with(reader.line(), reader.column());
+                return;
+            }
             let Some(key) = reader.poll_key(rune_term::shell::POLL_INTERVAL) else {
                 return;
             };
@@ -1467,6 +1530,9 @@ fn run_turn_steerable(
             }
         },
     );
+    if let Ok(mut slot) = host.approval_requests.lock() {
+        *slot = None;
+    }
     // Anything still queued was typed after the turn's last boundary, so the
     // turn never saw it. The queue is drained in one piece, which makes what is
     // left the newest submissions and everything before them what was applied.
@@ -1483,6 +1549,106 @@ fn run_turn_steerable(
         applied: submitted,
         unsent,
     }
+}
+
+/// Shows the complete scope in scrollback, then waits on a two-choice picker.
+/// Deny is selected initially. Escape, Control-C, and Control-D cancel the turn.
+fn collect_approval(
+    request: &ApprovalRequest,
+    host: &SessionHost,
+    reader: &mut rune_term::input::KeyReader,
+) -> Outcome {
+    let mut picker = rune_term::picker::Picker::new(
+        "permission required",
+        vec![String::from("Run once"), String::from("Deny")],
+        2,
+    );
+    picker.to(1);
+    host.refresh_size();
+    let lines = approval_lines(request, usize::from(host.width()));
+    if draw_approval(host, &picker, &lines).is_err() {
+        return Outcome::Deny;
+    }
+    loop {
+        if host.cancellation.is_cancelled() {
+            return Outcome::Deny;
+        }
+        if let Some(key) = reader.poll_choice(rune_term::shell::POLL_INTERVAL)
+            && let Some(answer) = approval_key(key, &mut picker, &host.cancellation)
+        {
+            return answer;
+        }
+        // Also refreshes dimensions when no input arrives.
+        if draw_approval(host, &picker, &[]).is_err() {
+            return Outcome::Deny;
+        }
+    }
+}
+
+/// Quoting makes control characters visible without changing the approved scope.
+fn approval_lines(request: &ApprovalRequest, width: usize) -> Vec<String> {
+    [
+        format!("Permission request for {:?}", request.tool),
+        format!("Reason: {:?}", request.reason),
+        format!("Scope: {:?}", request.target),
+    ]
+    .into_iter()
+    .flat_map(|line| rune_term::width::wrap(&line, width.max(1)))
+    .collect()
+}
+
+fn approval_key(
+    key: KeyAction,
+    picker: &mut rune_term::picker::Picker,
+    cancellation: &Cancellation,
+) -> Option<Outcome> {
+    match key {
+        KeyAction::Submit => Some(if picker.selected() == Some("Run once") {
+            Outcome::Allow
+        } else {
+            Outcome::Deny
+        }),
+        KeyAction::Up => {
+            picker.up();
+            None
+        }
+        KeyAction::Down => {
+            picker.down();
+            None
+        }
+        KeyAction::Escape | KeyAction::Cancel | KeyAction::Interrupt => {
+            cancellation.cancel();
+            Some(Outcome::Deny)
+        }
+        KeyAction::Complete | KeyAction::Ignored => None,
+    }
+}
+
+/// Uses the session renderer and refuses approval if the prompt cannot be written.
+fn draw_approval(
+    host: &SessionHost,
+    picker: &rune_term::picker::Picker,
+    settled: &[String],
+) -> Result<()> {
+    let _frame = host
+        .frame
+        .lock()
+        .map_err(|_| RuneError::new(ErrorCode::Internal, "the frame lock was poisoned"))?;
+    let out = host
+        .live_out
+        .lock()
+        .ok()
+        .and_then(|slot| slot.clone())
+        .ok_or_else(|| RuneError::new(ErrorCode::Internal, "approval output is unavailable"))?;
+    let hint = vec![String::from(
+        "Up/Down choose, Enter confirm, Esc/Ctrl-C cancel",
+    )];
+    let menu = picker.rows(&host.theme, host.truecolor);
+    let painted = host.paint_with_menu(settled, Some(picker.title()), &hint, &[], &menu, (0, 0))?;
+    let mut sink = LockedSink { stream: out };
+    sink.write_all(&painted)?;
+    sink.flush()?;
+    Ok(())
 }
 
 /// Runs a turn on its own thread, calling `between` until it finishes.
@@ -3638,6 +3804,148 @@ mod tests {
     }
 
     #[test]
+    fn a_terminal_answer_resolves_only_the_displayed_call() {
+        let mut host = test_host();
+        host.mode = PermissionMode::Ask;
+        let (requests, pending) = mpsc::channel();
+        *host.approval_requests.lock().expect("lock") = Some(requests);
+        std::thread::scope(|scope| {
+            let worker = scope.spawn(|| {
+                let first = host.decide("shell", Some("printf AUDIT_SHELL_OK"));
+                let second = host.decide("shell", Some("printf AUDIT_SHELL_OK"));
+                (first, second)
+            });
+            let first = pending
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .expect("first approval request");
+            assert_eq!(first.tool, "shell");
+            assert_eq!(first.target, "printf AUDIT_SHELL_OK");
+            assert!(
+                approval_lines(&first, 80)
+                    .join("\n")
+                    .contains(&first.target)
+            );
+            first.answer.send(Outcome::Allow).expect("approve once");
+            let second = pending
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .expect("the same command needs another approval");
+            second.answer.send(Outcome::Deny).expect("deny");
+            let (first, second) = worker.join().expect("worker");
+            assert_eq!(first.0, Outcome::Allow, "{}", first.1);
+            assert_eq!(second.0, Outcome::Deny, "{}", second.1);
+        });
+    }
+
+    #[test]
+    fn cancellation_wakes_a_worker_waiting_for_approval() {
+        let mut host = test_host();
+        host.mode = PermissionMode::Ask;
+        let (requests, pending) = mpsc::channel();
+        *host.approval_requests.lock().expect("lock") = Some(requests);
+        std::thread::scope(|scope| {
+            let worker = scope.spawn(|| host.decide("shell", Some("printf AUDIT_SHELL_OK")));
+            let _request = pending
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .expect("approval request");
+            host.cancellation.cancel();
+            let (answer, reason) = worker.join().expect("worker");
+            assert_eq!(answer, Outcome::Deny);
+            assert!(reason.contains("cancelled"), "{reason}");
+        });
+    }
+
+    #[test]
+    fn closed_approval_input_never_allows_a_call() {
+        let mut host = test_host();
+        host.mode = PermissionMode::Ask;
+        let (requests, pending) = mpsc::channel();
+        *host.approval_requests.lock().expect("lock") = Some(requests);
+        std::thread::scope(|scope| {
+            let worker = scope.spawn(|| host.decide("shell", Some("printf AUDIT_SHELL_OK")));
+            let request = pending
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .expect("approval request");
+            drop(request);
+            let (answer, reason) = worker.join().expect("worker");
+            assert_eq!(answer, Outcome::Deny);
+            assert!(reason.contains("closed"), "{reason}");
+        });
+        drop(pending);
+        assert_eq!(
+            host.decide("shell", Some("printf AUDIT_SHELL_OK")).0,
+            Outcome::Deny
+        );
+    }
+
+    #[test]
+    fn terminal_approval_does_not_override_a_rule_or_approve_without_input() {
+        let mut host = test_host();
+        host.mode = PermissionMode::Ask;
+        host.rules.push(rune_policy::rules::Rule::deny(
+            "read_file",
+            ".env",
+            rune_policy::decision::Layer::User,
+        ));
+        assert_eq!(
+            host.decide("shell", Some("printf AUDIT_SHELL_OK")).0,
+            Outcome::Ask
+        );
+        let (requests, pending) = mpsc::channel();
+        *host.approval_requests.lock().expect("lock") = Some(requests);
+        assert_eq!(
+            host.decide("read_file", Some("src/main.rs")).0,
+            Outcome::Allow
+        );
+        assert_eq!(host.decide("read_file", Some(".env")).0, Outcome::Deny);
+        assert!(
+            pending.try_recv().is_err(),
+            "settled rules must never prompt"
+        );
+    }
+
+    #[test]
+    fn approval_scope_cannot_hide_terminal_controls_or_clip_long_commands() {
+        let (answer, _response) = mpsc::sync_channel(1);
+        let request = ApprovalRequest {
+            tool: "shell".to_owned(),
+            target: "printf 'a\\b'\n\t\u{1b}[2J\u{202e}TAIL-END".to_owned(),
+            reason: "no rule allows it".to_owned(),
+            answer,
+        };
+        let lines = approval_lines(&request, 80).join("\n");
+        assert!(
+            lines.contains("\\n\\t\\u{1b}[2J\\u{202e}TAIL-END"),
+            "{lines}"
+        );
+        assert!(lines.contains("a\\\\b"), "{lines}");
+        assert!(!lines.contains('\u{1b}'));
+        let narrow = approval_lines(&request, 12);
+        assert!(
+            narrow
+                .iter()
+                .all(|line| rune_term::width::str_width(line) <= 12)
+        );
+        assert!(narrow.join("").ends_with("TAIL-END\""));
+    }
+
+    #[test]
+    fn an_approval_prompt_that_cannot_be_displayed_denies() {
+        let host = test_host();
+        let (answer, _response) = mpsc::sync_channel(1);
+        let request = ApprovalRequest {
+            tool: "shell".to_owned(),
+            target: "printf AUDIT_SHELL_OK".to_owned(),
+            reason: "no rule allows it".to_owned(),
+            answer,
+        };
+        let mut reader = rune_term::input::KeyReader::new();
+        assert_eq!(
+            collect_approval(&request, &host, &mut reader),
+            Outcome::Deny
+        );
+    }
+
+    #[test]
     fn the_status_line_names_the_model_and_the_mode() {
         let host = test_host();
         let line = host.status_line(120);
@@ -4944,6 +5252,7 @@ mod tests {
             totals: Mutex::new(Totals::default()),
             undo: Mutex::new(BTreeMap::new()),
             review_session: Arc::new(Mutex::new(ReviewSession::new(&BudgetSet::new()))),
+            approval_requests: Mutex::new(None),
         }
     }
 }

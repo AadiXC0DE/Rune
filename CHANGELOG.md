@@ -32,6 +32,9 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Fixed
 
+- Interactive permission requests display their complete scope and offer Run
+  once or Deny. Escape or Control-C cancels the waiting turn without executing
+  the request.
 - `grep_files` rejects context windows above 1,000 lines with a tool validation
   error, keeping the session usable instead of aborting on an oversized allocation.
 - Connecting a provider creates Rune's state directory with mode 0700, so a
