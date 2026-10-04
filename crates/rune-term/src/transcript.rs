@@ -7,7 +7,7 @@
 
 use std::fmt::Write as _;
 
-use crate::width::{str_width, truncate_to_width, wrap};
+use crate::width::{grapheme_width, graphemes, str_width, truncate_to_width, wrap};
 
 /// Who produced a line.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -458,7 +458,7 @@ fn consume_escape(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
     }
 }
 
-/// Renders a single line of a prompt being typed.
+/// Renders a single line of a prompt echo.
 ///
 /// Used where the caller echoes input itself rather than letting the terminal
 /// do it. A pasted line break is drawn as a visible mark, so the input stays on
@@ -469,6 +469,36 @@ pub fn render_prompt(prompt: &str, input: &str, width: usize) -> String {
     let input = crate::editor::displayed(input);
     let (shown, _) = truncate_to_width(&input, room.max(1));
     format!("{prompt}{shown}")
+}
+
+/// Renders an editable prompt and its caret column in a horizontal viewport.
+///
+/// `column` is the display width before the caret, as returned by the line
+/// editor. Long drafts scroll by whole grapheme clusters, leaving a visible
+/// cell for the caret even when it is at the end of the input. The prompt is
+/// kept at the left, shortened only when the terminal has no room beside it.
+#[must_use]
+pub fn render_prompt_at(prompt: &str, input: &str, column: usize, width: usize) -> (String, usize) {
+    if width == 0 {
+        return (String::new(), 0);
+    }
+    let (prompt, prompt_width) = truncate_to_width(prompt, width.saturating_sub(1));
+    let room = width.saturating_sub(prompt_width);
+    let input = crate::editor::displayed(input);
+    let column = column.min(str_width(&input));
+    let offset = column.saturating_sub(room.saturating_sub(1));
+    let mut skipped_columns = 0_usize;
+    let mut skipped_bytes = 0_usize;
+    for cluster in graphemes(&input) {
+        if skipped_columns >= offset {
+            break;
+        }
+        skipped_columns = skipped_columns.saturating_add(grapheme_width(cluster));
+        skipped_bytes = skipped_bytes.saturating_add(cluster.len());
+    }
+    let (shown, _) = truncate_to_width(&input[skipped_bytes..], room);
+    let caret = prompt_width.saturating_add(column.saturating_sub(skipped_columns));
+    (format!("{prompt}{shown}"), caret)
 }
 
 #[cfg(test)]
@@ -790,5 +820,69 @@ mod tests {
         let rendered = render_prompt("> ", &"x".repeat(100), 20);
         assert_eq!(str_width(&rendered), 20);
         assert!(rendered.starts_with("> "));
+    }
+
+    #[test]
+    fn an_editable_prompt_scrolls_to_the_caret_and_back() {
+        let mut composer = crate::editor::Composer::new();
+        let draft = "a".repeat(160) + "TAIL-END";
+        composer.insert(&draft);
+        let render = |composer: &crate::editor::Composer| {
+            render_prompt_at("> ", composer.text(), composer.cursor_column(), 80)
+        };
+        let (row, caret) = render(&composer);
+        assert!(row.ends_with("TAIL-END"), "{row}");
+        assert_eq!(caret, 79);
+        assert_eq!(str_width(&row), caret);
+
+        composer.move_left();
+        let (row, caret) = render(&composer);
+        assert!(row.ends_with("TAIL-END"), "{row}");
+        assert_eq!(row.chars().nth(caret), Some('D'));
+        composer.delete_forward();
+        composer.insert("Z");
+        assert!(render(&composer).0.ends_with("TAIL-ENZ"));
+
+        composer.move_home();
+        assert_eq!(render(&composer), ("> ".to_owned() + &"a".repeat(78), 2));
+        composer.move_end();
+        assert!(render(&composer).0.ends_with("TAIL-ENZ"));
+        assert_eq!(composer.text(), "a".repeat(160) + "TAIL-ENZ");
+    }
+
+    #[test]
+    fn prompt_scrolling_preserves_wide_and_combining_clusters() {
+        let input = "ab書👋🏽e\u{301}Z";
+        let (row, caret) = render_prompt_at("> ", input, str_width(input), 8);
+        assert_eq!(row, "> 👋🏽e\u{301}Z");
+        assert_eq!(caret, 6);
+        let (row, caret) = render_prompt_at("> ", input, 4, 8);
+        assert_eq!(row, "> ab書👋🏽");
+        assert_eq!(caret, 6);
+    }
+
+    #[test]
+    fn short_drafts_keep_their_text_and_caret_position() {
+        assert_eq!(
+            render_prompt_at("> ", "abcd", 1, 80),
+            ("> abcd".to_owned(), 3)
+        );
+        assert_eq!(render_prompt_at("> ", "", 0, 80), ("> ".to_owned(), 2));
+        assert_eq!(
+            render_prompt_at("> ", "a\n\t書", 5, 80),
+            ("> a⏎ 書".to_owned(), 7)
+        );
+    }
+
+    #[test]
+    fn prompt_carets_stay_inside_even_the_smallest_widths() {
+        let input = "書👋🏽e\u{301}Z";
+        for width in 0..=12 {
+            for column in [0, 2, 4, 5, 6, usize::MAX] {
+                let (row, caret) = render_prompt_at("> ", input, column, width);
+                assert!(str_width(&row) <= width, "{row:?} at width {width}");
+                assert!(caret < width.max(1), "caret {caret} at width {width}");
+            }
+        }
     }
 }

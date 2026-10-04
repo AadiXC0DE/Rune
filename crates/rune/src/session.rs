@@ -848,8 +848,7 @@ impl SessionHost {
         // A frame that changes nothing costs only a caret move.
         let marker = rune_term::shell::prompt();
         let width = usize::from(self.width());
-        let prompt_row = transcript::render_prompt(marker, line, width);
-        let caret = rune_term::width::str_width(marker).saturating_add(column);
+        let (prompt_row, caret) = transcript::render_prompt_at(marker, line, column, width);
         let Ok(painted) = self.paint(
             &[],
             notice,
@@ -1722,8 +1721,12 @@ fn close_turn(
         ));
     }
     let marker = rune_term::shell::prompt();
-    let prompt_row = transcript::render_prompt(marker, reader.line(), usize::from(host.width()));
-    let caret = rune_term::width::str_width(marker).saturating_add(reader.column());
+    let (prompt_row, caret) = transcript::render_prompt_at(
+        marker,
+        reader.line(),
+        reader.column(),
+        usize::from(host.width()),
+    );
     if let Ok(mut typed) = host.typed.lock() {
         *typed = (reader.line().to_owned(), reader.column());
     }
@@ -1753,8 +1756,7 @@ fn turn_interrupted() -> RuneError {
 /// Waits for a line to be submitted, drawing the prompt as it is typed.
 ///
 /// Returns the submitted input, or `None` when the user asked to leave. The
-/// cursor is placed after the text typed so far, which is the whole reason the
-/// line is drawn here rather than by the terminal.
+/// cursor is placed at the editor's caret within the visible draft.
 ///
 /// `recall` supplies earlier prompts for the up and down arrows. Passing an
 /// empty slice leaves those keys doing nothing, which is what a session with no
@@ -1902,8 +1904,8 @@ fn open_completion(
 
 /// Draws the prompt row, with any rows that belong below it.
 ///
-/// A caret is placed at the end of the typed text so the terminal's cursor is
-/// where the next character will go.
+/// The visible draft scrolls with the caret so the terminal's cursor is where
+/// the next character will go.
 fn draw_prompt(
     reader: &rune_term::input::KeyReader,
     host: &SessionHost,
@@ -1911,13 +1913,15 @@ fn draw_prompt(
     menu: &[String],
     marker: &str,
 ) -> Result<()> {
-    use rune_term::width::str_width;
-
     let mut sink = out
         .lock()
         .map_err(|_| RuneError::new(ErrorCode::Internal, "the output lock was poisoned"))?;
-    let row = transcript::render_prompt(marker, reader.line(), usize::from(host.width()));
-    let caret = str_width(marker).saturating_add(reader.column());
+    let (row, caret) = transcript::render_prompt_at(
+        marker,
+        reader.line(),
+        reader.column(),
+        usize::from(host.width()),
+    );
     let painted = host.paint_with_menu(
         &[],
         None,
@@ -3265,6 +3269,44 @@ mod tests {
         let end = text.rfind('G')?;
         let start = text.get(..end)?.rfind("\u{1b}[")?.saturating_add(2);
         text.get(start..end)?.parse().ok()
+    }
+
+    #[test]
+    fn a_long_draft_stays_visible_as_a_turn_streams_and_closes() {
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let out: LiveSink = Arc::new(Mutex::new(SharedSink(Arc::clone(&bytes))));
+        let host = test_host();
+        *host.live_out.lock().expect("lock") = Some(Arc::clone(&out));
+        let mut reader = rune_term::input::KeyReader::new();
+        reader.replace(&("a".repeat(160) + "TAIL-END"));
+        let mut grid = rune_term::Grid::new(80, 24).expect("grid");
+        let check = |grid: &mut rune_term::Grid| {
+            let drawn = std::mem::take(&mut *bytes.lock().expect("lock"));
+            assert!(last_caret_column(&drawn).expect("caret") <= 80);
+            grid.feed(&drawn).expect("feed");
+            assert!(grid.text().contains("TAIL-END"), "{}", grid.text());
+            assert_eq!(grid.cursor().col, 79);
+        };
+        host.draw_stream_with(reader.line(), reader.column());
+        check(&mut grid);
+        host.emit(Event::TextDelta {
+            delta: "answer".to_owned(),
+        });
+        check(&mut grid);
+        host.draw_notice("still working");
+        check(&mut grid);
+        let mut sink = LockedSink { stream: out };
+        close_turn(
+            &host,
+            &mut sink,
+            &mut reader,
+            &["answer".to_owned()],
+            None,
+            &[],
+        )
+        .expect("closed");
+        check(&mut grid);
+        assert_eq!(reader.line(), "a".repeat(160) + "TAIL-END");
     }
 
     #[test]

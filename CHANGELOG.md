@@ -32,6 +32,8 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Fixed
 
+- Long drafts scroll horizontally to keep the caret and the text being edited
+  visible, both at the prompt and while a turn is running.
 - Interactive permission requests display their complete scope and offer Run
   once or Deny. Escape or Control-C cancels the waiting turn without executing
   the request.
