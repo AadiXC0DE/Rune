@@ -1862,7 +1862,7 @@ Resource accumulation after cancellation, session holder handover and concurrent
 
 ## Execution order
 
-- [ ] R-001 | T1 | fix | config | Create private state parents during connect | acceptance: Connect in a fresh HOME with umask 002 and observe state/rune mode 700 and an open session.
+- [x] R-001 | T1 | fix | config | Create private state parents during connect | acceptance: Connect in a fresh HOME with umask 002 and observe state/rune mode 700 and an open session.
 - [ ] R-002 | T1 | fix | tools | Bound grep context allocation before allocating | acceptance: Submit context_lines 18446744073709551615 through grep_files and observe a tool validation error while the session remains usable.
 - [ ] R-003 | T1 | fix | permissions | Display and resolve terminal approval requests | acceptance: In ask mode submit permission and approve the displayed shell request, then observe AUDIT_SHELL_OK.
 - [ ] R-004 | T1 | fix | input | Scroll long drafts to keep the caret visible | acceptance: At 80 columns enter 160 a characters plus TAIL-END and observe TAIL-END while editing the final character.

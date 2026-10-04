@@ -160,7 +160,8 @@ fn read_file(paths: &Paths) -> Result<Option<StoredFile>> {
     Ok(Some(parsed))
 }
 
-/// Writes a credential to the profile file.
+/// Writes a credential to the profile file, creating or verifying its private
+/// state directory before reading or writing credentials.
 pub fn store(paths: &Paths, provider: &str, value: &str) -> Result<()> {
     if value.is_empty() {
         return Err(RuneError::invalid_field("credential", "must not be empty"));
@@ -173,6 +174,7 @@ pub fn store(paths: &Paths, provider: &str, value: &str) -> Result<()> {
         ));
     }
 
+    paths::create_dir_private(&paths.state_root)?;
     let mut file = read_file(paths)?.unwrap_or_default();
     file.version = default_version();
     file.entries.insert(
@@ -491,6 +493,51 @@ mod tests {
                 & 0o777;
             assert_eq!(mode, 0o600, "credential file mode was {mode:o}");
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn storing_a_credential_refuses_a_widened_state_directory() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = TempDir::new().expect("tempdir");
+        let paths = paths_for(&dir);
+        std::fs::create_dir(&paths.state_root).expect("state directory");
+        std::fs::set_permissions(&paths.state_root, std::fs::Permissions::from_mode(0o775))
+            .expect("chmod");
+
+        let err = store(&paths, "anthropic", "secret").expect_err("refused");
+        assert_eq!(err.code(), ErrorCode::UnsafePath);
+        assert!(
+            !paths.credentials_file().exists(),
+            "a credential was written"
+        );
+        assert_eq!(
+            std::fs::metadata(&paths.state_root)
+                .expect("metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o775,
+            "an existing directory must not be silently changed"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn storing_a_credential_refuses_a_symlinked_state_directory() {
+        let dir = TempDir::new().expect("tempdir");
+        let paths = paths_for(&dir);
+        let target = dir.path().join("target");
+        std::fs::create_dir(&target).expect("target");
+        std::os::unix::fs::symlink(&target, &paths.state_root).expect("symlink");
+
+        let err = store(&paths, "anthropic", "secret").expect_err("refused");
+        assert_eq!(err.code(), ErrorCode::UnsafePath);
+        assert!(
+            !target.join("credentials.json").exists(),
+            "a credential was written through the link"
+        );
     }
 
     #[test]

@@ -590,6 +590,95 @@ fn connecting_with_the_key_exported_succeeds() {
     assert!(!out.stdout.contains("sk-ant-test"), "{}", out.stdout);
 }
 
+#[cfg(unix)]
+#[test]
+fn connecting_in_a_fresh_home_creates_private_state_and_opens_a_session() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    // Set the umask in a child shell so parallel tests keep their own mask.
+    for mask in ["022", "002"] {
+        for xdg in [false, true] {
+            let dir = tempfile::tempdir().expect("fresh home");
+            let state = dir.path().join(if xdg {
+                "state/rune"
+            } else {
+                ".local/state/rune"
+            });
+            let command = || {
+                let mut command = Command::new("sh");
+                command
+                    .args(["-c", r#"umask "$1"; shift; exec "$@""#, "rune-test", mask])
+                    .arg(binary())
+                    .env_clear()
+                    .env("HOME", dir.path())
+                    .current_dir(dir.path());
+                if xdg {
+                    command.env("XDG_STATE_HOME", dir.path().join("state"));
+                }
+                command
+            };
+            assert!(!state.exists(), "the home already has Rune state");
+
+            let connected = command()
+                .args(["connect", "anthropic", "--json"])
+                .env("ANTHROPIC_API_KEY", "sk-ant-test")
+                .output()
+                .expect("connect");
+            assert!(
+                connected.status.success(),
+                "umask {mask}, xdg {xdg}: {}",
+                String::from_utf8_lossy(&connected.stderr)
+            );
+            for (path, mode) in [
+                (state.clone(), 0o700),
+                (state.join("credentials.json"), 0o600),
+            ] {
+                assert_eq!(
+                    std::fs::metadata(&path)
+                        .expect("metadata")
+                        .permissions()
+                        .mode()
+                        & 0o777,
+                    mode,
+                    "{} with umask {mask}, xdg {xdg}",
+                    path.display()
+                );
+            }
+
+            // No key in the environment: the session must use the stored one.
+            // EOF ends it after startup, without needing a live provider.
+            let session = command()
+                .args(["--offline", "--model", "claude-test"])
+                .stdin(std::process::Stdio::null())
+                .output()
+                .expect("open session");
+            assert!(
+                session.status.success(),
+                "umask {mask}, xdg {xdg}: {}",
+                String::from_utf8_lossy(&session.stderr)
+            );
+            assert!(
+                String::from_utf8_lossy(&session.stdout).contains("session "),
+                "the session was not announced"
+            );
+            let sessions: Vec<_> = std::fs::read_dir(state.join("sessions"))
+                .expect("sessions directory")
+                .collect::<Result<_, _>>()
+                .expect("session entries");
+            assert_eq!(sessions.len(), 1, "one session must have opened");
+            let session_dir = camino::Utf8PathBuf::from_path_buf(sessions[0].path()).expect("utf8");
+            let saved = rune_session::store::load_read_only(&session_dir).expect("session log");
+            assert!(
+                saved.events.iter().any(|frame| matches!(
+                    &frame.event,
+                    rune_session::event::SessionEvent::WorkspaceSet { .. }
+                )),
+                "the session did not record its workspace"
+            );
+        }
+    }
+}
+
 #[test]
 fn a_flag_the_command_does_not_take_is_refused() {
     let out = run(&["models", "--nonsense"]);

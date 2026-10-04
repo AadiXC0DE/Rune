@@ -32,6 +32,8 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Fixed
 
+- Connecting a provider creates Rune's state directory with mode 0700, so a
+  fresh install can start a session with umask 022 or 002.
 - Anthropic sessions send the key in the header Anthropic reads.
 - Streamed tool calls on the Responses API, reasoning replay, retries of
   errors reported mid-stream, `Retry-After`, unrecognized stop reasons, and
