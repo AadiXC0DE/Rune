@@ -23,6 +23,9 @@ const PROBE_BYTES: usize = 8 * 1024;
 /// Names listed before a footer says how many more there are.
 const MAX_LISTED_NAMES: usize = 20;
 
+/// Largest context window a model may request, bounding the ring allocation.
+const MAX_CONTEXT_LINES: usize = 1000;
+
 /// Characters that make a pattern look like a regular expression.
 ///
 /// Only a hint is produced: the match is literal whatever the pattern contains.
@@ -100,6 +103,7 @@ impl Tool for GrepFiles {
                 "context_lines": {
                     "type": "integer",
                     "minimum": 0,
+                    "maximum": MAX_CONTEXT_LINES,
                     "description": "Lines shown before and after each match, in matches mode.",
                 },
             },
@@ -198,6 +202,15 @@ fn parse(
         ));
     }
 
+    let context_lines = usize_arg(arguments, "context_lines")?.unwrap_or(0);
+    if context_lines > MAX_CONTEXT_LINES {
+        return Err(RuneError::invalid_field(
+            "context_lines",
+            format!("`context_lines` must be at most {MAX_CONTEXT_LINES}"),
+        )
+        .with_observed(context_lines.to_string()));
+    }
+
     let root = match string_arg(arguments, "path")? {
         Some(raw) => resolve(context, raw)?.path,
         None => default_root(context)?.path,
@@ -221,7 +234,7 @@ fn parse(
         mode: Mode::of(arguments)?,
         head_limit,
         offset: usize_arg(arguments, "offset")?.unwrap_or(0),
-        context_lines: usize_arg(arguments, "context_lines")?.unwrap_or(0),
+        context_lines,
     })
 }
 
@@ -861,6 +874,73 @@ mod tests {
         assert!(output.text.contains(":needle here"), "{}", output.text);
     }
 
+    #[test]
+    fn an_extreme_context_argument_returns_a_validation_error() {
+        let repo = Repo::new();
+        repo.write("fixture.txt", "x\n");
+        let arguments = serde_json::from_str(
+            r#"{"pattern":"x","path":"fixture.txt","context_lines":18446744073709551615}"#,
+        )
+        .expect("arguments");
+        let err = GrepFiles::default()
+            .call(&arguments, &repo.context())
+            .expect_err("context must be bounded before allocation");
+        assert_eq!(err.code(), ErrorCode::InvalidField);
+        assert_eq!(err.detail().field.as_deref(), Some("context_lines"));
+    }
+
+    #[test]
+    fn context_over_the_maximum_is_rejected_in_every_mode() {
+        let repo = Repo::new();
+        repo.write("fixture.txt", "x\n");
+        for mode in ["matches", "files_with_matches", "count"] {
+            let err = GrepFiles::default()
+                .call(
+                    &serde_json::json!({
+                        "pattern": "x",
+                        "path": "fixture.txt",
+                        "mode": mode,
+                        "context_lines": MAX_CONTEXT_LINES.saturating_add(1),
+                    }),
+                    &repo.context(),
+                )
+                .expect_err("context exceeds the maximum");
+            assert_eq!(err.code(), ErrorCode::InvalidField);
+            assert_eq!(err.detail().field.as_deref(), Some("context_lines"));
+            assert!(
+                err.message().contains(&MAX_CONTEXT_LINES.to_string()),
+                "{err}"
+            );
+        }
+    }
+
+    #[test]
+    fn zero_and_maximum_context_windows_are_accepted_without_clamping() {
+        let repo = Repo::new();
+        let before = "before\n".repeat(MAX_CONTEXT_LINES);
+        let after = "after\n".repeat(MAX_CONTEXT_LINES);
+        repo.write("fixture.txt", &format!("{before}x\n{after}"));
+        for context_lines in [0, MAX_CONTEXT_LINES] {
+            let output = GrepFiles::default()
+                .call(
+                    &serde_json::json!({
+                        "pattern": "x",
+                        "path": "fixture.txt",
+                        "context_lines": context_lines,
+                    }),
+                    &repo.context(),
+                )
+                .expect("valid context");
+            assert!(!output.is_error);
+            assert_eq!(
+                lines_for(&output.text, "fixture.txt").len(),
+                context_lines.saturating_mul(2).saturating_add(1),
+                "{}",
+                output.text
+            );
+        }
+    }
+
     /// Returns the lines a search printed for one file, in order.
     fn lines_for(text: &str, file: &str) -> Vec<String> {
         let prefix = format!("{file}:");
@@ -1310,6 +1390,11 @@ mod tests {
         let schema = GrepFiles::default().input_schema();
         assert_eq!(schema["required"][0], "pattern");
         assert_eq!(schema["additionalProperties"], false);
+        assert_eq!(schema["properties"]["context_lines"]["minimum"], 0);
+        assert_eq!(
+            schema["properties"]["context_lines"]["maximum"],
+            MAX_CONTEXT_LINES
+        );
         assert_eq!(
             schema["properties"]["mode"]["enum"],
             serde_json::json!(["matches", "files_with_matches", "count"])

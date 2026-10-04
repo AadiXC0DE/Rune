@@ -45,8 +45,8 @@ pub const SUMMARY_RESERVE_BYTES: usize = 512;
 
 /// The caps a file tool applies, resolved once from the limit set.
 ///
-/// Every bound a tool enforces comes from here, so `rune limits` reports the
-/// number that actually governs the run rather than a compiled constant.
+/// Configurable bounds come from here, so `rune limits` reports their values.
+/// Tools may also enforce fixed safety ceilings, such as grep's context window.
 #[derive(Clone, Copy, Debug)]
 pub struct FileLimits {
     /// Lines returned by one read.

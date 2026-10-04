@@ -31,12 +31,13 @@ use rune_policy::decision::{Layer, Outcome};
 use rune_policy::rules::{Rule, RuleSet};
 use rune_testkit::{MockEndpoint, Script};
 use rune_tools::contract::{ExecutionContext, ToolOutput};
+use rune_tools::registry::Registry;
 
 /// A host that records what happened, for assertions.
 struct TestHost {
     /// Held so the mock server outlives the host. Dropping it closes the
     /// listener, which would make every request fail with a refused connection.
-    _server: Option<MockEndpoint>,
+    server: Option<MockEndpoint>,
     endpoint: Endpoint,
     dialect: Box<dyn Provider>,
     model: String,
@@ -46,6 +47,8 @@ struct TestHost {
     events: Mutex<Vec<Event>>,
     executed: Mutex<Vec<(String, serde_json::Value)>>,
     tool_response: Mutex<Option<ToolOutput>>,
+    /// Real tools used by regressions that must reach the implementation.
+    registry: Option<Registry>,
     cancellation: Cancellation,
     steering: SteeringQueue,
     workspace: Utf8PathBuf,
@@ -66,7 +69,7 @@ impl TestHost {
     fn new(endpoint: MockEndpoint) -> Self {
         let base = endpoint.base_url();
         Self {
-            _server: Some(endpoint),
+            server: Some(endpoint),
             endpoint: Endpoint::new(base, "test-key"),
             dialect: Box::new(rune_net::chat_completions::ChatCompletions),
             model: "test/model".to_owned(),
@@ -76,6 +79,7 @@ impl TestHost {
             events: Mutex::new(Vec::new()),
             executed: Mutex::new(Vec::new()),
             tool_response: Mutex::new(None),
+            registry: None,
             cancellation: Cancellation::new(),
             steering: SteeringQueue::new(8),
             workspace: Utf8PathBuf::from("/tmp/rune-test"),
@@ -203,6 +207,9 @@ impl Host for TestHost {
         if std::mem::take(&mut *self.cancel_on_execute.lock().expect("lock")) {
             self.cancellation.cancel();
             return Err(rune_agent::steering::cancelled_error());
+        }
+        if let Some(registry) = &self.registry {
+            return registry.call(name, arguments, &self.context());
         }
         Ok(self
             .tool_response
@@ -554,6 +561,79 @@ fn a_tool_failure_does_not_end_the_turn() {
     assert_eq!(outcome.calls.len(), 1);
     assert!(outcome.calls[0].output.is_error);
     assert!(outcome.text.contains("does not exist"));
+}
+
+#[test]
+fn an_extreme_grep_context_is_reported_to_the_model_and_the_session_continues() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    std::fs::write(workspace.path().join("fixture.txt"), "x\n").expect("fixture");
+    let endpoint = MockEndpoint::start(vec![
+        Script::tool_call(
+            "bad_context",
+            "grep_files",
+            r#"{"pattern":"x","path":"fixture.txt","context_lines":18446744073709551615}"#,
+        ),
+        Script::text("The context value was rejected."),
+        Script::tool_call(
+            "valid_context",
+            "grep_files",
+            r#"{"pattern":"x","path":"fixture.txt","context_lines":1}"#,
+        ),
+        Script::text("The session is still usable."),
+    ]);
+    let mut registry = Registry::new();
+    registry
+        .insert(Box::new(rune_tools::GrepFiles::new()))
+        .expect("registered");
+    let mut host = TestHost::new(endpoint).with_tools(registry.all_schemas());
+    host.workspace = Utf8PathBuf::from_path_buf(workspace.path().to_owned()).expect("UTF-8 path");
+    host.registry = Some(registry);
+
+    let mut history = rune_agent::History::new();
+    history.push_user("search with an excessive context value");
+    let rejected = run_turn(&mut history, &host).expect("validation must not end the turn");
+    assert_eq!(rejected.stop_reason, StopReason::Completed);
+    assert_eq!(rejected.calls.len(), 1);
+    assert!(rejected.calls[0].output.is_error);
+    assert!(
+        rejected.calls[0].output.text.contains("context_lines"),
+        "{}",
+        rejected.calls[0].output.text
+    );
+    history.validate().expect("the failed call has an answer");
+
+    let request = host
+        .server
+        .as_ref()
+        .expect("endpoint")
+        .last_body()
+        .expect("request");
+    let result = request["messages"]
+        .as_array()
+        .expect("messages")
+        .iter()
+        .find(|message| message["tool_call_id"] == "bad_context")
+        .expect("the provider received the validation error");
+    assert_eq!(result["is_error"], true);
+    assert_eq!(result["content"], rejected.calls[0].output.text);
+
+    history.push_user("search again with valid context");
+    let recovered = run_turn(&mut history, &host).expect("the next turn runs");
+    assert_eq!(recovered.stop_reason, StopReason::Completed);
+    assert_eq!(recovered.text, "The session is still usable.");
+    assert_eq!(recovered.calls.len(), 1);
+    assert!(!recovered.calls[0].output.is_error);
+    assert!(
+        recovered.calls[0]
+            .output
+            .text
+            .contains("fixture.txt:     1:x"),
+        "{}",
+        recovered.calls[0].output.text
+    );
+    history
+        .validate()
+        .expect("the session history remains valid");
 }
 
 #[test]
