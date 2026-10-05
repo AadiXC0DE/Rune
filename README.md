@@ -111,6 +111,9 @@ rune resume last            # continue the most recent session here
 and names the unsupported calls. With `--json`, `error_code` is
 `unsupported_tool_call`, each requested tool has status `error`, and
 `final_output` is empty. Any accompanying text remains in `output`.
+Completed exchanges are saved as sessions for the current workspace, and
+`--json` reports their `session_id`. Pass `--no-save` to create no session and
+return an empty ID.
 
 Sessions are written as they run, so an interrupted session resumes. Prompts are
 remembered and recallable with `/history`. Custom slash commands live in

@@ -11,6 +11,27 @@ use serde_json::{Value, json};
 
 /// Serves one completion from an isolated local endpoint.
 fn run_fixture(delta: &Value, finish: &str, json_output: bool) -> Output {
+    run_fixture_with_options(delta, finish, json_output, false).0
+}
+
+fn isolated_command(dir: &tempfile::TempDir) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_rune"));
+    command
+        .env_clear()
+        .env("HOME", dir.path())
+        .env("RUNE_HOME", dir.path().join("state"))
+        .env("XDG_CONFIG_HOME", dir.path().join("config"))
+        .env("XDG_DATA_HOME", dir.path().join("data"))
+        .current_dir(dir.path());
+    command
+}
+
+fn run_fixture_with_options(
+    delta: &Value,
+    finish: &str,
+    json_output: bool,
+    no_save: bool,
+) -> (Output, tempfile::TempDir) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind fixture");
     listener.set_nonblocking(true).expect("nonblocking");
     let address = listener.local_addr().expect("fixture address");
@@ -70,29 +91,26 @@ fn run_fixture(delta: &Value, finish: &str, json_output: bool) -> Output {
     });
 
     let dir = tempfile::tempdir().expect("isolated state");
-    let mut command = Command::new(env!("CARGO_BIN_EXE_rune"));
+    let mut command = isolated_command(&dir);
     command
-        .env_clear()
-        .env("HOME", dir.path())
-        .env("RUNE_HOME", dir.path().join("state"))
-        .env("XDG_CONFIG_HOME", dir.path().join("config"))
-        .env("XDG_DATA_HOME", dir.path().join("data"))
         .env("RUNE_PROVIDER", "chat_completions")
         .env("RUNE_BASE_URL", format!("http://{address}/v1"))
         .env("RUNE_MODEL", "fixture-model")
         .env("RUNE_API_KEY_ENV", "RUNE_ASK_TEST_KEY")
         .env("RUNE_ASK_TEST_KEY", "fixture-key")
-        .current_dir(dir.path())
         .arg("ask");
     if json_output {
         command.arg("--json");
+    }
+    if no_save {
+        command.arg("--no-save");
     }
     let output = command
         .arg("run the fixture command")
         .output()
         .expect("ask");
     server.join().expect("fixture server");
-    output
+    (output, dir)
 }
 
 fn tool_call_delta() -> Value {
@@ -192,4 +210,139 @@ fn ask_text_only_completion_still_succeeds() {
             assert_eq!(output.stdout, b"Fixture answer.\n");
         }
     }
+}
+
+#[test]
+fn ask_saves_a_resolvable_exchange_in_its_workspace() {
+    for json_output in [false, true] {
+        let (output, dir) = run_fixture_with_options(
+            &json!({"content": "Fixture answer."}),
+            "stop",
+            json_output,
+            false,
+        );
+        assert_eq!(output.status.code(), Some(0));
+        assert!(output.stderr.is_empty());
+
+        let listing = isolated_command(&dir)
+            .args(["sessions", "--json"])
+            .output()
+            .expect("list saved sessions");
+        assert!(listing.status.success());
+        let listing: Value = serde_json::from_slice(&listing.stdout).expect("session listing");
+        let sessions = listing["sessions"].as_array().expect("sessions");
+        assert_eq!(sessions.len(), 1);
+        let session_id = sessions[0]["id"].as_str().expect("saved session id");
+        assert!(!session_id.is_empty());
+        if json_output {
+            let result: Value = serde_json::from_slice(&output.stdout).expect("ask JSON");
+            assert_eq!(result["session_id"], session_id);
+        } else {
+            assert_eq!(output.stdout, b"Fixture answer.\n");
+        }
+
+        let inspection = isolated_command(&dir)
+            .args(["session", session_id, "--json"])
+            .output()
+            .expect("inspect saved session");
+        assert!(inspection.status.success());
+        let inspection: Value =
+            serde_json::from_slice(&inspection.stdout).expect("session inspection");
+        assert_eq!(inspection["id"], session_id);
+        assert_eq!(inspection["title"], "run the fixture command");
+        assert_eq!(inspection["turns"], 1);
+        assert_eq!(
+            inspection["usage"],
+            json!({"input_tokens": 11, "output_tokens": 0})
+        );
+        assert_eq!(inspection["truncated"], false);
+
+        let session_dir = dir.path().join("state/sessions").join(session_id);
+        let session_dir = camino::Utf8Path::from_path(&session_dir).expect("UTF-8 session path");
+        let state = rune_session::load_read_only(session_dir).expect("read saved exchange");
+        let workspace = dir.path().canonicalize().expect("canonical workspace");
+        assert_eq!(state.workspace.as_deref(), workspace.to_str());
+        let exchange: Vec<_> = state
+            .events
+            .iter()
+            .filter_map(|frame| match &frame.event {
+                rune_session::SessionEvent::UserMessage { text } => Some(("user", text.as_str())),
+                rune_session::SessionEvent::AssistantMessage { turn, text } => {
+                    assert_eq!(*turn, 1);
+                    Some(("assistant", text.as_str()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            exchange,
+            [
+                ("user", "run the fixture command"),
+                ("assistant", "Fixture answer.")
+            ]
+        );
+    }
+}
+
+#[test]
+fn ask_no_save_creates_no_session() {
+    for json_output in [false, true] {
+        let (output, dir) = run_fixture_with_options(
+            &json!({"content": "Unsaved answer."}),
+            "stop",
+            json_output,
+            true,
+        );
+        assert_eq!(output.status.code(), Some(0));
+        assert!(output.stderr.is_empty());
+        assert!(!dir.path().join("state/sessions").exists());
+        if json_output {
+            let result: Value = serde_json::from_slice(&output.stdout).expect("ask JSON");
+            assert_eq!(result["session_id"], "");
+            assert_eq!(result["final_output"], "Unsaved answer.");
+        } else {
+            assert_eq!(output.stdout, b"Unsaved answer.\n");
+        }
+        let listing = isolated_command(&dir)
+            .args(["sessions", "--json"])
+            .output()
+            .expect("list unsaved sessions");
+        assert!(listing.status.success());
+        let listing: Value = serde_json::from_slice(&listing.stdout).expect("session listing");
+        assert_eq!(listing["sessions"], json!([]));
+    }
+}
+
+#[test]
+fn ask_saves_a_rejected_tool_exchange_with_its_failure() {
+    let (output, dir) = run_fixture_with_options(&tool_call_delta(), "tool_calls", true, false);
+    assert_eq!(output.status.code(), Some(1));
+    let result: Value = serde_json::from_slice(&output.stdout).expect("ask JSON");
+    let session_id = result["session_id"].as_str().expect("saved session id");
+    assert!(!session_id.is_empty());
+    let session_dir = dir.path().join("state/sessions").join(session_id);
+    let session_dir = camino::Utf8Path::from_path(&session_dir).expect("UTF-8 session path");
+    let state = rune_session::load_read_only(session_dir).expect("read rejected exchange");
+    assert_eq!(state.turns, 1);
+    assert_eq!(state.usage.input_tokens, 11);
+    assert_eq!(state.usage.output_tokens, 0);
+    let messages: Vec<_> = state
+        .events
+        .iter()
+        .filter_map(|frame| match &frame.event {
+            rune_session::SessionEvent::UserMessage { text }
+            | rune_session::SessionEvent::AssistantMessage { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        messages,
+        ["run the fixture command", "I will run the command."]
+    );
+    assert!(matches!(
+        state.events.last().map(|frame| &frame.event),
+        Some(rune_session::SessionEvent::TurnFailed { turn: 1, code, message })
+            if *code == rune_core::error::ErrorCode::UnsupportedToolCall
+                && Some(message.as_str()) == result["error"].as_str()
+    ));
 }

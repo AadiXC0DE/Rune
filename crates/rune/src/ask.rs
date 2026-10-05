@@ -4,6 +4,7 @@
 //! every diagnostic to standard error, and exits. With `--json` it prints one
 //! object instead, which is the contract scripts depend on. This path supports
 //! text only; a returned tool call fails because no tool can be executed here.
+//! Completed exchanges are saved unless `--no-save` is selected.
 //!
 //! The key set and its order are fixed. `output` is the text produced during the
 //! request; `final_output` is the completed final response. A usage count the
@@ -14,11 +15,13 @@ use std::io::Write;
 
 use rune_core::config::Settings;
 use rune_core::error::{ErrorCode, Result, RuneError};
+use rune_core::id::SessionId;
 use rune_core::paths::Paths;
 use rune_net::message::Message;
 use rune_net::provider::{Provider, RequestPlan};
-use rune_net::stream::FinishReason;
+use rune_net::stream::{FinishReason, Usage};
 use rune_net::transport;
+use rune_session::{SessionEvent, SessionStore};
 use serde::Serialize;
 
 /// Exit code for a successful run.
@@ -237,6 +240,18 @@ pub fn run(
     } else {
         i32::from(EXIT_FAILURE)
     };
+    let session_id = if options.no_save {
+        String::new()
+    } else {
+        save_exchange(
+            paths,
+            &options.prompt,
+            &text,
+            &outcome.usage,
+            error.as_ref(),
+        )?
+        .to_string()
+    };
 
     Ok(JsonResult {
         final_output: if error.is_none() {
@@ -248,13 +263,7 @@ pub fn run(
         exit_code,
         model,
         resolved_provider: None,
-        session_id: if options.no_save {
-            String::new()
-        } else {
-            // Sessions land next; a run without one reports an empty id rather
-            // than an identifier that cannot be resolved.
-            String::new()
-        },
+        session_id,
         steps: 1,
         usage: UsageReport {
             input_tokens: outcome.usage.input_tokens,
@@ -264,6 +273,49 @@ pub fn run(
         error: error.as_ref().map(|error| error.message().to_owned()),
         error_code: error.as_ref().map(RuneError::code),
     })
+}
+
+/// Saves a completed request before its identifier is reported to the caller.
+fn save_exchange(
+    paths: &Paths,
+    prompt: &str,
+    text: &str,
+    usage: &Usage,
+    error: Option<&RuneError>,
+) -> Result<SessionId> {
+    let workspace = crate::current_workspace()?;
+    let id = SessionId::generate();
+    let store = SessionStore::create(paths, &id)?;
+    store.append(SessionEvent::WorkspaceSet {
+        workspace: rune_policy::trust::canonical_workspace(&workspace).to_string(),
+    })?;
+    store.append(SessionEvent::TitleSet {
+        title: crate::session_log::derive_title(prompt),
+    })?;
+    store.append(SessionEvent::UserMessage {
+        text: prompt.to_owned(),
+    })?;
+    store.append(SessionEvent::TurnStarted { turn: 1 })?;
+    if !text.is_empty() {
+        store.append(SessionEvent::AssistantMessage {
+            turn: 1,
+            text: text.to_owned(),
+        })?;
+    }
+    if let (Some(input_tokens), Some(output_tokens)) = (usage.input_tokens, usage.output_tokens) {
+        store.append(SessionEvent::UsageRecorded {
+            input_tokens,
+            output_tokens,
+        })?;
+    }
+    if let Some(error) = error {
+        store.append(SessionEvent::TurnFailed {
+            turn: 1,
+            code: error.code(),
+            message: error.message().to_owned(),
+        })?;
+    }
+    Ok(id)
 }
 
 /// Writes a result to the two output streams.

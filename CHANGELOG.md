@@ -39,6 +39,9 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Fixed
 
+- `rune ask` saves completed exchanges with their prompt, reply, and reported
+  usage. JSON reports a resolvable `session_id`; `--no-save` creates no session
+  and keeps the identifier empty.
 - Failed terminal turns save their visible partial answer and failure cause.
   Resuming retains the answer, and `/tree` shows the failure boundary and code once.
 - Cancelled terminal turns save their visible partial answer and a cancellation
