@@ -33,6 +33,7 @@ use rune_term::shell::ExitReason;
 use rune_term::shell::{Action, Input, Shell};
 use rune_term::theme::{Slot, Theme};
 use rune_term::transcript::{self, Display, Entry};
+use rune_tools::ask_user::{Answer, Answerer, Question, Unavailable};
 use rune_tools::contract::{ExecutionContext, ToolOutput};
 use rune_tools::inventory;
 use rune_tools::registry::Registry;
@@ -55,6 +56,8 @@ pub struct SessionConfig {
     pub registry: Registry,
     /// Rules in force.
     pub rules: RuleSet,
+    /// Question bridge, enabled only while terminal input is being polled.
+    questions: Arc<TerminalQuestions>,
 }
 
 /// A writer that locks the shared stream for the length of one write.
@@ -172,6 +175,52 @@ struct ApprovalRequest {
     answer: mpsc::SyncSender<Outcome>,
 }
 
+/// A tool worker hands questions to the thread that owns terminal input.
+#[derive(Debug)]
+struct QuestionRequest {
+    questions: Vec<Question>,
+    answer: mpsc::SyncSender<Result<Answer>>,
+}
+
+#[derive(Debug, Default)]
+struct TerminalQuestions {
+    requests: Mutex<Option<mpsc::Sender<QuestionRequest>>>,
+    cancellation: Cancellation,
+}
+
+impl Answerer for TerminalQuestions {
+    fn ask(&self, questions: &[Question], context: &ExecutionContext) -> Result<Answer> {
+        let Some(requests) = self.requests.lock().ok().and_then(|slot| slot.clone()) else {
+            return Unavailable.ask(questions, context);
+        };
+        let (answer, response) = mpsc::sync_channel(1);
+        if requests
+            .send(QuestionRequest {
+                questions: questions.to_vec(),
+                answer,
+            })
+            .is_err()
+        {
+            return Unavailable.ask(questions, context);
+        }
+        loop {
+            self.cancellation.check()?;
+            context.check_cancelled()?;
+            match response.recv_timeout(rune_term::shell::POLL_INTERVAL) {
+                Ok(answer) => {
+                    self.cancellation.check()?;
+                    context.check_cancelled()?;
+                    return answer;
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Unavailable.ask(questions, context);
+                }
+            }
+        }
+    }
+}
+
 /// Host state for a turn.
 struct SessionHost {
     endpoint: Endpoint,
@@ -270,6 +319,7 @@ struct SessionHost {
     review_session: Arc<Mutex<ReviewSession>>,
     /// Attached only while a terminal input loop can collect an answer.
     approval_requests: Mutex<Option<mpsc::Sender<ApprovalRequest>>>,
+    questions: Arc<TerminalQuestions>,
 }
 
 /// Locks the model, recovering from a poisoned lock.
@@ -1034,7 +1084,7 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
         context: ExecutionContext::new(config.workspace.clone())
             .with_allow_unsandboxed(config.settings.allow_unsandboxed),
         registry: config.registry,
-        cancellation: Cancellation::new(),
+        cancellation: config.questions.cancellation.clone(),
         steering: SteeringQueue::from_limits(&limits),
         events: Arc::new(Mutex::new(Vec::new())),
         context_used: std::sync::atomic::AtomicU64::new(0),
@@ -1060,6 +1110,7 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
         undo: Mutex::new(BTreeMap::new()),
         review_session: Arc::new(Mutex::new(ReviewSession::new(&limits))),
         approval_requests: Mutex::new(None),
+        questions: config.questions,
     };
 
     // The stream is shared: the loop writes to it, and the host writes to it
@@ -1457,6 +1508,10 @@ fn run_turn_steerable(
     if let Ok(mut slot) = host.approval_requests.lock() {
         *slot = Some(requests);
     }
+    let (questions, pending_questions) = mpsc::channel();
+    if let Ok(mut slot) = host.questions.requests.lock() {
+        *slot = Some(questions);
+    }
 
     let result = run_on_worker(
         history,
@@ -1465,6 +1520,13 @@ fn run_turn_steerable(
             if let Ok(request) = pending.try_recv() {
                 gesture.disarm();
                 let answer = collect_approval(&request, host, reader);
+                let _ = request.answer.send(answer);
+                host.draw_stream_with(reader.line(), reader.column());
+                return;
+            }
+            if let Ok(request) = pending_questions.try_recv() {
+                gesture.disarm();
+                let answer = collect_questions(&request.questions, host, reader);
                 let _ = request.answer.send(answer);
                 host.draw_stream_with(reader.line(), reader.column());
                 return;
@@ -1538,6 +1600,9 @@ fn run_turn_steerable(
     if let Ok(mut slot) = host.approval_requests.lock() {
         *slot = None;
     }
+    if let Ok(mut slot) = host.questions.requests.lock() {
+        *slot = None;
+    }
     // Anything still queued was typed after the turn's last boundary, so the
     // turn never saw it. The queue is drained in one piece, which makes what is
     // left the newest submissions and everything before them what was applied.
@@ -1571,7 +1636,7 @@ fn collect_approval(
     picker.to(1);
     host.refresh_size();
     let lines = approval_lines(request, usize::from(host.width()));
-    if draw_approval(host, &picker, &lines).is_err() {
+    if draw_choice(host, &picker, &lines).is_err() {
         return Outcome::Deny;
     }
     loop {
@@ -1584,9 +1649,86 @@ fn collect_approval(
             return answer;
         }
         // Also refreshes dimensions when no input arrives.
-        if draw_approval(host, &picker, &[]).is_err() {
+        if draw_choice(host, &picker, &[]).is_err() {
             return Outcome::Deny;
         }
+    }
+}
+
+/// Collects every answer without editing or submitting the current draft.
+fn collect_questions(
+    questions: &[Question],
+    host: &SessionHost,
+    reader: &mut rune_term::input::KeyReader,
+) -> Result<Answer> {
+    let mut answers = Vec::with_capacity(questions.len());
+    for (index, question) in questions.iter().enumerate() {
+        host.cancellation.check()?;
+        let mut picker = rune_term::picker::Picker::new(
+            format!(
+                "answer required ({}/{})",
+                index.saturating_add(1),
+                questions.len()
+            ),
+            question
+                .options
+                .iter()
+                .map(|option| transcript::sanitize(&option.label))
+                .collect(),
+            question.options.len(),
+        );
+        host.refresh_size();
+        let lines = question_lines(question, usize::from(host.width()));
+        draw_choice(host, &picker, &lines)?;
+        loop {
+            host.cancellation.check()?;
+            if let Some(key) = reader.poll_choice(rune_term::shell::POLL_INTERVAL) {
+                let chosen = question_key(key, &mut picker, &host.cancellation);
+                host.cancellation.check()?;
+                if let Some(chosen) = chosen {
+                    answers.push(chosen);
+                    break;
+                }
+            }
+            draw_choice(host, &picker, &[])?;
+        }
+    }
+    Ok(Answer::Chosen(answers))
+}
+
+/// Keeps the full question and option descriptions available in scrollback.
+fn question_lines(question: &Question, width: usize) -> Vec<String> {
+    std::iter::once(question.text.clone())
+        .chain(question.options.iter().map(|option| {
+            option.description.as_ref().map_or_else(
+                || option.label.clone(),
+                |description| format!("{}: {description}", option.label),
+            )
+        }))
+        .flat_map(|line| rune_term::width::wrap(&transcript::sanitize(&line), width.max(1)))
+        .collect()
+}
+
+fn question_key(
+    key: KeyAction,
+    picker: &mut rune_term::picker::Picker,
+    cancellation: &Cancellation,
+) -> Option<usize> {
+    match key {
+        KeyAction::Submit => picker.selected().map(|_| picker.cursor()),
+        KeyAction::Up => {
+            picker.up();
+            None
+        }
+        KeyAction::Down => {
+            picker.down();
+            None
+        }
+        KeyAction::Escape | KeyAction::Cancel | KeyAction::Interrupt => {
+            cancellation.cancel();
+            None
+        }
+        KeyAction::Complete | KeyAction::Ignored => None,
     }
 }
 
@@ -1629,8 +1771,8 @@ fn approval_key(
     }
 }
 
-/// Uses the session renderer and refuses approval if the prompt cannot be written.
-fn draw_approval(
+/// Uses the session renderer and reports if the choice cannot be displayed.
+fn draw_choice(
     host: &SessionHost,
     picker: &rune_term::picker::Picker,
     settled: &[String],
@@ -1644,7 +1786,7 @@ fn draw_approval(
         .lock()
         .ok()
         .and_then(|slot| slot.clone())
-        .ok_or_else(|| RuneError::new(ErrorCode::Internal, "approval output is unavailable"))?;
+        .ok_or_else(|| RuneError::new(ErrorCode::InputRequired, "choice output is unavailable"))?;
     let hint = vec![String::from(
         "Up/Down choose, Enter confirm, Esc/Ctrl-C cancel",
     )];
@@ -3182,11 +3324,13 @@ pub fn prepare(
         _ => Box::new(rune_net::chat_completions::ChatCompletions),
     };
 
-    let mut registry = inventory::builtin_with_web(
+    let questions = Arc::new(TerminalQuestions::default());
+    let mut registry = inventory::builtin_with_answerer(
         &rune_tools::workspace::FileLimits::from_budget(&settings.limits),
         &settings.limits,
         &paths.managed_skills_dir(),
         crate::web_client::backends(settings),
+        questions.clone(),
     )?;
     // The delegation tool lives with the authority model it enforces, and the
     // tool registry cannot depend on that crate, so it is added here where both
@@ -3223,6 +3367,7 @@ pub fn prepare(
         // is refused, and an unknown command resolves to the mode's default
         // rather than to nothing.
         rules: crate::permissions::validated(settings)?,
+        questions,
     })
 }
 
@@ -3991,6 +4136,137 @@ mod tests {
             collect_approval(&request, &host, &mut reader),
             Outcome::Deny
         );
+    }
+
+    fn fixture_question() -> Question {
+        Question {
+            text: "Which choice?".to_owned(),
+            options: vec![
+                rune_tools::ask_user::Choice {
+                    label: "Alpha".to_owned(),
+                    description: None,
+                },
+                rune_tools::ask_user::Choice {
+                    label: "Beta".to_owned(),
+                    description: Some("The second choice".to_owned()),
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn question_input_unavailable_or_closed_never_selects_an_answer() {
+        let answerer = TerminalQuestions::default();
+        let context = ExecutionContext::new(Utf8PathBuf::from("/tmp"));
+        let questions = [fixture_question()];
+        assert_eq!(
+            answerer
+                .ask(&questions, &context)
+                .expect_err("unavailable")
+                .code(),
+            ErrorCode::InputRequired
+        );
+        let (requests, pending) = mpsc::channel();
+        *answerer.requests.lock().expect("lock") = Some(requests);
+        std::thread::scope(|scope| {
+            let worker = scope.spawn(|| answerer.ask(&questions, &context));
+            let request = pending
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .expect("question request");
+            assert_eq!(request.questions, questions);
+            drop(request);
+            assert_eq!(
+                worker.join().expect("worker").expect_err("closed").code(),
+                ErrorCode::InputRequired
+            );
+        });
+        drop(pending);
+        assert_eq!(
+            answerer
+                .ask(&questions, &context)
+                .expect_err("disconnected")
+                .code(),
+            ErrorCode::InputRequired
+        );
+    }
+
+    #[test]
+    fn cancellation_wakes_a_worker_waiting_for_question_input() {
+        for cancel_context in [false, true] {
+            let answerer = TerminalQuestions::default();
+            let context = ExecutionContext::new(Utf8PathBuf::from("/tmp"));
+            let questions = [fixture_question()];
+            let (requests, pending) = mpsc::channel();
+            *answerer.requests.lock().expect("lock") = Some(requests);
+            std::thread::scope(|scope| {
+                let worker = scope.spawn(|| answerer.ask(&questions, &context));
+                let _request = pending
+                    .recv_timeout(std::time::Duration::from_secs(2))
+                    .expect("question request");
+                if cancel_context {
+                    context.cancellation().cancel();
+                } else {
+                    answerer.cancellation.cancel();
+                }
+                assert_eq!(
+                    worker
+                        .join()
+                        .expect("worker")
+                        .expect_err("cancelled")
+                        .code(),
+                    ErrorCode::Cancelled
+                );
+            });
+        }
+    }
+
+    #[test]
+    fn question_choices_keep_indices_and_sanitize_displayed_text() {
+        let mut question = fixture_question();
+        question.text.push_str("\u{1b}[2JTAIL-END");
+        question.options[0].label = "Beta".to_owned();
+        question.options[1].description = Some("\u{1b}]52;c;clipboard\u{7}details".to_owned());
+        let lines = question_lines(&question, 12);
+        assert!(!lines.join("").contains('\u{1b}'));
+        assert!(lines.join("").contains("TAIL-END"));
+        assert!(lines.join("").contains("details"));
+        assert!(
+            lines
+                .iter()
+                .all(|line| rune_term::width::str_width(line) <= 12)
+        );
+        let mut picker = rune_term::picker::Picker::new(
+            "question",
+            question
+                .options
+                .iter()
+                .map(|option| option.label.clone())
+                .collect(),
+            2,
+        );
+        let cancellation = Cancellation::new();
+        assert_eq!(
+            question_key(KeyAction::Down, &mut picker, &cancellation),
+            None
+        );
+        assert_eq!(
+            question_key(KeyAction::Ignored, &mut picker, &cancellation),
+            None
+        );
+        assert_eq!(
+            question_key(KeyAction::Submit, &mut picker, &cancellation),
+            Some(1)
+        );
+        assert!(!cancellation.is_cancelled());
+    }
+
+    #[test]
+    fn a_question_that_cannot_be_displayed_requires_input() {
+        let host = test_host();
+        let mut reader = rune_term::input::KeyReader::new();
+        let error = collect_questions(&[fixture_question()], &host, &mut reader)
+            .expect_err("cannot display the question");
+        assert_eq!(error.code(), ErrorCode::InputRequired);
     }
 
     #[test]
@@ -5233,6 +5509,7 @@ mod tests {
             dialect: Box::new(rune_net::chat_completions::ChatCompletions),
             registry: Registry::new(),
             rules: RuleSet::new(),
+            questions: Arc::new(TerminalQuestions::default()),
         }
     }
 
@@ -5262,6 +5539,7 @@ mod tests {
         registry
             .insert(Box::new(rune_tools::ReadFile::new()))
             .expect("registered");
+        let questions = Arc::new(TerminalQuestions::default());
         SessionHost {
             endpoint: Endpoint::new("https://example.invalid", "k"),
             dialect: Box::new(rune_net::chat_completions::ChatCompletions),
@@ -5275,7 +5553,7 @@ mod tests {
             limits: BudgetSet::new(),
             context: ExecutionContext::new(Utf8PathBuf::from("/tmp")),
             registry,
-            cancellation: Cancellation::new(),
+            cancellation: questions.cancellation.clone(),
             steering: SteeringQueue::new(4),
             events: Arc::new(Mutex::new(Vec::new())),
             context_used: std::sync::atomic::AtomicU64::new(0),
@@ -5301,6 +5579,7 @@ mod tests {
             undo: Mutex::new(BTreeMap::new()),
             review_session: Arc::new(Mutex::new(ReviewSession::new(&BudgetSet::new()))),
             approval_requests: Mutex::new(None),
+            questions,
         }
     }
 }

@@ -32,6 +32,9 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Fixed
 
+- Structured questions in terminal sessions now collect choices with the arrow
+  keys and Enter, then send the selected answers to the model. Escape or
+  Control-C cancels the waiting turn; piped sessions still report input unavailable.
 - `rune ask` fails with `unsupported_tool_call` when the model requests tools
   that its text-only path cannot execute. JSON lists those calls with status
   `error` instead of reporting them as successful.

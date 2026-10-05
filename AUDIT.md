@@ -1869,7 +1869,7 @@ Resource accumulation after cancellation, session holder handover and concurrent
 - [x] R-005 | T1 | fix | permissions | Normalize equivalent file paths before rule matching | acceptance: A denial for .env must also deny ./.env and its equivalent absolute workspace path without denying an unrelated file.
 - [ ] R-006 | T1 | fix | permissions | Escape literal filenames in remembered grants | acceptance: Approve the literal filename foo* and observe foo* allowed while foobar remains unapproved after restart.
 - [x] R-007 | T1 | fix | scripting | Stop reporting unexecuted ask tool calls as successful | acceptance: Return a tool call to the current text-only ask path and observe a named unsupported-tool-call error rather than status success.
-- [ ] R-008 | T1 | fix | tools | Connect structured questions to terminal input | acceptance: Choose Beta in the question fixture and observe Beta in the next provider request.
+- [x] R-008 | T1 | fix | tools | Connect structured questions to terminal input | acceptance: Choose Beta in the question fixture and observe Beta in the next provider request.
 - [ ] R-009 | T1 | fix | packaging | Extract verified release archives before installation | acceptance: Upgrade a disposable target from a staged tar.gz release and successfully execute its version command.
 - [ ] R-010 | T1 | fix | packaging | Create an exclusive unique upgrade staging file | acceptance: Precreate .rune-install-staged as a symlink and observe its target unchanged after upgrade.
 - [ ] R-011 | T1 | fix | tui | Bound completion and model menus by terminal height | acceptance: At 32x8 open /model, reach the last choice, close the picker and observe no stale rows.
