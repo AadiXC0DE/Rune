@@ -336,6 +336,10 @@ pub struct UserConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<Provider>,
 
+    /// Whether every outbound request is refused, including model requests.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offline: Option<bool>,
+
     /// Whether the web tools may reach the network.
     ///
     /// On by default, because a coding agent that cannot look something up is
@@ -845,6 +849,7 @@ const PROFILE_ONLY_KEYS: &[&str] = &[
     "fast_mode",
     "theme",
     "auto_upgrade",
+    "offline",
     "collapse_tool_calls",
     "session_titles",
     "additional_directories",
@@ -1029,6 +1034,10 @@ fn read_bounded(path: &Utf8Path, layer: Layer) -> std::result::Result<Option<Str
 
 /// Applies a user configuration to the settings.
 fn apply_user(settings: &mut Settings, user: &UserConfig, layer: Layer) {
+    if let Some(offline) = user.offline {
+        settings.offline = offline;
+        settings.sources.record("offline", layer);
+    }
     if let Some(web_tools) = user.web_tools {
         // A project file cannot set this: it decides whether a repository can
         // send the user's queries to a search engine, which is the profile
@@ -1568,6 +1577,87 @@ theme_unused = "x"
         let settings = load(None, Some(&user), &env);
         assert_eq!(settings.permission_mode, PermissionMode::FullAccess);
         assert_eq!(settings.source_of("permission_mode"), Layer::Environment);
+    }
+
+    #[test]
+    fn user_offline_setting_preserves_the_remaining_config() {
+        let dir = TempDir::new().expect("tempdir");
+        for offline in [true, false] {
+            let user = write(
+                &dir,
+                "config.toml",
+                &format!(
+                    r#"
+offline = {offline}
+provider = "chat_completions"
+web_tools = true
+theme = "light"
+[models]
+chat_completions = "configured-model"
+[limits]
+max_agent_steps = 50
+"#
+                ),
+            );
+            let settings = load(None, Some(&user), &empty_env());
+            assert!(
+                settings.diagnostics.is_empty(),
+                "{:?}",
+                settings.diagnostics
+            );
+            assert_eq!(settings.offline, offline);
+            assert_eq!(settings.source_of("offline"), Layer::User);
+            assert_eq!(settings.provider, Provider::ChatCompletions);
+            assert_eq!(settings.model, "configured-model");
+            assert_eq!(settings.theme.as_deref(), Some("light"));
+            assert!(settings.web_tools);
+            assert_eq!(settings.source_of("model"), Layer::User);
+            assert_eq!(
+                settings.limits.get(LimitName::MaxAgentSteps),
+                Budget::Bounded(50)
+            );
+        }
+    }
+
+    #[test]
+    fn environment_overrides_the_user_offline_setting() {
+        let dir = TempDir::new().expect("tempdir");
+        for offline in [true, false] {
+            let user = write(&dir, "config.toml", &format!("offline = {offline}\n"));
+            let env = EnvironmentOverrides::from_lookup(|key| {
+                (key == "RUNE_OFFLINE").then(|| (!offline).to_string())
+            });
+            let settings = load(None, Some(&user), &env);
+            assert!(
+                settings.diagnostics.is_empty(),
+                "{:?}",
+                settings.diagnostics
+            );
+            assert_eq!(settings.offline, !offline);
+            assert_eq!(settings.source_of("offline"), Layer::Environment);
+        }
+    }
+
+    #[test]
+    fn project_cannot_change_the_user_offline_setting() {
+        let dir = TempDir::new().expect("tempdir");
+        for offline in [true, false] {
+            let user = write(&dir, "config.toml", &format!("offline = {offline}\n"));
+            let project = write(
+                &dir,
+                ".rune.toml",
+                &format!("offline = {}\ncontext = false\n", !offline),
+            );
+            let settings = load(Some(&project), Some(&user), &empty_env());
+            assert_eq!(settings.offline, offline);
+            assert_eq!(settings.source_of("offline"), Layer::User);
+            assert!(!settings.context);
+            assert_eq!(settings.diagnostics.len(), 1, "{:?}", settings.diagnostics);
+            let diagnostic = &settings.diagnostics[0];
+            assert_eq!(diagnostic.layer, Layer::Project);
+            assert_eq!(diagnostic.code, ErrorCode::KeyNotAllowedInScope);
+            assert_eq!(diagnostic.key.as_deref(), Some("offline"));
+        }
     }
 
     #[test]

@@ -481,6 +481,65 @@ fn offline_after_the_command_refuses_the_request() {
 }
 
 #[test]
+fn offline_in_the_user_file_preserves_the_model_and_refuses_requests() {
+    let listener = Listener::start();
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let config_dir = dir.path().join("config").join("rune");
+    std::fs::create_dir_all(&config_dir).expect("mkdir");
+    std::fs::write(
+        config_dir.join("config.toml"),
+        format!(
+            r#"
+offline = true
+web_tools = true
+provider = "chat_completions"
+base_url = "http://127.0.0.1:{}/v1"
+api_key_env = "RUNE_CLI_TEST_KEY"
+[models]
+chat_completions = "configured-model"
+[limits]
+provider_request_timeout_ms = 1000
+"#,
+            listener.port
+        ),
+    )
+    .expect("write config");
+
+    let run_with_config = |args: &[&str]| {
+        Command::new(binary())
+            .env_clear()
+            .env("HOME", dir.path())
+            .env("RUNE_HOME", dir.path().join("state"))
+            .env("XDG_CONFIG_HOME", dir.path().join("config"))
+            .env("XDG_DATA_HOME", dir.path().join("data"))
+            .env("RUNE_CLI_TEST_KEY", "sk-test")
+            .current_dir(dir.path())
+            .args(args)
+            .output()
+            .expect("run binary")
+    };
+
+    let models = run_with_config(&["models"]);
+    assert!(models.status.success(), "{models:?}");
+    assert!(
+        String::from_utf8_lossy(&models.stdout).contains("configured-model"),
+        "{models:?}"
+    );
+    assert!(models.stderr.is_empty(), "{models:?}");
+
+    let ask = run_with_config(&["ask", "hi"]);
+    assert_eq!(ask.status.code(), Some(1), "{ask:?}");
+    let stderr = String::from_utf8_lossy(&ask.stderr);
+    assert!(stderr.contains("outbound requests are disabled"), "{ask:?}");
+    assert!(!stderr.contains("could not parse"), "{ask:?}");
+    assert_eq!(
+        listener.count(),
+        0,
+        "the offline user file allowed a request"
+    );
+}
+
+#[test]
 fn a_model_named_after_the_command_is_used() {
     let listener = Listener::start();
     let out = run_against(

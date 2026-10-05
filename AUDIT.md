@@ -1877,7 +1877,7 @@ Resource accumulation after cancellation, session holder handover and concurrent
 - [ ] R-013 | T1 | fix | tui | Refresh dimensions before laying out a draft | acceptance: Grow a 32-column draft to 80 columns and observe VISIBLE-END without another keypress.
 - [x] R-014 | T1 | fix | providers | Enforce the total provider request deadline | acceptance: Set provider_request_timeout_ms=1000 and observe a slow ongoing stream stop within 1500 ms with a timeout cause.
 - [x] R-015 | T1 | fix | providers | Enforce the first-event deadline during silent reads | acceptance: A response that sends headers and no events must stop at its configured head deadline without waiting for EOF.
-- [ ] R-016 | T1 | fix | config | Accept and enforce the documented offline file setting | acceptance: Load offline=true from the user config and observe offline enabled without discarding the remaining config.
+- [x] R-016 | T1 | fix | config | Accept and enforce the documented offline file setting | acceptance: Load offline=true from the user config and observe offline enabled without discarding the remaining config.
 - [ ] R-017 | T1 | fix | sandbox | Carry offline mode into shell network policy | acceptance: With a Linux sandbox and offline full-access context, a shell connection to a local fixture must fail before the fixture receives data.
 - [ ] R-018 | T1 | fix | config | Align the web default with the documented opt-in | acceptance: With no web setting, the documented opt-in behavior must refuse a fixture web call; explicitly enabling web_tools must allow that same permitted fixture call.
 - [ ] R-019 | T1 | fix | web | Reject abbreviated private IPv4 addresses | acceptance: Fetch 127.1, 127.0.1 and 10.1 without a private grant and observe zero backend calls.
