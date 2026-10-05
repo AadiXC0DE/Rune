@@ -39,6 +39,8 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Fixed
 
+- Failed terminal turns save their visible partial answer and failure cause.
+  Resuming retains the answer, and `/tree` shows the failure boundary and code once.
 - Cancelled terminal turns save their visible partial answer and a cancellation
   boundary. Resuming retains the answer, and `/tree` shows the boundary once.
 - Responses requests now send explicit reasoning effort as `reasoning.effort`.

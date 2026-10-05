@@ -53,6 +53,15 @@ pub enum SessionEvent {
         /// Turn number of the cancelled exchange.
         turn: u64,
     },
+    /// A turn failed, after any visible answer was recorded.
+    TurnFailed {
+        /// Turn number of the failed exchange.
+        turn: u64,
+        /// Stable failure code.
+        code: ErrorCode,
+        /// Human-readable failure cause.
+        message: String,
+    },
     /// The user contributed a message.
     UserMessage {
         /// Message text.
@@ -129,6 +138,7 @@ impl SessionEvent {
         match self {
             Self::TurnStarted { .. } => "turn_started",
             Self::TurnCancelled { .. } => "turn_cancelled",
+            Self::TurnFailed { .. } => "turn_failed",
             Self::UserMessage { .. } => "user_message",
             Self::AssistantMessage { .. } => "assistant_message",
             Self::ToolCall { .. } => "tool_call",
@@ -655,6 +665,11 @@ mod tests {
     fn every_event_kind_round_trips() {
         let events = [
             SessionEvent::TurnStarted { turn: 1 },
+            SessionEvent::TurnFailed {
+                turn: 1,
+                code: ErrorCode::IncompleteStream,
+                message: "the response stream ended without a completion event".to_owned(),
+            },
             SessionEvent::UserMessage {
                 text: "line one\nline two".to_owned(),
             },

@@ -1369,12 +1369,14 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                     // failure, because a script reads it from the exit status.
                     Err(err) => {
                         let partial = host.partial_answer();
+                        // Save before clearing the live answer or reporting
+                        // the boundary, just as for a completed exchange.
                         if err.code() == ErrorCode::Cancelled {
-                            // Save before clearing the live answer or reporting
-                            // the boundary, just as for a completed exchange.
                             recorder.cancelled_turn(&partial)?;
-                            retain_cancelled_answer(&mut history, history_start, &partial);
+                        } else {
+                            recorder.failed_turn(&partial, &err)?;
                         }
+                        retain_partial_answer(&mut history, history_start, &partial);
                         if !reader.is_active() {
                             return Err(err);
                         }
@@ -3291,7 +3293,7 @@ fn report_turn(outcome: &turn::TurnOutcome, host: &SessionHost) -> Result<Vec<St
 ///
 /// What streamed before the failure is kept, because the reader watched it
 /// arrive and a transcript that dropped it would disagree with the screen.
-/// Cancelled answers are also saved and retained in the conversation.
+/// Interrupted answers are also saved and retained in the conversation.
 fn report_failed_turn(err: &RuneError, host: &SessionHost) -> Vec<String> {
     let mut entries = event_entries(host);
     let partial = host.partial_answer();
@@ -3311,10 +3313,10 @@ fn report_failed_turn(err: &RuneError, host: &SessionHost) -> Vec<String> {
 
 /// Keeps only the answer bytes the turn has not already added to history.
 ///
-/// A cancellation can follow completed model steps or a tool call, whose
+/// An interruption can follow completed model steps or a tool call, whose
 /// assistant text is already in history. The live answer may include that
 /// prefix, so appending it all would repeat those steps on the next request.
-fn retain_cancelled_answer(history: &mut History, start: usize, partial: &str) {
+fn retain_partial_answer(history: &mut History, start: usize, partial: &str) {
     let recorded: String = history.turns()[start..]
         .iter()
         .filter(|turn| turn.role == rune_net::message::Role::Assistant)
@@ -3869,13 +3871,13 @@ mod tests {
         history.push_assistant(vec![rune_net::message::ContentPart::Text {
             text: "STREAM-01\n".to_owned(),
         }]);
-        retain_cancelled_answer(&mut history, start, "STREAM-01\nSTREAM-02\nSTREAM-03\n");
+        retain_partial_answer(&mut history, start, "STREAM-01\nSTREAM-02\nSTREAM-03\n");
         assert_eq!(history.turns()[3].text(), "STREAM-01\n");
         assert_eq!(history.turns()[4].text(), "STREAM-02\nSTREAM-03\n");
 
         // Cancelling after text is in history, or before any arrives, adds none.
-        retain_cancelled_answer(&mut history, start, "STREAM-01\nSTREAM-02\nSTREAM-03\n");
-        retain_cancelled_answer(&mut history, start, "");
+        retain_partial_answer(&mut history, start, "STREAM-01\nSTREAM-02\nSTREAM-03\n");
+        retain_partial_answer(&mut history, start, "");
         assert_eq!(history.len(), 5);
         history
             .validate()

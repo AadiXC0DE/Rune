@@ -191,6 +191,28 @@ impl Recorder {
         Ok(())
     }
 
+    /// Records the visible answer and cause of a failed exchange.
+    ///
+    /// A failure is numbered even when no text arrived. Unknown usage is left
+    /// absent rather than recorded as a completed request with zero usage.
+    pub fn failed_turn(&mut self, partial: &str, error: &RuneError) -> Result<()> {
+        self.turn = self.turn.saturating_add(1);
+        let turn = self.turn;
+        self.store.append(SessionEvent::TurnStarted { turn })?;
+        if !partial.trim().is_empty() {
+            self.store.append(SessionEvent::AssistantMessage {
+                turn,
+                text: partial.to_owned(),
+            })?;
+        }
+        self.store.append(SessionEvent::TurnFailed {
+            turn,
+            code: error.code(),
+            message: error.message().to_owned(),
+        })?;
+        Ok(())
+    }
+
     /// Returns true when the session has no title yet.
     #[must_use]
     pub fn title_is_unset(&self) -> bool {
@@ -370,10 +392,15 @@ pub fn tree_of(state: &SessionState) -> Tree {
     let mut tree = Tree::new();
     let mut parent: Option<u64> = None;
     for frame in &state.events {
+        let failure;
         let (role, preview) = match &frame.event {
             SessionEvent::UserMessage { text } => (Role::User, text.as_str()),
             SessionEvent::AssistantMessage { text, .. } => (Role::Assistant, text.as_str()),
             SessionEvent::TurnCancelled { .. } => (Role::System, "[cancelled]"),
+            SessionEvent::TurnFailed { code, .. } => {
+                failure = format!("[failed: {code}]");
+                (Role::System, failure.as_str())
+            }
             SessionEvent::ToolResult { output, .. } => (Role::Tool, output.as_str()),
             SessionEvent::ToolCall { name, .. } => (Role::Assistant, name.as_str()),
             SessionEvent::TurnStarted { .. }
@@ -408,9 +435,16 @@ pub fn render_tree(tree: &Tree, state: &SessionState) -> String {
     let _ = writeln!(out, "session {} ({} turns)", state.id, state.turns);
 
     for branch in tree.branches() {
-        // The cancellation boundary has its own row below. Keep it out of the
+        // An interrupted boundary has its own row below. Keep it out of the
         // branch summary so an exchange ending here reports the boundary once.
-        let summary = if branch.summary == "[cancelled]" {
+        let failure_boundary = branch
+            .head_seq
+            .and_then(|seq| tree.node(seq))
+            .is_some_and(|node| {
+                node.role == rune_session::tree::Role::System
+                    && node.preview.starts_with("[failed: ")
+            });
+        let summary = if branch.summary == "[cancelled]" || failure_boundary {
             ""
         } else {
             &branch.summary
@@ -597,7 +631,8 @@ pub fn history_from(state: &SessionState) -> History {
             | SessionEvent::TitleSet { .. }
             | SessionEvent::WorkspaceSet { .. }
             | SessionEvent::ChildOf { .. }
-            | SessionEvent::TurnCancelled { .. } => {}
+            | SessionEvent::TurnCancelled { .. }
+            | SessionEvent::TurnFailed { .. } => {}
         }
     }
 
@@ -826,6 +861,96 @@ mod tests {
                 1
             );
         }
+    }
+
+    #[test]
+    fn failed_exchanges_round_trip_with_the_visible_answer_and_cause() {
+        for partial in ["", "STREAM-01\nSTREAM-02\nSTREAM-03\n"] {
+            let dir = tempfile::tempdir().expect("temp");
+            let root = Utf8Path::from_path(dir.path()).expect("utf8");
+            let paths = paths(root);
+            let key = id("sessionfffff");
+            let error = RuneError::new(
+                ErrorCode::IncompleteStream,
+                "the provider closed the stream",
+            );
+            let mut recorder = Recorder::create(&paths, &key).expect("created");
+            recorder.user_message("die").expect("wrote");
+            recorder.failed_turn(partial, &error).expect("failed");
+            drop(recorder);
+
+            let (mut recorder, history) = load(&paths, &key).expect("resumed");
+            history.validate().expect("valid replay");
+            assert_eq!(history.len(), if partial.is_empty() { 1 } else { 2 });
+            if !partial.is_empty() {
+                assert_eq!(history.turns()[1].text(), partial);
+            }
+            let state = inspect(&paths, &key).expect("inspected");
+            assert_eq!(state.turns, 1);
+            assert_eq!(state.usage.total(), 0);
+            assert!(
+                !state
+                    .events
+                    .iter()
+                    .any(|frame| matches!(frame.event, SessionEvent::UsageRecorded { .. }))
+            );
+            let failures: Vec<_> = state
+                .events
+                .iter()
+                .filter(|frame| matches!(frame.event, SessionEvent::TurnFailed { .. }))
+                .map(|frame| &frame.event)
+                .collect();
+            assert_eq!(
+                failures,
+                [&SessionEvent::TurnFailed {
+                    turn: 1,
+                    code: ErrorCode::IncompleteStream,
+                    message: error.message().to_owned(),
+                }]
+            );
+            let rendered = render_tree(&tree_of(&state), &state);
+            assert_eq!(rendered.matches("[failed: incomplete_stream]").count(), 1);
+            for line in partial.lines() {
+                assert_eq!(rendered.matches(line).count(), 1, "{rendered}");
+            }
+
+            recorder.user_message("continue").expect("wrote");
+            recorder.turn(&outcome("continued")).expect("wrote");
+            drop(recorder);
+            let state = inspect(&paths, &key).expect("inspected");
+            assert_eq!(state.turns, 2);
+            assert!(state.events.iter().any(|frame| matches!(
+                frame.event,
+                SessionEvent::AssistantMessage { turn: 2, .. }
+            )));
+            assert_eq!(
+                render_tree(&tree_of(&state), &state)
+                    .matches("[failed: incomplete_stream]")
+                    .count(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_reply_text_does_not_become_a_failure_boundary() {
+        let dir = tempfile::tempdir().expect("temp");
+        let root = Utf8Path::from_path(dir.path()).expect("utf8");
+        let paths = paths(root);
+        let key = id("sessionfffff");
+        let mut recorder = Recorder::create(&paths, &key).expect("created");
+        recorder.user_message("quote this marker").expect("wrote");
+        recorder
+            .turn(&outcome("[failed: incomplete_stream]"))
+            .expect("wrote");
+        let state = inspect(&paths, &key).expect("inspected");
+        let rendered = render_tree(&tree_of(&state), &state);
+        assert!(
+            rendered.lines().any(|line| {
+                line.starts_with("  branch ") && line.ends_with("[failed: incomplete_stream]")
+            }),
+            "{rendered}"
+        );
     }
 
     #[test]

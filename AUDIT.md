@@ -1886,7 +1886,7 @@ Resource accumulation after cancellation, session holder handover and concurrent
 - [x] R-022 | T1 | fix | providers | Serialize Chat Completions reasoning effort | acceptance: Build Auto and High compatible requests and assert reasoning_effort reaches a supporting endpoint.
 - [x] R-023 | T1 | fix | providers | Serialize Responses reasoning effort | acceptance: Build Auto and High Responses requests and assert reasoning.effort reaches the fixture.
 - [x] R-024 | T1 | fix | sessions | Persist cancellation with its visible partial answer | acceptance: Cancel after STREAM-03, resume and observe STREAM-01 through STREAM-03 plus the cancelled boundary exactly once.
-- [ ] R-025 | T1 | fix | sessions | Record provider failure with visible partial output | acceptance: Cut a provider after three deltas and observe those deltas and the failure boundary in the resumed log.
+- [x] R-025 | T1 | fix | sessions | Record provider failure with visible partial output | acceptance: Cut a provider after three deltas and observe those deltas and the failure boundary in the resumed log.
 - [ ] R-026 | T1 | fix | scripting | Save ask exchanges unless no-save is selected | acceptance: Run rune ask --json fixture, resolve its nonempty session_id and inspect the exchange; --no-save creates no session.
 - [ ] R-027 | T1 | fix | tools | Retain oversized tool results instead of discarding them | acceptance: Return output larger than max_tool_result_bytes and observe a preview plus a retrievable retained handle.
 - [ ] R-028 | T1 | feature | tools | Expose a bounded read_tool_result tool | acceptance: Read two pages of a retained fixture and reconstruct its full bytes without exceeding either response cap.
