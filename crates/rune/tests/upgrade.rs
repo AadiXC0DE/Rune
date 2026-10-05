@@ -63,6 +63,14 @@ fn upgrade(root: &std::path::Path, bytes: &[u8], expected: &str) -> Output {
         .expect("run upgrade")
 }
 
+fn staging_entries(root: &std::path::Path) -> Vec<std::ffi::OsString> {
+    std::fs::read_dir(root)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .filter(|name| name.to_string_lossy().starts_with(".rune-install-staged"))
+        .collect()
+}
+
 fn assert_refused(bytes: &[u8], expected: &str, code: &str) {
     let dir = tempfile::tempdir().expect("tempdir");
     let target = dir.path().join(MEMBER);
@@ -74,7 +82,7 @@ fn assert_refused(bytes: &[u8], expected: &str, code: &str) {
     assert!(error.starts_with(&format!("rune: {code}:")), "{error}");
     assert!(output.stdout.is_empty(), "{output:?}");
     assert_eq!(std::fs::read(target).expect("read target"), b"original");
-    assert!(!dir.path().join(".rune-install-staged").exists());
+    assert!(staging_entries(dir.path()).is_empty());
 }
 
 #[test]
@@ -97,7 +105,7 @@ fn a_verified_release_installs_the_executable_member() {
             let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
             assert_eq!(result["checksum"], digest);
             assert_eq!(result["bytes"], bytes.len());
-            assert!(!dir.path().join(".rune-install-staged").exists());
+            assert!(staging_entries(dir.path()).is_empty());
         }
     }
 }
@@ -119,6 +127,80 @@ fn upgrading_from_a_release_archive_runs_its_version_command() {
     assert!(version.status.success(), "{version:?}");
     assert_eq!(version.stdout, b"rune release-fixture\n");
     assert!(version.stderr.is_empty());
+}
+
+#[test]
+#[cfg(unix)]
+fn a_preexisting_staging_symlink_cannot_redirect_an_upgrade() {
+    use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+    let payload = b"#!/bin/sh\nprintf 'rune staging-fixture\\n'\n";
+    for bytes in [payload.to_vec(), gzip(&tar(MEMBER, payload))] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let victim = dir.path().join("victim");
+        std::fs::write(&victim, b"keep these bytes").expect("seed victim");
+        std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o640))
+            .expect("set victim permissions");
+        let staged = dir.path().join(".rune-install-staged");
+        symlink(&victim, &staged).expect("seed staging symlink");
+        let target = dir.path().join(MEMBER);
+        std::fs::write(&target, b"original").expect("seed target");
+
+        let output = upgrade(dir.path(), &bytes, &checksum(&bytes));
+        assert!(output.status.success(), "{output:?}");
+        assert!(output.stderr.is_empty(), "{output:?}");
+        assert_eq!(std::fs::read(&victim).unwrap(), b"keep these bytes");
+        assert_eq!(
+            std::fs::metadata(&victim).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+        assert_eq!(std::fs::read_link(&staged).unwrap(), victim);
+        assert!(std::fs::symlink_metadata(&target).unwrap().is_file());
+        assert_eq!(std::fs::read(&target).unwrap(), payload);
+        assert_eq!(staging_entries(dir.path()), [".rune-install-staged"]);
+    }
+}
+
+#[test]
+fn a_preexisting_staging_file_is_preserved() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let staged = dir.path().join(".rune-install-staged");
+    std::fs::write(&staged, b"another install owns this file").expect("seed staging file");
+    let bytes = b"new binary";
+
+    let output = upgrade(dir.path(), bytes, &checksum(bytes));
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(std::fs::read(dir.path().join(MEMBER)).unwrap(), bytes);
+    assert_eq!(
+        std::fs::read(&staged).unwrap(),
+        b"another install owns this file"
+    );
+    assert_eq!(staging_entries(dir.path()), [".rune-install-staged"]);
+}
+
+#[test]
+fn a_failed_replacement_cleans_up_only_its_own_staging_file() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    // Renaming a regular staging file over a nonempty directory must fail.
+    let target = dir.path().join(MEMBER);
+    std::fs::create_dir(&target).expect("seed target directory");
+    let original = target.join("original");
+    std::fs::write(&original, b"keep these bytes").expect("seed original");
+    let staged = dir.path().join(".rune-install-staged");
+    std::fs::write(&staged, b"another install owns this file").expect("seed staging file");
+    let bytes = b"new binary";
+
+    let output = upgrade(dir.path(), bytes, &checksum(bytes));
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(output.stdout.is_empty(), "{output:?}");
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(error.starts_with("rune: permission_denied:"), "{error}");
+    assert_eq!(std::fs::read(&original).unwrap(), b"keep these bytes");
+    assert_eq!(
+        std::fs::read(&staged).unwrap(),
+        b"another install owns this file"
+    );
+    assert_eq!(staging_entries(dir.path()), [".rune-install-staged"]);
 }
 
 #[test]

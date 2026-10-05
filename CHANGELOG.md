@@ -18,6 +18,8 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Security
 
+- `rune upgrade` creates a unique staging file exclusively, so a preexisting
+  staging symlink cannot overwrite another file or become the installed binary.
 - Commands receive an allowlisted environment and no longer inherit the
   provider credential. They run with CPU, process, and file size ceilings.
 - A sandboxed command can no longer read or write the credential stores under
