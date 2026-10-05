@@ -1884,7 +1884,7 @@ Resource accumulation after cancellation, session holder handover and concurrent
 - [x] R-020 | T1 | fix | web | Validate the resolved web destination before connecting | acceptance: A hostname resolving to loopback must be refused before HTTP, while a permitted public destination connects to the vetted address rather than resolving again unchecked.
 - [x] R-021 | T1 | fix | providers | Serialize Anthropic reasoning effort | acceptance: Build Auto and High Anthropic requests and assert the provider-supported thinking fields differ as specified.
 - [x] R-022 | T1 | fix | providers | Serialize Chat Completions reasoning effort | acceptance: Build Auto and High compatible requests and assert reasoning_effort reaches a supporting endpoint.
-- [ ] R-023 | T1 | fix | providers | Serialize Responses reasoning effort | acceptance: Build Auto and High Responses requests and assert reasoning.effort reaches the fixture.
+- [x] R-023 | T1 | fix | providers | Serialize Responses reasoning effort | acceptance: Build Auto and High Responses requests and assert reasoning.effort reaches the fixture.
 - [ ] R-024 | T1 | fix | sessions | Persist cancellation with its visible partial answer | acceptance: Cancel after STREAM-03, resume and observe STREAM-01 through STREAM-03 plus the cancelled boundary exactly once.
 - [ ] R-025 | T1 | fix | sessions | Record provider failure with visible partial output | acceptance: Cut a provider after three deltas and observe those deltas and the failure boundary in the resumed log.
 - [ ] R-026 | T1 | fix | scripting | Save ask exchanges unless no-save is selected | acceptance: Run rune ask --json fixture, resolve its nonempty session_id and inspect the exchange; --no-save creates no session.

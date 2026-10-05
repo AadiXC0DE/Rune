@@ -39,6 +39,8 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Fixed
 
+- Responses requests now send explicit reasoning effort as `reasoning.effort`.
+  Auto keeps provider defaults.
 - Chat Completions requests now send explicit reasoning effort as
   `reasoning_effort` to compatible endpoints. Auto keeps provider defaults.
 - Anthropic requests now serialize reasoning effort for models that support
