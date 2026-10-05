@@ -1882,7 +1882,7 @@ Resource accumulation after cancellation, session holder handover and concurrent
 - [x] R-018 | T1 | fix | config | Align the web default with the documented opt-in | acceptance: With no web setting, the documented opt-in behavior must refuse a fixture web call; explicitly enabling web_tools must allow that same permitted fixture call.
 - [ ] R-019 | T1 | fix | web | Reject abbreviated private IPv4 addresses | acceptance: Fetch 127.1, 127.0.1 and 10.1 without a private grant and observe zero backend calls.
 - [ ] R-020 | T1 | fix | web | Validate the resolved web destination before connecting | acceptance: A hostname resolving to loopback must be refused before HTTP, while a permitted public destination connects to the vetted address rather than resolving again unchecked.
-- [ ] R-021 | T1 | fix | providers | Serialize Anthropic reasoning effort | acceptance: Build Auto and High Anthropic requests and assert the provider-supported thinking fields differ as specified.
+- [x] R-021 | T1 | fix | providers | Serialize Anthropic reasoning effort | acceptance: Build Auto and High Anthropic requests and assert the provider-supported thinking fields differ as specified.
 - [ ] R-022 | T1 | fix | providers | Serialize Chat Completions reasoning effort | acceptance: Build Auto and High compatible requests and assert reasoning_effort reaches a supporting endpoint.
 - [ ] R-023 | T1 | fix | providers | Serialize Responses reasoning effort | acceptance: Build Auto and High Responses requests and assert reasoning.effort reaches the fixture.
 - [ ] R-024 | T1 | fix | sessions | Persist cancellation with its visible partial answer | acceptance: Cancel after STREAM-03, resume and observe STREAM-01 through STREAM-03 plus the cancelled boundary exactly once.

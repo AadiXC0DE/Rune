@@ -6,6 +6,7 @@
 //! field, tool calls and results are content blocks, and a response may carry
 //! thinking blocks that must be replayed with the assistant turn.
 
+use rune_core::config::Effort;
 use rune_core::error::{Result, RuneError};
 use rune_core::id::ToolCallId;
 
@@ -22,9 +23,11 @@ pub const NAME: &str = "anthropic";
 /// Path appended to the endpoint base URL.
 pub const PATH: &str = "/v1/messages";
 
-/// Default output ceiling.
+/// Default output ceiling without extended thinking.
 ///
 /// The field is required, so a plan without one still produces a valid request.
+/// With extended thinking, the fallback also includes the thinking budget so
+/// this many tokens remain available for the reply.
 pub const DEFAULT_MAX_TOKENS: u64 = 8192;
 
 /// The dialect.
@@ -56,14 +59,44 @@ impl Provider for Anthropic {
             merge_adjacent(&mut messages, encoded);
         }
 
+        let requested_budget = thinking_budget(plan.effort);
+        let max_tokens = plan
+            .max_output_tokens
+            .unwrap_or(DEFAULT_MAX_TOKENS.saturating_add(requested_budget.unwrap_or_default()));
         let mut body = serde_json::Map::new();
         body.insert("model".to_owned(), serde_json::json!(plan.model));
-        body.insert(
-            "max_tokens".to_owned(),
-            serde_json::json!(plan.max_output_tokens.unwrap_or(DEFAULT_MAX_TOKENS)),
-        );
+        body.insert("max_tokens".to_owned(), serde_json::json!(max_tokens));
         body.insert("stream".to_owned(), serde_json::json!(true));
         body.insert("messages".to_owned(), serde_json::Value::Array(messages));
+
+        if let Some(budget) = requested_budget {
+            // Manual thinking needs at least 1024 tokens and a budget strictly
+            // below the total output ceiling. Keep an explicit ceiling intact.
+            if max_tokens <= 1024 {
+                return Err(RuneError::invalid_field(
+                    "max_output_tokens",
+                    "extended thinking requires an output ceiling of at least 1025 tokens",
+                ));
+            }
+            if plan.has_tools() && plan.tool_choice == ToolChoice::Required {
+                return Err(RuneError::invalid_field(
+                    "tool_choice",
+                    "forced tool use is incompatible with extended thinking",
+                ));
+            }
+            body.insert(
+                "thinking".to_owned(),
+                serde_json::json!({
+                    "type": "enabled",
+                    "budget_tokens": budget.min(max_tokens.saturating_sub(1)),
+                }),
+            );
+        } else if plan.effort == Effort::None {
+            body.insert(
+                "thinking".to_owned(),
+                serde_json::json!({ "type": "disabled" }),
+            );
+        }
 
         if !plan.instructions.is_empty() {
             body.insert("system".to_owned(), serde_json::json!(plan.instructions));
@@ -248,13 +281,12 @@ fn merge_adjacent(messages: &mut Vec<serde_json::Value>, encoded: serde_json::Va
     messages.push(encoded);
 }
 
-/// Maps a reasoning effort onto the dialect's thinking budget.
+/// Maps a reasoning effort onto the dialect's manual thinking budget.
 ///
-/// The endpoint takes a token budget rather than a label, so the label is
-/// translated into a budget.
+/// Models supporting manual extended thinking take a token budget rather than
+/// a label. Request serialization bounds it by any explicit output ceiling.
 #[must_use]
-pub fn thinking_budget(effort: rune_core::config::Effort) -> Option<u64> {
-    use rune_core::config::Effort;
+pub fn thinking_budget(effort: Effort) -> Option<u64> {
     match effort {
         Effort::Auto | Effort::None => None,
         Effort::Minimal => Some(1024),
@@ -656,6 +688,7 @@ mod tests {
     use super::*;
     use crate::message::ToolSpec;
     use crate::stream::ProviderEvent;
+    use rune_core::config::Effort;
     use rune_core::error::ErrorCode;
 
     fn plan_with_user(text: &str) -> RequestPlan {
@@ -698,6 +731,115 @@ mod tests {
         plan.max_output_tokens = Some(1024);
         let body = Anthropic.build_request(&plan).expect("build");
         assert_eq!(body["max_tokens"], 1024);
+    }
+
+    #[test]
+    fn auto_and_high_requests_have_distinct_thinking_settings() {
+        let mut plan = plan_with_user("hi");
+        let auto = Anthropic.build_request(&plan).expect("auto request");
+        plan.effort = Effort::High;
+        let high = Anthropic.build_request(&plan).expect("high request");
+
+        assert_ne!(auto, high);
+        assert!(auto.get("thinking").is_none());
+        assert_eq!(auto["max_tokens"], 8192);
+        assert_eq!(
+            high["thinking"],
+            serde_json::json!({ "type": "enabled", "budget_tokens": 16_384 })
+        );
+        assert_eq!(high["max_tokens"], 24_576);
+        assert_eq!(auto["messages"], high["messages"]);
+        assert_eq!(auto["system"], high["system"]);
+    }
+
+    #[test]
+    fn none_effort_explicitly_disables_thinking() {
+        let mut plan = plan_with_user("hi");
+        plan.effort = Effort::None;
+        plan.max_output_tokens = Some(1024);
+        let body = Anthropic.build_request(&plan).expect("build");
+        assert_eq!(body["thinking"], serde_json::json!({ "type": "disabled" }));
+        assert_eq!(body["max_tokens"], 1024);
+    }
+
+    #[test]
+    fn positive_efforts_serialize_manual_thinking_budgets() {
+        for (effort, budget) in [
+            (Effort::Minimal, 1024),
+            (Effort::Low, 2048),
+            (Effort::Medium, 8192),
+            (Effort::High, 16_384),
+            (Effort::Xhigh, 32_768),
+            (Effort::Max, 65_536),
+        ] {
+            let mut plan = plan_with_user("hi");
+            plan.effort = effort;
+            let body = Anthropic.build_request(&plan).expect("build");
+            assert_eq!(
+                body["thinking"],
+                serde_json::json!({ "type": "enabled", "budget_tokens": budget }),
+                "{effort}"
+            );
+            assert_eq!(body["max_tokens"], budget + 8192, "{effort}");
+        }
+    }
+
+    #[test]
+    fn thinking_respects_explicit_output_ceilings() {
+        let mut plan = plan_with_user("hi");
+        plan.effort = Effort::High;
+        for (ceiling, budget) in [
+            (1025, 1024),
+            (4096, 4095),
+            (16_384, 16_383),
+            (32_768, 16_384),
+            (u64::MAX, 16_384),
+        ] {
+            plan.max_output_tokens = Some(ceiling);
+            let body = Anthropic.build_request(&plan).expect("build");
+            assert_eq!(body["max_tokens"], ceiling);
+            assert_eq!(body["thinking"]["budget_tokens"], budget);
+        }
+
+        for ceiling in [0, 1023, 1024] {
+            plan.max_output_tokens = Some(ceiling);
+            let err = Anthropic.build_request(&plan).expect_err("too little room");
+            assert_eq!(err.code(), ErrorCode::InvalidField);
+            assert_eq!(err.detail().field.as_deref(), Some("max_output_tokens"));
+        }
+    }
+
+    #[test]
+    fn manual_thinking_rejects_forced_tool_use() {
+        let mut plan = plan_with_user("hi");
+        plan.effort = Effort::High;
+        plan.tools = vec![ToolSpec {
+            name: "t".to_owned(),
+            description: "d".to_owned(),
+            input_schema: serde_json::json!({ "type": "object" }),
+        }];
+
+        // Both supported tool choices still serialize alongside thinking.
+        for choice in [ToolChoice::Auto, ToolChoice::None] {
+            plan.tool_choice = choice;
+            let body = Anthropic.build_request(&plan).expect("build");
+            assert_eq!(body["thinking"]["type"], "enabled");
+            assert_eq!(body["tools"][0]["name"], "t");
+        }
+
+        plan.tool_choice = ToolChoice::Required;
+        let err = Anthropic
+            .build_request(&plan)
+            .expect_err("incompatible choice");
+        assert_eq!(err.code(), ErrorCode::InvalidField);
+        assert_eq!(err.detail().field.as_deref(), Some("tool_choice"));
+
+        // Forced tool use still works when extended thinking is not enabled.
+        for effort in [Effort::Auto, Effort::None] {
+            plan.effort = effort;
+            let body = Anthropic.build_request(&plan).expect("build");
+            assert_eq!(body["tool_choice"], serde_json::json!({ "type": "any" }));
+        }
     }
 
     #[test]

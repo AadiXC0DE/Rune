@@ -34,6 +34,9 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Fixed
 
+- Anthropic requests now serialize reasoning effort for models that support
+  manual extended thinking. Auto keeps provider defaults, None disables thinking,
+  and explicit output ceilings bound the thinking budget without being raised.
 - Web fetch and search are disabled by default, matching the documented opt-in.
   Set `web_tools = true` or `RUNE_WEB_TOOLS=true` to enable them; offline mode
   still refuses outbound requests.
