@@ -34,6 +34,8 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Fixed
 
+- Transcript text wraps to fit narrow terminals, preserving long words and
+  their complete endings when finished answers enter scrollback.
 - Completion and model menus shrink to fit the terminal height while keeping
   the highlighted choice visible. Closing a menu clears its rows without
   moving the prompt's caret off its row.

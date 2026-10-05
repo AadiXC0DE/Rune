@@ -342,8 +342,10 @@ pub fn render_lanes(entries: &[Entry], display: Display, lanes: &Lanes) -> Strin
 
 /// Renders one entry into `out`.
 fn render_entry(entry: &Entry, display: Display, lanes: &Lanes, out: &mut String) {
-    let width = display.width.max(MIN_WIDTH);
-    let body = wrap(&sanitize(&entry.text), width.saturating_sub(2));
+    // Reserve the lane's two marker columns without widening a narrow terminal:
+    // the inline renderer clips any overflow, permanently losing those bytes.
+    let width = display.width.saturating_sub(2).max(MIN_WIDTH);
+    let body = wrap(&sanitize(&entry.text), width);
 
     match entry.speaker {
         Speaker::User => {
@@ -385,8 +387,8 @@ fn render_entry(entry: &Entry, display: Display, lanes: &Lanes, out: &mut String
     }
 }
 
-/// Narrowest body a transcript renders at.
-pub const MIN_WIDTH: usize = 20;
+/// Minimum nonzero text width used by transcript wrapping.
+pub const MIN_WIDTH: usize = 1;
 
 /// Removes control sequences a terminal would act on.
 ///
@@ -700,9 +702,10 @@ mod tests {
         };
         let rendered = render(&[Entry::assistant("hello world")], display);
         assert!(!rendered.is_empty());
-        // The minimum width applies rather than a zero-width layout.
+        // Even below the space reserved for markers, the answer uses the
+        // terminal's actual width rather than overflowing and being clipped.
         for line in rendered.lines() {
-            assert!(str_width(line) <= MIN_WIDTH, "{line:?}");
+            assert!(str_width(line) <= display.width, "{line:?}");
         }
     }
 
