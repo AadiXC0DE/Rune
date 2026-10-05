@@ -32,6 +32,8 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Fixed
 
+- `rune upgrade` verifies a release tar.gz before extracting its single Rune
+  executable, so upgrading from a staged release installs a runnable binary.
 - Structured questions in terminal sessions now collect choices with the arrow
   keys and Enter, then send the selected answers to the model. Escape or
   Control-C cancels the waiting turn; piped sessions still report input unavailable.

@@ -7,10 +7,14 @@
 //!
 //! A local artifact installs without any network access, which is what makes the
 //! same code path usable on a machine that has none.
+//! Release archives are verified as downloaded, then decoded to their single
+//! regular `rune` (`rune.exe` on Windows) member before staging. Raw binaries are
+//! still accepted.
 
 use camino::{Utf8Path, Utf8PathBuf};
 use rune_core::error::{ErrorCode, Result, RuneError};
 use sha2::{Digest, Sha256};
+use std::io::Read as _;
 
 /// Largest artifact accepted, in bytes.
 pub const MAX_ARTIFACT_BYTES: u64 = 512 * 1024 * 1024;
@@ -135,6 +139,115 @@ pub fn digest_of(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
+/// Decodes only the single-file tar format used by release staging. No archive
+/// path is ever used as a filesystem destination.
+fn release_binary(bytes: &[u8]) -> Result<std::borrow::Cow<'_, [u8]>> {
+    const MAX_TRAILER_BYTES: u64 = 20 * 512;
+
+    if !bytes.starts_with(&[0x1f, 0x8b]) {
+        return Ok(std::borrow::Cow::Borrowed(bytes));
+    }
+
+    let mut decoder = flate2::bufread::GzDecoder::new(bytes);
+    let mut header = [0_u8; 512];
+    decoder
+        .read_exact(&mut header)
+        .map_err(|err| archive_read_error(&err))?;
+    let checksum: u64 = header
+        .iter()
+        .enumerate()
+        .map(|(index, byte)| {
+            if (148..156).contains(&index) {
+                u64::from(b' ')
+            } else {
+                u64::from(*byte)
+            }
+        })
+        .sum();
+    if tar_octal(&header[148..156])? != checksum {
+        return Err(invalid_archive("the tar header checksum does not match"));
+    }
+
+    let name = if cfg!(windows) { "rune.exe" } else { "rune" };
+    if !header[..100]
+        .strip_prefix(name.as_bytes())
+        .is_some_and(|suffix| suffix.iter().all(|byte| *byte == 0))
+        || header[345..500].iter().any(|byte| *byte != 0)
+        || header[157..257].iter().any(|byte| *byte != 0)
+        || !matches!(header[156], 0 | b'0')
+    {
+        return Err(invalid_archive(format!(
+            "expected a single regular `{name}` member at the archive root"
+        )));
+    }
+
+    let size = tar_octal(&header[124..136])?;
+    if size == 0 {
+        return Err(invalid_archive("the executable member is empty"));
+    }
+    if size > MAX_ARTIFACT_BYTES {
+        return Err(RuneError::too_large(
+            "archive executable",
+            usize::try_from(size).unwrap_or(usize::MAX),
+            usize::try_from(MAX_ARTIFACT_BYTES).unwrap_or(usize::MAX),
+        ));
+    }
+    let mut binary = Vec::new();
+    decoder
+        .by_ref()
+        .take(size)
+        .read_to_end(&mut binary)
+        .map_err(|err| archive_read_error(&err))?;
+    if binary.len() as u64 != size {
+        return Err(invalid_archive("the executable member is truncated"));
+    }
+
+    let padding = (512_u64.saturating_sub(size % 512) % 512) as usize;
+    let mut block = [0_u8; 512];
+    decoder
+        .read_exact(&mut block[..padding])
+        .map_err(|err| archive_read_error(&err))?;
+    if block[..padding].iter().any(|byte| *byte != 0) {
+        return Err(invalid_archive("the executable padding is not zero"));
+    }
+
+    // Require both end blocks and allow conventional tar record padding. Bound
+    // this read too, so compressed zeroes cannot cause unbounded allocation.
+    let mut trailer = Vec::new();
+    decoder
+        .by_ref()
+        .take(MAX_TRAILER_BYTES.saturating_add(1))
+        .read_to_end(&mut trailer)
+        .map_err(|err| archive_read_error(&err))?;
+    if trailer.len() < 1024
+        || trailer.len() as u64 > MAX_TRAILER_BYTES
+        || trailer.len() % 512 != 0
+        || trailer.iter().any(|byte| *byte != 0)
+        || !decoder.get_ref().is_empty()
+    {
+        return Err(invalid_archive(
+            "expected only tar end blocks after the executable member",
+        ));
+    }
+    Ok(std::borrow::Cow::Owned(binary))
+}
+
+fn tar_octal(field: &[u8]) -> Result<u64> {
+    let text = std::str::from_utf8(field)
+        .map_err(|_| invalid_archive("a tar numeric field is not ASCII"))?
+        .trim_matches(['\0', ' ']);
+    u64::from_str_radix(text, 8)
+        .map_err(|_| invalid_archive("a tar numeric field is not valid octal"))
+}
+
+fn invalid_archive(message: impl Into<String>) -> RuneError {
+    RuneError::invalid_field("archive", message)
+}
+
+fn archive_read_error(error: &std::io::Error) -> RuneError {
+    invalid_archive(format!("the release archive could not be decoded: {error}"))
+}
+
 /// Replaces the binary at `target` with a verified artifact.
 ///
 /// The staged file is written beside the target and renamed over it, so a crash
@@ -143,6 +256,7 @@ pub fn digest_of(bytes: &[u8]) -> String {
 /// is not an installed binary.
 pub fn install(target: &Utf8Path, artifact: &Artifact, expected: &str) -> Result<()> {
     artifact.verify(expected)?;
+    let binary = release_binary(&artifact.bytes)?;
 
     let parent = target.parent().ok_or_else(|| {
         RuneError::invalid_field("target", format!("`{target}` has no parent directory"))
@@ -151,7 +265,7 @@ pub fn install(target: &Utf8Path, artifact: &Artifact, expected: &str) -> Result
 
     // Written first, then checked, then renamed. A failure at any point before
     // the rename leaves the original untouched.
-    let written = write_staged(&staged, &artifact.bytes);
+    let written = write_staged(&staged, &binary);
     if let Err(err) = written {
         let _ = std::fs::remove_file(&staged);
         return Err(err);
