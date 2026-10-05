@@ -874,7 +874,10 @@ fn run_one<W: Write + Send + 'static>(server: &Arc<Server<W>>, queued: Queued) {
         session: session.clone(),
         config: snapshot.config.clone(),
         rules: Mutex::new(snapshot.rules),
-        context: snapshot.context.clone(),
+        context: snapshot
+            .context
+            .clone()
+            .with_offline(server.config.endpoint.offline),
         cancellation: cancellation.clone(),
         steering: snapshot.steering,
         tools: server.config.registry.all_schemas(),

@@ -152,6 +152,8 @@ pub struct ExecutionContext {
     pub additional_roots: Vec<Utf8PathBuf>,
     /// Whether the tool was permitted to reach outside the roots.
     pub external_access: bool,
+    /// Whether shell network access is disabled, even with external access.
+    pub offline: bool,
     /// Whether a command may run without a sandbox.
     ///
     /// Separate from reaching outside the workspace: a host with no usable
@@ -172,6 +174,7 @@ impl ExecutionContext {
             workspace,
             additional_roots: Vec::new(),
             external_access: false,
+            offline: false,
             allow_unsandboxed: false,
             max_output_bytes: 64 * 1024,
             cancelled: Arc::new(AtomicBool::new(false)),
@@ -189,6 +192,13 @@ impl ExecutionContext {
     #[must_use]
     pub const fn with_external_access(mut self, allowed: bool) -> Self {
         self.external_access = allowed;
+        self
+    }
+
+    /// Sets offline mode for shell network policy.
+    #[must_use]
+    pub const fn with_offline(mut self, offline: bool) -> Self {
+        self.offline = offline;
         self
     }
 
@@ -216,6 +226,7 @@ impl ExecutionContext {
             workspace: self.workspace.clone(),
             additional_roots: self.additional_roots.clone(),
             external_access: self.external_access,
+            offline: self.offline,
             allow_unsandboxed: self.allow_unsandboxed,
             max_output_bytes: self.max_output_bytes,
             cancelled: Arc::clone(&self.cancelled),

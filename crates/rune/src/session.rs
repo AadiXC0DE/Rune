@@ -1091,6 +1091,7 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
         fast_mode: config.settings.fast_mode,
         limits: limits.clone(),
         context: ExecutionContext::new(config.workspace.clone())
+            .with_offline(config.settings.offline)
             .with_allow_unsandboxed(config.settings.allow_unsandboxed),
         registry: config.registry,
         cancellation: config.questions.cancellation.clone(),

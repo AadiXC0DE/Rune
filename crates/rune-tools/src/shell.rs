@@ -500,6 +500,15 @@ fn session_id(started: u64) -> String {
     format!("shell-{}-{started}", std::process::id())
 }
 
+/// Carries the context's grants and offline restriction into the sandbox.
+fn sandbox_policy(context: &ExecutionContext) -> rune_exec::SandboxPolicy {
+    rune_exec::SandboxPolicy::new(
+        context.workspace.clone(),
+        context.additional_roots.clone(),
+        context.external_access && !context.offline,
+    )
+}
+
 /// Starts a command in a process group of its own, under the host sandbox.
 ///
 /// The command string is prepared first so the argv that runs is the one that
@@ -523,14 +532,7 @@ fn start(
     let environment = rune_exec::minimal_environment();
     let prepared =
         rune_exec::command::prepare_shell(command, workspace, None, environment.clone())?;
-    let policy = rune_exec::SandboxPolicy::new(
-        context.workspace.clone(),
-        context.additional_roots.clone(),
-        // The tool layer is not a policy decider: whether a command may reach
-        // the network is settled before it runs, so the sandbox mirrors the
-        // context rather than choosing.
-        context.external_access,
-    );
+    let policy = sandbox_policy(context);
     // Reaching outside the workspace and skipping the sandbox are different
     // questions, so the second is read from its own field rather than borrowed
     // from the first.
@@ -1735,6 +1737,85 @@ mod tests {
             !unsandboxed.external_access,
             "skipping the sandbox also permitted paths outside the workspace"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn offline_shell_policy_restricts_network_even_with_external_access() {
+        use rune_exec::Sandbox;
+
+        let (_dir, context) = workspace();
+        let backend = rune_exec::LinuxSandbox::with_helper(Utf8PathBuf::from("/usr/bin/bwrap"));
+        let prepared = rune_exec::command::prepare_shell(
+            "printf probe",
+            &context.workspace,
+            None,
+            rune_exec::minimal_environment(),
+        )
+        .expect("prepare");
+        for (external_access, offline, restricted) in [
+            (false, false, true),
+            (false, true, true),
+            (true, false, false),
+            (true, true, true),
+        ] {
+            let context = context
+                .fork()
+                .with_external_access(external_access)
+                .with_offline(offline)
+                .fork();
+            let wrapped = backend
+                .wrap(&prepared, &sandbox_policy(&context), false)
+                .expect("wrap");
+            assert_eq!(
+                wrapped.argv.iter().any(|arg| arg == "--unshare-net"),
+                restricted,
+                "external_access={external_access}, offline={offline}"
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_offline_full_access_shell_cannot_reach_a_local_fixture() {
+        use std::io::Read;
+        use std::net::TcpListener;
+
+        let backend = rune_exec::detect();
+        if !backend.support().is_full() {
+            eprintln!("skipping live Linux sandbox test: {:?}", backend.support());
+            return;
+        }
+        let dir = tempfile::tempdir().expect("workspace");
+        let root = Utf8Path::from_path(dir.path()).expect("utf8");
+        let context = ExecutionContext::new(root.to_owned()).with_external_access(true);
+        let listener = TcpListener::bind("127.0.0.1:0").expect("fixture");
+        listener.set_nonblocking(true).expect("nonblocking");
+        let port = listener.local_addr().expect("address").port();
+        let arguments = serde_json::json!({
+            "action": "run",
+            "command": format!(
+                "printf 'SHELL_STARTED\\n'; /bin/bash -c 'printf FIXTURE_DATA > /dev/tcp/127.0.0.1/{port}'"
+            ),
+            "yield_time_ms": 2_000,
+        });
+        let tool = shell(4, TEST_CAP);
+
+        // The online control proves the command reaches this fixture.
+        text(&tool, &context, &arguments);
+        let (mut stream, _) = listener.accept().expect("online connection");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("read deadline");
+        let mut received = String::new();
+        stream.read_to_string(&mut received).expect("fixture data");
+        assert_eq!(received, "FIXTURE_DATA");
+
+        let output = call(&tool, &context.with_offline(true).fork(), &arguments);
+        assert!(output.is_error, "{}", output.text);
+        assert!(output.text.contains("SHELL_STARTED"), "{}", output.text);
+        let error = listener.accept().expect_err("offline opened no connection");
+        assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
     }
 
     #[test]

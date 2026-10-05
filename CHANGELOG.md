@@ -34,6 +34,8 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Fixed
 
+- Offline mode disables sandboxed shell networking even when external access
+  is granted.
 - The user configuration accepts `offline = true` and enforces offline mode
   without discarding the other settings in the file. `RUNE_OFFLINE` still takes
   precedence over the file setting.
