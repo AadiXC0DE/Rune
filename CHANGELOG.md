@@ -30,6 +30,8 @@ Notable changes, newest first. Each entry describes what a user can observe.
 - A shell rule is judged against every command a line runs, so `ls; rm -rf .git`
   no longer matches an allow for `ls*`.
 - Web fetch checks every redirect hop before following it.
+- Web fetch refuses abbreviated private IPv4 addresses such as `127.1`,
+  `127.0.1`, and `10.1` before calling the backend, unless `allow_private` is true.
 - Model output is stripped of terminal control sequences while it streams.
 
 ### Fixed

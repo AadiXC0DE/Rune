@@ -448,7 +448,8 @@ fn is_local_v4(octets: [u8; 4]) -> bool {
 }
 
 /// Parses an IPv4 address, accepting the decimal, octal, and hexadecimal
-/// spellings of each part and the single-integer form.
+/// spellings of each part and forms with one through four parts. In abbreviated
+/// forms, the last part fills the remaining bits: 24 for two parts, 16 for three.
 fn parse_ipv4(text: &str) -> Option<[u8; 4]> {
     let parts = text
         .split('.')
@@ -456,6 +457,10 @@ fn parse_ipv4(text: &str) -> Option<[u8; 4]> {
         .collect::<Option<Vec<u32>>>()?;
     match parts.as_slice() {
         [single] => Some(single.to_be_bytes()),
+        [a, b] if *a <= 0xff && *b <= 0x00ff_ffff => Some(((*a << 24) | *b).to_be_bytes()),
+        [a, b, c] if *a <= 0xff && *b <= 0xff && *c <= 0xffff => {
+            Some(((*a << 24) | (*b << 16) | *c).to_be_bytes())
+        }
         [a, b, c, d] => Some([
             u8::try_from(*a).ok()?,
             u8::try_from(*b).ok()?,
@@ -1732,6 +1737,138 @@ mod tests {
         ] {
             let err = check_target(url, false).expect_err("refused");
             assert_eq!(err.code(), ErrorCode::PermissionDenied, "{url}: {err}");
+        }
+    }
+
+    #[test]
+    fn abbreviated_private_addresses_are_refused_before_the_backend_is_called() {
+        let backend = Arc::new(RecordingBackend::new());
+        let tool = fetch_with(backend.clone(), &budget());
+
+        for host in [
+            "127.1",
+            "127.0.1",
+            "10.1",
+            "172.16.1",
+            "192.168.257",
+            "169.254.43518",
+            "0177.01",
+            "0177.0.01",
+            "0x7f.0x1",
+            "0x7f.0.0x1",
+        ] {
+            let url = format!("http://{host}/");
+            for arguments in [
+                serde_json::json!({ "url": url }),
+                serde_json::json!({ "url": url, "allow_private": false }),
+            ] {
+                backend.push(fetched(200, "text/plain", "private answer"));
+                let err = call(&tool, &arguments).expect_err("refused before fetching");
+                assert_eq!(err.code(), ErrorCode::PermissionDenied, "{host}: {err}");
+                assert!(backend.requests().is_empty(), "{host} reached the backend");
+            }
+        }
+    }
+
+    #[test]
+    fn abbreviated_ipv4_parts_fill_the_remaining_address_bytes() {
+        for (host, octets) in [
+            ("127.1", [127, 0, 0, 1]),
+            ("127.0.1", [127, 0, 0, 1]),
+            ("10.65537", [10, 1, 0, 1]),
+            ("172.16.257", [172, 16, 1, 1]),
+            ("0177.01", [127, 0, 0, 1]),
+            ("0x7f.0x1", [127, 0, 0, 1]),
+            ("0177.0.0401", [127, 0, 1, 1]),
+            ("0x7f.0.0x101", [127, 0, 1, 1]),
+            ("255.16777215", [255, 255, 255, 255]),
+            ("255.255.65535", [255, 255, 255, 255]),
+        ] {
+            assert_eq!(parse_ipv4(host), Some(octets), "{host}");
+        }
+    }
+
+    #[test]
+    fn abbreviated_ipv4_parts_must_fit_their_address_bytes() {
+        for host in [
+            "256.1",
+            "1.16777216",
+            "256.1.1",
+            "1.256.1",
+            "1.1.65536",
+            "0x100.1",
+            "1.0x1000000",
+            "1.1.0x10000",
+            "1.",
+            "1..1",
+            "1.2.3.4.5",
+            "127.example",
+        ] {
+            assert!(parse_ipv4(host).is_none(), "{host} parsed");
+        }
+    }
+
+    #[test]
+    fn abbreviated_public_addresses_still_reach_the_backend() {
+        let backend = Arc::new(RecordingBackend::new());
+        let tool = fetch_with(backend.clone(), &budget());
+
+        for host in [
+            "8.8",
+            "8.8.8",
+            "010.010",
+            "010.010.010",
+            "0x8.0x8",
+            "0x8.0x8.0x8",
+        ] {
+            let url = format!("http://{host}/");
+            backend.push(fetched(200, "text/plain", "public answer"));
+            let output = call(&tool, &serde_json::json!({ "url": url })).expect("accepted");
+            assert!(!output.is_error, "{host}: {}", output.text);
+            assert!(
+                output.text.contains("public answer"),
+                "{host}: {}",
+                output.text
+            );
+            assert_eq!(backend.requests().last().expect("requested").0, url);
+        }
+    }
+
+    #[test]
+    fn abbreviated_private_addresses_still_accept_the_private_opt_in() {
+        let backend = Arc::new(RecordingBackend::new());
+        let tool = fetch_with(backend.clone(), &budget());
+
+        for host in ["127.1", "127.0.1", "10.1"] {
+            let url = format!("http://{host}/");
+            backend.push(fetched(200, "text/plain", "private answer"));
+            let output = call(
+                &tool,
+                &serde_json::json!({ "url": url, "allow_private": true }),
+            )
+            .expect("accepted with opt-in");
+            assert!(!output.is_error, "{host}: {}", output.text);
+            assert!(
+                output.text.contains("private answer"),
+                "{host}: {}",
+                output.text
+            );
+            assert_eq!(backend.requests().last().expect("requested").0, url);
+        }
+    }
+
+    #[test]
+    fn redirects_to_abbreviated_private_addresses_are_refused_before_fetching_them() {
+        for host in ["127.1", "127.0.1", "10.1"] {
+            let backend = Arc::new(RecordingBackend::new());
+            backend.push(redirect(302, &format!("http://{host}/")));
+            backend.push(fetched(200, "text/plain", "private answer"));
+            let tool = fetch_with(backend.clone(), &budget());
+
+            let err = call(&tool, &serde_json::json!({ "url": "https://example.com/" }))
+                .expect_err("refused before fetching the redirect");
+            assert_eq!(err.code(), ErrorCode::PermissionDenied, "{host}: {err}");
+            assert_eq!(requested(&backend), vec!["https://example.com/"]);
         }
     }
 
