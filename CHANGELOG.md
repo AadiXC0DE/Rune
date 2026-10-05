@@ -34,6 +34,9 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Fixed
 
+- Completion and model menus shrink to fit the terminal height while keeping
+  the highlighted choice visible. Closing a menu clears its rows without
+  moving the prompt's caret off its row.
 - `rune upgrade` verifies a release tar.gz before extracting its single Rune
   executable, so upgrading from a staged release installs a runnable binary.
 - Structured questions in terminal sessions now collect choices with the arrow

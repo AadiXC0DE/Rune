@@ -853,6 +853,15 @@ impl SessionHost {
             .collect()
     }
 
+    /// Rows left below the one-line prompt, including menu headings and hints.
+    fn menu_room(&self) -> usize {
+        self.refresh_size();
+        usize::from(self.height.load(std::sync::atomic::Ordering::Relaxed))
+            .saturating_sub(1)
+            .saturating_sub(self.status_rows().len())
+            .saturating_sub(1)
+    }
+
     /// Writes bytes to the session's stream.
     ///
     /// Silently ignores a failure. Presentation must never be able to end a
@@ -1922,7 +1931,13 @@ fn await_submission(
     let mut selected = 0_usize;
 
     loop {
-        let rows = completion_rows(reader.line(), selected, host.theme(), host.truecolor());
+        let rows = completion_rows(
+            reader.line(),
+            selected,
+            host.theme(),
+            host.truecolor(),
+            host.menu_room(),
+        );
         draw_prompt(reader, host, out, &rows, marker)?;
 
         match idle_key(reader.read_key(), reader, &mut selected, &rows, recall) {
@@ -2106,9 +2121,7 @@ fn run_picker(
     reader.clear();
 
     let chosen = loop {
-        let mut below = vec![picker.title().to_owned()];
-        below.extend(picker.rows(&host.theme, host.truecolor));
-        below.push(rune_term::picker::Picker::hint().to_owned());
+        let below = picker_menu(&mut picker, &host.theme, host.truecolor, host.menu_room());
         draw_prompt(reader, host, out, &below, marker)?;
 
         match reader.read_key() {
@@ -2134,6 +2147,33 @@ fn run_picker(
 
     reader.replace(&draft);
     Ok(chosen)
+}
+
+/// Fits the model menu to the remaining rows before rendering its choices.
+fn picker_menu(
+    picker: &mut rune_term::picker::Picker,
+    theme: &Theme,
+    truecolor: bool,
+    max_rows: usize,
+) -> Vec<String> {
+    if max_rows == 0 {
+        return Vec::new();
+    }
+    // Keep a choice visible even when the title and key hint cannot fit.
+    let decorated = max_rows >= 4;
+    let room = max_rows.saturating_sub(if decorated { 2 } else { 0 });
+    picker.set_window(menu_window(
+        picker.matches().len(),
+        rune_term::picker::DEFAULT_WINDOW,
+        room,
+    ));
+    let mut rows = picker.rows(theme, truecolor);
+    rows.truncate(room);
+    if decorated {
+        rows.insert(0, picker.title().to_owned());
+        rows.push(rune_term::picker::Picker::hint().to_owned());
+    }
+    rows
 }
 
 /// Summarizes older turns and installs the summary.
@@ -2354,20 +2394,30 @@ pub const COMPLETION_WINDOW: usize = 6;
 /// screen until the window has to move, rather than the list jumping on every
 /// key.
 #[must_use]
-pub fn completion_window(count: usize, selected: usize) -> std::ops::Range<usize> {
-    if count <= COMPLETION_WINDOW {
+pub fn completion_window(count: usize, selected: usize, window: usize) -> std::ops::Range<usize> {
+    if window == 0 {
+        return 0..0;
+    }
+    if count <= window {
         return 0..count;
     }
     // The last screenful is the floor, so the list can scroll to its end.
-    let last_start = count.saturating_sub(COMPLETION_WINDOW);
+    let last_start = count.saturating_sub(window);
     let selected = selected.min(count.saturating_sub(1));
     // Start far enough back that the selection sits on the last row of the
     // window once it has moved past the first screenful.
     let start = selected
         .saturating_add(1)
-        .saturating_sub(COMPLETION_WINDOW)
+        .saturating_sub(window)
         .min(last_start);
-    start..start.saturating_add(COMPLETION_WINDOW)
+    start..start.saturating_add(window)
+}
+
+/// Leaves a row for the position indicator whenever a long list has room.
+fn menu_window(count: usize, maximum: usize, room: usize) -> usize {
+    let window = maximum.min(room);
+    let position_row = usize::from(count > window && room > 1);
+    window.min(room.saturating_sub(position_row))
 }
 
 /// Returns the rows showing what can be typed next.
@@ -2384,7 +2434,16 @@ pub fn completion_window(count: usize, selected: usize) -> std::ops::Range<usize
 ///
 /// Returns an empty list when the line is not a command being typed, so a
 /// caller can pass every keystroke without checking first.
-pub fn completion_rows(line: &str, selected: usize, theme: &Theme, truecolor: bool) -> Vec<String> {
+pub fn completion_rows(
+    line: &str,
+    selected: usize,
+    theme: &Theme,
+    truecolor: bool,
+    max_rows: usize,
+) -> Vec<String> {
+    if max_rows == 0 {
+        return Vec::new();
+    }
     let Some(word) = slash_word(line) else {
         return Vec::new();
     };
@@ -2409,8 +2468,12 @@ pub fn completion_rows(line: &str, selected: usize, theme: &Theme, truecolor: bo
         .max()
         .unwrap_or(0);
 
-    let window = completion_window(matches.len(), selected);
-    let mut rows: Vec<String> = Vec::with_capacity(COMPLETION_WINDOW.saturating_add(1));
+    let window = completion_window(
+        matches.len(),
+        selected,
+        menu_window(matches.len(), COMPLETION_WINDOW, max_rows),
+    );
+    let mut rows: Vec<String> = Vec::with_capacity(window.len().saturating_add(1));
     for index in window.clone() {
         let Some(entry) = matches.get(index) else {
             continue;
@@ -2430,7 +2493,7 @@ pub fn completion_rows(line: &str, selected: usize, theme: &Theme, truecolor: bo
 
     // How far through the list this window is, so a reader can tell a list that
     // ends here from one that continues. Shown only when there is more to see.
-    if matches.len() > COMPLETION_WINDOW {
+    if matches.len() > window.len() && rows.len() < max_rows {
         let first = window.start.saturating_add(1);
         let last = window.end;
         rows.push(styled(
@@ -4986,7 +5049,7 @@ mod tests {
     #[test]
     fn the_dropdown_offers_a_command_being_typed() {
         let theme = Theme::no_color();
-        let rows = completion_rows("/mod", 0, &theme, false);
+        let rows = completion_rows("/mod", 0, &theme, false, usize::MAX);
         assert_eq!(rows.len(), 2, "{rows:?}");
         assert!(rows[0].starts_with("> /model"), "{rows:?}");
         assert!(rows[1].starts_with("  /models"), "{rows:?}");
@@ -5002,7 +5065,7 @@ mod tests {
         // the screen for a list a reader only ever takes the top few rows of, so
         // a window is shown with a row saying how far through it is.
         let theme = Theme::no_color();
-        let rows = completion_rows("/", 0, &theme, false);
+        let rows = completion_rows("/", 0, &theme, false, usize::MAX);
         let total = rune_term::commands::BUILTINS.len();
         assert_eq!(rows.len(), COMPLETION_WINDOW.saturating_add(1), "{rows:?}");
         assert!(rows[0].starts_with("> /model"), "{rows:?}");
@@ -5019,7 +5082,7 @@ mod tests {
     #[test]
     fn a_list_that_fits_carries_no_position_row() {
         let theme = Theme::no_color();
-        let rows = completion_rows("/mod", 0, &theme, false);
+        let rows = completion_rows("/mod", 0, &theme, false, usize::MAX);
         assert_eq!(rows.len(), 2, "{rows:?}");
         assert!(!rows.iter().any(|r| r.contains(" of ")), "{rows:?}");
     }
@@ -5031,26 +5094,29 @@ mod tests {
         // jumping on every key.
         let count = rune_term::commands::BUILTINS.len();
         // Inside the first screenful the window does not move.
-        assert_eq!(completion_window(count, 0), 0..COMPLETION_WINDOW);
         assert_eq!(
-            completion_window(count, COMPLETION_WINDOW - 1),
+            completion_window(count, 0, COMPLETION_WINDOW),
+            0..COMPLETION_WINDOW
+        );
+        assert_eq!(
+            completion_window(count, COMPLETION_WINDOW - 1, COMPLETION_WINDOW),
             0..COMPLETION_WINDOW
         );
         // Past it, the selection stays on the last visible row.
-        let scrolled = completion_window(count, COMPLETION_WINDOW);
+        let scrolled = completion_window(count, COMPLETION_WINDOW, COMPLETION_WINDOW);
         assert_eq!(scrolled, 1..COMPLETION_WINDOW.saturating_add(1));
         // And the end of the list is reachable rather than cut off.
-        let last = completion_window(count, count.saturating_sub(1));
+        let last = completion_window(count, count.saturating_sub(1), COMPLETION_WINDOW);
         assert_eq!(last.end, count);
     }
 
     #[test]
     fn a_window_never_looks_past_the_end_of_a_short_list() {
-        assert_eq!(completion_window(2, 0), 0..2);
-        assert_eq!(completion_window(0, 0), 0..0);
+        assert_eq!(completion_window(2, 0, COMPLETION_WINDOW), 0..2);
+        assert_eq!(completion_window(0, 0, COMPLETION_WINDOW), 0..0);
         // A selection past the end is clamped rather than panicking.
         let count = rune_term::commands::BUILTINS.len();
-        assert!(completion_window(count, 999).end <= count);
+        assert!(completion_window(count, 999, COMPLETION_WINDOW).end <= count);
     }
 
     #[test]
@@ -5060,24 +5126,69 @@ mod tests {
         let theme = Theme::no_color();
         let count = rune_term::commands::BUILTINS.len();
         for selected in 0..count {
-            let rows = completion_rows("/", selected, &theme, false);
+            let rows = completion_rows("/", selected, &theme, false, usize::MAX);
             let marked = rows.iter().filter(|r| r.starts_with('>')).count();
             assert_eq!(marked, 1, "selection {selected} marked {marked} rows");
         }
     }
 
     #[test]
+    fn short_completion_menus_keep_every_command_visible_and_selectable() {
+        let theme = Theme::no_color();
+        let count = rune_term::commands::BUILTINS.len();
+        for room in 1..=8 {
+            for selected in 0..count {
+                let rows = completion_rows("/", selected, &theme, false, room);
+                assert!(rows.len() <= room, "{rows:?}");
+                let chosen = open_completion("/", &rows, selected).expect("completion");
+                assert!(
+                    rows.iter()
+                        .any(|row| row.starts_with(&format!("> /{}", chosen.name))),
+                    "selection {selected} is hidden: {rows:?}"
+                );
+            }
+        }
+        assert!(completion_rows("/", 0, &theme, false, 0).is_empty());
+    }
+
+    #[test]
+    fn model_menus_keep_the_selection_visible_after_resizing_and_narrowing() {
+        let theme = Theme::no_color();
+        let mut picker = rune_term::picker::Picker::new(
+            "models from fixture",
+            (1..=15).map(|index| format!("model-{index:02}")).collect(),
+            rune_term::picker::DEFAULT_WINDOW,
+        );
+        picker.to(14);
+        for room in [16, 4, 3, 2, 1, 16] {
+            let menu = picker_menu(&mut picker, &theme, false, room);
+            assert!(menu.len() <= room, "{menu:?}");
+            assert_eq!(picker.selected(), Some("model-15"));
+            assert!(menu.iter().any(|row| row == "> model-15"), "{menu:?}");
+        }
+        assert!(picker_menu(&mut picker, &theme, false, 0).is_empty());
+        picker.set_query("model-03");
+        let menu = picker_menu(&mut picker, &theme, false, 4);
+        assert!(menu.iter().any(|row| row == "> model-03"), "{menu:?}");
+        assert!(!menu.iter().any(|row| row.contains(" of ")), "{menu:?}");
+        picker.set_query("missing");
+        let menu = picker_menu(&mut picker, &theme, false, 1);
+        assert_eq!(menu.len(), 1);
+        assert!(menu[0].contains("no match"), "{menu:?}");
+    }
+
+    #[test]
     fn accepting_uses_the_selection_the_window_is_showing() {
         // The position row must not be mistaken for a command.
         let theme = Theme::no_color();
-        let rows = completion_rows("/", 0, &theme, false);
+        let rows = completion_rows("/", 0, &theme, false, usize::MAX);
         let chosen = open_completion("/", &rows, 0).expect("a completion");
         assert_eq!(chosen.name, "model");
         // Every command is reachable, including the ones past the first window:
         // clamping on the drawn rows instead of the matches left the tail of the
         // list unselectable.
         let last = rune_term::commands::BUILTINS.len().saturating_sub(1);
-        let rows = completion_rows("/", last, &theme, false);
+        let rows = completion_rows("/", last, &theme, false, usize::MAX);
         assert!(rows.iter().any(|r| r.starts_with('>')), "{rows:?}");
         let chosen = open_completion("/", &rows, last).expect("a completion");
         assert_eq!(chosen.name, "quit");
@@ -5088,21 +5199,21 @@ mod tests {
         let theme = Theme::no_color();
         for line in ["", "hello", "/help me", "/model x", "a/b", "/zzz"] {
             assert!(
-                completion_rows(line, 0, &theme, false).is_empty(),
+                completion_rows(line, 0, &theme, false, usize::MAX).is_empty(),
                 "{line:?} offered rows"
             );
         }
         // A whole command name is still offered, so the row does not vanish as
         // the last letter is typed.
-        assert!(!completion_rows("/help", 0, &theme, false).is_empty());
+        assert!(!completion_rows("/help", 0, &theme, false, usize::MAX).is_empty());
     }
 
     #[test]
     fn the_highlighted_row_is_the_one_the_arrows_moved_to() {
         let theme = Theme::no_color();
-        let first = completion_rows("/mod", 0, &theme, false);
+        let first = completion_rows("/mod", 0, &theme, false, usize::MAX);
         assert!(first[0].starts_with('>'), "{first:?}");
-        let second = completion_rows("/mod", 1, &theme, false);
+        let second = completion_rows("/mod", 1, &theme, false, usize::MAX);
         assert!(second[1].starts_with('>'), "{second:?}");
         assert!(second[0].starts_with("  "), "{second:?}");
     }
@@ -5110,7 +5221,7 @@ mod tests {
     #[test]
     fn the_rows_line_up_their_descriptions() {
         let theme = Theme::no_color();
-        let rows = completion_rows("/mod", 0, &theme, false);
+        let rows = completion_rows("/mod", 0, &theme, false, usize::MAX);
         let summaries = rune_term::commands::matching("mod");
         let columns: Vec<usize> = rows
             .iter()
@@ -5131,10 +5242,10 @@ mod tests {
         // Tab completes to the highlighted command, and Enter takes it too when
         // the name is not yet whole, so a half-typed command is never run.
         let theme = Theme::no_color();
-        let rows = completion_rows("/mod", 0, &theme, false);
+        let rows = completion_rows("/mod", 0, &theme, false, usize::MAX);
         let chosen = open_completion("/mod", &rows, 0).expect("a completion");
         assert_eq!(chosen.name, "model");
-        let rows = completion_rows("/mod", 1, &theme, false);
+        let rows = completion_rows("/mod", 1, &theme, false, usize::MAX);
         let chosen = open_completion("/mod", &rows, 1).expect("a completion");
         assert_eq!(chosen.name, "models");
         // With no dropdown there is nothing to accept.
@@ -5144,13 +5255,13 @@ mod tests {
     #[test]
     fn a_colorless_theme_emits_no_escapes_in_the_dropdown() {
         let theme = Theme::no_color();
-        let plain = completion_rows("/mod", 0, &theme, false);
+        let plain = completion_rows("/mod", 0, &theme, false, usize::MAX);
         assert!(!plain.is_empty(), "nothing matched");
         for row in plain {
             assert!(!row.contains('\u{1b}'), "{row:?}");
         }
         // A colored theme does style them.
-        let styled_rows = completion_rows("/mod", 0, &Theme::fx_dark(), true);
+        let styled_rows = completion_rows("/mod", 0, &Theme::fx_dark(), true, usize::MAX);
         assert!(
             styled_rows.iter().any(|r| r.contains('\u{1b}')),
             "{styled_rows:?}"
