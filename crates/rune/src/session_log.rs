@@ -173,6 +173,24 @@ impl Recorder {
         Ok(())
     }
 
+    /// Records the visible answer and boundary of a cancelled exchange.
+    ///
+    /// A cancellation is numbered even when no text arrived. Unknown usage is
+    /// left absent rather than recorded as a completed request with zero usage.
+    pub fn cancelled_turn(&mut self, partial: &str) -> Result<()> {
+        self.turn = self.turn.saturating_add(1);
+        let turn = self.turn;
+        self.store.append(SessionEvent::TurnStarted { turn })?;
+        if !partial.trim().is_empty() {
+            self.store.append(SessionEvent::AssistantMessage {
+                turn,
+                text: partial.to_owned(),
+            })?;
+        }
+        self.store.append(SessionEvent::TurnCancelled { turn })?;
+        Ok(())
+    }
+
     /// Returns true when the session has no title yet.
     #[must_use]
     pub fn title_is_unset(&self) -> bool {
@@ -355,6 +373,7 @@ pub fn tree_of(state: &SessionState) -> Tree {
         let (role, preview) = match &frame.event {
             SessionEvent::UserMessage { text } => (Role::User, text.as_str()),
             SessionEvent::AssistantMessage { text, .. } => (Role::Assistant, text.as_str()),
+            SessionEvent::TurnCancelled { .. } => (Role::System, "[cancelled]"),
             SessionEvent::ToolResult { output, .. } => (Role::Tool, output.as_str()),
             SessionEvent::ToolCall { name, .. } => (Role::Assistant, name.as_str()),
             SessionEvent::TurnStarted { .. }
@@ -389,10 +408,17 @@ pub fn render_tree(tree: &Tree, state: &SessionState) -> String {
     let _ = writeln!(out, "session {} ({} turns)", state.id, state.turns);
 
     for branch in tree.branches() {
+        // The cancellation boundary has its own row below. Keep it out of the
+        // branch summary so an exchange ending here reports the boundary once.
+        let summary = if branch.summary == "[cancelled]" {
+            ""
+        } else {
+            &branch.summary
+        };
         let _ = writeln!(
             out,
             "  branch {}  {} turn(s)  {}",
-            branch.name, branch.turn_count, branch.summary
+            branch.name, branch.turn_count, summary
         );
     }
 
@@ -570,7 +596,8 @@ pub fn history_from(state: &SessionState) -> History {
             | SessionEvent::UsageRecorded { .. }
             | SessionEvent::TitleSet { .. }
             | SessionEvent::WorkspaceSet { .. }
-            | SessionEvent::ChildOf { .. } => {}
+            | SessionEvent::ChildOf { .. }
+            | SessionEvent::TurnCancelled { .. } => {}
         }
     }
 
@@ -740,6 +767,65 @@ mod tests {
         assert_eq!(history.turns().len(), 2);
         assert_eq!(history.turns()[0].text(), "what changed?");
         assert_eq!(history.turns()[1].text(), "two files");
+    }
+
+    #[test]
+    fn cancelled_exchanges_round_trip_without_duplicate_text_or_invented_usage() {
+        for partial in ["", "STREAM-01\nSTREAM-02\nSTREAM-03\n"] {
+            let dir = tempfile::tempdir().expect("temp");
+            let root = Utf8Path::from_path(dir.path()).expect("utf8");
+            let paths = paths(root);
+            let key = id("sessionccccc");
+            let mut recorder = Recorder::create(&paths, &key).expect("created");
+            recorder.user_message("slow").expect("wrote");
+            recorder.cancelled_turn(partial).expect("cancelled");
+            drop(recorder);
+
+            let (mut recorder, history) = load(&paths, &key).expect("resumed");
+            history.validate().expect("valid replay");
+            assert_eq!(history.len(), if partial.is_empty() { 1 } else { 2 });
+            if !partial.is_empty() {
+                assert_eq!(history.turns()[1].text(), partial);
+            }
+            let state = inspect(&paths, &key).expect("inspected");
+            assert_eq!(state.turns, 1);
+            assert_eq!(state.usage.total(), 0);
+            assert!(
+                !state
+                    .events
+                    .iter()
+                    .any(|frame| matches!(frame.event, SessionEvent::UsageRecorded { .. }))
+            );
+            assert_eq!(
+                state
+                    .events
+                    .iter()
+                    .filter(|frame| matches!(frame.event, SessionEvent::TurnCancelled { turn: 1 }))
+                    .count(),
+                1
+            );
+            let rendered = render_tree(&tree_of(&state), &state);
+            assert_eq!(rendered.matches("[cancelled]").count(), 1);
+            for line in partial.lines() {
+                assert_eq!(rendered.matches(line).count(), 1, "{rendered}");
+            }
+
+            recorder.user_message("continue").expect("wrote");
+            recorder.turn(&outcome("continued")).expect("wrote");
+            drop(recorder);
+            let state = inspect(&paths, &key).expect("inspected");
+            assert_eq!(state.turns, 2);
+            assert!(state.events.iter().any(|frame| matches!(
+                frame.event,
+                SessionEvent::AssistantMessage { turn: 2, .. }
+            )));
+            assert_eq!(
+                render_tree(&tree_of(&state), &state)
+                    .matches("[cancelled]")
+                    .count(),
+                1
+            );
+        }
     }
 
     #[test]

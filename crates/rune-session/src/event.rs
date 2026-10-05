@@ -48,6 +48,11 @@ pub enum SessionEvent {
         /// Turn number, starting at one.
         turn: u64,
     },
+    /// The caller cancelled a turn, after any visible answer was recorded.
+    TurnCancelled {
+        /// Turn number of the cancelled exchange.
+        turn: u64,
+    },
     /// The user contributed a message.
     UserMessage {
         /// Message text.
@@ -123,6 +128,7 @@ impl SessionEvent {
     pub const fn kind(&self) -> &'static str {
         match self {
             Self::TurnStarted { .. } => "turn_started",
+            Self::TurnCancelled { .. } => "turn_cancelled",
             Self::UserMessage { .. } => "user_message",
             Self::AssistantMessage { .. } => "assistant_message",
             Self::ToolCall { .. } => "tool_call",

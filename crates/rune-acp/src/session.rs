@@ -669,6 +669,7 @@ pub fn history_from_events(frames: &[EventFrame]) -> History {
                 }
             }
             SessionEvent::TurnStarted { .. }
+            | SessionEvent::TurnCancelled { .. }
             | SessionEvent::Compaction { .. }
             | SessionEvent::UsageRecorded { .. }
             | SessionEvent::TitleSet { .. }

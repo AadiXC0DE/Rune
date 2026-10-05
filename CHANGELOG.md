@@ -39,6 +39,8 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Fixed
 
+- Cancelled terminal turns save their visible partial answer and a cancellation
+  boundary. Resuming retains the answer, and `/tree` shows the boundary once.
 - Responses requests now send explicit reasoning effort as `reasoning.effort`.
   Auto keeps provider defaults.
 - Chat Completions requests now send explicit reasoning effort as
