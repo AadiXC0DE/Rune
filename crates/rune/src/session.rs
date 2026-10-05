@@ -5581,30 +5581,29 @@ mod tests {
             Outcome::Allow,
             "a read tool would ask for approval it never gets"
         );
-        // The web tools are on unless the run says otherwise, so a fresh session
-        // can look something up rather than reporting that it was refused.
+        // A fresh session refuses web calls until the user enables them.
         assert_eq!(
             config
-                .rules
-                .evaluate("web_fetch", "https://example.com", Outcome::Deny)
-                .outcome,
-            Outcome::Allow,
-            "the web tools are refused on a default configuration"
-        );
-        // And turning them off still refuses, so the setting is a real switch.
-        let off = Settings {
-            web_tools: false,
-            ..settings.clone()
-        };
-        let off_config =
-            prepare(&off, &paths, Utf8Path::new("/tmp"), None).expect("a session prepares");
-        assert_eq!(
-            off_config
                 .rules
                 .evaluate("web_fetch", "https://example.com", Outcome::Allow)
                 .outcome,
             Outcome::Deny,
-            "turning the web tools off did not refuse them"
+            "the web tools were allowed without an explicit opt-in"
+        );
+        // Explicitly enabling web installs the allow above the built-in denial.
+        let on = Settings {
+            web_tools: true,
+            ..settings.clone()
+        };
+        let on_config =
+            prepare(&on, &paths, Utf8Path::new("/tmp"), None).expect("a session prepares");
+        assert_eq!(
+            on_config
+                .rules
+                .evaluate("web_fetch", "https://example.com", Outcome::Deny)
+                .outcome,
+            Outcome::Allow,
+            "explicitly enabling the web tools did not allow them"
         );
     }
 

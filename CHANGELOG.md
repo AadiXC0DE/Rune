@@ -34,6 +34,9 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Fixed
 
+- Web fetch and search are disabled by default, matching the documented opt-in.
+  Set `web_tools = true` or `RUNE_WEB_TOOLS=true` to enable them; offline mode
+  still refuses outbound requests.
 - Offline mode disables sandboxed shell networking even when external access
   is granted.
 - The user configuration accepts `offline = true` and enforces offline mode
@@ -104,13 +107,11 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Changed
 
-- The web tools are on by default. `web_search` and `web_fetch` were registered
-  with a backend that refused every call and were then denied by a built-in rule
-  that nothing could overrule, so both reported that the session had refused them
-  whatever the configuration said. A coding agent that cannot look something up
-  is the odd one out, so reaching the network is now the default and
-  `web_tools = false` turns it off. `offline = true` still refuses everything,
-  including the model.
+- Web tools received working outbound clients and user-level permission rules,
+  so explicitly enabling them could overrule the built-in denial. This release
+  enabled web tools by default; 0.1.16 restores the documented opt-in via
+  `web_tools = true`. `offline = true` still refuses everything, including the
+  model.
 - The site's canonical and Open Graph URLs name `rune.heyaadi.com`.
 
 ## 0.1.13

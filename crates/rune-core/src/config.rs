@@ -342,12 +342,9 @@ pub struct UserConfig {
 
     /// Whether the web tools may reach the network.
     ///
-    /// On by default, because a coding agent that cannot look something up is
-    /// the odd one out: every comparable harness reaches the network unless told
-    /// not to. `offline = true` is the switch that refuses everything, including
-    /// the model, and it overrules this. Setting this to false allows the model
-    /// while refusing the web tools, which is what a run that must not send a
-    /// query to a third party wants.
+    /// Off by default. Set `web_tools = true` or `RUNE_WEB_TOOLS=true` to enable
+    /// web fetch and search. `offline = true` refuses every outbound request,
+    /// including model requests, and overrules this setting.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub web_tools: Option<bool>,
 
@@ -552,7 +549,7 @@ impl Default for Settings {
         Self {
             provider: Provider::default(),
             model: String::new(),
-            web_tools: true,
+            web_tools: false,
             context_window: None,
             base_url: None,
             api_key_env: None,
@@ -1539,6 +1536,28 @@ mod tests {
         assert_eq!(settings.permission_mode, PermissionMode::Auto);
         assert_eq!(settings.source_of("permission_mode"), Layer::Default);
         assert!(settings.context);
+        assert!(!settings.web_tools);
+        assert_eq!(settings.source_of("web_tools"), Layer::Default);
+    }
+
+    #[test]
+    fn web_tools_respect_explicit_user_and_environment_settings() {
+        let dir = TempDir::new().expect("tempdir");
+        for enabled in [true, false] {
+            let user = write(&dir, "config.toml", &format!("web_tools = {enabled}\n"));
+            let settings = load(None, Some(&user), &empty_env());
+            assert!(settings.diagnostics.is_empty());
+            assert_eq!(settings.web_tools, enabled);
+            assert_eq!(settings.source_of("web_tools"), Layer::User);
+
+            let env = EnvironmentOverrides::from_lookup(|key| {
+                (key == "RUNE_WEB_TOOLS").then(|| (!enabled).to_string())
+            });
+            let settings = load(None, Some(&user), &env);
+            assert!(settings.diagnostics.is_empty());
+            assert_eq!(settings.web_tools, !enabled);
+            assert_eq!(settings.source_of("web_tools"), Layer::Environment);
+        }
     }
 
     #[test]

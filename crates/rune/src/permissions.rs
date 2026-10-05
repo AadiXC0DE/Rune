@@ -440,15 +440,37 @@ mod tests {
         // The built-in set refuses the web tools, because it is built without
         // the configuration. Enabling them adds an allow above that refusal, so
         // the reported set is the built-ins plus one rule per web tool.
-        let settings = default_settings();
+        let settings = Settings {
+            web_tools: true,
+            ..default_settings()
+        };
         let rules = validated(&settings).expect("valid");
         let builtins = builtin_rules(&settings.permission_mode).len();
         let expected = builtins.saturating_add(2);
         assert_eq!(rules.len(), expected);
-        assert!(
-            settings.web_tools,
-            "web tools should be on unless the run says otherwise"
-        );
+        for tool in ["web_fetch", "web_search"] {
+            assert_eq!(
+                rules
+                    .evaluate(tool, "domain:example.com", Outcome::Deny)
+                    .outcome,
+                Outcome::Allow
+            );
+        }
+    }
+
+    #[test]
+    fn a_default_configuration_refuses_the_web_tools() {
+        let settings = default_settings();
+        let rules = validated(&settings).expect("valid");
+        assert_eq!(rules.len(), builtin_rules(&settings.permission_mode).len());
+        for tool in ["web_fetch", "web_search"] {
+            assert_eq!(
+                rules
+                    .evaluate(tool, "domain:example.com", Outcome::Allow)
+                    .outcome,
+                Outcome::Deny
+            );
+        }
     }
 
     #[test]
