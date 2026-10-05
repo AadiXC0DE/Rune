@@ -17,7 +17,6 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
-use std::time::Duration;
 
 use rune_agent::History;
 use rune_agent::steering::Cancellation;
@@ -1110,6 +1109,8 @@ fn request(
     provider: &dyn Provider,
     plan: &RequestPlan,
 ) -> Result<StreamOutcome> {
+    let started = std::time::Instant::now();
+    let mut timeouts = rune_net::transport::RequestTimeouts::from_limits(&context.limits);
     context.cancel.check()?;
     provider.validate(plan)?;
     let body = provider.build_request(plan)?;
@@ -1160,17 +1161,15 @@ fn request(
         _ => {}
     };
 
-    let head_timeout = Duration::from_millis(
-        context
-            .limits
-            .get(LimitName::ProviderHeadTimeoutMs)
-            .value()
-            .unwrap_or(120_000),
-    );
+    // HostFetch owns the blocking send. Its elapsed time still consumes the
+    // total budget available to the shared stream reader.
+    timeouts.total = timeouts
+        .total
+        .map(|total| total.saturating_sub(started.elapsed()));
     rune_net::transport::read_stream(
         response.body,
         provider,
-        head_timeout,
+        timeouts,
         &|| context.cancel.is_cancelled(),
         &mut observe,
     )

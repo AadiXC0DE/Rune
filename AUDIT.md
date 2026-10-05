@@ -1875,7 +1875,7 @@ Resource accumulation after cancellation, session holder handover and concurrent
 - [x] R-011 | T1 | fix | tui | Bound completion and model menus by terminal height | acceptance: At 32x8 open /model, reach the last choice, close the picker and observe no stale rows.
 - [x] R-012 | T1 | fix | tui | Wrap transcript text at the actual narrow width | acceptance: At 12 columns render 300 Ws and END-LONG-WORD and recover all 300 Ws and the complete marker from scrollback.
 - [ ] R-013 | T1 | fix | tui | Refresh dimensions before laying out a draft | acceptance: Grow a 32-column draft to 80 columns and observe VISIBLE-END without another keypress.
-- [ ] R-014 | T1 | fix | providers | Enforce the total provider request deadline | acceptance: Set provider_request_timeout_ms=1000 and observe a slow ongoing stream stop within 1500 ms with a timeout cause.
+- [x] R-014 | T1 | fix | providers | Enforce the total provider request deadline | acceptance: Set provider_request_timeout_ms=1000 and observe a slow ongoing stream stop within 1500 ms with a timeout cause.
 - [ ] R-015 | T1 | fix | providers | Enforce the first-event deadline during silent reads | acceptance: A response that sends headers and no events must stop at its configured head deadline without waiting for EOF.
 - [ ] R-016 | T1 | fix | config | Accept and enforce the documented offline file setting | acceptance: Load offline=true from the user config and observe offline enabled without discarding the remaining config.
 - [ ] R-017 | T1 | fix | sandbox | Carry offline mode into shell network policy | acceptance: With a Linux sandbox and offline full-access context, a shell connection to a local fixture must fail before the fixture receives data.

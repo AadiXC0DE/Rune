@@ -34,6 +34,9 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Fixed
 
+- Native provider requests enforce `provider_request_timeout_ms` across the
+  response head and streamed body, returning a timeout even while output keeps
+  arriving.
 - Transcript text wraps to fit narrow terminals, preserving long words and
   their complete endings when finished answers enter scrollback.
 - Completion and model menus shrink to fit the terminal height while keeping

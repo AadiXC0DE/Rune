@@ -2213,7 +2213,10 @@ fn compact_history(
         &host.endpoint,
         host.dialect.as_ref(),
         &request_plan,
-        compaction_timeout(host),
+        rune_net::transport::RequestTimeouts {
+            head: compaction_timeout(host),
+            ..rune_net::transport::RequestTimeouts::from_limits(&host.limits)
+        },
         &|| false,
     ) {
         Ok(outcome) => outcome,

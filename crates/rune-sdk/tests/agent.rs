@@ -263,6 +263,22 @@ fn closing_during_a_turn_resolves_a_cancelled_result() {
 }
 
 #[test]
+fn time_spent_in_the_host_fetch_consumes_the_total_request_budget() {
+    let fetch = Arc::new(SlowFetch {
+        delay: Duration::from_millis(1100),
+        hits: AtomicUsize::new(0),
+    });
+    let mut agent = Agent::new(options("https://example.invalid/v1", fetch))
+        .expect("agent")
+        .with_limits(limit(LimitName::ProviderRequestTimeoutMs, 1000));
+    let mut turn = agent
+        .prompt("work", PromptOptions::default())
+        .expect("turn");
+    let err = turn.result().expect_err("the request budget was exhausted");
+    assert_eq!(err.code(), ErrorCode::Timeout, "{err}");
+}
+
+#[test]
 fn a_checkpoint_taken_mid_turn_is_refused() {
     let endpoint = MockEndpoint::start(vec![Script::text("slow")]);
     let fetch = Arc::new(SlowFetch {

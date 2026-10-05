@@ -196,20 +196,14 @@ pub fn run(
     );
 
     let agent = transport::agent();
-    let head_timeout = std::time::Duration::from_millis(
-        settings
-            .limits
-            .get(rune_core::LimitName::ProviderHeadTimeoutMs)
-            .value()
-            .unwrap_or(120_000),
-    );
+    let timeouts = transport::RequestTimeouts::from_limits(&settings.limits);
 
     let outcome = transport::stream_completion(
         &agent,
         &endpoint,
         dialect.as_ref(),
         &plan,
-        head_timeout,
+        timeouts,
         &|| false,
     )
     .map_err(|err| err.to_rune_error())?;

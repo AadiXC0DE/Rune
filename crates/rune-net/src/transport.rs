@@ -43,6 +43,44 @@ pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 /// too early.
 pub const DEFAULT_HEAD_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// Time budgets for one provider request attempt.
+#[derive(Clone, Copy, Debug)]
+pub struct RequestTimeouts {
+    /// Time allowed for the response head and initial stream output.
+    pub head: Duration,
+    /// Total time allowed, including sending the request and reading its body.
+    /// `None` disables the total deadline.
+    pub total: Option<Duration>,
+}
+
+impl RequestTimeouts {
+    /// Resolves the provider time budgets from configuration.
+    #[must_use]
+    pub fn from_limits(limits: &rune_core::budget::BudgetSet) -> Self {
+        use rune_core::budget::LimitName;
+
+        Self {
+            head: Duration::from_millis(
+                limits
+                    .get(LimitName::ProviderHeadTimeoutMs)
+                    .value()
+                    .unwrap_or(120_000),
+            ),
+            total: limits
+                .get(LimitName::ProviderRequestTimeoutMs)
+                .value()
+                .map(Duration::from_millis),
+        }
+    }
+}
+
+impl From<Duration> for RequestTimeouts {
+    /// Preserves the head-only budget accepted by earlier transport callers.
+    fn from(head: Duration) -> Self {
+        Self { head, total: None }
+    }
+}
+
 /// How a request is authenticated.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum AuthStyle {
@@ -304,8 +342,7 @@ impl StreamOutcome {
 pub fn agent() -> ureq::Agent {
     ureq::Agent::config_builder()
         .timeout_connect(Some(CONNECT_TIMEOUT))
-        // No overall body timeout: a long generation is expected, and the head
-        // timeout bounds the part that can actually hang.
+        // Callers supply each request's total budget through FetchRequest.
         .timeout_global(None)
         .http_status_as_error(false)
         .build()
@@ -457,7 +494,7 @@ pub fn stream_completion(
     endpoint: &Endpoint,
     provider: &dyn Provider,
     plan: &RequestPlan,
-    head_timeout: Duration,
+    timeouts: impl Into<RequestTimeouts>,
     cancel: &dyn Fn() -> bool,
 ) -> NetResult<StreamOutcome> {
     stream_completion_observed(
@@ -465,7 +502,7 @@ pub fn stream_completion(
         endpoint,
         provider,
         plan,
-        head_timeout,
+        timeouts,
         cancel,
         &mut |_| {},
     )
@@ -482,7 +519,7 @@ pub fn stream_completion_observed(
     endpoint: &Endpoint,
     provider: &dyn Provider,
     plan: &RequestPlan,
-    head_timeout: Duration,
+    timeouts: impl Into<RequestTimeouts>,
     cancel: &dyn Fn() -> bool,
     observe: &mut dyn FnMut(&ProviderEvent),
 ) -> NetResult<StreamOutcome> {
@@ -503,9 +540,11 @@ pub fn stream_completion_observed(
 
     let url = endpoint.url_for(provider.request_path());
     let encoded = serde_json::to_string(&body)?;
+    let timeouts = timeouts.into();
 
     let mut request = FetchRequest::post(url, encoded.into_bytes())
-        .with_head_timeout(Some(head_timeout))
+        .with_head_timeout(Some(timeouts.head))
+        .with_timeout(timeouts.total)
         .with_header("content-type", "application/json")
         .with_header("accept", "text/event-stream")
         .with_header(
@@ -524,7 +563,9 @@ pub fn stream_completion_observed(
         request = request.with_header(name, value);
     }
 
+    let started = Instant::now();
     let response = client.send(request)?;
+    check_request_timeout(started, timeouts.total)?;
 
     if response.status >= 400 {
         let retry_after = response
@@ -532,6 +573,7 @@ pub fn stream_completion_observed(
             .as_deref()
             .and_then(crate::error::parse_retry_after);
         let text = read_bounded_text(response.body, 64 * 1024);
+        check_request_timeout(started, timeouts.total)?;
         let sanitized = redact::redact(&text);
         let mut error = NetError::classify_status(response.status, &sanitized).with_hint(format!(
             "provider `{}` rejected the request",
@@ -545,7 +587,7 @@ pub fn stream_completion_observed(
         return Err(error);
     }
 
-    read_stream(response.body, provider, head_timeout, cancel, observe)
+    read_stream_started(response.body, provider, timeouts, started, cancel, observe)
 }
 
 /// One response to an outbound request that is not a model completion.
@@ -735,9 +777,8 @@ pub fn list_models(
         request = request.with_header(name, value);
     }
 
-    // The client carries no overall timeout, because a streaming generation is
-    // expected to be long. A listing is a small document, so it is bounded here
-    // rather than leaving a stalled endpoint to hold the command open.
+    // Each request supplies its own total budget. A listing is a small
+    // document, so it gets the caller's listing budget here.
     let response = client.send(request.with_timeout(Some(timeout)))?;
 
     let text = read_bounded_text(response.body, 1024 * 1024);
@@ -787,16 +828,36 @@ const STREAM_POLL: Duration = Duration::from_millis(50);
 ///
 /// Public because a host that reaches an endpoint through its own [`Fetch`],
 /// including one that runs where the built-in client cannot compile, reduces
-/// the body with the same decoder, limits, and head timeout rather than a
+/// the body with the same decoder, limits, and time budgets rather than a
 /// second implementation that can disagree with this one.
+/// The total budget starts here; `stream_completion_observed` also counts the
+/// time spent sending the request and waiting for its response head.
 pub fn read_stream(
     body: Box<dyn Read + Send>,
     provider: &dyn Provider,
-    head_timeout: Duration,
+    timeouts: impl Into<RequestTimeouts>,
     cancel: &dyn Fn() -> bool,
     observe: &mut dyn FnMut(&ProviderEvent),
 ) -> NetResult<StreamOutcome> {
-    let mut state = StreamState::new(provider, observe, head_timeout);
+    read_stream_started(
+        body,
+        provider,
+        timeouts.into(),
+        Instant::now(),
+        cancel,
+        observe,
+    )
+}
+
+fn read_stream_started(
+    body: Box<dyn Read + Send>,
+    provider: &dyn Provider,
+    timeouts: RequestTimeouts,
+    started: Instant,
+    cancel: &dyn Fn() -> bool,
+    observe: &mut dyn FnMut(&ProviderEvent),
+) -> NetResult<StreamOutcome> {
+    let mut state = StreamState::new(provider, observe, timeouts, started);
     feed(body, &mut state, cancel)?;
     state.finish()
 }
@@ -805,10 +866,10 @@ pub fn read_stream(
 ///
 /// A blocking read cannot be interrupted, so the body is read on a helper
 /// thread and this one waits on the handover in short slices, checking for a
-/// cancellation between them. The handover is bounded, so the helper reads
-/// only a few chunks ahead of the decoder. Once nothing is listening the
-/// helper ends at its next chunk; a read that never returns holds it until the
-/// connection closes.
+/// cancellation and the total deadline between them. The handover is bounded,
+/// so the helper reads only a few chunks ahead of the decoder. Once nothing is
+/// listening the helper ends at its next chunk; a read that never returns holds
+/// it until the connection closes.
 #[cfg(not(target_family = "wasm"))]
 fn feed(
     mut body: Box<dyn Read + Send>,
@@ -841,7 +902,10 @@ fn feed(
         if cancel() {
             return Err(cancelled());
         }
-        match chunks.recv_timeout(STREAM_POLL) {
+        state.check_request_timeout()?;
+        let chunk = chunks.recv_timeout(STREAM_POLL);
+        state.check_request_timeout()?;
+        match chunk {
             Ok(chunk) => {
                 state.push(&chunk.map_err(NetError::from)?)?;
                 if state.is_done() {
@@ -870,6 +934,7 @@ fn feed(
         if cancel() {
             return Err(cancelled());
         }
+        state.check_request_timeout()?;
         let count = match body.read(&mut buffer) {
             Ok(0) => return Ok(()),
             Ok(count) => count,
@@ -888,6 +953,18 @@ fn cancelled() -> NetError {
     NetError::new(FailureKind::Cancelled, "the request was cancelled")
 }
 
+/// Checks a total budget without restarting it when a chunk arrives.
+fn check_request_timeout(started: Instant, total: Option<Duration>) -> NetResult<()> {
+    if total.is_some_and(|timeout| started.elapsed() >= timeout) {
+        return Err(NetError::new(
+            FailureKind::Timeout,
+            "the provider request exceeded its total timeout",
+        )
+        .with_hint("raise provider_request_timeout_ms to allow a longer generation"));
+    }
+    Ok(())
+}
+
 /// The decoding half of a streamed read.
 ///
 /// Kept apart from the reading so the threaded and the plain read loops share
@@ -900,6 +977,8 @@ struct StreamState<'a> {
     observe: &'a mut dyn FnMut(&ProviderEvent),
     head_timeout: Duration,
     started: Instant,
+    request_timeout: Option<Duration>,
+    request_started: Instant,
     /// Whether any event has been decoded, which ends the wait for output.
     saw_event: bool,
 }
@@ -908,7 +987,8 @@ impl<'a> StreamState<'a> {
     fn new(
         provider: &dyn Provider,
         observe: &'a mut dyn FnMut(&ProviderEvent),
-        head_timeout: Duration,
+        timeouts: RequestTimeouts,
+        request_started: Instant,
     ) -> Self {
         Self {
             decoder: Decoder::new(provider.limits()),
@@ -916,14 +996,17 @@ impl<'a> StreamState<'a> {
             outcome: StreamOutcome::default(),
             frames: Vec::new(),
             observe,
-            head_timeout,
+            head_timeout: timeouts.head,
             started: Instant::now(),
+            request_timeout: timeouts.total,
+            request_started,
             saw_event: false,
         }
     }
 
     /// Decodes one chunk, reducing and reporting every event it completes.
     fn push(&mut self, chunk: &[u8]) -> NetResult<()> {
+        self.check_request_timeout()?;
         self.decoder
             .push(chunk, &mut self.frames)
             .map_err(NetError::from)?;
@@ -948,6 +1031,10 @@ impl<'a> StreamState<'a> {
         self.decoder.is_done()
     }
 
+    fn check_request_timeout(&self) -> NetResult<()> {
+        check_request_timeout(self.request_started, self.request_timeout)
+    }
+
     /// Hands every decoded event to the reducer.
     fn reduce_frames(&mut self) -> NetResult<()> {
         for event in self.frames.drain(..) {
@@ -970,6 +1057,7 @@ impl<'a> StreamState<'a> {
 
     /// Ends the stream and returns what it produced.
     fn finish(mut self) -> NetResult<StreamOutcome> {
+        self.check_request_timeout()?;
         self.decoder
             .finish(&mut self.frames)
             .map_err(NetError::from)?;
@@ -1087,6 +1175,92 @@ mod tests {
     const ANSWER_HEAD: &[u8] = b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"late\"},\"finish_reason\":\"stop\"}]}\n";
     const ANSWER_TAIL: &[u8] = b"\ndata: [DONE]\n\n";
 
+    const DELTA: &[u8] =
+        b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"still streaming\"}}]}\n\n";
+
+    /// A client whose head and body each consume part of the request budget.
+    struct PacedFetch {
+        expected_timeout: Option<Duration>,
+    }
+
+    impl Fetch for PacedFetch {
+        fn send(&self, request: FetchRequest) -> NetResult<crate::fetch::FetchResponse> {
+            assert_eq!(request.timeout, self.expected_timeout);
+            assert_eq!(request.head_timeout, Some(DEFAULT_HEAD_TIMEOUT));
+            std::thread::sleep(Duration::from_millis(100));
+            Ok(crate::fetch::FetchResponse {
+                status: 200,
+                content_type: "text/event-stream".to_owned(),
+                retry_after: None,
+                location: None,
+                body: PacedBody::body(vec![
+                    (Duration::ZERO, DELTA),
+                    (Duration::from_millis(50), DELTA),
+                    (Duration::from_millis(100), ANSWER_HEAD),
+                    (Duration::ZERO, ANSWER_TAIL),
+                ]),
+            })
+        }
+    }
+
+    #[test]
+    fn the_total_deadline_includes_the_head_and_does_not_reset_on_output() {
+        let mut observed = Vec::new();
+        let started = Instant::now();
+        let err = stream_completion_observed(
+            &PacedFetch {
+                expected_timeout: Some(Duration::from_millis(200)),
+            },
+            &Endpoint::new("https://api.example.com", "k"),
+            &crate::chat_completions::ChatCompletions,
+            &RequestPlan::new("m"),
+            RequestTimeouts {
+                head: DEFAULT_HEAD_TIMEOUT,
+                total: Some(Duration::from_millis(200)),
+            },
+            &|| false,
+            &mut |event| observed.push(event.clone()),
+        )
+        .expect_err("the late completion must time out");
+        assert_eq!(err.kind(), FailureKind::Timeout, "{err}");
+        assert_eq!(
+            err.to_rune_error().code(),
+            rune_core::error::ErrorCode::Timeout
+        );
+        assert!(err.message().contains("total timeout"), "{err}");
+        assert!(started.elapsed() < Duration::from_millis(500));
+        assert!(
+            observed
+                .iter()
+                .any(|event| matches!(event, ProviderEvent::TextDelta { .. })),
+            "the request must start streaming before timing out"
+        );
+    }
+
+    #[test]
+    fn disabling_the_total_deadline_keeps_a_longer_completion() {
+        let mut limits = rune_core::budget::BudgetSet::new();
+        limits
+            .set(
+                rune_core::budget::LimitName::ProviderRequestTimeoutMs,
+                rune_core::budget::Budget::Unbounded,
+                rune_core::config::Layer::User,
+            )
+            .expect("disable total deadline");
+        let outcome = stream_completion(
+            &PacedFetch {
+                expected_timeout: None,
+            },
+            &Endpoint::new("https://api.example.com", "k"),
+            &crate::chat_completions::ChatCompletions,
+            &RequestPlan::new("m"),
+            RequestTimeouts::from_limits(&limits),
+            &|| false,
+        )
+        .expect("completion with no total deadline");
+        assert_eq!(outcome.text(), "still streamingstill streaminglate");
+    }
+
     #[test]
     fn a_first_event_completed_after_the_head_timeout_is_kept() {
         // The endpoint answered, and only the line that closes its first
@@ -1133,6 +1307,32 @@ mod tests {
             let _ = self.0.recv();
             Ok(0)
         }
+    }
+
+    #[test]
+    fn the_total_deadline_expires_during_a_blocked_body_read() {
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let (report, reported) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let result = read_stream(
+                Box::new(SilentBody(released)),
+                &crate::chat_completions::ChatCompletions,
+                RequestTimeouts {
+                    head: DEFAULT_HEAD_TIMEOUT,
+                    total: Some(Duration::from_millis(100)),
+                },
+                &|| false,
+                &mut |_| {},
+            );
+            let _ = report.send(result);
+        });
+        let result = reported.recv_timeout(Duration::from_secs(2));
+        drop(release);
+        let err = result
+            .expect("the total deadline interrupted the stream wait")
+            .expect_err("total timeout");
+        assert_eq!(err.kind(), FailureKind::Timeout, "{err}");
+        assert!(err.message().contains("total timeout"), "{err}");
     }
 
     #[test]
@@ -1241,6 +1441,35 @@ mod tests {
             .expect("the request gave up on the endpoint")
             .expect_err("timed out");
         assert_eq!(err.kind(), FailureKind::Timeout, "{err}");
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn the_total_deadline_also_bounds_waiting_for_response_headers() {
+        let (base, hold) = mute_endpoint();
+        let started = Instant::now();
+        let (report, reported) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let result = stream_completion(
+                &UreqFetch::new(),
+                &Endpoint::new(base, "k"),
+                &crate::chat_completions::ChatCompletions,
+                &RequestPlan::new("m"),
+                RequestTimeouts {
+                    head: DEFAULT_HEAD_TIMEOUT,
+                    total: Some(Duration::from_millis(200)),
+                },
+                &|| false,
+            );
+            let _ = report.send(result);
+        });
+        let result = reported.recv_timeout(Duration::from_secs(2));
+        drop(hold);
+        let err = result
+            .expect("the request returned before its head timeout")
+            .expect_err("the total deadline bounds the HTTP client");
+        assert_eq!(err.kind(), FailureKind::Timeout, "{err}");
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
     /// A client that answers every request with one canned status.

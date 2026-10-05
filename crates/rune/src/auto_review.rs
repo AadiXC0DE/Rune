@@ -15,7 +15,7 @@ use rune_net::error::FailureKind;
 use rune_net::error::NetError;
 use rune_net::message::Message;
 use rune_net::provider::{Provider, RequestPlan};
-use rune_net::transport::{Endpoint, agent, stream_completion};
+use rune_net::transport::{Endpoint, RequestTimeouts, agent, stream_completion};
 use rune_policy::review::{ReviewOutcome, ReviewRequest, Reviewer};
 
 /// Most characters of one evidence excerpt kept in the prompt.
@@ -74,6 +74,7 @@ pub fn build(settings: &Settings, paths: &Paths) -> Result<Option<Box<dyn Review
                 .limits
                 .get_bytes(rune_core::budget::LimitName::ReviewTimeoutMs),
         ),
+        request_timeout: RequestTimeouts::from_limits(&settings.limits).total,
         attempts: RETRIES,
     })))
 }
@@ -84,6 +85,7 @@ struct ModelReviewer {
     dialect: Box<dyn Provider>,
     endpoint: Endpoint,
     timeout: Duration,
+    request_timeout: Option<Duration>,
     /// Extra attempts after the first. Capped at one: a malformed answer is
     /// worth one more try, and a second failure means the model is not reliable
     /// for this task rather than unlucky.
@@ -164,7 +166,10 @@ impl ModelReviewer {
             &self.endpoint,
             self.dialect.as_ref(),
             &plan,
-            self.timeout,
+            RequestTimeouts {
+                head: self.timeout,
+                total: self.request_timeout,
+            },
             &|| false,
         )?;
         Ok(outcome.text())
@@ -354,6 +359,7 @@ mod tests {
             dialect: Box::new(rune_net::chat_completions::ChatCompletions),
             endpoint: Endpoint::new("http://127.0.0.1:1/v1", "k").offline(true),
             timeout: Duration::from_millis(10),
+            request_timeout: None,
             attempts: 0,
         };
         let outcome = reviewer.review(&request());
@@ -371,6 +377,7 @@ mod tests {
             dialect: Box::new(rune_net::chat_completions::ChatCompletions),
             endpoint: Endpoint::new("http://127.0.0.1:1/v1", "k"),
             timeout: Duration::from_millis(30),
+            request_timeout: None,
             attempts: 1,
         };
         let outcome = reviewer.review(&request());
@@ -392,6 +399,7 @@ mod tests {
             dialect: Box::new(rune_net::chat_completions::ChatCompletions),
             endpoint: Endpoint::new("http://127.0.0.1:1/v1", "k"),
             timeout: Duration::from_millis(20),
+            request_timeout: None,
             attempts: RETRIES,
         };
         let outcome = reviewer.review(&request());

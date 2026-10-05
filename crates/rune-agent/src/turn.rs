@@ -289,12 +289,7 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
     let step_limit = limits.get(LimitName::MaxAgentSteps).value().unwrap_or(0);
     let result_limit = limits.get_usize(LimitName::MaxTurnResultBytes);
     let max_attempts = limits.get_usize(LimitName::ProviderMaxAttempts).max(1);
-    let head_timeout = Duration::from_millis(
-        limits
-            .get(LimitName::ProviderHeadTimeoutMs)
-            .value()
-            .unwrap_or(120_000),
-    );
+    let timeouts = transport::RequestTimeouts::from_limits(&limits);
 
     let instructions = host.instructions();
     history.set_instructions(instructions);
@@ -348,7 +343,7 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
             host,
             history,
             steps,
-            head_timeout,
+            timeouts,
             max_attempts,
             &cancellation,
         )?;
@@ -527,7 +522,7 @@ fn stream_with_retry(
     host: &dyn Host,
     history: &History,
     step: u32,
-    head_timeout: Duration,
+    timeouts: transport::RequestTimeouts,
     max_attempts: usize,
     cancellation: &Cancellation,
 ) -> Result<(StreamOutcome, bool)> {
@@ -585,7 +580,7 @@ fn stream_with_retry(
             host.endpoint(),
             host.dialect(),
             &plan,
-            head_timeout,
+            timeouts,
             &|| cancellation.is_cancelled(),
             &mut observe,
         ) {
