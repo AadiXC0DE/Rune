@@ -34,6 +34,9 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Fixed
 
+- Native provider streams enforce `provider_head_timeout_ms` when response
+  headers arrive but the body stays silent, without waiting for the connection
+  to close.
 - Native provider requests enforce `provider_request_timeout_ms` across the
   response head and streamed body, returning a timeout even while output keeps
   arriving.

@@ -35,7 +35,7 @@ pub const MAX_RESPONSE_BYTES: u64 = 32 * 1024 * 1024;
 /// Connection setup budget.
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Time to wait for a response head before failing the attempt.
+/// Time to wait for a response head or initial stream output before failing.
 ///
 /// Configurable through the `provider_head_timeout_ms` limit. The default is
 /// generous because a cold local model can take a long time to produce its
@@ -814,7 +814,7 @@ const STREAM_CHUNK_BYTES: usize = 16 * 1024;
 #[cfg(not(target_family = "wasm"))]
 const STREAM_CHUNKS_AHEAD: usize = 8;
 
-/// How often a silent stream is checked for cancellation.
+/// Longest wait between checks for cancellation and stream deadlines.
 #[cfg(not(target_family = "wasm"))]
 const STREAM_POLL: Duration = Duration::from_millis(50);
 
@@ -866,7 +866,7 @@ fn read_stream_started(
 ///
 /// A blocking read cannot be interrupted, so the body is read on a helper
 /// thread and this one waits on the handover in short slices, checking for a
-/// cancellation and the total deadline between them. The handover is bounded,
+/// cancellation and stream deadlines between them. The handover is bounded,
 /// so the helper reads only a few chunks ahead of the decoder. Once nothing is
 /// listening the helper ends at its next chunk; a read that never returns holds
 /// it until the connection closes.
@@ -903,7 +903,10 @@ fn feed(
             return Err(cancelled());
         }
         state.check_request_timeout()?;
-        let chunk = chunks.recv_timeout(STREAM_POLL);
+        let wait = state
+            .head_wait_remaining()
+            .map_or(STREAM_POLL, |remaining| STREAM_POLL.min(remaining));
+        let chunk = chunks.recv_timeout(wait);
         state.check_request_timeout()?;
         match chunk {
             Ok(chunk) => {
@@ -912,7 +915,7 @@ fn feed(
                     return Ok(());
                 }
             }
-            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Timeout) => state.check_head_timeout()?,
             // The helper has reached the end of the body.
             Err(RecvTimeoutError::Disconnected) => return Ok(()),
         }
@@ -1016,7 +1019,19 @@ impl<'a> StreamState<'a> {
         // the first event is that event arriving, not more waiting. What
         // remains is an endpoint holding the connection open with keep-alive
         // lines and nothing else.
-        if !self.saw_event && self.decoder.is_idle() && self.started.elapsed() > self.head_timeout {
+        self.check_head_timeout()
+    }
+
+    /// A partial first event may finish after the deadline, as before.
+    fn head_wait_remaining(&self) -> Option<Duration> {
+        if self.saw_event || !self.decoder.is_idle() {
+            return None;
+        }
+        Some(self.head_timeout.saturating_sub(self.started.elapsed()))
+    }
+
+    fn check_head_timeout(&self) -> NetResult<()> {
+        if self.head_wait_remaining() == Some(Duration::ZERO) {
             return Err(NetError::new(
                 FailureKind::Timeout,
                 "the endpoint produced no output within the head timeout",
@@ -1309,6 +1324,54 @@ mod tests {
         }
     }
 
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn the_head_deadline_expires_during_a_blocked_body_read() {
+        for initial in [b"".as_slice(), b": keep-alive\n\n"] {
+            let (release, released) = std::sync::mpsc::channel::<()>();
+            let (report, reported) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let started = Instant::now();
+                let body = std::io::Cursor::new(initial).chain(SilentBody(released));
+                let result = read_stream(
+                    Box::new(body),
+                    &crate::chat_completions::ChatCompletions,
+                    Duration::from_millis(75),
+                    &|| false,
+                    &mut |_| {},
+                );
+                let _ = report.send((result, started.elapsed()));
+            });
+            let result = reported.recv_timeout(Duration::from_secs(2));
+            drop(release);
+            let (result, elapsed) = result.expect("the head deadline interrupted the stream wait");
+            let err = result.expect_err("head timeout");
+            assert_eq!(err.kind(), FailureKind::Timeout, "{err}");
+            assert!(err.message().contains("head timeout"), "{err}");
+            assert!(elapsed >= Duration::from_millis(75), "{elapsed:?}");
+            assert!(elapsed < Duration::from_millis(500), "{elapsed:?}");
+        }
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn the_head_deadline_ends_when_the_first_event_arrives() {
+        let body = PacedBody::body(vec![
+            (Duration::ZERO, DELTA),
+            (Duration::from_millis(150), ANSWER_HEAD),
+            (Duration::ZERO, ANSWER_TAIL),
+        ]);
+        let outcome = read_stream(
+            body,
+            &crate::chat_completions::ChatCompletions,
+            Duration::from_millis(50),
+            &|| false,
+            &mut |_| {},
+        )
+        .expect("silence after the first event does not hit the head deadline");
+        assert_eq!(outcome.text(), "still streaminglate");
+    }
+
     #[test]
     fn the_total_deadline_expires_during_a_blocked_body_read() {
         let (release, released) = std::sync::mpsc::channel::<()>();
@@ -1441,6 +1504,69 @@ mod tests {
             .expect("the request gave up on the endpoint")
             .expect_err("timed out");
         assert_eq!(err.kind(), FailureKind::Timeout, "{err}");
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn an_endpoint_that_sends_headers_then_stays_silent_hits_the_head_deadline() {
+        use std::io::{BufRead as _, Write as _};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let address = listener.local_addr().expect("address");
+        let (hold, held) = std::sync::mpsc::channel::<()>();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("read timeout");
+            let mut reader = std::io::BufReader::new(stream.try_clone().expect("clone"));
+            let mut length = 0_usize;
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).expect("request head") == 0 || line.trim().is_empty()
+                {
+                    break;
+                }
+                if let Some((name, value)) = line.split_once(':')
+                    && name.eq_ignore_ascii_case("content-length")
+                {
+                    length = value.trim().parse().expect("content length");
+                }
+            }
+            reader
+                .read_exact(&mut vec![0_u8; length])
+                .expect("request body");
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\
+                      transfer-encoding: chunked\r\nconnection: close\r\n\r\n",
+                )
+                .expect("response headers");
+            stream.flush().expect("flush headers");
+            let _ = held.recv();
+        });
+        let (report, reported) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let started = Instant::now();
+            let result = stream_completion(
+                &UreqFetch::new(),
+                &Endpoint::new(format!("http://{address}"), "k"),
+                &crate::chat_completions::ChatCompletions,
+                &RequestPlan::new("m"),
+                Duration::from_millis(200),
+                &|| false,
+            );
+            let _ = report.send((result, started.elapsed()));
+        });
+        let result = reported.recv_timeout(Duration::from_secs(2));
+        drop(hold);
+        server.join().expect("server");
+        let (result, elapsed) = result.expect("the request returned while the body was still open");
+        let err = result.expect_err("head timeout");
+        assert_eq!(err.kind(), FailureKind::Timeout, "{err}");
+        assert!(err.message().contains("head timeout"), "{err}");
+        assert!(elapsed >= Duration::from_millis(200), "{elapsed:?}");
+        assert!(elapsed < Duration::from_secs(1), "{elapsed:?}");
     }
 
     #[cfg(not(target_family = "wasm"))]
