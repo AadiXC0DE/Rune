@@ -6,6 +6,21 @@ The workspace contains fourteen crates under `crates/`, plus `xtask`, fifteen wo
 
 There are three evidence levels in this report: observed binary behavior with commands/captures; executable library probes; and source findings that still need the specified integration test. A feature row proposes behavior; its evidence identifies the existing boundary or competitor behavior motivating it. Acceptance checks are future requirements, not claims that those tests already exist or passed. T1 is the first-week queue, T2 follows, T3 is optional expansion. Dependencies are explicit where a reader or host integration needs another item first.
 
+## Status: parked after the first pass
+
+Branch `feat/expansion-audit`. Every commit here was accepted only after `cargo xtask check` (format, clippy with warnings denied, and the full workspace suite) passed on that exact tree. Anything that failed the gate twice, or whose change exceeded 30 files or 1200 lines, was reverted instead of committed.
+
+| state | count |
+|---|---|
+| implemented and committed | 24 |
+| tier 1 still open | 13 |
+| tier 2, not started | 141 |
+| tier 3, not started | 32 |
+
+Two of the open tier 1 items, R-006 and R-013, were judged by the implementer to need no change. They are left unticked pending a human read rather than closed on that word alone.
+
+The next pass starts at the remaining tier 1 items, in the order listed below.
+
 ## Build, test and budgets
 
 The host is Linux x86_64 GNU, kernel `6.8.0-139-generic` (`uname -a`). Neither Cargo nor rustc was initially on PATH. An isolated official rustup installation under `/tmp` supplied `rustc 1.98.1 (48a229cea 2026-09-01)` (`/tmp/rune-audit-cargo/bin/rustc --version`). All Cargo runs used:
