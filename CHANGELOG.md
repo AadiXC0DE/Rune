@@ -29,7 +29,10 @@ Notable changes, newest first. Each entry describes what a user can observe.
   `edit_file` are held to the same roots as reads.
 - A shell rule is judged against every command a line runs, so `ls; rm -rf .git`
   no longer matches an allow for `ls*`.
-- Web fetch checks every redirect hop before following it.
+- Native web fetch checks every redirect hop and its resolved addresses before
+  connecting, then connects only to those vetted addresses. Private destinations
+  still require `allow_private`. Proxy requests are refused unless `NO_PROXY`
+  permits a direct connection, because proxy DNS can bypass address vetting.
 - Web fetch refuses abbreviated private IPv4 addresses such as `127.1`,
   `127.0.1`, and `10.1` before calling the backend, unless `allow_private` is true.
 - Model output is stripped of terminal control sequences while it streams.

@@ -29,14 +29,34 @@ pub struct NetworkFetch;
 
 impl FetchBackend for NetworkFetch {
     fn get(&self, url: &str, timeout: Duration) -> Result<Fetched> {
+        self.get_with_private_access(url, timeout, false)
+    }
+
+    fn get_with_private_access(
+        &self,
+        url: &str,
+        timeout: Duration,
+        allow_private: bool,
+    ) -> Result<Fetched> {
         // One hop only: the tool follows a redirect itself, after checking
-        // where it points.
-        let fetched = rune_net::transport::fetch_hop(
+        // where it points. The transport pins the vetted DNS result as well.
+        let fetched = rune_net::transport::fetch_hop_checked(
             url,
             "text/html,application/json,text/plain;q=0.9,*/*;q=0.8",
             timeout,
-        )
-        .map_err(|err| err.to_rune_error())?;
+            |address| {
+                if !allow_private && rune_tools::web::is_local_host(&address.to_string()) {
+                    return Err(RuneError::new(
+                        ErrorCode::PermissionDenied,
+                        format!(
+                            "the destination resolves to `{address}`, a loopback, private, or link-local address"
+                        ),
+                    )
+                    .with_hint("pass allow_private: true to reach an address on the local network"));
+                }
+                Ok(())
+            },
+        )?;
         Ok(Fetched {
             status: fetched.status,
             content_type: fetched.content_type,
@@ -109,6 +129,25 @@ mod tests {
     use rune_core::config::{EnvironmentOverrides, Settings, load};
     use rune_policy::decision::Outcome;
     use rune_tools::contract::ExecutionContext;
+
+    #[test]
+    fn a_hostname_resolving_to_loopback_is_refused_before_http() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        listener.set_nonblocking(true).expect("nonblocking");
+        let port = listener.local_addr().expect("address").port();
+        let error = NetworkFetch
+            .get(
+                &format!("http://localhost:{port}/fixture"),
+                Duration::from_secs(2),
+            )
+            .expect_err("resolved loopback must be refused");
+        assert_eq!(error.code(), ErrorCode::PermissionDenied);
+        assert!(error.message().contains("resolves to"), "{error}");
+        assert_eq!(
+            listener.accept().expect_err("no connection").kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
 
     #[test]
     fn a_fixture_fetch_requires_an_explicit_web_opt_in() {

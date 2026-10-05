@@ -92,16 +92,30 @@ pub struct Fetched {
 
 /// Fetches one URL.
 ///
-/// The implementation owns the connection and the TLS configuration; the tool
-/// owns the bounds, the refusals, and the redirects. A backend returns a
-/// redirect as it is rather than following it, so the tool can refuse an
-/// address on the chain before it is requested. That split is also what lets
+/// The implementation owns the connection, TLS configuration, and resolved
+/// address checks; the tool owns the bounds, URL refusals, and redirects. A
+/// backend returns a redirect as it is rather than following it, so the tool
+/// can refuse an address on the chain before it is requested. That split is also what lets
 /// a test drive the tool without a socket.
 pub trait FetchBackend: Send + Sync {
     /// Performs one request, without following a redirect.
     ///
     /// Returns the response, or a failure the tool reports to the model.
     fn get(&self, url: &str, timeout: Duration) -> Result<Fetched>;
+
+    /// Performs one request with the caller's private-network opt-in.
+    ///
+    /// A network backend must check the resolved addresses and connect only to
+    /// those addresses, retaining the URL's host for HTTP and TLS. The default
+    /// supports backends that do not open sockets, such as recorded responses.
+    fn get_with_private_access(
+        &self,
+        url: &str,
+        timeout: Duration,
+        _allow_private: bool,
+    ) -> Result<Fetched> {
+        self.get(url, timeout)
+    }
 }
 
 /// One source returned by a search backend.
@@ -1102,15 +1116,19 @@ impl Tool for WebFetch {
         let mut remaining = self.timeout;
         let fetched = loop {
             let started = Instant::now();
-            let fetched = match self.backend.get(&current, remaining) {
-                Ok(fetched) => fetched,
-                Err(error) => {
-                    return Ok(backend_failure(
-                        &format!("`{current}` could not be fetched"),
-                        &error,
-                    ));
-                }
-            };
+            let fetched =
+                match self
+                    .backend
+                    .get_with_private_access(&current, remaining, allow_private)
+                {
+                    Ok(fetched) => fetched,
+                    Err(error) => {
+                        return Ok(backend_failure(
+                            &format!("`{current}` could not be fetched"),
+                            &error,
+                        ));
+                    }
+                };
             let Some(location) = redirect_location(&fetched) else {
                 break fetched;
             };
@@ -1603,6 +1621,47 @@ mod tests {
 
     fn call(tool: &WebFetch, arguments: &serde_json::Value) -> Result<ToolOutput> {
         tool.call(arguments, &context())
+    }
+
+    #[test]
+    fn the_private_access_policy_reaches_the_backend_on_every_hop() {
+        #[derive(Debug, Default)]
+        struct PolicyBackend {
+            recording: RecordingBackend,
+            policies: Mutex<Vec<bool>>,
+        }
+
+        impl FetchBackend for PolicyBackend {
+            fn get(&self, _url: &str, _timeout: Duration) -> Result<Fetched> {
+                panic!("the tool must supply its private-access policy");
+            }
+
+            fn get_with_private_access(
+                &self,
+                url: &str,
+                timeout: Duration,
+                allow_private: bool,
+            ) -> Result<Fetched> {
+                lock(&self.policies).push(allow_private);
+                self.recording.get(url, timeout)
+            }
+        }
+
+        for allow_private in [false, true] {
+            let backend = Arc::new(PolicyBackend::default());
+            let mut redirect = fetched(302, "text/plain", "");
+            redirect.location = Some("https://other.example/final".to_owned());
+            backend.recording.push(redirect);
+            backend.recording.push(fetched(200, "text/plain", "final"));
+            let tool = fetch_with(backend.clone(), &budget());
+            let mut arguments = serde_json::json!({ "url": "https://public.example/" });
+            if allow_private {
+                arguments["allow_private"] = serde_json::json!(true);
+            }
+            let output = call(&tool, &arguments).expect("fetch");
+            assert!(!output.is_error, "{output:?}");
+            assert_eq!(*lock(&backend.policies), vec![allow_private; 2]);
+        }
     }
 
     #[test]

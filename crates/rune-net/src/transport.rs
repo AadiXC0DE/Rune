@@ -624,7 +624,8 @@ pub const TOOL_USER_AGENT: &str = concat!(
 /// a way around them.
 ///
 /// The chain is followed without being seen, so an address a model or a user
-/// supplied goes through [`fetch_hop`] instead, whose caller vets every hop.
+/// supplied goes through [`fetch_hop_checked`] instead, whose caller vets every
+/// hop and its resolved addresses.
 ///
 /// Absent on a target where the built-in client cannot build. Such a target
 /// reaches the endpoint through [`stream_completion`] and its own [`Fetch`], or
@@ -641,15 +642,127 @@ pub fn fetch_url(url: &str, accept: &str, timeout: Duration) -> NetResult<Fetche
 /// before the tool could check one, so a public page redirecting to a private
 /// address would be fetched; the tool follows the chain instead, checking each
 /// address before it is requested.
+/// For a user-supplied URL, use [`fetch_hop_checked`] to vet DNS results as well.
 #[cfg(not(target_family = "wasm"))]
 pub fn fetch_hop(url: &str, accept: &str, timeout: Duration) -> NetResult<Fetched> {
     fetch(url, accept, timeout, false)
 }
 
+/// Fetches one hop after checking every resolved destination address.
+///
+/// Resolution consumes the same timeout as the request. The client receives
+/// only the checked socket addresses, so it cannot resolve the hostname again
+/// unchecked. The original URL is retained for the Host header and TLS peer
+/// verification. A proxy is refused unless NO_PROXY bypasses it, because a
+/// proxy may resolve the target independently of the vetted DNS result.
+#[cfg(not(target_family = "wasm"))]
+pub fn fetch_hop_checked(
+    url: &str,
+    accept: &str,
+    timeout: Duration,
+    check_address: impl FnMut(std::net::IpAddr) -> Result<()>,
+) -> Result<Fetched> {
+    use ureq::unversioned::{resolver::DefaultResolver, transport::DefaultConnector};
+
+    fetch_hop_checked_with(
+        url,
+        accept,
+        timeout,
+        check_address,
+        &DefaultResolver::default(),
+        DefaultConnector::default(),
+        agent().config().clone(),
+    )
+}
+
+#[cfg(not(target_family = "wasm"))]
+#[derive(Debug)]
+struct PinnedResolver {
+    uri: ureq::http::Uri,
+    addresses: ureq::unversioned::resolver::ResolvedSocketAddrs,
+}
+
+#[cfg(not(target_family = "wasm"))]
+impl ureq::unversioned::resolver::Resolver for PinnedResolver {
+    fn resolve(
+        &self,
+        uri: &ureq::http::Uri,
+        _config: &ureq::config::Config,
+        _timeout: ureq::unversioned::transport::NextTimeout,
+    ) -> std::result::Result<ureq::unversioned::resolver::ResolvedSocketAddrs, ureq::Error> {
+        if uri.authority() != self.uri.authority() || uri.scheme() != self.uri.scheme() {
+            return Err(ureq::Error::HostNotFound);
+        }
+        Ok(self.addresses.clone())
+    }
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn fetch_hop_checked_with(
+    url: &str,
+    accept: &str,
+    timeout: Duration,
+    mut check_address: impl FnMut(std::net::IpAddr) -> Result<()>,
+    resolver: &impl ureq::unversioned::resolver::Resolver,
+    connector: impl ureq::unversioned::transport::Connector,
+    config: ureq::config::Config,
+) -> Result<Fetched> {
+    use rune_core::error::{ErrorCode, RuneError};
+    use ureq::unversioned::transport::NextTimeout;
+
+    let started = Instant::now();
+    let uri = url
+        .parse::<ureq::http::Uri>()
+        .map_err(|error| RuneError::invalid_field("url", error.to_string()))?;
+    if config.proxy().is_some_and(|proxy| !proxy.is_no_proxy(&uri)) {
+        return Err(RuneError::new(
+            ErrorCode::Unsupported,
+            "web fetch cannot pin the destination through a proxy",
+        )
+        .with_hint("use NO_PROXY for this host to connect to its vetted address directly"));
+    }
+    let addresses = resolver
+        .resolve(
+            &uri,
+            &config,
+            NextTimeout {
+                after: timeout.into(),
+                reason: ureq::Timeout::Resolve,
+            },
+        )
+        .map_err(|error| classify_transport_error(&error).to_rune_error())?;
+    if addresses.is_empty() {
+        return Err(classify_transport_error(&ureq::Error::HostNotFound).to_rune_error());
+    }
+    for address in &addresses {
+        check_address(address.ip())?;
+    }
+    let remaining = timeout.saturating_sub(started.elapsed());
+    if remaining.is_zero() {
+        return Err(RuneError::new(
+            ErrorCode::Timeout,
+            "the web fetch timeout ran out while resolving the destination",
+        ));
+    }
+    let client = ureq::Agent::with_parts(config, connector, PinnedResolver { uri, addresses });
+    fetch_over(&client, url, accept, remaining, false).map_err(|error| error.to_rune_error())
+}
+
 /// Performs one bounded GET and holds its body.
 #[cfg(not(target_family = "wasm"))]
 fn fetch(url: &str, accept: &str, timeout: Duration, follow_redirects: bool) -> NetResult<Fetched> {
-    let response = UreqFetch::new().send(
+    fetch_over(&UreqFetch::new(), url, accept, timeout, follow_redirects)
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn fetch_over(
+    client: &dyn Fetch,
+    url: &str,
+    accept: &str,
+    timeout: Duration,
+    follow_redirects: bool,
+) -> NetResult<Fetched> {
+    let response = client.send(
         FetchRequest::get(url)
             .with_header("user-agent", TOOL_USER_AGENT)
             .with_header("accept", accept)
@@ -1749,6 +1862,345 @@ mod tests {
             0,
             "the redirect target was requested"
         );
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[derive(Debug)]
+    struct ChangingResolver {
+        answers: Vec<Vec<std::net::SocketAddr>>,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    impl ureq::unversioned::resolver::Resolver for ChangingResolver {
+        fn resolve(
+            &self,
+            uri: &ureq::http::Uri,
+            _config: &ureq::config::Config,
+            _timeout: ureq::unversioned::transport::NextTimeout,
+        ) -> std::result::Result<ureq::unversioned::resolver::ResolvedSocketAddrs, ureq::Error>
+        {
+            assert_eq!(uri.host(), Some("public.example"));
+            let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let mut addresses = self.empty();
+            for address in &self.answers[call] {
+                addresses.push(*address);
+            }
+            Ok(addresses)
+        }
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    fn refuse_test_private_address(address: std::net::IpAddr) -> Result<()> {
+        use rune_core::error::{ErrorCode, RuneError};
+
+        if address.is_loopback()
+            || match address {
+                std::net::IpAddr::V4(address) => address.is_private() || address.is_link_local(),
+                std::net::IpAddr::V6(address) => {
+                    address.is_unique_local()
+                        || address.is_unicast_link_local()
+                        || address.to_ipv4_mapped().is_some_and(|address| {
+                            address.is_loopback() || address.is_private() || address.is_link_local()
+                        })
+                }
+            }
+        {
+            return Err(RuneError::new(
+                ErrorCode::PermissionDenied,
+                format!("refused resolved address {address}"),
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn resolved_private_destinations_are_refused_before_connecting() {
+        use ureq::unversioned::transport::DefaultConnector;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        listener.set_nonblocking(true).expect("nonblocking");
+        let loopback = listener.local_addr().expect("address");
+        let public = "93.184.216.34:80".parse().expect("public address");
+        for addresses in [
+            vec![loopback],
+            vec!["[::1]:80".parse().expect("IPv6 loopback")],
+            vec!["10.0.0.1:80".parse().expect("private")],
+            vec!["169.254.169.254:80".parse().expect("link local")],
+            vec!["[fd00::1]:80".parse().expect("unique local")],
+            vec!["[fe80::1]:80".parse().expect("IPv6 link local")],
+            vec!["[::ffff:127.0.0.1]:80".parse().expect("mapped loopback")],
+            vec![public, loopback],
+            vec![loopback, public],
+        ] {
+            let resolver = ChangingResolver {
+                answers: vec![addresses.clone()],
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            };
+            let error = fetch_hop_checked_with(
+                "http://public.example/fixture",
+                "*/*",
+                Duration::from_secs(2),
+                refuse_test_private_address,
+                &resolver,
+                DefaultConnector::default(),
+                ureq::Agent::config_builder().proxy(None).build(),
+            )
+            .expect_err("private DNS must be refused");
+            assert_eq!(
+                error.code(),
+                rune_core::error::ErrorCode::PermissionDenied,
+                "{addresses:?}: {error}"
+            );
+            assert_eq!(
+                listener.accept().expect_err("no connection").kind(),
+                std::io::ErrorKind::WouldBlock
+            );
+        }
+    }
+
+    /// Routes an asserted public destination to a local HTTP fixture. The
+    /// production resolver and request code run unchanged; only TCP routing
+    /// is replaced, so the test does not need a live public server.
+    #[cfg(not(target_family = "wasm"))]
+    #[derive(Debug)]
+    struct FixtureConnector {
+        vetted: Vec<std::net::SocketAddr>,
+        fixture: std::net::SocketAddr,
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    impl ureq::unversioned::transport::Connector for FixtureConnector {
+        type Out = Box<dyn ureq::unversioned::transport::Transport>;
+
+        fn connect(
+            &self,
+            details: &ureq::unversioned::transport::ConnectionDetails<'_>,
+            chained: Option<()>,
+        ) -> std::result::Result<Option<Self::Out>, ureq::Error> {
+            use ureq::unversioned::transport::{ConnectionDetails, DefaultConnector};
+
+            assert_eq!(details.uri.host(), Some("public.example"));
+            assert_eq!(&*details.addrs, self.vetted.as_slice());
+            // Even another resolver call must return the pinned result.
+            let pinned = details
+                .resolver
+                .resolve(details.uri, details.config, details.timeout)?;
+            assert_eq!(&*pinned, self.vetted.as_slice());
+            let mut addresses = details.resolver.empty();
+            addresses.push(self.fixture);
+            let routed = ConnectionDetails {
+                uri: details.uri,
+                addrs: addresses,
+                config: details.config,
+                request_level: details.request_level,
+                resolver: details.resolver,
+                now: details.now,
+                timeout: details.timeout,
+                current_time: details.current_time.clone(),
+                run_connector: details.run_connector.clone(),
+            };
+            DefaultConnector::default().connect(&routed, chained)
+        }
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn a_public_fetch_connects_to_vetted_addresses_without_another_dns_lookup() {
+        use std::io::{BufRead as _, Write as _};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        listener.set_nonblocking(true).expect("nonblocking");
+        let fixture_address = listener.local_addr().expect("address");
+        let fixture = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(Instant::now() < deadline, "fixture was not called");
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("fixture accept: {error}"),
+                }
+            };
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("read timeout");
+            stream
+                .set_write_timeout(Some(Duration::from_secs(2)))
+                .expect("write timeout");
+            let mut request = String::new();
+            let mut reader = std::io::BufReader::new(&stream);
+            loop {
+                let mut line = String::new();
+                assert!(reader.read_line(&mut line).expect("request") > 0);
+                request.push_str(&line);
+                if line == "\r\n" {
+                    break;
+                }
+            }
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 12\r\nConnection: close\r\n\r\nR020_WEB_OK\n")
+                .expect("response");
+            request
+        });
+        let public = "93.184.216.34:8080".parse().expect("public address");
+        let resolver = ChangingResolver {
+            // A second lookup would change to the local server. It must never
+            // happen, even if the connector asks to resolve again.
+            answers: vec![vec![public], vec![fixture_address]],
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let mut vetted = Vec::new();
+        let response = fetch_hop_checked_with(
+            "http://public.example:8080/fixture",
+            "text/plain",
+            Duration::from_secs(2),
+            |address| {
+                vetted.push(address);
+                refuse_test_private_address(address)
+            },
+            &resolver,
+            FixtureConnector {
+                vetted: vec![public],
+                fixture: fixture_address,
+            },
+            // An explicit NO_PROXY bypass must still permit a vetted request.
+            ureq::Agent::config_builder()
+                .proxy(Some(
+                    ureq::Proxy::builder(ureq::ProxyProtocol::Http)
+                        .host("127.0.0.1")
+                        .port(1)
+                        .no_proxy("public.example")
+                        .build()
+                        .expect("proxy"),
+                ))
+                .build(),
+        )
+        .expect("vetted fetch");
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body, b"R020_WEB_OK\n");
+        assert_eq!(vetted, vec![public.ip()]);
+        assert_eq!(resolver.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let request = fixture.join().expect("fixture thread");
+        assert!(
+            request.starts_with("GET /fixture HTTP/1.1\r\n"),
+            "{request}"
+        );
+        assert!(
+            request
+                .to_ascii_lowercase()
+                .contains("\r\nhost: public.example:8080\r\n"),
+            "{request}"
+        );
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn a_checked_fetch_refuses_empty_dns_and_proxy_resolution() {
+        use ureq::unversioned::transport::DefaultConnector;
+
+        let resolver = ChangingResolver {
+            answers: vec![vec![]],
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let error = fetch_hop_checked_with(
+            "http://public.example/fixture",
+            "*/*",
+            Duration::from_secs(2),
+            |_| panic!("no address to check"),
+            &resolver,
+            DefaultConnector::default(),
+            ureq::Agent::config_builder().proxy(None).build(),
+        )
+        .expect_err("empty DNS");
+        assert_eq!(error.code(), rune_core::error::ErrorCode::TransportFailure);
+        let error = fetch_hop_checked_with(
+            "http://public.example/fixture",
+            "*/*",
+            Duration::from_secs(2),
+            |_| panic!("proxy must be refused before resolution"),
+            &resolver,
+            DefaultConnector::default(),
+            ureq::Agent::config_builder()
+                .proxy(Some(ureq::Proxy::new("http://127.0.0.1:1").expect("proxy")))
+                .build(),
+        )
+        .expect_err("unchecked proxy DNS");
+        assert_eq!(error.code(), rune_core::error::ErrorCode::Unsupported);
+        assert_eq!(resolver.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn a_checked_https_fetch_keeps_the_original_tls_peer_name() {
+        use ureq::unversioned::transport::{ConnectionDetails, Connector, Transport};
+
+        #[derive(Debug)]
+        struct TlsPeerConnector;
+
+        impl Connector for TlsPeerConnector {
+            type Out = Box<dyn Transport>;
+
+            fn connect(
+                &self,
+                details: &ConnectionDetails<'_>,
+                _chained: Option<()>,
+            ) -> std::result::Result<Option<Self::Out>, ureq::Error> {
+                assert!(details.needs_tls());
+                assert_eq!(details.uri.host(), Some("public.example"));
+                assert_eq!(
+                    details.addrs[0],
+                    "93.184.216.34:443".parse().expect("public")
+                );
+                Err(ureq::Error::ConnectionFailed)
+            }
+        }
+
+        let resolver = ChangingResolver {
+            answers: vec![vec!["93.184.216.34:443".parse().expect("public")]],
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let error = fetch_hop_checked_with(
+            "https://public.example/fixture",
+            "*/*",
+            Duration::from_secs(2),
+            refuse_test_private_address,
+            &resolver,
+            TlsPeerConnector,
+            ureq::Agent::config_builder().proxy(None).build(),
+        )
+        .expect_err("fixture stops before TLS handshake");
+        assert_eq!(error.code(), rune_core::error::ErrorCode::TransportFailure);
+        assert_eq!(resolver.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn checking_resolved_addresses_consumes_the_fetch_timeout() {
+        use ureq::unversioned::transport::DefaultConnector;
+
+        let resolver = ChangingResolver {
+            answers: vec![vec!["93.184.216.34:80".parse().expect("public")]],
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let error = fetch_hop_checked_with(
+            "http://public.example/fixture",
+            "*/*",
+            Duration::from_millis(10),
+            |_| {
+                std::thread::sleep(Duration::from_millis(20));
+                Ok(())
+            },
+            &resolver,
+            DefaultConnector::default(),
+            ureq::Agent::config_builder().proxy(None).build(),
+        )
+        .expect_err("deadline expired before connecting");
+        assert_eq!(error.code(), rune_core::error::ErrorCode::Timeout);
+        assert!(error.message().contains("resolving"), "{error}");
     }
 
     #[test]
