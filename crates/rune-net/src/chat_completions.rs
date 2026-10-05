@@ -119,6 +119,10 @@ impl Provider for ChatCompletions {
             }
         }
 
+        if let Some(effort) = effort_wire(plan.effort) {
+            body.insert("reasoning_effort".to_owned(), serde_json::json!(effort));
+        }
+
         if let Some(max) = plan.max_output_tokens {
             // `max_tokens` rather than `max_completion_tokens`, because the
             // compatible-server ecosystem understands the former.
@@ -969,6 +973,32 @@ mod tests {
         plan.tool_choice = ToolChoice::Required;
         let body = ChatCompletions.build_request(&plan).expect("build");
         assert_eq!(body["tool_choice"], "required");
+    }
+
+    #[test]
+    fn auto_effort_preserves_provider_defaults() {
+        let body = ChatCompletions
+            .build_request(&plan_with_user("hi"))
+            .expect("build");
+        assert!(body.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn explicit_efforts_are_serialized_in_the_request() {
+        for (effort, wire) in [
+            (Effort::None, "none"),
+            (Effort::Minimal, "minimal"),
+            (Effort::Low, "low"),
+            (Effort::Medium, "medium"),
+            (Effort::High, "high"),
+            (Effort::Xhigh, "xhigh"),
+            (Effort::Max, "max"),
+        ] {
+            let mut plan = plan_with_user("hi");
+            plan.effort = effort;
+            let body = ChatCompletions.build_request(&plan).expect("build");
+            assert_eq!(body["reasoning_effort"], wire, "{effort}");
+        }
     }
 
     #[test]
