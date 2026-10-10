@@ -462,14 +462,38 @@ fn write_restore(out: &mut impl std::io::Write) {
     let _ = out.flush();
 }
 
+thread_local! {
+    /// Only this thread's caught worker panic bypasses the ordinary hook.
+    static CATCHING_WORKER_PANIC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Catches a worker panic without writing into the renderer's live region.
+///
+/// The caller must discard the worker's partially mutated state on failure and
+/// pass the returned panic payload to the renderer. Other threads and aborting
+/// builds retain the ordinary panic hook and terminal restoration.
+pub fn catch_worker_panic<T>(work: impl FnOnce() -> T) -> std::thread::Result<T> {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            CATCHING_WORKER_PANIC.set(self.0);
+        }
+    }
+
+    install_panic_hook();
+    let _restore = Restore(CATCHING_WORKER_PANIC.replace(true));
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(work))
+}
+
 /// Restores the terminal before a panic ends the process.
 ///
 /// The release build aborts on a panic, so nothing unwinds and the reader's
 /// drop never runs: without this a panic leaves the shell in raw mode, with no
 /// echo and a hidden cursor. A build that unwinds is left to the drop, because
 /// a panic there can be caught, as a turn's worker's is, and the session then
-/// goes on in the mode it needs. The previous hook still runs, after the
-/// terminal is back, so its report is printed with ordinary line endings.
+/// goes on in the mode it needs. Caught workers return their diagnostic to the
+/// renderer; every other panic still invokes the previous hook. An aborting
+/// build restores the terminal before printing the fatal report.
 fn install_panic_hook() {
     static INSTALLED: std::sync::Once = std::sync::Once::new();
     INSTALLED.call_once(|| {
@@ -477,6 +501,8 @@ fn install_panic_hook() {
         std::panic::set_hook(Box::new(move |info| {
             if cfg!(panic = "abort") {
                 restore_terminal();
+            } else if CATCHING_WORKER_PANIC.get() {
+                return;
             }
             previous(info);
         }));
@@ -808,6 +834,55 @@ mod tests {
             secret_event(&mut secret, Event::Key(control('c'))),
             SecretStep::Interrupt
         );
+    }
+
+    #[test]
+    fn worker_panic_hook_is_scoped_to_the_catching_thread() {
+        if std::env::var_os("RUNE_R059_HOOK_CHILD").is_none() {
+            let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+                .args([
+                    "--exact",
+                    "input::tests::worker_panic_hook_is_scoped_to_the_catching_thread",
+                    "--nocapture",
+                ])
+                .env("RUNE_R059_HOOK_CHILD", "1")
+                .output()
+                .expect("hook fixture subprocess");
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        // Only this subprocess changes the global hook. Fatal/unmanaged panics
+        // must keep reaching it while a different worker is being caught.
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let recorded = std::sync::Arc::clone(&calls);
+        std::panic::set_hook(Box::new(move |_| {
+            recorded.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }));
+        assert!(
+            catch_worker_panic(|| {
+                assert!(catch_worker_panic(|| panic!("nested caught panic")).is_err());
+                assert!(CATCHING_WORKER_PANIC.get());
+                assert!(
+                    std::thread::spawn(|| panic!("other thread"))
+                        .join()
+                        .is_err()
+                );
+                panic!("caught worker panic");
+            })
+            .is_err()
+        );
+        assert!(!CATCHING_WORKER_PANIC.get());
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert_eq!(catch_worker_panic(|| 42).expect("successful work"), 42);
+        assert!(!CATCHING_WORKER_PANIC.get());
+        assert!(std::panic::catch_unwind(|| panic!("ordinary panic")).is_err());
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 2);
     }
 
     #[test]

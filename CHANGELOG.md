@@ -61,6 +61,9 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Fixed
 
+- Caught worker panics in unwinding builds display one diagnostic through the
+  session renderer without leaving duplicate prompt or status rows.
+
 - `grep_files` searches source text before adding long-line truncation annotations,
   so the annotation cannot create a match for text absent from the source.
 - Unknown `--permission-mode` values fail with `invalid_field`, list the

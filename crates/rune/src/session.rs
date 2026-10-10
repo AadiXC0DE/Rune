@@ -1620,14 +1620,20 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                             .min(history.len());
                         retain_partial_answer(&mut history, history_start, &partial);
                         host.capture_history(&history);
-                        host.transcript
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .push(Entry::notice(err.message()));
+                        {
+                            let mut transcript = host
+                                .transcript
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            if let Some(diagnostic) = &steered.diagnostic {
+                                transcript.push(Entry::notice(diagnostic));
+                            }
+                            transcript.push(Entry::notice(err.message()));
+                        }
                         if !reader.is_active() {
                             return Err(err);
                         }
-                        let lines = report_failed_turn(&err, &host);
+                        let lines = report_failed_turn(&err, &host, steered.diagnostic.as_deref());
                         host.clear_events();
                         host.clear_streaming();
                         close_turn(&host, sink, reader, &lines, None, &steered.unsent)?;
@@ -1770,6 +1776,7 @@ fn run_turn_steerable(
         // and the steering path is simply unused.
         return SteeredTurn {
             outcome: turn::run_turn(history, host),
+            diagnostic: None,
             applied: Vec::new(),
             unsent: Vec::new(),
         };
@@ -1794,7 +1801,7 @@ fn run_turn_steerable(
         *slot = Some(questions);
     }
 
-    let result = run_on_worker(
+    let (result, diagnostic) = run_on_worker(
         history,
         |taken| turn::run_turn(taken, host),
         || {
@@ -1902,6 +1909,7 @@ fn run_turn_steerable(
     submitted.truncate(applied_count);
     SteeredTurn {
         outcome: result,
+        diagnostic,
         applied: submitted,
         unsent,
     }
@@ -2096,33 +2104,54 @@ fn draw_choice(
 /// turn one defect into the loss of the session. What the worker held is not
 /// used, because a turn stopped partway can hold a tool call with no result,
 /// and every later request would then be refused.
-fn run_on_worker<T, B>(history: &mut History, turn: T, mut between: B) -> Result<turn::TurnOutcome>
+/// Its panic diagnostic is returned separately for the closing frame.
+fn run_on_worker<T, B>(
+    history: &mut History,
+    turn: T,
+    mut between: B,
+) -> (Result<turn::TurnOutcome>, Option<String>)
 where
     T: FnOnce(&mut History) -> Result<turn::TurnOutcome> + Send,
     B: FnMut(),
 {
     let before = history.clone();
     let mut taken = std::mem::take(history);
-    let (returned, result) = std::thread::scope(|scope| {
+    let (returned, result, diagnostic) = std::thread::scope(|scope| {
         let worker = scope.spawn(move || {
-            let result = turn(&mut taken);
-            (taken, result)
+            rune_term::input::catch_worker_panic(|| {
+                let result = turn(&mut taken);
+                (taken, result)
+            })
         });
         while !worker.is_finished() {
             between();
         }
-        worker
-            .join()
-            .unwrap_or_else(|_| (before, Err(turn_interrupted())))
+        match worker.join().and_then(std::convert::identity) {
+            Ok((returned, result)) => (returned, result, None),
+            Err(payload) => {
+                let message = payload
+                    .downcast_ref::<String>()
+                    .map(String::as_str)
+                    .or_else(|| payload.downcast_ref::<&str>().copied())
+                    .unwrap_or("non-text panic payload");
+                (
+                    before,
+                    Err(turn_interrupted()),
+                    Some(format!("worker panicked: {message}")),
+                )
+            }
+        }
     });
     *history = returned;
-    result
+    (result, diagnostic)
 }
 
 /// What a steerable turn produced beside its outcome.
 struct SteeredTurn {
     /// The turn's own result.
     outcome: Result<turn::TurnOutcome>,
+    /// A caught worker panic, settled once through the renderer.
+    diagnostic: Option<String>,
     /// Corrections the turn took in, in the order they were typed.
     applied: Vec<String>,
     /// Corrections typed after the turn's last boundary, which it never saw.
@@ -3782,11 +3811,18 @@ fn report_turn(outcome: &turn::TurnOutcome, host: &SessionHost) -> Result<Vec<St
 /// What streamed before the failure is kept, because the reader watched it
 /// arrive and a transcript that dropped it would disagree with the screen.
 /// Interrupted answers are also saved and retained in the conversation.
-fn report_failed_turn(err: &RuneError, host: &SessionHost) -> Vec<String> {
+fn report_failed_turn(
+    err: &RuneError,
+    host: &SessionHost,
+    diagnostic: Option<&str>,
+) -> Vec<String> {
     let mut entries = event_entries(host);
     let partial = host.partial_answer();
     if !partial.trim().is_empty() {
         entries.push(Entry::assistant(partial));
+    }
+    if let Some(diagnostic) = diagnostic {
+        entries.push(Entry::notice(diagnostic));
     }
     if err.code() == ErrorCode::Cancelled {
         entries.push(Entry::notice("cancelled"));
@@ -4398,6 +4434,99 @@ mod tests {
     }
 
     #[test]
+    fn caught_worker_panic_renders_one_diagnostic_without_duplicate_status_rows() {
+        // A subprocess makes writes from the default panic hook observable,
+        // rather than letting the test harness capture and hide the defect.
+        if std::env::var_os("RUNE_R059_PANIC_CHILD").is_none() {
+            let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+                .args([
+                    "--exact",
+                    "session::tests::caught_worker_panic_renders_one_diagnostic_without_duplicate_status_rows",
+                    "--nocapture",
+                ])
+                .env("RUNE_R059_PANIC_CHILD", "1")
+                .output()
+                .expect("panic fixture subprocess");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(output.status.success(), "{stdout}\n{stderr}");
+            assert!(stderr.is_empty(), "panic bypassed the renderer: {stderr}");
+            assert!(!stdout.contains("panicked at"), "{stdout}");
+            assert!(
+                !stdout.contains('\u{1b}'),
+                "terminal writes bypassed the sink: {stdout}"
+            );
+            let capture = stdout
+                .lines()
+                .find_map(|line| line.strip_prefix("R059_CAPTURE:"))
+                .expect("renderer capture");
+            let bytes: Vec<u8> = serde_json::from_str(capture).expect("frame bytes");
+            let mut grid = rune_term::Grid::new(80, 24).expect("grid");
+            grid.feed(&bytes).expect("replay");
+            let screen = grid.text();
+            assert_eq!(
+                screen.matches("worker panicked: R059_FIXTURE").count(),
+                1,
+                "{screen}"
+            );
+            assert_eq!(screen.matches("ctrl-c cancel").count(), 1, "{screen}");
+            assert_eq!(screen.matches("test | ").count(), 1, "{screen}");
+            assert_eq!(screen.matches("draft after panic").count(), 1, "{screen}");
+            assert!(screen.contains("partial before panic"), "{screen}");
+            assert!(screen.contains("next turn answer"), "{screen}");
+            return;
+        }
+
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let out: LiveSink = Arc::new(Mutex::new(SharedSink(Arc::clone(&bytes))));
+        let host = test_host();
+        *host.live_out.lock().expect("output") = Some(Arc::clone(&out));
+        let mut reader = rune_term::input::KeyReader::new();
+        reader.replace("draft after panic");
+        host.draw_stream_with(reader.line(), reader.column());
+        let mut history = History::new();
+        history.push_user("panic fixture");
+        let (result, diagnostic) = run_on_worker(
+            &mut history,
+            |_| {
+                host.emit(Event::TextDelta {
+                    delta: "partial before panic".to_owned(),
+                });
+                // Bounded, debug-only fixture also checks terminal sanitization.
+                std::panic::panic_any(String::from("R059_FIXTURE\u{1b}[2J"));
+            },
+            || std::thread::sleep(std::time::Duration::from_millis(1)),
+        );
+        let lines = report_failed_turn(
+            &result.expect_err("caught panic"),
+            &host,
+            diagnostic.as_deref(),
+        );
+        host.clear_events();
+        host.clear_streaming();
+        let mut sink = LockedSink { stream: out };
+        close_turn(&host, &mut sink, &mut reader, &lines, None, &[]).expect("closed");
+        // A subsequent worker and frame must still be usable, and redraws must
+        // not settle the diagnostic a second time.
+        let (_, diagnostic) = run_on_worker(&mut history, |_| Err(turn_interrupted()), || {});
+        assert!(diagnostic.is_none());
+        host.draw_stream_with(reader.line(), reader.column());
+        close_turn(
+            &host,
+            &mut sink,
+            &mut reader,
+            &["next turn answer".to_owned()],
+            None,
+            &[],
+        )
+        .expect("next turn closed");
+        println!(
+            "R059_CAPTURE:{}",
+            serde_json::to_string(&*bytes.lock().expect("bytes")).expect("json")
+        );
+    }
+
+    #[test]
     fn a_turn_that_panics_keeps_the_conversation_it_started_with() {
         // A panic inside a turn ends that exchange and nothing more: falling
         // back to an empty history would throw away every earlier turn.
@@ -4408,7 +4537,7 @@ mod tests {
         }]);
         history.push_user("second question");
 
-        let result = run_on_worker(
+        let (result, diagnostic) = run_on_worker(
             &mut history,
             |taken| {
                 // Stopped partway: an assistant turn holding a call with no
@@ -4427,6 +4556,10 @@ mod tests {
             result.err().map(|err| err.code()),
             Some(ErrorCode::Cancelled)
         );
+        assert_eq!(
+            diagnostic.as_deref(),
+            Some("worker panicked: the turn failed")
+        );
         assert_eq!(history.len(), 3, "the conversation was not kept");
         assert_eq!(history.turns()[0].text(), "first question");
         assert_eq!(history.turns()[2].text(), "second question");
@@ -4439,7 +4572,7 @@ mod tests {
     fn a_finished_turn_hands_back_what_it_added() {
         let mut history = History::new();
         history.push_user("question");
-        let result = run_on_worker(
+        let (result, diagnostic) = run_on_worker(
             &mut history,
             |taken| {
                 taken.push_assistant(vec![rune_net::message::ContentPart::Text {
@@ -4450,6 +4583,7 @@ mod tests {
             || {},
         );
         assert!(result.is_err());
+        assert!(diagnostic.is_none());
         assert_eq!(history.len(), 2);
         assert_eq!(history.turns()[1].text(), "answer");
     }
@@ -4462,7 +4596,8 @@ mod tests {
         if let Ok(mut streaming) = host.streaming.lock() {
             streaming.answer.push_str("half an answer");
         }
-        let lines = report_failed_turn(&rune_agent::steering::cancelled_error(), &host).join("\n");
+        let lines =
+            report_failed_turn(&rune_agent::steering::cancelled_error(), &host, None).join("\n");
         assert!(lines.contains("half an answer"), "{lines}");
         assert!(lines.contains("cancelled"), "{lines}");
         assert!(
@@ -4504,7 +4639,7 @@ mod tests {
             "the endpoint closed the stream",
         )
         .with_hint("check the provider status");
-        let lines = report_failed_turn(&err, &host).join("\n");
+        let lines = report_failed_turn(&err, &host, None).join("\n");
         assert!(lines.contains("the endpoint closed the stream"), "{lines}");
         assert!(lines.contains("check the provider status"), "{lines}");
     }
