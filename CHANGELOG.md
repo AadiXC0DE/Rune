@@ -56,6 +56,8 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Fixed
 
+- `grep_files` searches source text before adding long-line truncation annotations,
+  so the annotation cannot create a match for text absent from the source.
 - Unknown `--permission-mode` values fail with `invalid_field`, list the
   accepted modes, and exit 1 instead of silently keeping the configured mode.
 - Unknown `--effort` values fail with `invalid_field`, list the accepted

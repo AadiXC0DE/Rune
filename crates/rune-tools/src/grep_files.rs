@@ -365,14 +365,13 @@ fn scan(
         number = number.saturating_add(1);
         let text = String::from_utf8_lossy(&buffer);
         let text = text.trim_end_matches(['\n', '\r']);
-        let shown = truncate_line(text, line.length, MAX_MATCH_LINE_BYTES);
-        let haystack = if query.case_insensitive {
-            shown.to_lowercase()
+        // Search source text before adding display-only truncation annotations.
+        let matched = if query.case_insensitive {
+            text.to_lowercase().contains(&needle)
         } else {
-            shown.clone()
+            text.contains(&needle)
         };
-
-        let matched = haystack.contains(&needle);
+        let shown = truncate_line(text, line.length, MAX_MATCH_LINE_BYTES);
         let mut recorded = false;
         if matched {
             found.matches = found.matches.saturating_add(1);
@@ -1273,6 +1272,92 @@ mod tests {
             "{}",
             output.text
         );
+    }
+
+    #[test]
+    fn a_long_line_truncation_annotation_is_not_searched() {
+        let repo = Repo::new();
+        let line = format!("wideword {}\n", "q".repeat(MAX_MATCH_LINE_BYTES + 1));
+        assert!(!line.contains("line truncated"));
+        repo.write("wide/one.txt", &line);
+
+        let cap = 2 * MAX_MATCH_LINE_BYTES;
+        let context = repo.context().with_output_cap(cap);
+        let tool = GrepFiles::with_limits(FileLimits {
+            output_bytes: cap,
+            ..FileLimits::default()
+        });
+        let rendered = tool
+            .call(
+                &serde_json::json!({ "pattern": "wideword", "path": "wide/one.txt" }),
+                &context,
+            )
+            .expect("call");
+        assert!(!rendered.is_error);
+        assert!(rendered.text.contains("... [line truncated, the line is "));
+        assert!(summary(&rendered.text).contains("1 matching lines in 1 files"));
+        assert!(rendered.text.len() <= cap);
+
+        for mode in ["matches", "files_with_matches", "count"] {
+            for case_insensitive in [false, true] {
+                let pattern = if case_insensitive {
+                    "LINE TRUNCATED"
+                } else {
+                    "line truncated"
+                };
+                let output = tool
+                    .call(
+                        &serde_json::json!({
+                            "pattern": pattern,
+                            "path": "wide/one.txt",
+                            "mode": mode,
+                            "case_insensitive": case_insensitive,
+                        }),
+                        &context,
+                    )
+                    .expect("call");
+                assert!(!output.is_error);
+                assert!(
+                    summary(&output.text).contains("0 matching lines in 0 files"),
+                    "mode={mode}, case_insensitive={case_insensitive}: {}",
+                    summary(&output.text)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_literal_truncation_phrase_in_a_long_line_still_matches() {
+        let repo = Repo::new();
+        let line = format!("LINE TRUNCATED {}\n", "q".repeat(MAX_MATCH_LINE_BYTES + 1));
+        repo.write("wide/one.txt", &line);
+
+        for mode in ["matches", "files_with_matches", "count"] {
+            for case_insensitive in [false, true] {
+                let pattern = if case_insensitive {
+                    "line truncated"
+                } else {
+                    "LINE TRUNCATED"
+                };
+                let output = GrepFiles::default()
+                    .call(
+                        &serde_json::json!({
+                            "pattern": pattern,
+                            "path": "wide/one.txt",
+                            "mode": mode,
+                            "case_insensitive": case_insensitive,
+                        }),
+                        &repo.context(),
+                    )
+                    .expect("call");
+                assert!(!output.is_error);
+                assert!(
+                    summary(&output.text).contains("1 matching lines in 1 files"),
+                    "mode={mode}, case_insensitive={case_insensitive}: {}",
+                    summary(&output.text)
+                );
+            }
+        }
     }
 
     #[test]
