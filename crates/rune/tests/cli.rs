@@ -119,6 +119,35 @@ fn missing_flag_value_is_reported_as_a_missing_field() {
 }
 
 #[test]
+fn auth_status_json_matches_the_default_inspection() {
+    let default = run(&["auth", "--json"]);
+    let status = run(&["auth", "status", "--json"]);
+    for out in [&default, &status] {
+        assert_eq!(out.status, Some(0), "stderr: {}", out.stderr);
+        assert!(out.stderr.is_empty(), "{}", out.stderr);
+    }
+    let default: serde_json::Value = serde_json::from_str(&default.stdout).expect("valid json");
+    let status: serde_json::Value = serde_json::from_str(&status.stdout).expect("valid json");
+    assert!(status.is_object());
+    assert!(status["provider"].is_string());
+    assert!(status["model"].is_string());
+    assert!(status.get("base_url").is_some());
+    assert_eq!(status, default);
+}
+
+#[test]
+fn auth_status_text_matches_the_default_inspection() {
+    let default = run(&["auth"]);
+    let status = run(&["auth", "status"]);
+    for out in [&default, &status] {
+        assert_eq!(out.status, Some(0), "stderr: {}", out.stderr);
+        assert!(out.stderr.is_empty(), "{}", out.stderr);
+        assert!(!out.stdout.is_empty());
+    }
+    assert_eq!(status.stdout, default.stdout);
+}
+
+#[test]
 fn usage_reports_the_selected_period_and_interval() {
     let day_ms = 24 * 60 * 60 * 1_000;
     for (args, period, days) in [

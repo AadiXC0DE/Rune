@@ -494,14 +494,7 @@ fn run_auth(
                 println!("no credential was stored for {provider}");
             }
         }
-        Some(other) => {
-            return Err(RuneError::new(
-                ErrorCode::InvalidField,
-                format!("`{other}` is not an action for auth"),
-            )
-            .with_hint("run `rune auth` to inspect, or `rune auth remove` to clear"));
-        }
-        None => {
+        None | Some("status") => {
             if output.json {
                 let value = serde_json::json!({
                     "provider": settings.provider.to_string(),
@@ -512,6 +505,13 @@ fn run_auth(
             } else {
                 println!("{}", provider_setup::render_connection(settings, paths));
             }
+        }
+        Some(other) => {
+            return Err(RuneError::new(
+                ErrorCode::InvalidField,
+                format!("`{other}` is not an action for auth"),
+            )
+            .with_hint("run `rune auth` to inspect, or `rune auth remove` to clear"));
         }
     }
     Ok(ExitCode::from(EXIT_OK))

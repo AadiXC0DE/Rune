@@ -56,6 +56,8 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Fixed
 
+- `rune auth status` reports the same connection status as `rune auth`, including
+  JSON output, and exits successfully.
 - `rune usage` honors `--period` when selecting the reporting interval, while
   preserving positional periods and the default 24-hour report.
 - CLI sessions automatically compact earlier conversation before sending a model request
