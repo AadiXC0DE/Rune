@@ -102,6 +102,9 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Fixed
 
+- Declared boolean command flags reject attached values, including empty values.
+  `rune sessions --all=no` reports that `--all` takes no value and exits 1.
+
 - Help and the generated command reference describe the accepted aliases
   `login`, `setup`, `provider`, `pr`, `issue`, `cost`, `logout`, and `settings`.
   `logout` behaves like `auth`: without an action it shows connection status;

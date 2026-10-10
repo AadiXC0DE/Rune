@@ -268,6 +268,28 @@ fn missing_flag_value_is_reported_as_a_missing_field() {
 }
 
 #[test]
+fn declared_boolean_flags_with_attached_values_fail() {
+    for (command, token, flag) in [
+        ("sessions", "--all=no", "--all"),
+        ("sessions", "--all=", "--all"),
+        ("sessions", "--all=true", "--all"),
+        ("sessions", "--json=false", "--json"),
+        ("ask", "--no-save=no", "--no-save"),
+        ("config", "--explain=no", "--explain"),
+    ] {
+        let out = run(&[command, token]);
+        assert_eq!(out.status, Some(1), "{command} {token}: {}", out.stderr);
+        assert!(out.stdout.is_empty(), "{}", out.stdout);
+        assert!(out.stderr.contains("invalid_field"), "{}", out.stderr);
+        assert!(
+            out.stderr.contains(&format!("`{flag}` takes no value")),
+            "{}",
+            out.stderr
+        );
+    }
+}
+
+#[test]
 fn session_last_inspects_the_saved_session_in_the_current_workspace() {
     use camino::Utf8PathBuf;
     use rune_core::{id::SessionId, paths::Paths};

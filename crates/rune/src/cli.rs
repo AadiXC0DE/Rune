@@ -525,6 +525,12 @@ fn finish(mut launch: Launch, tokens: &[String], mut index: usize) -> Result<Lau
             None => (token.clone(), None),
         };
         if let Some(flag) = declared.iter().find(|flag| flag.name == name) {
+            if flag.value.is_none() && inline.is_some() {
+                return Err(RuneError::invalid_field(
+                    &name,
+                    format!("`{name}` takes no value"),
+                ));
+            }
             let mut value = inline;
             if flag.value.is_some() && value.is_none() {
                 // The next token is the value whatever it looks like, because
@@ -873,6 +879,38 @@ mod tests {
     fn command_flag_with_equals_value_is_captured() {
         let launch = parse_list(&["session", "last", "--id=abc123"]).expect("parse");
         assert_eq!(launch.flag("--id"), Some("abc123"));
+    }
+
+    #[test]
+    fn declared_boolean_flags_reject_attached_values() {
+        for command in spec::all_commands() {
+            for flag in command.flags.iter().filter(|flag| flag.value.is_none()) {
+                for value in ["", "no", "yes", "false", "true", "0", "1"] {
+                    let token = format!("{}={value}", flag.name);
+                    let err = parse_list(&[command.name, &token]).expect_err("attached value");
+                    assert_eq!(err.code(), ErrorCode::InvalidField, "{token}");
+                    assert_eq!(err.message(), format!("`{}` takes no value", flag.name));
+                    assert_eq!(err.detail().field.as_deref(), Some(flag.name));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn declared_boolean_flags_preserve_bare_flags_and_positional_text() {
+        for command in spec::all_commands() {
+            for flag in command.flags.iter().filter(|flag| flag.value.is_none()) {
+                let launch = parse_list(&[command.name, flag.name, "no"]).expect("bare flag");
+                assert!(launch.has_flag(flag.name));
+                assert_eq!(launch.flag(flag.name), None);
+                assert_eq!(launch.args, vec!["no"]);
+
+                let token = format!("{}=no", flag.name);
+                let launch = parse_list(&[command.name, "--", &token]).expect("positional text");
+                assert!(!launch.has_flag(flag.name));
+                assert_eq!(launch.args, vec![token]);
+            }
+        }
     }
 
     #[test]
