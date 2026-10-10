@@ -150,6 +150,20 @@ impl KeyReader {
         self.composer.cursor_column()
     }
 
+    /// Returns the byte offset of the caret in the draft.
+    #[must_use]
+    pub fn cursor_byte(&self) -> usize {
+        self.line()
+            .char_indices()
+            .nth(self.composer.cursor())
+            .map_or(self.line().len(), |(offset, _)| offset)
+    }
+
+    /// Replaces a completed token as one undoable edit, preserving its suffix.
+    pub fn complete_path(&mut self, range: std::ops::Range<usize>, replacement: &str) {
+        self.composer.replace_range(range, replacement);
+    }
+
     /// Empties the line.
     pub fn clear(&mut self) {
         self.composer.clear();
@@ -594,6 +608,27 @@ mod tests {
 
     fn control(c: char) -> KeyEvent {
         KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+    }
+
+    #[test]
+    fn path_completion_preserves_unicode_suffix_and_is_one_undoable_edit() {
+        let mut reader = reader();
+        reader.replace("界 read fiOLD please e\u{301}");
+        for _ in crate::width::graphemes("OLD please e\u{301}") {
+            reader.apply(key(KeyCode::Left));
+        }
+        let original_caret = reader.cursor_byte();
+        assert_eq!(original_caret, "界 read fi".len());
+        let start = "界 read ".len();
+        reader.complete_path(start..start + 5, "'file space.txt'");
+        assert_eq!(reader.line(), "界 read 'file space.txt' please e\u{301}");
+        assert_eq!(reader.cursor_byte(), "界 read 'file space.txt'".len());
+        reader.apply(control('_'));
+        assert_eq!(reader.line(), "界 read fiOLD please e\u{301}");
+        assert_eq!(reader.cursor_byte(), original_caret);
+        reader.apply(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::ALT));
+        assert_eq!(reader.line(), "界 read 'file space.txt' please e\u{301}");
+        assert_eq!(reader.cursor_byte(), "界 read 'file space.txt'".len());
     }
 
     #[test]

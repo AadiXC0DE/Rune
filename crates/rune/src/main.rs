@@ -17,6 +17,7 @@ mod connect_flow;
 mod diagnostics;
 mod help;
 mod install;
+mod path_completion;
 mod permissions;
 mod prompt_history;
 mod provider_setup;

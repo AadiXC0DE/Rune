@@ -126,6 +126,15 @@ the provider as newline characters. Left and Right move across line breaks;
 the terminal caret follows the line being edited. Long lines scroll horizontally
 and tall drafts scroll vertically to keep the caret visible.
 
+At the idle prompt, Tab completes the workspace path at the caret. A unique
+match is inserted immediately; multiple matches open a menu where Up/Down
+select and Tab or Enter inserts one path without submitting. Escape closes
+the menu. Paths with spaces or shell metacharacters are quoted as one literal
+selection, and Ctrl-_ undoes the completion. Directories end in `/` so another
+Tab lists their children. Completion only lists names inside the primary or
+configured additional workspace roots, including where symlinks lead.
+Use forward slashes in paths. Slash command completion keeps its existing keys.
+
 Ctrl-G opens the draft in `$VISUAL`, falling back to `$EDITOR` and then `vi`.
 Editor commands may include arguments. Save and exit to reload the draft with
 the caret at its end; Ctrl-_ undoes the replacement. Rune restores terminal

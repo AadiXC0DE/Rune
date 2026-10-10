@@ -232,6 +232,18 @@ sys.exit(9 if mode == "editor-failed" else 0)
             capture("second-line", "second é line".encode(), "second é line")
             assert not prompts, prompts
             submitted = "first 界 line\nsecond é line"
+        elif sys.argv[2:] == ["path-completion"]:
+            (root / "fixture second.txt").write_text("second fixture")
+            (root / "fixture space.txt").write_text("space fixture")
+            capture("typed", b"read ./fixture", "read ./fixture")
+            capture("menu", b"\t", "> './fixture second.txt'")
+            assert not prompts, prompts
+            capture("selected", b"\x1b[B", "> './fixture space.txt'")
+            capture("chosen", b"\r", "read './fixture space.txt'")
+            assert not prompts, "Enter on a completion must not submit a prompt"
+            capture("undone", b"\x1f", "read ./fixture")
+            capture("redone", b"\x1br", "read './fixture space.txt'")
+            submitted = "read './fixture space.txt'"
         elif sys.argv[2:] == ["multiline"]:
             draft = "first 界\nsecond e\u0301\nthird 👩‍💻"
             capture("pasted", b"\x1b[200~" + draft.encode() + b"\x1b[201~", "third 👩‍💻")

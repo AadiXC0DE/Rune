@@ -6,6 +6,10 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Added
 
+- Tab completes workspace paths in idle prompts, quoting spaces and shell
+  metacharacters as one selection. Multiple matches use Up/Down and Tab or
+  Enter; completion stays inside configured workspace roots and is undoable.
+
 - Ctrl-G edits the draft in `VISUAL`, `EDITOR`, or `vi`, then restores terminal
   input and reloads the saved text. Failed edits preserve the draft and caret.
 

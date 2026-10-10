@@ -132,6 +132,27 @@ impl Composer {
         self.settle();
     }
 
+    /// Replaces a byte range as one edit and puts the caret after the replacement.
+    /// Invalid ranges leave the draft unchanged.
+    pub fn replace_range(&mut self, range: std::ops::Range<usize>, replacement: &str) {
+        if range.start > range.end
+            || !self.text.is_char_boundary(range.start)
+            || !self.text.is_char_boundary(range.end)
+        {
+            return;
+        }
+        let caret = self.text[..range.start]
+            .chars()
+            .count()
+            .saturating_add(replacement.chars().count());
+        self.record();
+        self.text.replace_range(range, replacement);
+        self.cursor = caret;
+        self.recall = None;
+        self.draft.clear();
+        self.settle();
+    }
+
     /// Empties the line.
     ///
     /// Recall starts over as well. A line is cleared when it is submitted or

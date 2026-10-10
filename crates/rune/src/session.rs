@@ -1382,6 +1382,11 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
     // input closure borrows the config and a model chosen mid-session has to be
     // able to build a catalog from the same settings the session started with.
     let settings = config.settings.clone();
+    let mut completion_context = ExecutionContext::new(config.workspace.clone());
+    for root in &settings.additional_directories {
+        completion_context = completion_context.with_root(root.clone());
+    }
+    let completion_limits = rune_tools::workspace::FileLimits::from_budget(&limits);
 
     // The prompts already recorded in this workspace, oldest first, which is
     // the order the up arrow walks backwards through. Refreshed after each
@@ -1681,7 +1686,14 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
         // what was typed rather than waiting for the terminal to decide the
         // line is finished.
         let mut reason = ExitReason::EndOfInput;
-        while let Some(input) = await_submission(&mut reader, &host, &out, &recall)? {
+        while let Some(input) = await_submission(
+            &mut reader,
+            &host,
+            &out,
+            &recall,
+            &completion_context,
+            &completion_limits,
+        )? {
             let mut sink = LockedSink {
                 stream: Arc::clone(&out),
             };
@@ -2443,20 +2455,36 @@ fn await_submission(
     host: &SessionHost,
     out: &LiveSink,
     recall: &[String],
+    context: &ExecutionContext,
+    limits: &rune_tools::workspace::FileLimits,
 ) -> Result<Option<Input>> {
     let marker = rune_term::shell::prompt();
     // Which completion row is highlighted. While the dropdown is open the
     // arrows move it rather than walking the prompt history, because the list is
     // what the user is looking at.
     let mut selected = 0_usize;
+    let mut paths: Option<crate::path_completion::Paths> = None;
 
     loop {
-        let rows = completion_rows(
-            reader.line(),
-            selected,
-            host.theme(),
-            host.truecolor(),
-            host.menu_room(),
+        let rows = paths.as_ref().map_or_else(
+            || {
+                completion_rows(
+                    reader.line(),
+                    selected,
+                    host.theme(),
+                    host.truecolor(),
+                    host.menu_room(),
+                )
+            },
+            |paths| {
+                path_completion_rows(
+                    paths,
+                    selected,
+                    host.theme(),
+                    host.truecolor(),
+                    host.menu_room(),
+                )
+            },
         );
         draw_prompt(reader, host, out, &rows, marker)?;
 
@@ -2468,6 +2496,10 @@ fn await_submission(
         if key == KeyAction::ExternalEditor {
             edit_draft(reader, host);
             selected = 0;
+            paths = None;
+            continue;
+        }
+        if path_key(key, reader, &mut paths, &mut selected, context, limits) {
             continue;
         }
         match idle_key(key, reader, &mut selected, &rows, recall) {
@@ -2476,6 +2508,102 @@ fn await_submission(
             Idle::Submit(input) => return Ok(Some(input)),
         }
     }
+}
+
+/// A filesystem menu is opened only by Tab and discarded when the draft changes.
+fn path_key(
+    key: KeyAction,
+    reader: &mut rune_term::input::KeyReader,
+    paths: &mut Option<crate::path_completion::Paths>,
+    selected: &mut usize,
+    context: &ExecutionContext,
+    limits: &rune_tools::workspace::FileLimits,
+) -> bool {
+    if let Some(open) = paths {
+        match key {
+            KeyAction::Submit | KeyAction::Complete => {
+                if let Some(chosen) = open.matches.get(*selected) {
+                    reader.complete_path(open.range.clone(), chosen);
+                }
+                *paths = None;
+                *selected = 0;
+                return true;
+            }
+            KeyAction::Up | KeyAction::Down => {
+                *selected = if key == KeyAction::Up {
+                    selected.saturating_sub(1)
+                } else {
+                    selected
+                        .saturating_add(1)
+                        .min(open.matches.len().saturating_sub(1))
+                };
+                return true;
+            }
+            KeyAction::Escape => {
+                *paths = None;
+                *selected = 0;
+                return true;
+            }
+            _ => *paths = None,
+        }
+    }
+    if key != KeyAction::Complete
+        || completion_matches(reader.line()) > 0
+        || matches!(Input::parse(reader.line()), Input::Command { .. })
+    {
+        return false;
+    }
+    let choices = crate::path_completion::Paths::collect(
+        reader.line(),
+        reader.cursor_byte(),
+        context,
+        limits,
+    );
+    *selected = 0;
+    if choices.matches.len() == 1 {
+        if let Some(chosen) = choices.matches.first() {
+            reader.complete_path(choices.range, chosen);
+        }
+    } else if !choices.matches.is_empty() {
+        *paths = Some(choices);
+    }
+    true
+}
+
+fn path_completion_rows(
+    paths: &crate::path_completion::Paths,
+    selected: usize,
+    theme: &Theme,
+    truecolor: bool,
+    room: usize,
+) -> Vec<String> {
+    let count = paths.matches.len();
+    let window = completion_window(count, selected, menu_window(count, COMPLETION_WINDOW, room));
+    let accent = theme.sgr(Slot::Accent, truecolor);
+    let dim = theme.sgr(Slot::Dim, truecolor);
+    let mut rows: Vec<_> = window
+        .clone()
+        .filter_map(|index| {
+            paths.matches.get(index).map(|path| {
+                if index == selected {
+                    styled(&accent, &format!("> {path}"))
+                } else {
+                    styled(&dim, &format!("  {path}"))
+                }
+            })
+        })
+        .collect();
+    if count > window.len() && rows.len() < room {
+        rows.push(styled(
+            &dim,
+            &format!(
+                "  {}-{} of {count}",
+                window.start.saturating_add(1),
+                window.end
+            ),
+        ));
+    }
+    rows
 }
 
 /// What a key pressed at the idle prompt leads to.
@@ -6377,6 +6505,63 @@ mod tests {
         // usable without trying every name.
         assert!(rows[0].contains("choose a model"), "{rows:?}");
         assert!(rows[1].contains("same as"), "{rows:?}");
+    }
+
+    #[test]
+    fn path_menus_scroll_with_the_selection_and_keep_within_available_rows() {
+        let paths = crate::path_completion::Paths {
+            range: 5..7,
+            matches: (0..15)
+                .map(|index| format!("'fixture {index:02}.txt'"))
+                .collect(),
+        };
+        for selected in 0..paths.matches.len() {
+            for room in 1..=8 {
+                let rows = path_completion_rows(&paths, selected, &Theme::no_color(), false, room);
+                assert!(rows.len() <= room);
+                assert!(
+                    rows.contains(&format!("> {}", paths.matches[selected])),
+                    "{rows:?}"
+                );
+                assert!(rows.iter().all(|row| !row.contains('\u{1b}')));
+            }
+        }
+        assert!(path_completion_rows(&paths, 0, &Theme::no_color(), false, 0).is_empty());
+    }
+
+    #[test]
+    fn tab_completes_one_match_without_opening_a_menu_or_changing_slash_commands() {
+        let temp = tempfile::tempdir().expect("workspace");
+        let root = Utf8PathBuf::from_path_buf(temp.path().to_owned()).expect("UTF-8");
+        std::fs::write(root.join("fixture space.txt"), "fixture").expect("file");
+        let context = ExecutionContext::new(root);
+        let limits = rune_tools::workspace::FileLimits::default();
+        let mut reader = rune_term::input::KeyReader::new();
+        let mut paths = None;
+        let mut selected = 0;
+        reader.replace("read ./fi");
+        assert!(path_key(
+            KeyAction::Complete,
+            &mut reader,
+            &mut paths,
+            &mut selected,
+            &context,
+            &limits
+        ));
+        assert_eq!(reader.line(), "read './fixture space.txt'");
+        assert!(paths.is_none());
+        for line in ["/mod", "/help fixture", "/zzz"] {
+            reader.replace(line);
+            assert!(!path_key(
+                KeyAction::Complete,
+                &mut reader,
+                &mut paths,
+                &mut selected,
+                &context,
+                &limits
+            ));
+            assert_eq!(reader.line(), line);
+        }
     }
 
     #[test]
