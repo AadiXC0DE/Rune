@@ -56,6 +56,10 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Fixed
 
+- Changing the provider with `--provider` selects its configured model and
+  capacity and discards the previous provider's endpoint and credential variable.
+  Changing the model with `--model` discards the previous model's capacity;
+  overrides naming the same provider or model preserve their settings.
 - Changing the model with `RUNE_MODEL` discards the previous model's declared
   context window and reports the default capacity and source. An override naming
   the same model preserves its declared window.

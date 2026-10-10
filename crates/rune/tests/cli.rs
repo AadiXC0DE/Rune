@@ -251,6 +251,200 @@ fn config_explain_reports_the_source_layer() {
 }
 
 #[test]
+fn cli_provider_and_model_overrides_resolve_only_their_own_settings() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let config = dir.path().join("user.toml");
+    std::fs::write(
+        &config,
+        r#"
+provider = "anthropic"
+base_url = "https://previous-provider.invalid"
+api_key_env = "PREVIOUS_PROVIDER_KEY"
+[models.anthropic]
+id = "large-model"
+context_window = 2000000
+[models.chat_completions]
+id = "chat-model"
+context_window = 64000
+[models.responses]
+id = "large-model"
+context_window = 32000
+[models]
+opencode = "named-model"
+"#,
+    )
+    .expect("write config");
+
+    for (args, provider, provider_source, model, model_source, capacity, capacity_source, reset) in [
+        (
+            vec!["--provider", "openai", "config"],
+            "chat_completions",
+            "command_line",
+            "chat-model",
+            "user",
+            "64000",
+            "user",
+            true,
+        ),
+        (
+            vec!["config", "--provider", "responses"],
+            "responses",
+            "command_line",
+            "large-model",
+            "user",
+            "32000",
+            "user",
+            true,
+        ),
+        (
+            vec!["--provider", "opencode", "config"],
+            "opencode",
+            "command_line",
+            "named-model",
+            "user",
+            "128000",
+            "default",
+            true,
+        ),
+        (
+            vec!["--provider", "unknown-provider", "config"],
+            "unknown-provider",
+            "command_line",
+            "",
+            "default",
+            "128000",
+            "default",
+            true,
+        ),
+        (
+            vec!["--provider", "ANTHROPIC", "config"],
+            "anthropic",
+            "command_line",
+            "large-model",
+            "user",
+            "2000000",
+            "user",
+            false,
+        ),
+        (
+            vec![
+                "--provider",
+                "openai",
+                "--model",
+                "explicit-model",
+                "config",
+            ],
+            "chat_completions",
+            "command_line",
+            "explicit-model",
+            "command_line",
+            "128000",
+            "default",
+            true,
+        ),
+        (
+            vec![
+                "--model",
+                "explicit-model",
+                "config",
+                "--provider",
+                "openai",
+            ],
+            "chat_completions",
+            "command_line",
+            "explicit-model",
+            "command_line",
+            "128000",
+            "default",
+            true,
+        ),
+        (
+            vec!["--provider", "openai", "--model", "chat-model", "config"],
+            "chat_completions",
+            "command_line",
+            "chat-model",
+            "command_line",
+            "64000",
+            "user",
+            true,
+        ),
+        (
+            vec!["--model", "small-model", "config"],
+            "anthropic",
+            "user",
+            "small-model",
+            "command_line",
+            "128000",
+            "default",
+            false,
+        ),
+        (
+            vec!["config", "--model", "large-model"],
+            "anthropic",
+            "user",
+            "large-model",
+            "command_line",
+            "2000000",
+            "user",
+            false,
+        ),
+    ] {
+        let mut command = Command::new(binary());
+        // Keep the fixture independent of the developer's provider environment.
+        for (key, _) in std::env::vars_os() {
+            if key.to_string_lossy().starts_with("RUNE_") {
+                command.env_remove(key);
+            }
+        }
+        let out = command
+            .args(&args)
+            .arg("--json")
+            .current_dir(dir.path())
+            .env("RUNE_CONFIG", &config)
+            .env("RUNE_STATE", dir.path().join("state"))
+            .env("XDG_CONFIG_HOME", dir.path().join("config"))
+            .env("XDG_DATA_HOME", dir.path().join("data"))
+            .output()
+            .expect("run config");
+        assert!(out.status.success(), "{args:?}: {out:?}");
+        assert!(out.stderr.is_empty(), "{args:?}: {out:?}");
+        let value: serde_json::Value = serde_json::from_slice(&out.stdout).expect("valid json");
+        assert_eq!(value["diagnostics"], serde_json::json!([]), "{args:?}");
+        let values = value["values"].as_array().expect("values array");
+        for (key, expected, source) in [
+            ("provider", provider, provider_source),
+            ("model", model, model_source),
+            ("context_window", capacity, capacity_source),
+            (
+                "base_url",
+                if reset {
+                    "default"
+                } else {
+                    "https://previous-provider.invalid"
+                },
+                if reset { "default" } else { "user" },
+            ),
+            (
+                "api_key_env",
+                if reset {
+                    "default"
+                } else {
+                    "PREVIOUS_PROVIDER_KEY"
+                },
+                if reset { "default" } else { "user" },
+            ),
+        ] {
+            let row = values
+                .iter()
+                .find(|row| row["key"] == key)
+                .expect("config row");
+            assert_eq!(row["value"], expected, "{args:?}: {key}");
+            assert_eq!(row["source"], source, "{args:?}: {key}");
+        }
+    }
+}
+
+#[test]
 fn a_project_file_cannot_set_the_model() {
     let dir = tempfile::TempDir::new().expect("tempdir");
     std::fs::write(dir.path().join(".rune.toml"), "model = \"sneaky\"\n").expect("write");

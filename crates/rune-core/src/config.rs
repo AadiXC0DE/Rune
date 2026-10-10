@@ -492,6 +492,8 @@ pub struct Settings {
     pub provider: Provider,
     /// Effective model identifier for the active provider.
     pub model: String,
+    /// User-configured models retained for command-line provider selection.
+    pub configured_models: BTreeMap<String, ModelEntry>,
     /// Whether the web tools may reach the network.
     pub web_tools: bool,
     /// Input capacity the configured model accepts, when one is declared.
@@ -549,6 +551,7 @@ impl Default for Settings {
         Self {
             provider: Provider::default(),
             model: String::new(),
+            configured_models: BTreeMap::new(),
             web_tools: false,
             context_window: None,
             base_url: None,
@@ -1055,6 +1058,7 @@ fn apply_user(settings: &mut Settings, user: &UserConfig, layer: Layer) {
         settings.sources.record("api_key_env", layer);
     }
     if let Some(models) = &user.models {
+        settings.configured_models.clone_from(models);
         let key = provider_key(&settings.provider);
         if let Some(model) = models.get(&key).or_else(|| models.get("default")) {
             model.id().clone_into(&mut settings.model);

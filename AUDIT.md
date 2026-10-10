@@ -1919,7 +1919,7 @@ Resource accumulation after cancellation, session holder handover and concurrent
 - [x] R-040 | T2 | feature | web | Require user authority for private network access | acceptance: A model setting allow_private=true must trigger a distinct private-network decision and cannot grant itself access.
 - [x] R-041 | T2 | fix | providers | Close the stream socket when a request is cancelled | acceptance: Cancel 50 silent streams and observe reader-thread and open-socket counts return to baseline.
 - [x] R-042 | T2 | fix | config | Reset capacity when an environment override changes model | acceptance: Override a declared 2000000-token model with RUNE_MODEL=small and observe that the old window is discarded.
-- [ ] R-043 | T2 | fix | config | Reset provider-derived fields on CLI overrides | acceptance: Switch provider with a CLI flag and observe its model, endpoint and capacity resolved without using the previous provider's values.
+- [x] R-043 | T2 | fix | config | Reset provider-derived fields on CLI overrides | acceptance: Switch provider with a CLI flag and observe its model, endpoint and capacity resolved without using the previous provider's values.
 - [ ] R-044 | T2 | fix | context | Invoke automatic compaction before an oversized CLI request | acceptance: Cross compaction_trigger_percent with fixture turns and observe a compaction event before the next model request.
 - [ ] R-045 | T2 | fix | cli | Read usage periods from the documented flag | acceptance: Run rune usage --period 7d --json and observe period 7d with a seven-day interval.
 - [ ] R-046 | T2 | fix | cli | Accept the documented auth status action | acceptance: Run rune auth status --json and observe a status object with exit 0.

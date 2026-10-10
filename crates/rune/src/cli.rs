@@ -594,13 +594,42 @@ fn to_strings(args: Vec<OsString>) -> Result<Vec<String>> {
 pub fn apply_to_settings(launch: &Launch, settings: &mut rune_core::config::Settings) {
     let layer = Layer::CommandLine;
 
+    if let Some(provider) = &launch.provider {
+        let provider = rune_core::config::parse_provider(provider);
+        if settings.provider != provider {
+            // These values describe the previous provider. Keep the model
+            // declarations so the newly selected provider can resolve its own.
+            settings.model.clear();
+            settings.context_window = None;
+            settings.base_url = None;
+            settings.api_key_env = None;
+            for key in ["model", "context_window", "base_url", "api_key_env"] {
+                settings.sources.sources.remove(key);
+            }
+            let key = rune_core::config::provider_key(&provider);
+            if let Some(model) = settings
+                .configured_models
+                .get(&key)
+                .or_else(|| settings.configured_models.get("default"))
+            {
+                model.id().clone_into(&mut settings.model);
+                settings.sources.record("model", Layer::User);
+                settings.context_window = model.context_window();
+                if settings.context_window.is_some() {
+                    settings.sources.record("context_window", Layer::User);
+                }
+            }
+        }
+        settings.provider = provider;
+        settings.sources.record("provider", layer);
+    }
     if let Some(model) = &launch.model {
+        if settings.model != *model {
+            settings.context_window = None;
+            settings.sources.sources.remove("context_window");
+        }
         settings.model.clone_from(model);
         settings.sources.record("model", layer);
-    }
-    if let Some(provider) = &launch.provider {
-        settings.provider = rune_core::config::parse_provider(provider);
-        settings.sources.record("provider", layer);
     }
     if let Some(effort) = launch.effort.as_deref().and_then(parse_effort) {
         settings.effort = effort;
@@ -984,6 +1013,54 @@ mod tests {
         apply_to_settings(&launch, &mut settings);
         assert_eq!(settings.model, "m");
         assert_eq!(settings.source_of("model"), Layer::CommandLine);
+    }
+
+    #[test]
+    fn provider_override_resolves_the_default_model_and_the_new_endpoint() {
+        use rune_core::config::{EnvironmentOverrides, load};
+
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let path =
+            camino::Utf8PathBuf::from_path_buf(dir.path().join("config.toml")).expect("UTF-8 path");
+        std::fs::write(
+            &path,
+            r#"
+provider = "responses"
+base_url = "https://old-endpoint.invalid"
+api_key_env = "OLD_KEY"
+[models.responses]
+id = "old-model"
+context_window = 2000000
+[models.default]
+id = "fallback-model"
+context_window = 64000
+"#,
+        )
+        .expect("write config");
+
+        for (provider, endpoint) in [
+            ("anthropic", Some("https://api.anthropic.com")),
+            ("openai", None),
+            ("custom-provider", None),
+        ] {
+            let mut settings = load(None, Some(&path), &EnvironmentOverrides::default());
+            let launch = parse_list(&["--provider", provider]).expect("parse");
+            apply_to_settings(&launch, &mut settings);
+            assert_eq!(settings.model, "fallback-model");
+            assert_eq!(settings.context_window, Some(64000));
+            assert_eq!(settings.source_of("model"), Layer::User);
+            assert_eq!(settings.source_of("context_window"), Layer::User);
+            assert!(settings.base_url.is_none());
+            assert!(settings.api_key_env.is_none());
+            assert_eq!(
+                crate::provider_setup::configured_base_url(&settings).as_deref(),
+                endpoint
+            );
+            assert_eq!(
+                crate::provider_setup::require_base_url(&settings).is_ok(),
+                endpoint.is_some()
+            );
+        }
     }
 
     #[test]
