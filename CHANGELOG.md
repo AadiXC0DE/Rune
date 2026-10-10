@@ -6,6 +6,9 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Added
 
+- Fenced code preserves indentation and spaces while streaming and in the
+  finished transcript. Long lines wrap with an indented `↪` continuation marker;
+  code tabs use eight-column stops and wrapping adapts to terminal resizing.
 - `rune sandbox explain` previews a shell command without executing it, showing
   the backend, writable roots, network policy, protected paths and their sources.
   It reports refusal or unsandboxed fallback when enforcement is unavailable.

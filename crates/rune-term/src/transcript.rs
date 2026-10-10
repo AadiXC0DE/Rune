@@ -345,7 +345,12 @@ fn render_entry(entry: &Entry, display: Display, lanes: &Lanes, out: &mut String
     // Reserve the lane's two marker columns without widening a narrow terminal:
     // the inline renderer clips any overflow, permanently losing those bytes.
     let width = display.width.saturating_sub(2).max(MIN_WIDTH);
-    let body = wrap(&sanitize(&entry.text), width);
+    let text = sanitize(&entry.text);
+    let body = if entry.speaker == Speaker::Assistant {
+        AssistantRows::default().rows(&text, width)
+    } else {
+        wrap(&text, width)
+    };
 
     match entry.speaker {
         Speaker::User => {
@@ -389,6 +394,130 @@ fn render_entry(entry: &Entry, display: Display, lanes: &Lanes, out: &mut String
 
 /// Minimum nonzero text width used by transcript wrapping.
 pub const MIN_WIDTH: usize = 1;
+
+/// Wrapped assistant rows, cached across appended, sanitized text deltas.
+///
+/// Complete source lines keep their rows and fence state. Only the unfinished
+/// line is rewrapped, so completing a fence or appending code cannot move an
+/// earlier line. A width change or a cleared source resets the cache.
+#[derive(Clone, Debug, Default)]
+pub struct AssistantRows {
+    finished: Vec<String>,
+    covered: usize,
+    width: Option<usize>,
+    fence: Option<Fence>,
+}
+
+impl AssistantRows {
+    /// Returns all rows for text that grows by appending deltas.
+    ///
+    /// Prose uses ordinary word wrapping. Inside backtick or tilde fences,
+    /// whitespace is preserved, tabs expand to eight-column stops, and soft
+    /// breaks repeat the source indentation followed by `↪ `. On narrow
+    /// terminals the repeated indentation shrinks to leave room for code.
+    #[must_use]
+    pub fn rows(&mut self, text: &str, width: usize) -> Vec<String> {
+        let width = width.max(MIN_WIDTH);
+        if text.len() < self.covered || self.width != Some(width) {
+            *self = Self::default();
+        }
+        self.width = Some(width);
+        let sealed = text.rfind('\n').map_or(0, |at| at.saturating_add(1));
+        for line in text[self.covered..sealed].split_inclusive('\n') {
+            self.finished.extend(assistant_line(
+                line.strip_suffix('\n').unwrap_or(line),
+                width,
+                &mut self.fence,
+            ));
+        }
+        self.covered = sealed;
+        let mut rows = self.finished.clone();
+        // A partial closing fence must not change the cached state until its
+        // newline arrives: the next delta may still make it ordinary code.
+        let mut fence = self.fence;
+        rows.extend(assistant_line(&text[sealed..], width, &mut fence));
+        rows
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Fence {
+    marker: u8,
+    length: usize,
+}
+
+/// Recognizes a Markdown fence with at most three leading spaces.
+fn fence_start(line: &str) -> Option<(Fence, &str)> {
+    let rest = line.trim_start_matches(' ');
+    if line.len().saturating_sub(rest.len()) > 3 {
+        return None;
+    }
+    let marker = *rest.as_bytes().first()?;
+    if !matches!(marker, b'`' | b'~') {
+        return None;
+    }
+    let length = rest.bytes().take_while(|byte| *byte == marker).count();
+    (length >= 3).then(|| (Fence { marker, length }, &rest[length..]))
+}
+
+fn assistant_line(line: &str, width: usize, fence: &mut Option<Fence>) -> Vec<String> {
+    let candidate = fence_start(line);
+    if let Some(open) = *fence {
+        if candidate.is_some_and(|(close, rest)| {
+            close.marker == open.marker && close.length >= open.length && rest.trim().is_empty()
+        }) {
+            *fence = None;
+            return wrap(line, width);
+        }
+        return wrap_code(line, width);
+    }
+    if let Some((open, rest)) = candidate
+        && (open.marker != b'`' || !rest.contains('`'))
+    {
+        *fence = Some(open);
+    }
+    wrap(line, width)
+}
+
+/// Hard wraps code by grapheme, retaining every space instead of word breaks.
+fn wrap_code(source: &str, width: usize) -> Vec<String> {
+    let mut expanded = String::new();
+    let mut column = 0_usize;
+    for cluster in graphemes(source) {
+        if cluster == "\t" {
+            let spaces = 8_usize.saturating_sub(column % 8);
+            expanded.extend(std::iter::repeat_n(' ', spaces));
+            column = column.saturating_add(spaces);
+        } else {
+            expanded.push_str(cluster);
+            column = column.saturating_add(grapheme_width(cluster));
+        }
+    }
+    let indent = expanded.bytes().take_while(|byte| *byte == b' ').count();
+    let marker = if width >= 3 { "↪ " } else { "↪" };
+    // Leave at least two cells for a wide grapheme whenever possible.
+    let prefix = " ".repeat(indent.min(width.saturating_sub(4))) + marker;
+    let mut rows = Vec::new();
+    let mut row = String::new();
+    let mut used = 0_usize;
+    let mut has_source = false;
+    for cluster in graphemes(&expanded) {
+        let columns = grapheme_width(cluster);
+        if has_source && used.saturating_add(columns) > width {
+            rows.push(std::mem::take(&mut row));
+            // Below three columns the marker may need to shrink or disappear
+            // to accommodate a wide glyph without clipping its code bytes.
+            let (shown, columns_used) = truncate_to_width(&prefix, width.saturating_sub(columns));
+            shown.clone_into(&mut row);
+            used = columns_used;
+        }
+        row.push_str(cluster);
+        used = used.saturating_add(columns);
+        has_source = true;
+    }
+    rows.push(row);
+    rows
+}
 
 /// Removes control sequences a terminal would act on.
 ///
@@ -516,6 +645,136 @@ mod tests {
             40,
             "assistant text was summarized"
         );
+    }
+
+    #[test]
+    fn fenced_code_preserves_spaces_and_indents_its_continuations() {
+        let text = "before\n```rust\n    abcdefghijkl  mnop\n\n```\nafter";
+        let rendered = render(
+            &[Entry::assistant(text)],
+            Display {
+                width: 12,
+                ..Display::default()
+            },
+        );
+        assert_eq!(
+            rendered,
+            "before\n```rust\n    abcdef\n    ↪ ghij\n    ↪ kl  \n    ↪ mnop\n\n```\nafter"
+        );
+    }
+
+    #[test]
+    fn streamed_code_keeps_completed_rows_stable_at_every_character() {
+        let mut cache = AssistantRows::default();
+        let mut text = "```rust\n".to_owned();
+        let mut previous = cache.rows(&text, 18);
+        for ch in "    call(\"alpha  beta\",  gamma);\n```\nprose after".chars() {
+            text.push(ch);
+            let rows = cache.rows(&text, 18);
+            let completed = previous.len().saturating_sub(1);
+            assert_eq!(rows[..completed], previous[..completed], "{text:?}");
+            assert_eq!(rows, AssistantRows::default().rows(&text, 18));
+            previous = rows;
+        }
+        assert!(previous.iter().any(|row| row.starts_with("    ↪ ")));
+    }
+
+    #[test]
+    fn fences_close_only_with_the_matching_marker_and_sufficient_length() {
+        for opening in ["````rust", "~~~~rust", "   ````rust"] {
+            let close = if opening.starts_with('~') {
+                "~~~~"
+            } else {
+                "````"
+            };
+            let text = format!(
+                "{opening}\n```\n~~~\n````suffix\n    abcdefghijkl\n{close}\nwords after the code"
+            );
+            let rows = AssistantRows::default().rows(&text, 12);
+            assert!(rows.iter().any(|row| row == "    ↪ ijkl"), "{rows:?}");
+            assert_eq!(
+                &rows[rows.len().saturating_sub(2)..],
+                &["words after", "the code"]
+            );
+        }
+        // Inline backticks, four-space indentation and a backtick in the info
+        // string are prose, so they cannot put subsequent lines into code mode.
+        for invalid in ["inline ```rust", "    ```rust", "```ru`st"] {
+            let text = format!("{invalid}\nwords after the code");
+            let rows = AssistantRows::default().rows(&text, 12);
+            assert_eq!(rows, wrap(&text, 12));
+        }
+    }
+
+    #[test]
+    fn code_tabs_and_graphemes_fit_narrow_rows_without_losing_indentation() {
+        let rows = AssistantRows::default().rows("~~~\n\t書e\u{301}👩‍💻書\n~~~", 12);
+        assert_eq!(
+            rows,
+            [
+                "~~~",
+                "        書e\u{301}",
+                "        ↪ 👩‍💻",
+                "        ↪ 書",
+                "~~~"
+            ]
+        );
+        assert!(rows.iter().all(|row| str_width(row) <= 12));
+        for width in 1..=12 {
+            let rows = AssistantRows::default().rows("```\n                abcdef\n```", width);
+            assert!(rows.iter().all(|row| str_width(row) <= width), "{rows:?}");
+            let recovered: String = rows
+                .iter()
+                .flat_map(|row| row.chars())
+                .filter(char::is_ascii_alphabetic)
+                .collect();
+            assert_eq!(recovered, "abcdef");
+        }
+    }
+
+    #[test]
+    fn assistant_rows_reset_fence_state_on_clear_and_rewrap_on_resize() {
+        let text = "```\n    abcdefghijkl\n```\nafter";
+        let mut cache = AssistantRows::default();
+        let _ = cache.rows(text, 18);
+        assert_eq!(
+            cache.rows(text, 10),
+            AssistantRows::default().rows(text, 10)
+        );
+        assert_eq!(
+            cache.rows(text, 30),
+            AssistantRows::default().rows(text, 30)
+        );
+        let _ = cache.rows("```\ncode\n", 12);
+        let _ = cache.rows("", 12);
+        assert_eq!(
+            cache.rows("words after the code", 12),
+            wrap("words after the code", 12)
+        );
+    }
+
+    #[test]
+    fn fence_state_does_not_leak_between_assistant_entries_or_other_lanes() {
+        let display = Display {
+            width: 14,
+            ..Display::default()
+        };
+        let prose = "words after the code";
+        let rendered = render(
+            &[Entry::assistant("```\ncode"), Entry::assistant(prose)],
+            display,
+        );
+        assert!(
+            rendered.ends_with(&wrap(prose, 12).join("\n")),
+            "{rendered}"
+        );
+        let text = "```\n    abcdefghijkl\n```";
+        let expected: Vec<String> = wrap(text, 12)
+            .into_iter()
+            .enumerate()
+            .map(|(index, row)| format!("{}{row}", if index == 0 { "> " } else { "  " }))
+            .collect();
+        assert_eq!(render(&[Entry::user(text)], display), expected.join("\n"));
     }
 
     #[test]

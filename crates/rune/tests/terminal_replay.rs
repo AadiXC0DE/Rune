@@ -157,3 +157,43 @@ fn twelve_column_text_grids_and_scrollback() {
     let actual = event_replay("narrow");
     assert_eq!(actual, include_str!("fixtures/terminal_replay/narrow.grid"));
 }
+
+#[test]
+fn fenced_code_continuations_are_stable_while_streaming_and_when_finished() {
+    let captures: Vec<Capture> =
+        serde_json::from_slice(&record(include_str!("terminal_replay.py"), Some("code")))
+            .expect("code captures");
+    let mut grid = Grid::new(32, 24).expect("grid");
+    let mut scrollback = Vec::new();
+    let first_row = "    abcdefghijklmnopqrstuvwxyz";
+    let continuation = "    ↪ 0123456789  END-CODE";
+    assert_eq!(captures.len(), 3);
+    for capture in captures {
+        for byte in capture.bytes {
+            let top = grid.row_text(0);
+            let stats = grid.feed(&[byte]).expect("replay byte");
+            if stats.scrolled {
+                scrollback.push(top);
+            }
+        }
+        let screen = grid.text();
+        let rows: Vec<&str> = scrollback
+            .iter()
+            .map(String::as_str)
+            .chain(screen.lines())
+            .collect();
+        assert!(rows.contains(&first_row), "{}: {rows:?}", capture.stage);
+        let expected = if capture.stage == "code-started" {
+            "    ↪ 0123456789"
+        } else {
+            continuation
+        };
+        assert!(rows.contains(&expected), "{}: {rows:?}", capture.stage);
+        if capture.stage == "code-finished" {
+            assert!(rows.contains(&"AFTER-CODE"), "{rows:?}");
+            assert_eq!(rows.iter().filter(|row| **row == first_row).count(), 1);
+            assert_eq!(rows.iter().filter(|row| **row == continuation).count(), 1);
+            assert_eq!(rows.iter().filter(|row| **row == "```").count(), 1);
+        }
+    }
+}

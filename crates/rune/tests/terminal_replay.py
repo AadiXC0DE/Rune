@@ -22,6 +22,7 @@ import time
 
 prompts = []
 errors = []
+code_steps = [threading.Event(), threading.Event()]
 
 
 class Provider(http.server.BaseHTTPRequestHandler):
@@ -42,6 +43,27 @@ class Provider(http.server.BaseHTTPRequestHandler):
         try:
             request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
             prompts.append(request["messages"][-1]["content"])
+            if scenario == "code":
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.end_headers()
+                for index, chunk in enumerate([
+                    "```rust\n    abcdefghijklmnopqrstuvwxyz0123456789",
+                    "  END-CODE",
+                    "\n```\nAFTER-CODE",
+                ]):
+                    choice = {"index": 0, "delta": {"content": chunk},
+                              "finish_reason": None}
+                    self.wfile.write(("data: " + json.dumps({"choices": [choice]})
+                                      + "\n\n").encode())
+                    self.wfile.flush()
+                    if index < len(code_steps):
+                        assert code_steps[index].wait(10), "code frame was not captured"
+                choice = {"index": 0, "delta": {}, "finish_reason": "stop"}
+                self.wfile.write(("data: " + json.dumps({"choices": [choice]})
+                                  + "\n\ndata: [DONE]\n\n").encode())
+                self.wfile.flush()
+                return
             choices = [
                 {"index": 0, "delta": {"content": "W" * 300 + "END-LONG-WORD"},
                  "finish_reason": None},
@@ -67,7 +89,7 @@ def controlling_terminal():
 
 
 scenario = sys.argv[2]
-assert scenario in {"resize", "narrow", "menu-resize"}, scenario
+assert scenario in {"resize", "narrow", "menu-resize", "code"}, scenario
 with tempfile.TemporaryDirectory(prefix="rune-r034-") as directory:
     root = pathlib.Path(directory)
     config = root / "config" / "rune"
@@ -100,7 +122,7 @@ with tempfile.TemporaryDirectory(prefix="rune-r034-") as directory:
         "TERM": "xterm-256color",
     })
     cols, rows = {"resize": (32, 24), "narrow": (12, 24),
-                  "menu-resize": (80, 24)}[scenario]
+                  "menu-resize": (80, 24), "code": (32, 24)}[scenario]
     master, slave = pty.openpty()
     fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
     try:
@@ -166,6 +188,15 @@ with tempfile.TemporaryDirectory(prefix="rune-r034-") as directory:
             capture("model-closed", b"\x1b")
             capture("closed-grown", size=(80, 24))
             assert not prompts, prompts
+        elif scenario == "code":
+            # The provider pauses until each live frame has been captured,
+            # proving wrapping before the closing fence or turn completion.
+            capture("code-started", b"code\r", "↪ 0123456789")
+            code_steps[0].set()
+            capture("code-continued", expected="END-CODE")
+            code_steps[1].set()
+            capture("code-finished", expected="AFTER-CODE\r\n")
+            assert prompts == ["code"], prompts
         else:
             # Wait for the committed ending, rather than an intermediate frame.
             capture("finished-answer", b"long-word\r", "END-LONG-W\r\nORD\r\n")

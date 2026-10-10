@@ -103,7 +103,7 @@ struct StreamingText {
     /// Kept so a delta wraps only the text that arrived, rather than the whole
     /// answer again. Re-wrapping everything per delta is quadratic in the length
     /// of the response, which is what made a long answer stutter.
-    answer_rows: LazyRows,
+    answer_rows: transcript::AssistantRows,
     reasoning_rows: LazyRows,
 }
 
@@ -998,9 +998,7 @@ impl SessionHost {
             }
         }
         if !answer.trim().is_empty() {
-            for line in rows_for(answer_rows, answer, width) {
-                rows.push(line.clone());
-            }
+            rows.extend(answer_rows.rows(answer, width.saturating_sub(2).max(1)));
         }
 
         // Every row of the answer is handed over. The renderer owns the region
@@ -1016,7 +1014,7 @@ impl SessionHost {
         if let Ok(mut streaming) = self.streaming.lock() {
             streaming.answer.clear();
             streaming.reasoning.clear();
-            streaming.answer_rows = LazyRows::default();
+            streaming.answer_rows = transcript::AssistantRows::default();
             streaming.reasoning_rows = LazyRows::default();
         }
     }
@@ -4435,6 +4433,47 @@ mod tests {
                 "incremental wrapping diverged at {prefix:?}"
             );
         }
+    }
+
+    #[test]
+    fn streamed_fenced_code_matches_the_finished_transcript_across_resize() {
+        let host = test_host();
+        host.width.store(20, std::sync::atomic::Ordering::Relaxed);
+        let mut text = String::new();
+        for ch in "```rust\n    call(\"alpha  beta\",  gamma);\n```\nafter".chars() {
+            text.push(ch);
+            // Accumulate without painting, which refreshes the size from the
+            // runner's own terminal rather than this test's chosen width.
+            host.streaming.lock().expect("streaming").answer.push(ch);
+            assert_eq!(
+                host.streaming_rows().join("\n").trim_end(),
+                render_entries(&[Entry::assistant(&text)], &host).join("\n"),
+                "streamed and finished code disagree at {text:?}"
+            );
+        }
+        assert!(
+            host.streaming_rows()
+                .iter()
+                .any(|row| row.starts_with("    ↪ "))
+        );
+        for width in [12, 40, 20] {
+            host.width
+                .store(width, std::sync::atomic::Ordering::Relaxed);
+            assert_eq!(
+                host.streaming_rows(),
+                render_entries(&[Entry::assistant(&text)], &host)
+            );
+        }
+        host.clear_streaming();
+        host.streaming
+            .lock()
+            .expect("streaming")
+            .answer
+            .push_str("words after the code");
+        assert_eq!(
+            host.streaming_rows(),
+            render_entries(&[Entry::assistant("words after the code")], &host)
+        );
     }
 
     #[test]
