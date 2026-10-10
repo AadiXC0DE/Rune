@@ -42,6 +42,8 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Fixed
 
+- Long Unicode tool descriptions truncate at a character boundary, so registering
+  a custom tool preserves valid UTF-8 without panicking.
 - Completed shell sessions keep their final output until `interact` or `stop`
   reads it, even when another command starts. Completed sessions release their
   running slot, and reading their final output removes the session.

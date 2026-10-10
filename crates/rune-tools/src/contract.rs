@@ -376,7 +376,8 @@ pub fn model_spec(tool: &dyn Tool) -> ToolSpec {
     if description.len() > MAX_DESCRIPTION_BYTES {
         // Truncation is explicit rather than silent, because a description cut
         // mid-sentence without a marker looks like a bug in the tool.
-        description.truncate(MAX_DESCRIPTION_BYTES.saturating_sub(16));
+        let end = description.floor_char_boundary(MAX_DESCRIPTION_BYTES.saturating_sub(16));
+        description.truncate(end);
         description.push_str("... [truncated]");
     }
     ToolSpec {
@@ -632,6 +633,56 @@ mod tests {
             spec.description.ends_with("[truncated]"),
             "truncation was not marked"
         );
+    }
+
+    #[test]
+    fn unicode_descriptions_register_and_serialize_at_character_boundaries() {
+        struct UnicodeTool {
+            text: &'static str,
+        }
+        impl Tool for UnicodeTool {
+            fn name(&self) -> &'static str {
+                "unicode"
+            }
+            fn description(&self) -> &'static str {
+                self.text
+            }
+            fn input_schema(&self) -> serde_json::Value {
+                serde_json::json!({ "type": "object" })
+            }
+            fn activity(&self) -> Activity {
+                Activity::Read
+            }
+            fn call(
+                &self,
+                _arguments: &serde_json::Value,
+                _context: &ExecutionContext,
+            ) -> Result<ToolOutput> {
+                Ok(ToolOutput::success("ok"))
+            }
+        }
+
+        for (character, retained) in [("é", 503), ("€", 335), ("🦀", 251)] {
+            let text = Box::leak(format!("a{}", character.repeat(600)).into_boxed_str());
+            let mut registry = crate::registry::Registry::new();
+            registry
+                .insert(Box::new(UnicodeTool { text }))
+                .expect("register Unicode description without panicking");
+            let specs = registry.all_schemas();
+            let spec = &specs[0];
+            assert_eq!(
+                spec.description,
+                format!("a{}... [truncated]", character.repeat(retained))
+            );
+            assert!(spec.description.len() <= MAX_DESCRIPTION_BYTES);
+            rune_core::tool::validate_tool_spec(spec).expect("valid tool schema");
+
+            let bytes = serde_json::to_vec(&specs).expect("serialize tool schemas");
+            std::str::from_utf8(&bytes).expect("valid UTF-8 JSON");
+            let decoded: Vec<ToolSpec> =
+                serde_json::from_slice(&bytes).expect("deserialize tool schemas");
+            assert_eq!(decoded, specs);
+        }
     }
 
     #[test]
