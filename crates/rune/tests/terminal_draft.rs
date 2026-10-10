@@ -1,7 +1,47 @@
-//! R-004 regression through the real binary and an 80-column PTY.
+//! Draft editing regressions through the real binary and an 80-column PTY.
 
 #![cfg(unix)]
 #![allow(clippy::expect_used, clippy::panic)]
+
+#[test]
+fn undo_restores_unicode_drafts_and_carets_in_a_real_terminal() {
+    let output = std::process::Command::new("python3")
+        .args([
+            "-c",
+            include_str!("terminal_draft.py"),
+            env!("CARGO_BIN_EXE_rune"),
+            "undo",
+        ])
+        .output()
+        .expect("python3 is required for the Unix terminal undo regression");
+    assert!(
+        output.status.success(),
+        "terminal undo regression failed:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let captures: Vec<(String, Vec<u8>)> =
+        serde_json::from_slice(&output.stdout).expect("terminal captures");
+    assert_eq!(captures.len(), 6);
+    for (stage, bytes) in captures {
+        let mut grid = rune_term::Grid::new(80, 24).expect("grid");
+        grid.feed(&bytes).expect("feed");
+        let screen = grid.text();
+        let caret = grid.cursor();
+        let input = screen
+            .lines()
+            .nth(usize::from(caret.row))
+            .expect("input row");
+        let (text, column) = match stage.as_str() {
+            "original" | "deleted" | "undo-insert" => ("> 界ab", 5),
+            "inserted" | "undo-delete" => ("> 界ae\u{301}b", 6),
+            "moved" => ("> 界ab", 2),
+            _ => panic!("unexpected capture {stage}"),
+        };
+        assert_eq!(input, text, "{stage}: {screen}");
+        assert_eq!(caret.col, column, "{stage}: {screen}");
+    }
+}
 
 #[test]
 fn long_drafts_scroll_with_the_caret_in_a_real_terminal() {

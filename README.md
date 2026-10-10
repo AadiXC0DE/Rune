@@ -120,6 +120,10 @@ rune review                 # review the pending changes in this repository
 rune resume last            # continue the most recent session here
 ```
 
+In the interactive composer, Ctrl-_ (Ctrl-Shift-minus) undoes the last draft
+edit and restores its caret. Repeated presses undo earlier edits, including
+Unicode grapheme deletion and pasted text.
+
 `rune ask` sends one text-only request. If the model requests tools, it exits 1
 and names the unsupported calls. With `--json`, `error_code` is
 `unsupported_tool_call`, each requested tool has status `error`, and

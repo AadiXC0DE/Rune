@@ -1,4 +1,4 @@
-"""R-004: edit a long draft through the real process and capture terminal bytes."""
+"""Edit long drafts or undo Unicode edits through the real process in a PTY."""
 
 import fcntl
 import http.server
@@ -127,17 +127,31 @@ with tempfile.TemporaryDirectory(prefix="rune-r004-") as directory:
 
     try:
         wait_for("ctrl-c cancel")
-        draft = "a" * 160 + "TAIL-END"
-        capture("end", draft.encode(), "TAIL-END")
-        capture("left", b"\x1b[D", "TAIL-END")
-        capture("edited", b"\x1b[3~Z", "TAIL-ENZ")
-        capture("home", b"\x01", "> " + "a" * 78)
-        capture("end-again", b"\x05", "TAIL-ENZ")
+        if sys.argv[2:] == ["undo"]:
+            capture("original", "界ab".encode() + b"\x1b[D", "界ab")
+            capture(
+                "inserted", b"\x1b[200~" + "e\u0301".encode() + b"\x1b[201~",
+                "界ae\u0301b",
+            )
+            capture("deleted", b"\x7f", "界ab")
+            # Navigation must not change the caret restored by undo.
+            capture("moved", b"\x01", "\x1b[3G")
+            capture("undo-delete", b"\x1f", "界ae\u0301b")
+            capture("undo-insert", b"\x1f", "界ab")
+            submitted = "界ab"
+        else:
+            draft = "a" * 160 + "TAIL-END"
+            capture("end", draft.encode(), "TAIL-END")
+            capture("left", b"\x1b[D", "TAIL-END")
+            capture("edited", b"\x1b[3~Z", "TAIL-ENZ")
+            capture("home", b"\x01", "> " + "a" * 78)
+            capture("end-again", b"\x05", "TAIL-ENZ")
+            submitted = "a" * 160 + "TAIL-ENZ"
         os.write(master, b"\r")
         # Wait for close_turn's committed line, not its earlier streamed row,
         # so /quit is handled as a command rather than steering the old turn.
         wait_for("DRAFT_RECEIVED\r\n")
-        assert prompts == ["a" * 160 + "TAIL-ENZ"], prompts
+        assert prompts == [submitted], prompts
         os.write(master, b"/quit\r")
         assert child.wait(timeout=10) == 0
         assert not errors, errors

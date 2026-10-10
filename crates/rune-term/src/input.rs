@@ -292,6 +292,12 @@ impl KeyReader {
                 self.composer.yank();
                 KeyAction::Ignored
             }
+            // Legacy terminals send Ctrl-_ as 0x1f, which Crossterm decodes
+            // as Ctrl-7. Enhanced keyboard events can report '_' directly.
+            (KeyCode::Char('_' | '7'), true, _) => {
+                self.composer.undo();
+                KeyAction::Ignored
+            }
             (KeyCode::Char('w'), true, _) => {
                 self.composer.delete_word();
                 KeyAction::Ignored
@@ -770,6 +776,68 @@ mod tests {
         typed(&mut reader, "one two");
         reader.apply(control('w'));
         assert_eq!(reader.line(), "one ");
+    }
+
+    #[test]
+    fn undo_binding_restores_unicode_edits_and_their_carets() {
+        for binding in [
+            control('_'),
+            control('7'),
+            KeyEvent::new(
+                KeyCode::Char('_'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            ),
+        ] {
+            for grapheme in ["e\u{301}", "👍🏽", "👩‍💻", "界"] {
+                for deletion in [KeyCode::Backspace, KeyCode::Delete] {
+                    let mut reader = reader();
+                    reader.replace("界ab");
+                    reader.apply(key(KeyCode::Left));
+                    let original = (reader.line().to_owned(), reader.composer.cursor());
+                    reader.handle(Event::Paste(grapheme.to_owned()));
+                    if deletion == KeyCode::Delete {
+                        reader.apply(key(KeyCode::Left));
+                    }
+                    let inserted = (reader.line().to_owned(), reader.composer.cursor());
+                    let inserted_column = reader.column();
+                    reader.handle(Event::Key(key(deletion)));
+                    assert_eq!(reader.line(), original.0);
+                    // Undo restores the saved caret, even after navigation.
+                    reader.apply(key(KeyCode::Home));
+
+                    assert_eq!(reader.handle(Event::Key(binding)), Some(KeyAction::Ignored));
+                    assert_eq!(reader.line(), inserted.0);
+                    assert_eq!(reader.composer.cursor(), inserted.1);
+                    assert_eq!(reader.column(), inserted_column);
+
+                    assert_eq!(reader.handle(Event::Key(binding)), Some(KeyAction::Ignored));
+                    assert_eq!(reader.line(), original.0);
+                    assert_eq!(reader.composer.cursor(), original.1);
+                    assert_eq!(reader.column(), 3);
+                    // An exhausted undo history leaves the draft untouched.
+                    assert_eq!(reader.handle(Event::Key(binding)), Some(KeyAction::Ignored));
+                    assert_eq!(reader.line(), original.0);
+                    assert_eq!(reader.composer.cursor(), original.1);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn releasing_undo_does_not_revert_another_edit() {
+        let mut reader = reader();
+        reader.replace("ab");
+        reader.apply(key(KeyCode::Left));
+        reader.handle(Event::Key(key(KeyCode::Char('x'))));
+        reader.handle(Event::Key(key(KeyCode::Char('界'))));
+        let mut undo = control('_');
+        assert_eq!(reader.handle(Event::Key(undo)), Some(KeyAction::Ignored));
+        assert_eq!(reader.line(), "axb");
+        assert_eq!(reader.column(), 2);
+        undo.kind = KeyEventKind::Release;
+        assert_eq!(reader.handle(Event::Key(undo)), None);
+        assert_eq!(reader.line(), "axb");
+        assert_eq!(reader.column(), 2);
     }
 
     #[test]
