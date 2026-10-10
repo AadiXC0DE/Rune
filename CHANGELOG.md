@@ -6,6 +6,8 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Added
 
+- Ctrl-O opens a scrollable full transcript snapshot, including recorded tool
+  calls and result bodies. Escape or Ctrl-O returns to the same draft and caret.
 - Fenced code preserves indentation and spaces while streaming and in the
   finished transcript. Long lines wrap with an indented `↪` continuation marker;
   code tabs use eight-column stops and wrapping adapts to terminal resizing.

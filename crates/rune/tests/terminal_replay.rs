@@ -159,6 +159,82 @@ fn twelve_column_text_grids_and_scrollback() {
 }
 
 #[test]
+fn full_transcript_scrolls_tools_and_replies_and_preserves_the_draft_and_caret() {
+    let captures: Vec<Capture> = serde_json::from_slice(&record(
+        include_str!("terminal_replay.py"),
+        Some("transcript"),
+    ))
+    .expect("transcript captures");
+    let mut grid = Grid::new(80, 24).expect("grid");
+    let mut main = None;
+    let mut draft = None;
+    let mut opened = None;
+    for capture in captures {
+        grid.resize(capture.cols, capture.rows).expect("resize");
+        // Grid models one screen. Replay the terminal's alternate-screen swap
+        // explicitly, retaining the main image and saved cursor as a real PTY
+        // terminal does on DECSET/DECRST 1049.
+        let bytes = capture.bytes.as_slice();
+        let mut start = 0;
+        for at in 0..bytes.len().saturating_sub(7) {
+            let sequence = &bytes[at..at + 8];
+            if sequence == b"\x1b[?1049h" || sequence == b"\x1b[?1049l" {
+                grid.feed(&bytes[start..at]).expect("replay before swap");
+                if sequence.ends_with(b"h") {
+                    assert!(main.is_none(), "second alternate-screen owner");
+                    main = Some(grid.clone());
+                    grid = Grid::new(capture.cols, capture.rows).expect("alternate grid");
+                } else {
+                    grid = main.take().expect("main screen was saved");
+                    grid.resize(capture.cols, capture.rows)
+                        .expect("main resize");
+                }
+                start = at + 8;
+            }
+        }
+        grid.feed(&bytes[start..]).expect("replay after swap");
+        let text = grid.text();
+        match capture.stage.as_str() {
+            "draft" => draft = Some(grid.clone()),
+            "opened" => {
+                assert!(text.contains("> inspect"), "{text}");
+                assert!(text.contains("read_file"), "{text}");
+                opened = Some(grid.clone());
+            }
+            "page-down" => assert!(text.contains("TOOL-30"), "{text}"),
+            "end" | "down" => assert!(text.contains("REPLY-40"), "{text}"),
+            "up" => {
+                assert!(text.contains("REPLY-17"), "{text}");
+                assert!(!text.contains("REPLY-40"), "{text}");
+            }
+            "home" => assert_eq!(Some(&grid), opened.as_ref()),
+            "closed" => assert_eq!(Some(&grid), draft.as_ref(), "draft screen or caret changed"),
+            "edited" => assert!(text.contains("draft Z界 tail"), "{text}"),
+            "resized" => assert!(text.contains("Transcript"), "{text}"),
+            "live-end" => {
+                assert!(text.contains("LIVE-PARTIAL"), "{text}");
+                assert!(
+                    !text.contains("LIVE-END"),
+                    "snapshot contained future output"
+                );
+            }
+            "live-closed" => assert!(text.contains("live draft"), "{text}"),
+            "live-edited" => assert!(text.contains("live dZraft"), "{text}"),
+            "empty" => {
+                assert!(text.contains("Transcript"), "{text}");
+                assert!(!text.contains("TOOL-"), "old tools leaked into new session");
+                assert!(
+                    !text.contains("REPLY-"),
+                    "old replies leaked into new session"
+                );
+            }
+            _ => {}
+        }
+    }
+    assert!(main.is_none(), "viewer left the alternate screen open");
+}
+
+#[test]
 fn fenced_code_continuations_are_stable_while_streaming_and_when_finished() {
     let captures: Vec<Capture> =
         serde_json::from_slice(&record(include_str!("terminal_replay.py"), Some("code")))

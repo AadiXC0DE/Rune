@@ -278,6 +278,10 @@ struct SessionHost {
     /// covering both steps, one frame's bytes can land inside another's and the
     /// screen shows a mix of two.
     frame: Mutex<()>,
+    /// Complete recorded conversation, retained even when model context compacts.
+    transcript: Mutex<Vec<Entry>>,
+    /// Prevents streaming frames from painting over the transcript snapshot.
+    transcript_open: std::sync::atomic::AtomicBool,
     /// The line being typed while a turn runs, with the caret's display column.
     ///
     /// Held on the host because the streaming thread redraws the whole frame
@@ -908,6 +912,12 @@ impl SessionHost {
         let Ok(_frame) = self.frame.lock() else {
             return;
         };
+        if self
+            .transcript_open
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return;
+        }
         // Even a frame with nothing in it is painted, because the one before it
         // may have shown a line or a notice that has to be taken off the screen.
         // A frame that changes nothing costs only a caret move.
@@ -1115,6 +1125,8 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
         height: std::sync::atomic::AtomicU16::new(terminal_height()),
         inline: Mutex::new(rune_term::inline::Inline::new(terminal_width())),
         frame: Mutex::new(()),
+        transcript: Mutex::new(history_entries(history.turns())),
+        transcript_open: std::sync::atomic::AtomicBool::new(false),
         typed: Mutex::new((String::new(), 0)),
         provider_order: config.settings.provider_order.clone(),
         provider_strict: config.settings.provider_strict,
@@ -1264,6 +1276,10 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                         fresh.set_workspace(&config.workspace)?;
                         recorder = fresh;
                         history = History::new();
+                        host.transcript
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .clear();
                         host.set_session_id(id.as_str());
                         // The context reading belongs to the conversation that
                         // just ended, so it is cleared rather than carried into
@@ -1346,7 +1362,11 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                     let _ = history.record(entry);
                 }
                 recorder.user_message(&text)?;
-                history.push_user(text);
+                history.push_user(text.clone());
+                host.transcript
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(Entry::user(text));
                 // The turn runs on its own thread so this one keeps reading
                 // keys. A turn that ran inline made the keyboard dead for as
                 // long as the model took, which is the difference between
@@ -1375,6 +1395,14 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                             recorder.failed_turn(&partial, &err)?;
                         }
                         retain_partial_answer(&mut history, history_start, &partial);
+                        host.transcript
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .extend(history_entries(&history.turns()[history_start..]));
+                        host.transcript
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .push(Entry::notice(err.message()));
                         if !reader.is_active() {
                             return Err(err);
                         }
@@ -1388,6 +1416,10 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                 // The turn is recorded before it is reported, so a session that
                 // dies while rendering still has its exchange on disk.
                 recorder.turn(&outcome)?;
+                host.transcript
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .extend(history_entries(&history.turns()[history_start..]));
                 // The model is read back rather than captured at start, so a
                 // turn that ran after `/model` is billed to the model that ran.
                 record_usage(&config.paths, &host.model(), &outcome);
@@ -1563,6 +1595,11 @@ fn run_turn_steerable(
                 return;
             };
             match key {
+                KeyAction::Transcript => {
+                    gesture.disarm();
+                    let _ = view_transcript(reader, host);
+                    host.draw_stream_with(reader.line(), reader.column());
+                }
                 // Enter submits what has been typed as steering rather than as
                 // a new turn, so a correction reaches the running turn instead
                 // of queueing behind it.
@@ -1756,7 +1793,7 @@ fn question_key(
             cancellation.cancel();
             None
         }
-        KeyAction::Complete | KeyAction::Ignored => None,
+        KeyAction::Complete | KeyAction::Ignored | KeyAction::Transcript => None,
     }
 }
 
@@ -1795,7 +1832,7 @@ fn approval_key(
             cancellation.cancel();
             Some(Outcome::Deny)
         }
-        KeyAction::Complete | KeyAction::Ignored => None,
+        KeyAction::Complete | KeyAction::Ignored | KeyAction::Transcript => None,
     }
 }
 
@@ -1929,6 +1966,153 @@ fn turn_interrupted() -> RuneError {
     RuneError::new(ErrorCode::Cancelled, "the turn was interrupted")
 }
 
+/// Restores the main terminal even when rendering fails or unwinds.
+struct TranscriptScreen<'a>(&'a SessionHost);
+
+impl Drop for TranscriptScreen<'_> {
+    fn drop(&mut self) {
+        let _frame = self
+            .0
+            .frame
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.0.show(b"\x1b[0m\x1b[?1049l\x1b[?25h");
+        self.0
+            .transcript_open
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Reads a stable snapshot on the alternate screen. The reader's composer is
+/// never replaced, so its caret, recall state and kill buffer survive intact.
+fn view_transcript(reader: &rune_term::input::KeyReader, host: &SessionHost) -> Result<()> {
+    use rune_term::input::TranscriptAction;
+
+    let mut entries = host
+        .transcript
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    entries.extend(event_entries(host));
+    let partial = host.partial_answer();
+    if !partial.is_empty() {
+        entries.push(Entry::assistant(partial));
+    }
+    host.refresh_size();
+    let mut size = (
+        host.width(),
+        host.height.load(std::sync::atomic::Ordering::Relaxed),
+    );
+    let mut view = rune_term::screen::Transcript::new(full_transcript_rows(&entries, size.0));
+    let mut surface = rune_term::frame::FrameSurface::new(size.0, size.1)?;
+    let _screen = {
+        let _frame = host
+            .frame
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        host.transcript_open
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let screen = TranscriptScreen(host);
+        host.show(b"\x1b[?1049h\x1b[0m\x1b[2J\x1b[H\x1b[?25l");
+        screen
+    };
+
+    let mut redraw = true;
+    loop {
+        host.refresh_size();
+        let next_size = (
+            host.width(),
+            host.height.load(std::sync::atomic::Ordering::Relaxed),
+        );
+        if next_size != size {
+            let top = view.top();
+            size = next_size;
+            view = rune_term::screen::Transcript::new(full_transcript_rows(&entries, size.0));
+            view.jump(top, usize::from(size.1.saturating_sub(1)));
+            // Resizing can leave stale cells anywhere on the alternate screen.
+            host.show(b"\x1b[2J");
+            redraw = true;
+        }
+        let height = usize::from(size.1.saturating_sub(1));
+        if redraw {
+            let mut lines = view.visible(height).to_vec();
+            lines.resize(height, String::new());
+            let footer = vec![String::from(
+                "Transcript | Up/Down PgUp/PgDn Home/End | Esc/Ctrl-O close",
+            )];
+            let target = rune_term::frame::compose(
+                &rune_term::frame::Regions::new(&lines, &footer),
+                size.0,
+                size.1,
+            )?;
+            let painted = surface.commit(&target)?;
+            host.show(&painted.bytes);
+        }
+        let action = reader.poll_transcript(std::time::Duration::from_millis(50));
+        redraw = !matches!(action, Some(TranscriptAction::Ignored) | None);
+        match action {
+            Some(TranscriptAction::Close) => break,
+            Some(TranscriptAction::Up) => view.scroll_up(1),
+            Some(TranscriptAction::Down) => view.scroll_down(1, height),
+            Some(TranscriptAction::PageUp) => view.page_up(height),
+            Some(TranscriptAction::PageDown) => view.page_down(height),
+            Some(TranscriptAction::Home) => view.jump(0, height),
+            Some(TranscriptAction::End) => view.jump(usize::MAX, height),
+            Some(TranscriptAction::Ignored) | None => {}
+        }
+    }
+    Ok(())
+}
+
+/// Projects recorded messages in order, keeping tool arguments and result bodies.
+fn history_entries(turns: &[rune_agent::history::Turn]) -> Vec<Entry> {
+    use rune_net::message::{ContentPart, Role};
+    turns
+        .iter()
+        .flat_map(|turn| {
+            turn.parts.iter().map(|part| match part {
+                ContentPart::Text { text } => match turn.role {
+                    Role::User => Entry::user(text.clone()),
+                    Role::Assistant => Entry::assistant(text.clone()),
+                    Role::Tool => Entry::tool(text.clone()),
+                    Role::System => Entry::notice(text.clone()),
+                },
+                ContentPart::Reasoning { text } => Entry::reasoning(text.clone()),
+                ContentPart::ToolCall {
+                    name, arguments, ..
+                } => Entry::tool(format!("{name} {arguments}")),
+                ContentPart::ToolResult {
+                    name,
+                    content,
+                    is_error,
+                    ..
+                } => Entry::tool(format!(
+                    "{name}{}:\n{content}",
+                    if *is_error { " (error)" } else { "" }
+                )),
+                ContentPart::Image { image } => {
+                    Entry::notice(format!("image {} ({})", image.id, image.media_type))
+                }
+            })
+        })
+        .collect()
+}
+
+/// Expands every recorded tool line using the same wrapping as the inline view.
+fn full_transcript_rows(entries: &[Entry], cols: u16) -> Vec<String> {
+    transcript::render(
+        entries,
+        Display {
+            width: usize::from(cols),
+            tool_lines: usize::MAX,
+            ..Display::default()
+        },
+    )
+    .lines()
+    .map(str::to_owned)
+    .collect()
+}
+
 /// Waits for a line to be submitted, drawing the prompt as it is typed.
 ///
 /// Returns the submitted input, or `None` when the user asked to leave. The
@@ -1959,7 +2143,12 @@ fn await_submission(
         );
         draw_prompt(reader, host, out, &rows, marker)?;
 
-        match idle_key(reader.read_key(), reader, &mut selected, &rows, recall) {
+        let key = reader.read_key();
+        if key == KeyAction::Transcript {
+            view_transcript(reader, host)?;
+            continue;
+        }
+        match idle_key(key, reader, &mut selected, &rows, recall) {
             Idle::Stay => {}
             Idle::Leave => return Ok(None),
             Idle::Submit(input) => return Ok(Some(input)),
@@ -2057,6 +2246,7 @@ fn idle_key(
             }
             Idle::Stay
         }
+        KeyAction::Transcript => Idle::Stay,
         KeyAction::Ignored => {
             // Typing narrows the list, so the highlight returns to the top
             // rather than pointing at a row that may no longer exist.
@@ -2157,6 +2347,9 @@ fn run_picker(
                 } else {
                     picker.down();
                 }
+            }
+            KeyAction::Transcript => {
+                view_transcript(reader, host)?;
             }
             KeyAction::Ignored => {
                 picker.set_query(reader.line());
@@ -3512,6 +3705,96 @@ mod tests {
             written.contains("streamed"),
             "the delta was not drawn when it arrived: {written:?}"
         );
+    }
+
+    #[test]
+    fn transcript_ownership_suppresses_streaming_frames_and_restores_after_drop() {
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let host = test_host();
+        *host.live_out.lock().expect("lock") =
+            Some(Arc::new(Mutex::new(SharedSink(Arc::clone(&bytes)))));
+        host.transcript_open
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let screen = TranscriptScreen(&host);
+        host.emit(Event::TextDelta {
+            delta: String::from("LIVE-ANSWER"),
+        });
+        assert!(
+            bytes.lock().expect("lock").is_empty(),
+            "stream painted over the viewer"
+        );
+        assert_eq!(host.partial_answer(), "LIVE-ANSWER");
+        drop(screen);
+        assert!(
+            !host
+                .transcript_open
+                .load(std::sync::atomic::Ordering::Relaxed)
+        );
+        assert!(String::from_utf8_lossy(&bytes.lock().expect("lock")).contains("\x1b[?1049l"));
+        bytes.lock().expect("lock").clear();
+        host.draw_stream_with("saved draft", 3);
+        let written = String::from_utf8_lossy(&bytes.lock().expect("lock")).into_owned();
+        assert!(written.contains("LIVE-ANSWER"), "{written:?}");
+        assert!(written.contains("saved draft"), "{written:?}");
+    }
+
+    #[test]
+    fn full_transcript_keeps_recorded_calls_replies_and_every_tool_row() {
+        use rune_agent::history::Turn;
+        use rune_core::id::ToolCallId;
+        use rune_net::message::{ContentPart, Role};
+
+        let mut content = String::new();
+        for row in 1..=40 {
+            writeln!(content, "TOOL-{row:02}").expect("tool row");
+        }
+        let turns = vec![
+            Turn::user(1, "inspect"),
+            Turn::assistant(
+                2,
+                vec![ContentPart::ToolCall {
+                    id: ToolCallId::new("read").expect("tool id"),
+                    name: String::from("read_file"),
+                    arguments: String::from("{\"path\":\"fixture\"}"),
+                }],
+            ),
+            Turn::new(
+                3,
+                Role::Tool,
+                vec![ContentPart::ToolResult {
+                    id: ToolCallId::new("read").expect("tool id"),
+                    name: String::from("read_file"),
+                    content,
+                    is_error: false,
+                }],
+            ),
+            Turn::assistant(
+                4,
+                vec![ContentPart::Text {
+                    text: String::from("REPLY-END\x1b[2J"),
+                }],
+            ),
+        ];
+        let entries = history_entries(&turns);
+        let rows = full_transcript_rows(&entries, 80);
+        let rendered = rows.join("\n");
+        assert!(rendered.starts_with("> inspect"));
+        assert!(rendered.contains("read_file {\"path\":\"fixture\"}"));
+        for row in 1..=40 {
+            assert!(
+                rendered.contains(&format!("TOOL-{row:02}")),
+                "missing row {row}"
+            );
+        }
+        assert!(rendered.ends_with("REPLY-END"));
+        assert!(!rendered.contains("more line(s)"));
+        assert!(!rendered.contains("\x1b[2J"));
+        let mut view = rune_term::screen::Transcript::new(rows);
+        assert!(view.visible(8).iter().any(|row| row.contains("inspect")));
+        view.page_down(8);
+        assert!(view.visible(8).iter().any(|row| row.contains("TOOL-10")));
+        view.jump(usize::MAX, 8);
+        assert!(view.visible(8).iter().any(|row| row.contains("REPLY-END")));
     }
 
     /// Returns the one-based column of the last caret move in a frame.
@@ -5781,6 +6064,8 @@ mod tests {
             height: std::sync::atomic::AtomicU16::new(24),
             inline: Mutex::new(rune_term::inline::Inline::new(80)),
             frame: Mutex::new(()),
+            transcript: Mutex::new(Vec::new()),
+            transcript_open: std::sync::atomic::AtomicBool::new(false),
             typed: Mutex::new((String::new(), 0)),
             provider_order: Vec::new(),
             provider_strict: false,

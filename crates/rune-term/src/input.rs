@@ -43,6 +43,51 @@ pub enum KeyAction {
     Down,
     /// The user asked to complete what is being typed.
     Complete,
+    /// Open the full transcript without editing the composer.
+    Transcript,
+}
+
+/// Navigation while the transcript owns the terminal.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TranscriptAction {
+    /// Leave the viewer and restore the draft.
+    Close,
+    /// Scroll one row up.
+    Up,
+    /// Scroll one row down.
+    Down,
+    /// Scroll one page up.
+    PageUp,
+    /// Scroll one page down.
+    PageDown,
+    /// Jump to the beginning.
+    Home,
+    /// Jump to the end.
+    End,
+    /// Ignore editing, paste, and non-input events.
+    Ignored,
+}
+
+/// Maps viewer input without touching a composer or its editing history.
+#[must_use]
+pub fn transcript_event(event: &Event) -> TranscriptAction {
+    let Event::Key(key) = event else {
+        return TranscriptAction::Ignored;
+    };
+    if key.kind == KeyEventKind::Release {
+        return TranscriptAction::Ignored;
+    }
+    let control = key.modifiers.contains(KeyModifiers::CONTROL);
+    match (key.code, control) {
+        (KeyCode::Esc, _) | (KeyCode::Char('o' | 'c' | 'd'), true) => TranscriptAction::Close,
+        (KeyCode::Up, _) => TranscriptAction::Up,
+        (KeyCode::Down, _) => TranscriptAction::Down,
+        (KeyCode::PageUp, _) => TranscriptAction::PageUp,
+        (KeyCode::PageDown, _) => TranscriptAction::PageDown,
+        (KeyCode::Home, _) => TranscriptAction::Home,
+        (KeyCode::End, _) => TranscriptAction::End,
+        _ => TranscriptAction::Ignored,
+    }
 }
 
 /// Reads keys and drives a composer.
@@ -169,6 +214,14 @@ impl KeyReader {
         action
     }
 
+    /// Polls viewer navigation, leaving the complete composer untouched.
+    pub fn poll_transcript(&self, timeout: Duration) -> Option<TranscriptAction> {
+        if !self.active || !crossterm::event::poll(timeout).unwrap_or(false) {
+            return None;
+        }
+        crossterm::event::read().ok().as_ref().map(transcript_event)
+    }
+
     /// Applies one terminal event, returning `None` for one that is not input.
     ///
     /// Shared by both ways of reading, so a paste means the same thing whether
@@ -209,6 +262,7 @@ impl KeyReader {
         let alt = key.modifiers.contains(KeyModifiers::ALT);
 
         match (key.code, control, alt) {
+            (KeyCode::Char('o'), true, _) => KeyAction::Transcript,
             (KeyCode::Char('c'), true, _) => KeyAction::Cancel,
             (KeyCode::Char('d'), true, _) => {
                 if self.composer.is_empty() {
@@ -402,6 +456,7 @@ fn restore_terminal() {
 
 /// Writes the sequences that turn bracketed paste off and show the cursor.
 fn write_restore(out: &mut impl std::io::Write) {
+    let _ = crossterm::QueueableCommand::queue(out, crossterm::terminal::LeaveAlternateScreen);
     let _ = crossterm::QueueableCommand::queue(out, crossterm::event::DisableBracketedPaste);
     let _ = crossterm::QueueableCommand::queue(out, crossterm::cursor::Show);
     let _ = out.flush();
@@ -438,6 +493,48 @@ mod tests {
 
     fn control(c: char) -> KeyEvent {
         KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+    }
+
+    #[test]
+    fn transcript_shortcut_and_navigation_leave_the_complete_draft_untouched() {
+        let mut reader = reader();
+        let history = vec![String::from("earlier prompt")];
+        reader.replace("draft 界 tail");
+        reader.apply(key(KeyCode::Left));
+        reader.recall_previous(&history);
+        reader.recall_next(&history);
+        let before = (reader.line().to_owned(), reader.column());
+        assert_eq!(reader.apply(control('o')), KeyAction::Transcript);
+        for (event, expected) in [
+            (Event::Key(key(KeyCode::Up)), TranscriptAction::Up),
+            (Event::Key(key(KeyCode::Down)), TranscriptAction::Down),
+            (Event::Key(key(KeyCode::PageUp)), TranscriptAction::PageUp),
+            (
+                Event::Key(key(KeyCode::PageDown)),
+                TranscriptAction::PageDown,
+            ),
+            (Event::Key(key(KeyCode::Home)), TranscriptAction::Home),
+            (Event::Key(key(KeyCode::End)), TranscriptAction::End),
+            (
+                Event::Key(key(KeyCode::Char('x'))),
+                TranscriptAction::Ignored,
+            ),
+            (
+                Event::Paste(String::from("replace\nthis")),
+                TranscriptAction::Ignored,
+            ),
+            (Event::Key(key(KeyCode::Enter)), TranscriptAction::Ignored),
+            (Event::Resize(32, 8), TranscriptAction::Ignored),
+            (Event::Key(key(KeyCode::Esc)), TranscriptAction::Close),
+            (Event::Key(control('o')), TranscriptAction::Close),
+            (Event::Key(control('c')), TranscriptAction::Close),
+        ] {
+            assert_eq!(transcript_event(&event), expected);
+            assert_eq!((reader.line().to_owned(), reader.column()), before);
+        }
+        reader.recall_previous(&history);
+        reader.recall_next(&history);
+        assert_eq!((reader.line().to_owned(), reader.column()), before);
     }
 
     /// Builds a reader with keys enabled, without touching a real terminal.

@@ -148,7 +148,12 @@ failure within the available output budget.
 - **Small and fast.** Binary size and startup are budgets enforced in CI, not
   aspirations. The argument and configuration paths never load the agent runtime.
 - **Shell-like output.** The session renders inline and preserves terminal
-  scrollback rather than taking over the screen.
+  scrollback. Ctrl-O opens a full transcript snapshot on the alternate screen,
+  including recorded tool arguments and result bodies. Up/Down scroll by row,
+  Page Up/Page Down by page, and Home/End jump to the beginning/end. Escape or
+  Ctrl-O closes it with the draft and caret preserved. A running turn continues
+  while the snapshot is open; reopen it to see newer output. Provider and tool
+  result limits still apply to what is recorded.
 - **Permission first.** Every sensitive action passes a policy gate, and
   `rune permissions` explains exactly which rule decided it.
   Interactive requests show the complete scope with Run once and Deny choices.
