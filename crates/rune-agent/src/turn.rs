@@ -26,8 +26,8 @@ use rune_net::stream::{FinishReason, Usage};
 use rune_net::transport::{self, Endpoint, StreamOutcome};
 use rune_policy::decision::Outcome;
 use rune_policy::rules::RuleSet;
-use rune_tools::Registry;
 use rune_tools::contract::{Activity, ExecutionContext, ToolOutput};
+use rune_tools::{Registry, Tool};
 
 use crate::history::History;
 use crate::steering::{Boundary, Cancellation, SteeringQueue};
@@ -287,8 +287,6 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
     let cancellation = host.cancellation();
     let steering = host.steering();
     let step_limit = limits.get(LimitName::MaxAgentSteps).value().unwrap_or(0);
-    let result_limit = limits.get_usize(LimitName::MaxTurnResultBytes);
-    let tool_result_limit = limits.get_usize(LimitName::MaxToolResultBytes);
     let max_attempts = limits.get_usize(LimitName::ProviderMaxAttempts).max(1);
     let timeouts = transport::RequestTimeouts::from_limits(&limits);
 
@@ -459,24 +457,7 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
 
         // Execute the batch. Policy is resolved per call before anything runs,
         // so a denial never reaches a tool.
-        let mut results = execute_batch(&pending_calls, host);
-
-        // Every result must still be answered, because an unanswered call is an
-        // invalid request. The retained bytes are charged against the turn's
-        // bound, so a turn that runs for many steps cannot accumulate more
-        // result text than the limit allows.
-        for result in &mut results {
-            let remaining = result_limit.saturating_sub(result_bytes);
-            let text = std::mem::take(&mut result.output.text);
-            let cap = remaining.min(tool_result_limit);
-            let bounded = if text.len() > cap {
-                spill_result(history, result, text, cap)
-            } else {
-                text
-            };
-            result_bytes = result_bytes.saturating_add(bounded.len());
-            result.output.text = bounded;
-        }
+        let results = execute_batch(&pending_calls, host, history, &mut result_bytes, &limits);
 
         let mut result_parts = Vec::new();
         for result in &results {
@@ -635,142 +616,177 @@ fn backoff(attempt: usize) -> Duration {
 /// Every call is answered, including those left unrun by a cancellation, so
 /// the history never holds a call without its result. A conversation in that
 /// state cannot form another request.
-fn execute_batch(calls: &[PreparedCall], host: &dyn Host) -> Vec<CallResult> {
+fn execute_batch(
+    calls: &[PreparedCall],
+    host: &dyn Host,
+    history: &mut History,
+    result_bytes: &mut usize,
+    limits: &BudgetSet,
+) -> Vec<CallResult> {
     let mut results = Vec::with_capacity(calls.len());
     let mut cancelled = false;
-    // The names the model was offered. A call to anything else is answered
-    // before policy is consulted: asking whether a tool that does not exist
-    // may run puts a question to the person that has no useful answer.
     let offered: Vec<String> = host.tools().into_iter().map(|spec| spec.name).collect();
-
+    let turn_cap = limits.get_usize(LimitName::MaxTurnResultBytes);
+    let tool_cap = limits.get_usize(LimitName::MaxToolResultBytes);
     for call in calls {
-        if cancelled {
-            results.push(CallResult {
-                call: call.clone(),
-                output: ToolOutput::failure("not run: the turn was cancelled"),
-                executed: false,
-            });
-            continue;
-        }
+        let cap = turn_cap.saturating_sub(*result_bytes).min(tool_cap);
+        let mut result = execute_call(call, host, &offered, &mut cancelled, history, cap);
+        // Charge each answer before the next call, so a reader in this batch
+        // receives the remaining budget and can read a preceding spilled result.
+        let text = std::mem::take(&mut result.output.text);
+        let bounded = if text.len() > cap {
+            spill_result(history, &result, text, cap)
+        } else {
+            text
+        };
+        *result_bytes = result_bytes.saturating_add(bounded.len());
+        result.output.text = bounded;
+        results.push(result);
+    }
+    results
+}
 
-        if !offered.iter().any(|name| name == &call.name) {
-            let reason = format!(
-                "there is no tool named `{}`; the tools are {}",
-                call.name,
-                offered.join(", ")
-            );
+/// Executes one offered, policy-approved call and preserves batch cancellation.
+fn execute_call(
+    call: &PreparedCall,
+    host: &dyn Host,
+    offered: &[String],
+    cancelled: &mut bool,
+    history: &History,
+    output_cap: usize,
+) -> CallResult {
+    if *cancelled {
+        return CallResult {
+            call: call.clone(),
+            output: ToolOutput::failure("not run: the turn was cancelled"),
+            executed: false,
+        };
+    }
+
+    if !offered.iter().any(|name| name == &call.name) {
+        let reason = format!(
+            "there is no tool named `{}`; the tools are {}",
+            call.name,
+            offered.join(", ")
+        );
+        host.emit(Event::ToolDenied {
+            call: call.clone(),
+            reason: reason.clone(),
+        });
+        return CallResult {
+            call: call.clone(),
+            output: ToolOutput::failure(reason),
+            executed: false,
+        };
+    }
+
+    let activity = infer_activity(&call.name);
+    let arguments: serde_json::Value = match serde_json::from_str(&call.arguments) {
+        Ok(value) => value,
+        Err(err) => {
+            // A malformed argument string is the model's error to correct.
+            let output = ToolOutput::failure(format!(
+                "the arguments for `{}` are not valid JSON: {err}",
+                call.name
+            ));
+            return CallResult {
+                call: call.clone(),
+                output,
+                executed: false,
+            };
+        }
+    };
+
+    let target = infer_target(host, &call.name, &arguments);
+    let (outcome, reason) = host.decide(&call.name, target.as_deref());
+
+    match outcome {
+        Outcome::Deny => {
             host.emit(Event::ToolDenied {
                 call: call.clone(),
                 reason: reason.clone(),
             });
-            results.push(CallResult {
+            return CallResult {
                 call: call.clone(),
-                output: ToolOutput::failure(reason),
-                executed: false,
-            });
-            continue;
-        }
-
-        let activity = infer_activity(&call.name);
-        let arguments: serde_json::Value = match serde_json::from_str(&call.arguments) {
-            Ok(value) => value,
-            Err(err) => {
-                // A malformed argument string is the model's error to correct.
-                let output = ToolOutput::failure(format!(
-                    "the arguments for `{}` are not valid JSON: {err}",
+                output: ToolOutput::failure(format!(
+                    "`{}` was refused by policy: {reason}",
                     call.name
-                ));
-                results.push(CallResult {
-                    call: call.clone(),
-                    output,
-                    executed: false,
-                });
-                continue;
-            }
-        };
-
-        let target = infer_target(host, &call.name, &arguments);
-        let (outcome, reason) = host.decide(&call.name, target.as_deref());
-
-        match outcome {
-            Outcome::Deny => {
-                host.emit(Event::ToolDenied {
-                    call: call.clone(),
-                    reason: reason.clone(),
-                });
-                results.push(CallResult {
-                    call: call.clone(),
-                    output: ToolOutput::failure(format!(
-                        "`{}` was refused by policy: {reason}",
-                        call.name
-                    )),
-                    executed: false,
-                });
-                continue;
-            }
-            Outcome::Ask => {
-                // The host resolves an ask before reaching this point, so an
-                // ask that arrives here means nothing could approve the call.
-                // It is reported like a refusal, so the person watching sees
-                // it, and the model is told why and not to retry, because the
-                // same call will be held the same way every time.
-                let action = target.as_deref().unwrap_or(&call.name);
-                host.emit(Event::ToolDenied {
-                    call: call.clone(),
-                    reason: format!("{reason}; nothing in this session could approve it"),
-                });
-                results.push(CallResult {
-                    call: call.clone(),
-                    output: ToolOutput::failure(format!(
-                        "`{}` was not run: no rule allows `{action}`, and this session has no \
-                         way to ask for approval. Do not retry it or a variation of it. Continue \
-                         without it, or tell the user what to run or which rule to add.",
-                        call.name
-                    )),
-                    executed: false,
-                });
-                continue;
-            }
-            Outcome::Allow => {}
+                )),
+                executed: false,
+            };
         }
-
-        host.emit(Event::ToolStarted {
-            call: call.clone(),
-            activity,
-        });
-
-        let output = match host.execute(&call.name, &arguments) {
-            Ok(output) => output,
-            Err(err) if matches!(err.code(), ErrorCode::Cancelled) => {
-                results.push(CallResult {
-                    call: call.clone(),
-                    output: ToolOutput::failure("the call was cancelled"),
-                    executed: false,
-                });
-                cancelled = true;
-                continue;
-            }
-            // The hint is part of the answer: it is what tells the model how
-            // to correct the call.
-            Err(err) => ToolOutput::failure(match err.hint() {
-                Some(hint) => format!("{}; {hint}", err.message()),
-                None => err.message().to_owned(),
-            }),
-        };
-
-        host.emit(Event::ToolFinished {
-            call: call.clone(),
-            is_error: output.is_error,
-        });
-
-        results.push(CallResult {
-            call: call.clone(),
-            output,
-            executed: true,
-        });
+        Outcome::Ask => {
+            // The host resolves an ask before reaching this point, so an
+            // ask that arrives here means nothing could approve the call.
+            // It is reported like a refusal, so the person watching sees
+            // it, and the model is told why and not to retry, because the
+            // same call will be held the same way every time.
+            let action = target.as_deref().unwrap_or(&call.name);
+            host.emit(Event::ToolDenied {
+                call: call.clone(),
+                reason: format!("{reason}; nothing in this session could approve it"),
+            });
+            return CallResult {
+                call: call.clone(),
+                output: ToolOutput::failure(format!(
+                    "`{}` was not run: no rule allows `{action}`, and this session has no \
+                     way to ask for approval. Do not retry it or a variation of it. Continue \
+                     without it, or tell the user what to run or which rule to add.",
+                    call.name
+                )),
+                executed: false,
+            };
+        }
+        Outcome::Allow => {}
     }
 
-    results
+    host.emit(Event::ToolStarted {
+        call: call.clone(),
+        activity,
+    });
+
+    // Retained output is owned by the history rather than the host. Supply
+    // that store only after advertisement and policy checks have passed.
+    let execution = if call.name == "read_tool_result" {
+        let context = host.context();
+        let cap = context.max_output_bytes.min(output_cap);
+        rune_tools::ReadToolResult::default().call(
+            &arguments,
+            &context
+                .with_output_cap(cap)
+                .with_result_store(history.shared_result_store()),
+        )
+    } else {
+        host.execute(&call.name, &arguments)
+    };
+    let output = match execution {
+        Ok(output) => output,
+        Err(err) if matches!(err.code(), ErrorCode::Cancelled) => {
+            *cancelled = true;
+            return CallResult {
+                call: call.clone(),
+                output: ToolOutput::failure("the call was cancelled"),
+                executed: false,
+            };
+        }
+        // The hint is part of the answer: it is what tells the model how
+        // to correct the call.
+        Err(err) => ToolOutput::failure(match err.hint() {
+            Some(hint) => format!("{}; {hint}", err.message()),
+            None => err.message().to_owned(),
+        }),
+    };
+
+    host.emit(Event::ToolFinished {
+        call: call.clone(),
+        is_error: output.is_error,
+    });
+
+    CallResult {
+        call: call.clone(),
+        output,
+        executed: true,
+    }
 }
 
 /// Returns the activity for a tool name.
@@ -779,7 +795,7 @@ fn execute_batch(calls: &[PreparedCall], host: &dyn Host) -> Vec<CallResult> {
 /// conservative answer for presentation purposes.
 fn infer_activity(name: &str) -> Activity {
     match name {
-        "read_file" => Activity::Read,
+        "read_file" | "read_tool_result" => Activity::Read,
         "glob_files" => Activity::List,
         "grep_files" => Activity::Search,
         "write_file" => Activity::Write,

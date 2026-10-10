@@ -162,6 +162,8 @@ pub struct ExecutionContext {
     pub allow_unsandboxed: bool,
     /// Per-call byte budget for produced output.
     pub max_output_bytes: usize,
+    /// Retained output from the live conversation, supplied by its owner.
+    result_store: Option<Arc<crate::result_store::Store>>,
     /// Composite cancellation flag, checked between steps of long work.
     cancelled: Arc<AtomicBool>,
 }
@@ -177,6 +179,7 @@ impl ExecutionContext {
             offline: false,
             allow_unsandboxed: false,
             max_output_bytes: 64 * 1024,
+            result_store: None,
             cancelled: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -216,6 +219,19 @@ impl ExecutionContext {
         self
     }
 
+    /// Supplies the conversation's retained output for `read_tool_result`.
+    #[must_use]
+    pub fn with_result_store(mut self, store: Arc<crate::result_store::Store>) -> Self {
+        self.result_store = Some(store);
+        self
+    }
+
+    /// Returns the retained output this call may read.
+    #[must_use]
+    pub fn result_store(&self) -> Option<&crate::result_store::Store> {
+        self.result_store.as_deref()
+    }
+
     /// Returns a copy sharing this context's cancellation flag.
     ///
     /// Used where a host must hand a fresh context to each call while keeping a
@@ -229,6 +245,7 @@ impl ExecutionContext {
             offline: self.offline,
             allow_unsandboxed: self.allow_unsandboxed,
             max_output_bytes: self.max_output_bytes,
+            result_store: self.result_store.clone(),
             cancelled: Arc::clone(&self.cancelled),
         }
     }

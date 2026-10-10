@@ -59,7 +59,7 @@ pub fn builtin_rules(mode: &PermissionMode) -> RuleSet {
 
     // Reading is what an agent does constantly; asking each time would make the
     // default unusable.
-    for tool in ["read_file", "glob_files", "grep_files"] {
+    for tool in ["read_file", "glob_files", "grep_files", "read_tool_result"] {
         rules.push(Rule::allow(tool, "*", Layer::Default));
     }
 
@@ -208,6 +208,19 @@ mod tests {
         let rules = builtin_rules(&PermissionMode::Auto);
         let decision = rules.evaluate("read_file", "src/main.rs", Outcome::Ask);
         assert_eq!(decision.outcome, Outcome::Allow);
+    }
+
+    #[test]
+    fn retained_output_can_be_read_without_an_approval_prompt() {
+        for mode in [PermissionMode::Auto, PermissionMode::Ask] {
+            let rules = builtin_rules(&mode);
+            assert_eq!(
+                rules
+                    .evaluate("read_tool_result", "read_tool_result", Outcome::Ask)
+                    .outcome,
+                Outcome::Allow
+            );
+        }
     }
 
     #[test]

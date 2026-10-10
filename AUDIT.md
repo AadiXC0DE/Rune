@@ -1904,7 +1904,7 @@ Resource accumulation after cancellation, session holder handover and concurrent
 - [x] R-025 | T1 | fix | sessions | Record provider failure with visible partial output | acceptance: Cut a provider after three deltas and observe those deltas and the failure boundary in the resumed log.
 - [x] R-026 | T1 | fix | scripting | Save ask exchanges unless no-save is selected | acceptance: Run rune ask --json fixture, resolve its nonempty session_id and inspect the exchange; --no-save creates no session.
 - [x] R-027 | T1 | fix | tools | Retain oversized tool results instead of discarding them | acceptance: Return output larger than max_tool_result_bytes and observe a preview plus a retrievable retained handle.
-- [ ] R-028 | T1 | feature | tools | Expose a bounded read_tool_result tool | acceptance: Read two pages of a retained fixture and reconstruct its full bytes without exceeding either response cap.
+- [x] R-028 | T1 | feature | tools | Expose a bounded read_tool_result tool | acceptance: Read two pages of a retained fixture and reconstruct its full bytes without exceeding either response cap.
 - [ ] R-029 | T1 | fix | tools | Keep completed shell output until it is consumed | acceptance: Start a yielding command, let it finish, start another command and still retrieve the first command's final output.
 - [ ] R-030 | T1 | fix | tools | Truncate Unicode tool descriptions at a character boundary | acceptance: Register a description of one ASCII byte plus 600 e-acute characters and observe no panic and a valid UTF-8 schema.
 - [ ] R-031 | T1 | fix | config | Replace credential files atomically | acceptance: Kill a credential writer before replacement and observe either complete old or complete new JSON, never truncated authority.

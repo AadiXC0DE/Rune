@@ -128,9 +128,16 @@ or the remaining `max_turn_result_bytes` into the live conversation's memory.
 The model receives a bounded preview with the retained byte count and handle,
 including that metadata within both limits. If the limit cannot fit the handle,
 the model receives an empty result while the full body is still retained.
-Embedding callers can retrieve retained bytes with `History::result_store()`
-and `Store::read`; a model-callable reader is not yet available. Retention lasts
-across live turns and compaction, but is not saved or restored with transcripts.
+Models can call `read_tool_result` with the handle, a byte `offset` (default 0),
+and a positive `length` (default 65536). It returns JSON containing `text`,
+`offset`, `next_offset`, `total_bytes`, and `eof`. Continue at `next_offset` until
+`eof` to reconstruct the full bytes. Pages stay within 64 KiB, the configured
+tool cap, and the turn's remaining result budget, including JSON escaping and
+metadata. An insufficient budget returns a bounded tool error; start a new turn
+to replenish the turn budget. Offsets must be UTF-8 character boundaries.
+Embedding callers can also use `History::result_store()` and `Store::read`.
+Retention lasts across live turns and compaction, but is not saved or restored
+with transcripts.
 The store holds at most 256 results and 64 MiB; a full store reports a retention
 failure within the available output budget.
 

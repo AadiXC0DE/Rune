@@ -6,6 +6,9 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Added
 
+- Models can read retained tool output with `read_tool_result`, paging by byte
+  offset until EOF. JSON page metadata and escaping fit within the tool cap and
+  the turn's remaining result budget; handles stay scoped to the live conversation.
 - A running turn can be steered from the keyboard. Enter sends what was typed to
   the turn at its next step, Escape twice cancels it, and Control-C clears a
   typed line before cancelling. A cancelled or failed turn ends that exchange
