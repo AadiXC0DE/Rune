@@ -61,6 +61,9 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Fixed
 
+- Short terminals describe the usable compact mode instead of saying to resize
+  to continue while prompts are still accepted.
+
 - Caught worker panics in unwinding builds display one diagnostic through the
   session renderer without leaving duplicate prompt or status rows. They are
   reported and saved as internal failures rather than user cancellations.

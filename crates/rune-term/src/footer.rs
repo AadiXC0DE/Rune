@@ -187,7 +187,7 @@ fn too_small_row(state: &FooterState, layout: &Layout, theme: &Theme, truecolor:
     let mut row = paint(theme, Slot::Error, truecolor, flag::BOLD);
     let _ = write!(
         row,
-        "terminal is {} rows, too small for the interface; resize to continue",
+        "compact mode ({} rows): prompts work; resize for full interface",
         layout.rows
     );
     row.push_str(&reset(theme));
@@ -386,7 +386,11 @@ mod tests {
         assert_eq!(layout.prompt_rows, 0);
         let rows = render(&state(), &layout, &Theme::fx_dark(), 80, true);
         assert_eq!(rows.len(), 1);
-        assert!(strip(&rows)[0].contains("too small"));
+        let message = strip(&rows).remove(0);
+        assert!(
+            message.starts_with("compact mode (4 rows): prompts work; resize for full interface")
+        );
+        assert!(!message.contains("resize to continue"));
         for row in &rows {
             assert!(str_width(row) <= 80, "row too wide: {row:?}");
         }

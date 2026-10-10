@@ -108,8 +108,9 @@ class Provider(http.server.BaseHTTPRequestHandler):
                                   + "\n\ndata: [DONE]\n\n").encode())
                 self.wfile.flush()
                 return
+            answer = "COMPACT-REPLY" if scenario == "compact" else "W" * 300 + "END-LONG-WORD"
             choices = [
-                {"index": 0, "delta": {"content": "W" * 300 + "END-LONG-WORD"},
+                {"index": 0, "delta": {"content": answer},
                  "finish_reason": None},
                 {"index": 0, "delta": {}, "finish_reason": "stop"},
             ]
@@ -133,7 +134,7 @@ def controlling_terminal():
 
 
 scenario = sys.argv[2]
-assert scenario in {"resize", "narrow", "menu-resize", "code", "transcript"}, scenario
+assert scenario in {"resize", "narrow", "menu-resize", "code", "transcript", "compact"}, scenario
 with tempfile.TemporaryDirectory(prefix="rune-r034-") as directory:
     root = pathlib.Path(directory)
     config = root / "config" / "rune"
@@ -173,7 +174,7 @@ with tempfile.TemporaryDirectory(prefix="rune-r034-") as directory:
         environment["RUNE_PERMISSION_MODE"] = "full-access"
     cols, rows = {"resize": (32, 24), "narrow": (12, 24),
                   "menu-resize": (80, 24), "code": (32, 24),
-                  "transcript": (80, 24)}[scenario]
+                  "transcript": (80, 24), "compact": (80, 4)}[scenario]
     master, slave = pty.openpty()
     fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
     try:
@@ -221,8 +222,11 @@ with tempfile.TemporaryDirectory(prefix="rune-r034-") as directory:
         offset = len(transcript)
 
     try:
-        # At 12 columns the hint is deliberately clipped to this prefix.
-        wait_for("ctrl-c cance")
+        if scenario == "compact":
+            capture("compact-idle", expected="compact mode (4 rows): prompts work")
+        else:
+            # At 12 columns the hint is deliberately clipped to this prefix.
+            wait_for("ctrl-c cance")
         if scenario == "resize":
             draft = "0123456789" * 5 + "VISIBLE-END"
             capture("narrow-draft", draft.encode(), "VISIBLE-END")
@@ -232,6 +236,11 @@ with tempfile.TemporaryDirectory(prefix="rune-r034-") as directory:
             capture("grown-again", expected=draft, size=(80, 24))
             os.write(master, b"\x03")
             wait_for("\x1b[?25h", offset)
+        elif scenario == "compact":
+            capture("compact-draft", b"narrow height", "> narrow height")
+            assert not prompts, prompts
+            capture("compact-answer", b"\r", "COMPACT-REPLY\r\n")
+            assert prompts == ["narrow height"], prompts
         elif scenario == "menu-resize":
             capture("model-open", b"/model\r", "type to narrow")
             capture("model-shrunk", expected="type to narrow", size=(32, 8))

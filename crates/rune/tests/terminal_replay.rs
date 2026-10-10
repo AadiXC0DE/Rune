@@ -121,6 +121,38 @@ fn event_replay(scenario: &str) -> String {
 }
 
 #[test]
+fn four_row_compact_mode_message_matches_provider_traffic() {
+    let captures: Vec<Capture> =
+        serde_json::from_slice(&record(include_str!("terminal_replay.py"), Some("compact")))
+            .expect("compact captures");
+    assert_eq!(captures.len(), 3);
+    let mut grid = Grid::new(80, 4).expect("grid");
+    for capture in captures {
+        assert_eq!((capture.cols, capture.rows), (80, 4));
+        grid.feed(&capture.bytes).expect("replay");
+        let screen = grid.text();
+        assert_eq!(
+            screen
+                .matches("compact mode (4 rows): prompts work; resize for full interface")
+                .count(),
+            1,
+            "{}: {screen}",
+            capture.stage
+        );
+        assert!(!screen.contains("resize to continue"), "{screen}");
+        let input = grid.row_text(grid.cursor().row);
+        if capture.stage == "compact-draft" {
+            assert_eq!(input, "> narrow height");
+        } else {
+            assert_eq!(input, ">");
+        }
+        if capture.stage == "compact-answer" {
+            assert!(screen.contains("COMPACT-REPLY"), "{screen}");
+        }
+    }
+}
+
+#[test]
 fn long_draft_grids() {
     let actual = fixed_size_replay(include_str!("terminal_draft.py"), 80, 24);
     assert_eq!(
