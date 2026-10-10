@@ -73,6 +73,14 @@ which is your call rather than a repository's, so a project file cannot enable
 them. Set `offline = true` in the user configuration to refuse every outbound
 request, including requests to the model.
 
+A fetch with `allow_private = true` requests separate user approval for loopback,
+private, and link-local access, including redirects. Enabling web tools,
+full-access mode, and automatic model review do not grant this authority. The
+terminal asks under `web_fetch_private`. Hosts can also supply user rules that
+explicitly grant that permission for a `domain:host` target. Project rules and
+general web grants cannot grant private access. Without an approval path or user grant,
+the fetch is refused before contacting the network.
+
 A model larger than the default window declares its capacity, which is what
 `rune config` reports and what the status line budgets against:
 

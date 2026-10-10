@@ -152,6 +152,8 @@ pub struct ExecutionContext {
     pub additional_roots: Vec<Utf8PathBuf>,
     /// Whether the tool was permitted to reach outside the roots.
     pub external_access: bool,
+    /// Whether a separate user decision allowed private-network web access.
+    pub private_network_access: bool,
     /// Whether shell network access is disabled, even with external access.
     pub offline: bool,
     /// Whether a command may run without a sandbox.
@@ -176,6 +178,7 @@ impl ExecutionContext {
             workspace,
             additional_roots: Vec::new(),
             external_access: false,
+            private_network_access: false,
             offline: false,
             allow_unsandboxed: false,
             max_output_bytes: 64 * 1024,
@@ -195,6 +198,13 @@ impl ExecutionContext {
     #[must_use]
     pub const fn with_external_access(mut self, allowed: bool) -> Self {
         self.external_access = allowed;
+        self
+    }
+
+    /// Carries the resolved private-network decision for this call.
+    #[must_use]
+    pub const fn with_private_network_access(mut self, allowed: bool) -> Self {
+        self.private_network_access = allowed;
         self
     }
 
@@ -242,6 +252,7 @@ impl ExecutionContext {
             workspace: self.workspace.clone(),
             additional_roots: self.additional_roots.clone(),
             external_access: self.external_access,
+            private_network_access: self.private_network_access,
             offline: self.offline,
             allow_unsandboxed: self.allow_unsandboxed,
             max_output_bytes: self.max_output_bytes,

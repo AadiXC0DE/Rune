@@ -57,6 +57,8 @@ struct TestHost {
     /// it and, when nothing is concerning, allow it. A host that cannot review
     /// leaves the call unresolved, which the loop reports rather than running.
     resolve_ask: bool,
+    private_authority: Option<Outcome>,
+    private_decisions: Mutex<Vec<Option<String>>>,
     /// Text submitted as steering the first time a delta arrives, which is when
     /// a user typing during a stream would reach the queue.
     submit_on_first_delta: Mutex<Option<String>>,
@@ -85,6 +87,8 @@ impl TestHost {
             workspace: Utf8PathBuf::from("/tmp/rune-test"),
             limits: BudgetSet::new(),
             resolve_ask: true,
+            private_authority: None,
+            private_decisions: Mutex::new(Vec::new()),
             submit_on_first_delta: Mutex::new(None),
             cancel_on_execute: Mutex::new(false),
         }
@@ -237,6 +241,41 @@ impl Host for TestHost {
             ),
             other => (other, reason),
         }
+    }
+
+    fn decide_private_network(&self, target: Option<&str>) -> (Outcome, String) {
+        self.private_decisions
+            .lock()
+            .expect("lock")
+            .push(target.map(str::to_owned));
+        (
+            self.private_authority.unwrap_or(Outcome::Deny),
+            "separate user decision".to_owned(),
+        )
+    }
+
+    fn execute_with_context(
+        &self,
+        name: &str,
+        arguments: &serde_json::Value,
+        context: &ExecutionContext,
+    ) -> Result<ToolOutput> {
+        if name == "web_fetch" {
+            assert_eq!(
+                context.private_network_access,
+                arguments
+                    .get("allow_private")
+                    .and_then(serde_json::Value::as_bool)
+                    == Some(true),
+                "private authority must be isolated to the approved call",
+            );
+            return self
+                .registry
+                .as_ref()
+                .expect("web registry")
+                .call(name, arguments, context);
+        }
+        self.execute(name, arguments)
     }
 
     fn context(&self) -> ExecutionContext {
@@ -824,6 +863,60 @@ fn the_request_carries_the_instructions_the_conversation_and_the_tools() {
             .iter()
             .any(|event| matches!(event, Event::TurnStarted { step: 1 }))
     );
+}
+
+#[test]
+fn private_web_requests_use_a_distinct_decision_before_any_backend_call() {
+    use rune_tools::web::{Fetched, RecordingBackend, WebFetch};
+    use std::sync::Arc;
+
+    for authority in [
+        None,
+        Some(Outcome::Ask),
+        Some(Outcome::Deny),
+        Some(Outcome::Allow),
+    ] {
+        let endpoint = MockEndpoint::start(vec![
+            Script::tool_call(
+                "private",
+                "web_fetch",
+                r#"{"url":"https://example.com/","allow_private":true}"#,
+            ),
+            Script::tool_call("public", "web_fetch", r#"{"url":"https://example.com/"}"#),
+            Script::text("done"),
+        ]);
+        let backend = Arc::new(RecordingBackend::new());
+        for _ in 0..2 {
+            backend.push(Fetched {
+                status: 200,
+                content_type: "text/plain".to_owned(),
+                body: b"fixture answer".to_vec(),
+                location: None,
+            });
+        }
+        let tool = WebFetch::new(backend.clone(), &BudgetSet::new());
+        let mut host = TestHost::new(endpoint)
+            .with_tools(vec![rune_tools::contract::model_spec(&tool)])
+            .with_mode(PermissionMode::FullAccess);
+        let mut registry = Registry::new();
+        registry.insert(Box::new(tool)).expect("register");
+        host.registry = Some(registry);
+        host.private_authority = authority;
+        let mut history = rune_agent::History::new();
+        history.push_user("fetch");
+        let outcome = run_turn(&mut history, &host).expect("turn");
+        assert_eq!(
+            *host.private_decisions.lock().expect("lock"),
+            vec![Some("domain:example.com".to_owned())]
+        );
+        let allowed = authority == Some(Outcome::Allow);
+        assert_eq!(outcome.calls[0].executed, allowed);
+        assert_eq!(outcome.calls[0].output.is_error, !allowed);
+        assert!(outcome.calls[1].executed, "ordinary fetch must still work");
+        assert!(!outcome.calls[1].output.is_error);
+        assert_eq!(backend.requests().len(), if allowed { 2 } else { 1 });
+        history.validate().expect("all calls answered");
+    }
 }
 
 #[test]

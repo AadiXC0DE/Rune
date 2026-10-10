@@ -52,7 +52,7 @@ impl FetchBackend for NetworkFetch {
                             "the destination resolves to `{address}`, a loopback, private, or link-local address"
                         ),
                     )
-                    .with_hint("pass allow_private: true to reach an address on the local network"));
+                    .with_hint("request allow_private: true and separate user approval to reach the local network"));
                 }
                 Ok(())
             },
@@ -156,9 +156,10 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind fixture");
         listener.set_nonblocking(true).expect("nonblocking fixture");
         let url = format!("http://{}/fixture", listener.local_addr().expect("address"));
-        // The private-address opt-in permits this local fixture in both calls.
+        // The host supplies separate private authority for this local fixture.
+        // The web opt-in is still required independently.
         let arguments = serde_json::json!({ "url": url, "allow_private": true });
-        let context = ExecutionContext::new(workspace.to_owned());
+        let context = ExecutionContext::new(workspace.to_owned()).with_private_network_access(true);
         let env = EnvironmentOverrides::default();
         let settings = load(None, None, &env);
         let rules = crate::permissions::validated(&settings).expect("rules");
@@ -219,6 +220,22 @@ mod tests {
             backends(&settings),
         )
         .expect("registry");
+        let error = registry
+            .call(
+                "web_fetch",
+                &arguments,
+                &ExecutionContext::new(workspace.to_owned()),
+            )
+            .expect("private denial is returned as a tool failure");
+        assert!(
+            error.is_error,
+            "web enablement and model opt-in granted private authority"
+        );
+        assert!(error.text.contains("separate user decision"), "{error:?}");
+        assert_eq!(
+            listener.accept().expect_err("no private connection").kind(),
+            std::io::ErrorKind::WouldBlock
+        );
         let fixture = std::thread::spawn(move || {
             let deadline = std::time::Instant::now() + Duration::from_secs(3);
             let mut stream = loop {

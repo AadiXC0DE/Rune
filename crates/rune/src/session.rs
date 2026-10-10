@@ -418,6 +418,42 @@ impl Host for SessionHost {
         self.registry.call(name, arguments, &self.context)
     }
 
+    fn execute_with_context(
+        &self,
+        name: &str,
+        arguments: &serde_json::Value,
+        context: &ExecutionContext,
+    ) -> Result<ToolOutput> {
+        if name == "web_fetch" {
+            return self.registry.call(name, arguments, context);
+        }
+        self.execute(name, arguments)
+    }
+
+    fn decide_private_network(&self, target: Option<&str>) -> (Outcome, String) {
+        // Only a rule explicitly naming this authority at a user-controlled
+        // layer can grant it. Broad web grants and project rules cannot.
+        let mut rules = RuleSet::new();
+        for rule in self.rules.rules() {
+            if rule.tool == "web_fetch_private"
+                && (rule.outcome != Outcome::Allow
+                    || rule.layer >= rune_policy::decision::Layer::User)
+            {
+                rules.push(rule.clone());
+            }
+        }
+        let target = target.unwrap_or("web_fetch_private");
+        let decision = rules.evaluate("web_fetch_private", target, Outcome::Ask);
+        let reason = format!(
+            "private-network access for this fetch and its redirects; {}",
+            decision.explain()
+        );
+        if decision.outcome != Outcome::Ask {
+            return (decision.outcome, reason);
+        }
+        self.request_approval("web_fetch_private", target, reason)
+    }
+
     fn decide(&self, name: &str, target: Option<&str>) -> (Outcome, String) {
         let (outcome, reason) = turn::decide_call_in_workspace(
             &self.rules,
@@ -4447,6 +4483,107 @@ mod tests {
         host.mode = PermissionMode::Auto;
         let (outcome, reason) = host.decide("shell", Some("rm -rf /tmp/x"));
         assert_eq!(outcome, Outcome::Ask, "{reason}");
+    }
+
+    #[test]
+    fn private_network_access_requires_a_user_answer_in_every_mode() {
+        for mode in [
+            PermissionMode::Ask,
+            PermissionMode::Auto,
+            PermissionMode::FullAccess,
+        ] {
+            let mut host = host_with_reviewer(ReviewOutcome::Clear {
+                reviewed_action: "domain:localhost".to_owned(),
+            });
+            host.mode = mode;
+            host.rules.push(rune_policy::rules::Rule::allow(
+                "web_fetch",
+                "*",
+                rune_policy::decision::Layer::User,
+            ));
+            host.rules.push(rune_policy::rules::Rule::allow(
+                "*",
+                "*",
+                rune_policy::decision::Layer::User,
+            ));
+            assert_eq!(
+                host.decide("web_fetch", Some("domain:localhost")).0,
+                Outcome::Allow
+            );
+            assert_eq!(
+                host.decide_private_network(Some("domain:localhost")).0,
+                Outcome::Ask
+            );
+            let (requests, pending) = mpsc::channel();
+            *host.approval_requests.lock().expect("lock") = Some(requests);
+            std::thread::scope(|scope| {
+                let worker = scope.spawn(|| {
+                    let first = host.decide_private_network(Some("domain:localhost"));
+                    let second = host.decide_private_network(Some("domain:localhost"));
+                    (first, second)
+                });
+                let request = pending
+                    .recv_timeout(std::time::Duration::from_secs(2))
+                    .expect("separate private-network approval");
+                assert_eq!(request.tool, "web_fetch_private");
+                assert_eq!(request.target, "domain:localhost");
+                assert!(request.reason.contains("private-network access"));
+                assert!(request.reason.contains("redirects"));
+                request.answer.send(Outcome::Allow).expect("approve once");
+                let request = pending
+                    .recv_timeout(std::time::Duration::from_secs(2))
+                    .expect("approval cannot leak to the next call");
+                request.answer.send(Outcome::Deny).expect("deny");
+                let (first, second) = worker.join().expect("worker");
+                assert_eq!(first.0, Outcome::Allow);
+                assert_eq!(second.0, Outcome::Deny);
+            });
+        }
+    }
+
+    #[test]
+    fn only_an_explicit_user_private_network_rule_can_grant_access() {
+        use rune_policy::decision::Layer;
+        use rune_policy::rules::Rule;
+        for layer in [
+            Layer::Default,
+            Layer::Project,
+            Layer::User,
+            Layer::Session,
+            Layer::Grant,
+        ] {
+            let mut host = test_host();
+            host.mode = PermissionMode::FullAccess;
+            host.rules
+                .push(Rule::allow("web_fetch_private", "domain:localhost", layer));
+            let outcome = host.decide_private_network(Some("domain:localhost")).0;
+            assert_eq!(
+                outcome,
+                if layer >= Layer::User {
+                    Outcome::Allow
+                } else {
+                    Outcome::Ask
+                }
+            );
+            assert_eq!(
+                host.decide_private_network(Some("domain:other")).0,
+                Outcome::Ask
+            );
+        }
+        let mut host = test_host();
+        host.mode = PermissionMode::FullAccess;
+        host.rules
+            .push(Rule::deny("web_fetch_private", "*", Layer::User));
+        let (requests, pending) = mpsc::channel();
+        *host.approval_requests.lock().expect("lock") = Some(requests);
+        assert_eq!(
+            host.decide_private_network(Some("domain:localhost")).0,
+            Outcome::Deny
+        );
+        assert!(
+            pending.try_recv().is_err(),
+            "denial cannot be overridden by a prompt"
+        );
     }
 
     #[test]

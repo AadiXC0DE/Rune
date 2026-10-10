@@ -236,6 +236,27 @@ pub trait Host {
     /// Returns the outcome and, for an explanation, the deciding rule.
     fn decide(&self, name: &str, target: Option<&str>) -> (Outcome, String);
 
+    /// Resolves a separate user decision for private-network access, including
+    /// this fetch's redirects. A model review or full-access mode is insufficient.
+    /// Hosts without a user approval path refuse it by default.
+    fn decide_private_network(&self, _target: Option<&str>) -> (Outcome, String) {
+        (
+            Outcome::Deny,
+            "private-network access requires user authority".to_owned(),
+        )
+    }
+
+    /// Executes with the per-call authority resolved by the loop.
+    /// Hosts running web tools must pass this context to their implementation.
+    fn execute_with_context(
+        &self,
+        name: &str,
+        arguments: &serde_json::Value,
+        _context: &ExecutionContext,
+    ) -> Result<ToolOutput> {
+        self.execute(name, arguments)
+    }
+
     /// Returns the execution context for this turn.
     fn context(&self) -> ExecutionContext;
 
@@ -740,6 +761,29 @@ fn execute_call(
         Outcome::Allow => {}
     }
 
+    let private_access = call.name == "web_fetch"
+        && arguments
+            .get("allow_private")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true);
+    if private_access {
+        let (outcome, reason) = host.decide_private_network(target.as_deref());
+        if outcome != Outcome::Allow {
+            host.emit(Event::ToolDenied {
+                call: call.clone(),
+                reason: reason.clone(),
+            });
+            return CallResult {
+                call: call.clone(),
+                output: ToolOutput::failure(format!(
+                    "private-network access was not approved: {reason}"
+                )),
+                executed: false,
+            };
+        }
+    }
+    let context = host.context().with_private_network_access(private_access);
+
     host.emit(Event::ToolStarted {
         call: call.clone(),
         activity,
@@ -748,7 +792,6 @@ fn execute_call(
     // Retained output is owned by the history rather than the host. Supply
     // that store only after advertisement and policy checks have passed.
     let execution = if call.name == "read_tool_result" {
-        let context = host.context();
         let cap = context.max_output_bytes.min(output_cap);
         rune_tools::ReadToolResult::default().call(
             &arguments,
@@ -757,7 +800,7 @@ fn execute_call(
                 .with_result_store(history.shared_result_store()),
         )
     } else {
-        host.execute(&call.name, &arguments)
+        host.execute_with_context(&call.name, &arguments, &context)
     };
     let output = match execution {
         Ok(output) => output,
