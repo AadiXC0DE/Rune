@@ -42,6 +42,9 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Fixed
 
+- Completed shell sessions keep their final output until `interact` or `stop`
+  reads it, even when another command starts. Completed sessions release their
+  running slot, and reading their final output removes the session.
 - The shared agent turn loop retains oversized tool output in the live
   conversation and returns a bounded preview with a readable retained handle.
   Both output limits include preview metadata; retained bytes can be retrieved

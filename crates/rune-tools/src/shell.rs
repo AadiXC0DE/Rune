@@ -107,12 +107,16 @@ struct Slot<'a> {
 impl<'a> Slot<'a> {
     /// Reserves a slot and mints the session id, or reports the bound is full.
     ///
-    /// A command whose process has ended holds nothing worth reading, so it
-    /// stops occupying the bound as soon as another command starts.
+    /// Completed sessions keep their unread output until observed, but only
+    /// running processes and reserved starts occupy the bound.
     fn reserve(shell: &'a Shell) -> Result<(Self, String)> {
         let mut state = lock(&shell.state);
-        state.sessions.retain(|_, held| held.process.is_running());
-        let live = state.sessions.len().saturating_add(state.starting);
+        let live = state
+            .sessions
+            .values()
+            .filter(|held| held.process.is_running())
+            .count()
+            .saturating_add(state.starting);
         if live >= shell.max_sessions {
             return Err(RuneError::new(
                 ErrorCode::LimitExceeded,
@@ -2012,6 +2016,80 @@ mod tests {
             wait_until(|| !group_alive(&group), Duration::from_secs(10)),
             "the group survived the escalation"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn starting_another_command_keeps_unread_completed_output() {
+        for code in [0, 7] {
+            let tool = shell(1, 64 * 1024);
+            let (_dir, context) = workspace();
+            let command =
+                format!("read line; echo got \"$line\"; echo error \"$line\" >&2; exit {code}");
+            let started = text(
+                &tool,
+                &context,
+                &serde_json::json!({
+                    "action": "run",
+                    "command": command,
+                    "interactive": true,
+                    "yield_time_ms": 0,
+                }),
+            );
+            let (id, _group) = running(&started);
+
+            // Let the yielded command finish without consuming its output.
+            // Waiting for the recorded exit avoids a timing-dependent sleep.
+            {
+                let held = Arc::clone(lock(&tool.state).sessions.get(&id).expect("a session"));
+                held.process
+                    .write(b"LAST\n", Duration::from_secs(2))
+                    .expect("release the command");
+                assert!(wait_until(
+                    || !held.process.is_running(),
+                    Duration::from_secs(10)
+                ));
+            }
+
+            // The completed session must release the only running slot while
+            // keeping its output and permission target available.
+            let other = text(
+                &tool,
+                &context,
+                &serde_json::json!({ "action": "run", "command": "echo OTHER" }),
+            );
+            assert!(other.lines().any(|line| line == "OTHER"), "{other}");
+            assert_eq!(tool.live_sessions(), 1);
+            let arguments = serde_json::json!({
+                "action": "interact",
+                "session_id": id,
+                "yield_time_ms": 0,
+            });
+            assert_eq!(tool.permission_target(&arguments), Some(command));
+            let ended = call(&tool, &context, &arguments);
+            assert_eq!(ended.is_error, code != 0, "{}", ended.text);
+            assert!(
+                ended.text.lines().any(|line| line == "got LAST"),
+                "{}",
+                ended.text
+            );
+            assert!(
+                ended.text.lines().any(|line| line == "error LAST"),
+                "{}",
+                ended.text
+            );
+            assert!(
+                ended.text.contains(&format!("exited with status {code}")),
+                "{}",
+                ended.text
+            );
+            assert_eq!(tool.live_sessions(), 0);
+            let err = tool
+                .call(&arguments, &context)
+                .expect_err("the final output was already consumed");
+            assert_eq!(err.code(), ErrorCode::NotFound);
+            assert!(session_command(&id).is_none());
+        }
     }
 
     #[cfg(unix)]
