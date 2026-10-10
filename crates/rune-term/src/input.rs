@@ -45,6 +45,8 @@ pub enum KeyAction {
     Complete,
     /// Open the full transcript without editing the composer.
     Transcript,
+    /// Edit the draft in the configured external editor.
+    ExternalEditor,
 }
 
 /// Navigation while the transcript owns the terminal.
@@ -174,6 +176,23 @@ impl KeyReader {
         self.composer.set(text);
     }
 
+    /// Hands the terminal to VISUAL, EDITOR, or vi, then reloads the draft.
+    /// Failed edits leave the complete composer untouched.
+    pub fn edit_external(&mut self) -> std::io::Result<()> {
+        let edited = if self.active {
+            let suspension = TerminalSuspension::new()?;
+            let result = crate::external_editor::edit(self.line());
+            suspension.resume()?;
+            result?
+        } else {
+            crate::external_editor::edit(self.line())?
+        };
+        let edited = edited.replace("\r\n", "\n").replace('\r', "\n");
+        let edited = crate::transcript::sanitize(&edited);
+        self.composer.replace_draft(&edited);
+        Ok(())
+    }
+
     /// Waits for one key and applies it.
     ///
     /// Blocks until a key arrives, so the caller can render between keystrokes
@@ -264,6 +283,7 @@ impl KeyReader {
         let alt = key.modifiers.contains(KeyModifiers::ALT);
 
         match (key.code, control, alt) {
+            (KeyCode::Char('g'), true, _) => KeyAction::ExternalEditor,
             (KeyCode::Char('o'), true, _) => KeyAction::Transcript,
             (KeyCode::Char('c'), true, _) => KeyAction::Cancel,
             (KeyCode::Char('d'), true, _) => {
@@ -369,6 +389,41 @@ impl KeyReader {
 impl Default for KeyReader {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Restores key input even when spawning or reading the editor fails.
+struct TerminalSuspension(bool);
+
+impl TerminalSuspension {
+    fn new() -> std::io::Result<Self> {
+        use crossterm::ExecutableCommand;
+        let guard = Self(true);
+        std::io::stdout().execute(crossterm::event::DisableBracketedPaste)?;
+        std::io::stdout().execute(crossterm::cursor::Show)?;
+        crossterm::terminal::disable_raw_mode()?;
+        Ok(guard)
+    }
+
+    fn resume(mut self) -> std::io::Result<()> {
+        Self::restore()?;
+        self.0 = false;
+        Ok(())
+    }
+
+    fn restore() -> std::io::Result<()> {
+        use crossterm::ExecutableCommand;
+        crossterm::terminal::enable_raw_mode()?;
+        std::io::stdout().execute(crossterm::event::EnableBracketedPaste)?;
+        Ok(())
+    }
+}
+
+impl Drop for TerminalSuspension {
+    fn drop(&mut self) {
+        if self.0 {
+            let _ = Self::restore();
+        }
     }
 }
 
@@ -539,6 +594,23 @@ mod tests {
 
     fn control(c: char) -> KeyEvent {
         KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+    }
+
+    #[test]
+    fn editor_binding_requests_handoff_without_changing_the_draft() {
+        let mut reader = reader();
+        reader.replace("draft 界");
+        reader.apply(key(KeyCode::Left));
+        let before = (reader.line().to_owned(), reader.column());
+        assert_eq!(
+            reader.handle(Event::Key(control('g'))),
+            Some(KeyAction::ExternalEditor)
+        );
+        assert_eq!((reader.line().to_owned(), reader.column()), before);
+        let mut release = control('g');
+        release.kind = KeyEventKind::Release;
+        assert_eq!(reader.handle(Event::Key(release)), None);
+        assert_eq!((reader.line().to_owned(), reader.column()), before);
     }
 
     #[test]

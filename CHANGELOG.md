@@ -6,6 +6,9 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Added
 
+- Ctrl-G edits the draft in `VISUAL`, `EDITOR`, or `vi`, then restores terminal
+  input and reloads the saved text. Failed edits preserve the draft and caret.
+
 - Alt-Enter inserts a newline at the composer caret. Enter submits the whole
   prompt with its newlines preserved.
 - Multiline drafts display on separate rows with the caret on the edited line,

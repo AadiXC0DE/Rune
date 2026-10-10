@@ -344,6 +344,19 @@ impl Composer {
         self.draft.clear();
     }
 
+    /// Replaces an externally edited draft as one undoable edit.
+    /// An unchanged draft retains its caret and editing history.
+    pub fn replace_draft(&mut self, text: &str) {
+        if text == self.text {
+            return;
+        }
+        self.record();
+        text.clone_into(&mut self.text);
+        self.cursor = self.text.chars().count();
+        self.recall = None;
+        self.draft.clear();
+    }
+
     /// Recalls the previous entry of a history.
     ///
     /// The entry nearest the cursor is the most recent one. At the oldest entry

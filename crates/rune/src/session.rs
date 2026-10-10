@@ -285,7 +285,7 @@ struct SessionHost {
     transcript: Mutex<Vec<Entry>>,
     /// History turns already captured, adjusted whenever compaction renumbers it.
     transcript_history_len: std::sync::atomic::AtomicUsize,
-    /// Prevents streaming frames from painting over the transcript snapshot.
+    /// Prevents streaming frames from painting over the transcript or editor.
     transcript_open: std::sync::atomic::AtomicBool,
     /// The line being typed while a turn runs, with the caret's display column.
     ///
@@ -1817,6 +1817,11 @@ fn run_turn_steerable(
                 return;
             };
             match key {
+                KeyAction::ExternalEditor => {
+                    gesture.disarm();
+                    edit_draft(reader, host);
+                    host.draw_stream_with(reader.line(), reader.column());
+                }
                 KeyAction::Transcript => {
                     gesture.disarm();
                     let _ = view_transcript(reader, host);
@@ -2016,7 +2021,10 @@ fn question_key(
             cancellation.cancel();
             None
         }
-        KeyAction::Complete | KeyAction::Ignored | KeyAction::Transcript => None,
+        KeyAction::Complete
+        | KeyAction::Ignored
+        | KeyAction::Transcript
+        | KeyAction::ExternalEditor => None,
     }
 }
 
@@ -2055,7 +2063,10 @@ fn approval_key(
             cancellation.cancel();
             Some(Outcome::Deny)
         }
-        KeyAction::Complete | KeyAction::Ignored | KeyAction::Transcript => None,
+        KeyAction::Complete
+        | KeyAction::Ignored
+        | KeyAction::Transcript
+        | KeyAction::ExternalEditor => None,
     }
 }
 
@@ -2201,6 +2212,45 @@ fn close_turn(
 
 /// Restores the main terminal even when rendering fails or unwinds.
 struct TranscriptScreen<'a>(&'a SessionHost);
+
+/// Uses the same terminal ownership as the transcript to keep worker output
+/// away from the editor and preserve the main screen underneath it.
+fn edit_draft(reader: &mut rune_term::input::KeyReader, host: &SessionHost) {
+    let screen = {
+        let _frame = host
+            .frame
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        host.transcript_open
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let screen = TranscriptScreen(host);
+        host.show(b"\x1b[?1049h\x1b[0m\x1b[2J\x1b[H\x1b[?25h");
+        screen
+    };
+    let result = reader.edit_external();
+    if let Ok(mut typed) = host.typed.lock() {
+        *typed = (reader.line().to_owned(), reader.column());
+    }
+    drop(screen);
+    if let Err(error) = result {
+        let _frame = host
+            .frame
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (prompt, caret) = transcript::render_draft_at(
+            rune_term::shell::prompt(),
+            reader.line(),
+            reader.column(),
+            usize::from(host.width()),
+        );
+        let message = format!("external editor failed: {error}");
+        if let Ok(painted) =
+            host.paint(&[transcript::sanitize(&message)], None, &prompt, &[], caret)
+        {
+            host.show(&painted);
+        }
+    }
+}
 
 impl Drop for TranscriptScreen<'_> {
     fn drop(&mut self) {
@@ -2415,6 +2465,11 @@ fn await_submission(
             view_transcript(reader, host)?;
             continue;
         }
+        if key == KeyAction::ExternalEditor {
+            edit_draft(reader, host);
+            selected = 0;
+            continue;
+        }
         match idle_key(key, reader, &mut selected, &rows, recall) {
             Idle::Stay => {}
             Idle::Leave => return Ok(None),
@@ -2513,7 +2568,7 @@ fn idle_key(
             }
             Idle::Stay
         }
-        KeyAction::Transcript => Idle::Stay,
+        KeyAction::Transcript | KeyAction::ExternalEditor => Idle::Stay,
         KeyAction::Ignored => {
             // Typing narrows the list, so the highlight returns to the top
             // rather than pointing at a row that may no longer exist.
@@ -2611,6 +2666,7 @@ fn run_picker(
             KeyAction::Transcript => {
                 view_transcript(reader, host)?;
             }
+            KeyAction::ExternalEditor => {}
             KeyAction::Ignored => {
                 picker.set_query(reader.line());
             }

@@ -7,6 +7,7 @@ import os
 import pathlib
 import pty
 import select
+import shlex
 import struct
 import subprocess
 import sys
@@ -18,6 +19,9 @@ import time
 
 prompts = []
 errors = []
+editor_open = threading.Event()
+stream_sent = threading.Event()
+editor_done = threading.Event()
 
 
 class Provider(http.server.BaseHTTPRequestHandler):
@@ -36,6 +40,26 @@ class Provider(http.server.BaseHTTPRequestHandler):
         try:
             request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
             prompts.append(request["messages"][-1]["content"])
+            if editor_mode == "editor-steering" and len(prompts) == 1:
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.end_headers()
+
+                def delta(text, finish=None):
+                    choice = {"index": 0, "delta": {"content": text}, "finish_reason": finish}
+                    self.wfile.write(("data: " + json.dumps({"choices": [choice]}) + "\n\n").encode())
+                    self.wfile.flush()
+
+                delta("EDITOR_TURN_STARTED")
+                assert editor_open.wait(10), "editor did not open"
+                delta("EDITOR_STREAM_HIDDEN")
+                stream_sent.set()
+                assert editor_done.wait(10), "editor did not return"
+                delta("DRAFT_RECEIVED")
+                delta("", "stop")
+                self.wfile.write(b"data: [DONE]\n\n")
+                self.wfile.flush()
+                return
             body = "".join(
                 "data: " + json.dumps({"choices": [choice]}) + "\n\n"
                 for choice in [
@@ -91,6 +115,37 @@ with tempfile.TemporaryDirectory(prefix="rune-r004-") as directory:
         "NO_COLOR": "1",
         "TERM": "xterm-256color",
     })
+    editor_mode = sys.argv[2] if sys.argv[2:] and sys.argv[2].startswith("editor") else None
+    if editor_mode:
+        stub = root / "stub editor.py"
+        stub.write_text('''import pathlib, stat, sys, termios, time
+mode, path = sys.argv[1], pathlib.Path(sys.argv[2])
+flags = termios.tcgetattr(0)[3]
+assert flags & termios.ICANON and flags & termios.ECHO, flags
+assert stat.S_IMODE(path.stat().st_mode) == 0o600
+assert stat.S_IMODE(path.parent.stat().st_mode) == 0o700
+assert path.read_text() == "draft 界"
+pathlib.Path("editor-path").write_text(str(path))
+if mode == "editor-steering":
+    deadline = time.monotonic() + 10
+    while not pathlib.Path("editor-exit").exists():
+        assert time.monotonic() < deadline, "editor was not released"
+        time.sleep(0.01)
+if mode == "editor-invalid":
+    path.write_bytes(b"\\xff")
+elif mode != "editor-unchanged":
+    path.write_text("edited é\\nsecond 界")
+sys.exit(9 if mode == "editor-failed" else 0)
+''')
+        command = f"{shlex.quote(sys.executable)} {shlex.quote(str(stub))} {editor_mode}"
+        environment["VISUAL"] = command
+        # VISUAL must take precedence over EDITOR. Empty VISUAL falls back.
+        environment["EDITOR"] = "exit 99"
+        if editor_mode == "editor-fallback":
+            environment["VISUAL"] = ""
+            environment["EDITOR"] = command
+        if editor_mode == "editor-missing":
+            environment["VISUAL"] = "rune-editor-that-does-not-exist"
     master, slave = pty.openpty()
     fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 80, 0, 0))
     child = subprocess.Popen(
@@ -117,6 +172,18 @@ with tempfile.TemporaryDirectory(prefix="rune-r004-") as directory:
     def capture(stage, keys, expected):
         start = len(transcript)
         os.write(master, keys)
+        if editor_mode == "editor-steering" and stage == "returned":
+            deadline = time.monotonic() + 10
+            while not (root / "editor-path").exists():
+                assert time.monotonic() < deadline, "editor did not start"
+                time.sleep(0.01)
+            editor_open.set()
+            assert stream_sent.wait(10), "provider did not stream while editing"
+            while select.select([master], [], [], 0.2)[0]:
+                assert time.monotonic() < deadline, "terminal never became idle"
+                transcript.extend(os.read(master, 65536))
+            assert b"EDITOR_STREAM_HIDDEN" not in transcript[start:], transcript[start:]
+            (root / "editor-exit").touch()
         wait_for(expected, start)
         # Drain complete frames before handing the byte stream to Rune's grid.
         deadline = time.monotonic() + 10
@@ -127,7 +194,36 @@ with tempfile.TemporaryDirectory(prefix="rune-r004-") as directory:
 
     try:
         wait_for("ctrl-c cancel")
-        if sys.argv[2:] == ["newline"]:
+        if editor_mode:
+            if editor_mode == "editor-steering":
+                os.write(master, b"start\r")
+                wait_for("EDITOR_TURN_STARTED")
+            capture("original", "draft 界".encode() + b"\x1b[D", "draft 界")
+            changed = editor_mode in {"editor", "editor-fallback", "editor-steering"}
+            capture("returned", b"\x07", "second 界" if changed else "\x1b[?1049l")
+            flags = termios.tcgetattr(master)[3]
+            assert not flags & termios.ICANON and not flags & termios.ECHO, flags
+            restored = bytes(transcript)
+            assert b"\x1b[?2004l" in restored
+            assert restored.rfind(b"\x1b[?2004h") > restored.rfind(b"\x1b[?2004l")
+            if editor_mode != "editor-missing":
+                scratch = pathlib.Path((root / "editor-path").read_text())
+                assert not scratch.exists() and not scratch.parent.exists(), scratch
+            if editor_mode in {"editor-failed", "editor-invalid", "editor-missing"}:
+                assert b"external editor failed:" in restored, restored
+            assert prompts == (["start"] if editor_mode == "editor-steering" else []), prompts
+            if editor_mode == "editor-steering":
+                editor_done.set()
+                wait_for("DRAFT_RECEIVED\r\n")
+            if changed:
+                capture("undone", b"\x1f", "draft 界")
+                capture("redone", b"\x1br", "second 界")
+                capture("typed", b"!", "second 界!")
+                submitted = "edited é\nsecond 界!"
+            else:
+                capture("typed", b"!", "draft !界")
+                submitted = "draft !界"
+        elif sys.argv[2:] == ["newline"]:
             capture("first-line", "first 界 line".encode(), "first 界 line")
             # Alt-Enter is ESC followed by CR on a legacy terminal. It must
             # insert one LF without sending an early provider request.
@@ -178,8 +274,8 @@ with tempfile.TemporaryDirectory(prefix="rune-r004-") as directory:
         os.write(master, b"\r")
         # Wait for close_turn's committed line, not its earlier streamed row,
         # so /quit is handled as a command rather than steering the old turn.
-        wait_for("DRAFT_RECEIVED\r\n")
-        assert prompts == [submitted], prompts
+        wait_for("DRAFT_RECEIVED\r\n", len(transcript) if editor_mode == "editor-steering" else 0)
+        assert prompts == (["start", submitted] if editor_mode == "editor-steering" else [submitted]), prompts
         os.write(master, b"/quit\r")
         assert child.wait(timeout=10) == 0
         assert not errors, errors

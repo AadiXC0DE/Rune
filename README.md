@@ -126,6 +126,13 @@ the provider as newline characters. Left and Right move across line breaks;
 the terminal caret follows the line being edited. Long lines scroll horizontally
 and tall drafts scroll vertically to keep the caret visible.
 
+Ctrl-G opens the draft in `$VISUAL`, falling back to `$EDITOR` and then `vi`.
+Editor commands may include arguments. Save and exit to reload the draft with
+the caret at its end; Ctrl-_ undoes the replacement. Rune restores terminal
+input after the editor exits and removes the private scratch file. A failed
+editor leaves the draft and caret intact. The binding also edits steering
+drafts while a turn runs.
+
 Ctrl-_ (Ctrl-Shift-minus) undoes the last draft
 edit and restores its caret. Repeated presses undo earlier edits, including
 Unicode grapheme deletion and pasted text. Alt-R reapplies an undone edit and

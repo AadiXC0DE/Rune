@@ -4,6 +4,81 @@
 #![allow(clippy::expect_used, clippy::panic)]
 
 #[test]
+fn external_editor_reloads_the_draft_and_restores_the_terminal_on_success_and_failure() {
+    for scenario in [
+        "editor",
+        "editor-fallback",
+        "editor-steering",
+        "editor-failed",
+        "editor-invalid",
+        "editor-unchanged",
+        "editor-missing",
+    ] {
+        let output = std::process::Command::new("python3")
+            .args([
+                "-c",
+                include_str!("terminal_draft.py"),
+                env!("CARGO_BIN_EXE_rune"),
+                scenario,
+            ])
+            .output()
+            .expect("python3 is required for the Unix editor test");
+        assert!(
+            output.status.success(),
+            "{scenario}:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let captures: Vec<(String, Vec<u8>)> =
+            serde_json::from_slice(&output.stdout).expect("captures");
+        let changed = matches!(scenario, "editor" | "editor-fallback" | "editor-steering");
+        assert_eq!(captures.len(), if changed { 5 } else { 3 });
+        for (stage, bytes) in captures {
+            let mut grid = rune_term::Grid::new(80, 24).expect("grid");
+            let mut main = None;
+            let mut start = 0;
+            for at in 0..bytes.len().saturating_sub(7) {
+                let sequence = &bytes[at..at + 8];
+                if sequence == b"\x1b[?1049h" || sequence == b"\x1b[?1049l" {
+                    grid.feed(&bytes[start..at]).expect("before swap");
+                    if sequence.ends_with(b"h") {
+                        main = Some(grid.clone());
+                        grid = rune_term::Grid::new(80, 24).expect("editor grid");
+                    } else {
+                        grid = main.take().expect("saved main screen");
+                    }
+                    start = at + 8;
+                }
+            }
+            grid.feed(&bytes[start..]).expect("after swap");
+            assert!(
+                main.is_none(),
+                "{scenario}: editor did not restore main screen"
+            );
+            let (expected, column) = match stage.as_str() {
+                "original" | "undone" => ("> draft 界", 8),
+                "returned" | "redone" if changed => ("  second 界", 11),
+                "returned" => ("> draft 界", 8),
+                "typed" if changed => ("  second 界!", 12),
+                "typed" => ("> draft !界", 9),
+                _ => panic!("unexpected stage {stage}"),
+            };
+            assert_eq!(
+                grid.row_text(grid.cursor().row),
+                expected,
+                "{scenario}/{stage}"
+            );
+            assert_eq!(grid.cursor().col, column, "{scenario}/{stage}");
+            assert_eq!(
+                grid.text().matches("ctrl-c cancel").count(),
+                1,
+                "{scenario}/{stage}"
+            );
+        }
+    }
+}
+
+#[test]
 fn alt_enter_sends_one_two_line_prompt_with_an_exact_newline_to_the_provider() {
     let output = std::process::Command::new("python3")
         .args([
