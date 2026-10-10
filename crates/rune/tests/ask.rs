@@ -4,7 +4,7 @@
 
 use std::io::{BufRead as _, Read as _, Write as _};
 use std::net::TcpListener;
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
@@ -24,6 +24,77 @@ fn isolated_command(dir: &tempfile::TempDir) -> Command {
         .env("XDG_DATA_HOME", dir.path().join("data"))
         .current_dir(dir.path());
     command
+}
+
+#[test]
+fn ask_json_reports_an_empty_prompt_as_one_failure_object() {
+    for args in [
+        vec!["ask", "--json"],
+        vec!["--json", "ask"],
+        vec!["ask", "--json", " \t "],
+    ] {
+        for input in ["", " \t\r\n"] {
+            let dir = tempfile::tempdir().expect("isolated state");
+            let mut child = isolated_command(&dir)
+                .env("RUNE_MODEL", "fixture-model")
+                .args(&args)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("ask");
+            child
+                .stdin
+                .take()
+                .expect("piped stdin")
+                .write_all(input.as_bytes())
+                .expect("write prompt");
+            let output = child.wait_with_output().expect("ask output");
+
+            assert_eq!(output.status.code(), Some(1), "{args:?}, {input:?}");
+            let result: Value = serde_json::from_slice(&output.stdout).expect("one JSON result");
+            assert_eq!(result["exit_code"], 1);
+            assert_eq!(result["error_code"], "missing_field");
+            assert!(
+                result["error"]
+                    .as_str()
+                    .expect("failure detail")
+                    .contains("prompt")
+            );
+            assert_eq!(result["model"], "fixture-model");
+            assert_eq!(result["output"], "");
+            assert_eq!(result["final_output"], "");
+            assert_eq!(result["steps"], 0);
+            assert_eq!(result["usage"], json!({}));
+            assert_eq!(result["tool_calls"], json!([]));
+            assert_eq!(result["session_id"], "");
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(stderr.contains("missing_field"), "{stderr}");
+            assert!(
+                stderr.contains("pass the prompt as an argument"),
+                "{stderr}"
+            );
+            assert!(!dir.path().join("state").exists());
+        }
+    }
+}
+
+#[test]
+fn ask_plain_text_empty_prompt_keeps_stdout_empty() {
+    let dir = tempfile::tempdir().expect("isolated state");
+    let output = isolated_command(&dir)
+        .arg("ask")
+        .stdin(Stdio::null())
+        .output()
+        .expect("ask");
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("missing_field"), "{stderr}");
+    assert!(
+        stderr.contains("pass the prompt as an argument"),
+        "{stderr}"
+    );
 }
 
 fn run_fixture_with_options(

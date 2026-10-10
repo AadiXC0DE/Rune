@@ -263,8 +263,13 @@ fn run_ask(
     };
 
     if prompt.trim().is_empty() {
-        return Err(RuneError::missing_field("prompt")
-            .with_hint("pass the prompt as an argument, or pipe it on standard input"));
+        let err = RuneError::missing_field("prompt")
+            .with_hint("pass the prompt as an argument, or pipe it on standard input");
+        if output.json {
+            let result = ask::JsonResult::failure(&settings.model, &err, i32::from(EXIT_FAILURE));
+            println!("{}", result.render()?);
+        }
+        return Err(err);
     }
 
     let options = ask::Options {
