@@ -953,6 +953,32 @@ fn config_mutation_command(root: &camino::Utf8Path) -> Command {
 }
 
 #[test]
+fn workspace_clear_reports_an_empty_list_and_persists_it() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = camino::Utf8Path::from_path(dir.path()).expect("utf8");
+    let added = root.join("added");
+    std::fs::create_dir(&added).expect("additional directory");
+    let added = added.canonicalize_utf8().expect("canonical directory");
+
+    for (args, expected) in [
+        (vec!["add", added.as_str()], serde_json::json!([added])),
+        (vec!["clear"], serde_json::json!([])),
+        (vec!["list"], serde_json::json!([])),
+        (vec!["clear"], serde_json::json!([])),
+    ] {
+        let out = config_mutation_command(root)
+            .arg("workspace")
+            .args(&args)
+            .arg("--json")
+            .output()
+            .expect("workspace command");
+        assert!(out.status.success(), "{args:?}: {out:?}");
+        let value: serde_json::Value = serde_json::from_slice(&out.stdout).expect("valid json");
+        assert_eq!(value["directories"], expected, "{args:?}");
+    }
+}
+
+#[test]
 fn workspace_mutations_read_and_write_the_active_config() {
     for override_path in [
         None,

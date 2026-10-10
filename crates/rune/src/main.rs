@@ -1415,7 +1415,8 @@ fn run_workspace_edit(
             }
         }
         _ => {
-            write_directories(paths, &Vec::new())?;
+            directories.clear();
+            write_directories(paths, &directories)?;
             if !output.json {
                 println!("cleared the additional directories");
             }
