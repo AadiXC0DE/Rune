@@ -2507,6 +2507,7 @@ fn view_transcript(reader: &rune_term::input::KeyReader, host: &SessionHost) -> 
     );
     let mut view =
         rune_term::screen::Transcript::new(full_transcript_rows(&entries, size.0, host.ascii));
+    let mut details = transcript::ToolDetails::new(entries);
     let mut surface = rune_term::frame::FrameSurface::new(size.0, size.1)?;
     let _screen = {
         let _frame = host
@@ -2530,9 +2531,15 @@ fn view_transcript(reader: &rune_term::input::KeyReader, host: &SessionHost) -> 
         if next_size != size {
             let top = view.top();
             size = next_size;
-            view = rune_term::screen::Transcript::new(full_transcript_rows(
-                &entries, size.0, host.ascii,
-            ));
+            view = rune_term::screen::Transcript::new(
+                details
+                    .rows(Display {
+                        width: usize::from(size.0),
+                        ascii: host.ascii,
+                        ..Display::default()
+                    })
+                    .0,
+            );
             view.jump(top, usize::from(size.1.saturating_sub(1)));
             // Resizing can leave stale cells anywhere on the alternate screen.
             host.show(b"\x1b[2J");
@@ -2543,7 +2550,7 @@ fn view_transcript(reader: &rune_term::input::KeyReader, host: &SessionHost) -> 
             let mut lines = view.visible(height).to_vec();
             lines.resize(height, String::new());
             let footer = vec![String::from(
-                "Transcript | Up/Down PgUp/PgDn Home/End | Esc/Ctrl-O close",
+                "Transcript | Tab tool Space toggle | Up/Down PgUp/PgDn Home/End | Esc/Ctrl-O close",
             )];
             let target = rune_term::frame::compose(
                 &rune_term::frame::Regions::new(&lines, &footer),
@@ -2563,6 +2570,25 @@ fn view_transcript(reader: &rune_term::input::KeyReader, host: &SessionHost) -> 
             Some(TranscriptAction::PageDown) => view.page_down(height),
             Some(TranscriptAction::Home) => view.jump(0, height),
             Some(TranscriptAction::End) => view.jump(usize::MAX, height),
+            Some(
+                action @ (TranscriptAction::NextTool
+                | TranscriptAction::PreviousTool
+                | TranscriptAction::ToggleTool),
+            ) => {
+                match action {
+                    TranscriptAction::NextTool => details.select(false),
+                    TranscriptAction::PreviousTool => details.select(true),
+                    _ => details.toggle(),
+                }
+                let (rows, selected) = details.rows(Display {
+                    width: usize::from(size.0),
+                    ascii: host.ascii,
+                    ..Display::default()
+                });
+                let top = selected.unwrap_or(view.top());
+                view = rune_term::screen::Transcript::new(rows);
+                view.jump(top, height);
+            }
             Some(TranscriptAction::Ignored) | None => {}
         }
     }

@@ -73,6 +73,8 @@ Transcript:
   Up / Down     scroll one row
   PageUp / PageDown  scroll one page
   Home / End    jump to the beginning / end
+  Tab / Shift-Tab  select the next / previous tool
+  Space         collapse or expand the selected tool (16 KiB / 200 rows)
   Esc / Ctrl-O / Ctrl-C / Ctrl-D  close and restore the draft and caret
 
 Paste:
@@ -135,6 +137,12 @@ pub enum TranscriptAction {
     Home,
     /// Jump to the end.
     End,
+    /// Select the next tool entry.
+    NextTool,
+    /// Select the previous tool entry.
+    PreviousTool,
+    /// Collapse or expand the selected tool entry.
+    ToggleTool,
     /// Ignore editing, paste, and non-input events.
     Ignored,
 }
@@ -157,6 +165,9 @@ pub fn transcript_event(event: &Event) -> TranscriptAction {
         (KeyCode::PageDown, _) => TranscriptAction::PageDown,
         (KeyCode::Home, _) => TranscriptAction::Home,
         (KeyCode::End, _) => TranscriptAction::End,
+        (KeyCode::Tab, false) => TranscriptAction::NextTool,
+        (KeyCode::BackTab, false) => TranscriptAction::PreviousTool,
+        (KeyCode::Char(' '), false) => TranscriptAction::ToggleTool,
         _ => TranscriptAction::Ignored,
     }
 }
@@ -806,6 +817,15 @@ mod tests {
             ),
             (Event::Key(key(KeyCode::Home)), TranscriptAction::Home),
             (Event::Key(key(KeyCode::End)), TranscriptAction::End),
+            (Event::Key(key(KeyCode::Tab)), TranscriptAction::NextTool),
+            (
+                Event::Key(key(KeyCode::BackTab)),
+                TranscriptAction::PreviousTool,
+            ),
+            (
+                Event::Key(key(KeyCode::Char(' '))),
+                TranscriptAction::ToggleTool,
+            ),
             (
                 Event::Key(key(KeyCode::Char('x'))),
                 TranscriptAction::Ignored,

@@ -248,8 +248,11 @@ failure within the available output budget.
   scrollback. Ctrl-O opens a full transcript snapshot on the alternate screen,
   including recorded tool arguments and result bodies. Up/Down scroll by row,
   Page Up/Page Down by page, and Home/End jump to the beginning/end. Escape or
-  Ctrl-O closes it with the draft and caret preserved. A running turn continues
-  while the snapshot is open; reopen it to see newer output. Provider and tool
+  Ctrl-O closes it with the draft and caret preserved. Tab/Shift-Tab selects a
+  tool; Space collapses it to a preview or expands up to 16 KiB and 200 wrapped
+  content rows. Reopen the snapshot to restore full recorded output.
+  A running turn continues while the snapshot is open; reopen it to see newer
+  output. Provider and tool
   result limits still apply to what is recorded.
 - **Permission first.** Every sensitive action passes a policy gate, and
   `rune permissions` explains exactly which rule decided it.

@@ -269,6 +269,14 @@ with tempfile.TemporaryDirectory(prefix="rune-r034-") as directory:
             capture("down", b"\x1b[B", "\x1b[24;1H")
             capture("page-up", b"\x1b[5~", "\x1b[24;1H")
             capture("home", b"\x1b[H", "\x1b[24;1H")
+            # Select the result after its call, then exercise disclosure without
+            # sending any of these keys to the saved composer draft.
+            capture("tool-selected", b"\t\t", "\x1b[24;1H")
+            capture("tool-collapsed", b" ", "\x1b[24;1H")
+            capture("tool-expanded", b" ", "\x1b[24;1H")
+            capture("tool-recollapsed", b" ", "\x1b[24;1H")
+            capture("tool-surrounding-start", b"\x1b[H", "\x1b[24;1H")
+            capture("tool-surrounding-end", b"\x1b[F", "\x1b[24;1H")
             # Editing keys, Enter and a paste must never reach the composer.
             capture("closed", b"ignored\r\x1b[200~pasted\ntext\x1b[201~\x1b",
                     "\x1b[?1049l")

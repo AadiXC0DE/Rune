@@ -6,6 +6,10 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Added
 
+- In the transcript viewer, Tab/Shift-Tab selects a tool and Space collapses or
+  expands its preview. Requested expansions show up to 16 KiB and 200 wrapped
+  content rows, preserving surrounding entries and the composer draft.
+
 - `/help` lists active composer, menu, and transcript bindings, cancellation
   precedence, and bracketed paste behavior. Line-input sessions describe their
   input mode.

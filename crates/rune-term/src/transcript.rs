@@ -336,6 +336,147 @@ pub fn render(entries: &[Entry], display: Display) -> String {
     render_lanes(entries, display, &Lanes::default())
 }
 
+/// Maximum source bytes and wrapped rows in a requested tool expansion.
+pub const TOOL_DETAIL_BYTES: usize = 16 * 1024;
+/// Maximum wrapped content rows in a requested tool expansion.
+pub const TOOL_DETAIL_ROWS: usize = 200;
+
+/// Tool selection and disclosure state for a transcript snapshot.
+///
+/// Untouched entries retain the full transcript view. Toggling a selected tool
+/// collapses it to the normal preview, then expands it within fixed bounds.
+/// Source entries are kept intact so closing and reopening restores the full view.
+#[derive(Debug)]
+pub struct ToolDetails {
+    entries: Vec<Entry>,
+    expanded: Vec<Option<bool>>,
+    selected: Option<usize>,
+}
+
+impl ToolDetails {
+    /// Starts with every recorded entry visible, matching the full viewer.
+    #[must_use]
+    pub fn new(entries: Vec<Entry>) -> Self {
+        Self {
+            expanded: vec![None; entries.len()],
+            entries,
+            selected: None,
+        }
+    }
+
+    /// Selects the next or previous expandable tool, wrapping at either end.
+    pub fn select(&mut self, backwards: bool) {
+        let tools: Vec<usize> = self
+            .entries
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| entry.speaker == Speaker::Tool && entry.expandable)
+            .map(|(index, _)| index)
+            .collect();
+        self.selected = if backwards {
+            tools
+                .iter()
+                .rev()
+                .find(|&&index| self.selected.is_some_and(|selected| index < selected))
+                .or_else(|| tools.last())
+        } else {
+            tools
+                .iter()
+                .find(|&&index| self.selected.is_none_or(|selected| index > selected))
+                .or_else(|| tools.first())
+        }
+        .copied();
+    }
+
+    /// Toggles the selected tool; without a selection this is a no-op.
+    pub fn toggle(&mut self) {
+        if let Some(index) = self.selected {
+            self.expanded[index] = Some(!self.expanded[index].unwrap_or(true));
+        }
+    }
+
+    /// Renders rows and the selected tool's header row for viewport navigation.
+    #[must_use]
+    pub fn rows(&self, display: Display) -> (Vec<String>, Option<usize>) {
+        let mut out = String::new();
+        let mut selected_row = None;
+        for (index, entry) in self.entries.iter().enumerate() {
+            if index > 0 {
+                out.push('\n');
+            }
+            let selected = self.selected == Some(index);
+            if selected || self.expanded[index].is_some() {
+                if selected {
+                    selected_row = Some(out.lines().count());
+                }
+                let state = match self.expanded[index] {
+                    None => "full",
+                    Some(false) => "collapsed",
+                    Some(true) => "expanded, up to 16 KiB / 200 rows",
+                };
+                for line in wrap(
+                    &format!(
+                        "{}tool {}: {state}",
+                        if selected { "> " } else { "  " },
+                        index.saturating_add(1)
+                    ),
+                    display.width.max(MIN_WIDTH),
+                ) {
+                    let _ = writeln!(out, "{line}");
+                }
+            }
+            if let Some(expanded) = self.expanded[index] {
+                let end = entry
+                    .text
+                    .floor_char_boundary(TOOL_DETAIL_BYTES.min(entry.text.len()));
+                let bounded = Entry::tool(&entry.text[..end]);
+                let mut preview = String::new();
+                render_entry(
+                    &bounded,
+                    Display {
+                        tool_lines: if expanded {
+                            TOOL_DETAIL_ROWS
+                        } else {
+                            display.tool_lines
+                        },
+                        ..display
+                    },
+                    &Lanes::default(),
+                    &mut preview,
+                );
+                for line in preview
+                    .lines()
+                    .flat_map(|line| wrap(line, display.width.max(MIN_WIDTH)))
+                {
+                    let _ = writeln!(out, "{line}");
+                }
+                if end < entry.text.len() {
+                    for line in wrap(
+                        "  [tool preview byte limit; reopen for full recorded output]",
+                        display.width.max(MIN_WIDTH),
+                    ) {
+                        let _ = writeln!(out, "{line}");
+                    }
+                }
+            } else {
+                render_entry(
+                    entry,
+                    Display {
+                        tool_lines: usize::MAX,
+                        ..display
+                    },
+                    &Lanes::default(),
+                    &mut out,
+                );
+            }
+        }
+        (
+            out.trim_end().lines().map(str::to_owned).collect(),
+            selected_row,
+        )
+    }
+}
+
 /// How a lane is drawn.
 ///
 /// The caller supplies the escapes so the theme decides the colours rather than
@@ -732,6 +873,108 @@ pub fn render_draft_at(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tool_disclosure_bounds_rows_and_preserves_surrounding_entries() {
+        let content = (0..300)
+            .map(|row| format!("TOOL-{row:03}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let entries = vec![
+            Entry::user("before"),
+            Entry::tool(content),
+            Entry::assistant("after"),
+        ];
+        let mut details = ToolDetails::new(entries.clone());
+        let display = Display::default();
+        assert_eq!(
+            details.rows(display).0.join("\n"),
+            render(
+                &entries,
+                Display {
+                    tool_lines: usize::MAX,
+                    ..display
+                }
+            )
+        );
+        details.toggle();
+        assert_eq!(details.rows(display).1, None);
+        details.select(false);
+        details.toggle();
+        let collapsed = details.rows(display);
+        assert!(collapsed.0.join("\n").contains("TOOL-011"));
+        assert!(!collapsed.0.join("\n").contains("TOOL-012"));
+        assert!(collapsed.0[collapsed.1.expect("selection")].contains("collapsed"));
+        details.toggle();
+        let expanded = details.rows(display).0.join("\n");
+        assert!(expanded.contains("TOOL-199"));
+        assert!(!expanded.contains("TOOL-200"));
+        assert!(expanded.contains("100 more line(s)"));
+        assert!(expanded.starts_with("> before"));
+        assert!(expanded.ends_with("after"));
+        details.toggle();
+        assert_eq!(details.rows(display), collapsed);
+        details.select(true);
+        assert_eq!(details.rows(display), collapsed, "one tool wraps to itself");
+        assert_eq!(details.entries, entries, "source content stays intact");
+    }
+
+    #[test]
+    fn tool_disclosure_bounds_unicode_bytes_and_rewraps_without_losing_state() {
+        let mut details = ToolDetails::new(vec![
+            Entry::tool(String::from("x") + &"é".repeat(TOOL_DETAIL_BYTES) + "END"),
+            Entry::assistant("after"),
+        ]);
+        details.select(true);
+        details.toggle();
+        details.toggle();
+        for width in [80, 12] {
+            let rows = details
+                .rows(Display {
+                    width,
+                    ascii: true,
+                    ..Display::default()
+                })
+                .0;
+            let text = rows.join("\n");
+            assert!(text.contains("expanded"));
+            assert!(text.contains("byte"));
+            assert!(!text.contains("END"));
+            assert!(text.ends_with("after"));
+            assert!(rows.iter().all(|row| str_width(row) <= width));
+            assert_eq!(
+                text.chars().filter(|ch| *ch == 'é').count(),
+                ((TOOL_DETAIL_BYTES - 1) / 2).min(TOOL_DETAIL_ROWS * (width - 2) - 1)
+            );
+        }
+    }
+
+    #[test]
+    fn tool_selection_skips_other_lanes_and_nonexpandable_tools() {
+        let mut fixed = Entry::tool("fixed");
+        fixed.expandable = false;
+        let mut details = ToolDetails::new(vec![
+            Entry::tool("first"),
+            Entry::assistant("answer"),
+            fixed,
+            Entry::tool("last"),
+        ]);
+        details.select(false);
+        assert_eq!(details.selected, Some(0));
+        details.select(false);
+        assert_eq!(details.selected, Some(3));
+        details.select(false);
+        assert_eq!(details.selected, Some(0));
+        details.select(true);
+        assert_eq!(details.selected, Some(3));
+        let mut empty = ToolDetails::new(vec![Entry::assistant("answer")]);
+        empty.select(false);
+        empty.toggle();
+        assert_eq!(
+            empty.rows(Display::default()),
+            (vec![String::from("answer")], None)
+        );
+    }
 
     #[test]
     fn accessible_output_labels_every_line_and_preserves_content_without_controls() {

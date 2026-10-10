@@ -240,6 +240,18 @@ fn full_transcript_scrolls_tools_and_replies_and_preserves_the_draft_and_caret()
                 assert!(!text.contains("REPLY-40"), "{text}");
             }
             "home" => assert_eq!(Some(&grid), opened.as_ref()),
+            "tool-selected" => assert!(text.contains("> tool 3: full"), "{text}"),
+            "tool-collapsed" | "tool-recollapsed" => {
+                assert!(text.contains("collapsed"), "{text}");
+                assert!(text.contains("more line(s)"), "{text}");
+                assert!(!text.contains("TOOL-20"), "{text}");
+            }
+            "tool-expanded" => {
+                assert!(text.contains("expanded"), "{text}");
+                assert!(text.contains("TOOL-20"), "{text}");
+            }
+            "tool-surrounding-start" => assert!(text.contains("> inspect"), "{text}"),
+            "tool-surrounding-end" => assert!(text.contains("REPLY-40"), "{text}"),
             "closed" => assert_eq!(Some(&grid), draft.as_ref(), "draft screen or caret changed"),
             "edited" => assert!(text.contains("draft Z界 tail"), "{text}"),
             "resized" => assert!(text.contains("Transcript"), "{text}"),
