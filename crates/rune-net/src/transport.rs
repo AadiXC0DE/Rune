@@ -26,6 +26,9 @@ use crate::redact;
 use crate::sse::{Decoder, Event};
 use crate::stream::ProviderEvent;
 
+#[cfg(not(target_family = "wasm"))]
+mod interrupt;
+
 /// Longest accepted endpoint URL.
 pub const MAX_URL_BYTES: usize = 2048;
 
@@ -340,13 +343,26 @@ impl StreamOutcome {
 #[cfg(not(target_family = "wasm"))]
 #[must_use]
 pub fn agent() -> ureq::Agent {
-    ureq::Agent::config_builder()
+    use ureq::unversioned::resolver::DefaultResolver;
+    use ureq::unversioned::transport::{
+        ConnectProxyConnector, Connector, RustlsConnector, SocksConnector, TcpConnector,
+    };
+
+    let config = ureq::Agent::config_builder()
         .timeout_connect(Some(CONNECT_TIMEOUT))
         // Callers supply each request's total budget through FetchRequest.
         .timeout_global(None)
         .http_status_as_error(false)
-        .build()
-        .into()
+        .build();
+    // Match ureq's SOCKS, CONNECT, TCP and rustls chain, adding cancellable
+    // socket reads below TLS so a silent response can release its reader.
+    let connector =
+        ().chain(SocksConnector::default())
+            .chain(ConnectProxyConnector::default())
+            .chain(TcpConnector::default())
+            .chain(interrupt::StreamConnector)
+            .chain(RustlsConnector::default());
+    ureq::Agent::with_parts(config, connector, DefaultResolver::default())
 }
 
 /// Adds headers to a request of either typestate.
@@ -977,39 +993,20 @@ fn read_stream_started(
 
 /// Feeds a body to the decoder on a thread of its own.
 ///
-/// A blocking read cannot be interrupted, so the body is read on a helper
-/// thread and this one waits on the handover in short slices, checking for a
-/// cancellation and stream deadlines between them. The handover is bounded,
-/// so the helper reads only a few chunks ahead of the decoder. Once nothing is
-/// listening the helper ends at its next chunk; a read that never returns holds
-/// it until the connection closes.
+/// The body is read on a helper thread while this one checks cancellation and
+/// deadlines between bounded handovers. The built-in socket transport polls
+/// the helper's stop signal below TLS; ending decoding stops and joins that
+/// reader, releasing the connection even when the endpoint is silent. An
+/// arbitrary host-supplied blocking reader still needs its host to interrupt it.
 #[cfg(not(target_family = "wasm"))]
 fn feed(
-    mut body: Box<dyn Read + Send>,
+    body: Box<dyn Read + Send>,
     state: &mut StreamState<'_>,
     cancel: &dyn Fn() -> bool,
 ) -> NetResult<()> {
-    use std::sync::mpsc::{RecvTimeoutError, sync_channel};
+    use std::sync::mpsc::RecvTimeoutError;
 
-    let (sender, chunks) = sync_channel::<std::io::Result<Vec<u8>>>(STREAM_CHUNKS_AHEAD);
-    std::thread::Builder::new()
-        .name("rune-stream-read".to_owned())
-        .spawn(move || {
-            let mut buffer = vec![0_u8; STREAM_CHUNK_BYTES];
-            loop {
-                let chunk = match body.read(&mut buffer) {
-                    Ok(0) => break,
-                    Ok(count) => Ok(buffer.get(..count).unwrap_or_default().to_vec()),
-                    Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
-                    Err(err) => Err(err),
-                };
-                let failed = chunk.is_err();
-                if sender.send(chunk).is_err() || failed {
-                    break;
-                }
-            }
-        })
-        .map_err(NetError::from)?;
+    let chunks = interrupt::StreamReader::spawn(body).map_err(NetError::from)?;
 
     loop {
         if cancel() {

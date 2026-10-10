@@ -95,6 +95,8 @@ Notable changes, newest first. Each entry describes what a user can observe.
 - The user configuration accepts `offline = true` and enforces offline mode
   without discarding the other settings in the file. `RUNE_OFFLINE` still takes
   precedence over the file setting.
+- Cancelling a native provider stream releases its socket and reader thread,
+  including when the response body stays silent.
 - Native provider streams enforce `provider_head_timeout_ms` when response
   headers arrive but the body stays silent, without waiting for the connection
   to close.
