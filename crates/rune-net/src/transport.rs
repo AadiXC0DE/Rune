@@ -13,6 +13,7 @@
 //! Every request is bounded in time, every response body is bounded in bytes,
 //! and every failure maps onto the taxonomy the retry policy reads.
 
+use std::fmt;
 use std::io::Read;
 use std::time::{Duration, Instant};
 
@@ -114,7 +115,9 @@ impl AuthStyle {
 }
 
 /// Everything needed to reach one endpoint.
-#[derive(Clone, Debug)]
+///
+/// Debug formatting redacts the credential value.
+#[derive(Clone)]
 pub struct Endpoint {
     /// Base URL without a trailing slash.
     pub base_url: String,
@@ -131,6 +134,18 @@ pub struct Endpoint {
     pub headers: Vec<(String, String)>,
     /// Whether outbound requests are refused entirely.
     pub offline: bool,
+}
+
+impl fmt::Debug for Endpoint {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Endpoint")
+            .field("base_url", &self.base_url)
+            .field("credential", &"[REDACTED]")
+            .field("auth", &self.auth)
+            .field("headers", &self.headers)
+            .field("offline", &self.offline)
+            .finish()
+    }
 }
 
 impl Endpoint {
@@ -2279,6 +2294,28 @@ mod tests {
     #[test]
     fn a_url_with_a_fragment_is_rejected() {
         assert!(validate_url("https://example.com/v1#frag").is_err());
+    }
+
+    #[test]
+    fn endpoint_debug_redacts_the_credential() {
+        let secret = "this-is-a-real-secret";
+        for auth in [AuthStyle::Bearer, AuthStyle::ApiKeyHeader] {
+            let endpoint = Endpoint::new("https://example.com", secret)
+                .with_auth(auth)
+                .with_header("user-agent", "rune-test")
+                .offline(true);
+
+            for rendered in [format!("{endpoint:?}"), format!("{endpoint:#?}")] {
+                assert!(!rendered.contains(secret), "{rendered}");
+                assert!(rendered.contains("[REDACTED]"), "{rendered}");
+                assert!(rendered.contains("https://example.com"), "{rendered}");
+                assert!(rendered.contains(&format!("{auth:?}")), "{rendered}");
+                assert!(rendered.contains("user-agent"), "{rendered}");
+                assert!(rendered.contains("rune-test"), "{rendered}");
+                assert!(rendered.contains("offline: true"), "{rendered}");
+            }
+            assert_eq!(endpoint.credential, secret);
+        }
     }
 
     #[test]

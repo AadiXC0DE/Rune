@@ -1933,7 +1933,7 @@ Resource accumulation after cancellation, session holder handover and concurrent
 - [x] R-054 | T2 | fix | cli | Reject unknown effort values | acceptance: Run rune --effort banana config and observe invalid_field with the accepted efforts and exit 1.
 - [x] R-055 | T2 | fix | cli | Reject unknown permission modes | acceptance: Run rune --permission-mode banana permissions and observe invalid_field with accepted modes and exit 1.
 - [x] R-056 | T2 | fix | tools | Search original grep lines before truncating display | acceptance: Search an over-one-MiB line that lacks the phrase line truncated and observe zero matches for that phrase even though its rendered output is annotated.
-- [ ] R-057 | T2 | fix | observability | Redact credentials from Endpoint Debug | acceptance: Format an Endpoint containing an audit secret with Debug and assert no secret bytes appear.
+- [x] R-057 | T2 | fix | observability | Redact credentials from Endpoint Debug | acceptance: Format an Endpoint containing an audit secret with Debug and assert no secret bytes appear.
 - [ ] R-058 | T2 | feature | sessions | Journal assistant deltas before a process can be killed | acceptance: SIGKILL after STREAM-03 must leave a replayable partial assistant entry without a false completed turn.
 - [ ] R-059 | T2 | fix | tui | Route caught worker panic diagnostics through the renderer | acceptance: Trigger the bounded panic fixture in a debug worker and observe one diagnostic without duplicated status rows.
 - [ ] R-060 | T2 | fix | observability | Report worker panics as internal failures | acceptance: A caught worker panic must report internal failure rather than the user-cancelled label.
