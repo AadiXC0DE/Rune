@@ -1363,7 +1363,7 @@ fn run_workspace_edit(
 ) -> Result<ExitCode> {
     let stored = config::load(
         None,
-        Some(&paths.config_file(None)),
+        Some(&paths.config_file(std::env::var("RUNE_CONFIG").ok().as_deref())),
         &EnvironmentOverrides::default(),
     );
     let mut directories: Vec<String> = stored

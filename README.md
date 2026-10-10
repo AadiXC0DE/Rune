@@ -194,6 +194,10 @@ Five layers, highest first: command-line flags, `RUNE_*` environment variables,
 the project file `.rune.toml`, the user file at `$XDG_CONFIG_HOME/rune/config.toml`,
 then built-in defaults.
 
+Set `RUNE_CONFIG` to use a different user configuration file. Workspace edits
+and provider selections read and write that file. An empty or unset value uses
+the default path.
+
 Only repository-safe keys are accepted in a project file. A user setting placed
 there is ignored and reported rather than applied, because a repository can be
 changed by anyone who can open a pull request.

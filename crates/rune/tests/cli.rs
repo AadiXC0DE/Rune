@@ -936,6 +936,215 @@ fn workspace_list_is_empty_on_a_fresh_install() {
     assert_eq!(value["directories"].as_array().expect("array").len(), 0);
 }
 
+/// Isolates configuration mutations from the caller's Rune settings.
+fn config_mutation_command(root: &camino::Utf8Path) -> Command {
+    let mut command = Command::new(binary());
+    for (key, _) in std::env::vars_os() {
+        if key.to_string_lossy().starts_with("RUNE_") {
+            command.env_remove(key);
+        }
+    }
+    command
+        .current_dir(root)
+        .env("RUNE_HOME", root.join("state"))
+        .env("XDG_CONFIG_HOME", root.join("config"))
+        .env("XDG_DATA_HOME", root.join("data"));
+    command
+}
+
+#[test]
+fn workspace_mutations_read_and_write_the_active_config() {
+    for override_path in [
+        None,
+        Some(""),
+        Some("settings.toml"),
+        Some("custom/settings.toml"),
+    ] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = camino::Utf8Path::from_path(dir.path()).expect("utf8");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700))
+                .expect("private scratch directory");
+        }
+        let default_path = root.join("config/rune/config.toml");
+        let default_text = "effort = 'low'\n";
+        rune_core::paths::create_dir_private(default_path.parent().expect("default parent"))
+            .expect("private default parent");
+        rune_core::paths::write_private(&default_path, default_text).expect("default config");
+        let active_path = override_path
+            .filter(|path| !path.is_empty())
+            .map_or_else(|| default_path.clone(), |path| root.join(path));
+        let existing = root.join("existing");
+        let added = root.join("added");
+        std::fs::create_dir(&existing).expect("existing directory");
+        std::fs::create_dir(&added).expect("added directory");
+        let existing = existing.canonicalize_utf8().expect("canonical existing");
+        let added = added.canonicalize_utf8().expect("canonical added");
+        let mut original: toml::Table =
+            toml::from_str("effort = 'high'\n[models]\nanthropic = 'saved-model'\n")
+                .expect("original config");
+        original.insert(
+            "additional_directories".to_owned(),
+            toml::Value::Array(vec![toml::Value::String(existing.to_string())]),
+        );
+        rune_core::paths::create_dir_private(active_path.parent().expect("active parent"))
+            .expect("private active parent");
+        rune_core::paths::write_private(
+            &active_path,
+            &toml::to_string(&original).expect("render config"),
+        )
+        .expect("active config");
+        let mut both = vec![existing.as_str(), added.as_str()];
+        both.sort_unstable();
+
+        for (args, expected) in [
+            (vec!["add", added.as_str()], both.clone()),
+            (vec!["add", added.as_str()], both),
+            (vec!["remove", added.as_str()], vec![existing.as_str()]),
+            (vec!["clear"], vec![]),
+        ] {
+            let mut command = config_mutation_command(root);
+            if let Some(path) = override_path {
+                command.env("RUNE_CONFIG", path);
+            }
+            let out = command
+                .arg("workspace")
+                .args(&args)
+                .arg("--json")
+                .output()
+                .expect("workspace mutation");
+            assert!(out.status.success(), "{override_path:?} {args:?}: {out:?}");
+            let stored: toml::Table =
+                toml::from_str(&std::fs::read_to_string(&active_path).expect("read active config"))
+                    .expect("parse active config");
+            assert_eq!(stored["effort"], original["effort"]);
+            assert_eq!(stored["models"], original["models"]);
+            let directories = stored
+                .get("additional_directories")
+                .map_or_else(Vec::new, |value| {
+                    value
+                        .as_array()
+                        .expect("directory array")
+                        .iter()
+                        .map(|value| value.as_str().expect("directory string"))
+                        .collect::<Vec<_>>()
+                });
+            assert_eq!(directories, expected, "{override_path:?} {args:?}");
+            if active_path != default_path {
+                assert_eq!(
+                    std::fs::read_to_string(&default_path).expect("default"),
+                    default_text
+                );
+            }
+            // Reload in a fresh process, including after clear.
+            let mut command = config_mutation_command(root);
+            if let Some(path) = override_path {
+                command.env("RUNE_CONFIG", path);
+            }
+            let out = command
+                .args(["workspace", "list", "--json"])
+                .output()
+                .expect("list");
+            assert!(out.status.success(), "{out:?}");
+            let value: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json");
+            assert_eq!(value["directories"], serde_json::json!(expected));
+        }
+    }
+}
+
+#[test]
+fn config_mutations_create_an_override_without_creating_the_default() {
+    for (args, override_path) in [
+        (
+            vec!["workspace", "add", ".", "--json"],
+            "custom/settings.toml",
+        ),
+        (
+            vec!["connect", "anthropic", "--model", "saved-model", "--json"],
+            "custom/settings.toml",
+        ),
+        (vec!["workspace", "add", ".", "--json"], "settings.toml"),
+        (
+            vec!["connect", "anthropic", "--model", "saved-model", "--json"],
+            "settings.toml",
+        ),
+    ] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = camino::Utf8Path::from_path(dir.path()).expect("utf8");
+        let path = root.join(override_path);
+        let out = config_mutation_command(root)
+            .args(&args)
+            .env("RUNE_CONFIG", override_path)
+            .env("ANTHROPIC_API_KEY", "test-key")
+            .output()
+            .expect("config mutation");
+        assert!(out.status.success(), "{args:?}: {out:?}");
+        let text = rune_core::paths::read_private(&path, 4096)
+            .expect("private config")
+            .expect("created config");
+        let stored: toml::Table = toml::from_str(&text).expect("parse config");
+        if args[0] == "workspace" {
+            assert_eq!(
+                stored["additional_directories"]
+                    .as_array()
+                    .expect("array")
+                    .len(),
+                1
+            );
+        } else {
+            assert_eq!(stored["provider"].as_str(), Some("anthropic"));
+            assert_eq!(stored["models"]["anthropic"].as_str(), Some("saved-model"));
+        }
+        assert!(
+            !root.join("config").exists(),
+            "default config directory was created"
+        );
+    }
+}
+
+#[test]
+fn provider_selection_preserves_the_override_and_leaves_the_default_unchanged() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = camino::Utf8Path::from_path(dir.path()).expect("utf8");
+    let default_path = root.join("config/rune/config.toml");
+    let default_text = "effort = 'low'\n";
+    rune_core::paths::create_dir_private(default_path.parent().expect("default parent"))
+        .expect("private default parent");
+    rune_core::paths::write_private(&default_path, default_text).expect("default config");
+    let path = root.join("custom/settings.toml");
+    rune_core::paths::create_dir_private(path.parent().expect("active parent"))
+        .expect("private active parent");
+    rune_core::paths::write_private(
+        &path,
+        "effort = 'high'\n[models]\nresponses = 'other-model'\n",
+    )
+    .expect("active config");
+    let out = config_mutation_command(root)
+        .args(["connect", "anthropic", "--model", "saved-model", "--json"])
+        .env("RUNE_CONFIG", &path)
+        .env("ANTHROPIC_API_KEY", "test-key")
+        .output()
+        .expect("connect");
+    assert!(out.status.success(), "{out:?}");
+    let stored: toml::Table =
+        toml::from_str(&std::fs::read_to_string(&path).expect("active config"))
+            .expect("parse config");
+    assert_eq!(stored["provider"].as_str(), Some("anthropic"));
+    assert_eq!(
+        stored["base_url"].as_str(),
+        Some("https://api.anthropic.com")
+    );
+    assert_eq!(stored["models"]["anthropic"].as_str(), Some("saved-model"));
+    assert_eq!(stored["models"]["responses"].as_str(), Some("other-model"));
+    assert_eq!(stored["effort"].as_str(), Some("high"));
+    assert_eq!(
+        std::fs::read_to_string(&default_path).expect("default config"),
+        default_text
+    );
+}
+
 #[test]
 fn an_unknown_workspace_subcommand_is_rejected() {
     let out = run(&["workspace", "frobnicate"]);

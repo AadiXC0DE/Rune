@@ -1927,7 +1927,7 @@ Resource accumulation after cancellation, session holder handover and concurrent
 - [x] R-048 | T2 | fix | cli | Resolve tree last before parsing an exact ID | acceptance: Save a session and run rune tree last --json, then observe its branch structure.
 - [x] R-049 | T2 | fix | cli | Use the documented permission explanation flag | acceptance: Run rune permissions --explain shell:pwd --json and observe one structured decision with its deciding rule.
 - [x] R-050 | T2 | fix | cli | Emit an ask JSON error for an empty prompt | acceptance: Run rune ask --json with empty stdin and observe one valid failure object on stdout and exit 1.
-- [ ] R-051 | T2 | fix | config | Write settings to the active RUNE_CONFIG path | acceptance: Set RUNE_CONFIG to a scratch file, run workspace add and observe only that file updated.
+- [x] R-051 | T2 | fix | config | Write settings to the active RUNE_CONFIG path | acceptance: Set RUNE_CONFIG to a scratch file, run workspace add and observe only that file updated.
 - [ ] R-052 | T2 | fix | xtask | Make gate include formatting and lint checks | acceptance: On a scratch checkout with an intentional formatting violation, cargo xtask gate must fail before budget and tests.
 - [ ] R-053 | T2 | fix | cli | Return an empty directory list after workspace clear | acceptance: Add one directory then run rune workspace clear --json and observe directories=[] in both response and following list.
 - [ ] R-054 | T2 | fix | cli | Reject unknown effort values | acceptance: Run rune --effort banana config and observe invalid_field with the accepted efforts and exit 1.
