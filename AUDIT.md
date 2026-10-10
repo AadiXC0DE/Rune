@@ -1941,7 +1941,7 @@ Resource accumulation after cancellation, session holder handover and concurrent
 - [x] R-062 | T2 | fix | input | Bind the existing yank operation to Ctrl-Y | acceptance: Type abc, Ctrl-U, Ctrl-Y and observe abc restored with the caret at its end.
 - [x] R-063 | T2 | fix | input | Bind the existing composer undo operation | acceptance: Insert and delete a Unicode grapheme, invoke the documented undo binding and observe the original draft and caret.
 - [x] R-064 | T2 | fix | input | Bind the existing composer redo operation | acceptance: Undo a draft edit, invoke the documented redo binding and observe the edited draft and caret.
-- [ ] R-065 | T2 | feature | input | Add an explicit newline key binding | acceptance: Press the documented newline binding and submit a two-line prompt whose exact newline reaches the provider fixture.
+- [x] R-065 | T2 | feature | input | Add an explicit newline key binding | acceptance: Press the documented newline binding and submit a two-line prompt whose exact newline reaches the provider fixture.
 - [ ] R-066 | T2 | feature | input | Lay out multiline drafts with a visible caret | acceptance: Paste three lines, navigate across them and observe each edited line and the correct terminal caret row.
 - [ ] R-067 | T2 | feature | input | Edit a draft using the configured external editor | acceptance: Invoke the editor binding with a stub editor that changes the scratch draft and observe the changed composer text after terminal restoration.
 - [ ] R-068 | T2 | feature | input | Complete workspace paths in tool-oriented prompts | acceptance: Complete a fixture path containing spaces and observe a single correctly quoted selection without reading outside workspace roots.

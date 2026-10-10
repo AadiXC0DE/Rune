@@ -120,7 +120,11 @@ rune review                 # review the pending changes in this repository
 rune resume last            # continue the most recent session here
 ```
 
-In the interactive composer, Ctrl-_ (Ctrl-Shift-minus) undoes the last draft
+In the interactive composer, Alt-Enter inserts a newline at the caret; Enter
+submits the whole prompt. Draft newlines appear as `⏎` on the input row and reach
+the provider as newline characters.
+
+Ctrl-_ (Ctrl-Shift-minus) undoes the last draft
 edit and restores its caret. Repeated presses undo earlier edits, including
 Unicode grapheme deletion and pasted text. Alt-R reapplies an undone edit and
 restores its caret. Repeated presses redo later edits; a new edit clears redo

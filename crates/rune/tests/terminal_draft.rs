@@ -4,6 +4,46 @@
 #![allow(clippy::expect_used, clippy::panic)]
 
 #[test]
+fn alt_enter_sends_one_two_line_prompt_with_an_exact_newline_to_the_provider() {
+    let output = std::process::Command::new("python3")
+        .args([
+            "-c",
+            include_str!("terminal_draft.py"),
+            env!("CARGO_BIN_EXE_rune"),
+            "newline",
+        ])
+        .output()
+        .expect("python3 is required for the Unix terminal newline test");
+    assert!(
+        output.status.success(),
+        "terminal newline test failed:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let captures: Vec<(String, Vec<u8>)> =
+        serde_json::from_slice(&output.stdout).expect("terminal captures");
+    assert_eq!(captures.len(), 3);
+    for (stage, bytes) in captures {
+        let mut grid = rune_term::Grid::new(80, 24).expect("grid");
+        grid.feed(&bytes).expect("feed");
+        let caret = grid.cursor();
+        let input = grid.row_text(caret.row);
+        let expected = match stage.as_str() {
+            "first-line" => "> first 界 line",
+            "newline" => "> first 界 line⏎",
+            "second-line" => "> first 界 line⏎second é line",
+            _ => panic!("unexpected capture {stage}"),
+        };
+        assert_eq!(input, expected, "{stage}");
+        assert_eq!(
+            usize::from(caret.col),
+            rune_term::width::str_width(expected),
+            "{stage}"
+        );
+    }
+}
+
+#[test]
 fn redo_restores_unicode_drafts_and_carets_in_a_real_terminal() {
     let output = std::process::Command::new("python3")
         .args([

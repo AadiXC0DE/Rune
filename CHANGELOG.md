@@ -6,6 +6,9 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Added
 
+- Alt-Enter inserts a newline at the composer caret. Enter submits the whole
+  prompt with its newlines preserved; draft line breaks appear as `⏎`.
+
 - Interactive assistant text is durably journalled before display. After process
   death, resume restores the partial answer once with an interrupted boundary
   and leaves the turn unfinished.

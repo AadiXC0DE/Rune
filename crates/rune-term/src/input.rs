@@ -314,9 +314,13 @@ impl KeyReader {
                 self.composer.move_word_right();
                 KeyAction::Ignored
             }
+            (KeyCode::Enter, _, true) => {
+                self.composer.insert("\n");
+                KeyAction::Ignored
+            }
             (KeyCode::Enter, _, _) => KeyAction::Submit,
-            // Tab completes rather than inserting a tab: a prompt is a single
-            // line, so a tab character has nothing to align.
+            // Tab completes rather than inserting a tab. Draft line breaks are
+            // drawn as visible marks on one row, so tabs have nothing to align.
             (KeyCode::Tab, _, _) => KeyAction::Complete,
             (KeyCode::Esc, _, _) => KeyAction::Escape,
             (KeyCode::Backspace, _, _) => {
@@ -612,6 +616,45 @@ mod tests {
             reader.apply(control('c')),
             "escape and control-c must be told apart"
         );
+    }
+
+    #[test]
+    fn alt_enter_inserts_a_newline_at_the_caret_and_enter_submits_it() {
+        let mut reader = reader();
+        reader.replace("界tail");
+        reader.apply(key(KeyCode::Home));
+        reader.apply(key(KeyCode::Right));
+        let newline = KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT);
+        assert_eq!(reader.handle(Event::Key(newline)), Some(KeyAction::Ignored));
+        assert_eq!(reader.line(), "界\ntail");
+        assert_eq!(reader.composer.cursor(), 2);
+        assert_eq!(reader.column(), 3);
+
+        // The inserted break is a regular draft edit, including its caret.
+        reader.apply(control('_'));
+        assert_eq!(reader.line(), "界tail");
+        assert_eq!(reader.column(), 2);
+        reader.apply(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::ALT));
+        assert_eq!(reader.line(), "界\ntail");
+        assert_eq!(reader.column(), 3);
+        typed(&mut reader, "second ");
+        assert_eq!(
+            reader.handle(Event::Key(key(KeyCode::Enter))),
+            Some(KeyAction::Submit)
+        );
+        assert_eq!(reader.line(), "界\nsecond tail");
+    }
+
+    #[test]
+    fn releasing_alt_enter_does_not_insert_another_newline() {
+        let mut reader = reader();
+        typed(&mut reader, "first");
+        let mut newline = KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT);
+        assert_eq!(reader.handle(Event::Key(newline)), Some(KeyAction::Ignored));
+        newline.kind = KeyEventKind::Release;
+        assert_eq!(reader.handle(Event::Key(newline)), None);
+        assert_eq!(reader.line(), "first\n");
+        assert_eq!(reader.column(), 6);
     }
 
     #[test]

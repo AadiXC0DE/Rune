@@ -1,4 +1,4 @@
-"""Edit long drafts or undo and redo Unicode edits in the real process in a PTY."""
+"""Edit drafts, insert newlines, and undo and redo edits in the real process in a PTY."""
 
 import fcntl
 import http.server
@@ -127,7 +127,16 @@ with tempfile.TemporaryDirectory(prefix="rune-r004-") as directory:
 
     try:
         wait_for("ctrl-c cancel")
-        if sys.argv[2:] == ["redo"]:
+        if sys.argv[2:] == ["newline"]:
+            capture("first-line", "first 界 line".encode(), "first 界 line")
+            # Alt-Enter is ESC followed by CR on a legacy terminal. It must
+            # insert one LF without sending an early provider request.
+            capture("newline", b"\x1b\r", "first 界 line⏎")
+            assert not prompts, prompts
+            capture("second-line", "second é line".encode(), "first 界 line⏎second é line")
+            assert not prompts, prompts
+            submitted = "first 界 line\nsecond é line"
+        elif sys.argv[2:] == ["redo"]:
             capture("original", "界ab".encode() + b"\x1b[D", "界ab")
             capture(
                 "inserted", b"\x1b[200~" + "e\u0301".encode() + b"\x1b[201~",
