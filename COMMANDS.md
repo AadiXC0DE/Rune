@@ -30,6 +30,10 @@ Accepted anywhere on the command line.
 
 ## Run
 
+### `rune resume [last|id]`
+
+Resume a saved session, defaulting to the latest in this workspace
+
 ### `rune ask [flags] <prompt>`
 
 Run one request without an interactive session

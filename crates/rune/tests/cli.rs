@@ -89,6 +89,33 @@ fn help_for_one_command_shows_its_usage() {
 }
 
 #[test]
+fn resume_help_and_reference_document_the_same_usage() {
+    let usage = "rune resume [last|id]";
+    let help = run(&["help", "resume"]);
+    assert_eq!(help.status, Some(0), "{}", help.stderr);
+    assert!(help.stderr.is_empty(), "{}", help.stderr);
+    assert!(help.stdout.contains(usage), "{}", help.stdout);
+    assert!(help.stdout.contains("latest in this workspace"));
+
+    for args in [
+        &["resume", "--help"][..],
+        &["resume", "-h"][..],
+        &["--help", "resume"][..],
+    ] {
+        let out = run(args);
+        assert_eq!(out.status, Some(0), "{args:?}: {}", out.stderr);
+        assert!(out.stderr.is_empty(), "{}", out.stderr);
+        assert_eq!(out.stdout, help.stdout, "{args:?}");
+    }
+
+    let reference = run(&["reference"]);
+    assert_eq!(reference.status, Some(0), "{}", reference.stderr);
+    assert!(reference.stderr.is_empty(), "{}", reference.stderr);
+    assert!(reference.stdout.contains(&format!("### `{usage}`")));
+    assert!(run(&["help"]).stdout.contains("  resume "));
+}
+
+#[test]
 fn help_for_an_unknown_command_says_so() {
     let out = run(&["help", "frobnicate"]);
     assert!(out.stdout.contains("frobnicate"));

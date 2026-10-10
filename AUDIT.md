@@ -1952,7 +1952,7 @@ Resource accumulation after cancellation, session holder handover and concurrent
 - [x] R-073 | T2 | feature | accessibility | Expose the active bindings in interactive help | acceptance: Run /help and verify every documented binding with a PTY action, including cancellation precedence and paste.
 - [x] R-074 | T2 | feature | tui | Make tool summaries expandable on request | acceptance: Expand a collapsed fixture tool result and observe bounded contents, then collapse it without losing surrounding transcript.
 - [x] R-075 | T2 | feature | tui | Show the active provider retry and next delay | acceptance: Serve two retryable failures and observe attempt counts and the pending delay in one renderer-owned status row.
-- [ ] R-076 | T2 | fix | cli | Add resume to the shared command specification | acceptance: Run rune help resume and rune resume --help and observe valid usage included in rune reference.
+- [x] R-076 | T2 | fix | cli | Add resume to the shared command specification | acceptance: Run rune help resume and rune resume --help and observe valid usage included in rune reference.
 - [ ] R-077 | T2 | fix | cli | Declare accepted aliases in the shared table | acceptance: For login, setup, provider, pr, issue, cost, logout and settings, help and generated reference must describe the actual alias behavior.
 - [ ] R-078 | T2 | fix | cli | Reject values attached to declared boolean flags | acceptance: Run rune sessions --all=no and observe a takes-no-value error with exit 1.
 - [ ] R-079 | T2 | fix | cli | Honor exact session selectors for inspect | acceptance: Run rune session --id with a valid fixture identifier and observe that session without requiring a positional argument.

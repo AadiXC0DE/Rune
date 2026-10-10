@@ -102,6 +102,9 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Fixed
 
+- `rune help resume` and `rune resume --help` show usage for resuming a saved
+  session, and the generated command reference includes `resume`.
+
 - Alt-R reapplies an undone composer edit and restores the draft and caret.
 
 - Ctrl-_ undoes the last composer edit and restores the draft and caret,

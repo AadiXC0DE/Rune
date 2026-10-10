@@ -163,6 +163,15 @@ pub const GLOBAL_FLAGS: &[FlagSpec] = &[
 /// Commands that start an interactive session rather than performing one action.
 pub const RUN: &[CommandSpec] = &[
     CommandSpec {
+        name: "resume",
+        aliases: &[],
+        summary: "Resume a saved session, defaulting to the latest in this workspace",
+        usage: "rune resume [last|id]",
+        flags: &[],
+        requirements: Requirements::FULL,
+        supports_json: false,
+    },
+    CommandSpec {
         name: "ask",
         aliases: &[],
         summary: "Run one request without an interactive session",
@@ -543,6 +552,14 @@ mod tests {
         assert_eq!(find("--help").map(|s| s.name), Some("help"));
         assert_eq!(find("-v").map(|s| s.name), Some("version"));
         assert!(find("nonexistent").is_none());
+    }
+
+    #[test]
+    fn resume_declares_its_interactive_runtime_requirements() {
+        let spec = spec_for(Command::Resume).expect("resume specification");
+        assert_eq!(spec.name, "resume");
+        assert_eq!(spec.requirements, Requirements::FULL);
+        assert!(!spec.supports_json);
     }
 
     #[test]
