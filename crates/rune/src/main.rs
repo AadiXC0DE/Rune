@@ -754,17 +754,19 @@ fn run_session_migrate(paths: &Paths, launch: &Launch, output: &OutputFlags) -> 
 
 /// Reports the branch structure of a stored session.
 ///
-/// Without an identifier the most recent session is used, because that is what a
-/// user means by "the current one".
+/// Without an identifier, or with `last`, the most recent session in the current
+/// workspace is used.
 fn run_tree(
     paths: &Paths,
     launch: &Launch,
     workspace: &Utf8Path,
     output: &OutputFlags,
 ) -> Result<ExitCode> {
-    let id = match launch.args.first() {
+    let id = match launch.args.first().map(String::as_str) {
+        None | Some("last") => {
+            session_log::resolve_target(&ResumeTarget::Latest, paths, workspace)?
+        }
         Some(raw) => raw.parse()?,
-        None => session_log::resolve_target(&ResumeTarget::Latest, paths, workspace)?,
     };
     let state = session_log::inspect(paths, &id)?;
     let tree = session_log::tree_of(&state);

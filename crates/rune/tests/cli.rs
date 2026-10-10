@@ -212,6 +212,126 @@ fn session_inspection_still_requires_a_valid_selector() {
 }
 
 #[test]
+fn tree_last_reports_the_saved_branch_structure_in_the_current_workspace() {
+    use camino::Utf8PathBuf;
+    use rune_core::{id::SessionId, paths::Paths};
+    use rune_session::{SessionEvent, SessionStore};
+
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let root = Utf8PathBuf::from_path_buf(dir.path().canonicalize().expect("canonical tempdir"))
+        .expect("utf-8 path");
+    let paths = Paths {
+        state_root: root.join("state"),
+        config_root: root.join("config/rune"),
+        data_root: root.join("data/rune"),
+    };
+    let workspaces = [root.join("one"), root.join("two")];
+    let ids = ["sessionws001", "sessionws002"];
+    for ((workspace, raw), turns) in workspaces.iter().zip(ids).zip([1_u64, 2]) {
+        std::fs::create_dir(workspace).expect("workspace");
+        let id: SessionId = raw.parse().expect("session id");
+        let store = SessionStore::create(&paths, &id).expect("create session");
+        store
+            .append(SessionEvent::WorkspaceSet {
+                workspace: workspace.to_string(),
+            })
+            .expect("save workspace");
+        for turn in 1..=turns {
+            store
+                .append(SessionEvent::UserMessage {
+                    text: "saved prompt".into(),
+                })
+                .expect("save prompt");
+            store
+                .append(SessionEvent::AssistantMessage {
+                    turn,
+                    text: "saved reply".into(),
+                })
+                .expect("save reply");
+        }
+    }
+
+    for (workspace, raw) in workspaces.iter().zip(ids) {
+        let command = || {
+            let mut command = Command::new(binary());
+            command
+                .current_dir(workspace)
+                .env("RUNE_HOME", &paths.state_root)
+                .env("XDG_CONFIG_HOME", root.join("config"))
+                .env("XDG_DATA_HOME", root.join("data"));
+            command
+        };
+        for selector in [None, Some("last"), Some(ids[0]), Some(ids[1])] {
+            let out = command()
+                .arg("tree")
+                .args(selector)
+                .arg("--json")
+                .output()
+                .expect("run binary");
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert!(out.stderr.is_empty());
+            let value: serde_json::Value = serde_json::from_slice(&out.stdout).expect("valid json");
+            let expected_id = match selector {
+                None | Some("last") => raw,
+                Some(id) => id,
+            };
+            let nodes = if expected_id == ids[0] { 2 } else { 4 };
+            assert_eq!(
+                value,
+                serde_json::json!({
+                    "session": expected_id,
+                    "active_branch": "main",
+                    "branches": [{
+                        "name": "main",
+                        "turns": nodes,
+                        "head": nodes,
+                        "diverges_at": null,
+                    }],
+                    "turns": nodes,
+                })
+            );
+        }
+        let out = command()
+            .args(["tree", "last"])
+            .output()
+            .expect("run binary");
+        assert!(out.status.success());
+        assert!(out.stderr.is_empty());
+        let text = String::from_utf8_lossy(&out.stdout);
+        for expected in [raw, "main", "saved prompt", "saved reply"] {
+            assert!(text.contains(expected), "{text}");
+        }
+    }
+}
+
+#[test]
+fn tree_last_without_saved_sessions_reports_not_found() {
+    for args in [vec!["tree", "last", "--json"], vec!["tree", "--json"]] {
+        let out = run(&args);
+        assert_eq!(out.status, Some(1));
+        assert!(out.stdout.is_empty(), "{}", out.stdout);
+        assert!(out.stderr.contains("not_found"), "{}", out.stderr);
+        assert!(
+            out.stderr.contains("no session has been saved yet"),
+            "{}",
+            out.stderr
+        );
+    }
+}
+
+#[test]
+fn tree_still_rejects_an_invalid_exact_id() {
+    let out = run(&["tree", "bad", "--json"]);
+    assert_eq!(out.status, Some(1));
+    assert!(out.stdout.is_empty(), "{}", out.stdout);
+    assert!(out.stderr.contains("invalid_field"), "{}", out.stderr);
+}
+
+#[test]
 fn auth_status_json_matches_the_default_inspection() {
     let default = run(&["auth", "--json"]);
     let status = run(&["auth", "status", "--json"]);
