@@ -91,6 +91,9 @@ context_window = 2000000
 ```
 
 A bare identifier still works for a model whose window the endpoint reports.
+Setting `RUNE_MODEL` to a different identifier discards the configured model's
+declared window. Until the new model's capacity is resolved, configuration
+reports the default 128000-token window.
 
 The providers that ship in the table are:
 

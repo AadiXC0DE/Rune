@@ -56,6 +56,9 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Fixed
 
+- Changing the model with `RUNE_MODEL` discards the previous model's declared
+  context window and reports the default capacity and source. An override naming
+  the same model preserves its declared window.
 - Resumed sessions initialize the context meter from saved usage or history
   bytes and label the estimate with its source until live usage arrives.
 - README and budget help distinguish the audited 4.50 MiB stripped release

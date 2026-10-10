@@ -1237,6 +1237,11 @@ fn apply_environment(settings: &mut Settings, env: &EnvironmentOverrides) {
         settings.sources.record("provider", layer);
     }
     if let Some(model) = &env.model {
+        if settings.model != *model {
+            // A declared window belongs to the model it describes.
+            settings.context_window = None;
+            settings.sources.sources.remove("context_window");
+        }
         settings.model.clone_from(model);
         settings.sources.record("model", layer);
     }
@@ -2071,6 +2076,67 @@ max_agent_steps = 50
         assert_eq!(settings.model, "m");
         assert_eq!(settings.context_window, Some(200_000));
         assert_eq!(settings.source_of("context_window"), Layer::User);
+    }
+
+    #[test]
+    fn environment_model_change_discards_the_declared_window() {
+        let dir = TempDir::new().expect("tempdir");
+        let user = write(
+            &dir,
+            "config.toml",
+            "provider = 'anthropic'\n[models.anthropic]\nid = 'wide'\ncontext_window = 2000000\n",
+        );
+        let env = EnvironmentOverrides::from_lookup(|key| {
+            (key == "RUNE_MODEL").then(|| "small".to_owned())
+        });
+
+        let settings = load(None, Some(&user), &env);
+        assert!(settings.diagnostics.is_empty());
+        assert_eq!(settings.provider, Provider::Anthropic);
+        assert_eq!(settings.model, "small");
+        assert_eq!(settings.source_of("model"), Layer::Environment);
+        assert_eq!(settings.context_window, None);
+        assert_eq!(settings.source_of("context_window"), Layer::Default);
+        let row = settings
+            .explain()
+            .into_iter()
+            .find(|row| row.key == "context_window")
+            .expect("context_window is reported");
+        assert_eq!(row.value, DEFAULT_CONTEXT_WINDOW.to_string());
+        assert_eq!(row.source, Layer::Default);
+    }
+
+    #[test]
+    fn unchanged_environment_model_preserves_the_declared_window() {
+        let dir = TempDir::new().expect("tempdir");
+        let user = write(
+            &dir,
+            "config.toml",
+            "provider = 'anthropic'\n[models.anthropic]\nid = 'wide'\ncontext_window = 2000000\n",
+        );
+        for model in [None, Some(""), Some("  "), Some("wide")] {
+            let env = EnvironmentOverrides::from_lookup(|key| {
+                if key == "RUNE_MODEL" {
+                    model.map(str::to_owned)
+                } else {
+                    None
+                }
+            });
+
+            let settings = load(None, Some(&user), &env);
+            assert!(settings.diagnostics.is_empty());
+            assert_eq!(settings.model, "wide");
+            assert_eq!(
+                settings.source_of("model"),
+                if model == Some("wide") {
+                    Layer::Environment
+                } else {
+                    Layer::User
+                }
+            );
+            assert_eq!(settings.context_window, Some(2_000_000));
+            assert_eq!(settings.source_of("context_window"), Layer::User);
+        }
     }
 
     #[test]
