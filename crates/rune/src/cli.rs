@@ -39,6 +39,8 @@ pub enum Command {
     Models,
     /// Show permission state.
     Permissions,
+    /// Explain a command's sandbox policy without running it.
+    Sandbox,
     /// Inspect and change workspace trust.
     Projects,
     /// Show resolved configuration.
@@ -85,6 +87,7 @@ impl Command {
             Self::Auth => "auth",
             Self::Models => "models",
             Self::Permissions => "permissions",
+            Self::Sandbox => "sandbox",
             Self::Projects => "projects",
             Self::Config => "config",
             Self::Limits => "limits",
@@ -314,6 +317,7 @@ pub fn parse(args: Vec<OsString>, benchmark: bool) -> Result<Launch> {
                 "auth" | "logout" => Command::Auth,
                 "models" => Command::Models,
                 "permissions" => Command::Permissions,
+                "sandbox" => Command::Sandbox,
                 "projects" => Command::Projects,
                 "config" | "settings" => Command::Config,
                 "limits" => Command::Limits,

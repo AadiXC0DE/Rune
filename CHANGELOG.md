@@ -6,6 +6,10 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Added
 
+- `rune sandbox explain` previews a shell command without executing it, showing
+  the backend, writable roots, network policy, protected paths and their sources.
+  It reports refusal or unsandboxed fallback when enforcement is unavailable.
+
 - CI replays the actual Rune process in Unix PTYs and compares captured grids
   for long drafts, 12-column output, short menus, and draft resizing. The gate
   checks caret positions and that narrow output survives in scrollback.

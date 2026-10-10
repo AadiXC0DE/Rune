@@ -505,7 +505,7 @@ fn session_id(started: u64) -> String {
 }
 
 /// Carries the context's grants and offline restriction into the sandbox.
-fn sandbox_policy(context: &ExecutionContext) -> rune_exec::SandboxPolicy {
+pub fn sandbox_policy(context: &ExecutionContext) -> rune_exec::SandboxPolicy {
     rune_exec::SandboxPolicy::new(
         context.workspace.clone(),
         context.additional_roots.clone(),

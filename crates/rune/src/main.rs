@@ -21,6 +21,7 @@ mod permissions;
 mod prompt_history;
 mod provider_setup;
 mod reference;
+mod sandbox;
 mod session;
 mod session_log;
 mod spec;
@@ -128,6 +129,8 @@ fn run(launch: &Launch) -> Result<ExitCode> {
         Settings::default()
     };
 
+    let saved_directory_source = settings.source_of("additional_directories");
+
     // Command-line flags sit above every file and environment layer.
     cli::apply_to_settings(launch, &mut settings);
     apply_limit_overrides(launch, &mut settings)?;
@@ -166,6 +169,15 @@ fn run(launch: &Launch) -> Result<ExitCode> {
         Command::Connect => run_connect(&settings, &paths, launch, &output_flags),
         Command::Models => run_models(&settings, &paths, &output_flags),
         Command::Permissions => run_permissions(&settings, launch, &output_flags),
+        Command::Sandbox => {
+            let report = sandbox::explain(&settings, saved_directory_source, launch, &workspace)?;
+            if output_flags.json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                print!("{}", sandbox::render(&report));
+            }
+            Ok(ExitCode::from(EXIT_OK))
+        }
         Command::Projects => run_projects(&paths, launch, &workspace, &output_flags),
         Command::Workspace => run_workspace(&settings, &paths, launch, &output_flags),
         Command::Ask => run_ask(&settings, &paths, launch, &output_flags),

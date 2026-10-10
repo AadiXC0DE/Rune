@@ -156,6 +156,14 @@ failure within the available output budget.
   turn. Run once approves only the displayed call.
 - **Sandboxed execution.** Commands run under the platform sandbox where one
   exists. `rune doctor` reports what your host can enforce.
+  `rune sandbox explain -- 'git status'` previews the backend, writable roots,
+  network decision and existing protected paths with sources, without running
+  the command. The preview uses the current workspace and configured additional
+  directories (`--add-dir` adds roots; `--no-additional-dirs` ignores saved roots).
+  Network access requires an explicit shell context grant, previewed with
+  `--external-access`; offline mode overrides it. `--json` emits the same report.
+  Refused commands apply no protections; an unsandboxed fallback has unrestricted
+  access. This explains sandbox policy, independently of command approval.
 - **Offline mode.** `--offline` refuses every outbound request.
 - **Local.** Sessions, usage, and credentials stay on the machine.
 

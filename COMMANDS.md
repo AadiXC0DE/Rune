@@ -117,6 +117,14 @@ Show the permission mode and rules
 |---|---|
 | `--explain <target>` | Explain the decision for one target. |
 | `--json` | Emit JSON. |
+### `rune sandbox explain [--external-access] [--json] -- <command>`
+
+Explain a command's sandbox policy without running it
+
+| Flag | Description |
+|---|---|
+| `--external-access` | Preview an explicit external-access grant to the shell context. |
+| `--json` | Emit JSON. |
 ### `rune projects [status|approve|reject|reset]`
 
 Inspect or change workspace trust

@@ -49,6 +49,9 @@ pub const NAMESPACE_HELPER: &str = "bwrap";
 /// carries anything.
 const NULL_DEVICE: &str = "/dev/null";
 
+/// Device paths the Seatbelt profile permits a command to write.
+const WRITABLE_DEVICES: [&str; 4] = ["/dev/null", "/dev/stdout", "/dev/stderr", "/dev/tty"];
+
 /// Locations under the home directory that hold credentials.
 ///
 /// A sandboxed command has no business reading any of these, so each backend
@@ -155,6 +158,23 @@ impl SandboxPolicy {
         std::iter::once(&self.workspace).chain(self.writable_roots.iter())
     }
 
+    /// Resolves the same roots and exceptions used to build backend rules.
+    pub fn resolved_paths(&self) -> Result<PolicyPaths> {
+        self.paths_with(&existing_credential_paths())
+    }
+
+    fn paths_with(&self, credentials: &[Utf8PathBuf]) -> Result<PolicyPaths> {
+        let writable_roots = self
+            .writable()
+            .map(|path| resolve(path, "a writable path"))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(PolicyPaths {
+            protected_paths: protected_paths(&writable_roots),
+            credential_paths: masked_paths(credentials, &writable_roots),
+            writable_roots,
+        })
+    }
+
     /// Returns the credential locations a command under this policy has
     /// hidden, for a caller to assert against without repeating the list.
     pub fn credential_paths(&self) -> Result<Vec<Utf8PathBuf>> {
@@ -164,6 +184,17 @@ impl SandboxPolicy {
             .collect::<Result<Vec<_>>>()?;
         Ok(masked_paths(&existing_credential_paths(), &writable))
     }
+}
+
+/// Resolved paths used by both sandbox backends and policy diagnostics.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct PolicyPaths {
+    /// Workspace followed by any additional writable roots.
+    pub writable_roots: Vec<Utf8PathBuf>,
+    /// Existing repository paths whose writes are denied.
+    pub protected_paths: Vec<Utf8PathBuf>,
+    /// Existing credential locations masked by the backend.
+    pub credential_paths: Vec<Utf8PathBuf>,
 }
 
 /// A way to restrict what a command can reach.
@@ -177,6 +208,17 @@ pub trait Sandbox {
 
     /// Reports what this host can enforce.
     fn support(&self) -> Support;
+
+    /// Returns writable scratch directories added by this backend.
+    /// These are separate from host workspace grants.
+    fn temporary_writable_roots(&self) -> Vec<Utf8PathBuf> {
+        Vec::new()
+    }
+
+    /// Returns writable device paths added by this backend.
+    fn writable_device_paths(&self) -> Vec<Utf8PathBuf> {
+        Vec::new()
+    }
 
     /// Returns the command that runs under the restriction.
     ///
@@ -495,10 +537,8 @@ impl MacSandbox {
     /// can build a profile over a fixture home without moving this process's own
     /// home directory.
     fn profile_with(policy: &SandboxPolicy, credentials: &[Utf8PathBuf]) -> Result<String> {
-        let writable = policy
-            .writable()
-            .map(|path| resolve(path, "a writable path"))
-            .collect::<Result<Vec<_>>>()?;
+        let paths = policy.paths_with(credentials)?;
+        let writable = &paths.writable_roots;
         let mut profile = String::new();
         let _ = writeln!(profile, "(version 1)");
         let _ = writeln!(profile, "(allow default)");
@@ -508,12 +548,12 @@ impl MacSandbox {
         }
         // Redirection to these is not a way to change the machine, and denying
         // them breaks almost every command that prints.
-        for device in ["/dev/null", "/dev/stdout", "/dev/stderr", "/dev/tty"] {
+        for device in WRITABLE_DEVICES {
             let _ = writeln!(profile, "(allow file-write* (literal \"{device}\"))");
         }
         // After the grants, so the deny is the rule that decides for these.
-        for protected in protected_paths(&writable) {
-            let _ = writeln!(profile, "(deny file-write* {})", operand(&protected)?);
+        for protected in &paths.protected_paths {
+            let _ = writeln!(profile, "(deny file-write* {})", operand(protected)?);
         }
         // Reading stays open everywhere else, so a command still reads its own
         // libraries and the files it was pointed at. The roots it works in are
@@ -523,16 +563,16 @@ impl MacSandbox {
         //
         // The readable roots and the writable ones are the same paths, so the
         // loop is shared.
-        for resolved in &writable {
+        for resolved in writable {
             let _ = writeln!(profile, "(allow file-read* {})", operand(resolved)?);
         }
         // Writes are denied as well as reads. When the home directory is the
         // workspace, a credential location sits under a writable grant, and a
         // command could otherwise add a key to `authorized_keys` or a
         // `ProxyCommand` to the SSH configuration without reading either.
-        for credential in masked_paths(credentials, &writable) {
-            let _ = writeln!(profile, "(deny file-read* {})", operand(&credential)?);
-            let _ = writeln!(profile, "(deny file-write* {})", operand(&credential)?);
+        for credential in &paths.credential_paths {
+            let _ = writeln!(profile, "(deny file-read* {})", operand(credential)?);
+            let _ = writeln!(profile, "(deny file-write* {})", operand(credential)?);
         }
         if !policy.network {
             let _ = writeln!(profile, "(deny network*)");
@@ -542,6 +582,17 @@ impl MacSandbox {
 }
 
 impl Sandbox for MacSandbox {
+    fn writable_device_paths(&self) -> Vec<Utf8PathBuf> {
+        WRITABLE_DEVICES
+            .into_iter()
+            .map(Utf8PathBuf::from)
+            .collect()
+    }
+
+    fn temporary_writable_roots(&self) -> Vec<Utf8PathBuf> {
+        temporary_roots()
+    }
+
     fn name(&self) -> &'static str {
         "seatbelt"
     }
@@ -676,18 +727,16 @@ impl LinuxSandbox {
             String::from("--tmpfs"),
             String::from("/tmp"),
         ]);
-        let writable = policy
-            .writable()
-            .map(|path| resolve(path, "a writable path"))
-            .collect::<Result<Vec<_>>>()?;
-        for resolved in &writable {
+        let paths = policy.resolved_paths()?;
+        let writable = &paths.writable_roots;
+        for resolved in writable {
             argv.push(String::from("--bind"));
             argv.push(resolved.as_str().to_owned());
             argv.push(resolved.as_str().to_owned());
         }
         // Bound again read-only after the writable binds, so the later mount is
         // the one a command sees at these paths.
-        for protected in protected_paths(&writable) {
+        for protected in &paths.protected_paths {
             argv.push(String::from("--ro-bind"));
             argv.push(protected.as_str().to_owned());
             argv.push(protected.as_str().to_owned());
@@ -695,7 +744,7 @@ impl LinuxSandbox {
         // The credential locations are covered last, so the mask is the rule
         // that applies to a path a writable bind would otherwise expose, which
         // is the case when the home directory is itself the workspace.
-        for credential in masked_paths(&existing_credential_paths(), &writable) {
+        for credential in &paths.credential_paths {
             if credential.is_dir() {
                 // A directory is covered by an empty filesystem, which hides
                 // everything under it in one operation.
@@ -719,6 +768,14 @@ impl LinuxSandbox {
 }
 
 impl Sandbox for LinuxSandbox {
+    fn writable_device_paths(&self) -> Vec<Utf8PathBuf> {
+        vec![Utf8PathBuf::from("/dev")]
+    }
+
+    fn temporary_writable_roots(&self) -> Vec<Utf8PathBuf> {
+        vec![Utf8PathBuf::from("/tmp")]
+    }
+
     fn name(&self) -> &'static str {
         "namespaces"
     }
@@ -853,6 +910,73 @@ mod tests {
     /// Returns a policy over one workspace.
     fn policy(workspace: &Utf8Path) -> SandboxPolicy {
         SandboxPolicy::new(workspace.to_owned(), Vec::new(), false)
+    }
+
+    #[test]
+    fn reported_paths_match_the_rules_of_both_backends() {
+        let (_guard, root) = tempdir();
+        let workspace = root.join("workspace");
+        let extra = root.join("extra");
+        let credentials = root.join("credentials");
+        for directory in [&workspace, &extra, &credentials] {
+            std::fs::create_dir_all(directory.join(".git/hooks")).expect("fixture directories");
+            std::fs::write(directory.join(".git/config"), "[core]\n").expect("git config");
+        }
+        let policy = SandboxPolicy::new(workspace, vec![extra], false);
+        let credentials = vec![credentials.canonicalize_utf8().expect("resolved")];
+        let paths = policy.paths_with(&credentials).expect("paths");
+        assert_eq!(paths.writable_roots.len(), 2);
+        assert_eq!(paths.protected_paths.len(), 4);
+        assert_eq!(paths.credential_paths, credentials);
+        let profile = MacSandbox::profile_with(&policy, &credentials).expect("profile");
+        for path in &paths.writable_roots {
+            assert!(profile.contains(&format!(
+                "(allow file-write* {})",
+                operand(path).expect("operand")
+            )));
+        }
+        for path in &paths.protected_paths {
+            assert!(profile.contains(&format!(
+                "(deny file-write* {})",
+                operand(path).expect("operand")
+            )));
+        }
+        for path in &paths.credential_paths {
+            assert!(profile.contains(&format!(
+                "(deny file-read* {})",
+                operand(path).expect("operand")
+            )));
+            assert!(profile.contains(&format!(
+                "(deny file-write* {})",
+                operand(path).expect("operand")
+            )));
+        }
+        let prepared =
+            prepare("echo fixture", &policy.workspace, None, environment()).expect("prepare");
+        let argv =
+            LinuxSandbox::argv(Utf8Path::new("/fixture/bwrap"), &prepared, &policy).expect("argv");
+        let host_paths = policy.resolved_paths().expect("host paths");
+        for path in &host_paths.writable_roots {
+            assert!(
+                argv.windows(3)
+                    .any(|args| args == ["--bind", path.as_str(), path.as_str()])
+            );
+        }
+        for path in &host_paths.protected_paths {
+            assert!(
+                argv.windows(3)
+                    .any(|args| args == ["--ro-bind", path.as_str(), path.as_str()])
+            );
+        }
+        for path in &host_paths.credential_paths {
+            assert!(
+                argv.windows(2)
+                    .any(|args| args == ["--tmpfs", path.as_str()])
+                    || argv
+                        .windows(3)
+                        .any(|args| args == ["--ro-bind", NULL_DEVICE, path.as_str()])
+            );
+        }
     }
 
     #[test]

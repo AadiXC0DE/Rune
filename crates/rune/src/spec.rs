@@ -295,6 +295,21 @@ pub const ACCOUNT: &[CommandSpec] = &[
         supports_json: true,
     },
     CommandSpec {
+        name: "sandbox",
+        aliases: &[],
+        summary: "Explain a command's sandbox policy without running it",
+        usage: "rune sandbox explain [--external-access] [--json] -- <command>",
+        flags: &[
+            flag(
+                "--external-access",
+                "Preview an explicit external-access grant to the shell context.",
+            ),
+            flag("--json", "Emit JSON."),
+        ],
+        requirements: Requirements::CONFIG,
+        supports_json: true,
+    },
+    CommandSpec {
         name: "projects",
         aliases: &[],
         summary: "Inspect or change workspace trust",
