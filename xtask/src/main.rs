@@ -82,7 +82,7 @@ fn print_help() {
     println!("  lint     run clippy with warnings denied");
     println!("  test     run the workspace test suite");
     println!("  budget   build the release profile and check size and startup");
-    println!("  gate     budget plus the full workspace test suite");
+    println!("  gate     format, lint, budget, and the full workspace test suite");
     println!("  release  stage a release artifact, its checksum, and a manifest");
     println!("  web      build the harness for the landing page into site/demo/rune.wasm");
     println!();
@@ -107,6 +107,12 @@ fn print_budget_help() {
 
 /// The per-commit loop: format, lint, test.
 fn check() -> Result<(), String> {
+    format_and_lint()?;
+    cargo(&["test", "--workspace"])
+}
+
+/// Checks formatting and lint before more expensive work.
+fn format_and_lint() -> Result<(), String> {
     cargo(&["fmt", "--all", "--", "--check"])?;
     cargo(&[
         "clippy",
@@ -115,8 +121,7 @@ fn check() -> Result<(), String> {
         "--",
         "-D",
         "warnings",
-    ])?;
-    cargo(&["test", "--workspace"])
+    ])
 }
 
 /// Runs cargo with the given arguments, inheriting stdio.
@@ -189,8 +194,9 @@ fn budget() -> Result<(), String> {
     Ok(())
 }
 
-/// Budget plus the full suite, for a pull request.
+/// Format, lint, budget, and the full suite, for a pull request.
 fn gate() -> Result<(), String> {
+    format_and_lint()?;
     budget()?;
     cargo(&["test", "--workspace"])
 }

@@ -56,6 +56,8 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Fixed
 
+- `cargo xtask gate` checks formatting and Clippy with warnings denied before
+  running the size and startup budgets and workspace tests.
 - Workspace edits and provider selections honor `RUNE_CONFIG`, preserving
   unrelated settings in that file and leaving the default config untouched.
 - `rune ask --json` emits one failure object and exits 1 when the prompt is
