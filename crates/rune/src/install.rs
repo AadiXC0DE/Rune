@@ -4,13 +4,19 @@
 //! it, so a tampered or truncated download is refused before it can replace
 //! anything. Replacement is staged beside the target and renamed over it, so the
 //! old binary is either wholly replaced or wholly kept, never half of each.
+//! Each staging file has a unique name and is created exclusively, so an
+//! existing file or symlink cannot redirect the write.
 //!
 //! A local artifact installs without any network access, which is what makes the
 //! same code path usable on a machine that has none.
+//! Release archives are verified as downloaded, then decoded to their single
+//! regular `rune` (`rune.exe` on Windows) member before staging. Raw binaries are
+//! still accepted.
 
 use camino::{Utf8Path, Utf8PathBuf};
 use rune_core::error::{ErrorCode, Result, RuneError};
 use sha2::{Digest, Sha256};
+use std::io::Read as _;
 
 /// Largest artifact accepted, in bytes.
 pub const MAX_ARTIFACT_BYTES: u64 = 512 * 1024 * 1024;
@@ -135,6 +141,115 @@ pub fn digest_of(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
+/// Decodes only the single-file tar format used by release staging. No archive
+/// path is ever used as a filesystem destination.
+fn release_binary(bytes: &[u8]) -> Result<std::borrow::Cow<'_, [u8]>> {
+    const MAX_TRAILER_BYTES: u64 = 20 * 512;
+
+    if !bytes.starts_with(&[0x1f, 0x8b]) {
+        return Ok(std::borrow::Cow::Borrowed(bytes));
+    }
+
+    let mut decoder = flate2::bufread::GzDecoder::new(bytes);
+    let mut header = [0_u8; 512];
+    decoder
+        .read_exact(&mut header)
+        .map_err(|err| archive_read_error(&err))?;
+    let checksum: u64 = header
+        .iter()
+        .enumerate()
+        .map(|(index, byte)| {
+            if (148..156).contains(&index) {
+                u64::from(b' ')
+            } else {
+                u64::from(*byte)
+            }
+        })
+        .sum();
+    if tar_octal(&header[148..156])? != checksum {
+        return Err(invalid_archive("the tar header checksum does not match"));
+    }
+
+    let name = if cfg!(windows) { "rune.exe" } else { "rune" };
+    if !header[..100]
+        .strip_prefix(name.as_bytes())
+        .is_some_and(|suffix| suffix.iter().all(|byte| *byte == 0))
+        || header[345..500].iter().any(|byte| *byte != 0)
+        || header[157..257].iter().any(|byte| *byte != 0)
+        || !matches!(header[156], 0 | b'0')
+    {
+        return Err(invalid_archive(format!(
+            "expected a single regular `{name}` member at the archive root"
+        )));
+    }
+
+    let size = tar_octal(&header[124..136])?;
+    if size == 0 {
+        return Err(invalid_archive("the executable member is empty"));
+    }
+    if size > MAX_ARTIFACT_BYTES {
+        return Err(RuneError::too_large(
+            "archive executable",
+            usize::try_from(size).unwrap_or(usize::MAX),
+            usize::try_from(MAX_ARTIFACT_BYTES).unwrap_or(usize::MAX),
+        ));
+    }
+    let mut binary = Vec::new();
+    decoder
+        .by_ref()
+        .take(size)
+        .read_to_end(&mut binary)
+        .map_err(|err| archive_read_error(&err))?;
+    if binary.len() as u64 != size {
+        return Err(invalid_archive("the executable member is truncated"));
+    }
+
+    let padding = (512_u64.saturating_sub(size % 512) % 512) as usize;
+    let mut block = [0_u8; 512];
+    decoder
+        .read_exact(&mut block[..padding])
+        .map_err(|err| archive_read_error(&err))?;
+    if block[..padding].iter().any(|byte| *byte != 0) {
+        return Err(invalid_archive("the executable padding is not zero"));
+    }
+
+    // Require both end blocks and allow conventional tar record padding. Bound
+    // this read too, so compressed zeroes cannot cause unbounded allocation.
+    let mut trailer = Vec::new();
+    decoder
+        .by_ref()
+        .take(MAX_TRAILER_BYTES.saturating_add(1))
+        .read_to_end(&mut trailer)
+        .map_err(|err| archive_read_error(&err))?;
+    if trailer.len() < 1024
+        || trailer.len() as u64 > MAX_TRAILER_BYTES
+        || trailer.len() % 512 != 0
+        || trailer.iter().any(|byte| *byte != 0)
+        || !decoder.get_ref().is_empty()
+    {
+        return Err(invalid_archive(
+            "expected only tar end blocks after the executable member",
+        ));
+    }
+    Ok(std::borrow::Cow::Owned(binary))
+}
+
+fn tar_octal(field: &[u8]) -> Result<u64> {
+    let text = std::str::from_utf8(field)
+        .map_err(|_| invalid_archive("a tar numeric field is not ASCII"))?
+        .trim_matches(['\0', ' ']);
+    u64::from_str_radix(text, 8)
+        .map_err(|_| invalid_archive("a tar numeric field is not valid octal"))
+}
+
+fn invalid_archive(message: impl Into<String>) -> RuneError {
+    RuneError::invalid_field("archive", message)
+}
+
+fn archive_read_error(error: &std::io::Error) -> RuneError {
+    invalid_archive(format!("the release archive could not be decoded: {error}"))
+}
+
 /// Replaces the binary at `target` with a verified artifact.
 ///
 /// The staged file is written beside the target and renamed over it, so a crash
@@ -143,21 +258,21 @@ pub fn digest_of(bytes: &[u8]) -> String {
 /// is not an installed binary.
 pub fn install(target: &Utf8Path, artifact: &Artifact, expected: &str) -> Result<()> {
     artifact.verify(expected)?;
+    let binary = release_binary(&artifact.bytes)?;
 
     let parent = target.parent().ok_or_else(|| {
         RuneError::invalid_field("target", format!("`{target}` has no parent directory"))
     })?;
-    let staged = parent.join(".rune-install-staged");
+    let (staged, mut file) = create_staged(parent)?;
 
     // Written first, then checked, then renamed. A failure at any point before
     // the rename leaves the original untouched.
-    let written = write_staged(&staged, &artifact.bytes);
+    let written = write_staged(&mut file, &staged, &binary)
+        .and_then(|()| set_executable(&file))
+        .and_then(|()| file.sync_all().map_err(RuneError::from));
+    // Close the file before removing or renaming it, including on Windows.
+    drop(file);
     if let Err(err) = written {
-        let _ = std::fs::remove_file(&staged);
-        return Err(err);
-    }
-
-    if let Err(err) = set_executable(&staged) {
         let _ = std::fs::remove_file(&staged);
         return Err(err);
     }
@@ -172,34 +287,66 @@ pub fn install(target: &Utf8Path, artifact: &Artifact, expected: &str) -> Result
     })
 }
 
-/// Writes the staged file, refusing to leave a partial one behind.
-fn write_staged(path: &Utf8Path, bytes: &[u8]) -> Result<()> {
+/// Creates an owned staging file beside the target, retrying name collisions.
+fn create_staged(parent: &Utf8Path) -> Result<(Utf8PathBuf, std::fs::File)> {
+    for _ in 0..16 {
+        let path = parent.join(format!(
+            ".rune-install-staged-{}",
+            rune_core::SessionId::generate()
+        ));
+        match open_staged(&path) {
+            Ok(file) => return Ok((path, file)),
+            // An existing file, including a dangling symlink, belongs to
+            // someone else. Leave it untouched and try a fresh name.
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(err) => {
+                return Err(RuneError::new(
+                    ErrorCode::PermissionDenied,
+                    format!("`{path}` could not be created: {err}"),
+                ));
+            }
+        }
+    }
+    Err(RuneError::new(
+        ErrorCode::PermissionDenied,
+        format!("could not create a unique upgrade staging file in `{parent}`"),
+    ))
+}
+
+/// Atomically refuses any existing path rather than following or truncating it.
+fn open_staged(path: &Utf8Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    options.open(path)
+}
+
+/// Writes only through the handle returned by exclusive creation.
+fn write_staged(file: &mut std::fs::File, path: &Utf8Path, bytes: &[u8]) -> Result<()> {
     use std::io::Write as _;
-    let mut file = std::fs::File::create(path).map_err(|err| {
-        RuneError::new(
-            ErrorCode::PermissionDenied,
-            format!("`{path}` could not be created: {err}"),
-        )
-    })?;
     file.write_all(bytes).map_err(|err| {
         RuneError::new(
             ErrorCode::TransportFailure,
             format!("`{path}` could not be written: {err}"),
         )
-    })?;
-    file.sync_all().map_err(RuneError::from)
+    })
 }
 
 /// Marks a file executable.
 #[cfg(unix)]
-fn set_executable(path: &Utf8Path) -> Result<()> {
+fn set_executable(file: &std::fs::File) -> Result<()> {
     use std::os::unix::fs::PermissionsExt as _;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).map_err(RuneError::from)
+    file.set_permissions(std::fs::Permissions::from_mode(0o755))
+        .map_err(RuneError::from)
 }
 
 /// Marks a file executable.
 #[cfg(not(unix))]
-fn set_executable(_path: &Utf8Path) -> Result<()> {
+fn set_executable(_file: &std::fs::File) -> Result<()> {
     // The platform decides executability from the file name.
     Ok(())
 }
@@ -266,6 +413,67 @@ mod tests {
         (dir, root)
     }
 
+    fn assert_no_staging_files(root: &Utf8Path) {
+        assert!(std::fs::read_dir(root).expect("entries").all(|entry| {
+            !entry
+                .expect("entry")
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".rune-install-staged")
+        }));
+    }
+
+    #[test]
+    fn staging_files_have_unique_names_beside_the_target() {
+        let (_dir, root) = artifact_dir();
+        let (first_path, first) = create_staged(&root).expect("first stage");
+        let (second_path, second) = create_staged(&root).expect("second stage");
+
+        assert_ne!(first_path, second_path);
+        assert_eq!(first_path.parent(), Some(root.as_path()));
+        assert_eq!(second_path.parent(), Some(root.as_path()));
+        assert!(first.metadata().expect("first metadata").is_file());
+        assert!(second.metadata().expect("second metadata").is_file());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_eq!(
+                first.metadata().unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[test]
+    fn exclusive_staging_creation_does_not_truncate_existing_files() {
+        let (_dir, root) = artifact_dir();
+        let path = root.join(".rune-install-staged-collision");
+        std::fs::write(&path, b"original").expect("seed collision");
+
+        let error = open_staged(&path).expect_err("existing path refused");
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&path).unwrap(), b"original");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn exclusive_staging_creation_refuses_live_and_dangling_symlinks() {
+        let (_dir, root) = artifact_dir();
+        let victim = root.join("victim");
+        let path = root.join(".rune-install-staged-collision");
+        std::os::unix::fs::symlink(&victim, &path).expect("seed symlink");
+
+        for bytes in [None, Some(b"original".as_slice())] {
+            if let Some(bytes) = bytes {
+                std::fs::write(&victim, bytes).expect("seed victim");
+            }
+            let error = open_staged(&path).expect_err("symlink refused");
+            assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+            assert_eq!(std::fs::read_link(&path).unwrap(), victim.as_std_path());
+            assert_eq!(std::fs::read(&victim).ok().as_deref(), bytes);
+        }
+    }
+
     #[test]
     fn a_source_names_a_file_or_a_url() {
         assert_eq!(
@@ -326,10 +534,7 @@ mod tests {
         install(&target, &artifact, &artifact.digest).expect("installed");
 
         assert_eq!(std::fs::read(&target).expect("read"), b"new binary");
-        assert!(
-            !root.join(".rune-install-staged").exists(),
-            "the staged file was left behind"
-        );
+        assert_no_staging_files(&root);
     }
 
     #[test]
@@ -343,10 +548,7 @@ mod tests {
         let err = install(&target, &artifact, &digest_of(b"expected")).expect_err("refused");
         assert_eq!(err.code(), ErrorCode::InvalidState);
         assert_eq!(std::fs::read(&target).expect("read"), b"original");
-        assert!(
-            !root.join(".rune-install-staged").exists(),
-            "a stage file was left behind"
-        );
+        assert_no_staging_files(&root);
     }
 
     #[test]

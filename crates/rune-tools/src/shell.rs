@@ -107,12 +107,16 @@ struct Slot<'a> {
 impl<'a> Slot<'a> {
     /// Reserves a slot and mints the session id, or reports the bound is full.
     ///
-    /// A command whose process has ended holds nothing worth reading, so it
-    /// stops occupying the bound as soon as another command starts.
+    /// Completed sessions keep their unread output until observed, but only
+    /// running processes and reserved starts occupy the bound.
     fn reserve(shell: &'a Shell) -> Result<(Self, String)> {
         let mut state = lock(&shell.state);
-        state.sessions.retain(|_, held| held.process.is_running());
-        let live = state.sessions.len().saturating_add(state.starting);
+        let live = state
+            .sessions
+            .values()
+            .filter(|held| held.process.is_running())
+            .count()
+            .saturating_add(state.starting);
         if live >= shell.max_sessions {
             return Err(RuneError::new(
                 ErrorCode::LimitExceeded,
@@ -500,6 +504,15 @@ fn session_id(started: u64) -> String {
     format!("shell-{}-{started}", std::process::id())
 }
 
+/// Carries the context's grants and offline restriction into the sandbox.
+pub fn sandbox_policy(context: &ExecutionContext) -> rune_exec::SandboxPolicy {
+    rune_exec::SandboxPolicy::new(
+        context.workspace.clone(),
+        context.additional_roots.clone(),
+        context.external_access && !context.offline,
+    )
+}
+
 /// Starts a command in a process group of its own, under the host sandbox.
 ///
 /// The command string is prepared first so the argv that runs is the one that
@@ -523,14 +536,7 @@ fn start(
     let environment = rune_exec::minimal_environment();
     let prepared =
         rune_exec::command::prepare_shell(command, workspace, None, environment.clone())?;
-    let policy = rune_exec::SandboxPolicy::new(
-        context.workspace.clone(),
-        context.additional_roots.clone(),
-        // The tool layer is not a policy decider: whether a command may reach
-        // the network is settled before it runs, so the sandbox mirrors the
-        // context rather than choosing.
-        context.external_access,
-    );
+    let policy = sandbox_policy(context);
     // Reaching outside the workspace and skipping the sandbox are different
     // questions, so the second is read from its own field rather than borrowed
     // from the first.
@@ -1737,6 +1743,85 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn offline_shell_policy_restricts_network_even_with_external_access() {
+        use rune_exec::Sandbox;
+
+        let (_dir, context) = workspace();
+        let backend = rune_exec::LinuxSandbox::with_helper(Utf8PathBuf::from("/usr/bin/bwrap"));
+        let prepared = rune_exec::command::prepare_shell(
+            "printf probe",
+            &context.workspace,
+            None,
+            rune_exec::minimal_environment(),
+        )
+        .expect("prepare");
+        for (external_access, offline, restricted) in [
+            (false, false, true),
+            (false, true, true),
+            (true, false, false),
+            (true, true, true),
+        ] {
+            let context = context
+                .fork()
+                .with_external_access(external_access)
+                .with_offline(offline)
+                .fork();
+            let wrapped = backend
+                .wrap(&prepared, &sandbox_policy(&context), false)
+                .expect("wrap");
+            assert_eq!(
+                wrapped.argv.iter().any(|arg| arg == "--unshare-net"),
+                restricted,
+                "external_access={external_access}, offline={offline}"
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_offline_full_access_shell_cannot_reach_a_local_fixture() {
+        use std::io::Read;
+        use std::net::TcpListener;
+
+        let backend = rune_exec::detect();
+        if !backend.support().is_full() {
+            eprintln!("skipping live Linux sandbox test: {:?}", backend.support());
+            return;
+        }
+        let dir = tempfile::tempdir().expect("workspace");
+        let root = Utf8Path::from_path(dir.path()).expect("utf8");
+        let context = ExecutionContext::new(root.to_owned()).with_external_access(true);
+        let listener = TcpListener::bind("127.0.0.1:0").expect("fixture");
+        listener.set_nonblocking(true).expect("nonblocking");
+        let port = listener.local_addr().expect("address").port();
+        let arguments = serde_json::json!({
+            "action": "run",
+            "command": format!(
+                "printf 'SHELL_STARTED\\n'; /bin/bash -c 'printf FIXTURE_DATA > /dev/tcp/127.0.0.1/{port}'"
+            ),
+            "yield_time_ms": 2_000,
+        });
+        let tool = shell(4, TEST_CAP);
+
+        // The online control proves the command reaches this fixture.
+        text(&tool, &context, &arguments);
+        let (mut stream, _) = listener.accept().expect("online connection");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("read deadline");
+        let mut received = String::new();
+        stream.read_to_string(&mut received).expect("fixture data");
+        assert_eq!(received, "FIXTURE_DATA");
+
+        let output = call(&tool, &context.with_offline(true).fork(), &arguments);
+        assert!(output.is_error, "{}", output.text);
+        assert!(output.text.contains("SHELL_STARTED"), "{}", output.text);
+        let error = listener.accept().expect_err("offline opened no connection");
+        assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+    }
+
     #[test]
     fn a_command_cannot_write_outside_the_workspace() {
         // The probe is written under the build's output directory, which no
@@ -1931,6 +2016,80 @@ mod tests {
             wait_until(|| !group_alive(&group), Duration::from_secs(10)),
             "the group survived the escalation"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn starting_another_command_keeps_unread_completed_output() {
+        for code in [0, 7] {
+            let tool = shell(1, 64 * 1024);
+            let (_dir, context) = workspace();
+            let command =
+                format!("read line; echo got \"$line\"; echo error \"$line\" >&2; exit {code}");
+            let started = text(
+                &tool,
+                &context,
+                &serde_json::json!({
+                    "action": "run",
+                    "command": command,
+                    "interactive": true,
+                    "yield_time_ms": 0,
+                }),
+            );
+            let (id, _group) = running(&started);
+
+            // Let the yielded command finish without consuming its output.
+            // Waiting for the recorded exit avoids a timing-dependent sleep.
+            {
+                let held = Arc::clone(lock(&tool.state).sessions.get(&id).expect("a session"));
+                held.process
+                    .write(b"LAST\n", Duration::from_secs(2))
+                    .expect("release the command");
+                assert!(wait_until(
+                    || !held.process.is_running(),
+                    Duration::from_secs(10)
+                ));
+            }
+
+            // The completed session must release the only running slot while
+            // keeping its output and permission target available.
+            let other = text(
+                &tool,
+                &context,
+                &serde_json::json!({ "action": "run", "command": "echo OTHER" }),
+            );
+            assert!(other.lines().any(|line| line == "OTHER"), "{other}");
+            assert_eq!(tool.live_sessions(), 1);
+            let arguments = serde_json::json!({
+                "action": "interact",
+                "session_id": id,
+                "yield_time_ms": 0,
+            });
+            assert_eq!(tool.permission_target(&arguments), Some(command));
+            let ended = call(&tool, &context, &arguments);
+            assert_eq!(ended.is_error, code != 0, "{}", ended.text);
+            assert!(
+                ended.text.lines().any(|line| line == "got LAST"),
+                "{}",
+                ended.text
+            );
+            assert!(
+                ended.text.lines().any(|line| line == "error LAST"),
+                "{}",
+                ended.text
+            );
+            assert!(
+                ended.text.contains(&format!("exited with status {code}")),
+                "{}",
+                ended.text
+            );
+            assert_eq!(tool.live_sessions(), 0);
+            let err = tool
+                .call(&arguments, &context)
+                .expect_err("the final output was already consumed");
+            assert_eq!(err.code(), ErrorCode::NotFound);
+            assert!(session_command(&id).is_none());
+        }
     }
 
     #[cfg(unix)]

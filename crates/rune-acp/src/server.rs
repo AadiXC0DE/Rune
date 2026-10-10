@@ -874,7 +874,10 @@ fn run_one<W: Write + Send + 'static>(server: &Arc<Server<W>>, queued: Queued) {
         session: session.clone(),
         config: snapshot.config.clone(),
         rules: Mutex::new(snapshot.rules),
-        context: snapshot.context.clone(),
+        context: snapshot
+            .context
+            .clone()
+            .with_offline(server.config.endpoint.offline),
         cancellation: cancellation.clone(),
         steering: snapshot.steering,
         tools: server.config.registry.all_schemas(),
@@ -1149,7 +1152,10 @@ impl<W: Write + Send + 'static> Host for TurnHost<W> {
                     self.server.config.context_window,
                 )));
             }
-            Event::SteeringApplied { .. } => {}
+            Event::SteeringApplied { .. }
+            | Event::ContextCompacted { .. }
+            | Event::ProviderRetry { .. }
+            | Event::ProviderRetryFinished { .. } => {}
         }
     }
 
@@ -1166,8 +1172,13 @@ impl<W: Write + Send + 'static> Host for TurnHost<W> {
             .lock()
             .map(|guard| guard.clone())
             .unwrap_or_default();
-        let (outcome, reason) =
-            rune_agent::turn::decide_call(&rules, self.config.mode, name, target);
+        let (outcome, reason) = rune_agent::turn::decide_call_in_workspace(
+            &rules,
+            self.config.mode,
+            name,
+            target,
+            self.context.workspace(),
+        );
         match outcome {
             // This server has no reviewer of its own, so the client is the
             // reviewer for a call the rules left open.

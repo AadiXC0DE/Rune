@@ -336,14 +336,15 @@ pub struct UserConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<Provider>,
 
+    /// Whether every outbound request is refused, including model requests.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offline: Option<bool>,
+
     /// Whether the web tools may reach the network.
     ///
-    /// On by default, because a coding agent that cannot look something up is
-    /// the odd one out: every comparable harness reaches the network unless told
-    /// not to. `offline = true` is the switch that refuses everything, including
-    /// the model, and it overrules this. Setting this to false allows the model
-    /// while refusing the web tools, which is what a run that must not send a
-    /// query to a third party wants.
+    /// Off by default. Set `web_tools = true` or `RUNE_WEB_TOOLS=true` to enable
+    /// web fetch and search. `offline = true` refuses every outbound request,
+    /// including model requests, and overrules this setting.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub web_tools: Option<bool>,
 
@@ -374,6 +375,10 @@ pub struct UserConfig {
     /// Theme name or a light or dark pin.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub theme: Option<String>,
+
+    /// Whether terminal decorations use only ASCII.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ascii: Option<bool>,
 
     /// Whether automatic update checks run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -491,6 +496,8 @@ pub struct Settings {
     pub provider: Provider,
     /// Effective model identifier for the active provider.
     pub model: String,
+    /// User-configured models retained for command-line provider selection.
+    pub configured_models: BTreeMap<String, ModelEntry>,
     /// Whether the web tools may reach the network.
     pub web_tools: bool,
     /// Input capacity the configured model accepts, when one is declared.
@@ -517,6 +524,8 @@ pub struct Settings {
     pub fast_mode: bool,
     /// Theme selection.
     pub theme: Option<String>,
+    /// Whether terminal decorations use only ASCII.
+    pub ascii: bool,
     /// Whether automatic update checks run.
     pub auto_upgrade: bool,
     /// Whether every outbound request is refused.
@@ -548,7 +557,8 @@ impl Default for Settings {
         Self {
             provider: Provider::default(),
             model: String::new(),
-            web_tools: true,
+            configured_models: BTreeMap::new(),
+            web_tools: false,
             context_window: None,
             base_url: None,
             api_key_env: None,
@@ -557,6 +567,7 @@ impl Default for Settings {
             effort: Effort::default(),
             fast_mode: false,
             theme: None,
+            ascii: false,
             auto_upgrade: true,
             offline: false,
             collapse_tool_calls: false,
@@ -651,6 +662,7 @@ impl Settings {
                 "theme",
                 self.theme.clone().unwrap_or_else(|| "auto".to_owned()),
             ),
+            ("ascii", self.ascii.to_string()),
             ("web_tools", self.web_tools.to_string()),
             ("auto_upgrade", self.auto_upgrade.to_string()),
             ("collapse_tool_calls", self.collapse_tool_calls.to_string()),
@@ -710,6 +722,8 @@ pub struct EnvironmentOverrides {
     pub fast_mode: Option<bool>,
     /// Theme.
     pub theme: Option<String>,
+    /// ASCII terminal decorations.
+    pub ascii: Option<bool>,
     /// Automatic updates.
     pub auto_upgrade: Option<bool>,
     /// Additional directories.
@@ -772,6 +786,7 @@ impl EnvironmentOverrides {
             effort: lookup("RUNE_EFFORT"),
             fast_mode: boolean(&mut lookup, "RUNE_FAST_MODE"),
             theme: lookup("RUNE_THEME"),
+            ascii: boolean(&mut lookup, "RUNE_ASCII"),
             auto_upgrade: boolean(&mut lookup, "RUNE_AUTO_UPGRADE"),
             additional_directories: Vec::new(),
             limits: Vec::new(),
@@ -844,7 +859,9 @@ const PROFILE_ONLY_KEYS: &[&str] = &[
     "effort",
     "fast_mode",
     "theme",
+    "ascii",
     "auto_upgrade",
+    "offline",
     "collapse_tool_calls",
     "session_titles",
     "additional_directories",
@@ -1029,6 +1046,10 @@ fn read_bounded(path: &Utf8Path, layer: Layer) -> std::result::Result<Option<Str
 
 /// Applies a user configuration to the settings.
 fn apply_user(settings: &mut Settings, user: &UserConfig, layer: Layer) {
+    if let Some(offline) = user.offline {
+        settings.offline = offline;
+        settings.sources.record("offline", layer);
+    }
     if let Some(web_tools) = user.web_tools {
         // A project file cannot set this: it decides whether a repository can
         // send the user's queries to a search engine, which is the profile
@@ -1049,6 +1070,7 @@ fn apply_user(settings: &mut Settings, user: &UserConfig, layer: Layer) {
         settings.sources.record("api_key_env", layer);
     }
     if let Some(models) = &user.models {
+        settings.configured_models.clone_from(models);
         let key = provider_key(&settings.provider);
         if let Some(model) = models.get(&key).or_else(|| models.get("default")) {
             model.id().clone_into(&mut settings.model);
@@ -1076,6 +1098,10 @@ fn apply_user(settings: &mut Settings, user: &UserConfig, layer: Layer) {
     if let Some(theme) = &user.theme {
         settings.theme = Some(theme.clone());
         settings.sources.record("theme", layer);
+    }
+    if let Some(ascii) = user.ascii {
+        settings.ascii = ascii;
+        settings.sources.record("ascii", layer);
     }
     if let Some(auto) = user.auto_upgrade {
         settings.auto_upgrade = auto;
@@ -1231,6 +1257,11 @@ fn apply_environment(settings: &mut Settings, env: &EnvironmentOverrides) {
         settings.sources.record("provider", layer);
     }
     if let Some(model) = &env.model {
+        if settings.model != *model {
+            // A declared window belongs to the model it describes.
+            settings.context_window = None;
+            settings.sources.sources.remove("context_window");
+        }
         settings.model.clone_from(model);
         settings.sources.record("model", layer);
     }
@@ -1296,6 +1327,10 @@ fn apply_environment(settings: &mut Settings, env: &EnvironmentOverrides) {
     if let Some(theme) = &env.theme {
         settings.theme = Some(theme.clone());
         settings.sources.record("theme", layer);
+    }
+    if let Some(ascii) = env.ascii {
+        settings.ascii = ascii;
+        settings.sources.record("ascii", layer);
     }
     if let Some(auto) = env.auto_upgrade {
         settings.auto_upgrade = auto;
@@ -1483,6 +1518,7 @@ pub fn to_status_json(settings: &Settings, workspace: &Utf8Path) -> serde_json::
         "effort": settings.effort,
         "fast_mode": settings.fast_mode,
         "theme": settings.theme,
+        "ascii": settings.ascii,
         "auto_upgrade": settings.auto_upgrade,
         "context": settings.context,
         "collapse_tool_calls": settings.collapse_tool_calls,
@@ -1530,6 +1566,71 @@ mod tests {
         assert_eq!(settings.permission_mode, PermissionMode::Auto);
         assert_eq!(settings.source_of("permission_mode"), Layer::Default);
         assert!(settings.context);
+        assert!(!settings.web_tools);
+        assert_eq!(settings.source_of("web_tools"), Layer::Default);
+    }
+
+    #[test]
+    fn ascii_setting_respects_profile_and_environment_precedence() {
+        assert!(!load(None, None, &empty_env()).ascii);
+        let dir = TempDir::new().expect("tempdir");
+        let project = write(&dir, "project.toml", "ascii = true\n");
+        let scoped = load(Some(&project), None, &empty_env());
+        assert!(!scoped.ascii);
+        assert!(scoped.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == ErrorCode::KeyNotAllowedInScope
+                && diagnostic.key.as_deref() == Some("ascii")
+        }));
+        for enabled in [true, false] {
+            let user = write(&dir, "config.toml", &format!("ascii = {enabled}\n"));
+            let settings = load(None, Some(&user), &empty_env());
+            assert!(settings.diagnostics.is_empty());
+            assert_eq!(settings.ascii, enabled);
+            assert_eq!(settings.source_of("ascii"), Layer::User);
+            let env = EnvironmentOverrides::from_lookup(|key| {
+                (key == "RUNE_ASCII").then(|| (!enabled).to_string())
+            });
+            let settings = load(None, Some(&user), &env);
+            assert!(settings.diagnostics.is_empty());
+            assert_eq!(settings.ascii, !enabled);
+            assert_eq!(settings.source_of("ascii"), Layer::Environment);
+            assert_eq!(
+                to_status_json(&settings, Utf8Path::new("/w"))["ascii"],
+                !enabled
+            );
+            assert!(settings.explain().iter().any(|entry| {
+                entry.key == "ascii"
+                    && entry.value == (!enabled).to_string()
+                    && entry.source == Layer::Environment
+            }));
+        }
+        let invalid = EnvironmentOverrides::from_lookup(|key| {
+            (key == "RUNE_ASCII").then(|| "invalid".to_owned())
+        });
+        assert_eq!(
+            invalid.invalid_booleans,
+            [("RUNE_ASCII", "invalid".to_owned())]
+        );
+    }
+
+    #[test]
+    fn web_tools_respect_explicit_user_and_environment_settings() {
+        let dir = TempDir::new().expect("tempdir");
+        for enabled in [true, false] {
+            let user = write(&dir, "config.toml", &format!("web_tools = {enabled}\n"));
+            let settings = load(None, Some(&user), &empty_env());
+            assert!(settings.diagnostics.is_empty());
+            assert_eq!(settings.web_tools, enabled);
+            assert_eq!(settings.source_of("web_tools"), Layer::User);
+
+            let env = EnvironmentOverrides::from_lookup(|key| {
+                (key == "RUNE_WEB_TOOLS").then(|| (!enabled).to_string())
+            });
+            let settings = load(None, Some(&user), &env);
+            assert!(settings.diagnostics.is_empty());
+            assert_eq!(settings.web_tools, !enabled);
+            assert_eq!(settings.source_of("web_tools"), Layer::Environment);
+        }
     }
 
     #[test]
@@ -1568,6 +1669,87 @@ theme_unused = "x"
         let settings = load(None, Some(&user), &env);
         assert_eq!(settings.permission_mode, PermissionMode::FullAccess);
         assert_eq!(settings.source_of("permission_mode"), Layer::Environment);
+    }
+
+    #[test]
+    fn user_offline_setting_preserves_the_remaining_config() {
+        let dir = TempDir::new().expect("tempdir");
+        for offline in [true, false] {
+            let user = write(
+                &dir,
+                "config.toml",
+                &format!(
+                    r#"
+offline = {offline}
+provider = "chat_completions"
+web_tools = true
+theme = "light"
+[models]
+chat_completions = "configured-model"
+[limits]
+max_agent_steps = 50
+"#
+                ),
+            );
+            let settings = load(None, Some(&user), &empty_env());
+            assert!(
+                settings.diagnostics.is_empty(),
+                "{:?}",
+                settings.diagnostics
+            );
+            assert_eq!(settings.offline, offline);
+            assert_eq!(settings.source_of("offline"), Layer::User);
+            assert_eq!(settings.provider, Provider::ChatCompletions);
+            assert_eq!(settings.model, "configured-model");
+            assert_eq!(settings.theme.as_deref(), Some("light"));
+            assert!(settings.web_tools);
+            assert_eq!(settings.source_of("model"), Layer::User);
+            assert_eq!(
+                settings.limits.get(LimitName::MaxAgentSteps),
+                Budget::Bounded(50)
+            );
+        }
+    }
+
+    #[test]
+    fn environment_overrides_the_user_offline_setting() {
+        let dir = TempDir::new().expect("tempdir");
+        for offline in [true, false] {
+            let user = write(&dir, "config.toml", &format!("offline = {offline}\n"));
+            let env = EnvironmentOverrides::from_lookup(|key| {
+                (key == "RUNE_OFFLINE").then(|| (!offline).to_string())
+            });
+            let settings = load(None, Some(&user), &env);
+            assert!(
+                settings.diagnostics.is_empty(),
+                "{:?}",
+                settings.diagnostics
+            );
+            assert_eq!(settings.offline, !offline);
+            assert_eq!(settings.source_of("offline"), Layer::Environment);
+        }
+    }
+
+    #[test]
+    fn project_cannot_change_the_user_offline_setting() {
+        let dir = TempDir::new().expect("tempdir");
+        for offline in [true, false] {
+            let user = write(&dir, "config.toml", &format!("offline = {offline}\n"));
+            let project = write(
+                &dir,
+                ".rune.toml",
+                &format!("offline = {}\ncontext = false\n", !offline),
+            );
+            let settings = load(Some(&project), Some(&user), &empty_env());
+            assert_eq!(settings.offline, offline);
+            assert_eq!(settings.source_of("offline"), Layer::User);
+            assert!(!settings.context);
+            assert_eq!(settings.diagnostics.len(), 1, "{:?}", settings.diagnostics);
+            let diagnostic = &settings.diagnostics[0];
+            assert_eq!(diagnostic.layer, Layer::Project);
+            assert_eq!(diagnostic.code, ErrorCode::KeyNotAllowedInScope);
+            assert_eq!(diagnostic.key.as_deref(), Some("offline"));
+        }
     }
 
     #[test]
@@ -1962,6 +2144,67 @@ theme_unused = "x"
         assert_eq!(settings.model, "m");
         assert_eq!(settings.context_window, Some(200_000));
         assert_eq!(settings.source_of("context_window"), Layer::User);
+    }
+
+    #[test]
+    fn environment_model_change_discards_the_declared_window() {
+        let dir = TempDir::new().expect("tempdir");
+        let user = write(
+            &dir,
+            "config.toml",
+            "provider = 'anthropic'\n[models.anthropic]\nid = 'wide'\ncontext_window = 2000000\n",
+        );
+        let env = EnvironmentOverrides::from_lookup(|key| {
+            (key == "RUNE_MODEL").then(|| "small".to_owned())
+        });
+
+        let settings = load(None, Some(&user), &env);
+        assert!(settings.diagnostics.is_empty());
+        assert_eq!(settings.provider, Provider::Anthropic);
+        assert_eq!(settings.model, "small");
+        assert_eq!(settings.source_of("model"), Layer::Environment);
+        assert_eq!(settings.context_window, None);
+        assert_eq!(settings.source_of("context_window"), Layer::Default);
+        let row = settings
+            .explain()
+            .into_iter()
+            .find(|row| row.key == "context_window")
+            .expect("context_window is reported");
+        assert_eq!(row.value, DEFAULT_CONTEXT_WINDOW.to_string());
+        assert_eq!(row.source, Layer::Default);
+    }
+
+    #[test]
+    fn unchanged_environment_model_preserves_the_declared_window() {
+        let dir = TempDir::new().expect("tempdir");
+        let user = write(
+            &dir,
+            "config.toml",
+            "provider = 'anthropic'\n[models.anthropic]\nid = 'wide'\ncontext_window = 2000000\n",
+        );
+        for model in [None, Some(""), Some("  "), Some("wide")] {
+            let env = EnvironmentOverrides::from_lookup(|key| {
+                if key == "RUNE_MODEL" {
+                    model.map(str::to_owned)
+                } else {
+                    None
+                }
+            });
+
+            let settings = load(None, Some(&user), &env);
+            assert!(settings.diagnostics.is_empty());
+            assert_eq!(settings.model, "wide");
+            assert_eq!(
+                settings.source_of("model"),
+                if model == Some("wide") {
+                    Layer::Environment
+                } else {
+                    Layer::User
+                }
+            );
+            assert_eq!(settings.context_window, Some(2_000_000));
+            assert_eq!(settings.source_of("context_window"), Layer::User);
+        }
     }
 
     #[test]

@@ -16,6 +16,75 @@ use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 use crate::editor::Composer;
 
+/// Describes the bindings used by this reader and the session's input modes.
+/// Line input leaves editing to the terminal instead of the Rune composer.
+#[must_use]
+pub fn render_bindings_help(active: bool) -> String {
+    if !active {
+        return "Input: terminal line mode\nEnter submits one line; end of input leaves the session.\nComposer shortcuts, menus, and live steering require interactive key input."
+            .to_owned();
+    }
+    format!(
+        "Keyboard bindings (interactive key input)
+
+Composer:
+  Enter         submit the draft; while a turn runs, queue steering
+  Alt-Enter     insert a newline at the caret
+  Left / Right  move by one grapheme, including across newlines
+  Home / Ctrl-A move to the start of the whole draft
+  End / Ctrl-E  move to the end of the whole draft
+  Ctrl-B / Alt-Left   move one word left
+  Ctrl-F / Alt-Right  move one word right
+  Backspace     delete the grapheme before the caret
+  Delete        delete the grapheme at the caret
+  Ctrl-D        delete at the caret; empty idle draft leaves the session
+  Ctrl-W        delete the word before the caret
+  Ctrl-U        cut from the caret to the start of the draft
+  Ctrl-K        cut from the caret to the end of the draft
+  Ctrl-Y        yank the last cut text at the caret
+  Ctrl-_        undo a draft edit (Ctrl-Shift-minus; legacy Ctrl-7)
+  Alt-R         redo a draft edit (Alt with lowercase r)
+  Ctrl-G        edit the draft in VISUAL, EDITOR, or vi
+
+Idle prompt and menus:
+  Up / Down     recall prompts; select a menu row when a menu is open
+  Tab           complete a slash command or workspace path
+  Enter         accept an incomplete command; run a complete command
+  Tab / Enter   accept a path, model, or history selection
+  Ctrl-R        search workspace history by substring; type to filter
+  Esc / Ctrl-C / Ctrl-D  cancel model/history menus (Ctrl-D: empty query)
+                cancelling preserves the draft and caret
+  Esc           close a path menu first; otherwise clear the idle draft
+
+Permission and question menus:
+  Up / Down     select an option without editing the draft
+  Enter         confirm the selected option
+  Esc / Ctrl-C / Ctrl-D  cancel the turn, preserving the draft and caret
+
+Cancellation (outside menus and the transcript):
+  Ctrl-C        clear a nonempty draft first; with an empty draft,
+                cancel a running turn or leave an idle session
+  Esc           while running, clear the draft and arm cancellation;
+                press again within {} ms to cancel; other keys disarm
+  Ctrl-D        with an empty draft during a turn, keep the turn running
+
+Transcript:
+  Ctrl-O        open a snapshot while idle or during a turn
+  Up / Down     scroll one row
+  PageUp / PageDown  scroll one page
+  Home / End    jump to the beginning / end
+  Tab / Shift-Tab  select the next / previous tool
+  Space         collapse or expand the selected tool (16 KiB / 200 rows)
+  Esc / Ctrl-O / Ctrl-C / Ctrl-D  close and restore the draft and caret
+
+Paste:
+  Bracketed paste inserts at the caret without submitting or completing.
+  Newlines and tabs stay in the draft; CR/CRLF become LF; other controls
+  are removed. Terminals without bracketed paste send ordinary keys.",
+        crate::shell::ESCAPE_CANCEL_WINDOW.as_millis()
+    )
+}
+
 /// What a key asks the session to do.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum KeyAction {
@@ -43,6 +112,64 @@ pub enum KeyAction {
     Down,
     /// The user asked to complete what is being typed.
     Complete,
+    /// Open the full transcript without editing the composer.
+    Transcript,
+    /// Edit the draft in the configured external editor.
+    ExternalEditor,
+    /// Search recorded prompts without submitting the composer.
+    HistorySearch,
+}
+
+/// Navigation while the transcript owns the terminal.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TranscriptAction {
+    /// Leave the viewer and restore the draft.
+    Close,
+    /// Scroll one row up.
+    Up,
+    /// Scroll one row down.
+    Down,
+    /// Scroll one page up.
+    PageUp,
+    /// Scroll one page down.
+    PageDown,
+    /// Jump to the beginning.
+    Home,
+    /// Jump to the end.
+    End,
+    /// Select the next tool entry.
+    NextTool,
+    /// Select the previous tool entry.
+    PreviousTool,
+    /// Collapse or expand the selected tool entry.
+    ToggleTool,
+    /// Ignore editing, paste, and non-input events.
+    Ignored,
+}
+
+/// Maps viewer input without touching a composer or its editing history.
+#[must_use]
+pub fn transcript_event(event: &Event) -> TranscriptAction {
+    let Event::Key(key) = event else {
+        return TranscriptAction::Ignored;
+    };
+    if key.kind == KeyEventKind::Release {
+        return TranscriptAction::Ignored;
+    }
+    let control = key.modifiers.contains(KeyModifiers::CONTROL);
+    match (key.code, control) {
+        (KeyCode::Esc, _) | (KeyCode::Char('o' | 'c' | 'd'), true) => TranscriptAction::Close,
+        (KeyCode::Up, _) => TranscriptAction::Up,
+        (KeyCode::Down, _) => TranscriptAction::Down,
+        (KeyCode::PageUp, _) => TranscriptAction::PageUp,
+        (KeyCode::PageDown, _) => TranscriptAction::PageDown,
+        (KeyCode::Home, _) => TranscriptAction::Home,
+        (KeyCode::End, _) => TranscriptAction::End,
+        (KeyCode::Tab, false) => TranscriptAction::NextTool,
+        (KeyCode::BackTab, false) => TranscriptAction::PreviousTool,
+        (KeyCode::Char(' '), false) => TranscriptAction::ToggleTool,
+        _ => TranscriptAction::Ignored,
+    }
 }
 
 /// Reads keys and drives a composer.
@@ -83,6 +210,15 @@ impl KeyReader {
         }
     }
 
+    /// Keeps canonical line input without enabling raw mode or terminal escapes.
+    #[must_use]
+    pub fn line_mode() -> Self {
+        Self {
+            composer: Composer::new(),
+            active: false,
+        }
+    }
+
     /// Returns whether keys are being read directly.
     #[must_use]
     pub const fn is_active(&self) -> bool {
@@ -95,10 +231,26 @@ impl KeyReader {
         self.composer.text()
     }
 
-    /// Returns the cursor as a count of columns from the start of the line.
+    /// Returns the displayed prefix width, counting each newline and tab as
+    /// one column. A multiline renderer resolves it into the caret's row and
+    /// column within that row.
     #[must_use]
     pub fn column(&self) -> usize {
         self.composer.cursor_column()
+    }
+
+    /// Returns the byte offset of the caret in the draft.
+    #[must_use]
+    pub fn cursor_byte(&self) -> usize {
+        self.line()
+            .char_indices()
+            .nth(self.composer.cursor())
+            .map_or(self.line().len(), |(offset, _)| offset)
+    }
+
+    /// Replaces a completed token as one undoable edit, preserving its suffix.
+    pub fn complete_path(&mut self, range: std::ops::Range<usize>, replacement: &str) {
+        self.composer.replace_range(range, replacement);
     }
 
     /// Empties the line.
@@ -125,6 +277,38 @@ impl KeyReader {
     /// Puts text on the line, replacing whatever is there.
     pub fn replace(&mut self, text: &str) {
         self.composer.set(text);
+    }
+
+    /// Runs a query with a separate composer, then restores the entire draft.
+    /// Query edits cannot change the draft's caret, recall, kill, or undo state.
+    pub fn with_temporary_line<T>(&mut self, action: impl FnOnce(&mut Self) -> T) -> T {
+        let draft = std::mem::take(&mut self.composer);
+        let result = action(self);
+        self.composer = draft;
+        result
+    }
+
+    /// Restores a selected prompt as one undoable draft edit.
+    pub fn restore_prompt(&mut self, text: &str) {
+        self.composer.replace_draft(text);
+        self.composer.move_end();
+    }
+
+    /// Hands the terminal to VISUAL, EDITOR, or vi, then reloads the draft.
+    /// Failed edits leave the complete composer untouched.
+    pub fn edit_external(&mut self) -> std::io::Result<()> {
+        let edited = if self.active {
+            let suspension = TerminalSuspension::new()?;
+            let result = crate::external_editor::edit(self.line());
+            suspension.resume()?;
+            result?
+        } else {
+            crate::external_editor::edit(self.line())?
+        };
+        let edited = edited.replace("\r\n", "\n").replace('\r', "\n");
+        let edited = crate::transcript::sanitize(&edited);
+        self.composer.replace_draft(&edited);
+        Ok(())
     }
 
     /// Waits for one key and applies it.
@@ -156,6 +340,25 @@ impl KeyReader {
             return None;
         };
         self.handle(event)
+    }
+
+    /// Polls a choice without changing the draft, caret, or editing history.
+    ///
+    /// Used by permission prompts, where typing and pasting must never become
+    /// steering input or replace the correction being edited.
+    pub fn poll_choice(&mut self, timeout: Duration) -> Option<KeyAction> {
+        let draft = std::mem::take(&mut self.composer);
+        let action = self.poll_key(timeout);
+        self.composer = draft;
+        action
+    }
+
+    /// Polls viewer navigation, leaving the complete composer untouched.
+    pub fn poll_transcript(&self, timeout: Duration) -> Option<TranscriptAction> {
+        if !self.active || !crossterm::event::poll(timeout).unwrap_or(false) {
+            return None;
+        }
+        crossterm::event::read().ok().as_ref().map(transcript_event)
     }
 
     /// Applies one terminal event, returning `None` for one that is not input.
@@ -198,6 +401,9 @@ impl KeyReader {
         let alt = key.modifiers.contains(KeyModifiers::ALT);
 
         match (key.code, control, alt) {
+            (KeyCode::Char('r'), true, _) => KeyAction::HistorySearch,
+            (KeyCode::Char('g'), true, _) => KeyAction::ExternalEditor,
+            (KeyCode::Char('o'), true, _) => KeyAction::Transcript,
             (KeyCode::Char('c'), true, _) => KeyAction::Cancel,
             (KeyCode::Char('d'), true, _) => {
                 if self.composer.is_empty() {
@@ -223,6 +429,20 @@ impl KeyReader {
                 self.composer.kill_to_end();
                 KeyAction::Ignored
             }
+            (KeyCode::Char('y'), true, _) => {
+                self.composer.yank();
+                KeyAction::Ignored
+            }
+            // Legacy terminals send Ctrl-_ as 0x1f, which Crossterm decodes
+            // as Ctrl-7. Enhanced keyboard events can report '_' directly.
+            (KeyCode::Char('_' | '7'), true, _) => {
+                self.composer.undo();
+                KeyAction::Ignored
+            }
+            (KeyCode::Char('r'), false, true) => {
+                self.composer.redo();
+                KeyAction::Ignored
+            }
             (KeyCode::Char('w'), true, _) => {
                 self.composer.delete_word();
                 KeyAction::Ignored
@@ -235,9 +455,13 @@ impl KeyReader {
                 self.composer.move_word_right();
                 KeyAction::Ignored
             }
+            (KeyCode::Enter, _, true) => {
+                self.composer.insert("\n");
+                KeyAction::Ignored
+            }
             (KeyCode::Enter, _, _) => KeyAction::Submit,
-            // Tab completes rather than inserting a tab: a prompt is a single
-            // line, so a tab character has nothing to align.
+            // Tab completes rather than inserting a tab. Pasted tabs stay in
+            // the draft and are displayed as spaces.
             (KeyCode::Tab, _, _) => KeyAction::Complete,
             (KeyCode::Esc, _, _) => KeyAction::Escape,
             (KeyCode::Backspace, _, _) => {
@@ -284,6 +508,41 @@ impl KeyReader {
 impl Default for KeyReader {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Restores key input even when spawning or reading the editor fails.
+struct TerminalSuspension(bool);
+
+impl TerminalSuspension {
+    fn new() -> std::io::Result<Self> {
+        use crossterm::ExecutableCommand;
+        let guard = Self(true);
+        std::io::stdout().execute(crossterm::event::DisableBracketedPaste)?;
+        std::io::stdout().execute(crossterm::cursor::Show)?;
+        crossterm::terminal::disable_raw_mode()?;
+        Ok(guard)
+    }
+
+    fn resume(mut self) -> std::io::Result<()> {
+        Self::restore()?;
+        self.0 = false;
+        Ok(())
+    }
+
+    fn restore() -> std::io::Result<()> {
+        use crossterm::ExecutableCommand;
+        crossterm::terminal::enable_raw_mode()?;
+        std::io::stdout().execute(crossterm::event::EnableBracketedPaste)?;
+        Ok(())
+    }
+}
+
+impl Drop for TerminalSuspension {
+    fn drop(&mut self) {
+        if self.0 {
+            let _ = Self::restore();
+        }
     }
 }
 
@@ -391,9 +650,33 @@ fn restore_terminal() {
 
 /// Writes the sequences that turn bracketed paste off and show the cursor.
 fn write_restore(out: &mut impl std::io::Write) {
+    let _ = crossterm::QueueableCommand::queue(out, crossterm::terminal::LeaveAlternateScreen);
     let _ = crossterm::QueueableCommand::queue(out, crossterm::event::DisableBracketedPaste);
     let _ = crossterm::QueueableCommand::queue(out, crossterm::cursor::Show);
     let _ = out.flush();
+}
+
+thread_local! {
+    /// Only this thread's caught worker panic bypasses the ordinary hook.
+    static CATCHING_WORKER_PANIC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Catches a worker panic without writing into the renderer's live region.
+///
+/// The caller must discard the worker's partially mutated state on failure and
+/// pass the returned panic payload to the renderer. Other threads and aborting
+/// builds retain the ordinary panic hook and terminal restoration.
+pub fn catch_worker_panic<T>(work: impl FnOnce() -> T) -> std::thread::Result<T> {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            CATCHING_WORKER_PANIC.set(self.0);
+        }
+    }
+
+    install_panic_hook();
+    let _restore = Restore(CATCHING_WORKER_PANIC.replace(true));
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(work))
 }
 
 /// Restores the terminal before a panic ends the process.
@@ -402,8 +685,9 @@ fn write_restore(out: &mut impl std::io::Write) {
 /// drop never runs: without this a panic leaves the shell in raw mode, with no
 /// echo and a hidden cursor. A build that unwinds is left to the drop, because
 /// a panic there can be caught, as a turn's worker's is, and the session then
-/// goes on in the mode it needs. The previous hook still runs, after the
-/// terminal is back, so its report is printed with ordinary line endings.
+/// goes on in the mode it needs. Caught workers return their diagnostic to the
+/// renderer; every other panic still invokes the previous hook. An aborting
+/// build restores the terminal before printing the fatal report.
 fn install_panic_hook() {
     static INSTALLED: std::sync::Once = std::sync::Once::new();
     INSTALLED.call_once(|| {
@@ -411,6 +695,8 @@ fn install_panic_hook() {
         std::panic::set_hook(Box::new(move |info| {
             if cfg!(panic = "abort") {
                 restore_terminal();
+            } else if CATCHING_WORKER_PANIC.get() {
+                return;
             }
             previous(info);
         }));
@@ -427,6 +713,139 @@ mod tests {
 
     fn control(c: char) -> KeyEvent {
         KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+    }
+
+    #[test]
+    fn path_completion_preserves_unicode_suffix_and_is_one_undoable_edit() {
+        let mut reader = reader();
+        reader.replace("界 read fiOLD please e\u{301}");
+        for _ in crate::width::graphemes("OLD please e\u{301}") {
+            reader.apply(key(KeyCode::Left));
+        }
+        let original_caret = reader.cursor_byte();
+        assert_eq!(original_caret, "界 read fi".len());
+        let start = "界 read ".len();
+        reader.complete_path(start..start + 5, "'file space.txt'");
+        assert_eq!(reader.line(), "界 read 'file space.txt' please e\u{301}");
+        assert_eq!(reader.cursor_byte(), "界 read 'file space.txt'".len());
+        reader.apply(control('_'));
+        assert_eq!(reader.line(), "界 read fiOLD please e\u{301}");
+        assert_eq!(reader.cursor_byte(), original_caret);
+        reader.apply(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::ALT));
+        assert_eq!(reader.line(), "界 read 'file space.txt' please e\u{301}");
+        assert_eq!(reader.cursor_byte(), "界 read 'file space.txt'".len());
+    }
+
+    #[test]
+    fn history_search_requests_a_picker_without_editing_or_submitting() {
+        let mut reader = reader();
+        reader.replace("draft 界");
+        reader.apply(key(KeyCode::Left));
+        let before = (reader.line().to_owned(), reader.cursor_byte());
+        assert_eq!(
+            reader.handle(Event::Key(control('r'))),
+            Some(KeyAction::HistorySearch)
+        );
+        assert_eq!((reader.line().to_owned(), reader.cursor_byte()), before);
+        let mut release = control('r');
+        release.kind = KeyEventKind::Release;
+        assert_eq!(reader.handle(Event::Key(release)), None);
+        assert_eq!((reader.line().to_owned(), reader.cursor_byte()), before);
+    }
+
+    #[test]
+    fn search_queries_preserve_draft_state_and_restoration_is_one_undoable_edit() {
+        let mut reader = reader();
+        reader.replace("draft 界");
+        reader.apply(key(KeyCode::Left));
+        reader.apply(key(KeyCode::Char('!')));
+        let before = (reader.line().to_owned(), reader.cursor_byte());
+        let result = reader.with_temporary_line(|query| {
+            assert_eq!(query.line(), "");
+            query.apply(key(KeyCode::Char('x')));
+            query.apply(control('u'));
+            Err::<(), _>("cancelled")
+        });
+        assert_eq!(result, Err("cancelled"));
+        assert_eq!((reader.line().to_owned(), reader.cursor_byte()), before);
+        reader.restore_prompt("older middle word\n界");
+        assert_eq!(reader.line(), "older middle word\n界");
+        assert_eq!(reader.cursor_byte(), reader.line().len());
+        reader.apply(key(KeyCode::Left));
+        reader.restore_prompt("older middle word\n界");
+        assert_eq!(reader.cursor_byte(), reader.line().len());
+        reader.apply(control('_'));
+        assert_eq!((reader.line().to_owned(), reader.cursor_byte()), before);
+        reader.apply(control('_'));
+        assert_eq!(reader.line(), "draft 界");
+    }
+
+    #[test]
+    fn editor_binding_requests_handoff_without_changing_the_draft() {
+        let mut reader = reader();
+        reader.replace("draft 界");
+        reader.apply(key(KeyCode::Left));
+        let before = (reader.line().to_owned(), reader.column());
+        assert_eq!(
+            reader.handle(Event::Key(control('g'))),
+            Some(KeyAction::ExternalEditor)
+        );
+        assert_eq!((reader.line().to_owned(), reader.column()), before);
+        let mut release = control('g');
+        release.kind = KeyEventKind::Release;
+        assert_eq!(reader.handle(Event::Key(release)), None);
+        assert_eq!((reader.line().to_owned(), reader.column()), before);
+    }
+
+    #[test]
+    fn transcript_shortcut_and_navigation_leave_the_complete_draft_untouched() {
+        let mut reader = reader();
+        let history = vec![String::from("earlier prompt")];
+        reader.replace("draft 界 tail");
+        reader.apply(key(KeyCode::Left));
+        reader.recall_previous(&history);
+        reader.recall_next(&history);
+        let before = (reader.line().to_owned(), reader.column());
+        assert_eq!(reader.apply(control('o')), KeyAction::Transcript);
+        for (event, expected) in [
+            (Event::Key(key(KeyCode::Up)), TranscriptAction::Up),
+            (Event::Key(key(KeyCode::Down)), TranscriptAction::Down),
+            (Event::Key(key(KeyCode::PageUp)), TranscriptAction::PageUp),
+            (
+                Event::Key(key(KeyCode::PageDown)),
+                TranscriptAction::PageDown,
+            ),
+            (Event::Key(key(KeyCode::Home)), TranscriptAction::Home),
+            (Event::Key(key(KeyCode::End)), TranscriptAction::End),
+            (Event::Key(key(KeyCode::Tab)), TranscriptAction::NextTool),
+            (
+                Event::Key(key(KeyCode::BackTab)),
+                TranscriptAction::PreviousTool,
+            ),
+            (
+                Event::Key(key(KeyCode::Char(' '))),
+                TranscriptAction::ToggleTool,
+            ),
+            (
+                Event::Key(key(KeyCode::Char('x'))),
+                TranscriptAction::Ignored,
+            ),
+            (
+                Event::Paste(String::from("replace\nthis")),
+                TranscriptAction::Ignored,
+            ),
+            (Event::Key(key(KeyCode::Enter)), TranscriptAction::Ignored),
+            (Event::Resize(32, 8), TranscriptAction::Ignored),
+            (Event::Key(key(KeyCode::Esc)), TranscriptAction::Close),
+            (Event::Key(control('o')), TranscriptAction::Close),
+            (Event::Key(control('c')), TranscriptAction::Close),
+        ] {
+            assert_eq!(transcript_event(&event), expected);
+            assert_eq!((reader.line().to_owned(), reader.column()), before);
+        }
+        reader.recall_previous(&history);
+        reader.recall_next(&history);
+        assert_eq!((reader.line().to_owned(), reader.column()), before);
     }
 
     /// Builds a reader with keys enabled, without touching a real terminal.
@@ -464,6 +883,45 @@ mod tests {
             reader.apply(control('c')),
             "escape and control-c must be told apart"
         );
+    }
+
+    #[test]
+    fn alt_enter_inserts_a_newline_at_the_caret_and_enter_submits_it() {
+        let mut reader = reader();
+        reader.replace("界tail");
+        reader.apply(key(KeyCode::Home));
+        reader.apply(key(KeyCode::Right));
+        let newline = KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT);
+        assert_eq!(reader.handle(Event::Key(newline)), Some(KeyAction::Ignored));
+        assert_eq!(reader.line(), "界\ntail");
+        assert_eq!(reader.composer.cursor(), 2);
+        assert_eq!(reader.column(), 3);
+
+        // The inserted break is a regular draft edit, including its caret.
+        reader.apply(control('_'));
+        assert_eq!(reader.line(), "界tail");
+        assert_eq!(reader.column(), 2);
+        reader.apply(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::ALT));
+        assert_eq!(reader.line(), "界\ntail");
+        assert_eq!(reader.column(), 3);
+        typed(&mut reader, "second ");
+        assert_eq!(
+            reader.handle(Event::Key(key(KeyCode::Enter))),
+            Some(KeyAction::Submit)
+        );
+        assert_eq!(reader.line(), "界\nsecond tail");
+    }
+
+    #[test]
+    fn releasing_alt_enter_does_not_insert_another_newline() {
+        let mut reader = reader();
+        typed(&mut reader, "first");
+        let mut newline = KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT);
+        assert_eq!(reader.handle(Event::Key(newline)), Some(KeyAction::Ignored));
+        newline.kind = KeyEventKind::Release;
+        assert_eq!(reader.handle(Event::Key(newline)), None);
+        assert_eq!(reader.line(), "first\n");
+        assert_eq!(reader.column(), 6);
     }
 
     #[test]
@@ -583,11 +1041,192 @@ mod tests {
     }
 
     #[test]
+    fn control_y_restores_control_u_text_with_the_caret_at_its_end() {
+        let mut reader = reader();
+        typed(&mut reader, "abc");
+        assert_eq!(
+            reader.handle(Event::Key(control('u'))),
+            Some(KeyAction::Ignored)
+        );
+        assert_eq!(reader.line(), "");
+        assert_eq!(reader.column(), 0);
+
+        assert_eq!(
+            reader.handle(Event::Key(control('y'))),
+            Some(KeyAction::Ignored)
+        );
+        assert_eq!(reader.line(), "abc");
+        assert_eq!(reader.column(), 3);
+    }
+
+    #[test]
+    fn control_y_inserts_control_k_text_at_the_caret() {
+        let mut reader = reader();
+        typed(&mut reader, "ab界");
+        reader.apply(key(KeyCode::Left));
+        reader.apply(control('k'));
+        assert_eq!(reader.line(), "ab");
+        reader.apply(key(KeyCode::Home));
+
+        assert_eq!(reader.apply(control('y')), KeyAction::Ignored);
+        assert_eq!(reader.line(), "界ab");
+        assert_eq!(reader.column(), 2);
+    }
+
+    #[test]
+    fn control_y_without_killed_text_leaves_the_draft_and_caret_unchanged() {
+        let mut reader = reader();
+        typed(&mut reader, "abc");
+        reader.apply(key(KeyCode::Left));
+
+        assert_eq!(reader.apply(control('y')), KeyAction::Ignored);
+        assert_eq!(reader.line(), "abc");
+        assert_eq!(reader.column(), 2);
+    }
+
+    #[test]
     fn control_w_removes_the_word_before_the_cursor() {
         let mut reader = reader();
         typed(&mut reader, "one two");
         reader.apply(control('w'));
         assert_eq!(reader.line(), "one ");
+    }
+
+    #[test]
+    fn undo_binding_restores_unicode_edits_and_their_carets() {
+        for binding in [
+            control('_'),
+            control('7'),
+            KeyEvent::new(
+                KeyCode::Char('_'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            ),
+        ] {
+            for grapheme in ["e\u{301}", "👍🏽", "👩‍💻", "界"] {
+                for deletion in [KeyCode::Backspace, KeyCode::Delete] {
+                    let mut reader = reader();
+                    reader.replace("界ab");
+                    reader.apply(key(KeyCode::Left));
+                    let original = (reader.line().to_owned(), reader.composer.cursor());
+                    reader.handle(Event::Paste(grapheme.to_owned()));
+                    if deletion == KeyCode::Delete {
+                        reader.apply(key(KeyCode::Left));
+                    }
+                    let inserted = (reader.line().to_owned(), reader.composer.cursor());
+                    let inserted_column = reader.column();
+                    reader.handle(Event::Key(key(deletion)));
+                    assert_eq!(reader.line(), original.0);
+                    // Undo restores the saved caret, even after navigation.
+                    reader.apply(key(KeyCode::Home));
+
+                    assert_eq!(reader.handle(Event::Key(binding)), Some(KeyAction::Ignored));
+                    assert_eq!(reader.line(), inserted.0);
+                    assert_eq!(reader.composer.cursor(), inserted.1);
+                    assert_eq!(reader.column(), inserted_column);
+
+                    assert_eq!(reader.handle(Event::Key(binding)), Some(KeyAction::Ignored));
+                    assert_eq!(reader.line(), original.0);
+                    assert_eq!(reader.composer.cursor(), original.1);
+                    assert_eq!(reader.column(), 3);
+                    // An exhausted undo history leaves the draft untouched.
+                    assert_eq!(reader.handle(Event::Key(binding)), Some(KeyAction::Ignored));
+                    assert_eq!(reader.line(), original.0);
+                    assert_eq!(reader.composer.cursor(), original.1);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn releasing_undo_does_not_revert_another_edit() {
+        let mut reader = reader();
+        reader.replace("ab");
+        reader.apply(key(KeyCode::Left));
+        reader.handle(Event::Key(key(KeyCode::Char('x'))));
+        reader.handle(Event::Key(key(KeyCode::Char('界'))));
+        let mut undo = control('_');
+        assert_eq!(reader.handle(Event::Key(undo)), Some(KeyAction::Ignored));
+        assert_eq!(reader.line(), "axb");
+        assert_eq!(reader.column(), 2);
+        undo.kind = KeyEventKind::Release;
+        assert_eq!(reader.handle(Event::Key(undo)), None);
+        assert_eq!(reader.line(), "axb");
+        assert_eq!(reader.column(), 2);
+    }
+
+    #[test]
+    fn alt_r_redoes_unicode_edits_and_restores_their_carets() {
+        let redo = KeyEvent::new(KeyCode::Char('r'), KeyModifiers::ALT);
+        for grapheme in ["e\u{301}", "👍🏽", "👩‍💻", "界"] {
+            for deletion in [KeyCode::Backspace, KeyCode::Delete] {
+                let mut reader = reader();
+                reader.replace("界ab");
+                reader.apply(key(KeyCode::Left));
+                reader.handle(Event::Paste(grapheme.to_owned()));
+                if deletion == KeyCode::Delete {
+                    reader.apply(key(KeyCode::Left));
+                }
+                let inserted = (
+                    reader.line().to_owned(),
+                    reader.composer.cursor(),
+                    reader.column(),
+                );
+                reader.handle(Event::Key(key(deletion)));
+                let deleted = (
+                    reader.line().to_owned(),
+                    reader.composer.cursor(),
+                    reader.column(),
+                );
+                reader.handle(Event::Key(control('_')));
+                reader.handle(Event::Key(control('_')));
+                assert_eq!(reader.line(), "界ab");
+                // Moving after undo must not change the caret restored by redo.
+                reader.apply(key(KeyCode::Home));
+
+                for expected in [inserted, deleted.clone(), deleted] {
+                    assert_eq!(reader.handle(Event::Key(redo)), Some(KeyAction::Ignored));
+                    assert_eq!(reader.line(), expected.0);
+                    assert_eq!(reader.composer.cursor(), expected.1);
+                    assert_eq!(reader.column(), expected.2);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn releasing_alt_r_does_not_redo_another_edit() {
+        let mut reader = reader();
+        reader.replace("ab");
+        reader.apply(key(KeyCode::Left));
+        typed(&mut reader, "x界");
+        reader.apply(control('_'));
+        reader.apply(control('_'));
+        let mut redo = KeyEvent::new(KeyCode::Char('r'), KeyModifiers::ALT);
+        assert_eq!(reader.handle(Event::Key(redo)), Some(KeyAction::Ignored));
+        assert_eq!(reader.line(), "axb");
+        assert_eq!(reader.column(), 2);
+        redo.kind = KeyEventKind::Release;
+        assert_eq!(reader.handle(Event::Key(redo)), None);
+        assert_eq!(reader.line(), "axb");
+        assert_eq!(reader.column(), 2);
+    }
+
+    #[test]
+    fn alt_r_without_redo_history_leaves_the_draft_and_caret_unchanged() {
+        let mut reader = reader();
+        reader.replace("ab");
+        reader.apply(key(KeyCode::Left));
+        let redo = KeyEvent::new(KeyCode::Char('r'), KeyModifiers::ALT);
+        assert_eq!(reader.handle(Event::Key(redo)), Some(KeyAction::Ignored));
+        assert_eq!(reader.line(), "ab");
+        assert_eq!(reader.column(), 1);
+
+        typed(&mut reader, "x");
+        reader.apply(control('_'));
+        typed(&mut reader, "界");
+        assert_eq!(reader.handle(Event::Key(redo)), Some(KeyAction::Ignored));
+        assert_eq!(reader.line(), "a界b");
+        assert_eq!(reader.column(), 3);
     }
 
     #[test]
@@ -700,6 +1339,55 @@ mod tests {
             secret_event(&mut secret, Event::Key(control('c'))),
             SecretStep::Interrupt
         );
+    }
+
+    #[test]
+    fn worker_panic_hook_is_scoped_to_the_catching_thread() {
+        if std::env::var_os("RUNE_R059_HOOK_CHILD").is_none() {
+            let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+                .args([
+                    "--exact",
+                    "input::tests::worker_panic_hook_is_scoped_to_the_catching_thread",
+                    "--nocapture",
+                ])
+                .env("RUNE_R059_HOOK_CHILD", "1")
+                .output()
+                .expect("hook fixture subprocess");
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        // Only this subprocess changes the global hook. Fatal/unmanaged panics
+        // must keep reaching it while a different worker is being caught.
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let recorded = std::sync::Arc::clone(&calls);
+        std::panic::set_hook(Box::new(move |_| {
+            recorded.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }));
+        assert!(
+            catch_worker_panic(|| {
+                assert!(catch_worker_panic(|| panic!("nested caught panic")).is_err());
+                assert!(CATCHING_WORKER_PANIC.get());
+                assert!(
+                    std::thread::spawn(|| panic!("other thread"))
+                        .join()
+                        .is_err()
+                );
+                panic!("caught worker panic");
+            })
+            .is_err()
+        );
+        assert!(!CATCHING_WORKER_PANIC.get());
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert_eq!(catch_worker_panic(|| 42).expect("successful work"), 42);
+        assert!(!CATCHING_WORKER_PANIC.get());
+        assert!(std::panic::catch_unwind(|| panic!("ordinary panic")).is_err());
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 2);
     }
 
     #[test]

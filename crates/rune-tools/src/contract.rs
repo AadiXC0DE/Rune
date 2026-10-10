@@ -152,6 +152,10 @@ pub struct ExecutionContext {
     pub additional_roots: Vec<Utf8PathBuf>,
     /// Whether the tool was permitted to reach outside the roots.
     pub external_access: bool,
+    /// Whether a separate user decision allowed private-network web access.
+    pub private_network_access: bool,
+    /// Whether shell network access is disabled, even with external access.
+    pub offline: bool,
     /// Whether a command may run without a sandbox.
     ///
     /// Separate from reaching outside the workspace: a host with no usable
@@ -160,6 +164,8 @@ pub struct ExecutionContext {
     pub allow_unsandboxed: bool,
     /// Per-call byte budget for produced output.
     pub max_output_bytes: usize,
+    /// Retained output from the live conversation, supplied by its owner.
+    result_store: Option<Arc<crate::result_store::Store>>,
     /// Composite cancellation flag, checked between steps of long work.
     cancelled: Arc<AtomicBool>,
 }
@@ -172,8 +178,11 @@ impl ExecutionContext {
             workspace,
             additional_roots: Vec::new(),
             external_access: false,
+            private_network_access: false,
+            offline: false,
             allow_unsandboxed: false,
             max_output_bytes: 64 * 1024,
+            result_store: None,
             cancelled: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -192,6 +201,20 @@ impl ExecutionContext {
         self
     }
 
+    /// Carries the resolved private-network decision for this call.
+    #[must_use]
+    pub const fn with_private_network_access(mut self, allowed: bool) -> Self {
+        self.private_network_access = allowed;
+        self
+    }
+
+    /// Sets offline mode for shell network policy.
+    #[must_use]
+    pub const fn with_offline(mut self, offline: bool) -> Self {
+        self.offline = offline;
+        self
+    }
+
     /// Allows a command to run where no sandbox backend is available.
     #[must_use]
     pub const fn with_allow_unsandboxed(mut self, allowed: bool) -> Self {
@@ -206,6 +229,19 @@ impl ExecutionContext {
         self
     }
 
+    /// Supplies the conversation's retained output for `read_tool_result`.
+    #[must_use]
+    pub fn with_result_store(mut self, store: Arc<crate::result_store::Store>) -> Self {
+        self.result_store = Some(store);
+        self
+    }
+
+    /// Returns the retained output this call may read.
+    #[must_use]
+    pub fn result_store(&self) -> Option<&crate::result_store::Store> {
+        self.result_store.as_deref()
+    }
+
     /// Returns a copy sharing this context's cancellation flag.
     ///
     /// Used where a host must hand a fresh context to each call while keeping a
@@ -216,8 +252,11 @@ impl ExecutionContext {
             workspace: self.workspace.clone(),
             additional_roots: self.additional_roots.clone(),
             external_access: self.external_access,
+            private_network_access: self.private_network_access,
+            offline: self.offline,
             allow_unsandboxed: self.allow_unsandboxed,
             max_output_bytes: self.max_output_bytes,
+            result_store: self.result_store.clone(),
             cancelled: Arc::clone(&self.cancelled),
         }
     }
@@ -348,7 +387,8 @@ pub fn model_spec(tool: &dyn Tool) -> ToolSpec {
     if description.len() > MAX_DESCRIPTION_BYTES {
         // Truncation is explicit rather than silent, because a description cut
         // mid-sentence without a marker looks like a bug in the tool.
-        description.truncate(MAX_DESCRIPTION_BYTES.saturating_sub(16));
+        let end = description.floor_char_boundary(MAX_DESCRIPTION_BYTES.saturating_sub(16));
+        description.truncate(end);
         description.push_str("... [truncated]");
     }
     ToolSpec {
@@ -604,6 +644,56 @@ mod tests {
             spec.description.ends_with("[truncated]"),
             "truncation was not marked"
         );
+    }
+
+    #[test]
+    fn unicode_descriptions_register_and_serialize_at_character_boundaries() {
+        struct UnicodeTool {
+            text: &'static str,
+        }
+        impl Tool for UnicodeTool {
+            fn name(&self) -> &'static str {
+                "unicode"
+            }
+            fn description(&self) -> &'static str {
+                self.text
+            }
+            fn input_schema(&self) -> serde_json::Value {
+                serde_json::json!({ "type": "object" })
+            }
+            fn activity(&self) -> Activity {
+                Activity::Read
+            }
+            fn call(
+                &self,
+                _arguments: &serde_json::Value,
+                _context: &ExecutionContext,
+            ) -> Result<ToolOutput> {
+                Ok(ToolOutput::success("ok"))
+            }
+        }
+
+        for (character, retained) in [("é", 503), ("€", 335), ("🦀", 251)] {
+            let text = Box::leak(format!("a{}", character.repeat(600)).into_boxed_str());
+            let mut registry = crate::registry::Registry::new();
+            registry
+                .insert(Box::new(UnicodeTool { text }))
+                .expect("register Unicode description without panicking");
+            let specs = registry.all_schemas();
+            let spec = &specs[0];
+            assert_eq!(
+                spec.description,
+                format!("a{}... [truncated]", character.repeat(retained))
+            );
+            assert!(spec.description.len() <= MAX_DESCRIPTION_BYTES);
+            rune_core::tool::validate_tool_spec(spec).expect("valid tool schema");
+
+            let bytes = serde_json::to_vec(&specs).expect("serialize tool schemas");
+            std::str::from_utf8(&bytes).expect("valid UTF-8 JSON");
+            let decoded: Vec<ToolSpec> =
+                serde_json::from_slice(&bytes).expect("deserialize tool schemas");
+            assert_eq!(decoded, specs);
+        }
     }
 
     #[test]

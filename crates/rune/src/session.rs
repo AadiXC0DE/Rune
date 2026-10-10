@@ -7,7 +7,7 @@
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::io::{BufRead, Write as _};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 
 use crate::session_log::{self, Recorder};
 use camino::{Utf8Path, Utf8PathBuf};
@@ -27,18 +27,21 @@ use rune_policy::decision::Outcome;
 use rune_policy::review::{ReviewOutcome, ReviewRequest, ReviewSession, Reviewer};
 use rune_policy::rules::RuleSet;
 use rune_session::usage::{HelperKind, Ledger, UsageRecord, now_ms};
-use rune_term::footer::{self, FooterState};
+use rune_term::footer::{self, FooterState, ProviderRetry};
 use rune_term::input::KeyAction;
 use rune_term::shell::ExitReason;
-use rune_term::shell::{Action, Input, Shell};
+use rune_term::shell::{Action, Input, InputSource, Shell};
 use rune_term::theme::{Slot, Theme};
 use rune_term::transcript::{self, Display, Entry};
+use rune_tools::ask_user::{Answer, Answerer, Question, Unavailable};
 use rune_tools::contract::{ExecutionContext, ToolOutput};
 use rune_tools::inventory;
 use rune_tools::registry::Registry;
 
 /// Everything a session needs to run.
 pub struct SessionConfig {
+    /// Use canonical line input and append-only labelled output.
+    pub accessible: bool,
     /// Resolved settings.
     pub settings: Settings,
     /// State paths, used for the session log.
@@ -55,6 +58,8 @@ pub struct SessionConfig {
     pub registry: Registry,
     /// Rules in force.
     pub rules: RuleSet,
+    /// Question bridge, enabled only while terminal input is being polled.
+    questions: Arc<TerminalQuestions>,
 }
 
 /// A writer that locks the shared stream for the length of one write.
@@ -100,7 +105,7 @@ struct StreamingText {
     /// Kept so a delta wraps only the text that arrived, rather than the whole
     /// answer again. Re-wrapping everything per delta is quadratic in the length
     /// of the response, which is what made a long answer stutter.
-    answer_rows: LazyRows,
+    answer_rows: transcript::AssistantRows,
     reasoning_rows: LazyRows,
 }
 
@@ -164,8 +169,65 @@ fn rows_for(lazy: &mut LazyRows, text: &str, width: usize) -> Vec<String> {
 /// producing it.
 type LiveSink = Arc<Mutex<dyn std::io::Write + Send>>;
 
+/// One call waiting for the input thread's answer. No answer creates a grant.
+struct ApprovalRequest {
+    tool: String,
+    target: String,
+    reason: String,
+    answer: mpsc::SyncSender<Outcome>,
+}
+
+/// A tool worker hands questions to the thread that owns terminal input.
+#[derive(Debug)]
+struct QuestionRequest {
+    questions: Vec<Question>,
+    answer: mpsc::SyncSender<Result<Answer>>,
+}
+
+#[derive(Debug, Default)]
+struct TerminalQuestions {
+    requests: Mutex<Option<mpsc::Sender<QuestionRequest>>>,
+    cancellation: Cancellation,
+}
+
+impl Answerer for TerminalQuestions {
+    fn ask(&self, questions: &[Question], context: &ExecutionContext) -> Result<Answer> {
+        let Some(requests) = self.requests.lock().ok().and_then(|slot| slot.clone()) else {
+            return Unavailable.ask(questions, context);
+        };
+        let (answer, response) = mpsc::sync_channel(1);
+        if requests
+            .send(QuestionRequest {
+                questions: questions.to_vec(),
+                answer,
+            })
+            .is_err()
+        {
+            return Unavailable.ask(questions, context);
+        }
+        loop {
+            self.cancellation.check()?;
+            context.check_cancelled()?;
+            match response.recv_timeout(rune_term::shell::POLL_INTERVAL) {
+                Ok(answer) => {
+                    self.cancellation.check()?;
+                    context.check_cancelled()?;
+                    return answer;
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Unavailable.ask(questions, context);
+                }
+            }
+        }
+    }
+}
+
 /// Host state for a turn.
 struct SessionHost {
+    accessible: bool,
+    ascii: bool,
+    recorder: Option<Arc<Mutex<Recorder>>>,
     endpoint: Endpoint,
     dialect: Box<dyn Provider>,
     /// Model the session sends to, changeable while the session runs.
@@ -186,8 +248,12 @@ struct SessionHost {
     cancellation: Cancellation,
     steering: SteeringQueue,
     events: Arc<Mutex<Vec<Event>>>,
-    /// Tokens spent from the context window, summed across turns.
+    /// The pending or active retry, drawn only through the live footer.
+    provider_retry: Mutex<Option<ProviderRetry>>,
+    /// Largest observed conversation size, initially estimated on resume.
     context_used: std::sync::atomic::AtomicU64,
+    /// Present while the meter is seeded from saved history.
+    context_source: Mutex<Option<&'static str>>,
     /// Size of the context window, zero when the provider stated none.
     ///
     /// Atomic because choosing another model mid-session changes the window the
@@ -221,6 +287,12 @@ struct SessionHost {
     /// covering both steps, one frame's bytes can land inside another's and the
     /// screen shows a mix of two.
     frame: Mutex<()>,
+    /// Complete recorded conversation, retained even when model context compacts.
+    transcript: Mutex<Vec<Entry>>,
+    /// History turns already captured, adjusted whenever compaction renumbers it.
+    transcript_history_len: std::sync::atomic::AtomicUsize,
+    /// Prevents streaming frames from painting over the transcript or editor.
+    transcript_open: std::sync::atomic::AtomicBool,
     /// The line being typed while a turn runs, with the caret's display column.
     ///
     /// Held on the host because the streaming thread redraws the whole frame
@@ -260,6 +332,9 @@ struct SessionHost {
     undo: Mutex<BTreeMap<Utf8PathBuf, Option<Vec<u8>>>>,
     /// Review activity for the current turn.
     review_session: Arc<Mutex<ReviewSession>>,
+    /// Attached only while a terminal input loop can collect an answer.
+    approval_requests: Mutex<Option<mpsc::Sender<ApprovalRequest>>>,
+    questions: Arc<TerminalQuestions>,
 }
 
 /// Locks the model, recovering from a poisoned lock.
@@ -311,6 +386,38 @@ impl Host for SessionHost {
         self.fast_mode
     }
 
+    fn prepare_request(
+        &self,
+        history: &mut History,
+        plan: &mut rune_net::provider::RequestPlan,
+        client: &dyn rune_net::fetch::Fetch,
+    ) -> Result<()> {
+        use rune_agent::compaction::{self, Trigger};
+        let estimate = request_estimate(self, plan)?;
+        match compaction::trigger(&estimate, &self.limits) {
+            Trigger::NotNeeded | Trigger::Approaching => return Ok(()),
+            Trigger::Impossible => return Err(compaction::cannot_fit_error()),
+            Trigger::Required => {}
+        }
+        let Some(compaction_plan) = compaction::plan(history, &self.limits) else {
+            // A short conversation can cross the trigger while still fitting.
+            return Ok(());
+        };
+        let removed = summarize_history(self, history, &compaction_plan, client, &|| {
+            self.cancellation.is_cancelled()
+        })?;
+        plan.messages = history.to_messages();
+        self.emit(Event::ContextCompacted {
+            removed_turns: removed,
+            remaining_turns: history.len(),
+        });
+        self.forget_context();
+        if request_estimate(self, plan)?.input_tokens > estimate.capacity {
+            return Err(compaction::cannot_fit_error());
+        }
+        Ok(())
+    }
+
     fn emit(&self, event: Event) {
         // Text is accumulated as it arrives and drawn straight away, which is
         // what makes an answer appear while it is being written rather than
@@ -322,9 +429,36 @@ impl Host for SessionHost {
         // as they are. A sequence split across two deltas loses its introducer
         // in the first, so what arrives in the second is plain text.
         match &event {
+            Event::ProviderRetry {
+                next_attempt,
+                max_attempts,
+                delay,
+                ..
+            } => {
+                *self
+                    .provider_retry
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(ProviderRetry {
+                    attempt: *next_attempt,
+                    max_attempts: *max_attempts,
+                    delay: Some(*delay),
+                });
+                self.draw_stream();
+            }
+            Event::ProviderRetryFinished { .. }
+            | Event::TurnStarted { .. }
+            | Event::Finished { .. } => {
+                if self.clear_provider_retry() {
+                    self.draw_stream();
+                }
+            }
             Event::TextDelta { delta } => {
+                let delta = transcript::sanitize(delta);
+                if !self.journal_text(Some(&delta)) {
+                    return;
+                }
                 if let Ok(mut streaming) = self.streaming.lock() {
-                    streaming.answer.push_str(&transcript::sanitize(delta));
+                    streaming.answer.push_str(&delta);
                 }
                 self.draw_stream();
             }
@@ -334,7 +468,27 @@ impl Host for SessionHost {
                 }
                 self.draw_stream();
             }
-            Event::StepRestarted { .. } => self.clear_streaming(),
+            Event::StepRestarted { .. } => {
+                if !self.journal_text(None) {
+                    return;
+                }
+                self.clear_streaming();
+                if let Some(retry) = self
+                    .provider_retry
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .as_mut()
+                {
+                    retry.delay = None;
+                }
+                self.draw_stream();
+            }
+            Event::ContextCompacted {
+                removed_turns,
+                remaining_turns,
+            } => self.draw_notice(&format!(
+                "compacted {removed_turns} earlier turn(s); {remaining_turns} turn(s) remain"
+            )),
             _ => {}
         }
         if let Ok(mut events) = self.events.lock() {
@@ -352,8 +506,50 @@ impl Host for SessionHost {
         self.registry.call(name, arguments, &self.context)
     }
 
+    fn execute_with_context(
+        &self,
+        name: &str,
+        arguments: &serde_json::Value,
+        context: &ExecutionContext,
+    ) -> Result<ToolOutput> {
+        if name == "web_fetch" {
+            return self.registry.call(name, arguments, context);
+        }
+        self.execute(name, arguments)
+    }
+
+    fn decide_private_network(&self, target: Option<&str>) -> (Outcome, String) {
+        // Only a rule explicitly naming this authority at a user-controlled
+        // layer can grant it. Broad web grants and project rules cannot.
+        let mut rules = RuleSet::new();
+        for rule in self.rules.rules() {
+            if rule.tool == "web_fetch_private"
+                && (rule.outcome != Outcome::Allow
+                    || rule.layer >= rune_policy::decision::Layer::User)
+            {
+                rules.push(rule.clone());
+            }
+        }
+        let target = target.unwrap_or("web_fetch_private");
+        let decision = rules.evaluate("web_fetch_private", target, Outcome::Ask);
+        let reason = format!(
+            "private-network access for this fetch and its redirects; {}",
+            decision.explain()
+        );
+        if decision.outcome != Outcome::Ask {
+            return (decision.outcome, reason);
+        }
+        self.request_approval("web_fetch_private", target, reason)
+    }
+
     fn decide(&self, name: &str, target: Option<&str>) -> (Outcome, String) {
-        let (outcome, reason) = turn::decide_call(&self.rules, self.mode, name, target);
+        let (outcome, reason) = turn::decide_call_in_workspace(
+            &self.rules,
+            self.mode,
+            name,
+            target,
+            self.context.workspace(),
+        );
         if outcome != Outcome::Ask {
             return (outcome, reason);
         }
@@ -381,10 +577,7 @@ impl Host for SessionHost {
             };
         }
 
-        // Nothing has judged the action, so it stays unresolved. Being
-        // interactive is not a judgment: approving here would authorize an
-        // action that no rule allowed and no reviewer saw.
-        (outcome, reason)
+        self.request_approval(name, target.unwrap_or(name), reason)
     }
 
     fn context(&self) -> ExecutionContext {
@@ -415,6 +608,49 @@ impl Host for SessionHost {
 }
 
 impl SessionHost {
+    /// Waits for a terminal answer while allowing cancellation to wake us.
+    fn request_approval(&self, tool: &str, target: &str, reason: String) -> (Outcome, String) {
+        let Some(requests) = self
+            .approval_requests
+            .lock()
+            .ok()
+            .and_then(|slot| slot.clone())
+        else {
+            return (Outcome::Ask, reason);
+        };
+        let (answer, response) = mpsc::sync_channel(1);
+        let request = ApprovalRequest {
+            tool: tool.to_owned(),
+            target: target.to_owned(),
+            reason: reason.clone(),
+            answer,
+        };
+        if requests.send(request).is_err() {
+            return (
+                Outcome::Deny,
+                format!("{reason}; approval input is unavailable"),
+            );
+        }
+        loop {
+            if self.cancellation.is_cancelled() {
+                return (Outcome::Deny, format!("{reason}; approval was cancelled"));
+            }
+            match response.recv_timeout(rune_term::shell::POLL_INTERVAL) {
+                Ok(Outcome::Allow) if !self.cancellation.is_cancelled() => {
+                    return (Outcome::Allow, format!("{reason}; approved for this call"));
+                }
+                Ok(_) => return (Outcome::Deny, format!("{reason}; approval was denied")),
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return (
+                        Outcome::Deny,
+                        format!("{reason}; approval input was closed"),
+                    );
+                }
+            }
+        }
+    }
+
     /// Points the session at another model.
     ///
     /// The next request uses it. A turn already running keeps the model it
@@ -487,6 +723,10 @@ impl SessionHost {
             session_id: self.session_id_name(),
             workspace: &self.workspace,
             context_used: self.context_used.load(std::sync::atomic::Ordering::Relaxed),
+            context_source: *self
+                .context_source
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
             context_limit: self
                 .context_limit
                 .load(std::sync::atomic::Ordering::Relaxed),
@@ -589,12 +829,44 @@ impl SessionHost {
     /// turn: adding them counts the same history once per turn, which is what
     /// made a session appear to fill its window several times over.
     fn record_context_size(&self, used: u64) {
-        self.context_used
-            .fetch_max(used, std::sync::atomic::Ordering::Relaxed);
+        if used == 0 {
+            return;
+        }
+        let mut source = self
+            .context_source
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if source.take().is_some() {
+            // The first live reading supersedes the resume estimate, even when
+            // the saved per-turn usage overestimated a multi-request turn.
+            self.context_used
+                .store(used, std::sync::atomic::Ordering::Relaxed);
+        } else {
+            self.context_used
+                .fetch_max(used, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Captures new turns before compaction can remove them from model context.
+    fn capture_history(&self, history: &History) {
+        let start = self
+            .transcript_history_len
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .min(history.len());
+        self.transcript
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .extend(history_entries(&history.turns()[start..]));
+        self.transcript_history_len
+            .store(history.len(), std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Forgets the context reading, for a conversation that has been replaced.
     fn forget_context(&self) {
+        *self
+            .context_source
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
         self.context_used
             .store(0, std::sync::atomic::Ordering::Relaxed);
     }
@@ -619,10 +891,18 @@ impl SessionHost {
     /// Returns the status line for the current state.
     fn status_line(&self, width: usize) -> String {
         let state = FooterState {
+            provider_retry: *self
+                .provider_retry
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
             model: lock_model(&self.model).clone(),
             permission_mode: self.mode,
             workspace: self.workspace.clone(),
             context_used: self.context_used.load(std::sync::atomic::Ordering::Relaxed),
+            context_source: *self
+                .context_source
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
             context_limit: self
                 .context_limit
                 .load(std::sync::atomic::Ordering::Relaxed),
@@ -713,6 +993,16 @@ impl SessionHost {
         menu: &[String],
         caret: (u16, u16),
     ) -> Result<Vec<u8>> {
+        if self.accessible {
+            let mut lines: Vec<String> = settled
+                .iter()
+                .map(|line| transcript::sanitize(line))
+                .collect();
+            if let Some(activity) = activity {
+                lines.extend(transcript::accessible_lines(&[Entry::notice(activity)]));
+            }
+            return Ok(transcript::append_lines(&lines));
+        }
         self.refresh_size();
         let footer_rows = self.status_rows();
         let mut inline = self
@@ -732,6 +1022,9 @@ impl SessionHost {
 
     /// Removes the live region, for a clean exit.
     fn clear_region(&self) -> Result<Vec<u8>> {
+        if self.accessible {
+            return Ok(Vec::new());
+        }
         let mut inline = self
             .inline
             .lock()
@@ -745,6 +1038,15 @@ impl SessionHost {
             .lines()
             .map(str::to_owned)
             .collect()
+    }
+
+    /// Rows left below the one-line prompt, including menu headings and hints.
+    fn menu_room(&self) -> usize {
+        self.refresh_size();
+        usize::from(self.height.load(std::sync::atomic::Ordering::Relaxed))
+            .saturating_sub(1)
+            .saturating_sub(self.status_rows().len())
+            .saturating_sub(1)
     }
 
     /// Writes bytes to the session's stream.
@@ -783,6 +1085,18 @@ impl SessionHost {
     ///
     /// `notice` is drawn as the activity line, above the input.
     fn draw_frame(&self, notice: Option<&str>, line: &str, column: usize) {
+        if self.accessible {
+            if let Some(notice) = notice {
+                let _frame = self
+                    .frame
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                self.show(&transcript::append_lines(&transcript::accessible_lines(&[
+                    Entry::notice(notice),
+                ])));
+            }
+            return;
+        }
         if let Ok(mut typed) = self.typed.lock() {
             line.clone_into(&mut typed.0);
             typed.1 = column;
@@ -793,20 +1107,19 @@ impl SessionHost {
         let Ok(_frame) = self.frame.lock() else {
             return;
         };
+        if self
+            .transcript_open
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return;
+        }
         // Even a frame with nothing in it is painted, because the one before it
         // may have shown a line or a notice that has to be taken off the screen.
         // A frame that changes nothing costs only a caret move.
         let marker = rune_term::shell::prompt();
         let width = usize::from(self.width());
-        let prompt_row = transcript::render_prompt(marker, line, width);
-        let caret = rune_term::width::str_width(marker).saturating_add(column);
-        let Ok(painted) = self.paint(
-            &[],
-            notice,
-            std::slice::from_ref(&prompt_row),
-            &rows,
-            (0, u16::try_from(caret).unwrap_or(u16::MAX)),
-        ) else {
+        let (prompt_rows, caret) = transcript::render_draft_at(marker, line, column, width);
+        let Ok(painted) = self.paint(&[], notice, &prompt_rows, &rows, caret) else {
             return;
         };
         self.show(&painted);
@@ -884,9 +1197,11 @@ impl SessionHost {
             }
         }
         if !answer.trim().is_empty() {
-            for line in rows_for(answer_rows, answer, width) {
-                rows.push(line.clone());
-            }
+            rows.extend(answer_rows.rows_with_ascii(
+                answer,
+                width.saturating_sub(2).max(1),
+                self.ascii,
+            ));
         }
 
         // Every row of the answer is handed over. The renderer owns the region
@@ -897,14 +1212,51 @@ impl SessionHost {
         rows
     }
 
+    /// Saves a delta or retry reset before changing the visible answer.
+    fn journal_text(&self, delta: Option<&str>) -> bool {
+        let Some(recorder) = &self.recorder else {
+            return true;
+        };
+        let mut recorder = recorder
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let result = match delta {
+            Some(text) => recorder.assistant_delta(text),
+            None => recorder.reset_assistant(),
+        };
+        if let Err(error) = result {
+            recorder.journal_failed(error);
+            self.cancellation.cancel();
+            return false;
+        }
+        true
+    }
+
     /// Clears the streamed text, which a finished step has taken over.
     fn clear_streaming(&self) {
         if let Ok(mut streaming) = self.streaming.lock() {
             streaming.answer.clear();
             streaming.reasoning.clear();
-            streaming.answer_rows = LazyRows::default();
+            streaming.answer_rows = transcript::AssistantRows::default();
             streaming.reasoning_rows = LazyRows::default();
         }
+    }
+
+    /// Clears retry state when a request advances or the turn is finalized.
+    fn clear_provider_retry(&self) -> bool {
+        self.provider_retry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            .is_some()
+    }
+
+    /// Returns the sanitized answer currently visible in the live transcript.
+    fn partial_answer(&self) -> String {
+        self.streaming
+            .lock()
+            .map(|streaming| streaming.answer.clone())
+            .unwrap_or_default()
     }
 
     /// Drops the events of the turn that just finished.
@@ -932,7 +1284,7 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
 
     // A resumed session continues its stored conversation; a new one starts
     // empty and writes a fresh log.
-    let (mut recorder, mut history) = if let Some(id) = &config.resume {
+    let (recorder, mut history) = if let Some(id) = &config.resume {
         session_log::load(&config.paths, id)?
     } else {
         let id = SessionId::generate();
@@ -965,7 +1317,17 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
     let endpoint_url = config.endpoint.base_url.clone();
     let provider_name = config.settings.provider.to_string();
 
+    let (initial_context, context_source) = recorder.resumed_context();
+    let transcript = if let Some(id) = &config.resume {
+        resumed_entries(&history, &session_log::inspect(&config.paths, id)?)
+    } else {
+        Vec::new()
+    };
+    let recorder = Arc::new(Mutex::new(recorder));
     let host = SessionHost {
+        accessible: config.accessible,
+        ascii: config.settings.ascii,
+        recorder: Some(Arc::clone(&recorder)),
         endpoint: config.endpoint,
         dialect: config.dialect,
         model: Mutex::new(config.settings.model.clone()),
@@ -977,15 +1339,24 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
         fast_mode: config.settings.fast_mode,
         limits: limits.clone(),
         context: ExecutionContext::new(config.workspace.clone())
+            .with_offline(config.settings.offline)
             .with_allow_unsandboxed(config.settings.allow_unsandboxed),
         registry: config.registry,
-        cancellation: Cancellation::new(),
+        cancellation: config.questions.cancellation.clone(),
         steering: SteeringQueue::from_limits(&limits),
         events: Arc::new(Mutex::new(Vec::new())),
-        context_used: std::sync::atomic::AtomicU64::new(0),
+        provider_retry: Mutex::new(None),
+        context_used: std::sync::atomic::AtomicU64::new(initial_context),
+        context_source: Mutex::new(context_source),
         context_limit: std::sync::atomic::AtomicU64::new(context_limit(&config.settings, &limits)),
         theme,
-        session_id: Mutex::new(recorder.id().to_string()),
+        session_id: Mutex::new(
+            recorder
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .id()
+                .to_string(),
+        ),
         workspace: config.workspace.to_string(),
         truecolor: truecolor_supported(),
         // Seeded from the terminal and refreshed on every frame, so a window
@@ -994,6 +1365,9 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
         height: std::sync::atomic::AtomicU16::new(terminal_height()),
         inline: Mutex::new(rune_term::inline::Inline::new(terminal_width())),
         frame: Mutex::new(()),
+        transcript: Mutex::new(transcript),
+        transcript_history_len: std::sync::atomic::AtomicUsize::new(history.len()),
+        transcript_open: std::sync::atomic::AtomicBool::new(false),
         typed: Mutex::new((String::new(), 0)),
         provider_order: config.settings.provider_order.clone(),
         provider_strict: config.settings.provider_strict,
@@ -1004,6 +1378,8 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
         totals: Mutex::new(Totals::default()),
         undo: Mutex::new(BTreeMap::new()),
         review_session: Arc::new(Mutex::new(ReviewSession::new(&limits))),
+        approval_requests: Mutex::new(None),
+        questions: config.questions,
     };
 
     // The stream is shared: the loop writes to it, and the host writes to it
@@ -1024,14 +1400,47 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
         resolve_context_window(&host, &config.settings, &config.paths);
     }
 
+    // Enable raw input before announcing the session. Otherwise input sent in
+    // response to the banner can have its Enter translated by canonical mode
+    // before the key reader starts, leaving a complete prompt unsubmitted.
+    let mut reader = if config.accessible {
+        rune_term::input::KeyReader::line_mode()
+    } else {
+        rune_term::input::KeyReader::new()
+    };
+    let keyed = reader.is_active();
+
     // The session identifier is announced up front so a resumed-or-new session
     // can be named later without consulting the listing. It goes through the
     // renderer like everything else, so the rows it occupies are known to the
     // component that later redraws over them.
     {
-        let banner = format!("session {}", recorder.id());
+        let banner = format!(
+            "session {}",
+            recorder
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .id()
+        );
+        let mut opening = if config.accessible {
+            transcript::accessible_lines(&[
+                Entry::notice(banner),
+                Entry::notice("accessible mode: enter one line per prompt; /exit quits"),
+            ])
+        } else {
+            vec![banner]
+        };
+        // Replay only for an interactive resume. These settled rows enter the
+        // terminal's scrollback once, before the composer accepts any input.
+        if (keyed || config.accessible) && config.resume.is_some() {
+            let entries = host
+                .transcript
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            opening.extend(render_entries(&entries, &host));
+        }
         let (prompt_row, caret) = host.idle_prompt();
-        let painted = host.paint(std::slice::from_ref(&banner), None, &prompt_row, &[], caret)?;
+        let painted = host.paint(&opening, None, &prompt_row, &[], caret)?;
         if let Ok(mut sink) = out.lock() {
             sink.write_all(&painted)?;
             sink.flush()?;
@@ -1039,14 +1448,12 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
     }
 
     // A resumed session keeps the title it was given.
-    let mut is_first_prompt = config.resume.is_none() && recorder.title_is_unset();
+    let mut is_first_prompt = config.resume.is_none()
+        && recorder
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .title_is_unset();
 
-    // Keys are read directly when a terminal is attached, so the line being
-    // typed is drawn by this program with a cursor placed where it belongs.
-    // Without that, the terminal echoes each key at a position this program
-    // does not know, and the two disagree about what is on the line.
-    let mut reader = rune_term::input::KeyReader::new();
-    let keyed = reader.is_active();
     // The Escape gesture spans presses, so it outlives a single read.
     let mut cancellation_gesture = rune_term::shell::EscapeGesture::default();
 
@@ -1069,6 +1476,11 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
     // input closure borrows the config and a model chosen mid-session has to be
     // able to build a catalog from the same settings the session started with.
     let settings = config.settings.clone();
+    let mut completion_context = ExecutionContext::new(config.workspace.clone());
+    for root in &settings.additional_directories {
+        completion_context = completion_context.with_root(root.clone());
+    }
+    let completion_limits = rune_tools::workspace::FileLimits::from_budget(&limits);
 
     // The prompts already recorded in this workspace, oldest first, which is
     // the order the up arrow walks backwards through. Refreshed after each
@@ -1077,7 +1489,6 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
     let mut recall = recorded_prompts(history_file.as_ref(), &config.workspace);
 
     let mut source = rune_term::shell::StdinSource::new(input);
-    let mut shell = Shell::new(&mut source);
 
     // One handler for both input paths, so a keystroke and a piped line mean
     // exactly the same thing.
@@ -1092,7 +1503,8 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                             sink: &mut LockedSink,
                             history_file: &mut Option<crate::prompt_history::History>,
                             reader: &mut rune_term::input::KeyReader,
-                            gesture: &mut rune_term::shell::EscapeGesture|
+                            gesture: &mut rune_term::shell::EscapeGesture,
+                            line_input: Option<&mut dyn InputSource>|
      -> Result<Step> {
         match input {
             Input::Command { name, arguments } => {
@@ -1113,10 +1525,20 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                     &info,
                     &mut captured,
                 )?;
+                if name == "help" {
+                    let _ = writeln!(
+                        captured,
+                        "\n{}",
+                        rune_term::input::render_bindings_help(reader.is_active())
+                    );
+                }
                 let mut note = |text: String| captured.extend_from_slice(text.as_bytes());
                 match handled {
                     Handled::Exit => return Ok(Step::Exit),
                     Handled::PickModel => return Ok(Step::PickModel),
+                    Handled::Copy if host.accessible => {
+                        note("accessible mode: copy the reply from terminal scrollback".to_owned());
+                    }
                     Handled::Copy => {
                         // The reply is read from the conversation rather than
                         // from the screen, because what is on screen has been
@@ -1139,8 +1561,16 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                         let id = SessionId::generate();
                         let fresh = Recorder::create(&config.paths, &id)?;
                         fresh.set_workspace(&config.workspace)?;
-                        recorder = fresh;
+                        *recorder
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) = fresh;
                         history = History::new();
+                        host.transcript_history_len
+                            .store(0, std::sync::atomic::Ordering::Relaxed);
+                        host.transcript
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .clear();
                         host.set_session_id(id.as_str());
                         // The context reading belongs to the conversation that
                         // just ended, so it is cleared rather than carried into
@@ -1156,10 +1586,12 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                         return compact_history(&host, &mut history, sink);
                     }
                     Handled::Rename(title) => {
-                        // Handled here because this closure already holds the
-                        // recorder, and giving the loop a second way to reach
-                        // it would be two writers for one file.
-                        recorder.set_title(&session_log::derive_title(&title))?;
+                        // The input loop and stream observer share one recorder;
+                        // its lock serializes every write to the session log.
+                        recorder
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .set_title(&session_log::derive_title(&title))?;
                         note(format!("renamed this session to {title}"));
                     }
                     Handled::SetModel(model) => {
@@ -1197,42 +1629,79 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                 // The submitted line is committed to the flow before the turn
                 // runs, so what the user typed stays on screen once the reply
                 // replaces the region it was typed in.
-                let echo = transcript::render_prompt(
-                    rune_term::shell::prompt(),
-                    &text,
-                    usize::from(host.width()),
-                );
+                let echo = if host.accessible {
+                    transcript::accessible_lines(&[Entry::user(&text)])
+                } else {
+                    vec![transcript::render_prompt_with_ascii(
+                        rune_term::shell::prompt(),
+                        &text,
+                        usize::from(host.width()),
+                        host.ascii,
+                    )]
+                };
                 // The typed line is committed and an empty input row is drawn
                 // under it, so the caret has its own row from the moment the
                 // line is submitted rather than only once streaming starts.
                 let (prompt_row, caret) = host.idle_prompt();
-                let painted =
-                    host.paint(std::slice::from_ref(&echo), None, &prompt_row, &[], caret)?;
+                let painted = host.paint(&echo, None, &prompt_row, &[], caret)?;
                 sink.write_all(&painted)?;
                 sink.flush()?;
 
                 if is_first_prompt {
-                    recorder.set_title(&session_log::derive_title(&text))?;
+                    recorder
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .set_title(&session_log::derive_title(&text))?;
                     is_first_prompt = false;
                 }
                 // Recorded before the turn runs, so a prompt that is interrupted
                 // is still recallable.
                 if let Some(history) = history_file.as_mut() {
-                    let entry = crate::prompt_history::Entry::new(text.clone())
-                        .located(&config.workspace, recorder.id().as_str());
+                    let entry = crate::prompt_history::Entry::new(text.clone()).located(
+                        &config.workspace,
+                        recorder
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .id()
+                            .as_str(),
+                    );
                     let _ = history.record(entry);
                 }
-                recorder.user_message(&text)?;
-                history.push_user(text);
+                recorder
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .user_message(&text)?;
+                history.push_user(text.clone());
+                host.transcript
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(Entry::user(text));
                 // The turn runs on its own thread so this one keeps reading
                 // keys. A turn that ran inline made the keyboard dead for as
                 // long as the model took, which is the difference between
                 // correcting a long turn and waiting it out.
-                let steered = run_turn_steerable(&mut history, &host, reader, gesture);
+                host.transcript_history_len
+                    .store(history.len(), std::sync::atomic::Ordering::Relaxed);
+                recorder
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .begin_turn()?;
+                let steered = if let Some(input) = line_input {
+                    run_turn_accessible(&mut history, &host, input)
+                } else {
+                    run_turn_steerable(&mut history, &host, reader, gesture)
+                };
+                recorder
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .check_journal()?;
                 // A correction the turn took in is part of the conversation the
                 // model saw, so a resumed session must see it too.
                 for correction in &steered.applied {
-                    recorder.user_message(correction)?;
+                    recorder
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .user_message(correction)?;
                 }
                 let outcome = match steered.outcome {
                     Ok(outcome) => outcome,
@@ -1241,18 +1710,55 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                     // a turn runs, so ending the session for it would make the
                     // gesture indistinguishable from quitting. A pipe keeps the
                     // failure, because a script reads it from the exit status.
-                    Err(err) if reader.is_active() => {
-                        let lines = report_failed_turn(&err, &host);
+                    Err(err) => {
+                        let partial = host.partial_answer();
+                        // Save before clearing the live answer or reporting
+                        // the boundary, just as for a completed exchange.
+                        if err.code() == ErrorCode::Cancelled {
+                            recorder
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .cancelled_turn(&partial)?;
+                        } else {
+                            recorder
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .failed_turn(&partial, &err)?;
+                        }
+                        let history_start = host
+                            .transcript_history_len
+                            .load(std::sync::atomic::Ordering::Relaxed)
+                            .min(history.len());
+                        retain_partial_answer(&mut history, history_start, &partial);
+                        host.capture_history(&history);
+                        {
+                            let mut transcript = host
+                                .transcript
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            if let Some(diagnostic) = &steered.diagnostic {
+                                transcript.push(Entry::notice(diagnostic));
+                            }
+                            transcript.push(Entry::notice(err.message()));
+                        }
+                        if !reader.is_active() && !host.accessible {
+                            return Err(err);
+                        }
+                        let lines = report_failed_turn(&err, &host, steered.diagnostic.as_deref());
                         host.clear_events();
                         host.clear_streaming();
+                        host.clear_provider_retry();
                         close_turn(&host, sink, reader, &lines, None, &steered.unsent)?;
                         return Ok(Step::Continue);
                     }
-                    Err(err) => return Err(err),
                 };
                 // The turn is recorded before it is reported, so a session that
                 // dies while rendering still has its exchange on disk.
-                recorder.turn(&outcome)?;
+                recorder
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .turn(&outcome)?;
+                host.capture_history(&history);
                 // The model is read back rather than captured at start, so a
                 // turn that ran after `/model` is billed to the model that ran.
                 record_usage(&config.paths, &host.model(), &outcome);
@@ -1273,7 +1779,11 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                 // terminal's search and copy. Nothing else writes to the
                 // terminal: the region below is redrawn in place.
                 let lines = report_turn(&outcome, &host)?;
-                let activity = SessionHost::activity_line(&outcome);
+                let activity = if host.accessible {
+                    None
+                } else {
+                    SessionHost::activity_line(&outcome)
+                };
                 close_turn(
                     &host,
                     sink,
@@ -1293,7 +1803,14 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
         // what was typed rather than waiting for the terminal to decide the
         // line is finished.
         let mut reason = ExitReason::EndOfInput;
-        while let Some(input) = await_submission(&mut reader, &host, &out, &recall)? {
+        while let Some(input) = await_submission(
+            &mut reader,
+            &host,
+            &out,
+            &recall,
+            &completion_context,
+            &completion_limits,
+        )? {
             let mut sink = LockedSink {
                 stream: Arc::clone(&out),
             };
@@ -1303,6 +1820,7 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                 &mut history_file,
                 &mut reader,
                 &mut cancellation_gesture,
+                None,
             )? {
                 Step::Exit => {
                     reason = ExitReason::Requested;
@@ -1322,14 +1840,46 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
             recall = recorded_prompts(history_file.as_ref(), &config.workspace);
         }
         reason
+    } else if config.accessible {
+        loop {
+            host.show(&transcript::append_lines(&[
+                "Input: enter a prompt or slash command".to_owned(),
+            ]));
+            let Some(line) = source.next_line()? else {
+                break ExitReason::EndOfInput;
+            };
+            let mut sink = LockedSink {
+                stream: Arc::clone(&out),
+            };
+            match handle_input(
+                Input::parse(&line),
+                &mut sink,
+                &mut history_file,
+                &mut reader,
+                &mut cancellation_gesture,
+                Some(&mut source),
+            )? {
+                Step::Exit => break ExitReason::Requested,
+                Step::Undo => report_undo(&host, &mut sink)?,
+                Step::PickModel => {
+                    flush_lines(
+                        &host,
+                        &mut sink,
+                        &["use /model <id>; rune models lists model ids".to_owned()],
+                    )?;
+                }
+                Step::Continue => {}
+            }
+        }
     } else {
+        let mut shell = Shell::new(&mut source);
         // A pipe has no keystrokes to drive a picker, so a model change is
         // reported instead of silently doing nothing.
         shell.run(|input| {
             let mut sink = LockedSink {
                 stream: Arc::clone(&out),
             };
-            match handle_input(input, &mut sink, &mut history_file, &mut reader, &mut cancellation_gesture)? {
+            match handle_input(input, &mut sink, &mut history_file, &mut reader, &mut cancellation_gesture, None)? {
                 Step::Exit => Ok(Action::Exit),
                 Step::Continue => Ok(Action::Continue),
                 Step::Undo => {
@@ -1360,6 +1910,110 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
     Ok(reason.exit_code())
 }
 
+/// Runs with canonical line input, reading only explicit approval and question
+/// responses during a turn. Completed replies are settled once by the caller.
+fn run_turn_accessible(
+    history: &mut History,
+    host: &SessionHost,
+    input: &mut dyn InputSource,
+) -> SteeredTurn {
+    host.cancellation.reset();
+    let (requests, pending) = mpsc::channel();
+    *host
+        .approval_requests
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(requests);
+    let (questions, pending_questions) = mpsc::channel();
+    *host
+        .questions
+        .requests
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(questions);
+    let (outcome, diagnostic) = run_on_worker(
+        history,
+        |taken| turn::run_turn(taken, host),
+        || {
+            if let Ok(request) = pending.try_recv() {
+                let mut lines = approval_lines(&request, usize::MAX);
+                lines.push("type yes to run once; any other answer denies".to_owned());
+                host.show(&transcript::append_lines(&transcript::accessible_lines(&[
+                    Entry::notice(lines.join("\n")),
+                ])));
+                let answer = match input.next_line() {
+                    Ok(Some(line)) if line.trim().eq_ignore_ascii_case("yes") => Outcome::Allow,
+                    _ => Outcome::Deny,
+                };
+                let _ = request.answer.send(answer);
+            } else if let Ok(request) = pending_questions.try_recv() {
+                let answer = collect_accessible_questions(&request.questions, host, input);
+                let _ = request.answer.send(answer);
+            } else {
+                std::thread::sleep(rune_term::shell::POLL_INTERVAL);
+            }
+        },
+    );
+    *host
+        .approval_requests
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    *host
+        .questions
+        .requests
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    SteeredTurn {
+        outcome,
+        diagnostic,
+        applied: Vec::new(),
+        unsent: Vec::new(),
+    }
+}
+
+fn collect_accessible_questions(
+    questions: &[Question],
+    host: &SessionHost,
+    input: &mut dyn InputSource,
+) -> Result<Answer> {
+    let mut answers = Vec::new();
+    for question in questions {
+        let mut lines = vec![format!("Question: {}", question.text)];
+        for (index, option) in question.options.iter().enumerate() {
+            lines.push(format!(
+                "Option {}: {}",
+                index.saturating_add(1),
+                option.label
+            ));
+            if let Some(description) = &option.description {
+                lines.push(format!("Description: {description}"));
+            }
+        }
+        lines.push("Answer: enter an option number, or /cancel".to_owned());
+        host.show(&transcript::append_lines(&lines));
+        loop {
+            let Some(line) = input.next_line()? else {
+                host.cancellation.cancel();
+                return Ok(Answer::Cancelled);
+            };
+            if line.trim() == "/cancel" {
+                host.cancellation.cancel();
+                return Ok(Answer::Cancelled);
+            }
+            if let Some(choice) = line
+                .trim()
+                .parse::<usize>()
+                .ok()
+                .and_then(|number| number.checked_sub(1))
+                .filter(|index| *index < question.options.len())
+            {
+                answers.push(choice);
+                break;
+            }
+            host.show(b"Answer: invalid option number; try again or /cancel\n");
+        }
+    }
+    Ok(Answer::Chosen(answers))
+}
+
 /// Runs one turn while keeping the keyboard live.
 ///
 /// The turn runs on its own thread because a turn that ran here would block
@@ -1382,6 +2036,7 @@ fn run_turn_steerable(
         // and the steering path is simply unused.
         return SteeredTurn {
             outcome: turn::run_turn(history, host),
+            diagnostic: None,
             applied: Vec::new(),
             unsent: Vec::new(),
         };
@@ -1397,14 +2052,47 @@ fn run_turn_steerable(
     }
     let mut submitted: Vec<String> = Vec::new();
 
-    let result = run_on_worker(
+    let (requests, pending) = mpsc::channel();
+    if let Ok(mut slot) = host.approval_requests.lock() {
+        *slot = Some(requests);
+    }
+    let (questions, pending_questions) = mpsc::channel();
+    if let Ok(mut slot) = host.questions.requests.lock() {
+        *slot = Some(questions);
+    }
+
+    let (result, diagnostic) = run_on_worker(
         history,
         |taken| turn::run_turn(taken, host),
         || {
+            if let Ok(request) = pending.try_recv() {
+                gesture.disarm();
+                let answer = collect_approval(&request, host, reader);
+                let _ = request.answer.send(answer);
+                host.draw_stream_with(reader.line(), reader.column());
+                return;
+            }
+            if let Ok(request) = pending_questions.try_recv() {
+                gesture.disarm();
+                let answer = collect_questions(&request.questions, host, reader);
+                let _ = request.answer.send(answer);
+                host.draw_stream_with(reader.line(), reader.column());
+                return;
+            }
             let Some(key) = reader.poll_key(rune_term::shell::POLL_INTERVAL) else {
                 return;
             };
             match key {
+                KeyAction::ExternalEditor => {
+                    gesture.disarm();
+                    edit_draft(reader, host);
+                    host.draw_stream_with(reader.line(), reader.column());
+                }
+                KeyAction::Transcript => {
+                    gesture.disarm();
+                    let _ = view_transcript(reader, host);
+                    host.draw_stream_with(reader.line(), reader.column());
+                }
                 // Enter submits what has been typed as steering rather than as
                 // a new turn, so a correction reaches the running turn instead
                 // of queueing behind it.
@@ -1467,6 +2155,12 @@ fn run_turn_steerable(
             }
         },
     );
+    if let Ok(mut slot) = host.approval_requests.lock() {
+        *slot = None;
+    }
+    if let Ok(mut slot) = host.questions.requests.lock() {
+        *slot = None;
+    }
     // Anything still queued was typed after the turn's last boundary, so the
     // turn never saw it. The queue is drained in one piece, which makes what is
     // left the newest submissions and everything before them what was applied.
@@ -1480,9 +2174,195 @@ fn run_turn_steerable(
     submitted.truncate(applied_count);
     SteeredTurn {
         outcome: result,
+        diagnostic,
         applied: submitted,
         unsent,
     }
+}
+
+/// Shows the complete scope in scrollback, then waits on a two-choice picker.
+/// Deny is selected initially. Escape, Control-C, and Control-D cancel the turn.
+fn collect_approval(
+    request: &ApprovalRequest,
+    host: &SessionHost,
+    reader: &mut rune_term::input::KeyReader,
+) -> Outcome {
+    let mut picker = rune_term::picker::Picker::new(
+        "permission required",
+        vec![String::from("Run once"), String::from("Deny")],
+        2,
+    );
+    picker.to(1);
+    host.refresh_size();
+    let lines = approval_lines(request, usize::from(host.width()));
+    if draw_choice(host, &picker, &lines).is_err() {
+        return Outcome::Deny;
+    }
+    loop {
+        if host.cancellation.is_cancelled() {
+            return Outcome::Deny;
+        }
+        if let Some(key) = reader.poll_choice(rune_term::shell::POLL_INTERVAL)
+            && let Some(answer) = approval_key(key, &mut picker, &host.cancellation)
+        {
+            return answer;
+        }
+        // Also refreshes dimensions when no input arrives.
+        if draw_choice(host, &picker, &[]).is_err() {
+            return Outcome::Deny;
+        }
+    }
+}
+
+/// Collects every answer without editing or submitting the current draft.
+fn collect_questions(
+    questions: &[Question],
+    host: &SessionHost,
+    reader: &mut rune_term::input::KeyReader,
+) -> Result<Answer> {
+    let mut answers = Vec::with_capacity(questions.len());
+    for (index, question) in questions.iter().enumerate() {
+        host.cancellation.check()?;
+        let mut picker = rune_term::picker::Picker::new(
+            format!(
+                "answer required ({}/{})",
+                index.saturating_add(1),
+                questions.len()
+            ),
+            question
+                .options
+                .iter()
+                .map(|option| transcript::sanitize(&option.label))
+                .collect(),
+            question.options.len(),
+        );
+        host.refresh_size();
+        let lines = question_lines(question, usize::from(host.width()));
+        draw_choice(host, &picker, &lines)?;
+        loop {
+            host.cancellation.check()?;
+            if let Some(key) = reader.poll_choice(rune_term::shell::POLL_INTERVAL) {
+                let chosen = question_key(key, &mut picker, &host.cancellation);
+                host.cancellation.check()?;
+                if let Some(chosen) = chosen {
+                    answers.push(chosen);
+                    break;
+                }
+            }
+            draw_choice(host, &picker, &[])?;
+        }
+    }
+    Ok(Answer::Chosen(answers))
+}
+
+/// Keeps the full question and option descriptions available in scrollback.
+fn question_lines(question: &Question, width: usize) -> Vec<String> {
+    std::iter::once(question.text.clone())
+        .chain(question.options.iter().map(|option| {
+            option.description.as_ref().map_or_else(
+                || option.label.clone(),
+                |description| format!("{}: {description}", option.label),
+            )
+        }))
+        .flat_map(|line| rune_term::width::wrap(&transcript::sanitize(&line), width.max(1)))
+        .collect()
+}
+
+fn question_key(
+    key: KeyAction,
+    picker: &mut rune_term::picker::Picker,
+    cancellation: &Cancellation,
+) -> Option<usize> {
+    match key {
+        KeyAction::Submit => picker.selected().map(|_| picker.cursor()),
+        KeyAction::Up => {
+            picker.up();
+            None
+        }
+        KeyAction::Down => {
+            picker.down();
+            None
+        }
+        KeyAction::Escape | KeyAction::Cancel | KeyAction::Interrupt => {
+            cancellation.cancel();
+            None
+        }
+        KeyAction::Complete
+        | KeyAction::Ignored
+        | KeyAction::Transcript
+        | KeyAction::HistorySearch
+        | KeyAction::ExternalEditor => None,
+    }
+}
+
+/// Quoting makes control characters visible without changing the approved scope.
+fn approval_lines(request: &ApprovalRequest, width: usize) -> Vec<String> {
+    [
+        format!("Permission request for {:?}", request.tool),
+        format!("Reason: {:?}", request.reason),
+        format!("Scope: {:?}", request.target),
+    ]
+    .into_iter()
+    .flat_map(|line| rune_term::width::wrap(&line, width.max(1)))
+    .collect()
+}
+
+fn approval_key(
+    key: KeyAction,
+    picker: &mut rune_term::picker::Picker,
+    cancellation: &Cancellation,
+) -> Option<Outcome> {
+    match key {
+        KeyAction::Submit => Some(if picker.selected() == Some("Run once") {
+            Outcome::Allow
+        } else {
+            Outcome::Deny
+        }),
+        KeyAction::Up => {
+            picker.up();
+            None
+        }
+        KeyAction::Down => {
+            picker.down();
+            None
+        }
+        KeyAction::Escape | KeyAction::Cancel | KeyAction::Interrupt => {
+            cancellation.cancel();
+            Some(Outcome::Deny)
+        }
+        KeyAction::Complete
+        | KeyAction::Ignored
+        | KeyAction::Transcript
+        | KeyAction::HistorySearch
+        | KeyAction::ExternalEditor => None,
+    }
+}
+
+/// Uses the session renderer and reports if the choice cannot be displayed.
+fn draw_choice(
+    host: &SessionHost,
+    picker: &rune_term::picker::Picker,
+    settled: &[String],
+) -> Result<()> {
+    let _frame = host
+        .frame
+        .lock()
+        .map_err(|_| RuneError::new(ErrorCode::Internal, "the frame lock was poisoned"))?;
+    let out = host
+        .live_out
+        .lock()
+        .ok()
+        .and_then(|slot| slot.clone())
+        .ok_or_else(|| RuneError::new(ErrorCode::InputRequired, "choice output is unavailable"))?;
+    let hint = vec![String::from(
+        "Up/Down choose, Enter confirm, Esc/Ctrl-C cancel",
+    )];
+    let menu = picker.rows(&host.theme, host.truecolor);
+    let painted = host.paint_with_menu(settled, Some(picker.title()), &hint, &[], &menu, (0, 0))?;
+    let mut sink = LockedSink { stream: out };
+    sink.write_all(&painted)?;
+    sink.flush()?;
+    Ok(())
 }
 
 /// Runs a turn on its own thread, calling `between` until it finishes.
@@ -1497,33 +2377,58 @@ fn run_turn_steerable(
 /// turn one defect into the loss of the session. What the worker held is not
 /// used, because a turn stopped partway can hold a tool call with no result,
 /// and every later request would then be refused.
-fn run_on_worker<T, B>(history: &mut History, turn: T, mut between: B) -> Result<turn::TurnOutcome>
+/// The panic is an internal failure, with its diagnostic returned separately
+/// for the closing frame.
+fn run_on_worker<T, B>(
+    history: &mut History,
+    turn: T,
+    mut between: B,
+) -> (Result<turn::TurnOutcome>, Option<String>)
 where
     T: FnOnce(&mut History) -> Result<turn::TurnOutcome> + Send,
     B: FnMut(),
 {
     let before = history.clone();
     let mut taken = std::mem::take(history);
-    let (returned, result) = std::thread::scope(|scope| {
+    let (returned, result, diagnostic) = std::thread::scope(|scope| {
         let worker = scope.spawn(move || {
-            let result = turn(&mut taken);
-            (taken, result)
+            rune_term::input::catch_worker_panic(|| {
+                let result = turn(&mut taken);
+                (taken, result)
+            })
         });
         while !worker.is_finished() {
             between();
         }
-        worker
-            .join()
-            .unwrap_or_else(|_| (before, Err(turn_interrupted())))
+        match worker.join().and_then(std::convert::identity) {
+            Ok((returned, result)) => (returned, result, None),
+            Err(payload) => {
+                let message = payload
+                    .downcast_ref::<String>()
+                    .map(String::as_str)
+                    .or_else(|| payload.downcast_ref::<&str>().copied())
+                    .unwrap_or("non-text panic payload");
+                (
+                    before,
+                    Err(RuneError::new(
+                        ErrorCode::Internal,
+                        "internal worker failure",
+                    )),
+                    Some(format!("worker panicked: {message}")),
+                )
+            }
+        }
     });
     *history = returned;
-    result
+    (result, diagnostic)
 }
 
 /// What a steerable turn produced beside its outcome.
 struct SteeredTurn {
     /// The turn's own result.
     outcome: Result<turn::TurnOutcome>,
+    /// A caught worker panic, settled once through the renderer.
+    diagnostic: Option<String>,
     /// Corrections the turn took in, in the order they were typed.
     applied: Vec<String>,
     /// Corrections typed after the turn's last boundary, which it never saw.
@@ -1556,18 +2461,16 @@ fn close_turn(
         ));
     }
     let marker = rune_term::shell::prompt();
-    let prompt_row = transcript::render_prompt(marker, reader.line(), usize::from(host.width()));
-    let caret = rune_term::width::str_width(marker).saturating_add(reader.column());
+    let (prompt_rows, caret) = transcript::render_draft_at(
+        marker,
+        reader.line(),
+        reader.column(),
+        usize::from(host.width()),
+    );
     if let Ok(mut typed) = host.typed.lock() {
         *typed = (reader.line().to_owned(), reader.column());
     }
-    let painted = host.paint(
-        lines,
-        notice.as_deref(),
-        std::slice::from_ref(&prompt_row),
-        &[],
-        (0, u16::try_from(caret).unwrap_or(u16::MAX)),
-    )?;
+    let painted = host.paint(lines, notice.as_deref(), &prompt_rows, &[], caret)?;
     if !painted.is_empty() {
         sink.write_all(&painted)?;
         sink.flush()?;
@@ -1575,20 +2478,260 @@ fn close_turn(
     Ok(())
 }
 
-/// Returns the error an interrupted turn is reported with.
-///
-/// A worker that panics is reported as an interruption rather than as a panic:
-/// a panic inside a turn is not a reason to end the session, and the only other
-/// thing the caller could do with it is stop.
-fn turn_interrupted() -> RuneError {
-    RuneError::new(ErrorCode::Cancelled, "the turn was interrupted")
+/// Restores the main terminal even when rendering fails or unwinds.
+struct TranscriptScreen<'a>(&'a SessionHost);
+
+/// Uses the same terminal ownership as the transcript to keep worker output
+/// away from the editor and preserve the main screen underneath it.
+fn edit_draft(reader: &mut rune_term::input::KeyReader, host: &SessionHost) {
+    let screen = {
+        let _frame = host
+            .frame
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        host.transcript_open
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let screen = TranscriptScreen(host);
+        host.show(b"\x1b[?1049h\x1b[0m\x1b[2J\x1b[H\x1b[?25h");
+        screen
+    };
+    let result = reader.edit_external();
+    if let Ok(mut typed) = host.typed.lock() {
+        *typed = (reader.line().to_owned(), reader.column());
+    }
+    drop(screen);
+    if let Err(error) = result {
+        let _frame = host
+            .frame
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (prompt, caret) = transcript::render_draft_at(
+            rune_term::shell::prompt(),
+            reader.line(),
+            reader.column(),
+            usize::from(host.width()),
+        );
+        let message = format!("external editor failed: {error}");
+        if let Ok(painted) =
+            host.paint(&[transcript::sanitize(&message)], None, &prompt, &[], caret)
+        {
+            host.show(&painted);
+        }
+    }
+}
+
+impl Drop for TranscriptScreen<'_> {
+    fn drop(&mut self) {
+        let _frame = self
+            .0
+            .frame
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.0.show(b"\x1b[0m\x1b[?1049l\x1b[?25h");
+        self.0
+            .transcript_open
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Reads a stable snapshot on the alternate screen. The reader's composer is
+/// never replaced, so its caret, recall state and kill buffer survive intact.
+fn view_transcript(reader: &rune_term::input::KeyReader, host: &SessionHost) -> Result<()> {
+    use rune_term::input::TranscriptAction;
+
+    let mut entries = host
+        .transcript
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    entries.extend(event_entries(host));
+    let partial = host.partial_answer();
+    if !partial.is_empty() {
+        entries.push(Entry::assistant(partial));
+    }
+    host.refresh_size();
+    let mut size = (
+        host.width(),
+        host.height.load(std::sync::atomic::Ordering::Relaxed),
+    );
+    let mut view =
+        rune_term::screen::Transcript::new(full_transcript_rows(&entries, size.0, host.ascii));
+    let mut details = transcript::ToolDetails::new(entries);
+    let mut surface = rune_term::frame::FrameSurface::new(size.0, size.1)?;
+    let _screen = {
+        let _frame = host
+            .frame
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        host.transcript_open
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let screen = TranscriptScreen(host);
+        host.show(b"\x1b[?1049h\x1b[0m\x1b[2J\x1b[H\x1b[?25l");
+        screen
+    };
+
+    let mut redraw = true;
+    loop {
+        host.refresh_size();
+        let next_size = (
+            host.width(),
+            host.height.load(std::sync::atomic::Ordering::Relaxed),
+        );
+        if next_size != size {
+            let top = view.top();
+            size = next_size;
+            view = rune_term::screen::Transcript::new(
+                details
+                    .rows(Display {
+                        width: usize::from(size.0),
+                        ascii: host.ascii,
+                        ..Display::default()
+                    })
+                    .0,
+            );
+            view.jump(top, usize::from(size.1.saturating_sub(1)));
+            // Resizing can leave stale cells anywhere on the alternate screen.
+            host.show(b"\x1b[2J");
+            redraw = true;
+        }
+        let height = usize::from(size.1.saturating_sub(1));
+        if redraw {
+            let mut lines = view.visible(height).to_vec();
+            lines.resize(height, String::new());
+            let footer = vec![String::from(
+                "Transcript | Tab tool Space toggle | Up/Down PgUp/PgDn Home/End | Esc/Ctrl-O close",
+            )];
+            let target = rune_term::frame::compose(
+                &rune_term::frame::Regions::new(&lines, &footer),
+                size.0,
+                size.1,
+            )?;
+            let painted = surface.commit(&target)?;
+            host.show(&painted.bytes);
+        }
+        let action = reader.poll_transcript(std::time::Duration::from_millis(50));
+        redraw = !matches!(action, Some(TranscriptAction::Ignored) | None);
+        match action {
+            Some(TranscriptAction::Close) => break,
+            Some(TranscriptAction::Up) => view.scroll_up(1),
+            Some(TranscriptAction::Down) => view.scroll_down(1, height),
+            Some(TranscriptAction::PageUp) => view.page_up(height),
+            Some(TranscriptAction::PageDown) => view.page_down(height),
+            Some(TranscriptAction::Home) => view.jump(0, height),
+            Some(TranscriptAction::End) => view.jump(usize::MAX, height),
+            Some(
+                action @ (TranscriptAction::NextTool
+                | TranscriptAction::PreviousTool
+                | TranscriptAction::ToggleTool),
+            ) => {
+                match action {
+                    TranscriptAction::NextTool => details.select(false),
+                    TranscriptAction::PreviousTool => details.select(true),
+                    _ => details.toggle(),
+                }
+                let (rows, selected) = details.rows(Display {
+                    width: usize::from(size.0),
+                    ascii: host.ascii,
+                    ..Display::default()
+                });
+                let top = selected.unwrap_or(view.top());
+                view = rune_term::screen::Transcript::new(rows);
+                view.jump(top, height);
+            }
+            Some(TranscriptAction::Ignored) | None => {}
+        }
+    }
+    Ok(())
+}
+
+/// Adds process interruption boundaries to the saved transcript without putting
+/// those display notices into the conversation sent to the provider.
+fn resumed_entries(history: &History, state: &rune_session::store::SessionState) -> Vec<Entry> {
+    use rune_session::event::SessionEvent;
+    use rune_term::transcript::Speaker;
+
+    let mut boundaries = std::collections::BTreeSet::new();
+    let mut messages = 0_usize;
+    for frame in rune_session::replay::replay_events(&state.events) {
+        match &frame.event {
+            SessionEvent::UserMessage { .. } => messages = messages.saturating_add(1),
+            SessionEvent::AssistantMessage { text, .. } if !text.is_empty() => {
+                messages = messages.saturating_add(1);
+            }
+            SessionEvent::TurnInterrupted { .. } => {
+                boundaries.insert(messages);
+            }
+            _ => {}
+        }
+    }
+    messages = 0;
+    let mut entries = Vec::new();
+    for entry in history_entries(history.turns()) {
+        if matches!(entry.speaker, Speaker::User | Speaker::Assistant) {
+            messages = messages.saturating_add(1);
+        }
+        entries.push(entry);
+        if boundaries.remove(&messages) {
+            entries.push(Entry::notice("interrupted"));
+        }
+    }
+    entries
+}
+
+/// Projects recorded messages in order, keeping tool arguments and result bodies.
+fn history_entries(turns: &[rune_agent::history::Turn]) -> Vec<Entry> {
+    use rune_net::message::{ContentPart, Role};
+    turns
+        .iter()
+        .flat_map(|turn| {
+            turn.parts.iter().map(|part| match part {
+                ContentPart::Text { text } => match turn.role {
+                    Role::User => Entry::user(text.clone()),
+                    Role::Assistant => Entry::assistant(text.clone()),
+                    Role::Tool => Entry::tool(text.clone()),
+                    Role::System => Entry::notice(text.clone()),
+                },
+                ContentPart::Reasoning { text } => Entry::reasoning(text.clone()),
+                ContentPart::ToolCall {
+                    name, arguments, ..
+                } => Entry::tool(format!("{name} {arguments}")),
+                ContentPart::ToolResult {
+                    name,
+                    content,
+                    is_error,
+                    ..
+                } => Entry::tool(format!(
+                    "{name}{}:\n{content}",
+                    if *is_error { " (error)" } else { "" }
+                )),
+                ContentPart::Image { image } => {
+                    Entry::notice(format!("image {} ({})", image.id, image.media_type))
+                }
+            })
+        })
+        .collect()
+}
+
+/// Expands every recorded tool line using the same wrapping as the inline view.
+fn full_transcript_rows(entries: &[Entry], cols: u16, ascii: bool) -> Vec<String> {
+    transcript::render(
+        entries,
+        Display {
+            width: usize::from(cols),
+            ascii,
+            tool_lines: usize::MAX,
+            ..Display::default()
+        },
+    )
+    .lines()
+    .map(str::to_owned)
+    .collect()
 }
 
 /// Waits for a line to be submitted, drawing the prompt as it is typed.
 ///
 /// Returns the submitted input, or `None` when the user asked to leave. The
-/// cursor is placed after the text typed so far, which is the whole reason the
-/// line is drawn here rather than by the terminal.
+/// cursor is placed at the editor's caret within the visible draft.
 ///
 /// `recall` supplies earlier prompts for the up and down arrows. Passing an
 /// empty slice leaves those keys doing nothing, which is what a session with no
@@ -1598,23 +2741,161 @@ fn await_submission(
     host: &SessionHost,
     out: &LiveSink,
     recall: &[String],
+    context: &ExecutionContext,
+    limits: &rune_tools::workspace::FileLimits,
 ) -> Result<Option<Input>> {
     let marker = rune_term::shell::prompt();
     // Which completion row is highlighted. While the dropdown is open the
     // arrows move it rather than walking the prompt history, because the list is
     // what the user is looking at.
     let mut selected = 0_usize;
+    let mut paths: Option<crate::path_completion::Paths> = None;
 
     loop {
-        let rows = completion_rows(reader.line(), selected, host.theme(), host.truecolor());
+        let rows = paths.as_ref().map_or_else(
+            || {
+                completion_rows(
+                    reader.line(),
+                    selected,
+                    host.theme(),
+                    host.truecolor(),
+                    host.menu_room(),
+                )
+            },
+            |paths| {
+                path_completion_rows(
+                    paths,
+                    selected,
+                    host.theme(),
+                    host.truecolor(),
+                    host.menu_room(),
+                )
+            },
+        );
         draw_prompt(reader, host, out, &rows, marker)?;
 
-        match idle_key(reader.read_key(), reader, &mut selected, &rows, recall) {
+        let key = reader.read_key();
+        if key == KeyAction::Transcript {
+            view_transcript(reader, host)?;
+            continue;
+        }
+        if key == KeyAction::ExternalEditor {
+            edit_draft(reader, host);
+            selected = 0;
+            paths = None;
+            continue;
+        }
+        if key == KeyAction::HistorySearch {
+            search_prompt_history(reader, host, out, recall)?;
+            selected = 0;
+            paths = None;
+            continue;
+        }
+        if path_key(key, reader, &mut paths, &mut selected, context, limits) {
+            continue;
+        }
+        match idle_key(key, reader, &mut selected, &rows, recall) {
             Idle::Stay => {}
             Idle::Leave => return Ok(None),
             Idle::Submit(input) => return Ok(Some(input)),
         }
     }
+}
+
+/// A filesystem menu is opened only by Tab and discarded when the draft changes.
+fn path_key(
+    key: KeyAction,
+    reader: &mut rune_term::input::KeyReader,
+    paths: &mut Option<crate::path_completion::Paths>,
+    selected: &mut usize,
+    context: &ExecutionContext,
+    limits: &rune_tools::workspace::FileLimits,
+) -> bool {
+    if let Some(open) = paths {
+        match key {
+            KeyAction::Submit | KeyAction::Complete => {
+                if let Some(chosen) = open.matches.get(*selected) {
+                    reader.complete_path(open.range.clone(), chosen);
+                }
+                *paths = None;
+                *selected = 0;
+                return true;
+            }
+            KeyAction::Up | KeyAction::Down => {
+                *selected = if key == KeyAction::Up {
+                    selected.saturating_sub(1)
+                } else {
+                    selected
+                        .saturating_add(1)
+                        .min(open.matches.len().saturating_sub(1))
+                };
+                return true;
+            }
+            KeyAction::Escape => {
+                *paths = None;
+                *selected = 0;
+                return true;
+            }
+            _ => *paths = None,
+        }
+    }
+    if key != KeyAction::Complete
+        || completion_matches(reader.line()) > 0
+        || matches!(Input::parse(reader.line()), Input::Command { .. })
+    {
+        return false;
+    }
+    let choices = crate::path_completion::Paths::collect(
+        reader.line(),
+        reader.cursor_byte(),
+        context,
+        limits,
+    );
+    *selected = 0;
+    if choices.matches.len() == 1 {
+        if let Some(chosen) = choices.matches.first() {
+            reader.complete_path(choices.range, chosen);
+        }
+    } else if !choices.matches.is_empty() {
+        *paths = Some(choices);
+    }
+    true
+}
+
+fn path_completion_rows(
+    paths: &crate::path_completion::Paths,
+    selected: usize,
+    theme: &Theme,
+    truecolor: bool,
+    room: usize,
+) -> Vec<String> {
+    let count = paths.matches.len();
+    let window = completion_window(count, selected, menu_window(count, COMPLETION_WINDOW, room));
+    let accent = theme.sgr(Slot::Accent, truecolor);
+    let dim = theme.sgr(Slot::Dim, truecolor);
+    let mut rows: Vec<_> = window
+        .clone()
+        .filter_map(|index| {
+            paths.matches.get(index).map(|path| {
+                if index == selected {
+                    styled(&accent, &format!("> {path}"))
+                } else {
+                    styled(&dim, &format!("  {path}"))
+                }
+            })
+        })
+        .collect();
+    if count > window.len() && rows.len() < room {
+        rows.push(styled(
+            &dim,
+            &format!(
+                "  {}-{} of {count}",
+                window.start.saturating_add(1),
+                window.end
+            ),
+        ));
+    }
+    rows
 }
 
 /// What a key pressed at the idle prompt leads to.
@@ -1707,6 +2988,7 @@ fn idle_key(
             }
             Idle::Stay
         }
+        KeyAction::Transcript | KeyAction::ExternalEditor | KeyAction::HistorySearch => Idle::Stay,
         KeyAction::Ignored => {
             // Typing narrows the list, so the highlight returns to the top
             // rather than pointing at a row that may no longer exist.
@@ -1736,8 +3018,8 @@ fn open_completion(
 
 /// Draws the prompt row, with any rows that belong below it.
 ///
-/// A caret is placed at the end of the typed text so the terminal's cursor is
-/// where the next character will go.
+/// The visible draft scrolls with the caret so the terminal's cursor is where
+/// the next character will go.
 fn draw_prompt(
     reader: &rune_term::input::KeyReader,
     host: &SessionHost,
@@ -1745,21 +3027,16 @@ fn draw_prompt(
     menu: &[String],
     marker: &str,
 ) -> Result<()> {
-    use rune_term::width::str_width;
-
     let mut sink = out
         .lock()
         .map_err(|_| RuneError::new(ErrorCode::Internal, "the output lock was poisoned"))?;
-    let row = transcript::render_prompt(marker, reader.line(), usize::from(host.width()));
-    let caret = str_width(marker).saturating_add(reader.column());
-    let painted = host.paint_with_menu(
-        &[],
-        None,
-        std::slice::from_ref(&row),
-        &[],
-        menu,
-        (0, u16::try_from(caret).unwrap_or(u16::MAX)),
-    )?;
+    let (rows, caret) = transcript::render_draft_at(
+        marker,
+        reader.line(),
+        reader.column(),
+        usize::from(host.width()),
+    );
+    let painted = host.paint_with_menu(&[], None, &rows, &[], menu, caret)?;
     if !painted.is_empty() {
         sink.write_all(&painted)?;
         sink.flush()?;
@@ -1788,9 +3065,7 @@ fn run_picker(
     reader.clear();
 
     let chosen = loop {
-        let mut below = vec![picker.title().to_owned()];
-        below.extend(picker.rows(&host.theme, host.truecolor));
-        below.push(rune_term::picker::Picker::hint().to_owned());
+        let below = picker_menu(&mut picker, &host.theme, host.truecolor, host.menu_room());
         draw_prompt(reader, host, out, &below, marker)?;
 
         match reader.read_key() {
@@ -1808,6 +3083,10 @@ fn run_picker(
                     picker.down();
                 }
             }
+            KeyAction::Transcript => {
+                view_transcript(reader, host)?;
+            }
+            KeyAction::ExternalEditor | KeyAction::HistorySearch => {}
             KeyAction::Ignored => {
                 picker.set_query(reader.line());
             }
@@ -1816,6 +3095,96 @@ fn run_picker(
 
     reader.replace(&draft);
     Ok(chosen)
+}
+
+/// Flattens history for a menu without changing the selected prompt.
+fn history_preview(row: &str, ascii: bool) -> String {
+    transcript::sanitize(row)
+        .replace('\n', if ascii { " / " } else { " ↵ " })
+        .replace('\t', " ")
+}
+
+/// Searches workspace recall, restoring a choice without handing it to the session.
+fn search_prompt_history(
+    reader: &mut rune_term::input::KeyReader,
+    host: &SessionHost,
+    out: &LiveSink,
+    recall: &[String],
+) -> Result<()> {
+    let chosen = reader.with_temporary_line(|query| -> Result<Option<String>> {
+        let mut picker = history_picker(recall);
+        loop {
+            let rows = picker_menu(&mut picker, &Theme::no_color(), false, host.menu_room())
+                .into_iter()
+                .map(|row| {
+                    let preview = history_preview(&row, host.ascii);
+                    let slot = if row.starts_with("> ") {
+                        Slot::Accent
+                    } else {
+                        Slot::Dim
+                    };
+                    styled(&host.theme.sgr(slot, host.truecolor), &preview)
+                })
+                .collect::<Vec<_>>();
+            draw_prompt(query, host, out, &rows, rune_term::shell::prompt())?;
+            match query.read_key() {
+                KeyAction::Submit | KeyAction::Complete => {
+                    if let Some(prompt) = picker.selected() {
+                        return Ok(Some(prompt.to_owned()));
+                    }
+                }
+                KeyAction::Escape | KeyAction::Cancel | KeyAction::Interrupt => return Ok(None),
+                KeyAction::Up => {
+                    picker.up();
+                }
+                KeyAction::Down => {
+                    picker.down();
+                }
+                KeyAction::Ignored => picker.set_query(query.line()),
+                KeyAction::Transcript | KeyAction::ExternalEditor | KeyAction::HistorySearch => {}
+            }
+        }
+    })?;
+    if let Some(prompt) = chosen {
+        reader.restore_prompt(&prompt);
+    }
+    Ok(())
+}
+
+/// Newest first, with case-insensitive substring matching supplied by the picker.
+fn history_picker(recall: &[String]) -> rune_term::picker::Picker {
+    rune_term::picker::Picker::new(
+        "prompt history (Enter restores without submitting)",
+        recall.iter().rev().cloned().collect(),
+        rune_term::picker::DEFAULT_WINDOW,
+    )
+}
+
+/// Fits the model menu to the remaining rows before rendering its choices.
+fn picker_menu(
+    picker: &mut rune_term::picker::Picker,
+    theme: &Theme,
+    truecolor: bool,
+    max_rows: usize,
+) -> Vec<String> {
+    if max_rows == 0 {
+        return Vec::new();
+    }
+    // Keep a choice visible even when the title and key hint cannot fit.
+    let decorated = max_rows >= 4;
+    let room = max_rows.saturating_sub(if decorated { 2 } else { 0 });
+    picker.set_window(menu_window(
+        picker.matches().len(),
+        rune_term::picker::DEFAULT_WINDOW,
+        room,
+    ));
+    let mut rows = picker.rows(theme, truecolor);
+    rows.truncate(room);
+    if decorated {
+        rows.insert(0, picker.title().to_owned());
+        rows.push(rune_term::picker::Picker::hint().to_owned());
+    }
+    rows
 }
 
 /// Summarizes older turns and installs the summary.
@@ -1845,54 +3214,94 @@ fn compact_history(
         );
     }
 
-    let request = rune_agent::compaction::render_summary_request(history, &plan);
+    match summarize_history(host, history, &plan, &rune_net::transport::agent(), &|| {
+        false
+    }) {
+        Ok(removed) => report(
+            host,
+            sink,
+            &format!(
+                "compacted {removed} earlier turn(s); {} turn(s) remain",
+                history.len()
+            ),
+        ),
+        Err(err) => report(host, sink, err.message()),
+    }
+}
+
+/// Estimates the actual dialect body, including instructions and tool schemas.
+fn request_estimate(
+    host: &SessionHost,
+    plan: &rune_net::provider::RequestPlan,
+) -> Result<rune_agent::tokens::Estimate> {
+    let body = host.dialect.build_request(plan)?;
+    let bytes = serde_json::to_vec(&body)
+        .map_err(|err| RuneError::new(ErrorCode::Internal, err.to_string()))?
+        .len() as u64;
+    // Include dialect defaults such as Anthropic's max_tokens reserve.
+    let output = ["max_tokens", "max_completion_tokens", "max_output_tokens"]
+        .iter()
+        .find_map(|key| body.get(key).and_then(serde_json::Value::as_u64))
+        .unwrap_or(0);
+    let capacity = rune_agent::tokens::usable_input_tokens(
+        host.context_limit
+            .load(std::sync::atomic::Ordering::Relaxed),
+        output,
+    );
+    Ok(rune_agent::tokens::Estimate::new(
+        bytes,
+        rune_agent::tokens::estimate_tokens(bytes),
+        capacity,
+    ))
+}
+
+/// Shares the summarizer between manual and automatic compaction.
+/// History changes only after a usable summary has arrived.
+fn summarize_history(
+    host: &SessionHost,
+    history: &mut History,
+    plan: &rune_agent::compaction::Plan,
+    client: &dyn rune_net::fetch::Fetch,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<usize> {
+    let request = rune_agent::compaction::render_summary_request(history, plan);
     let mut request_plan = rune_net::provider::RequestPlan::new(host.model());
     rune_agent::compaction::SUMMARY_INSTRUCTIONS.clone_into(&mut request_plan.instructions);
     request_plan.messages = rune_net::transport::one_shot_messages(&request);
-
-    let outcome = match rune_net::transport::stream_completion(
-        &rune_net::transport::agent(),
+    let outcome = rune_net::transport::stream_completion(
+        client,
         &host.endpoint,
         host.dialect.as_ref(),
         &request_plan,
-        compaction_timeout(host),
-        &|| false,
-    ) {
-        Ok(outcome) => outcome,
-        Err(err) => {
-            return report(
-                host,
-                sink,
-                &format!("compaction failed, nothing was changed: {err}"),
-            );
-        }
-    };
-
+        rune_net::transport::RequestTimeouts {
+            head: compaction_timeout(host),
+            ..rune_net::transport::RequestTimeouts::from_limits(&host.limits)
+        },
+        cancelled,
+    )
+    .map_err(|err| {
+        RuneError::new(
+            err.kind().code(),
+            format!("compaction failed, nothing was changed: {err}"),
+        )
+    })?;
     let summary = outcome.text();
-    // A summary that is empty or trivial would replace the conversation it was
-    // meant to compress with nothing, so it is refused and the history stands.
-    if let Err(err) = rune_agent::compaction::validate_summary(&summary) {
-        return report(
-            host,
-            sink,
-            &format!("compaction produced nothing usable: {err}"),
-        );
-    }
-
+    rune_agent::compaction::validate_summary(&summary).map_err(|err| {
+        RuneError::new(
+            err.code(),
+            format!("compaction produced nothing usable: {err}"),
+        )
+    })?;
+    host.capture_history(history);
     let removed = rune_agent::compaction::apply(
         history,
-        &plan,
+        plan,
         rune_agent::compaction::wrap_summary(&summary),
     );
+    host.transcript_history_len
+        .store(history.len(), std::sync::atomic::Ordering::Relaxed);
     host.record_usage(&outcome.usage);
-    report(
-        host,
-        sink,
-        &format!(
-            "compacted {removed} earlier turn(s); {} turn(s) remain",
-            history.len()
-        ),
-    )
+    Ok(removed)
 }
 
 /// Commits one line of command output through the renderer.
@@ -2036,20 +3445,30 @@ pub const COMPLETION_WINDOW: usize = 6;
 /// screen until the window has to move, rather than the list jumping on every
 /// key.
 #[must_use]
-pub fn completion_window(count: usize, selected: usize) -> std::ops::Range<usize> {
-    if count <= COMPLETION_WINDOW {
+pub fn completion_window(count: usize, selected: usize, window: usize) -> std::ops::Range<usize> {
+    if window == 0 {
+        return 0..0;
+    }
+    if count <= window {
         return 0..count;
     }
     // The last screenful is the floor, so the list can scroll to its end.
-    let last_start = count.saturating_sub(COMPLETION_WINDOW);
+    let last_start = count.saturating_sub(window);
     let selected = selected.min(count.saturating_sub(1));
     // Start far enough back that the selection sits on the last row of the
     // window once it has moved past the first screenful.
     let start = selected
         .saturating_add(1)
-        .saturating_sub(COMPLETION_WINDOW)
+        .saturating_sub(window)
         .min(last_start);
-    start..start.saturating_add(COMPLETION_WINDOW)
+    start..start.saturating_add(window)
+}
+
+/// Leaves a row for the position indicator whenever a long list has room.
+fn menu_window(count: usize, maximum: usize, room: usize) -> usize {
+    let window = maximum.min(room);
+    let position_row = usize::from(count > window && room > 1);
+    window.min(room.saturating_sub(position_row))
 }
 
 /// Returns the rows showing what can be typed next.
@@ -2066,7 +3485,16 @@ pub fn completion_window(count: usize, selected: usize) -> std::ops::Range<usize
 ///
 /// Returns an empty list when the line is not a command being typed, so a
 /// caller can pass every keystroke without checking first.
-pub fn completion_rows(line: &str, selected: usize, theme: &Theme, truecolor: bool) -> Vec<String> {
+pub fn completion_rows(
+    line: &str,
+    selected: usize,
+    theme: &Theme,
+    truecolor: bool,
+    max_rows: usize,
+) -> Vec<String> {
+    if max_rows == 0 {
+        return Vec::new();
+    }
     let Some(word) = slash_word(line) else {
         return Vec::new();
     };
@@ -2091,8 +3519,12 @@ pub fn completion_rows(line: &str, selected: usize, theme: &Theme, truecolor: bo
         .max()
         .unwrap_or(0);
 
-    let window = completion_window(matches.len(), selected);
-    let mut rows: Vec<String> = Vec::with_capacity(COMPLETION_WINDOW.saturating_add(1));
+    let window = completion_window(
+        matches.len(),
+        selected,
+        menu_window(matches.len(), COMPLETION_WINDOW, max_rows),
+    );
+    let mut rows: Vec<String> = Vec::with_capacity(window.len().saturating_add(1));
     for index in window.clone() {
         let Some(entry) = matches.get(index) else {
             continue;
@@ -2112,7 +3544,7 @@ pub fn completion_rows(line: &str, selected: usize, theme: &Theme, truecolor: bo
 
     // How far through the list this window is, so a reader can tell a list that
     // ends here from one that continues. Shown only when there is more to see.
-    if matches.len() > COMPLETION_WINDOW {
+    if matches.len() > window.len() && rows.len() < max_rows {
         let first = window.start.saturating_add(1);
         let last = window.end;
         rows.push(styled(
@@ -2165,6 +3597,13 @@ fn flush_lines(host: &SessionHost, sink: &mut LockedSink, lines: &[String]) -> R
     if lines.is_empty() {
         return Ok(());
     }
+    let labelled;
+    let lines = if host.accessible {
+        labelled = transcript::accessible_lines(&[Entry::notice(lines.join("\n"))]);
+        &labelled
+    } else {
+        lines
+    };
     let (prompt_row, caret) = host.idle_prompt();
     let painted = host.paint(lines, None, &prompt_row, &[], caret)?;
     if !painted.is_empty() {
@@ -2340,6 +3779,9 @@ fn render_status(info: &SessionInfo<'_>) -> String {
             " of {} ({percent}%)",
             footer::format_tokens(info.context_limit)
         );
+    }
+    if let Some(source) = info.context_source {
+        let _ = writeln!(out, "context source {source} (estimate)");
     }
     out.trim_end().to_owned()
 }
@@ -2670,6 +4112,8 @@ struct SessionInfo<'a> {
     workspace: &'a str,
     /// Tokens spent from the context window.
     context_used: u64,
+    /// Source of the initial resume estimate, absent for live readings.
+    context_source: Option<&'static str>,
     /// Size of the context window, zero when none is known.
     context_limit: u64,
     /// What this session has spent so far.
@@ -2887,17 +4331,20 @@ fn report_turn(outcome: &turn::TurnOutcome, host: &SessionHost) -> Result<Vec<St
 /// Renders a turn that ended in an error rather than an outcome.
 ///
 /// What streamed before the failure is kept, because the reader watched it
-/// arrive and a transcript that dropped it would disagree with the screen. It
-/// is not part of the conversation the model will see next.
-fn report_failed_turn(err: &RuneError, host: &SessionHost) -> Vec<String> {
+/// arrive and a transcript that dropped it would disagree with the screen.
+/// Interrupted answers are also saved and retained in the conversation.
+fn report_failed_turn(
+    err: &RuneError,
+    host: &SessionHost,
+    diagnostic: Option<&str>,
+) -> Vec<String> {
     let mut entries = event_entries(host);
-    let partial = host
-        .streaming
-        .lock()
-        .map(|streaming| streaming.answer.clone())
-        .unwrap_or_default();
+    let partial = host.partial_answer();
     if !partial.trim().is_empty() {
         entries.push(Entry::assistant(partial));
+    }
+    if let Some(diagnostic) = diagnostic {
+        entries.push(Entry::notice(diagnostic));
     }
     if err.code() == ErrorCode::Cancelled {
         entries.push(Entry::notice("cancelled"));
@@ -2908,6 +4355,25 @@ fn report_failed_turn(err: &RuneError, host: &SessionHost) -> Vec<String> {
         }
     }
     render_entries(&entries, host)
+}
+
+/// Keeps only the answer bytes the turn has not already added to history.
+///
+/// An interruption can follow completed model steps or a tool call, whose
+/// assistant text is already in history. The live answer may include that
+/// prefix, so appending it all would repeat those steps on the next request.
+fn retain_partial_answer(history: &mut History, start: usize, partial: &str) {
+    let recorded: String = history.turns()[start..]
+        .iter()
+        .filter(|turn| turn.role == rune_net::message::Role::Assistant)
+        .map(|turn| transcript::sanitize(&turn.text()))
+        .collect();
+    let unrecorded = partial.strip_prefix(&recorded).unwrap_or(partial);
+    if !unrecorded.trim().is_empty() {
+        history.push_assistant(vec![rune_net::message::ContentPart::Text {
+            text: unrecorded.to_owned(),
+        }]);
+    }
 }
 
 /// Returns the transcript entries for the events the running turn reported.
@@ -2945,11 +4411,15 @@ fn event_entries(host: &SessionHost) -> Vec<Entry> {
 
 /// Renders transcript entries into terminal lines.
 fn render_entries(entries: &[Entry], host: &SessionHost) -> Vec<String> {
+    if host.accessible {
+        return transcript::accessible_lines(entries);
+    }
     // Measured against the terminal rather than a fixed width, so a line is
     // wrapped where the reader's own window wraps it instead of mid-word at a
     // column that has nothing to do with this terminal.
     let display = Display {
         width: usize::from(host.width()),
+        ascii: host.ascii,
         ..Display::default()
     };
     let lanes = transcript::Lanes {
@@ -3006,11 +4476,13 @@ pub fn prepare(
         _ => Box::new(rune_net::chat_completions::ChatCompletions),
     };
 
-    let mut registry = inventory::builtin_with_web(
+    let questions = Arc::new(TerminalQuestions::default());
+    let mut registry = inventory::builtin_with_answerer(
         &rune_tools::workspace::FileLimits::from_budget(&settings.limits),
         &settings.limits,
         &paths.managed_skills_dir(),
         crate::web_client::backends(settings),
+        questions.clone(),
     )?;
     // The delegation tool lives with the authority model it enforces, and the
     // tool registry cannot depend on that crate, so it is added here where both
@@ -3030,6 +4502,7 @@ pub fn prepare(
     )))?;
 
     Ok(SessionConfig {
+        accessible: false,
         settings: settings.clone(),
         paths: paths.clone(),
         resume,
@@ -3047,6 +4520,7 @@ pub fn prepare(
         // is refused, and an unknown command resolves to the mode's default
         // rather than to nothing.
         rules: crate::permissions::validated(settings)?,
+        questions,
     })
 }
 
@@ -3068,6 +4542,40 @@ mod tests {
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
         }
+    }
+
+    #[test]
+    fn a_journal_write_failure_cancels_before_showing_unsaved_text() {
+        let root = tempfile::tempdir().expect("temp");
+        let base = Utf8PathBuf::from_path_buf(root.path().to_owned()).expect("utf8");
+        let paths = Paths {
+            config_root: base.join("config"),
+            state_root: base.join("state"),
+            data_root: base.join("data"),
+        };
+        let id = SessionId::generate();
+        let mut recorder = Recorder::create(&paths, &id).expect("created");
+        recorder.user_message("slow").expect("prompt");
+        recorder.begin_turn().expect("started");
+        let metadata = paths.session_dir(&id).join("session.json");
+        std::fs::remove_file(&metadata).expect("removed metadata");
+        std::fs::create_dir(&metadata).expect("prevent metadata writes");
+        let recorder = Arc::new(Mutex::new(recorder));
+        let mut host = test_host();
+        host.recorder = Some(Arc::clone(&recorder));
+        host.emit(Event::TextDelta {
+            delta: "unsaved".to_owned(),
+        });
+        assert!(host.cancellation.is_cancelled());
+        assert!(host.partial_answer().is_empty());
+        let log = paths.session_dir(&id).join("events.jsonl");
+        let bytes = std::fs::read(&log).expect("log");
+        host.emit(Event::TextDelta {
+            delta: "more unsaved".to_owned(),
+        });
+        assert!(host.partial_answer().is_empty());
+        assert_eq!(std::fs::read(log).expect("log"), bytes);
+        assert!(recorder.lock().expect("lock").check_journal().is_err());
     }
 
     #[test]
@@ -3093,12 +4601,218 @@ mod tests {
         );
     }
 
+    #[test]
+    fn transcript_ownership_suppresses_streaming_frames_and_restores_after_drop() {
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let host = test_host();
+        *host.live_out.lock().expect("lock") =
+            Some(Arc::new(Mutex::new(SharedSink(Arc::clone(&bytes)))));
+        host.transcript_open
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let screen = TranscriptScreen(&host);
+        host.emit(Event::TextDelta {
+            delta: String::from("LIVE-ANSWER"),
+        });
+        assert!(
+            bytes.lock().expect("lock").is_empty(),
+            "stream painted over the viewer"
+        );
+        assert_eq!(host.partial_answer(), "LIVE-ANSWER");
+        drop(screen);
+        assert!(
+            !host
+                .transcript_open
+                .load(std::sync::atomic::Ordering::Relaxed)
+        );
+        assert!(String::from_utf8_lossy(&bytes.lock().expect("lock")).contains("\x1b[?1049l"));
+        bytes.lock().expect("lock").clear();
+        host.draw_stream_with("saved draft", 3);
+        let written = String::from_utf8_lossy(&bytes.lock().expect("lock")).into_owned();
+        assert!(written.contains("LIVE-ANSWER"), "{written:?}");
+        assert!(written.contains("saved draft"), "{written:?}");
+    }
+
+    #[test]
+    fn full_transcript_keeps_recorded_calls_replies_and_every_tool_row() {
+        use rune_agent::history::Turn;
+        use rune_core::id::ToolCallId;
+        use rune_net::message::{ContentPart, Role};
+
+        let mut content = String::new();
+        for row in 1..=40 {
+            writeln!(content, "TOOL-{row:02}").expect("tool row");
+        }
+        let turns = vec![
+            Turn::user(1, "inspect"),
+            Turn::assistant(
+                2,
+                vec![ContentPart::ToolCall {
+                    id: ToolCallId::new("read").expect("tool id"),
+                    name: String::from("read_file"),
+                    arguments: String::from("{\"path\":\"fixture\"}"),
+                }],
+            ),
+            Turn::new(
+                3,
+                Role::Tool,
+                vec![ContentPart::ToolResult {
+                    id: ToolCallId::new("read").expect("tool id"),
+                    name: String::from("read_file"),
+                    content,
+                    is_error: false,
+                }],
+            ),
+            Turn::assistant(
+                4,
+                vec![ContentPart::Text {
+                    text: String::from("REPLY-END\x1b[2J"),
+                }],
+            ),
+        ];
+        let entries = history_entries(&turns);
+        let rows = full_transcript_rows(&entries, 80, false);
+        let rendered = rows.join("\n");
+        assert!(rendered.starts_with("> inspect"));
+        assert!(rendered.contains("read_file {\"path\":\"fixture\"}"));
+        for row in 1..=40 {
+            assert!(
+                rendered.contains(&format!("TOOL-{row:02}")),
+                "missing row {row}"
+            );
+        }
+        assert!(rendered.ends_with("REPLY-END"));
+        assert!(!rendered.contains("more line(s)"));
+        assert!(!rendered.contains("\x1b[2J"));
+        let mut view = rune_term::screen::Transcript::new(rows);
+        assert!(view.visible(8).iter().any(|row| row.contains("inspect")));
+        view.page_down(8);
+        assert!(view.visible(8).iter().any(|row| row.contains("TOOL-10")));
+        view.jump(usize::MAX, 8);
+        assert!(view.visible(8).iter().any(|row| row.contains("REPLY-END")));
+    }
+
     /// Returns the one-based column of the last caret move in a frame.
     fn last_caret_column(bytes: &[u8]) -> Option<usize> {
         let text = String::from_utf8_lossy(bytes);
         let end = text.rfind('G')?;
         let start = text.get(..end)?.rfind("\u{1b}[")?.saturating_add(2);
         text.get(start..end)?.parse().ok()
+    }
+
+    #[test]
+    fn accessible_frames_append_settled_lines_and_ignore_live_regions() {
+        let mut host = test_host();
+        host.accessible = true;
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let out: LiveSink = Arc::new(Mutex::new(SharedSink(Arc::clone(&bytes))));
+        *host.live_out.lock().expect("output lock") = Some(out);
+        let rows = vec!["live answer".to_owned()];
+        for _ in 0..10 {
+            host.emit(Event::TextDelta {
+                delta: "streamed ".to_owned(),
+            });
+            assert!(
+                host.paint_with_menu(&[], None, &rows, &rows, &rows, (2, 5))
+                    .expect("paint")
+                    .is_empty()
+            );
+        }
+        assert!(bytes.lock().expect("bytes").is_empty());
+        let lines = render_entries(&[Entry::assistant("finished\nnext line")], &host);
+        assert_eq!(
+            host.paint(&lines, None, &[], &[], (0, 0)).expect("paint"),
+            b"Assistant: finished\nAssistant: next line\n"
+        );
+        assert!(host.clear_region().expect("clear").is_empty());
+        assert!(!rune_term::input::KeyReader::line_mode().is_active());
+    }
+
+    #[test]
+    fn a_long_draft_stays_visible_as_a_turn_streams_and_closes() {
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let out: LiveSink = Arc::new(Mutex::new(SharedSink(Arc::clone(&bytes))));
+        let host = test_host();
+        *host.live_out.lock().expect("lock") = Some(Arc::clone(&out));
+        let mut reader = rune_term::input::KeyReader::new();
+        reader.replace(&("a".repeat(160) + "TAIL-END"));
+        let mut grid = rune_term::Grid::new(80, 24).expect("grid");
+        let check = |grid: &mut rune_term::Grid| {
+            let drawn = std::mem::take(&mut *bytes.lock().expect("lock"));
+            assert!(last_caret_column(&drawn).expect("caret") <= 80);
+            grid.feed(&drawn).expect("feed");
+            assert!(grid.text().contains("TAIL-END"), "{}", grid.text());
+            assert_eq!(grid.cursor().col, 79);
+        };
+        host.draw_stream_with(reader.line(), reader.column());
+        check(&mut grid);
+        host.emit(Event::TextDelta {
+            delta: "answer".to_owned(),
+        });
+        check(&mut grid);
+        host.draw_notice("still working");
+        check(&mut grid);
+        let mut sink = LockedSink { stream: out };
+        close_turn(
+            &host,
+            &mut sink,
+            &mut reader,
+            &["answer".to_owned()],
+            None,
+            &[],
+        )
+        .expect("closed");
+        check(&mut grid);
+        assert_eq!(reader.line(), "a".repeat(160) + "TAIL-END");
+    }
+
+    #[test]
+    fn multiline_caret_survives_streaming_notices_and_turn_close() {
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let out: LiveSink = Arc::new(Mutex::new(SharedSink(Arc::clone(&bytes))));
+        let host = test_host();
+        *host.live_out.lock().expect("lock") = Some(Arc::clone(&out));
+        let mut reader = rune_term::input::KeyReader::new();
+        reader.paste("first 界\nsecond e\u{301}\nthird 👩‍💻");
+        let mut grid = rune_term::Grid::new(80, 24).expect("grid");
+        let check = |grid: &mut rune_term::Grid, edited_row: u16| {
+            let drawn = std::mem::take(&mut *bytes.lock().expect("lock"));
+            grid.feed(&drawn).expect("feed");
+            let caret = grid.cursor();
+            let first = caret.row.saturating_sub(edited_row);
+            assert_eq!(grid.row_text(first), "> first 界");
+            assert_eq!(grid.row_text(first + 1), "  second e\u{301}");
+            assert_eq!(grid.row_text(first + 2), "  third 👩‍💻");
+            assert_eq!(caret.col, 10);
+        };
+        let column =
+            rune_term::width::str_width(&rune_term::editor::displayed("first 界\nsecond e\u{301}"));
+        host.draw_stream_with(reader.line(), column);
+        check(&mut grid, 1);
+        host.emit(Event::TextDelta {
+            delta: "answer".to_owned(),
+        });
+        check(&mut grid, 1);
+        host.draw_notice("still working");
+        check(&mut grid, 1);
+        let mut sink = LockedSink { stream: out };
+        close_turn(
+            &host,
+            &mut sink,
+            &mut reader,
+            &["answer".to_owned()],
+            None,
+            &[],
+        )
+        .expect("closed");
+        check(&mut grid, 2);
+        draw_prompt(&reader, &host, &sink.stream, &[], "> ").expect("idle prompt");
+        check(&mut grid, 2);
+        reader.clear();
+        draw_prompt(&reader, &host, &sink.stream, &[], "> ").expect("cleared");
+        grid.feed(&std::mem::take(&mut *bytes.lock().expect("lock")))
+            .expect("feed");
+        assert!(!grid.text().contains("second"), "{}", grid.text());
+        assert!(!grid.text().contains("third"), "{}", grid.text());
     }
 
     #[test]
@@ -3164,6 +4878,74 @@ mod tests {
         });
         let answer = host.streaming.lock().expect("lock").answer.clone();
         assert_eq!(answer, "complete");
+    }
+
+    #[test]
+    fn retry_frames_replace_one_status_row_and_preserve_the_draft() {
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let host = test_host();
+        *host.live_out.lock().expect("output") =
+            Some(Arc::new(Mutex::new(SharedSink(Arc::clone(&bytes)))));
+        host.draw_stream_with("saved draft", 5);
+        let mut grid = rune_term::Grid::new(80, 24).expect("grid");
+        let replay = |grid: &mut rune_term::Grid| {
+            grid.feed(&std::mem::take(&mut *bytes.lock().expect("bytes")))
+                .expect("feed");
+            let screen = grid.text();
+            assert_eq!(screen.matches("ctrl-c cancel").count(), 1, "{screen}");
+            assert!(screen.contains("> saved draft"), "{screen}");
+            assert_eq!(grid.cursor().col, 7);
+            screen
+        };
+        replay(&mut grid);
+        for (attempt, delay) in [(2, 250), (3, 500)] {
+            host.emit(Event::ProviderRetry {
+                step: 1,
+                next_attempt: attempt,
+                max_attempts: 3,
+                delay: std::time::Duration::from_millis(delay),
+            });
+            let screen = replay(&mut grid);
+            assert_eq!(screen.matches("provider retry").count(), 1, "{screen}");
+            assert!(
+                screen.contains(&format!("provider retry {attempt}/3 in {delay}ms")),
+                "{screen}"
+            );
+            host.emit(Event::StepRestarted { step: 1 });
+            let screen = replay(&mut grid);
+            assert!(
+                screen.contains(&format!("provider retry {attempt}/3 |")),
+                "{screen}"
+            );
+            assert!(!screen.contains("ms"), "{screen}");
+        }
+        // A successful request clears the row before tool approval can begin.
+        // A new step and finalization also clear it; host error finalization
+        // does so before close_turn redraws the failed exchange.
+        for event in [
+            Event::ProviderRetryFinished { step: 1 },
+            Event::TurnStarted { step: 2 },
+            Event::Finished {
+                reason: StopReason::Cancelled,
+                usage: rune_net::stream::Usage::default(),
+                last_request: rune_net::stream::Usage::default(),
+                steps: 1,
+            },
+        ] {
+            host.emit(event);
+            assert!(!replay(&mut grid).contains("provider retry"));
+            host.emit(Event::ProviderRetry {
+                step: 1,
+                next_attempt: 2,
+                max_attempts: 3,
+                delay: std::time::Duration::from_millis(250),
+            });
+            replay(&mut grid);
+        }
+        host.clear_provider_retry();
+        host.draw_stream();
+        assert!(!replay(&mut grid).contains("provider retry"));
+        assert!(event_entries(&host).is_empty());
     }
 
     #[test]
@@ -3299,6 +5081,42 @@ mod tests {
     }
 
     #[test]
+    fn history_search_matches_middle_words_in_workspace_prompts_newest_first() {
+        let dir = tempfile::tempdir().expect("temp");
+        let root = Utf8Path::from_path(dir.path()).expect("utf8");
+        let paths = Paths::resolve(
+            Some(root.as_str()),
+            Some(root.as_str()),
+            Some(root.as_str()),
+            Some(root.as_str()),
+            None,
+        );
+        paths.ensure_roots().expect("roots");
+        let mut history = crate::prompt_history::History::open(&paths).expect("history");
+        for (text, workspace, session) in [
+            ("older needle prompt\n界", root.to_owned(), "s1"),
+            ("unrelated latest prompt", root.to_owned(), "s2"),
+            ("newer needle prompt", root.to_owned(), "s2"),
+            ("other needle workspace", root.join("other"), "s3"),
+        ] {
+            history
+                .record(crate::prompt_history::Entry::new(text).located(&workspace, session))
+                .expect("record");
+        }
+        let reopened = crate::prompt_history::History::open(&paths).expect("reopen");
+        let mut picker = history_picker(&recorded_prompts(Some(&reopened), root));
+        assert_eq!(picker.len(), 3);
+        assert_eq!(picker.selected(), Some("newer needle prompt"));
+        picker.set_query("NEEDLE");
+        assert_eq!(picker.matches().len(), 2);
+        picker.down();
+        assert_eq!(picker.selected(), Some("older needle prompt\n界"));
+        picker.set_query("absent");
+        assert_eq!(picker.selected(), None);
+        assert_eq!(history_picker(&[]).selected(), None);
+    }
+
+    #[test]
     fn escape_at_the_prompt_clears_the_line_and_never_leaves() {
         // While a turn runs, Escape asks for a second press to cancel. A turn
         // that ends between the two presses hands the second to this prompt,
@@ -3325,6 +5143,135 @@ mod tests {
     }
 
     #[test]
+    fn caught_worker_panic_renders_one_diagnostic_without_duplicate_status_rows() {
+        // A subprocess makes writes from the default panic hook observable,
+        // rather than letting the test harness capture and hide the defect.
+        if std::env::var_os("RUNE_R059_PANIC_CHILD").is_none() {
+            let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+                .args([
+                    "--exact",
+                    "session::tests::caught_worker_panic_renders_one_diagnostic_without_duplicate_status_rows",
+                    "--nocapture",
+                ])
+                .env("RUNE_R059_PANIC_CHILD", "1")
+                .output()
+                .expect("panic fixture subprocess");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(output.status.success(), "{stdout}\n{stderr}");
+            assert!(stderr.is_empty(), "panic bypassed the renderer: {stderr}");
+            assert!(!stdout.contains("panicked at"), "{stdout}");
+            assert!(
+                !stdout.contains('\u{1b}'),
+                "terminal writes bypassed the sink: {stdout}"
+            );
+            let capture = stdout
+                .lines()
+                .find_map(|line| line.strip_prefix("R059_CAPTURE:"))
+                .expect("renderer capture");
+            let bytes: Vec<u8> = serde_json::from_str(capture).expect("frame bytes");
+            let mut grid = rune_term::Grid::new(80, 24).expect("grid");
+            grid.feed(&bytes).expect("replay");
+            let screen = grid.text();
+            assert_eq!(
+                screen.matches("worker panicked: R059_FIXTURE").count(),
+                1,
+                "{screen}"
+            );
+            assert_eq!(screen.matches("ctrl-c cancel").count(), 1, "{screen}");
+            assert_eq!(screen.matches("test | ").count(), 1, "{screen}");
+            assert_eq!(screen.matches("draft after panic").count(), 1, "{screen}");
+            assert!(screen.contains("partial before panic"), "{screen}");
+            assert!(screen.contains("next turn answer"), "{screen}");
+            return;
+        }
+
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let out: LiveSink = Arc::new(Mutex::new(SharedSink(Arc::clone(&bytes))));
+        let host = test_host();
+        *host.live_out.lock().expect("output") = Some(Arc::clone(&out));
+        let mut reader = rune_term::input::KeyReader::new();
+        reader.replace("draft after panic");
+        host.draw_stream_with(reader.line(), reader.column());
+        let mut history = History::new();
+        history.push_user("panic fixture");
+        let (result, diagnostic) = run_on_worker(
+            &mut history,
+            |_| {
+                host.emit(Event::TextDelta {
+                    delta: "partial before panic".to_owned(),
+                });
+                // Bounded, debug-only fixture also checks terminal sanitization.
+                std::panic::panic_any(String::from("R059_FIXTURE\u{1b}[2J"));
+            },
+            || std::thread::sleep(std::time::Duration::from_millis(1)),
+        );
+        let lines = report_failed_turn(
+            &result.expect_err("caught panic"),
+            &host,
+            diagnostic.as_deref(),
+        );
+        host.clear_events();
+        host.clear_streaming();
+        let mut sink = LockedSink { stream: out };
+        close_turn(&host, &mut sink, &mut reader, &lines, None, &[]).expect("closed");
+        // A subsequent worker and frame must still be usable, and redraws must
+        // not settle the diagnostic a second time.
+        let (_, diagnostic) = run_on_worker(
+            &mut history,
+            |_| Err(rune_agent::steering::cancelled_error()),
+            || {},
+        );
+        assert!(diagnostic.is_none());
+        host.draw_stream_with(reader.line(), reader.column());
+        close_turn(
+            &host,
+            &mut sink,
+            &mut reader,
+            &["next turn answer".to_owned()],
+            None,
+            &[],
+        )
+        .expect("next turn closed");
+        println!(
+            "R059_CAPTURE:{}",
+            serde_json::to_string(&*bytes.lock().expect("bytes")).expect("json")
+        );
+    }
+
+    #[test]
+    fn a_caught_worker_panic_reports_an_internal_failure() {
+        let host = test_host();
+        let mut history = History::new();
+        history.push_user("panic fixture");
+        let (result, diagnostic) = run_on_worker(
+            &mut history,
+            |_| {
+                host.emit(Event::TextDelta {
+                    delta: "partial before panic".to_owned(),
+                });
+                panic!("R060_FIXTURE");
+            },
+            || std::thread::sleep(std::time::Duration::from_millis(1)),
+        );
+
+        let error = result.expect_err("caught worker panic");
+        assert_eq!(error.code(), ErrorCode::Internal);
+        let lines = report_failed_turn(&error, &host, diagnostic.as_deref()).join("\n");
+        assert!(
+            lines.contains("the turn failed: internal worker failure"),
+            "{lines}"
+        );
+        assert!(lines.contains("partial before panic"), "{lines}");
+        assert_eq!(
+            lines.matches("worker panicked: R060_FIXTURE").count(),
+            1,
+            "{lines}"
+        );
+        assert!(!lines.contains("cancelled"), "{lines}");
+    }
+
+    #[test]
     fn a_turn_that_panics_keeps_the_conversation_it_started_with() {
         // A panic inside a turn ends that exchange and nothing more: falling
         // back to an empty history would throw away every earlier turn.
@@ -3335,7 +5282,7 @@ mod tests {
         }]);
         history.push_user("second question");
 
-        let result = run_on_worker(
+        let (result, diagnostic) = run_on_worker(
             &mut history,
             |taken| {
                 // Stopped partway: an assistant turn holding a call with no
@@ -3352,7 +5299,11 @@ mod tests {
 
         assert_eq!(
             result.err().map(|err| err.code()),
-            Some(ErrorCode::Cancelled)
+            Some(ErrorCode::Internal)
+        );
+        assert_eq!(
+            diagnostic.as_deref(),
+            Some("worker panicked: the turn failed")
         );
         assert_eq!(history.len(), 3, "the conversation was not kept");
         assert_eq!(history.turns()[0].text(), "first question");
@@ -3366,17 +5317,21 @@ mod tests {
     fn a_finished_turn_hands_back_what_it_added() {
         let mut history = History::new();
         history.push_user("question");
-        let result = run_on_worker(
+        let (result, diagnostic) = run_on_worker(
             &mut history,
             |taken| {
                 taken.push_assistant(vec![rune_net::message::ContentPart::Text {
                     text: "answer".to_owned(),
                 }]);
-                Err(turn_interrupted())
+                Err(rune_agent::steering::cancelled_error())
             },
             || {},
         );
-        assert!(result.is_err());
+        assert_eq!(
+            result.expect_err("cancelled turn").code(),
+            ErrorCode::Cancelled
+        );
+        assert!(diagnostic.is_none());
         assert_eq!(history.len(), 2);
         assert_eq!(history.turns()[1].text(), "answer");
     }
@@ -3389,13 +5344,39 @@ mod tests {
         if let Ok(mut streaming) = host.streaming.lock() {
             streaming.answer.push_str("half an answer");
         }
-        let lines = report_failed_turn(&rune_agent::steering::cancelled_error(), &host).join("\n");
+        let lines =
+            report_failed_turn(&rune_agent::steering::cancelled_error(), &host, None).join("\n");
         assert!(lines.contains("half an answer"), "{lines}");
         assert!(lines.contains("cancelled"), "{lines}");
         assert!(
             !lines.contains("failed"),
             "a cancel is not a failure: {lines}"
         );
+    }
+
+    #[test]
+    fn cancelled_answers_keep_only_text_not_already_in_the_conversation() {
+        let mut history = History::new();
+        history.push_user("an earlier question");
+        history.push_assistant(vec![rune_net::message::ContentPart::Text {
+            text: "an earlier answer".to_owned(),
+        }]);
+        history.push_user("slow");
+        let start = history.len();
+        history.push_assistant(vec![rune_net::message::ContentPart::Text {
+            text: "STREAM-01\n".to_owned(),
+        }]);
+        retain_partial_answer(&mut history, start, "STREAM-01\nSTREAM-02\nSTREAM-03\n");
+        assert_eq!(history.turns()[3].text(), "STREAM-01\n");
+        assert_eq!(history.turns()[4].text(), "STREAM-02\nSTREAM-03\n");
+
+        // Cancelling after text is in history, or before any arrives, adds none.
+        retain_partial_answer(&mut history, start, "STREAM-01\nSTREAM-02\nSTREAM-03\n");
+        retain_partial_answer(&mut history, start, "");
+        assert_eq!(history.len(), 5);
+        history
+            .validate()
+            .expect("the next request can use the partial answer");
     }
 
     #[test]
@@ -3406,7 +5387,7 @@ mod tests {
             "the endpoint closed the stream",
         )
         .with_hint("check the provider status");
-        let lines = report_failed_turn(&err, &host).join("\n");
+        let lines = report_failed_turn(&err, &host, None).join("\n");
         assert!(lines.contains("the endpoint closed the stream"), "{lines}");
         assert!(lines.contains("check the provider status"), "{lines}");
     }
@@ -3638,6 +5619,380 @@ mod tests {
     }
 
     #[test]
+    fn private_network_access_requires_a_user_answer_in_every_mode() {
+        for mode in [
+            PermissionMode::Ask,
+            PermissionMode::Auto,
+            PermissionMode::FullAccess,
+        ] {
+            let mut host = host_with_reviewer(ReviewOutcome::Clear {
+                reviewed_action: "domain:localhost".to_owned(),
+            });
+            host.mode = mode;
+            host.rules.push(rune_policy::rules::Rule::allow(
+                "web_fetch",
+                "*",
+                rune_policy::decision::Layer::User,
+            ));
+            host.rules.push(rune_policy::rules::Rule::allow(
+                "*",
+                "*",
+                rune_policy::decision::Layer::User,
+            ));
+            assert_eq!(
+                host.decide("web_fetch", Some("domain:localhost")).0,
+                Outcome::Allow
+            );
+            assert_eq!(
+                host.decide_private_network(Some("domain:localhost")).0,
+                Outcome::Ask
+            );
+            let (requests, pending) = mpsc::channel();
+            *host.approval_requests.lock().expect("lock") = Some(requests);
+            std::thread::scope(|scope| {
+                let worker = scope.spawn(|| {
+                    let first = host.decide_private_network(Some("domain:localhost"));
+                    let second = host.decide_private_network(Some("domain:localhost"));
+                    (first, second)
+                });
+                let request = pending
+                    .recv_timeout(std::time::Duration::from_secs(2))
+                    .expect("separate private-network approval");
+                assert_eq!(request.tool, "web_fetch_private");
+                assert_eq!(request.target, "domain:localhost");
+                assert!(request.reason.contains("private-network access"));
+                assert!(request.reason.contains("redirects"));
+                request.answer.send(Outcome::Allow).expect("approve once");
+                let request = pending
+                    .recv_timeout(std::time::Duration::from_secs(2))
+                    .expect("approval cannot leak to the next call");
+                request.answer.send(Outcome::Deny).expect("deny");
+                let (first, second) = worker.join().expect("worker");
+                assert_eq!(first.0, Outcome::Allow);
+                assert_eq!(second.0, Outcome::Deny);
+            });
+        }
+    }
+
+    #[test]
+    fn only_an_explicit_user_private_network_rule_can_grant_access() {
+        use rune_policy::decision::Layer;
+        use rune_policy::rules::Rule;
+        for layer in [
+            Layer::Default,
+            Layer::Project,
+            Layer::User,
+            Layer::Session,
+            Layer::Grant,
+        ] {
+            let mut host = test_host();
+            host.mode = PermissionMode::FullAccess;
+            host.rules
+                .push(Rule::allow("web_fetch_private", "domain:localhost", layer));
+            let outcome = host.decide_private_network(Some("domain:localhost")).0;
+            assert_eq!(
+                outcome,
+                if layer >= Layer::User {
+                    Outcome::Allow
+                } else {
+                    Outcome::Ask
+                }
+            );
+            assert_eq!(
+                host.decide_private_network(Some("domain:other")).0,
+                Outcome::Ask
+            );
+        }
+        let mut host = test_host();
+        host.mode = PermissionMode::FullAccess;
+        host.rules
+            .push(Rule::deny("web_fetch_private", "*", Layer::User));
+        let (requests, pending) = mpsc::channel();
+        *host.approval_requests.lock().expect("lock") = Some(requests);
+        assert_eq!(
+            host.decide_private_network(Some("domain:localhost")).0,
+            Outcome::Deny
+        );
+        assert!(
+            pending.try_recv().is_err(),
+            "denial cannot be overridden by a prompt"
+        );
+    }
+
+    #[test]
+    fn a_terminal_answer_resolves_only_the_displayed_call() {
+        let mut host = test_host();
+        host.mode = PermissionMode::Ask;
+        let (requests, pending) = mpsc::channel();
+        *host.approval_requests.lock().expect("lock") = Some(requests);
+        std::thread::scope(|scope| {
+            let worker = scope.spawn(|| {
+                let first = host.decide("shell", Some("printf AUDIT_SHELL_OK"));
+                let second = host.decide("shell", Some("printf AUDIT_SHELL_OK"));
+                (first, second)
+            });
+            let first = pending
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .expect("first approval request");
+            assert_eq!(first.tool, "shell");
+            assert_eq!(first.target, "printf AUDIT_SHELL_OK");
+            assert!(
+                approval_lines(&first, 80)
+                    .join("\n")
+                    .contains(&first.target)
+            );
+            first.answer.send(Outcome::Allow).expect("approve once");
+            let second = pending
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .expect("the same command needs another approval");
+            second.answer.send(Outcome::Deny).expect("deny");
+            let (first, second) = worker.join().expect("worker");
+            assert_eq!(first.0, Outcome::Allow, "{}", first.1);
+            assert_eq!(second.0, Outcome::Deny, "{}", second.1);
+        });
+    }
+
+    #[test]
+    fn cancellation_wakes_a_worker_waiting_for_approval() {
+        let mut host = test_host();
+        host.mode = PermissionMode::Ask;
+        let (requests, pending) = mpsc::channel();
+        *host.approval_requests.lock().expect("lock") = Some(requests);
+        std::thread::scope(|scope| {
+            let worker = scope.spawn(|| host.decide("shell", Some("printf AUDIT_SHELL_OK")));
+            let _request = pending
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .expect("approval request");
+            host.cancellation.cancel();
+            let (answer, reason) = worker.join().expect("worker");
+            assert_eq!(answer, Outcome::Deny);
+            assert!(reason.contains("cancelled"), "{reason}");
+        });
+    }
+
+    #[test]
+    fn closed_approval_input_never_allows_a_call() {
+        let mut host = test_host();
+        host.mode = PermissionMode::Ask;
+        let (requests, pending) = mpsc::channel();
+        *host.approval_requests.lock().expect("lock") = Some(requests);
+        std::thread::scope(|scope| {
+            let worker = scope.spawn(|| host.decide("shell", Some("printf AUDIT_SHELL_OK")));
+            let request = pending
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .expect("approval request");
+            drop(request);
+            let (answer, reason) = worker.join().expect("worker");
+            assert_eq!(answer, Outcome::Deny);
+            assert!(reason.contains("closed"), "{reason}");
+        });
+        drop(pending);
+        assert_eq!(
+            host.decide("shell", Some("printf AUDIT_SHELL_OK")).0,
+            Outcome::Deny
+        );
+    }
+
+    #[test]
+    fn terminal_approval_does_not_override_a_rule_or_approve_without_input() {
+        let mut host = test_host();
+        host.mode = PermissionMode::Ask;
+        host.rules.push(rune_policy::rules::Rule::deny(
+            "read_file",
+            ".env",
+            rune_policy::decision::Layer::User,
+        ));
+        assert_eq!(
+            host.decide("shell", Some("printf AUDIT_SHELL_OK")).0,
+            Outcome::Ask
+        );
+        let (requests, pending) = mpsc::channel();
+        *host.approval_requests.lock().expect("lock") = Some(requests);
+        assert_eq!(
+            host.decide("read_file", Some("src/main.rs")).0,
+            Outcome::Allow
+        );
+        assert_eq!(host.decide("read_file", Some(".env")).0, Outcome::Deny);
+        assert!(
+            pending.try_recv().is_err(),
+            "settled rules must never prompt"
+        );
+    }
+
+    #[test]
+    fn approval_scope_cannot_hide_terminal_controls_or_clip_long_commands() {
+        let (answer, _response) = mpsc::sync_channel(1);
+        let request = ApprovalRequest {
+            tool: "shell".to_owned(),
+            target: "printf 'a\\b'\n\t\u{1b}[2J\u{202e}TAIL-END".to_owned(),
+            reason: "no rule allows it".to_owned(),
+            answer,
+        };
+        let lines = approval_lines(&request, 80).join("\n");
+        assert!(
+            lines.contains("\\n\\t\\u{1b}[2J\\u{202e}TAIL-END"),
+            "{lines}"
+        );
+        assert!(lines.contains("a\\\\b"), "{lines}");
+        assert!(!lines.contains('\u{1b}'));
+        let narrow = approval_lines(&request, 12);
+        assert!(
+            narrow
+                .iter()
+                .all(|line| rune_term::width::str_width(line) <= 12)
+        );
+        assert!(narrow.join("").ends_with("TAIL-END\""));
+    }
+
+    #[test]
+    fn an_approval_prompt_that_cannot_be_displayed_denies() {
+        let host = test_host();
+        let (answer, _response) = mpsc::sync_channel(1);
+        let request = ApprovalRequest {
+            tool: "shell".to_owned(),
+            target: "printf AUDIT_SHELL_OK".to_owned(),
+            reason: "no rule allows it".to_owned(),
+            answer,
+        };
+        let mut reader = rune_term::input::KeyReader::new();
+        assert_eq!(
+            collect_approval(&request, &host, &mut reader),
+            Outcome::Deny
+        );
+    }
+
+    fn fixture_question() -> Question {
+        Question {
+            text: "Which choice?".to_owned(),
+            options: vec![
+                rune_tools::ask_user::Choice {
+                    label: "Alpha".to_owned(),
+                    description: None,
+                },
+                rune_tools::ask_user::Choice {
+                    label: "Beta".to_owned(),
+                    description: Some("The second choice".to_owned()),
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn question_input_unavailable_or_closed_never_selects_an_answer() {
+        let answerer = TerminalQuestions::default();
+        let context = ExecutionContext::new(Utf8PathBuf::from("/tmp"));
+        let questions = [fixture_question()];
+        assert_eq!(
+            answerer
+                .ask(&questions, &context)
+                .expect_err("unavailable")
+                .code(),
+            ErrorCode::InputRequired
+        );
+        let (requests, pending) = mpsc::channel();
+        *answerer.requests.lock().expect("lock") = Some(requests);
+        std::thread::scope(|scope| {
+            let worker = scope.spawn(|| answerer.ask(&questions, &context));
+            let request = pending
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .expect("question request");
+            assert_eq!(request.questions, questions);
+            drop(request);
+            assert_eq!(
+                worker.join().expect("worker").expect_err("closed").code(),
+                ErrorCode::InputRequired
+            );
+        });
+        drop(pending);
+        assert_eq!(
+            answerer
+                .ask(&questions, &context)
+                .expect_err("disconnected")
+                .code(),
+            ErrorCode::InputRequired
+        );
+    }
+
+    #[test]
+    fn cancellation_wakes_a_worker_waiting_for_question_input() {
+        for cancel_context in [false, true] {
+            let answerer = TerminalQuestions::default();
+            let context = ExecutionContext::new(Utf8PathBuf::from("/tmp"));
+            let questions = [fixture_question()];
+            let (requests, pending) = mpsc::channel();
+            *answerer.requests.lock().expect("lock") = Some(requests);
+            std::thread::scope(|scope| {
+                let worker = scope.spawn(|| answerer.ask(&questions, &context));
+                let _request = pending
+                    .recv_timeout(std::time::Duration::from_secs(2))
+                    .expect("question request");
+                if cancel_context {
+                    context.cancellation().cancel();
+                } else {
+                    answerer.cancellation.cancel();
+                }
+                assert_eq!(
+                    worker
+                        .join()
+                        .expect("worker")
+                        .expect_err("cancelled")
+                        .code(),
+                    ErrorCode::Cancelled
+                );
+            });
+        }
+    }
+
+    #[test]
+    fn question_choices_keep_indices_and_sanitize_displayed_text() {
+        let mut question = fixture_question();
+        question.text.push_str("\u{1b}[2JTAIL-END");
+        question.options[0].label = "Beta".to_owned();
+        question.options[1].description = Some("\u{1b}]52;c;clipboard\u{7}details".to_owned());
+        let lines = question_lines(&question, 12);
+        assert!(!lines.join("").contains('\u{1b}'));
+        assert!(lines.join("").contains("TAIL-END"));
+        assert!(lines.join("").contains("details"));
+        assert!(
+            lines
+                .iter()
+                .all(|line| rune_term::width::str_width(line) <= 12)
+        );
+        let mut picker = rune_term::picker::Picker::new(
+            "question",
+            question
+                .options
+                .iter()
+                .map(|option| option.label.clone())
+                .collect(),
+            2,
+        );
+        let cancellation = Cancellation::new();
+        assert_eq!(
+            question_key(KeyAction::Down, &mut picker, &cancellation),
+            None
+        );
+        assert_eq!(
+            question_key(KeyAction::Ignored, &mut picker, &cancellation),
+            None
+        );
+        assert_eq!(
+            question_key(KeyAction::Submit, &mut picker, &cancellation),
+            Some(1)
+        );
+        assert!(!cancellation.is_cancelled());
+    }
+
+    #[test]
+    fn a_question_that_cannot_be_displayed_requires_input() {
+        let host = test_host();
+        let mut reader = rune_term::input::KeyReader::new();
+        let error = collect_questions(&[fixture_question()], &host, &mut reader)
+            .expect_err("cannot display the question");
+        assert_eq!(error.code(), ErrorCode::InputRequired);
+    }
+
+    #[test]
     fn the_status_line_names_the_model_and_the_mode() {
         let host = test_host();
         let line = host.status_line(120);
@@ -3679,6 +6034,47 @@ mod tests {
     }
 
     #[test]
+    fn streamed_fenced_code_matches_the_finished_transcript_across_resize() {
+        let host = test_host();
+        host.width.store(20, std::sync::atomic::Ordering::Relaxed);
+        let mut text = String::new();
+        for ch in "```rust\n    call(\"alpha  beta\",  gamma);\n```\nafter".chars() {
+            text.push(ch);
+            // Accumulate without painting, which refreshes the size from the
+            // runner's own terminal rather than this test's chosen width.
+            host.streaming.lock().expect("streaming").answer.push(ch);
+            assert_eq!(
+                host.streaming_rows().join("\n").trim_end(),
+                render_entries(&[Entry::assistant(&text)], &host).join("\n"),
+                "streamed and finished code disagree at {text:?}"
+            );
+        }
+        assert!(
+            host.streaming_rows()
+                .iter()
+                .any(|row| row.starts_with("    ↪ "))
+        );
+        for width in [12, 40, 20] {
+            host.width
+                .store(width, std::sync::atomic::Ordering::Relaxed);
+            assert_eq!(
+                host.streaming_rows(),
+                render_entries(&[Entry::assistant(&text)], &host)
+            );
+        }
+        host.clear_streaming();
+        host.streaming
+            .lock()
+            .expect("streaming")
+            .answer
+            .push_str("words after the code");
+        assert_eq!(
+            host.streaming_rows(),
+            render_entries(&[Entry::assistant("words after the code")], &host)
+        );
+    }
+
+    #[test]
     fn wrapping_across_several_lines_keeps_every_line() {
         let mut lazy = LazyRows::default();
         let mut prefix = String::new();
@@ -3699,6 +6095,28 @@ mod tests {
         assert!(!rows.is_empty());
         let rows = rows_for(&mut lazy, "", 20);
         assert!(rows.is_empty(), "stale rows survived: {rows:?}");
+    }
+
+    #[test]
+    fn live_usage_supersedes_the_resume_estimate_and_new_clears_its_source() {
+        let host = test_host();
+        host.context_used
+            .store(1234, std::sync::atomic::Ordering::Relaxed);
+        *host.context_source.lock().expect("source") = Some("saved usage");
+        assert!(host.status_line(120).contains("ctx ~1.2k (saved usage)"));
+        assert!(render_status(&host.info("p", "e")).contains("saved usage (estimate)"));
+        host.record_context_size(0);
+        assert!(host.status_line(120).contains("saved usage"));
+        host.record_context_size(1000);
+        let info = host.info("p", "e");
+        assert_eq!(info.context_used, 1000);
+        assert_eq!(info.context_source, None);
+        assert!(!host.status_line(120).contains("saved usage"));
+        *host.context_source.lock().expect("source") = Some("history bytes");
+        host.forget_context();
+        let info = host.info("p", "e");
+        assert_eq!(info.context_used, 0);
+        assert_eq!(info.context_source, None);
     }
 
     #[test]
@@ -3816,6 +6234,20 @@ mod tests {
         // rather than the configuration.
         let with_color = resolve_theme_for(&config, false);
         assert_ne!(with_color.base(), Theme::no_color().base());
+    }
+
+    #[test]
+    fn no_color_overrides_the_named_high_contrast_theme() {
+        let mut config = colorless_config();
+        config.settings.theme = Some("high-contrast".to_owned());
+        assert_eq!(resolve_theme_for(&config, false), Theme::high_contrast());
+        let theme = resolve_theme_for(&config, true);
+        assert_eq!(theme, Theme::no_color());
+        for slot in rune_term::theme::SLOTS {
+            for truecolor in [false, true] {
+                assert!(theme.sgr(slot, truecolor).is_empty());
+            }
+        }
     }
 
     #[test]
@@ -4233,6 +6665,230 @@ mod tests {
         assert_eq!(history.len(), 1, "the conversation was changed anyway");
     }
 
+    struct SummaryFixture {
+        reply: String,
+        status: u16,
+        requests: Mutex<Vec<serde_json::Value>>,
+        events: Option<Arc<Mutex<Vec<Event>>>>,
+    }
+
+    impl SummaryFixture {
+        fn new(reply: &str) -> Self {
+            Self {
+                reply: reply.to_owned(),
+                status: 200,
+                requests: Mutex::new(Vec::new()),
+                events: None,
+            }
+        }
+    }
+
+    impl rune_net::fetch::Fetch for SummaryFixture {
+        fn send(
+            &self,
+            request: rune_net::fetch::FetchRequest,
+        ) -> rune_net::error::NetResult<rune_net::fetch::FetchResponse> {
+            let body: serde_json::Value =
+                serde_json::from_slice(&request.body).expect("request JSON");
+            if body.to_string().contains("<context_handoff>") {
+                let events = self
+                    .events
+                    .as_ref()
+                    .expect("event observer")
+                    .lock()
+                    .expect("events");
+                assert!(
+                    events
+                        .iter()
+                        .any(|event| matches!(event, Event::ContextCompacted { .. })),
+                    "the compaction event must precede the next model request"
+                );
+            }
+            self.requests.lock().expect("requests").push(body);
+            let body = format!(
+                "data: {}\n\ndata: [DONE]\n\n",
+                serde_json::json!({
+                    "choices": [{"delta": {"content": self.reply}, "finish_reason": "stop"}]
+                })
+            );
+            Ok(rune_net::fetch::FetchResponse {
+                status: self.status,
+                content_type: "text/event-stream".to_owned(),
+                retry_after: None,
+                location: None,
+                body: Box::new(std::io::Cursor::new(body.into_bytes())),
+            })
+        }
+    }
+
+    fn compaction_fixture() -> (SessionHost, History, rune_net::provider::RequestPlan) {
+        let mut host = test_host();
+        for (name, value) in [
+            (rune_core::budget::LimitName::MaxToolResultBytes, 16 * 1024),
+            (rune_core::budget::LimitName::CompactionTriggerPercent, 50),
+        ] {
+            host.limits
+                .set(
+                    name,
+                    rune_core::budget::Budget::Bounded(value),
+                    rune_core::config::Layer::User,
+                )
+                .expect("limit");
+        }
+        let mut history = History::new();
+        for index in 0..4 {
+            history.push_user(format!("fixture question {index}"));
+            history.push_assistant(vec![rune_net::message::ContentPart::Text {
+                text: "earlier answer ".repeat(100),
+            }]);
+        }
+        history.push_user("continue the fixture");
+        host.capture_history(&history);
+        let mut plan = rune_net::provider::RequestPlan::new(host.model());
+        plan.messages = history.to_messages();
+        let tokens = request_estimate(&host, &plan)
+            .expect("estimate")
+            .input_tokens;
+        host.context_limit.store(
+            tokens.saturating_mul(100).saturating_div(60),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        (host, history, plan)
+    }
+
+    #[test]
+    fn crossing_the_configured_trigger_compacts_before_the_next_request() {
+        let (host, mut history, mut plan) = compaction_fixture();
+        let mut fetch = SummaryFixture::new(
+            "The earlier fixture exchanges established the task and its current progress.",
+        );
+        fetch.events = Some(Arc::clone(&host.events));
+        let before = history.clone();
+        let cut = rune_agent::compaction::plan(&history, &host.limits)
+            .expect("plan")
+            .removed_turns;
+        let estimate = request_estimate(&host, &plan).expect("estimate");
+        assert!(estimate.used_percent() >= 50 && estimate.used_percent() < 80);
+        host.prepare_request(&mut history, &mut plan, &fetch)
+            .expect("automatic compaction");
+        assert_eq!(fetch.requests.lock().expect("requests").len(), 1);
+        assert!(
+            fetch.requests.lock().expect("requests")[0]
+                .to_string()
+                .contains("<conversation>")
+        );
+        assert_eq!(plan.messages, history.to_messages());
+        assert!(history.turns()[0].text().contains("<context_handoff>"));
+        for (retained, original) in history.turns()[1..].iter().zip(&before.turns()[cut..]) {
+            assert_eq!(retained.parts, original.parts);
+        }
+        assert!(matches!(
+            host.events.lock().expect("events").last(),
+            Some(Event::ContextCompacted { .. })
+        ));
+        assert!(
+            request_estimate(&host, &plan)
+                .expect("estimate")
+                .used_percent()
+                < 50
+        );
+        host.capture_history(&history);
+        assert_eq!(
+            *host.transcript.lock().expect("transcript"),
+            history_entries(before.turns()),
+            "compaction must preserve the visible transcript without inserting the handoff"
+        );
+        history.validate().expect("compacted history is valid");
+        rune_net::transport::stream_completion(
+            &fetch,
+            &host.endpoint,
+            host.dialect.as_ref(),
+            &plan,
+            rune_net::transport::RequestTimeouts::from_limits(&host.limits),
+            &|| false,
+        )
+        .expect("next model request");
+        assert_eq!(fetch.requests.lock().expect("requests").len(), 2);
+    }
+
+    #[test]
+    fn below_the_trigger_no_summary_request_is_sent() {
+        let (host, mut history, mut plan) = compaction_fixture();
+        host.context_limit
+            .store(100_000, std::sync::atomic::Ordering::Relaxed);
+        let fetch = SummaryFixture::new("unused");
+        let before = history.to_messages();
+        host.prepare_request(&mut history, &mut plan, &fetch)
+            .expect("fits");
+        assert!(fetch.requests.lock().expect("requests").is_empty());
+        assert_eq!(history.to_messages(), before);
+        assert!(host.events.lock().expect("events").is_empty());
+    }
+
+    #[test]
+    fn failed_automatic_compaction_preserves_history_and_blocks_the_model_request() {
+        for (reply, status) in [("", 200), ("too short", 200), ("provider error", 500)] {
+            let (host, mut history, mut plan) = compaction_fixture();
+            let mut fetch = SummaryFixture::new(reply);
+            fetch.status = status;
+            let before = history.to_messages();
+            assert!(
+                host.prepare_request(&mut history, &mut plan, &fetch)
+                    .is_err()
+            );
+            assert_eq!(history.to_messages(), before);
+            assert_eq!(plan.messages, before);
+            assert!(host.events.lock().expect("events").is_empty());
+        }
+    }
+
+    #[test]
+    fn compaction_estimates_include_instructions_tools_and_dialect_output_reserve() {
+        let mut host = test_host();
+        host.dialect = Box::new(rune_net::anthropic::Anthropic);
+        host.context_limit
+            .store(20_000, std::sync::atomic::Ordering::Relaxed);
+        let mut plan = rune_net::provider::RequestPlan::new(host.model());
+        plan.messages = rune_net::transport::one_shot_messages("hello");
+        let small = request_estimate(&host, &plan).expect("estimate");
+        plan.instructions = "instructions ".repeat(100);
+        plan.tools = inventory::advertisement(&host.registry);
+        let full = request_estimate(&host, &plan).expect("estimate");
+        assert!(full.input_tokens > small.input_tokens);
+        assert_eq!(
+            full.capacity,
+            20_000 - rune_net::anthropic::DEFAULT_MAX_TOKENS
+        );
+        assert_eq!(
+            full.output_tokens, 0,
+            "output reserve is subtracted exactly once"
+        );
+    }
+
+    #[test]
+    fn compaction_during_a_turn_keeps_new_transcript_entries_and_partial_answers() {
+        let (host, mut history, mut plan) = compaction_fixture();
+        history.push_assistant(vec![rune_net::message::ContentPart::Text {
+            text: "completed step".to_owned(),
+        }]);
+        history.push_user("steered correction");
+        plan.messages = history.to_messages();
+        let fetch = SummaryFixture::new(
+            "The earlier exchanges established the task and its current progress.",
+        );
+        host.prepare_request(&mut history, &mut plan, &fetch)
+            .expect("compacted");
+        let start = host
+            .transcript_history_len
+            .load(std::sync::atomic::Ordering::Relaxed);
+        retain_partial_answer(&mut history, start, "partial next step");
+        host.capture_history(&history);
+        let entries = host.transcript.lock().expect("transcript");
+        for text in ["completed step", "steered correction", "partial next step"] {
+            assert_eq!(entries.iter().filter(|entry| entry.text == text).count(), 1);
+        }
+    }
+
     /// A sink that appends to a buffer the test can read back.
     struct SharedBuffer(Arc<Mutex<Vec<u8>>>);
 
@@ -4354,7 +7010,7 @@ mod tests {
     #[test]
     fn the_dropdown_offers_a_command_being_typed() {
         let theme = Theme::no_color();
-        let rows = completion_rows("/mod", 0, &theme, false);
+        let rows = completion_rows("/mod", 0, &theme, false, usize::MAX);
         assert_eq!(rows.len(), 2, "{rows:?}");
         assert!(rows[0].starts_with("> /model"), "{rows:?}");
         assert!(rows[1].starts_with("  /models"), "{rows:?}");
@@ -4365,12 +7021,69 @@ mod tests {
     }
 
     #[test]
+    fn path_menus_scroll_with_the_selection_and_keep_within_available_rows() {
+        let paths = crate::path_completion::Paths {
+            range: 5..7,
+            matches: (0..15)
+                .map(|index| format!("'fixture {index:02}.txt'"))
+                .collect(),
+        };
+        for selected in 0..paths.matches.len() {
+            for room in 1..=8 {
+                let rows = path_completion_rows(&paths, selected, &Theme::no_color(), false, room);
+                assert!(rows.len() <= room);
+                assert!(
+                    rows.contains(&format!("> {}", paths.matches[selected])),
+                    "{rows:?}"
+                );
+                assert!(rows.iter().all(|row| !row.contains('\u{1b}')));
+            }
+        }
+        assert!(path_completion_rows(&paths, 0, &Theme::no_color(), false, 0).is_empty());
+    }
+
+    #[test]
+    fn tab_completes_one_match_without_opening_a_menu_or_changing_slash_commands() {
+        let temp = tempfile::tempdir().expect("workspace");
+        let root = Utf8PathBuf::from_path_buf(temp.path().to_owned()).expect("UTF-8");
+        std::fs::write(root.join("fixture space.txt"), "fixture").expect("file");
+        let context = ExecutionContext::new(root);
+        let limits = rune_tools::workspace::FileLimits::default();
+        let mut reader = rune_term::input::KeyReader::new();
+        let mut paths = None;
+        let mut selected = 0;
+        reader.replace("read ./fi");
+        assert!(path_key(
+            KeyAction::Complete,
+            &mut reader,
+            &mut paths,
+            &mut selected,
+            &context,
+            &limits
+        ));
+        assert_eq!(reader.line(), "read './fixture space.txt'");
+        assert!(paths.is_none());
+        for line in ["/mod", "/help fixture", "/zzz"] {
+            reader.replace(line);
+            assert!(!path_key(
+                KeyAction::Complete,
+                &mut reader,
+                &mut paths,
+                &mut selected,
+                &context,
+                &limits
+            ));
+            assert_eq!(reader.line(), line);
+        }
+    }
+
+    #[test]
     fn a_bare_slash_offers_a_window_and_says_how_many_there_are() {
         // Every command matches a bare slash. Drawing all of them would swallow
         // the screen for a list a reader only ever takes the top few rows of, so
         // a window is shown with a row saying how far through it is.
         let theme = Theme::no_color();
-        let rows = completion_rows("/", 0, &theme, false);
+        let rows = completion_rows("/", 0, &theme, false, usize::MAX);
         let total = rune_term::commands::BUILTINS.len();
         assert_eq!(rows.len(), COMPLETION_WINDOW.saturating_add(1), "{rows:?}");
         assert!(rows[0].starts_with("> /model"), "{rows:?}");
@@ -4387,7 +7100,7 @@ mod tests {
     #[test]
     fn a_list_that_fits_carries_no_position_row() {
         let theme = Theme::no_color();
-        let rows = completion_rows("/mod", 0, &theme, false);
+        let rows = completion_rows("/mod", 0, &theme, false, usize::MAX);
         assert_eq!(rows.len(), 2, "{rows:?}");
         assert!(!rows.iter().any(|r| r.contains(" of ")), "{rows:?}");
     }
@@ -4399,26 +7112,29 @@ mod tests {
         // jumping on every key.
         let count = rune_term::commands::BUILTINS.len();
         // Inside the first screenful the window does not move.
-        assert_eq!(completion_window(count, 0), 0..COMPLETION_WINDOW);
         assert_eq!(
-            completion_window(count, COMPLETION_WINDOW - 1),
+            completion_window(count, 0, COMPLETION_WINDOW),
+            0..COMPLETION_WINDOW
+        );
+        assert_eq!(
+            completion_window(count, COMPLETION_WINDOW - 1, COMPLETION_WINDOW),
             0..COMPLETION_WINDOW
         );
         // Past it, the selection stays on the last visible row.
-        let scrolled = completion_window(count, COMPLETION_WINDOW);
+        let scrolled = completion_window(count, COMPLETION_WINDOW, COMPLETION_WINDOW);
         assert_eq!(scrolled, 1..COMPLETION_WINDOW.saturating_add(1));
         // And the end of the list is reachable rather than cut off.
-        let last = completion_window(count, count.saturating_sub(1));
+        let last = completion_window(count, count.saturating_sub(1), COMPLETION_WINDOW);
         assert_eq!(last.end, count);
     }
 
     #[test]
     fn a_window_never_looks_past_the_end_of_a_short_list() {
-        assert_eq!(completion_window(2, 0), 0..2);
-        assert_eq!(completion_window(0, 0), 0..0);
+        assert_eq!(completion_window(2, 0, COMPLETION_WINDOW), 0..2);
+        assert_eq!(completion_window(0, 0, COMPLETION_WINDOW), 0..0);
         // A selection past the end is clamped rather than panicking.
         let count = rune_term::commands::BUILTINS.len();
-        assert!(completion_window(count, 999).end <= count);
+        assert!(completion_window(count, 999, COMPLETION_WINDOW).end <= count);
     }
 
     #[test]
@@ -4428,24 +7144,69 @@ mod tests {
         let theme = Theme::no_color();
         let count = rune_term::commands::BUILTINS.len();
         for selected in 0..count {
-            let rows = completion_rows("/", selected, &theme, false);
+            let rows = completion_rows("/", selected, &theme, false, usize::MAX);
             let marked = rows.iter().filter(|r| r.starts_with('>')).count();
             assert_eq!(marked, 1, "selection {selected} marked {marked} rows");
         }
     }
 
     #[test]
+    fn short_completion_menus_keep_every_command_visible_and_selectable() {
+        let theme = Theme::no_color();
+        let count = rune_term::commands::BUILTINS.len();
+        for room in 1..=8 {
+            for selected in 0..count {
+                let rows = completion_rows("/", selected, &theme, false, room);
+                assert!(rows.len() <= room, "{rows:?}");
+                let chosen = open_completion("/", &rows, selected).expect("completion");
+                assert!(
+                    rows.iter()
+                        .any(|row| row.starts_with(&format!("> /{}", chosen.name))),
+                    "selection {selected} is hidden: {rows:?}"
+                );
+            }
+        }
+        assert!(completion_rows("/", 0, &theme, false, 0).is_empty());
+    }
+
+    #[test]
+    fn model_menus_keep_the_selection_visible_after_resizing_and_narrowing() {
+        let theme = Theme::no_color();
+        let mut picker = rune_term::picker::Picker::new(
+            "models from fixture",
+            (1..=15).map(|index| format!("model-{index:02}")).collect(),
+            rune_term::picker::DEFAULT_WINDOW,
+        );
+        picker.to(14);
+        for room in [16, 4, 3, 2, 1, 16] {
+            let menu = picker_menu(&mut picker, &theme, false, room);
+            assert!(menu.len() <= room, "{menu:?}");
+            assert_eq!(picker.selected(), Some("model-15"));
+            assert!(menu.iter().any(|row| row == "> model-15"), "{menu:?}");
+        }
+        assert!(picker_menu(&mut picker, &theme, false, 0).is_empty());
+        picker.set_query("model-03");
+        let menu = picker_menu(&mut picker, &theme, false, 4);
+        assert!(menu.iter().any(|row| row == "> model-03"), "{menu:?}");
+        assert!(!menu.iter().any(|row| row.contains(" of ")), "{menu:?}");
+        picker.set_query("missing");
+        let menu = picker_menu(&mut picker, &theme, false, 1);
+        assert_eq!(menu.len(), 1);
+        assert!(menu[0].contains("no match"), "{menu:?}");
+    }
+
+    #[test]
     fn accepting_uses_the_selection_the_window_is_showing() {
         // The position row must not be mistaken for a command.
         let theme = Theme::no_color();
-        let rows = completion_rows("/", 0, &theme, false);
+        let rows = completion_rows("/", 0, &theme, false, usize::MAX);
         let chosen = open_completion("/", &rows, 0).expect("a completion");
         assert_eq!(chosen.name, "model");
         // Every command is reachable, including the ones past the first window:
         // clamping on the drawn rows instead of the matches left the tail of the
         // list unselectable.
         let last = rune_term::commands::BUILTINS.len().saturating_sub(1);
-        let rows = completion_rows("/", last, &theme, false);
+        let rows = completion_rows("/", last, &theme, false, usize::MAX);
         assert!(rows.iter().any(|r| r.starts_with('>')), "{rows:?}");
         let chosen = open_completion("/", &rows, last).expect("a completion");
         assert_eq!(chosen.name, "quit");
@@ -4456,21 +7217,21 @@ mod tests {
         let theme = Theme::no_color();
         for line in ["", "hello", "/help me", "/model x", "a/b", "/zzz"] {
             assert!(
-                completion_rows(line, 0, &theme, false).is_empty(),
+                completion_rows(line, 0, &theme, false, usize::MAX).is_empty(),
                 "{line:?} offered rows"
             );
         }
         // A whole command name is still offered, so the row does not vanish as
         // the last letter is typed.
-        assert!(!completion_rows("/help", 0, &theme, false).is_empty());
+        assert!(!completion_rows("/help", 0, &theme, false, usize::MAX).is_empty());
     }
 
     #[test]
     fn the_highlighted_row_is_the_one_the_arrows_moved_to() {
         let theme = Theme::no_color();
-        let first = completion_rows("/mod", 0, &theme, false);
+        let first = completion_rows("/mod", 0, &theme, false, usize::MAX);
         assert!(first[0].starts_with('>'), "{first:?}");
-        let second = completion_rows("/mod", 1, &theme, false);
+        let second = completion_rows("/mod", 1, &theme, false, usize::MAX);
         assert!(second[1].starts_with('>'), "{second:?}");
         assert!(second[0].starts_with("  "), "{second:?}");
     }
@@ -4478,7 +7239,7 @@ mod tests {
     #[test]
     fn the_rows_line_up_their_descriptions() {
         let theme = Theme::no_color();
-        let rows = completion_rows("/mod", 0, &theme, false);
+        let rows = completion_rows("/mod", 0, &theme, false, usize::MAX);
         let summaries = rune_term::commands::matching("mod");
         let columns: Vec<usize> = rows
             .iter()
@@ -4499,10 +7260,10 @@ mod tests {
         // Tab completes to the highlighted command, and Enter takes it too when
         // the name is not yet whole, so a half-typed command is never run.
         let theme = Theme::no_color();
-        let rows = completion_rows("/mod", 0, &theme, false);
+        let rows = completion_rows("/mod", 0, &theme, false, usize::MAX);
         let chosen = open_completion("/mod", &rows, 0).expect("a completion");
         assert_eq!(chosen.name, "model");
-        let rows = completion_rows("/mod", 1, &theme, false);
+        let rows = completion_rows("/mod", 1, &theme, false, usize::MAX);
         let chosen = open_completion("/mod", &rows, 1).expect("a completion");
         assert_eq!(chosen.name, "models");
         // With no dropdown there is nothing to accept.
@@ -4512,13 +7273,13 @@ mod tests {
     #[test]
     fn a_colorless_theme_emits_no_escapes_in_the_dropdown() {
         let theme = Theme::no_color();
-        let plain = completion_rows("/mod", 0, &theme, false);
+        let plain = completion_rows("/mod", 0, &theme, false, usize::MAX);
         assert!(!plain.is_empty(), "nothing matched");
         for row in plain {
             assert!(!row.contains('\u{1b}'), "{row:?}");
         }
         // A colored theme does style them.
-        let styled_rows = completion_rows("/mod", 0, &Theme::fx_dark(), true);
+        let styled_rows = completion_rows("/mod", 0, &Theme::fx_dark(), true, usize::MAX);
         assert!(
             styled_rows.iter().any(|r| r.contains('\u{1b}')),
             "{styled_rows:?}"
@@ -4834,30 +7595,29 @@ mod tests {
             Outcome::Allow,
             "a read tool would ask for approval it never gets"
         );
-        // The web tools are on unless the run says otherwise, so a fresh session
-        // can look something up rather than reporting that it was refused.
+        // A fresh session refuses web calls until the user enables them.
         assert_eq!(
             config
-                .rules
-                .evaluate("web_fetch", "https://example.com", Outcome::Deny)
-                .outcome,
-            Outcome::Allow,
-            "the web tools are refused on a default configuration"
-        );
-        // And turning them off still refuses, so the setting is a real switch.
-        let off = Settings {
-            web_tools: false,
-            ..settings.clone()
-        };
-        let off_config =
-            prepare(&off, &paths, Utf8Path::new("/tmp"), None).expect("a session prepares");
-        assert_eq!(
-            off_config
                 .rules
                 .evaluate("web_fetch", "https://example.com", Outcome::Allow)
                 .outcome,
             Outcome::Deny,
-            "turning the web tools off did not refuse them"
+            "the web tools were allowed without an explicit opt-in"
+        );
+        // Explicitly enabling web installs the allow above the built-in denial.
+        let on = Settings {
+            web_tools: true,
+            ..settings.clone()
+        };
+        let on_config =
+            prepare(&on, &paths, Utf8Path::new("/tmp"), None).expect("a session prepares");
+        assert_eq!(
+            on_config
+                .rules
+                .evaluate("web_fetch", "https://example.com", Outcome::Deny)
+                .outcome,
+            Outcome::Allow,
+            "explicitly enabling the web tools did not allow them"
         );
     }
 
@@ -4869,6 +7629,7 @@ mod tests {
     /// Builds a session config whose terminal accepts no color.
     fn colorless_config() -> SessionConfig {
         SessionConfig {
+            accessible: false,
             settings: Settings::default(),
             paths: Paths::resolve(Some("/tmp"), None, None, None, Some("/tmp/s")),
             resume: None,
@@ -4877,6 +7638,7 @@ mod tests {
             dialect: Box::new(rune_net::chat_completions::ChatCompletions),
             registry: Registry::new(),
             rules: RuleSet::new(),
+            questions: Arc::new(TerminalQuestions::default()),
         }
     }
 
@@ -4896,9 +7658,60 @@ mod tests {
             session_id: "sessiontest1".to_owned(),
             workspace: "/w",
             context_used: 0,
+            context_source: None,
             context_limit: rune_net::catalog::DEFAULT_CONTEXT_WINDOW,
             totals,
         }
+    }
+
+    #[test]
+    fn ascii_session_covers_status_menus_streaming_and_transcript() {
+        let mut host = test_host();
+        let mut settings = Settings::default();
+        let launch =
+            crate::cli::parse(vec![std::ffi::OsString::from("--ascii")], false).expect("parse");
+        crate::cli::apply_to_settings(&launch, &mut settings);
+        host.ascii = settings.ascii;
+        host.width.store(12, std::sync::atomic::Ordering::Relaxed);
+        let text = "```rust\n    abcdefghijklmnop\n```";
+        host.streaming.lock().expect("streaming").answer = text.to_owned();
+        assert!(host.status_line(100).is_ascii());
+        for theme in [Theme::no_color(), Theme::fx_dark(), Theme::high_contrast()] {
+            for truecolor in [true, false] {
+                host.theme = theme.clone();
+                host.truecolor = truecolor;
+                assert!(host.status_line(100).is_ascii());
+                let rows = completion_rows("/", 0, &theme, truecolor, 8);
+                assert!(rows.iter().all(|row| row.is_ascii()));
+                let paths = crate::path_completion::Paths {
+                    // The values are content, while the selection is a decoration.
+                    range: 0..0,
+                    matches: vec!["one".to_owned(), "two".to_owned()],
+                };
+                let rows = path_completion_rows(&paths, 0, &theme, truecolor, 8);
+                assert!(rows.iter().all(|row| row.is_ascii()));
+            }
+        }
+        host.theme = Theme::no_color();
+        let streaming = host.streaming_rows();
+        let entries = [Entry::assistant(text), Entry::tool("read_file\none\ntwo")];
+        let settled = render_entries(&entries, &host);
+        assert_eq!(streaming, render_entries(&entries[..1], &host));
+        assert!(settled.iter().all(|row| row.is_ascii()));
+        assert!(settled.iter().any(|row| row.starts_with("    > ")));
+        assert!(
+            full_transcript_rows(&entries, 12, host.ascii)
+                .iter()
+                .all(|row| row.is_ascii())
+        );
+        assert_eq!(
+            history_preview("> first\nsecond\tline", host.ascii),
+            "> first / second line"
+        );
+        assert_eq!(
+            history_preview("> 界↵\nsecond", host.ascii),
+            "> 界↵ / second"
+        );
     }
 
     fn test_host() -> SessionHost {
@@ -4906,7 +7719,11 @@ mod tests {
         registry
             .insert(Box::new(rune_tools::ReadFile::new()))
             .expect("registered");
+        let questions = Arc::new(TerminalQuestions::default());
         SessionHost {
+            accessible: false,
+            ascii: false,
+            recorder: None,
             endpoint: Endpoint::new("https://example.invalid", "k"),
             dialect: Box::new(rune_net::chat_completions::ChatCompletions),
             model: Mutex::new("test".to_owned()),
@@ -4919,10 +7736,12 @@ mod tests {
             limits: BudgetSet::new(),
             context: ExecutionContext::new(Utf8PathBuf::from("/tmp")),
             registry,
-            cancellation: Cancellation::new(),
+            cancellation: questions.cancellation.clone(),
             steering: SteeringQueue::new(4),
             events: Arc::new(Mutex::new(Vec::new())),
+            provider_retry: Mutex::new(None),
             context_used: std::sync::atomic::AtomicU64::new(0),
+            context_source: Mutex::new(None),
             context_limit: std::sync::atomic::AtomicU64::new(
                 rune_net::catalog::DEFAULT_CONTEXT_WINDOW,
             ),
@@ -4934,6 +7753,9 @@ mod tests {
             height: std::sync::atomic::AtomicU16::new(24),
             inline: Mutex::new(rune_term::inline::Inline::new(80)),
             frame: Mutex::new(()),
+            transcript: Mutex::new(Vec::new()),
+            transcript_history_len: std::sync::atomic::AtomicUsize::new(0),
+            transcript_open: std::sync::atomic::AtomicBool::new(false),
             typed: Mutex::new((String::new(), 0)),
             provider_order: Vec::new(),
             provider_strict: false,
@@ -4944,6 +7766,8 @@ mod tests {
             totals: Mutex::new(Totals::default()),
             undo: Mutex::new(BTreeMap::new()),
             review_session: Arc::new(Mutex::new(ReviewSession::new(&BudgetSet::new()))),
+            approval_requests: Mutex::new(None),
+            questions,
         }
     }
 }

@@ -75,6 +75,13 @@ impl Provider for Responses {
             serde_json::json!(["reasoning.encrypted_content"]),
         );
 
+        if let Some(effort) = effort_wire(plan.effort) {
+            body.insert(
+                "reasoning".to_owned(),
+                serde_json::json!({ "effort": effort }),
+            );
+        }
+
         if plan.has_tools() {
             let tools: Vec<serde_json::Value> = plan
                 .tools
@@ -904,6 +911,37 @@ mod tests {
         ])];
         let body = Responses.build_request(&plan).expect("build");
         assert_eq!(body["input"][0]["content"][1]["type"], "input_image");
+    }
+
+    #[test]
+    fn auto_effort_preserves_provider_defaults() {
+        let body = Responses
+            .build_request(&plan_with_user("hi"))
+            .expect("build");
+        assert!(body.get("reasoning").is_none());
+    }
+
+    #[test]
+    fn explicit_efforts_are_serialized_in_the_request() {
+        use rune_core::config::Effort;
+        for (effort, wire) in [
+            (Effort::None, "low"),
+            (Effort::Minimal, "low"),
+            (Effort::Low, "low"),
+            (Effort::Medium, "medium"),
+            (Effort::High, "high"),
+            (Effort::Xhigh, "xhigh"),
+            (Effort::Max, "xhigh"),
+        ] {
+            let mut plan = plan_with_user("hi");
+            plan.effort = effort;
+            let body = Responses.build_request(&plan).expect("build");
+            assert_eq!(
+                body["reasoning"],
+                serde_json::json!({ "effort": wire }),
+                "{effort}"
+            );
+        }
     }
 
     #[test]

@@ -6,6 +6,68 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Added
 
+- Provider retries show the next attempt, attempt limit, and pending delay in
+  the existing terminal status row. The delay disappears when the retry starts.
+
+- In the transcript viewer, Tab/Shift-Tab selects a tool and Space collapses or
+  expands its preview. Requested expansions show up to 16 KiB and 200 wrapped
+  content rows, preserving surrounding entries and the composer draft.
+
+- `/help` lists active composer, menu, and transcript bindings, cancellation
+  precedence, and bracketed paste behavior. Line-input sessions describe their
+  input mode.
+
+- `--ascii`, `RUNE_ASCII=true`, and profile `ascii = true` select ASCII terminal
+  decorations, including code continuations, history previews and prompt echoes.
+  Status, selection markers, and tool summaries stay ASCII; message text keeps Unicode.
+
+- `--theme high-contrast` selects bright themed foregrounds on explicit black,
+  with a documented 7:1 contrast target for every palette pair in truecolor and
+  256-color output. Footer metadata stays bright; `NO_COLOR` suppresses colors.
+
+- `--accessible` provides line input and append-only screen reader transcripts
+  with explicit speaker labels, completed replies, numbered questions, and
+  permission prompts. Saved sessions replay in the same format without cursor
+  movement or rewritten status rows.
+
+- Ctrl-R searches workspace prompt history by a case-insensitive substring.
+  Enter or Tab restores the selected prompt without submitting; cancelling
+  preserves the draft and caret, and restoration is undoable.
+
+- Tab completes workspace paths in idle prompts, quoting spaces and shell
+  metacharacters as one selection. Multiple matches use Up/Down and Tab or
+  Enter; completion stays inside configured workspace roots and is undoable.
+
+- Ctrl-G edits the draft in `VISUAL`, `EDITOR`, or `vi`, then restores terminal
+  input and reloads the saved text. Failed edits preserve the draft and caret.
+
+- Alt-Enter inserts a newline at the composer caret. Enter submits the whole
+  prompt with its newlines preserved.
+- Multiline drafts display on separate rows with the caret on the edited line,
+  including while a turn runs. Tall drafts scroll to keep the caret visible.
+
+- Interactive assistant text is durably journalled before display. After process
+  death, resume restores the partial answer once with an interrupted boundary
+  and leaves the turn unfinished.
+
+- Interactive resume replays saved user and assistant exchanges before the first
+  input, preserving them in terminal scrollback.
+- Ctrl-O opens a scrollable full transcript snapshot, including recorded tool
+  calls and result bodies. Escape or Ctrl-O returns to the same draft and caret.
+- Fenced code preserves indentation and spaces while streaming and in the
+  finished transcript. Long lines wrap with an indented `↪` continuation marker
+  (`>` with `--ascii`);
+  code tabs use eight-column stops and wrapping adapts to terminal resizing.
+- `rune sandbox explain` previews a shell command without executing it, showing
+  the backend, writable roots, network policy, protected paths and their sources.
+  It reports refusal or unsandboxed fallback when enforcement is unavailable.
+
+- CI replays the actual Rune process in Unix PTYs and compares captured grids
+  for long drafts, 12-column output, short menus, and draft resizing. The gate
+  checks caret positions and that narrow output survives in scrollback.
+- Models can read retained tool output with `read_tool_result`, paging by byte
+  offset until EOF. JSON page metadata and escaping fit within the tool cap and
+  the turn's remaining result budget; handles stay scoped to the live conversation.
 - A running turn can be steered from the keyboard. Enter sends what was typed to
   the turn at its next step, Escape twice cancels it, and Control-C clears a
   typed line before cancelling. A cancelled or failed turn ends that exchange
@@ -18,6 +80,9 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Security
 
+- `Endpoint` debug formatting redacts the provider credential.
+- `rune upgrade` creates a unique staging file exclusively, so a preexisting
+  staging symlink cannot overwrite another file or become the installed binary.
 - Commands receive an allowlisted environment and no longer inherit the
   provider credential. They run with CPU, process, and file size ceilings.
 - A sandboxed command can no longer read or write the credential stores under
@@ -27,11 +92,148 @@ Notable changes, newest first. Each entry describes what a user can observe.
   `edit_file` are held to the same roots as reads.
 - A shell rule is judged against every command a line runs, so `ls; rm -rf .git`
   no longer matches an allow for `ls*`.
-- Web fetch checks every redirect hop before following it.
+- Native web fetch checks every redirect hop and its resolved addresses before
+  connecting, then connects only to those vetted addresses. Private destinations
+  still require `allow_private`. Proxy requests are refused unless `NO_PROXY`
+  permits a direct connection, because proxy DNS can bypass address vetting.
+- Web fetch refuses abbreviated private IPv4 addresses such as `127.1`,
+  `127.0.1`, and `10.1` before calling the backend, unless `allow_private` is true.
 - Model output is stripped of terminal control sequences while it streams.
 
 ### Fixed
 
+- Declared boolean command flags reject attached values, including empty values.
+  `rune sessions --all=no` reports that `--all` takes no value and exits 1.
+
+- Help and the generated command reference describe the accepted aliases
+  `login`, `setup`, `provider`, `pr`, `issue`, `cost`, `logout`, and `settings`.
+  `logout` behaves like `auth`: without an action it shows connection status;
+  `rune auth logout` removes the stored credential.
+
+- `rune help resume` and `rune resume --help` show usage for resuming a saved
+  session, and the generated command reference includes `resume`.
+
+- Alt-R reapplies an undone composer edit and restores the draft and caret.
+
+- Ctrl-_ undoes the last composer edit and restores the draft and caret,
+  including Unicode grapheme deletions and pasted text.
+
+- Ctrl-Y restores the last text cut with Ctrl-U or Ctrl-K at the caret, leaving
+  the caret after the restored text.
+
+- Short terminals describe the usable compact mode instead of saying to resize
+  to continue while prompts are still accepted.
+
+- Caught worker panics in unwinding builds display one diagnostic through the
+  session renderer without leaving duplicate prompt or status rows. They are
+  reported and saved as internal failures rather than user cancellations.
+
+- `grep_files` searches source text before adding long-line truncation annotations,
+  so the annotation cannot create a match for text absent from the source.
+- Unknown `--permission-mode` values fail with `invalid_field`, list the
+  accepted modes, and exit 1 instead of silently keeping the configured mode.
+- Unknown `--effort` values fail with `invalid_field`, list the accepted
+  efforts, and exit 1 instead of silently keeping the configured effort.
+- `rune workspace clear --json` reports an empty directory list, matching the
+  saved configuration and subsequent `rune workspace list --json` output.
+- `cargo xtask gate` checks formatting and Clippy with warnings denied before
+  running the size and startup budgets and workspace tests.
+- Workspace edits and provider selections honor `RUNE_CONFIG`, preserving
+  unrelated settings in that file and leaving the default config untouched.
+- `rune ask --json` emits one failure object and exits 1 when the prompt is
+  empty or contains only whitespace, including when read from standard input.
+- `rune permissions --explain shell:pwd --json` reports one structured decision
+  with its outcome, deciding rule and source layer. Positional explanations also
+  honor `--json`.
+- `rune tree last` shows the branch structure of the most recent saved session
+  in the current workspace, including JSON output.
+- `rune session last` inspects the most recent saved session in the current
+  workspace, including JSON output, instead of parsing `last` as an exact ID.
+- `rune auth status` reports the same connection status as `rune auth`, including
+  JSON output, and exits successfully.
+- `rune usage` honors `--period` when selecting the reporting interval, while
+  preserving positional periods and the default 24-hour report.
+- CLI sessions automatically compact earlier conversation before sending a model request
+  when its estimate reaches `compaction_trigger_percent`, including after tool results. A failed
+  summary preserves history and stops the pending request.
+- Changing the provider with `--provider` selects its configured model and
+  capacity and discards the previous provider's endpoint and credential variable.
+  Changing the model with `--model` discards the previous model's capacity;
+  overrides naming the same provider or model preserve their settings.
+- Changing the model with `RUNE_MODEL` discards the previous model's declared
+  context window and reports the default capacity and source. An override naming
+  the same model preserves its declared window.
+- Resumed sessions initialize the context meter from saved usage or history
+  bytes and label the estimate with its source until live usage arrives.
+- README and budget help distinguish the audited 4.50 MiB stripped release
+  build for `x86_64-unknown-linux-gnu` from the enforced 8 MiB binary size ceiling.
+- Concurrent credential updates and removals hold an OS lock across the full
+  update, preserving other provider profiles when multiple processes connect.
+- Credential updates and removals replace the complete file atomically, so
+  interrupting a writer preserves the previous credentials until replacement.
+- Long Unicode tool descriptions truncate at a character boundary, so registering
+  a custom tool preserves valid UTF-8 without panicking.
+- Completed shell sessions keep their final output until `interact` or `stop`
+  reads it, even when another command starts. Completed sessions release their
+  running slot, and reading their final output removes the session.
+- The shared agent turn loop retains oversized tool output in the live
+  conversation and returns a bounded preview with a readable retained handle.
+  Both output limits include preview metadata; retained bytes can be retrieved
+  through the store API across turns and compaction.
+- `rune ask` saves completed exchanges with their prompt, reply, and reported
+  usage. JSON reports a resolvable `session_id`; `--no-save` creates no session
+  and keeps the identifier empty.
+- Failed terminal turns save their visible partial answer and failure cause.
+  Resuming retains the answer, and `/tree` shows the failure boundary and code once.
+- Cancelled terminal turns save their visible partial answer and a cancellation
+  boundary. Resuming retains the answer, and `/tree` shows the boundary once.
+- Responses requests now send explicit reasoning effort as `reasoning.effort`.
+  Auto keeps provider defaults.
+- Chat Completions requests now send explicit reasoning effort as
+  `reasoning_effort` to compatible endpoints. Auto keeps provider defaults.
+- Anthropic requests now serialize reasoning effort for models that support
+  manual extended thinking. Auto keeps provider defaults, None disables thinking,
+  and explicit output ceilings bound the thinking budget without being raised.
+- Web fetch and search are disabled by default, matching the documented opt-in.
+  Set `web_tools = true` or `RUNE_WEB_TOOLS=true` to enable them; offline mode
+  still refuses outbound requests.
+- Offline mode disables sandboxed shell networking even when external access
+  is granted.
+- The user configuration accepts `offline = true` and enforces offline mode
+  without discarding the other settings in the file. `RUNE_OFFLINE` still takes
+  precedence over the file setting.
+- Cancelling a native provider stream releases its socket and reader thread,
+  including when the response body stays silent.
+- Native provider streams enforce `provider_head_timeout_ms` when response
+  headers arrive but the body stays silent, without waiting for the connection
+  to close.
+- Native provider requests enforce `provider_request_timeout_ms` across the
+  response head and streamed body, returning a timeout even while output keeps
+  arriving.
+- Transcript text wraps to fit narrow terminals, preserving long words and
+  their complete endings when finished answers enter scrollback.
+- Completion and model menus shrink to fit the terminal height while keeping
+  the highlighted choice visible. Closing a menu clears its rows without
+  moving the prompt's caret off its row.
+- `rune upgrade` verifies a release tar.gz before extracting its single Rune
+  executable, so upgrading from a staged release installs a runnable binary.
+- Structured questions in terminal sessions now collect choices with the arrow
+  keys and Enter, then send the selected answers to the model. Escape or
+  Control-C cancels the waiting turn; piped sessions still report input unavailable.
+- `rune ask` fails with `unsupported_tool_call` when the model requests tools
+  that its text-only path cannot execute. JSON lists those calls with status
+  `error` instead of reporting them as successful.
+- File permission rules also match normalized absolute and workspace-relative
+  paths, so denying `.env` also denies `./.env` and its absolute workspace path.
+- Long drafts scroll horizontally to keep the caret and the text being edited
+  visible, both at the prompt and while a turn is running.
+- Interactive permission requests display their complete scope and offer Run
+  once or Deny. Escape or Control-C cancels the waiting turn without executing
+  the request.
+- `grep_files` rejects context windows above 1,000 lines with a tool validation
+  error, keeping the session usable instead of aborting on an oversized allocation.
+- Connecting a provider creates Rune's state directory with mode 0700, so a
+  fresh install can start a session with umask 022 or 002.
 - Anthropic sessions send the key in the header Anthropic reads.
 - Streamed tool calls on the Responses API, reasoning replay, retries of
   errors reported mid-stream, `Retry-After`, unrecognized stop reasons, and
@@ -67,13 +269,11 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Changed
 
-- The web tools are on by default. `web_search` and `web_fetch` were registered
-  with a backend that refused every call and were then denied by a built-in rule
-  that nothing could overrule, so both reported that the session had refused them
-  whatever the configuration said. A coding agent that cannot look something up
-  is the odd one out, so reaching the network is now the default and
-  `web_tools = false` turns it off. `offline = true` still refuses everything,
-  including the model.
+- Web tools received working outbound clients and user-level permission rules,
+  so explicitly enabling them could overrule the built-in denial. This release
+  enabled web tools by default; 0.1.16 restores the documented opt-in via
+  `web_tools = true`. `offline = true` still refuses everything, including the
+  model.
 - The site's canonical and Open Graph URLs name `rune.heyaadi.com`.
 
 ## 0.1.13

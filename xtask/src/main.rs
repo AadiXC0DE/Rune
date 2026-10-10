@@ -7,11 +7,10 @@
 
 use std::process::{Command, ExitCode};
 
-/// Budget targets. These are Rune's own numbers, measured on the release
-/// profile, not a restatement of another project's figures.
 /// Runs per measurement. The fastest is kept, so more samples only reduce noise.
 const MEASUREMENT_SAMPLES: usize = 31;
 
+/// Enforced release budget ceilings, distinct from measured build results.
 mod targets {
     /// Largest accepted stripped release binary, in bytes.
     pub const MAX_BINARY_BYTES: u64 = 8 * 1024 * 1024;
@@ -40,6 +39,14 @@ fn main() -> ExitCode {
             "warnings",
         ]),
         "test" => cargo(&["test", "--workspace"]),
+        "budget"
+            if extra
+                .first()
+                .is_some_and(|arg| arg == "--help" || arg == "-h") =>
+        {
+            print_budget_help();
+            Ok(())
+        }
         "budget" => budget(),
         "gate" => gate(),
         "release" => release(&extra),
@@ -75,15 +82,37 @@ fn print_help() {
     println!("  lint     run clippy with warnings denied");
     println!("  test     run the workspace test suite");
     println!("  budget   build the release profile and check size and startup");
-    println!("  gate     budget plus the full workspace test suite");
+    println!("  gate     format, lint, budget, and the full workspace test suite");
     println!("  release  stage a release artifact, its checksum, and a manifest");
     println!("  web      build the harness for the landing page into site/demo/rune.wasm");
     println!();
     println!("  release takes: cargo xtask release <channel> [version] [target]");
+    println!();
+    print_budget_help();
+}
+
+/// Explains the measured reference build and the enforced size ceiling.
+fn print_budget_help() {
+    println!("usage: cargo xtask budget [--help]");
+    println!();
+    println!("  Builds the release profile and checks size and startup.");
+    println!("  The audited stripped release build measured 4.50 MiB for");
+    println!("  x86_64-unknown-linux-gnu (GNU/Linux).");
+    println!(
+        "  The enforced binary size budget is an {} MiB ceiling ({} bytes).",
+        targets::MAX_BINARY_BYTES / (1024 * 1024),
+        targets::MAX_BINARY_BYTES
+    );
 }
 
 /// The per-commit loop: format, lint, test.
 fn check() -> Result<(), String> {
+    format_and_lint()?;
+    cargo(&["test", "--workspace"])
+}
+
+/// Checks formatting and lint before more expensive work.
+fn format_and_lint() -> Result<(), String> {
     cargo(&["fmt", "--all", "--", "--check"])?;
     cargo(&[
         "clippy",
@@ -92,8 +121,7 @@ fn check() -> Result<(), String> {
         "--",
         "-D",
         "warnings",
-    ])?;
-    cargo(&["test", "--workspace"])
+    ])
 }
 
 /// Runs cargo with the given arguments, inheriting stdio.
@@ -166,8 +194,9 @@ fn budget() -> Result<(), String> {
     Ok(())
 }
 
-/// Budget plus the full suite, for a pull request.
+/// Format, lint, budget, and the full suite, for a pull request.
 fn gate() -> Result<(), String> {
+    format_and_lint()?;
     budget()?;
     cargo(&["test", "--workspace"])
 }

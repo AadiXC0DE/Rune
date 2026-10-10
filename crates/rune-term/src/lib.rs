@@ -8,6 +8,7 @@
 pub mod commands;
 pub mod editor;
 pub mod engine;
+mod external_editor;
 pub mod footer;
 pub mod frame;
 pub mod inline;

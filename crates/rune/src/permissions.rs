@@ -59,7 +59,7 @@ pub fn builtin_rules(mode: &PermissionMode) -> RuleSet {
 
     // Reading is what an agent does constantly; asking each time would make the
     // default unusable.
-    for tool in ["read_file", "glob_files", "grep_files"] {
+    for tool in ["read_file", "glob_files", "grep_files", "read_tool_result"] {
         rules.push(Rule::allow(tool, "*", Layer::Default));
     }
 
@@ -135,6 +135,30 @@ pub fn explain(rules: &RuleSet, mode: PermissionMode, tool: &str, target: &str) 
     }
 }
 
+/// Reports one action's effective outcome and deciding rule as JSON.
+#[must_use]
+pub fn explain_json(
+    rules: &RuleSet,
+    mode: PermissionMode,
+    tool: &str,
+    target: &str,
+) -> serde_json::Value {
+    let fallback = rune_policy::decision::mode_default(mode);
+    let decision = rules.evaluate(tool, target, fallback);
+    let outcome = rune_agent::turn::effective_outcome(mode, decision.outcome);
+    serde_json::json!({
+        "mode": mode.as_str(),
+        "tool": tool,
+        "target": target,
+        "outcome": outcome.as_str(),
+        "rule": decision.rule,
+        "layer": decision.layer.as_str(),
+        "from_rule": decision.from_rule,
+        "considered": decision.considered,
+        "explanation": decision.explain(),
+    })
+}
+
 /// Renders the rule table for a terminal.
 #[must_use]
 pub fn render(rules: &RuleSet, mode: PermissionMode) -> String {
@@ -208,6 +232,19 @@ mod tests {
         let rules = builtin_rules(&PermissionMode::Auto);
         let decision = rules.evaluate("read_file", "src/main.rs", Outcome::Ask);
         assert_eq!(decision.outcome, Outcome::Allow);
+    }
+
+    #[test]
+    fn retained_output_can_be_read_without_an_approval_prompt() {
+        for mode in [PermissionMode::Auto, PermissionMode::Ask] {
+            let rules = builtin_rules(&mode);
+            assert_eq!(
+                rules
+                    .evaluate("read_tool_result", "read_tool_result", Outcome::Ask)
+                    .outcome,
+                Outcome::Allow
+            );
+        }
     }
 
     #[test]
@@ -440,15 +477,37 @@ mod tests {
         // The built-in set refuses the web tools, because it is built without
         // the configuration. Enabling them adds an allow above that refusal, so
         // the reported set is the built-ins plus one rule per web tool.
-        let settings = default_settings();
+        let settings = Settings {
+            web_tools: true,
+            ..default_settings()
+        };
         let rules = validated(&settings).expect("valid");
         let builtins = builtin_rules(&settings.permission_mode).len();
         let expected = builtins.saturating_add(2);
         assert_eq!(rules.len(), expected);
-        assert!(
-            settings.web_tools,
-            "web tools should be on unless the run says otherwise"
-        );
+        for tool in ["web_fetch", "web_search"] {
+            assert_eq!(
+                rules
+                    .evaluate(tool, "domain:example.com", Outcome::Deny)
+                    .outcome,
+                Outcome::Allow
+            );
+        }
+    }
+
+    #[test]
+    fn a_default_configuration_refuses_the_web_tools() {
+        let settings = default_settings();
+        let rules = validated(&settings).expect("valid");
+        assert_eq!(rules.len(), builtin_rules(&settings.permission_mode).len());
+        for tool in ["web_fetch", "web_search"] {
+            assert_eq!(
+                rules
+                    .evaluate(tool, "domain:example.com", Outcome::Allow)
+                    .outcome,
+                Outcome::Deny
+            );
+        }
     }
 
     #[test]

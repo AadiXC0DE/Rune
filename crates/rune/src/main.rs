@@ -17,10 +17,12 @@ mod connect_flow;
 mod diagnostics;
 mod help;
 mod install;
+mod path_completion;
 mod permissions;
 mod prompt_history;
 mod provider_setup;
 mod reference;
+mod sandbox;
 mod session;
 mod session_log;
 mod spec;
@@ -128,6 +130,8 @@ fn run(launch: &Launch) -> Result<ExitCode> {
         Settings::default()
     };
 
+    let saved_directory_source = settings.source_of("additional_directories");
+
     // Command-line flags sit above every file and environment layer.
     cli::apply_to_settings(launch, &mut settings);
     apply_limit_overrides(launch, &mut settings)?;
@@ -160,12 +164,21 @@ fn run(launch: &Launch) -> Result<ExitCode> {
         Command::Prompt => run_prompt(&settings, launch, &output_flags),
         Command::Sessions => run_sessions(&paths, launch, &workspace, &output_flags),
         Command::Tree => run_tree(&paths, launch, &workspace, &output_flags),
-        Command::Session => run_session(&paths, launch, &output_flags),
+        Command::Session => run_session(&paths, launch, &workspace, &output_flags),
         Command::Usage => run_usage(&paths, launch, &output_flags),
         Command::Auth => run_auth(&settings, &paths, launch, &output_flags),
         Command::Connect => run_connect(&settings, &paths, launch, &output_flags),
         Command::Models => run_models(&settings, &paths, &output_flags),
         Command::Permissions => run_permissions(&settings, launch, &output_flags),
+        Command::Sandbox => {
+            let report = sandbox::explain(&settings, saved_directory_source, launch, &workspace)?;
+            if output_flags.json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                print!("{}", sandbox::render(&report));
+            }
+            Ok(ExitCode::from(EXIT_OK))
+        }
         Command::Projects => run_projects(&paths, launch, &workspace, &output_flags),
         Command::Workspace => run_workspace(&settings, &paths, launch, &output_flags),
         Command::Ask => run_ask(&settings, &paths, launch, &output_flags),
@@ -251,8 +264,13 @@ fn run_ask(
     };
 
     if prompt.trim().is_empty() {
-        return Err(RuneError::missing_field("prompt")
-            .with_hint("pass the prompt as an argument, or pipe it on standard input"));
+        let err = RuneError::missing_field("prompt")
+            .with_hint("pass the prompt as an argument, or pipe it on standard input");
+        if output.json {
+            let result = ask::JsonResult::failure(&settings.model, &err, i32::from(EXIT_FAILURE));
+            println!("{}", result.render()?);
+        }
+        return Err(err);
     }
 
     let options = ask::Options {
@@ -427,7 +445,7 @@ fn run_interactive(
     // reaches a working session. A piped or machine invocation is not asked
     // anything: the error it already gets names what to do.
     let mut settings = settings.clone();
-    if settings.provider == Provider::Unconfigured && interactive_stdin() {
+    if settings.provider == Provider::Unconfigured && interactive_stdin() && !launch.accessible {
         let entry = connect_flow::choose_provider()?;
         // The flow writes the selection itself, so the only thing left is to
         // read it back rather than patch the values in by hand: the session then
@@ -448,7 +466,8 @@ fn run_interactive(
         Some(target) => Some(session_log::resolve_target(target, paths, workspace)?),
         None => None,
     };
-    let config = session::prepare(&settings, paths, workspace, resume)?;
+    let mut config = session::prepare(&settings, paths, workspace, resume)?;
+    config.accessible = launch.accessible;
     let stdin = std::io::stdin();
     let input = std::io::BufReader::new(stdin.lock());
     let code = session::run(config, input, std::io::stdout())?;
@@ -482,14 +501,7 @@ fn run_auth(
                 println!("no credential was stored for {provider}");
             }
         }
-        Some(other) => {
-            return Err(RuneError::new(
-                ErrorCode::InvalidField,
-                format!("`{other}` is not an action for auth"),
-            )
-            .with_hint("run `rune auth` to inspect, or `rune auth remove` to clear"));
-        }
-        None => {
+        None | Some("status") => {
             if output.json {
                 let value = serde_json::json!({
                     "provider": settings.provider.to_string(),
@@ -500,6 +512,13 @@ fn run_auth(
             } else {
                 println!("{}", provider_setup::render_connection(settings, paths));
             }
+        }
+        Some(other) => {
+            return Err(RuneError::new(
+                ErrorCode::InvalidField,
+                format!("`{other}` is not an action for auth"),
+            )
+            .with_hint("run `rune auth` to inspect, or `rune auth remove` to clear"));
         }
     }
     Ok(ExitCode::from(EXIT_OK))
@@ -742,17 +761,19 @@ fn run_session_migrate(paths: &Paths, launch: &Launch, output: &OutputFlags) -> 
 
 /// Reports the branch structure of a stored session.
 ///
-/// Without an identifier the most recent session is used, because that is what a
-/// user means by "the current one".
+/// Without an identifier, or with `last`, the most recent session in the current
+/// workspace is used.
 fn run_tree(
     paths: &Paths,
     launch: &Launch,
     workspace: &Utf8Path,
     output: &OutputFlags,
 ) -> Result<ExitCode> {
-    let id = match launch.args.first() {
+    let id = match launch.args.first().map(String::as_str) {
+        None | Some("last") => {
+            session_log::resolve_target(&ResumeTarget::Latest, paths, workspace)?
+        }
         Some(raw) => raw.parse()?,
-        None => session_log::resolve_target(&ResumeTarget::Latest, paths, workspace)?,
     };
     let state = session_log::inspect(paths, &id)?;
     let tree = session_log::tree_of(&state);
@@ -777,7 +798,12 @@ fn run_tree(
 }
 
 /// Reports one stored session.
-fn run_session(paths: &Paths, launch: &Launch, output: &OutputFlags) -> Result<ExitCode> {
+fn run_session(
+    paths: &Paths,
+    launch: &Launch,
+    workspace: &Utf8Path,
+    output: &OutputFlags,
+) -> Result<ExitCode> {
     match launch.args.first().map(String::as_str) {
         Some("recover") => return run_session_recover(paths, launch, output),
         Some("migrate") => return run_session_migrate(paths, launch, output),
@@ -787,7 +813,11 @@ fn run_session(paths: &Paths, launch: &Launch, output: &OutputFlags) -> Result<E
     let raw = launch.args.first().ok_or_else(|| {
         RuneError::missing_field("session").with_hint("name a session, or run `rune sessions`")
     })?;
-    let id: rune_core::id::SessionId = raw.parse()?;
+    let id = if raw == "last" {
+        session_log::resolve_target(&ResumeTarget::Latest, paths, workspace)?
+    } else {
+        raw.parse()?
+    };
     let state = session_log::inspect(paths, &id)?;
 
     if output.json {
@@ -806,7 +836,11 @@ fn run_session(paths: &Paths, launch: &Launch, output: &OutputFlags) -> Result<E
 
 /// Reports token usage over a period.
 fn run_usage(paths: &Paths, launch: &Launch, output: &OutputFlags) -> Result<ExitCode> {
-    let period = period_from(launch.args.first().map(String::as_str))?;
+    let period = period_from(
+        launch
+            .flag("--period")
+            .or_else(|| launch.args.first().map(String::as_str)),
+    )?;
 
     let ledger = Ledger::from_paths(paths);
     let read = ledger.read()?;
@@ -1003,16 +1037,32 @@ fn run_reference(launch: &Launch) -> Result<ExitCode> {
 fn run_permissions(settings: &Settings, launch: &Launch, output: &OutputFlags) -> Result<ExitCode> {
     let rules = permissions::validated(settings)?;
 
-    // An action given as a positional argument is explained rather than listed,
-    // because that is the question a user actually has.
-    if let Some(action) = launch.args.first() {
-        let text = permissions::explain(
-            &rules,
-            settings.permission_mode,
-            action,
-            launch.args.get(1).map_or("", String::as_str),
-        );
-        println!("{text}");
+    let action = if let Some(raw) = launch.flag("--explain") {
+        let (tool, target) = raw
+            .split_once(':')
+            .filter(|(tool, target)| !tool.is_empty() && !target.is_empty())
+            .ok_or_else(|| {
+                RuneError::invalid_field("explain", "expected a tool:target action")
+                    .with_hint("use `rune permissions --explain shell:pwd`")
+            })?;
+        Some((tool, target))
+    } else {
+        // Preserve the existing positional tool and target syntax.
+        launch
+            .args
+            .first()
+            .map(|tool| (tool.as_str(), launch.args.get(1).map_or("", String::as_str)))
+    };
+    if let Some((tool, target)) = action {
+        if output.json {
+            let value = permissions::explain_json(&rules, settings.permission_mode, tool, target);
+            println!("{}", serde_json::to_string_pretty(&value)?);
+        } else {
+            println!(
+                "{}",
+                permissions::explain(&rules, settings.permission_mode, tool, target)
+            );
+        }
         return Ok(ExitCode::from(EXIT_OK));
     }
 
@@ -1315,7 +1365,7 @@ fn run_workspace_edit(
 ) -> Result<ExitCode> {
     let stored = config::load(
         None,
-        Some(&paths.config_file(None)),
+        Some(&paths.config_file(std::env::var("RUNE_CONFIG").ok().as_deref())),
         &EnvironmentOverrides::default(),
     );
     let mut directories: Vec<String> = stored
@@ -1367,7 +1417,8 @@ fn run_workspace_edit(
             }
         }
         _ => {
-            write_directories(paths, &Vec::new())?;
+            directories.clear();
+            write_directories(paths, &directories)?;
             if !output.json {
                 println!("cleared the additional directories");
             }

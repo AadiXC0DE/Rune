@@ -48,6 +48,25 @@ pub enum SessionEvent {
         /// Turn number, starting at one.
         turn: u64,
     },
+    /// A running exchange saved its final outcome.
+    TurnFinished {
+        /// Turn whose outcome was saved.
+        turn: u64,
+    },
+    /// The caller cancelled a turn, after any visible answer was recorded.
+    TurnCancelled {
+        /// Turn number of the cancelled exchange.
+        turn: u64,
+    },
+    /// A turn failed, after any visible answer was recorded.
+    TurnFailed {
+        /// Turn number of the failed exchange.
+        turn: u64,
+        /// Stable failure code.
+        code: ErrorCode,
+        /// Human-readable failure cause.
+        message: String,
+    },
     /// The user contributed a message.
     UserMessage {
         /// Message text.
@@ -59,6 +78,25 @@ pub enum SessionEvent {
         turn: u64,
         /// Message text.
         text: String,
+    },
+    /// Visible assistant text durably saved while a turn is still running.
+    /// A final message or outcome supersedes these deltas during replay.
+    AssistantDelta {
+        /// Turn the delta belongs to.
+        turn: u64,
+        /// Additional visible text, without terminal control sequences.
+        text: String,
+    },
+    /// Discards the text of a request attempt before retrying it.
+    AssistantReset {
+        /// Turn whose streamed text was cleared.
+        turn: u64,
+    },
+    /// Replay boundary derived from a journal without a final outcome.
+    /// This is synthesized by replay, rather than written by a dying process.
+    TurnInterrupted {
+        /// Turn that stopped before its outcome was saved.
+        turn: u64,
     },
     /// The model asked for a tool call.
     ToolCall {
@@ -123,8 +161,14 @@ impl SessionEvent {
     pub const fn kind(&self) -> &'static str {
         match self {
             Self::TurnStarted { .. } => "turn_started",
+            Self::TurnFinished { .. } => "turn_finished",
+            Self::TurnCancelled { .. } => "turn_cancelled",
+            Self::TurnFailed { .. } => "turn_failed",
             Self::UserMessage { .. } => "user_message",
             Self::AssistantMessage { .. } => "assistant_message",
+            Self::AssistantDelta { .. } => "assistant_delta",
+            Self::AssistantReset { .. } => "assistant_reset",
+            Self::TurnInterrupted { .. } => "turn_interrupted",
             Self::ToolCall { .. } => "tool_call",
             Self::ToolResult { .. } => "tool_result",
             Self::Compaction { .. } => "compaction",
@@ -649,6 +693,11 @@ mod tests {
     fn every_event_kind_round_trips() {
         let events = [
             SessionEvent::TurnStarted { turn: 1 },
+            SessionEvent::TurnFailed {
+                turn: 1,
+                code: ErrorCode::IncompleteStream,
+                message: "the response stream ended without a completion event".to_owned(),
+            },
             SessionEvent::UserMessage {
                 text: "line one\nline two".to_owned(),
             },

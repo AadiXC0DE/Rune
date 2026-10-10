@@ -23,7 +23,7 @@ use rune_policy::rules::{Rule, RuleSet};
 use rune_tools::contract::{ExecutionContext, ToolOutput};
 use rune_tools::registry::Registry;
 use rune_tools::workspace::FileLimits;
-use rune_tools::{EditFile, GlobFiles, GrepFiles, ReadFile, WriteFile};
+use rune_tools::{EditFile, GlobFiles, GrepFiles, ReadFile, ReadToolResult, WriteFile};
 use serde::Deserialize;
 use serde_json::json;
 
@@ -171,6 +171,7 @@ impl Session {
         registry.insert(Box::new(GlobFiles::with_limits(file_limits)))?;
         registry.insert(Box::new(GrepFiles::with_limits(file_limits)))?;
         registry.insert(Box::new(ReadFile::with_limits(file_limits)))?;
+        registry.insert(Box::new(ReadToolResult::new(&limits)))?;
         registry.insert(Box::new(WriteFile))?;
         registry.insert(Box::new(EditFile))?;
         registry.insert(Box::new(PageShell::new(Arc::clone(&bridge))))?;
@@ -234,6 +235,7 @@ fn rules() -> RuleSet {
     let mut rules = RuleSet::new();
     for tool in [
         "read_file",
+        "read_tool_result",
         "glob_files",
         "grep_files",
         "write_file",
@@ -318,7 +320,13 @@ impl Host for Session {
     }
 
     fn decide(&self, name: &str, target: Option<&str>) -> (Outcome, String) {
-        let (outcome, reason) = turn::decide_call(&self.rules, PermissionMode::Ask, name, target);
+        let (outcome, reason) = turn::decide_call_in_workspace(
+            &self.rules,
+            PermissionMode::Ask,
+            name,
+            target,
+            self.context.workspace(),
+        );
         if outcome != Outcome::Ask {
             return (outcome, reason);
         }
@@ -355,6 +363,21 @@ impl Host for Session {
 fn encode(event: &Event) -> serde_json::Value {
     match event {
         Event::TurnStarted { step } => json!({ "kind": "step", "step": step }),
+        Event::ProviderRetry {
+            step,
+            next_attempt,
+            max_attempts,
+            delay,
+        } => json!({
+            "kind": "provider_retry",
+            "step": step,
+            "next_attempt": next_attempt,
+            "max_attempts": max_attempts,
+            "delay_ms": u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
+        }),
+        Event::ProviderRetryFinished { step } => {
+            json!({ "kind": "provider_retry_finished", "step": step })
+        }
         Event::TextDelta { delta } => json!({ "kind": "text", "delta": delta }),
         Event::ReasoningDelta { delta } => json!({ "kind": "reasoning", "delta": delta }),
         Event::ToolStarted { call, activity } => json!({
@@ -376,6 +399,14 @@ fn encode(event: &Event) -> serde_json::Value {
             "name": call.name,
             "arguments": call.arguments,
             "reason": reason,
+        }),
+        Event::ContextCompacted {
+            removed_turns,
+            remaining_turns,
+        } => json!({
+            "kind": "compacted",
+            "removed_turns": removed_turns,
+            "remaining_turns": remaining_turns,
         }),
         Event::SteeringApplied { count, .. } => json!({ "kind": "steering", "count": count }),
         Event::Finished {
@@ -561,6 +592,26 @@ mod tests {
         let path = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).expect("utf8");
         std::fs::write(path.join("notes.txt"), "the answer is forty-two\n").expect("fixture");
         (dir, path)
+    }
+
+    #[test]
+    fn the_page_advertises_and_allows_the_retained_result_reader() {
+        let (_guard, root) = workspace();
+        let page = ScriptedPage::new(vec![answer("ready")], false);
+        let session = session(&page, &root);
+        assert!(
+            session
+                .tools
+                .iter()
+                .any(|tool| tool.name == "read_tool_result")
+        );
+        assert_eq!(
+            session
+                .rules
+                .evaluate("read_tool_result", "read_tool_result", Outcome::Ask)
+                .outcome,
+            Outcome::Allow
+        );
     }
 
     #[test]

@@ -1423,10 +1423,14 @@ fn resolve_endpoint(base: &str, endpoint: &str) -> String {
 /// Builds the HTTP agent shared by the remote transports.
 #[cfg(not(target_family = "wasm"))]
 fn http_agent() -> ureq::Agent {
-    ureq::Agent::config_builder()
+    let config = ureq::Agent::config_builder()
         .http_status_as_error(false)
-        .build()
-        .into()
+        .build();
+    ureq::Agent::with_parts(
+        config,
+        super::http_transport::Connector::default(),
+        ureq::unversioned::resolver::DefaultResolver::default(),
+    )
 }
 
 /// Copies a string map into request order.

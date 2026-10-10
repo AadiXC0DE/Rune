@@ -13,6 +13,7 @@
 //! Every request is bounded in time, every response body is bounded in bytes,
 //! and every failure maps onto the taxonomy the retry policy reads.
 
+use std::fmt;
 use std::io::Read;
 use std::time::{Duration, Instant};
 
@@ -26,6 +27,9 @@ use crate::redact;
 use crate::sse::{Decoder, Event};
 use crate::stream::ProviderEvent;
 
+#[cfg(not(target_family = "wasm"))]
+mod interrupt;
+
 /// Longest accepted endpoint URL.
 pub const MAX_URL_BYTES: usize = 2048;
 
@@ -35,13 +39,51 @@ pub const MAX_RESPONSE_BYTES: u64 = 32 * 1024 * 1024;
 /// Connection setup budget.
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Time to wait for a response head before failing the attempt.
+/// Time to wait for a response head or initial stream output before failing.
 ///
 /// Configurable through the `provider_head_timeout_ms` limit. The default is
 /// generous because a cold local model can take a long time to produce its
 /// first byte, which is a failure mode other harnesses get wrong by timing out
 /// too early.
 pub const DEFAULT_HEAD_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Time budgets for one provider request attempt.
+#[derive(Clone, Copy, Debug)]
+pub struct RequestTimeouts {
+    /// Time allowed for the response head and initial stream output.
+    pub head: Duration,
+    /// Total time allowed, including sending the request and reading its body.
+    /// `None` disables the total deadline.
+    pub total: Option<Duration>,
+}
+
+impl RequestTimeouts {
+    /// Resolves the provider time budgets from configuration.
+    #[must_use]
+    pub fn from_limits(limits: &rune_core::budget::BudgetSet) -> Self {
+        use rune_core::budget::LimitName;
+
+        Self {
+            head: Duration::from_millis(
+                limits
+                    .get(LimitName::ProviderHeadTimeoutMs)
+                    .value()
+                    .unwrap_or(120_000),
+            ),
+            total: limits
+                .get(LimitName::ProviderRequestTimeoutMs)
+                .value()
+                .map(Duration::from_millis),
+        }
+    }
+}
+
+impl From<Duration> for RequestTimeouts {
+    /// Preserves the head-only budget accepted by earlier transport callers.
+    fn from(head: Duration) -> Self {
+        Self { head, total: None }
+    }
+}
 
 /// How a request is authenticated.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -73,7 +115,9 @@ impl AuthStyle {
 }
 
 /// Everything needed to reach one endpoint.
-#[derive(Clone, Debug)]
+///
+/// Debug formatting redacts the credential value.
+#[derive(Clone)]
 pub struct Endpoint {
     /// Base URL without a trailing slash.
     pub base_url: String,
@@ -90,6 +134,18 @@ pub struct Endpoint {
     pub headers: Vec<(String, String)>,
     /// Whether outbound requests are refused entirely.
     pub offline: bool,
+}
+
+impl fmt::Debug for Endpoint {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Endpoint")
+            .field("base_url", &self.base_url)
+            .field("credential", &"[REDACTED]")
+            .field("auth", &self.auth)
+            .field("headers", &self.headers)
+            .field("offline", &self.offline)
+            .finish()
+    }
 }
 
 impl Endpoint {
@@ -302,14 +358,26 @@ impl StreamOutcome {
 #[cfg(not(target_family = "wasm"))]
 #[must_use]
 pub fn agent() -> ureq::Agent {
-    ureq::Agent::config_builder()
+    use ureq::unversioned::resolver::DefaultResolver;
+    use ureq::unversioned::transport::{
+        ConnectProxyConnector, Connector, RustlsConnector, SocksConnector, TcpConnector,
+    };
+
+    let config = ureq::Agent::config_builder()
         .timeout_connect(Some(CONNECT_TIMEOUT))
-        // No overall body timeout: a long generation is expected, and the head
-        // timeout bounds the part that can actually hang.
+        // Callers supply each request's total budget through FetchRequest.
         .timeout_global(None)
         .http_status_as_error(false)
-        .build()
-        .into()
+        .build();
+    // Match ureq's SOCKS, CONNECT, TCP and rustls chain, adding cancellable
+    // socket reads below TLS so a silent response can release its reader.
+    let connector =
+        ().chain(SocksConnector::default())
+            .chain(ConnectProxyConnector::default())
+            .chain(TcpConnector::default())
+            .chain(interrupt::StreamConnector)
+            .chain(RustlsConnector::default());
+    ureq::Agent::with_parts(config, connector, DefaultResolver::default())
 }
 
 /// Adds headers to a request of either typestate.
@@ -457,7 +525,7 @@ pub fn stream_completion(
     endpoint: &Endpoint,
     provider: &dyn Provider,
     plan: &RequestPlan,
-    head_timeout: Duration,
+    timeouts: impl Into<RequestTimeouts>,
     cancel: &dyn Fn() -> bool,
 ) -> NetResult<StreamOutcome> {
     stream_completion_observed(
@@ -465,7 +533,7 @@ pub fn stream_completion(
         endpoint,
         provider,
         plan,
-        head_timeout,
+        timeouts,
         cancel,
         &mut |_| {},
     )
@@ -482,7 +550,7 @@ pub fn stream_completion_observed(
     endpoint: &Endpoint,
     provider: &dyn Provider,
     plan: &RequestPlan,
-    head_timeout: Duration,
+    timeouts: impl Into<RequestTimeouts>,
     cancel: &dyn Fn() -> bool,
     observe: &mut dyn FnMut(&ProviderEvent),
 ) -> NetResult<StreamOutcome> {
@@ -503,9 +571,11 @@ pub fn stream_completion_observed(
 
     let url = endpoint.url_for(provider.request_path());
     let encoded = serde_json::to_string(&body)?;
+    let timeouts = timeouts.into();
 
     let mut request = FetchRequest::post(url, encoded.into_bytes())
-        .with_head_timeout(Some(head_timeout))
+        .with_head_timeout(Some(timeouts.head))
+        .with_timeout(timeouts.total)
         .with_header("content-type", "application/json")
         .with_header("accept", "text/event-stream")
         .with_header(
@@ -524,7 +594,9 @@ pub fn stream_completion_observed(
         request = request.with_header(name, value);
     }
 
+    let started = Instant::now();
     let response = client.send(request)?;
+    check_request_timeout(started, timeouts.total)?;
 
     if response.status >= 400 {
         let retry_after = response
@@ -532,6 +604,7 @@ pub fn stream_completion_observed(
             .as_deref()
             .and_then(crate::error::parse_retry_after);
         let text = read_bounded_text(response.body, 64 * 1024);
+        check_request_timeout(started, timeouts.total)?;
         let sanitized = redact::redact(&text);
         let mut error = NetError::classify_status(response.status, &sanitized).with_hint(format!(
             "provider `{}` rejected the request",
@@ -545,7 +618,7 @@ pub fn stream_completion_observed(
         return Err(error);
     }
 
-    read_stream(response.body, provider, head_timeout, cancel, observe)
+    read_stream_started(response.body, provider, timeouts, started, cancel, observe)
 }
 
 /// One response to an outbound request that is not a model completion.
@@ -582,7 +655,8 @@ pub const TOOL_USER_AGENT: &str = concat!(
 /// a way around them.
 ///
 /// The chain is followed without being seen, so an address a model or a user
-/// supplied goes through [`fetch_hop`] instead, whose caller vets every hop.
+/// supplied goes through [`fetch_hop_checked`] instead, whose caller vets every
+/// hop and its resolved addresses.
 ///
 /// Absent on a target where the built-in client cannot build. Such a target
 /// reaches the endpoint through [`stream_completion`] and its own [`Fetch`], or
@@ -599,15 +673,127 @@ pub fn fetch_url(url: &str, accept: &str, timeout: Duration) -> NetResult<Fetche
 /// before the tool could check one, so a public page redirecting to a private
 /// address would be fetched; the tool follows the chain instead, checking each
 /// address before it is requested.
+/// For a user-supplied URL, use [`fetch_hop_checked`] to vet DNS results as well.
 #[cfg(not(target_family = "wasm"))]
 pub fn fetch_hop(url: &str, accept: &str, timeout: Duration) -> NetResult<Fetched> {
     fetch(url, accept, timeout, false)
 }
 
+/// Fetches one hop after checking every resolved destination address.
+///
+/// Resolution consumes the same timeout as the request. The client receives
+/// only the checked socket addresses, so it cannot resolve the hostname again
+/// unchecked. The original URL is retained for the Host header and TLS peer
+/// verification. A proxy is refused unless NO_PROXY bypasses it, because a
+/// proxy may resolve the target independently of the vetted DNS result.
+#[cfg(not(target_family = "wasm"))]
+pub fn fetch_hop_checked(
+    url: &str,
+    accept: &str,
+    timeout: Duration,
+    check_address: impl FnMut(std::net::IpAddr) -> Result<()>,
+) -> Result<Fetched> {
+    use ureq::unversioned::{resolver::DefaultResolver, transport::DefaultConnector};
+
+    fetch_hop_checked_with(
+        url,
+        accept,
+        timeout,
+        check_address,
+        &DefaultResolver::default(),
+        DefaultConnector::default(),
+        agent().config().clone(),
+    )
+}
+
+#[cfg(not(target_family = "wasm"))]
+#[derive(Debug)]
+struct PinnedResolver {
+    uri: ureq::http::Uri,
+    addresses: ureq::unversioned::resolver::ResolvedSocketAddrs,
+}
+
+#[cfg(not(target_family = "wasm"))]
+impl ureq::unversioned::resolver::Resolver for PinnedResolver {
+    fn resolve(
+        &self,
+        uri: &ureq::http::Uri,
+        _config: &ureq::config::Config,
+        _timeout: ureq::unversioned::transport::NextTimeout,
+    ) -> std::result::Result<ureq::unversioned::resolver::ResolvedSocketAddrs, ureq::Error> {
+        if uri.authority() != self.uri.authority() || uri.scheme() != self.uri.scheme() {
+            return Err(ureq::Error::HostNotFound);
+        }
+        Ok(self.addresses.clone())
+    }
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn fetch_hop_checked_with(
+    url: &str,
+    accept: &str,
+    timeout: Duration,
+    mut check_address: impl FnMut(std::net::IpAddr) -> Result<()>,
+    resolver: &impl ureq::unversioned::resolver::Resolver,
+    connector: impl ureq::unversioned::transport::Connector,
+    config: ureq::config::Config,
+) -> Result<Fetched> {
+    use rune_core::error::{ErrorCode, RuneError};
+    use ureq::unversioned::transport::NextTimeout;
+
+    let started = Instant::now();
+    let uri = url
+        .parse::<ureq::http::Uri>()
+        .map_err(|error| RuneError::invalid_field("url", error.to_string()))?;
+    if config.proxy().is_some_and(|proxy| !proxy.is_no_proxy(&uri)) {
+        return Err(RuneError::new(
+            ErrorCode::Unsupported,
+            "web fetch cannot pin the destination through a proxy",
+        )
+        .with_hint("use NO_PROXY for this host to connect to its vetted address directly"));
+    }
+    let addresses = resolver
+        .resolve(
+            &uri,
+            &config,
+            NextTimeout {
+                after: timeout.into(),
+                reason: ureq::Timeout::Resolve,
+            },
+        )
+        .map_err(|error| classify_transport_error(&error).to_rune_error())?;
+    if addresses.is_empty() {
+        return Err(classify_transport_error(&ureq::Error::HostNotFound).to_rune_error());
+    }
+    for address in &addresses {
+        check_address(address.ip())?;
+    }
+    let remaining = timeout.saturating_sub(started.elapsed());
+    if remaining.is_zero() {
+        return Err(RuneError::new(
+            ErrorCode::Timeout,
+            "the web fetch timeout ran out while resolving the destination",
+        ));
+    }
+    let client = ureq::Agent::with_parts(config, connector, PinnedResolver { uri, addresses });
+    fetch_over(&client, url, accept, remaining, false).map_err(|error| error.to_rune_error())
+}
+
 /// Performs one bounded GET and holds its body.
 #[cfg(not(target_family = "wasm"))]
 fn fetch(url: &str, accept: &str, timeout: Duration, follow_redirects: bool) -> NetResult<Fetched> {
-    let response = UreqFetch::new().send(
+    fetch_over(&UreqFetch::new(), url, accept, timeout, follow_redirects)
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn fetch_over(
+    client: &dyn Fetch,
+    url: &str,
+    accept: &str,
+    timeout: Duration,
+    follow_redirects: bool,
+) -> NetResult<Fetched> {
+    let response = client.send(
         FetchRequest::get(url)
             .with_header("user-agent", TOOL_USER_AGENT)
             .with_header("accept", accept)
@@ -735,9 +921,8 @@ pub fn list_models(
         request = request.with_header(name, value);
     }
 
-    // The client carries no overall timeout, because a streaming generation is
-    // expected to be long. A listing is a small document, so it is bounded here
-    // rather than leaving a stalled endpoint to hold the command open.
+    // Each request supplies its own total budget. A listing is a small
+    // document, so it gets the caller's listing budget here.
     let response = client.send(request.with_timeout(Some(timeout)))?;
 
     let text = read_bounded_text(response.body, 1024 * 1024);
@@ -773,7 +958,7 @@ const STREAM_CHUNK_BYTES: usize = 16 * 1024;
 #[cfg(not(target_family = "wasm"))]
 const STREAM_CHUNKS_AHEAD: usize = 8;
 
-/// How often a silent stream is checked for cancellation.
+/// Longest wait between checks for cancellation and stream deadlines.
 #[cfg(not(target_family = "wasm"))]
 const STREAM_POLL: Duration = Duration::from_millis(50);
 
@@ -787,68 +972,75 @@ const STREAM_POLL: Duration = Duration::from_millis(50);
 ///
 /// Public because a host that reaches an endpoint through its own [`Fetch`],
 /// including one that runs where the built-in client cannot compile, reduces
-/// the body with the same decoder, limits, and head timeout rather than a
+/// the body with the same decoder, limits, and time budgets rather than a
 /// second implementation that can disagree with this one.
+/// The total budget starts here; `stream_completion_observed` also counts the
+/// time spent sending the request and waiting for its response head.
 pub fn read_stream(
     body: Box<dyn Read + Send>,
     provider: &dyn Provider,
-    head_timeout: Duration,
+    timeouts: impl Into<RequestTimeouts>,
     cancel: &dyn Fn() -> bool,
     observe: &mut dyn FnMut(&ProviderEvent),
 ) -> NetResult<StreamOutcome> {
-    let mut state = StreamState::new(provider, observe, head_timeout);
+    read_stream_started(
+        body,
+        provider,
+        timeouts.into(),
+        Instant::now(),
+        cancel,
+        observe,
+    )
+}
+
+fn read_stream_started(
+    body: Box<dyn Read + Send>,
+    provider: &dyn Provider,
+    timeouts: RequestTimeouts,
+    started: Instant,
+    cancel: &dyn Fn() -> bool,
+    observe: &mut dyn FnMut(&ProviderEvent),
+) -> NetResult<StreamOutcome> {
+    let mut state = StreamState::new(provider, observe, timeouts, started);
     feed(body, &mut state, cancel)?;
     state.finish()
 }
 
 /// Feeds a body to the decoder on a thread of its own.
 ///
-/// A blocking read cannot be interrupted, so the body is read on a helper
-/// thread and this one waits on the handover in short slices, checking for a
-/// cancellation between them. The handover is bounded, so the helper reads
-/// only a few chunks ahead of the decoder. Once nothing is listening the
-/// helper ends at its next chunk; a read that never returns holds it until the
-/// connection closes.
+/// The body is read on a helper thread while this one checks cancellation and
+/// deadlines between bounded handovers. The built-in socket transport polls
+/// the helper's stop signal below TLS; ending decoding stops and joins that
+/// reader, releasing the connection even when the endpoint is silent. An
+/// arbitrary host-supplied blocking reader still needs its host to interrupt it.
 #[cfg(not(target_family = "wasm"))]
 fn feed(
-    mut body: Box<dyn Read + Send>,
+    body: Box<dyn Read + Send>,
     state: &mut StreamState<'_>,
     cancel: &dyn Fn() -> bool,
 ) -> NetResult<()> {
-    use std::sync::mpsc::{RecvTimeoutError, sync_channel};
+    use std::sync::mpsc::RecvTimeoutError;
 
-    let (sender, chunks) = sync_channel::<std::io::Result<Vec<u8>>>(STREAM_CHUNKS_AHEAD);
-    std::thread::Builder::new()
-        .name("rune-stream-read".to_owned())
-        .spawn(move || {
-            let mut buffer = vec![0_u8; STREAM_CHUNK_BYTES];
-            loop {
-                let chunk = match body.read(&mut buffer) {
-                    Ok(0) => break,
-                    Ok(count) => Ok(buffer.get(..count).unwrap_or_default().to_vec()),
-                    Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
-                    Err(err) => Err(err),
-                };
-                let failed = chunk.is_err();
-                if sender.send(chunk).is_err() || failed {
-                    break;
-                }
-            }
-        })
-        .map_err(NetError::from)?;
+    let chunks = interrupt::StreamReader::spawn(body).map_err(NetError::from)?;
 
     loop {
         if cancel() {
             return Err(cancelled());
         }
-        match chunks.recv_timeout(STREAM_POLL) {
+        state.check_request_timeout()?;
+        let wait = state
+            .head_wait_remaining()
+            .map_or(STREAM_POLL, |remaining| STREAM_POLL.min(remaining));
+        let chunk = chunks.recv_timeout(wait);
+        state.check_request_timeout()?;
+        match chunk {
             Ok(chunk) => {
                 state.push(&chunk.map_err(NetError::from)?)?;
                 if state.is_done() {
                     return Ok(());
                 }
             }
-            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Timeout) => state.check_head_timeout()?,
             // The helper has reached the end of the body.
             Err(RecvTimeoutError::Disconnected) => return Ok(()),
         }
@@ -870,6 +1062,7 @@ fn feed(
         if cancel() {
             return Err(cancelled());
         }
+        state.check_request_timeout()?;
         let count = match body.read(&mut buffer) {
             Ok(0) => return Ok(()),
             Ok(count) => count,
@@ -888,6 +1081,18 @@ fn cancelled() -> NetError {
     NetError::new(FailureKind::Cancelled, "the request was cancelled")
 }
 
+/// Checks a total budget without restarting it when a chunk arrives.
+fn check_request_timeout(started: Instant, total: Option<Duration>) -> NetResult<()> {
+    if total.is_some_and(|timeout| started.elapsed() >= timeout) {
+        return Err(NetError::new(
+            FailureKind::Timeout,
+            "the provider request exceeded its total timeout",
+        )
+        .with_hint("raise provider_request_timeout_ms to allow a longer generation"));
+    }
+    Ok(())
+}
+
 /// The decoding half of a streamed read.
 ///
 /// Kept apart from the reading so the threaded and the plain read loops share
@@ -900,6 +1105,8 @@ struct StreamState<'a> {
     observe: &'a mut dyn FnMut(&ProviderEvent),
     head_timeout: Duration,
     started: Instant,
+    request_timeout: Option<Duration>,
+    request_started: Instant,
     /// Whether any event has been decoded, which ends the wait for output.
     saw_event: bool,
 }
@@ -908,7 +1115,8 @@ impl<'a> StreamState<'a> {
     fn new(
         provider: &dyn Provider,
         observe: &'a mut dyn FnMut(&ProviderEvent),
-        head_timeout: Duration,
+        timeouts: RequestTimeouts,
+        request_started: Instant,
     ) -> Self {
         Self {
             decoder: Decoder::new(provider.limits()),
@@ -916,14 +1124,17 @@ impl<'a> StreamState<'a> {
             outcome: StreamOutcome::default(),
             frames: Vec::new(),
             observe,
-            head_timeout,
+            head_timeout: timeouts.head,
             started: Instant::now(),
+            request_timeout: timeouts.total,
+            request_started,
             saw_event: false,
         }
     }
 
     /// Decodes one chunk, reducing and reporting every event it completes.
     fn push(&mut self, chunk: &[u8]) -> NetResult<()> {
+        self.check_request_timeout()?;
         self.decoder
             .push(chunk, &mut self.frames)
             .map_err(NetError::from)?;
@@ -933,7 +1144,19 @@ impl<'a> StreamState<'a> {
         // the first event is that event arriving, not more waiting. What
         // remains is an endpoint holding the connection open with keep-alive
         // lines and nothing else.
-        if !self.saw_event && self.decoder.is_idle() && self.started.elapsed() > self.head_timeout {
+        self.check_head_timeout()
+    }
+
+    /// A partial first event may finish after the deadline, as before.
+    fn head_wait_remaining(&self) -> Option<Duration> {
+        if self.saw_event || !self.decoder.is_idle() {
+            return None;
+        }
+        Some(self.head_timeout.saturating_sub(self.started.elapsed()))
+    }
+
+    fn check_head_timeout(&self) -> NetResult<()> {
+        if self.head_wait_remaining() == Some(Duration::ZERO) {
             return Err(NetError::new(
                 FailureKind::Timeout,
                 "the endpoint produced no output within the head timeout",
@@ -946,6 +1169,10 @@ impl<'a> StreamState<'a> {
     /// Returns true once the stream has said it is done.
     fn is_done(&self) -> bool {
         self.decoder.is_done()
+    }
+
+    fn check_request_timeout(&self) -> NetResult<()> {
+        check_request_timeout(self.request_started, self.request_timeout)
     }
 
     /// Hands every decoded event to the reducer.
@@ -970,6 +1197,7 @@ impl<'a> StreamState<'a> {
 
     /// Ends the stream and returns what it produced.
     fn finish(mut self) -> NetResult<StreamOutcome> {
+        self.check_request_timeout()?;
         self.decoder
             .finish(&mut self.frames)
             .map_err(NetError::from)?;
@@ -1087,6 +1315,92 @@ mod tests {
     const ANSWER_HEAD: &[u8] = b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"late\"},\"finish_reason\":\"stop\"}]}\n";
     const ANSWER_TAIL: &[u8] = b"\ndata: [DONE]\n\n";
 
+    const DELTA: &[u8] =
+        b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"still streaming\"}}]}\n\n";
+
+    /// A client whose head and body each consume part of the request budget.
+    struct PacedFetch {
+        expected_timeout: Option<Duration>,
+    }
+
+    impl Fetch for PacedFetch {
+        fn send(&self, request: FetchRequest) -> NetResult<crate::fetch::FetchResponse> {
+            assert_eq!(request.timeout, self.expected_timeout);
+            assert_eq!(request.head_timeout, Some(DEFAULT_HEAD_TIMEOUT));
+            std::thread::sleep(Duration::from_millis(100));
+            Ok(crate::fetch::FetchResponse {
+                status: 200,
+                content_type: "text/event-stream".to_owned(),
+                retry_after: None,
+                location: None,
+                body: PacedBody::body(vec![
+                    (Duration::ZERO, DELTA),
+                    (Duration::from_millis(50), DELTA),
+                    (Duration::from_millis(100), ANSWER_HEAD),
+                    (Duration::ZERO, ANSWER_TAIL),
+                ]),
+            })
+        }
+    }
+
+    #[test]
+    fn the_total_deadline_includes_the_head_and_does_not_reset_on_output() {
+        let mut observed = Vec::new();
+        let started = Instant::now();
+        let err = stream_completion_observed(
+            &PacedFetch {
+                expected_timeout: Some(Duration::from_millis(200)),
+            },
+            &Endpoint::new("https://api.example.com", "k"),
+            &crate::chat_completions::ChatCompletions,
+            &RequestPlan::new("m"),
+            RequestTimeouts {
+                head: DEFAULT_HEAD_TIMEOUT,
+                total: Some(Duration::from_millis(200)),
+            },
+            &|| false,
+            &mut |event| observed.push(event.clone()),
+        )
+        .expect_err("the late completion must time out");
+        assert_eq!(err.kind(), FailureKind::Timeout, "{err}");
+        assert_eq!(
+            err.to_rune_error().code(),
+            rune_core::error::ErrorCode::Timeout
+        );
+        assert!(err.message().contains("total timeout"), "{err}");
+        assert!(started.elapsed() < Duration::from_millis(500));
+        assert!(
+            observed
+                .iter()
+                .any(|event| matches!(event, ProviderEvent::TextDelta { .. })),
+            "the request must start streaming before timing out"
+        );
+    }
+
+    #[test]
+    fn disabling_the_total_deadline_keeps_a_longer_completion() {
+        let mut limits = rune_core::budget::BudgetSet::new();
+        limits
+            .set(
+                rune_core::budget::LimitName::ProviderRequestTimeoutMs,
+                rune_core::budget::Budget::Unbounded,
+                rune_core::config::Layer::User,
+            )
+            .expect("disable total deadline");
+        let outcome = stream_completion(
+            &PacedFetch {
+                expected_timeout: None,
+            },
+            &Endpoint::new("https://api.example.com", "k"),
+            &crate::chat_completions::ChatCompletions,
+            &RequestPlan::new("m"),
+            RequestTimeouts::from_limits(&limits),
+            &|| false,
+        )
+        .expect("completion with no total deadline");
+        assert_eq!(outcome.text(), "still streamingstill streaminglate");
+    }
+
     #[test]
     fn a_first_event_completed_after_the_head_timeout_is_kept() {
         // The endpoint answered, and only the line that closes its first
@@ -1133,6 +1447,80 @@ mod tests {
             let _ = self.0.recv();
             Ok(0)
         }
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn the_head_deadline_expires_during_a_blocked_body_read() {
+        for initial in [b"".as_slice(), b": keep-alive\n\n"] {
+            let (release, released) = std::sync::mpsc::channel::<()>();
+            let (report, reported) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let started = Instant::now();
+                let body = std::io::Cursor::new(initial).chain(SilentBody(released));
+                let result = read_stream(
+                    Box::new(body),
+                    &crate::chat_completions::ChatCompletions,
+                    Duration::from_millis(75),
+                    &|| false,
+                    &mut |_| {},
+                );
+                let _ = report.send((result, started.elapsed()));
+            });
+            let result = reported.recv_timeout(Duration::from_secs(2));
+            drop(release);
+            let (result, elapsed) = result.expect("the head deadline interrupted the stream wait");
+            let err = result.expect_err("head timeout");
+            assert_eq!(err.kind(), FailureKind::Timeout, "{err}");
+            assert!(err.message().contains("head timeout"), "{err}");
+            assert!(elapsed >= Duration::from_millis(75), "{elapsed:?}");
+            assert!(elapsed < Duration::from_millis(500), "{elapsed:?}");
+        }
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn the_head_deadline_ends_when_the_first_event_arrives() {
+        let body = PacedBody::body(vec![
+            (Duration::ZERO, DELTA),
+            (Duration::from_millis(150), ANSWER_HEAD),
+            (Duration::ZERO, ANSWER_TAIL),
+        ]);
+        let outcome = read_stream(
+            body,
+            &crate::chat_completions::ChatCompletions,
+            Duration::from_millis(50),
+            &|| false,
+            &mut |_| {},
+        )
+        .expect("silence after the first event does not hit the head deadline");
+        assert_eq!(outcome.text(), "still streaminglate");
+    }
+
+    #[test]
+    fn the_total_deadline_expires_during_a_blocked_body_read() {
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let (report, reported) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let result = read_stream(
+                Box::new(SilentBody(released)),
+                &crate::chat_completions::ChatCompletions,
+                RequestTimeouts {
+                    head: DEFAULT_HEAD_TIMEOUT,
+                    total: Some(Duration::from_millis(100)),
+                },
+                &|| false,
+                &mut |_| {},
+            );
+            let _ = report.send(result);
+        });
+        let result = reported.recv_timeout(Duration::from_secs(2));
+        drop(release);
+        let err = result
+            .expect("the total deadline interrupted the stream wait")
+            .expect_err("total timeout");
+        assert_eq!(err.kind(), FailureKind::Timeout, "{err}");
+        assert!(err.message().contains("total timeout"), "{err}");
     }
 
     #[test]
@@ -1241,6 +1629,98 @@ mod tests {
             .expect("the request gave up on the endpoint")
             .expect_err("timed out");
         assert_eq!(err.kind(), FailureKind::Timeout, "{err}");
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn an_endpoint_that_sends_headers_then_stays_silent_hits_the_head_deadline() {
+        use std::io::{BufRead as _, Write as _};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let address = listener.local_addr().expect("address");
+        let (hold, held) = std::sync::mpsc::channel::<()>();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("read timeout");
+            let mut reader = std::io::BufReader::new(stream.try_clone().expect("clone"));
+            let mut length = 0_usize;
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).expect("request head") == 0 || line.trim().is_empty()
+                {
+                    break;
+                }
+                if let Some((name, value)) = line.split_once(':')
+                    && name.eq_ignore_ascii_case("content-length")
+                {
+                    length = value.trim().parse().expect("content length");
+                }
+            }
+            reader
+                .read_exact(&mut vec![0_u8; length])
+                .expect("request body");
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\
+                      transfer-encoding: chunked\r\nconnection: close\r\n\r\n",
+                )
+                .expect("response headers");
+            stream.flush().expect("flush headers");
+            let _ = held.recv();
+        });
+        let (report, reported) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let started = Instant::now();
+            let result = stream_completion(
+                &UreqFetch::new(),
+                &Endpoint::new(format!("http://{address}"), "k"),
+                &crate::chat_completions::ChatCompletions,
+                &RequestPlan::new("m"),
+                Duration::from_millis(200),
+                &|| false,
+            );
+            let _ = report.send((result, started.elapsed()));
+        });
+        let result = reported.recv_timeout(Duration::from_secs(2));
+        drop(hold);
+        server.join().expect("server");
+        let (result, elapsed) = result.expect("the request returned while the body was still open");
+        let err = result.expect_err("head timeout");
+        assert_eq!(err.kind(), FailureKind::Timeout, "{err}");
+        assert!(err.message().contains("head timeout"), "{err}");
+        assert!(elapsed >= Duration::from_millis(200), "{elapsed:?}");
+        assert!(elapsed < Duration::from_secs(1), "{elapsed:?}");
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn the_total_deadline_also_bounds_waiting_for_response_headers() {
+        let (base, hold) = mute_endpoint();
+        let started = Instant::now();
+        let (report, reported) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let result = stream_completion(
+                &UreqFetch::new(),
+                &Endpoint::new(base, "k"),
+                &crate::chat_completions::ChatCompletions,
+                &RequestPlan::new("m"),
+                RequestTimeouts {
+                    head: DEFAULT_HEAD_TIMEOUT,
+                    total: Some(Duration::from_millis(200)),
+                },
+                &|| false,
+            );
+            let _ = report.send(result);
+        });
+        let result = reported.recv_timeout(Duration::from_secs(2));
+        drop(hold);
+        let err = result
+            .expect("the request returned before its head timeout")
+            .expect_err("the total deadline bounds the HTTP client");
+        assert_eq!(err.kind(), FailureKind::Timeout, "{err}");
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
     /// A client that answers every request with one canned status.
@@ -1396,6 +1876,345 @@ mod tests {
         );
     }
 
+    #[cfg(not(target_family = "wasm"))]
+    #[derive(Debug)]
+    struct ChangingResolver {
+        answers: Vec<Vec<std::net::SocketAddr>>,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    impl ureq::unversioned::resolver::Resolver for ChangingResolver {
+        fn resolve(
+            &self,
+            uri: &ureq::http::Uri,
+            _config: &ureq::config::Config,
+            _timeout: ureq::unversioned::transport::NextTimeout,
+        ) -> std::result::Result<ureq::unversioned::resolver::ResolvedSocketAddrs, ureq::Error>
+        {
+            assert_eq!(uri.host(), Some("public.example"));
+            let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let mut addresses = self.empty();
+            for address in &self.answers[call] {
+                addresses.push(*address);
+            }
+            Ok(addresses)
+        }
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    fn refuse_test_private_address(address: std::net::IpAddr) -> Result<()> {
+        use rune_core::error::{ErrorCode, RuneError};
+
+        if address.is_loopback()
+            || match address {
+                std::net::IpAddr::V4(address) => address.is_private() || address.is_link_local(),
+                std::net::IpAddr::V6(address) => {
+                    address.is_unique_local()
+                        || address.is_unicast_link_local()
+                        || address.to_ipv4_mapped().is_some_and(|address| {
+                            address.is_loopback() || address.is_private() || address.is_link_local()
+                        })
+                }
+            }
+        {
+            return Err(RuneError::new(
+                ErrorCode::PermissionDenied,
+                format!("refused resolved address {address}"),
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn resolved_private_destinations_are_refused_before_connecting() {
+        use ureq::unversioned::transport::DefaultConnector;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        listener.set_nonblocking(true).expect("nonblocking");
+        let loopback = listener.local_addr().expect("address");
+        let public = "93.184.216.34:80".parse().expect("public address");
+        for addresses in [
+            vec![loopback],
+            vec!["[::1]:80".parse().expect("IPv6 loopback")],
+            vec!["10.0.0.1:80".parse().expect("private")],
+            vec!["169.254.169.254:80".parse().expect("link local")],
+            vec!["[fd00::1]:80".parse().expect("unique local")],
+            vec!["[fe80::1]:80".parse().expect("IPv6 link local")],
+            vec!["[::ffff:127.0.0.1]:80".parse().expect("mapped loopback")],
+            vec![public, loopback],
+            vec![loopback, public],
+        ] {
+            let resolver = ChangingResolver {
+                answers: vec![addresses.clone()],
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            };
+            let error = fetch_hop_checked_with(
+                "http://public.example/fixture",
+                "*/*",
+                Duration::from_secs(2),
+                refuse_test_private_address,
+                &resolver,
+                DefaultConnector::default(),
+                ureq::Agent::config_builder().proxy(None).build(),
+            )
+            .expect_err("private DNS must be refused");
+            assert_eq!(
+                error.code(),
+                rune_core::error::ErrorCode::PermissionDenied,
+                "{addresses:?}: {error}"
+            );
+            assert_eq!(
+                listener.accept().expect_err("no connection").kind(),
+                std::io::ErrorKind::WouldBlock
+            );
+        }
+    }
+
+    /// Routes an asserted public destination to a local HTTP fixture. The
+    /// production resolver and request code run unchanged; only TCP routing
+    /// is replaced, so the test does not need a live public server.
+    #[cfg(not(target_family = "wasm"))]
+    #[derive(Debug)]
+    struct FixtureConnector {
+        vetted: Vec<std::net::SocketAddr>,
+        fixture: std::net::SocketAddr,
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    impl ureq::unversioned::transport::Connector for FixtureConnector {
+        type Out = Box<dyn ureq::unversioned::transport::Transport>;
+
+        fn connect(
+            &self,
+            details: &ureq::unversioned::transport::ConnectionDetails<'_>,
+            chained: Option<()>,
+        ) -> std::result::Result<Option<Self::Out>, ureq::Error> {
+            use ureq::unversioned::transport::{ConnectionDetails, DefaultConnector};
+
+            assert_eq!(details.uri.host(), Some("public.example"));
+            assert_eq!(&*details.addrs, self.vetted.as_slice());
+            // Even another resolver call must return the pinned result.
+            let pinned = details
+                .resolver
+                .resolve(details.uri, details.config, details.timeout)?;
+            assert_eq!(&*pinned, self.vetted.as_slice());
+            let mut addresses = details.resolver.empty();
+            addresses.push(self.fixture);
+            let routed = ConnectionDetails {
+                uri: details.uri,
+                addrs: addresses,
+                config: details.config,
+                request_level: details.request_level,
+                resolver: details.resolver,
+                now: details.now,
+                timeout: details.timeout,
+                current_time: details.current_time.clone(),
+                run_connector: details.run_connector.clone(),
+            };
+            DefaultConnector::default().connect(&routed, chained)
+        }
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn a_public_fetch_connects_to_vetted_addresses_without_another_dns_lookup() {
+        use std::io::{BufRead as _, Write as _};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        listener.set_nonblocking(true).expect("nonblocking");
+        let fixture_address = listener.local_addr().expect("address");
+        let fixture = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(Instant::now() < deadline, "fixture was not called");
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("fixture accept: {error}"),
+                }
+            };
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("read timeout");
+            stream
+                .set_write_timeout(Some(Duration::from_secs(2)))
+                .expect("write timeout");
+            let mut request = String::new();
+            let mut reader = std::io::BufReader::new(&stream);
+            loop {
+                let mut line = String::new();
+                assert!(reader.read_line(&mut line).expect("request") > 0);
+                request.push_str(&line);
+                if line == "\r\n" {
+                    break;
+                }
+            }
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 12\r\nConnection: close\r\n\r\nR020_WEB_OK\n")
+                .expect("response");
+            request
+        });
+        let public = "93.184.216.34:8080".parse().expect("public address");
+        let resolver = ChangingResolver {
+            // A second lookup would change to the local server. It must never
+            // happen, even if the connector asks to resolve again.
+            answers: vec![vec![public], vec![fixture_address]],
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let mut vetted = Vec::new();
+        let response = fetch_hop_checked_with(
+            "http://public.example:8080/fixture",
+            "text/plain",
+            Duration::from_secs(2),
+            |address| {
+                vetted.push(address);
+                refuse_test_private_address(address)
+            },
+            &resolver,
+            FixtureConnector {
+                vetted: vec![public],
+                fixture: fixture_address,
+            },
+            // An explicit NO_PROXY bypass must still permit a vetted request.
+            ureq::Agent::config_builder()
+                .proxy(Some(
+                    ureq::Proxy::builder(ureq::ProxyProtocol::Http)
+                        .host("127.0.0.1")
+                        .port(1)
+                        .no_proxy("public.example")
+                        .build()
+                        .expect("proxy"),
+                ))
+                .build(),
+        )
+        .expect("vetted fetch");
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body, b"R020_WEB_OK\n");
+        assert_eq!(vetted, vec![public.ip()]);
+        assert_eq!(resolver.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let request = fixture.join().expect("fixture thread");
+        assert!(
+            request.starts_with("GET /fixture HTTP/1.1\r\n"),
+            "{request}"
+        );
+        assert!(
+            request
+                .to_ascii_lowercase()
+                .contains("\r\nhost: public.example:8080\r\n"),
+            "{request}"
+        );
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn a_checked_fetch_refuses_empty_dns_and_proxy_resolution() {
+        use ureq::unversioned::transport::DefaultConnector;
+
+        let resolver = ChangingResolver {
+            answers: vec![vec![]],
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let error = fetch_hop_checked_with(
+            "http://public.example/fixture",
+            "*/*",
+            Duration::from_secs(2),
+            |_| panic!("no address to check"),
+            &resolver,
+            DefaultConnector::default(),
+            ureq::Agent::config_builder().proxy(None).build(),
+        )
+        .expect_err("empty DNS");
+        assert_eq!(error.code(), rune_core::error::ErrorCode::TransportFailure);
+        let error = fetch_hop_checked_with(
+            "http://public.example/fixture",
+            "*/*",
+            Duration::from_secs(2),
+            |_| panic!("proxy must be refused before resolution"),
+            &resolver,
+            DefaultConnector::default(),
+            ureq::Agent::config_builder()
+                .proxy(Some(ureq::Proxy::new("http://127.0.0.1:1").expect("proxy")))
+                .build(),
+        )
+        .expect_err("unchecked proxy DNS");
+        assert_eq!(error.code(), rune_core::error::ErrorCode::Unsupported);
+        assert_eq!(resolver.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn a_checked_https_fetch_keeps_the_original_tls_peer_name() {
+        use ureq::unversioned::transport::{ConnectionDetails, Connector, Transport};
+
+        #[derive(Debug)]
+        struct TlsPeerConnector;
+
+        impl Connector for TlsPeerConnector {
+            type Out = Box<dyn Transport>;
+
+            fn connect(
+                &self,
+                details: &ConnectionDetails<'_>,
+                _chained: Option<()>,
+            ) -> std::result::Result<Option<Self::Out>, ureq::Error> {
+                assert!(details.needs_tls());
+                assert_eq!(details.uri.host(), Some("public.example"));
+                assert_eq!(
+                    details.addrs[0],
+                    "93.184.216.34:443".parse().expect("public")
+                );
+                Err(ureq::Error::ConnectionFailed)
+            }
+        }
+
+        let resolver = ChangingResolver {
+            answers: vec![vec!["93.184.216.34:443".parse().expect("public")]],
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let error = fetch_hop_checked_with(
+            "https://public.example/fixture",
+            "*/*",
+            Duration::from_secs(2),
+            refuse_test_private_address,
+            &resolver,
+            TlsPeerConnector,
+            ureq::Agent::config_builder().proxy(None).build(),
+        )
+        .expect_err("fixture stops before TLS handshake");
+        assert_eq!(error.code(), rune_core::error::ErrorCode::TransportFailure);
+        assert_eq!(resolver.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn checking_resolved_addresses_consumes_the_fetch_timeout() {
+        use ureq::unversioned::transport::DefaultConnector;
+
+        let resolver = ChangingResolver {
+            answers: vec![vec!["93.184.216.34:80".parse().expect("public")]],
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let error = fetch_hop_checked_with(
+            "http://public.example/fixture",
+            "*/*",
+            Duration::from_millis(10),
+            |_| {
+                std::thread::sleep(Duration::from_millis(20));
+                Ok(())
+            },
+            &resolver,
+            DefaultConnector::default(),
+            ureq::Agent::config_builder().proxy(None).build(),
+        )
+        .expect_err("deadline expired before connecting");
+        assert_eq!(error.code(), rune_core::error::ErrorCode::Timeout);
+        assert!(error.message().contains("resolving"), "{error}");
+    }
+
     #[test]
     fn https_is_accepted() {
         validate_url("https://api.example.com").expect("accepted");
@@ -1475,6 +2294,28 @@ mod tests {
     #[test]
     fn a_url_with_a_fragment_is_rejected() {
         assert!(validate_url("https://example.com/v1#frag").is_err());
+    }
+
+    #[test]
+    fn endpoint_debug_redacts_the_credential() {
+        let secret = "this-is-a-real-secret";
+        for auth in [AuthStyle::Bearer, AuthStyle::ApiKeyHeader] {
+            let endpoint = Endpoint::new("https://example.com", secret)
+                .with_auth(auth)
+                .with_header("user-agent", "rune-test")
+                .offline(true);
+
+            for rendered in [format!("{endpoint:?}"), format!("{endpoint:#?}")] {
+                assert!(!rendered.contains(secret), "{rendered}");
+                assert!(rendered.contains("[REDACTED]"), "{rendered}");
+                assert!(rendered.contains("https://example.com"), "{rendered}");
+                assert!(rendered.contains(&format!("{auth:?}")), "{rendered}");
+                assert!(rendered.contains("user-agent"), "{rendered}");
+                assert!(rendered.contains("rune-test"), "{rendered}");
+                assert!(rendered.contains("offline: true"), "{rendered}");
+            }
+            assert_eq!(endpoint.credential, secret);
+        }
     }
 
     #[test]

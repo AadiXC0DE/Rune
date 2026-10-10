@@ -10,6 +10,7 @@
 //! passed in, which keeps a render reproducible from its arguments.
 
 use std::fmt::Write as _;
+use std::time::Duration;
 
 use rune_core::config::PermissionMode;
 
@@ -38,18 +39,33 @@ pub const HINTS: &str = "ctrl-c cancel  /help commands  esc clear";
 /// Everything the status line displays.
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub struct FooterState {
+    /// Pending or active provider retry, absent outside a retried request.
+    pub provider_retry: Option<ProviderRetry>,
     /// Model the session is talking to.
     pub model: String,
     /// Effective permission mode.
     pub permission_mode: PermissionMode,
     /// Working directory, shown as given.
     pub workspace: String,
-    /// Tokens already spent from the context window.
+    /// Observed or estimated conversation tokens.
     pub context_used: u64,
+    /// Source of a resume estimate, absent for live provider readings.
+    pub context_source: Option<&'static str>,
     /// Size of the context window, zero when the provider did not state one.
     pub context_limit: u64,
     /// Identifier of the session, shown shortened.
     pub session_id: String,
+}
+
+/// The provider attempt shown in the renderer-owned status row.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ProviderRetry {
+    /// Attempt to be sent, or currently being streamed, counting from one.
+    pub attempt: usize,
+    /// Maximum requests allowed for this step.
+    pub max_attempts: usize,
+    /// Pending wait, absent once the retry starts.
+    pub delay: Option<Duration>,
 }
 
 impl FooterState {
@@ -182,10 +198,13 @@ pub fn render(
 
 /// Returns the message shown when the terminal cannot hold the layout.
 fn too_small_row(state: &FooterState, layout: &Layout, theme: &Theme, truecolor: bool) -> String {
+    if let Some(retry) = state.provider_retry {
+        return retry_field(retry, theme, truecolor);
+    }
     let mut row = paint(theme, Slot::Error, truecolor, flag::BOLD);
     let _ = write!(
         row,
-        "terminal is {} rows, too small for the interface; resize to continue",
+        "compact mode ({} rows): prompts work; resize for full interface",
         layout.rows
     );
     row.push_str(&reset(theme));
@@ -208,6 +227,10 @@ fn hint_row(theme: &Theme, truecolor: bool) -> String {
 /// Returns the status line.
 fn status_row(state: &FooterState, theme: &Theme, truecolor: bool) -> String {
     let mut row = String::new();
+    if let Some(retry) = state.provider_retry {
+        row.push_str(&retry_field(retry, theme, truecolor));
+        row.push_str(&divider(theme, truecolor));
+    }
     if !state.model.is_empty() {
         row.push_str(&paint(theme, Slot::Accent, truecolor, flag::BOLD));
         row.push_str(&state.model);
@@ -234,13 +257,47 @@ fn status_row(state: &FooterState, theme: &Theme, truecolor: bool) -> String {
     row
 }
 
+/// Puts the attempt and pending delay first so they survive width clipping.
+fn retry_field(retry: ProviderRetry, theme: &Theme, truecolor: bool) -> String {
+    let mut field = paint(theme, Slot::Accent, truecolor, flag::BOLD);
+    let _ = write!(
+        field,
+        "provider retry {}/{}",
+        retry.attempt, retry.max_attempts
+    );
+    if let Some(delay) = retry.delay {
+        let _ = write!(field, " in {}ms", delay.as_millis());
+    }
+    field.push_str(&reset(theme));
+    field
+}
+
 /// Returns the context usage field of the status line.
 ///
 /// An unstated window prints only the amount spent, since a percentage of a
 /// window the provider never stated would be a guess.
 fn context_field(state: &FooterState, theme: &Theme, truecolor: bool) -> String {
     let mut field = String::new();
-    if state.context_limit == 0 {
+    if let Some(source) = state.context_source {
+        let slot = if state.context_is_tight() {
+            Slot::Error
+        } else {
+            Slot::Dim
+        };
+        field.push_str(&paint(theme, slot, truecolor, 0));
+        let _ = write!(
+            field,
+            "ctx ~{} ({source})",
+            format_tokens(state.context_used)
+        );
+        if state.context_limit > 0 {
+            let _ = write!(
+                field,
+                " ({} left)",
+                format_tokens(state.context_remaining())
+            );
+        }
+    } else if state.context_limit == 0 {
         field.push_str(&paint(theme, Slot::Dim, truecolor, 0));
         let _ = write!(field, "ctx {}", format_tokens(state.context_used));
     } else {
@@ -276,6 +333,9 @@ fn paint(theme: &Theme, slot: Slot, truecolor: bool, bits: u16) -> String {
     }
     let mut style = theme.style(slot, truecolor);
     style.set_flag(bits);
+    if theme.base() == Base::HighContrast {
+        style.clear_flag(flag::DIM);
+    }
     style.sgr()
 }
 
@@ -320,10 +380,12 @@ mod tests {
 
     fn state() -> FooterState {
         FooterState {
+            provider_retry: None,
             model: "claude-sonnet-4".to_owned(),
             permission_mode: PermissionMode::Auto,
             workspace: "/Users/dev/rune/".to_owned(),
             context_used: 24_500,
+            context_source: None,
             context_limit: 200_000,
             session_id: "9f2c1a7b4e".to_owned(),
         }
@@ -364,7 +426,11 @@ mod tests {
         assert_eq!(layout.prompt_rows, 0);
         let rows = render(&state(), &layout, &Theme::fx_dark(), 80, true);
         assert_eq!(rows.len(), 1);
-        assert!(strip(&rows)[0].contains("too small"));
+        let message = strip(&rows).remove(0);
+        assert!(
+            message.starts_with("compact mode (4 rows): prompts work; resize for full interface")
+        );
+        assert!(!message.contains("resize to continue"));
         for row in &rows {
             assert!(str_width(row) <= 80, "row too wide: {row:?}");
         }
@@ -413,6 +479,38 @@ mod tests {
         let layout = solve((100, 40), 1, false, DEFAULT_MINIMUM_ROWS);
         let rows = render(&state(), &layout, &Theme::fx_dark(), 100, true);
         assert_eq!(rows.len(), usize::from(layout.footer_rows));
+    }
+
+    #[test]
+    fn provider_retry_uses_one_existing_row_in_full_and_compact_layouts() {
+        let mut state = state();
+        state.provider_retry = Some(ProviderRetry {
+            attempt: 2,
+            max_attempts: 3,
+            delay: Some(Duration::from_millis(250)),
+        });
+        for height in [4, 24] {
+            let layout = solve((80, height), 1, false, DEFAULT_MINIMUM_ROWS);
+            for theme in [Theme::no_color(), Theme::high_contrast()] {
+                let rows = strip(&render(&state, &layout, &theme, 80, true));
+                assert_eq!(rows.len(), usize::from(layout.footer_rows));
+                assert!(
+                    rows.last()
+                        .expect("status")
+                        .starts_with("provider retry 2/3 in 250ms")
+                );
+                for width in [12, 32, 80] {
+                    for row in render(&state, &layout, &theme, width, true) {
+                        assert!(str_width(&row) <= width);
+                    }
+                }
+            }
+        }
+        state.provider_retry.as_mut().expect("retry").delay = None;
+        let status = status_of(&state, 80);
+        assert!(status.starts_with("provider retry 2/3 |"), "{status}");
+        assert!(!status.contains("250ms"), "{status}");
+        assert!(status.is_ascii(), "{status}");
     }
 
     #[test]
@@ -484,6 +582,25 @@ mod tests {
     }
 
     #[test]
+    fn a_resume_estimate_names_its_source_even_below_one_percent() {
+        let mut resumed = state();
+        resumed.context_used = 1234;
+        for source in ["saved usage", "history bytes"] {
+            resumed.context_source = Some(source);
+            for window in [0, 200_000] {
+                resumed.context_limit = window;
+                let status = status_of(&resumed, 120);
+                assert!(
+                    status.contains(&format!("ctx ~1.2k ({source})")),
+                    "{status}"
+                );
+                assert!(!status.contains("ctx 0%"), "{status}");
+                assert_eq!(status.contains("198.7k left"), window > 0, "{status}");
+            }
+        }
+    }
+
+    #[test]
     fn an_unstated_context_window_shows_only_what_was_spent() {
         let mut unknown = state();
         unknown.context_limit = 0;
@@ -510,6 +627,32 @@ mod tests {
         let rows = render(&state(), &layout, &Theme::fx_dark(), 100, false);
         assert!(rows[1].contains("38;5;"), "{:?}", rows[1]);
         assert!(!rows[1].contains("38;2;"), "{:?}", rows[1]);
+    }
+
+    #[test]
+    fn high_contrast_footer_keeps_metadata_bright_on_black() {
+        let layout = solve((100, 40), 1, false, DEFAULT_MINIMUM_ROWS);
+        for truecolor in [false, true] {
+            let rows = render(&state(), &layout, &Theme::high_contrast(), 100, truecolor);
+            for row in rows {
+                let mut grid = crate::engine::Grid::new(100, 1).expect("grid");
+                grid.feed(row.as_bytes()).expect("footer");
+                for col in 0..100 {
+                    let cell = grid.cell(0, col).expect("cell");
+                    if cell.style.fg != crate::engine::Color::Default {
+                        assert!(!cell.style.has_flag(flag::DIM), "dimmed metadata: {row:?}");
+                        assert_eq!(
+                            cell.style.bg,
+                            if truecolor {
+                                crate::engine::Color::Rgb(0, 0, 0)
+                            } else {
+                                crate::engine::Color::Indexed(16)
+                            }
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]

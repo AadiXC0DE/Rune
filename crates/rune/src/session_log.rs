@@ -72,13 +72,23 @@ pub struct Summary {
 pub struct Recorder {
     store: SessionStore,
     turn: u64,
+    active_turn: bool,
+    journal_error: Option<RuneError>,
+    /// Initial estimate and its source, populated only when resuming.
+    resumed_context: (u64, Option<&'static str>),
 }
 
 impl Recorder {
     /// Creates a new session and its log.
     pub fn create(paths: &Paths, id: &SessionId) -> Result<Self> {
         let store = SessionStore::create(paths, id)?;
-        Ok(Self { store, turn: 0 })
+        Ok(Self {
+            store,
+            turn: 0,
+            active_turn: false,
+            journal_error: None,
+            resumed_context: (0, None),
+        })
     }
 
     /// Marks this session as a child of another.
@@ -111,7 +121,18 @@ impl Recorder {
     pub fn open(paths: &Paths, id: &SessionId) -> Result<Self> {
         let store = SessionStore::open(&paths.session_dir(id))?;
         let turn = store.turns();
-        Ok(Self { store, turn })
+        Ok(Self {
+            store,
+            turn,
+            active_turn: false,
+            journal_error: None,
+            resumed_context: (0, None),
+        })
+    }
+
+    /// Returns the initial context estimate and its source for a resumed log.
+    pub fn resumed_context(&self) -> (u64, Option<&'static str>) {
+        self.resumed_context
     }
 
     /// Returns the session identifier.
@@ -128,14 +149,70 @@ impl Recorder {
         Ok(())
     }
 
+    /// Starts an exchange before the provider can produce visible text.
+    pub fn begin_turn(&mut self) -> Result<()> {
+        if !self.active_turn {
+            let turn = self.turn.saturating_add(1);
+            self.store.append(SessionEvent::TurnStarted { turn })?;
+            self.turn = turn;
+            self.active_turn = true;
+        }
+        Ok(())
+    }
+
+    /// Journals visible text in bounded frames before the terminal draws it.
+    pub fn assistant_delta(&self, text: &str) -> Result<()> {
+        // Bound encoded frames even when a provider sends a very large delta.
+        // JSON escaping can expand each byte by at most six times.
+        const CHUNK_BYTES: usize = 8 * 1024;
+        if let Some(error) = &self.journal_error {
+            return Err(error.clone());
+        }
+        let mut remaining = text;
+        while !remaining.is_empty() {
+            let mut end = remaining.len().min(CHUNK_BYTES);
+            while !remaining.is_char_boundary(end) {
+                end = end.saturating_sub(1);
+            }
+            self.store.append(SessionEvent::AssistantDelta {
+                turn: self.turn,
+                text: remaining[..end].to_owned(),
+            })?;
+            remaining = &remaining[end..];
+        }
+        Ok(())
+    }
+
+    /// Durably clears a failed request attempt's visible text before a retry.
+    pub fn reset_assistant(&self) -> Result<()> {
+        if let Some(error) = &self.journal_error {
+            return Err(error.clone());
+        }
+        self.store
+            .append(SessionEvent::AssistantReset { turn: self.turn })?;
+        Ok(())
+    }
+
+    /// Remembers an observer write failure, since the observer cannot return it.
+    pub fn journal_failed(&mut self, error: RuneError) {
+        if self.journal_error.is_none() {
+            self.journal_error = Some(error);
+        }
+    }
+
+    /// Returns a journal failure to the input loop after its worker stops.
+    pub fn check_journal(&mut self) -> Result<()> {
+        self.journal_error.take().map_or(Ok(()), Err)
+    }
+
     /// Records a turn and everything it produced.
     ///
-    /// The turn number is assigned here rather than by the caller, so a turn
-    /// that produced no output is still numbered in the order it ran.
+    /// A streamed exchange keeps the number assigned before its request. A
+    /// caller recording a finished outcome directly starts the exchange here,
+    /// so even a turn with no output is numbered in the order it ran.
     pub fn turn(&mut self, outcome: &TurnOutcome) -> Result<()> {
-        self.turn = self.turn.saturating_add(1);
+        self.begin_turn()?;
         let turn = self.turn;
-        self.store.append(SessionEvent::TurnStarted { turn })?;
 
         // The calls of one step are a batch, and their results follow the whole
         // batch. Writing them interleaved would leave a log that cannot be
@@ -170,6 +247,48 @@ impl Recorder {
                 output_tokens: output,
             })?;
         }
+        self.store.append(SessionEvent::TurnFinished { turn })?;
+        self.active_turn = false;
+        Ok(())
+    }
+
+    /// Records the visible answer and boundary of a cancelled exchange.
+    ///
+    /// A cancellation is numbered even when no text arrived. Unknown usage is
+    /// left absent rather than recorded as a completed request with zero usage.
+    pub fn cancelled_turn(&mut self, partial: &str) -> Result<()> {
+        self.begin_turn()?;
+        let turn = self.turn;
+        if !partial.trim().is_empty() {
+            self.store.append(SessionEvent::AssistantMessage {
+                turn,
+                text: partial.to_owned(),
+            })?;
+        }
+        self.store.append(SessionEvent::TurnCancelled { turn })?;
+        self.active_turn = false;
+        Ok(())
+    }
+
+    /// Records the visible answer and cause of a failed exchange.
+    ///
+    /// A failure is numbered even when no text arrived. Unknown usage is left
+    /// absent rather than recorded as a completed request with zero usage.
+    pub fn failed_turn(&mut self, partial: &str, error: &RuneError) -> Result<()> {
+        self.begin_turn()?;
+        let turn = self.turn;
+        if !partial.trim().is_empty() {
+            self.store.append(SessionEvent::AssistantMessage {
+                turn,
+                text: partial.to_owned(),
+            })?;
+        }
+        self.store.append(SessionEvent::TurnFailed {
+            turn,
+            code: error.code(),
+            message: error.message().to_owned(),
+        })?;
+        self.active_turn = false;
         Ok(())
     }
 
@@ -351,13 +470,23 @@ pub fn tree_of(state: &SessionState) -> Tree {
 
     let mut tree = Tree::new();
     let mut parent: Option<u64> = None;
-    for frame in &state.events {
+    for frame in rune_session::replay::replay_events(&state.events) {
+        let failure;
         let (role, preview) = match &frame.event {
             SessionEvent::UserMessage { text } => (Role::User, text.as_str()),
             SessionEvent::AssistantMessage { text, .. } => (Role::Assistant, text.as_str()),
+            SessionEvent::TurnCancelled { .. } => (Role::System, "[cancelled]"),
+            SessionEvent::TurnInterrupted { .. } => (Role::System, "[interrupted]"),
+            SessionEvent::TurnFailed { code, .. } => {
+                failure = format!("[failed: {code}]");
+                (Role::System, failure.as_str())
+            }
             SessionEvent::ToolResult { output, .. } => (Role::Tool, output.as_str()),
             SessionEvent::ToolCall { name, .. } => (Role::Assistant, name.as_str()),
-            SessionEvent::TurnStarted { .. }
+            SessionEvent::AssistantDelta { .. }
+            | SessionEvent::AssistantReset { .. }
+            | SessionEvent::TurnStarted { .. }
+            | SessionEvent::TurnFinished { .. }
             | SessionEvent::Compaction { .. }
             | SessionEvent::UsageRecorded { .. }
             | SessionEvent::TitleSet { .. }
@@ -389,10 +518,26 @@ pub fn render_tree(tree: &Tree, state: &SessionState) -> String {
     let _ = writeln!(out, "session {} ({} turns)", state.id, state.turns);
 
     for branch in tree.branches() {
+        // An interrupted boundary has its own row below. Keep it out of the
+        // branch summary so an exchange ending here reports the boundary once.
+        let failure_boundary = branch
+            .head_seq
+            .and_then(|seq| tree.node(seq))
+            .is_some_and(|node| {
+                node.role == rune_session::tree::Role::System
+                    && node.preview.starts_with("[failed: ")
+            });
+        let summary = if matches!(branch.summary.as_str(), "[cancelled]" | "[interrupted]")
+            || failure_boundary
+        {
+            ""
+        } else {
+            &branch.summary
+        };
         let _ = writeln!(
             out,
             "  branch {}  {} turn(s)  {}",
-            branch.name, branch.turn_count, branch.summary
+            branch.name, branch.turn_count, summary
         );
     }
 
@@ -507,7 +652,30 @@ pub fn load(paths: &Paths, id: &SessionId) -> Result<(Recorder, History)> {
         .with_hint("resume the session that created it"));
     }
     let history = history_from(&state);
-    let recorder = Recorder::open(paths, id)?;
+    let mut recorder = Recorder::open(paths, id)?;
+    // Usage is per turn and can include several requests. It is an estimate,
+    // not an exact current request count. Never sum repeated conversation input.
+    let saved = state
+        .events
+        .iter()
+        .filter_map(|frame| match frame.event {
+            SessionEvent::UsageRecorded {
+                input_tokens,
+                output_tokens,
+            } => Some(input_tokens.saturating_add(output_tokens)),
+            _ => None,
+        })
+        .max()
+        .unwrap_or(0);
+    let bytes = u64::try_from(history.byte_len()).unwrap_or(u64::MAX);
+    let estimated = rune_agent::tokens::estimate_tokens(bytes).max(u64::from(!history.is_empty()));
+    recorder.resumed_context = if saved > 0 && saved >= estimated {
+        (saved, Some("saved usage"))
+    } else if estimated > 0 {
+        (estimated, Some("history bytes"))
+    } else {
+        (0, None)
+    };
     Ok((recorder, history))
 }
 
@@ -521,7 +689,7 @@ pub fn history_from(state: &SessionState) -> History {
     let mut calls: Vec<ContentPart> = Vec::new();
     let mut results: Vec<ContentPart> = Vec::new();
 
-    for frame in &state.events {
+    for frame in rune_session::replay::replay_events(&state.events) {
         match &frame.event {
             SessionEvent::UserMessage { text } => {
                 flush(&mut history, &mut calls, &mut results);
@@ -565,12 +733,18 @@ pub fn history_from(state: &SessionState) -> History {
                     });
                 }
             }
-            SessionEvent::TurnStarted { .. }
+            SessionEvent::AssistantDelta { .. }
+            | SessionEvent::AssistantReset { .. }
+            | SessionEvent::TurnStarted { .. }
+            | SessionEvent::TurnFinished { .. }
             | SessionEvent::Compaction { .. }
             | SessionEvent::UsageRecorded { .. }
             | SessionEvent::TitleSet { .. }
             | SessionEvent::WorkspaceSet { .. }
-            | SessionEvent::ChildOf { .. } => {}
+            | SessionEvent::ChildOf { .. }
+            | SessionEvent::TurnInterrupted { .. }
+            | SessionEvent::TurnCancelled { .. }
+            | SessionEvent::TurnFailed { .. } => {}
         }
     }
 
@@ -725,6 +899,103 @@ mod tests {
     }
 
     #[test]
+    fn journal_frames_are_bounded_and_recover_unicode_before_a_torn_tail() {
+        use std::io::Write as _;
+
+        let dir = tempfile::tempdir().expect("temp");
+        let paths = paths(Utf8Path::from_path(dir.path()).expect("utf8"));
+        let key = id("sessionjrnl1");
+        let text = "aé🦀\n\t".repeat(5000);
+        let mut recorder = Recorder::create(&paths, &key).expect("created");
+        recorder.user_message("slow").expect("prompt saved");
+        recorder.begin_turn().expect("started");
+        recorder.assistant_delta(&text).expect("journalled");
+        let state = recorder.store.read().expect("read while streaming");
+        let deltas: Vec<_> = state
+            .events
+            .iter()
+            .filter_map(|frame| match &frame.event {
+                SessionEvent::AssistantDelta { text, .. } => {
+                    assert!(text.len() <= 8 * 1024);
+                    assert!(frame.encode().expect("encoded").len() < 50 * 1024);
+                    Some(text.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(deltas.len() > 1);
+        assert_eq!(deltas.concat(), text);
+        assert_eq!(state.usage, rune_session::store::UsageTotal::default());
+        drop(recorder);
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(paths.session_dir(&key).join("events.jsonl"))
+            .expect("log")
+            .write_all(b"{\"schema\":1,\"seq\":")
+            .expect("torn frame");
+        let (mut recorder, history) = load(&paths, &key).expect("recovered");
+        assert_eq!(history.to_messages()[1].text(), text);
+        recorder.user_message("continue").expect("continued prompt");
+        recorder.begin_turn().expect("next turn");
+        recorder.assistant_delta("done").expect("journalled");
+        recorder.turn(&outcome("done")).expect("finished");
+        let state = recorder.store.read().expect("read");
+        assert_eq!(state.turns, 2);
+        assert_eq!(
+            state
+                .events
+                .iter()
+                .filter(|frame| matches!(frame.event, SessionEvent::TurnFinished { turn: 2 }))
+                .count(),
+            1
+        );
+        let replay = render_tree(&tree_of(&state), &state);
+        assert_eq!(replay.matches("[interrupted]").count(), 1);
+        assert_eq!(history_from(&state).to_messages()[1].text(), text);
+    }
+
+    #[test]
+    fn resume_estimates_context_without_summing_repeated_inputs() {
+        for usage in [Some((1234, 0)), None, Some((u64::MAX, 1))] {
+            let dir = tempfile::tempdir().expect("temp");
+            let root = Utf8Path::from_path(dir.path()).expect("utf8");
+            let paths = paths(root);
+            let key = id("sessionctx01");
+            let recorder = Recorder::create(&paths, &key).expect("created");
+            assert_eq!(recorder.resumed_context(), (0, None));
+            recorder.user_message("hello").expect("user");
+            if let Some((input_tokens, output_tokens)) = usage {
+                for _ in 0..2 {
+                    recorder
+                        .store
+                        .append(SessionEvent::UsageRecorded {
+                            input_tokens,
+                            output_tokens,
+                        })
+                        .expect("usage");
+                }
+            }
+            drop(recorder);
+            let (recorder, _) = load(&paths, &key).expect("resumed");
+            let expected = match usage {
+                Some((input, output)) => (input.saturating_add(output), Some("saved usage")),
+                None => (1, Some("history bytes")),
+            };
+            assert_eq!(recorder.resumed_context(), expected);
+        }
+    }
+
+    #[test]
+    fn resuming_an_empty_log_keeps_an_empty_context_meter() {
+        let dir = tempfile::tempdir().expect("temp");
+        let paths = paths(Utf8Path::from_path(dir.path()).expect("utf8"));
+        let key = id("sessionctx02");
+        drop(Recorder::create(&paths, &key).expect("created"));
+        let (recorder, _) = load(&paths, &key).expect("resumed");
+        assert_eq!(recorder.resumed_context(), (0, None));
+    }
+
+    #[test]
     fn a_turn_round_trips_through_the_log() {
         let dir = tempfile::tempdir().expect("temp");
         let root = Utf8Path::from_path(dir.path()).expect("utf8");
@@ -740,6 +1011,155 @@ mod tests {
         assert_eq!(history.turns().len(), 2);
         assert_eq!(history.turns()[0].text(), "what changed?");
         assert_eq!(history.turns()[1].text(), "two files");
+    }
+
+    #[test]
+    fn cancelled_exchanges_round_trip_without_duplicate_text_or_invented_usage() {
+        for partial in ["", "STREAM-01\nSTREAM-02\nSTREAM-03\n"] {
+            let dir = tempfile::tempdir().expect("temp");
+            let root = Utf8Path::from_path(dir.path()).expect("utf8");
+            let paths = paths(root);
+            let key = id("sessionccccc");
+            let mut recorder = Recorder::create(&paths, &key).expect("created");
+            recorder.user_message("slow").expect("wrote");
+            recorder.cancelled_turn(partial).expect("cancelled");
+            drop(recorder);
+
+            let (mut recorder, history) = load(&paths, &key).expect("resumed");
+            history.validate().expect("valid replay");
+            assert_eq!(history.len(), if partial.is_empty() { 1 } else { 2 });
+            if !partial.is_empty() {
+                assert_eq!(history.turns()[1].text(), partial);
+            }
+            let state = inspect(&paths, &key).expect("inspected");
+            assert_eq!(state.turns, 1);
+            assert_eq!(state.usage.total(), 0);
+            assert!(
+                !state
+                    .events
+                    .iter()
+                    .any(|frame| matches!(frame.event, SessionEvent::UsageRecorded { .. }))
+            );
+            assert_eq!(
+                state
+                    .events
+                    .iter()
+                    .filter(|frame| matches!(frame.event, SessionEvent::TurnCancelled { turn: 1 }))
+                    .count(),
+                1
+            );
+            let rendered = render_tree(&tree_of(&state), &state);
+            assert_eq!(rendered.matches("[cancelled]").count(), 1);
+            for line in partial.lines() {
+                assert_eq!(rendered.matches(line).count(), 1, "{rendered}");
+            }
+
+            recorder.user_message("continue").expect("wrote");
+            recorder.turn(&outcome("continued")).expect("wrote");
+            drop(recorder);
+            let state = inspect(&paths, &key).expect("inspected");
+            assert_eq!(state.turns, 2);
+            assert!(state.events.iter().any(|frame| matches!(
+                frame.event,
+                SessionEvent::AssistantMessage { turn: 2, .. }
+            )));
+            assert_eq!(
+                render_tree(&tree_of(&state), &state)
+                    .matches("[cancelled]")
+                    .count(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn failed_exchanges_round_trip_with_the_visible_answer_and_cause() {
+        for partial in ["", "STREAM-01\nSTREAM-02\nSTREAM-03\n"] {
+            let dir = tempfile::tempdir().expect("temp");
+            let root = Utf8Path::from_path(dir.path()).expect("utf8");
+            let paths = paths(root);
+            let key = id("sessionfffff");
+            let error = RuneError::new(
+                ErrorCode::IncompleteStream,
+                "the provider closed the stream",
+            );
+            let mut recorder = Recorder::create(&paths, &key).expect("created");
+            recorder.user_message("die").expect("wrote");
+            recorder.failed_turn(partial, &error).expect("failed");
+            drop(recorder);
+
+            let (mut recorder, history) = load(&paths, &key).expect("resumed");
+            history.validate().expect("valid replay");
+            assert_eq!(history.len(), if partial.is_empty() { 1 } else { 2 });
+            if !partial.is_empty() {
+                assert_eq!(history.turns()[1].text(), partial);
+            }
+            let state = inspect(&paths, &key).expect("inspected");
+            assert_eq!(state.turns, 1);
+            assert_eq!(state.usage.total(), 0);
+            assert!(
+                !state
+                    .events
+                    .iter()
+                    .any(|frame| matches!(frame.event, SessionEvent::UsageRecorded { .. }))
+            );
+            let failures: Vec<_> = state
+                .events
+                .iter()
+                .filter(|frame| matches!(frame.event, SessionEvent::TurnFailed { .. }))
+                .map(|frame| &frame.event)
+                .collect();
+            assert_eq!(
+                failures,
+                [&SessionEvent::TurnFailed {
+                    turn: 1,
+                    code: ErrorCode::IncompleteStream,
+                    message: error.message().to_owned(),
+                }]
+            );
+            let rendered = render_tree(&tree_of(&state), &state);
+            assert_eq!(rendered.matches("[failed: incomplete_stream]").count(), 1);
+            for line in partial.lines() {
+                assert_eq!(rendered.matches(line).count(), 1, "{rendered}");
+            }
+
+            recorder.user_message("continue").expect("wrote");
+            recorder.turn(&outcome("continued")).expect("wrote");
+            drop(recorder);
+            let state = inspect(&paths, &key).expect("inspected");
+            assert_eq!(state.turns, 2);
+            assert!(state.events.iter().any(|frame| matches!(
+                frame.event,
+                SessionEvent::AssistantMessage { turn: 2, .. }
+            )));
+            assert_eq!(
+                render_tree(&tree_of(&state), &state)
+                    .matches("[failed: incomplete_stream]")
+                    .count(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_reply_text_does_not_become_a_failure_boundary() {
+        let dir = tempfile::tempdir().expect("temp");
+        let root = Utf8Path::from_path(dir.path()).expect("utf8");
+        let paths = paths(root);
+        let key = id("sessionfffff");
+        let mut recorder = Recorder::create(&paths, &key).expect("created");
+        recorder.user_message("quote this marker").expect("wrote");
+        recorder
+            .turn(&outcome("[failed: incomplete_stream]"))
+            .expect("wrote");
+        let state = inspect(&paths, &key).expect("inspected");
+        let rendered = render_tree(&tree_of(&state), &state);
+        assert!(
+            rendered.lines().any(|line| {
+                line.starts_with("  branch ") && line.ends_with("[failed: incomplete_stream]")
+            }),
+            "{rendered}"
+        );
     }
 
     #[test]

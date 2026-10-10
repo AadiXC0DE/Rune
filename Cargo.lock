@@ -974,6 +974,7 @@ name = "rune"
 version = "0.1.16"
 dependencies = [
  "camino",
+ "flate2",
  "jiff",
  "rune-acp",
  "rune-agent",

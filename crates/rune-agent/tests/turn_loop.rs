@@ -31,12 +31,13 @@ use rune_policy::decision::{Layer, Outcome};
 use rune_policy::rules::{Rule, RuleSet};
 use rune_testkit::{MockEndpoint, Script};
 use rune_tools::contract::{ExecutionContext, ToolOutput};
+use rune_tools::registry::Registry;
 
 /// A host that records what happened, for assertions.
 struct TestHost {
     /// Held so the mock server outlives the host. Dropping it closes the
     /// listener, which would make every request fail with a refused connection.
-    _server: Option<MockEndpoint>,
+    server: Option<MockEndpoint>,
     endpoint: Endpoint,
     dialect: Box<dyn Provider>,
     model: String,
@@ -46,6 +47,8 @@ struct TestHost {
     events: Mutex<Vec<Event>>,
     executed: Mutex<Vec<(String, serde_json::Value)>>,
     tool_response: Mutex<Option<ToolOutput>>,
+    /// Real tools used by regressions that must reach the implementation.
+    registry: Option<Registry>,
     cancellation: Cancellation,
     steering: SteeringQueue,
     workspace: Utf8PathBuf,
@@ -54,6 +57,8 @@ struct TestHost {
     /// it and, when nothing is concerning, allow it. A host that cannot review
     /// leaves the call unresolved, which the loop reports rather than running.
     resolve_ask: bool,
+    private_authority: Option<Outcome>,
+    private_decisions: Mutex<Vec<Option<String>>>,
     /// Text submitted as steering the first time a delta arrives, which is when
     /// a user typing during a stream would reach the queue.
     submit_on_first_delta: Mutex<Option<String>>,
@@ -66,7 +71,7 @@ impl TestHost {
     fn new(endpoint: MockEndpoint) -> Self {
         let base = endpoint.base_url();
         Self {
-            _server: Some(endpoint),
+            server: Some(endpoint),
             endpoint: Endpoint::new(base, "test-key"),
             dialect: Box::new(rune_net::chat_completions::ChatCompletions),
             model: "test/model".to_owned(),
@@ -76,11 +81,14 @@ impl TestHost {
             events: Mutex::new(Vec::new()),
             executed: Mutex::new(Vec::new()),
             tool_response: Mutex::new(None),
+            registry: None,
             cancellation: Cancellation::new(),
             steering: SteeringQueue::new(8),
             workspace: Utf8PathBuf::from("/tmp/rune-test"),
             limits: BudgetSet::new(),
             resolve_ask: true,
+            private_authority: None,
+            private_decisions: Mutex::new(Vec::new()),
             submit_on_first_delta: Mutex::new(None),
             cancel_on_execute: Mutex::new(false),
         }
@@ -204,6 +212,9 @@ impl Host for TestHost {
             self.cancellation.cancel();
             return Err(rune_agent::steering::cancelled_error());
         }
+        if let Some(registry) = &self.registry {
+            return registry.call(name, arguments, &self.context());
+        }
         Ok(self
             .tool_response
             .lock()
@@ -213,7 +224,13 @@ impl Host for TestHost {
     }
 
     fn decide(&self, name: &str, target: Option<&str>) -> (Outcome, String) {
-        let (outcome, reason) = rune_agent::turn::decide_call(&self.rules, self.mode, name, target);
+        let (outcome, reason) = rune_agent::turn::decide_call_in_workspace(
+            &self.rules,
+            self.mode,
+            name,
+            target,
+            &self.workspace,
+        );
         match outcome {
             // A host resolves an ask before the loop sees it. Allowing here
             // models a review that found nothing concerning; the test that
@@ -224,6 +241,41 @@ impl Host for TestHost {
             ),
             other => (other, reason),
         }
+    }
+
+    fn decide_private_network(&self, target: Option<&str>) -> (Outcome, String) {
+        self.private_decisions
+            .lock()
+            .expect("lock")
+            .push(target.map(str::to_owned));
+        (
+            self.private_authority.unwrap_or(Outcome::Deny),
+            "separate user decision".to_owned(),
+        )
+    }
+
+    fn execute_with_context(
+        &self,
+        name: &str,
+        arguments: &serde_json::Value,
+        context: &ExecutionContext,
+    ) -> Result<ToolOutput> {
+        if name == "web_fetch" {
+            assert_eq!(
+                context.private_network_access,
+                arguments
+                    .get("allow_private")
+                    .and_then(serde_json::Value::as_bool)
+                    == Some(true),
+                "private authority must be isolated to the approved call",
+            );
+            return self
+                .registry
+                .as_ref()
+                .expect("web registry")
+                .call(name, arguments, context);
+        }
+        self.execute(name, arguments)
     }
 
     fn context(&self) -> ExecutionContext {
@@ -281,6 +333,430 @@ fn two_reads(first: &str, second: &str) -> Script {
         r#"{"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#.to_owned(),
         "[DONE]".to_owned(),
     ])
+}
+
+fn retained_handle(text: &str) -> rune_tools::Handle {
+    let raw = text
+        .split("handle ")
+        .nth(1)
+        .expect("a retained handle")
+        .trim_end_matches(']');
+    rune_tools::Handle::parse(raw).expect("valid handle")
+}
+
+fn result_reader_spec() -> ToolSpec {
+    let registry = rune_tools::inventory::builtin_default().expect("registry");
+    registry.schemas(&["read_tool_result"]).remove(0)
+}
+
+fn result_read_batch(handle: &rune_tools::Handle, requests: &[(usize, usize)]) -> Script {
+    let mut frames: Vec<String> = requests
+        .iter()
+        .enumerate()
+        .map(|(index, (offset, length))| {
+            serde_json::json!({
+                "choices": [{"index": 0, "delta": {"tool_calls": [{
+                    "index": index,
+                    "id": format!("page_{index}"),
+                    "function": {
+                        "name": "read_tool_result",
+                        "arguments": serde_json::json!({"handle": handle.as_str(), "offset": offset, "length": length}).to_string(),
+                    },
+                }]}}],
+            }).to_string()
+        })
+        .collect();
+    frames.push(r#"{"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#.to_owned());
+    frames.push("[DONE]".to_owned());
+    Script::Frames(frames)
+}
+
+fn set_result_caps(host: &mut TestHost, tool: u64, turn: u64) {
+    for (name, cap) in [
+        (rune_core::LimitName::MaxToolResultBytes, tool),
+        (rune_core::LimitName::MaxTurnResultBytes, turn),
+    ] {
+        host.limits
+            .set(
+                name,
+                rune_core::budget::Budget::Bounded(cap),
+                rune_core::config::Layer::User,
+            )
+            .expect("result cap");
+    }
+}
+
+#[test]
+fn a_reader_can_page_a_result_spilled_earlier_in_the_same_batch() {
+    let content = "é".repeat(2000);
+    let mut history = rune_agent::History::new();
+    let handle = rune_tools::Handle::derive(history.result_store().session(), "fixture", &content);
+    let Script::Frames(mut frames) =
+        Script::tool_call("fixture", "read_file", r#"{"path":"fixture.txt"}"#)
+    else {
+        panic!("tool frames");
+    };
+    frames.truncate(2);
+    frames.push(serde_json::json!({
+        "choices": [{"index": 0, "delta": {"tool_calls": [{
+            "index": 1, "id": "page",
+            "function": {"name": "read_tool_result", "arguments": serde_json::json!({"handle": handle.as_str(), "length": 512}).to_string()},
+        }]}}],
+    }).to_string());
+    frames.push(r#"{"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#.to_owned());
+    frames.push("[DONE]".to_owned());
+    let endpoint = MockEndpoint::start(vec![Script::Frames(frames), Script::text("read")]);
+    let mut host = TestHost::new(endpoint)
+        .with_tools(vec![read_tool(), result_reader_spec()])
+        .with_tool_response(ToolOutput::success(content));
+    set_result_caps(&mut host, 2048, 3000);
+    history.push_user("retain and read");
+    let outcome = run_turn(&mut history, &host).expect("turn");
+    assert_eq!(outcome.calls.len(), 2);
+    assert_eq!(retained_handle(&outcome.calls[0].output.text), handle);
+    assert!(
+        !outcome.calls[1].output.is_error,
+        "{}",
+        outcome.calls[1].output.text
+    );
+    let page: serde_json::Value =
+        serde_json::from_str(&outcome.calls[1].output.text).expect("JSON");
+    assert_eq!(page["text"], "é".repeat(256));
+    assert_eq!(page["next_offset"], 512);
+    assert_eq!(page["eof"], false);
+    assert_eq!(history.result_store().len(), 1);
+    history.validate().expect("paired calls");
+}
+
+#[test]
+fn a_model_reads_two_pages_of_retained_output_without_exceeding_either_response_cap() {
+    let content = format!("{}FULL-TAIL", "é".repeat(1745));
+    let mut history = rune_agent::History::new();
+    let handle = rune_tools::Handle::derive(history.result_store().session(), "fixture", &content);
+    let endpoint = MockEndpoint::start(vec![
+        Script::tool_call("fixture", "read_file", r#"{"path":"fixture.txt"}"#),
+        Script::text("retained"),
+        result_read_batch(&handle, &[(0, 1800), (1800, usize::MAX)]),
+        Script::text("read both pages"),
+    ]);
+    let mut host = TestHost::new(endpoint)
+        .with_tools(vec![read_tool(), result_reader_spec()])
+        .with_tool_response(ToolOutput::success(content.clone()));
+    set_result_caps(&mut host, 2048, 3800);
+    history.push_user("retain the fixture");
+    let initial = run_turn(&mut history, &host).expect("spill turn");
+    assert_eq!(retained_handle(&initial.calls[0].output.text), handle);
+
+    // Retention and the reader survive compaction and the next live turn.
+    history.replace_with_summary("fixture retained", u64::MAX);
+    history.push_user("read the retained fixture in two pages");
+    let outcome = run_turn(&mut history, &host).expect("reader turn");
+    assert_eq!(outcome.stop_reason, StopReason::Completed);
+    assert_eq!(outcome.calls.len(), 2);
+    let mut reconstructed = String::new();
+    for (index, call) in outcome.calls.iter().enumerate() {
+        assert!(call.executed);
+        assert!(!call.output.is_error, "{}", call.output.text);
+        assert!(call.output.text.len() <= 2048);
+        let page: serde_json::Value = serde_json::from_str(&call.output.text).expect("JSON page");
+        assert_eq!(page["offset"], reconstructed.len());
+        assert_eq!(page["total_bytes"], content.len());
+        reconstructed.push_str(page["text"].as_str().expect("page bytes"));
+        assert_eq!(page["next_offset"], reconstructed.len());
+        assert_eq!(page["eof"], index == 1);
+    }
+    assert_eq!(reconstructed.as_bytes(), content.as_bytes());
+    assert!(
+        outcome
+            .calls
+            .iter()
+            .map(|call| call.output.text.len())
+            .sum::<usize>()
+            <= 3800
+    );
+    assert_eq!(
+        history.result_store().len(),
+        1,
+        "pages were not spilled again"
+    );
+    assert_eq!(
+        host.executed_calls().len(),
+        1,
+        "the loop owns the retained store"
+    );
+    history.validate().expect("paired calls");
+    let request = host
+        .server
+        .as_ref()
+        .expect("server")
+        .last_body()
+        .expect("request");
+    assert!(
+        request.to_string().contains("FULL-TAIL"),
+        "pages reached the provider"
+    );
+    assert!(host.events().iter().any(|event| matches!(event,
+        Event::ToolStarted { call, activity: rune_tools::Activity::Read }
+        if call.name == "read_tool_result"
+    )));
+}
+
+#[test]
+fn readers_in_one_batch_share_the_remaining_turn_budget_including_metadata() {
+    let content = "x".repeat(3500);
+    let mut history = rune_agent::History::new();
+    let handle = rune_tools::Handle::derive(history.result_store().session(), "fixture", &content);
+    let endpoint = MockEndpoint::start(vec![
+        Script::tool_call("fixture", "read_file", r#"{"path":"fixture.txt"}"#),
+        Script::text("retained"),
+        result_read_batch(
+            &handle,
+            &[(0, usize::MAX), (0, usize::MAX), (0, usize::MAX)],
+        ),
+        Script::text("bounded"),
+    ]);
+    let mut host = TestHost::new(endpoint)
+        .with_tools(vec![read_tool(), result_reader_spec()])
+        .with_tool_response(ToolOutput::success(content));
+    set_result_caps(&mut host, 2048, 3000);
+    history.push_user("retain");
+    run_turn(&mut history, &host).expect("spill");
+    history.push_user("read");
+    let outcome = run_turn(&mut history, &host).expect("read");
+    assert_eq!(outcome.calls.len(), 3);
+    let first = &outcome.calls[0].output;
+    let second = &outcome.calls[1].output;
+    assert!(!first.is_error);
+    assert!(!second.is_error);
+    assert!(first.text.len() <= 2048);
+    assert!(second.text.len() <= 3000 - first.text.len());
+    assert!(second.text.len() < first.text.len());
+    for output in [first, second] {
+        let page: serde_json::Value =
+            serde_json::from_str(&output.text).expect("complete page JSON");
+        assert_eq!(page["eof"], false);
+        assert_eq!(
+            page["next_offset"],
+            page["text"].as_str().expect("text").len()
+        );
+    }
+    assert!(outcome.calls[2].output.is_error);
+    assert!(
+        outcome
+            .calls
+            .iter()
+            .map(|call| call.output.text.len())
+            .sum::<usize>()
+            <= 3000
+    );
+    assert_eq!(
+        history.result_store().len(),
+        1,
+        "no page retained as another result"
+    );
+    history.validate().expect("valid after budget exhaustion");
+}
+
+#[test]
+fn retained_reader_respects_policy_and_conversation_isolation() {
+    let content = "SECRET-TAIL".repeat(300);
+    let mut history = rune_agent::History::new();
+    let handle = rune_tools::Handle::derive(history.result_store().session(), "fixture", &content);
+    let endpoint = MockEndpoint::start(vec![
+        Script::tool_call("fixture", "read_file", r#"{"path":"fixture.txt"}"#),
+        Script::text("retained"),
+        result_read_batch(&handle, &[(0, usize::MAX)]),
+        Script::text("refused"),
+        result_read_batch(&handle, &[(0, usize::MAX)]),
+        Script::text("unknown"),
+    ]);
+    let mut host = TestHost::new(endpoint)
+        .with_tools(vec![read_tool(), result_reader_spec()])
+        .with_tool_response(ToolOutput::success(content));
+    set_result_caps(&mut host, 128, 4096);
+    history.push_user("retain");
+    run_turn(&mut history, &host).expect("spill");
+    host.rules
+        .push(Rule::deny("read_tool_result", "*", Layer::User));
+    history.push_user("read");
+    let denied = run_turn(&mut history, &host).expect("denied turn");
+    assert!(!denied.calls[0].executed);
+    assert!(denied.calls[0].output.is_error);
+    assert!(denied.calls[0].output.text.contains("refused by policy"));
+    host.rules = RuleSet::new();
+    let mut other = rune_agent::History::new();
+    other.push_user("read a foreign handle");
+    let unknown = run_turn(&mut other, &host).expect("foreign read");
+    assert!(unknown.calls[0].output.is_error);
+    assert!(unknown.calls[0].output.text.contains("no retained result"));
+    assert!(!unknown.calls[0].output.text.contains("SECRET-TAIL"));
+    assert!(other.result_store().is_empty());
+}
+
+#[test]
+fn oversized_tool_results_have_a_bounded_preview_and_a_readable_full_body() {
+    for is_error in [false, true] {
+        let endpoint = MockEndpoint::start(vec![
+            Script::tool_call("large", "read_file", "{\"path\":\"a.rs\"}"),
+            Script::text("inspected"),
+            Script::text("later turn"),
+        ]);
+        let content = format!("PREVIEW {} FULL-TAIL", "é".repeat(40_000));
+        let output = if is_error {
+            ToolOutput::failure(content.clone())
+        } else {
+            ToolOutput::success(content.clone())
+        };
+        let host = TestHost::new(endpoint)
+            .with_tools(vec![read_tool()])
+            .with_tool_response(output);
+        let mut history = rune_agent::History::new();
+        history.push_user("read");
+
+        let outcome = run_turn(&mut history, &host).expect("turn");
+        let shown = &outcome.calls[0].output;
+        assert!(shown.text.starts_with("PREVIEW "));
+        assert!(!shown.text.contains("FULL-TAIL"));
+        assert!(shown.text.len() <= 65_536);
+        assert_eq!(shown.produced_bytes, content.len() as u64);
+        assert_eq!(shown.is_error, is_error);
+        let handle = retained_handle(&shown.text);
+        assert_eq!(history.result_store().len(), 1);
+        assert_eq!(history.result_store().total_bytes(), content.len());
+        assert_eq!(
+            history.result_store().describe(&handle),
+            Some(("read_file", content.len() as u64, is_error))
+        );
+        let mut full = String::new();
+        while full.len() < content.len() {
+            let page = history
+                .result_store()
+                .read(&handle, full.len(), 4096)
+                .expect("read retained bytes");
+            assert!(!page.text.is_empty());
+            full.push_str(&page.text);
+        }
+        assert_eq!(full, content);
+
+        let body = host
+            .server
+            .as_ref()
+            .expect("server")
+            .last_body()
+            .expect("request");
+        assert!(body.to_string().contains(handle.as_str()));
+        assert!(!body.to_string().contains("FULL-TAIL"));
+        assert!(
+            rune_agent::History::new()
+                .result_store()
+                .read(&handle, 0, 64)
+                .is_err()
+        );
+        assert!(
+            rune_agent::History::default()
+                .result_store()
+                .read(&handle, 0, 64)
+                .is_err()
+        );
+        let saved = serde_json::to_string(&history).expect("serialized history");
+        assert!(!saved.contains("FULL-TAIL"));
+        let restored: rune_agent::History = serde_json::from_str(&saved).expect("restored history");
+        assert!(restored.result_store().is_empty());
+
+        history.push_user("continue");
+        run_turn(&mut history, &host).expect("later turn");
+        history.replace_with_summary("summary", u64::MAX);
+        assert_eq!(
+            history
+                .result_store()
+                .read(&handle, content.len() - 9, 9)
+                .expect("tail")
+                .text,
+            "FULL-TAIL"
+        );
+    }
+}
+
+#[test]
+fn lowered_tool_caps_include_preview_metadata_and_leave_small_results_unchanged() {
+    for content in ["é".repeat(200), "é".repeat(64)] {
+        let endpoint = MockEndpoint::start(vec![
+            Script::tool_call("lowered", "read_file", "{\"path\":\"a.rs\"}"),
+            Script::text("done"),
+        ]);
+        let mut host = TestHost::new(endpoint)
+            .with_tools(vec![read_tool()])
+            .with_tool_response(ToolOutput::success(content.clone()));
+        host.limits
+            .set(
+                rune_core::LimitName::MaxToolResultBytes,
+                rune_core::budget::Budget::Bounded(128),
+                rune_core::config::Layer::User,
+            )
+            .expect("limit");
+        let mut history = rune_agent::History::new();
+        history.push_user("read");
+        let outcome = run_turn(&mut history, &host).expect("turn");
+        let shown = &outcome.calls[0].output.text;
+        assert!(shown.len() <= 128);
+        if content.len() > 128 {
+            let handle = retained_handle(shown);
+            assert_eq!(
+                history
+                    .result_store()
+                    .read(&handle, 0, 4096)
+                    .expect("read")
+                    .text,
+                content
+            );
+            assert!(shown.starts_with('é'));
+        } else {
+            assert_eq!(shown, &content);
+            assert!(history.result_store().is_empty());
+        }
+    }
+}
+
+#[test]
+fn the_turn_budget_retains_cut_results_even_when_no_preview_space_remains() {
+    let endpoint = MockEndpoint::start(vec![two_reads("first", "second"), Script::text("done")]);
+    let content = "z".repeat(1000);
+    let mut host = TestHost::new(endpoint)
+        .with_tools(vec![read_tool()])
+        .with_tool_response(ToolOutput::success(content.clone()));
+    host.limits
+        .set(
+            rune_core::LimitName::MaxTurnResultBytes,
+            rune_core::budget::Budget::Bounded(128),
+            rune_core::config::Layer::User,
+        )
+        .expect("limit");
+    let mut history = rune_agent::History::new();
+    history.push_user("read both");
+    let outcome = run_turn(&mut history, &host).expect("turn");
+    assert_eq!(outcome.calls[0].output.text.len(), 128);
+    assert!(outcome.calls[1].output.text.is_empty());
+    assert_eq!(history.result_store().len(), 2);
+    let second_handle =
+        rune_tools::Handle::derive(history.result_store().session(), "second", &content);
+    assert_eq!(
+        history
+            .result_store()
+            .read(&second_handle, 0, 4096)
+            .expect("second retained output")
+            .text,
+        content
+    );
+    let handle = retained_handle(&outcome.calls[0].output.text);
+    assert_eq!(
+        history
+            .result_store()
+            .read(&handle, 0, 4096)
+            .expect("read")
+            .text,
+        content
+    );
+    history.validate().expect("paired tool calls");
 }
 
 #[test]
@@ -390,6 +866,60 @@ fn the_request_carries_the_instructions_the_conversation_and_the_tools() {
 }
 
 #[test]
+fn private_web_requests_use_a_distinct_decision_before_any_backend_call() {
+    use rune_tools::web::{Fetched, RecordingBackend, WebFetch};
+    use std::sync::Arc;
+
+    for authority in [
+        None,
+        Some(Outcome::Ask),
+        Some(Outcome::Deny),
+        Some(Outcome::Allow),
+    ] {
+        let endpoint = MockEndpoint::start(vec![
+            Script::tool_call(
+                "private",
+                "web_fetch",
+                r#"{"url":"https://example.com/","allow_private":true}"#,
+            ),
+            Script::tool_call("public", "web_fetch", r#"{"url":"https://example.com/"}"#),
+            Script::text("done"),
+        ]);
+        let backend = Arc::new(RecordingBackend::new());
+        for _ in 0..2 {
+            backend.push(Fetched {
+                status: 200,
+                content_type: "text/plain".to_owned(),
+                body: b"fixture answer".to_vec(),
+                location: None,
+            });
+        }
+        let tool = WebFetch::new(backend.clone(), &BudgetSet::new());
+        let mut host = TestHost::new(endpoint)
+            .with_tools(vec![rune_tools::contract::model_spec(&tool)])
+            .with_mode(PermissionMode::FullAccess);
+        let mut registry = Registry::new();
+        registry.insert(Box::new(tool)).expect("register");
+        host.registry = Some(registry);
+        host.private_authority = authority;
+        let mut history = rune_agent::History::new();
+        history.push_user("fetch");
+        let outcome = run_turn(&mut history, &host).expect("turn");
+        assert_eq!(
+            *host.private_decisions.lock().expect("lock"),
+            vec![Some("domain:example.com".to_owned())]
+        );
+        let allowed = authority == Some(Outcome::Allow);
+        assert_eq!(outcome.calls[0].executed, allowed);
+        assert_eq!(outcome.calls[0].output.is_error, !allowed);
+        assert!(outcome.calls[1].executed, "ordinary fetch must still work");
+        assert!(!outcome.calls[1].output.is_error);
+        assert_eq!(backend.requests().len(), if allowed { 2 } else { 1 });
+        history.validate().expect("all calls answered");
+    }
+}
+
+#[test]
 fn a_tool_call_is_executed_and_answered() {
     let endpoint = MockEndpoint::start(vec![
         Script::tool_call("call_1", "read_file", "{\"path\":\"src/main.rs\"}"),
@@ -447,6 +977,54 @@ fn a_denied_tool_call_is_not_executed_and_tells_the_model() {
         .into_iter()
         .any(|event| matches!(event, Event::ToolDenied { .. }));
     assert!(denied, "no denial was reported");
+}
+
+#[test]
+fn a_file_denial_blocks_equivalent_paths_but_allows_an_unrelated_read() {
+    let directory = tempfile::tempdir().expect("workspace");
+    std::fs::write(directory.path().join(".env"), "PRIVATE_SENTINEL\n").expect("secret");
+    std::fs::write(directory.path().join("unrelated.txt"), "PUBLIC_SENTINEL\n")
+        .expect("unrelated file");
+    let workspace = Utf8PathBuf::from_path_buf(directory.path().to_owned()).expect("UTF-8 path");
+    let absolute = workspace.join(".env");
+
+    for target in [".env", "./.env", absolute.as_str()] {
+        let endpoint = MockEndpoint::start(vec![
+            Script::tool_call(
+                "blocked",
+                "read_file",
+                &serde_json::json!({ "path": target }).to_string(),
+            ),
+            Script::tool_call("unrelated", "read_file", r#"{"path":"unrelated.txt"}"#),
+            Script::text("done"),
+        ]);
+        let mut rules = RuleSet::new();
+        rules.push(Rule::allow("read_file", "*", Layer::Default));
+        rules.push(Rule::deny("read_file", ".env", Layer::User));
+        let mut registry = Registry::new();
+        registry
+            .insert(Box::new(rune_tools::ReadFile::new()))
+            .expect("registered");
+        let mut host = TestHost::new(endpoint)
+            .with_tools(registry.all_schemas())
+            .with_rules(rules);
+        host.workspace = workspace.clone();
+        host.registry = Some(registry);
+        let mut history = rune_agent::History::new();
+        history.push_user("read both files");
+
+        let outcome = run_turn(&mut history, &host).expect("turn");
+        assert_eq!(outcome.calls.len(), 2);
+        assert!(!outcome.calls[0].executed, "{target} reached the tool");
+        assert!(outcome.calls[0].output.is_error);
+        assert!(!outcome.calls[0].output.text.contains("PRIVATE_SENTINEL"));
+        assert!(outcome.calls[1].executed);
+        assert!(!outcome.calls[1].output.is_error);
+        assert!(outcome.calls[1].output.text.contains("PUBLIC_SENTINEL"));
+        let executed = host.executed_calls();
+        assert_eq!(executed.len(), 1);
+        assert_eq!(executed[0].1["path"], "unrelated.txt");
+    }
 }
 
 #[test]
@@ -557,6 +1135,79 @@ fn a_tool_failure_does_not_end_the_turn() {
 }
 
 #[test]
+fn an_extreme_grep_context_is_reported_to_the_model_and_the_session_continues() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    std::fs::write(workspace.path().join("fixture.txt"), "x\n").expect("fixture");
+    let endpoint = MockEndpoint::start(vec![
+        Script::tool_call(
+            "bad_context",
+            "grep_files",
+            r#"{"pattern":"x","path":"fixture.txt","context_lines":18446744073709551615}"#,
+        ),
+        Script::text("The context value was rejected."),
+        Script::tool_call(
+            "valid_context",
+            "grep_files",
+            r#"{"pattern":"x","path":"fixture.txt","context_lines":1}"#,
+        ),
+        Script::text("The session is still usable."),
+    ]);
+    let mut registry = Registry::new();
+    registry
+        .insert(Box::new(rune_tools::GrepFiles::new()))
+        .expect("registered");
+    let mut host = TestHost::new(endpoint).with_tools(registry.all_schemas());
+    host.workspace = Utf8PathBuf::from_path_buf(workspace.path().to_owned()).expect("UTF-8 path");
+    host.registry = Some(registry);
+
+    let mut history = rune_agent::History::new();
+    history.push_user("search with an excessive context value");
+    let rejected = run_turn(&mut history, &host).expect("validation must not end the turn");
+    assert_eq!(rejected.stop_reason, StopReason::Completed);
+    assert_eq!(rejected.calls.len(), 1);
+    assert!(rejected.calls[0].output.is_error);
+    assert!(
+        rejected.calls[0].output.text.contains("context_lines"),
+        "{}",
+        rejected.calls[0].output.text
+    );
+    history.validate().expect("the failed call has an answer");
+
+    let request = host
+        .server
+        .as_ref()
+        .expect("endpoint")
+        .last_body()
+        .expect("request");
+    let result = request["messages"]
+        .as_array()
+        .expect("messages")
+        .iter()
+        .find(|message| message["tool_call_id"] == "bad_context")
+        .expect("the provider received the validation error");
+    assert_eq!(result["is_error"], true);
+    assert_eq!(result["content"], rejected.calls[0].output.text);
+
+    history.push_user("search again with valid context");
+    let recovered = run_turn(&mut history, &host).expect("the next turn runs");
+    assert_eq!(recovered.stop_reason, StopReason::Completed);
+    assert_eq!(recovered.text, "The session is still usable.");
+    assert_eq!(recovered.calls.len(), 1);
+    assert!(!recovered.calls[0].output.is_error);
+    assert!(
+        recovered.calls[0]
+            .output
+            .text
+            .contains("fixture.txt:     1:x"),
+        "{}",
+        recovered.calls[0].output.text
+    );
+    history
+        .validate()
+        .expect("the session history remains valid");
+}
+
+#[test]
 fn malformed_tool_arguments_are_reported_to_the_model_without_executing() {
     let endpoint = MockEndpoint::start(vec![
         Script::tool_call("call_1", "read_file", "{not valid json"),
@@ -641,6 +1292,69 @@ fn a_transient_failure_is_retried_and_the_turn_completes() {
     let outcome = run_turn(&mut history, &host).expect("turn");
     assert_eq!(outcome.stop_reason, StopReason::Completed);
     assert_eq!(outcome.text, "recovered");
+}
+
+#[test]
+fn two_failures_report_the_next_attempt_and_backoff_before_each_restart() {
+    let endpoint = MockEndpoint::start(vec![Script::text("recovered")]);
+    endpoint.fail_first(2);
+    let host = TestHost::new(endpoint);
+    let mut history = rune_agent::History::new();
+    history.push_user("hello");
+    let outcome = run_turn(&mut history, &host).expect("turn");
+    assert_eq!(outcome.text, "recovered");
+    assert_eq!(host.server.as_ref().expect("server").request_count(), 3);
+    let retries: Vec<_> = host
+        .events()
+        .into_iter()
+        .filter_map(|event| match event {
+            Event::ProviderRetry {
+                step,
+                next_attempt,
+                max_attempts,
+                delay,
+            } => Some((step, next_attempt, max_attempts, delay.as_millis())),
+            Event::StepRestarted { step } => Some((step, 0, 0, 0)),
+            Event::ProviderRetryFinished { step } => Some((step, 0, 0, 1)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        retries,
+        [
+            (1, 2, 10, 250),
+            (1, 0, 0, 0),
+            (1, 3, 10, 500),
+            (1, 0, 0, 0),
+            (1, 0, 0, 1),
+        ]
+    );
+}
+
+#[test]
+fn an_exhausted_budget_never_announces_a_pending_retry() {
+    let endpoint = MockEndpoint::start(vec![Script::Status {
+        code: 503,
+        body: "unavailable".to_owned(),
+    }]);
+    let mut host = TestHost::new(endpoint);
+    host.limits
+        .set(
+            rune_core::budget::LimitName::ProviderMaxAttempts,
+            rune_core::budget::Budget::Bounded(1),
+            rune_core::config::Layer::User,
+        )
+        .expect("limit");
+    let mut history = rune_agent::History::new();
+    history.push_user("hello");
+    run_turn(&mut history, &host).expect_err("exhausted");
+    assert!(
+        !host
+            .events()
+            .iter()
+            .any(|event| matches!(event, Event::ProviderRetry { .. }))
+    );
+    assert_eq!(host.server.as_ref().expect("server").request_count(), 1);
 }
 
 #[test]

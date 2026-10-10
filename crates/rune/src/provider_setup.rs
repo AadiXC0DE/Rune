@@ -78,10 +78,10 @@ fn credential_from_environment(provider: &str, configured: Option<&str>) -> Opti
 /// Writes one key into the user configuration.
 ///
 /// Reads the file first and replaces only the named key, so a value the user set
-/// by hand survives. A value of `None` removes the key.
+/// by hand survives. Honors `RUNE_CONFIG`. A value of `None` removes the key.
 pub fn save_key(paths: &Paths, key: &str, value: Option<toml::Value>) -> Result<()> {
-    let path = paths.config_file(None);
-    if let Some(parent) = path.parent() {
+    let path = paths.config_file(std::env::var("RUNE_CONFIG").ok().as_deref());
+    if let Some(parent) = path.parent().filter(|parent| !parent.as_str().is_empty()) {
         rune_core::paths::create_dir_private(parent)?;
     }
 
@@ -119,9 +119,10 @@ pub fn save_key(paths: &Paths, key: &str, value: Option<toml::Value>) -> Result<
 ///
 /// The file is read first and the named keys are replaced, so a value the user
 /// set by hand is preserved rather than overwritten by a whole-file write.
+/// Honors `RUNE_CONFIG`.
 pub fn save_selection(paths: &Paths, selection: &Selection) -> Result<()> {
-    let path = paths.config_file(None);
-    if let Some(parent) = path.parent() {
+    let path = paths.config_file(std::env::var("RUNE_CONFIG").ok().as_deref());
+    if let Some(parent) = path.parent().filter(|parent| !parent.as_str().is_empty()) {
         rune_core::paths::create_dir_private(parent)?;
     }
 

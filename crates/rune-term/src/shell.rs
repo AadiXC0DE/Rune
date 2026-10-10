@@ -4,8 +4,9 @@
 //! handles approval prompts. The renderer and the agent are both supplied, so
 //! this module owns only the loop that connects them.
 //!
-//! The loop never takes the alternate screen. Output is written inline and
-//! finished content is promoted into the terminal's own scrollback, which is what
+//! The loop writes output inline. The session can open an on-demand transcript
+//! on the alternate screen while preserving this shell underneath. Finished
+//! content is promoted into the terminal's own scrollback, which is what
 //! keeps a long session readable with the terminal's own search and copy.
 
 use std::io::BufRead;

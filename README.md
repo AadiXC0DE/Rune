@@ -4,9 +4,11 @@
 
 **A tiny, native coding agent harness.**
 
-About 3 MiB and 2 ms to start, written in Rust, with a build that fails if either
-grows. One binary for the terminal, for scripts, and for embedding in other
-systems. Every limit, rule, and setting names the source that set it.
+The audited stripped release build measured 4.50 MiB for
+`x86_64-unknown-linux-gnu` (GNU/Linux). The build enforces an 8 MiB ceiling
+and startup budgets. Written in Rust, with about 2 ms to start. One binary for
+the terminal, for scripts, and for embedding in other systems. Every limit,
+rule, and setting names the source that set it.
 
 [![CI](https://github.com/AadiXC0DE/Rune/actions/workflows/ci.yml/badge.svg)](https://github.com/AadiXC0DE/Rune/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
@@ -68,7 +70,16 @@ web_tools = true
 
 They are refused by default because they send your queries to a search engine,
 which is your call rather than a repository's, so a project file cannot enable
-them. `offline = true` refuses every outbound request including the model.
+them. Set `offline = true` in the user configuration to refuse every outbound
+request, including requests to the model.
+
+A fetch with `allow_private = true` requests separate user approval for loopback,
+private, and link-local access, including redirects. Enabling web tools,
+full-access mode, and automatic model review do not grant this authority. The
+terminal asks under `web_fetch_private`. Hosts can also supply user rules that
+explicitly grant that permission for a `domain:host` target. Project rules and
+general web grants cannot grant private access. Without an approval path or user grant,
+the fetch is refused before contacting the network.
 
 A model larger than the default window declares its capacity, which is what
 `rune config` reports and what the status line budgets against:
@@ -80,6 +91,9 @@ context_window = 2000000
 ```
 
 A bare identifier still works for a model whose window the endpoint reports.
+Setting `RUNE_MODEL` to a different identifier discards the configured model's
+declared window. Until the new model's capacity is resolved, configuration
+reports the default 128000-token window.
 
 The providers that ship in the table are:
 
@@ -106,24 +120,155 @@ rune review                 # review the pending changes in this repository
 rune resume last            # continue the most recent session here
 ```
 
-Sessions are written as they run, so an interrupted session resumes. Prompts are
-remembered and recallable with `/history`. Custom slash commands live in
-`.rune/commands/*.md` in a repository, so a team can ship a workflow with the
-code.
+Use `rune --accessible` for a screen reader transcript, or
+`rune --accessible resume last` to replay and continue a saved conversation.
+Configure a provider and model first. This mode keeps the terminal's line input:
+Enter submits one line, and `/exit` or end of input quits. Replies are printed
+once after each turn, with explicit User, Assistant, Reasoning, Tool, and Notice
+labels. Output is append-only, without cursor controls, colours, live status
+rows, or menus. Permission prompts accept `yes` to run once and deny any other
+answer. Questions accept a numbered option or `/cancel`. `/model <id>` changes
+models; `/copy` points to terminal scrollback. Composer shortcuts and steering
+while a turn runs belong to the default interactive mode.
+
+Select `rune --ascii`, set `RUNE_ASCII=true`, or set `ascii = true` in profile
+configuration to use ASCII decorations. Status fields use `|`, selections use
+`>`, and tool summaries use `...`. Code continuation arrows become `>` and
+history preview and prompt echo newline arrows become `/`. Unicode in prompts, replies, paths,
+and tool output is preserved. This setting works with any theme and `NO_COLOR`.
+
+Select `rune --theme high-contrast`, set `RUNE_THEME=high-contrast`, or set
+`theme = "high-contrast"` in configuration for bright themed text on an explicit
+black background. Every defined foreground/background pair targets at least
+7:1 using the [WCAG relative luminance contrast formula](https://www.w3.org/WAI/WCAG22/Understanding/contrast-enhanced.html).
+The palette uses exact colors from the fixed xterm 256-color cube, so the
+same ratios apply in truecolor and 256-color terminals:
+
+| Foreground slots | Foreground | Background | Contrast ratio (approximate) |
+|---|---|---|---|
+| `fg`, `variable` (also text on `bg`) | `#ffffff` | `#000000` | 21.00:1 |
+| `dim`, `divider`, `comment` | `#d7d7d7` | `#000000` | 14.59:1 |
+| `accent`, `link`, `function`, `operator` | `#5fd7ff` | `#000000` | 12.65:1 |
+| `error` | `#ff8787` | `#000000` | 9.07:1 |
+| `success`, `string` | `#87ff87` | `#000000` | 16.68:1 |
+| `user_rail`, `keyword` | `#d7afff` | `#000000` | 11.47:1 |
+| `number` | `#ffd75f` | `#000000` | 15.14:1 |
+
+High-contrast footer hints and metadata do not use the terminal's faint
+attribute. These targets describe Rune's defined theme colors; unstyled text
+uses terminal defaults, and terminal palette customization can affect indexed
+colors. `NO_COLOR`, including an empty value, suppresses colors even when
+high-contrast is selected. Accessible mode continues to produce colorless output.
+
+Run `/help` to list commands and the active input bindings, including menu and
+transcript controls, cancellation precedence, and bracketed paste behavior.
+Line-input sessions report their input mode instead of composer shortcuts.
+
+In the default interactive composer, Alt-Enter inserts a newline at the caret; Enter
+submits the whole prompt. Draft newlines appear on separate rows and reach
+the provider as newline characters. Left and Right move across line breaks;
+the terminal caret follows the line being edited. Long lines scroll horizontally
+and tall drafts scroll vertically to keep the caret visible.
+
+At the idle prompt, Tab completes the workspace path at the caret. A unique
+match is inserted immediately; multiple matches open a menu where Up/Down
+select and Tab or Enter inserts one path without submitting. Escape closes
+the menu. Paths with spaces or shell metacharacters are quoted as one literal
+selection, and Ctrl-_ undoes the completion. Directories end in `/` so another
+Tab lists their children. Completion only lists names inside the primary or
+configured additional workspace roots, including where symlinks lead.
+Use forward slashes in paths. Slash command completion keeps its existing keys.
+
+At the idle prompt, Ctrl-R searches recorded prompts from the current workspace,
+newest first. Type any substring, ignoring case, and use Up/Down to choose a
+match. Enter or Tab restores its exact text into the composer with the caret at
+the end, without submitting it. Escape or Ctrl-C cancels and preserves the draft
+and caret. Ctrl-_ undoes a restored prompt.
+
+Ctrl-G opens the draft in `$VISUAL`, falling back to `$EDITOR` and then `vi`.
+Editor commands may include arguments. Save and exit to reload the draft with
+the caret at its end; Ctrl-_ undoes the replacement. Rune restores terminal
+input after the editor exits and removes the private scratch file. A failed
+editor leaves the draft and caret intact. The binding also edits steering
+drafts while a turn runs.
+
+Ctrl-_ (Ctrl-Shift-minus) undoes the last draft
+edit and restores its caret. Repeated presses undo earlier edits, including
+Unicode grapheme deletion and pasted text. Alt-R reapplies an undone edit and
+restores its caret. Repeated presses redo later edits; a new edit clears redo
+history. Press Alt with lowercase `r`.
+
+`rune ask` sends one text-only request. If the model requests tools, it exits 1
+and names the unsupported calls. With `--json`, `error_code` is
+`unsupported_tool_call`, each requested tool has status `error`, and
+`final_output` is empty. Any accompanying text remains in `output`.
+Completed exchanges are saved as sessions for the current workspace, and
+`--json` reports their `session_id`. Pass `--no-save` to create no session and
+return an empty ID.
+
+Sessions are written as they run, so an interrupted session resumes. Interactive
+assistant text is journalled in bounded, durable frames before it is displayed.
+After process death, resume replays the partial answer once with an
+`[interrupted]` boundary, without inventing a completed turn or token usage.
+Interactive resume replays the saved exchanges above the composer before you
+type. Its context meter starts with an estimate labelled `saved usage` or `history bytes`
+until a live provider count arrives. Prompts are remembered and recallable with
+`/history`. Custom slash commands live in `.rune/commands/*.md` in a repository,
+so a team can ship a workflow with the code. Before each CLI session request,
+Rune estimates the serialized input, including instructions and tool schemas,
+and summarizes earlier turns at `compaction_trigger_percent` of usable input
+capacity. A failed summary preserves the conversation and stops that request.
 
 Run `rune help` for everything, or see [COMMANDS.md](COMMANDS.md) for the full
 reference.
+
+The shared agent turn loop spills tool output exceeding `max_tool_result_bytes`
+or the remaining `max_turn_result_bytes` into the live conversation's memory.
+The model receives a bounded preview with the retained byte count and handle,
+including that metadata within both limits. If the limit cannot fit the handle,
+the model receives an empty result while the full body is still retained.
+Models can call `read_tool_result` with the handle, a byte `offset` (default 0),
+and a positive `length` (default 65536). It returns JSON containing `text`,
+`offset`, `next_offset`, `total_bytes`, and `eof`. Continue at `next_offset` until
+`eof` to reconstruct the full bytes. Pages stay within 64 KiB, the configured
+tool cap, and the turn's remaining result budget, including JSON escaping and
+metadata. An insufficient budget returns a bounded tool error; start a new turn
+to replenish the turn budget. Offsets must be UTF-8 character boundaries.
+Embedding callers can also use `History::result_store()` and `Store::read`.
+Retention lasts across live turns and compaction, but is not saved or restored
+with transcripts.
+The store holds at most 256 results and 64 MiB; a full store reports a retention
+failure within the available output budget.
 
 ## Design
 
 - **Small and fast.** Binary size and startup are budgets enforced in CI, not
   aspirations. The argument and configuration paths never load the agent runtime.
 - **Shell-like output.** The session renders inline and preserves terminal
-  scrollback rather than taking over the screen.
+  scrollback. Ctrl-O opens a full transcript snapshot on the alternate screen,
+  including recorded tool arguments and result bodies. Up/Down scroll by row,
+  Page Up/Page Down by page, and Home/End jump to the beginning/end. Escape or
+  Ctrl-O closes it with the draft and caret preserved. Tab/Shift-Tab selects a
+  tool; Space collapses it to a preview or expands up to 16 KiB and 200 wrapped
+  content rows. Reopen the snapshot to restore full recorded output.
+  A running turn continues while the snapshot is open; reopen it to see newer
+  output. Provider and tool
+  result limits still apply to what is recorded.
 - **Permission first.** Every sensitive action passes a policy gate, and
   `rune permissions` explains exactly which rule decided it.
+  Interactive requests show the complete scope with Run once and Deny choices.
+  Use Up/Down and Enter to answer; Escape, Control-C, or Control-D cancels the
+  turn. Run once approves only the displayed call.
 - **Sandboxed execution.** Commands run under the platform sandbox where one
   exists. `rune doctor` reports what your host can enforce.
+  `rune sandbox explain -- 'git status'` previews the backend, writable roots,
+  network decision and existing protected paths with sources, without running
+  the command. The preview uses the current workspace and configured additional
+  directories (`--add-dir` adds roots; `--no-additional-dirs` ignores saved roots).
+  Network access requires an explicit shell context grant, previewed with
+  `--external-access`; offline mode overrides it. `--json` emits the same report.
+  Refused commands apply no protections; an unsandboxed fallback has unrestricted
+  access. This explains sandbox policy, independently of command approval.
 - **Offline mode.** `--offline` refuses every outbound request.
 - **Local.** Sessions, usage, and credentials stay on the machine.
 
@@ -132,6 +277,10 @@ reference.
 Five layers, highest first: command-line flags, `RUNE_*` environment variables,
 the project file `.rune.toml`, the user file at `$XDG_CONFIG_HOME/rune/config.toml`,
 then built-in defaults.
+
+Set `RUNE_CONFIG` to use a different user configuration file. Workspace edits
+and provider selections read and write that file. An empty or unset value uses
+the default path.
 
 Only repository-safe keys are accepted in a project file. A user setting placed
 there is ignored and reported rather than applied, because a repository can be
@@ -165,6 +314,25 @@ Issues and pull requests are welcome. Before opening a pull request:
 cargo xtask check      # format, lint, and test
 cargo xtask gate       # the above plus the size and startup budgets
 ```
+
+`gate` checks formatting and lint first, then the size and startup budgets,
+then the workspace tests. A failed step stops the gate immediately.
+
+On Unix, workspace tests also run the real PTY replay gate. It starts the built
+`rune` binary against an isolated local provider and compares captured grids
+and caret positions for long draft edits, 12-column output, short menus, and
+draft resizing without keystrokes. The narrow case also checks the complete
+answer in scrollback. Python 3 with its standard-library PTY modules is required;
+CI checks this prerequisite on Linux and macOS. Run just this gate with:
+
+```sh
+cargo test -p rune --test terminal_replay
+```
+
+The reviewed grids live in `crates/rune/tests/fixtures/terminal_replay`.
+Only temporary workspace paths and session identifiers are masked. If intended
+terminal behavior changes, review the failing grid and caret differences before
+updating a fixture. There is no automatic snapshot update mode.
 
 ## License
 

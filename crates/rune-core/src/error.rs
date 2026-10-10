@@ -69,6 +69,8 @@ pub enum ErrorCode {
     UnsupportedVersion,
     /// The requested capability is unavailable in this runtime or platform.
     Unsupported,
+    /// The model requested a tool call in a path that cannot execute tools.
+    UnsupportedToolCall,
     /// An operation is not valid in the current state.
     InvalidState,
     /// An internal invariant failed. Indicates a defect, not user input.
@@ -106,6 +108,7 @@ impl ErrorCode {
             Self::CorruptRecord => "corrupt_record",
             Self::UnsupportedVersion => "unsupported_version",
             Self::Unsupported => "unsupported",
+            Self::UnsupportedToolCall => "unsupported_tool_call",
             Self::InvalidState => "invalid_state",
             Self::Internal => "internal",
         }
@@ -141,6 +144,7 @@ impl ErrorCode {
             Self::CorruptRecord,
             Self::UnsupportedVersion,
             Self::Unsupported,
+            Self::UnsupportedToolCall,
             Self::InvalidState,
             Self::Internal,
         ]

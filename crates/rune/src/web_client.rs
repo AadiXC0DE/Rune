@@ -29,14 +29,34 @@ pub struct NetworkFetch;
 
 impl FetchBackend for NetworkFetch {
     fn get(&self, url: &str, timeout: Duration) -> Result<Fetched> {
+        self.get_with_private_access(url, timeout, false)
+    }
+
+    fn get_with_private_access(
+        &self,
+        url: &str,
+        timeout: Duration,
+        allow_private: bool,
+    ) -> Result<Fetched> {
         // One hop only: the tool follows a redirect itself, after checking
-        // where it points.
-        let fetched = rune_net::transport::fetch_hop(
+        // where it points. The transport pins the vetted DNS result as well.
+        let fetched = rune_net::transport::fetch_hop_checked(
             url,
             "text/html,application/json,text/plain;q=0.9,*/*;q=0.8",
             timeout,
-        )
-        .map_err(|err| err.to_rune_error())?;
+            |address| {
+                if !allow_private && rune_tools::web::is_local_host(&address.to_string()) {
+                    return Err(RuneError::new(
+                        ErrorCode::PermissionDenied,
+                        format!(
+                            "the destination resolves to `{address}`, a loopback, private, or link-local address"
+                        ),
+                    )
+                    .with_hint("request allow_private: true and separate user approval to reach the local network"));
+                }
+                Ok(())
+            },
+        )?;
         Ok(Fetched {
             status: fetched.status,
             content_type: fetched.content_type,
@@ -103,7 +123,166 @@ pub fn backends(settings: &rune_core::config::Settings) -> Option<WebBackends> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rune_core::config::Settings;
+    use std::io::{BufRead as _, Write as _};
+
+    use camino::Utf8Path;
+    use rune_core::config::{EnvironmentOverrides, Settings, load};
+    use rune_policy::decision::Outcome;
+    use rune_tools::contract::ExecutionContext;
+
+    #[test]
+    fn a_hostname_resolving_to_loopback_is_refused_before_http() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        listener.set_nonblocking(true).expect("nonblocking");
+        let port = listener.local_addr().expect("address").port();
+        let error = NetworkFetch
+            .get(
+                &format!("http://localhost:{port}/fixture"),
+                Duration::from_secs(2),
+            )
+            .expect_err("resolved loopback must be refused");
+        assert_eq!(error.code(), ErrorCode::PermissionDenied);
+        assert!(error.message().contains("resolves to"), "{error}");
+        assert_eq!(
+            listener.accept().expect_err("no connection").kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
+
+    #[test]
+    fn a_fixture_fetch_requires_an_explicit_web_opt_in() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let workspace = Utf8Path::from_path(dir.path()).expect("utf8 path");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind fixture");
+        listener.set_nonblocking(true).expect("nonblocking fixture");
+        let url = format!("http://{}/fixture", listener.local_addr().expect("address"));
+        // The host supplies separate private authority for this local fixture.
+        // The web opt-in is still required independently.
+        let arguments = serde_json::json!({ "url": url, "allow_private": true });
+        let context = ExecutionContext::new(workspace.to_owned()).with_private_network_access(true);
+        let env = EnvironmentOverrides::default();
+        let settings = load(None, None, &env);
+        let rules = crate::permissions::validated(&settings).expect("rules");
+        assert_eq!(
+            rules
+                .evaluate("web_fetch", "domain:127.0.0.1", Outcome::Allow)
+                .outcome,
+            Outcome::Deny
+        );
+        assert!(backends(&settings).is_none());
+        let registry = rune_tools::inventory::builtin_with_web(
+            &rune_tools::workspace::FileLimits::default(),
+            &settings.limits,
+            workspace,
+            backends(&settings),
+        )
+        .expect("registry");
+        // Even a caller that already permitted the tool cannot bypass the setting.
+        let refused = registry
+            .call("web_fetch", &arguments, &context)
+            .expect("call");
+        assert!(refused.is_error, "{refused:?}");
+        assert!(
+            refused.text.contains("no network access is configured"),
+            "{refused:?}"
+        );
+        assert_eq!(
+            listener
+                .accept()
+                .expect_err("default opened no connection")
+                .kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+
+        let user = workspace.join("config.toml");
+        std::fs::write(
+            &user,
+            "web_tools = true\n[limits]\nweb_fetch_timeout_ms = 2000\n",
+        )
+        .expect("write opt-in");
+        let settings = load(None, Some(&user), &env);
+        assert!(
+            settings.diagnostics.is_empty(),
+            "{:?}",
+            settings.diagnostics
+        );
+        let rules = crate::permissions::validated(&settings).expect("rules");
+        assert_eq!(
+            rules
+                .evaluate("web_fetch", "domain:127.0.0.1", Outcome::Deny)
+                .outcome,
+            Outcome::Allow
+        );
+        let registry = rune_tools::inventory::builtin_with_web(
+            &rune_tools::workspace::FileLimits::default(),
+            &settings.limits,
+            workspace,
+            backends(&settings),
+        )
+        .expect("registry");
+        let error = registry
+            .call(
+                "web_fetch",
+                &arguments,
+                &ExecutionContext::new(workspace.to_owned()),
+            )
+            .expect("private denial is returned as a tool failure");
+        assert!(
+            error.is_error,
+            "web enablement and model opt-in granted private authority"
+        );
+        assert!(error.text.contains("separate user decision"), "{error:?}");
+        assert_eq!(
+            listener.accept().expect_err("no private connection").kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        let fixture = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(3);
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "fixture was not called"
+                        );
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("fixture accept failed: {error}"),
+                }
+            };
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("read timeout");
+            stream
+                .set_write_timeout(Some(Duration::from_secs(2)))
+                .expect("write timeout");
+            let mut reader = std::io::BufReader::new(&stream);
+            let mut request = String::new();
+            reader.read_line(&mut request).expect("request line");
+            loop {
+                let mut header = String::new();
+                assert!(
+                    reader.read_line(&mut header).expect("header") > 0,
+                    "incomplete request"
+                );
+                if header == "\r\n" {
+                    break;
+                }
+            }
+            let body = "R018_WEB_OK\n";
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len())
+                .expect("fixture response");
+            request
+        });
+        let fetched = registry
+            .call("web_fetch", &arguments, &context)
+            .expect("call");
+        let request = fixture.join().expect("fixture thread");
+        assert_eq!(request, "GET /fixture HTTP/1.1\r\n");
+        assert!(!fetched.is_error, "{fetched:?}");
+        assert!(fetched.text.contains("R018_WEB_OK"), "{fetched:?}");
+    }
 
     #[test]
     fn an_offline_run_gets_no_clients() {

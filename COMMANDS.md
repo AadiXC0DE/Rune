@@ -20,6 +20,8 @@ Accepted anywhere on the command line.
 | `--offline` | - | Refuse every outbound network request. |
 | `--allow-unsandboxed` | - | Run commands where the host has no sandbox backend. Without this, such a host refuses them. |
 | `--json` | - | Emit machine-readable output where supported. |
+| `--accessible` | - | Use append-only labelled session output and line input for screen readers. |
+| `--ascii` | - | Use ASCII terminal decorations, preserving message text. |
 | `--theme` | `name` | Override the theme for this process. |
 | `--provider-order` | `a,b` | Prefer these upstream providers in order. |
 | `--provider-strict` | - | Restrict requests to the listed providers. |
@@ -27,6 +29,10 @@ Accepted anywhere on the command line.
 | `-v, --version` | - | Print the version. |
 
 ## Run
+
+### `rune resume [last|id]`
+
+Resume a saved session, defaulting to the latest in this workspace
 
 ### `rune ask [flags] <prompt>`
 
@@ -47,9 +53,20 @@ Serve the Agent Client Protocol over standard input and output
 
 Review the pending changes in the workspace
 
+Aliases:
+
+- `pr`: Same as `rune review`; reviews pending workspace changes with optional context.
+- `issue`: Same as `rune review`; reviews pending workspace changes with optional context.
+
 ### `rune connect [<name>] [--json]`
 
 Connect a model provider, choosing from a list
+
+Aliases:
+
+- `login`: Same as `rune connect`; connects a provider, choosing from a list when no name is given.
+- `setup`: Same as `rune connect`; connects a provider, choosing from a list when no name is given.
+- `provider`: Same as `rune connect`; connects a provider, choosing from a list when no name is given.
 
 | Flag | Description |
 |---|---|
@@ -88,6 +105,10 @@ Show the branch structure of a session
 
 Report token usage recorded on this machine
 
+Aliases:
+
+- `cost`: Same as `rune usage`; reports token usage recorded on this machine.
+
 | Flag | Description |
 |---|---|
 | `--period <span>` | One of 24h, 7d, or 30d. |
@@ -98,6 +119,10 @@ Report token usage recorded on this machine
 ### `rune auth [status|logout] [--json]`
 
 Show or manage stored credentials
+
+Aliases:
+
+- `logout`: Same as `rune auth`; without an action, shows connection status. Use `rune auth logout` to remove the stored credential.
 
 | Flag | Description |
 |---|---|
@@ -115,7 +140,15 @@ Show the permission mode and rules
 
 | Flag | Description |
 |---|---|
-| `--explain <target>` | Explain the decision for one target. |
+| `--explain <target>` | Explain one tool:target action, such as shell:pwd. JSON includes the outcome, deciding rule and layer. |
+| `--json` | Emit JSON. |
+### `rune sandbox explain [--external-access] [--json] -- <command>`
+
+Explain a command's sandbox policy without running it
+
+| Flag | Description |
+|---|---|
+| `--external-access` | Preview an explicit external-access grant to the shell context. |
 | `--json` | Emit JSON. |
 ### `rune projects [status|approve|reject|reset]`
 
@@ -127,6 +160,10 @@ Inspect or change workspace trust
 ### `rune config [--explain] [--json]`
 
 Show the resolved configuration and where each value came from
+
+Aliases:
+
+- `settings`: Same as `rune config`; shows resolved configuration and value sources.
 
 | Flag | Description |
 |---|---|
@@ -201,13 +238,19 @@ Print the generated command reference
 
 Print help
 
-Aliases: `-h`, `--help`
+Aliases:
+
+- `-h`: Same as `rune help`.
+- `--help`: Same as `rune help`.
 
 ### `rune version`
 
 Print the version
 
-Aliases: `-v`, `--version`
+Aliases:
+
+- `-v`: Same as `rune version`.
+- `--version`: Same as `rune version`.
 
 
 ## Limits

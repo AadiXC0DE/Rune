@@ -10,7 +10,7 @@ use rune_core::error::Result;
 use rune_core::tool::ToolSpec;
 use sha2::{Digest as _, Sha256};
 
-use crate::ask_user::AskUserQuestion;
+use crate::ask_user::{Answerer, AskUserQuestion, Unavailable};
 use crate::contract::{Tool, model_spec};
 use crate::registry::Registry;
 use crate::shell::Shell;
@@ -18,7 +18,7 @@ use crate::skill::{CapabilitySearch, InstallSkill, LoadSkill};
 use crate::vision::Vision;
 use crate::web::{WebFetch, WebSearch};
 use crate::workspace::FileLimits;
-use crate::{EditFile, GlobFiles, GrepFiles, ReadFile, WriteFile};
+use crate::{EditFile, GlobFiles, GrepFiles, ReadFile, ReadToolResult, WriteFile};
 
 /// Names of every tool this build ships, in advertisement order.
 ///
@@ -28,6 +28,7 @@ pub const ADVERTISEMENT_ORDER: &[&str] = &[
     "glob_files",
     "grep_files",
     "read_file",
+    "read_tool_result",
     "write_file",
     "edit_file",
     "shell",
@@ -100,14 +101,35 @@ pub fn builtin_with_web(
     skills_root: &camino::Utf8Path,
     web: Option<WebBackends>,
 ) -> Result<Registry> {
+    builtin_with_answerer(
+        limits,
+        budget,
+        skills_root,
+        web,
+        std::sync::Arc::new(Unavailable),
+    )
+}
+
+/// Builds the registry with a host-supplied structured question answerer.
+///
+/// Machine callers keep using [`builtin_with_web`], which reports unavailable
+/// input instead of selecting an answer or waiting for terminal input.
+pub fn builtin_with_answerer(
+    limits: &FileLimits,
+    budget: &rune_core::budget::BudgetSet,
+    skills_root: &camino::Utf8Path,
+    web: Option<WebBackends>,
+    answerer: std::sync::Arc<dyn Answerer>,
+) -> Result<Registry> {
     let mut registry = Registry::new();
     registry.insert(Box::new(GlobFiles::with_limits(*limits)))?;
     registry.insert(Box::new(GrepFiles::with_limits(*limits)))?;
     registry.insert(Box::new(ReadFile::with_limits(*limits)))?;
+    registry.insert(Box::new(ReadToolResult::new(budget)))?;
     registry.insert(Box::new(WriteFile))?;
     registry.insert(Box::new(EditFile))?;
     registry.insert(Box::new(Shell::new(budget)))?;
-    registry.insert(Box::new(AskUserQuestion::unavailable()))?;
+    registry.insert(Box::new(AskUserQuestion::new(answerer)))?;
 
     // The catalog is supplied by the host, so a run with no workspace to scan
     // reports an empty catalog rather than failing.
@@ -223,6 +245,40 @@ mod tests {
     }
 
     #[test]
+    fn a_host_answerer_preserves_the_advertisement_and_returns_the_chosen_label() {
+        let registry = builtin_with_answerer(
+            &FileLimits::default(),
+            &rune_core::budget::BudgetSet::new(),
+            camino::Utf8Path::new("/tmp/skills"),
+            None,
+            std::sync::Arc::new(crate::ask_user::Scripted::new([
+                crate::ask_user::Answer::Chosen(vec![1]),
+            ])),
+        )
+        .expect("built");
+        let machine = builtin_default().expect("built");
+        assert_eq!(
+            advertisement_digest(&registry),
+            advertisement_digest(&machine)
+        );
+        let arguments = serde_json::json!({"questions": [{
+            "question": "Which choice?",
+            "options": [{"label": "Alpha"}, {"label": "Beta"}]
+        }]});
+        let context = crate::contract::ExecutionContext::new(camino::Utf8PathBuf::from("/tmp"));
+        let chosen = registry
+            .call("ask_user_question", &arguments, &context)
+            .expect("answer");
+        assert!(!chosen.is_error);
+        assert_eq!(chosen.text, "Which choice?\nAnswer: Beta");
+        let unavailable = machine
+            .call("ask_user_question", &arguments, &context)
+            .expect("unavailable");
+        assert!(unavailable.is_error);
+        assert!(unavailable.text.contains("this run cannot collect one"));
+    }
+
+    #[test]
     fn the_registry_holds_exactly_the_advertised_set() {
         let registry = builtin_default().expect("built");
         assert_eq!(registry.len(), ADVERTISEMENT_ORDER.len());
@@ -329,7 +385,7 @@ mod tests {
     fn the_read_only_set_is_identified() {
         let registry = builtin_default().expect("built");
         let read_only = registry.read_only_names();
-        for name in ["glob_files", "grep_files", "read_file"] {
+        for name in ["glob_files", "grep_files", "read_file", "read_tool_result"] {
             assert!(read_only.contains(&name), "`{name}` should be read only");
         }
         for name in ["write_file", "edit_file"] {

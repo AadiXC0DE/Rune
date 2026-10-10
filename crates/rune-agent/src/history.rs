@@ -5,9 +5,12 @@
 //! shape; this is the owner of the sequence, and it is what compaction, forking,
 //! and session persistence operate on.
 
+use std::sync::Arc;
+
 use rune_core::error::{ErrorCode, Result, RuneError};
 use rune_core::id::ToolCallId;
 use rune_net::message::{ContentPart, Message, Role, validate};
+use rune_tools::result_store::Store;
 use serde::{Deserialize, Serialize};
 
 /// One turn in the conversation.
@@ -111,7 +114,7 @@ impl Turn {
 }
 
 /// The conversation history.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct History {
     /// System instructions, separate from the turn list.
     instructions: String,
@@ -119,6 +122,25 @@ pub struct History {
     turns: Vec<Turn>,
     /// Next sequence number.
     next_seq: u64,
+    /// Retained output lives as long as this in-memory conversation. It is not
+    /// part of a provider request or a serialized transcript.
+    #[serde(skip, default = "new_result_store")]
+    result_store: Arc<Store>,
+}
+
+fn new_result_store() -> Arc<Store> {
+    Arc::new(Store::new(rune_core::id::SessionId::generate().to_string()))
+}
+
+impl Default for History {
+    fn default() -> Self {
+        Self {
+            instructions: String::default(),
+            turns: Vec::default(),
+            next_seq: u64::default(),
+            result_store: new_result_store(),
+        }
+    }
 }
 
 impl History {
@@ -129,7 +151,25 @@ impl History {
             instructions: String::new(),
             turns: Vec::new(),
             next_seq: 1,
+            result_store: new_result_store(),
         }
+    }
+
+    /// Returns the full tool results spilled from this live conversation.
+    ///
+    /// Handles remain readable across turns and compaction, but are not saved
+    /// in serialized history or shared with a new conversation.
+    #[must_use]
+    pub fn result_store(&self) -> &Store {
+        &self.result_store
+    }
+
+    pub(crate) fn result_store_mut(&mut self) -> &mut Store {
+        Arc::make_mut(&mut self.result_store)
+    }
+
+    pub(crate) fn shared_result_store(&self) -> Arc<Store> {
+        Arc::clone(&self.result_store)
     }
 
     /// Sets the system instructions.
@@ -368,6 +408,7 @@ impl History {
             instructions: self.instructions.clone(),
             turns,
             next_seq,
+            result_store: self.result_store.clone(),
         }
     }
 
@@ -423,6 +464,31 @@ pub fn invalid_history(err: &RuneError) -> RuneError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retained_store_snapshots_and_branches_remain_independent_on_a_spill() {
+        let mut history = History::new();
+        history.push_user("retain");
+        let first = history
+            .result_store_mut()
+            .spill("shell", "first", "first body".to_owned(), false, 0)
+            .expect("spill");
+        let snapshot = history.shared_result_store();
+        let branch = history.branch_at(1);
+        let second = history
+            .result_store_mut()
+            .spill("shell", "second", "second body".to_owned(), false, 0)
+            .expect("spill");
+        assert_eq!(history.result_store().len(), 2);
+        for store in [snapshot.as_ref(), branch.result_store()] {
+            assert_eq!(store.len(), 1);
+            assert_eq!(
+                store.read(&first.handle, 0, 64).expect("first").text,
+                "first body"
+            );
+            assert!(store.read(&second.handle, 0, 64).is_err());
+        }
+    }
 
     fn call(id: &str, name: &str) -> ContentPart {
         ContentPart::ToolCall {
