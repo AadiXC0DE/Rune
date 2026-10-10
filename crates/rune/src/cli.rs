@@ -311,21 +311,21 @@ pub fn parse(args: Vec<OsString>, benchmark: bool) -> Result<Launch> {
     // Subcommand.
     if let Some(token) = tokens.get(index).filter(|token| !token.starts_with('-')) {
         {
-            launch.command = match token.as_str() {
+            launch.command = match spec::find(token).map_or(token.as_str(), |spec| spec.name) {
                 "ask" => Command::Ask,
                 "acp" => Command::Acp,
-                "review" | "pr" | "issue" => Command::Review,
-                "connect" | "login" | "setup" | "provider" => Command::Connect,
+                "review" => Command::Review,
+                "connect" => Command::Connect,
                 "sessions" => Command::Sessions,
                 "session" => Command::Session,
                 "tree" => Command::Tree,
-                "usage" | "cost" => Command::Usage,
-                "auth" | "logout" => Command::Auth,
+                "usage" => Command::Usage,
+                "auth" => Command::Auth,
                 "models" => Command::Models,
                 "permissions" => Command::Permissions,
                 "sandbox" => Command::Sandbox,
                 "projects" => Command::Projects,
-                "config" | "settings" => Command::Config,
+                "config" => Command::Config,
                 "limits" => Command::Limits,
                 "workspace" => Command::Workspace,
                 "prompt" => Command::Prompt,
@@ -801,6 +801,34 @@ mod tests {
             Command::Config
         );
         assert_eq!(parse_list(&["pr"]).expect("parse").command, Command::Review);
+    }
+
+    #[test]
+    fn declared_aliases_preserve_arguments_and_flags() {
+        for (alias, canonical, args) in [
+            ("login", "connect", &["anthropic", "--json"][..]),
+            ("setup", "connect", &["anthropic", "--json"][..]),
+            ("provider", "connect", &["anthropic", "--json"][..]),
+            ("pr", "review", &["context", "-la"][..]),
+            ("issue", "review", &["context", "-la"][..]),
+            ("cost", "usage", &["--period", "7d", "--json"][..]),
+            ("logout", "auth", &["--json"][..]),
+            ("logout", "auth", &["logout", "--json"][..]),
+            ("settings", "config", &["--explain", "--json"][..]),
+        ] {
+            assert_eq!(spec::find(alias).expect("declared alias").name, canonical);
+            let tokens = |name| {
+                let mut tokens = vec![name];
+                tokens.extend_from_slice(args);
+                tokens
+            };
+            let alias_launch = parse_list(&tokens(alias)).expect("alias parse");
+            let canonical_launch = parse_list(&tokens(canonical)).expect("canonical parse");
+            assert_eq!(alias_launch.command, canonical_launch.command, "{alias}");
+            assert_eq!(alias_launch.args, canonical_launch.args, "{alias}");
+            assert_eq!(alias_launch.flags, canonical_launch.flags, "{alias}");
+            assert_eq!(alias_launch.json, canonical_launch.json, "{alias}");
+        }
     }
 
     #[test]

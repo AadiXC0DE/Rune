@@ -71,16 +71,11 @@ fn render_command(command: &CommandSpec, out: &mut String) {
     let _ = writeln!(out, "### `{}`\n", command.usage);
     let _ = writeln!(out, "{}\n", command.summary);
     if !command.aliases.is_empty() {
-        let _ = writeln!(
-            out,
-            "Aliases: {}\n",
-            command
-                .aliases
-                .iter()
-                .map(|alias| format!("`{alias}`"))
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
+        out.push_str("Aliases:\n\n");
+        for alias in command.aliases {
+            let _ = writeln!(out, "- `{}`: {}", alias.name, alias.description);
+        }
+        out.push('\n');
     }
     if command.flags.is_empty() {
         return;

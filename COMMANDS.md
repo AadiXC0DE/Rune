@@ -53,9 +53,20 @@ Serve the Agent Client Protocol over standard input and output
 
 Review the pending changes in the workspace
 
+Aliases:
+
+- `pr`: Same as `rune review`; reviews pending workspace changes with optional context.
+- `issue`: Same as `rune review`; reviews pending workspace changes with optional context.
+
 ### `rune connect [<name>] [--json]`
 
 Connect a model provider, choosing from a list
+
+Aliases:
+
+- `login`: Same as `rune connect`; connects a provider, choosing from a list when no name is given.
+- `setup`: Same as `rune connect`; connects a provider, choosing from a list when no name is given.
+- `provider`: Same as `rune connect`; connects a provider, choosing from a list when no name is given.
 
 | Flag | Description |
 |---|---|
@@ -94,6 +105,10 @@ Show the branch structure of a session
 
 Report token usage recorded on this machine
 
+Aliases:
+
+- `cost`: Same as `rune usage`; reports token usage recorded on this machine.
+
 | Flag | Description |
 |---|---|
 | `--period <span>` | One of 24h, 7d, or 30d. |
@@ -104,6 +119,10 @@ Report token usage recorded on this machine
 ### `rune auth [status|logout] [--json]`
 
 Show or manage stored credentials
+
+Aliases:
+
+- `logout`: Same as `rune auth`; without an action, shows connection status. Use `rune auth logout` to remove the stored credential.
 
 | Flag | Description |
 |---|---|
@@ -141,6 +160,10 @@ Inspect or change workspace trust
 ### `rune config [--explain] [--json]`
 
 Show the resolved configuration and where each value came from
+
+Aliases:
+
+- `settings`: Same as `rune config`; shows resolved configuration and value sources.
 
 | Flag | Description |
 |---|---|
@@ -215,13 +238,19 @@ Print the generated command reference
 
 Print help
 
-Aliases: `-h`, `--help`
+Aliases:
+
+- `-h`: Same as `rune help`.
+- `--help`: Same as `rune help`.
 
 ### `rune version`
 
 Print the version
 
-Aliases: `-v`, `--version`
+Aliases:
+
+- `-v`: Same as `rune version`.
+- `--version`: Same as `rune version`.
 
 
 ## Limits

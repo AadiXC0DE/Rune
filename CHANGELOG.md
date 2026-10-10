@@ -102,6 +102,11 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Fixed
 
+- Help and the generated command reference describe the accepted aliases
+  `login`, `setup`, `provider`, `pr`, `issue`, `cost`, `logout`, and `settings`.
+  `logout` behaves like `auth`: without an action it shows connection status;
+  `rune auth logout` removes the stored credential.
+
 - `rune help resume` and `rune resume --help` show usage for resuming a saved
   session, and the generated command reference includes `resume`.
 

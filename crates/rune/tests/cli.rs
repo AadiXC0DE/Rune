@@ -116,6 +116,106 @@ fn resume_help_and_reference_document_the_same_usage() {
 }
 
 #[test]
+fn accepted_aliases_are_documented_in_help_and_reference() {
+    let reference = run(&["reference"]);
+    assert_eq!(reference.status, Some(0), "{}", reference.stderr);
+    assert!(reference.stderr.is_empty(), "{}", reference.stderr);
+
+    for (alias, canonical) in [
+        ("login", "connect"),
+        ("setup", "connect"),
+        ("provider", "connect"),
+        ("pr", "review"),
+        ("issue", "review"),
+        ("cost", "usage"),
+        ("logout", "auth"),
+        ("settings", "config"),
+    ] {
+        let help = run(&["help", alias]);
+        assert_eq!(help.status, Some(0), "{alias}: {}", help.stderr);
+        assert!(help.stderr.is_empty(), "{alias}: {}", help.stderr);
+        assert_eq!(help.stdout, run(&["help", canonical]).stdout, "{alias}");
+        assert!(help.stdout.contains(alias), "{alias}: {}", help.stdout);
+        for args in [
+            &[alias, "--help"][..],
+            &[alias, "-h"][..],
+            &["--help", alias][..],
+        ] {
+            let out = run(args);
+            assert_eq!(out.status, Some(0), "{args:?}: {}", out.stderr);
+            assert!(out.stderr.is_empty(), "{args:?}: {}", out.stderr);
+            assert_eq!(out.stdout, help.stdout, "{args:?}");
+        }
+
+        let section = reference
+            .stdout
+            .split("### ")
+            .find(|section| section.starts_with(&format!("`rune {canonical} ")))
+            .expect("canonical reference entry");
+        assert!(section.contains(&format!("`{alias}`")), "{section}");
+        assert!(
+            section.contains(&format!("Same as `rune {canonical}`")),
+            "{section}"
+        );
+        if alias == "logout" {
+            for text in [&help.stdout, section] {
+                assert!(
+                    text.contains("without an action, shows connection status"),
+                    "{text}"
+                );
+                assert!(text.contains("rune auth logout"), "{text}");
+            }
+        }
+    }
+}
+
+#[test]
+fn logout_alias_shows_status_until_given_a_logout_action() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = camino::Utf8Path::from_path(dir.path()).expect("utf8");
+    let paths = rune_core::paths::Paths {
+        state_root: root.join("state"),
+        config_root: root.join("config/rune"),
+        data_root: root.join("data/rune"),
+    };
+    rune_net::auth::store(&paths, "anthropic", "alias-test-credential").expect("store credential");
+    for args in [
+        &["auth", "--json"][..],
+        &["logout", "--json"][..],
+        &["logout", "status", "--json"][..],
+    ] {
+        let out = config_mutation_command(root)
+            .env("RUNE_PROVIDER", "anthropic")
+            .args(args)
+            .output()
+            .expect("auth status");
+        assert!(out.status.success(), "{args:?}: {out:?}");
+        assert!(out.stderr.is_empty(), "{out:?}");
+        let value: serde_json::Value = serde_json::from_slice(&out.stdout).expect("valid json");
+        assert_eq!(value["provider"], "anthropic");
+        assert!(value.get("removed").is_none(), "{value}");
+        assert_eq!(
+            rune_net::auth::stored_providers(&paths).expect("stored providers"),
+            vec!["anthropic"]
+        );
+    }
+    let out = config_mutation_command(root)
+        .env("RUNE_PROVIDER", "anthropic")
+        .args(["logout", "logout", "--json"])
+        .output()
+        .expect("logout action");
+    assert!(out.status.success(), "{out:?}");
+    assert!(out.stderr.is_empty(), "{out:?}");
+    let value: serde_json::Value = serde_json::from_slice(&out.stdout).expect("valid json");
+    assert_eq!(value["removed"], true);
+    assert!(
+        rune_net::auth::stored_providers(&paths)
+            .expect("stored providers")
+            .is_empty()
+    );
+}
+
+#[test]
 fn help_for_an_unknown_command_says_so() {
     let out = run(&["help", "frobnicate"]);
     assert!(out.stdout.contains("frobnicate"));
