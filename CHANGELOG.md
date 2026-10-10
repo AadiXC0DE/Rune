@@ -42,6 +42,8 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Fixed
 
+- Credential updates and removals replace the complete file atomically, so
+  interrupting a writer preserves the previous credentials until replacement.
 - Long Unicode tool descriptions truncate at a character boundary, so registering
   a custom tool preserves valid UTF-8 without panicking.
 - Completed shell sessions keep their final output until `interact` or `stop`

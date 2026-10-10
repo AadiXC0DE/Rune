@@ -161,7 +161,8 @@ fn read_file(paths: &Paths) -> Result<Option<StoredFile>> {
 }
 
 /// Writes a credential to the profile file, creating or verifying its private
-/// state directory before reading or writing credentials.
+/// state directory before reading or writing credentials. The complete JSON
+/// replaces the previous file atomically.
 pub fn store(paths: &Paths, provider: &str, value: &str) -> Result<()> {
     if value.is_empty() {
         return Err(RuneError::invalid_field("credential", "must not be empty"));
@@ -185,12 +186,13 @@ pub fn store(paths: &Paths, provider: &str, value: &str) -> Result<()> {
     );
 
     let encoded = serde_json::to_string_pretty(&file)?;
-    paths::write_private(&paths.credentials_file(), &encoded)
+    paths::write_private_atomic(&paths.credentials_file(), &encoded)
 }
 
 /// Removes a stored credential.
 ///
-/// Returns true when an entry was removed.
+/// Returns true when an entry was removed. The complete JSON replaces the
+/// previous file atomically.
 pub fn remove(paths: &Paths, provider: &str) -> Result<bool> {
     let Some(mut file) = read_file(paths)? else {
         return Ok(false);
@@ -198,7 +200,7 @@ pub fn remove(paths: &Paths, provider: &str) -> Result<bool> {
     let removed = file.entries.remove(provider).is_some();
     if removed {
         let encoded = serde_json::to_string_pretty(&file)?;
-        paths::write_private(&paths.credentials_file(), &encoded)?;
+        paths::write_private_atomic(&paths.credentials_file(), &encoded)?;
     }
     Ok(removed)
 }
@@ -566,6 +568,54 @@ mod tests {
                 .expect("b")
                 .expose(),
             "two"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn storing_and_removing_replace_the_file_without_truncating_open_readers() {
+        use std::io::Read;
+
+        let dir = TempDir::new().expect("tempdir");
+        let paths = paths_for(&dir);
+        store(&paths, "anthropic", "old-secret").expect("store");
+
+        let original = std::fs::read_to_string(paths.credentials_file()).expect("original JSON");
+        let mut reader = std::fs::File::open(paths.credentials_file()).expect("original reader");
+        store(&paths, "anthropic", "new-secret").expect("replace");
+        let mut retained = String::new();
+        reader
+            .read_to_string(&mut retained)
+            .expect("original reader");
+        assert_eq!(
+            retained, original,
+            "store must not truncate the original inode"
+        );
+        assert_eq!(
+            from_file(&paths, "anthropic")
+                .expect("read")
+                .expect("credential")
+                .expose(),
+            "new-secret"
+        );
+
+        let original = std::fs::read_to_string(paths.credentials_file()).expect("updated JSON");
+        let mut reader = std::fs::File::open(paths.credentials_file()).expect("updated reader");
+        assert!(remove(&paths, "anthropic").expect("remove"));
+        let mut retained = String::new();
+        reader
+            .read_to_string(&mut retained)
+            .expect("updated reader");
+        assert_eq!(
+            retained, original,
+            "remove must not truncate the original inode"
+        );
+        assert!(from_file(&paths, "anthropic").expect("read").is_none());
+        assert_eq!(
+            std::fs::read_dir(&paths.state_root)
+                .expect("directory")
+                .count(),
+            1
         );
     }
 

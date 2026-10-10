@@ -1907,7 +1907,7 @@ Resource accumulation after cancellation, session holder handover and concurrent
 - [x] R-028 | T1 | feature | tools | Expose a bounded read_tool_result tool | acceptance: Read two pages of a retained fixture and reconstruct its full bytes without exceeding either response cap.
 - [x] R-029 | T1 | fix | tools | Keep completed shell output until it is consumed | acceptance: Start a yielding command, let it finish, start another command and still retrieve the first command's final output.
 - [x] R-030 | T1 | fix | tools | Truncate Unicode tool descriptions at a character boundary | acceptance: Register a description of one ASCII byte plus 600 e-acute characters and observe no panic and a valid UTF-8 schema.
-- [ ] R-031 | T1 | fix | config | Replace credential files atomically | acceptance: Kill a credential writer before replacement and observe either complete old or complete new JSON, never truncated authority.
+- [x] R-031 | T1 | fix | config | Replace credential files atomically | acceptance: Kill a credential writer before replacement and observe either complete old or complete new JSON, never truncated authority.
 - [ ] R-032 | T1 | fix | config | Serialize concurrent credential updates | acceptance: Connect two scratch provider profiles concurrently and observe both credentials after reopening.
 - [ ] R-033 | T1 | fix | docs | Report the measured binary size and actual ceiling | acceptance: README and budget help must distinguish the measured 4.50 MiB GNU build from the 8 MiB ceiling and name the target.
 - [ ] R-034 | T1 | feature | tui | Add a real PTY replay gate for observed defects | acceptance: CI must replay long drafts, 12-column text, short menus and draft resize through the actual rune process and compare captured grids.

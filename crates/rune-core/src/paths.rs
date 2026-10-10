@@ -429,6 +429,87 @@ pub fn write_private(path: &Utf8Path, contents: &str) -> Result<()> {
     Ok(())
 }
 
+/// Replaces a private file with a complete, synced file staged in the same
+/// directory. An interrupted write leaves the previous file intact.
+///
+/// Staging files are created exclusively with mode 0600 and removed on errors.
+/// A killed process may leave a private staging file, but never publishes it.
+pub fn write_private_atomic(path: &Utf8Path, contents: &str) -> Result<()> {
+    write_private_atomic_before_replace(path, contents, |_| Ok(()))
+}
+
+fn write_private_atomic_before_replace(
+    path: &Utf8Path,
+    contents: &str,
+    before_replace: impl FnOnce(&Utf8Path) -> Result<()>,
+) -> Result<()> {
+    use std::io::Write;
+
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_str().is_empty())
+        .unwrap_or_else(|| Utf8Path::new("."));
+    std::fs::create_dir_all(parent)?;
+    verify_replacement_target(path)?;
+
+    let (staging, mut file) = loop {
+        let mut random = [0; 16];
+        getrandom::getrandom(&mut random).map_err(|err| std::io::Error::other(err.to_string()))?;
+        let staging = parent.join(format!(
+            ".rune-private-{:032x}.tmp",
+            u128::from_le_bytes(random)
+        ));
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        set_open_mode(&mut options, FILE_MODE);
+        match options.open(&staging) {
+            Ok(file) => break (PrivateStagingFile(staging), file),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(err) => return Err(err.into()),
+        }
+    };
+
+    // The closure owns the handle, closing it before staging cleanup on every
+    // error path, including on platforms that cannot unlink an open file.
+    (|| {
+        file.write_all(contents.as_bytes())?;
+        file.sync_all()?;
+        drop(file);
+        before_replace(&staging.0)?;
+        verify_replacement_target(path)?;
+        std::fs::rename(&staging.0, path)?;
+        #[cfg(unix)]
+        std::fs::File::open(parent)?.sync_all()?;
+        Ok(())
+    })()
+}
+
+fn verify_replacement_target(path: &Utf8Path) -> Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) => {
+            if !meta.is_file() || meta.file_type().is_symlink() {
+                return Err(RuneError::new(
+                    ErrorCode::UnsafePath,
+                    format!("`{path}` is not a regular file"),
+                ));
+            }
+            verify_mode(path, &meta, FILE_MODE)
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err.into()),
+    }
+}
+
+/// Removes unpublished staging files on success or failure.
+#[derive(Debug)]
+struct PrivateStagingFile(Utf8PathBuf);
+
+impl Drop for PrivateStagingFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
 /// Reads a file after verifying it is a regular, single-linked, private file.
 pub fn read_private(path: &Utf8Path, max_bytes: u64) -> Result<Option<String>> {
     let meta = match std::fs::symlink_metadata(path) {
@@ -743,6 +824,187 @@ mod tests {
         write_private(&target, "{\"a\":1}").expect("write");
         let read = read_private(&target, 1024).expect("read").expect("present");
         assert_eq!(read, "{\"a\":1}");
+    }
+
+    const OLD_CREDENTIALS: &str = r#"{"version":1,"entries":{"old":{"value":"old-secret"}}}"#;
+    const NEW_CREDENTIALS: &str = r#"{"version":1,"entries":{"new":{"value":"new-secret"}}}"#;
+
+    #[test]
+    fn atomic_replacement_publishes_complete_private_json_and_cleans_staging() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let target = Utf8PathBuf::from_path_buf(dir.path().join("credentials.json")).expect("utf8");
+        // Exercise both initial creation and replacement.
+        for contents in [OLD_CREDENTIALS, NEW_CREDENTIALS] {
+            write_private_atomic(&target, contents).expect("replace");
+            assert_eq!(
+                read_private(&target, 1024).expect("read").expect("present"),
+                contents
+            );
+            serde_json::from_str::<serde_json::Value>(
+                &std::fs::read_to_string(&target).expect("read"),
+            )
+            .expect("complete JSON");
+            assert_eq!(std::fs::read_dir(dir.path()).expect("directory").count(), 1);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                assert_eq!(
+                    std::fs::metadata(&target)
+                        .expect("metadata")
+                        .permissions()
+                        .mode()
+                        & 0o777,
+                    FILE_MODE
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn failure_before_atomic_replacement_preserves_authority_and_cleans_staging() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let target = Utf8PathBuf::from_path_buf(dir.path().join("credentials.json")).expect("utf8");
+        write_private(&target, OLD_CREDENTIALS).expect("old file");
+        let result = write_private_atomic_before_replace(&target, NEW_CREDENTIALS, |staging| {
+            assert_eq!(
+                read_private(staging, 1024)
+                    .expect("private staging")
+                    .expect("present"),
+                NEW_CREDENTIALS
+            );
+            assert_eq!(
+                std::fs::read_to_string(&target).expect("old file"),
+                OLD_CREDENTIALS
+            );
+            Err(std::io::Error::other("injected failure before replacement").into())
+        });
+        assert!(result.is_err());
+        assert_eq!(
+            std::fs::read_to_string(&target).expect("old file"),
+            OLD_CREDENTIALS
+        );
+        assert_eq!(std::fs::read_dir(dir.path()).expect("directory").count(), 1);
+    }
+
+    #[test]
+    fn killing_a_writer_before_atomic_replacement_preserves_complete_credentials() {
+        use std::time::{Duration, Instant};
+
+        for existing in [false, true] {
+            let dir = tempfile::TempDir::new().expect("tempdir");
+            let root = Utf8Path::from_path(dir.path()).expect("utf8");
+            let target = root.join("credentials.json");
+            if existing {
+                write_private(&target, OLD_CREDENTIALS).expect("old file");
+            }
+            let mut child =
+                std::process::Command::new(std::env::current_exe().expect("test executable"))
+                    .args(["--exact", "paths::tests::atomic_credential_writer_child"])
+                    .env("RUNE_ATOMIC_CREDENTIAL_TEST_ROOT", root)
+                    .stdout(std::process::Stdio::null())
+                    .spawn()
+                    .expect("spawn writer");
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let ready = root.join("ready");
+            while !ready.exists() && Instant::now() < deadline {
+                if child.try_wait().expect("writer status").is_some() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let paused = ready.exists();
+            child.kill().expect("kill writer");
+            assert!(!child.wait().expect("reap writer").success());
+            assert!(paused, "writer did not reach the replacement boundary");
+
+            if existing {
+                let body = read_private(&target, 1024)
+                    .expect("read")
+                    .expect("old file");
+                assert_eq!(body, OLD_CREDENTIALS);
+                serde_json::from_str::<serde_json::Value>(&body).expect("complete JSON");
+            } else {
+                assert!(!target.exists(), "initial write must remain unpublished");
+            }
+            let staging = std::fs::read_to_string(&ready).expect("staging path");
+            assert_eq!(
+                read_private(Utf8Path::new(&staging), 1024)
+                    .expect("private staging")
+                    .expect("present"),
+                NEW_CREDENTIALS
+            );
+
+            // An orphan from the killed writer cannot interfere with retrying.
+            write_private_atomic(&target, NEW_CREDENTIALS).expect("retry replacement");
+            assert_eq!(
+                read_private(&target, 1024)
+                    .expect("read")
+                    .expect("new file"),
+                NEW_CREDENTIALS
+            );
+        }
+    }
+
+    #[test]
+    fn atomic_credential_writer_child() {
+        let Ok(root) = std::env::var("RUNE_ATOMIC_CREDENTIAL_TEST_ROOT") else {
+            return;
+        };
+        let root = Utf8Path::new(&root);
+        write_private_atomic_before_replace(
+            &root.join("credentials.json"),
+            NEW_CREDENTIALS,
+            |staging| {
+                std::fs::write(root.join("ready.tmp"), staging.as_str())?;
+                std::fs::rename(root.join("ready.tmp"), root.join("ready"))?;
+                loop {
+                    std::thread::park();
+                }
+            },
+        )
+        .expect("write credentials");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_replacement_refuses_unsafe_targets_without_modifying_them() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let root = Utf8Path::from_path(dir.path()).expect("utf8");
+        let target = root.join("credentials.json");
+        write_private(&target, OLD_CREDENTIALS).expect("old file");
+        let link = root.join("symlink");
+        symlink(&target, &link).expect("symlink");
+        assert_eq!(
+            write_private_atomic(&link, NEW_CREDENTIALS)
+                .expect_err("refuse symlink")
+                .code(),
+            ErrorCode::UnsafePath
+        );
+        std::fs::remove_file(&link).expect("remove symlink");
+
+        std::fs::hard_link(&target, &link).expect("hard link");
+        assert_eq!(
+            write_private_atomic(&target, NEW_CREDENTIALS)
+                .expect_err("refuse hard link")
+                .code(),
+            ErrorCode::UnsafePath
+        );
+        std::fs::remove_file(&link).expect("remove hard link");
+
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+        assert_eq!(
+            write_private_atomic(&target, NEW_CREDENTIALS)
+                .expect_err("refuse widened file")
+                .code(),
+            ErrorCode::UnsafePath
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target).expect("unchanged authority"),
+            OLD_CREDENTIALS
+        );
+        assert_eq!(std::fs::read_dir(root).expect("directory").count(), 1);
     }
 
     #[test]
