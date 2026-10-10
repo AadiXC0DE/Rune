@@ -123,6 +123,17 @@ code.
 Run `rune help` for everything, or see [COMMANDS.md](COMMANDS.md) for the full
 reference.
 
+The shared agent turn loop spills tool output exceeding `max_tool_result_bytes`
+or the remaining `max_turn_result_bytes` into the live conversation's memory.
+The model receives a bounded preview with the retained byte count and handle,
+including that metadata within both limits. If the limit cannot fit the handle,
+the model receives an empty result while the full body is still retained.
+Embedding callers can retrieve retained bytes with `History::result_store()`
+and `Store::read`; a model-callable reader is not yet available. Retention lasts
+across live turns and compaction, but is not saved or restored with transcripts.
+The store holds at most 256 results and 64 MiB; a full store reports a retention
+failure within the available output budget.
+
 ## Design
 
 - **Small and fast.** Binary size and startup are budgets enforced in CI, not

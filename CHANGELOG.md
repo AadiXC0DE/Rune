@@ -39,6 +39,10 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Fixed
 
+- The shared agent turn loop retains oversized tool output in the live
+  conversation and returns a bounded preview with a readable retained handle.
+  Both output limits include preview metadata; retained bytes can be retrieved
+  through the store API across turns and compaction.
 - `rune ask` saves completed exchanges with their prompt, reply, and reported
   usage. JSON reports a resolvable `session_id`; `--no-save` creates no session
   and keeps the identifier empty.

@@ -288,6 +288,7 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
     let steering = host.steering();
     let step_limit = limits.get(LimitName::MaxAgentSteps).value().unwrap_or(0);
     let result_limit = limits.get_usize(LimitName::MaxTurnResultBytes);
+    let tool_result_limit = limits.get_usize(LimitName::MaxToolResultBytes);
     let max_attempts = limits.get_usize(LimitName::ProviderMaxAttempts).max(1);
     let timeouts = transport::RequestTimeouts::from_limits(&limits);
 
@@ -467,7 +468,12 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
         for result in &mut results {
             let remaining = result_limit.saturating_sub(result_bytes);
             let text = std::mem::take(&mut result.output.text);
-            let bounded = bound_result(text, remaining);
+            let cap = remaining.min(tool_result_limit);
+            let bounded = if text.len() > cap {
+                spill_result(history, result, text, cap)
+            } else {
+                text
+            };
             result_bytes = result_bytes.saturating_add(bounded.len());
             result.output.text = bounded;
         }
@@ -804,6 +810,37 @@ fn infer_target(host: &dyn Host, name: &str, arguments: &serde_json::Value) -> O
 
 /// Marker appended to a result cut by the turn's result budget.
 const RESULT_TRUNCATION_MARKER: &str = "\n[tool result truncated at the turn's result limit]";
+
+/// Stores the full body before reducing the model-visible text. Metadata is
+/// charged to both result budgets, so a tiny or exhausted budget can still
+/// answer the call with an empty body without exceeding its limit.
+fn spill_result(history: &mut History, result: &CallResult, text: String, cap: usize) -> String {
+    match history.result_store_mut().spill(
+        &result.call.name,
+        &result.call.id,
+        text,
+        result.output.is_error,
+        cap,
+    ) {
+        Ok(preview) => {
+            let marker = format!(
+                "\n[{} bytes retained; handle {}]",
+                preview.retained_bytes, preview.handle
+            );
+            if marker.len() > cap {
+                return String::new();
+            }
+            let mut end = preview.text.len().min(cap.saturating_sub(marker.len()));
+            while end > 0 && !preview.text.is_char_boundary(end) {
+                end = end.saturating_sub(1);
+            }
+            let mut output = preview.text.get(..end).unwrap_or_default().to_owned();
+            output.push_str(&marker);
+            output
+        }
+        Err(err) => bound_result(format!("[tool result could not be retained: {err}]"), cap),
+    }
+}
 
 /// Cuts a rendered tool result to the bytes the turn can still retain.
 ///

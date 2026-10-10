@@ -296,6 +296,181 @@ fn two_reads(first: &str, second: &str) -> Script {
     ])
 }
 
+fn retained_handle(text: &str) -> rune_tools::Handle {
+    let raw = text
+        .split("handle ")
+        .nth(1)
+        .expect("a retained handle")
+        .trim_end_matches(']');
+    rune_tools::Handle::parse(raw).expect("valid handle")
+}
+
+#[test]
+fn oversized_tool_results_have_a_bounded_preview_and_a_readable_full_body() {
+    for is_error in [false, true] {
+        let endpoint = MockEndpoint::start(vec![
+            Script::tool_call("large", "read_file", "{\"path\":\"a.rs\"}"),
+            Script::text("inspected"),
+            Script::text("later turn"),
+        ]);
+        let content = format!("PREVIEW {} FULL-TAIL", "é".repeat(40_000));
+        let output = if is_error {
+            ToolOutput::failure(content.clone())
+        } else {
+            ToolOutput::success(content.clone())
+        };
+        let host = TestHost::new(endpoint)
+            .with_tools(vec![read_tool()])
+            .with_tool_response(output);
+        let mut history = rune_agent::History::new();
+        history.push_user("read");
+
+        let outcome = run_turn(&mut history, &host).expect("turn");
+        let shown = &outcome.calls[0].output;
+        assert!(shown.text.starts_with("PREVIEW "));
+        assert!(!shown.text.contains("FULL-TAIL"));
+        assert!(shown.text.len() <= 65_536);
+        assert_eq!(shown.produced_bytes, content.len() as u64);
+        assert_eq!(shown.is_error, is_error);
+        let handle = retained_handle(&shown.text);
+        assert_eq!(history.result_store().len(), 1);
+        assert_eq!(history.result_store().total_bytes(), content.len());
+        assert_eq!(
+            history.result_store().describe(&handle),
+            Some(("read_file", content.len() as u64, is_error))
+        );
+        let mut full = String::new();
+        while full.len() < content.len() {
+            let page = history
+                .result_store()
+                .read(&handle, full.len(), 4096)
+                .expect("read retained bytes");
+            assert!(!page.text.is_empty());
+            full.push_str(&page.text);
+        }
+        assert_eq!(full, content);
+
+        let body = host
+            .server
+            .as_ref()
+            .expect("server")
+            .last_body()
+            .expect("request");
+        assert!(body.to_string().contains(handle.as_str()));
+        assert!(!body.to_string().contains("FULL-TAIL"));
+        assert!(
+            rune_agent::History::new()
+                .result_store()
+                .read(&handle, 0, 64)
+                .is_err()
+        );
+        assert!(
+            rune_agent::History::default()
+                .result_store()
+                .read(&handle, 0, 64)
+                .is_err()
+        );
+        let saved = serde_json::to_string(&history).expect("serialized history");
+        assert!(!saved.contains("FULL-TAIL"));
+        let restored: rune_agent::History = serde_json::from_str(&saved).expect("restored history");
+        assert!(restored.result_store().is_empty());
+
+        history.push_user("continue");
+        run_turn(&mut history, &host).expect("later turn");
+        history.replace_with_summary("summary", u64::MAX);
+        assert_eq!(
+            history
+                .result_store()
+                .read(&handle, content.len() - 9, 9)
+                .expect("tail")
+                .text,
+            "FULL-TAIL"
+        );
+    }
+}
+
+#[test]
+fn lowered_tool_caps_include_preview_metadata_and_leave_small_results_unchanged() {
+    for content in ["é".repeat(200), "é".repeat(64)] {
+        let endpoint = MockEndpoint::start(vec![
+            Script::tool_call("lowered", "read_file", "{\"path\":\"a.rs\"}"),
+            Script::text("done"),
+        ]);
+        let mut host = TestHost::new(endpoint)
+            .with_tools(vec![read_tool()])
+            .with_tool_response(ToolOutput::success(content.clone()));
+        host.limits
+            .set(
+                rune_core::LimitName::MaxToolResultBytes,
+                rune_core::budget::Budget::Bounded(128),
+                rune_core::config::Layer::User,
+            )
+            .expect("limit");
+        let mut history = rune_agent::History::new();
+        history.push_user("read");
+        let outcome = run_turn(&mut history, &host).expect("turn");
+        let shown = &outcome.calls[0].output.text;
+        assert!(shown.len() <= 128);
+        if content.len() > 128 {
+            let handle = retained_handle(shown);
+            assert_eq!(
+                history
+                    .result_store()
+                    .read(&handle, 0, 4096)
+                    .expect("read")
+                    .text,
+                content
+            );
+            assert!(shown.starts_with('é'));
+        } else {
+            assert_eq!(shown, &content);
+            assert!(history.result_store().is_empty());
+        }
+    }
+}
+
+#[test]
+fn the_turn_budget_retains_cut_results_even_when_no_preview_space_remains() {
+    let endpoint = MockEndpoint::start(vec![two_reads("first", "second"), Script::text("done")]);
+    let content = "z".repeat(1000);
+    let mut host = TestHost::new(endpoint)
+        .with_tools(vec![read_tool()])
+        .with_tool_response(ToolOutput::success(content.clone()));
+    host.limits
+        .set(
+            rune_core::LimitName::MaxTurnResultBytes,
+            rune_core::budget::Budget::Bounded(128),
+            rune_core::config::Layer::User,
+        )
+        .expect("limit");
+    let mut history = rune_agent::History::new();
+    history.push_user("read both");
+    let outcome = run_turn(&mut history, &host).expect("turn");
+    assert_eq!(outcome.calls[0].output.text.len(), 128);
+    assert!(outcome.calls[1].output.text.is_empty());
+    assert_eq!(history.result_store().len(), 2);
+    let second_handle =
+        rune_tools::Handle::derive(history.result_store().session(), "second", &content);
+    assert_eq!(
+        history
+            .result_store()
+            .read(&second_handle, 0, 4096)
+            .expect("second retained output")
+            .text,
+        content
+    );
+    let handle = retained_handle(&outcome.calls[0].output.text);
+    assert_eq!(
+        history
+            .result_store()
+            .read(&handle, 0, 4096)
+            .expect("read")
+            .text,
+        content
+    );
+    history.validate().expect("paired tool calls");
+}
+
 #[test]
 fn a_single_step_turn_returns_the_answer() {
     let endpoint = MockEndpoint::start(vec![Script::text("The answer is 42.")]);

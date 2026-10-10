@@ -2,8 +2,8 @@
 //!
 //! A large result stays out of the model's context but remains fully
 //! inspectable. The model receives a bounded preview, the retained byte count,
-//! and an opaque handle; `read_tool_result` reads a byte range or searches for a
-//! literal through that handle.
+//! and an opaque handle. The store API reads a byte range or searches for a
+//! literal through that handle; a model-callable reader is not yet registered.
 //!
 //! A handle is scoped to one session and is not guessable from another, so one
 //! session cannot read another's retained output.
@@ -11,7 +11,7 @@
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
-use rune_core::budget::{BudgetSet, LimitName};
+use rune_core::budget::{BudgetSet, EMERGENCY_CEILING_BYTES, LimitName};
 use rune_core::error::{ErrorCode, Result, RuneError};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -137,7 +137,7 @@ impl Preview {
 }
 
 /// The session-scoped store of retained results.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct Store {
     session: String,
     entries: BTreeMap<Handle, Retained>,
@@ -185,6 +185,58 @@ impl Store {
     pub fn preview_bytes(limits: &BudgetSet) -> usize {
         let cap = limits.get_usize(LimitName::MaxToolResultBytes);
         cap.min(DEFAULT_PREVIEW_BYTES)
+    }
+
+    /// Spills a full result that would otherwise be cut from the conversation.
+    ///
+    /// Unlike `retain`, the model's per-result cap does not cut the stored body.
+    /// The session's emergency byte ceiling and entry bound still apply. A
+    /// failure leaves the store unchanged so the caller can report that the
+    /// result could not be retained.
+    pub fn spill(
+        &mut self,
+        tool: &str,
+        tool_call: &str,
+        content: String,
+        is_error: bool,
+        preview_bytes: usize,
+    ) -> Result<Preview> {
+        let handle = Handle::derive(&self.session, tool_call, &content);
+        let replaced_bytes = self
+            .entries
+            .get(&handle)
+            .map_or(0, |entry| entry.content.len());
+        let total_bytes = self
+            .total_bytes
+            .saturating_sub(replaced_bytes)
+            .saturating_add(content.len());
+        if (self.entries.len() >= MAX_RETAINED_RESULTS && !self.entries.contains_key(&handle))
+            || u64::try_from(total_bytes).unwrap_or(u64::MAX) > EMERGENCY_CEILING_BYTES
+        {
+            return Err(RuneError::new(
+                ErrorCode::LimitExceeded,
+                "the session's retained tool result store is full",
+            )
+            .with_hint("start a new session to retain more"));
+        }
+
+        let preview = Self::build_preview(
+            &content,
+            &handle,
+            is_error,
+            preview_bytes.min(DEFAULT_PREVIEW_BYTES),
+        );
+        self.entries.insert(
+            handle.clone(),
+            Retained {
+                handle,
+                tool: tool.to_owned(),
+                content,
+                is_error,
+            },
+        );
+        self.total_bytes = total_bytes;
+        Ok(preview)
     }
 
     /// Retains a result and returns its preview.
@@ -443,6 +495,76 @@ mod tests {
         assert_eq!(store.len(), 1);
         assert!(preview.text.len() <= DEFAULT_PREVIEW_BYTES);
         assert_eq!(preview.retained_bytes, 50_000);
+    }
+
+    #[test]
+    fn spilling_keeps_the_full_body_even_with_a_zero_byte_preview() {
+        let mut store = store();
+        let content = format!("{}TAIL", "é".repeat(40_000));
+        let preview = store
+            .spill("shell", "spill", content.clone(), true, 0)
+            .expect("spilled");
+        assert!(preview.text.is_empty());
+        assert_eq!(preview.retained_bytes, content.len() as u64);
+        assert_eq!(store.total_bytes(), content.len());
+        assert_eq!(
+            store
+                .read(&preview.handle, content.len() - 4, 4)
+                .expect("tail")
+                .text,
+            "TAIL"
+        );
+        assert_eq!(
+            store.describe(&preview.handle),
+            Some(("shell", content.len() as u64, true))
+        );
+    }
+
+    #[test]
+    fn spilling_refuses_a_full_store_without_losing_existing_results() {
+        let mut store = store();
+        let mut first = None;
+        for index in 0..MAX_RETAINED_RESULTS {
+            let preview = store
+                .spill("shell", &index.to_string(), "kept".to_owned(), false, 4)
+                .expect("spilled");
+            first.get_or_insert(preview.handle);
+        }
+        let err = store
+            .spill("shell", "overflow", "lost".to_owned(), false, 4)
+            .expect_err("full");
+        assert_eq!(err.code(), ErrorCode::LimitExceeded);
+        assert_eq!(store.len(), MAX_RETAINED_RESULTS);
+        assert_eq!(store.total_bytes(), 4 * MAX_RETAINED_RESULTS);
+        assert_eq!(
+            store
+                .read(&first.expect("first"), 0, 4)
+                .expect("existing output")
+                .text,
+            "kept"
+        );
+    }
+
+    #[test]
+    fn spilled_bytes_cannot_exceed_the_session_emergency_ceiling() {
+        let mut store = store();
+        let ceiling = usize::try_from(EMERGENCY_CEILING_BYTES).expect("ceiling fits");
+        let preview = store
+            .spill("shell", "full", "x".repeat(ceiling), false, 8)
+            .expect("at ceiling");
+        let err = store
+            .spill("shell", "overflow", "x".to_owned(), false, 1)
+            .expect_err("past ceiling");
+        assert_eq!(err.code(), ErrorCode::LimitExceeded);
+        assert_eq!(store.len(), 1);
+        assert_eq!(store.total_bytes(), ceiling);
+        assert_eq!(
+            store
+                .read(&preview.handle, ceiling - 1, 1)
+                .expect("existing tail")
+                .text,
+            "x"
+        );
     }
 
     #[test]

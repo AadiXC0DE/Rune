@@ -8,6 +8,7 @@
 use rune_core::error::{ErrorCode, Result, RuneError};
 use rune_core::id::ToolCallId;
 use rune_net::message::{ContentPart, Message, Role, validate};
+use rune_tools::result_store::Store;
 use serde::{Deserialize, Serialize};
 
 /// One turn in the conversation.
@@ -111,7 +112,7 @@ impl Turn {
 }
 
 /// The conversation history.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct History {
     /// System instructions, separate from the turn list.
     instructions: String,
@@ -119,6 +120,25 @@ pub struct History {
     turns: Vec<Turn>,
     /// Next sequence number.
     next_seq: u64,
+    /// Retained output lives as long as this in-memory conversation. It is not
+    /// part of a provider request or a serialized transcript.
+    #[serde(skip, default = "new_result_store")]
+    result_store: Store,
+}
+
+fn new_result_store() -> Store {
+    Store::new(rune_core::id::SessionId::generate().to_string())
+}
+
+impl Default for History {
+    fn default() -> Self {
+        Self {
+            instructions: String::default(),
+            turns: Vec::default(),
+            next_seq: u64::default(),
+            result_store: new_result_store(),
+        }
+    }
 }
 
 impl History {
@@ -129,7 +149,21 @@ impl History {
             instructions: String::new(),
             turns: Vec::new(),
             next_seq: 1,
+            result_store: new_result_store(),
         }
+    }
+
+    /// Returns the full tool results spilled from this live conversation.
+    ///
+    /// Handles remain readable across turns and compaction, but are not saved
+    /// in serialized history or shared with a new conversation.
+    #[must_use]
+    pub fn result_store(&self) -> &Store {
+        &self.result_store
+    }
+
+    pub(crate) fn result_store_mut(&mut self) -> &mut Store {
+        &mut self.result_store
     }
 
     /// Sets the system instructions.
@@ -368,6 +402,7 @@ impl History {
             instructions: self.instructions.clone(),
             turns,
             next_seq,
+            result_store: self.result_store.clone(),
         }
     }
 
