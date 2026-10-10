@@ -112,6 +112,28 @@ fn unknown_global_flag_fails_before_loading_configuration() {
 }
 
 #[test]
+fn unknown_effort_fails_with_the_accepted_values() {
+    for args in [
+        vec!["--effort", "banana", "config"],
+        vec!["--effort=banana", "config"],
+        vec!["config", "--effort", "banana"],
+        vec!["config", "--effort=banana", "--json"],
+    ] {
+        let out = run(&args);
+        assert_eq!(out.status, Some(1), "{args:?}: {}", out.stderr);
+        assert!(out.stdout.is_empty(), "{}", out.stdout);
+        for expected in [
+            "invalid_field",
+            "--effort",
+            "banana",
+            "auto, none, minimal, low, medium, high, xhigh, max",
+        ] {
+            assert!(out.stderr.contains(expected), "{}", out.stderr);
+        }
+    }
+}
+
+#[test]
 fn missing_flag_value_is_reported_as_a_missing_field() {
     let out = run(&["--model"]);
     assert_eq!(out.status, Some(1));

@@ -56,6 +56,8 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Fixed
 
+- Unknown `--effort` values fail with `invalid_field`, list the accepted
+  efforts, and exit 1 instead of silently keeping the configured effort.
 - `rune workspace clear --json` reports an empty directory list, matching the
   saved configuration and subsequent `rune workspace list --json` output.
 - `cargo xtask gate` checks formatting and Clippy with warnings denied before

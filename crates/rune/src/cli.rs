@@ -432,7 +432,17 @@ fn take_global(launch: &mut Launch, tokens: &[String], index: &mut usize) -> Res
     match canonical {
         "--model" => launch.model = Some(value),
         "--provider" => launch.provider = Some(value),
-        "--effort" => launch.effort = Some(value),
+        "--effort" => {
+            if parse_effort(&value).is_none() {
+                return Err(RuneError::invalid_field(
+                    canonical,
+                    format!(
+                        "`{value}` is not a reasoning effort; accepted efforts: auto, none, minimal, low, medium, high, xhigh, max"
+                    ),
+                ));
+            }
+            launch.effort = Some(value);
+        }
         "--permission-mode" => launch.permission_mode = Some(value),
         "--add-dir" => launch.add_dirs.push(value),
         "--theme" => launch.theme = Some(value),
@@ -942,10 +952,10 @@ mod tests {
             }
             let mut list = vec!["status", flag.name];
             if flag.value.is_some() {
-                list.push(if flag.name == "--limit" {
-                    "list_entries=5"
-                } else {
-                    "value"
+                list.push(match flag.name {
+                    "--limit" => "list_entries=5",
+                    "--effort" => "high",
+                    _ => "value",
                 });
             }
             let parsed = parse_list(&list);
@@ -1064,13 +1074,49 @@ context_window = 64000
     }
 
     #[test]
-    fn invalid_effort_on_the_command_line_is_ignored_rather_than_applied() {
+    fn invalid_effort_on_the_command_line_is_rejected() {
+        for args in [
+            vec!["--effort", "banana", "config"],
+            vec!["--effort=banana", "config"],
+            vec!["config", "--effort", "banana"],
+            vec!["config", "--effort=banana"],
+            vec!["--effort", "banana", "--effort", "high", "config"],
+            vec!["--effort", "sideways"],
+            vec!["--effort="],
+            vec!["--effort", "   "],
+        ] {
+            let error = parse_list(&args).expect_err("invalid effort");
+            assert_eq!(error.code(), ErrorCode::InvalidField, "{args:?}");
+            assert!(error.to_string().contains("--effort"), "{error}");
+            assert!(
+                error
+                    .to_string()
+                    .contains("auto, none, minimal, low, medium, high, xhigh, max"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn accepted_efforts_on_the_command_line_are_applied() {
         use rune_core::config::{Effort, Settings};
-        let launch = parse_list(&["--effort", "sideways"]).expect("parse");
-        let mut settings = Settings::default();
-        apply_to_settings(&launch, &mut settings);
-        assert_eq!(settings.effort, Effort::Auto);
-        assert_eq!(settings.source_of("effort"), Layer::Default);
+        for (raw, expected) in [
+            ("auto", Effort::Auto),
+            ("none", Effort::None),
+            ("minimal", Effort::Minimal),
+            ("low", Effort::Low),
+            ("medium", Effort::Medium),
+            ("high", Effort::High),
+            ("xhigh", Effort::Xhigh),
+            ("max", Effort::Max),
+            (" HIGH ", Effort::High),
+        ] {
+            let launch = parse_list(&["--effort", raw, "config"]).expect("parse");
+            let mut settings = Settings::default();
+            apply_to_settings(&launch, &mut settings);
+            assert_eq!(settings.effort, expected, "{raw}");
+            assert_eq!(settings.source_of("effort"), Layer::CommandLine, "{raw}");
+        }
     }
 
     #[test]
