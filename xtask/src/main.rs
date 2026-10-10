@@ -7,11 +7,10 @@
 
 use std::process::{Command, ExitCode};
 
-/// Budget targets. These are Rune's own numbers, measured on the release
-/// profile, not a restatement of another project's figures.
 /// Runs per measurement. The fastest is kept, so more samples only reduce noise.
 const MEASUREMENT_SAMPLES: usize = 31;
 
+/// Enforced release budget ceilings, distinct from measured build results.
 mod targets {
     /// Largest accepted stripped release binary, in bytes.
     pub const MAX_BINARY_BYTES: u64 = 8 * 1024 * 1024;
@@ -40,6 +39,14 @@ fn main() -> ExitCode {
             "warnings",
         ]),
         "test" => cargo(&["test", "--workspace"]),
+        "budget"
+            if extra
+                .first()
+                .is_some_and(|arg| arg == "--help" || arg == "-h") =>
+        {
+            print_budget_help();
+            Ok(())
+        }
         "budget" => budget(),
         "gate" => gate(),
         "release" => release(&extra),
@@ -80,6 +87,22 @@ fn print_help() {
     println!("  web      build the harness for the landing page into site/demo/rune.wasm");
     println!();
     println!("  release takes: cargo xtask release <channel> [version] [target]");
+    println!();
+    print_budget_help();
+}
+
+/// Explains the measured reference build and the enforced size ceiling.
+fn print_budget_help() {
+    println!("usage: cargo xtask budget [--help]");
+    println!();
+    println!("  Builds the release profile and checks size and startup.");
+    println!("  The audited stripped release build measured 4.50 MiB for");
+    println!("  x86_64-unknown-linux-gnu (GNU/Linux).");
+    println!(
+        "  The enforced binary size budget is an {} MiB ceiling ({} bytes).",
+        targets::MAX_BINARY_BYTES / (1024 * 1024),
+        targets::MAX_BINARY_BYTES
+    );
 }
 
 /// The per-commit loop: format, lint, test.

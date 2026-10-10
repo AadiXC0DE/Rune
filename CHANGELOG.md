@@ -42,6 +42,8 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Fixed
 
+- README and budget help distinguish the audited 4.50 MiB stripped release
+  build for `x86_64-unknown-linux-gnu` from the enforced 8 MiB binary size ceiling.
 - Concurrent credential updates and removals hold an OS lock across the full
   update, preserving other provider profiles when multiple processes connect.
 - Credential updates and removals replace the complete file atomically, so
