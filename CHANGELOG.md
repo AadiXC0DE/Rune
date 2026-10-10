@@ -6,6 +6,10 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Added
 
+- `--theme high-contrast` selects bright themed foregrounds on explicit black,
+  with a documented 7:1 contrast target for every palette pair in truecolor and
+  256-color output. Footer metadata stays bright; `NO_COLOR` suppresses colors.
+
 - `--accessible` provides line input and append-only screen reader transcripts
   with explicit speaker labels, completed replies, numbered questions, and
   permission prompts. Saved sessions replay in the same format without cursor

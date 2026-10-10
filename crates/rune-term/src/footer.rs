@@ -297,6 +297,9 @@ fn paint(theme: &Theme, slot: Slot, truecolor: bool, bits: u16) -> String {
     }
     let mut style = theme.style(slot, truecolor);
     style.set_flag(bits);
+    if theme.base() == Base::HighContrast {
+        style.clear_flag(flag::DIM);
+    }
     style.sgr()
 }
 
@@ -555,6 +558,32 @@ mod tests {
         let rows = render(&state(), &layout, &Theme::fx_dark(), 100, false);
         assert!(rows[1].contains("38;5;"), "{:?}", rows[1]);
         assert!(!rows[1].contains("38;2;"), "{:?}", rows[1]);
+    }
+
+    #[test]
+    fn high_contrast_footer_keeps_metadata_bright_on_black() {
+        let layout = solve((100, 40), 1, false, DEFAULT_MINIMUM_ROWS);
+        for truecolor in [false, true] {
+            let rows = render(&state(), &layout, &Theme::high_contrast(), 100, truecolor);
+            for row in rows {
+                let mut grid = crate::engine::Grid::new(100, 1).expect("grid");
+                grid.feed(row.as_bytes()).expect("footer");
+                for col in 0..100 {
+                    let cell = grid.cell(0, col).expect("cell");
+                    if cell.style.fg != crate::engine::Color::Default {
+                        assert!(!cell.style.has_flag(flag::DIM), "dimmed metadata: {row:?}");
+                        assert_eq!(
+                            cell.style.bg,
+                            if truecolor {
+                                crate::engine::Color::Rgb(0, 0, 0)
+                            } else {
+                                crate::engine::Color::Indexed(16)
+                            }
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]

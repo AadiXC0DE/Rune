@@ -131,6 +131,29 @@ answer. Questions accept a numbered option or `/cancel`. `/model <id>` changes
 models; `/copy` points to terminal scrollback. Composer shortcuts and steering
 while a turn runs belong to the default interactive mode.
 
+Select `rune --theme high-contrast`, set `RUNE_THEME=high-contrast`, or set
+`theme = "high-contrast"` in configuration for bright themed text on an explicit
+black background. Every defined foreground/background pair targets at least
+7:1 using the [WCAG relative luminance contrast formula](https://www.w3.org/WAI/WCAG22/Understanding/contrast-enhanced.html).
+The palette uses exact colors from the fixed xterm 256-color cube, so the
+same ratios apply in truecolor and 256-color terminals:
+
+| Foreground slots | Foreground | Background | Contrast ratio (approximate) |
+|---|---|---|---|
+| `fg`, `variable` (also text on `bg`) | `#ffffff` | `#000000` | 21.00:1 |
+| `dim`, `divider`, `comment` | `#d7d7d7` | `#000000` | 14.59:1 |
+| `accent`, `link`, `function`, `operator` | `#5fd7ff` | `#000000` | 12.65:1 |
+| `error` | `#ff8787` | `#000000` | 9.07:1 |
+| `success`, `string` | `#87ff87` | `#000000` | 16.68:1 |
+| `user_rail`, `keyword` | `#d7afff` | `#000000` | 11.47:1 |
+| `number` | `#ffd75f` | `#000000` | 15.14:1 |
+
+High-contrast footer hints and metadata do not use the terminal's faint
+attribute. These targets describe Rune's defined theme colors; unstyled text
+uses terminal defaults, and terminal palette customization can affect indexed
+colors. `NO_COLOR`, including an empty value, suppresses colors even when
+high-contrast is selected. Accessible mode continues to produce colorless output.
+
 In the default interactive composer, Alt-Enter inserts a newline at the caret; Enter
 submits the whole prompt. Draft newlines appear on separate rows and reach
 the provider as newline characters. Left and Right move across line breaks;

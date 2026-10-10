@@ -6070,6 +6070,20 @@ mod tests {
     }
 
     #[test]
+    fn no_color_overrides_the_named_high_contrast_theme() {
+        let mut config = colorless_config();
+        config.settings.theme = Some("high-contrast".to_owned());
+        assert_eq!(resolve_theme_for(&config, false), Theme::high_contrast());
+        let theme = resolve_theme_for(&config, true);
+        assert_eq!(theme, Theme::no_color());
+        for slot in rune_term::theme::SLOTS {
+            for truecolor in [false, true] {
+                assert!(theme.sgr(slot, truecolor).is_empty());
+            }
+        }
+    }
+
+    #[test]
     fn the_truecolor_check_reads_the_advertised_variables() {
         // The helper consults the environment, so the assertion is on its shape
         // rather than on a value a test would have to mutate globally.
