@@ -1051,14 +1051,8 @@ impl SessionHost {
         // A frame that changes nothing costs only a caret move.
         let marker = rune_term::shell::prompt();
         let width = usize::from(self.width());
-        let (prompt_row, caret) = transcript::render_prompt_at(marker, line, column, width);
-        let Ok(painted) = self.paint(
-            &[],
-            notice,
-            std::slice::from_ref(&prompt_row),
-            &rows,
-            (0, u16::try_from(caret).unwrap_or(u16::MAX)),
-        ) else {
+        let (prompt_rows, caret) = transcript::render_draft_at(marker, line, column, width);
+        let Ok(painted) = self.paint(&[], notice, &prompt_rows, &rows, caret) else {
             return;
         };
         self.show(&painted);
@@ -2188,7 +2182,7 @@ fn close_turn(
         ));
     }
     let marker = rune_term::shell::prompt();
-    let (prompt_row, caret) = transcript::render_prompt_at(
+    let (prompt_rows, caret) = transcript::render_draft_at(
         marker,
         reader.line(),
         reader.column(),
@@ -2197,13 +2191,7 @@ fn close_turn(
     if let Ok(mut typed) = host.typed.lock() {
         *typed = (reader.line().to_owned(), reader.column());
     }
-    let painted = host.paint(
-        lines,
-        notice.as_deref(),
-        std::slice::from_ref(&prompt_row),
-        &[],
-        (0, u16::try_from(caret).unwrap_or(u16::MAX)),
-    )?;
+    let painted = host.paint(lines, notice.as_deref(), &prompt_rows, &[], caret)?;
     if !painted.is_empty() {
         sink.write_all(&painted)?;
         sink.flush()?;
@@ -2567,20 +2555,13 @@ fn draw_prompt(
     let mut sink = out
         .lock()
         .map_err(|_| RuneError::new(ErrorCode::Internal, "the output lock was poisoned"))?;
-    let (row, caret) = transcript::render_prompt_at(
+    let (rows, caret) = transcript::render_draft_at(
         marker,
         reader.line(),
         reader.column(),
         usize::from(host.width()),
     );
-    let painted = host.paint_with_menu(
-        &[],
-        None,
-        std::slice::from_ref(&row),
-        &[],
-        menu,
-        (0, u16::try_from(caret).unwrap_or(u16::MAX)),
-    )?;
+    let painted = host.paint_with_menu(&[], None, &rows, &[], menu, caret)?;
     if !painted.is_empty() {
         sink.write_all(&painted)?;
         sink.flush()?;
@@ -4203,6 +4184,56 @@ mod tests {
         .expect("closed");
         check(&mut grid);
         assert_eq!(reader.line(), "a".repeat(160) + "TAIL-END");
+    }
+
+    #[test]
+    fn multiline_caret_survives_streaming_notices_and_turn_close() {
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let out: LiveSink = Arc::new(Mutex::new(SharedSink(Arc::clone(&bytes))));
+        let host = test_host();
+        *host.live_out.lock().expect("lock") = Some(Arc::clone(&out));
+        let mut reader = rune_term::input::KeyReader::new();
+        reader.paste("first 界\nsecond e\u{301}\nthird 👩‍💻");
+        let mut grid = rune_term::Grid::new(80, 24).expect("grid");
+        let check = |grid: &mut rune_term::Grid, edited_row: u16| {
+            let drawn = std::mem::take(&mut *bytes.lock().expect("lock"));
+            grid.feed(&drawn).expect("feed");
+            let caret = grid.cursor();
+            let first = caret.row.saturating_sub(edited_row);
+            assert_eq!(grid.row_text(first), "> first 界");
+            assert_eq!(grid.row_text(first + 1), "  second e\u{301}");
+            assert_eq!(grid.row_text(first + 2), "  third 👩‍💻");
+            assert_eq!(caret.col, 10);
+        };
+        let column =
+            rune_term::width::str_width(&rune_term::editor::displayed("first 界\nsecond e\u{301}"));
+        host.draw_stream_with(reader.line(), column);
+        check(&mut grid, 1);
+        host.emit(Event::TextDelta {
+            delta: "answer".to_owned(),
+        });
+        check(&mut grid, 1);
+        host.draw_notice("still working");
+        check(&mut grid, 1);
+        let mut sink = LockedSink { stream: out };
+        close_turn(
+            &host,
+            &mut sink,
+            &mut reader,
+            &["answer".to_owned()],
+            None,
+            &[],
+        )
+        .expect("closed");
+        check(&mut grid, 2);
+        draw_prompt(&reader, &host, &sink.stream, &[], "> ").expect("idle prompt");
+        check(&mut grid, 2);
+        reader.clear();
+        draw_prompt(&reader, &host, &sink.stream, &[], "> ").expect("cleared");
+        grid.feed(&std::mem::take(&mut *bytes.lock().expect("lock")))
+            .expect("feed");
+        assert!(!grid.text().contains("second"), "{}", grid.text());
+        assert!(!grid.text().contains("third"), "{}", grid.text());
     }
 
     #[test]

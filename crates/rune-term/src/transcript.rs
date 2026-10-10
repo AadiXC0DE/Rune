@@ -632,9 +632,89 @@ pub fn render_prompt_at(prompt: &str, input: &str, column: usize, width: usize) 
     (format!("{prompt}{shown}"), caret)
 }
 
+/// Renders draft line breaks as separate rows with an editable caret.
+///
+/// `column` counts the displayed prefix, including one cell for each newline
+/// and tab, as returned by [`crate::editor::Composer::cursor_column`]. Each
+/// logical line uses a horizontal viewport; the active line scrolls to its
+/// caret. Continuations align with the text after the prompt marker.
+#[must_use]
+pub fn render_draft_at(
+    prompt: &str,
+    input: &str,
+    mut column: usize,
+    width: usize,
+) -> (Vec<String>, (u16, u16)) {
+    if !input.contains('\n') {
+        let (row, caret) = render_prompt_at(prompt, input, column, width);
+        return (vec![row], (0, u16::try_from(caret).unwrap_or(u16::MAX)));
+    }
+    column = column.min(str_width(&crate::editor::displayed(input)));
+    let continuation = " ".repeat(str_width(prompt).min(width.saturating_sub(1)));
+    let mut rows = Vec::new();
+    let mut caret = (0, 0);
+    let mut located = false;
+    for (index, line) in input.split('\n').enumerate() {
+        let line_width = str_width(&crate::editor::displayed(line));
+        let active = !located && column <= line_width;
+        let marker = if index == 0 { prompt } else { &continuation };
+        let (row, col) = render_prompt_at(marker, line, if active { column } else { 0 }, width);
+        rows.push(row);
+        if active {
+            caret = (
+                u16::try_from(index).unwrap_or(u16::MAX),
+                u16::try_from(col).unwrap_or(u16::MAX),
+            );
+            located = true;
+        } else if !located {
+            column = column.saturating_sub(line_width.saturating_add(1));
+        }
+    }
+    (rows, caret)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn multiline_draft_carets_follow_graphemes_and_empty_lines() {
+        let mut composer = crate::editor::Composer::new();
+        composer.insert("界\n\ne\u{301}\t👩‍💻\n");
+        for expected in [
+            (3, 2),
+            (2, 6),
+            (2, 4),
+            (2, 3),
+            (2, 2),
+            (1, 2),
+            (0, 4),
+            (0, 2),
+        ] {
+            let (rows, caret) =
+                render_draft_at("> ", composer.text(), composer.cursor_column(), 80);
+            assert_eq!(rows, ["> 界", "  ", "  e\u{301} 👩‍💻", "  "]);
+            assert_eq!(caret, expected);
+            composer.move_left();
+        }
+    }
+
+    #[test]
+    fn multiline_drafts_scroll_only_the_edited_line_and_bound_narrow_carets() {
+        let input = "first\nab書👋🏽e\u{301}Z\nlast";
+        for width in 0..=12 {
+            for column in 0..=str_width(&crate::editor::displayed(input)) {
+                let (rows, caret) = render_draft_at("> ", input, column, width);
+                assert_eq!(rows.len(), 3);
+                assert!(rows.iter().all(|row| str_width(row) <= width));
+                assert!(usize::from(caret.1) < width.max(1));
+                assert!(caret.0 < 3);
+            }
+        }
+        let (rows, caret) = render_draft_at("> ", input, 14, 8);
+        assert_eq!(rows, ["> first", "  👋🏽e\u{301}Z", "  last"]);
+        assert_eq!(caret, (1, 6));
+    }
 
     #[test]
     fn an_assistant_message_renders_in_full() {

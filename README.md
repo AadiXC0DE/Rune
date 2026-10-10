@@ -121,8 +121,10 @@ rune resume last            # continue the most recent session here
 ```
 
 In the interactive composer, Alt-Enter inserts a newline at the caret; Enter
-submits the whole prompt. Draft newlines appear as `⏎` on the input row and reach
-the provider as newline characters.
+submits the whole prompt. Draft newlines appear on separate rows and reach
+the provider as newline characters. Left and Right move across line breaks;
+the terminal caret follows the line being edited. Long lines scroll horizontally
+and tall drafts scroll vertically to keep the caret visible.
 
 Ctrl-_ (Ctrl-Shift-minus) undoes the last draft
 edit and restores its caret. Repeated presses undo earlier edits, including

@@ -112,9 +112,9 @@ impl Composer {
 
     /// Returns the columns before the cursor.
     ///
-    /// This is where a renderer places the cursor, which is not the same as the
-    /// character count: a wide character advances two columns, and a pasted line
-    /// break or tab is drawn as one column.
+    /// This differs from the character count: a wide character advances two
+    /// columns, and a line break or tab counts as one. Multiline renderers
+    /// resolve this prefix width into a row and a column within that row.
     #[must_use]
     pub fn cursor_column(&self) -> usize {
         str_width(&displayed(self.head()))
@@ -540,10 +540,10 @@ impl Composer {
     }
 }
 
-/// Drawn in place of a line break inside the line being edited.
+/// Drawn in place of a line break in a single-row prompt echo.
 pub const LINE_BREAK: char = '\u{23ce}';
 
-/// Returns the line as it is drawn on its single row.
+/// Returns the text for a single-row echo or prefix width measurement.
 ///
 /// A pasted line break or tab is part of the text, but written to the terminal
 /// as it is it would move the cursor to another row or column. Each is drawn as

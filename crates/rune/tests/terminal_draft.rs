@@ -30,15 +30,98 @@ fn alt_enter_sends_one_two_line_prompt_with_an_exact_newline_to_the_provider() {
         let input = grid.row_text(caret.row);
         let expected = match stage.as_str() {
             "first-line" => "> first 界 line",
-            "newline" => "> first 界 line⏎",
-            "second-line" => "> first 界 line⏎second é line",
+            "newline" => "",
+            "second-line" => "  second é line",
             _ => panic!("unexpected capture {stage}"),
         };
         assert_eq!(input, expected, "{stage}");
         assert_eq!(
             usize::from(caret.col),
-            rune_term::width::str_width(expected),
+            rune_term::width::str_width(expected).max(2),
             "{stage}"
+        );
+        if stage != "first-line" {
+            assert_eq!(grid.row_text(caret.row - 1), "> first 界 line", "{stage}");
+        }
+    }
+}
+
+#[test]
+fn pasted_multiline_drafts_show_each_edited_line_and_its_terminal_caret() {
+    let output = std::process::Command::new("python3")
+        .args([
+            "-c",
+            include_str!("terminal_draft.py"),
+            env!("CARGO_BIN_EXE_rune"),
+            "multiline",
+        ])
+        .output()
+        .expect("python3 is required for the Unix multiline draft test");
+    assert!(
+        output.status.success(),
+        "multiline draft test failed:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let captures: Vec<(String, Vec<u8>)> =
+        serde_json::from_slice(&output.stdout).expect("terminal captures");
+    assert_eq!(captures.len(), 5);
+    for (stage, bytes) in captures {
+        let mut grid = rune_term::Grid::new(80, 24).expect("grid");
+        grid.feed(&bytes).expect("feed");
+        let screen = grid.text();
+        let rows: Vec<&str> = screen.lines().collect();
+        let first = rows
+            .iter()
+            .position(|row| row.starts_with("> first 界"))
+            .expect("first draft row");
+        let (edited_row, column) = match stage.as_str() {
+            "pasted" => (2, 10),
+            "third-edited" | "end-again" => (2, 11),
+            "second-edited" => (1, 11),
+            "first-edited" => (0, 11),
+            _ => panic!("unexpected capture {stage}"),
+        };
+        assert_eq!(
+            rows[first],
+            if stage == "first-edited" || stage == "end-again" {
+                "> first 界Y"
+            } else {
+                "> first 界"
+            },
+            "{stage}"
+        );
+        assert_eq!(
+            rows[first + 1],
+            if matches!(
+                stage.as_str(),
+                "second-edited" | "first-edited" | "end-again"
+            ) {
+                "  second e\u{301}X"
+            } else {
+                "  second e\u{301}"
+            },
+            "{stage}"
+        );
+        assert_eq!(
+            rows[first + 2],
+            if stage == "pasted" {
+                "  third 👩‍💻"
+            } else {
+                "  third 👩‍💻Z"
+            },
+            "{stage}"
+        );
+        assert_eq!(
+            usize::from(grid.cursor().row),
+            first + edited_row,
+            "{stage}: {screen}"
+        );
+        assert_eq!(grid.cursor().col, column, "{stage}: {screen}");
+        assert_eq!(
+            screen.matches("ctrl-c cancel").count(),
+            1,
+            "{stage}: {screen}"
         );
     }
 }

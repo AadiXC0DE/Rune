@@ -188,6 +188,22 @@ impl Inline {
             prompt
         };
 
+        // A pasted draft may be taller than the terminal. Window its logical
+        // rows around the caret before reserving room for menus and streaming
+        // text, so every rendered row can still be repainted and erased.
+        let prompt_room = usize::from(self.max_rows)
+            .saturating_sub(usize::from(activity.is_some()))
+            .saturating_sub(footer.len())
+            .max(1);
+        let within = usize::from(caret.0).min(prompt.len().saturating_sub(1));
+        let prompt_offset = within.saturating_sub(prompt_room.saturating_sub(1));
+        let prompt_end = prompt_offset.saturating_add(prompt_room).min(prompt.len());
+        let prompt = &prompt[prompt_offset..prompt_end];
+        let caret = (
+            u16::try_from(within.saturating_sub(prompt_offset)).unwrap_or(u16::MAX),
+            caret.1,
+        );
+
         let capacity = usize::from(activity.is_some())
             .saturating_add(footer.len())
             .saturating_add(prompt.len())
@@ -254,18 +270,21 @@ impl Inline {
         let unchanged = self.drawn
             && self.shown == rows
             && self.shown_settled == settled.len()
-            && self.cursor_row == caret_row
             && settled.is_empty();
         if unchanged {
             let mut out = String::new();
             out.push_str(HIDE_CURSOR);
-            // The caret is already on its row, so only the column moves. Any
-            // vertical move here is a round trip, and on the screen's last row
-            // the downward half is clamped, which would leave the caret on the
-            // status row for the next frame to write over.
+            // Move directly between input rows. Walking past the region and
+            // back can be clamped at the screen's bottom and lose a row.
+            if caret_row < self.cursor_row {
+                up(&mut out, self.cursor_row.saturating_sub(caret_row));
+            } else {
+                down(&mut out, caret_row.saturating_sub(self.cursor_row));
+            }
             out.push('\r');
             column(&mut out, caret.1);
             out.push_str(SHOW_CURSOR);
+            self.cursor_row = caret_row;
             return out.into_bytes();
         }
 
@@ -413,6 +432,67 @@ fn column(out: &mut String, col: u16) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tall_drafts_window_around_the_caret_and_clear_after_shrinking() {
+        let mut inline = Inline::new(20);
+        inline.set_max_rows(5);
+        let mut grid = crate::Grid::new(20, 6).expect("grid");
+        let prompt: Vec<String> = (0..20).map(|i| format!("  line-{i:02}")).collect();
+        let footer = vec!["status".to_owned()];
+        grid.feed(&inline.frame(&Frame {
+            settled: &[],
+            arriving: &["streaming answer".to_owned()],
+            activity: Some("working"),
+            footer: &footer,
+            prompt: &prompt,
+            menu: &["choice".to_owned()],
+            caret: (19, 9),
+        }))
+        .expect("feed");
+        assert_eq!(inline.shown.len(), 5);
+        assert_eq!(grid.row_text(grid.cursor().row), "  line-19");
+        for row in [19, 0, 10, 19] {
+            let bytes = frame_with_menu(&mut inline, &footer, &prompt, &[], (row, 9));
+            grid.feed(&bytes).expect("feed");
+            assert_eq!(grid.row_text(grid.cursor().row), format!("  line-{row:02}"));
+            assert_eq!(grid.cursor().col, 9);
+            assert_eq!(grid.text().matches("status").count(), 1, "{}", grid.text());
+            assert!(inline.shown.len() <= 5);
+        }
+        grid.feed(&frame_with_menu(
+            &mut inline,
+            &footer,
+            &["> ".to_owned()],
+            &[],
+            (0, 2),
+        ))
+        .expect("feed");
+        assert!(!grid.text().contains("line-"), "{}", grid.text());
+        assert_eq!(grid.row_text(grid.cursor().row), ">");
+    }
+
+    #[test]
+    fn moving_between_unchanged_draft_rows_at_screen_bottom_keeps_the_caret_exact() {
+        let mut inline = Inline::new(20);
+        inline.set_max_rows(5);
+        let mut grid = crate::Grid::new(20, 6).expect("grid");
+        grid.feed(b"\r\n\r\n\r\n\r\n\r\n").expect("bottom");
+        let prompt = vec![
+            "> first".to_owned(),
+            "  second".to_owned(),
+            "  third".to_owned(),
+        ];
+        let footer = vec!["status".to_owned()];
+        grid.feed(&frame_with_menu(&mut inline, &footer, &prompt, &[], (2, 7)))
+            .expect("feed");
+        for row in [0, 2, 1, 2, 0] {
+            let bytes = frame_with_menu(&mut inline, &footer, &prompt, &[], (row, 2));
+            grid.feed(&bytes).expect("feed");
+            assert_eq!(grid.row_text(grid.cursor().row), prompt[usize::from(row)]);
+            assert_eq!(grid.cursor().col, 2);
+        }
+    }
 
     /// Every control sequence in a byte string, in order.
     ///

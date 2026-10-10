@@ -131,11 +131,20 @@ with tempfile.TemporaryDirectory(prefix="rune-r004-") as directory:
             capture("first-line", "first 界 line".encode(), "first 界 line")
             # Alt-Enter is ESC followed by CR on a legacy terminal. It must
             # insert one LF without sending an early provider request.
-            capture("newline", b"\x1b\r", "first 界 line⏎")
+            capture("newline", b"\x1b\r", "\x1b[3G")
             assert not prompts, prompts
-            capture("second-line", "second é line".encode(), "first 界 line⏎second é line")
+            capture("second-line", "second é line".encode(), "second é line")
             assert not prompts, prompts
             submitted = "first 界 line\nsecond é line"
+        elif sys.argv[2:] == ["multiline"]:
+            draft = "first 界\nsecond e\u0301\nthird 👩‍💻"
+            capture("pasted", b"\x1b[200~" + draft.encode() + b"\x1b[201~", "third 👩‍💻")
+            assert not prompts, prompts
+            capture("third-edited", b"Z", "third 👩‍💻Z")
+            capture("second-edited", b"\x1b[D" * 9 + b"X", "second e\u0301X")
+            capture("first-edited", b"\x1b[D" * 10 + b"Y", "first 界Y")
+            capture("end-again", b"\x05", "\x1b[12G")
+            submitted = "first 界Y\nsecond e\u0301X\nthird 👩‍💻Z"
         elif sys.argv[2:] == ["redo"]:
             capture("original", "界ab".encode() + b"\x1b[D", "界ab")
             capture(

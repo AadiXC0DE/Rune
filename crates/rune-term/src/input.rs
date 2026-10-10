@@ -140,7 +140,9 @@ impl KeyReader {
         self.composer.text()
     }
 
-    /// Returns the cursor as a count of columns from the start of the line.
+    /// Returns the displayed prefix width, counting each newline and tab as
+    /// one column. A multiline renderer resolves it into the caret's row and
+    /// column within that row.
     #[must_use]
     pub fn column(&self) -> usize {
         self.composer.cursor_column()
@@ -319,8 +321,8 @@ impl KeyReader {
                 KeyAction::Ignored
             }
             (KeyCode::Enter, _, _) => KeyAction::Submit,
-            // Tab completes rather than inserting a tab. Draft line breaks are
-            // drawn as visible marks on one row, so tabs have nothing to align.
+            // Tab completes rather than inserting a tab. Pasted tabs stay in
+            // the draft and are displayed as spaces.
             (KeyCode::Tab, _, _) => KeyAction::Complete,
             (KeyCode::Esc, _, _) => KeyAction::Escape,
             (KeyCode::Backspace, _, _) => {
