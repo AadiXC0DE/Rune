@@ -282,6 +282,8 @@ struct SessionHost {
     frame: Mutex<()>,
     /// Complete recorded conversation, retained even when model context compacts.
     transcript: Mutex<Vec<Entry>>,
+    /// History turns already captured, adjusted whenever compaction renumbers it.
+    transcript_history_len: std::sync::atomic::AtomicUsize,
     /// Prevents streaming frames from painting over the transcript snapshot.
     transcript_open: std::sync::atomic::AtomicBool,
     /// The line being typed while a turn runs, with the caret's display column.
@@ -377,6 +379,38 @@ impl Host for SessionHost {
         self.fast_mode
     }
 
+    fn prepare_request(
+        &self,
+        history: &mut History,
+        plan: &mut rune_net::provider::RequestPlan,
+        client: &dyn rune_net::fetch::Fetch,
+    ) -> Result<()> {
+        use rune_agent::compaction::{self, Trigger};
+        let estimate = request_estimate(self, plan)?;
+        match compaction::trigger(&estimate, &self.limits) {
+            Trigger::NotNeeded | Trigger::Approaching => return Ok(()),
+            Trigger::Impossible => return Err(compaction::cannot_fit_error()),
+            Trigger::Required => {}
+        }
+        let Some(compaction_plan) = compaction::plan(history, &self.limits) else {
+            // A short conversation can cross the trigger while still fitting.
+            return Ok(());
+        };
+        let removed = summarize_history(self, history, &compaction_plan, client, &|| {
+            self.cancellation.is_cancelled()
+        })?;
+        plan.messages = history.to_messages();
+        self.emit(Event::ContextCompacted {
+            removed_turns: removed,
+            remaining_turns: history.len(),
+        });
+        self.forget_context();
+        if request_estimate(self, plan)?.input_tokens > estimate.capacity {
+            return Err(compaction::cannot_fit_error());
+        }
+        Ok(())
+    }
+
     fn emit(&self, event: Event) {
         // Text is accumulated as it arrives and drawn straight away, which is
         // what makes an answer appear while it is being written rather than
@@ -401,6 +435,12 @@ impl Host for SessionHost {
                 self.draw_stream();
             }
             Event::StepRestarted { .. } => self.clear_streaming(),
+            Event::ContextCompacted {
+                removed_turns,
+                remaining_turns,
+            } => self.draw_notice(&format!(
+                "compacted {removed_turns} earlier turn(s); {remaining_turns} turn(s) remain"
+            )),
             _ => {}
         }
         if let Ok(mut events) = self.events.lock() {
@@ -757,6 +797,20 @@ impl SessionHost {
             self.context_used
                 .fetch_max(used, std::sync::atomic::Ordering::Relaxed);
         }
+    }
+
+    /// Captures new turns before compaction can remove them from model context.
+    fn capture_history(&self, history: &History) {
+        let start = self
+            .transcript_history_len
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .min(history.len());
+        self.transcript
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .extend(history_entries(&history.turns()[start..]));
+        self.transcript_history_len
+            .store(history.len(), std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Forgets the context reading, for a conversation that has been replaced.
@@ -1192,6 +1246,7 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
         inline: Mutex::new(rune_term::inline::Inline::new(terminal_width())),
         frame: Mutex::new(()),
         transcript: Mutex::new(history_entries(history.turns())),
+        transcript_history_len: std::sync::atomic::AtomicUsize::new(history.len()),
         transcript_open: std::sync::atomic::AtomicBool::new(false),
         typed: Mutex::new((String::new(), 0)),
         provider_order: config.settings.provider_order.clone(),
@@ -1352,6 +1407,8 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                         fresh.set_workspace(&config.workspace)?;
                         recorder = fresh;
                         history = History::new();
+                        host.transcript_history_len
+                            .store(0, std::sync::atomic::Ordering::Relaxed);
                         host.transcript
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1447,7 +1504,8 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                 // keys. A turn that ran inline made the keyboard dead for as
                 // long as the model took, which is the difference between
                 // correcting a long turn and waiting it out.
-                let history_start = history.len();
+                host.transcript_history_len
+                    .store(history.len(), std::sync::atomic::Ordering::Relaxed);
                 let steered = run_turn_steerable(&mut history, &host, reader, gesture);
                 // A correction the turn took in is part of the conversation the
                 // model saw, so a resumed session must see it too.
@@ -1470,11 +1528,12 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                         } else {
                             recorder.failed_turn(&partial, &err)?;
                         }
+                        let history_start = host
+                            .transcript_history_len
+                            .load(std::sync::atomic::Ordering::Relaxed)
+                            .min(history.len());
                         retain_partial_answer(&mut history, history_start, &partial);
-                        host.transcript
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .extend(history_entries(&history.turns()[history_start..]));
+                        host.capture_history(&history);
                         host.transcript
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1492,10 +1551,7 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                 // The turn is recorded before it is reported, so a session that
                 // dies while rendering still has its exchange on disk.
                 recorder.turn(&outcome)?;
-                host.transcript
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .extend(history_entries(&history.turns()[history_start..]));
+                host.capture_history(&history);
                 // The model is read back rather than captured at start, so a
                 // turn that ran after `/model` is billed to the model that ran.
                 record_usage(&config.paths, &host.model(), &outcome);
@@ -2491,13 +2547,62 @@ fn compact_history(
         );
     }
 
-    let request = rune_agent::compaction::render_summary_request(history, &plan);
+    match summarize_history(host, history, &plan, &rune_net::transport::agent(), &|| {
+        false
+    }) {
+        Ok(removed) => report(
+            host,
+            sink,
+            &format!(
+                "compacted {removed} earlier turn(s); {} turn(s) remain",
+                history.len()
+            ),
+        ),
+        Err(err) => report(host, sink, err.message()),
+    }
+}
+
+/// Estimates the actual dialect body, including instructions and tool schemas.
+fn request_estimate(
+    host: &SessionHost,
+    plan: &rune_net::provider::RequestPlan,
+) -> Result<rune_agent::tokens::Estimate> {
+    let body = host.dialect.build_request(plan)?;
+    let bytes = serde_json::to_vec(&body)
+        .map_err(|err| RuneError::new(ErrorCode::Internal, err.to_string()))?
+        .len() as u64;
+    // Include dialect defaults such as Anthropic's max_tokens reserve.
+    let output = ["max_tokens", "max_completion_tokens", "max_output_tokens"]
+        .iter()
+        .find_map(|key| body.get(key).and_then(serde_json::Value::as_u64))
+        .unwrap_or(0);
+    let capacity = rune_agent::tokens::usable_input_tokens(
+        host.context_limit
+            .load(std::sync::atomic::Ordering::Relaxed),
+        output,
+    );
+    Ok(rune_agent::tokens::Estimate::new(
+        bytes,
+        rune_agent::tokens::estimate_tokens(bytes),
+        capacity,
+    ))
+}
+
+/// Shares the summarizer between manual and automatic compaction.
+/// History changes only after a usable summary has arrived.
+fn summarize_history(
+    host: &SessionHost,
+    history: &mut History,
+    plan: &rune_agent::compaction::Plan,
+    client: &dyn rune_net::fetch::Fetch,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<usize> {
+    let request = rune_agent::compaction::render_summary_request(history, plan);
     let mut request_plan = rune_net::provider::RequestPlan::new(host.model());
     rune_agent::compaction::SUMMARY_INSTRUCTIONS.clone_into(&mut request_plan.instructions);
     request_plan.messages = rune_net::transport::one_shot_messages(&request);
-
-    let outcome = match rune_net::transport::stream_completion(
-        &rune_net::transport::agent(),
+    let outcome = rune_net::transport::stream_completion(
+        client,
         &host.endpoint,
         host.dialect.as_ref(),
         &request_plan,
@@ -2505,43 +2610,31 @@ fn compact_history(
             head: compaction_timeout(host),
             ..rune_net::transport::RequestTimeouts::from_limits(&host.limits)
         },
-        &|| false,
-    ) {
-        Ok(outcome) => outcome,
-        Err(err) => {
-            return report(
-                host,
-                sink,
-                &format!("compaction failed, nothing was changed: {err}"),
-            );
-        }
-    };
-
+        cancelled,
+    )
+    .map_err(|err| {
+        RuneError::new(
+            err.kind().code(),
+            format!("compaction failed, nothing was changed: {err}"),
+        )
+    })?;
     let summary = outcome.text();
-    // A summary that is empty or trivial would replace the conversation it was
-    // meant to compress with nothing, so it is refused and the history stands.
-    if let Err(err) = rune_agent::compaction::validate_summary(&summary) {
-        return report(
-            host,
-            sink,
-            &format!("compaction produced nothing usable: {err}"),
-        );
-    }
-
+    rune_agent::compaction::validate_summary(&summary).map_err(|err| {
+        RuneError::new(
+            err.code(),
+            format!("compaction produced nothing usable: {err}"),
+        )
+    })?;
+    host.capture_history(history);
     let removed = rune_agent::compaction::apply(
         history,
-        &plan,
+        plan,
         rune_agent::compaction::wrap_summary(&summary),
     );
+    host.transcript_history_len
+        .store(history.len(), std::sync::atomic::Ordering::Relaxed);
     host.record_usage(&outcome.usage);
-    report(
-        host,
-        sink,
-        &format!(
-            "compacted {removed} earlier turn(s); {} turn(s) remain",
-            history.len()
-        ),
-    )
+    Ok(removed)
 }
 
 /// Commits one line of command output through the renderer.
@@ -5518,6 +5611,230 @@ mod tests {
         assert_eq!(history.len(), 1, "the conversation was changed anyway");
     }
 
+    struct SummaryFixture {
+        reply: String,
+        status: u16,
+        requests: Mutex<Vec<serde_json::Value>>,
+        events: Option<Arc<Mutex<Vec<Event>>>>,
+    }
+
+    impl SummaryFixture {
+        fn new(reply: &str) -> Self {
+            Self {
+                reply: reply.to_owned(),
+                status: 200,
+                requests: Mutex::new(Vec::new()),
+                events: None,
+            }
+        }
+    }
+
+    impl rune_net::fetch::Fetch for SummaryFixture {
+        fn send(
+            &self,
+            request: rune_net::fetch::FetchRequest,
+        ) -> rune_net::error::NetResult<rune_net::fetch::FetchResponse> {
+            let body: serde_json::Value =
+                serde_json::from_slice(&request.body).expect("request JSON");
+            if body.to_string().contains("<context_handoff>") {
+                let events = self
+                    .events
+                    .as_ref()
+                    .expect("event observer")
+                    .lock()
+                    .expect("events");
+                assert!(
+                    events
+                        .iter()
+                        .any(|event| matches!(event, Event::ContextCompacted { .. })),
+                    "the compaction event must precede the next model request"
+                );
+            }
+            self.requests.lock().expect("requests").push(body);
+            let body = format!(
+                "data: {}\n\ndata: [DONE]\n\n",
+                serde_json::json!({
+                    "choices": [{"delta": {"content": self.reply}, "finish_reason": "stop"}]
+                })
+            );
+            Ok(rune_net::fetch::FetchResponse {
+                status: self.status,
+                content_type: "text/event-stream".to_owned(),
+                retry_after: None,
+                location: None,
+                body: Box::new(std::io::Cursor::new(body.into_bytes())),
+            })
+        }
+    }
+
+    fn compaction_fixture() -> (SessionHost, History, rune_net::provider::RequestPlan) {
+        let mut host = test_host();
+        for (name, value) in [
+            (rune_core::budget::LimitName::MaxToolResultBytes, 16 * 1024),
+            (rune_core::budget::LimitName::CompactionTriggerPercent, 50),
+        ] {
+            host.limits
+                .set(
+                    name,
+                    rune_core::budget::Budget::Bounded(value),
+                    rune_core::config::Layer::User,
+                )
+                .expect("limit");
+        }
+        let mut history = History::new();
+        for index in 0..4 {
+            history.push_user(format!("fixture question {index}"));
+            history.push_assistant(vec![rune_net::message::ContentPart::Text {
+                text: "earlier answer ".repeat(100),
+            }]);
+        }
+        history.push_user("continue the fixture");
+        host.capture_history(&history);
+        let mut plan = rune_net::provider::RequestPlan::new(host.model());
+        plan.messages = history.to_messages();
+        let tokens = request_estimate(&host, &plan)
+            .expect("estimate")
+            .input_tokens;
+        host.context_limit.store(
+            tokens.saturating_mul(100).saturating_div(60),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        (host, history, plan)
+    }
+
+    #[test]
+    fn crossing_the_configured_trigger_compacts_before_the_next_request() {
+        let (host, mut history, mut plan) = compaction_fixture();
+        let mut fetch = SummaryFixture::new(
+            "The earlier fixture exchanges established the task and its current progress.",
+        );
+        fetch.events = Some(Arc::clone(&host.events));
+        let before = history.clone();
+        let cut = rune_agent::compaction::plan(&history, &host.limits)
+            .expect("plan")
+            .removed_turns;
+        let estimate = request_estimate(&host, &plan).expect("estimate");
+        assert!(estimate.used_percent() >= 50 && estimate.used_percent() < 80);
+        host.prepare_request(&mut history, &mut plan, &fetch)
+            .expect("automatic compaction");
+        assert_eq!(fetch.requests.lock().expect("requests").len(), 1);
+        assert!(
+            fetch.requests.lock().expect("requests")[0]
+                .to_string()
+                .contains("<conversation>")
+        );
+        assert_eq!(plan.messages, history.to_messages());
+        assert!(history.turns()[0].text().contains("<context_handoff>"));
+        for (retained, original) in history.turns()[1..].iter().zip(&before.turns()[cut..]) {
+            assert_eq!(retained.parts, original.parts);
+        }
+        assert!(matches!(
+            host.events.lock().expect("events").last(),
+            Some(Event::ContextCompacted { .. })
+        ));
+        assert!(
+            request_estimate(&host, &plan)
+                .expect("estimate")
+                .used_percent()
+                < 50
+        );
+        host.capture_history(&history);
+        assert_eq!(
+            *host.transcript.lock().expect("transcript"),
+            history_entries(before.turns()),
+            "compaction must preserve the visible transcript without inserting the handoff"
+        );
+        history.validate().expect("compacted history is valid");
+        rune_net::transport::stream_completion(
+            &fetch,
+            &host.endpoint,
+            host.dialect.as_ref(),
+            &plan,
+            rune_net::transport::RequestTimeouts::from_limits(&host.limits),
+            &|| false,
+        )
+        .expect("next model request");
+        assert_eq!(fetch.requests.lock().expect("requests").len(), 2);
+    }
+
+    #[test]
+    fn below_the_trigger_no_summary_request_is_sent() {
+        let (host, mut history, mut plan) = compaction_fixture();
+        host.context_limit
+            .store(100_000, std::sync::atomic::Ordering::Relaxed);
+        let fetch = SummaryFixture::new("unused");
+        let before = history.to_messages();
+        host.prepare_request(&mut history, &mut plan, &fetch)
+            .expect("fits");
+        assert!(fetch.requests.lock().expect("requests").is_empty());
+        assert_eq!(history.to_messages(), before);
+        assert!(host.events.lock().expect("events").is_empty());
+    }
+
+    #[test]
+    fn failed_automatic_compaction_preserves_history_and_blocks_the_model_request() {
+        for (reply, status) in [("", 200), ("too short", 200), ("provider error", 500)] {
+            let (host, mut history, mut plan) = compaction_fixture();
+            let mut fetch = SummaryFixture::new(reply);
+            fetch.status = status;
+            let before = history.to_messages();
+            assert!(
+                host.prepare_request(&mut history, &mut plan, &fetch)
+                    .is_err()
+            );
+            assert_eq!(history.to_messages(), before);
+            assert_eq!(plan.messages, before);
+            assert!(host.events.lock().expect("events").is_empty());
+        }
+    }
+
+    #[test]
+    fn compaction_estimates_include_instructions_tools_and_dialect_output_reserve() {
+        let mut host = test_host();
+        host.dialect = Box::new(rune_net::anthropic::Anthropic);
+        host.context_limit
+            .store(20_000, std::sync::atomic::Ordering::Relaxed);
+        let mut plan = rune_net::provider::RequestPlan::new(host.model());
+        plan.messages = rune_net::transport::one_shot_messages("hello");
+        let small = request_estimate(&host, &plan).expect("estimate");
+        plan.instructions = "instructions ".repeat(100);
+        plan.tools = inventory::advertisement(&host.registry);
+        let full = request_estimate(&host, &plan).expect("estimate");
+        assert!(full.input_tokens > small.input_tokens);
+        assert_eq!(
+            full.capacity,
+            20_000 - rune_net::anthropic::DEFAULT_MAX_TOKENS
+        );
+        assert_eq!(
+            full.output_tokens, 0,
+            "output reserve is subtracted exactly once"
+        );
+    }
+
+    #[test]
+    fn compaction_during_a_turn_keeps_new_transcript_entries_and_partial_answers() {
+        let (host, mut history, mut plan) = compaction_fixture();
+        history.push_assistant(vec![rune_net::message::ContentPart::Text {
+            text: "completed step".to_owned(),
+        }]);
+        history.push_user("steered correction");
+        plan.messages = history.to_messages();
+        let fetch = SummaryFixture::new(
+            "The earlier exchanges established the task and its current progress.",
+        );
+        host.prepare_request(&mut history, &mut plan, &fetch)
+            .expect("compacted");
+        let start = host
+            .transcript_history_len
+            .load(std::sync::atomic::Ordering::Relaxed);
+        retain_partial_answer(&mut history, start, "partial next step");
+        host.capture_history(&history);
+        let entries = host.transcript.lock().expect("transcript");
+        for text in ["completed step", "steered correction", "partial next step"] {
+            assert_eq!(entries.iter().filter(|entry| entry.text == text).count(), 1);
+        }
+    }
+
     /// A sink that appends to a buffer the test can read back.
     struct SharedBuffer(Arc<Mutex<Vec<u8>>>);
 
@@ -6271,6 +6588,7 @@ mod tests {
             inline: Mutex::new(rune_term::inline::Inline::new(80)),
             frame: Mutex::new(()),
             transcript: Mutex::new(Vec::new()),
+            transcript_history_len: std::sync::atomic::AtomicUsize::new(0),
             transcript_open: std::sync::atomic::AtomicBool::new(false),
             typed: Mutex::new((String::new(), 0)),
             provider_order: Vec::new(),

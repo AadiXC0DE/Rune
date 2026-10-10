@@ -385,6 +385,14 @@ fn encode(event: &Event) -> serde_json::Value {
             "arguments": call.arguments,
             "reason": reason,
         }),
+        Event::ContextCompacted {
+            removed_turns,
+            remaining_turns,
+        } => json!({
+            "kind": "compacted",
+            "removed_turns": removed_turns,
+            "remaining_turns": remaining_turns,
+        }),
         Event::SteeringApplied { count, .. } => json!({ "kind": "steering", "count": count }),
         Event::Finished {
             reason,

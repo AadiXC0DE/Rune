@@ -1152,7 +1152,7 @@ impl<W: Write + Send + 'static> Host for TurnHost<W> {
                     self.server.config.context_window,
                 )));
             }
-            Event::SteeringApplied { .. } => {}
+            Event::SteeringApplied { .. } | Event::ContextCompacted { .. } => {}
         }
     }
 

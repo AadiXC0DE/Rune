@@ -150,6 +150,13 @@ pub enum Event {
         /// How many messages were applied.
         count: usize,
     },
+    /// Earlier context was summarized before a model request.
+    ContextCompacted {
+        /// Original turns replaced by the summary.
+        removed_turns: usize,
+        /// Turns remaining, including the summary.
+        remaining_turns: usize,
+    },
     /// The turn finished.
     Finished {
         /// How it ended.
@@ -223,6 +230,19 @@ pub trait Host {
     /// Returns whether requests are restricted to that preference.
     fn provider_strict(&self) -> bool {
         false
+    }
+
+    /// Prepares context immediately before sending a model request.
+    ///
+    /// A host may compact history and update the plan's messages. The default
+    /// leaves both unchanged, so context policy remains the host's decision.
+    fn prepare_request(
+        &self,
+        _history: &mut History,
+        _plan: &mut RequestPlan,
+        _client: &dyn Fetch,
+    ) -> Result<()> {
+        Ok(())
     }
 
     /// Reports an event.
@@ -528,7 +548,7 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
 fn stream_with_retry(
     client: &dyn Fetch,
     host: &dyn Host,
-    history: &History,
+    history: &mut History,
     step: u32,
     timeouts: transport::RequestTimeouts,
     max_attempts: usize,
@@ -564,6 +584,8 @@ fn stream_with_retry(
         plan.fast_mode = host.fast_mode();
         plan.provider_order = host.provider_order();
         plan.provider_strict = host.provider_strict();
+        host.prepare_request(history, &mut plan, client)?;
+        cancellation.check()?;
 
         // Each event is handed to the host as it is decoded, so text appears
         // while it is being produced rather than once the response has ended.

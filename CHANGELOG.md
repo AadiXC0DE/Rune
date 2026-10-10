@@ -56,6 +56,9 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Fixed
 
+- CLI sessions automatically compact earlier conversation before sending a model request
+  when its estimate reaches `compaction_trigger_percent`, including after tool results. A failed
+  summary preserves history and stops the pending request.
 - Changing the provider with `--provider` selects its configured model and
   capacity and discards the previous provider's endpoint and credential variable.
   Changing the model with `--model` discards the previous model's capacity;

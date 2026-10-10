@@ -133,7 +133,10 @@ resume replays the saved exchanges above the composer before you type. Its
 context meter starts with an estimate labelled `saved usage` or `history bytes`
 until a live provider count arrives. Prompts are remembered and recallable with
 `/history`. Custom slash commands live in `.rune/commands/*.md` in a repository,
-so a team can ship a workflow with the code.
+so a team can ship a workflow with the code. Before each CLI session request,
+Rune estimates the serialized input, including instructions and tool schemas,
+and summarizes earlier turns at `compaction_trigger_percent` of usable input
+capacity. A failed summary preserves the conversation and stops that request.
 
 Run `rune help` for everything, or see [COMMANDS.md](COMMANDS.md) for the full
 reference.
