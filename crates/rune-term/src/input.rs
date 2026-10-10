@@ -47,6 +47,8 @@ pub enum KeyAction {
     Transcript,
     /// Edit the draft in the configured external editor.
     ExternalEditor,
+    /// Search recorded prompts without submitting the composer.
+    HistorySearch,
 }
 
 /// Navigation while the transcript owns the terminal.
@@ -190,6 +192,21 @@ impl KeyReader {
         self.composer.set(text);
     }
 
+    /// Runs a query with a separate composer, then restores the entire draft.
+    /// Query edits cannot change the draft's caret, recall, kill, or undo state.
+    pub fn with_temporary_line<T>(&mut self, action: impl FnOnce(&mut Self) -> T) -> T {
+        let draft = std::mem::take(&mut self.composer);
+        let result = action(self);
+        self.composer = draft;
+        result
+    }
+
+    /// Restores a selected prompt as one undoable draft edit.
+    pub fn restore_prompt(&mut self, text: &str) {
+        self.composer.replace_draft(text);
+        self.composer.move_end();
+    }
+
     /// Hands the terminal to VISUAL, EDITOR, or vi, then reloads the draft.
     /// Failed edits leave the complete composer untouched.
     pub fn edit_external(&mut self) -> std::io::Result<()> {
@@ -297,6 +314,7 @@ impl KeyReader {
         let alt = key.modifiers.contains(KeyModifiers::ALT);
 
         match (key.code, control, alt) {
+            (KeyCode::Char('r'), true, _) => KeyAction::HistorySearch,
             (KeyCode::Char('g'), true, _) => KeyAction::ExternalEditor,
             (KeyCode::Char('o'), true, _) => KeyAction::Transcript,
             (KeyCode::Char('c'), true, _) => KeyAction::Cancel,
@@ -629,6 +647,50 @@ mod tests {
         reader.apply(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::ALT));
         assert_eq!(reader.line(), "界 read 'file space.txt' please e\u{301}");
         assert_eq!(reader.cursor_byte(), "界 read 'file space.txt'".len());
+    }
+
+    #[test]
+    fn history_search_requests_a_picker_without_editing_or_submitting() {
+        let mut reader = reader();
+        reader.replace("draft 界");
+        reader.apply(key(KeyCode::Left));
+        let before = (reader.line().to_owned(), reader.cursor_byte());
+        assert_eq!(
+            reader.handle(Event::Key(control('r'))),
+            Some(KeyAction::HistorySearch)
+        );
+        assert_eq!((reader.line().to_owned(), reader.cursor_byte()), before);
+        let mut release = control('r');
+        release.kind = KeyEventKind::Release;
+        assert_eq!(reader.handle(Event::Key(release)), None);
+        assert_eq!((reader.line().to_owned(), reader.cursor_byte()), before);
+    }
+
+    #[test]
+    fn search_queries_preserve_draft_state_and_restoration_is_one_undoable_edit() {
+        let mut reader = reader();
+        reader.replace("draft 界");
+        reader.apply(key(KeyCode::Left));
+        reader.apply(key(KeyCode::Char('!')));
+        let before = (reader.line().to_owned(), reader.cursor_byte());
+        let result = reader.with_temporary_line(|query| {
+            assert_eq!(query.line(), "");
+            query.apply(key(KeyCode::Char('x')));
+            query.apply(control('u'));
+            Err::<(), _>("cancelled")
+        });
+        assert_eq!(result, Err("cancelled"));
+        assert_eq!((reader.line().to_owned(), reader.cursor_byte()), before);
+        reader.restore_prompt("older middle word\n界");
+        assert_eq!(reader.line(), "older middle word\n界");
+        assert_eq!(reader.cursor_byte(), reader.line().len());
+        reader.apply(key(KeyCode::Left));
+        reader.restore_prompt("older middle word\n界");
+        assert_eq!(reader.cursor_byte(), reader.line().len());
+        reader.apply(control('_'));
+        assert_eq!((reader.line().to_owned(), reader.cursor_byte()), before);
+        reader.apply(control('_'));
+        assert_eq!(reader.line(), "draft 界");
     }
 
     #[test]

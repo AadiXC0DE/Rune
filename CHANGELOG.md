@@ -6,6 +6,10 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Added
 
+- Ctrl-R searches workspace prompt history by a case-insensitive substring.
+  Enter or Tab restores the selected prompt without submitting; cancelling
+  preserves the draft and caret, and restoration is undoable.
+
 - Tab completes workspace paths in idle prompts, quoting spaces and shell
   metacharacters as one selection. Multiple matches use Up/Down and Tab or
   Enter; completion stays inside configured workspace roots and is undoable.

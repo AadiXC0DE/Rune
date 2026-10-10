@@ -135,6 +135,12 @@ Tab lists their children. Completion only lists names inside the primary or
 configured additional workspace roots, including where symlinks lead.
 Use forward slashes in paths. Slash command completion keeps its existing keys.
 
+At the idle prompt, Ctrl-R searches recorded prompts from the current workspace,
+newest first. Type any substring, ignoring case, and use Up/Down to choose a
+match. Enter or Tab restores its exact text into the composer with the caret at
+the end, without submitting it. Escape or Ctrl-C cancels and preserves the draft
+and caret. Ctrl-_ undoes a restored prompt.
+
 Ctrl-G opens the draft in `$VISUAL`, falling back to `$EDITOR` and then `vi`.
 Editor commands may include arguments. Save and exit to reload the draft with
 the caret at its end; Ctrl-_ undoes the replacement. Rune restores terminal

@@ -2036,6 +2036,7 @@ fn question_key(
         KeyAction::Complete
         | KeyAction::Ignored
         | KeyAction::Transcript
+        | KeyAction::HistorySearch
         | KeyAction::ExternalEditor => None,
     }
 }
@@ -2078,6 +2079,7 @@ fn approval_key(
         KeyAction::Complete
         | KeyAction::Ignored
         | KeyAction::Transcript
+        | KeyAction::HistorySearch
         | KeyAction::ExternalEditor => None,
     }
 }
@@ -2499,6 +2501,12 @@ fn await_submission(
             paths = None;
             continue;
         }
+        if key == KeyAction::HistorySearch {
+            search_prompt_history(reader, host, out, recall)?;
+            selected = 0;
+            paths = None;
+            continue;
+        }
         if path_key(key, reader, &mut paths, &mut selected, context, limits) {
             continue;
         }
@@ -2696,7 +2704,7 @@ fn idle_key(
             }
             Idle::Stay
         }
-        KeyAction::Transcript | KeyAction::ExternalEditor => Idle::Stay,
+        KeyAction::Transcript | KeyAction::ExternalEditor | KeyAction::HistorySearch => Idle::Stay,
         KeyAction::Ignored => {
             // Typing narrows the list, so the highlight returns to the top
             // rather than pointing at a row that may no longer exist.
@@ -2794,7 +2802,7 @@ fn run_picker(
             KeyAction::Transcript => {
                 view_transcript(reader, host)?;
             }
-            KeyAction::ExternalEditor => {}
+            KeyAction::ExternalEditor | KeyAction::HistorySearch => {}
             KeyAction::Ignored => {
                 picker.set_query(reader.line());
             }
@@ -2803,6 +2811,64 @@ fn run_picker(
 
     reader.replace(&draft);
     Ok(chosen)
+}
+
+/// Searches workspace recall, restoring a choice without handing it to the session.
+fn search_prompt_history(
+    reader: &mut rune_term::input::KeyReader,
+    host: &SessionHost,
+    out: &LiveSink,
+    recall: &[String],
+) -> Result<()> {
+    let chosen = reader.with_temporary_line(|query| -> Result<Option<String>> {
+        let mut picker = history_picker(recall);
+        loop {
+            let rows = picker_menu(&mut picker, &Theme::no_color(), false, host.menu_room())
+                .into_iter()
+                .map(|row| {
+                    let preview = transcript::sanitize(&row)
+                        .replace('\n', " ↵ ")
+                        .replace('\t', " ");
+                    let slot = if row.starts_with("> ") {
+                        Slot::Accent
+                    } else {
+                        Slot::Dim
+                    };
+                    styled(&host.theme.sgr(slot, host.truecolor), &preview)
+                })
+                .collect::<Vec<_>>();
+            draw_prompt(query, host, out, &rows, rune_term::shell::prompt())?;
+            match query.read_key() {
+                KeyAction::Submit | KeyAction::Complete => {
+                    if let Some(prompt) = picker.selected() {
+                        return Ok(Some(prompt.to_owned()));
+                    }
+                }
+                KeyAction::Escape | KeyAction::Cancel | KeyAction::Interrupt => return Ok(None),
+                KeyAction::Up => {
+                    picker.up();
+                }
+                KeyAction::Down => {
+                    picker.down();
+                }
+                KeyAction::Ignored => picker.set_query(query.line()),
+                KeyAction::Transcript | KeyAction::ExternalEditor | KeyAction::HistorySearch => {}
+            }
+        }
+    })?;
+    if let Some(prompt) = chosen {
+        reader.restore_prompt(&prompt);
+    }
+    Ok(())
+}
+
+/// Newest first, with case-insensitive substring matching supplied by the picker.
+fn history_picker(recall: &[String]) -> rune_term::picker::Picker {
+    rune_term::picker::Picker::new(
+        "prompt history (Enter restores without submitting)",
+        recall.iter().rev().cloned().collect(),
+        rune_term::picker::DEFAULT_WINDOW,
+    )
 }
 
 /// Fits the model menu to the remaining rows before rendering its choices.
@@ -4615,6 +4681,42 @@ mod tests {
             report < sent,
             "the report is not above the prompt:\n{screen}"
         );
+    }
+
+    #[test]
+    fn history_search_matches_middle_words_in_workspace_prompts_newest_first() {
+        let dir = tempfile::tempdir().expect("temp");
+        let root = Utf8Path::from_path(dir.path()).expect("utf8");
+        let paths = Paths::resolve(
+            Some(root.as_str()),
+            Some(root.as_str()),
+            Some(root.as_str()),
+            Some(root.as_str()),
+            None,
+        );
+        paths.ensure_roots().expect("roots");
+        let mut history = crate::prompt_history::History::open(&paths).expect("history");
+        for (text, workspace, session) in [
+            ("older needle prompt\n界", root.to_owned(), "s1"),
+            ("unrelated latest prompt", root.to_owned(), "s2"),
+            ("newer needle prompt", root.to_owned(), "s2"),
+            ("other needle workspace", root.join("other"), "s3"),
+        ] {
+            history
+                .record(crate::prompt_history::Entry::new(text).located(&workspace, session))
+                .expect("record");
+        }
+        let reopened = crate::prompt_history::History::open(&paths).expect("reopen");
+        let mut picker = history_picker(&recorded_prompts(Some(&reopened), root));
+        assert_eq!(picker.len(), 3);
+        assert_eq!(picker.selected(), Some("newer needle prompt"));
+        picker.set_query("NEEDLE");
+        assert_eq!(picker.matches().len(), 2);
+        picker.down();
+        assert_eq!(picker.selected(), Some("older needle prompt\n界"));
+        picker.set_query("absent");
+        assert_eq!(picker.selected(), None);
+        assert_eq!(history_picker(&[]).selected(), None);
     }
 
     #[test]

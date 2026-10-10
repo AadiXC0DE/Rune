@@ -146,6 +146,19 @@ sys.exit(9 if mode == "editor-failed" else 0)
             environment["EDITOR"] = command
         if editor_mode == "editor-missing":
             environment["VISUAL"] = "rune-editor-that-does-not-exist"
+    if sys.argv[2:] == ["history-search"]:
+        state = root / "state"
+        state.mkdir(mode=0o700)
+        history_file = state / "history.jsonl"
+        history_file.write_text("".join(json.dumps({
+            "text": text, "workspace": str(workspace), "session": "fixture-history",
+        }) + "\n" for text, workspace in [
+            ("older needle prompt\n界", root),
+            ("newer needle prompt", root),
+            ("unrelated latest prompt", root),
+            ("other needle workspace", root / "other"),
+        ]))
+        history_file.chmod(0o600)
     master, slave = pty.openpty()
     fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 80, 0, 0))
     child = subprocess.Popen(
@@ -223,6 +236,24 @@ sys.exit(9 if mode == "editor-failed" else 0)
             else:
                 capture("typed", b"!", "draft !界")
                 submitted = "draft !界"
+        elif sys.argv[2:] == ["history-search"]:
+            capture("original", "draft 界".encode() + b"\x1b[D", "draft 界")
+            for label, cancel in [("escape", b"\x1b"), ("control-c", b"\x03")]:
+                capture("search-" + label, b"\x12absent", "no match for `absent`")
+                # Enter with no match must keep searching, never submit the query.
+                os.write(master, b"\r")
+                capture("cancel-" + label, cancel, "draft 界")
+                assert not prompts, prompts
+            capture("search-control-d", b"\x12", "prompt history")
+            capture("cancel-control-d", b"\x04", "draft 界")
+            capture("filtered", b"\x12NEEDLE", "> newer needle prompt")
+            assert b"other needle workspace" not in bytes(transcript), transcript
+            capture("selected", b"\x1b[B", "> older needle prompt")
+            capture("restored", b"\r", "  界")
+            assert not prompts, "accepting a history prompt must not submit it"
+            capture("undone", b"\x1f", "draft 界")
+            capture("redone", b"\x1br", "  界")
+            submitted = "older needle prompt\n界"
         elif sys.argv[2:] == ["newline"]:
             capture("first-line", "first 界 line".encode(), "first 界 line")
             # Alt-Enter is ESC followed by CR on a legacy terminal. It must

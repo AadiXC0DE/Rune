@@ -4,6 +4,68 @@
 #![allow(clippy::expect_used, clippy::panic)]
 
 #[test]
+fn history_search_restores_an_older_prompt_by_its_middle_word_without_submitting() {
+    let output = std::process::Command::new("python3")
+        .args([
+            "-c",
+            include_str!("terminal_draft.py"),
+            env!("CARGO_BIN_EXE_rune"),
+            "history-search",
+        ])
+        .output()
+        .expect("python3 is required for the Unix history search test");
+    assert!(
+        output.status.success(),
+        "history search failed:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let captures: Vec<(String, Vec<u8>)> =
+        serde_json::from_slice(&output.stdout).expect("captures");
+    assert_eq!(captures.len(), 12);
+    for (stage, bytes) in captures {
+        let mut grid = rune_term::Grid::new(80, 24).expect("grid");
+        grid.feed(&bytes).expect("frame");
+        let screen = grid.text();
+        let (expected, column) = match stage.as_str() {
+            "original" | "cancel-escape" | "cancel-control-c" | "cancel-control-d" | "undone" => {
+                assert!(
+                    !screen.contains("prompt history"),
+                    "stale search in {stage}"
+                );
+                ("> draft 界", 8)
+            }
+            "restored" | "redone" => {
+                assert!(
+                    !screen.contains("prompt history"),
+                    "stale search in {stage}"
+                );
+                assert!(screen.contains("> older needle prompt"), "{stage}");
+                ("  界", 4)
+            }
+            "filtered" | "selected" => {
+                assert!(!screen.contains("unrelated latest prompt"), "{stage}");
+                let chosen = if stage == "selected" {
+                    "older"
+                } else {
+                    "newer"
+                };
+                assert!(
+                    screen.contains(&format!("> {chosen} needle prompt")),
+                    "{stage}"
+                );
+                ("> NEEDLE", 8)
+            }
+            "search-control-d" => (">", 2),
+            "search-escape" | "search-control-c" => ("> absent", 8),
+            _ => panic!("unexpected stage {stage}"),
+        };
+        assert_eq!(grid.row_text(grid.cursor().row), expected, "{stage}");
+        assert_eq!(grid.cursor().col, column, "{stage}");
+    }
+}
+
+#[test]
 fn workspace_path_completion_submits_one_quoted_path_containing_spaces() {
     let output = std::process::Command::new("python3")
         .args([
