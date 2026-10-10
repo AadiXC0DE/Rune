@@ -20,6 +20,7 @@ Accepted anywhere on the command line.
 | `--offline` | - | Refuse every outbound network request. |
 | `--allow-unsandboxed` | - | Run commands where the host has no sandbox backend. Without this, such a host refuses them. |
 | `--json` | - | Emit machine-readable output where supported. |
+| `--accessible` | - | Use append-only labelled session output and line input for screen readers. |
 | `--theme` | `name` | Override the theme for this process. |
 | `--provider-order` | `a,b` | Prefer these upstream providers in order. |
 | `--provider-strict` | - | Restrict requests to the listed providers. |

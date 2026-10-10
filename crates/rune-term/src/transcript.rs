@@ -87,6 +87,39 @@ impl Entry {
     }
 }
 
+/// Plain logical lines with an explicit speaker on every line. No wrapping,
+/// Markdown styling, tool collapsing, or terminal control sequences are used.
+#[must_use]
+pub fn accessible_lines(entries: &[Entry]) -> Vec<String> {
+    entries
+        .iter()
+        .flat_map(|entry| {
+            let label = match entry.speaker {
+                Speaker::User => "User",
+                Speaker::Reasoning => "Reasoning",
+                Speaker::Assistant => "Assistant",
+                Speaker::Tool => "Tool",
+                Speaker::Notice => "Notice",
+            };
+            sanitize(&entry.text)
+                .lines()
+                .map(|line| format!("{label}: {line}"))
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+/// Appends plain lines using newlines, without cursor positioning or erasure.
+#[must_use]
+pub fn append_lines(lines: &[String]) -> Vec<u8> {
+    let mut out = String::new();
+    for line in lines {
+        out.push_str(&sanitize(line));
+        out.push('\n');
+    }
+    out.into_bytes()
+}
+
 /// A run of consecutive tool calls, collapsed to one row.
 ///
 /// A turn that calls five tools would otherwise push everything else off the
@@ -676,6 +709,29 @@ pub fn render_draft_at(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn accessible_output_labels_every_line_and_preserves_content_without_controls() {
+        let long = "W".repeat(300);
+        let entries = [
+            Entry::user(format!("{long}\nsecond line")),
+            Entry::reasoning("thinking"),
+            Entry::assistant("```rust\n  code\n```\x1b[2J\r\x08\x07"),
+            Entry::tool("first result\nsecond result"),
+            Entry::tool("another tool"),
+            Entry::notice("finished"),
+        ];
+        let bytes = append_lines(&accessible_lines(&entries));
+        let output = String::from_utf8(bytes).expect("UTF-8");
+        assert_eq!(
+            output,
+            format!(
+                "User: {long}\nUser: second line\nReasoning: thinking\nAssistant: ```rust\nAssistant:   code\nAssistant: ```\nTool: first result\nTool: second result\nTool: another tool\nNotice: finished\n"
+            )
+        );
+        assert!(output.chars().all(|ch| !ch.is_control() || ch == '\n'));
+        assert!(append_lines(&[]).is_empty());
+    }
 
     #[test]
     fn multiline_draft_carets_follow_graphemes_and_empty_lines() {

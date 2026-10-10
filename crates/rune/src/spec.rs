@@ -138,6 +138,10 @@ pub const GLOBAL_FLAGS: &[FlagSpec] = &[
         "Run commands where the host has no sandbox backend. Without this, such a host refuses them.",
     ),
     flag("--json", "Emit machine-readable output where supported."),
+    flag(
+        "--accessible",
+        "Use append-only labelled session output and line input for screen readers.",
+    ),
     option("--theme", "name", "Override the theme for this process."),
     option(
         "--provider-order",

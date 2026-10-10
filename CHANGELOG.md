@@ -6,6 +6,11 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Added
 
+- `--accessible` provides line input and append-only screen reader transcripts
+  with explicit speaker labels, completed replies, numbered questions, and
+  permission prompts. Saved sessions replay in the same format without cursor
+  movement or rewritten status rows.
+
 - Ctrl-R searches workspace prompt history by a case-insensitive substring.
   Enter or Tab restores the selected prompt without submitting; cancelling
   preserves the draft and caret, and restoration is undoable.

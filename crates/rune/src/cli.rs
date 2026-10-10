@@ -148,6 +148,8 @@ pub struct Launch {
     pub offline: bool,
     /// Whether a command may run where the host has no sandbox backend.
     pub allow_unsandboxed: bool,
+    /// Whether sessions use append-only, labelled output and line input.
+    pub accessible: bool,
     /// Whether output is machine readable.
     pub json: bool,
     /// Positional arguments after the command.
@@ -232,6 +234,7 @@ pub fn parse(args: Vec<OsString>, benchmark: bool) -> Result<Launch> {
         provider_strict: None,
         offline: false,
         allow_unsandboxed: false,
+        accessible: false,
         json: false,
         args: Vec::new(),
         flags: Vec::new(),
@@ -388,6 +391,7 @@ fn take_global(launch: &mut Launch, tokens: &[String], index: &mut usize) -> Res
             | "--offline"
             | "--allow-unsandboxed"
             | "--json"
+            | "--accessible"
     ) {
         if inline.is_some() {
             return Err(RuneError::invalid_field(
@@ -403,6 +407,7 @@ fn take_global(launch: &mut Launch, tokens: &[String], index: &mut usize) -> Res
             "--no-provider-strict" => launch.provider_strict = Some(false),
             "--offline" => launch.offline = true,
             "--allow-unsandboxed" => launch.allow_unsandboxed = true,
+            "--accessible" => launch.accessible = true,
             _ => launch.json = true,
         }
         *index = (*index).saturating_add(1);
@@ -728,6 +733,18 @@ mod tests {
         let launch = parse_list(&[]).expect("parse");
         assert_eq!(launch.command, Command::Interactive);
         assert!(launch.args.is_empty());
+        assert!(!launch.accessible);
+    }
+
+    #[test]
+    fn accessible_mode_is_explicit_and_accepts_no_value() {
+        let launch = parse_list(&["--accessible"]).expect("parse");
+        assert!(launch.accessible);
+        assert_eq!(launch.command, Command::Interactive);
+        let launch = parse_list(&["resume", "last", "--accessible"]).expect("parse");
+        assert!(launch.accessible);
+        assert_eq!(launch.resume, Some(ResumeTarget::Latest));
+        assert!(parse_list(&["--accessible=false"]).is_err());
     }
 
     #[test]

@@ -132,6 +132,15 @@ impl KeyReader {
         }
     }
 
+    /// Keeps canonical line input without enabling raw mode or terminal escapes.
+    #[must_use]
+    pub fn line_mode() -> Self {
+        Self {
+            composer: Composer::new(),
+            active: false,
+        }
+    }
+
     /// Returns whether keys are being read directly.
     #[must_use]
     pub const fn is_active(&self) -> bool {

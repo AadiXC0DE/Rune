@@ -445,7 +445,7 @@ fn run_interactive(
     // reaches a working session. A piped or machine invocation is not asked
     // anything: the error it already gets names what to do.
     let mut settings = settings.clone();
-    if settings.provider == Provider::Unconfigured && interactive_stdin() {
+    if settings.provider == Provider::Unconfigured && interactive_stdin() && !launch.accessible {
         let entry = connect_flow::choose_provider()?;
         // The flow writes the selection itself, so the only thing left is to
         // read it back rather than patch the values in by hand: the session then
@@ -466,7 +466,8 @@ fn run_interactive(
         Some(target) => Some(session_log::resolve_target(target, paths, workspace)?),
         None => None,
     };
-    let config = session::prepare(&settings, paths, workspace, resume)?;
+    let mut config = session::prepare(&settings, paths, workspace, resume)?;
+    config.accessible = launch.accessible;
     let stdin = std::io::stdin();
     let input = std::io::BufReader::new(stdin.lock());
     let code = session::run(config, input, std::io::stdout())?;

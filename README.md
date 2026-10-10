@@ -120,7 +120,18 @@ rune review                 # review the pending changes in this repository
 rune resume last            # continue the most recent session here
 ```
 
-In the interactive composer, Alt-Enter inserts a newline at the caret; Enter
+Use `rune --accessible` for a screen reader transcript, or
+`rune --accessible resume last` to replay and continue a saved conversation.
+Configure a provider and model first. This mode keeps the terminal's line input:
+Enter submits one line, and `/exit` or end of input quits. Replies are printed
+once after each turn, with explicit User, Assistant, Reasoning, Tool, and Notice
+labels. Output is append-only, without cursor controls, colours, live status
+rows, or menus. Permission prompts accept `yes` to run once and deny any other
+answer. Questions accept a numbered option or `/cancel`. `/model <id>` changes
+models; `/copy` points to terminal scrollback. Composer shortcuts and steering
+while a turn runs belong to the default interactive mode.
+
+In the default interactive composer, Alt-Enter inserts a newline at the caret; Enter
 submits the whole prompt. Draft newlines appear on separate rows and reach
 the provider as newline characters. Left and Right move across line breaks;
 the terminal caret follows the line being edited. Long lines scroll horizontally

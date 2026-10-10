@@ -30,7 +30,7 @@ use rune_session::usage::{HelperKind, Ledger, UsageRecord, now_ms};
 use rune_term::footer::{self, FooterState};
 use rune_term::input::KeyAction;
 use rune_term::shell::ExitReason;
-use rune_term::shell::{Action, Input, Shell};
+use rune_term::shell::{Action, Input, InputSource, Shell};
 use rune_term::theme::{Slot, Theme};
 use rune_term::transcript::{self, Display, Entry};
 use rune_tools::ask_user::{Answer, Answerer, Question, Unavailable};
@@ -40,6 +40,8 @@ use rune_tools::registry::Registry;
 
 /// Everything a session needs to run.
 pub struct SessionConfig {
+    /// Use canonical line input and append-only labelled output.
+    pub accessible: bool,
     /// Resolved settings.
     pub settings: Settings,
     /// State paths, used for the session log.
@@ -223,6 +225,7 @@ impl Answerer for TerminalQuestions {
 
 /// Host state for a turn.
 struct SessionHost {
+    accessible: bool,
     recorder: Option<Arc<Mutex<Recorder>>>,
     endpoint: Endpoint,
     dialect: Box<dyn Provider>,
@@ -951,6 +954,16 @@ impl SessionHost {
         menu: &[String],
         caret: (u16, u16),
     ) -> Result<Vec<u8>> {
+        if self.accessible {
+            let mut lines: Vec<String> = settled
+                .iter()
+                .map(|line| transcript::sanitize(line))
+                .collect();
+            if let Some(activity) = activity {
+                lines.extend(transcript::accessible_lines(&[Entry::notice(activity)]));
+            }
+            return Ok(transcript::append_lines(&lines));
+        }
         self.refresh_size();
         let footer_rows = self.status_rows();
         let mut inline = self
@@ -970,6 +983,9 @@ impl SessionHost {
 
     /// Removes the live region, for a clean exit.
     fn clear_region(&self) -> Result<Vec<u8>> {
+        if self.accessible {
+            return Ok(Vec::new());
+        }
         let mut inline = self
             .inline
             .lock()
@@ -1030,6 +1046,18 @@ impl SessionHost {
     ///
     /// `notice` is drawn as the activity line, above the input.
     fn draw_frame(&self, notice: Option<&str>, line: &str, column: usize) {
+        if self.accessible {
+            if let Some(notice) = notice {
+                let _frame = self
+                    .frame
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                self.show(&transcript::append_lines(&transcript::accessible_lines(&[
+                    Entry::notice(notice),
+                ])));
+            }
+            return;
+        }
         if let Ok(mut typed) = self.typed.lock() {
             line.clone_into(&mut typed.0);
             typed.1 = column;
@@ -1245,6 +1273,7 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
     };
     let recorder = Arc::new(Mutex::new(recorder));
     let host = SessionHost {
+        accessible: config.accessible,
         recorder: Some(Arc::clone(&recorder)),
         endpoint: config.endpoint,
         dialect: config.dialect,
@@ -1320,7 +1349,11 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
     // Enable raw input before announcing the session. Otherwise input sent in
     // response to the banner can have its Enter translated by canonical mode
     // before the key reader starts, leaving a complete prompt unsubmitted.
-    let mut reader = rune_term::input::KeyReader::new();
+    let mut reader = if config.accessible {
+        rune_term::input::KeyReader::line_mode()
+    } else {
+        rune_term::input::KeyReader::new()
+    };
     let keyed = reader.is_active();
 
     // The session identifier is announced up front so a resumed-or-new session
@@ -1335,10 +1368,17 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .id()
         );
-        let mut opening = vec![banner];
+        let mut opening = if config.accessible {
+            transcript::accessible_lines(&[
+                Entry::notice(banner),
+                Entry::notice("accessible mode: enter one line per prompt; /exit quits"),
+            ])
+        } else {
+            vec![banner]
+        };
         // Replay only for an interactive resume. These settled rows enter the
         // terminal's scrollback once, before the composer accepts any input.
-        if keyed && config.resume.is_some() {
+        if (keyed || config.accessible) && config.resume.is_some() {
             let entries = host
                 .transcript
                 .lock()
@@ -1395,7 +1435,6 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
     let mut recall = recorded_prompts(history_file.as_ref(), &config.workspace);
 
     let mut source = rune_term::shell::StdinSource::new(input);
-    let mut shell = Shell::new(&mut source);
 
     // One handler for both input paths, so a keystroke and a piped line mean
     // exactly the same thing.
@@ -1410,7 +1449,8 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                             sink: &mut LockedSink,
                             history_file: &mut Option<crate::prompt_history::History>,
                             reader: &mut rune_term::input::KeyReader,
-                            gesture: &mut rune_term::shell::EscapeGesture|
+                            gesture: &mut rune_term::shell::EscapeGesture,
+                            line_input: Option<&mut dyn InputSource>|
      -> Result<Step> {
         match input {
             Input::Command { name, arguments } => {
@@ -1435,6 +1475,9 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                 match handled {
                     Handled::Exit => return Ok(Step::Exit),
                     Handled::PickModel => return Ok(Step::PickModel),
+                    Handled::Copy if host.accessible => {
+                        note("accessible mode: copy the reply from terminal scrollback".to_owned());
+                    }
                     Handled::Copy => {
                         // The reply is read from the conversation rather than
                         // from the screen, because what is on screen has been
@@ -1525,17 +1568,20 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                 // The submitted line is committed to the flow before the turn
                 // runs, so what the user typed stays on screen once the reply
                 // replaces the region it was typed in.
-                let echo = transcript::render_prompt(
-                    rune_term::shell::prompt(),
-                    &text,
-                    usize::from(host.width()),
-                );
+                let echo = if host.accessible {
+                    transcript::accessible_lines(&[Entry::user(&text)])
+                } else {
+                    vec![transcript::render_prompt(
+                        rune_term::shell::prompt(),
+                        &text,
+                        usize::from(host.width()),
+                    )]
+                };
                 // The typed line is committed and an empty input row is drawn
                 // under it, so the caret has its own row from the moment the
                 // line is submitted rather than only once streaming starts.
                 let (prompt_row, caret) = host.idle_prompt();
-                let painted =
-                    host.paint(std::slice::from_ref(&echo), None, &prompt_row, &[], caret)?;
+                let painted = host.paint(&echo, None, &prompt_row, &[], caret)?;
                 sink.write_all(&painted)?;
                 sink.flush()?;
 
@@ -1578,7 +1624,11 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .begin_turn()?;
-                let steered = run_turn_steerable(&mut history, &host, reader, gesture);
+                let steered = if let Some(input) = line_input {
+                    run_turn_accessible(&mut history, &host, input)
+                } else {
+                    run_turn_steerable(&mut history, &host, reader, gesture)
+                };
                 recorder
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1629,7 +1679,7 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                             }
                             transcript.push(Entry::notice(err.message()));
                         }
-                        if !reader.is_active() {
+                        if !reader.is_active() && !host.accessible {
                             return Err(err);
                         }
                         let lines = report_failed_turn(&err, &host, steered.diagnostic.as_deref());
@@ -1666,7 +1716,11 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                 // terminal's search and copy. Nothing else writes to the
                 // terminal: the region below is redrawn in place.
                 let lines = report_turn(&outcome, &host)?;
-                let activity = SessionHost::activity_line(&outcome);
+                let activity = if host.accessible {
+                    None
+                } else {
+                    SessionHost::activity_line(&outcome)
+                };
                 close_turn(
                     &host,
                     sink,
@@ -1703,6 +1757,7 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                 &mut history_file,
                 &mut reader,
                 &mut cancellation_gesture,
+                None,
             )? {
                 Step::Exit => {
                     reason = ExitReason::Requested;
@@ -1722,14 +1777,46 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
             recall = recorded_prompts(history_file.as_ref(), &config.workspace);
         }
         reason
+    } else if config.accessible {
+        loop {
+            host.show(&transcript::append_lines(&[
+                "Input: enter a prompt or slash command".to_owned(),
+            ]));
+            let Some(line) = source.next_line()? else {
+                break ExitReason::EndOfInput;
+            };
+            let mut sink = LockedSink {
+                stream: Arc::clone(&out),
+            };
+            match handle_input(
+                Input::parse(&line),
+                &mut sink,
+                &mut history_file,
+                &mut reader,
+                &mut cancellation_gesture,
+                Some(&mut source),
+            )? {
+                Step::Exit => break ExitReason::Requested,
+                Step::Undo => report_undo(&host, &mut sink)?,
+                Step::PickModel => {
+                    flush_lines(
+                        &host,
+                        &mut sink,
+                        &["use /model <id>; rune models lists model ids".to_owned()],
+                    )?;
+                }
+                Step::Continue => {}
+            }
+        }
     } else {
+        let mut shell = Shell::new(&mut source);
         // A pipe has no keystrokes to drive a picker, so a model change is
         // reported instead of silently doing nothing.
         shell.run(|input| {
             let mut sink = LockedSink {
                 stream: Arc::clone(&out),
             };
-            match handle_input(input, &mut sink, &mut history_file, &mut reader, &mut cancellation_gesture)? {
+            match handle_input(input, &mut sink, &mut history_file, &mut reader, &mut cancellation_gesture, None)? {
                 Step::Exit => Ok(Action::Exit),
                 Step::Continue => Ok(Action::Continue),
                 Step::Undo => {
@@ -1758,6 +1845,110 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
     }
 
     Ok(reason.exit_code())
+}
+
+/// Runs with canonical line input, reading only explicit approval and question
+/// responses during a turn. Completed replies are settled once by the caller.
+fn run_turn_accessible(
+    history: &mut History,
+    host: &SessionHost,
+    input: &mut dyn InputSource,
+) -> SteeredTurn {
+    host.cancellation.reset();
+    let (requests, pending) = mpsc::channel();
+    *host
+        .approval_requests
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(requests);
+    let (questions, pending_questions) = mpsc::channel();
+    *host
+        .questions
+        .requests
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(questions);
+    let (outcome, diagnostic) = run_on_worker(
+        history,
+        |taken| turn::run_turn(taken, host),
+        || {
+            if let Ok(request) = pending.try_recv() {
+                let mut lines = approval_lines(&request, usize::MAX);
+                lines.push("type yes to run once; any other answer denies".to_owned());
+                host.show(&transcript::append_lines(&transcript::accessible_lines(&[
+                    Entry::notice(lines.join("\n")),
+                ])));
+                let answer = match input.next_line() {
+                    Ok(Some(line)) if line.trim().eq_ignore_ascii_case("yes") => Outcome::Allow,
+                    _ => Outcome::Deny,
+                };
+                let _ = request.answer.send(answer);
+            } else if let Ok(request) = pending_questions.try_recv() {
+                let answer = collect_accessible_questions(&request.questions, host, input);
+                let _ = request.answer.send(answer);
+            } else {
+                std::thread::sleep(rune_term::shell::POLL_INTERVAL);
+            }
+        },
+    );
+    *host
+        .approval_requests
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    *host
+        .questions
+        .requests
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    SteeredTurn {
+        outcome,
+        diagnostic,
+        applied: Vec::new(),
+        unsent: Vec::new(),
+    }
+}
+
+fn collect_accessible_questions(
+    questions: &[Question],
+    host: &SessionHost,
+    input: &mut dyn InputSource,
+) -> Result<Answer> {
+    let mut answers = Vec::new();
+    for question in questions {
+        let mut lines = vec![format!("Question: {}", question.text)];
+        for (index, option) in question.options.iter().enumerate() {
+            lines.push(format!(
+                "Option {}: {}",
+                index.saturating_add(1),
+                option.label
+            ));
+            if let Some(description) = &option.description {
+                lines.push(format!("Description: {description}"));
+            }
+        }
+        lines.push("Answer: enter an option number, or /cancel".to_owned());
+        host.show(&transcript::append_lines(&lines));
+        loop {
+            let Some(line) = input.next_line()? else {
+                host.cancellation.cancel();
+                return Ok(Answer::Cancelled);
+            };
+            if line.trim() == "/cancel" {
+                host.cancellation.cancel();
+                return Ok(Answer::Cancelled);
+            }
+            if let Some(choice) = line
+                .trim()
+                .parse::<usize>()
+                .ok()
+                .and_then(|number| number.checked_sub(1))
+                .filter(|index| *index < question.options.len())
+            {
+                answers.push(choice);
+                break;
+            }
+            host.show(b"Answer: invalid option number; try again or /cancel\n");
+        }
+    }
+    Ok(Answer::Chosen(answers))
 }
 
 /// Runs one turn while keeping the keyboard live.
@@ -3308,6 +3499,13 @@ fn flush_lines(host: &SessionHost, sink: &mut LockedSink, lines: &[String]) -> R
     if lines.is_empty() {
         return Ok(());
     }
+    let labelled;
+    let lines = if host.accessible {
+        labelled = transcript::accessible_lines(&[Entry::notice(lines.join("\n"))]);
+        &labelled
+    } else {
+        lines
+    };
     let (prompt_row, caret) = host.idle_prompt();
     let painted = host.paint(lines, None, &prompt_row, &[], caret)?;
     if !painted.is_empty() {
@@ -4115,6 +4313,9 @@ fn event_entries(host: &SessionHost) -> Vec<Entry> {
 
 /// Renders transcript entries into terminal lines.
 fn render_entries(entries: &[Entry], host: &SessionHost) -> Vec<String> {
+    if host.accessible {
+        return transcript::accessible_lines(entries);
+    }
     // Measured against the terminal rather than a fixed width, so a line is
     // wrapped where the reader's own window wraps it instead of mid-word at a
     // column that has nothing to do with this terminal.
@@ -4202,6 +4403,7 @@ pub fn prepare(
     )))?;
 
     Ok(SessionConfig {
+        accessible: false,
         settings: settings.clone(),
         paths: paths.clone(),
         resume,
@@ -4396,6 +4598,34 @@ mod tests {
         let end = text.rfind('G')?;
         let start = text.get(..end)?.rfind("\u{1b}[")?.saturating_add(2);
         text.get(start..end)?.parse().ok()
+    }
+
+    #[test]
+    fn accessible_frames_append_settled_lines_and_ignore_live_regions() {
+        let mut host = test_host();
+        host.accessible = true;
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let out: LiveSink = Arc::new(Mutex::new(SharedSink(Arc::clone(&bytes))));
+        *host.live_out.lock().expect("output lock") = Some(out);
+        let rows = vec!["live answer".to_owned()];
+        for _ in 0..10 {
+            host.emit(Event::TextDelta {
+                delta: "streamed ".to_owned(),
+            });
+            assert!(
+                host.paint_with_menu(&[], None, &rows, &rows, &rows, (2, 5))
+                    .expect("paint")
+                    .is_empty()
+            );
+        }
+        assert!(bytes.lock().expect("bytes").is_empty());
+        let lines = render_entries(&[Entry::assistant("finished\nnext line")], &host);
+        assert_eq!(
+            host.paint(&lines, None, &[], &[], (0, 0)).expect("paint"),
+            b"Assistant: finished\nAssistant: next line\n"
+        );
+        assert!(host.clear_region().expect("clear").is_empty());
+        assert!(!rune_term::input::KeyReader::line_mode().is_active());
     }
 
     #[test]
@@ -7218,6 +7448,7 @@ mod tests {
     /// Builds a session config whose terminal accepts no color.
     fn colorless_config() -> SessionConfig {
         SessionConfig {
+            accessible: false,
             settings: Settings::default(),
             paths: Paths::resolve(Some("/tmp"), None, None, None, Some("/tmp/s")),
             resume: None,
@@ -7259,6 +7490,7 @@ mod tests {
             .expect("registered");
         let questions = Arc::new(TerminalQuestions::default());
         SessionHost {
+            accessible: false,
             recorder: None,
             endpoint: Endpoint::new("https://example.invalid", "k"),
             dialect: Box::new(rune_net::chat_completions::ChatCompletions),
