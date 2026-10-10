@@ -27,7 +27,7 @@ use rune_policy::decision::Outcome;
 use rune_policy::review::{ReviewOutcome, ReviewRequest, ReviewSession, Reviewer};
 use rune_policy::rules::RuleSet;
 use rune_session::usage::{HelperKind, Ledger, UsageRecord, now_ms};
-use rune_term::footer::{self, FooterState};
+use rune_term::footer::{self, FooterState, ProviderRetry};
 use rune_term::input::KeyAction;
 use rune_term::shell::ExitReason;
 use rune_term::shell::{Action, Input, InputSource, Shell};
@@ -248,6 +248,8 @@ struct SessionHost {
     cancellation: Cancellation,
     steering: SteeringQueue,
     events: Arc<Mutex<Vec<Event>>>,
+    /// The pending or active retry, drawn only through the live footer.
+    provider_retry: Mutex<Option<ProviderRetry>>,
     /// Largest observed conversation size, initially estimated on resume.
     context_used: std::sync::atomic::AtomicU64,
     /// Present while the meter is seeded from saved history.
@@ -427,6 +429,29 @@ impl Host for SessionHost {
         // as they are. A sequence split across two deltas loses its introducer
         // in the first, so what arrives in the second is plain text.
         match &event {
+            Event::ProviderRetry {
+                next_attempt,
+                max_attempts,
+                delay,
+                ..
+            } => {
+                *self
+                    .provider_retry
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(ProviderRetry {
+                    attempt: *next_attempt,
+                    max_attempts: *max_attempts,
+                    delay: Some(*delay),
+                });
+                self.draw_stream();
+            }
+            Event::ProviderRetryFinished { .. }
+            | Event::TurnStarted { .. }
+            | Event::Finished { .. } => {
+                if self.clear_provider_retry() {
+                    self.draw_stream();
+                }
+            }
             Event::TextDelta { delta } => {
                 let delta = transcript::sanitize(delta);
                 if !self.journal_text(Some(&delta)) {
@@ -448,6 +473,15 @@ impl Host for SessionHost {
                     return;
                 }
                 self.clear_streaming();
+                if let Some(retry) = self
+                    .provider_retry
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .as_mut()
+                {
+                    retry.delay = None;
+                }
+                self.draw_stream();
             }
             Event::ContextCompacted {
                 removed_turns,
@@ -857,6 +891,10 @@ impl SessionHost {
     /// Returns the status line for the current state.
     fn status_line(&self, width: usize) -> String {
         let state = FooterState {
+            provider_retry: *self
+                .provider_retry
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
             model: lock_model(&self.model).clone(),
             permission_mode: self.mode,
             workspace: self.workspace.clone(),
@@ -1204,6 +1242,15 @@ impl SessionHost {
         }
     }
 
+    /// Clears retry state when a request advances or the turn is finalized.
+    fn clear_provider_retry(&self) -> bool {
+        self.provider_retry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            .is_some()
+    }
+
     /// Returns the sanitized answer currently visible in the live transcript.
     fn partial_answer(&self) -> String {
         self.streaming
@@ -1298,6 +1345,7 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
         cancellation: config.questions.cancellation.clone(),
         steering: SteeringQueue::from_limits(&limits),
         events: Arc::new(Mutex::new(Vec::new())),
+        provider_retry: Mutex::new(None),
         context_used: std::sync::atomic::AtomicU64::new(initial_context),
         context_source: Mutex::new(context_source),
         context_limit: std::sync::atomic::AtomicU64::new(context_limit(&config.settings, &limits)),
@@ -1699,6 +1747,7 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                         let lines = report_failed_turn(&err, &host, steered.diagnostic.as_deref());
                         host.clear_events();
                         host.clear_streaming();
+                        host.clear_provider_retry();
                         close_turn(&host, sink, reader, &lines, None, &steered.unsent)?;
                         return Ok(Step::Continue);
                     }
@@ -4832,6 +4881,74 @@ mod tests {
     }
 
     #[test]
+    fn retry_frames_replace_one_status_row_and_preserve_the_draft() {
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let host = test_host();
+        *host.live_out.lock().expect("output") =
+            Some(Arc::new(Mutex::new(SharedSink(Arc::clone(&bytes)))));
+        host.draw_stream_with("saved draft", 5);
+        let mut grid = rune_term::Grid::new(80, 24).expect("grid");
+        let replay = |grid: &mut rune_term::Grid| {
+            grid.feed(&std::mem::take(&mut *bytes.lock().expect("bytes")))
+                .expect("feed");
+            let screen = grid.text();
+            assert_eq!(screen.matches("ctrl-c cancel").count(), 1, "{screen}");
+            assert!(screen.contains("> saved draft"), "{screen}");
+            assert_eq!(grid.cursor().col, 7);
+            screen
+        };
+        replay(&mut grid);
+        for (attempt, delay) in [(2, 250), (3, 500)] {
+            host.emit(Event::ProviderRetry {
+                step: 1,
+                next_attempt: attempt,
+                max_attempts: 3,
+                delay: std::time::Duration::from_millis(delay),
+            });
+            let screen = replay(&mut grid);
+            assert_eq!(screen.matches("provider retry").count(), 1, "{screen}");
+            assert!(
+                screen.contains(&format!("provider retry {attempt}/3 in {delay}ms")),
+                "{screen}"
+            );
+            host.emit(Event::StepRestarted { step: 1 });
+            let screen = replay(&mut grid);
+            assert!(
+                screen.contains(&format!("provider retry {attempt}/3 |")),
+                "{screen}"
+            );
+            assert!(!screen.contains("ms"), "{screen}");
+        }
+        // A successful request clears the row before tool approval can begin.
+        // A new step and finalization also clear it; host error finalization
+        // does so before close_turn redraws the failed exchange.
+        for event in [
+            Event::ProviderRetryFinished { step: 1 },
+            Event::TurnStarted { step: 2 },
+            Event::Finished {
+                reason: StopReason::Cancelled,
+                usage: rune_net::stream::Usage::default(),
+                last_request: rune_net::stream::Usage::default(),
+                steps: 1,
+            },
+        ] {
+            host.emit(event);
+            assert!(!replay(&mut grid).contains("provider retry"));
+            host.emit(Event::ProviderRetry {
+                step: 1,
+                next_attempt: 2,
+                max_attempts: 3,
+                delay: std::time::Duration::from_millis(250),
+            });
+            replay(&mut grid);
+        }
+        host.clear_provider_retry();
+        host.draw_stream();
+        assert!(!replay(&mut grid).contains("provider retry"));
+        assert!(event_entries(&host).is_empty());
+    }
+
+    #[test]
     fn a_streamed_delta_cannot_drive_the_terminal() {
         // Streamed rows reach the terminal as they are, so a clipboard write, a
         // screen clear, or a switch to the alternate screen in model output
@@ -7622,6 +7739,7 @@ mod tests {
             cancellation: questions.cancellation.clone(),
             steering: SteeringQueue::new(4),
             events: Arc::new(Mutex::new(Vec::new())),
+            provider_retry: Mutex::new(None),
             context_used: std::sync::atomic::AtomicU64::new(0),
             context_source: Mutex::new(None),
             context_limit: std::sync::atomic::AtomicU64::new(

@@ -1295,6 +1295,69 @@ fn a_transient_failure_is_retried_and_the_turn_completes() {
 }
 
 #[test]
+fn two_failures_report_the_next_attempt_and_backoff_before_each_restart() {
+    let endpoint = MockEndpoint::start(vec![Script::text("recovered")]);
+    endpoint.fail_first(2);
+    let host = TestHost::new(endpoint);
+    let mut history = rune_agent::History::new();
+    history.push_user("hello");
+    let outcome = run_turn(&mut history, &host).expect("turn");
+    assert_eq!(outcome.text, "recovered");
+    assert_eq!(host.server.as_ref().expect("server").request_count(), 3);
+    let retries: Vec<_> = host
+        .events()
+        .into_iter()
+        .filter_map(|event| match event {
+            Event::ProviderRetry {
+                step,
+                next_attempt,
+                max_attempts,
+                delay,
+            } => Some((step, next_attempt, max_attempts, delay.as_millis())),
+            Event::StepRestarted { step } => Some((step, 0, 0, 0)),
+            Event::ProviderRetryFinished { step } => Some((step, 0, 0, 1)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        retries,
+        [
+            (1, 2, 10, 250),
+            (1, 0, 0, 0),
+            (1, 3, 10, 500),
+            (1, 0, 0, 0),
+            (1, 0, 0, 1),
+        ]
+    );
+}
+
+#[test]
+fn an_exhausted_budget_never_announces_a_pending_retry() {
+    let endpoint = MockEndpoint::start(vec![Script::Status {
+        code: 503,
+        body: "unavailable".to_owned(),
+    }]);
+    let mut host = TestHost::new(endpoint);
+    host.limits
+        .set(
+            rune_core::budget::LimitName::ProviderMaxAttempts,
+            rune_core::budget::Budget::Bounded(1),
+            rune_core::config::Layer::User,
+        )
+        .expect("limit");
+    let mut history = rune_agent::History::new();
+    history.push_user("hello");
+    run_turn(&mut history, &host).expect_err("exhausted");
+    assert!(
+        !host
+            .events()
+            .iter()
+            .any(|event| matches!(event, Event::ProviderRetry { .. }))
+    );
+    assert_eq!(host.server.as_ref().expect("server").request_count(), 1);
+}
+
+#[test]
 fn a_truncated_stream_is_retried_rather_than_accepted() {
     let endpoint = MockEndpoint::start(vec![
         Script::truncated("partial answer"),

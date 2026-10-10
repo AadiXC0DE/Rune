@@ -10,6 +10,7 @@
 //! passed in, which keeps a render reproducible from its arguments.
 
 use std::fmt::Write as _;
+use std::time::Duration;
 
 use rune_core::config::PermissionMode;
 
@@ -38,6 +39,8 @@ pub const HINTS: &str = "ctrl-c cancel  /help commands  esc clear";
 /// Everything the status line displays.
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub struct FooterState {
+    /// Pending or active provider retry, absent outside a retried request.
+    pub provider_retry: Option<ProviderRetry>,
     /// Model the session is talking to.
     pub model: String,
     /// Effective permission mode.
@@ -52,6 +55,17 @@ pub struct FooterState {
     pub context_limit: u64,
     /// Identifier of the session, shown shortened.
     pub session_id: String,
+}
+
+/// The provider attempt shown in the renderer-owned status row.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ProviderRetry {
+    /// Attempt to be sent, or currently being streamed, counting from one.
+    pub attempt: usize,
+    /// Maximum requests allowed for this step.
+    pub max_attempts: usize,
+    /// Pending wait, absent once the retry starts.
+    pub delay: Option<Duration>,
 }
 
 impl FooterState {
@@ -184,6 +198,9 @@ pub fn render(
 
 /// Returns the message shown when the terminal cannot hold the layout.
 fn too_small_row(state: &FooterState, layout: &Layout, theme: &Theme, truecolor: bool) -> String {
+    if let Some(retry) = state.provider_retry {
+        return retry_field(retry, theme, truecolor);
+    }
     let mut row = paint(theme, Slot::Error, truecolor, flag::BOLD);
     let _ = write!(
         row,
@@ -210,6 +227,10 @@ fn hint_row(theme: &Theme, truecolor: bool) -> String {
 /// Returns the status line.
 fn status_row(state: &FooterState, theme: &Theme, truecolor: bool) -> String {
     let mut row = String::new();
+    if let Some(retry) = state.provider_retry {
+        row.push_str(&retry_field(retry, theme, truecolor));
+        row.push_str(&divider(theme, truecolor));
+    }
     if !state.model.is_empty() {
         row.push_str(&paint(theme, Slot::Accent, truecolor, flag::BOLD));
         row.push_str(&state.model);
@@ -234,6 +255,21 @@ fn status_row(state: &FooterState, theme: &Theme, truecolor: bool) -> String {
         row.push_str(&reset(theme));
     }
     row
+}
+
+/// Puts the attempt and pending delay first so they survive width clipping.
+fn retry_field(retry: ProviderRetry, theme: &Theme, truecolor: bool) -> String {
+    let mut field = paint(theme, Slot::Accent, truecolor, flag::BOLD);
+    let _ = write!(
+        field,
+        "provider retry {}/{}",
+        retry.attempt, retry.max_attempts
+    );
+    if let Some(delay) = retry.delay {
+        let _ = write!(field, " in {}ms", delay.as_millis());
+    }
+    field.push_str(&reset(theme));
+    field
 }
 
 /// Returns the context usage field of the status line.
@@ -344,6 +380,7 @@ mod tests {
 
     fn state() -> FooterState {
         FooterState {
+            provider_retry: None,
             model: "claude-sonnet-4".to_owned(),
             permission_mode: PermissionMode::Auto,
             workspace: "/Users/dev/rune/".to_owned(),
@@ -442,6 +479,38 @@ mod tests {
         let layout = solve((100, 40), 1, false, DEFAULT_MINIMUM_ROWS);
         let rows = render(&state(), &layout, &Theme::fx_dark(), 100, true);
         assert_eq!(rows.len(), usize::from(layout.footer_rows));
+    }
+
+    #[test]
+    fn provider_retry_uses_one_existing_row_in_full_and_compact_layouts() {
+        let mut state = state();
+        state.provider_retry = Some(ProviderRetry {
+            attempt: 2,
+            max_attempts: 3,
+            delay: Some(Duration::from_millis(250)),
+        });
+        for height in [4, 24] {
+            let layout = solve((80, height), 1, false, DEFAULT_MINIMUM_ROWS);
+            for theme in [Theme::no_color(), Theme::high_contrast()] {
+                let rows = strip(&render(&state, &layout, &theme, 80, true));
+                assert_eq!(rows.len(), usize::from(layout.footer_rows));
+                assert!(
+                    rows.last()
+                        .expect("status")
+                        .starts_with("provider retry 2/3 in 250ms")
+                );
+                for width in [12, 32, 80] {
+                    for row in render(&state, &layout, &theme, width, true) {
+                        assert!(str_width(&row) <= width);
+                    }
+                }
+            }
+        }
+        state.provider_retry.as_mut().expect("retry").delay = None;
+        let status = status_of(&state, 80);
+        assert!(status.starts_with("provider retry 2/3 |"), "{status}");
+        assert!(!status.contains("250ms"), "{status}");
+        assert!(status.is_ascii(), "{status}");
     }
 
     #[test]

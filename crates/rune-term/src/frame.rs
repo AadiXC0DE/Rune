@@ -880,6 +880,7 @@ mod tests {
     #[test]
     fn a_frame_drawn_from_the_footer_layout_covers_the_terminal() {
         let state = crate::footer::FooterState {
+            provider_retry: None,
             model: "claude-sonnet-4".to_owned(),
             permission_mode: rune_core::config::PermissionMode::Auto,
             workspace: "/Users/dev/rune".to_owned(),

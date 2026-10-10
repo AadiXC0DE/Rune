@@ -103,6 +103,22 @@ pub enum Event {
         /// Step index, starting at one.
         step: u32,
     },
+    /// A retryable provider failure scheduled another request attempt.
+    ProviderRetry {
+        /// Step index, starting at one.
+        step: u32,
+        /// Next request attempt, counting the initial request as one.
+        next_attempt: usize,
+        /// Maximum requests allowed for this step.
+        max_attempts: usize,
+        /// Wait before the next attempt, including a provider Retry-After.
+        delay: Duration,
+    },
+    /// A retried provider request succeeded, before any tool decisions begin.
+    ProviderRetryFinished {
+        /// Step index, starting at one.
+        step: u32,
+    },
     /// A step's request failed and is being sent again.
     ///
     /// The retry streams its answer from the beginning, so the text and
@@ -614,7 +630,12 @@ fn stream_with_retry(
             &|| cancellation.is_cancelled(),
             &mut observe,
         ) {
-            Ok(outcome) => return Ok((outcome, !steering.is_empty())),
+            Ok(outcome) => {
+                if attempt > 1 {
+                    host.emit(Event::ProviderRetryFinished { step });
+                }
+                return Ok((outcome, !steering.is_empty()));
+            }
             Err(err) => {
                 if !err.is_retryable() {
                     return Err(err.to_rune_error());
@@ -626,6 +647,14 @@ fn stream_with_retry(
                     .retry_after_ms()
                     .map_or_else(|| backoff(attempt), Duration::from_millis);
                 last = Some(err.to_rune_error());
+                if attempt < max_attempts {
+                    host.emit(Event::ProviderRetry {
+                        step,
+                        next_attempt: attempt.saturating_add(1),
+                        max_attempts,
+                        delay,
+                    });
+                }
 
                 // Sleep in small slices so a cancellation is noticed promptly
                 // rather than after the whole delay.

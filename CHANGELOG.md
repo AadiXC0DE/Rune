@@ -6,6 +6,9 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Added
 
+- Provider retries show the next attempt, attempt limit, and pending delay in
+  the existing terminal status row. The delay disappears when the retry starts.
+
 - In the transcript viewer, Tab/Shift-Tab selects a tool and Space collapses or
   expands its preview. Requested expansions show up to 16 KiB and 200 wrapped
   content rows, preserving surrounding entries and the composer draft.

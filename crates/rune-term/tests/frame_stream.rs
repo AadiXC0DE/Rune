@@ -21,6 +21,7 @@ use rune_term::theme::Theme;
 
 fn state() -> FooterState {
     FooterState {
+        provider_retry: None,
         model: "claude-sonnet-4".to_owned(),
         permission_mode: PermissionMode::Auto,
         workspace: "/Users/dev/rune".to_owned(),

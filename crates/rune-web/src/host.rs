@@ -363,6 +363,21 @@ impl Host for Session {
 fn encode(event: &Event) -> serde_json::Value {
     match event {
         Event::TurnStarted { step } => json!({ "kind": "step", "step": step }),
+        Event::ProviderRetry {
+            step,
+            next_attempt,
+            max_attempts,
+            delay,
+        } => json!({
+            "kind": "provider_retry",
+            "step": step,
+            "next_attempt": next_attempt,
+            "max_attempts": max_attempts,
+            "delay_ms": u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
+        }),
+        Event::ProviderRetryFinished { step } => {
+            json!({ "kind": "provider_retry_finished", "step": step })
+        }
         Event::TextDelta { delta } => json!({ "kind": "text", "delta": delta }),
         Event::ReasoningDelta { delta } => json!({ "kind": "reasoning", "delta": delta }),
         Event::ToolStarted { call, activity } => json!({
