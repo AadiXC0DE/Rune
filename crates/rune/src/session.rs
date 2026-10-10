@@ -243,8 +243,10 @@ struct SessionHost {
     cancellation: Cancellation,
     steering: SteeringQueue,
     events: Arc<Mutex<Vec<Event>>>,
-    /// Tokens spent from the context window, summed across turns.
+    /// Largest observed conversation size, initially estimated on resume.
     context_used: std::sync::atomic::AtomicU64,
+    /// Present while the meter is seeded from saved history.
+    context_source: Mutex<Option<&'static str>>,
     /// Size of the context window, zero when the provider stated none.
     ///
     /// Atomic because choosing another model mid-session changes the window the
@@ -597,6 +599,10 @@ impl SessionHost {
             session_id: self.session_id_name(),
             workspace: &self.workspace,
             context_used: self.context_used.load(std::sync::atomic::Ordering::Relaxed),
+            context_source: *self
+                .context_source
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
             context_limit: self
                 .context_limit
                 .load(std::sync::atomic::Ordering::Relaxed),
@@ -699,12 +705,30 @@ impl SessionHost {
     /// turn: adding them counts the same history once per turn, which is what
     /// made a session appear to fill its window several times over.
     fn record_context_size(&self, used: u64) {
-        self.context_used
-            .fetch_max(used, std::sync::atomic::Ordering::Relaxed);
+        if used == 0 {
+            return;
+        }
+        let mut source = self
+            .context_source
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if source.take().is_some() {
+            // The first live reading supersedes the resume estimate, even when
+            // the saved per-turn usage overestimated a multi-request turn.
+            self.context_used
+                .store(used, std::sync::atomic::Ordering::Relaxed);
+        } else {
+            self.context_used
+                .fetch_max(used, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 
     /// Forgets the context reading, for a conversation that has been replaced.
     fn forget_context(&self) {
+        *self
+            .context_source
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
         self.context_used
             .store(0, std::sync::atomic::Ordering::Relaxed);
     }
@@ -733,6 +757,10 @@ impl SessionHost {
             permission_mode: self.mode,
             workspace: self.workspace.clone(),
             context_used: self.context_used.load(std::sync::atomic::Ordering::Relaxed),
+            context_source: *self
+                .context_source
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
             context_limit: self
                 .context_limit
                 .load(std::sync::atomic::Ordering::Relaxed),
@@ -1095,6 +1123,7 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
     let endpoint_url = config.endpoint.base_url.clone();
     let provider_name = config.settings.provider.to_string();
 
+    let (initial_context, context_source) = recorder.resumed_context();
     let host = SessionHost {
         endpoint: config.endpoint,
         dialect: config.dialect,
@@ -1113,7 +1142,8 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
         cancellation: config.questions.cancellation.clone(),
         steering: SteeringQueue::from_limits(&limits),
         events: Arc::new(Mutex::new(Vec::new())),
-        context_used: std::sync::atomic::AtomicU64::new(0),
+        context_used: std::sync::atomic::AtomicU64::new(initial_context),
+        context_source: Mutex::new(context_source),
         context_limit: std::sync::atomic::AtomicU64::new(context_limit(&config.settings, &limits)),
         theme,
         session_id: Mutex::new(recorder.id().to_string()),
@@ -2947,6 +2977,9 @@ fn render_status(info: &SessionInfo<'_>) -> String {
             footer::format_tokens(info.context_limit)
         );
     }
+    if let Some(source) = info.context_source {
+        let _ = writeln!(out, "context source {source} (estimate)");
+    }
     out.trim_end().to_owned()
 }
 
@@ -3276,6 +3309,8 @@ struct SessionInfo<'a> {
     workspace: &'a str,
     /// Tokens spent from the context window.
     context_used: u64,
+    /// Source of the initial resume estimate, absent for live readings.
+    context_source: Option<&'static str>,
     /// Size of the context window, zero when none is known.
     context_limit: u64,
     /// What this session has spent so far.
@@ -4793,6 +4828,28 @@ mod tests {
     }
 
     #[test]
+    fn live_usage_supersedes_the_resume_estimate_and_new_clears_its_source() {
+        let host = test_host();
+        host.context_used
+            .store(1234, std::sync::atomic::Ordering::Relaxed);
+        *host.context_source.lock().expect("source") = Some("saved usage");
+        assert!(host.status_line(120).contains("ctx ~1.2k (saved usage)"));
+        assert!(render_status(&host.info("p", "e")).contains("saved usage (estimate)"));
+        host.record_context_size(0);
+        assert!(host.status_line(120).contains("saved usage"));
+        host.record_context_size(1000);
+        let info = host.info("p", "e");
+        assert_eq!(info.context_used, 1000);
+        assert_eq!(info.context_source, None);
+        assert!(!host.status_line(120).contains("saved usage"));
+        *host.context_source.lock().expect("source") = Some("history bytes");
+        host.forget_context();
+        let info = host.info("p", "e");
+        assert_eq!(info.context_used, 0);
+        assert_eq!(info.context_source, None);
+    }
+
+    #[test]
     fn context_usage_is_the_size_of_the_conversation_not_a_running_sum() {
         // Every turn resends the whole conversation, so an input count already
         // contains the earlier turns. Summing them counts the same history once
@@ -6035,6 +6092,7 @@ mod tests {
             session_id: "sessiontest1".to_owned(),
             workspace: "/w",
             context_used: 0,
+            context_source: None,
             context_limit: rune_net::catalog::DEFAULT_CONTEXT_WINDOW,
             totals,
         }
@@ -6063,6 +6121,7 @@ mod tests {
             steering: SteeringQueue::new(4),
             events: Arc::new(Mutex::new(Vec::new())),
             context_used: std::sync::atomic::AtomicU64::new(0),
+            context_source: Mutex::new(None),
             context_limit: std::sync::atomic::AtomicU64::new(
                 rune_net::catalog::DEFAULT_CONTEXT_WINDOW,
             ),

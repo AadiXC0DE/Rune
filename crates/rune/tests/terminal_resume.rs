@@ -1,4 +1,4 @@
-//! R-038: saved exchanges appear in the real terminal before any resume input.
+//! R-038 and R-039: saved exchanges and context estimates appear before resume input.
 
 #![cfg(unix)]
 #![allow(clippy::expect_used, clippy::panic)]
@@ -48,6 +48,10 @@ fn interactive_resume_replays_saved_exchanges_once_before_input() {
         rows.extend((0..24).map(|row| grid.row_text(row)));
         let text = rows.join("\n");
         let caret = grid.cursor();
+        if capture.stage.starts_with("resume-") && capture.cols == 80 {
+            assert!(text.contains("ctx ~1.2k (saved usage)"), "{text}");
+            assert!(!text.contains("ctx 0%"), "{text}");
+        }
         if capture.stage == "new-session-before-input" {
             assert!(!text.contains("SAVED-REPLY"), "{text}");
             assert!(!text.contains("saved prompt"), "{text}");

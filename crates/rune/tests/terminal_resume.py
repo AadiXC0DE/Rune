@@ -40,8 +40,10 @@ class Provider(http.server.BaseHTTPRequestHandler):
             {"index": 0, "delta": {"content": answer}, "finish_reason": None},
             {"index": 0, "delta": {}, "finish_reason": "stop"},
         ]
+        usage = {"choices": [], "usage": {"prompt_tokens": 1234, "completion_tokens": 0}}
         body = ("".join("data: " + json.dumps({"choices": [choice]}) + "\n\n"
-                        for choice in choices) + "data: [DONE]\n\n").encode()
+                        for choice in choices) + "data: " + json.dumps(usage) + "\n\n"
+                + "data: [DONE]\n\n").encode()
         self.respond(body, "text/event-stream")
 
     def respond(self, body, content_type):

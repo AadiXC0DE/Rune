@@ -118,10 +118,11 @@ Completed exchanges are saved as sessions for the current workspace, and
 return an empty ID.
 
 Sessions are written as they run, so an interrupted session resumes. Interactive
-resume replays the saved exchanges above the composer before you type. Prompts
-are remembered and recallable with `/history`. Custom slash commands live in
-`.rune/commands/*.md` in a repository, so a team can ship a workflow with the
-code.
+resume replays the saved exchanges above the composer before you type. Its
+context meter starts with an estimate labelled `saved usage` or `history bytes`
+until a live provider count arrives. Prompts are remembered and recallable with
+`/history`. Custom slash commands live in `.rune/commands/*.md` in a repository,
+so a team can ship a workflow with the code.
 
 Run `rune help` for everything, or see [COMMANDS.md](COMMANDS.md) for the full
 reference.

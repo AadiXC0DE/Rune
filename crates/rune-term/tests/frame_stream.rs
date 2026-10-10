@@ -25,6 +25,7 @@ fn state() -> FooterState {
         permission_mode: PermissionMode::Auto,
         workspace: "/Users/dev/rune".to_owned(),
         context_used: 24_500,
+        context_source: None,
         context_limit: 200_000,
         session_id: "9f2c1a7b4e".to_owned(),
     }

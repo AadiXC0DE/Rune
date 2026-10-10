@@ -44,8 +44,10 @@ pub struct FooterState {
     pub permission_mode: PermissionMode,
     /// Working directory, shown as given.
     pub workspace: String,
-    /// Tokens already spent from the context window.
+    /// Observed or estimated conversation tokens.
     pub context_used: u64,
+    /// Source of a resume estimate, absent for live provider readings.
+    pub context_source: Option<&'static str>,
     /// Size of the context window, zero when the provider did not state one.
     pub context_limit: u64,
     /// Identifier of the session, shown shortened.
@@ -240,7 +242,26 @@ fn status_row(state: &FooterState, theme: &Theme, truecolor: bool) -> String {
 /// window the provider never stated would be a guess.
 fn context_field(state: &FooterState, theme: &Theme, truecolor: bool) -> String {
     let mut field = String::new();
-    if state.context_limit == 0 {
+    if let Some(source) = state.context_source {
+        let slot = if state.context_is_tight() {
+            Slot::Error
+        } else {
+            Slot::Dim
+        };
+        field.push_str(&paint(theme, slot, truecolor, 0));
+        let _ = write!(
+            field,
+            "ctx ~{} ({source})",
+            format_tokens(state.context_used)
+        );
+        if state.context_limit > 0 {
+            let _ = write!(
+                field,
+                " ({} left)",
+                format_tokens(state.context_remaining())
+            );
+        }
+    } else if state.context_limit == 0 {
         field.push_str(&paint(theme, Slot::Dim, truecolor, 0));
         let _ = write!(field, "ctx {}", format_tokens(state.context_used));
     } else {
@@ -324,6 +345,7 @@ mod tests {
             permission_mode: PermissionMode::Auto,
             workspace: "/Users/dev/rune/".to_owned(),
             context_used: 24_500,
+            context_source: None,
             context_limit: 200_000,
             session_id: "9f2c1a7b4e".to_owned(),
         }
@@ -481,6 +503,25 @@ mod tests {
         assert_eq!(over.context_remaining(), 0);
         let status = status_of(&over, 100);
         assert!(status.contains("100%"), "{status}");
+    }
+
+    #[test]
+    fn a_resume_estimate_names_its_source_even_below_one_percent() {
+        let mut resumed = state();
+        resumed.context_used = 1234;
+        for source in ["saved usage", "history bytes"] {
+            resumed.context_source = Some(source);
+            for window in [0, 200_000] {
+                resumed.context_limit = window;
+                let status = status_of(&resumed, 120);
+                assert!(
+                    status.contains(&format!("ctx ~1.2k ({source})")),
+                    "{status}"
+                );
+                assert!(!status.contains("ctx 0%"), "{status}");
+                assert_eq!(status.contains("198.7k left"), window > 0, "{status}");
+            }
+        }
     }
 
     #[test]

@@ -72,13 +72,19 @@ pub struct Summary {
 pub struct Recorder {
     store: SessionStore,
     turn: u64,
+    /// Initial estimate and its source, populated only when resuming.
+    resumed_context: (u64, Option<&'static str>),
 }
 
 impl Recorder {
     /// Creates a new session and its log.
     pub fn create(paths: &Paths, id: &SessionId) -> Result<Self> {
         let store = SessionStore::create(paths, id)?;
-        Ok(Self { store, turn: 0 })
+        Ok(Self {
+            store,
+            turn: 0,
+            resumed_context: (0, None),
+        })
     }
 
     /// Marks this session as a child of another.
@@ -111,7 +117,16 @@ impl Recorder {
     pub fn open(paths: &Paths, id: &SessionId) -> Result<Self> {
         let store = SessionStore::open(&paths.session_dir(id))?;
         let turn = store.turns();
-        Ok(Self { store, turn })
+        Ok(Self {
+            store,
+            turn,
+            resumed_context: (0, None),
+        })
+    }
+
+    /// Returns the initial context estimate and its source for a resumed log.
+    pub fn resumed_context(&self) -> (u64, Option<&'static str>) {
+        self.resumed_context
     }
 
     /// Returns the session identifier.
@@ -567,7 +582,30 @@ pub fn load(paths: &Paths, id: &SessionId) -> Result<(Recorder, History)> {
         .with_hint("resume the session that created it"));
     }
     let history = history_from(&state);
-    let recorder = Recorder::open(paths, id)?;
+    let mut recorder = Recorder::open(paths, id)?;
+    // Usage is per turn and can include several requests. It is an estimate,
+    // not an exact current request count. Never sum repeated conversation input.
+    let saved = state
+        .events
+        .iter()
+        .filter_map(|frame| match frame.event {
+            SessionEvent::UsageRecorded {
+                input_tokens,
+                output_tokens,
+            } => Some(input_tokens.saturating_add(output_tokens)),
+            _ => None,
+        })
+        .max()
+        .unwrap_or(0);
+    let bytes = u64::try_from(history.byte_len()).unwrap_or(u64::MAX);
+    let estimated = rune_agent::tokens::estimate_tokens(bytes).max(u64::from(!history.is_empty()));
+    recorder.resumed_context = if saved > 0 && saved >= estimated {
+        (saved, Some("saved usage"))
+    } else if estimated > 0 {
+        (estimated, Some("history bytes"))
+    } else {
+        (0, None)
+    };
     Ok((recorder, history))
 }
 
@@ -784,6 +822,47 @@ mod tests {
             steps: 1,
             calls: Vec::new(),
         }
+    }
+
+    #[test]
+    fn resume_estimates_context_without_summing_repeated_inputs() {
+        for usage in [Some((1234, 0)), None, Some((u64::MAX, 1))] {
+            let dir = tempfile::tempdir().expect("temp");
+            let root = Utf8Path::from_path(dir.path()).expect("utf8");
+            let paths = paths(root);
+            let key = id("sessionctx01");
+            let recorder = Recorder::create(&paths, &key).expect("created");
+            assert_eq!(recorder.resumed_context(), (0, None));
+            recorder.user_message("hello").expect("user");
+            if let Some((input_tokens, output_tokens)) = usage {
+                for _ in 0..2 {
+                    recorder
+                        .store
+                        .append(SessionEvent::UsageRecorded {
+                            input_tokens,
+                            output_tokens,
+                        })
+                        .expect("usage");
+                }
+            }
+            drop(recorder);
+            let (recorder, _) = load(&paths, &key).expect("resumed");
+            let expected = match usage {
+                Some((input, output)) => (input.saturating_add(output), Some("saved usage")),
+                None => (1, Some("history bytes")),
+            };
+            assert_eq!(recorder.resumed_context(), expected);
+        }
+    }
+
+    #[test]
+    fn resuming_an_empty_log_keeps_an_empty_context_meter() {
+        let dir = tempfile::tempdir().expect("temp");
+        let paths = paths(Utf8Path::from_path(dir.path()).expect("utf8"));
+        let key = id("sessionctx02");
+        drop(Recorder::create(&paths, &key).expect("created"));
+        let (recorder, _) = load(&paths, &key).expect("resumed");
+        assert_eq!(recorder.resumed_context(), (0, None));
     }
 
     #[test]
