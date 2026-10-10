@@ -61,6 +61,9 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Fixed
 
+- Ctrl-Y restores the last text cut with Ctrl-U or Ctrl-K at the caret, leaving
+  the caret after the restored text.
+
 - Short terminals describe the usable compact mode instead of saying to resize
   to continue while prompts are still accepted.
 

@@ -1938,7 +1938,7 @@ Resource accumulation after cancellation, session holder handover and concurrent
 - [x] R-059 | T2 | fix | tui | Route caught worker panic diagnostics through the renderer | acceptance: Trigger the bounded panic fixture in a debug worker and observe one diagnostic without duplicated status rows.
 - [x] R-060 | T2 | fix | observability | Report worker panics as internal failures | acceptance: A caught worker panic must report internal failure rather than the user-cancelled label.
 - [x] R-061 | T2 | fix | tui | Make the minimum-height warning match submission behavior | acceptance: At four rows either refuse prompt submission until resize or describe the supported compact mode, with the displayed statement matching request traffic.
-- [ ] R-062 | T2 | fix | input | Bind the existing yank operation to Ctrl-Y | acceptance: Type abc, Ctrl-U, Ctrl-Y and observe abc restored with the caret at its end.
+- [x] R-062 | T2 | fix | input | Bind the existing yank operation to Ctrl-Y | acceptance: Type abc, Ctrl-U, Ctrl-Y and observe abc restored with the caret at its end.
 - [ ] R-063 | T2 | fix | input | Bind the existing composer undo operation | acceptance: Insert and delete a Unicode grapheme, invoke the documented undo binding and observe the original draft and caret.
 - [ ] R-064 | T2 | fix | input | Bind the existing composer redo operation | acceptance: Undo a draft edit, invoke the documented redo binding and observe the edited draft and caret.
 - [ ] R-065 | T2 | feature | input | Add an explicit newline key binding | acceptance: Press the documented newline binding and submit a two-line prompt whose exact newline reaches the provider fixture.

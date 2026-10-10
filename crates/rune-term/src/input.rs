@@ -288,6 +288,10 @@ impl KeyReader {
                 self.composer.kill_to_end();
                 KeyAction::Ignored
             }
+            (KeyCode::Char('y'), true, _) => {
+                self.composer.yank();
+                KeyAction::Ignored
+            }
             (KeyCode::Char('w'), true, _) => {
                 self.composer.delete_word();
                 KeyAction::Ignored
@@ -714,6 +718,50 @@ mod tests {
         assert_eq!(reader.line(), "hello ");
         reader.apply(control('u'));
         assert_eq!(reader.line(), "");
+    }
+
+    #[test]
+    fn control_y_restores_control_u_text_with_the_caret_at_its_end() {
+        let mut reader = reader();
+        typed(&mut reader, "abc");
+        assert_eq!(
+            reader.handle(Event::Key(control('u'))),
+            Some(KeyAction::Ignored)
+        );
+        assert_eq!(reader.line(), "");
+        assert_eq!(reader.column(), 0);
+
+        assert_eq!(
+            reader.handle(Event::Key(control('y'))),
+            Some(KeyAction::Ignored)
+        );
+        assert_eq!(reader.line(), "abc");
+        assert_eq!(reader.column(), 3);
+    }
+
+    #[test]
+    fn control_y_inserts_control_k_text_at_the_caret() {
+        let mut reader = reader();
+        typed(&mut reader, "ab界");
+        reader.apply(key(KeyCode::Left));
+        reader.apply(control('k'));
+        assert_eq!(reader.line(), "ab");
+        reader.apply(key(KeyCode::Home));
+
+        assert_eq!(reader.apply(control('y')), KeyAction::Ignored);
+        assert_eq!(reader.line(), "界ab");
+        assert_eq!(reader.column(), 2);
+    }
+
+    #[test]
+    fn control_y_without_killed_text_leaves_the_draft_and_caret_unchanged() {
+        let mut reader = reader();
+        typed(&mut reader, "abc");
+        reader.apply(key(KeyCode::Left));
+
+        assert_eq!(reader.apply(control('y')), KeyAction::Ignored);
+        assert_eq!(reader.line(), "abc");
+        assert_eq!(reader.column(), 2);
     }
 
     #[test]
