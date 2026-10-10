@@ -670,6 +670,60 @@ fn permissions_explain_reports_mode_defaults_and_effective_outcomes() {
 }
 
 #[test]
+fn unknown_permission_mode_fails_with_the_accepted_values() {
+    for args in [
+        vec!["--permission-mode", "banana", "permissions"],
+        vec!["--permission-mode=banana", "permissions"],
+        vec!["permissions", "--permission-mode", "banana"],
+        vec!["permissions", "--permission-mode=banana", "--json"],
+        vec!["--permissions", "banana", "permissions"],
+        vec!["permissions", "--permissions=banana"],
+        vec![
+            "--permission-mode",
+            "banana",
+            "--permission-mode",
+            "auto",
+            "permissions",
+        ],
+        vec!["--permission-mode=", "permissions"],
+        vec!["--permission-mode", "   ", "permissions"],
+    ] {
+        let out = run(&args);
+        assert_eq!(out.status, Some(1), "{args:?}: {}", out.stderr);
+        assert!(out.stdout.is_empty(), "{}", out.stdout);
+        for expected in [
+            "invalid_field",
+            "--permission-mode",
+            "accepted modes: ask, auto, full-access",
+        ] {
+            assert!(out.stderr.contains(expected), "{args:?}: {}", out.stderr);
+        }
+    }
+}
+
+#[test]
+fn accepted_permission_modes_and_aliases_still_apply() {
+    for (raw, expected) in [
+        ("ask", "ask"),
+        ("auto", "auto"),
+        ("full-access", "full_access"),
+        ("full_access", "full_access"),
+        ("fullaccess", "full_access"),
+        ("yolo", "full_access"),
+        (" ASK ", "ask"),
+        (" FULL-ACCESS ", "full_access"),
+    ] {
+        for flag in ["--permission-mode", "--permissions"] {
+            let out = run(&["permissions", flag, raw, "--json"]);
+            assert_eq!(out.status, Some(0), "{flag} {raw}: {}", out.stderr);
+            assert!(out.stderr.is_empty(), "{}", out.stderr);
+            let value: serde_json::Value = serde_json::from_str(&out.stdout).expect("valid json");
+            assert_eq!(value["mode"], expected, "{flag} {raw}: {value}");
+        }
+    }
+}
+
+#[test]
 fn permissions_without_an_action_still_lists_rules() {
     let out = run(&["permissions", "--json"]);
     assert_eq!(out.status, Some(0), "{}", out.stderr);

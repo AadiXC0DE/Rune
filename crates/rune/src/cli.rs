@@ -443,7 +443,17 @@ fn take_global(launch: &mut Launch, tokens: &[String], index: &mut usize) -> Res
             }
             launch.effort = Some(value);
         }
-        "--permission-mode" => launch.permission_mode = Some(value),
+        "--permission-mode" => {
+            if rune_core::config::PermissionMode::from_name(&value).is_none() {
+                return Err(RuneError::invalid_field(
+                    canonical,
+                    format!(
+                        "`{value}` is not a permission mode; accepted modes: ask, auto, full-access (aliases: full_access, fullaccess, yolo)"
+                    ),
+                ));
+            }
+            launch.permission_mode = Some(value);
+        }
         "--add-dir" => launch.add_dirs.push(value),
         "--theme" => launch.theme = Some(value),
         "--provider-order" => launch.provider_order = Some(value),
@@ -955,6 +965,7 @@ mod tests {
                 list.push(match flag.name {
                     "--limit" => "list_entries=5",
                     "--effort" => "high",
+                    "--permission-mode" => "ask",
                     _ => "value",
                 });
             }
