@@ -115,7 +115,7 @@ Show the permission mode and rules
 
 | Flag | Description |
 |---|---|
-| `--explain <target>` | Explain the decision for one target. |
+| `--explain <target>` | Explain one tool:target action, such as shell:pwd. JSON includes the outcome, deciding rule and layer. |
 | `--json` | Emit JSON. |
 ### `rune sandbox explain [--external-access] [--json] -- <command>`
 

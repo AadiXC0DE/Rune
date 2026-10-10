@@ -135,6 +135,30 @@ pub fn explain(rules: &RuleSet, mode: PermissionMode, tool: &str, target: &str) 
     }
 }
 
+/// Reports one action's effective outcome and deciding rule as JSON.
+#[must_use]
+pub fn explain_json(
+    rules: &RuleSet,
+    mode: PermissionMode,
+    tool: &str,
+    target: &str,
+) -> serde_json::Value {
+    let fallback = rune_policy::decision::mode_default(mode);
+    let decision = rules.evaluate(tool, target, fallback);
+    let outcome = rune_agent::turn::effective_outcome(mode, decision.outcome);
+    serde_json::json!({
+        "mode": mode.as_str(),
+        "tool": tool,
+        "target": target,
+        "outcome": outcome.as_str(),
+        "rule": decision.rule,
+        "layer": decision.layer.as_str(),
+        "from_rule": decision.from_rule,
+        "considered": decision.considered,
+        "explanation": decision.explain(),
+    })
+}
+
 /// Renders the rule table for a terminal.
 #[must_use]
 pub fn render(rules: &RuleSet, mode: PermissionMode) -> String {

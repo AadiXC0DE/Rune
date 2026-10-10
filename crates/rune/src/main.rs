@@ -1030,16 +1030,32 @@ fn run_reference(launch: &Launch) -> Result<ExitCode> {
 fn run_permissions(settings: &Settings, launch: &Launch, output: &OutputFlags) -> Result<ExitCode> {
     let rules = permissions::validated(settings)?;
 
-    // An action given as a positional argument is explained rather than listed,
-    // because that is the question a user actually has.
-    if let Some(action) = launch.args.first() {
-        let text = permissions::explain(
-            &rules,
-            settings.permission_mode,
-            action,
-            launch.args.get(1).map_or("", String::as_str),
-        );
-        println!("{text}");
+    let action = if let Some(raw) = launch.flag("--explain") {
+        let (tool, target) = raw
+            .split_once(':')
+            .filter(|(tool, target)| !tool.is_empty() && !target.is_empty())
+            .ok_or_else(|| {
+                RuneError::invalid_field("explain", "expected a tool:target action")
+                    .with_hint("use `rune permissions --explain shell:pwd`")
+            })?;
+        Some((tool, target))
+    } else {
+        // Preserve the existing positional tool and target syntax.
+        launch
+            .args
+            .first()
+            .map(|tool| (tool.as_str(), launch.args.get(1).map_or("", String::as_str)))
+    };
+    if let Some((tool, target)) = action {
+        if output.json {
+            let value = permissions::explain_json(&rules, settings.permission_mode, tool, target);
+            println!("{}", serde_json::to_string_pretty(&value)?);
+        } else {
+            println!(
+                "{}",
+                permissions::explain(&rules, settings.permission_mode, tool, target)
+            );
+        }
         return Ok(ExitCode::from(EXIT_OK));
     }
 

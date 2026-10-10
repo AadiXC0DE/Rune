@@ -287,7 +287,7 @@ pub const ACCOUNT: &[CommandSpec] = &[
             option(
                 "--explain",
                 "target",
-                "Explain the decision for one target.",
+                "Explain one tool:target action, such as shell:pwd. JSON includes the outcome, deciding rule and layer.",
             ),
             flag("--json", "Emit JSON."),
         ],

@@ -56,6 +56,9 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Fixed
 
+- `rune permissions --explain shell:pwd --json` reports one structured decision
+  with its outcome, deciding rule and source layer. Positional explanations also
+  honor `--json`.
 - `rune tree last` shows the branch structure of the most recent saved session
   in the current workspace, including JSON output.
 - `rune session last` inspects the most recent saved session in the current

@@ -545,6 +545,129 @@ fn an_unknown_limit_name_is_rejected() {
 }
 
 #[test]
+fn permissions_explain_flag_reports_one_structured_decision() {
+    for args in [
+        vec!["permissions", "--explain", "shell:pwd", "--json"],
+        vec!["permissions", "--explain=shell:pwd", "--json"],
+    ] {
+        let out = run(&args);
+        assert_eq!(out.status, Some(0), "{}", out.stderr);
+        assert!(out.stderr.is_empty(), "{}", out.stderr);
+        let value: serde_json::Value = serde_json::from_str(&out.stdout).expect("one JSON object");
+        assert_eq!(value["tool"], "shell");
+        assert_eq!(value["target"], "pwd");
+        assert_eq!(value["mode"], "auto");
+        assert_eq!(value["outcome"], "allow");
+        assert_eq!(value["rule"], "shell pwd");
+        assert_eq!(value["layer"], "default");
+        assert!(value.get("rules").is_none(), "{value}");
+    }
+}
+
+#[test]
+fn permissions_explanations_preserve_positional_and_text_output() {
+    let positional = run(&["permissions", "shell", "pwd"]);
+    let flagged = run(&["permissions", "--explain", "shell:pwd"]);
+    assert_eq!(positional.status, Some(0), "{}", positional.stderr);
+    assert_eq!(flagged.status, Some(0), "{}", flagged.stderr);
+    assert_eq!(flagged.stdout, positional.stdout);
+    assert_eq!(
+        flagged.stdout,
+        "shell `pwd`: allowed (allow: matched `shell pwd` at the default layer)\n"
+    );
+
+    let json = run(&["permissions", "shell", "pwd", "--json"]);
+    assert_eq!(json.status, Some(0), "{}", json.stderr);
+    let value: serde_json::Value = serde_json::from_str(&json.stdout).expect("one JSON object");
+    assert_eq!(value["outcome"], "allow");
+    assert_eq!(value["rule"], "shell pwd");
+}
+
+#[test]
+fn permissions_explain_preserves_colons_in_the_target() {
+    let out = run(&[
+        "permissions",
+        "--explain",
+        "read_file:path:segment",
+        "--json",
+    ]);
+    assert_eq!(out.status, Some(0), "{}", out.stderr);
+    let value: serde_json::Value = serde_json::from_str(&out.stdout).expect("one JSON object");
+    assert_eq!(value["tool"], "read_file");
+    assert_eq!(value["target"], "path:segment");
+    assert_eq!(value["outcome"], "allow");
+    assert_eq!(value["rule"], "read_file *");
+}
+
+#[test]
+fn permissions_explain_rejects_malformed_actions() {
+    for action in ["pwd", ":pwd", "shell:", ""] {
+        let out = run(&["permissions", "--explain", action]);
+        assert_eq!(out.status, Some(1), "{action}: {}", out.stderr);
+        assert!(out.stdout.is_empty(), "{}", out.stdout);
+        assert!(out.stderr.contains("invalid_field"), "{}", out.stderr);
+        assert!(out.stderr.contains("tool:target"), "{}", out.stderr);
+        assert!(out.stderr.contains("shell:pwd"), "{}", out.stderr);
+    }
+}
+
+#[test]
+fn permissions_explain_reports_mode_defaults_and_effective_outcomes() {
+    for (mode, action, outcome, rule, from_rule) in [
+        ("ask", "shell:pwd", "ask", "no rule matched `pwd`", false),
+        (
+            "auto",
+            "web_fetch:https://example.com",
+            "deny",
+            "web_fetch *",
+            true,
+        ),
+        (
+            "full-access",
+            "web_fetch:https://example.com",
+            "allow",
+            "web_fetch *",
+            true,
+        ),
+    ] {
+        let out = run(&[
+            "permissions",
+            "--permission-mode",
+            mode,
+            "--explain",
+            action,
+            "--json",
+        ]);
+        assert_eq!(out.status, Some(0), "{}", out.stderr);
+        let value: serde_json::Value = serde_json::from_str(&out.stdout).expect("one JSON object");
+        assert_eq!(value["outcome"], outcome, "{mode}: {value}");
+        assert_eq!(value["rule"], rule, "{mode}: {value}");
+        assert_eq!(value["from_rule"], from_rule, "{mode}: {value}");
+        assert_eq!(value["layer"], "default");
+    }
+}
+
+#[test]
+fn permissions_without_an_action_still_lists_rules() {
+    let out = run(&["permissions", "--json"]);
+    assert_eq!(out.status, Some(0), "{}", out.stderr);
+    let value: serde_json::Value = serde_json::from_str(&out.stdout).expect("one JSON object");
+    assert_eq!(value["mode"], "auto");
+    let rules = value["rules"].as_array().expect("rules array");
+    assert!(
+        rules
+            .iter()
+            .any(|rule| rule["tool"] == "shell" && rule["pattern"] == "pwd")
+    );
+    assert!(value.get("outcome").is_none(), "{value}");
+
+    let text = run(&["permissions"]);
+    assert_eq!(text.status, Some(0), "{}", text.stderr);
+    assert!(text.stdout.contains("mode: auto"), "{}", text.stdout);
+    assert!(text.stdout.contains("pattern"), "{}", text.stdout);
+}
+
+#[test]
 fn config_explain_reports_the_source_layer() {
     let out = run(&["config", "--json"]);
     assert_eq!(out.status, Some(0));
