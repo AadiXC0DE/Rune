@@ -160,6 +160,10 @@ uses terminal defaults, and terminal palette customization can affect indexed
 colors. `NO_COLOR`, including an empty value, suppresses colors even when
 high-contrast is selected. Accessible mode continues to produce colorless output.
 
+Run `/help` to list commands and the active input bindings, including menu and
+transcript controls, cancellation precedence, and bracketed paste behavior.
+Line-input sessions report their input mode instead of composer shortcuts.
+
 In the default interactive composer, Alt-Enter inserts a newline at the caret; Enter
 submits the whole prompt. Draft newlines appear on separate rows and reach
 the provider as newline characters. Left and Right move across line breaks;

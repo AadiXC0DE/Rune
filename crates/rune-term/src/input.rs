@@ -16,6 +16,73 @@ use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 use crate::editor::Composer;
 
+/// Describes the bindings used by this reader and the session's input modes.
+/// Line input leaves editing to the terminal instead of the Rune composer.
+#[must_use]
+pub fn render_bindings_help(active: bool) -> String {
+    if !active {
+        return "Input: terminal line mode\nEnter submits one line; end of input leaves the session.\nComposer shortcuts, menus, and live steering require interactive key input."
+            .to_owned();
+    }
+    format!(
+        "Keyboard bindings (interactive key input)
+
+Composer:
+  Enter         submit the draft; while a turn runs, queue steering
+  Alt-Enter     insert a newline at the caret
+  Left / Right  move by one grapheme, including across newlines
+  Home / Ctrl-A move to the start of the whole draft
+  End / Ctrl-E  move to the end of the whole draft
+  Ctrl-B / Alt-Left   move one word left
+  Ctrl-F / Alt-Right  move one word right
+  Backspace     delete the grapheme before the caret
+  Delete        delete the grapheme at the caret
+  Ctrl-D        delete at the caret; empty idle draft leaves the session
+  Ctrl-W        delete the word before the caret
+  Ctrl-U        cut from the caret to the start of the draft
+  Ctrl-K        cut from the caret to the end of the draft
+  Ctrl-Y        yank the last cut text at the caret
+  Ctrl-_        undo a draft edit (Ctrl-Shift-minus; legacy Ctrl-7)
+  Alt-R         redo a draft edit (Alt with lowercase r)
+  Ctrl-G        edit the draft in VISUAL, EDITOR, or vi
+
+Idle prompt and menus:
+  Up / Down     recall prompts; select a menu row when a menu is open
+  Tab           complete a slash command or workspace path
+  Enter         accept an incomplete command; run a complete command
+  Tab / Enter   accept a path, model, or history selection
+  Ctrl-R        search workspace history by substring; type to filter
+  Esc / Ctrl-C / Ctrl-D  cancel model/history menus (Ctrl-D: empty query)
+                cancelling preserves the draft and caret
+  Esc           close a path menu first; otherwise clear the idle draft
+
+Permission and question menus:
+  Up / Down     select an option without editing the draft
+  Enter         confirm the selected option
+  Esc / Ctrl-C / Ctrl-D  cancel the turn, preserving the draft and caret
+
+Cancellation (outside menus and the transcript):
+  Ctrl-C        clear a nonempty draft first; with an empty draft,
+                cancel a running turn or leave an idle session
+  Esc           while running, clear the draft and arm cancellation;
+                press again within {} ms to cancel; other keys disarm
+  Ctrl-D        with an empty draft during a turn, keep the turn running
+
+Transcript:
+  Ctrl-O        open a snapshot while idle or during a turn
+  Up / Down     scroll one row
+  PageUp / PageDown  scroll one page
+  Home / End    jump to the beginning / end
+  Esc / Ctrl-O / Ctrl-C / Ctrl-D  close and restore the draft and caret
+
+Paste:
+  Bracketed paste inserts at the caret without submitting or completing.
+  Newlines and tabs stay in the draft; CR/CRLF become LF; other controls
+  are removed. Terminals without bracketed paste send ordinary keys.",
+        crate::shell::ESCAPE_CANCEL_WINDOW.as_millis()
+    )
+}
+
 /// What a key asks the session to do.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum KeyAction {

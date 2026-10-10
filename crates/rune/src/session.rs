@@ -1477,6 +1477,13 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                     &info,
                     &mut captured,
                 )?;
+                if name == "help" {
+                    let _ = writeln!(
+                        captured,
+                        "\n{}",
+                        rune_term::input::render_bindings_help(reader.is_active())
+                    );
+                }
                 let mut note = |text: String| captured.extend_from_slice(text.as_bytes());
                 match handled {
                     Handled::Exit => return Ok(Step::Exit),

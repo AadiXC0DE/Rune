@@ -6,6 +6,10 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Added
 
+- `/help` lists active composer, menu, and transcript bindings, cancellation
+  precedence, and bracketed paste behavior. Line-input sessions describe their
+  input mode.
+
 - `--ascii`, `RUNE_ASCII=true`, and profile `ascii = true` select ASCII terminal
   decorations, including code continuations, history previews and prompt echoes.
   Status, selection markers, and tool summaries stay ASCII; message text keeps Unicode.

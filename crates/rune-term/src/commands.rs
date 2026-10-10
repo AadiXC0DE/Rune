@@ -80,7 +80,7 @@ pub const BUILTINS: &[Builtin] = &[
     Builtin {
         name: "help",
         arguments: "",
-        summary: "list the commands, and any this project defines",
+        summary: "list commands and active keyboard bindings",
     },
     Builtin {
         name: "quit",
