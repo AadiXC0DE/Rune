@@ -117,8 +117,9 @@ Completed exchanges are saved as sessions for the current workspace, and
 `--json` reports their `session_id`. Pass `--no-save` to create no session and
 return an empty ID.
 
-Sessions are written as they run, so an interrupted session resumes. Prompts are
-remembered and recallable with `/history`. Custom slash commands live in
+Sessions are written as they run, so an interrupted session resumes. Interactive
+resume replays the saved exchanges above the composer before you type. Prompts
+are remembered and recallable with `/history`. Custom slash commands live in
 `.rune/commands/*.md` in a repository, so a team can ship a workflow with the
 code.
 

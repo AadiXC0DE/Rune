@@ -1171,8 +1171,18 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
     // component that later redraws over them.
     {
         let banner = format!("session {}", recorder.id());
+        let mut opening = vec![banner];
+        // Replay only for an interactive resume. These settled rows enter the
+        // terminal's scrollback once, before the composer accepts any input.
+        if keyed && config.resume.is_some() {
+            let entries = host
+                .transcript
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            opening.extend(render_entries(&entries, &host));
+        }
         let (prompt_row, caret) = host.idle_prompt();
-        let painted = host.paint(std::slice::from_ref(&banner), None, &prompt_row, &[], caret)?;
+        let painted = host.paint(&opening, None, &prompt_row, &[], caret)?;
         if let Ok(mut sink) = out.lock() {
             sink.write_all(&painted)?;
             sink.flush()?;

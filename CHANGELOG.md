@@ -6,6 +6,8 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Added
 
+- Interactive resume replays saved user and assistant exchanges before the first
+  input, preserving them in terminal scrollback.
 - Ctrl-O opens a scrollable full transcript snapshot, including recorded tool
   calls and result bodies. Escape or Ctrl-O returns to the same draft and caret.
 - Fenced code preserves indentation and spaces while streaming and in the
