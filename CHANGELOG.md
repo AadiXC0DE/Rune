@@ -102,6 +102,10 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Fixed
 
+- `rune session --id <id>` inspects that exact saved session without a positional
+  argument, in text or JSON output. The flag takes precedence over a positional
+  inspection selector.
+
 - Declared boolean command flags reject attached values, including empty values.
   `rune sessions --all=no` reports that `--all` takes no value and exits 1.
 

@@ -84,13 +84,13 @@ List sessions
 | `--limit <n>` | Page size, 1 to 100. |
 | `--cursor <c>` | Continue from a previous page. |
 | `--json` | Emit JSON. |
-### `rune session <last|id> [--json] | rune session migrate <id> | rune session recover <id>`
+### `rune session <last|id> [--json] | rune session --id <id> [--json] | rune session migrate <id> | rune session recover <id>`
 
 Inspect, migrate, or recover one session
 
 | Flag | Description |
 |---|---|
-| `--id <id>` | Read the argument as an exact session identifier. |
+| `--id <id>` | Inspect this exact session identifier, taking precedence over a positional selector. |
 | `--allow-large` | Permit migrating an oversized session. |
 | `--json` | Emit JSON. |
 ### `rune tree [last|id] [--json]`

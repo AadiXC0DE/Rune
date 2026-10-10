@@ -810,13 +810,17 @@ fn run_session(
         _ => {}
     }
 
-    let raw = launch.args.first().ok_or_else(|| {
-        RuneError::missing_field("session").with_hint("name a session, or run `rune sessions`")
-    })?;
-    let id = if raw == "last" {
-        session_log::resolve_target(&ResumeTarget::Latest, paths, workspace)?
-    } else {
+    let id = if let Some(raw) = launch.flag("--id") {
         raw.parse()?
+    } else {
+        let raw = launch.args.first().ok_or_else(|| {
+            RuneError::missing_field("session").with_hint("name a session, or run `rune sessions`")
+        })?;
+        if raw == "last" {
+            session_log::resolve_target(&ResumeTarget::Latest, paths, workspace)?
+        } else {
+            raw.parse()?
+        }
     };
     let state = session_log::inspect(paths, &id)?;
 

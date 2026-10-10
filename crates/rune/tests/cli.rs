@@ -357,6 +357,78 @@ fn session_last_inspects_the_saved_session_in_the_current_workspace() {
 }
 
 #[test]
+fn session_id_flag_inspects_the_exact_saved_session() {
+    use camino::Utf8PathBuf;
+    use rune_core::{id::SessionId, paths::Paths};
+    use rune_session::{SessionEvent, SessionStore};
+
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let root = Utf8PathBuf::from_path_buf(dir.path().canonicalize().expect("canonical tempdir"))
+        .expect("utf-8 path");
+    let paths = Paths {
+        state_root: root.join("state"),
+        config_root: root.join("config/rune"),
+        data_root: root.join("data/rune"),
+    };
+    let workspaces = [root.join("one"), root.join("two")];
+    let ids = ["sessionws001", "sessionws002"];
+    for (workspace, raw) in workspaces.iter().zip(ids) {
+        std::fs::create_dir(workspace).expect("workspace");
+        let id: SessionId = raw.parse().expect("session id");
+        let store = SessionStore::create(&paths, &id).expect("create session");
+        store
+            .append(SessionEvent::WorkspaceSet {
+                workspace: workspace.to_string(),
+            })
+            .expect("save workspace");
+        store
+            .append(SessionEvent::UserMessage {
+                text: format!("saved prompt for {raw}"),
+            })
+            .expect("save message");
+    }
+
+    for args in [
+        vec!["session", "--id", ids[1]],
+        vec!["session", "--id=sessionws002"],
+        vec!["session", "last", "--id", ids[1]],
+        vec!["session", ids[0], "--id", ids[1]],
+    ] {
+        for json in [false, true] {
+            let mut command = Command::new(binary());
+            command.args(&args);
+            if json {
+                command.arg("--json");
+            }
+            let out = command
+                .current_dir(&workspaces[0])
+                .env("RUNE_HOME", &paths.state_root)
+                .env("XDG_CONFIG_HOME", root.join("config"))
+                .env("XDG_DATA_HOME", root.join("data"))
+                .output()
+                .expect("run binary");
+            assert!(
+                out.status.success(),
+                "{args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert!(out.stderr.is_empty());
+            if json {
+                let value: serde_json::Value =
+                    serde_json::from_slice(&out.stdout).expect("valid json");
+                assert_eq!(value["id"], ids[1]);
+                assert_eq!(value["events"], 2);
+            } else {
+                let text = String::from_utf8_lossy(&out.stdout);
+                assert!(text.contains(ids[1]), "{text}");
+                let id: SessionId = ids[1].parse().expect("session id");
+                assert!(text.contains(paths.session_dir(&id).as_str()), "{text}");
+            }
+        }
+    }
+}
+
+#[test]
 fn session_last_without_saved_sessions_reports_not_found() {
     let out = run(&["session", "last", "--json"]);
     assert_eq!(out.status, Some(1));
@@ -374,6 +446,14 @@ fn session_inspection_still_requires_a_valid_selector() {
     for (args, error) in [
         (vec!["session", "--json"], "missing_field"),
         (vec!["session", "bad", "--json"], "invalid_field"),
+        (vec!["session", "--id"], "missing_field"),
+        (vec!["session", "--id", "bad", "--json"], "invalid_field"),
+        (vec!["session", "--id=last", "--json"], "invalid_field"),
+        (vec!["session", "--id=sessionws001", "--json"], "not_found"),
+        (
+            vec!["session", "last", "--id=bad", "--json"],
+            "invalid_field",
+        ),
     ] {
         let out = run(&args);
         assert_eq!(out.status, Some(1));

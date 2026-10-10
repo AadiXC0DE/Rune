@@ -1955,7 +1955,7 @@ Resource accumulation after cancellation, session holder handover and concurrent
 - [x] R-076 | T2 | fix | cli | Add resume to the shared command specification | acceptance: Run rune help resume and rune resume --help and observe valid usage included in rune reference.
 - [x] R-077 | T2 | fix | cli | Declare accepted aliases in the shared table | acceptance: For login, setup, provider, pr, issue, cost, logout and settings, help and generated reference must describe the actual alias behavior.
 - [x] R-078 | T2 | fix | cli | Reject values attached to declared boolean flags | acceptance: Run rune sessions --all=no and observe a takes-no-value error with exit 1.
-- [ ] R-079 | T2 | fix | cli | Honor exact session selectors for inspect | acceptance: Run rune session --id with a valid fixture identifier and observe that session without requiring a positional argument.
+- [x] R-079 | T2 | fix | cli | Honor exact session selectors for inspect | acceptance: Run rune session --id with a valid fixture identifier and observe that session without requiring a positional argument.
 - [ ] R-080 | T2 | fix | cli | Honor exact session selectors for tree | acceptance: Run rune tree --id with a valid fixture identifier and observe that session's tree.
 - [ ] R-081 | T2 | fix | observability | Print each ask failure once | acceptance: Run an unauthenticated rune ask --json and observe exactly one stderr error line plus one hint.
 - [ ] R-082 | T2 | fix | cli | Make unknown-command help return failure | acceptance: Run rune help not-real and observe a nonzero exit while valid help still exits 0.

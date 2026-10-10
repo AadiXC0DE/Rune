@@ -272,12 +272,12 @@ pub const SESSIONS: &[CommandSpec] = &[
         name: "session",
         aliases: &[],
         summary: "Inspect, migrate, or recover one session",
-        usage: "rune session <last|id> [--json] | rune session migrate <id> | rune session recover <id>",
+        usage: "rune session <last|id> [--json] | rune session --id <id> [--json] | rune session migrate <id> | rune session recover <id>",
         flags: &[
             option(
                 "--id",
                 "id",
-                "Read the argument as an exact session identifier.",
+                "Inspect this exact session identifier, taking precedence over a positional selector.",
             ),
             flag("--allow-large", "Permit migrating an oversized session."),
             flag("--json", "Emit JSON."),
