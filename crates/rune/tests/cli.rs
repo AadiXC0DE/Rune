@@ -649,6 +649,100 @@ fn connecting_with_the_key_exported_succeeds() {
     assert!(!out.stdout.contains("sk-ant-test"), "{}", out.stdout);
 }
 
+#[test]
+fn concurrent_connect_processes_preserve_both_credentials_after_reopening() {
+    use rune_core::paths::{self, Paths};
+    use std::process::Stdio;
+    use std::time::Duration;
+
+    let dir = tempfile::tempdir().expect("scratch home");
+    let home = dir.path().to_str().expect("utf8");
+    let state = dir.path().join("state");
+    let resolved = Paths::resolve(
+        Some(home),
+        None,
+        None,
+        None,
+        Some(state.to_str().expect("utf8")),
+    );
+    paths::create_dir_private(&resolved.state_root).expect("state");
+    let lock = paths::lock_private(&resolved.credentials_lock()).expect("hold lock");
+
+    let mut children = Vec::new();
+    for (provider, variable, value) in [
+        ("anthropic", "ANTHROPIC_API_KEY", "scratch-anthropic"),
+        ("opencode", "OPENCODE_API_KEY", "scratch-opencode"),
+    ] {
+        // Each profile has its own selection config; credentials share the
+        // state root. This isolates credential concurrency from config writes.
+        children.push(
+            Command::new(binary())
+                .args(["connect", provider, "--json"])
+                .env_clear()
+                .env("HOME", dir.path())
+                .env("RUNE_HOME", &state)
+                .env("XDG_CONFIG_HOME", dir.path().join(provider))
+                .env(variable, value)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("connect process"),
+        );
+    }
+    std::thread::sleep(Duration::from_millis(200));
+    let blocked: Vec<_> = children
+        .iter_mut()
+        .map(|child| child.try_wait().expect("status").is_none())
+        .collect();
+    // A writer must read only after acquiring the lock, or this entry is lost.
+    let body = serde_json::json!({
+        "version": 1,
+        "entries": { "holder": { "value": "scratch-holder" } }
+    });
+    paths::write_private_atomic(&resolved.credentials_file(), &body.to_string())
+        .expect("holder update");
+    drop(lock);
+    for child in children {
+        let output = child.wait_with_output().expect("connect result");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    assert!(
+        blocked.into_iter().all(|waiting| waiting),
+        "connect bypassed the held lock"
+    );
+
+    let reopened = Paths::resolve(
+        Some(home),
+        None,
+        None,
+        None,
+        Some(state.to_str().expect("utf8")),
+    );
+    let providers = rune_net::auth::stored_providers(&reopened).expect("reopen");
+    assert_eq!(providers, ["anthropic", "holder", "opencode"]);
+    let stored: serde_json::Value = serde_json::from_str(
+        &paths::read_private(
+            &reopened.credentials_file(),
+            rune_net::auth::MAX_CREDENTIAL_FILE_BYTES,
+        )
+        .expect("read")
+        .expect("file"),
+    )
+    .expect("complete JSON");
+    for (provider, value) in [
+        ("anthropic", "scratch-anthropic"),
+        ("opencode", "scratch-opencode"),
+        ("holder", "scratch-holder"),
+    ] {
+        assert_eq!(stored["entries"][provider]["value"], value);
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn connecting_in_a_fresh_home_creates_private_state_and_opens_a_session() {

@@ -42,6 +42,8 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Fixed
 
+- Concurrent credential updates and removals hold an OS lock across the full
+  update, preserving other provider profiles when multiple processes connect.
 - Credential updates and removals replace the complete file atomically, so
   interrupting a writer preserves the previous credentials until replacement.
 - Long Unicode tool descriptions truncate at a character boundary, so registering

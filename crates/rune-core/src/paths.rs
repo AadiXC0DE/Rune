@@ -429,6 +429,23 @@ pub fn write_private(path: &Utf8Path, contents: &str) -> Result<()> {
     Ok(())
 }
 
+/// Acquires an exclusive OS lock on a private, regular, single-linked file.
+///
+/// Keep the returned handle alive for the entire read/modify/write operation.
+/// Closing it releases the lock, including after a process exits. The file must
+/// remain on disk so waiting writers all lock the same inode.
+pub fn lock_private(path: &Utf8Path) -> Result<std::fs::File> {
+    verify_replacement_target(path)?;
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    set_open_mode(&mut options, FILE_MODE);
+    let file = options.open(path)?;
+    verify_replacement_target(path)?;
+    verify_mode(path, &file.metadata()?, FILE_MODE)?;
+    file.lock()?;
+    Ok(file)
+}
+
 /// Replaces a private file with a complete, synced file staged in the same
 /// directory. An interrupted write leaves the previous file intact.
 ///

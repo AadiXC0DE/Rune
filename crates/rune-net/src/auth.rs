@@ -162,7 +162,8 @@ fn read_file(paths: &Paths) -> Result<Option<StoredFile>> {
 
 /// Writes a credential to the profile file, creating or verifying its private
 /// state directory before reading or writing credentials. The complete JSON
-/// replaces the previous file atomically.
+/// replaces the previous file atomically. An exclusive OS lock covers the
+/// entire read/modify/write operation so concurrent updates are preserved.
 pub fn store(paths: &Paths, provider: &str, value: &str) -> Result<()> {
     if value.is_empty() {
         return Err(RuneError::invalid_field("credential", "must not be empty"));
@@ -176,6 +177,7 @@ pub fn store(paths: &Paths, provider: &str, value: &str) -> Result<()> {
     }
 
     paths::create_dir_private(&paths.state_root)?;
+    let _lock = paths::lock_private(&paths.credentials_lock())?;
     let mut file = read_file(paths)?.unwrap_or_default();
     file.version = default_version();
     file.entries.insert(
@@ -192,8 +194,14 @@ pub fn store(paths: &Paths, provider: &str, value: &str) -> Result<()> {
 /// Removes a stored credential.
 ///
 /// Returns true when an entry was removed. The complete JSON replaces the
-/// previous file atomically.
+/// previous file atomically, under the same exclusive lock used by `store`.
 pub fn remove(paths: &Paths, provider: &str) -> Result<bool> {
+    // Preserve the no-op on a state directory that has never been created.
+    if !paths.state_root.try_exists()? {
+        return Ok(false);
+    }
+    paths::create_dir_private(&paths.state_root)?;
+    let _lock = paths::lock_private(&paths.credentials_lock())?;
     let Some(mut file) = read_file(paths)? else {
         return Ok(false);
     };
@@ -571,6 +579,156 @@ mod tests {
         );
     }
 
+    #[test]
+    fn concurrent_stores_and_removals_preserve_other_profiles() {
+        let dir = TempDir::new().expect("tempdir");
+        let paths = paths_for(&dir);
+        for index in 0..16 {
+            store(&paths, &format!("old-{index}"), "old-value").expect("seed");
+        }
+        let barrier = std::sync::Barrier::new(32);
+        std::thread::scope(|scope| {
+            for index in 0..16 {
+                let paths = &paths;
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    barrier.wait();
+                    store(paths, &format!("new-{index}"), "new-value").expect("store");
+                });
+                scope.spawn(move || {
+                    barrier.wait();
+                    assert!(remove(paths, &format!("old-{index}")).expect("remove"));
+                });
+            }
+        });
+        let reopened = paths_for(&dir);
+        assert_eq!(stored_providers(&reopened).expect("providers").len(), 16);
+        for index in 0..16 {
+            assert_eq!(
+                from_file(&reopened, &format!("new-{index}"))
+                    .expect("read")
+                    .expect("present")
+                    .expose(),
+                "new-value"
+            );
+            assert!(
+                from_file(&reopened, &format!("old-{index}"))
+                    .expect("read")
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn removal_waits_for_the_lock_before_reading_credentials() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let dir = TempDir::new().expect("tempdir");
+        let paths = paths_for(&dir);
+        store(&paths, "obsolete", "old-value").expect("seed");
+        let lock = paths::lock_private(&paths.credentials_lock()).expect("lock");
+        let (started_tx, started_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                started_tx.send(()).expect("started");
+                done_tx.send(remove(&paths, "obsolete")).expect("done");
+            });
+            started_rx.recv().expect("started");
+            let blocked = done_rx.recv_timeout(Duration::from_millis(200));
+            // Simulate the current lock holder publishing another profile.
+            let body = serde_json::json!({
+                "version": 1,
+                "entries": {
+                    "obsolete": { "value": "old-value" },
+                    "concurrent": { "value": "new-value" }
+                }
+            });
+            paths::write_private_atomic(&paths.credentials_file(), &body.to_string())
+                .expect("holder update");
+            drop(lock);
+            assert!(matches!(blocked, Err(mpsc::RecvTimeoutError::Timeout)));
+            assert!(
+                done_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("completed")
+                    .expect("remove")
+            );
+        });
+        assert!(from_file(&paths, "obsolete").expect("read").is_none());
+        assert_eq!(
+            from_file(&paths, "concurrent")
+                .expect("read")
+                .expect("present")
+                .expose(),
+            "new-value"
+        );
+    }
+
+    #[test]
+    fn failed_updates_release_the_credential_lock() {
+        let dir = TempDir::new().expect("tempdir");
+        let paths = paths_for(&dir);
+        paths::create_dir_private(&paths.state_root).expect("state");
+        paths::write_private(&paths.credentials_file(), "invalid JSON").expect("corrupt");
+        for result in [
+            store(&paths, "scratch", "secret"),
+            remove(&paths, "scratch").map(|_| ()),
+        ] {
+            assert_eq!(
+                result.expect_err("refused").code(),
+                ErrorCode::CorruptRecord
+            );
+            let lock = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(paths.credentials_lock())
+                .expect("lock file");
+            lock.try_lock().expect("released after failure");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unsafe_credential_lock_files_are_refused() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let dir = TempDir::new().expect("tempdir");
+        let paths = paths_for(&dir);
+        paths::create_dir_private(&paths.state_root).expect("state");
+        let target = paths.state_root.join("target");
+        paths::write_private(&target, "unchanged").expect("target");
+        let lock = paths.credentials_lock();
+        symlink(&target, &lock).expect("symlink");
+        assert_eq!(
+            store(&paths, "scratch", "secret")
+                .expect_err("symlink")
+                .code(),
+            ErrorCode::UnsafePath
+        );
+        std::fs::remove_file(&lock).expect("remove link");
+        std::fs::hard_link(&target, &lock).expect("hard link");
+        assert_eq!(
+            store(&paths, "scratch", "secret")
+                .expect_err("hard link")
+                .code(),
+            ErrorCode::UnsafePath
+        );
+        std::fs::remove_file(&lock).expect("remove link");
+        paths::write_private(&lock, "").expect("lock");
+        std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+        assert_eq!(
+            store(&paths, "scratch", "secret").expect_err("mode").code(),
+            ErrorCode::UnsafePath
+        );
+        assert_eq!(
+            std::fs::read_to_string(target).expect("target"),
+            "unchanged"
+        );
+        assert!(!paths.credentials_file().exists());
+    }
+
     #[cfg(unix)]
     #[test]
     fn storing_and_removing_replace_the_file_without_truncating_open_readers() {
@@ -611,12 +769,12 @@ mod tests {
             "remove must not truncate the original inode"
         );
         assert!(from_file(&paths, "anthropic").expect("read").is_none());
-        assert_eq!(
-            std::fs::read_dir(&paths.state_root)
-                .expect("directory")
-                .count(),
-            1
-        );
+        let mut names: Vec<_> = std::fs::read_dir(&paths.state_root)
+            .expect("directory")
+            .map(|entry| entry.expect("entry").file_name())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["credentials.json", "credentials.lock"]);
     }
 
     #[test]
