@@ -1923,7 +1923,7 @@ Resource accumulation after cancellation, session holder handover and concurrent
 - [x] R-044 | T2 | fix | context | Invoke automatic compaction before an oversized CLI request | acceptance: Cross compaction_trigger_percent with fixture turns and observe a compaction event before the next model request.
 - [x] R-045 | T2 | fix | cli | Read usage periods from the documented flag | acceptance: Run rune usage --period 7d --json and observe period 7d with a seven-day interval.
 - [x] R-046 | T2 | fix | cli | Accept the documented auth status action | acceptance: Run rune auth status --json and observe a status object with exit 0.
-- [ ] R-047 | T2 | fix | cli | Resolve session last before parsing an exact ID | acceptance: Save a session and run rune session last --json, then observe that session's identifier.
+- [x] R-047 | T2 | fix | cli | Resolve session last before parsing an exact ID | acceptance: Save a session and run rune session last --json, then observe that session's identifier.
 - [ ] R-048 | T2 | fix | cli | Resolve tree last before parsing an exact ID | acceptance: Save a session and run rune tree last --json, then observe its branch structure.
 - [ ] R-049 | T2 | fix | cli | Use the documented permission explanation flag | acceptance: Run rune permissions --explain shell:pwd --json and observe one structured decision with its deciding rule.
 - [ ] R-050 | T2 | fix | cli | Emit an ask JSON error for an empty prompt | acceptance: Run rune ask --json with empty stdin and observe one valid failure object on stdout and exit 1.

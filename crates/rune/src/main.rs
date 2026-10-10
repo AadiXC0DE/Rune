@@ -163,7 +163,7 @@ fn run(launch: &Launch) -> Result<ExitCode> {
         Command::Prompt => run_prompt(&settings, launch, &output_flags),
         Command::Sessions => run_sessions(&paths, launch, &workspace, &output_flags),
         Command::Tree => run_tree(&paths, launch, &workspace, &output_flags),
-        Command::Session => run_session(&paths, launch, &output_flags),
+        Command::Session => run_session(&paths, launch, &workspace, &output_flags),
         Command::Usage => run_usage(&paths, launch, &output_flags),
         Command::Auth => run_auth(&settings, &paths, launch, &output_flags),
         Command::Connect => run_connect(&settings, &paths, launch, &output_flags),
@@ -789,7 +789,12 @@ fn run_tree(
 }
 
 /// Reports one stored session.
-fn run_session(paths: &Paths, launch: &Launch, output: &OutputFlags) -> Result<ExitCode> {
+fn run_session(
+    paths: &Paths,
+    launch: &Launch,
+    workspace: &Utf8Path,
+    output: &OutputFlags,
+) -> Result<ExitCode> {
     match launch.args.first().map(String::as_str) {
         Some("recover") => return run_session_recover(paths, launch, output),
         Some("migrate") => return run_session_migrate(paths, launch, output),
@@ -799,7 +804,11 @@ fn run_session(paths: &Paths, launch: &Launch, output: &OutputFlags) -> Result<E
     let raw = launch.args.first().ok_or_else(|| {
         RuneError::missing_field("session").with_hint("name a session, or run `rune sessions`")
     })?;
-    let id: rune_core::id::SessionId = raw.parse()?;
+    let id = if raw == "last" {
+        session_log::resolve_target(&ResumeTarget::Latest, paths, workspace)?
+    } else {
+        raw.parse()?
+    };
     let state = session_log::inspect(paths, &id)?;
 
     if output.json {
