@@ -72,6 +72,8 @@ pub struct Summary {
 pub struct Recorder {
     store: SessionStore,
     turn: u64,
+    active_turn: bool,
+    journal_error: Option<RuneError>,
     /// Initial estimate and its source, populated only when resuming.
     resumed_context: (u64, Option<&'static str>),
 }
@@ -83,6 +85,8 @@ impl Recorder {
         Ok(Self {
             store,
             turn: 0,
+            active_turn: false,
+            journal_error: None,
             resumed_context: (0, None),
         })
     }
@@ -120,6 +124,8 @@ impl Recorder {
         Ok(Self {
             store,
             turn,
+            active_turn: false,
+            journal_error: None,
             resumed_context: (0, None),
         })
     }
@@ -143,14 +149,70 @@ impl Recorder {
         Ok(())
     }
 
+    /// Starts an exchange before the provider can produce visible text.
+    pub fn begin_turn(&mut self) -> Result<()> {
+        if !self.active_turn {
+            let turn = self.turn.saturating_add(1);
+            self.store.append(SessionEvent::TurnStarted { turn })?;
+            self.turn = turn;
+            self.active_turn = true;
+        }
+        Ok(())
+    }
+
+    /// Journals visible text in bounded frames before the terminal draws it.
+    pub fn assistant_delta(&self, text: &str) -> Result<()> {
+        // Bound encoded frames even when a provider sends a very large delta.
+        // JSON escaping can expand each byte by at most six times.
+        const CHUNK_BYTES: usize = 8 * 1024;
+        if let Some(error) = &self.journal_error {
+            return Err(error.clone());
+        }
+        let mut remaining = text;
+        while !remaining.is_empty() {
+            let mut end = remaining.len().min(CHUNK_BYTES);
+            while !remaining.is_char_boundary(end) {
+                end = end.saturating_sub(1);
+            }
+            self.store.append(SessionEvent::AssistantDelta {
+                turn: self.turn,
+                text: remaining[..end].to_owned(),
+            })?;
+            remaining = &remaining[end..];
+        }
+        Ok(())
+    }
+
+    /// Durably clears a failed request attempt's visible text before a retry.
+    pub fn reset_assistant(&self) -> Result<()> {
+        if let Some(error) = &self.journal_error {
+            return Err(error.clone());
+        }
+        self.store
+            .append(SessionEvent::AssistantReset { turn: self.turn })?;
+        Ok(())
+    }
+
+    /// Remembers an observer write failure, since the observer cannot return it.
+    pub fn journal_failed(&mut self, error: RuneError) {
+        if self.journal_error.is_none() {
+            self.journal_error = Some(error);
+        }
+    }
+
+    /// Returns a journal failure to the input loop after its worker stops.
+    pub fn check_journal(&mut self) -> Result<()> {
+        self.journal_error.take().map_or(Ok(()), Err)
+    }
+
     /// Records a turn and everything it produced.
     ///
-    /// The turn number is assigned here rather than by the caller, so a turn
-    /// that produced no output is still numbered in the order it ran.
+    /// A streamed exchange keeps the number assigned before its request. A
+    /// caller recording a finished outcome directly starts the exchange here,
+    /// so even a turn with no output is numbered in the order it ran.
     pub fn turn(&mut self, outcome: &TurnOutcome) -> Result<()> {
-        self.turn = self.turn.saturating_add(1);
+        self.begin_turn()?;
         let turn = self.turn;
-        self.store.append(SessionEvent::TurnStarted { turn })?;
 
         // The calls of one step are a batch, and their results follow the whole
         // batch. Writing them interleaved would leave a log that cannot be
@@ -185,6 +247,8 @@ impl Recorder {
                 output_tokens: output,
             })?;
         }
+        self.store.append(SessionEvent::TurnFinished { turn })?;
+        self.active_turn = false;
         Ok(())
     }
 
@@ -193,9 +257,8 @@ impl Recorder {
     /// A cancellation is numbered even when no text arrived. Unknown usage is
     /// left absent rather than recorded as a completed request with zero usage.
     pub fn cancelled_turn(&mut self, partial: &str) -> Result<()> {
-        self.turn = self.turn.saturating_add(1);
+        self.begin_turn()?;
         let turn = self.turn;
-        self.store.append(SessionEvent::TurnStarted { turn })?;
         if !partial.trim().is_empty() {
             self.store.append(SessionEvent::AssistantMessage {
                 turn,
@@ -203,6 +266,7 @@ impl Recorder {
             })?;
         }
         self.store.append(SessionEvent::TurnCancelled { turn })?;
+        self.active_turn = false;
         Ok(())
     }
 
@@ -211,9 +275,8 @@ impl Recorder {
     /// A failure is numbered even when no text arrived. Unknown usage is left
     /// absent rather than recorded as a completed request with zero usage.
     pub fn failed_turn(&mut self, partial: &str, error: &RuneError) -> Result<()> {
-        self.turn = self.turn.saturating_add(1);
+        self.begin_turn()?;
         let turn = self.turn;
-        self.store.append(SessionEvent::TurnStarted { turn })?;
         if !partial.trim().is_empty() {
             self.store.append(SessionEvent::AssistantMessage {
                 turn,
@@ -225,6 +288,7 @@ impl Recorder {
             code: error.code(),
             message: error.message().to_owned(),
         })?;
+        self.active_turn = false;
         Ok(())
     }
 
@@ -406,19 +470,23 @@ pub fn tree_of(state: &SessionState) -> Tree {
 
     let mut tree = Tree::new();
     let mut parent: Option<u64> = None;
-    for frame in &state.events {
+    for frame in rune_session::replay::replay_events(&state.events) {
         let failure;
         let (role, preview) = match &frame.event {
             SessionEvent::UserMessage { text } => (Role::User, text.as_str()),
             SessionEvent::AssistantMessage { text, .. } => (Role::Assistant, text.as_str()),
             SessionEvent::TurnCancelled { .. } => (Role::System, "[cancelled]"),
+            SessionEvent::TurnInterrupted { .. } => (Role::System, "[interrupted]"),
             SessionEvent::TurnFailed { code, .. } => {
                 failure = format!("[failed: {code}]");
                 (Role::System, failure.as_str())
             }
             SessionEvent::ToolResult { output, .. } => (Role::Tool, output.as_str()),
             SessionEvent::ToolCall { name, .. } => (Role::Assistant, name.as_str()),
-            SessionEvent::TurnStarted { .. }
+            SessionEvent::AssistantDelta { .. }
+            | SessionEvent::AssistantReset { .. }
+            | SessionEvent::TurnStarted { .. }
+            | SessionEvent::TurnFinished { .. }
             | SessionEvent::Compaction { .. }
             | SessionEvent::UsageRecorded { .. }
             | SessionEvent::TitleSet { .. }
@@ -459,7 +527,9 @@ pub fn render_tree(tree: &Tree, state: &SessionState) -> String {
                 node.role == rune_session::tree::Role::System
                     && node.preview.starts_with("[failed: ")
             });
-        let summary = if branch.summary == "[cancelled]" || failure_boundary {
+        let summary = if matches!(branch.summary.as_str(), "[cancelled]" | "[interrupted]")
+            || failure_boundary
+        {
             ""
         } else {
             &branch.summary
@@ -619,7 +689,7 @@ pub fn history_from(state: &SessionState) -> History {
     let mut calls: Vec<ContentPart> = Vec::new();
     let mut results: Vec<ContentPart> = Vec::new();
 
-    for frame in &state.events {
+    for frame in rune_session::replay::replay_events(&state.events) {
         match &frame.event {
             SessionEvent::UserMessage { text } => {
                 flush(&mut history, &mut calls, &mut results);
@@ -663,12 +733,16 @@ pub fn history_from(state: &SessionState) -> History {
                     });
                 }
             }
-            SessionEvent::TurnStarted { .. }
+            SessionEvent::AssistantDelta { .. }
+            | SessionEvent::AssistantReset { .. }
+            | SessionEvent::TurnStarted { .. }
+            | SessionEvent::TurnFinished { .. }
             | SessionEvent::Compaction { .. }
             | SessionEvent::UsageRecorded { .. }
             | SessionEvent::TitleSet { .. }
             | SessionEvent::WorkspaceSet { .. }
             | SessionEvent::ChildOf { .. }
+            | SessionEvent::TurnInterrupted { .. }
             | SessionEvent::TurnCancelled { .. }
             | SessionEvent::TurnFailed { .. } => {}
         }
@@ -822,6 +896,62 @@ mod tests {
             steps: 1,
             calls: Vec::new(),
         }
+    }
+
+    #[test]
+    fn journal_frames_are_bounded_and_recover_unicode_before_a_torn_tail() {
+        use std::io::Write as _;
+
+        let dir = tempfile::tempdir().expect("temp");
+        let paths = paths(Utf8Path::from_path(dir.path()).expect("utf8"));
+        let key = id("sessionjrnl1");
+        let text = "aé🦀\n\t".repeat(5000);
+        let mut recorder = Recorder::create(&paths, &key).expect("created");
+        recorder.user_message("slow").expect("prompt saved");
+        recorder.begin_turn().expect("started");
+        recorder.assistant_delta(&text).expect("journalled");
+        let state = recorder.store.read().expect("read while streaming");
+        let deltas: Vec<_> = state
+            .events
+            .iter()
+            .filter_map(|frame| match &frame.event {
+                SessionEvent::AssistantDelta { text, .. } => {
+                    assert!(text.len() <= 8 * 1024);
+                    assert!(frame.encode().expect("encoded").len() < 50 * 1024);
+                    Some(text.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(deltas.len() > 1);
+        assert_eq!(deltas.concat(), text);
+        assert_eq!(state.usage, rune_session::store::UsageTotal::default());
+        drop(recorder);
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(paths.session_dir(&key).join("events.jsonl"))
+            .expect("log")
+            .write_all(b"{\"schema\":1,\"seq\":")
+            .expect("torn frame");
+        let (mut recorder, history) = load(&paths, &key).expect("recovered");
+        assert_eq!(history.to_messages()[1].text(), text);
+        recorder.user_message("continue").expect("continued prompt");
+        recorder.begin_turn().expect("next turn");
+        recorder.assistant_delta("done").expect("journalled");
+        recorder.turn(&outcome("done")).expect("finished");
+        let state = recorder.store.read().expect("read");
+        assert_eq!(state.turns, 2);
+        assert_eq!(
+            state
+                .events
+                .iter()
+                .filter(|frame| matches!(frame.event, SessionEvent::TurnFinished { turn: 2 }))
+                .count(),
+            1
+        );
+        let replay = render_tree(&tree_of(&state), &state);
+        assert_eq!(replay.matches("[interrupted]").count(), 1);
+        assert_eq!(history_from(&state).to_messages()[1].text(), text);
     }
 
     #[test]

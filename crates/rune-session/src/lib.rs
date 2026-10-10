@@ -15,6 +15,7 @@
 
 pub mod event;
 pub mod recovery;
+pub mod replay;
 pub mod report;
 pub mod store;
 pub mod tree;

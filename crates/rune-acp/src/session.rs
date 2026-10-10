@@ -623,7 +623,7 @@ pub fn history_from_events(frames: &[EventFrame]) -> History {
     let mut calls: Vec<ContentPart> = Vec::new();
     let mut results: Vec<ContentPart> = Vec::new();
 
-    for frame in frames {
+    for frame in rune_session::replay::replay_events(frames) {
         match &frame.event {
             SessionEvent::ToolCall {
                 call_id,
@@ -668,7 +668,11 @@ pub fn history_from_events(frames: &[EventFrame]) -> History {
                     history.push_assistant(vec![ContentPart::Text { text: text.clone() }]);
                 }
             }
-            SessionEvent::TurnStarted { .. }
+            SessionEvent::AssistantDelta { .. }
+            | SessionEvent::AssistantReset { .. }
+            | SessionEvent::TurnInterrupted { .. }
+            | SessionEvent::TurnStarted { .. }
+            | SessionEvent::TurnFinished { .. }
             | SessionEvent::TurnCancelled { .. }
             | SessionEvent::TurnFailed { .. }
             | SessionEvent::Compaction { .. }
@@ -934,6 +938,37 @@ mod tests {
         sessions.load(&id).expect("load");
         let session = sessions.get(&id).expect("held");
         assert_eq!(session.history.turns().len(), 1);
+    }
+
+    #[test]
+    fn loading_a_cli_stream_journal_replays_its_partial_answer_once() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let mut sessions = sessions(&root);
+        let id = sessions.create(Vec::new()).expect("create");
+        for event in [
+            SessionEvent::UserMessage {
+                text: "slow".to_owned(),
+            },
+            SessionEvent::TurnStarted { turn: 1 },
+            SessionEvent::AssistantDelta {
+                turn: 1,
+                text: "STREAM-01\n".to_owned(),
+            },
+            SessionEvent::AssistantDelta {
+                turn: 1,
+                text: "STREAM-02\nSTREAM-03\n".to_owned(),
+            },
+        ] {
+            sessions.record(&id, event).expect("record");
+        }
+        sessions.close(&id).expect("close");
+        let updates = sessions.load(&id).expect("load");
+        assert_eq!(updates.len(), 2);
+        assert_eq!(
+            updates[1].params["update"]["content"]["text"],
+            "STREAM-01\nSTREAM-02\nSTREAM-03\n"
+        );
+        assert_eq!(sessions.get(&id).expect("held").history.len(), 2);
     }
 
     #[test]

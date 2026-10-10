@@ -6,6 +6,10 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Added
 
+- Interactive assistant text is durably journalled before display. After process
+  death, resume restores the partial answer once with an interrupted boundary
+  and leaves the turn unfinished.
+
 - Interactive resume replays saved user and assistant exchanges before the first
   input, preserving them in terminal scrollback.
 - Ctrl-O opens a scrollable full transcript snapshot, including recorded tool

@@ -223,6 +223,7 @@ impl Answerer for TerminalQuestions {
 
 /// Host state for a turn.
 struct SessionHost {
+    recorder: Option<Arc<Mutex<Recorder>>>,
     endpoint: Endpoint,
     dialect: Box<dyn Provider>,
     /// Model the session sends to, changeable while the session runs.
@@ -423,8 +424,12 @@ impl Host for SessionHost {
         // in the first, so what arrives in the second is plain text.
         match &event {
             Event::TextDelta { delta } => {
+                let delta = transcript::sanitize(delta);
+                if !self.journal_text(Some(&delta)) {
+                    return;
+                }
                 if let Ok(mut streaming) = self.streaming.lock() {
-                    streaming.answer.push_str(&transcript::sanitize(delta));
+                    streaming.answer.push_str(&delta);
                 }
                 self.draw_stream();
             }
@@ -434,7 +439,12 @@ impl Host for SessionHost {
                 }
                 self.draw_stream();
             }
-            Event::StepRestarted { .. } => self.clear_streaming(),
+            Event::StepRestarted { .. } => {
+                if !self.journal_text(None) {
+                    return;
+                }
+                self.clear_streaming();
+            }
             Event::ContextCompacted {
                 removed_turns,
                 remaining_turns,
@@ -1137,6 +1147,26 @@ impl SessionHost {
         rows
     }
 
+    /// Saves a delta or retry reset before changing the visible answer.
+    fn journal_text(&self, delta: Option<&str>) -> bool {
+        let Some(recorder) = &self.recorder else {
+            return true;
+        };
+        let mut recorder = recorder
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let result = match delta {
+            Some(text) => recorder.assistant_delta(text),
+            None => recorder.reset_assistant(),
+        };
+        if let Err(error) = result {
+            recorder.journal_failed(error);
+            self.cancellation.cancel();
+            return false;
+        }
+        true
+    }
+
     /// Clears the streamed text, which a finished step has taken over.
     fn clear_streaming(&self) {
         if let Ok(mut streaming) = self.streaming.lock() {
@@ -1180,7 +1210,7 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
 
     // A resumed session continues its stored conversation; a new one starts
     // empty and writes a fresh log.
-    let (mut recorder, mut history) = if let Some(id) = &config.resume {
+    let (recorder, mut history) = if let Some(id) = &config.resume {
         session_log::load(&config.paths, id)?
     } else {
         let id = SessionId::generate();
@@ -1214,7 +1244,14 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
     let provider_name = config.settings.provider.to_string();
 
     let (initial_context, context_source) = recorder.resumed_context();
+    let transcript = if let Some(id) = &config.resume {
+        resumed_entries(&history, &session_log::inspect(&config.paths, id)?)
+    } else {
+        Vec::new()
+    };
+    let recorder = Arc::new(Mutex::new(recorder));
     let host = SessionHost {
+        recorder: Some(Arc::clone(&recorder)),
         endpoint: config.endpoint,
         dialect: config.dialect,
         model: Mutex::new(config.settings.model.clone()),
@@ -1236,7 +1273,13 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
         context_source: Mutex::new(context_source),
         context_limit: std::sync::atomic::AtomicU64::new(context_limit(&config.settings, &limits)),
         theme,
-        session_id: Mutex::new(recorder.id().to_string()),
+        session_id: Mutex::new(
+            recorder
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .id()
+                .to_string(),
+        ),
         workspace: config.workspace.to_string(),
         truecolor: truecolor_supported(),
         // Seeded from the terminal and refreshed on every frame, so a window
@@ -1245,7 +1288,7 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
         height: std::sync::atomic::AtomicU16::new(terminal_height()),
         inline: Mutex::new(rune_term::inline::Inline::new(terminal_width())),
         frame: Mutex::new(()),
-        transcript: Mutex::new(history_entries(history.turns())),
+        transcript: Mutex::new(transcript),
         transcript_history_len: std::sync::atomic::AtomicUsize::new(history.len()),
         transcript_open: std::sync::atomic::AtomicBool::new(false),
         typed: Mutex::new((String::new(), 0)),
@@ -1291,7 +1334,13 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
     // renderer like everything else, so the rows it occupies are known to the
     // component that later redraws over them.
     {
-        let banner = format!("session {}", recorder.id());
+        let banner = format!(
+            "session {}",
+            recorder
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .id()
+        );
         let mut opening = vec![banner];
         // Replay only for an interactive resume. These settled rows enter the
         // terminal's scrollback once, before the composer accepts any input.
@@ -1311,7 +1360,11 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
     }
 
     // A resumed session keeps the title it was given.
-    let mut is_first_prompt = config.resume.is_none() && recorder.title_is_unset();
+    let mut is_first_prompt = config.resume.is_none()
+        && recorder
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .title_is_unset();
 
     // The Escape gesture spans presses, so it outlives a single read.
     let mut cancellation_gesture = rune_term::shell::EscapeGesture::default();
@@ -1405,7 +1458,9 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                         let id = SessionId::generate();
                         let fresh = Recorder::create(&config.paths, &id)?;
                         fresh.set_workspace(&config.workspace)?;
-                        recorder = fresh;
+                        *recorder
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) = fresh;
                         history = History::new();
                         host.transcript_history_len
                             .store(0, std::sync::atomic::Ordering::Relaxed);
@@ -1428,10 +1483,12 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                         return compact_history(&host, &mut history, sink);
                     }
                     Handled::Rename(title) => {
-                        // Handled here because this closure already holds the
-                        // recorder, and giving the loop a second way to reach
-                        // it would be two writers for one file.
-                        recorder.set_title(&session_log::derive_title(&title))?;
+                        // The input loop and stream observer share one recorder;
+                        // its lock serializes every write to the session log.
+                        recorder
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .set_title(&session_log::derive_title(&title))?;
                         note(format!("renamed this session to {title}"));
                     }
                     Handled::SetModel(model) => {
@@ -1484,17 +1541,29 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                 sink.flush()?;
 
                 if is_first_prompt {
-                    recorder.set_title(&session_log::derive_title(&text))?;
+                    recorder
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .set_title(&session_log::derive_title(&text))?;
                     is_first_prompt = false;
                 }
                 // Recorded before the turn runs, so a prompt that is interrupted
                 // is still recallable.
                 if let Some(history) = history_file.as_mut() {
-                    let entry = crate::prompt_history::Entry::new(text.clone())
-                        .located(&config.workspace, recorder.id().as_str());
+                    let entry = crate::prompt_history::Entry::new(text.clone()).located(
+                        &config.workspace,
+                        recorder
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .id()
+                            .as_str(),
+                    );
                     let _ = history.record(entry);
                 }
-                recorder.user_message(&text)?;
+                recorder
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .user_message(&text)?;
                 history.push_user(text.clone());
                 host.transcript
                     .lock()
@@ -1506,11 +1575,22 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                 // correcting a long turn and waiting it out.
                 host.transcript_history_len
                     .store(history.len(), std::sync::atomic::Ordering::Relaxed);
+                recorder
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .begin_turn()?;
                 let steered = run_turn_steerable(&mut history, &host, reader, gesture);
+                recorder
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .check_journal()?;
                 // A correction the turn took in is part of the conversation the
                 // model saw, so a resumed session must see it too.
                 for correction in &steered.applied {
-                    recorder.user_message(correction)?;
+                    recorder
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .user_message(correction)?;
                 }
                 let outcome = match steered.outcome {
                     Ok(outcome) => outcome,
@@ -1524,9 +1604,15 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                         // Save before clearing the live answer or reporting
                         // the boundary, just as for a completed exchange.
                         if err.code() == ErrorCode::Cancelled {
-                            recorder.cancelled_turn(&partial)?;
+                            recorder
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .cancelled_turn(&partial)?;
                         } else {
-                            recorder.failed_turn(&partial, &err)?;
+                            recorder
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .failed_turn(&partial, &err)?;
                         }
                         let history_start = host
                             .transcript_history_len
@@ -1550,7 +1636,10 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                 };
                 // The turn is recorded before it is reported, so a session that
                 // dies while rendering still has its exchange on disk.
-                recorder.turn(&outcome)?;
+                recorder
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .turn(&outcome)?;
                 host.capture_history(&history);
                 // The model is read back rather than captured at start, so a
                 // turn that ran after `/model` is billed to the model that ran.
@@ -2194,6 +2283,40 @@ fn view_transcript(reader: &rune_term::input::KeyReader, host: &SessionHost) -> 
         }
     }
     Ok(())
+}
+
+/// Adds process interruption boundaries to the saved transcript without putting
+/// those display notices into the conversation sent to the provider.
+fn resumed_entries(history: &History, state: &rune_session::store::SessionState) -> Vec<Entry> {
+    use rune_session::event::SessionEvent;
+    use rune_term::transcript::Speaker;
+
+    let mut boundaries = std::collections::BTreeSet::new();
+    let mut messages = 0_usize;
+    for frame in rune_session::replay::replay_events(&state.events) {
+        match &frame.event {
+            SessionEvent::UserMessage { .. } => messages = messages.saturating_add(1),
+            SessionEvent::AssistantMessage { text, .. } if !text.is_empty() => {
+                messages = messages.saturating_add(1);
+            }
+            SessionEvent::TurnInterrupted { .. } => {
+                boundaries.insert(messages);
+            }
+            _ => {}
+        }
+    }
+    messages = 0;
+    let mut entries = Vec::new();
+    for entry in history_entries(history.turns()) {
+        if matches!(entry.speaker, Speaker::User | Speaker::Assistant) {
+            messages = messages.saturating_add(1);
+        }
+        entries.push(entry);
+        if boundaries.remove(&messages) {
+            entries.push(Entry::notice("interrupted"));
+        }
+    }
+    entries
 }
 
 /// Projects recorded messages in order, keeping tool arguments and result bodies.
@@ -3856,6 +3979,40 @@ mod tests {
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
         }
+    }
+
+    #[test]
+    fn a_journal_write_failure_cancels_before_showing_unsaved_text() {
+        let root = tempfile::tempdir().expect("temp");
+        let base = Utf8PathBuf::from_path_buf(root.path().to_owned()).expect("utf8");
+        let paths = Paths {
+            config_root: base.join("config"),
+            state_root: base.join("state"),
+            data_root: base.join("data"),
+        };
+        let id = SessionId::generate();
+        let mut recorder = Recorder::create(&paths, &id).expect("created");
+        recorder.user_message("slow").expect("prompt");
+        recorder.begin_turn().expect("started");
+        let metadata = paths.session_dir(&id).join("session.json");
+        std::fs::remove_file(&metadata).expect("removed metadata");
+        std::fs::create_dir(&metadata).expect("prevent metadata writes");
+        let recorder = Arc::new(Mutex::new(recorder));
+        let mut host = test_host();
+        host.recorder = Some(Arc::clone(&recorder));
+        host.emit(Event::TextDelta {
+            delta: "unsaved".to_owned(),
+        });
+        assert!(host.cancellation.is_cancelled());
+        assert!(host.partial_answer().is_empty());
+        let log = paths.session_dir(&id).join("events.jsonl");
+        let bytes = std::fs::read(&log).expect("log");
+        host.emit(Event::TextDelta {
+            delta: "more unsaved".to_owned(),
+        });
+        assert!(host.partial_answer().is_empty());
+        assert_eq!(std::fs::read(log).expect("log"), bytes);
+        assert!(recorder.lock().expect("lock").check_journal().is_err());
     }
 
     #[test]
@@ -6559,6 +6716,7 @@ mod tests {
             .expect("registered");
         let questions = Arc::new(TerminalQuestions::default());
         SessionHost {
+            recorder: None,
             endpoint: Endpoint::new("https://example.invalid", "k"),
             dialect: Box::new(rune_net::chat_completions::ChatCompletions),
             model: Mutex::new("test".to_owned()),

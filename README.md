@@ -129,8 +129,11 @@ Completed exchanges are saved as sessions for the current workspace, and
 return an empty ID.
 
 Sessions are written as they run, so an interrupted session resumes. Interactive
-resume replays the saved exchanges above the composer before you type. Its
-context meter starts with an estimate labelled `saved usage` or `history bytes`
+assistant text is journalled in bounded, durable frames before it is displayed.
+After process death, resume replays the partial answer once with an
+`[interrupted]` boundary, without inventing a completed turn or token usage.
+Interactive resume replays the saved exchanges above the composer before you
+type. Its context meter starts with an estimate labelled `saved usage` or `history bytes`
 until a live provider count arrives. Prompts are remembered and recallable with
 `/history`. Custom slash commands live in `.rune/commands/*.md` in a repository,
 so a team can ship a workflow with the code. Before each CLI session request,
