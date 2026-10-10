@@ -1,4 +1,4 @@
-"""Edit long drafts or undo Unicode edits through the real process in a PTY."""
+"""Edit long drafts or undo and redo Unicode edits in the real process in a PTY."""
 
 import fcntl
 import http.server
@@ -127,7 +127,17 @@ with tempfile.TemporaryDirectory(prefix="rune-r004-") as directory:
 
     try:
         wait_for("ctrl-c cancel")
-        if sys.argv[2:] == ["undo"]:
+        if sys.argv[2:] == ["redo"]:
+            capture("original", "界ab".encode() + b"\x1b[D", "界ab")
+            capture(
+                "inserted", b"\x1b[200~" + "e\u0301".encode() + b"\x1b[201~",
+                "界ae\u0301b",
+            )
+            capture("undone", b"\x1f", "界ab")
+            capture("moved", b"\x01", "\x1b[3G")
+            capture("redone", b"\x1br", "界ae\u0301b")
+            submitted = "界ae\u0301b"
+        elif sys.argv[2:] == ["undo"]:
             capture("original", "界ab".encode() + b"\x1b[D", "界ab")
             capture(
                 "inserted", b"\x1b[200~" + "e\u0301".encode() + b"\x1b[201~",

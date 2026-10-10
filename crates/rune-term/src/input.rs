@@ -298,6 +298,10 @@ impl KeyReader {
                 self.composer.undo();
                 KeyAction::Ignored
             }
+            (KeyCode::Char('r'), false, true) => {
+                self.composer.redo();
+                KeyAction::Ignored
+            }
             (KeyCode::Char('w'), true, _) => {
                 self.composer.delete_word();
                 KeyAction::Ignored
@@ -838,6 +842,81 @@ mod tests {
         assert_eq!(reader.handle(Event::Key(undo)), None);
         assert_eq!(reader.line(), "axb");
         assert_eq!(reader.column(), 2);
+    }
+
+    #[test]
+    fn alt_r_redoes_unicode_edits_and_restores_their_carets() {
+        let redo = KeyEvent::new(KeyCode::Char('r'), KeyModifiers::ALT);
+        for grapheme in ["e\u{301}", "👍🏽", "👩‍💻", "界"] {
+            for deletion in [KeyCode::Backspace, KeyCode::Delete] {
+                let mut reader = reader();
+                reader.replace("界ab");
+                reader.apply(key(KeyCode::Left));
+                reader.handle(Event::Paste(grapheme.to_owned()));
+                if deletion == KeyCode::Delete {
+                    reader.apply(key(KeyCode::Left));
+                }
+                let inserted = (
+                    reader.line().to_owned(),
+                    reader.composer.cursor(),
+                    reader.column(),
+                );
+                reader.handle(Event::Key(key(deletion)));
+                let deleted = (
+                    reader.line().to_owned(),
+                    reader.composer.cursor(),
+                    reader.column(),
+                );
+                reader.handle(Event::Key(control('_')));
+                reader.handle(Event::Key(control('_')));
+                assert_eq!(reader.line(), "界ab");
+                // Moving after undo must not change the caret restored by redo.
+                reader.apply(key(KeyCode::Home));
+
+                for expected in [inserted, deleted.clone(), deleted] {
+                    assert_eq!(reader.handle(Event::Key(redo)), Some(KeyAction::Ignored));
+                    assert_eq!(reader.line(), expected.0);
+                    assert_eq!(reader.composer.cursor(), expected.1);
+                    assert_eq!(reader.column(), expected.2);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn releasing_alt_r_does_not_redo_another_edit() {
+        let mut reader = reader();
+        reader.replace("ab");
+        reader.apply(key(KeyCode::Left));
+        typed(&mut reader, "x界");
+        reader.apply(control('_'));
+        reader.apply(control('_'));
+        let mut redo = KeyEvent::new(KeyCode::Char('r'), KeyModifiers::ALT);
+        assert_eq!(reader.handle(Event::Key(redo)), Some(KeyAction::Ignored));
+        assert_eq!(reader.line(), "axb");
+        assert_eq!(reader.column(), 2);
+        redo.kind = KeyEventKind::Release;
+        assert_eq!(reader.handle(Event::Key(redo)), None);
+        assert_eq!(reader.line(), "axb");
+        assert_eq!(reader.column(), 2);
+    }
+
+    #[test]
+    fn alt_r_without_redo_history_leaves_the_draft_and_caret_unchanged() {
+        let mut reader = reader();
+        reader.replace("ab");
+        reader.apply(key(KeyCode::Left));
+        let redo = KeyEvent::new(KeyCode::Char('r'), KeyModifiers::ALT);
+        assert_eq!(reader.handle(Event::Key(redo)), Some(KeyAction::Ignored));
+        assert_eq!(reader.line(), "ab");
+        assert_eq!(reader.column(), 1);
+
+        typed(&mut reader, "x");
+        reader.apply(control('_'));
+        typed(&mut reader, "界");
+        assert_eq!(reader.handle(Event::Key(redo)), Some(KeyAction::Ignored));
+        assert_eq!(reader.line(), "a界b");
+        assert_eq!(reader.column(), 3);
     }
 
     #[test]

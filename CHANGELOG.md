@@ -61,6 +61,8 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Fixed
 
+- Alt-R reapplies an undone composer edit and restores the draft and caret.
+
 - Ctrl-_ undoes the last composer edit and restores the draft and caret,
   including Unicode grapheme deletions and pasted text.
 
