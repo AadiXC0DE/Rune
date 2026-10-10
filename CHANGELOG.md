@@ -62,7 +62,8 @@ Notable changes, newest first. Each entry describes what a user can observe.
 ### Fixed
 
 - Caught worker panics in unwinding builds display one diagnostic through the
-  session renderer without leaving duplicate prompt or status rows.
+  session renderer without leaving duplicate prompt or status rows. They are
+  reported and saved as internal failures rather than user cancellations.
 
 - `grep_files` searches source text before adding long-line truncation annotations,
   so the annotation cannot create a match for text absent from the source.

@@ -2104,7 +2104,8 @@ fn draw_choice(
 /// turn one defect into the loss of the session. What the worker held is not
 /// used, because a turn stopped partway can hold a tool call with no result,
 /// and every later request would then be refused.
-/// Its panic diagnostic is returned separately for the closing frame.
+/// The panic is an internal failure, with its diagnostic returned separately
+/// for the closing frame.
 fn run_on_worker<T, B>(
     history: &mut History,
     turn: T,
@@ -2136,7 +2137,10 @@ where
                     .unwrap_or("non-text panic payload");
                 (
                     before,
-                    Err(turn_interrupted()),
+                    Err(RuneError::new(
+                        ErrorCode::Internal,
+                        "internal worker failure",
+                    )),
                     Some(format!("worker panicked: {message}")),
                 )
             }
@@ -2205,15 +2209,6 @@ fn close_turn(
         sink.flush()?;
     }
     Ok(())
-}
-
-/// Returns the error an interrupted turn is reported with.
-///
-/// A worker that panics is reported as an interruption rather than as a panic:
-/// a panic inside a turn is not a reason to end the session, and the only other
-/// thing the caller could do with it is stop.
-fn turn_interrupted() -> RuneError {
-    RuneError::new(ErrorCode::Cancelled, "the turn was interrupted")
 }
 
 /// Restores the main terminal even when rendering fails or unwinds.
@@ -4508,7 +4503,11 @@ mod tests {
         close_turn(&host, &mut sink, &mut reader, &lines, None, &[]).expect("closed");
         // A subsequent worker and frame must still be usable, and redraws must
         // not settle the diagnostic a second time.
-        let (_, diagnostic) = run_on_worker(&mut history, |_| Err(turn_interrupted()), || {});
+        let (_, diagnostic) = run_on_worker(
+            &mut history,
+            |_| Err(rune_agent::steering::cancelled_error()),
+            || {},
+        );
         assert!(diagnostic.is_none());
         host.draw_stream_with(reader.line(), reader.column());
         close_turn(
@@ -4524,6 +4523,38 @@ mod tests {
             "R059_CAPTURE:{}",
             serde_json::to_string(&*bytes.lock().expect("bytes")).expect("json")
         );
+    }
+
+    #[test]
+    fn a_caught_worker_panic_reports_an_internal_failure() {
+        let host = test_host();
+        let mut history = History::new();
+        history.push_user("panic fixture");
+        let (result, diagnostic) = run_on_worker(
+            &mut history,
+            |_| {
+                host.emit(Event::TextDelta {
+                    delta: "partial before panic".to_owned(),
+                });
+                panic!("R060_FIXTURE");
+            },
+            || std::thread::sleep(std::time::Duration::from_millis(1)),
+        );
+
+        let error = result.expect_err("caught worker panic");
+        assert_eq!(error.code(), ErrorCode::Internal);
+        let lines = report_failed_turn(&error, &host, diagnostic.as_deref()).join("\n");
+        assert!(
+            lines.contains("the turn failed: internal worker failure"),
+            "{lines}"
+        );
+        assert!(lines.contains("partial before panic"), "{lines}");
+        assert_eq!(
+            lines.matches("worker panicked: R060_FIXTURE").count(),
+            1,
+            "{lines}"
+        );
+        assert!(!lines.contains("cancelled"), "{lines}");
     }
 
     #[test]
@@ -4554,7 +4585,7 @@ mod tests {
 
         assert_eq!(
             result.err().map(|err| err.code()),
-            Some(ErrorCode::Cancelled)
+            Some(ErrorCode::Internal)
         );
         assert_eq!(
             diagnostic.as_deref(),
@@ -4578,11 +4609,14 @@ mod tests {
                 taken.push_assistant(vec![rune_net::message::ContentPart::Text {
                     text: "answer".to_owned(),
                 }]);
-                Err(turn_interrupted())
+                Err(rune_agent::steering::cancelled_error())
             },
             || {},
         );
-        assert!(result.is_err());
+        assert_eq!(
+            result.expect_err("cancelled turn").code(),
+            ErrorCode::Cancelled
+        );
         assert!(diagnostic.is_none());
         assert_eq!(history.len(), 2);
         assert_eq!(history.turns()[1].text(), "answer");
