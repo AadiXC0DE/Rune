@@ -119,6 +119,72 @@ fn missing_flag_value_is_reported_as_a_missing_field() {
 }
 
 #[test]
+fn usage_reports_the_selected_period_and_interval() {
+    let day_ms = 24 * 60 * 60 * 1_000;
+    for (args, period, days) in [
+        (vec!["usage", "--json"], "24h", 1),
+        (vec!["usage", "7d", "--json"], "7d", 7),
+        (vec!["usage", "--period", "24h", "--json"], "24h", 1),
+        (vec!["usage", "--period", "7d", "--json"], "7d", 7),
+        (vec!["usage", "--period", "30d", "--json"], "30d", 30),
+        (vec!["usage", "--period=7d", "--json"], "7d", 7),
+        (vec!["usage", "24h", "--period", "7d", "--json"], "7d", 7),
+    ] {
+        let out = run(&args);
+        assert_eq!(out.status, Some(0), "{args:?}: {}", out.stderr);
+        let value: serde_json::Value = serde_json::from_str(&out.stdout).expect("valid json");
+        assert_eq!(value["period"], period, "{args:?}");
+        let now_ms = value["now_ms"].as_i64().expect("now_ms");
+        let since_ms = value["since_ms"].as_i64().expect("since_ms");
+        assert_eq!(now_ms - since_ms, days * day_ms, "{args:?}");
+    }
+}
+
+#[test]
+fn usage_rejects_an_invalid_period_flag() {
+    let out = run(&["usage", "--period", "99y", "--json"]);
+    assert_eq!(out.status, Some(1), "{}", out.stdout);
+    assert!(out.stdout.is_empty(), "{}", out.stdout);
+    assert!(out.stderr.contains("invalid_field"), "{}", out.stderr);
+    assert!(out.stderr.contains("99y"), "{}", out.stderr);
+    assert!(out.stderr.contains("24h, 7d, or 30d"), "{}", out.stderr);
+}
+
+#[test]
+fn usage_period_flag_filters_the_ledger_to_seven_days() {
+    use rune_session::usage::{HelperKind, Ledger, UsageRecord, now_ms};
+
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let state = dir.path().join("state");
+    let path = camino::Utf8PathBuf::from_path_buf(state.join("usage.jsonl")).expect("utf-8 path");
+    let ledger = Ledger::new(path);
+    let now = now_ms();
+    let day_ms = 24 * 60 * 60 * 1_000;
+    for (days_ago, tokens) in [(0, 11), (3, 22), (8, 44)] {
+        let mut record = UsageRecord::new(now - days_ago * day_ms, "test-model", HelperKind::Main);
+        record.input_tokens = Some(tokens);
+        ledger.append(&record).expect("append usage");
+    }
+
+    let out = Command::new(binary())
+        .args(["usage", "--period", "7d", "--json"])
+        .env("RUNE_HOME", &state)
+        .env("XDG_CONFIG_HOME", dir.path().join("config"))
+        .env("XDG_DATA_HOME", dir.path().join("data"))
+        .output()
+        .expect("run binary");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&out.stdout).expect("valid json");
+    assert_eq!(value["period"], "7d");
+    assert_eq!(value["requests"], 2);
+    assert_eq!(value["tokens"]["input_tokens"], 33);
+}
+
+#[test]
 fn doctor_passes_on_a_clean_setup() {
     let out = run(&["doctor"]);
     assert_eq!(

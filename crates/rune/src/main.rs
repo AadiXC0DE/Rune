@@ -818,7 +818,11 @@ fn run_session(paths: &Paths, launch: &Launch, output: &OutputFlags) -> Result<E
 
 /// Reports token usage over a period.
 fn run_usage(paths: &Paths, launch: &Launch, output: &OutputFlags) -> Result<ExitCode> {
-    let period = period_from(launch.args.first().map(String::as_str))?;
+    let period = period_from(
+        launch
+            .flag("--period")
+            .or_else(|| launch.args.first().map(String::as_str)),
+    )?;
 
     let ledger = Ledger::from_paths(paths);
     let read = ledger.read()?;

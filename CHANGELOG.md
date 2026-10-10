@@ -56,6 +56,8 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Fixed
 
+- `rune usage` honors `--period` when selecting the reporting interval, while
+  preserving positional periods and the default 24-hour report.
 - CLI sessions automatically compact earlier conversation before sending a model request
   when its estimate reaches `compaction_trigger_percent`, including after tool results. A failed
   summary preserves history and stops the pending request.
