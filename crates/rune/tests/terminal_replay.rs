@@ -1,0 +1,159 @@
+//! R-034: CI replays actual process output, including PTY resize boundaries.
+//! Fixtures compare every screen row and the caret. The narrow fixture also
+//! compares the answer recovered from scrollback, where clipping loses bytes.
+
+#![cfg(unix)]
+#![allow(clippy::expect_used, clippy::panic)]
+
+use std::fmt::Write as _;
+
+use rune_term::Grid;
+use serde::Deserialize;
+
+#[derive(Debug, Deserialize)]
+struct Capture {
+    stage: String,
+    cols: u16,
+    rows: u16,
+    bytes: Vec<u8>,
+}
+
+fn record(script: &str, scenario: Option<&str>) -> Vec<u8> {
+    let mut command = std::process::Command::new("python3");
+    command.args(["-c", script, env!("CARGO_BIN_EXE_rune")]);
+    if let Some(scenario) = scenario {
+        command.arg(scenario);
+    }
+    let output = command
+        .output()
+        .expect("python3 is required for the Unix PTY replay gate");
+    assert!(
+        output.status.success(),
+        "PTY replay failed:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    output.stdout
+}
+
+fn screen_snapshot(stage: &str, cols: u16, rows: u16, grid: &Grid) -> String {
+    let cursor = grid.cursor();
+    let mut snapshot = format!(
+        "{stage}: {cols}x{rows}, caret {},{}\n",
+        cursor.col, cursor.row
+    );
+    for row in 0..rows {
+        let mut line = grid.row_text(row);
+        if let Some(id) = line.strip_prefix("session ") {
+            line = "session ".to_owned() + &"*".repeat(id.len());
+        }
+        // The fixture's temporary path and session id vary each launch. Only
+        // that suffix is masked; model, context, prompt and menu stay exact.
+        let line = line
+            .split_once(" | /")
+            .map_or(line.as_str(), |(status, _)| status);
+        writeln!(snapshot, "{row:02}|{line}|").expect("snapshot row");
+    }
+    snapshot
+}
+
+fn fixed_size_replay(script: &str, cols: u16, rows: u16) -> String {
+    let captures: Vec<(String, Vec<u8>)> =
+        serde_json::from_slice(&record(script, None)).expect("fixed-size captures");
+    let mut snapshot = String::new();
+    for (stage, bytes) in captures {
+        let mut grid = Grid::new(cols, rows).expect("grid");
+        grid.feed(&bytes).expect("replay");
+        snapshot.push_str(&screen_snapshot(&stage, cols, rows, &grid));
+    }
+    snapshot
+}
+
+fn event_replay(scenario: &str) -> String {
+    let captures: Vec<Capture> =
+        serde_json::from_slice(&record(include_str!("terminal_replay.py"), Some(scenario)))
+            .expect("event captures");
+    let first = captures.first().expect("at least one capture");
+    let mut grid = Grid::new(first.cols, first.rows).expect("grid");
+    let mut snapshot = String::new();
+    let mut scrollback = Vec::new();
+    for capture in captures {
+        grid.resize(capture.cols, capture.rows).expect("resize");
+        for byte in capture.bytes {
+            // Grid intentionally retains no scrollback. Preserve the row that
+            // leaves the screen when a byte triggers a linefeed or autowrap.
+            let top = grid.row_text(0);
+            let stats = grid.feed(&[byte]).expect("replay byte");
+            if stats.scrolled {
+                assert_eq!(stats.scroll_rows, 1, "one byte scrolled multiple rows");
+                scrollback.push(top);
+            }
+        }
+        snapshot.push_str(&screen_snapshot(
+            &capture.stage,
+            capture.cols,
+            capture.rows,
+            &grid,
+        ));
+    }
+    if scenario == "narrow" {
+        let screen = grid.text();
+        let answer: Vec<&str> = scrollback
+            .iter()
+            .map(String::as_str)
+            .chain(screen.lines())
+            .filter(|line| {
+                (!line.is_empty() && line.chars().all(|c| c == 'W'))
+                    || matches!(*line, "END-LONG-W" | "ORD")
+            })
+            .collect();
+        assert_eq!(
+            answer.concat(),
+            "W".repeat(300) + "END-LONG-WORD",
+            "lost or duplicated answer characters"
+        );
+        snapshot.push_str("answer rows in scrollback and screen:\n");
+        for line in answer {
+            writeln!(snapshot, "|{line}|").expect("answer row");
+        }
+    }
+    snapshot
+}
+
+#[test]
+fn long_draft_grids() {
+    let actual = fixed_size_replay(include_str!("terminal_draft.py"), 80, 24);
+    assert_eq!(
+        actual,
+        include_str!("fixtures/terminal_replay/long_draft.grid")
+    );
+}
+
+#[test]
+fn short_menu_grids() {
+    let actual = fixed_size_replay(include_str!("terminal_menu.py"), 32, 8);
+    assert_eq!(
+        actual,
+        include_str!("fixtures/terminal_replay/short_menu.grid")
+    );
+    let resized = event_replay("menu-resize");
+    assert_eq!(
+        resized,
+        include_str!("fixtures/terminal_replay/menu_resize.grid")
+    );
+}
+
+#[test]
+fn draft_resize_grids() {
+    let actual = event_replay("resize");
+    assert_eq!(
+        actual,
+        include_str!("fixtures/terminal_replay/draft_resize.grid")
+    );
+}
+
+#[test]
+fn twelve_column_text_grids_and_scrollback() {
+    let actual = event_replay("narrow");
+    assert_eq!(actual, include_str!("fixtures/terminal_replay/narrow.grid"));
+}

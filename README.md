@@ -198,6 +198,22 @@ cargo xtask check      # format, lint, and test
 cargo xtask gate       # the above plus the size and startup budgets
 ```
 
+On Unix, workspace tests also run the real PTY replay gate. It starts the built
+`rune` binary against an isolated local provider and compares captured grids
+and caret positions for long draft edits, 12-column output, short menus, and
+draft resizing without keystrokes. The narrow case also checks the complete
+answer in scrollback. Python 3 with its standard-library PTY modules is required;
+CI checks this prerequisite on Linux and macOS. Run just this gate with:
+
+```sh
+cargo test -p rune --test terminal_replay
+```
+
+The reviewed grids live in `crates/rune/tests/fixtures/terminal_replay`.
+Only temporary workspace paths and session identifiers are masked. If intended
+terminal behavior changes, review the failing grid and caret differences before
+updating a fixture. There is no automatic snapshot update mode.
+
 ## License
 
 Apache-2.0. See [LICENSE](LICENSE).

@@ -1,0 +1,77 @@
+model-open: 80x24, caret 2,3
+00|session ************|
+01|ctrl-c cancel  /help commands  esc clear|
+02|replay-model-01 | auto | ctx 0% (128.0k left)|
+03|>|
+04|models from chat_completions|
+05|> replay-model-01 (current)|
+06|  replay-model-02|
+07|  replay-model-03|
+08|  replay-model-04|
+09|  replay-model-05|
+10|  replay-model-06|
+11|  replay-model-07|
+12|  replay-model-08|
+13|  replay-model-09|
+14|  replay-model-10|
+15|  1-10 of 15|
+16|type to narrow, up/down choose, enter accept, esc cancel|
+17||
+18||
+19||
+20||
+21||
+22||
+23||
+model-shrunk: 32x8, caret 2,3
+00|session ************|
+01|ctrl-c cancel  /help commands  e|
+02|replay-model-01 | auto | ctx 0%|
+03|>|
+04|models from chat_completions|
+05|> replay-model-01 (current)|
+06|  1-1 of 15|
+07|type to narrow, up/down choose,|
+model-down: 32x8, caret 2,3
+00|session ************|
+01|ctrl-c cancel  /help commands  e|
+02|replay-model-01 | auto | ctx 0%|
+03|>|
+04|models from chat_completions|
+05|> replay-model-02|
+06|  2-2 of 15|
+07|type to narrow, up/down choose,|
+model-closed: 32x8, caret 2,3
+00|session ************|
+01|ctrl-c cancel  /help commands  e|
+02|replay-model-01 | auto | ctx 0%|
+03|>|
+04||
+05||
+06||
+07||
+closed-grown: 80x24, caret 2,3
+00|session ************|
+01|ctrl-c cancel  /help commands  esc clear|
+02|replay-model-01 | auto | ctx 0% (128.0k left)|
+03|>|
+04||
+05||
+06||
+07||
+08||
+09||
+10||
+11||
+12||
+13||
+14||
+15||
+16||
+17||
+18||
+19||
+20||
+21||
+22||
+23||

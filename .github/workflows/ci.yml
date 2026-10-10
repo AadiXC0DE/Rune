@@ -41,7 +41,10 @@ jobs:
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y bubblewrap
 
-      - name: Test
+      - name: Check PTY replay prerequisites
+        run: python3 -c "import fcntl, pty, termios"
+
+      - name: Test workspace including the real PTY replay gate
         run: cargo test --workspace
 
   # Gate lane: runs on a pull request. Adds budgets and every platform.
@@ -120,5 +123,9 @@ jobs:
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y bubblewrap
 
-      - name: Test
+      - name: Check PTY replay prerequisites
+        if: runner.os != 'Windows'
+        run: python3 -c "import fcntl, pty, termios"
+
+      - name: Test workspace including the real PTY replay gate on Unix
         run: cargo test --workspace

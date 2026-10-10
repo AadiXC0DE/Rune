@@ -6,6 +6,9 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Added
 
+- CI replays the actual Rune process in Unix PTYs and compares captured grids
+  for long drafts, 12-column output, short menus, and draft resizing. The gate
+  checks caret positions and that narrow output survives in scrollback.
 - Models can read retained tool output with `read_tool_result`, paging by byte
   offset until EOF. JSON page metadata and escaping fit within the tool cap and
   the turn's remaining result budget; handles stay scoped to the live conversation.

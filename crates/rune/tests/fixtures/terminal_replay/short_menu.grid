@@ -1,0 +1,36 @@
+completion-last: 32x8, caret 3,3
+00|session ************|
+01|ctrl-c cancel  /help commands  e|
+02|menu-model-01 | auto | ctx 0% (1|
+03|> /|
+04|  /history [here|session-id|clea|
+05|  /help|
+06|> /quit|
+07|  11-13 of 13|
+completion-closed: 32x8, caret 2,3
+00|session ************|
+01|ctrl-c cancel  /help commands  e|
+02|menu-model-01 | auto | ctx 0% (1|
+03|>|
+04||
+05||
+06||
+07||
+model-last: 32x8, caret 2,3
+00|session ************|
+01|ctrl-c cancel  /help commands  e|
+02|menu-model-01 | auto | ctx 0% (1|
+03|>|
+04|models from chat_completions|
+05|> menu-model-15|
+06|  15-15 of 15|
+07|type to narrow, up/down choose,|
+model-closed: 32x8, caret 2,3
+00|session ************|
+01|ctrl-c cancel  /help commands  e|
+02|menu-model-01 | auto | ctx 0% (1|
+03|>|
+04||
+05||
+06||
+07||
