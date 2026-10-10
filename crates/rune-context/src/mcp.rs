@@ -27,6 +27,8 @@
 
 pub mod client;
 pub mod config;
+#[cfg(not(target_family = "wasm"))]
+mod http_transport;
 pub mod protocol;
 pub mod schema;
 

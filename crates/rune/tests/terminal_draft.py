@@ -134,7 +134,9 @@ with tempfile.TemporaryDirectory(prefix="rune-r004-") as directory:
         capture("home", b"\x01", "> " + "a" * 78)
         capture("end-again", b"\x05", "TAIL-ENZ")
         os.write(master, b"\r")
-        wait_for("DRAFT_RECEIVED")
+        # Wait for close_turn's committed line, not its earlier streamed row,
+        # so /quit is handled as a command rather than steering the old turn.
+        wait_for("DRAFT_RECEIVED\r\n")
         assert prompts == ["a" * 160 + "TAIL-ENZ"], prompts
         os.write(master, b"/quit\r")
         assert child.wait(timeout=10) == 0

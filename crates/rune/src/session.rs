@@ -1149,6 +1149,12 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
         resolve_context_window(&host, &config.settings, &config.paths);
     }
 
+    // Enable raw input before announcing the session. Otherwise input sent in
+    // response to the banner can have its Enter translated by canonical mode
+    // before the key reader starts, leaving a complete prompt unsubmitted.
+    let mut reader = rune_term::input::KeyReader::new();
+    let keyed = reader.is_active();
+
     // The session identifier is announced up front so a resumed-or-new session
     // can be named later without consulting the listing. It goes through the
     // renderer like everything else, so the rows it occupies are known to the
@@ -1166,12 +1172,6 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
     // A resumed session keeps the title it was given.
     let mut is_first_prompt = config.resume.is_none() && recorder.title_is_unset();
 
-    // Keys are read directly when a terminal is attached, so the line being
-    // typed is drawn by this program with a cursor placed where it belongs.
-    // Without that, the terminal echoes each key at a position this program
-    // does not know, and the two disagree about what is on the line.
-    let mut reader = rune_term::input::KeyReader::new();
-    let keyed = reader.is_active();
     // The Escape gesture spans presses, so it outlives a single read.
     let mut cancellation_gesture = rune_term::shell::EscapeGesture::default();
 

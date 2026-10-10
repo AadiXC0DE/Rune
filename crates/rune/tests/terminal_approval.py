@@ -152,6 +152,13 @@ with tempfile.TemporaryDirectory(prefix="rune-r003-") as directory:
     def send(data):
         os.write(master, data)
 
+    def settled_reply(text, start):
+        # Streaming rows end in an erase/style sequence. The plain line ending
+        # appears only when close_turn commits the reply after joining the
+        # worker. Sending another prompt on streamed text races that join and
+        # submits steering to the old turn instead of starting the next one.
+        wait_for(text + "\r\n", start)
+
     def permission(prompt="permission"):
         start = len(transcript)
         send(prompt.encode() + b"\r")
@@ -167,7 +174,7 @@ with tempfile.TemporaryDirectory(prefix="rune-r003-") as directory:
         assert not side_effect.exists(), "shell ran before approval"
         confirmed_at = len(transcript)
         send(b"\x1b[A\r")
-        wait_for("FIXTURE_REPLY_1", start)
+        settled_reply("FIXTURE_REPLY_1", start)
         wait_for("AUDIT_SHELL_OK", confirmed_at)
         assert "AUDIT_SHELL_OK" in results[0], results
         assert side_effect.read_bytes() == b"x"
@@ -175,7 +182,7 @@ with tempfile.TemporaryDirectory(prefix="rune-r003-") as directory:
         # Approving once does not grant the same command on a subsequent turn.
         start = permission()
         send(b"\r")
-        wait_for("FIXTURE_REPLY_2", start)
+        settled_reply("FIXTURE_REPLY_2", start)
         assert "refused by policy" in results[1], results
         assert side_effect.read_bytes() == b"x", "denied shell ran"
 
@@ -183,11 +190,11 @@ with tempfile.TemporaryDirectory(prefix="rune-r003-") as directory:
         for cancel in [b"\x1b", b"\x03", b"\x04"]:
             start = permission()
             send(cancel)
-            wait_for("cancelled", start)
+            settled_reply("[cancelled]", start)
             assert side_effect.read_bytes() == b"x", "cancelled shell ran"
             start = len(transcript)
             send(b"after-cancel\r")
-            wait_for("SESSION_STILL_USABLE", start)
+            settled_reply("SESSION_STILL_USABLE", start)
 
         # An approval consumes neither a correction draft nor its caret position.
         start = len(transcript)
@@ -195,15 +202,19 @@ with tempfile.TemporaryDirectory(prefix="rune-r003-") as directory:
         assert draft_request.wait(10), "provider did not receive the draft turn"
         send(b"correction\x1b[D\x1b[D\x1b[D")
         wait_for("correction", start)
+        # Release the provider only after all three caret moves were rendered,
+        # otherwise a pending Left key can land in the approval picker.
+        draft_end = transcript.index(b"correction", start) + len(b"correction")
+        wait_for("\x1b[10G\x1b[?25h", draft_end)
         release_draft.set()
         wait_for("permission required", start)
         wait_for("> Deny", start)
         send(b"\x1b[200~SHOULD_NOT_STEER\x1b[201~\x15\x1b[A\r")
-        wait_for("FIXTURE_REPLY_3", start)
+        settled_reply("FIXTURE_REPLY_3", start)
         assert side_effect.read_bytes() == b"xx"
         start = len(transcript)
         send(b"X\r")
-        wait_for("SESSION_STILL_USABLE", start)
+        settled_reply("SESSION_STILL_USABLE", start)
         assert prompts[-1] == "correctXion", prompts
         assert all("SHOULD_NOT_STEER" not in prompt for prompt in prompts), prompts
 

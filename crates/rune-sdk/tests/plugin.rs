@@ -387,6 +387,13 @@ fn a_relative_program_is_found_beside_the_manifest() {
     let relative =
         PathBuf::from("bin").join(format!("plugin-fixture{}", std::env::consts::EXE_SUFFIX));
     std::fs::create_dir_all(directory.path().join("bin")).expect("create bin");
+    // A concurrent fork can inherit a copy's writable descriptor until exec,
+    // even after this thread closes it, making our exec fail with ETXTBSY.
+    // Link the immutable fixture so no process can hold it open for writing.
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(Fixture::binary(), directory.path().join(&relative))
+        .expect("link fixture");
+    #[cfg(not(unix))]
     std::fs::copy(Fixture::binary(), directory.path().join(&relative)).expect("copy fixture");
     std::fs::write(
         directory.path().join("plugin.json"),
