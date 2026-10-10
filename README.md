@@ -131,6 +131,12 @@ answer. Questions accept a numbered option or `/cancel`. `/model <id>` changes
 models; `/copy` points to terminal scrollback. Composer shortcuts and steering
 while a turn runs belong to the default interactive mode.
 
+Select `rune --ascii`, set `RUNE_ASCII=true`, or set `ascii = true` in profile
+configuration to use ASCII decorations. Status fields use `|`, selections use
+`>`, and tool summaries use `...`. Code continuation arrows become `>` and
+history preview and prompt echo newline arrows become `/`. Unicode in prompts, replies, paths,
+and tool output is preserved. This setting works with any theme and `NO_COLOR`.
+
 Select `rune --theme high-contrast`, set `RUNE_THEME=high-contrast`, or set
 `theme = "high-contrast"` in configuration for bright themed text on an explicit
 black background. Every defined foreground/background pair targets at least

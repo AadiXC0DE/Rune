@@ -140,6 +140,8 @@ pub struct Launch {
     pub permission_mode: Option<String>,
     /// Theme override.
     pub theme: Option<String>,
+    /// Use ASCII terminal decorations for this process.
+    pub ascii: bool,
     /// Provider order override.
     pub provider_order: Option<String>,
     /// Whether requests are restricted to the listed providers.
@@ -230,6 +232,7 @@ pub fn parse(args: Vec<OsString>, benchmark: bool) -> Result<Launch> {
         fast_mode: None,
         permission_mode: None,
         theme: None,
+        ascii: false,
         provider_order: None,
         provider_strict: None,
         offline: false,
@@ -392,6 +395,7 @@ fn take_global(launch: &mut Launch, tokens: &[String], index: &mut usize) -> Res
             | "--allow-unsandboxed"
             | "--json"
             | "--accessible"
+            | "--ascii"
     ) {
         if inline.is_some() {
             return Err(RuneError::invalid_field(
@@ -408,6 +412,7 @@ fn take_global(launch: &mut Launch, tokens: &[String], index: &mut usize) -> Res
             "--offline" => launch.offline = true,
             "--allow-unsandboxed" => launch.allow_unsandboxed = true,
             "--accessible" => launch.accessible = true,
+            "--ascii" => launch.ascii = true,
             _ => launch.json = true,
         }
         *index = (*index).saturating_add(1);
@@ -672,6 +677,10 @@ pub fn apply_to_settings(launch: &Launch, settings: &mut rune_core::config::Sett
         settings.permission_mode = parsed;
         settings.sources.record("permission_mode", layer);
     }
+    if launch.ascii {
+        settings.ascii = true;
+        settings.sources.record("ascii", layer);
+    }
     if let Some(theme) = &launch.theme {
         settings.theme = Some(theme.clone());
         settings.sources.record("theme", layer);
@@ -734,6 +743,27 @@ mod tests {
         assert_eq!(launch.command, Command::Interactive);
         assert!(launch.args.is_empty());
         assert!(!launch.accessible);
+    }
+
+    #[test]
+    fn ascii_flag_selects_decorations_before_or_after_the_command() {
+        let mut settings = rune_core::config::Settings::default();
+        let default = parse_list(&[]).expect("parse");
+        assert!(!default.ascii);
+        settings.ascii = true;
+        apply_to_settings(&default, &mut settings);
+        assert!(settings.ascii, "an absent flag must preserve configuration");
+        for arguments in [&["--ascii"][..], &["resume", "last", "--ascii"][..]] {
+            let launch = parse_list(arguments).expect("parse");
+            assert!(launch.ascii);
+            settings.ascii = false;
+            apply_to_settings(&launch, &mut settings);
+            assert!(settings.ascii);
+            assert_eq!(settings.source_of("ascii"), Layer::CommandLine);
+        }
+        assert!(parse_list(&["--ascii=false"]).is_err());
+        assert!(parse_list(&["--ascii=true"]).is_err());
+        assert!(crate::reference::render().contains("--ascii"));
     }
 
     #[test]

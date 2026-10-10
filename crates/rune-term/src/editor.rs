@@ -585,13 +585,26 @@ pub const LINE_BREAK: char = '\u{23ce}';
 /// measured from it is the column the terminal uses.
 #[must_use]
 pub fn displayed(text: &str) -> std::borrow::Cow<'_, str> {
+    displayed_with_ascii(text, false)
+}
+
+/// Returns a single-row echo, using `/` for newlines in ASCII mode.
+/// Source Unicode is preserved, including characters matching a decoration.
+#[must_use]
+pub fn displayed_with_ascii(text: &str, ascii: bool) -> std::borrow::Cow<'_, str> {
     if !text.contains(['\n', '\t']) {
         return std::borrow::Cow::Borrowed(text);
     }
     std::borrow::Cow::Owned(
         text.chars()
             .map(|c| match c {
-                '\n' => LINE_BREAK,
+                '\n' => {
+                    if ascii {
+                        '/'
+                    } else {
+                        LINE_BREAK
+                    }
+                }
                 '\t' => ' ',
                 c => c,
             })

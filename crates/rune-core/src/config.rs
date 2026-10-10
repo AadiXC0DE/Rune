@@ -376,6 +376,10 @@ pub struct UserConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub theme: Option<String>,
 
+    /// Whether terminal decorations use only ASCII.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ascii: Option<bool>,
+
     /// Whether automatic update checks run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_upgrade: Option<bool>,
@@ -520,6 +524,8 @@ pub struct Settings {
     pub fast_mode: bool,
     /// Theme selection.
     pub theme: Option<String>,
+    /// Whether terminal decorations use only ASCII.
+    pub ascii: bool,
     /// Whether automatic update checks run.
     pub auto_upgrade: bool,
     /// Whether every outbound request is refused.
@@ -561,6 +567,7 @@ impl Default for Settings {
             effort: Effort::default(),
             fast_mode: false,
             theme: None,
+            ascii: false,
             auto_upgrade: true,
             offline: false,
             collapse_tool_calls: false,
@@ -655,6 +662,7 @@ impl Settings {
                 "theme",
                 self.theme.clone().unwrap_or_else(|| "auto".to_owned()),
             ),
+            ("ascii", self.ascii.to_string()),
             ("web_tools", self.web_tools.to_string()),
             ("auto_upgrade", self.auto_upgrade.to_string()),
             ("collapse_tool_calls", self.collapse_tool_calls.to_string()),
@@ -714,6 +722,8 @@ pub struct EnvironmentOverrides {
     pub fast_mode: Option<bool>,
     /// Theme.
     pub theme: Option<String>,
+    /// ASCII terminal decorations.
+    pub ascii: Option<bool>,
     /// Automatic updates.
     pub auto_upgrade: Option<bool>,
     /// Additional directories.
@@ -776,6 +786,7 @@ impl EnvironmentOverrides {
             effort: lookup("RUNE_EFFORT"),
             fast_mode: boolean(&mut lookup, "RUNE_FAST_MODE"),
             theme: lookup("RUNE_THEME"),
+            ascii: boolean(&mut lookup, "RUNE_ASCII"),
             auto_upgrade: boolean(&mut lookup, "RUNE_AUTO_UPGRADE"),
             additional_directories: Vec::new(),
             limits: Vec::new(),
@@ -848,6 +859,7 @@ const PROFILE_ONLY_KEYS: &[&str] = &[
     "effort",
     "fast_mode",
     "theme",
+    "ascii",
     "auto_upgrade",
     "offline",
     "collapse_tool_calls",
@@ -1087,6 +1099,10 @@ fn apply_user(settings: &mut Settings, user: &UserConfig, layer: Layer) {
         settings.theme = Some(theme.clone());
         settings.sources.record("theme", layer);
     }
+    if let Some(ascii) = user.ascii {
+        settings.ascii = ascii;
+        settings.sources.record("ascii", layer);
+    }
     if let Some(auto) = user.auto_upgrade {
         settings.auto_upgrade = auto;
         settings.sources.record("auto_upgrade", layer);
@@ -1312,6 +1328,10 @@ fn apply_environment(settings: &mut Settings, env: &EnvironmentOverrides) {
         settings.theme = Some(theme.clone());
         settings.sources.record("theme", layer);
     }
+    if let Some(ascii) = env.ascii {
+        settings.ascii = ascii;
+        settings.sources.record("ascii", layer);
+    }
     if let Some(auto) = env.auto_upgrade {
         settings.auto_upgrade = auto;
         settings.sources.record("auto_upgrade", layer);
@@ -1498,6 +1518,7 @@ pub fn to_status_json(settings: &Settings, workspace: &Utf8Path) -> serde_json::
         "effort": settings.effort,
         "fast_mode": settings.fast_mode,
         "theme": settings.theme,
+        "ascii": settings.ascii,
         "auto_upgrade": settings.auto_upgrade,
         "context": settings.context,
         "collapse_tool_calls": settings.collapse_tool_calls,
@@ -1547,6 +1568,49 @@ mod tests {
         assert!(settings.context);
         assert!(!settings.web_tools);
         assert_eq!(settings.source_of("web_tools"), Layer::Default);
+    }
+
+    #[test]
+    fn ascii_setting_respects_profile_and_environment_precedence() {
+        assert!(!load(None, None, &empty_env()).ascii);
+        let dir = TempDir::new().expect("tempdir");
+        let project = write(&dir, "project.toml", "ascii = true\n");
+        let scoped = load(Some(&project), None, &empty_env());
+        assert!(!scoped.ascii);
+        assert!(scoped.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == ErrorCode::KeyNotAllowedInScope
+                && diagnostic.key.as_deref() == Some("ascii")
+        }));
+        for enabled in [true, false] {
+            let user = write(&dir, "config.toml", &format!("ascii = {enabled}\n"));
+            let settings = load(None, Some(&user), &empty_env());
+            assert!(settings.diagnostics.is_empty());
+            assert_eq!(settings.ascii, enabled);
+            assert_eq!(settings.source_of("ascii"), Layer::User);
+            let env = EnvironmentOverrides::from_lookup(|key| {
+                (key == "RUNE_ASCII").then(|| (!enabled).to_string())
+            });
+            let settings = load(None, Some(&user), &env);
+            assert!(settings.diagnostics.is_empty());
+            assert_eq!(settings.ascii, !enabled);
+            assert_eq!(settings.source_of("ascii"), Layer::Environment);
+            assert_eq!(
+                to_status_json(&settings, Utf8Path::new("/w"))["ascii"],
+                !enabled
+            );
+            assert!(settings.explain().iter().any(|entry| {
+                entry.key == "ascii"
+                    && entry.value == (!enabled).to_string()
+                    && entry.source == Layer::Environment
+            }));
+        }
+        let invalid = EnvironmentOverrides::from_lookup(|key| {
+            (key == "RUNE_ASCII").then(|| "invalid".to_owned())
+        });
+        assert_eq!(
+            invalid.invalid_booleans,
+            [("RUNE_ASCII", "invalid".to_owned())]
+        );
     }
 
     #[test]

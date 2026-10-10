@@ -142,6 +142,10 @@ pub const GLOBAL_FLAGS: &[FlagSpec] = &[
         "--accessible",
         "Use append-only labelled session output and line input for screen readers.",
     ),
+    flag(
+        "--ascii",
+        "Use ASCII terminal decorations, preserving message text.",
+    ),
     option("--theme", "name", "Override the theme for this process."),
     option(
         "--provider-order",

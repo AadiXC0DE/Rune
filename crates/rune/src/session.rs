@@ -226,6 +226,7 @@ impl Answerer for TerminalQuestions {
 /// Host state for a turn.
 struct SessionHost {
     accessible: bool,
+    ascii: bool,
     recorder: Option<Arc<Mutex<Recorder>>>,
     endpoint: Endpoint,
     dialect: Box<dyn Provider>,
@@ -1158,7 +1159,11 @@ impl SessionHost {
             }
         }
         if !answer.trim().is_empty() {
-            rows.extend(answer_rows.rows(answer, width.saturating_sub(2).max(1)));
+            rows.extend(answer_rows.rows_with_ascii(
+                answer,
+                width.saturating_sub(2).max(1),
+                self.ascii,
+            ));
         }
 
         // Every row of the answer is handed over. The renderer owns the region
@@ -1274,6 +1279,7 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
     let recorder = Arc::new(Mutex::new(recorder));
     let host = SessionHost {
         accessible: config.accessible,
+        ascii: config.settings.ascii,
         recorder: Some(Arc::clone(&recorder)),
         endpoint: config.endpoint,
         dialect: config.dialect,
@@ -1571,10 +1577,11 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                 let echo = if host.accessible {
                     transcript::accessible_lines(&[Entry::user(&text)])
                 } else {
-                    vec![transcript::render_prompt(
+                    vec![transcript::render_prompt_with_ascii(
                         rune_term::shell::prompt(),
                         &text,
                         usize::from(host.width()),
+                        host.ascii,
                     )]
                 };
                 // The typed line is committed and an empty input row is drawn
@@ -2491,7 +2498,8 @@ fn view_transcript(reader: &rune_term::input::KeyReader, host: &SessionHost) -> 
         host.width(),
         host.height.load(std::sync::atomic::Ordering::Relaxed),
     );
-    let mut view = rune_term::screen::Transcript::new(full_transcript_rows(&entries, size.0));
+    let mut view =
+        rune_term::screen::Transcript::new(full_transcript_rows(&entries, size.0, host.ascii));
     let mut surface = rune_term::frame::FrameSurface::new(size.0, size.1)?;
     let _screen = {
         let _frame = host
@@ -2515,7 +2523,9 @@ fn view_transcript(reader: &rune_term::input::KeyReader, host: &SessionHost) -> 
         if next_size != size {
             let top = view.top();
             size = next_size;
-            view = rune_term::screen::Transcript::new(full_transcript_rows(&entries, size.0));
+            view = rune_term::screen::Transcript::new(full_transcript_rows(
+                &entries, size.0, host.ascii,
+            ));
             view.jump(top, usize::from(size.1.saturating_sub(1)));
             // Resizing can leave stale cells anywhere on the alternate screen.
             host.show(b"\x1b[2J");
@@ -2621,11 +2631,12 @@ fn history_entries(turns: &[rune_agent::history::Turn]) -> Vec<Entry> {
 }
 
 /// Expands every recorded tool line using the same wrapping as the inline view.
-fn full_transcript_rows(entries: &[Entry], cols: u16) -> Vec<String> {
+fn full_transcript_rows(entries: &[Entry], cols: u16, ascii: bool) -> Vec<String> {
     transcript::render(
         entries,
         Display {
             width: usize::from(cols),
+            ascii,
             tool_lines: usize::MAX,
             ..Display::default()
         },
@@ -3004,6 +3015,13 @@ fn run_picker(
     Ok(chosen)
 }
 
+/// Flattens history for a menu without changing the selected prompt.
+fn history_preview(row: &str, ascii: bool) -> String {
+    transcript::sanitize(row)
+        .replace('\n', if ascii { " / " } else { " ↵ " })
+        .replace('\t', " ")
+}
+
 /// Searches workspace recall, restoring a choice without handing it to the session.
 fn search_prompt_history(
     reader: &mut rune_term::input::KeyReader,
@@ -3017,9 +3035,7 @@ fn search_prompt_history(
             let rows = picker_menu(&mut picker, &Theme::no_color(), false, host.menu_room())
                 .into_iter()
                 .map(|row| {
-                    let preview = transcript::sanitize(&row)
-                        .replace('\n', " ↵ ")
-                        .replace('\t', " ");
+                    let preview = history_preview(&row, host.ascii);
                     let slot = if row.starts_with("> ") {
                         Slot::Accent
                     } else {
@@ -4321,6 +4337,7 @@ fn render_entries(entries: &[Entry], host: &SessionHost) -> Vec<String> {
     // column that has nothing to do with this terminal.
     let display = Display {
         width: usize::from(host.width()),
+        ascii: host.ascii,
         ..Display::default()
     };
     let lanes = transcript::Lanes {
@@ -4571,7 +4588,7 @@ mod tests {
             ),
         ];
         let entries = history_entries(&turns);
-        let rows = full_transcript_rows(&entries, 80);
+        let rows = full_transcript_rows(&entries, 80, false);
         let rendered = rows.join("\n");
         assert!(rendered.starts_with("> inspect"));
         assert!(rendered.contains("read_file {\"path\":\"fixture\"}"));
@@ -7497,6 +7514,56 @@ mod tests {
         }
     }
 
+    #[test]
+    fn ascii_session_covers_status_menus_streaming_and_transcript() {
+        let mut host = test_host();
+        let mut settings = Settings::default();
+        let launch =
+            crate::cli::parse(vec![std::ffi::OsString::from("--ascii")], false).expect("parse");
+        crate::cli::apply_to_settings(&launch, &mut settings);
+        host.ascii = settings.ascii;
+        host.width.store(12, std::sync::atomic::Ordering::Relaxed);
+        let text = "```rust\n    abcdefghijklmnop\n```";
+        host.streaming.lock().expect("streaming").answer = text.to_owned();
+        assert!(host.status_line(100).is_ascii());
+        for theme in [Theme::no_color(), Theme::fx_dark(), Theme::high_contrast()] {
+            for truecolor in [true, false] {
+                host.theme = theme.clone();
+                host.truecolor = truecolor;
+                assert!(host.status_line(100).is_ascii());
+                let rows = completion_rows("/", 0, &theme, truecolor, 8);
+                assert!(rows.iter().all(|row| row.is_ascii()));
+                let paths = crate::path_completion::Paths {
+                    // The values are content, while the selection is a decoration.
+                    range: 0..0,
+                    matches: vec!["one".to_owned(), "two".to_owned()],
+                };
+                let rows = path_completion_rows(&paths, 0, &theme, truecolor, 8);
+                assert!(rows.iter().all(|row| row.is_ascii()));
+            }
+        }
+        host.theme = Theme::no_color();
+        let streaming = host.streaming_rows();
+        let entries = [Entry::assistant(text), Entry::tool("read_file\none\ntwo")];
+        let settled = render_entries(&entries, &host);
+        assert_eq!(streaming, render_entries(&entries[..1], &host));
+        assert!(settled.iter().all(|row| row.is_ascii()));
+        assert!(settled.iter().any(|row| row.starts_with("    > ")));
+        assert!(
+            full_transcript_rows(&entries, 12, host.ascii)
+                .iter()
+                .all(|row| row.is_ascii())
+        );
+        assert_eq!(
+            history_preview("> first\nsecond\tline", host.ascii),
+            "> first / second line"
+        );
+        assert_eq!(
+            history_preview("> 界↵\nsecond", host.ascii),
+            "> 界↵ / second"
+        );
+    }
+
     fn test_host() -> SessionHost {
         let mut registry = Registry::new();
         registry
@@ -7505,6 +7572,7 @@ mod tests {
         let questions = Arc::new(TerminalQuestions::default());
         SessionHost {
             accessible: false,
+            ascii: false,
             recorder: None,
             endpoint: Endpoint::new("https://example.invalid", "k"),
             dialect: Box::new(rune_net::chat_completions::ChatCompletions),

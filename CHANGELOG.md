@@ -6,6 +6,10 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Added
 
+- `--ascii`, `RUNE_ASCII=true`, and profile `ascii = true` select ASCII terminal
+  decorations, including code continuations, history previews and prompt echoes.
+  Status, selection markers, and tool summaries stay ASCII; message text keeps Unicode.
+
 - `--theme high-contrast` selects bright themed foregrounds on explicit black,
   with a documented 7:1 contrast target for every palette pair in truecolor and
   256-color output. Footer metadata stays bright; `NO_COLOR` suppresses colors.
@@ -40,7 +44,8 @@ Notable changes, newest first. Each entry describes what a user can observe.
 - Ctrl-O opens a scrollable full transcript snapshot, including recorded tool
   calls and result bodies. Escape or Ctrl-O returns to the same draft and caret.
 - Fenced code preserves indentation and spaces while streaming and in the
-  finished transcript. Long lines wrap with an indented `↪` continuation marker;
+  finished transcript. Long lines wrap with an indented `↪` continuation marker
+  (`>` with `--ascii`);
   code tabs use eight-column stops and wrapping adapts to terminal resizing.
 - `rune sandbox explain` previews a shell command without executing it, showing
   the backend, writable roots, network policy, protected paths and their sources.

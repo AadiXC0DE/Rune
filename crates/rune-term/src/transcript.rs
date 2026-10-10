@@ -308,6 +308,8 @@ impl Default for Watermark {
 pub struct Display {
     /// Width available, in terminal columns.
     pub width: usize,
+    /// Use ASCII for decorations while preserving source text.
+    pub ascii: bool,
     /// Lines a tool entry keeps before it is summarized.
     pub tool_lines: usize,
     /// Lines an assistant entry keeps before it is summarized.
@@ -318,6 +320,7 @@ impl Default for Display {
     fn default() -> Self {
         Self {
             width: 80,
+            ascii: false,
             tool_lines: 12,
             assistant_lines: 0,
         }
@@ -380,7 +383,7 @@ fn render_entry(entry: &Entry, display: Display, lanes: &Lanes, out: &mut String
     let width = display.width.saturating_sub(2).max(MIN_WIDTH);
     let text = sanitize(&entry.text);
     let body = if entry.speaker == Speaker::Assistant {
-        AssistantRows::default().rows(&text, width)
+        AssistantRows::default().rows_with_ascii(&text, width, display.ascii)
     } else {
         wrap(&text, width)
     };
@@ -438,6 +441,7 @@ pub struct AssistantRows {
     finished: Vec<String>,
     covered: usize,
     width: Option<usize>,
+    ascii: bool,
     fence: Option<Fence>,
 }
 
@@ -450,17 +454,25 @@ impl AssistantRows {
     /// terminals the repeated indentation shrinks to leave room for code.
     #[must_use]
     pub fn rows(&mut self, text: &str, width: usize) -> Vec<String> {
+        self.rows_with_ascii(text, width, false)
+    }
+
+    /// Returns wrapped rows using ASCII continuation markers when requested.
+    #[must_use]
+    pub fn rows_with_ascii(&mut self, text: &str, width: usize, ascii: bool) -> Vec<String> {
         let width = width.max(MIN_WIDTH);
-        if text.len() < self.covered || self.width != Some(width) {
+        if text.len() < self.covered || self.width != Some(width) || self.ascii != ascii {
             *self = Self::default();
         }
         self.width = Some(width);
+        self.ascii = ascii;
         let sealed = text.rfind('\n').map_or(0, |at| at.saturating_add(1));
         for line in text[self.covered..sealed].split_inclusive('\n') {
             self.finished.extend(assistant_line(
                 line.strip_suffix('\n').unwrap_or(line),
                 width,
                 &mut self.fence,
+                ascii,
             ));
         }
         self.covered = sealed;
@@ -468,7 +480,7 @@ impl AssistantRows {
         // A partial closing fence must not change the cached state until its
         // newline arrives: the next delta may still make it ordinary code.
         let mut fence = self.fence;
-        rows.extend(assistant_line(&text[sealed..], width, &mut fence));
+        rows.extend(assistant_line(&text[sealed..], width, &mut fence, ascii));
         rows
     }
 }
@@ -493,7 +505,7 @@ fn fence_start(line: &str) -> Option<(Fence, &str)> {
     (length >= 3).then(|| (Fence { marker, length }, &rest[length..]))
 }
 
-fn assistant_line(line: &str, width: usize, fence: &mut Option<Fence>) -> Vec<String> {
+fn assistant_line(line: &str, width: usize, fence: &mut Option<Fence>, ascii: bool) -> Vec<String> {
     let candidate = fence_start(line);
     if let Some(open) = *fence {
         if candidate.is_some_and(|(close, rest)| {
@@ -502,7 +514,7 @@ fn assistant_line(line: &str, width: usize, fence: &mut Option<Fence>) -> Vec<St
             *fence = None;
             return wrap(line, width);
         }
-        return wrap_code(line, width);
+        return wrap_code(line, width, ascii);
     }
     if let Some((open, rest)) = candidate
         && (open.marker != b'`' || !rest.contains('`'))
@@ -513,7 +525,7 @@ fn assistant_line(line: &str, width: usize, fence: &mut Option<Fence>) -> Vec<St
 }
 
 /// Hard wraps code by grapheme, retaining every space instead of word breaks.
-fn wrap_code(source: &str, width: usize) -> Vec<String> {
+fn wrap_code(source: &str, width: usize, ascii: bool) -> Vec<String> {
     let mut expanded = String::new();
     let mut column = 0_usize;
     for cluster in graphemes(source) {
@@ -527,7 +539,12 @@ fn wrap_code(source: &str, width: usize) -> Vec<String> {
         }
     }
     let indent = expanded.bytes().take_while(|byte| *byte == b' ').count();
-    let marker = if width >= 3 { "↪ " } else { "↪" };
+    let marker = match (ascii, width >= 3) {
+        (true, true) => "> ",
+        (true, false) => ">",
+        (false, true) => "↪ ",
+        (false, false) => "↪",
+    };
     // Leave at least two cells for a wide grapheme whenever possible.
     let prefix = " ".repeat(indent.min(width.saturating_sub(4))) + marker;
     let mut rows = Vec::new();
@@ -629,8 +646,14 @@ fn consume_escape(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
 /// one row.
 #[must_use]
 pub fn render_prompt(prompt: &str, input: &str, width: usize) -> String {
+    render_prompt_with_ascii(prompt, input, width, false)
+}
+
+/// Renders a prompt echo with ASCII newline decoration when requested.
+#[must_use]
+pub fn render_prompt_with_ascii(prompt: &str, input: &str, width: usize, ascii: bool) -> String {
     let room = width.saturating_sub(str_width(prompt));
-    let input = crate::editor::displayed(input);
+    let input = crate::editor::displayed_with_ascii(input, ascii);
     let (shown, _) = truncate_to_width(&input, room.max(1));
     format!("{prompt}{shown}")
 }
@@ -780,6 +803,74 @@ mod tests {
             rendered.lines().count(),
             40,
             "assistant text was summarized"
+        );
+    }
+
+    #[test]
+    fn ascii_decorations_cover_wrapping_and_tool_summaries() {
+        assert_eq!(
+            render_prompt_with_ascii("> ", "first\nsecond", 80, true),
+            "> first/second"
+        );
+        assert_eq!(
+            render_prompt_with_ascii("> ", "界⏎\nsecond", 80, true),
+            "> 界⏎/second"
+        );
+        let entries = [
+            Entry::assistant("```rust\n    abcdefghijkl  mnop\n```"),
+            Entry::tool("read_file\none\ntwo\nthree"),
+            Entry::tool("glob_files failed\none\ntwo"),
+        ];
+        for width in 1..=24 {
+            let display = Display {
+                width,
+                ascii: true,
+                tool_lines: 1,
+                ..Display::default()
+            };
+            let rendered = render(&entries, display);
+            assert!(rendered.is_ascii(), "{rendered}");
+            assert!(rendered.contains("more line(s)"));
+            assert!(render_grouped(&entries, display).is_ascii());
+            let rows = AssistantRows::default().rows_with_ascii(&entries[0].text, width, true);
+            assert!(
+                rows.iter()
+                    .all(|row| row.is_ascii() && str_width(row) <= width)
+            );
+        }
+        let display = Display {
+            width: 12,
+            ascii: true,
+            ..Display::default()
+        };
+        assert!(render(&entries, display).contains("    > "));
+        let text = "```\n    界↪éabcdefghij\n```";
+        let rows = AssistantRows::default().rows_with_ascii(text, 10, true);
+        let code: String = rows[1..rows.len() - 1]
+            .iter()
+            .enumerate()
+            .map(|(index, row)| {
+                if index == 0 {
+                    row.as_str()
+                } else {
+                    row.trim_start().strip_prefix("> ").unwrap_or(row)
+                }
+            })
+            .collect();
+        assert_eq!(code, "    界↪éabcdefghij", "source Unicode must survive");
+    }
+
+    #[test]
+    fn switching_ascii_markers_invalidates_finished_streaming_rows() {
+        let text = "```\n    abcdefghijklmnop\n```\n";
+        let mut cache = AssistantRows::default();
+        assert!(cache.rows(text, 10).iter().any(|row| row.contains('↪')));
+        let ascii = cache.rows_with_ascii(text, 10, true);
+        assert!(ascii.iter().all(|row| row.is_ascii()));
+        assert!(ascii.iter().any(|row| row.starts_with("    > ")));
+        assert_eq!(
+            cache.rows(text, 10),
+            AssistantRows::default().rows(text, 10)
         );
     }
 
