@@ -190,6 +190,8 @@ impl Range {
 pub enum LimitName {
     /// Maximum model tool-loop steps per turn. Zero means unlimited.
     MaxAgentSteps,
+    /// Consecutive failures allowed for an identical tool name and argument string.
+    MaxConsecutiveToolFailures,
     /// Maximum bytes retained from one tool result.
     MaxToolResultBytes,
     /// Tool-result bytes retained across one turn.
@@ -272,6 +274,7 @@ impl LimitName {
     pub const fn all() -> &'static [Self] {
         &[
             Self::MaxAgentSteps,
+            Self::MaxConsecutiveToolFailures,
             Self::MaxToolResultBytes,
             Self::MaxTurnResultBytes,
             Self::SkillCatalogBytes,
@@ -317,6 +320,7 @@ impl LimitName {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::MaxAgentSteps => "max_agent_steps",
+            Self::MaxConsecutiveToolFailures => "max_consecutive_tool_failures",
             Self::MaxToolResultBytes => "max_tool_result_bytes",
             Self::MaxTurnResultBytes => "max_turn_result_bytes",
             Self::SkillCatalogBytes => "skill_catalog_bytes",
@@ -363,6 +367,7 @@ impl LimitName {
         match self {
             // Zero means unlimited steps. Embedded hosts lower this.
             Self::MaxAgentSteps => Budget::Bounded(0),
+            Self::MaxConsecutiveToolFailures => Budget::Bounded(3),
             Self::MaxToolResultBytes => Budget::Bounded(64 * 1024),
             Self::MaxTurnResultBytes => Budget::Bounded(8 * 1024 * 1024),
             Self::SkillCatalogBytes => Budget::Bounded(32768),
@@ -409,6 +414,10 @@ impl LimitName {
         match self {
             Self::MaxAgentSteps => Range {
                 min: 0,
+                max: Some(10_000),
+            },
+            Self::MaxConsecutiveToolFailures => Range {
+                min: 1,
                 max: Some(10_000),
             },
             Self::CompactionTriggerPercent => Range {
@@ -467,7 +476,8 @@ impl LimitName {
             | Self::McpStartupTimeoutMs
             | Self::ReviewTimeoutMs
             | Self::WebFetchTimeoutMs => Unit::Millis,
-            Self::ParallelToolCalls
+            Self::MaxConsecutiveToolFailures
+            | Self::ParallelToolCalls
             | Self::SubagentChildren
             | Self::McpRestartLimit
             | Self::ReviewHoldsPerTurn
@@ -488,6 +498,9 @@ impl LimitName {
     pub const fn description(self) -> &'static str {
         match self {
             Self::MaxAgentSteps => "Maximum model tool-loop steps per turn; zero means unlimited.",
+            Self::MaxConsecutiveToolFailures => {
+                "Consecutive identical tool failures allowed before stopping the next duplicate."
+            }
             Self::MaxToolResultBytes => "Bytes retained from one tool result before spilling.",
             Self::MaxTurnResultBytes => "Tool-result bytes one turn retains across its steps.",
             Self::SkillCatalogBytes => "Combined size of the skill catalog placed in the prompt.",

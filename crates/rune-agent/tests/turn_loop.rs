@@ -2797,3 +2797,303 @@ fn configured_vision_receives_only_permitted_images_from_the_host_inventory() {
         }
     }
 }
+
+/// Builds one batch with independently chosen names, argument strings and IDs.
+fn failure_batch(calls: &[(&str, &str, &str)]) -> Script {
+    let mut frames: Vec<_> = calls
+        .iter()
+        .enumerate()
+        .map(|(index, (id, name, arguments))| {
+            serde_json::json!({"choices": [{"index": 0, "delta": {"tool_calls": [{
+                "index": index, "id": id,
+                "function": {"name": name, "arguments": arguments}
+            }]}}]})
+            .to_string()
+        })
+        .collect();
+    frames.push(r#"{"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#.to_owned());
+    frames.push("[DONE]".to_owned());
+    Script::Frames(frames)
+}
+
+fn set_failure_cap(host: &mut TestHost, cap: rune_core::budget::Budget) {
+    host.limits
+        .set(
+            rune_core::LimitName::MaxConsecutiveToolFailures,
+            cap,
+            rune_core::config::Layer::User,
+        )
+        .expect("failure cap");
+}
+
+fn assert_failure_stop(error: &RuneError, history: &rune_agent::History) {
+    assert_eq!(error.code(), rune_core::ErrorCode::LimitExceeded);
+    assert_eq!(
+        error.detail().invariant.as_deref(),
+        Some("max_consecutive_tool_failures")
+    );
+    history.validate().expect("all tool calls have results");
+}
+
+#[test]
+fn identical_failures_stop_before_the_next_duplicate_across_steps() {
+    let arguments = r#"{"path":"missing"}"#;
+    for host_error in [false, true] {
+        let endpoint = MockEndpoint::start(vec![
+            Script::tool_call("first", "read_file", arguments),
+            Script::tool_call("second", "read_file", arguments),
+            failure_batch(&[
+                ("blocked", "read_file", arguments),
+                ("also_blocked", "read_file", r#"{"path":"other"}"#),
+            ]),
+            Script::text("must not request this"),
+        ]);
+        let mut host = TestHost::new(endpoint)
+            .with_tools(vec![read_tool()])
+            .with_tool_response(ToolOutput::failure("missing file"));
+        if host_error {
+            host.tool_error = Some(RuneError::new(
+                rune_core::ErrorCode::NotFound,
+                "missing file",
+            ));
+        }
+        set_failure_cap(&mut host, rune_core::budget::Budget::Bounded(2));
+        let mut history = rune_agent::History::new();
+        history.push_user("read a missing file");
+        let error = run_turn(&mut history, &host).expect_err("duplicate must stop");
+        assert_failure_stop(&error, &history);
+        assert_eq!(host.executed_calls().len(), 2);
+        assert_eq!(host.decisions.lock().expect("lock").len(), 2);
+        assert_eq!(host.server.as_ref().expect("endpoint").request_count(), 3);
+        assert_eq!(
+            host.events().iter().filter(|event| matches!(event, Event::ToolDenied { reason, .. } if reason.contains("max_consecutive_tool_failures"))).count(),
+            2
+        );
+    }
+}
+
+/// Read-only fixture that can recover on a later invocation of the same call.
+struct FailureFixture {
+    outputs: Mutex<std::collections::VecDeque<ToolOutput>>,
+}
+
+impl rune_tools::Tool for FailureFixture {
+    fn name(&self) -> &'static str {
+        "read_file"
+    }
+    fn description(&self) -> &'static str {
+        "Return scripted success or failure."
+    }
+    fn input_schema(&self) -> serde_json::Value {
+        read_tool().input_schema
+    }
+    fn activity(&self) -> rune_tools::Activity {
+        rune_tools::Activity::Read
+    }
+    fn is_read_only(&self) -> bool {
+        true
+    }
+    fn call(
+        &self,
+        _arguments: &serde_json::Value,
+        _context: &ExecutionContext,
+    ) -> Result<ToolOutput> {
+        Ok(self
+            .outputs
+            .lock()
+            .expect("lock")
+            .pop_front()
+            .unwrap_or_else(|| ToolOutput::failure("missing file")))
+    }
+}
+
+fn enable_concurrent_failure_fixture(host: &mut TestHost, outputs: Vec<ToolOutput>) {
+    let mut registry = Registry::new();
+    registry
+        .insert(Box::new(FailureFixture {
+            outputs: Mutex::new(outputs.into()),
+        }))
+        .expect("fixture");
+    host.registry = Some(registry);
+}
+
+#[test]
+fn identical_failures_in_a_batch_stop_at_the_cap_even_for_concurrent_reads() {
+    let arguments = r#"{"path":"missing"}"#;
+    for concurrent in [false, true] {
+        for cap in [1, 2, 3] {
+            let batch: Vec<_> = ["a", "b", "c", "d", "e"]
+                .into_iter()
+                .map(|id| (id, "read_file", arguments))
+                .collect();
+            let endpoint = MockEndpoint::start(vec![failure_batch(&batch)]);
+            let mut host = TestHost::new(endpoint)
+                .with_tools(vec![read_tool()])
+                .with_tool_response(ToolOutput::failure("missing file"));
+            if cap != 3 {
+                set_failure_cap(&mut host, rune_core::budget::Budget::Bounded(cap));
+            }
+            if concurrent {
+                enable_concurrent_failure_fixture(&mut host, Vec::new());
+            }
+            // The decision must use is_error, even when no output is retained.
+            set_result_caps(&mut host, 0, 0);
+            let mut history = rune_agent::History::new();
+            history.push_user("repeat failing reads");
+            let error = run_turn(&mut history, &host).expect_err("duplicate must stop");
+            assert_failure_stop(&error, &history);
+            assert_eq!(host.executed_calls().len(), usize::try_from(cap).unwrap());
+            assert_eq!(host.server.as_ref().expect("endpoint").request_count(), 1);
+        }
+    }
+}
+
+#[test]
+fn different_calls_reset_the_failure_streak_including_in_parallel_groups() {
+    let a = r#"{"path":"a"}"#;
+    let b = r#"{"path":"b"}"#;
+    // Previous step ends at the cap for A. B resets it before the next A,
+    // including when B and A share a parallel execution group.
+    let endpoint = MockEndpoint::start(vec![
+        failure_batch(&[("a1", "read_file", a), ("a2", "read_file", a)]),
+        failure_batch(&[("b", "read_file", b), ("a3", "read_file", a)]),
+        failure_batch(&[("other", "other_read", a), ("a4", "read_file", a)]),
+        Script::text("done"),
+    ]);
+    let mut other = read_tool();
+    other.name = "other_read".to_owned();
+    let mut host = TestHost::new(endpoint)
+        .with_tools(vec![read_tool(), other])
+        .with_tool_response(ToolOutput::failure("missing file"));
+    set_failure_cap(&mut host, rune_core::budget::Budget::Bounded(2));
+    enable_concurrent_failure_fixture(&mut host, Vec::new());
+    let mut history = rune_agent::History::new();
+    history.push_user("try different calls");
+    let outcome = run_turn(&mut history, &host).expect("different calls reset the streak");
+    assert_eq!(outcome.stop_reason, StopReason::Completed);
+    assert_eq!(outcome.calls.len(), 6);
+    assert_eq!(host.executed_calls().len(), 6);
+    history.validate().expect("paired history");
+}
+
+#[test]
+fn success_resets_the_failure_streak_for_the_same_call() {
+    let arguments = r#"{"path":"missing"}"#;
+    let endpoint = MockEndpoint::start(vec![
+        failure_batch(&[
+            ("a", "read_file", arguments),
+            ("b", "read_file", arguments),
+            ("c", "read_file", arguments),
+            ("d", "read_file", arguments),
+        ]),
+        Script::text("done"),
+    ]);
+    let mut host = TestHost::new(endpoint).with_tools(vec![read_tool()]);
+    set_failure_cap(&mut host, rune_core::budget::Budget::Bounded(2));
+    enable_concurrent_failure_fixture(
+        &mut host,
+        vec![
+            ToolOutput::failure("first failure"),
+            ToolOutput::success("recovered"),
+        ],
+    );
+    let mut history = rune_agent::History::new();
+    history.push_user("retry a recovering tool");
+    let outcome = run_turn(&mut history, &host).expect("success resets the streak");
+    assert_eq!(outcome.stop_reason, StopReason::Completed);
+    assert_eq!(host.executed_calls().len(), 4);
+    assert!(!outcome.calls[1].output.is_error);
+    history.validate().expect("paired history");
+}
+
+#[test]
+fn failure_cap_off_allows_more_identical_failures_than_the_default() {
+    let arguments = r#"{"path":"missing"}"#;
+    let batch: Vec<_> = ["a", "b", "c", "d", "e"]
+        .into_iter()
+        .map(|id| (id, "read_file", arguments))
+        .collect();
+    let endpoint = MockEndpoint::start(vec![failure_batch(&batch), Script::text("done")]);
+    let mut host = TestHost::new(endpoint).with_tools(vec![read_tool()]);
+    set_failure_cap(&mut host, rune_core::budget::Budget::Unbounded);
+    enable_concurrent_failure_fixture(&mut host, Vec::new());
+    let mut history = rune_agent::History::new();
+    history.push_user("repeat reads with the failure cap off");
+    let outcome = run_turn(&mut history, &host).expect("off disables the guard");
+    assert_eq!(outcome.stop_reason, StopReason::Completed);
+    assert_eq!(host.executed_calls().len(), 5);
+    history.validate().expect("paired history");
+}
+
+#[test]
+fn the_failure_streak_is_local_to_a_turn_and_reaching_the_cap_allows_an_answer() {
+    let arguments = r#"{"path":"missing"}"#;
+    let endpoint = MockEndpoint::start(vec![
+        failure_batch(&[("a", "read_file", arguments), ("b", "read_file", arguments)]),
+        Script::text("first answer"),
+        failure_batch(&[("c", "read_file", arguments), ("d", "read_file", arguments)]),
+        Script::text("second answer"),
+    ]);
+    let mut host = TestHost::new(endpoint)
+        .with_tools(vec![read_tool()])
+        .with_tool_response(ToolOutput::failure("missing file"));
+    set_failure_cap(&mut host, rune_core::budget::Budget::Bounded(2));
+    let mut history = rune_agent::History::new();
+    for prompt in ["first turn", "second turn"] {
+        history.push_user(prompt);
+        let outcome = run_turn(&mut history, &host).expect("each turn has its own streak");
+        assert_eq!(outcome.stop_reason, StopReason::Completed);
+        assert_eq!(outcome.calls.len(), 2);
+        history.validate().expect("paired history");
+    }
+    assert_eq!(host.executed_calls().len(), 4);
+}
+
+#[test]
+fn repeated_malformed_unoffered_and_denied_calls_stop_without_execution() {
+    for scenario in ["malformed", "unoffered", "denied"] {
+        let arguments = if scenario == "malformed" {
+            "invalid JSON"
+        } else {
+            r#"{"path":"missing"}"#
+        };
+        let endpoint = MockEndpoint::start(vec![failure_batch(&[
+            ("a", "read_file", arguments),
+            ("b", "read_file", arguments),
+            ("c", "read_file", arguments),
+        ])]);
+        let mut host = TestHost::new(endpoint);
+        if scenario != "unoffered" {
+            host.tools = vec![read_tool()];
+        }
+        if scenario == "denied" {
+            host.rules.push(Rule::deny("read_file", "*", Layer::User));
+        }
+        set_failure_cap(&mut host, rune_core::budget::Budget::Bounded(2));
+        let mut history = rune_agent::History::new();
+        history.push_user("repeat an invalid call");
+        let error = run_turn(&mut history, &host).expect_err("repeated errors must stop");
+        assert_failure_stop(&error, &history);
+        assert!(host.executed_calls().is_empty(), "{scenario}");
+    }
+}
+
+#[test]
+fn cancellation_of_identical_calls_preserves_the_cancellation_outcome() {
+    let arguments = r#"{"path":"missing"}"#;
+    let endpoint = MockEndpoint::start(vec![failure_batch(&[
+        ("a", "read_file", arguments),
+        ("b", "read_file", arguments),
+        ("c", "read_file", arguments),
+    ])]);
+    let mut host = TestHost::new(endpoint)
+        .with_tools(vec![read_tool()])
+        .cancelling_the_next_call();
+    set_failure_cap(&mut host, rune_core::budget::Budget::Bounded(1));
+    let mut history = rune_agent::History::new();
+    history.push_user("cancel during the first call");
+    let error = run_turn(&mut history, &host).expect_err("cancelled turn");
+    assert_eq!(error.code(), rune_core::ErrorCode::Cancelled);
+    assert_eq!(host.executed_calls().len(), 1);
+    history.validate().expect("all cancelled calls answered");
+}

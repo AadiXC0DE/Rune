@@ -6,6 +6,11 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Added
 
+- The shared host turn loop stops before executing a duplicate after three
+  consecutive failures of the same tool name and exact argument string. The
+  `limit_exceeded` error names `max_consecutive_tool_failures`; configure that
+  limit to change the cap or use `off` to disable it.
+
 - `rune ask --jsonl` streams flushed `start`, `text_delta`, and `final` JSON
   records, with step boundaries and retry resets. Records are bounded to 1 MiB,
   deltas are split at UTF-8 boundaries, and diagnostics stay on stderr.

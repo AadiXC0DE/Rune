@@ -271,6 +271,7 @@ Every limit takes a count, or `off` to remove it. A hard ceiling still applies t
 | Name | Default | Unit | Range | Description |
 |---|---|---|---|---|
 | `max_agent_steps` | 0 | items | 0 to 10000 | Maximum model tool-loop steps per turn; zero means unlimited. |
+| `max_consecutive_tool_failures` | 3 | items | 1 to 10000 | Consecutive identical tool failures allowed before stopping the next duplicate. |
 | `max_tool_result_bytes` | 65536 | bytes | 0 to unbounded | Bytes retained from one tool result before spilling. |
 | `max_turn_result_bytes` | 8388608 | bytes | 0 to unbounded | Tool-result bytes one turn retains across its steps. |
 | `skill_catalog_bytes` | 32768 | bytes | 0 to unbounded | Combined size of the skill catalog placed in the prompt. |

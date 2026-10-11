@@ -10,7 +10,7 @@
 //!
 //! - A malformed tool call or a tool failure is information for the model, not
 //!   an error that ends the turn. Only a policy denial, a cancellation, or an
-//!   exhausted retry budget stops it.
+//!   exhausted retry budget or consecutive identical failure cap stops it.
 //! - Finalization happens exactly once, so a session cannot record a turn twice.
 
 use std::time::Duration;
@@ -549,7 +549,14 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
 
         // Execute the batch. Policy is resolved per call before anything runs,
         // so a denial never reaches a tool.
-        let results = execute_batch(&pending_calls, host, history, &mut result_bytes, &limits);
+        let (results, failure_limit_reached) = execute_batch(
+            &pending_calls,
+            host,
+            history,
+            &mut result_bytes,
+            &limits,
+            &calls,
+        );
 
         let mut result_parts = Vec::new();
         for result in &results {
@@ -562,6 +569,14 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
         }
         history.push_tool_results(result_parts);
         calls.extend(results);
+
+        if failure_limit_reached {
+            return Err(RuneError::new(
+                ErrorCode::LimitExceeded,
+                "stopped before repeating a tool call at max_consecutive_tool_failures",
+            )
+            .with_invariant(LimitName::MaxConsecutiveToolFailures.as_str()));
+        }
 
         // A provider error with tool calls in flight still ends the turn after
         // the results are recorded, so nothing is lost.
@@ -710,9 +725,12 @@ fn execute_batch(
     history: &mut History,
     result_bytes: &mut usize,
     limits: &BudgetSet,
-) -> Vec<CallResult> {
+    previous: &[CallResult],
+) -> (Vec<CallResult>, bool) {
     let mut results = Vec::with_capacity(calls.len());
     let mut cancelled = false;
+    let mut stopped = false;
+    let failure_limit = limits.get(LimitName::MaxConsecutiveToolFailures).value();
     let offered: Vec<String> = host.tools().into_iter().map(|spec| spec.name).collect();
     let turn_cap = limits.get_usize(LimitName::MaxTurnResultBytes);
     let tool_cap = limits.get_usize(LimitName::MaxToolResultBytes);
@@ -733,6 +751,17 @@ fn execute_batch(
     } else {
         0
     };
+    // Adjacent duplicates must see the preceding result before they can run.
+    // Keep those and the remaining calls in order, while other reads overlap.
+    #[cfg(not(target_family = "wasm"))]
+    let parallel_prefix = if failure_limit.is_some() {
+        calls[..parallel_prefix]
+            .windows(2)
+            .position(|pair| identical_call(&pair[0], &pair[1]))
+            .map_or(parallel_prefix, |index| index.saturating_add(1))
+    } else {
+        parallel_prefix
+    };
     #[cfg(target_family = "wasm")]
     let parallel_prefix = 0;
 
@@ -740,8 +769,26 @@ fn execute_batch(
     for group in calls[..parallel_prefix].chunks(width) {
         let group_results = std::thread::scope(|scope| {
             let mut pending = Vec::with_capacity(group.len());
-            for call in group {
-                let prepared = prepare_call(call, host, &offered, &mut cancelled);
+            for (index, call) in group.iter().enumerate() {
+                // Later calls in this group differ from their predecessor,
+                // so they cannot extend an existing failure streak.
+                let blocked = if index == 0 || stopped {
+                    failure_guard(
+                        call,
+                        host,
+                        previous,
+                        &results,
+                        failure_limit,
+                        cancelled,
+                        &mut stopped,
+                    )
+                } else {
+                    None
+                };
+                let prepared = match blocked {
+                    Some(result) => Err(result),
+                    None => prepare_call(call, host, &offered, &mut cancelled),
+                };
                 let execution = match prepared {
                     Ok((arguments, context)) => {
                         let executor = host.concurrent_tool_host(&call.name);
@@ -788,7 +835,16 @@ fn execute_batch(
     }
     for call in &calls[parallel_prefix..] {
         let cap = turn_cap.saturating_sub(*result_bytes).min(tool_cap);
-        let result = execute_call(call, host, &offered, &mut cancelled, history, cap);
+        let result = failure_guard(
+            call,
+            host,
+            previous,
+            &results,
+            failure_limit,
+            cancelled,
+            &mut stopped,
+        )
+        .unwrap_or_else(|| execute_call(call, host, &offered, &mut cancelled, history, cap));
         retain_result(
             result,
             history,
@@ -798,7 +854,52 @@ fn execute_batch(
             &mut results,
         );
     }
-    results
+    (results, stopped)
+}
+
+/// Call IDs identify requests, not the operation being repeated.
+fn identical_call(left: &PreparedCall, right: &PreparedCall) -> bool {
+    left.name == right.name && left.arguments == right.arguments
+}
+
+/// Checks failures in request order, across batches but only within this turn.
+fn failure_guard(
+    call: &PreparedCall,
+    host: &dyn Host,
+    previous: &[CallResult],
+    results: &[CallResult],
+    limit: Option<u64>,
+    cancelled: bool,
+    stopped: &mut bool,
+) -> Option<CallResult> {
+    // Cancellation retains its existing outcome and answers pending calls.
+    if cancelled || host.cancellation().is_cancelled() {
+        return None;
+    }
+    if !*stopped {
+        let limit = limit?;
+        let failures = previous
+            .iter()
+            .chain(results)
+            .rev()
+            .take_while(|result| result.output.is_error && identical_call(&result.call, call))
+            .take(usize::try_from(limit).unwrap_or(usize::MAX))
+            .count();
+        *stopped = u64::try_from(failures).unwrap_or(u64::MAX) >= limit;
+    }
+    if !*stopped {
+        return None;
+    }
+    let reason = "not run: the turn reached max_consecutive_tool_failures";
+    host.emit(Event::ToolDenied {
+        call: call.clone(),
+        reason: reason.to_owned(),
+    });
+    Some(CallResult {
+        call: call.clone(),
+        output: ToolOutput::failure(reason),
+        executed: false,
+    })
 }
 
 /// Retains and charges answers in request order, regardless of execution order.

@@ -252,6 +252,12 @@ workspace instruction files and the configured system prompt, on every request.
 It runs a bounded turn with the built-in host tools. Allowed calls run
 under the configured permission mode and workspace boundaries; calls requiring
 interactive approval return an error to the model without waiting for input.
+The shared host loop allows three consecutive failures of the same tool name
+and exact argument string per turn, ignoring call IDs. The next duplicate stops
+with `limit_exceeded` naming `max_consecutive_tool_failures`, before execution.
+A successful call or a different call resets the streak. Configure the cap in
+`[limits]` or with `--limit max_consecutive_tool_failures=N`; `off` disables it.
+Adjacent duplicate reads run in order to enforce this cap.
 The next request includes the tool results. A positive `max_agent_steps` sets
 the model step cap; zero or an unlimited setting uses a cap of 16 for `ask`.
 Transient provider failures retry within each step up to `provider_max_attempts`,
