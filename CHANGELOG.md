@@ -140,6 +140,9 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Fixed
 
+- Session lock handoffs preserve the new writer's diagnostic record. The
+  previous writer clears its record before releasing the lock.
+
 - Session metadata is replaced atomically after durable event appends. Killing
   a writer leaves complete old or new metadata; reopening rebuilds the summary
   from the authoritative event log.

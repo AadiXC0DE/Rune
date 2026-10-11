@@ -169,14 +169,13 @@ struct Projection {
 
 /// An open session directory with the writer lock held.
 ///
-/// Dropping the store releases the lock and clears the holder record.
+/// Dropping the store clears the holder record before releasing the lock.
 #[derive(Debug)]
 pub struct SessionStore {
     id: SessionId,
     dir: Utf8PathBuf,
     log: File,
-    /// The held writer lock. Closing this handle is what releases the lock, so
-    /// the handle is kept rather than the lock being released explicitly.
+    /// The writer lock, held until drop clears the holder record and unlocks it.
     lock: File,
     projection: std::cell::RefCell<Projection>,
 }
@@ -425,11 +424,15 @@ impl SessionStore {
 
 impl Drop for SessionStore {
     fn drop(&mut self) {
-        // A released lock leaves no holder behind, so the next writer cannot be
-        // misled by a stale record. The lock itself is released when the handle
-        // in `lock` closes, which happens with this value.
-        let _ = self.lock.unlock();
+        // Clear diagnostics while we still own the lock. After unlock, another
+        // writer can acquire it and record its identity, which must survive our
+        // drop. Closing the handle also releases the lock if unlock fails.
         let _ = paths::write_private(&self.dir.join(HOLDER_FILE), "");
+        let _ = self.lock.unlock();
+        #[cfg(test)]
+        if let Some(after_unlock) = tests::AFTER_UNLOCK.with_borrow_mut(Option::take) {
+            after_unlock();
+        }
     }
 }
 
@@ -562,9 +565,9 @@ fn acquire_lock(dir: &Utf8Path, id: &SessionId, deadline_ms: u64) -> Result<File
 ///
 /// Best effort, and deliberately so: the record is diagnostic text, while the
 /// lock itself is held by the operating system. Only one writer exists at a
-/// time, so no holder ever races another holder here; the record is empty only
-/// between one writer releasing and the next acquiring, when the lock is
-/// genuinely free.
+/// time. Both recording and clearing happen with the lock held, so an old
+/// writer cannot erase its successor's record. Readers can briefly observe an
+/// empty record during acquisition or release.
 fn record_holder(dir: &Utf8Path) -> Result<()> {
     let holder = LockHolder {
         pid: std::process::id(),
@@ -617,6 +620,12 @@ fn id_from_dir(dir: &Utf8Path) -> Result<SessionId> {
 mod tests {
     use super::*;
     use crate::event::{LogRead, read_log};
+
+    std::thread_local! {
+        /// Forces a handoff immediately after unlock, before drop continues.
+        pub(super) static AFTER_UNLOCK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+            std::cell::RefCell::new(None);
+    }
 
     /// Builds paths rooted entirely inside the temporary directory.
     ///
@@ -1026,6 +1035,52 @@ mod tests {
             next.append(user("second writer")).expect("append").seq,
             EventSeq(2)
         );
+    }
+
+    #[test]
+    fn releasing_an_old_owner_preserves_the_new_owners_holder_record() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let (_paths, store) = store_in(&root);
+        store.append(user("old owner")).expect("append");
+        let dir = store.dir().to_path_buf();
+        let next_owner = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let acquired = std::rc::Rc::clone(&next_owner);
+        let next_dir = dir.clone();
+
+        // Pause the old owner's drop after unlock until another thread takes
+        // the lock and writes its record. Cleanup after unlock would erase it.
+        AFTER_UNLOCK.with_borrow_mut(|hook| {
+            *hook = Some(Box::new(move || {
+                let next = std::thread::spawn(move || {
+                    let next = SessionStore::open_with_deadline(&next_dir, 0)
+                        .expect("new owner acquires the released lock");
+                    let record = std::fs::read(next_dir.join(HOLDER_FILE)).expect("new record");
+                    (next, record)
+                })
+                .join()
+                .expect("new owner thread");
+                *acquired.borrow_mut() = Some(next);
+            }));
+        });
+
+        drop(store);
+
+        let (next, record) = next_owner.borrow_mut().take().expect("new owner");
+        let holder: LockHolder = serde_json::from_slice(&record).expect("valid holder record");
+        assert_eq!(holder.pid, std::process::id());
+        assert_eq!(
+            std::fs::read(dir.join(HOLDER_FILE)).expect("preserved record"),
+            record,
+            "the old owner's drop must preserve the new owner's diagnostics"
+        );
+        let err = SessionStore::open_with_deadline(&dir, 0).expect_err("new owner holds lock");
+        assert_eq!(err.code(), ErrorCode::Locked);
+        assert!(err.message().contains(&holder.pid.to_string()));
+        assert_eq!(
+            next.append(user("new owner")).expect("append").seq,
+            EventSeq(2)
+        );
+        assert_eq!(next.read().expect("read").len(), 2);
     }
 
     #[test]

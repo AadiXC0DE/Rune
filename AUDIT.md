@@ -1985,7 +1985,7 @@ Resource accumulation after cancellation, session holder handover and concurrent
 - [x] R-106 | T2 | fix | sandbox | Protect nested repositories within writable roots | acceptance: A sandboxed command must be refused when writing a nested repository's config or hooks, while normal source writes still work.
 - [x] R-107 | T2 | fix | sessions | Write disposable session metadata atomically | acceptance: Kill during metadata replacement and observe valid old or new metadata and replayable authoritative events.
 - [x] R-108 | T2 | fix | sessions | Distinguish durable append success from projection failure | acceptance: Force metadata write failure after event sync and observe a reported durable event with a repair warning rather than retry ambiguity.
-- [ ] R-109 | T2 | fix | sessions | Clear lock-holder diagnostics before releasing the lock | acceptance: Race old-owner release with new-owner acquisition and observe the new holder's diagnostic record preserved.
+- [x] R-109 | T2 | fix | sessions | Clear lock-holder diagnostics before releasing the lock | acceptance: Race old-owner release with new-owner acquisition and observe the new holder's diagnostic record preserved.
 - [ ] R-110 | T2 | fix | sessions | Cap event reads despite concurrent log growth | acceptance: Grow a log between metadata and read and observe bounded bytes plus a named size error.
 - [ ] R-111 | T2 | feature | sessions | Export a session as a stable JSON stream | acceptance: Export a fixture twice and observe identical ordered event records without credentials or transport headers.
 - [ ] R-112 | T2 | feature | sessions | Search sessions by title and prompt text | acceptance: Find a fixture session using a title fragment and a user-message fragment with workspace scoping intact.
