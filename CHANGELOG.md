@@ -172,6 +172,11 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Fixed
 
+- ACP connects requested stdio MCP servers when creating, loading, or resuming
+  a session, advertises their tools to the model, and executes approved calls.
+  Servers stay isolated by session and are stopped when no longer in use;
+  startup failures and timeouts are reported instead of silently ignored.
+
 - ACP uses the client-supplied session `cwd` for relative file operations,
   workspace instructions and skills, and the cwd reported by session listings.
   The workspace is saved for loading and resuming; an omitted cwd defaults to

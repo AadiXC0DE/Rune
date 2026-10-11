@@ -378,6 +378,332 @@ impl Drop for Harness {
     }
 }
 
+fn stdio_server(log: &Path, greeting: &str) -> Value {
+    json!({
+        "name": "fixture",
+        "command": "/bin/sh",
+        "args": [concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/stdio_mcp.sh"), log, "--fixture"],
+        "env": [{"name": "ACP_MCP_GREETING", "value": greeting}],
+    })
+}
+
+fn assert_mcp_stopped(log: &Path) {
+    let pid = std::fs::read_to_string(log.with_extension("pid")).expect("fixture PID");
+    let deadline = Instant::now()
+        .checked_add(Duration::from_secs(3))
+        .expect("deadline");
+    while std::process::Command::new("/bin/kill")
+        .args(["-0", pid.trim()])
+        .stderr(std::process::Stdio::null())
+        .status()
+        .expect("check child")
+        .success()
+    {
+        assert!(
+            Instant::now() < deadline,
+            "MCP child still running after close"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn requested_stdio_mcp_is_advertised_callable_and_isolated_by_session() {
+    let mut harness = Harness::start(
+        vec![
+            Script::tool_call("greeting", "mcp_fixture_greet", r#"{"who":"Ada"}"#),
+            Script::text("greeted"),
+            Script::text("no MCP here"),
+            Script::tool_call("other", "mcp_fixture_greet", "{}"),
+            Script::text("other greeted"),
+        ],
+        PermissionMode::Ask,
+    );
+    let plain = harness.open_session();
+    let workspace = harness.root.path().join("workspace");
+    let log = harness.root.path().join("mcp-requests");
+    let created = harness.client().call(
+        3,
+        "session/new",
+        &json!({
+            "cwd": workspace, "mcpServers": [stdio_server(&log, "first")],
+        }),
+    );
+    assert!(created.get("error").is_none(), "{created}");
+    let session = created["result"]["sessionId"].as_str().expect("session");
+    let response = harness
+        .client()
+        .call(4, "session/prompt", &prompt(session, "greet"));
+    assert_eq!(response["result"]["stopReason"], "end_turn");
+    let body = harness.mock.last_body().expect("provider request");
+    let tool = body["tools"]
+        .as_array()
+        .expect("tools")
+        .iter()
+        .find(|tool| tool["function"]["name"] == "mcp_fixture_greet")
+        .expect("requested MCP tool advertised to model");
+    assert_eq!(
+        tool["function"]["parameters"],
+        json!({
+            "type": "object", "properties": {"who": {"type": "string"}}, "required": [],
+        })
+    );
+    assert!(body["messages"].as_array().expect("messages").iter().any(
+        |message| message["tool_call_id"] == "greeting" && message["content"] == "hello first"
+    ));
+    assert_eq!(
+        harness.client().approvals.len(),
+        1,
+        "MCP uses permission checks"
+    );
+    assert_eq!(
+        harness.client().approvals[0]["params"]["toolCall"]["title"],
+        "Running mcp_fixture_greet"
+    );
+    let requests = std::fs::read_to_string(&log).expect("MCP transcript");
+    assert!(
+        requests.contains(r#""name":"greet","arguments":{"who":"Ada"}"#),
+        "{requests}"
+    );
+
+    harness
+        .client()
+        .call(5, "session/prompt", &prompt(&plain, "plain session"));
+    let body = harness.mock.last_body().expect("plain provider request");
+    assert!(
+        !body["tools"]
+            .as_array()
+            .expect("tools")
+            .iter()
+            .any(|tool| tool["function"]["name"] == "mcp_fixture_greet")
+    );
+
+    let other_log = harness.root.path().join("other-mcp-requests");
+    let created = harness.client().call(
+        6,
+        "session/new",
+        &json!({
+            "cwd": workspace, "mcpServers": [stdio_server(&other_log, "second")],
+        }),
+    );
+    let other = created["result"]["sessionId"]
+        .as_str()
+        .expect("other session");
+    harness
+        .client()
+        .call(7, "session/prompt", &prompt(other, "other greeting"));
+    let body = harness.mock.last_body().expect("other provider request");
+    assert!(
+        body["messages"]
+            .as_array()
+            .expect("messages")
+            .iter()
+            .any(|message| message["tool_call_id"] == "other"
+                && message["content"] == "hello second")
+    );
+    harness
+        .client()
+        .call(8, "session/close", &json!({"sessionId": session}));
+    assert_mcp_stopped(&log);
+    harness
+        .client()
+        .to_server
+        .shutdown(std::net::Shutdown::Both)
+        .expect("disconnect");
+    harness
+        .join
+        .take()
+        .expect("server thread")
+        .join()
+        .expect("server shutdown");
+    assert_mcp_stopped(&other_log);
+}
+
+#[test]
+fn loaded_and_resumed_sessions_connect_the_requested_stdio_servers() {
+    let mut harness = Harness::start(
+        vec![
+            Script::tool_call("failed", "mcp_fixture_greet", r#"{"who":"fail"}"#),
+            Script::text("failure observed"),
+            Script::tool_call("resumed", "mcp_fixture_greet", "{}"),
+            Script::text("resumed greeting"),
+        ],
+        PermissionMode::FullAccess,
+    );
+    let session = harness.open_session();
+    harness
+        .client()
+        .call(3, "session/close", &json!({"sessionId": session}));
+    let log = harness.root.path().join("loaded-mcp");
+    let response = harness.client().call(
+        4,
+        "session/load",
+        &json!({
+            "sessionId": session, "mcpServers": [stdio_server(&log, "loaded")],
+        }),
+    );
+    assert!(response.get("error").is_none(), "{response}");
+    harness
+        .client()
+        .call(5, "session/prompt", &prompt(&session, "fail greeting"));
+    let body = harness.mock.last_body().expect("provider request");
+    assert!(
+        body["messages"]
+            .as_array()
+            .expect("messages")
+            .iter()
+            .any(|message| message["tool_call_id"] == "failed"
+                && message["content"] == "fixture failure")
+    );
+    assert!(
+        harness
+            .client()
+            .updates("tool_call_update")
+            .iter()
+            .any(|frame| frame["params"]["update"]["toolCallId"] == "failed"
+                && frame["params"]["update"]["status"] == "failed")
+    );
+    harness
+        .client()
+        .call(6, "session/close", &json!({"sessionId": session}));
+    assert_mcp_stopped(&log);
+    let resumed_log = harness.root.path().join("resumed-mcp");
+    let response = harness.client().call(
+        7,
+        "session/resume",
+        &json!({
+            "sessionId": session, "mcpServers": [stdio_server(&resumed_log, "resumed")],
+        }),
+    );
+    assert!(response.get("error").is_none(), "{response}");
+    harness
+        .client()
+        .call(8, "session/prompt", &prompt(&session, "resumed greeting"));
+    let body = harness.mock.last_body().expect("resumed provider request");
+    assert!(body["messages"].as_array().expect("messages").iter().any(
+        |message| message["tool_call_id"] == "resumed" && message["content"] == "hello resumed"
+    ));
+}
+
+#[test]
+fn denied_mcp_calls_never_reach_the_stdio_server() {
+    let mut harness = Harness::start(
+        vec![
+            Script::tool_call("denied", "mcp_fixture_greet", "{}"),
+            Script::text("denied greeting"),
+        ],
+        PermissionMode::Ask,
+    );
+    let session = harness.open_session();
+    let log = harness.root.path().join("denied-mcp");
+    harness.client().call(
+        3,
+        "session/load",
+        &json!({
+            "sessionId": session, "mcpServers": [stdio_server(&log, "denied")],
+        }),
+    );
+    harness.client().approval = Approval::Refuse;
+    harness
+        .client()
+        .call(4, "session/prompt", &prompt(&session, "greet"));
+    assert_eq!(harness.client().approvals.len(), 1);
+    assert!(
+        !std::fs::read_to_string(&log)
+            .expect("MCP transcript")
+            .contains("tools/call")
+    );
+}
+
+#[test]
+fn invalid_or_failed_mcp_setup_does_not_create_a_session_or_leak_children() {
+    let mut limits = BudgetSet::new();
+    limits
+        .set(
+            LimitName::McpStartupTimeoutMs,
+            Budget::Bounded(500),
+            Layer::CommandLine,
+        )
+        .expect("startup limit");
+    let mut harness = Harness::start_with(
+        vec![Script::text("unused")],
+        PermissionMode::Auto,
+        limits,
+        Vec::new(),
+    );
+    let workspace = harness.root.path().join("workspace");
+    let log = harness.root.path().join("validated-mcp");
+    let valid = stdio_server(&log, "valid");
+    let mut relative = valid.clone();
+    relative["command"] = json!("relative-server");
+    let mut bad_env = valid.clone();
+    bad_env["env"] = json!([{"name": "INVALID=NAME", "value": "fixture"}]);
+    let mut unsupported = valid.clone();
+    unsupported["type"] = json!("http");
+    for (index, servers) in [
+        json!({}),
+        json!([{"name": "missing-command"}]),
+        json!([relative]),
+        json!([bad_env]),
+        json!([unsupported]),
+        json!([valid.clone(), valid.clone()]),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let response = harness.client().call(
+            i64::try_from(index).expect("index"),
+            "session/new",
+            &json!({
+                "cwd": workspace, "mcpServers": servers,
+            }),
+        );
+        assert_eq!(response["error"]["code"], -32602, "{response}");
+        assert!(
+            !log.exists(),
+            "invalid declarations must not start any child"
+        );
+    }
+    let mut missing = valid.clone();
+    missing["name"] = json!("missing");
+    missing["command"] = json!(harness.root.path().join("no-such-server"));
+    let response = harness.client().call(
+        20,
+        "session/new",
+        &json!({
+            "cwd": workspace, "mcpServers": [valid, missing],
+        }),
+    );
+    assert!(
+        response.get("error").is_some(),
+        "startup failure: {response}"
+    );
+    assert_mcp_stopped(&log);
+    let silent_log = harness.root.path().join("silent-mcp");
+    let response = harness.client().call(
+        21,
+        "session/new",
+        &json!({
+            "cwd": workspace, "mcpServers": [stdio_server(&silent_log, "silent")],
+        }),
+    );
+    assert!(
+        response.get("error").is_some(),
+        "startup timeout: {response}"
+    );
+    assert!(
+        response["error"]["message"]
+            .as_str()
+            .expect("timeout message")
+            .contains("initialize"),
+        "{response}"
+    );
+    assert_mcp_stopped(&silent_log);
+    let listed = harness.client().call(22, "session/list", &json!({}));
+    assert_eq!(listed["result"]["sessions"], json!([]));
+    assert_eq!(harness.mock.request_count(), 0);
+}
+
 #[test]
 fn initialize_advertises_this_protocol_version_and_capabilities() {
     let mut harness = Harness::start(vec![Script::text("unused")], PermissionMode::Auto);

@@ -12,6 +12,7 @@
 #![cfg_attr(test, allow(clippy::expect_used, clippy::unwrap_used, clippy::panic))]
 
 pub mod jsonrpc;
+mod mcp;
 pub mod server;
 pub mod session;
 

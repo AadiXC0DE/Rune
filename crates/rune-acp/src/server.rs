@@ -27,6 +27,7 @@ use camino::{Utf8Path, Utf8PathBuf};
 use rune_agent::history::History;
 use rune_agent::steering::{Cancellation, SteeringQueue};
 use rune_agent::turn::{Event, Host, StopReason, run_turn};
+use rune_context::mcp::Client;
 use rune_core::budget::{BudgetSet, LimitName};
 use rune_core::config::{Effort, PermissionMode};
 use rune_core::error::{ErrorCode, Result, RuneError};
@@ -556,19 +557,13 @@ impl<W: Write + Send + 'static> Server<W> {
         let workspace = optional_string(params, "cwd")?
             .map_or_else(|| self.config.workspace.clone(), Utf8PathBuf::from);
         require_absolute(&workspace, "cwd")?;
-        if let Some(list) = params.get("mcpServers").and_then(Value::as_array)
-            && !list.is_empty()
-        {
-            // No MCP client is wired in, so the request is reported rather than
-            // implying servers the session will never reach.
-            self.note(format_args!(
-                "ignoring {} requested MCP server(s)",
-                list.len()
-            ));
-        }
+        let mcp = crate::mcp::connect(params, &self.config.limits)?;
         let mut sessions = self.lock_sessions()?;
         let id = sessions
             .create_in(workspace, roots)
+            .map_err(|err| RpcError::from_rune(&err))?;
+        sessions
+            .set_mcp(&id, mcp)
             .map_err(|err| RpcError::from_rune(&err))?;
         let session = sessions.get(&id).map_err(|err| RpcError::from_rune(&err))?;
         Ok(json!({
@@ -581,11 +576,16 @@ impl<W: Write + Send + 'static> Server<W> {
     /// Answers `session/load`, replaying the stored conversation first.
     fn load_session(&self, params: &Value) -> std::result::Result<Value, RpcError> {
         let id = string_field(params, "sessionId")?;
+        let mcp = crate::mcp::connect(params, &self.config.limits)?;
         let updates = {
             let mut sessions = self.lock_sessions()?;
-            sessions
+            let updates = sessions
                 .load(&id)
-                .map_err(|err| RpcError::from_rune(&err))?
+                .map_err(|err| RpcError::from_rune(&err))?;
+            sessions
+                .set_mcp(&id, mcp)
+                .map_err(|err| RpcError::from_rune(&err))?;
+            updates
         };
         for update in updates {
             self.send(&Message::Notification(update));
@@ -596,9 +596,13 @@ impl<W: Write + Send + 'static> Server<W> {
     /// Answers `session/resume`, which replays nothing.
     fn resume_session(&self, params: &Value) -> std::result::Result<Value, RpcError> {
         let id = string_field(params, "sessionId")?;
+        let mcp = crate::mcp::connect(params, &self.config.limits)?;
         let mut sessions = self.lock_sessions()?;
         sessions
             .resume(&id)
+            .map_err(|err| RpcError::from_rune(&err))?;
+        sessions
+            .set_mcp(&id, mcp)
             .map_err(|err| RpcError::from_rune(&err))?;
         drop(sessions);
         self.session_state(&id)
@@ -881,6 +885,14 @@ fn run_one<W: Write + Send + 'static>(server: &Arc<Server<W>>, queued: Queued) {
         &queued.text,
     )));
 
+    let mut tools = server.config.registry.all_schemas();
+    if let Some(client) = &snapshot.mcp {
+        tools.extend(client.tools().into_iter().map(|tool| ToolSpec {
+            name: tool.name,
+            description: tool.description,
+            input_schema: tool.input_schema,
+        }));
+    }
     let host = TurnHost {
         server: Arc::clone(server),
         session: session.clone(),
@@ -892,7 +904,8 @@ fn run_one<W: Write + Send + 'static>(server: &Arc<Server<W>>, queued: Queued) {
             .with_offline(server.config.endpoint.offline),
         cancellation: cancellation.clone(),
         steering: snapshot.steering,
-        tools: server.config.registry.all_schemas(),
+        tools,
+        mcp: snapshot.mcp,
         answer: Mutex::default(),
         thought: Mutex::default(),
     };
@@ -1009,6 +1022,7 @@ struct TurnHost<W: Write + Send + 'static> {
     cancellation: Cancellation,
     steering: SteeringQueue,
     tools: Vec<ToolSpec>,
+    mcp: Option<Arc<Client>>,
     /// Answer text of the running step, as the client has been sent it.
     answer: Mutex<StreamedStep>,
     /// Reasoning of the running step, as the client has been sent it.
@@ -1204,6 +1218,21 @@ impl<W: Write + Send + 'static> Host for TurnHost<W> {
     }
 
     fn execute(&self, name: &str, arguments: &Value) -> Result<ToolOutput> {
+        if let Some(client) = &self.mcp
+            && client.tools().iter().any(|tool| tool.name == name)
+        {
+            self.context.check_cancelled()?;
+            let output = match client.call(name, arguments) {
+                Ok(outcome) => ToolOutput {
+                    produced_bytes: outcome.text.len() as u64,
+                    text: outcome.text,
+                    is_error: outcome.is_error,
+                },
+                Err(err) => ToolOutput::from_error(&err),
+            };
+            self.context.check_cancelled()?;
+            return Ok(output);
+        }
         self.server
             .config
             .registry

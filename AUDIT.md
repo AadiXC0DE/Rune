@@ -1995,7 +1995,7 @@ Resource accumulation after cancellation, session holder handover and concurrent
 - [x] R-116 | T2 | feature | mcp | List resolved MCP servers and startup failures | acceptance: Run rune mcp list --json and observe configured servers, transport, trust state and each startup error without secret headers.
 - [x] R-117 | T2 | feature | mcp | Add a server connectivity check without starting an agent turn | acceptance: Run rune mcp check against a local fixture and observe its protocol, tools and timeout result without a model request.
 - [x] R-118 | T2 | fix | acp | Use the session cwd supplied by the client | acceptance: Launch ACP from workspace A, create a session for B and observe relative reads, listing and instructions rooted in B.
-- [ ] R-119 | T2 | fix | acp | Implement requested stdio MCP servers | acceptance: Create an ACP session with a stdio MCP fixture and observe its tool advertised and callable in that session.
+- [x] R-119 | T2 | fix | acp | Implement requested stdio MCP servers | acceptance: Create an ACP session with a stdio MCP fixture and observe its tool advertised and callable in that session.
 - [ ] R-120 | T2 | fix | acp | Filter session listings by stored workspace | acceptance: Create fixture sessions in A and B and observe each connection list only its intended workspace with truthful cwd.
 - [ ] R-121 | T2 | fix | acp | Sort sessions before applying the listing cap | acceptance: Create more sessions than the cap in shuffled directory order and observe the newest sessions consistently returned.
 - [ ] R-122 | T2 | fix | acp | Apply lifecycle root parameters when reopening a session | acceptance: Load a session with a new additional-root list and observe exactly that effective list, including removal when omitted.

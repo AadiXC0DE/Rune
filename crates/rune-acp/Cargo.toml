@@ -12,6 +12,8 @@ workspace = true
 
 [dependencies]
 rune-core = { workspace = true }
+# Reuse the existing bounded MCP transports for client-requested session tools.
+rune-context = { workspace = true }
 rune-net = { workspace = true }
 rune-policy = { workspace = true }
 rune-agent = { workspace = true }

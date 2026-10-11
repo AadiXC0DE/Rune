@@ -1001,6 +1001,7 @@ dependencies = [
  "camino",
  "jiff",
  "rune-agent",
+ "rune-context",
  "rune-core",
  "rune-net",
  "rune-policy",

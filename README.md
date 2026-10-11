@@ -356,6 +356,14 @@ rune prompt --show          # the exact instructions the model receives
 can drive a session. `rune-sdk` is the library an embedder links against: the
 host supplies the credential, the tools, and the network path.
 
+ACP session creation, loading, and resuming connect the client's requested
+stdio `mcpServers` using each server's absolute `command`, `args`, and `env`
+name/value pairs. Their tools are advertised as `mcp_<server>_<tool>` and use
+the session's normal permission checks. Connections belong to that session;
+clients supply them again when loading or resuming. Startup failures fail the
+request, and startup and calls use the configured MCP timeouts. HTTP and SSE
+MCP transports remain unsupported in ACP.
+
 A Node binding lives in [`bindings/node`](bindings/node).
 
 ## Status

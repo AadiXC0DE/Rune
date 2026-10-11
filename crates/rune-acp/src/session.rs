@@ -10,10 +10,12 @@
 //! for older stored sessions that have no recorded workspace.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use camino::Utf8PathBuf;
 use rune_agent::history::History;
 use rune_agent::steering::SteeringQueue;
+use rune_context::mcp::Client;
 use rune_core::budget::{BudgetSet, LimitName};
 use rune_core::config::{Effort, PermissionMode};
 use rune_core::error::{ErrorCode, Result, RuneError};
@@ -79,6 +81,8 @@ pub struct Session {
     grants: RuleSet,
     /// Additional roots this session's tools may reach.
     additional_roots: Vec<Utf8PathBuf>,
+    /// Connections owned by this session, retained by an in-flight turn.
+    mcp: Option<Arc<Client>>,
     store: SessionStore,
 }
 
@@ -114,6 +118,8 @@ pub struct Snapshot {
     pub context: ExecutionContext,
     /// Steering queue for the turn.
     pub steering: SteeringQueue,
+    /// Session-local MCP connections, kept alive for this turn.
+    pub mcp: Option<Arc<Client>>,
 }
 
 /// The sessions held by one connection.
@@ -219,6 +225,7 @@ impl Sessions {
                             history: History::new(),
                             grants: RuleSet::new(),
                             additional_roots,
+                            mcp: None,
                             store,
                         },
                     );
@@ -286,6 +293,7 @@ impl Sessions {
                 history,
                 grants: RuleSet::new(),
                 additional_roots: Vec::new(),
+                mcp: None,
                 store,
             },
         );
@@ -421,7 +429,18 @@ impl Sessions {
             rules: session.grants.clone(),
             context,
             steering: SteeringQueue::from_limits(&self.limits),
+            mcp: session.mcp.clone(),
         })
+    }
+
+    /// Attaches the connections supplied by the current lifecycle request.
+    pub(crate) fn set_mcp(&mut self, id: &str, client: Option<Arc<Client>>) -> Result<()> {
+        let session = self
+            .entries
+            .get_mut(id)
+            .ok_or_else(|| unknown_session(id))?;
+        session.mcp = client;
+        Ok(())
     }
 
     /// Replaces a session's conversation and approvals with what a turn produced.
