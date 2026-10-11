@@ -6,6 +6,9 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Added
 
+- CI runs `node --test bindings/node/test.mjs` with Node.js 22 on pushes to
+  `main` and pull requests, failing the fast job when the binding contract breaks.
+
 - CI checks the dependency advisory and license policy in `deny.toml` with
   `cargo deny check` and verifies that scratch policy violations are rejected.
   The existing `webpki-roots` 1.0.9 trust-store data has a license exception

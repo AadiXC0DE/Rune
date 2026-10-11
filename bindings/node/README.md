@@ -92,5 +92,7 @@ Invalid caps throw `TypeError` before resolving or spawning the binary.
 node --test bindings/node/test.mjs
 ```
 
+Run this command from the repository root. CI runs it with Node.js 22 in the
+fast job on pushes to `main` and pull requests; a failing test fails the job.
 The suite drives a stub executable, so it needs no provider, no credential, and
 no network.

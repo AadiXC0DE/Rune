@@ -29,13 +29,21 @@ jobs:
       - name: Test dependency policy enforcement
         run: bash .github/scripts/test-dependency-policy.sh
 
-  # Cheap lane: runs on every push. Format, lint, and the fast test set.
+  # Cheap lane: runs on every push. Node bindings, format, lint, and workspace tests.
   fast:
     name: fast
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Test Node bindings
+        run: node --test bindings/node/test.mjs
 
       - name: Install the pinned toolchain
         run: rustup show
