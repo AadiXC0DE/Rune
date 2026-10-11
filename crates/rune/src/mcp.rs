@@ -23,9 +23,9 @@ pub struct Connection {
     pub warnings: Vec<String>,
 }
 
-/// Connects only approved, enabled local servers. Remote transports remain
-/// outside the interactive CLI's tool surface, including when online.
-pub fn connect_stdio(
+/// Connects approved, enabled stdio and HTTP servers for the interactive host.
+/// Offline mode excludes HTTP before resolving configuration or credentials.
+pub fn connect_interactive(
     settings: &Settings,
     paths: &Paths,
     workspace: &Utf8Path,
@@ -40,10 +40,12 @@ pub fn connect_stdio(
     let mut configs = Vec::new();
     let mut warnings = Vec::new();
     for (name, entry) in entries {
+        let transport = transport_kind(&entry);
         // Filter before expansion or environment reads. Neither full-access
         // tool policy nor offline mode grants project startup trust.
         if decision(&trust, &workspace, &name) != Decision::Approved
-            || transport_kind(&entry) != "stdio"
+            || !matches!(transport, "stdio" | "http")
+            || (settings.offline && transport != "stdio")
             || entry.get("enabled").and_then(Value::as_bool) == Some(false)
         {
             continue;

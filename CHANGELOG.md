@@ -218,8 +218,12 @@ Notable changes, newest first. Each entry describes what a user can observe.
   advertise their discovered schemas, and execute model calls through the
   existing permission checks. Startup and calls obey MCP timeouts, cancellation
   stops pending calls, and session exit terminates the children. Optional startup
-  failures are notices; required failures stop startup. HTTP and SSE remain
-  outside the interactive tool surface.
+  failures are notices; required failures stop startup.
+
+- Interactive sessions also connect trusted, enabled project HTTP MCP servers
+  online, advertise their schemas, and dispatch calls through permission checks.
+  Offline mode skips HTTP before credential expansion or requests, including
+  loopback endpoints. SSE remains outside the interactive tool surface.
 
 - `vision` uses the profile's `vision_model` with the active provider endpoint
   and credential in interactive sessions, ask, and ACP. Permitted workspace

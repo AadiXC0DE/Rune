@@ -166,7 +166,10 @@ def run_fixture(scenario, terminal=False):
             }
 
         entries = {"local": declaration("local", mode)}
-        entries["remote"] = {"type": "http", "url": f"http://127.0.0.1:{server.server_port}/mcp"}
+        # HTTP is now supported online; this fixture exercises stdio and keeps
+        # its remote declaration disabled. R-164 covers online HTTP dispatch.
+        entries["remote"] = {"type": "http", "url": f"http://127.0.0.1:{server.server_port}/mcp",
+                             "enabled": False}
         if scenario == "disabled":
             entries["local"]["enabled"] = False
             entries["local"]["args"] = ["${UNSET_DISABLED_VARIABLE}"]

@@ -247,7 +247,7 @@ struct SessionHost {
     limits: BudgetSet,
     context: ExecutionContext,
     registry: Registry,
-    /// Local MCP connections live until the session host is dropped.
+    /// MCP connections live until the session host is dropped.
     mcp: Option<McpClient>,
     subagent: Option<Arc<crate::subagent::Bridge>>,
     cancellation: Cancellation,
@@ -1431,7 +1431,8 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
     // that states no window rather than keeping the documented fallback.
     adopt_skill_catalog_budget(&mut limits, config.settings.context_window);
     let prompt = build_prompt(&config.workspace, &config.paths.config_root, &limits);
-    let connection = crate::mcp::connect_stdio(&config.settings, &config.paths, &config.workspace)?;
+    let connection =
+        crate::mcp::connect_interactive(&config.settings, &config.paths, &config.workspace)?;
     let mut tools = inventory::advertisement(&config.registry);
     let (mcp, mcp_warnings) = match connection {
         Some(connection) => {

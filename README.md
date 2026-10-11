@@ -81,15 +81,16 @@ is blocked, disabled or skipped offline; an unknown name is an error. JSON adds
 a `check` object to each server entry. An empty workspace reports no servers
 and succeeds.
 
-Interactive sessions connect approved, enabled stdio servers from `.mcp.json`
+Interactive sessions connect approved, enabled stdio and HTTP servers from `.mcp.json`
 once at startup. Their discovered schemas are advertised as
 `mcp_<server>_<tool>`, and each call still goes through tool permission checks.
 Full-access mode does not grant project startup trust. Optional startup failures
 appear as notices; a required server failure prevents the session from starting.
 Startup and calls use the configured MCP timeouts. Ctrl-C cancels a pending
 stdio call, and exiting the session terminates its server process groups with a
-bounded termination grace. HTTP and SSE servers are not connected by interactive
-sessions.
+bounded termination grace. HTTP servers are skipped with `--offline`, including
+loopback endpoints, before resolving credentials or connecting. SSE servers are
+not connected by interactive sessions.
 
 The web tools are off until asked for. `rune doctor` reports what this machine
 supports, and turning them on is one setting:
@@ -399,7 +400,7 @@ and remote MCP refusals, so offline mode also blocks a locally hosted model.
 | Model/provider requests and model discovery | Provider transport refuses before contacting the endpoint, with `permission_denied` and no retry delay. `rune models --offline` reports only the configured model. | [`an_offline_endpoint_refuses_before_any_network_call` and `an_offline_model_list_is_a_policy_refusal_before_any_network_call`](crates/rune-net/src/transport.rs); [`offline_mode_produces_no_connection`](crates/rune/tests/egress.rs); [`listing_models_offline_reports_the_configured_model_without_a_request`](crates/rune/tests/cli.rs); [`an_offline_turn_refuses_without_fetch_calls_or_retry_delay`](crates/rune-agent/tests/turn_loop.rs) |
 | Web fetch and search | The CLI installs neither web backend and keeps the tools denied, even with `web_tools = true`. | [`an_offline_run_gets_no_clients`](crates/rune/src/web_client.rs); [`an_offline_run_does_not_enable_the_web_tools`](crates/rune/src/permissions.rs) |
 | Image analysis | The CLI omits the vision backend and labels the tool unavailable, even with `vision_model` set. Configured tools also refuse an offline execution context before reading images. | [`absent_configuration_and_offline_runs_have_no_vision_client`](crates/rune/src/vision_client.rs); [`an_offline_context_does_not_reach_a_configured_backend`](crates/rune-tools/src/vision.rs) |
-| Remote MCP over HTTP or SSE | `rune mcp list` and `rune mcp check` skip remote declarations before resolving credentials or connecting, including approved loopback servers. Interactive sessions connect only stdio servers. | [`pending_rejected_disabled_and_offline_servers_are_never_contacted` and `check_respects_trust_disabled_and_offline_states_without_contact_or_expansion`](crates/rune/tests/mcp_list.rs); [interactive MCP fixture](crates/rune/tests/mcp_stdio.rs) |
+| Remote MCP over HTTP or SSE | `rune mcp list`, `rune mcp check` and interactive sessions skip remote declarations before resolving credentials or connecting, including approved loopback servers. Online interactive sessions connect approved, enabled HTTP servers; SSE remains unsupported there. | [`pending_rejected_disabled_and_offline_servers_are_never_contacted` and `check_respects_trust_disabled_and_offline_states_without_contact_or_expansion`](crates/rune/tests/mcp_list.rs); [interactive HTTP MCP fixture](crates/rune/tests/mcp_http.rs) |
 | Local MCP over stdio | Approved, enabled servers still start during offline listing, checking and interactive sessions. These child processes do not use the shell sandbox; their own network traffic remains unrestricted by Rune offline mode. Project trust approval authorizes startup, not network isolation. | [`approved_stdio_can_start_during_offline_listing`, `check_local_stdio_works_offline_without_a_provider` and `offline_stdio_mcp_can_send_network_traffic`](crates/rune/tests/mcp_list.rs); [interactive MCP fixture](crates/rune/tests/mcp_stdio.rs) |
 | Shell commands | Offline mode disables the sandbox's network grant, overriding external access and full-access permission mode. Linux uses a network namespace; macOS generates a network-denying Seatbelt profile. Without a usable sandbox, commands are refused unless `--allow-unsandboxed` permits fallback. That fallback has no network isolation, including offline. | [`offline_shell_policy_restricts_network_even_with_external_access` and `an_offline_full_access_shell_cannot_reach_a_local_fixture`](crates/rune-tools/src/shell.rs); [sandbox profile and argv tests](crates/rune-exec/src/sandbox.rs); [`offline_shell_fallback_requires_opt_in_and_applies_no_isolation`](crates/rune/tests/egress.rs) |
 
