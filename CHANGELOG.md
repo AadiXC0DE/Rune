@@ -6,6 +6,11 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Added
 
+- `create_directory` creates nested directories within permitted workspace roots,
+  with policy checks and bounded summaries. Existing directories succeed without
+  changes; files and paths outside permitted roots are refused. Each call creates
+  at most 128 missing directories and accepts paths up to 16 KiB.
+
 - `rename_file` moves a file within permitted workspace roots. Policy checks
   both paths; existing destinations, symlinks, and directories are refused.
   A successful rename reports one tool mutation and can be undone with `/undo`.

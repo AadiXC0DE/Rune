@@ -67,6 +67,7 @@ pub fn builtin_rules(mode: &PermissionMode) -> RuleSet {
     rules.push(Rule::allow("write_file", "*", Layer::Default));
     rules.push(Rule::allow("edit_file", "*", Layer::Default));
     rules.push(Rule::allow("rename_file", "*", Layer::Default));
+    rules.push(Rule::allow("create_directory", "*", Layer::Default));
 
     // Refused by default, so a caller that never consults the configuration
     // cannot reach the network by omission. Whether the run may use them is
@@ -254,6 +255,31 @@ mod tests {
             assert_eq!(
                 rules
                     .evaluate("rename_file", "protected", Outcome::Ask)
+                    .outcome,
+                Outcome::Deny
+            );
+        }
+    }
+
+    #[test]
+    fn directory_creation_is_allowed_by_default_and_user_denials_take_precedence() {
+        for mode in [PermissionMode::Auto, PermissionMode::Ask] {
+            let settings = Settings {
+                permission_mode: mode,
+                ..default_settings()
+            };
+            let mut extra = RuleSet::new();
+            extra.push(Rule::deny("create_directory", "protected/*", Layer::User));
+            let rules = rules_for(&settings, &extra);
+            assert_eq!(
+                rules
+                    .evaluate("create_directory", "ordinary/nested", Outcome::Ask)
+                    .outcome,
+                Outcome::Allow
+            );
+            assert_eq!(
+                rules
+                    .evaluate("create_directory", "protected/nested", Outcome::Ask)
                     .outcome,
                 Outcome::Deny
             );

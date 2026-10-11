@@ -5,6 +5,7 @@
 
 pub mod ask_user;
 pub mod contract;
+pub mod create_directory;
 pub mod edit_file;
 pub mod glob_files;
 pub mod grep_files;
@@ -23,6 +24,7 @@ pub mod workspace;
 pub mod write_file;
 
 pub use contract::{Activity, Cancellation, ExecutionContext, Tool, ToolOutput};
+pub use create_directory::CreateDirectory;
 pub use edit_file::EditFile;
 pub use glob_files::GlobFiles;
 pub use grep_files::GrepFiles;

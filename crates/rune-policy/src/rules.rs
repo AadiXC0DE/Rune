@@ -231,7 +231,12 @@ pub fn glob_match(pattern: &str, target: &str) -> bool {
 fn is_file_path_tool(tool: &str) -> bool {
     matches!(
         tool,
-        "read_file" | "write_file" | "edit_file" | "rename_file" | "grep_files"
+        "read_file"
+            | "write_file"
+            | "edit_file"
+            | "rename_file"
+            | "create_directory"
+            | "grep_files"
     )
 }
 
@@ -803,7 +808,13 @@ mod tests {
         set.push(allow("*"));
         set.push(deny(".env"));
 
-        for tool in ["read_file", "write_file", "edit_file", "grep_files"] {
+        for tool in [
+            "read_file",
+            "write_file",
+            "edit_file",
+            "grep_files",
+            "create_directory",
+        ] {
             for target in [
                 ".env",
                 "./.env",

@@ -1955,6 +1955,124 @@ fn a_file_rename_requires_policy_to_allow_both_normalized_paths() {
 }
 
 #[test]
+fn directory_creation_is_advertised_idempotent_and_refuses_an_outside_path() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let outside = tempfile::tempdir().expect("outside");
+    let outside_path = outside.path().join("one/two");
+    let escape = serde_json::json!({"path": outside_path}).to_string();
+    let endpoint = MockEndpoint::start(vec![
+        Script::tool_call("create", "create_directory", r#"{"path":"one/two"}"#),
+        Script::tool_call("repeat", "create_directory", r#"{"path":"one/two"}"#),
+        Script::tool_call("escape", "create_directory", &escape),
+        Script::text("done"),
+    ]);
+    let registry = rune_tools::inventory::builtin_default().expect("builtins");
+    let mut rules = RuleSet::new();
+    rules.push(Rule::allow("create_directory", "*", Layer::User));
+    let mut host = TestHost::new(endpoint)
+        .with_tools(rune_tools::inventory::advertisement(&registry))
+        .with_rules(rules);
+    host.workspace = Utf8PathBuf::from_path_buf(workspace.path().to_owned()).expect("UTF-8 path");
+    host.registry = Some(registry);
+    let mut history = rune_agent::History::new();
+    history.push_user("create nested directories");
+    let outcome = run_turn(&mut history, &host).expect("turn");
+    assert_eq!(outcome.stop_reason, StopReason::Completed);
+    assert_eq!(outcome.calls.len(), 3);
+    for (index, created) in [(0, 2), (1, 0)] {
+        assert!(!outcome.calls[index].output.is_error);
+        assert!(
+            outcome.calls[index]
+                .output
+                .text
+                .contains(&format!("Created {created} directories"))
+        );
+        assert!(outcome.calls[index].output.text.len() <= host.context().max_output_bytes);
+    }
+    assert!(outcome.calls[2].output.is_error);
+    assert!(
+        outcome.calls[2]
+            .output
+            .text
+            .contains("path_outside_workspace")
+    );
+    assert!(workspace.path().join("one/two").is_dir());
+    assert!(!outside.path().join("one").exists());
+    assert_eq!(
+        host.events()
+            .iter()
+            .filter(|event| matches!(
+                event,
+                Event::ToolStarted {
+                    activity: rune_tools::Activity::Write,
+                    ..
+                }
+            ))
+            .count(),
+        3
+    );
+    history.validate().expect("paired results");
+}
+
+#[test]
+fn directory_creation_checks_policy_for_normalized_directory_targets() {
+    for spelling in [
+        "protected/nested",
+        "./protected/nested",
+        "unused/../protected/nested",
+        "absolute",
+    ] {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let absolute = workspace.path().join("protected/nested");
+        let path = if spelling == "absolute" {
+            absolute.to_str().expect("UTF-8 path")
+        } else {
+            spelling
+        };
+        let arguments = serde_json::json!({"path": path}).to_string();
+        let endpoint = MockEndpoint::start(vec![
+            Script::tool_call("denied", "create_directory", &arguments),
+            Script::text("refused"),
+        ]);
+        let registry = rune_tools::inventory::builtin_default().expect("builtins");
+        let mut rules = RuleSet::new();
+        rules.push(Rule::allow("create_directory", "*", Layer::Default));
+        rules.push(Rule::deny("create_directory", "protected/*", Layer::User));
+        let mut host = TestHost::new(endpoint)
+            .with_tools(registry.all_schemas())
+            .with_rules(rules);
+        host.workspace =
+            Utf8PathBuf::from_path_buf(workspace.path().to_owned()).expect("UTF-8 path");
+        host.registry = Some(registry);
+        let mut history = rune_agent::History::new();
+        history.push_user("try a denied directory");
+        let outcome = run_turn(&mut history, &host).expect("turn");
+        assert!(outcome.calls[0].output.is_error);
+        assert!(!outcome.calls[0].executed);
+        assert!(host.executed_calls().is_empty());
+        assert_eq!(
+            std::fs::read_dir(workspace.path())
+                .expect("entries")
+                .count(),
+            0
+        );
+        assert_eq!(
+            host.events()
+                .iter()
+                .filter(|event| matches!(event, Event::ToolDenied { .. }))
+                .count(),
+            1
+        );
+        assert!(
+            !host
+                .events()
+                .iter()
+                .any(|event| matches!(event, Event::ToolStarted { .. }))
+        );
+    }
+}
+
+#[test]
 fn a_long_conversation_stays_valid_across_many_turns() {
     let endpoint = MockEndpoint::start(vec![Script::text("reply")]);
     let host = TestHost::new(endpoint);

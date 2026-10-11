@@ -922,7 +922,7 @@ fn infer_activity(name: &str) -> Activity {
         "read_file" | "read_tool_result" => Activity::Read,
         "glob_files" => Activity::List,
         "grep_files" => Activity::Search,
-        "write_file" | "rename_file" => Activity::Write,
+        "write_file" | "rename_file" | "create_directory" => Activity::Write,
         "edit_file" => Activity::Edit,
         "shell" => Activity::Execute,
         "web_fetch" | "web_search" => Activity::Network,
@@ -1076,12 +1076,11 @@ pub fn permission_target_for(
 /// Returns the permission target without a host.
 fn infer_target_standalone(name: &str, arguments: &serde_json::Value) -> Option<String> {
     match name {
-        "read_file" | "write_file" | "edit_file" | "rename_file" | "glob_files" | "grep_files" => {
-            arguments
-                .get("path")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_owned)
-        }
+        "read_file" | "write_file" | "edit_file" | "rename_file" | "create_directory"
+        | "glob_files" | "grep_files" => arguments
+            .get("path")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
         "shell" => arguments
             .get("command")
             .and_then(serde_json::Value::as_str)
