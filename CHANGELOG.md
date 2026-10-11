@@ -531,6 +531,8 @@ Notable changes, newest first. Each entry describes what a user can observe.
   update, preserving other provider profiles when multiple processes connect.
 - Credential updates and removals replace the complete file atomically, so
   interrupting a writer preserves the previous credentials until replacement.
+- Credential updates and removals reject complete serialized files above the
+  64 KiB reader cap before writing, preserving the previous readable file.
 - Long Unicode tool descriptions truncate at a character boundary, so registering
   a custom tool preserves valid UTF-8 without panicking.
 - Completed shell sessions keep their final output until `interact` or `stop`

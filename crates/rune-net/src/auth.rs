@@ -160,10 +160,25 @@ fn read_file(paths: &Paths) -> Result<Option<StoredFile>> {
     Ok(Some(parsed))
 }
 
+/// Serializes and bounds the complete file before starting an atomic write.
+fn write_file(paths: &Paths, file: &StoredFile) -> Result<()> {
+    let encoded = serde_json::to_string_pretty(file)?;
+    let limit = MAX_CREDENTIAL_FILE_BYTES as usize;
+    if encoded.len() > limit {
+        return Err(RuneError::too_large(
+            "credential file",
+            encoded.len(),
+            limit,
+        ));
+    }
+    paths::write_private_atomic(&paths.credentials_file(), &encoded)
+}
+
 /// Writes a credential to the profile file, creating or verifying its private
 /// state directory before reading or writing credentials. The complete JSON
 /// replaces the previous file atomically. An exclusive OS lock covers the
 /// entire read/modify/write operation so concurrent updates are preserved.
+/// Serialized files above the reader's size cap are rejected before writing.
 pub fn store(paths: &Paths, provider: &str, value: &str) -> Result<()> {
     if value.is_empty() {
         return Err(RuneError::invalid_field("credential", "must not be empty"));
@@ -187,8 +202,7 @@ pub fn store(paths: &Paths, provider: &str, value: &str) -> Result<()> {
         },
     );
 
-    let encoded = serde_json::to_string_pretty(&file)?;
-    paths::write_private_atomic(&paths.credentials_file(), &encoded)
+    write_file(paths, &file)
 }
 
 /// Removes a stored credential.
@@ -207,8 +221,7 @@ pub fn remove(paths: &Paths, provider: &str) -> Result<bool> {
     };
     let removed = file.entries.remove(provider).is_some();
     if removed {
-        let encoded = serde_json::to_string_pretty(&file)?;
-        paths::write_private_atomic(&paths.credentials_file(), &encoded)?;
+        write_file(paths, &file)?;
     }
     Ok(removed)
 }
@@ -812,6 +825,127 @@ mod tests {
         let err = store(&paths, "anthropic", &"x".repeat(MAX_CREDENTIAL_BYTES + 1))
             .expect_err("rejected");
         assert_eq!(err.code(), ErrorCode::TooLarge);
+    }
+
+    #[test]
+    fn credential_additions_exceeding_the_file_cap_preserve_previous_credentials() {
+        let dir = TempDir::new().expect("tempdir");
+        let paths = paths_for(&dir);
+        let value = "x".repeat(MAX_CREDENTIAL_BYTES);
+        for provider in ["one", "two", "three"] {
+            store(&paths, provider, &value).expect("store within file cap");
+        }
+        let original = std::fs::read(paths.credentials_file()).expect("original file");
+
+        let err = store(&paths, "four", &value).expect_err("file cap exceeded");
+        assert_eq!(err.code(), ErrorCode::TooLarge);
+        assert_eq!(err.field(), Some("credential file"));
+        assert_eq!(
+            std::fs::read(paths.credentials_file()).expect("unchanged file"),
+            original
+        );
+        assert!(from_file(&paths, "four").expect("read").is_none());
+        for provider in ["one", "two", "three"] {
+            assert_eq!(
+                from_file(&paths, provider)
+                    .expect("read")
+                    .expect("previous credential")
+                    .expose(),
+                value
+            );
+        }
+    }
+
+    #[test]
+    fn the_file_cap_includes_escaped_values_and_provider_names() {
+        let dir = TempDir::new().expect("tempdir");
+        let paths = paths_for(&dir);
+        store(&paths, "previous", "secret").expect("seed");
+        let original = std::fs::read(paths.credentials_file()).expect("original file");
+
+        for (provider, value) in [
+            ("escaped".to_owned(), "\0".repeat(MAX_CREDENTIAL_BYTES)),
+            (
+                "p".repeat(MAX_CREDENTIAL_FILE_BYTES as usize),
+                "x".to_owned(),
+            ),
+        ] {
+            let err = store(&paths, &provider, &value).expect_err("file cap exceeded");
+            assert_eq!(err.code(), ErrorCode::TooLarge);
+            assert_eq!(err.field(), Some("credential file"));
+            assert_eq!(
+                std::fs::read(paths.credentials_file()).expect("unchanged file"),
+                original
+            );
+            assert_eq!(stored_providers(&paths).expect("read"), ["previous"]);
+        }
+    }
+
+    #[test]
+    fn the_file_cap_accepts_the_exact_limit_and_rejects_one_more_byte() {
+        let dir = TempDir::new().expect("tempdir");
+        let paths = paths_for(&dir);
+        for provider in ["one", "two", "three"] {
+            store(&paths, provider, &"x".repeat(MAX_CREDENTIAL_BYTES)).expect("seed");
+        }
+        store(&paths, "four", "x").expect("small fourth credential");
+        let size = std::fs::metadata(paths.credentials_file())
+            .expect("metadata")
+            .len();
+        let value = "x".repeat((MAX_CREDENTIAL_FILE_BYTES - size) as usize + 1);
+        store(&paths, "four", &value).expect("exact file cap accepted");
+        let original = std::fs::read(paths.credentials_file()).expect("file at cap");
+        assert_eq!(original.len() as u64, MAX_CREDENTIAL_FILE_BYTES);
+        assert_eq!(
+            from_file(&paths, "four")
+                .expect("read")
+                .expect("present")
+                .expose(),
+            value
+        );
+
+        let err = store(&paths, "four", &format!("{value}x")).expect_err("one byte too large");
+        assert_eq!(err.code(), ErrorCode::TooLarge);
+        assert_eq!(err.field(), Some("credential file"));
+        assert_eq!(err.detail().observed.as_deref(), Some("65537"));
+        assert_eq!(
+            std::fs::read(paths.credentials_file()).expect("unchanged file"),
+            original
+        );
+        assert_eq!(
+            from_file(&paths, "four")
+                .expect("read")
+                .expect("present")
+                .expose(),
+            value
+        );
+    }
+
+    #[test]
+    fn removal_rejects_a_serialized_file_exceeding_the_cap() {
+        let dir = TempDir::new().expect("tempdir");
+        let paths = paths_for(&dir);
+        paths::create_dir_private(&paths.state_root).expect("state");
+        let entries: std::collections::BTreeMap<_, _> = (0..1600)
+            .map(|index| {
+                (
+                    format!("provider-{index}"),
+                    serde_json::json!({"value": "x"}),
+                )
+            })
+            .collect();
+        let compact = serde_json::json!({"version": 1, "entries": entries}).to_string();
+        assert!(compact.len() as u64 <= MAX_CREDENTIAL_FILE_BYTES);
+        paths::write_private(&paths.credentials_file(), &compact).expect("compact file");
+
+        let err = remove(&paths, "provider-0").expect_err("pretty JSON exceeds file cap");
+        assert_eq!(err.code(), ErrorCode::TooLarge);
+        assert_eq!(err.field(), Some("credential file"));
+        assert_eq!(
+            std::fs::read_to_string(paths.credentials_file()).expect("unchanged file"),
+            compact
+        );
+        assert_eq!(stored_providers(&paths).expect("read").len(), 1600);
     }
 
     #[test]
