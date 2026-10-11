@@ -102,6 +102,10 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Fixed
 
+- Settings writers recover automatically after a lock holder is killed. The
+  OS releases the lock on process exit; the persistent `.lock` file no longer
+  blocks later writers, while live holders retain the two-second wait limit.
+
 - Invalid legacy project limits, such as `max_agent_steps = 10001`, report
   an `invalid_field` diagnostic naming the key and accepted range, matching
   `[limits]` validation while preserving user-selected limits.
