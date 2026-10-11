@@ -403,7 +403,8 @@ impl fmt::Debug for AgentOptions {
 /// Options for one prompt.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct PromptOptions {
-    /// Model steps allowed for this turn. Zero means unlimited.
+    /// Model steps allowed for this turn. A nonzero value overrides the agent's
+    /// `MaxAgentSteps` limit. Zero uses that limit, which is unlimited by default.
     pub max_steps: u64,
 }
 
@@ -775,7 +776,14 @@ impl Agent {
             tools: Arc::clone(&self.tools),
             specs: Arc::clone(&self.specs),
             limits: self.limits.clone(),
-            max_steps: options.max_steps,
+            max_steps: if options.max_steps == 0 {
+                self.limits
+                    .get(LimitName::MaxAgentSteps)
+                    .value()
+                    .unwrap_or(0)
+            } else {
+                options.max_steps
+            },
         };
 
         let guard = WorkerGuard {

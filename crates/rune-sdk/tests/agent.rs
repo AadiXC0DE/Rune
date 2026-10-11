@@ -413,6 +413,77 @@ fn a_step_limit_ends_the_turn_with_tool_calls_still_pending() {
 }
 
 #[test]
+fn prompt_step_limits_inherit_agent_limits_unless_overridden() {
+    for (budget, prompt_options, expected_steps, expected_stop) in [
+        (
+            Budget::Bounded(2),
+            PromptOptions::default(),
+            2,
+            StopReason::StepLimit,
+        ),
+        (
+            Budget::Bounded(2),
+            PromptOptions { max_steps: 1 },
+            1,
+            StopReason::StepLimit,
+        ),
+        (
+            Budget::Bounded(1),
+            PromptOptions { max_steps: 3 },
+            3,
+            StopReason::StepLimit,
+        ),
+        (
+            Budget::Bounded(0),
+            PromptOptions::default(),
+            4,
+            StopReason::Completed,
+        ),
+        (
+            Budget::Unbounded,
+            PromptOptions::default(),
+            4,
+            StopReason::Completed,
+        ),
+    ] {
+        let endpoint = MockEndpoint::start(vec![
+            Script::tool_call("call_1", "again", "{}"),
+            Script::tool_call("call_2", "again", "{}"),
+            Script::tool_call("call_3", "again", "{}"),
+            Script::text("finished"),
+        ]);
+        let fetch = Arc::new(CountingFetch::new());
+        let mut agent_options = options(&endpoint.base_url(), fetch.clone());
+        agent_options.tools.push(HostTool::new(
+            "again",
+            "Asks for another step.",
+            json!({"type": "object"}),
+            |_arguments, _context| Ok(rune_sdk::agent::HostToolResult::text("done")),
+        ));
+        let mut limits = BudgetSet::new();
+        limits
+            .set(LimitName::MaxAgentSteps, budget, Layer::CommandLine)
+            .expect("valid step limit");
+        let mut agent = Agent::new(agent_options)
+            .expect("agent")
+            .with_limits(limits);
+
+        let mut turn = agent.prompt("loop", prompt_options).expect("turn");
+        let result = turn.result().expect("result");
+
+        assert_eq!(
+            result.stop_reason, expected_stop,
+            "{budget}, {prompt_options:?}"
+        );
+        assert_eq!(result.steps, expected_steps, "{budget}, {prompt_options:?}");
+        assert_eq!(fetch.hits(), expected_steps as usize);
+        assert_eq!(endpoint.request_count(), expected_steps as usize);
+        assert_eq!(result.calls.len(), expected_steps.min(3) as usize);
+        assert!(result.calls.iter().all(|call| call.executed));
+    }
+}
+
+#[test]
 fn an_unknown_tool_name_is_answered_without_calling_anything() {
     let endpoint = MockEndpoint::start(vec![
         Script::tool_call("call_1", "nonexistent", "{}"),

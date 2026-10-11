@@ -182,6 +182,11 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Fixed
 
+- SDK prompts with default options honor the agent's configured
+  `max_agent_steps` limit. A nonzero `PromptOptions.max_steps` overrides that
+  limit for the turn; zero or `off` in the agent limits still allows unlimited
+  steps.
+
 - SDK checkpoint creation enforces the same `prompt_history_bytes` cap as
   restoration, returning `too_large` for `checkpoint` instead of bytes that
   cannot be restored under the same limits. The cap includes JSON metadata
