@@ -507,6 +507,30 @@ impl Host for SessionHost {
         if let Some(path) = mutating_path(name, arguments) {
             self.remember(path);
         }
+        if name == "rename_file"
+            && let (Some(source), Some(destination)) = (
+                arguments.get("path").and_then(serde_json::Value::as_str),
+                arguments
+                    .get("new_path")
+                    .and_then(serde_json::Value::as_str),
+            )
+        {
+            // Keep the source preimage, but record only successful renames so
+            // a refused directory or destination cannot pollute `/undo`.
+            let source = rune_tools::resolve(&self.context, source)?.path;
+            let destination = rune_tools::resolve(&self.context, destination)?.path;
+            let before = std::fs::read(&source).ok();
+            let output = self.registry.call(name, arguments, &self.context)?;
+            if !output.is_error {
+                let mut undo = self
+                    .undo
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                undo.entry(source).or_insert(before);
+                undo.entry(destination).or_insert(None);
+            }
+            return Ok(output);
+        }
         self.registry.call(name, arguments, &self.context)
     }
 
@@ -4073,10 +4097,10 @@ impl Totals {
     }
 }
 
-/// Returns the file a tool call will change, when it changes one.
+/// Returns the single file a content-rewriting tool call will change.
 ///
-/// Only the two tools that rewrite a file wholesale are treated as mutations.
-/// A tool that changes something else, such as the shell, is not tracked: what
+/// Renames are captured separately because they affect two paths. A tool that
+/// changes something else, such as the shell, is not tracked: what
 /// a shell command changed is not knowable from its arguments, and pretending
 /// otherwise would offer an undo that does not undo.
 fn mutating_path<'a>(name: &str, arguments: &'a serde_json::Value) -> Option<&'a Utf8Path> {
@@ -6603,6 +6627,54 @@ mod tests {
         std::fs::write(&created, "created by the session").expect("write");
         host.undo().expect("undo");
         assert!(!created.exists(), "the created file was left behind");
+    }
+
+    #[test]
+    fn undoing_a_file_rename_restores_the_source_and_removes_the_destination() {
+        let dir = tempfile::tempdir().expect("temp");
+        let root = Utf8Path::from_path(dir.path()).expect("utf8");
+        let mut host = test_host();
+        host.context = ExecutionContext::new(root.to_owned());
+        host.registry
+            .insert(Box::new(rune_tools::RenameFile))
+            .expect("registered");
+        std::fs::write(root.join("source"), [0, 255, 10]).expect("fixture");
+        let output = host
+            .execute(
+                "rename_file",
+                &serde_json::json!({"path": "source", "new_path": "destination"}),
+            )
+            .expect("rename");
+        assert!(!output.is_error);
+        assert!(!root.join("source").exists());
+        assert!(root.join("destination").exists());
+        host.undo().expect("undo");
+        assert_eq!(
+            std::fs::read(root.join("source")).expect("read"),
+            [0, 255, 10]
+        );
+        assert!(!root.join("destination").exists());
+    }
+
+    #[test]
+    fn a_refused_file_rename_does_not_create_an_undo_record() {
+        let dir = tempfile::tempdir().expect("temp");
+        let root = Utf8Path::from_path(dir.path()).expect("utf8");
+        let mut host = test_host();
+        host.context = ExecutionContext::new(root.to_owned());
+        host.registry
+            .insert(Box::new(rune_tools::RenameFile))
+            .expect("registered");
+        std::fs::create_dir(root.join("directory")).expect("fixture");
+        let output = host
+            .execute(
+                "rename_file",
+                &serde_json::json!({"path": "directory", "new_path": "destination"}),
+            )
+            .expect("tool error");
+        assert!(output.is_error);
+        assert!(!host.can_undo());
+        assert!(root.join("directory").is_dir());
     }
 
     #[test]

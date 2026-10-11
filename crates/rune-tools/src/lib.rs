@@ -13,6 +13,7 @@ pub mod mutation;
 pub mod read_file;
 pub mod read_tool_result;
 pub mod registry;
+pub mod rename_file;
 pub mod result_store;
 pub mod shell;
 pub mod skill;
@@ -29,6 +30,7 @@ pub use mutation::{Applied, ChangeSpan, Occurrence, Prepared, Preview};
 pub use read_file::ReadFile;
 pub use read_tool_result::ReadToolResult;
 pub use registry::Registry;
+pub use rename_file::RenameFile;
 pub use result_store::{Handle, Preview as ResultPreview, Store};
 pub use vision::{ImageAnalysis, Vision, VisionBackend, VisionSource};
 pub use web::{

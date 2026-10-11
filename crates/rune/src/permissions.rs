@@ -66,6 +66,7 @@ pub fn builtin_rules(mode: &PermissionMode) -> RuleSet {
     // A write inside the workspace is recoverable; a command is not.
     rules.push(Rule::allow("write_file", "*", Layer::Default));
     rules.push(Rule::allow("edit_file", "*", Layer::Default));
+    rules.push(Rule::allow("rename_file", "*", Layer::Default));
 
     // Refused by default, so a caller that never consults the configuration
     // cannot reach the network by omission. Whether the run may use them is
@@ -232,6 +233,31 @@ mod tests {
         let rules = builtin_rules(&PermissionMode::Auto);
         let decision = rules.evaluate("read_file", "src/main.rs", Outcome::Ask);
         assert_eq!(decision.outcome, Outcome::Allow);
+    }
+
+    #[test]
+    fn a_file_rename_is_allowed_by_default_and_can_be_denied_by_user_policy() {
+        for mode in [PermissionMode::Auto, PermissionMode::Ask] {
+            let settings = Settings {
+                permission_mode: mode,
+                ..default_settings()
+            };
+            let mut extra = RuleSet::new();
+            extra.push(Rule::deny("rename_file", "protected", Layer::User));
+            let rules = rules_for(&settings, &extra);
+            assert_eq!(
+                rules
+                    .evaluate("rename_file", "ordinary", Outcome::Ask)
+                    .outcome,
+                Outcome::Allow
+            );
+            assert_eq!(
+                rules
+                    .evaluate("rename_file", "protected", Outcome::Ask)
+                    .outcome,
+                Outcome::Deny
+            );
+        }
     }
 
     #[test]

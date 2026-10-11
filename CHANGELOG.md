@@ -6,6 +6,10 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Added
 
+- `rename_file` moves a file within permitted workspace roots. Policy checks
+  both paths; existing destinations, symlinks, and directories are refused.
+  A successful rename reports one tool mutation and can be undone with `/undo`.
+
 - `edit_file` accepts an `edits` array of up to 128 literal replacement hunks.
   Hunks run in order against earlier results and commit in one atomic write.
   A missing or ambiguous hunk leaves the entire file unchanged and returns a

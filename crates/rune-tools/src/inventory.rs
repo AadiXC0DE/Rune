@@ -18,7 +18,7 @@ use crate::skill::{CapabilitySearch, InstallSkill, LoadSkill};
 use crate::vision::Vision;
 use crate::web::{WebFetch, WebSearch};
 use crate::workspace::FileLimits;
-use crate::{EditFile, GlobFiles, GrepFiles, ReadFile, ReadToolResult, WriteFile};
+use crate::{EditFile, GlobFiles, GrepFiles, ReadFile, ReadToolResult, RenameFile, WriteFile};
 
 /// Names of every tool this build ships, in advertisement order.
 ///
@@ -31,6 +31,7 @@ pub const ADVERTISEMENT_ORDER: &[&str] = &[
     "read_tool_result",
     "write_file",
     "edit_file",
+    "rename_file",
     "shell",
     "ask_user_question",
     "web_fetch",
@@ -128,6 +129,7 @@ pub fn builtin_with_answerer(
     registry.insert(Box::new(ReadToolResult::new(budget)))?;
     registry.insert(Box::new(WriteFile))?;
     registry.insert(Box::new(EditFile))?;
+    registry.insert(Box::new(RenameFile))?;
     registry.insert(Box::new(Shell::new(budget)))?;
     registry.insert(Box::new(AskUserQuestion::new(answerer)))?;
 
@@ -451,7 +453,7 @@ mod tests {
         for name in ["glob_files", "grep_files", "read_file", "read_tool_result"] {
             assert!(read_only.contains(&name), "`{name}` should be read only");
         }
-        for name in ["write_file", "edit_file"] {
+        for name in ["write_file", "edit_file", "rename_file"] {
             assert!(!read_only.contains(&name), "`{name}` must not be read only");
         }
     }
