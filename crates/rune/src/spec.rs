@@ -284,7 +284,7 @@ pub const SESSIONS: &[CommandSpec] = &[
         name: "session",
         aliases: &[],
         summary: "Inspect, search, export, migrate, or recover one session",
-        usage: "rune session <last|id> [--search <text>] [--json] | rune session --id <id> [--search <text>] [--json] | rune session export <last|id> | rune session export --id <id> | rune session migrate <id> | rune session recover <id>",
+        usage: "rune session <last|id> [--search <text> | --record <id|all>] [--json] | rune session --id <id> [--search <text> | --record <id|all>] [--json] | rune session export <last|id> | rune session export --id <id> | rune session migrate <id> | rune session recover <id>",
         flags: &[
             option(
                 "--id",
@@ -297,6 +297,11 @@ pub const SESSIONS: &[CommandSpec] = &[
                 "Search saved message, tool, and summary records, including compacted context, by a case-insensitive literal fragment. Return original records and sequence positions.",
             ),
             flag("--allow-large", "Permit migrating an oversized session."),
+            option(
+                "--record",
+                "id|all",
+                "Retrieve exact original messages archived by manual compaction. IDs are stable within the session; all lists every archived record.",
+            ),
             flag(
                 "--json",
                 "Emit JSON. Export always emits ordered JSONL event records.",

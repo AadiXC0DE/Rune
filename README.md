@@ -302,6 +302,18 @@ version, and timestamp, in log order. `--json` returns `session_id`, `query`,
 session; `--id <id>` selects an exact session. An incomplete final frame is omitted
 with a warning on stderr; other log corruption fails the search.
 
+`/compact` saves every original message in its removed prefix before changing
+live history. The private archive retains all content parts, including complete
+tool-call/result pairs and provider replay state. An archive write failure keeps
+history unchanged. `rune session <last|id> --record all` lists these originals;
+`--record <id>` retrieves one by its stable, session-local archive ID, including
+after restart or later compactions. `--json` returns `session_id` and `records`,
+each containing `id` and the exact original `message`. Archive IDs are separate
+from journal sequence positions and from live positions that compaction renumbers.
+The archive is capped at 256 MiB per session; it covers manual compaction only.
+Summary failures do not add archive records. Search and export continue to read
+the session journal; use `--record` for exact archived message parts.
+
 `rune session export <last|id>` writes stable JSONL to stdout, one saved event
 per line in sequence order, with its schema version and original timestamp.
 Credentials, metadata, and transport headers are excluded. Recorded message

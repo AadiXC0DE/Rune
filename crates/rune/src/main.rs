@@ -13,6 +13,7 @@
 mod ask;
 mod auto_review;
 mod cli;
+mod compaction_archive;
 mod connect_flow;
 mod diagnostics;
 mod help;
@@ -866,6 +867,12 @@ fn run_session(
     }
 
     let exporting = launch.args.first().map(String::as_str) == Some("export");
+    if launch.flag("--record").is_some() && (exporting || launch.flag("--search").is_some()) {
+        return Err(RuneError::invalid_field(
+            "record",
+            "record retrieval cannot be combined with search or export",
+        ));
+    }
     if exporting && launch.flag("--search").is_some() {
         return Err(RuneError::invalid_field(
             "search",
@@ -887,7 +894,42 @@ fn run_session(
     };
     let state = session_log::inspect(paths, &id)?;
 
-    if let Some(query) = launch.flag("--search") {
+    if let Some(selector) = launch.flag("--record") {
+        let mut records = compaction_archive::read(&paths.session_dir(&id))?;
+        if selector != "all" {
+            let record_id = selector
+                .parse::<u64>()
+                .ok()
+                .filter(|id| *id > 0)
+                .ok_or_else(|| {
+                    RuneError::invalid_field("record", "expected a positive record ID or `all`")
+                })?;
+            records.retain(|record| record.id == record_id);
+            if records.is_empty() {
+                return Err(RuneError::new(
+                    ErrorCode::NotFound,
+                    format!("no archived record `{record_id}` in session `{id}`"),
+                ));
+            }
+        }
+        if output.json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "session_id": state.id,
+                    "records": records,
+                }))?
+            );
+        } else {
+            for record in records {
+                println!(
+                    "record {}: {}",
+                    record.id,
+                    serde_json::to_string(&record.message)?
+                );
+            }
+        }
+    } else if let Some(query) = launch.flag("--search") {
         let matches = state.search_records(query)?;
         if let Some(offset) = state.truncated_at {
             eprintln!("warning: omitted incomplete session tail at byte {offset}");

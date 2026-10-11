@@ -86,7 +86,7 @@ List sessions
 | `--limit <n>` | Page size, 1 to 100. |
 | `--cursor <c>` | Continue from a previous page. |
 | `--json` | Emit JSON. |
-### `rune session <last|id> [--search <text>] [--json] | rune session --id <id> [--search <text>] [--json] | rune session export <last|id> | rune session export --id <id> | rune session migrate <id> | rune session recover <id>`
+### `rune session <last|id> [--search <text> | --record <id|all>] [--json] | rune session --id <id> [--search <text> | --record <id|all>] [--json] | rune session export <last|id> | rune session export --id <id> | rune session migrate <id> | rune session recover <id>`
 
 Inspect, search, export, migrate, or recover one session
 
@@ -95,6 +95,7 @@ Inspect, search, export, migrate, or recover one session
 | `--id <id>` | Inspect, search, or export this exact session identifier, taking precedence over a positional selector. |
 | `--search <text>` | Search saved message, tool, and summary records, including compacted context, by a case-insensitive literal fragment. Return original records and sequence positions. |
 | `--allow-large` | Permit migrating an oversized session. |
+| `--record <id|all>` | Retrieve exact original messages archived by manual compaction. IDs are stable within the session; all lists every archived record. |
 | `--json` | Emit JSON. Export always emits ordered JSONL event records. |
 ### `rune tree [last|id] [--json] | rune tree --id <id> [--json]`
 

@@ -352,6 +352,11 @@ impl Recorder {
         })?;
         Ok(())
     }
+
+    /// Archives original messages while holding the session's writer lock.
+    pub fn archive_messages(&self, messages: &[rune_agent::history::Turn]) -> Result<()> {
+        crate::compaction_archive::append(self.store.dir(), messages)
+    }
 }
 
 /// Page size used when a caller does not choose one.

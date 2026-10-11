@@ -448,7 +448,7 @@ impl Host for SessionHost {
             // A short conversation can cross the trigger while still fitting.
             return Ok(());
         };
-        let removed = summarize_history(self, history, &compaction_plan, client, &|| {
+        let removed = summarize_history(self, history, &compaction_plan, client, false, &|| {
             self.cancellation.is_cancelled()
         })?;
         plan.messages = history.to_messages();
@@ -3486,15 +3486,21 @@ fn compact_history(
         );
     }
 
-    match summarize_history(host, history, &plan, &rune_net::transport::agent(), &|| {
-        false
-    }) {
+    match summarize_history(
+        host,
+        history,
+        &plan,
+        &rune_net::transport::agent(),
+        true,
+        &|| false,
+    ) {
         Ok(removed) => report(
             host,
             sink,
             &format!(
-                "compacted {removed} earlier turn(s); {} turn(s) remain",
-                history.len()
+                "compacted {removed} earlier turn(s); {} turn(s) remain; originals: rune session {} --record all",
+                history.len(),
+                host.session_id_name()
             ),
         ),
         Err(err) => report(host, sink, err.message()),
@@ -3534,6 +3540,7 @@ fn summarize_history(
     history: &mut History,
     plan: &rune_agent::compaction::Plan,
     client: &dyn rune_net::fetch::Fetch,
+    archive: bool,
     cancelled: &dyn Fn() -> bool,
 ) -> Result<usize> {
     let request = rune_agent::compaction::render_summary_request(history, plan);
@@ -3570,6 +3577,26 @@ fn summarize_history(
             format!("compaction produced nothing usable: {err}"),
         )
     })?;
+    if archive {
+        let recorder = host.recorder.as_ref().ok_or_else(|| {
+            RuneError::new(
+                ErrorCode::InvalidState,
+                "manual compaction requires a session archive",
+            )
+        })?;
+        recorder
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .archive_messages(&history.turns()[..plan.removed_turns])
+            .map_err(|err| {
+                RuneError::new(
+                    err.code(),
+                    format!(
+                        "compaction could not archive original messages; history unchanged: {err}"
+                    ),
+                )
+            })?;
+    }
     host.capture_history(history);
     let removed = rune_agent::compaction::apply(
         history,
@@ -7481,6 +7508,41 @@ mod tests {
     }
 
     #[test]
+    fn failed_manual_archive_keeps_history_and_previous_records() {
+        let (mut host, mut history, _) = compaction_fixture();
+        let temp = tempfile::tempdir().expect("temp");
+        let root = Utf8Path::from_path(temp.path()).expect("utf8");
+        let paths = Paths {
+            state_root: root.join("state"),
+            config_root: root.join("config"),
+            data_root: root.join("data"),
+        };
+        let id = "archivefail1".parse().expect("id");
+        let recorder = Recorder::create(&paths, &id).expect("recorder");
+        let archive = paths.session_dir(&id).join("compaction-archive.json");
+        rune_core::paths::write_private(&archive, "broken archive").expect("fixture");
+        host.recorder = Some(Arc::new(Mutex::new(recorder)));
+        let before = history.clone();
+        let plan = rune_agent::compaction::plan(&history, &host.limits).expect("plan");
+        let fetch = SummaryFixture::new(
+            "The earlier fixture exchanges established the task and its current progress.",
+        );
+        let error = summarize_history(&host, &mut history, &plan, &fetch, true, &|| false)
+            .expect_err("archive failure must prevent replacement");
+        assert_eq!(error.code(), ErrorCode::CorruptRecord);
+        assert!(error.message().contains("history unchanged"));
+        assert_eq!(history.turns(), before.turns());
+        assert_eq!(
+            std::fs::read_to_string(archive).expect("old archive"),
+            "broken archive"
+        );
+        assert_eq!(
+            *host.transcript.lock().expect("transcript"),
+            history_entries(before.turns())
+        );
+    }
+
+    #[test]
     fn crossing_the_configured_trigger_compacts_before_the_next_request() {
         let (host, mut history, mut plan) = compaction_fixture();
         let mut fetch = SummaryFixture::new(
@@ -7694,7 +7756,7 @@ mod tests {
                     .expect_err("automatic compaction must reject a truncated summary")
             } else {
                 let plan = rune_agent::compaction::plan(&history, &host.limits).expect("plan");
-                summarize_history(&host, &mut history, &plan, &fetch, &|| false)
+                summarize_history(&host, &mut history, &plan, &fetch, true, &|| false)
                     .expect_err("the shared summarizer must reject a truncated summary")
             };
             assert_eq!(error.code(), ErrorCode::InvalidState);
