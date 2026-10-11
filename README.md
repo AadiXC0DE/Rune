@@ -136,7 +136,7 @@ otherwise.
 
 ```sh
 rune                        # interactive session
-rune ask "..."              # one request, prints the answer
+rune ask "..."              # one bounded turn, prints the answer
 rune review                 # review the pending changes in this repository
 rune resume last            # continue the most recent session here
 ```
@@ -219,10 +219,14 @@ Unicode grapheme deletion and pasted text. Alt-R reapplies an undone edit and
 restores its caret. Repeated presses redo later edits; a new edit clears redo
 history. Press Alt with lowercase `r`.
 
-`rune ask` sends one text-only request. If the model requests tools, it exits 1
-and names the unsupported calls. With `--json`, `error_code` is
-`unsupported_tool_call`, each requested tool has status `error`, and
-`final_output` is empty. Any accompanying text remains in `output`.
+`rune ask` runs a bounded turn with the built-in host tools. Allowed calls run
+under the configured permission mode and workspace boundaries; calls requiring
+interactive approval return an error to the model without waiting for input.
+The next request includes the tool results. A positive `max_agent_steps` sets
+the request cap; zero or an unlimited setting uses a cap of 16 for `ask`.
+Reaching the cap before a final answer exits 1 with `limit_exceeded` and an
+empty `final_output`. JSON reports the steps, summed usage, and each tool's
+`success` or `error` status.
 Completed exchanges are saved as sessions for the current workspace, and
 `--json` reports their `session_id`. Pass `--no-save` to create no session and
 return an empty ID.

@@ -296,6 +296,7 @@ fn run_ask(
         prompt,
         json: output.json,
         no_save: launch.has_flag("--no-save"),
+        tool_loop: true,
     };
 
     match ask::run(settings, paths, &options) {
@@ -362,6 +363,7 @@ fn run_review(
         prompt,
         json: output.json,
         no_save: false,
+        tool_loop: false,
     };
 
     match ask::run(settings, paths, &options) {

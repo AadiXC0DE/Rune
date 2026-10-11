@@ -36,7 +36,7 @@ Resume a saved session, defaulting to the latest in this workspace
 
 ### `rune ask [flags] <prompt>`
 
-Run one request without an interactive session
+Run one bounded turn without an interactive session
 
 | Flag | Description |
 |---|---|

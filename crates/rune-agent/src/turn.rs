@@ -291,6 +291,10 @@ pub trait Host {
         Ok(())
     }
 
+    /// Observes a completed provider response before recording or executing it.
+    /// Hosts may retain finish metadata needed by their output contract.
+    fn observe_response(&self, _outcome: &StreamOutcome) {}
+
     /// Reports an event.
     fn emit(&self, event: Event);
 
@@ -434,6 +438,7 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
             &cancellation,
         )?;
 
+        host.observe_response(&outcome);
         usage = usage.merge_sum(outcome.usage);
         last_request = outcome.usage;
 

@@ -63,7 +63,7 @@ the validated object the binary printed, including `error` and `error_code`, or
 
 | Export | Purpose |
 | --- | --- |
-| `ask(prompt, options)` | Runs one request, resolves with the parsed result object |
+| `ask(prompt, options)` | Runs one bounded turn, resolves with the parsed result object |
 | `resolveBinary(options)` | Returns the path the next `ask` would run |
 | `RuneError` | Base class, with a `code` of `BINARY_NOT_FOUND`, `EXIT`, `OUTPUT`, `OUTPUT_LIMIT`, `TIMEOUT`, `ABORTED`, or `SIGNALED` |
 | `RuneBinaryNotFoundError` | No executable through the option, `RUNE_BIN`, or `PATH` |

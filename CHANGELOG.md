@@ -6,6 +6,12 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Added
 
+- `rune ask` executes allowed built-in tools through the shared host loop and
+  sends their results in subsequent requests. A positive `max_agent_steps`
+  bounds the turn; otherwise ask uses 16 steps. Cap exhaustion exits 1 with
+  `limit_exceeded`, while JSON reports actual tool statuses and summed usage.
+  Saved exchanges include the tool calls and results.
+
 - CI compares release binaries and archives from two independent clean builds
   in scratch target directories, failing if either pair of SHA-256 hashes differs.
 
@@ -537,9 +543,8 @@ Notable changes, newest first. Each entry describes what a user can observe.
 - Structured questions in terminal sessions now collect choices with the arrow
   keys and Enter, then send the selected answers to the model. Escape or
   Control-C cancels the waiting turn; piped sessions still report input unavailable.
-- `rune ask` fails with `unsupported_tool_call` when the model requests tools
-  that its text-only path cannot execute. JSON lists those calls with status
-  `error` instead of reporting them as successful.
+- `rune ask` fails with `unsupported_tool_call` when the provider reports a
+  tool-call finish without a completed call.
 - File permission rules also match normalized absolute and workspace-relative
   paths, so denying `.env` also denies `./.env` and its absolute workspace path.
 - Long drafts scroll horizontally to keep the caret and the text being edited
@@ -826,7 +831,7 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Added
 
-- `rune ask` for one request, with a JSON result object.
+- `rune ask` for one bounded turn, with a JSON result object.
 - Session persistence: every turn is written to a log, sessions can be listed,
   inspected, resumed, paged, and shown as a branch tree.
 - Recovery of a damaged session into a new one, and a report of the log schema

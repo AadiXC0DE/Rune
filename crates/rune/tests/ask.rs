@@ -1,4 +1,4 @@
-//! Regressions for the text-only one-shot path through the real binary.
+//! Regressions for the bounded one-shot tool loop through the real binary.
 
 #![allow(clippy::expect_used, clippy::panic)]
 
@@ -158,6 +158,16 @@ fn run_response_fixture(
     json_output: bool,
     no_save: bool,
 ) -> (Output, tempfile::TempDir) {
+    let (output, dir, _) = run_responses_fixture(vec![response], json_output, no_save, Some(1));
+    (output, dir)
+}
+
+fn run_responses_fixture(
+    responses: Vec<String>,
+    json_output: bool,
+    no_save: bool,
+    max_steps: Option<u64>,
+) -> (Output, tempfile::TempDir, Vec<Value>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind fixture");
     listener.set_nonblocking(true).expect("nonblocking");
     let address = listener.local_addr().expect("fixture address");
@@ -165,47 +175,65 @@ fn run_response_fixture(
         let deadline = Instant::now()
             .checked_add(Duration::from_secs(10))
             .expect("fixture deadline");
-        let mut stream = loop {
-            match listener.accept() {
-                Ok((stream, _)) => break stream,
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    assert!(Instant::now() < deadline, "no provider request arrived");
-                    std::thread::sleep(Duration::from_millis(10));
+        let mut requests = Vec::new();
+        for response in responses {
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(Instant::now() < deadline, "no provider request arrived");
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("accept fixture request: {error}"),
                 }
-                Err(error) => panic!("accept fixture request: {error}"),
-            }
-        };
-        stream
-            .set_read_timeout(Some(Duration::from_secs(10)))
-            .expect("request timeout");
-        stream
-            .set_write_timeout(Some(Duration::from_secs(10)))
-            .expect("response timeout");
+            };
+            stream
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .expect("request timeout");
+            stream
+                .set_write_timeout(Some(Duration::from_secs(10)))
+                .expect("response timeout");
 
-        // Consume the whole request before closing the connection, so unread
-        // request bytes cannot cause a reset to discard the fixture response.
-        let mut reader = std::io::BufReader::new(&mut stream);
-        let mut content_length = None;
-        loop {
-            let mut line = String::new();
-            assert!(reader.read_line(&mut line).expect("request header") > 0);
-            if line == "\r\n" {
-                break;
+            // Consume the whole request before closing the connection, so unread
+            // request bytes cannot cause a reset to discard the fixture response.
+            let mut reader = std::io::BufReader::new(&mut stream);
+            let mut content_length = None;
+            loop {
+                let mut line = String::new();
+                assert!(reader.read_line(&mut line).expect("request header") > 0);
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some(length) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    content_length = Some(length.trim().parse::<usize>().expect("content length"));
+                }
             }
-            if let Some(length) = line.to_ascii_lowercase().strip_prefix("content-length:") {
-                content_length = Some(length.trim().parse::<usize>().expect("content length"));
-            }
+            let mut request = vec![0; content_length.expect("request content length")];
+            reader.read_exact(&mut request).expect("request body");
+            drop(reader);
+            requests.push(serde_json::from_slice(&request).expect("request JSON"));
+
+            stream
+                .write_all(response.as_bytes())
+                .expect("fixture response");
         }
-        let mut request = vec![0; content_length.expect("request content length")];
-        reader.read_exact(&mut request).expect("request body");
-        drop(reader);
-
-        stream
-            .write_all(response.as_bytes())
-            .expect("fixture response");
+        requests
     });
 
     let dir = tempfile::tempdir().expect("isolated state");
+    std::fs::write(dir.path().join("fixture.txt"), "ALLOWED_READ_RESULT").expect("read fixture");
+    if let Some(cap) = max_steps {
+        rune_core::paths::create_dir_private(
+            camino::Utf8Path::from_path(&dir.path().join("config/rune"))
+                .expect("UTF-8 config path"),
+        )
+        .expect("configuration directory");
+        std::fs::write(
+            dir.path().join("config/rune/config.toml"),
+            format!("[limits]\nmax_agent_steps = {cap}\n"),
+        )
+        .expect("step cap");
+    }
     let mut command = isolated_command(&dir);
     command
         .env("RUNE_PROVIDER", "chat_completions")
@@ -224,8 +252,8 @@ fn run_response_fixture(
         .arg("run the fixture command")
         .output()
         .expect("ask");
-    server.join().expect("fixture server");
-    (output, dir)
+    let requests = server.join().expect("fixture server");
+    (output, dir, requests)
 }
 
 #[test]
@@ -291,16 +319,15 @@ fn tool_call_delta() -> Value {
 }
 
 #[test]
-fn ask_json_rejects_tool_calls_regardless_of_finish_reason() {
+fn ask_json_reports_tool_errors_and_stops_at_the_configured_cap() {
     for finish in ["tool_calls", "stop", "length"] {
         let output = run_fixture(&tool_call_delta(), finish, true);
         assert_eq!(output.status.code(), Some(1), "finish: {finish}");
         let result: Value = serde_json::from_slice(&output.stdout).expect("one JSON result");
         assert_eq!(result["exit_code"], 1);
-        assert_eq!(result["error_code"], "unsupported_tool_call");
+        assert_eq!(result["error_code"], "limit_exceeded");
         let error = result["error"].as_str().expect("failure detail");
-        assert!(error.contains("shell"), "{error}");
-        assert!(error.contains("read_file"), "{error}");
+        assert!(error.contains("limit of 1 model steps"), "{error}");
         assert_eq!(
             result["tool_calls"],
             json!([
@@ -319,20 +346,17 @@ fn ask_json_rejects_tool_calls_regardless_of_finish_reason() {
         assert!(!stdout.contains("SHOULD_NOT_RUN"), "{stdout}");
         assert!(!stdout.contains("private.txt"), "{stdout}");
         let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(stderr.contains("shell"), "{stderr}");
-        assert!(stderr.contains("read_file"), "{stderr}");
+        assert!(stderr.contains("limit of 1 model steps"), "{stderr}");
     }
 }
 
 #[test]
-fn ask_plain_text_rejects_tool_calls_without_printing_a_final_answer() {
+fn ask_plain_text_step_limit_does_not_print_a_final_answer() {
     let output = run_fixture(&tool_call_delta(), "tool_calls", false);
     assert_eq!(output.status.code(), Some(1));
     assert!(output.stdout.is_empty());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("tool calls"), "{stderr}");
-    assert!(stderr.contains("shell"), "{stderr}");
-    assert!(stderr.contains("read_file"), "{stderr}");
+    assert!(stderr.contains("limit of 1 model steps"), "{stderr}");
     assert!(!stderr.contains("SHOULD_NOT_RUN"), "{stderr}");
     assert!(!stderr.contains("private.txt"), "{stderr}");
 }
@@ -348,6 +372,12 @@ fn ask_rejects_a_tool_calls_finish_without_completed_calls() {
     let result: Value = serde_json::from_slice(&output.stdout).expect("one JSON result");
     assert_eq!(result["error_code"], "unsupported_tool_call");
     assert_eq!(result["tool_calls"], json!([]));
+    assert_eq!(result["output"], "An unfinished tool request.");
+    assert_eq!(result["steps"], 1);
+    assert_eq!(
+        result["usage"],
+        json!({"input_tokens": 11, "output_tokens": 0})
+    );
     assert_eq!(result["final_output"], "");
 }
 
@@ -400,10 +430,14 @@ fn ask_saves_a_resolvable_exchange_in_its_workspace() {
         }
 
         let inspection = isolated_command(&dir)
-            .args(["session", session_id, "--json"])
+            .args(["session", "--json", "--", session_id])
             .output()
             .expect("inspect saved session");
-        assert!(inspection.status.success());
+        assert!(
+            inspection.status.success(),
+            "{}",
+            String::from_utf8_lossy(&inspection.stderr)
+        );
         let inspection: Value =
             serde_json::from_slice(&inspection.stdout).expect("session inspection");
         assert_eq!(inspection["id"], session_id);
@@ -472,7 +506,7 @@ fn ask_no_save_creates_no_session() {
 }
 
 #[test]
-fn ask_saves_a_rejected_tool_exchange_with_its_failure() {
+fn ask_saves_a_tool_exchange_stopped_at_the_step_cap() {
     let (output, dir) = run_fixture_with_options(&tool_call_delta(), "tool_calls", true, false);
     assert_eq!(output.status.code(), Some(1));
     let result: Value = serde_json::from_slice(&output.stdout).expect("ask JSON");
@@ -500,7 +534,164 @@ fn ask_saves_a_rejected_tool_exchange_with_its_failure() {
     assert!(matches!(
         state.events.last().map(|frame| &frame.event),
         Some(rune_session::SessionEvent::TurnFailed { turn: 1, code, message })
-            if *code == rune_core::error::ErrorCode::UnsupportedToolCall
+            if *code == rune_core::error::ErrorCode::LimitExceeded
                 && Some(message.as_str()) == result["error"].as_str()
     ));
+}
+
+fn completion_response(delta: &Value, finish: &str) -> String {
+    let body = format!(
+        "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+        json!({"choices": [{"delta": delta, "finish_reason": null}]}),
+        json!({"choices": [{"delta": {}, "finish_reason": finish}],
+            "usage": {"prompt_tokens": 11, "completion_tokens": 2}})
+    );
+    format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
+}
+
+fn call_delta(name: &str, arguments: &str) -> Value {
+    json!({"content": "Checking the fixture.", "tool_calls": [{
+        "index": 0, "id": "call-fixture", "type": "function",
+        "function": {"name": name, "arguments": arguments}
+    }]})
+}
+
+#[test]
+fn ask_reads_an_allowed_file_and_sends_its_result_before_the_final_answer() {
+    for json_output in [true, false] {
+        let (output, dir, requests) = run_responses_fixture(
+            vec![
+                completion_response(
+                    &call_delta("read_file", r#"{"path":"fixture.txt"}"#),
+                    "tool_calls",
+                ),
+                completion_response(&json!({"content": "Final fixture answer."}), "stop"),
+            ],
+            json_output,
+            false,
+            Some(2),
+        );
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(output.stderr.is_empty());
+        assert_eq!(requests.len(), 2);
+        let tools = requests[0]["tools"].as_array().expect("advertised tools");
+        assert!(
+            tools
+                .iter()
+                .any(|tool| tool["function"]["name"] == "read_file")
+        );
+        let messages = requests[1]["messages"]
+            .as_array()
+            .expect("second request messages");
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[1]["role"], "assistant");
+        assert_eq!(messages[1]["tool_calls"][0]["id"], "call-fixture");
+        assert_eq!(messages[2]["role"], "tool");
+        assert_eq!(messages[2]["tool_call_id"], "call-fixture");
+        assert!(
+            messages[2]["content"]
+                .as_str()
+                .expect("read result")
+                .contains("ALLOWED_READ_RESULT")
+        );
+        if json_output {
+            let result: Value = serde_json::from_slice(&output.stdout).expect("one JSON result");
+            assert_eq!(result["steps"], 2);
+            assert_eq!(result["exit_code"], 0);
+            assert_eq!(result["final_output"], "Final fixture answer.");
+            assert_eq!(
+                result["tool_calls"],
+                json!([{"name": "read_file", "status": "success"}])
+            );
+            assert_eq!(
+                result["usage"],
+                json!({"input_tokens": 22, "output_tokens": 4})
+            );
+            let session_id = result["session_id"].as_str().expect("session ID");
+            let session_dir = dir.path().join("state/sessions").join(session_id);
+            let state = rune_session::load_read_only(
+                camino::Utf8Path::from_path(&session_dir).expect("UTF-8 path"),
+            )
+            .expect("saved tool exchange");
+            assert!(state.events.iter().any(|frame| matches!(&frame.event,
+                rune_session::SessionEvent::ToolResult { ok: true, output, .. } if output.contains("ALLOWED_READ_RESULT"))));
+            assert_eq!(state.usage.input_tokens, 22);
+        } else {
+            assert_eq!(output.stdout, b"Final fixture answer.\n");
+        }
+    }
+}
+
+#[test]
+fn ask_returns_denied_unknown_and_malformed_calls_to_the_model_without_running_them() {
+    for (name, arguments, expected) in [
+        (
+            "shell",
+            r#"{"action":"run","command":"printf SHOULD_NOT_RUN > forbidden.txt"}"#,
+            "no rule allows",
+        ),
+        ("read_file", r#"{"path":"../outside.txt"}"#, "outside"),
+        ("nonexistent_tool", "{}", "there is no tool"),
+        ("read_file", "{broken", "not valid JSON"),
+    ] {
+        let (output, dir, requests) = run_responses_fixture(
+            vec![
+                completion_response(&call_delta(name, arguments), "tool_calls"),
+                completion_response(&json!({"content": "The tool failed."}), "stop"),
+            ],
+            true,
+            true,
+            Some(2),
+        );
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let result: Value = serde_json::from_slice(&output.stdout).expect("one JSON result");
+        assert_eq!(
+            result["tool_calls"],
+            json!([{"name": name, "status": "error"}])
+        );
+        let tool_result = requests[1]["messages"][2]["content"]
+            .as_str()
+            .expect("failure feedback");
+        assert!(tool_result.contains(expected), "{tool_result}");
+        assert!(!dir.path().join("forbidden.txt").exists());
+        assert!(!dir.path().join("state/sessions").exists());
+    }
+}
+
+#[test]
+fn ask_bounds_repeated_tool_requests_with_configured_and_default_step_caps() {
+    for configured_cap in [Some(2), Some(0), None] {
+        let expected_steps = configured_cap.filter(|cap| *cap > 0).unwrap_or(16);
+        let responses = (0..expected_steps)
+            .map(|_| {
+                completion_response(
+                    &call_delta("read_file", r#"{"path":"fixture.txt"}"#),
+                    "tool_calls",
+                )
+            })
+            .collect();
+        let (output, _, requests) = run_responses_fixture(responses, true, true, configured_cap);
+        assert_eq!(output.status.code(), Some(1));
+        let result: Value = serde_json::from_slice(&output.stdout).expect("one JSON result");
+        assert_eq!(result["steps"], expected_steps);
+        assert_eq!(requests.len() as u64, expected_steps);
+        assert_eq!(result["error_code"], "limit_exceeded");
+        assert_eq!(result["final_output"], "");
+        assert_eq!(
+            result["tool_calls"].as_array().expect("calls").len() as u64,
+            expected_steps
+        );
+        assert_eq!(result["usage"]["input_tokens"], expected_steps * 11);
+    }
 }

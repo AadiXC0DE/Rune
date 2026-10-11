@@ -191,7 +191,7 @@ pub const RUN: &[CommandSpec] = &[
     CommandSpec {
         name: "ask",
         aliases: &[],
-        summary: "Run one request without an interactive session",
+        summary: "Run one bounded turn without an interactive session",
         usage: "rune ask [flags] <prompt>",
         flags: &[
             flag("--json", "Print one JSON object instead of Markdown."),

@@ -17,7 +17,7 @@ use crate::spec;
 /// A subcommand.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Command {
-    /// Run one request without an interactive session.
+    /// Run one bounded turn without an interactive session.
     Ask,
     /// Serve the Agent Client Protocol.
     Acp,

@@ -1,9 +1,9 @@
 //! The one-shot runner.
 //!
-//! Runs a single request, prints the assistant output to standard output and
+//! Runs a bounded turn, prints the assistant output to standard output and
 //! every diagnostic to standard error, and exits. With `--json` it prints one
 //! object instead, which is the contract scripts depend on. This path supports
-//! text only; a returned tool call fails because no tool can be executed here.
+//! host tools under the configured permission policy without interactive approval.
 //! Completed exchanges are saved unless `--no-save` is selected.
 //!
 //! The key set and its order are fixed. `output` is the text produced during the
@@ -11,17 +11,24 @@
 //! provider did not report is `null`, and a reported zero stays `0`, because the
 //! difference matters to a caller summing them.
 
+use std::cell::Cell;
 use std::io::Write;
 
-use rune_core::config::Settings;
+use rune_agent::history::History;
+use rune_agent::steering::{Cancellation, SteeringQueue};
+use rune_agent::turn::{self, Event, Host, StopReason};
+use rune_core::budget::{Budget, BudgetSet, LimitName};
+use rune_core::config::{Layer, Settings};
 use rune_core::error::{ErrorCode, ErrorDetail, Result, RuneError};
 use rune_core::id::SessionId;
 use rune_core::paths::Paths;
-use rune_net::message::Message;
-use rune_net::provider::{Provider, RequestPlan};
+use rune_net::message::{ContentPart, ToolSpec};
+use rune_net::provider::Provider;
 use rune_net::stream::{FinishReason, Usage};
-use rune_net::transport;
+use rune_net::transport::{self, Endpoint, StreamOutcome};
+use rune_policy::{Outcome, RuleSet};
 use rune_session::{SessionEvent, SessionStore};
+use rune_tools::{ExecutionContext, Registry, ToolOutput, inventory};
 use serde::Serialize;
 
 /// Exit code for a successful run.
@@ -33,6 +40,9 @@ pub const EXIT_FAILURE: u8 = 1;
 /// Largest prompt accepted from standard input.
 pub const MAX_STDIN_PROMPT_BYTES: usize = 8 * 1024 * 1024;
 
+/// Default finite bound when the configured step limit is zero or unbounded.
+pub const DEFAULT_MAX_STEPS: u64 = 16;
+
 /// Options for one run.
 #[derive(Clone, Debug, Default)]
 pub struct Options {
@@ -42,6 +52,8 @@ pub struct Options {
     pub json: bool,
     /// Do not create or update a session.
     pub no_save: bool,
+    /// Execute host tools in a bounded loop. The review command stays text-only.
+    pub tool_loop: bool,
 }
 
 /// One tool call as reported in the JSON result.
@@ -149,7 +161,114 @@ pub fn read_stdin_prompt() -> Result<String> {
     Ok(String::from_utf8_lossy(&buffer).trim_end().to_owned())
 }
 
-/// Runs one request and returns the result to report.
+/// Noninteractive composition of the shared agent loop and built-in tools.
+struct AskHost<'a> {
+    settings: &'a Settings,
+    dialect: Box<dyn Provider>,
+    endpoint: Endpoint,
+    registry: Registry,
+    rules: RuleSet,
+    context: ExecutionContext,
+    limits: BudgetSet,
+    steering: SteeringQueue,
+    cancellation: Cancellation,
+    incomplete_tool_call: Cell<bool>,
+}
+
+impl Host for AskHost<'_> {
+    fn dialect(&self) -> &dyn Provider {
+        self.dialect.as_ref()
+    }
+
+    fn endpoint(&self) -> &Endpoint {
+        &self.endpoint
+    }
+
+    fn model(&self) -> String {
+        self.settings.model.clone()
+    }
+
+    fn instructions(&self) -> String {
+        String::new()
+    }
+
+    fn tools(&self) -> Vec<ToolSpec> {
+        inventory::advertisement(&self.registry)
+    }
+
+    fn tool_activity(&self, name: &str) -> Option<rune_tools::Activity> {
+        self.registry.activity(name)
+    }
+
+    fn tool_permission_target(&self, name: &str, arguments: &serde_json::Value) -> Option<String> {
+        turn::permission_target_for(&self.registry, name, arguments)
+    }
+
+    fn effort(&self) -> rune_core::config::Effort {
+        self.settings.effort
+    }
+
+    fn fast_mode(&self) -> bool {
+        self.settings.fast_mode
+    }
+
+    fn provider_order(&self) -> Vec<String> {
+        self.settings.provider_order.clone()
+    }
+
+    fn provider_strict(&self) -> bool {
+        self.settings.provider_strict
+    }
+
+    fn observe_response(&self, outcome: &StreamOutcome) {
+        self.incomplete_tool_call.set(
+            outcome.finish == Some(FinishReason::ToolCalls) && outcome.tool_calls().is_empty(),
+        );
+    }
+
+    fn emit(&self, _event: Event) {}
+
+    fn execute(&self, name: &str, arguments: &serde_json::Value) -> Result<ToolOutput> {
+        self.registry.call(name, arguments, &self.context)
+    }
+
+    fn execute_with_context(
+        &self,
+        name: &str,
+        arguments: &serde_json::Value,
+        context: &ExecutionContext,
+    ) -> Result<ToolOutput> {
+        self.registry.call(name, arguments, context)
+    }
+
+    fn decide(&self, name: &str, target: Option<&str>) -> (Outcome, String) {
+        turn::decide_call_in_workspace(
+            &self.rules,
+            self.settings.permission_mode,
+            name,
+            target,
+            self.context.workspace(),
+        )
+    }
+
+    fn context(&self) -> ExecutionContext {
+        self.context.fork()
+    }
+
+    fn limits(&self) -> BudgetSet {
+        self.limits.clone()
+    }
+
+    fn cancellation(&self) -> Cancellation {
+        self.cancellation.clone()
+    }
+
+    fn steering(&self) -> &SteeringQueue {
+        &self.steering
+    }
+}
+
+/// Runs one bounded turn and returns the result to report.
 ///
 /// Performs no printing, so the caller decides the output shape and the tests
 /// can assert on the result directly.
@@ -184,73 +303,108 @@ pub fn run(
         _ => Box::new(rune_net::chat_completions::ChatCompletions),
     };
 
-    let model = settings.model.clone();
-
-    // An image attachment is not wired into this path yet, so a run that
-    // reaches here has no images to send.
-    let mut plan = RequestPlan::new(model.clone());
-    plan.messages = vec![Message::user(options.prompt.clone())];
-    plan.effort = settings.effort;
-    plan.fast_mode = settings.fast_mode;
-    plan.provider_order.clone_from(&settings.provider_order);
-    plan.provider_strict = settings.provider_strict;
-
-    let endpoint = crate::provider_setup::endpoint(
-        &settings.provider,
-        &base_url,
-        credential.expose(),
-        settings.offline,
-    );
-
-    let agent = transport::agent();
-    let timeouts = transport::RequestTimeouts::from_limits(&settings.limits);
-
-    let outcome = transport::stream_completion(
-        &agent,
-        &endpoint,
-        dialect.as_ref(),
-        &plan,
-        timeouts,
-        &|| false,
-    )
-    .map_err(|err| err.to_rune_error())?;
-
-    let text = outcome.text();
-    let tool_calls: Vec<ToolCallReport> = outcome
-        .tool_calls()
-        .into_iter()
-        .map(|(_, name, _)| ToolCallReport {
-            name,
-            status: "error",
-        })
-        .collect();
-
-    let finish = outcome.finish.unwrap_or(FinishReason::Stop);
-    let error = (!tool_calls.is_empty() || finish == FinishReason::ToolCalls).then(|| {
-        let names = tool_calls
+    let mut limits = settings.limits.clone();
+    let step_cap = limits
+        .get(LimitName::MaxAgentSteps)
+        .value()
+        .filter(|cap| *cap > 0)
+        .unwrap_or(DEFAULT_MAX_STEPS);
+    let step_cap = if options.tool_loop { step_cap } else { 1 };
+    limits.set(
+        LimitName::MaxAgentSteps,
+        Budget::Bounded(step_cap),
+        Layer::CommandLine,
+    )?;
+    // Retry behavior remains one attempt per step in the ask path.
+    limits.set(
+        LimitName::ProviderMaxAttempts,
+        Budget::Bounded(1),
+        Layer::CommandLine,
+    )?;
+    let registry = if options.tool_loop {
+        inventory::builtin_with_web(
+            &rune_tools::FileLimits::from_budget(&limits),
+            &limits,
+            &paths.managed_skills_dir(),
+            crate::web_client::backends(settings),
+        )?
+    } else {
+        Registry::new()
+    };
+    let mut history = History::new();
+    history.push_user(options.prompt.clone());
+    let mut context = ExecutionContext::new(crate::current_workspace()?)
+        .with_offline(settings.offline)
+        .with_allow_unsandboxed(settings.allow_unsandboxed);
+    context
+        .additional_roots
+        .clone_from(&settings.additional_directories);
+    let host = AskHost {
+        settings,
+        dialect,
+        endpoint: crate::provider_setup::endpoint(
+            &settings.provider,
+            &base_url,
+            credential.expose(),
+            settings.offline,
+        ),
+        registry,
+        rules: crate::permissions::validated(settings)?,
+        context,
+        steering: SteeringQueue::from_limits(&limits),
+        cancellation: Cancellation::new(),
+        incomplete_tool_call: Cell::new(false),
+        limits,
+    };
+    let outcome = turn::run_turn(&mut history, &host)?;
+    let error = if host.incomplete_tool_call.get() {
+        Some(RuneError::new(
+            ErrorCode::UnsupportedToolCall,
+            "the provider requested tools without a completed tool call",
+        ))
+    } else if !options.tool_loop && !outcome.calls.is_empty() {
+        let names = outcome
+            .calls
             .iter()
-            .map(|call| call.name.as_str())
+            .map(|call| call.call.name.as_str())
             .collect::<Vec<_>>()
             .join(", ");
-        let message = if names.is_empty() {
-            "tool calls are unsupported in the text-only ask path".to_owned()
-        } else {
-            format!("tool calls are unsupported in the text-only ask path: {names}")
-        };
-        RuneError::new(ErrorCode::UnsupportedToolCall, message)
-    });
-    let exit_code = if error.is_none() && finish == FinishReason::Stop {
+        Some(RuneError::new(
+            ErrorCode::UnsupportedToolCall,
+            format!("tool calls are unsupported in the text-only review path: {names}"),
+        ))
+    } else if outcome.stop_reason == StopReason::StepLimit {
+        Some(RuneError::new(
+            ErrorCode::LimitExceeded,
+            turn::step_limit_notice(step_cap),
+        ))
+    } else {
+        None
+    };
+    let exit_code = if error.is_none() && outcome.stop_reason == StopReason::Completed {
         i32::from(EXIT_OK)
     } else {
         i32::from(EXIT_FAILURE)
     };
+    let tool_calls = outcome
+        .calls
+        .iter()
+        .map(|call| ToolCallReport {
+            name: call.call.name.clone(),
+            status: if call.output.is_error {
+                "error"
+            } else {
+                "success"
+            },
+        })
+        .collect();
     let session_id = if options.no_save {
         String::new()
     } else {
         save_exchange(
             paths,
             &options.prompt,
-            &text,
+            &history,
             &outcome.usage,
             error.as_ref(),
         )?
@@ -259,16 +413,16 @@ pub fn run(
 
     Ok(JsonResult {
         final_output: if error.is_none() {
-            text.clone()
+            outcome.text.clone()
         } else {
             String::new()
         },
-        output: text,
+        output: outcome.text,
         exit_code,
-        model,
+        model: settings.model.clone(),
         resolved_provider: None,
         session_id,
-        steps: 1,
+        steps: outcome.steps,
         usage: UsageReport {
             input_tokens: outcome.usage.input_tokens,
             output_tokens: outcome.usage.output_tokens,
@@ -287,7 +441,7 @@ pub fn run(
 fn save_exchange(
     paths: &Paths,
     prompt: &str,
-    text: &str,
+    history: &History,
     usage: &Usage,
     error: Option<&RuneError>,
 ) -> Result<SessionId> {
@@ -310,11 +464,35 @@ fn save_exchange(
         text: prompt.to_owned(),
     })?;
     append(SessionEvent::TurnStarted { turn: 1 })?;
-    if !text.is_empty() {
-        append(SessionEvent::AssistantMessage {
-            turn: 1,
-            text: text.to_owned(),
-        })?;
+    for turn in history.turns().iter().skip(1) {
+        let text = turn.text();
+        if !text.is_empty() {
+            append(SessionEvent::AssistantMessage { turn: 1, text })?;
+        }
+        for part in &turn.parts {
+            match part {
+                ContentPart::ToolCall {
+                    id,
+                    name,
+                    arguments,
+                } => append(SessionEvent::ToolCall {
+                    call_id: id.to_string(),
+                    name: name.clone(),
+                    arguments: arguments.clone(),
+                })?,
+                ContentPart::ToolResult {
+                    id,
+                    content,
+                    is_error,
+                    ..
+                } => append(SessionEvent::ToolResult {
+                    call_id: id.to_string(),
+                    ok: !is_error,
+                    output: content.clone(),
+                })?,
+                _ => {}
+            }
+        }
     }
     if let (Some(input_tokens), Some(output_tokens)) = (usage.input_tokens, usage.output_tokens) {
         append(SessionEvent::UsageRecorded {
