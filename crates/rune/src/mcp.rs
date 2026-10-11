@@ -1,6 +1,7 @@
-//! Inspect project MCP declarations without granting project trust.
+//! Inspect and connect project MCP declarations without granting project trust.
 
 use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
 use camino::Utf8Path;
@@ -15,6 +16,122 @@ use serde::Serialize;
 use serde_json::{Value, json};
 
 use crate::cli::Launch;
+
+/// Owned by the interactive host. Dropping the client stops its stdio children.
+pub struct Connection {
+    pub client: Client,
+    pub warnings: Vec<String>,
+}
+
+/// Connects only approved, enabled local servers. Remote transports remain
+/// outside the interactive CLI's tool surface, including when online.
+pub fn connect_stdio(
+    settings: &Settings,
+    paths: &Paths,
+    workspace: &Utf8Path,
+) -> Result<Option<Connection>> {
+    let workspace = trust::canonical_workspace(workspace);
+    let entries = project_entries(&workspace, settings)?;
+    if entries.is_empty() {
+        return Ok(None);
+    }
+    let trust = TrustStore::load(&paths.trust_file())?;
+    let secrets = RefCell::new(Vec::new());
+    let mut configs = Vec::new();
+    let mut warnings = Vec::new();
+    for (name, entry) in entries {
+        // Filter before expansion or environment reads. Neither full-access
+        // tool policy nor offline mode grants project startup trust.
+        if decision(&trust, &workspace, &name) != Decision::Approved
+            || transport_kind(&entry) != "stdio"
+            || entry.get("enabled").and_then(Value::as_bool) == Some(false)
+        {
+            continue;
+        }
+        match resolve(&name, &entry, &workspace, settings, &secrets) {
+            Ok(config) => configs.push(config),
+            Err(error) => {
+                let message = redact(error.message(), &mut secrets.borrow_mut());
+                if entry.get("required").and_then(Value::as_bool) == Some(true) {
+                    return Err(RuneError::new(error.code(), message));
+                }
+                warnings.push(format!("MCP server `{name}`: {}: {message}", error.code()));
+            }
+        }
+    }
+    if configs.is_empty() && warnings.is_empty() {
+        return Ok(None);
+    }
+    let client = Client::new(&settings.limits);
+    let report = client.connect_all(&configs).map_err(|error| {
+        RuneError::new(
+            error.code(),
+            redact(error.message(), &mut secrets.borrow_mut()),
+        )
+    })?;
+    for failure in report.failed {
+        warnings.push(format!(
+            "MCP server `{}`: {}: {}",
+            failure.server,
+            failure.error.code(),
+            redact(failure.error.message(), &mut secrets.borrow_mut())
+        ));
+    }
+    Ok(Some(Connection { client, warnings }))
+}
+
+fn decision(trust: &TrustStore, workspace: &Utf8Path, name: &str) -> Decision {
+    if trust.is_trusted(workspace)
+        || trust
+            .approved_entries(workspace)
+            .contains(&format!("server:{name}"))
+    {
+        Decision::Approved
+    } else if trust.decision(workspace) == Some(WorkspaceTrust::Rejected) {
+        Decision::Rejected
+    } else {
+        Decision::Pending
+    }
+}
+
+fn transport_kind(entry: &Value) -> &str {
+    entry
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| {
+            if entry.get("url").is_some() {
+                "http"
+            } else {
+                "stdio"
+            }
+        })
+}
+
+fn project_entries(workspace: &Utf8Path, settings: &Settings) -> Result<BTreeMap<String, Value>> {
+    let Some(text) = mcp_trust::read_project_document(workspace)? else {
+        return Ok(BTreeMap::new());
+    };
+    let document: Value = serde_json::from_str(&text).map_err(|_| {
+        RuneError::new(
+            ErrorCode::InvalidConfiguration,
+            ".mcp.json is not valid JSON",
+        )
+    })?;
+    let Some(entries) = document.get("mcpServers") else {
+        return Ok(BTreeMap::new());
+    };
+    let entries = entries.as_object().ok_or_else(|| {
+        RuneError::invalid_field("mcpServers", "expected an object of server declarations")
+    })?;
+    let cap = settings.limits.get_usize(LimitName::ListEntries);
+    if entries.len() > cap {
+        return Err(RuneError::too_large("mcpServers", entries.len(), cap));
+    }
+    Ok(entries
+        .iter()
+        .map(|(name, entry)| (name.clone(), entry.clone()))
+        .collect())
+}
 
 /// Only diagnostic fields are serialized, never transport configuration.
 #[derive(Serialize)]
@@ -134,40 +251,22 @@ pub fn run(
         workspace: workspace.to_string(),
         servers: Vec::new(),
     };
-    let Some(text) = mcp_trust::read_project_document(&workspace)? else {
+    let entries = project_entries(&workspace, settings)?;
+    if entries.is_empty() {
         return empty_report(report, selected);
-    };
-    let document: Value = serde_json::from_str(&text).map_err(|_| {
-        RuneError::new(
-            ErrorCode::InvalidConfiguration,
-            ".mcp.json is not valid JSON",
-        )
-    })?;
-    let Some(entries) = document.get("mcpServers") else {
-        return empty_report(report, selected);
-    };
-    let entries = entries.as_object().ok_or_else(|| {
-        RuneError::invalid_field("mcpServers", "expected an object of server declarations")
-    })?;
-    let cap = settings.limits.get_usize(LimitName::ListEntries);
-    if entries.len() > cap {
-        return Err(RuneError::too_large("mcpServers", entries.len(), cap));
     }
     if let Some(name) = selected
         && !entries.contains_key(name)
     {
         return Err(unknown_server(name));
     }
-    // Sort independently of the order of declarations in the document.
-    let mut entries: Vec<_> = entries.iter().collect();
-    entries.sort_by_key(|(left, _)| *left);
     for (name, entry) in entries {
         if selected.is_some_and(|selected| selected != name) {
             continue;
         }
-        report
-            .servers
-            .push(inspect(name, entry, &workspace, &trust, settings, checking));
+        report.servers.push(inspect(
+            &name, &entry, &workspace, &trust, settings, checking,
+        ));
     }
     Ok(report)
 }
@@ -191,27 +290,8 @@ fn inspect(
     settings: &Settings,
     checking: bool,
 ) -> Server {
-    let decision = if trust.is_trusted(workspace)
-        || trust
-            .approved_entries(workspace)
-            .contains(&format!("server:{name}"))
-    {
-        Decision::Approved
-    } else if trust.decision(workspace) == Some(WorkspaceTrust::Rejected) {
-        Decision::Rejected
-    } else {
-        Decision::Pending
-    };
-    let kind = entry
-        .get("type")
-        .and_then(Value::as_str)
-        .unwrap_or_else(|| {
-            if entry.get("url").is_some() {
-                "http"
-            } else {
-                "stdio"
-            }
-        });
+    let decision = decision(trust, workspace, name);
+    let kind = transport_kind(entry);
     let transport = match kind {
         "stdio" => "stdio",
         "http" => "http",
@@ -352,16 +432,7 @@ fn resolve(
     secrets
         .borrow_mut()
         .extend(expanded.environment.values().cloned());
-    let kind = entry
-        .get("type")
-        .and_then(Value::as_str)
-        .unwrap_or_else(|| {
-            if entry.get("url").is_some() {
-                "http"
-            } else {
-                "stdio"
-            }
-        });
+    let kind = transport_kind(entry);
     let transport = match kind {
         "stdio" if entry.get("url").is_none() => json!({
             "transport": "stdio", "command": expanded.command, "environment": expanded.environment

@@ -14,6 +14,7 @@ use camino::{Utf8Path, Utf8PathBuf};
 use rune_agent::history::History;
 use rune_agent::steering::{Cancellation, SteeringQueue};
 use rune_agent::turn::{self, Event, Host, StopReason};
+use rune_context::mcp::Client as McpClient;
 use rune_context::prompt::{self, Prompt};
 use rune_core::budget::BudgetSet;
 use rune_core::config::{Effort, PermissionMode, Settings};
@@ -246,6 +247,8 @@ struct SessionHost {
     limits: BudgetSet,
     context: ExecutionContext,
     registry: Registry,
+    /// Local MCP connections live until the session host is dropped.
+    mcp: Option<McpClient>,
     subagent: Option<Arc<crate::subagent::Bridge>>,
     cancellation: Cancellation,
     steering: SteeringQueue,
@@ -531,6 +534,26 @@ impl Host for SessionHost {
     }
 
     fn execute(&self, name: &str, arguments: &serde_json::Value) -> Result<ToolOutput> {
+        if let Some(client) = &self.mcp
+            && client.tools().iter().any(|tool| tool.name == name)
+        {
+            self.cancellation.check()?;
+            self.context.check_cancelled()?;
+            let result = client.call_cancellable(name, arguments, &|| {
+                self.cancellation.is_cancelled() || self.context.is_cancelled()
+            });
+            self.cancellation.check()?;
+            self.context.check_cancelled()?;
+            return match result {
+                Ok(outcome) => Ok(ToolOutput {
+                    produced_bytes: outcome.text.len() as u64,
+                    text: outcome.text,
+                    is_error: outcome.is_error,
+                }),
+                Err(error) if error.code() == ErrorCode::Cancelled => Err(error),
+                Err(error) => Ok(ToolOutput::from_error(&error)),
+            };
+        }
         if name == "subagent"
             && let Some(subagent) = &self.subagent
         {
@@ -1398,6 +1421,27 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
     // that states no window rather than keeping the documented fallback.
     adopt_skill_catalog_budget(&mut limits, config.settings.context_window);
     let prompt = build_prompt(&config.workspace, &config.paths.config_root, &limits);
+    let connection = crate::mcp::connect_stdio(&config.settings, &config.paths, &config.workspace)?;
+    let mut tools = inventory::advertisement(&config.registry);
+    let (mcp, mcp_warnings) = match connection {
+        Some(connection) => {
+            for tool in connection.client.tools() {
+                if tools.iter().any(|existing| existing.name == tool.name) {
+                    return Err(RuneError::new(
+                        ErrorCode::AlreadyExists,
+                        format!("two tools are advertised as `{}`", tool.name),
+                    ));
+                }
+                tools.push(ToolSpec {
+                    name: tool.name,
+                    description: tool.description,
+                    input_schema: tool.input_schema,
+                });
+            }
+            (Some(connection.client), connection.warnings)
+        }
+        None => (None, Vec::new()),
+    };
 
     // A resumed session continues its stored conversation; a new one starts
     // empty and writes a fresh log.
@@ -1459,7 +1503,7 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
         dialect: config.dialect,
         model: Mutex::new(config.settings.model.clone()),
         instructions: prompt.instructions,
-        tools: inventory::advertisement(&config.registry),
+        tools,
         rules: config.rules,
         mode: config.settings.permission_mode,
         effort: config.settings.effort,
@@ -1467,6 +1511,7 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
         limits: limits.clone(),
         context,
         registry: config.registry,
+        mcp,
         subagent: config.subagent,
         cancellation: config.questions.cancellation.clone(),
         steering: SteeringQueue::from_limits(&limits),
@@ -1559,6 +1604,11 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
         } else {
             vec![banner]
         };
+        opening.extend(
+            mcp_warnings
+                .iter()
+                .flat_map(|warning| render_entries(&[Entry::notice(warning)], &host)),
+        );
         // Replay only for an interactive resume. These settled rows enter the
         // terminal's scrollback once, before the composer accepts any input.
         if (keyed || config.accessible) && config.resume.is_some() {
@@ -8677,6 +8727,7 @@ mod tests {
             limits: BudgetSet::new(),
             context: ExecutionContext::new(Utf8PathBuf::from("/tmp")),
             registry,
+            mcp: None,
             subagent: None,
             cancellation: questions.cancellation.clone(),
             steering: SteeringQueue::new(4),

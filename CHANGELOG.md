@@ -206,6 +206,13 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Fixed
 
+- Interactive sessions connect trusted, enabled project stdio MCP servers,
+  advertise their discovered schemas, and execute model calls through the
+  existing permission checks. Startup and calls obey MCP timeouts, cancellation
+  stops pending calls, and session exit terminates the children. Optional startup
+  failures are notices; required failures stop startup. HTTP and SSE remain
+  outside the interactive tool surface.
+
 - `vision` uses the profile's `vision_model` with the active provider endpoint
   and credential in interactive sessions, ask, and ACP. Permitted workspace
   images reach the host as bounded inline bytes, and their analysis returns to
