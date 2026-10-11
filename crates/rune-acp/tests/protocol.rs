@@ -734,6 +734,68 @@ fn a_new_session_is_listed_with_its_identifier() {
 }
 
 #[test]
+fn connections_list_only_sessions_with_their_stored_workspace() {
+    use rune_core::id::SessionId;
+    use rune_session::event::SessionEvent;
+    use rune_session::store::SessionStore;
+
+    let root = tempfile::tempdir().expect("shared session storage");
+    let paths = paths_for(root.path());
+    let workspaces = ["workspace-a", "workspace-b"].map(|name| {
+        let path = Utf8PathBuf::from_path_buf(root.path().join(name)).expect("UTF-8 workspace");
+        std::fs::create_dir(&path).expect("workspace");
+        path
+    });
+    let ids = workspaces.each_ref().map(|workspace| {
+        let id = SessionId::generate();
+        let store = SessionStore::create(&paths, &id).expect("fixture session");
+        store
+            .append(SessionEvent::WorkspaceSet {
+                workspace: workspace.to_string(),
+            })
+            .expect("record workspace");
+        id
+    });
+    let legacy = SessionId::generate();
+    drop(SessionStore::create(&paths, &legacy).expect("unscoped session"));
+    let mock = MockEndpoint::start(vec![Script::text("unused")]);
+
+    for (workspace, id) in workspaces.into_iter().zip(ids) {
+        let config = ServerConfig::new(
+            paths.clone(),
+            workspace.clone(),
+            Endpoint::new(mock.base_url(), "test-key"),
+            "test/model",
+        )
+        .expect("config");
+        let (server_side, client_side) = UnixStream::pair().expect("socket pair");
+        let output = server_side.try_clone().expect("output");
+        let server = Arc::new(Server::new(config, output).expect("server"));
+        let join = std::thread::spawn(move || {
+            let _ = server.run(BufReader::new(server_side));
+        });
+        let mut client = Client::new(client_side);
+        client.call(
+            1,
+            "initialize",
+            &json!({"protocolVersion": PROTOCOL_VERSION}),
+        );
+        let response = client.call(2, "session/list", &json!({}));
+        client
+            .to_server
+            .shutdown(std::net::Shutdown::Both)
+            .expect("disconnect");
+        join.join().expect("server stopped");
+
+        let listed = response["result"]["sessions"].as_array().expect("sessions");
+        assert_eq!(listed.len(), 1, "{response}");
+        assert_eq!(listed[0]["sessionId"], id.as_str());
+        assert_eq!(listed[0]["cwd"], workspace.as_str());
+    }
+    assert_eq!(mock.request_count(), 0);
+}
+
+#[test]
 fn an_omitted_session_cwd_uses_the_launch_workspace() {
     let mut harness = Harness::start(vec![Script::text("unused")], PermissionMode::Auto);
     let expected = harness.root.path().join("workspace");

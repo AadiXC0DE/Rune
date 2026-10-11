@@ -302,6 +302,9 @@ impl Sessions {
 
     /// Lists stored sessions for this workspace, most recently active first.
     ///
+    /// Sessions without a recorded workspace are omitted because their scope
+    /// cannot be determined from storage.
+    ///
     /// Bounded by the configured listing bound, so a large session directory
     /// costs a bounded read.
     #[must_use]
@@ -320,11 +323,15 @@ impl Sessions {
             let Ok(state) = load_read_only(&path) else {
                 continue;
             };
+            let Some(workspace) = state.workspace else {
+                continue;
+            };
+            if workspace != self.workspace.as_str() {
+                continue;
+            }
             out.push(SessionSummary {
                 id: state.id.to_string(),
-                cwd: state
-                    .workspace
-                    .unwrap_or_else(|| self.workspace.to_string()),
+                cwd: workspace,
                 title: state.title,
                 updated_at: state
                     .events
@@ -959,15 +966,10 @@ mod tests {
         );
 
         sessions.close(&second).expect("close");
-        assert_eq!(
-            sessions
-                .list()
-                .iter()
-                .find(|entry| entry.id == second)
-                .expect("listed")
-                .cwd,
-            requested
-        );
+        let listed = sessions.list();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, first);
+        assert_eq!(listed[0].cwd, "/tmp/work");
         sessions.load(&second).expect("load");
         assert_eq!(
             sessions
@@ -1004,7 +1006,7 @@ mod tests {
                 .workspace(),
             "/tmp/work"
         );
-        assert_eq!(sessions.list().first().expect("listed").cwd, "/tmp/work");
+        assert!(sessions.list().is_empty());
     }
 
     #[test]
@@ -1344,6 +1346,37 @@ mod tests {
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].id, id);
         assert_eq!(listed[0].cwd, "/tmp/work");
+    }
+
+    #[test]
+    fn foreign_sessions_do_not_consume_the_listing_cap() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let mut limits = BudgetSet::new();
+        limits
+            .set(
+                LimitName::ListEntries,
+                rune_core::budget::Budget::Bounded(1),
+                ConfigLayer::User,
+            )
+            .expect("set cap");
+        let workspace = utf8_path(&root, "workspace-a");
+        let mut sessions = Sessions::new(
+            paths_for(&root),
+            workspace.clone(),
+            SessionConfig::new("test/model", Effort::Auto, PermissionMode::Auto),
+            &limits,
+            Vec::new(),
+        );
+        let foreign = sessions
+            .create_in(utf8_path(&root, "workspace-b"), Vec::new())
+            .expect("foreign session");
+        sessions.close(&foreign).expect("close foreign session");
+        let id = sessions.create(Vec::new()).expect("matching session");
+        sessions.close(&id).expect("close matching session");
+        let listed = sessions.list();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, id);
+        assert_eq!(listed[0].cwd, workspace);
     }
 
     #[test]

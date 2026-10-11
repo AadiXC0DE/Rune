@@ -172,6 +172,11 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Fixed
 
+- ACP session listings include only sessions whose stored workspace matches
+  the connection's launch workspace, and report that stored cwd. Sessions with
+  no recorded workspace are omitted from listings; direct loading still uses
+  the launch workspace as their fallback.
+
 - ACP connects requested stdio MCP servers when creating, loading, or resuming
   a session, advertises their tools to the model, and executes approved calls.
   Servers stay isolated by session and are stopped when no longer in use;

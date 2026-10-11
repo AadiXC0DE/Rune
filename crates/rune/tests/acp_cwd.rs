@@ -176,11 +176,7 @@ fn client_cwd_roots_reads_listing_and_project_instructions() {
         &json!({"sessionId": session, "modeId": "full_access"}),
     );
     let listed = client.call(4, "session/list", &json!({}));
-    assert_eq!(listed["sessions"][0]["sessionId"], session);
-    assert_eq!(
-        listed["sessions"][0]["cwd"],
-        workspace_b.to_str().expect("UTF-8 cwd")
-    );
+    assert_eq!(listed["sessions"], json!([]));
     let response = client.call(5, "session/prompt", &json!({"sessionId": session, "prompt": [{"type": "text", "text": "inspect the workspace"}]}));
     assert_eq!(response["stopReason"], "end_turn");
 
