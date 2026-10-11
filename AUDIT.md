@@ -1983,7 +1983,7 @@ Resource accumulation after cancellation, session holder handover and concurrent
 - [x] R-104 | T2 | fix | sandbox | Protect absent Linux git hooks destinations | acceptance: With .git/hooks absent, a sandboxed fixture command must fail to create an executable hook there.
 - [x] R-105 | T2 | fix | sandbox | Protect absent macOS git hooks destinations | acceptance: On macOS with .git/hooks absent, a sandboxed fixture command must fail to create an executable hook there.
 - [x] R-106 | T2 | fix | sandbox | Protect nested repositories within writable roots | acceptance: A sandboxed command must be refused when writing a nested repository's config or hooks, while normal source writes still work.
-- [ ] R-107 | T2 | fix | sessions | Write disposable session metadata atomically | acceptance: Kill during metadata replacement and observe valid old or new metadata and replayable authoritative events.
+- [x] R-107 | T2 | fix | sessions | Write disposable session metadata atomically | acceptance: Kill during metadata replacement and observe valid old or new metadata and replayable authoritative events.
 - [ ] R-108 | T2 | fix | sessions | Distinguish durable append success from projection failure | acceptance: Force metadata write failure after event sync and observe a reported durable event with a repair warning rather than retry ambiguity.
 - [ ] R-109 | T2 | fix | sessions | Clear lock-holder diagnostics before releasing the lock | acceptance: Race old-owner release with new-owner acquisition and observe the new holder's diagnostic record preserved.
 - [ ] R-110 | T2 | fix | sessions | Cap event reads despite concurrent log growth | acceptance: Grow a log between metadata and read and observe bounded bytes plus a named size error.

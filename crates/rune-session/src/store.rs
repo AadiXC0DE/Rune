@@ -5,7 +5,8 @@
 //! - `events.jsonl` is the authority. Every other file can be deleted and
 //!   rebuilt from it.
 //! - `session.json` is the derived projection, written for tools that want the
-//!   summary without replaying the log.
+//!   summary without replaying the log. Atomic replacement gives readers a
+//!   complete old or new projection, even if the writer is killed.
 //! - `session.lock` is the advisory writer lock.
 //!
 //! One writer and any number of readers. A reader takes no lock and always sees
@@ -357,8 +358,8 @@ impl SessionStore {
             _ => {}
         }
 
-        // Refreshed on every append so a tool that reads the projection rather
-        // than the log never sees a summary behind the truth.
+        // Refreshed after every durable append. Until replacement completes,
+        // readers can still see the previous complete projection.
         self.write_metadata(&projection)?;
         Ok(seq)
     }
@@ -372,7 +373,7 @@ impl SessionStore {
         self.write_metadata(&projection)
     }
 
-    /// Serializes and writes the projection.
+    /// Serializes and atomically replaces the projection.
     fn write_metadata(&self, projection: &Projection) -> Result<()> {
         let metadata = Metadata {
             schema: METADATA_VERSION,
@@ -385,7 +386,7 @@ impl SessionStore {
         };
         let mut text = serde_json::to_string_pretty(&metadata)?;
         text.push('\n');
-        paths::write_private(&self.metadata_path(), &text)
+        paths::write_private_atomic(&self.metadata_path(), &text)
     }
 
     /// Reads this session without taking the lock.
@@ -819,6 +820,34 @@ mod tests {
         assert_eq!(reopened.title().as_deref(), Some("kept"));
         assert_eq!(reopened.append(user("after")).expect("append"), EventSeq(5));
         assert_eq!(reopened.read().expect("read").len(), 5);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn metadata_replacement_preserves_an_open_readers_complete_projection() {
+        use std::io::Read;
+
+        let root = tempfile::tempdir().expect("tempdir");
+        let (_paths, store) = store_in(&root);
+        for title in ["a long title 🦀".repeat(1024), "short".to_owned()] {
+            let before = std::fs::read(store.metadata_path()).expect("old metadata");
+            let mut reader = File::open(store.metadata_path()).expect("open reader");
+
+            store
+                .append(SessionEvent::TitleSet { title })
+                .expect("append");
+
+            let mut retained = Vec::new();
+            reader.read_to_end(&mut retained).expect("read old handle");
+            assert_eq!(retained, before, "an existing reader retains the old file");
+            let after = std::fs::read(store.metadata_path()).expect("new metadata");
+            assert_ne!(after, before);
+            assert_eq!(
+                serde_json::from_slice::<Metadata>(&after).expect("complete new metadata"),
+                store.metadata()
+            );
+            assert!(after.ends_with(b"\n"));
+        }
     }
 
     #[test]

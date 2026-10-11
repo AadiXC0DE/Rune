@@ -140,6 +140,10 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Fixed
 
+- Session metadata is replaced atomically after durable event appends. Killing
+  a writer leaves complete old or new metadata; reopening rebuilds the summary
+  from the authoritative event log.
+
 - Setting `parallel_tool_calls = 1` disables parallel tool calls in provider
   requests for Chat Completions, Responses, and Anthropic Messages.
 
