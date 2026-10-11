@@ -6,6 +6,11 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Added
 
+- ACP negotiates protocol version 1 and requires compatible initialization
+  before session methods can run. Unsupported versions receive the supported
+  version but leave sessions blocked until a version 1 retry; malformed versions
+  and repeated initialization after success receive explicit protocol errors.
+
 - ACP bounds unanswered client permission requests with
   `acp_permission_timeout_ms` (120000 ms by default). Expiry returns a `timeout`
   prompt error without executing the tool; later prompts still work on the same

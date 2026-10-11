@@ -356,6 +356,26 @@ rune prompt --show          # the exact instructions the model receives
 can drive a session. `rune-sdk` is the library an embedder links against: the
 host supplies the credential, the tools, and the network path.
 
+ACP clients must send an `initialize` request with an integer `protocolVersion`.
+Rune supports version 1 and returns `protocolVersion: 1`, its `agentInfo`,
+`agentCapabilities`, and an empty `authMethods` list. It advertises session
+loading, listing, resuming, and closing; text and embedded context prompts;
+and stdio MCP support. Image, audio, HTTP MCP, and SSE MCP support are false.
+Omitted client capabilities are treated as unsupported; Rune uses its own
+filesystem and shell tools.
+
+Following [ACP version negotiation](https://agentclientprotocol.com/protocol/v1/initialization),
+an unsupported client version still receives Rune's version 1 result. Session
+methods remain blocked until an `initialize` request explicitly selects version
+1. A client that supports it can retry with version 1; otherwise it should close
+the connection. Before compatibility is established, all implemented `session/*`
+requests return JSON-RPC `-32600` with `data.code: "not_initialized"` and
+`data.protocolVersion: 1`; session notifications are ignored and logged.
+Missing or malformed versions return `-32602` naming `protocolVersion`.
+An `initialize` notification cannot initialize the connection. After successful
+initialization, further initialization requests return `-32600` with
+`data.code: "already_initialized"`, leaving the established connection usable.
+
 ACP session creation, loading, and resuming connect the client's requested
 stdio `mcpServers` using each server's absolute `command`, `args`, and `env`
 name/value pairs. Their tools are advertised as `mcp_<server>_<tool>` and use

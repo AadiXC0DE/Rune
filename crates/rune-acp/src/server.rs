@@ -309,6 +309,8 @@ pub struct Server<W: Write + Send + 'static> {
     writer: Mutex<Writer<W>>,
     /// A failed frame makes this connection unusable for any further work.
     output_failed: AtomicBool,
+    /// True only after an initialize request agreed on our protocol version.
+    initialized: AtomicBool,
     sessions: Mutex<Sessions>,
     /// Endpoint capacities, discovered when a turn first uses another model.
     model_catalog: OnceLock<Catalog>,
@@ -358,6 +360,7 @@ impl<W: Write + Send + 'static> Server<W> {
             config,
             writer: Mutex::new(Writer::new(output)),
             output_failed: AtomicBool::new(false),
+            initialized: AtomicBool::new(false),
             sessions: Mutex::new(sessions),
             model_catalog: OnceLock::new(),
             pending: Mutex::new(BTreeMap::new()),
@@ -556,7 +559,31 @@ impl<W: Write + Send + 'static> Server<W> {
         id: Option<Id>,
     ) -> std::result::Result<Option<Value>, RpcError> {
         match method {
-            "initialize" => Ok(Some(self.initialize(params))),
+            "initialize" => {
+                if id.is_none() {
+                    return Err(RpcError::invalid_request("initialize must be a request"));
+                }
+                self.initialize(params).map(Some)
+            }
+            "session/new"
+            | "session/load"
+            | "session/resume"
+            | "session/close"
+            | "session/list"
+            | "session/set_config_option"
+            | "session/set_mode"
+            | "session/cancel"
+            | "session/prompt"
+                if !self.initialized.load(Ordering::SeqCst) =>
+            {
+                Err(RpcError::invalid_request(
+                    "initialize with a compatible protocolVersion before calling session methods",
+                )
+                .with_data(json!({
+                    "code": "not_initialized",
+                    "protocolVersion": PROTOCOL_VERSION,
+                })))
+            }
             "session/new" => self.new_session(params).map(Some),
             "session/load" => self.load_session(params).map(Some),
             "session/resume" => self.resume_session(params).map(Some),
@@ -570,15 +597,35 @@ impl<W: Write + Send + 'static> Server<W> {
         }
     }
 
-    /// Answers `initialize`, advertising what this server supports.
-    fn initialize(&self, params: &Value) -> Value {
+    /// Answers `initialize`, establishing compatibility only on a version match.
+    ///
+    /// ACP requires returning our latest version even on a mismatch. The client
+    /// can close the connection or retry with that version if it supports it.
+    fn initialize(&self, params: &Value) -> std::result::Result<Value, RpcError> {
+        if self.initialized.load(Ordering::SeqCst) {
+            return Err(
+                RpcError::invalid_request("connection is already initialized")
+                    .with_data(json!({"code": "already_initialized"})),
+            );
+        }
+        let version = params
+            .get("protocolVersion")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| {
+                RpcError::invalid_params("protocolVersion must be a nonnegative integer")
+                    .with_data(json!({"code": "invalid_field", "field": "protocolVersion"}))
+            })?;
+        self.initialized.store(
+            Some(version) == u64::try_from(PROTOCOL_VERSION).ok(),
+            Ordering::SeqCst,
+        );
         let client = params
             .get("clientInfo")
             .and_then(|info| info.get("name"))
             .and_then(Value::as_str)
             .unwrap_or("unknown");
         self.note(format_args!("client `{client}` opened a connection"));
-        json!({
+        Ok(json!({
             "protocolVersion": PROTOCOL_VERSION,
             "agentCapabilities": {
                 "loadSession": true,
@@ -600,7 +647,7 @@ impl<W: Write + Send + 'static> Server<W> {
                 "title": "Rune",
             },
             "authMethods": [],
-        })
+        }))
     }
 
     /// Answers `session/new`.
@@ -1791,6 +1838,9 @@ mod tests {
                 }
                 let defaults = config.additional_roots.clone();
                 let server = Arc::new(Server::new(config, Vec::new()).expect("server"));
+                server
+                    .initialize(&json!({"protocolVersion": PROTOCOL_VERSION}))
+                    .expect("initialize");
                 let created = server
                     .new_session(&json!({"additionalDirectories": [original]}))
                     .expect("create");

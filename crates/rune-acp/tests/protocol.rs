@@ -342,10 +342,10 @@ impl Harness {
         self.client.as_mut().expect("client")
     }
 
-    /// Initializes the connection and opens a session, returning its identifier.
-    fn open_session(&mut self) -> String {
+    /// Establishes protocol compatibility for this connection.
+    fn initialize(&mut self, id: i64) {
         let response = self.client().call(
-            1,
+            id,
             "initialize",
             &json!({
                 "protocolVersion": PROTOCOL_VERSION,
@@ -354,6 +354,11 @@ impl Harness {
             }),
         );
         assert_eq!(response["result"]["protocolVersion"], PROTOCOL_VERSION);
+    }
+
+    /// Initializes the connection and opens a session, returning its identifier.
+    fn open_session(&mut self) -> String {
+        self.initialize(1);
         let workspace = self.root.path().join("workspace");
         let response = self.client().call(
             2,
@@ -669,6 +674,7 @@ fn invalid_or_failed_mcp_setup_does_not_create_a_session_or_leak_children() {
         limits,
         Vec::new(),
     );
+    harness.initialize(1000);
     let workspace = harness.root.path().join("workspace");
     let log = harness.root.path().join("validated-mcp");
     let valid = stdio_server(&log, "valid");
@@ -743,6 +749,130 @@ fn invalid_or_failed_mcp_setup_does_not_create_a_session_or_leak_children() {
 }
 
 #[test]
+fn session_methods_require_compatible_initialization_before_any_work() {
+    let methods = [
+        "session/new",
+        "session/load",
+        "session/resume",
+        "session/close",
+        "session/list",
+        "session/set_config_option",
+        "session/set_mode",
+        "session/cancel",
+        "session/prompt",
+    ];
+    for version in [None, Some(0), Some(2)] {
+        let mut harness = Harness::start(vec![], PermissionMode::Auto);
+        if let Some(version) = version {
+            let response =
+                harness
+                    .client()
+                    .call(1, "initialize", &json!({"protocolVersion": version}));
+            assert_eq!(response["result"]["protocolVersion"], PROTOCOL_VERSION);
+            assert!(response.get("error").is_none(), "{response}");
+        }
+        // Valid creation params include an MCP fixture, so a missing guard
+        // would create a persisted session and launch a child process.
+        let log = harness.root.path().join("uninitialized-mcp");
+        let workspace = harness.root.path().join("workspace");
+        let params = json!({
+            "cwd": workspace,
+            "mcpServers": [stdio_server(&log, "must not start")],
+            "sessionId": "aaaaaaaaaaaa",
+            "configId": "model",
+            "value": "test/model",
+            "modeId": "default",
+            "prompt": [{"type": "text", "text": "must not run"}],
+        });
+        for (id, method) in (10..).zip(methods) {
+            let response = harness.client().call(id, method, &params);
+            assert_eq!(response["error"]["code"], -32600, "{method}: {response}");
+            assert_eq!(response["error"]["data"]["code"], "not_initialized");
+            assert_eq!(
+                response["error"]["data"]["protocolVersion"],
+                PROTOCOL_VERSION
+            );
+        }
+        harness.client().notify("session/new", &params);
+        harness.client().notify("session/prompt", &params);
+        let response = harness.client().call(
+            3,
+            "initialize",
+            &json!({"protocolVersion": PROTOCOL_VERSION}),
+        );
+        assert_eq!(response["result"]["protocolVersion"], PROTOCOL_VERSION);
+        let listed = harness.client().call(4, "session/list", &json!({}));
+        assert_eq!(listed["result"]["sessions"], json!([]));
+        assert!(!log.exists(), "MCP started before initialization");
+        assert!(!harness.root.path().join("state/sessions").exists());
+        assert_eq!(harness.mock.request_count(), 0);
+        let response = harness
+            .client()
+            .call(5, "session/new", &json!({"cwd": workspace}));
+        assert!(response["result"]["sessionId"].is_string(), "{response}");
+    }
+}
+
+#[test]
+fn malformed_initialize_requests_leave_the_connection_uninitialized() {
+    let mut harness = Harness::start(vec![], PermissionMode::Auto);
+    for (id, params) in (10_i64..).zip([
+        json!({}),
+        json!(null),
+        json!({"protocolVersion": null}),
+        json!({"protocolVersion": "1"}),
+        json!({"protocolVersion": true}),
+        json!({"protocolVersion": -1}),
+        json!({"protocolVersion": 1.5}),
+    ]) {
+        let response = harness.client().call(id, "initialize", &params);
+        assert_eq!(response["error"]["code"], -32602, "{params}: {response}");
+        assert_eq!(response["error"]["data"]["field"], "protocolVersion");
+        let response = harness
+            .client()
+            .call(id.saturating_add(100), "session/list", &json!({}));
+        assert_eq!(response["error"]["data"]["code"], "not_initialized");
+    }
+    let session = harness.open_session();
+    assert_eq!(session.len(), 12);
+}
+
+#[test]
+fn initialize_notifications_cannot_establish_compatibility() {
+    let mut harness = Harness::start(vec![], PermissionMode::Auto);
+    harness
+        .client()
+        .notify("initialize", &json!({"protocolVersion": PROTOCOL_VERSION}));
+    let response = harness.client().call(10, "session/list", &json!({}));
+    assert_eq!(response["error"]["data"]["code"], "not_initialized");
+    assert!(harness.logs().contains("initialize must be a request"));
+    let session = harness.open_session();
+    assert_eq!(session.len(), 12);
+}
+
+#[test]
+fn repeated_initialization_is_refused_without_revoking_compatibility() {
+    let mut harness = Harness::start(
+        vec![Script::text("still initialized")],
+        PermissionMode::Auto,
+    );
+    let session = harness.open_session();
+    for (id, version) in (3..).zip([PROTOCOL_VERSION, 2]) {
+        let response =
+            harness
+                .client()
+                .call(id, "initialize", &json!({"protocolVersion": version}));
+        assert_eq!(response["error"]["code"], -32600);
+        assert_eq!(response["error"]["data"]["code"], "already_initialized");
+    }
+    let response = harness
+        .client()
+        .call(5, "session/prompt", &prompt(&session, "continue"));
+    assert_eq!(response["result"]["stopReason"], "end_turn");
+    assert_eq!(harness.mock.request_count(), 1);
+}
+
+#[test]
 fn initialize_advertises_this_protocol_version_and_capabilities() {
     let mut harness = Harness::start(vec![Script::text("unused")], PermissionMode::Auto);
     let response = harness.client().call(
@@ -758,6 +888,19 @@ fn initialize_advertises_this_protocol_version_and_capabilities() {
     );
     assert_eq!(response["result"]["agentInfo"]["name"], "rune");
     assert_eq!(response["result"]["authMethods"], json!([]));
+    assert_eq!(
+        response["result"]["agentCapabilities"]["promptCapabilities"],
+        json!({"image": false, "audio": false, "embeddedContext": true})
+    );
+    assert_eq!(
+        response["result"]["agentCapabilities"]["mcpCapabilities"],
+        json!({"http": false, "sse": false})
+    );
+    assert_eq!(response["result"]["agentInfo"]["title"], "Rune");
+    assert_eq!(
+        response["result"]["agentInfo"]["version"],
+        env!("CARGO_PKG_VERSION")
+    );
 }
 
 #[test]
@@ -836,6 +979,7 @@ fn connections_list_only_sessions_with_their_stored_workspace() {
 #[test]
 fn an_omitted_session_cwd_uses_the_launch_workspace() {
     let mut harness = Harness::start(vec![Script::text("unused")], PermissionMode::Auto);
+    harness.initialize(1000);
     let expected = harness.root.path().join("workspace");
     let created = harness.client().call(1, "session/new", &json!({}));
     assert!(created["result"]["sessionId"].is_string(), "{created}");
@@ -849,6 +993,7 @@ fn an_omitted_session_cwd_uses_the_launch_workspace() {
 #[test]
 fn invalid_session_working_directories_are_rejected_without_creating_a_session() {
     let mut harness = Harness::start(vec![Script::text("unused")], PermissionMode::Auto);
+    harness.initialize(1000);
     for cwd in [json!("relative"), json!(42)] {
         let response = harness
             .client()
