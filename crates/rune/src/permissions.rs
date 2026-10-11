@@ -34,7 +34,7 @@ pub fn rules_for(settings: &Settings, extra: &RuleSet) -> RuleSet {
     // without the configuration and a refusal is the safe thing for it to say.
     // Enabling them is the configuration's decision, so the allow is written
     // here, at a layer above the default, which is what lets it overrule the
-    // built-in denial. `offline` refuses everything, so it wins over the
+    // built-in denial. `offline` disables web backends, so it wins over the
     // setting: there is no point allowing a tool whose transport will refuse
     // the request.
     if settings.web_tools && !settings.offline {
@@ -605,7 +605,7 @@ mod tests {
 
     #[test]
     fn an_offline_run_does_not_enable_the_web_tools() {
-        // Offline refuses every request, so allowing the tools would only make
+        // Offline disables web backends, so allowing the tools would only make
         // them fail later with a different message.
         let settings = Settings {
             web_tools: true,

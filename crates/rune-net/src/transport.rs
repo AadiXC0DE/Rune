@@ -1,14 +1,14 @@
 //! HTTP transport and streaming dispatch.
 //!
-//! One place performs network calls, so an audit of outbound traffic is a read
-//! of this module. The client is blocking: a streaming read loop needs no
-//! executor, and keeping one out of the process means command dispatch and
-//! configuration never link an async runtime.
+//! Provider and web network calls run here. Remote MCP has a separate client,
+//! and spawned processes can make their own calls. The client is blocking: a
+//! streaming read loop needs no executor, and keeping one out of the process
+//! means command dispatch and configuration never link an async runtime.
 //!
 //! The client itself sits behind [`Fetch`], and every request path here takes
-//! `&dyn Fetch` rather than a concrete client. This module is the only one that
-//! names the blocking client, so a target where it cannot compile supplies its
-//! own implementation of the trait instead of a second request path.
+//! `&dyn Fetch` rather than a concrete client. A target where this blocking
+//! client cannot compile supplies its own implementation of the trait instead
+//! of a second request path.
 //!
 //! Every request is bounded in time, every response body is bounded in bytes,
 //! and every failure maps onto the taxonomy the retry policy reads.

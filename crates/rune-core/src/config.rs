@@ -336,15 +336,17 @@ pub struct UserConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<Provider>,
 
-    /// Whether every outbound request is refused, including model requests.
+    /// Whether provider requests are refused, web backends disabled, remote MCP
+    /// checks skipped and sandboxed shell networking denied. Local MCP children
+    /// and unsandboxed shell fallback require separate network isolation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub offline: Option<bool>,
 
     /// Whether the web tools may reach the network.
     ///
     /// Off by default. Set `web_tools = true` or `RUNE_WEB_TOOLS=true` to enable
-    /// web fetch and search. `offline = true` refuses every outbound request,
-    /// including model requests, and overrules this setting.
+    /// web fetch and search. `offline = true` disables both web backends and
+    /// overrules this setting.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub web_tools: Option<bool>,
 
@@ -528,7 +530,9 @@ pub struct Settings {
     pub ascii: bool,
     /// Whether automatic update checks run.
     pub auto_upgrade: bool,
-    /// Whether every outbound request is refused.
+    /// Whether provider requests are refused, web backends disabled, remote MCP
+    /// checks skipped and sandboxed shell networking denied. This is not a
+    /// process-wide network filter; hosts must enforce each path's policy.
     pub offline: bool,
     /// Whether tool call groups are collapsed.
     pub collapse_tool_calls: bool,

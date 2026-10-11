@@ -200,6 +200,11 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Fixed
 
+- Offline documentation now maps provider, web, remote MCP, local MCP and shell
+  traffic to tested behavior. CLI help and the site describe the same boundary:
+  local MCP children and an explicitly permitted unsandboxed shell fallback
+  retain network access. Offline mode is not a process-wide network filter.
+
 - Startup budget output labels minimum-of-31 measurements and reports raw
   process latency median and p95 separately from baseline-subtracted work.
   The existing 5 ms version and 8 ms help work budgets remain unchanged.
@@ -473,7 +478,7 @@ Notable changes, newest first. Each entry describes what a user can observe.
   and explicit output ceilings bound the thinking budget without being raised.
 - Web fetch and search are disabled by default, matching the documented opt-in.
   Set `web_tools = true` or `RUNE_WEB_TOOLS=true` to enable them; offline mode
-  still refuses outbound requests.
+  still disables both web backends.
 - Offline mode disables sandboxed shell networking even when external access
   is granted.
 - The user configuration accepts `offline = true` and enforces offline mode
@@ -549,8 +554,9 @@ Notable changes, newest first. Each entry describes what a user can observe.
 - Web tools received working outbound clients and user-level permission rules,
   so explicitly enabling them could overrule the built-in denial. This release
   enabled web tools by default; 0.1.16 restores the documented opt-in via
-  `web_tools = true`. `offline = true` still refuses everything, including the
-  model.
+  `web_tools = true`. `offline = true` refuses provider requests and disables
+  web backends; local MCP processes and unsandboxed commands can still use
+  the network.
 - The site's canonical and Open Graph URLs name `rune.heyaadi.com`.
 
 ## 0.1.13
@@ -808,7 +814,7 @@ Notable changes, newest first. Each entry describes what a user can observe.
   edits by character and by word.
 - `rune upgrade` and `rune uninstall`, which verify an artifact against a
   checksum before replacing anything.
-- Offline mode, which refuses every outbound request.
+- Offline mode, which refuses provider requests and disables web backends.
 - A generated command reference at `COMMANDS.md`.
 
 ### Changed
@@ -821,7 +827,7 @@ Notable changes, newest first. Each entry describes what a user can observe.
 ### Fixed
 
 - Offline mode was parsed and never enforced, so a run that asked to stay
-  offline still made requests.
+  offline still made provider requests.
 - The system prompt override was checked for but never read, so writing one had
   no effect.
 - A prompt whose skill catalog was cut was never told anything was omitted.

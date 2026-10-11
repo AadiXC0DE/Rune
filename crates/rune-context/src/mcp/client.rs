@@ -137,6 +137,10 @@ pub struct CallOutcome {
 }
 
 /// Connects to MCP servers and dispatches their tools.
+///
+/// This client has no offline policy. A host must exclude remote servers before
+/// calling `connect_all` when offline. Stdio children are spawned without the
+/// shell sandbox, so their own network traffic requires host-supplied isolation.
 #[derive(Debug)]
 pub struct Client {
     limits: BudgetSet,
@@ -218,7 +222,7 @@ impl Client {
         }
     }
 
-    /// Connects every enabled server.
+    /// Connects every enabled server supplied by the host, without an offline check.
     pub fn connect_all(&self, servers: &[ServerConfig]) -> Result<ConnectReport> {
         let mut state = self.lock()?;
         state.shutdown = false;

@@ -374,6 +374,35 @@ fn approved_stdio_can_start_during_offline_listing() {
     assert!(report["servers"][0]["startup_error"].is_null());
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn offline_stdio_mcp_can_send_network_traffic() {
+    let workspace = Workspace::new();
+    let listener = TcpListener::bind("127.0.0.1:0").expect("fixture");
+    listener.set_nonblocking(true).expect("nonblocking");
+    let port = listener.local_addr().expect("address").port();
+    // Send bytes before the MCP handshake. A connected report therefore proves
+    // startup did not apply the shell tool's offline network sandbox.
+    let script = format!(
+        r#"printf LOCAL_MCP_EGRESS > /dev/tcp/127.0.0.1/{port} || exit 1; printf '%s\n' '{{"jsonrpc":"2.0","id":1,"result":{{"protocolVersion":"2025-11-25"}}}}' '{{"jsonrpc":"2.0","id":2,"result":{{"tools":[]}}}}'; cat >/dev/null"#
+    );
+    workspace.configure(&json!({"local": {"command": "/bin/bash", "args": ["-c", script]}}));
+    workspace.approve(&["local"]);
+    for command in ["list", "check"] {
+        let output = workspace.run(&["mcp", command, "--json", "--offline"]);
+        assert!(output.status.success(), "{output:?}");
+        let report: Value = serde_json::from_slice(&output.stdout).expect("report");
+        assert_eq!(report["servers"][0]["status"], "connected");
+        let (mut socket, _) = listener.accept().expect("stdio child connection");
+        socket
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("read deadline");
+        let mut received = String::new();
+        socket.read_to_string(&mut received).expect("fixture bytes");
+        assert_eq!(received, "LOCAL_MCP_EGRESS");
+    }
+}
+
 #[test]
 fn check_reports_protocol_and_all_tools_without_model_requests_or_sessions() {
     for json_output in [true, false] {

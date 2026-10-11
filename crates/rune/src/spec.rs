@@ -146,7 +146,10 @@ pub const GLOBAL_FLAGS: &[FlagSpec] = &[
         "--no-additional-dirs",
         "Ignore saved additional directories for this process.",
     ),
-    flag("--offline", "Refuse every outbound network request."),
+    flag(
+        "--offline",
+        "Refuse provider requests, disable web tools, skip remote MCP checks and restrict sandboxed shell networking. Local MCP and unsandboxed commands can still use the network.",
+    ),
     flag(
         "--allow-unsandboxed",
         "Run commands where the host has no sandbox backend. Without this, such a host refuses them.",
