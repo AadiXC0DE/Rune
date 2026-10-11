@@ -172,6 +172,9 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Fixed
 
+- ACP session listings sort all matching sessions by most recent activity
+  before applying the listing cap, so directory order cannot hide newer sessions.
+
 - ACP session listings include only sessions whose stored workspace matches
   the connection's launch workspace, and report that stored cwd. Sessions with
   no recorded workspace are omitted from listings; direct loading still uses

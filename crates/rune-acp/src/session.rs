@@ -305,8 +305,8 @@ impl Sessions {
     /// Sessions without a recorded workspace are omitted because their scope
     /// cannot be determined from storage.
     ///
-    /// Bounded by the configured listing bound, so a large session directory
-    /// costs a bounded read.
+    /// Reads all stored sessions to determine recency, then limits the returned
+    /// summaries to the configured listing bound.
     #[must_use]
     pub fn list(&self) -> Vec<SessionSummary> {
         let Ok(entries) = std::fs::read_dir(self.paths.sessions_dir()) else {
@@ -314,9 +314,6 @@ impl Sessions {
         };
         let mut out: Vec<SessionSummary> = Vec::new();
         for entry in entries.flatten() {
-            if out.len() >= self.cap {
-                break;
-            }
             let Ok(path) = Utf8PathBuf::from_path_buf(entry.path()) else {
                 continue;
             };
@@ -1346,6 +1343,78 @@ mod tests {
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].id, id);
         assert_eq!(listed[0].cwd, "/tmp/work");
+    }
+
+    #[test]
+    fn the_listing_cap_keeps_the_newest_sessions_in_shuffled_directory_order() {
+        use rune_session::store::write_log_atomic;
+
+        let root = tempfile::tempdir().expect("tempdir");
+        let paths = paths_for(&root);
+        let mut limits = BudgetSet::new();
+        limits
+            .set(
+                LimitName::ListEntries,
+                rune_core::budget::Budget::Bounded(3),
+                ConfigLayer::User,
+            )
+            .expect("set cap");
+        let workspace = utf8_path(&root, "workspace");
+        let sessions = Sessions::new(
+            paths.clone(),
+            workspace.clone(),
+            SessionConfig::new("test/model", Effort::Auto, PermissionMode::Auto),
+            &limits,
+            Vec::new(),
+        );
+        for _ in 0..6 {
+            let id = SessionId::generate();
+            drop(SessionStore::create(&paths, &id).expect("fixture session"));
+        }
+        let dirs: Vec<Utf8PathBuf> = std::fs::read_dir(paths.sessions_dir())
+            .expect("session directories")
+            .map(|entry| Utf8PathBuf::from_path_buf(entry.expect("entry").path()).expect("UTF-8"))
+            .collect();
+
+        // Assign timestamps in the observed directory order so the newest
+        // sessions lie beyond the cap regardless of the filesystem's ordering.
+        // A second shuffle checks that updating activity changes the selection.
+        for (timestamps, newest) in [
+            ([3_000, 1_000, 5_000, 2_000, 6_000, 4_000], [4, 2, 5]),
+            ([6_000, 2_000, 1_000, 5_000, 3_000, 4_000], [0, 3, 5]),
+        ] {
+            for (dir, timestamp) in dirs.iter().zip(timestamps) {
+                let frames = [
+                    EventFrame::new(
+                        EventSeq(1),
+                        0,
+                        SessionEvent::WorkspaceSet {
+                            workspace: workspace.to_string(),
+                        },
+                    ),
+                    EventFrame::new(
+                        EventSeq(2),
+                        timestamp,
+                        SessionEvent::TitleSet {
+                            title: format!("activity {timestamp}"),
+                        },
+                    ),
+                ];
+                write_log_atomic(dir, &frames).expect("fixture timestamps");
+            }
+            let expected = newest.map(|index| {
+                dirs[index]
+                    .file_name()
+                    .expect("session identifier")
+                    .to_owned()
+            });
+            for _ in 0..3 {
+                let listed = sessions.list();
+                let ids: Vec<&str> = listed.iter().map(|session| session.id.as_str()).collect();
+                assert_eq!(ids, expected);
+                assert!(listed.iter().all(|session| session.cwd == workspace));
+            }
+        }
     }
 
     #[test]
