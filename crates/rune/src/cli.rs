@@ -37,6 +37,8 @@ pub enum Command {
     Auth,
     /// List models.
     Models,
+    /// List resolved MCP servers and startup failures.
+    Mcp,
     /// Show permission state.
     Permissions,
     /// Explain a command's sandbox policy without running it.
@@ -86,6 +88,7 @@ impl Command {
             Self::Usage => "usage",
             Self::Auth => "auth",
             Self::Models => "models",
+            Self::Mcp => "mcp",
             Self::Permissions => "permissions",
             Self::Sandbox => "sandbox",
             Self::Projects => "projects",
@@ -322,6 +325,7 @@ pub fn parse(args: Vec<OsString>, benchmark: bool) -> Result<Launch> {
                 "usage" => Command::Usage,
                 "auth" => Command::Auth,
                 "models" => Command::Models,
+                "mcp" => Command::Mcp,
                 "permissions" => Command::Permissions,
                 "sandbox" => Command::Sandbox,
                 "projects" => Command::Projects,

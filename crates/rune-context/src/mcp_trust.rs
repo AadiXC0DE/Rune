@@ -359,10 +359,19 @@ pub fn expand_approved(
 /// as a bounded, no-follow regular file, so a symlink or an oversized file is
 /// refused rather than followed.
 pub fn read_project_file(workspace: &Utf8Path) -> Result<Vec<ProjectServer>> {
+    let Some(text) = read_project_document(workspace)? else {
+        return Ok(Vec::new());
+    };
+    parse_project_file(&text, &workspace.join(PROJECT_FILE))
+}
+
+/// Reads the bounded project document without expanding or starting any server.
+/// A missing file returns `None`.
+pub fn read_project_document(workspace: &Utf8Path) -> Result<Option<String>> {
     let path = workspace.join(PROJECT_FILE);
     let metadata = match std::fs::symlink_metadata(&path) {
         Ok(metadata) => metadata,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(err) => return Err(RuneError::from(err)),
     };
     if metadata.is_symlink() || !metadata.is_file() {
@@ -384,7 +393,7 @@ pub fn read_project_file(workspace: &Utf8Path) -> Result<Vec<ProjectServer>> {
             format!("{path} could not be read as text: {err}"),
         )
     })?;
-    parse_project_file(&text, &path)
+    Ok(Some(text))
 }
 
 /// Parses a project configuration document, reading only `mcpServers`.

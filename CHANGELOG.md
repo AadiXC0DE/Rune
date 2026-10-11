@@ -6,6 +6,12 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Added
 
+- `rune mcp list --json` reports project MCP declarations, transport, trust,
+  enabled/required flags and every eligible server's startup result. Required
+  failures do not hide later servers. Pending and rejected servers stay blocked;
+  offline listing skips remote servers. Reports omit transport secrets and redact
+  configured secret values from startup errors.
+
 - The footer and `/status` label provider-reported context counts distinctly
   from byte-derived estimates, including before the first response and when a
   provider omits token usage. Resume estimates retain their saved-history source.

@@ -17,6 +17,7 @@ mod connect_flow;
 mod diagnostics;
 mod help;
 mod install;
+mod mcp;
 mod path_completion;
 mod permissions;
 mod prompt_history;
@@ -174,6 +175,15 @@ fn run(launch: &Launch) -> Result<ExitCode> {
         Command::Auth => run_auth(&settings, &paths, launch, &output_flags),
         Command::Connect => run_connect(&settings, &paths, launch, &output_flags),
         Command::Models => run_models(&settings, &paths, &output_flags),
+        Command::Mcp => {
+            let report = mcp::list(&settings, &paths, launch, &workspace)?;
+            if output_flags.json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                print!("{}", report.render());
+            }
+            Ok(ExitCode::from(EXIT_OK))
+        }
         Command::Permissions => run_permissions(&settings, launch, &output_flags),
         Command::Sandbox => {
             let report = sandbox::explain(&settings, saved_directory_source, launch, &workspace)?;

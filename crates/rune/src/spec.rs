@@ -355,6 +355,18 @@ pub const ACCOUNT: &[CommandSpec] = &[
         supports_json: true,
     },
     CommandSpec {
+        name: "mcp",
+        aliases: &[],
+        summary: "List configured MCP servers, trust and startup errors",
+        usage: "rune mcp list [--json]",
+        flags: &[flag(
+            "--json",
+            "Emit JSON without secret headers or environment values.",
+        )],
+        requirements: Requirements::NETWORK,
+        supports_json: true,
+    },
+    CommandSpec {
         name: "permissions",
         aliases: &[],
         summary: "Show the permission mode and rules",

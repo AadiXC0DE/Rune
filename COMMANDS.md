@@ -136,6 +136,13 @@ List the models of the connected provider
 | Flag | Description |
 |---|---|
 | `--json` | Emit JSON. |
+### `rune mcp list [--json]`
+
+List configured MCP servers, trust and startup errors
+
+| Flag | Description |
+|---|---|
+| `--json` | Emit JSON without secret headers or environment values. |
 ### `rune permissions [--explain <target>] [--json]`
 
 Show the permission mode and rules

@@ -61,6 +61,16 @@ asks the endpoint rather than a table compiled into the binary, so a model
 released after this build still appears. Add `--offline` to report the configured
 model without contacting anything.
 
+`rune mcp list --json` lists the workspace's `.mcp.json` declarations in name
+order with transport, trust, enabled/required flags, startup status and errors.
+It attempts each approved, enabled server independently, then closes it; no
+provider or agent turn is needed. Pending and rejected servers stay blocked,
+and `--offline` skips remote servers. Approve a workspace with
+`rune projects approve`. Listing succeeds even when individual servers fail.
+Headers, environment values, commands and URLs are omitted from the report,
+and configured secrets are redacted from startup messages. Startup and operation
+waits use `mcp_startup_timeout_ms` and `mcp_operation_timeout_ms`.
+
 The web tools are off until asked for. `rune doctor` reports what this machine
 supports, and turning them on is one setting:
 
