@@ -317,11 +317,18 @@ pub fn run(
         Layer::CommandLine,
     )?;
     let registry = if options.tool_loop {
-        inventory::builtin_with_web(
+        let catalog = rune_context::skills::discover(
+            &crate::current_workspace()?,
+            rune_core::paths::home_directory().as_deref(),
+            &paths.config_root,
+        )?;
+        inventory::builtin_with_catalog(
             &rune_tools::FileLimits::from_budget(&limits),
             &limits,
             &paths.managed_skills_dir(),
             crate::web_client::backends(settings),
+            std::sync::Arc::new(rune_tools::ask_user::Unavailable),
+            std::sync::Arc::new(rune_tools::skill::Fixed::new(catalog)),
         )?
     } else {
         Registry::new()

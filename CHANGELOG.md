@@ -206,6 +206,11 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Fixed
 
+- Interactive sessions and `rune ask` connect `capability_search` and `skill`
+  to discovered workspace and user skills. Search returns declared names and
+  loadable locations; loading returns exact instructions within `skill_file_bytes`
+  and refuses oversized files.
+
 - Interactive `subagent` calls run one synchronous child with separate history
   and return its result to the parent. Children use only inherited, advertised
   read-only tools under the parent's permission policy, with at most 16 model

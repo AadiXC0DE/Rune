@@ -127,6 +127,28 @@ pub fn builtin_with_answerer(
     web: Option<WebBackends>,
     answerer: std::sync::Arc<dyn Answerer>,
 ) -> Result<Registry> {
+    builtin_with_catalog(
+        limits,
+        budget,
+        skills_root,
+        web,
+        answerer,
+        std::sync::Arc::new(crate::skill::Empty),
+    )
+}
+
+/// Builds the registry with a host-supplied discovered skill catalog.
+///
+/// Search and loading share the catalog, while instruction reads retain the
+/// caller's configured skill file limit.
+pub fn builtin_with_catalog(
+    limits: &FileLimits,
+    budget: &rune_core::budget::BudgetSet,
+    skills_root: &camino::Utf8Path,
+    web: Option<WebBackends>,
+    answerer: std::sync::Arc<dyn Answerer>,
+    catalog: std::sync::Arc<dyn crate::skill::Catalog>,
+) -> Result<Registry> {
     let mut registry = Registry::new();
     registry.insert(Box::new(GlobFiles::with_limits(*limits)))?;
     registry.insert(Box::new(GrepFiles::with_limits(*limits)))?;
@@ -140,10 +162,6 @@ pub fn builtin_with_answerer(
     registry.insert(Box::new(Shell::new(budget)))?;
     registry.insert(Box::new(AskUserQuestion::new(answerer)))?;
 
-    // The catalog is supplied by the host, so a run with no workspace to scan
-    // reports an empty catalog rather than failing.
-    let catalog: std::sync::Arc<dyn crate::skill::Catalog> =
-        std::sync::Arc::new(crate::skill::Empty);
     let context_limits = rune_context::limits::Limits::resolve(budget)?;
     registry.insert(Box::new(LoadSkill::new(
         std::sync::Arc::clone(&catalog),

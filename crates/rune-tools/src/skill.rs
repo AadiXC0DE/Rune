@@ -243,7 +243,9 @@ impl Tool for CapabilitySearch {
         for skill in matches {
             let _ = writeln!(
                 out,
-                "{}\n  {}",
+                "{}\n  {}{}\n  {}",
+                skill.name,
+                skill_invocation::LOCATION_PREFIX,
                 skill.location,
                 skill.description.as_deref().unwrap_or("(no description)")
             );

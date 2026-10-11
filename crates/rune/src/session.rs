@@ -4782,12 +4782,18 @@ pub fn prepare(
     };
 
     let questions = Arc::new(TerminalQuestions::default());
-    let mut registry = inventory::builtin_with_answerer(
+    let catalog = rune_context::skills::discover(
+        workspace,
+        rune_core::paths::home_directory().as_deref(),
+        &paths.config_root,
+    )?;
+    let mut registry = inventory::builtin_with_catalog(
         &rune_tools::workspace::FileLimits::from_budget(&settings.limits),
         &settings.limits,
         &paths.managed_skills_dir(),
         crate::web_client::backends(settings),
         questions.clone(),
+        Arc::new(rune_tools::skill::Fixed::new(catalog)),
     )?;
     let rules = crate::permissions::validated(settings)?;
     let mut tools: Vec<String> = registry.names().into_iter().map(str::to_owned).collect();
