@@ -2015,7 +2015,7 @@ Resource accumulation after cancellation, session holder handover and concurrent
 - [x] R-136 | T2 | fix | node | Bound captured child stdout and stderr | acceptance: Run a stub that writes beyond the configured output cap and observe a typed output-limit failure with bounded memory.
 - [x] R-137 | T2 | fix | node | Find rune.exe on Windows | acceptance: On Windows with only rune.exe in a fixture PATH, resolveBinary must return its executable path.
 - [x] R-138 | T2 | feature | node | Expose provider and offline process options | acceptance: Call ask with provider and offline options and assert both flags reach the stub before the command delimiter.
-- [ ] R-139 | T2 | fix | xtask | Honor CARGO_TARGET_DIR in budget and release artifact lookup | acceptance: Build with a scratch CARGO_TARGET_DIR and observe budget and release read its binary rather than target/release.
+- [x] R-139 | T2 | fix | xtask | Honor CARGO_TARGET_DIR in budget and release artifact lookup | acceptance: Build with a scratch CARGO_TARGET_DIR and observe budget and release read its binary rather than target/release.
 - [ ] R-140 | T2 | fix | xtask | Serialize release manifests as JSON | acceptance: Stage a channel containing a quote and observe valid JSON with the exact channel value, or reject it before writing.
 - [ ] R-141 | T2 | feature | ci | Run the declared dependency advisory and license policy | acceptance: CI must run cargo deny check and fail on a scratch dependency violating the declared policy.
 - [ ] R-142 | T2 | feature | ci | Run the Node binding tests in CI | acceptance: CI must execute node --test bindings/node/test.mjs and fail when its stub contract is intentionally broken.

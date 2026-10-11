@@ -5,6 +5,7 @@
 
 #![forbid(unsafe_code)]
 
+use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
 /// Runs per measurement. The fastest is kept, so more samples only reduce noise.
@@ -136,12 +137,12 @@ fn cargo(args: &[&str]) -> Result<(), String> {
 fn web() -> Result<(), String> {
     const TARGET: &str = "wasm32-wasip1";
     cargo(&["build", "--release", "-p", "rune-web", "--target", TARGET])?;
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .ok_or("the xtask crate has no parent directory")?
         .to_path_buf();
-    let target = std::env::var_os("CARGO_TARGET_DIR")
-        .map_or_else(|| root.join("target"), std::path::PathBuf::from);
+    let target =
+        std::env::var_os("CARGO_TARGET_DIR").map_or_else(|| root.join("target"), PathBuf::from);
     let built = target.join(TARGET).join("release").join("rune_web.wasm");
     let placed = root.join("site").join("demo").join("rune.wasm");
     std::fs::copy(&built, &placed).map_err(|err| {
@@ -177,7 +178,7 @@ fn budget() -> Result<(), String> {
 
     let binary = release_binary_path();
     let size = std::fs::metadata(&binary)
-        .map_err(|err| format!("could not read {binary}: {err}"))?
+        .map_err(|err| format!("could not read {}: {err}", binary.display()))?
         .len();
 
     let mib = size as f64 / (1024.0 * 1024.0);
@@ -202,12 +203,14 @@ fn gate() -> Result<(), String> {
 }
 
 /// Path of the built release binary.
-fn release_binary_path() -> String {
-    let mut path = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-    path.push("target");
-    path.push("release");
-    path.push(format!("rune{}", std::env::consts::EXE_SUFFIX));
-    path.display().to_string()
+fn release_binary_path() -> PathBuf {
+    binary_path(env!("TARGET"))
+}
+
+/// Cargo resolves a relative target directory against the build's working directory.
+fn target_directory() -> PathBuf {
+    let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    root.join(std::env::var_os("CARGO_TARGET_DIR").unwrap_or_else(|| "target".into()))
 }
 
 /// Stages a release artifact for the host that is building it.
@@ -262,8 +265,8 @@ fn release(extra: &[String]) -> Result<(), String> {
     // the other rejects, and an unpinned timestamp makes two runs over identical
     // input produce different archives. Writing it means the bytes depend on the
     // binary alone.
-    let binary_bytes =
-        std::fs::read(&binary).map_err(|err| format!("could not read {binary}: {err}"))?;
+    let binary_bytes = std::fs::read(&binary)
+        .map_err(|err| format!("could not read {}: {err}", binary.display()))?;
     std::fs::write(&archive_path, archive_bytes(&name, &binary_bytes)?)
         .map_err(|err| format!("could not write {archive_path}: {err}"))?;
 
@@ -379,15 +382,14 @@ fn tar_header(name: &str, size: usize) -> [u8; 512] {
 /// Returns the path of the built binary for a target.
 ///
 /// A cross build puts its output under the target name; a host build does not.
-fn binary_path(target: &str) -> String {
-    let mut path = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-    path.push("target");
+fn binary_path(target: &str) -> PathBuf {
+    let mut path = target_directory();
     if target != env!("TARGET") {
         path.push(target);
     }
     path.push("release");
     path.push(executable_name(target));
-    path.display().to_string()
+    path
 }
 
 /// Returns the executable name a platform produces.
@@ -445,7 +447,7 @@ fn write(path: &str, contents: &str) -> Result<(), String> {
 /// of the work the binary must actually do. The process floor is measured the
 /// same way and subtracted, so the number reported is our work rather than the
 /// host's fork and loader cost.
-fn check_startup(binary: &str) -> Result<(), String> {
+fn check_startup(binary: &Path) -> Result<(), String> {
     let floor = measure_floor()?;
     println!("process floor       {floor:.2} ms");
 
@@ -483,10 +485,7 @@ fn check_startup(binary: &str) -> Result<(), String> {
 /// Subtracting it isolates the work this binary does.
 fn measure_floor() -> Result<f64, String> {
     let candidates = ["/usr/bin/true", "/bin/true"];
-    let Some(program) = candidates
-        .iter()
-        .find(|path| std::path::Path::new(path).exists())
-    else {
+    let Some(program) = candidates.iter().find(|path| Path::new(path).exists()) else {
         // Without a suitable baseline the raw measurement stands on its own.
         return Ok(0.0);
     };
@@ -514,7 +513,7 @@ fn fastest(mut samples: Vec<f64>) -> f64 {
 }
 
 /// Returns the fastest wall time in milliseconds for one invocation path.
-fn fastest_startup_ms(binary: &str, flag: &str) -> Result<f64, String> {
+fn fastest_startup_ms(binary: &Path, flag: &str) -> Result<f64, String> {
     let mut samples = Vec::with_capacity(MEASUREMENT_SAMPLES);
     for _ in 0..MEASUREMENT_SAMPLES {
         let start = std::time::Instant::now();
@@ -523,9 +522,12 @@ fn fastest_startup_ms(binary: &str, flag: &str) -> Result<f64, String> {
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status()
-            .map_err(|err| format!("could not run {binary}: {err}"))?;
+            .map_err(|err| format!("could not run {}: {err}", binary.display()))?;
         if !status.success() {
-            return Err(format!("`{binary} {flag}` exited with a failure"));
+            return Err(format!(
+                "`{} {flag}` exited with a failure",
+                binary.display()
+            ));
         }
         samples.push(start.elapsed().as_secs_f64() * 1000.0);
     }

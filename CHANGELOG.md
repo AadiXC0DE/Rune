@@ -185,6 +185,10 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Fixed
 
+- `cargo xtask budget` and `cargo xtask release` read the freshly built binary
+  from `CARGO_TARGET_DIR` when set, including relative paths, instead of using
+  a stale binary under `target/release`.
+
 - The Node binding finds `rune.exe` on Windows `PATH`, including when `bin`
   or `RUNE_BIN` names `rune`. Exact names and PATH directory order retain priority.
 
