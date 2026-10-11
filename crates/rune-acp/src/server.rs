@@ -487,7 +487,18 @@ impl<W: Write + Send + 'static> Server<W> {
     }
 
     /// Issues a request to the client and waits for its answer.
-    fn ask(&self, method: &str, params: Value, cancellation: &Cancellation) -> Option<Value> {
+    fn ask(
+        &self,
+        method: &str,
+        params: Value,
+        cancellation: &Cancellation,
+    ) -> Result<Option<Value>> {
+        let started = Instant::now();
+        let timeout = Duration::from_millis(
+            self.config
+                .limits
+                .get_bytes(LimitName::AcpPermissionTimeoutMs),
+        );
         let id = self.next_request.fetch_add(1, Ordering::SeqCst);
         let (sender, receiver) = std::sync::mpsc::channel();
         if let Ok(mut guard) = self.pending.lock() {
@@ -498,7 +509,7 @@ impl<W: Write + Send + 'static> Server<W> {
             method,
             params,
         )));
-        let answer = wait_for(&receiver, cancellation);
+        let answer = wait_for(&receiver, cancellation, started, timeout);
         if let Ok(mut guard) = self.pending.lock() {
             guard.remove(&id);
         }
@@ -844,17 +855,34 @@ impl<W: Write + Send + 'static> Server<W> {
     }
 }
 
-/// Waits for a response, giving up when the turn is cancelled.
-fn wait_for(receiver: &Receiver<Response>, cancellation: &Cancellation) -> Option<Value> {
+/// Waits for a response until cancellation or the permission deadline.
+fn wait_for(
+    receiver: &Receiver<Response>,
+    cancellation: &Cancellation,
+    started: Instant,
+    timeout: Duration,
+) -> Result<Option<Value>> {
     loop {
-        match receiver.recv_timeout(POLL) {
-            Ok(response) => return response.into_outcome().and_then(std::result::Result::ok),
-            Err(RecvTimeoutError::Timeout) => {
-                if cancellation.is_cancelled() {
-                    return None;
-                }
+        if cancellation.is_cancelled() {
+            return Ok(None);
+        }
+        let remaining = timeout.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            return Err(RuneError::new(
+                ErrorCode::Timeout,
+                format!(
+                    "the client did not answer the permission request within {} ms \
+                     (`acp_permission_timeout_ms`)",
+                    timeout.as_millis()
+                ),
+            ));
+        }
+        match receiver.recv_timeout(POLL.min(remaining)) {
+            Ok(response) => {
+                return Ok(response.into_outcome().and_then(std::result::Result::ok));
             }
-            Err(RecvTimeoutError::Disconnected) => return None,
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => return Ok(None),
         }
     }
 }
@@ -965,11 +993,16 @@ fn run_one<W: Write + Send + 'static>(server: &Arc<Server<W>>, queued: Queued) {
         mcp: snapshot.mcp,
         answer: Mutex::default(),
         thought: Mutex::default(),
+        permission_timeout: OnceLock::new(),
     };
 
     let mut history = snapshot.history;
     history.push_user(queued.text.clone());
     let outcome = run_turn(&mut history, &host);
+    // The host cancels work when an approval expires. Preserve the deadline
+    // error so the prompt reports a timeout rather than a user cancellation.
+    let permission_timeout = host.permission_timeout.get();
+    let outcome = permission_timeout.map_or(outcome, |err| Err(err.clone()));
     let rules = host
         .rules
         .lock()
@@ -1007,7 +1040,10 @@ fn run_one<W: Write + Send + 'static>(server: &Arc<Server<W>>, queued: Queued) {
                 json!({ "stopReason": stop_reason(outcome.stop_reason) }),
             );
         }
-        Err(err) if cancellation.is_cancelled() || err.code() == ErrorCode::Cancelled => {
+        Err(err)
+            if permission_timeout.is_none()
+                && (cancellation.is_cancelled() || err.code() == ErrorCode::Cancelled) =>
+        {
             server.absorb(&session, history, rules);
             server.retire_tools();
             server.respond(queued.id, json!({ "stopReason": "cancelled" }));
@@ -1112,6 +1148,8 @@ struct TurnHost<W: Write + Send + 'static> {
     answer: Mutex<StreamedStep>,
     /// Reasoning of the running step, as the client has been sent it.
     thought: Mutex<StreamedStep>,
+    /// Deadline failure retained while cancellation stops the tool batch.
+    permission_timeout: OnceLock<RuneError>,
 }
 
 impl<W: Write + Send + 'static> TurnHost<W> {
@@ -1166,14 +1204,24 @@ impl<W: Write + Send + 'static> TurnHost<W> {
                 {"optionId": "reject_once", "name": "Reject", "kind": "reject_once"},
             ],
         });
-        let Some(answer) =
-            self.server
-                .ask("session/request_permission", params, &self.cancellation)
-        else {
-            return (
-                Outcome::Deny,
-                format!("the approval for {name} was not answered"),
-            );
+        let answer = match self
+            .server
+            .ask("session/request_permission", params, &self.cancellation)
+        {
+            Ok(Some(answer)) => answer,
+            Ok(None) => {
+                return (
+                    Outcome::Deny,
+                    format!("the approval for {name} was not answered"),
+                );
+            }
+            Err(err) => {
+                let reason = err.message().to_owned();
+                let _ = self.permission_timeout.set(err);
+                self.cancellation.cancel();
+                self.context.cancellation().cancel();
+                return (Outcome::Deny, reason);
+            }
         };
         let option = answer
             .get("outcome")
@@ -1551,6 +1599,68 @@ mod output_failure_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_expired_permission_is_removed_from_pending_requests() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let path = Utf8PathBuf::from_path_buf(root.path().to_owned()).expect("UTF-8 path");
+        let mut config = ServerConfig::new(
+            Paths {
+                config_root: path.join("config"),
+                state_root: path.join("state"),
+                data_root: path.join("data"),
+            },
+            path,
+            Endpoint::new("http://127.0.0.1:1", "test-key"),
+            "test/model",
+        )
+        .expect("config");
+        config
+            .limits
+            .set(
+                LimitName::AcpPermissionTimeoutMs,
+                rune_core::budget::Budget::Bounded(0),
+                rune_core::config::Layer::User,
+            )
+            .expect("immediate deadline");
+        let server = Server::new(config, Vec::new()).expect("server");
+        let error = server
+            .ask(
+                "session/request_permission",
+                json!({}),
+                &Cancellation::new(),
+            )
+            .expect_err("deadline exceeded");
+        assert_eq!(error.code(), ErrorCode::Timeout);
+        assert!(server.pending.lock().expect("pending").is_empty());
+        server.resolve(Response::ok(Id::Number(1), json!({})));
+        assert!(server.pending.lock().expect("pending").is_empty());
+    }
+
+    #[test]
+    fn permission_wait_preserves_answers_cancellation_and_disconnection() {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let cancellation = Cancellation::new();
+        sender
+            .send(Response::ok(Id::Number(1), json!({"approved": true})))
+            .expect("answer");
+        assert_eq!(
+            wait_for(&receiver, &cancellation, Instant::now(), POLL).expect("answer"),
+            Some(json!({"approved": true}))
+        );
+
+        // Cancellation wins even when the deadline has already elapsed.
+        cancellation.cancel();
+        assert_eq!(
+            wait_for(&receiver, &cancellation, Instant::now(), Duration::ZERO).expect("cancelled"),
+            None
+        );
+        drop(sender);
+        assert_eq!(
+            wait_for(&receiver, &Cancellation::new(), Instant::now(), POLL).expect("disconnected"),
+            None
+        );
+    }
 
     #[test]
     fn stop_reasons_map_to_the_protocol_names() {

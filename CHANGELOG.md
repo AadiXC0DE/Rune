@@ -6,6 +6,11 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Added
 
+- ACP bounds unanswered client permission requests with
+  `acp_permission_timeout_ms` (120000 ms by default). Expiry returns a `timeout`
+  prompt error without executing the tool; later prompts still work on the same
+  connection and late approvals are ignored.
+
 - `rune mcp check [server] [--json]` reports negotiated protocol, discovered
   tool names, warnings, timeouts and timeout outcomes without a model request.
   It respects project trust and offline settings, closes connections, and exits

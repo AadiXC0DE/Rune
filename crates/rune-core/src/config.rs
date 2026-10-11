@@ -2089,6 +2089,29 @@ max_agent_steps = 50
     }
 
     #[test]
+    fn acp_permission_deadline_resolves_from_user_config_and_environment() {
+        let dir = TempDir::new().expect("tempdir");
+        let user = write(
+            &dir,
+            "config.toml",
+            "[limits]\nacp_permission_timeout_ms = 250\n",
+        );
+        let name = LimitName::AcpPermissionTimeoutMs;
+        let settings = load(None, Some(&user), &empty_env());
+        assert!(settings.diagnostics.is_empty());
+        assert_eq!(settings.limits.get(name), Budget::Bounded(250));
+        assert_eq!(settings.limits.source(name), Some(Layer::User));
+
+        let env = EnvironmentOverrides::from_lookup(|key| {
+            (key == "RUNE_LIMITS").then(|| "acp_permission_timeout_ms=500".to_owned())
+        });
+        let settings = load(None, Some(&user), &env);
+        assert!(settings.diagnostics.is_empty());
+        assert_eq!(settings.limits.get(name), Budget::Bounded(500));
+        assert_eq!(settings.limits.source(name), Some(Layer::Environment));
+    }
+
+    #[test]
     fn environment_overrides_read_from_a_lookup() {
         let directories = std::env::join_paths(["/a", "/b"])
             .expect("join")

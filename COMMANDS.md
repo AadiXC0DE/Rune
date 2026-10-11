@@ -290,6 +290,7 @@ Every limit takes a count, or `off` to remove it. A hard ceiling still applies t
 | `provider_head_timeout_ms` | 120000 | ms | 1000 to 3600000 | Time to wait for a model response head. |
 | `provider_request_timeout_ms` | 600000 | ms | 1000 to 7200000 | Total time allowed for one model request attempt. |
 | `provider_max_attempts` | 10 | bytes | 1 to 20 | Provider attempts before the turn fails. |
+| `acp_permission_timeout_ms` | 120000 | ms | 0 to unbounded | Time allowed for a client to answer an ACP permission request. |
 | `mcp_operation_timeout_ms` | 60000 | ms | 0 to unbounded | Time allowed for one MCP operation. |
 | `mcp_startup_timeout_ms` | 30000 | ms | 0 to unbounded | Time allowed for an MCP server to start and be discovered. |
 | `mcp_restart_limit` | 1 | items | 0 to 10 | Automatic restarts permitted for a local MCP server. |

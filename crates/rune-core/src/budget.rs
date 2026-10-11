@@ -232,6 +232,8 @@ pub enum LimitName {
     ProviderRequestTimeoutMs,
     /// Attempts made against a provider before failing the turn.
     ProviderMaxAttempts,
+    /// Time allowed for a client to answer an ACP permission request.
+    AcpPermissionTimeoutMs,
     /// Time allowed for one MCP operation.
     McpOperationTimeoutMs,
     /// Time allowed for an MCP server to start and complete discovery.
@@ -291,6 +293,7 @@ impl LimitName {
             Self::ProviderHeadTimeoutMs,
             Self::ProviderRequestTimeoutMs,
             Self::ProviderMaxAttempts,
+            Self::AcpPermissionTimeoutMs,
             Self::McpOperationTimeoutMs,
             Self::McpStartupTimeoutMs,
             Self::McpRestartLimit,
@@ -335,6 +338,7 @@ impl LimitName {
             Self::ProviderHeadTimeoutMs => "provider_head_timeout_ms",
             Self::ProviderRequestTimeoutMs => "provider_request_timeout_ms",
             Self::ProviderMaxAttempts => "provider_max_attempts",
+            Self::AcpPermissionTimeoutMs => "acp_permission_timeout_ms",
             Self::McpOperationTimeoutMs => "mcp_operation_timeout_ms",
             Self::McpStartupTimeoutMs => "mcp_startup_timeout_ms",
             Self::McpRestartLimit => "mcp_restart_limit",
@@ -380,6 +384,7 @@ impl LimitName {
             Self::ProviderHeadTimeoutMs => Budget::Bounded(120_000),
             Self::ProviderRequestTimeoutMs => Budget::Bounded(600_000),
             Self::ProviderMaxAttempts => Budget::Bounded(10),
+            Self::AcpPermissionTimeoutMs => Budget::Bounded(120_000),
             Self::McpOperationTimeoutMs => Budget::Bounded(60_000),
             Self::McpStartupTimeoutMs => Budget::Bounded(30_000),
             Self::McpRestartLimit => Budget::Bounded(1),
@@ -457,6 +462,7 @@ impl LimitName {
         match self {
             Self::ProviderHeadTimeoutMs
             | Self::ProviderRequestTimeoutMs
+            | Self::AcpPermissionTimeoutMs
             | Self::McpOperationTimeoutMs
             | Self::McpStartupTimeoutMs
             | Self::ReviewTimeoutMs
@@ -505,6 +511,9 @@ impl LimitName {
             Self::ProviderHeadTimeoutMs => "Time to wait for a model response head.",
             Self::ProviderRequestTimeoutMs => "Total time allowed for one model request attempt.",
             Self::ProviderMaxAttempts => "Provider attempts before the turn fails.",
+            Self::AcpPermissionTimeoutMs => {
+                "Time allowed for a client to answer an ACP permission request."
+            }
             Self::McpOperationTimeoutMs => "Time allowed for one MCP operation.",
             Self::McpStartupTimeoutMs => {
                 "Time allowed for an MCP server to start and be discovered."

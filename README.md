@@ -364,6 +364,12 @@ clients supply them again when loading or resuming. Startup failures fail the
 request, and startup and calls use the configured MCP timeouts. HTTP and SSE
 MCP transports remain unsupported in ACP.
 
+ACP permission requests wait up to `acp_permission_timeout_ms` in `[limits]`
+(120000 ms by default). An unanswered request ends its prompt with a `timeout`
+error and leaves the tool unexecuted. The connection remains usable for later
+prompts, and late approval replies are ignored. Zero expires immediately;
+`off` still applies the limits system's hard ceiling of 67108864 ms.
+
 A Node binding lives in [`bindings/node`](bindings/node).
 
 ## Status

@@ -991,6 +991,99 @@ fn the_prompt_queue_is_bounded() {
 }
 
 #[test]
+fn unanswered_permissions_time_out_without_blocking_later_prompts_or_granting_access() {
+    let mut limits = BudgetSet::new();
+    limits
+        .set(
+            LimitName::AcpPermissionTimeoutMs,
+            Budget::Bounded(1000),
+            Layer::User,
+        )
+        .expect("permission deadline");
+    let mut harness = Harness::start_with(
+        vec![
+            Script::tool_call(
+                "c1",
+                "write_file",
+                r#"{"path":"notes.txt","content":"unapproved"}"#,
+            ),
+            Script::text("after the timeout"),
+            Script::tool_call(
+                "c2",
+                "write_file",
+                r#"{"path":"notes.txt","content":"approved"}"#,
+            ),
+            Script::text("done"),
+        ],
+        PermissionMode::Ask,
+        limits,
+        vec![("notes.txt", "original")],
+    );
+    harness.client().approval = Approval::Ignore;
+    let session = harness.open_session();
+    let started = Instant::now();
+    harness
+        .client()
+        .request(3, "session/prompt", &prompt(&session, "write it"));
+    let expired = harness.client().await_permission_request();
+    harness
+        .client()
+        .request(4, "session/prompt", &prompt(&session, "queued prompt"));
+
+    let timed_out = harness.client().response(3);
+    assert_eq!(timed_out["error"]["data"]["code"], "timeout");
+    assert!(
+        timed_out["error"]["message"]
+            .as_str()
+            .expect("deadline message")
+            .contains("1000 ms (`acp_permission_timeout_ms`)")
+    );
+    assert!(started.elapsed() >= Duration::from_millis(1000));
+    assert!(started.elapsed() < Duration::from_secs(5));
+    assert_eq!(
+        std::fs::read_to_string(harness.root.path().join("workspace/notes.txt"))
+            .expect("unchanged file"),
+        "original"
+    );
+    assert!(harness.client().updates("tool_call").is_empty());
+    assert_eq!(
+        harness.client().response(4)["result"]["stopReason"],
+        "end_turn",
+        "the queued prompt runs after the expired permission"
+    );
+    assert_eq!(harness.mock.request_count(), 2);
+
+    // A late session grant must not authorize this tool in the following turn.
+    harness.client().send(&json!({
+        "jsonrpc": "2.0", "id": expired["id"],
+        "result": {"outcome": {"outcome": "selected", "optionId": "allow_always"}},
+    }));
+    harness
+        .client()
+        .request(5, "session/prompt", &prompt(&session, "try again"));
+    let pending = harness.client().update_until(|frame| {
+        frame.get("method").and_then(Value::as_str) == Some("session/request_permission")
+            && frame["id"] != expired["id"]
+    });
+    assert_ne!(pending["id"], expired["id"]);
+    harness.client().send(&json!({
+        "jsonrpc": "2.0", "id": pending["id"],
+        "result": {"outcome": {"outcome": "selected", "optionId": "allow_once"}},
+    }));
+    assert_eq!(
+        harness.client().response(5)["result"]["stopReason"],
+        "end_turn"
+    );
+    assert_eq!(
+        std::fs::read_to_string(harness.root.path().join("workspace/notes.txt"))
+            .expect("approved write"),
+        "approved"
+    );
+    assert_eq!(harness.mock.request_count(), 4);
+    assert_eq!(harness.client().errors.len(), 1);
+}
+
+#[test]
 fn cancelling_stops_the_active_turn_and_the_connection_stays_usable() {
     // The turn blocks on an approval the client never answers, so it is provably
     // in flight when the cancel arrives.
