@@ -58,7 +58,7 @@ pub struct CommandSpec {
     pub summary: &'static str,
     /// Usage line shown by `rune <command> --help`.
     pub usage: &'static str,
-    /// Flags accepted by this command, for help rendering.
+    /// Flags accepted by this command, for parsing, help, and completion.
     pub flags: &'static [FlagSpec],
     /// What the command needs from the runtime.
     pub requirements: Requirements,
@@ -517,6 +517,15 @@ pub const MAINTENANCE: &[CommandSpec] = &[
         ],
         requirements: Requirements::CONFIG,
         supports_json: true,
+    },
+    CommandSpec {
+        name: "completion",
+        aliases: &[],
+        summary: "Generate shell completion from the command table",
+        usage: "rune completion bash",
+        flags: &[],
+        requirements: Requirements::NONE,
+        supports_json: false,
     },
     CommandSpec {
         name: "reference",

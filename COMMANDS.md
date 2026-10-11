@@ -238,6 +238,10 @@ Remove the installed binary and, on request, local state
 | `--keep-state` | Leave the state directory in place. |
 | `--yes` | Confirm removal of the state directory. |
 | `--json` | Emit JSON. |
+### `rune completion bash`
+
+Generate shell completion from the command table
+
 ### `rune reference [--write <path>]`
 
 Print the generated command reference

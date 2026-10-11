@@ -169,6 +169,12 @@ rune review                 # review the pending changes in this repository
 rune resume last            # continue the most recent session here
 ```
 
+Enable Bash completion for command names, aliases, and flags in the current
+shell with `source <(rune completion bash)`. To keep it across shells, save
+`rune completion bash > ~/.rune-completion.bash` and source that file from
+your `~/.bashrc`. The script is generated from the same table as command help,
+including `resume`, and does not load configuration or contact providers.
+
 Use `rune --accessible` for a screen reader transcript, or
 `rune --accessible resume last` to replay and continue a saved conversation.
 Configure a provider and model first. This mode keeps the terminal's line input:

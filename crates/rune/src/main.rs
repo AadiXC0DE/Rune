@@ -1,9 +1,9 @@
 //! Command entry point.
 //!
-//! The order here is deliberate. Argument parsing, help, and version run before
-//! anything else touches configuration, the filesystem, or a runtime, which is
-//! what keeps the startup path free of that cost. A command only loads what its
-//! specification declares it needs.
+//! The order here is deliberate. Argument parsing, help, version, and completion
+//! generation run before anything else touches configuration, the filesystem,
+//! or a runtime, which is what keeps the startup path free of that cost. A
+//! command only loads what its specification declares it needs.
 
 #![forbid(unsafe_code)]
 // Tests assert by panicking. The guards that forbid panicking apply to the
@@ -14,6 +14,7 @@ mod ask;
 mod auto_review;
 mod cli;
 mod compaction_archive;
+mod completion;
 mod connect_flow;
 mod diagnostics;
 mod help;
@@ -110,6 +111,19 @@ fn handle_runtime_free(launch: &Launch) -> Option<ExitCode> {
         Command::Version => {
             println!("{}", version::version_line());
             Some(ExitCode::from(EXIT_OK))
+        }
+        Command::Completion => {
+            let code = match completion::render(&launch.args) {
+                Ok(text) => {
+                    print!("{text}");
+                    EXIT_OK
+                }
+                Err(err) => {
+                    report_error(&err);
+                    EXIT_FAILURE
+                }
+            };
+            Some(ExitCode::from(code))
         }
         _ => None,
     }
@@ -212,7 +226,7 @@ fn run(launch: &Launch) -> Result<ExitCode> {
         Command::Upgrade => run_upgrade(launch, &output_flags),
         Command::Uninstall => run_uninstall(&paths, launch, &output_flags),
         Command::Reference => run_reference(launch),
-        Command::Help | Command::Version => Ok(ExitCode::from(EXIT_OK)),
+        Command::Help | Command::Version | Command::Completion => Ok(ExitCode::from(EXIT_OK)),
     }
 }
 

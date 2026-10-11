@@ -6,6 +6,10 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Added
 
+- `rune completion bash` generates a script for Bash to complete all declared
+  commands, aliases, global flags, and command flags from the shared command
+  table, including `resume`. Generation needs no configuration or network.
+
 - The shared host turn loop stops before executing a duplicate after three
   consecutive failures of the same tool name and exact argument string. The
   `limit_exceeded` error names `max_consecutive_tool_failures`; configure that

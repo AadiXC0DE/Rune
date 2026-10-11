@@ -63,6 +63,8 @@ pub enum Command {
     Uninstall,
     /// Print the generated command reference.
     Reference,
+    /// Generate shell completion from the command specification.
+    Completion,
     /// Print help.
     Help,
     /// Print the version.
@@ -101,6 +103,7 @@ impl Command {
             Self::Upgrade => "upgrade",
             Self::Uninstall => "uninstall",
             Self::Reference => "reference",
+            Self::Completion => "completion",
             Self::Help => "help",
             Self::Version => "version",
             Self::Interactive => "interactive",
@@ -338,6 +341,7 @@ pub fn parse(args: Vec<OsString>, benchmark: bool) -> Result<Launch> {
                 "upgrade" => Command::Upgrade,
                 "uninstall" => Command::Uninstall,
                 "reference" => Command::Reference,
+                "completion" => Command::Completion,
                 "help" => Command::Help,
                 "version" => Command::Version,
                 "resume" => {
