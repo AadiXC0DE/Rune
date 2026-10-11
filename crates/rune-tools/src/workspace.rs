@@ -370,7 +370,19 @@ pub fn read_line_bounded_checked<R: BufRead, E: From<std::io::Error>>(
     reader: &mut R,
     buffer: &mut Vec<u8>,
     keep: usize,
+    check: impl FnMut() -> std::result::Result<(), E>,
+) -> std::result::Result<LineRead, E> {
+    read_line_bounded_observed(reader, buffer, keep, check, |_| {})
+}
+
+/// Reads a bounded line with cancellation checks, passing every source chunk
+/// to `observe`, including bytes beyond the retained head and the terminator.
+pub fn read_line_bounded_observed<R: BufRead, E: From<std::io::Error>>(
+    reader: &mut R,
+    buffer: &mut Vec<u8>,
+    keep: usize,
     mut check: impl FnMut() -> std::result::Result<(), E>,
+    mut observe: impl FnMut(&[u8]),
 ) -> std::result::Result<LineRead, E> {
     buffer.clear();
     let mut read = LineRead::default();
@@ -393,6 +405,7 @@ pub fn read_line_bounded_checked<R: BufRead, E: From<std::io::Error>>(
         };
         let room = keep.saturating_sub(buffer.len()).min(chunk.len());
         buffer.extend_from_slice(&chunk[..room]);
+        observe(chunk);
         read.has_nul |= chunk.contains(&0);
         let tail = chunk
             .iter()

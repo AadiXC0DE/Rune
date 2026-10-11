@@ -10,7 +10,7 @@ use rune_core::error::{ErrorCode, Result, RuneError};
 use crate::contract::{Activity, ExecutionContext, Tool, ToolOutput, validate_closed_arguments};
 use crate::workspace::{
     FileLimits, MAX_MATCH_LINE_BYTES, Walker, bool_arg, compile_glob_as, default_root, display_in,
-    join_capped, read_line_bounded_checked, resolve, roots, string_arg, summarize, truncate_line,
+    join_capped, read_line_bounded_observed, resolve, roots, string_arg, summarize, truncate_line,
     usize_arg, walk_notes,
 };
 
@@ -360,6 +360,7 @@ fn scan_reader<R: BufRead>(
     } else {
         query.pattern.clone()
     };
+    let matcher = LiteralMatcher::new(&needle, query.case_insensitive)?;
 
     // Findings are staged locally and merged only when the whole file has been
     // read, so a file rejected partway through leaves no trace in the report.
@@ -381,9 +382,14 @@ fn scan_reader<R: BufRead>(
     let mut buffer = Vec::new();
 
     loop {
-        let line = read_line_bounded_checked(reader, &mut buffer, MAX_MATCH_LINE_BYTES, || {
-            context.check_cancelled()
-        })
+        let mut matching = matcher.line();
+        let line = read_line_bounded_observed(
+            reader,
+            &mut buffer,
+            MAX_MATCH_LINE_BYTES,
+            || context.check_cancelled(),
+            |chunk| matching.feed(chunk),
+        )
         .map_err(|err: RuneError| {
             if err.code() == ErrorCode::Cancelled {
                 ScanError::Cancelled(err)
@@ -402,12 +408,8 @@ fn scan_reader<R: BufRead>(
         number = number.saturating_add(1);
         let text = String::from_utf8_lossy(&buffer);
         let text = text.trim_end_matches(['\n', '\r']);
-        // Search source text before adding display-only truncation annotations.
-        let matched = if query.case_insensitive {
-            text.to_lowercase().contains(&needle)
-        } else {
-            text.contains(&needle)
-        };
+        // All source chunks are searched independently of the retained head.
+        let matched = matching.finish();
         let shown = truncate_line(text, line.length, MAX_MATCH_LINE_BYTES);
         let mut recorded = false;
         if matched {
@@ -481,6 +483,198 @@ struct Found {
     matches: usize,
     /// Hits to report, already limited to the page.
     hits: Vec<Hit>,
+}
+
+/// A streaming literal search. The prefix table bounds both memory and work
+/// even for patterns longer than the reader's buffer or with repeated prefixes.
+struct LiteralMatcher {
+    needle: Vec<u8>,
+    prefixes: Vec<usize>,
+    case_insensitive: bool,
+    /// Lowercasing Greek sigma depends on surrounding cased characters, ignoring
+    /// case-ignorable characters. Other lowercase mappings are per character.
+    sigma_context: Option<(regex::Regex, regex::Regex)>,
+}
+
+impl LiteralMatcher {
+    fn new(needle: &str, case_insensitive: bool) -> std::result::Result<Self, ScanError> {
+        let sigma_context = if case_insensitive && needle.contains(['σ', 'ς']) {
+            let compile = |pattern| {
+                regex::Regex::new(pattern)
+                    .map_err(|err| ScanError::Unreadable(format!("Unicode matcher: {err}")))
+            };
+            Some((
+                compile(r"\A\p{Cased}\z")?,
+                compile(r"\A\p{Case_Ignorable}\z")?,
+            ))
+        } else {
+            None
+        };
+        let needle = needle.as_bytes().to_vec();
+        let mut prefixes = vec![0; needle.len()];
+        let mut prefix = 0;
+        for index in 1..needle.len() {
+            while prefix > 0 && needle[index] != needle[prefix] {
+                prefix = prefixes[prefix.saturating_sub(1)];
+            }
+            if needle[index] == needle[prefix] {
+                prefix = prefix.saturating_add(1);
+            }
+            prefixes[index] = prefix;
+        }
+        Ok(Self {
+            needle,
+            prefixes,
+            case_insensitive,
+            sigma_context,
+        })
+    }
+
+    fn line(&self) -> MatchingLine<'_> {
+        MatchingLine {
+            matcher: self,
+            state: MatchState::default(),
+            final_sigma: None,
+            preceding_cased: false,
+            undecoded: Vec::new(),
+        }
+    }
+
+    fn advance(&self, state: &mut MatchState, bytes: &[u8]) {
+        for byte in bytes {
+            if state.matched {
+                return;
+            }
+            while state.prefix > 0 && *byte != self.needle[state.prefix] {
+                state.prefix = self.prefixes[state.prefix.saturating_sub(1)];
+            }
+            if *byte == self.needle[state.prefix] {
+                state.prefix = state.prefix.saturating_add(1);
+            }
+            state.matched = state.prefix == self.needle.len();
+        }
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct MatchState {
+    prefix: usize,
+    matched: bool,
+}
+
+/// Per-line state holds only the matcher prefix, incomplete UTF-8, and two
+/// possible sigma states until its following context decides the lowercase form.
+struct MatchingLine<'a> {
+    matcher: &'a LiteralMatcher,
+    state: MatchState,
+    final_sigma: Option<MatchState>,
+    preceding_cased: bool,
+    undecoded: Vec<u8>,
+}
+
+impl MatchingLine<'_> {
+    fn feed(&mut self, chunk: &[u8]) {
+        if self.state.matched && self.final_sigma.is_none() {
+            return;
+        }
+        // Carry incomplete UTF-8 into the next chunk. Invalid sequences have
+        // exactly the same replacement characters as from_utf8_lossy on a line.
+        if self.undecoded.is_empty() {
+            self.decode(chunk);
+        } else {
+            let mut bytes = std::mem::take(&mut self.undecoded);
+            bytes.extend_from_slice(chunk);
+            self.decode(&bytes);
+        }
+    }
+
+    fn decode(&mut self, mut rest: &[u8]) {
+        while !rest.is_empty() {
+            match std::str::from_utf8(rest) {
+                Ok(text) => {
+                    self.text(text);
+                    rest = &[];
+                }
+                Err(err) => {
+                    let valid = err.valid_up_to();
+                    if let Ok(text) = std::str::from_utf8(&rest[..valid]) {
+                        self.text(text);
+                    }
+                    rest = &rest[valid..];
+                    if let Some(invalid) = err.error_len() {
+                        self.character('�');
+                        rest = &rest[invalid..];
+                    } else {
+                        break;
+                    }
+                }
+            }
+        }
+        self.undecoded.extend_from_slice(rest);
+    }
+
+    fn text(&mut self, text: &str) {
+        if self.matcher.case_insensitive {
+            for character in text.chars() {
+                self.character(character);
+                if self.state.matched && self.final_sigma.is_none() {
+                    break;
+                }
+            }
+        } else {
+            self.matcher.advance(&mut self.state, text.as_bytes());
+        }
+    }
+
+    fn character(&mut self, character: char) {
+        let mut encoded = [0; 4];
+        if let Some((cased, ignorable)) = &self.matcher.sigma_context {
+            let text = character.encode_utf8(&mut encoded);
+            let (is_cased, is_ignorable) = if character.is_ascii_alphabetic() {
+                (true, false)
+            } else {
+                (cased.is_match(text), ignorable.is_match(text))
+            };
+            if !is_ignorable
+                && let Some(final_sigma) = self.final_sigma.take()
+                && !is_cased
+            {
+                self.state = final_sigma;
+            }
+            if character == 'Σ' && self.preceding_cased {
+                let mut alternate = self.state;
+                self.matcher.advance(&mut alternate, "ς".as_bytes());
+                self.final_sigma = Some(alternate);
+                self.matcher.advance(&mut self.state, "σ".as_bytes());
+                self.preceding_cased = true;
+                return;
+            }
+            if !is_ignorable {
+                self.preceding_cased = is_cased;
+            }
+        }
+        if self.matcher.case_insensitive {
+            for lower in character.to_lowercase() {
+                self.advance(lower.encode_utf8(&mut encoded).as_bytes());
+            }
+        } else {
+            self.advance(character.encode_utf8(&mut encoded).as_bytes());
+        }
+    }
+
+    fn advance(&mut self, bytes: &[u8]) {
+        self.matcher.advance(&mut self.state, bytes);
+        if let Some(alternate) = &mut self.final_sigma {
+            self.matcher.advance(alternate, bytes);
+        }
+    }
+
+    fn finish(mut self) -> bool {
+        if !self.undecoded.is_empty() {
+            self.character('�');
+        }
+        self.final_sigma.unwrap_or(self.state).matched
+    }
 }
 
 /// Renders the report for the model.
@@ -1499,6 +1693,167 @@ mod tests {
             "{}",
             output.text
         );
+    }
+
+    #[test]
+    fn streaming_search_preserves_whole_line_text_at_chunk_boundaries() {
+        let repo = Repo::new();
+        let cases: &[(&[u8], &[&str])] = &[
+            (
+                "prefix Éİ🦀 ΟΣ ΟΣΑ Σ AΣ' AΣ'B AΣ\u{301} AΣ\u{301}B\r\n".as_bytes(),
+                &[
+                    "Éİ🦀",
+                    "éİ🦀",
+                    "ΟΣ",
+                    "οσ",
+                    "ος",
+                    "σ",
+                    "ς",
+                    "aς'",
+                    "aσ'b",
+                    "aς\u{301}",
+                    "aσ\u{301}b",
+                ],
+            ),
+            (b"a\xffb\xe2\x82c\xf0\x9f", &["a�b", "b�c�", "�", "absent"]),
+            (b"ababababac\n", &["ababac", "abababad", "abac"]),
+            (b"hidden\nneedle\n", &["hiddenneedle"]),
+        ];
+        for (bytes, patterns) in cases {
+            repo.write_bytes("chunks.txt", bytes);
+            for pattern in *patterns {
+                for case_insensitive in [false, true] {
+                    let source = String::from_utf8_lossy(bytes);
+                    let expected = source
+                        .lines()
+                        .filter(|line| {
+                            if case_insensitive {
+                                line.to_lowercase().contains(&pattern.to_lowercase())
+                            } else {
+                                line.contains(pattern)
+                            }
+                        })
+                        .count();
+                    let context = repo.context();
+                    let query = parse(
+                        &GrepFiles::new(),
+                        &serde_json::json!({ "pattern": pattern, "case_insensitive": case_insensitive }),
+                        &context,
+                    ).expect("query");
+                    for capacity in [1, 2, 3, 7, PROBE_BYTES] {
+                        let mut reader = BufReader::with_capacity(capacity, *bytes);
+                        let mut report = Report::default();
+                        scan_reader(&mut reader, "chunks.txt", &query, 0, &mut report, &context)
+                            .expect("scan");
+                        assert_eq!(
+                            report.matches, expected,
+                            "pattern={pattern:?}, insensitive={case_insensitive}, capacity={capacity}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn long_line_matches_span_chunks_and_the_retained_head_boundary() {
+        let repo = Repo::new();
+        for start in [
+            MAX_MATCH_LINE_BYTES - 5,
+            MAX_MATCH_LINE_BYTES + PROBE_BYTES - 5,
+        ] {
+            for ending in ["\n", "\r\n", ""] {
+                repo.write(
+                    "long.txt",
+                    &format!("{}hiddenneedle{ending}", "a".repeat(start)),
+                );
+                let output = GrepFiles::new().call(
+                    &serde_json::json!({ "pattern": "hiddenneedle", "path": "long.txt", "mode": "count" }),
+                    &repo.context(),
+                ).expect("call");
+                assert!(summary(&output.text).contains("1 matching lines in 1 files"));
+            }
+        }
+        let pattern = format!("{}b", "a".repeat(MAX_MATCH_LINE_BYTES + 1));
+        repo.write("long.txt", &format!("aaaa{pattern}\n"));
+        let output = GrepFiles::new()
+            .call(
+                &serde_json::json!({ "pattern": pattern, "path": "long.txt", "mode": "count" }),
+                &repo.context(),
+            )
+            .expect("call");
+        assert!(summary(&output.text).contains("1 matching lines in 1 files"));
+    }
+
+    #[test]
+    fn long_line_tail_matches_keep_pagination_context_and_binary_detection() {
+        let repo = Repo::new();
+        let line = format!("{}hiddenneedle", "a".repeat(MAX_MATCH_LINE_BYTES + 1));
+        repo.write(
+            "long.txt",
+            &format!("hiddenneedle\nbefore\n{line}\nafter\n"),
+        );
+        let context = repo.context().with_output_cap(4096);
+        let output = GrepFiles::new()
+            .call(
+                &serde_json::json!({
+                    "pattern": "hiddenneedle", "path": "long.txt",
+                    "head_limit": 1, "offset": 1, "context_lines": 1,
+                }),
+                &context,
+            )
+            .expect("call");
+        assert!(summary(&output.text).contains("2 matching lines in 1 files"));
+        assert!(output.text.contains("long.txt:     2-before"));
+        assert!(output.text.contains("long.txt:     3:"));
+        assert!(!output.text.contains("long.txt:     1:"));
+        assert!(output.text.len() <= 4096);
+
+        // Finding a match does not stop reading or checking the rest of a file.
+        repo.write_bytes("long.txt", format!("{line}\0\n").as_bytes());
+        for mode in ["matches", "files_with_matches", "count"] {
+            let output = GrepFiles::new().call(
+                &serde_json::json!({ "pattern": "hiddenneedle", "path": "long.txt", "mode": mode }),
+                &context,
+            ).expect("call");
+            assert!(summary(&output.text).contains("0 matching lines in 0 files"));
+            assert!(output.text.contains("1 binary files skipped"));
+        }
+    }
+
+    #[test]
+    fn matches_past_the_retained_line_head_are_counted_in_every_mode() {
+        let repo = Repo::new();
+        repo.write(
+            "long.txt",
+            &format!(
+                "{}hiddenneedle hiddenneedle\n",
+                "a".repeat(MAX_MATCH_LINE_BYTES + 1)
+            ),
+        );
+        let context = repo.context().with_output_cap(4096);
+        for mode in ["matches", "files_with_matches", "count"] {
+            for case_insensitive in [false, true] {
+                let output = GrepFiles::new()
+                    .call(
+                        &serde_json::json!({
+                            "pattern": if case_insensitive { "HIDDENNEEDLE" } else { "hiddenneedle" },
+                            "path": "long.txt",
+                            "mode": mode,
+                            "case_insensitive": case_insensitive,
+                        }),
+                        &context,
+                    )
+                    .expect("call");
+                assert!(!output.is_error);
+                assert!(summary(&output.text).contains("1 matching lines in 1 files"));
+                assert!(output.text.len() <= 4096);
+                if mode == "matches" {
+                    assert!(output.text.contains("long.txt:     1:"));
+                    assert!(output.text.contains("output truncated at the byte cap"));
+                }
+            }
+        }
     }
 
     #[test]
