@@ -211,6 +211,15 @@ pub trait Host {
     /// Returns the tools available for this turn.
     fn tools(&self) -> Vec<ToolSpec>;
 
+    /// Returns the registered tool's activity for event presentation.
+    ///
+    /// Hosts with a registry should return its declared activity. When none
+    /// is supplied, built-in names retain their usual labels and other names
+    /// are presented as executions.
+    fn tool_activity(&self, _name: &str) -> Option<Activity> {
+        None
+    }
+
     /// Returns the reasoning effort to request.
     fn effort(&self) -> Effort {
         Effort::Auto
@@ -752,7 +761,9 @@ fn execute_call(
         };
     }
 
-    let activity = infer_activity(&call.name);
+    let activity = host
+        .tool_activity(&call.name)
+        .unwrap_or_else(|| infer_activity(&call.name));
     let arguments: serde_json::Value = match serde_json::from_str(&call.arguments) {
         Ok(value) => value,
         Err(err) => {
@@ -879,10 +890,10 @@ fn execute_call(
     }
 }
 
-/// Returns the activity for a tool name.
+/// Returns the fallback activity for a host without registered metadata.
 ///
-/// A name the registry does not know is treated as an execution, which is the
-/// conservative answer for presentation purposes.
+/// An unknown name is treated as an execution, which is the conservative
+/// answer for presentation purposes.
 fn infer_activity(name: &str) -> Activity {
     match name {
         "read_file" | "read_tool_result" => Activity::Read,

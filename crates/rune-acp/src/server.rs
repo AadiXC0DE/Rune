@@ -1101,6 +1101,10 @@ impl<W: Write + Send + 'static> Host for TurnHost<W> {
         self.tools.clone()
     }
 
+    fn tool_activity(&self, name: &str) -> Option<rune_tools::Activity> {
+        self.server.config.registry.activity(name)
+    }
+
     fn effort(&self) -> Effort {
         self.config.effort
     }

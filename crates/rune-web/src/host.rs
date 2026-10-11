@@ -270,6 +270,10 @@ impl Host for Session {
         self.tools.clone()
     }
 
+    fn tool_activity(&self, name: &str) -> Option<rune_tools::Activity> {
+        self.registry.activity(name)
+    }
+
     fn fetch(&self) -> Box<dyn Fetch> {
         Box::new(BridgeFetch::new(Arc::clone(&self.bridge)))
     }

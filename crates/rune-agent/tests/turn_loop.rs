@@ -187,6 +187,10 @@ impl Host for TestHost {
         self.tools.clone()
     }
 
+    fn tool_activity(&self, name: &str) -> Option<rune_tools::Activity> {
+        self.registry.as_ref()?.activity(name)
+    }
+
     fn effort(&self) -> Effort {
         Effort::Auto
     }
@@ -1137,6 +1141,90 @@ fn a_tool_failure_does_not_end_the_turn() {
     assert_eq!(outcome.calls.len(), 1);
     assert!(outcome.calls[0].output.is_error);
     assert!(outcome.text.contains("does not exist"));
+}
+
+#[test]
+fn registered_tool_activity_overrides_name_inference_in_events() {
+    use rune_tools::{Activity, Tool};
+
+    struct FixtureTool {
+        name: &'static str,
+        activity: Activity,
+    }
+
+    impl Tool for FixtureTool {
+        fn name(&self) -> &'static str {
+            self.name
+        }
+
+        fn description(&self) -> &'static str {
+            "Return fixture content."
+        }
+
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+
+        fn activity(&self) -> Activity {
+            self.activity
+        }
+
+        fn call(
+            &self,
+            _arguments: &serde_json::Value,
+            _context: &ExecutionContext,
+        ) -> Result<ToolOutput> {
+            Ok(ToolOutput::success("fixture content"))
+        }
+    }
+
+    for (name, declared, fallback) in [
+        ("custom_read", Activity::Read, Activity::Execute),
+        ("shell", Activity::Read, Activity::Execute),
+        ("read_file", Activity::Search, Activity::Read),
+    ] {
+        for through_registry in [false, true] {
+            let endpoint = MockEndpoint::start(vec![
+                Script::tool_call("call_fixture", name, "{}"),
+                Script::text("Finished reading."),
+            ]);
+            let mut registry = Registry::new();
+            registry
+                .insert(Box::new(FixtureTool {
+                    name,
+                    activity: declared,
+                }))
+                .expect("register");
+            let mut host = TestHost::new(endpoint).with_tools(registry.all_schemas());
+            if through_registry {
+                host.registry = Some(registry);
+            }
+            let mut history = rune_agent::History::new();
+            history.push_user("read the fixture");
+
+            let outcome = run_turn(&mut history, &host).expect("turn");
+            assert_eq!(outcome.stop_reason, StopReason::Completed);
+            assert_eq!(outcome.calls.len(), 1);
+            assert!(outcome.calls[0].executed);
+            assert!(!outcome.calls[0].output.is_error);
+            let activities: Vec<_> = host
+                .events()
+                .iter()
+                .filter_map(|event| match event {
+                    Event::ToolStarted { call, activity } => {
+                        assert_eq!(call.name, name);
+                        Some(*activity)
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                activities,
+                vec![if through_registry { declared } else { fallback }],
+                "{name}, through_registry={through_registry}"
+            );
+        }
+    }
 }
 
 #[test]

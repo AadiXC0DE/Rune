@@ -378,6 +378,10 @@ impl Host for SessionHost {
         self.tools.clone()
     }
 
+    fn tool_activity(&self, name: &str) -> Option<rune_tools::Activity> {
+        self.registry.activity(name)
+    }
+
     fn effort(&self) -> Effort {
         self.effort
     }
@@ -7712,6 +7716,64 @@ mod tests {
             history_preview("> 界↵\nsecond", host.ascii),
             "> 界↵ / second"
         );
+    }
+
+    #[test]
+    fn a_custom_read_tool_keeps_its_activity_in_transcript_summaries() {
+        use rune_tools::{Activity, Tool};
+
+        struct CustomRead;
+
+        impl Tool for CustomRead {
+            fn name(&self) -> &'static str {
+                "custom_read"
+            }
+
+            fn description(&self) -> &'static str {
+                "Read fixture content."
+            }
+
+            fn input_schema(&self) -> serde_json::Value {
+                serde_json::json!({"type": "object"})
+            }
+
+            fn activity(&self) -> Activity {
+                Activity::Read
+            }
+
+            fn call(
+                &self,
+                _arguments: &serde_json::Value,
+                _context: &ExecutionContext,
+            ) -> Result<ToolOutput> {
+                Ok(ToolOutput::success("fixture content"))
+            }
+        }
+
+        let mut host = test_host();
+        host.registry
+            .insert(Box::new(CustomRead))
+            .expect("register");
+        let activity = host.tool_activity("custom_read").expect("activity");
+        assert_eq!(activity, Activity::Read);
+        host.emit(Event::ToolStarted {
+            call: turn::PreparedCall {
+                id: "call_fixture".to_owned(),
+                name: "custom_read".to_owned(),
+                arguments: "{}".to_owned(),
+            },
+            activity,
+        });
+
+        let entries = event_entries(&host);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].text, "Reading custom_read");
+        for accessible in [false, true] {
+            host.accessible = accessible;
+            let summary = render_entries(&entries, &host).join("\n");
+            assert!(summary.contains("Reading custom_read"), "{summary}");
+            assert!(!summary.contains("Running custom_read"), "{summary}");
+        }
     }
 
     fn test_host() -> SessionHost {

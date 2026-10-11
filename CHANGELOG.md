@@ -102,6 +102,9 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Fixed
 
+- Tool events and transcript summaries use the registered tool's declared
+  activity, so custom Read tools are labelled Reading instead of Running.
+
 - Retained tool results include the truncation marker within the configured
   byte cap, preserving UTF-8 boundaries. Caps smaller than the marker keep
   only the portion of the marker that fits.
