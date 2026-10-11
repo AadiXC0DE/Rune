@@ -357,8 +357,8 @@ pub const ACCOUNT: &[CommandSpec] = &[
     CommandSpec {
         name: "mcp",
         aliases: &[],
-        summary: "List configured MCP servers, trust and startup errors",
-        usage: "rune mcp list [--json]",
+        summary: "List or check MCP servers without an agent turn",
+        usage: "rune mcp list [--json] | rune mcp check [server] [--json]",
         flags: &[flag(
             "--json",
             "Emit JSON without secret headers or environment values.",

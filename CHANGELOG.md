@@ -6,6 +6,11 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Added
 
+- `rune mcp check [server] [--json]` reports negotiated protocol, discovered
+  tool names, warnings, timeouts and timeout outcomes without a model request.
+  It respects project trust and offline settings, closes connections, and exits
+  unsuccessfully when a selected server cannot connect.
+
 - `rune mcp list --json` reports project MCP declarations, transport, trust,
   enabled/required flags and every eligible server's startup result. Required
   failures do not hide later servers. Pending and rejected servers stay blocked;

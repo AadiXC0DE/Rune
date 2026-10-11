@@ -58,6 +58,10 @@ impl Workspace {
     }
 
     fn run(&self, args: &[&str]) -> Output {
+        self.run_with_env(args, &[])
+    }
+
+    fn run_with_env(&self, args: &[&str], variables: &[(&str, &str)]) -> Output {
         Command::new(env!("CARGO_BIN_EXE_rune"))
             .args(args)
             .current_dir(self.dir.path())
@@ -68,6 +72,7 @@ impl Workspace {
             .env("XDG_DATA_HOME", self.dir.path().join("data"))
             .env("RUNE_CONFIG", self.dir.path().join("absent.toml"))
             .env("RUNE_MCP_LIST_SECRET", "expanded-header-secret")
+            .envs(variables.iter().copied())
             .output()
             .expect("run rune")
     }
@@ -84,12 +89,35 @@ impl Workspace {
 
 /// Minimal HTTP MCP fixture. An error reflects the received secret back to Rune
 /// to prove diagnostics redact it, including in a server-supplied message.
-fn http_fixture(fail: bool) -> (String, JoinHandle<()>) {
+fn http_fixture(fail: bool) -> (String, JoinHandle<Vec<String>>) {
+    http_scenario(if fail {
+        Scenario::Fail
+    } else {
+        Scenario::Empty
+    })
+}
+
+#[derive(Clone, Copy)]
+enum Scenario {
+    Fail,
+    Empty,
+    Paged,
+    StartupTimeout,
+    ToolsTimeout,
+}
+
+fn http_scenario(scenario: Scenario) -> (String, JoinHandle<Vec<String>>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     listener.set_nonblocking(true).expect("nonblocking");
     let url = format!("http://{}/mcp", listener.local_addr().expect("address"));
     let task = std::thread::spawn(move || {
-        for _ in 0..if fail { 1 } else { 3 } {
+        let count = match scenario {
+            Scenario::Fail | Scenario::StartupTimeout => 1,
+            Scenario::Paged => 4,
+            Scenario::Empty | Scenario::ToolsTimeout => 3,
+        };
+        let mut methods = Vec::new();
+        for _ in 0..count {
             let deadline = Instant::now()
                 .checked_add(Duration::from_secs(10))
                 .expect("deadline");
@@ -124,7 +152,17 @@ fn http_fixture(fail: bool) -> (String, JoinHandle<()>) {
             let mut body = vec![0; length];
             reader.read_exact(&mut body).expect("request body");
             let request: Value = serde_json::from_slice(&body).expect("request JSON");
-            let (status, reply) = if fail {
+            let method = request["method"].as_str().expect("method");
+            methods.push(method.to_owned());
+            if matches!(scenario, Scenario::StartupTimeout)
+                || (matches!(scenario, Scenario::ToolsTimeout) && method == "tools/list")
+            {
+                // Hold the socket without headers so the client's configured
+                // deadline, rather than an EOF, must end the check.
+                std::thread::sleep(Duration::from_millis(800));
+                return methods;
+            }
+            let (status, reply) = if matches!(scenario, Scenario::Fail) {
                 (
                     "200 OK",
                     json!({"jsonrpc": "2.0", "id": request["id"], "error": {
@@ -135,11 +173,20 @@ fn http_fixture(fail: bool) -> (String, JoinHandle<()>) {
             } else if request["method"] == "notifications/initialized" {
                 ("202 Accepted", String::new())
             } else {
-                let result = if request["method"] == "initialize" {
+                let result = if method == "initialize" {
                     json!({"protocolVersion": "2025-11-25", "capabilities": {"tools": {}}})
                 } else {
-                    assert_eq!(request["method"], "tools/list");
-                    json!({"tools": []})
+                    assert_eq!(method, "tools/list");
+                    if matches!(scenario, Scenario::Paged) {
+                        if request["params"]["cursor"] == "page-two" {
+                            json!({"tools": [{"name": "second", "inputSchema": {"type": "object"}}]})
+                        } else {
+                            assert!(request["params"].get("cursor").is_none());
+                            json!({"tools": [{"name": "first", "inputSchema": {"type": "object"}}], "nextCursor": "page-two"})
+                        }
+                    } else {
+                        json!({"tools": []})
+                    }
                 };
                 (
                     "200 OK",
@@ -148,6 +195,7 @@ fn http_fixture(fail: bool) -> (String, JoinHandle<()>) {
             };
             write!(socket, "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}", reply.len()).expect("reply");
         }
+        methods
     });
     (url, task)
 }
@@ -163,7 +211,14 @@ fn empty_listing_and_help_work_without_a_provider() {
     let help = workspace.run(&["mcp", "--help"]);
     assert!(help.status.success());
     assert!(String::from_utf8_lossy(&help.stdout).contains("rune mcp list [--json]"));
-    for args in [&["mcp"][..], &["mcp", "check"], &["mcp", "list", "extra"]] {
+    assert!(workspace.run(&["mcp", "check"]).status.success());
+    assert!(String::from_utf8_lossy(&help.stdout).contains("rune mcp check [server] [--json]"));
+    for args in [
+        &["mcp"][..],
+        &["mcp", "check", "unknown"],
+        &["mcp", "check", "one", "two"],
+        &["mcp", "list", "extra"],
+    ] {
         assert!(!workspace.run(args).status.success(), "{args:?}");
     }
 }
@@ -221,6 +276,7 @@ fn every_eligible_startup_is_reported_even_after_required_failure_without_secret
     assert!(servers[1]["startup_error"]["code"].is_string());
     assert_eq!(servers[2]["status"], "connected");
     assert!(servers[2]["startup_error"].is_null());
+    assert!(servers[2].get("check").is_none());
     assert_eq!(servers[3]["status"], "disabled");
     assert_eq!(servers[4]["status"], "failed");
     assert_eq!(servers[5]["trust"], "pending");
@@ -316,4 +372,210 @@ fn approved_stdio_can_start_during_offline_listing() {
     assert_eq!(report["servers"][0]["transport"], "stdio");
     assert_eq!(report["servers"][0]["status"], "connected");
     assert!(report["servers"][0]["startup_error"].is_null());
+}
+
+#[test]
+fn check_reports_protocol_and_all_tools_without_model_requests_or_sessions() {
+    for json_output in [true, false] {
+        let workspace = Workspace::new();
+        let (url, task) = http_scenario(Scenario::Paged);
+        workspace.configure(&json!({
+            "local": {"url": url, "headers": {"x-api-key": "${RUNE_MCP_LIST_SECRET}"}},
+            "unselected": {"command": "${MISSING}"}
+        }));
+        workspace.approve(&["local"]);
+        let model = TcpListener::bind("127.0.0.1:0").expect("model listener");
+        model.set_nonblocking(true).expect("nonblocking");
+        let model_url = format!("http://{}/v1", model.local_addr().expect("address"));
+        let mut args = vec!["mcp", "check", "local"];
+        if json_output {
+            args.push("--json");
+        }
+        let output = workspace.run_with_env(
+            &args,
+            &[
+                ("RUNE_BASE_URL", &model_url),
+                ("OPENAI_API_KEY", "model-fixture-key"),
+            ],
+        );
+        assert!(output.status.success(), "{output:?}");
+        assert!(output.stderr.is_empty(), "{output:?}");
+        assert_eq!(
+            task.join().expect("MCP fixture"),
+            [
+                "initialize",
+                "notifications/initialized",
+                "tools/list",
+                "tools/list"
+            ]
+        );
+        assert_eq!(
+            model.accept().expect_err("no model request").kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        assert!(!workspace.paths.sessions_dir().exists());
+        let text = String::from_utf8(output.stdout).expect("text");
+        if json_output {
+            let report: Value = serde_json::from_str(&text).expect("report");
+            assert_eq!(report["servers"].as_array().expect("servers").len(), 1);
+            let server = &report["servers"][0];
+            assert_eq!(server["status"], "connected");
+            assert_eq!(server["check"]["protocol_version"], "2025-11-25");
+            assert_eq!(
+                server["check"]["tools"],
+                json!([
+                    {"name": "mcp_local_first", "server_tool": "first"},
+                    {"name": "mcp_local_second", "server_tool": "second"}
+                ])
+            );
+            assert_eq!(server["check"]["warnings"], json!([]));
+            assert_eq!(server["check"]["timed_out"], false);
+            assert_eq!(server["check"]["startup_timeout_ms"], 30_000);
+            assert_eq!(server["check"]["operation_timeout_ms"], 60_000);
+        } else {
+            assert!(text.contains("local  http  approved  connected"), "{text}");
+            assert!(text.contains("protocol: 2025-11-25; tools: 2"), "{text}");
+            assert!(text.contains("first (mcp_local_first)"), "{text}");
+            assert!(text.contains("second (mcp_local_second)"), "{text}");
+            assert!(text.contains("timed_out=false"), "{text}");
+        }
+        assert!(!text.contains("expanded-header-secret"), "{text}");
+        assert!(!text.contains("model-fixture-key"), "{text}");
+    }
+}
+
+#[test]
+fn check_reports_startup_and_discovery_timeouts_and_checks_later_servers() {
+    for scenario in [Scenario::StartupTimeout, Scenario::ToolsTimeout] {
+        for json_output in [true, false] {
+            let workspace = Workspace::new();
+            let (slow_url, slow) = http_scenario(scenario);
+            let (healthy_url, healthy) = http_fixture(false);
+            workspace.configure(&json!({
+                "a_slow": {"url": slow_url, "headers": {"x-api-key": "${RUNE_MCP_LIST_SECRET}"}, "required": true},
+                "b_healthy": {"url": healthy_url, "headers": {"x-api-key": "${RUNE_MCP_LIST_SECRET}"}}
+            }));
+            workspace.approve(&["a_slow", "b_healthy"]);
+            let mut args = vec![
+                "mcp",
+                "check",
+                "--limit",
+                "mcp_startup_timeout_ms=200",
+                "--limit",
+                "mcp_operation_timeout_ms=200",
+            ];
+            if json_output {
+                args.push("--json");
+            }
+            let output = workspace.run(&args);
+            assert_eq!(output.status.code(), Some(1), "{output:?}");
+            assert!(output.stderr.is_empty(), "{output:?}");
+            let methods = slow.join().expect("slow fixture");
+            assert_eq!(
+                methods.last().expect("method"),
+                if matches!(scenario, Scenario::StartupTimeout) {
+                    "initialize"
+                } else {
+                    "tools/list"
+                }
+            );
+            healthy.join().expect("healthy fixture");
+            let text = String::from_utf8(output.stdout).expect("text");
+            if json_output {
+                let report: Value = serde_json::from_str(&text).expect("report");
+                let slow = &report["servers"][0];
+                assert_eq!(slow["status"], "failed");
+                assert_eq!(slow["startup_error"]["code"], "timeout");
+                assert_eq!(slow["check"]["timed_out"], true);
+                assert_eq!(slow["check"]["startup_timeout_ms"], 200);
+                assert_eq!(slow["check"]["operation_timeout_ms"], 200);
+                assert_eq!(report["servers"][1]["status"], "connected");
+                assert_eq!(report["servers"][1]["check"]["timed_out"], false);
+            } else {
+                assert!(text.contains("a_slow  http  approved  failed"), "{text}");
+                assert!(text.contains("timeout:"), "{text}");
+                assert!(text.contains("timed_out=true"), "{text}");
+                assert!(text.contains("startup=200 ms; operation=200 ms"), "{text}");
+                assert!(
+                    text.contains("b_healthy  http  approved  connected"),
+                    "{text}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn check_respects_trust_disabled_and_offline_states_without_contact_or_expansion() {
+    let workspace = Workspace::new();
+    let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
+    listener.set_nonblocking(true).expect("nonblocking");
+    workspace.configure(&json!({
+        "remote": {"url": format!("http://{}/mcp", listener.local_addr().expect("address")), "headers": {"x-secret": "${MISSING}"}}
+    }));
+    let assert_state = |flags: &[&str], expected: &str, trust: &str| {
+        let mut args = vec!["mcp", "check", "remote", "--json"];
+        args.extend_from_slice(flags);
+        let output = workspace.run(&args);
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        let report: Value = serde_json::from_slice(&output.stdout).expect("report");
+        assert_eq!(report["servers"][0]["status"], expected);
+        assert_eq!(report["servers"][0]["trust"], trust);
+        assert!(report["servers"][0]["startup_error"].is_null());
+        assert_eq!(report["servers"][0]["check"]["timed_out"], false);
+    };
+    assert_state(&[], "blocked", "pending");
+    assert!(workspace.run(&["projects", "reject"]).status.success());
+    assert_state(&[], "blocked", "rejected");
+    workspace.approve(&["remote"]);
+    assert_state(&["--offline"], "offline", "approved");
+    workspace.configure(&json!({"remote": {"command": "${MISSING}", "enabled": false}}));
+    assert_state(&[], "disabled", "approved");
+    assert_eq!(
+        listener.accept().expect_err("no contact").kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+}
+
+#[test]
+fn check_unknown_name_does_not_start_other_servers_and_errors_are_redacted() {
+    let workspace = Workspace::new();
+    let (url, task) = http_fixture(true);
+    workspace.configure(
+        &json!({"local": {"url": url, "headers": {"x-api-key": "${RUNE_MCP_LIST_SECRET}"}}}),
+    );
+    workspace.approve(&["local"]);
+    let unknown = workspace.run(&["mcp", "check", "missing", "--json"]);
+    assert_eq!(unknown.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&unknown.stderr).contains("no MCP server named"));
+    let output = workspace.run(&["mcp", "check", "local", "--json"]);
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(task.join().expect("fixture"), ["initialize"]);
+    let report: Value = serde_json::from_slice(&output.stdout).expect("report");
+    assert_eq!(report["servers"][0]["check"]["timed_out"], false);
+    let text = report.to_string();
+    assert!(text.contains("<redacted>"), "{text}");
+    assert!(!text.contains("expanded-header-secret"), "{text}");
+}
+
+#[cfg(unix)]
+#[test]
+fn check_local_stdio_works_offline_without_a_provider() {
+    let workspace = Workspace::new();
+    let script = r#"printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05"}}' '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"echo","inputSchema":{"type":"object"}}]}}'; cat >/dev/null"#;
+    workspace.configure(&json!({"local": {"command": "sh", "args": ["-c", script]}}));
+    workspace.approve(&["local"]);
+    let output = workspace.run(&["mcp", "check", "local", "--json", "--offline"]);
+    assert!(output.status.success(), "{output:?}");
+    let report: Value = serde_json::from_slice(&output.stdout).expect("report");
+    assert_eq!(report["servers"][0]["status"], "connected");
+    assert_eq!(
+        report["servers"][0]["check"]["protocol_version"],
+        "2024-11-05"
+    );
+    assert_eq!(
+        report["servers"][0]["check"]["tools"][0]["name"],
+        "mcp_local_echo"
+    );
+    assert!(!workspace.paths.sessions_dir().exists());
 }

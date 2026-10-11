@@ -71,6 +71,16 @@ Headers, environment values, commands and URLs are omitted from the report,
 and configured secrets are redacted from startup messages. Startup and operation
 waits use `mcp_startup_timeout_ms` and `mcp_operation_timeout_ms`.
 
+`rune mcp check [server] [--json]` checks one named server, or all declarations
+when the name is omitted. It also reports the negotiated protocol revision,
+discovered tool names, projection warnings, configured timeouts and whether a
+timeout occurred. It initializes and lists tools without calling a tool or
+requesting a model response, then closes each connection. The same trust and
+offline rules apply. Check exits with code 1 if any selected server fails or
+is blocked, disabled or skipped offline; an unknown name is an error. JSON adds
+a `check` object to each server entry. An empty workspace reports no servers
+and succeeds.
+
 The web tools are off until asked for. `rune doctor` reports what this machine
 supports, and turning them on is one setting:
 

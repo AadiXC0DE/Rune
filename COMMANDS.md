@@ -136,9 +136,9 @@ List the models of the connected provider
 | Flag | Description |
 |---|---|
 | `--json` | Emit JSON. |
-### `rune mcp list [--json]`
+### `rune mcp list [--json] | rune mcp check [server] [--json]`
 
-List configured MCP servers, trust and startup errors
+List or check MCP servers without an agent turn
 
 | Flag | Description |
 |---|---|

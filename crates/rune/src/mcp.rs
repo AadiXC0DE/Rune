@@ -33,6 +33,24 @@ struct Server {
     required: bool,
     status: &'static str,
     startup_error: Option<StartupError>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    check: Option<Connectivity>,
+}
+
+#[derive(Serialize)]
+struct Connectivity {
+    protocol_version: Option<String>,
+    tools: Vec<Tool>,
+    warnings: Vec<String>,
+    startup_timeout_ms: u64,
+    operation_timeout_ms: u64,
+    timed_out: bool,
+}
+
+#[derive(Serialize)]
+struct Tool {
+    name: String,
+    server_tool: String,
 }
 
 #[derive(Serialize)]
@@ -42,6 +60,12 @@ struct StartupError {
 }
 
 impl Report {
+    pub fn check_failed(&self) -> bool {
+        self.servers
+            .iter()
+            .any(|server| server.check.is_some() && server.status != "connected")
+    }
+
     pub fn render(&self) -> String {
         let mut out = String::new();
         if self.servers.is_empty() {
@@ -61,6 +85,25 @@ impl Report {
             if let Some(error) = &server.startup_error {
                 let _ = writeln!(out, "  {}: {}", error.code, error.message);
             }
+            if let Some(check) = &server.check {
+                let _ = writeln!(
+                    out,
+                    "  protocol: {}; tools: {}",
+                    check.protocol_version.as_deref().unwrap_or("unavailable"),
+                    check.tools.len()
+                );
+                for tool in &check.tools {
+                    let _ = writeln!(out, "  {} ({})", tool.server_tool, tool.name);
+                }
+                for warning in &check.warnings {
+                    let _ = writeln!(out, "  warning: {warning}");
+                }
+                let _ = writeln!(
+                    out,
+                    "  timeouts: startup={} ms; operation={} ms; timed_out={}",
+                    check.startup_timeout_ms, check.operation_timeout_ms, check.timed_out
+                );
+            }
         }
         out
     }
@@ -68,18 +111,23 @@ impl Report {
 
 /// Attempts each eligible server separately so a required failure cannot hide
 /// later failures. All child processes and connections close before returning.
-pub fn list(
+pub fn run(
     settings: &Settings,
     paths: &Paths,
     launch: &Launch,
     workspace: &Utf8Path,
 ) -> Result<Report> {
-    if launch.args.as_slice() != ["list"] {
-        return Err(RuneError::invalid_field(
-            "action",
-            "expected `rune mcp list`",
-        ));
-    }
+    let (checking, selected) = match launch.args.as_slice() {
+        [action] if action == "list" => (false, None),
+        [action] if action == "check" => (true, None),
+        [action, name] if action == "check" => (true, Some(name.as_str())),
+        _ => {
+            return Err(RuneError::invalid_field(
+                "action",
+                "expected `rune mcp list` or `rune mcp check [server]`",
+            ));
+        }
+    };
     let workspace = trust::canonical_workspace(workspace);
     let trust = TrustStore::load(&paths.trust_file())?;
     let mut report = Report {
@@ -87,7 +135,7 @@ pub fn list(
         servers: Vec::new(),
     };
     let Some(text) = mcp_trust::read_project_document(&workspace)? else {
-        return Ok(report);
+        return empty_report(report, selected);
     };
     let document: Value = serde_json::from_str(&text).map_err(|_| {
         RuneError::new(
@@ -96,7 +144,7 @@ pub fn list(
         )
     })?;
     let Some(entries) = document.get("mcpServers") else {
-        return Ok(report);
+        return empty_report(report, selected);
     };
     let entries = entries.as_object().ok_or_else(|| {
         RuneError::invalid_field("mcpServers", "expected an object of server declarations")
@@ -105,15 +153,34 @@ pub fn list(
     if entries.len() > cap {
         return Err(RuneError::too_large("mcpServers", entries.len(), cap));
     }
+    if let Some(name) = selected
+        && !entries.contains_key(name)
+    {
+        return Err(unknown_server(name));
+    }
     // Sort independently of the order of declarations in the document.
     let mut entries: Vec<_> = entries.iter().collect();
     entries.sort_by_key(|(left, _)| *left);
     for (name, entry) in entries {
+        if selected.is_some_and(|selected| selected != name) {
+            continue;
+        }
         report
             .servers
-            .push(inspect(name, entry, &workspace, &trust, settings));
+            .push(inspect(name, entry, &workspace, &trust, settings, checking));
     }
     Ok(report)
+}
+
+fn unknown_server(name: &str) -> RuneError {
+    RuneError::new(ErrorCode::NotFound, format!("no MCP server named `{name}`"))
+}
+
+fn empty_report(report: Report, selected: Option<&str>) -> Result<Report> {
+    match selected {
+        Some(name) => Err(unknown_server(name)),
+        None => Ok(report),
+    }
 }
 
 fn inspect(
@@ -122,6 +189,7 @@ fn inspect(
     workspace: &Utf8Path,
     trust: &TrustStore,
     settings: &Settings,
+    checking: bool,
 ) -> Server {
     let decision = if trust.is_trusted(workspace)
         || trust
@@ -165,6 +233,14 @@ fn inspect(
             .unwrap_or(false),
         status: "blocked",
         startup_error: None,
+        check: checking.then(|| Connectivity {
+            protocol_version: None,
+            tools: Vec::new(),
+            warnings: Vec::new(),
+            startup_timeout_ms: settings.limits.get_bytes(LimitName::McpStartupTimeoutMs),
+            operation_timeout_ms: settings.limits.get_bytes(LimitName::McpOperationTimeoutMs),
+            timed_out: false,
+        }),
     };
     if decision != Decision::Approved {
         return server;
@@ -184,6 +260,20 @@ fn inspect(
         // A separate client preserves required semantics while observing every
         // server, including those after a required server that fails.
         let result = client.connect_all(&[config]);
+        if let Some(check) = &mut server.check {
+            if let Some(status) = client.server(name) {
+                check.protocol_version = status.protocol_version;
+                check.warnings = status.warnings;
+            }
+            check.tools = client
+                .tools()
+                .into_iter()
+                .map(|tool| Tool {
+                    name: tool.name,
+                    server_tool: tool.server_tool,
+                })
+                .collect();
+        }
         client.shutdown();
         let report = result?;
         match report.failed.into_iter().next() {
@@ -191,13 +281,26 @@ fn inspect(
             None => Ok(()),
         }
     });
+    let mut secrets = secrets.into_inner();
+    if let Some(check) = &mut server.check {
+        for tool in &mut check.tools {
+            tool.name = redact(&tool.name, &mut secrets);
+            tool.server_tool = redact(&tool.server_tool, &mut secrets);
+        }
+        for warning in &mut check.warnings {
+            *warning = redact(warning, &mut secrets);
+        }
+    }
     match result {
         Ok(()) => server.status = "connected",
         Err(error) => {
             server.status = "failed";
+            if let Some(check) = &mut server.check {
+                check.timed_out = error.code() == ErrorCode::Timeout;
+            }
             server.startup_error = Some(StartupError {
                 code: error.code(),
-                message: redact(error.message(), &mut secrets.into_inner()),
+                message: redact(error.message(), &mut secrets),
             });
         }
     }

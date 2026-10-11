@@ -176,13 +176,17 @@ fn run(launch: &Launch) -> Result<ExitCode> {
         Command::Connect => run_connect(&settings, &paths, launch, &output_flags),
         Command::Models => run_models(&settings, &paths, &output_flags),
         Command::Mcp => {
-            let report = mcp::list(&settings, &paths, launch, &workspace)?;
+            let report = mcp::run(&settings, &paths, launch, &workspace)?;
             if output_flags.json {
                 println!("{}", serde_json::to_string_pretty(&report)?);
             } else {
                 print!("{}", report.render());
             }
-            Ok(ExitCode::from(EXIT_OK))
+            Ok(ExitCode::from(if report.check_failed() {
+                EXIT_FAILURE
+            } else {
+                EXIT_OK
+            }))
         }
         Command::Permissions => run_permissions(&settings, launch, &output_flags),
         Command::Sandbox => {

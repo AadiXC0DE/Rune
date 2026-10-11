@@ -37,7 +37,7 @@ pub enum Command {
     Auth,
     /// List models.
     Models,
-    /// List resolved MCP servers and startup failures.
+    /// List or check project MCP servers without an agent turn.
     Mcp,
     /// Show permission state.
     Permissions,
