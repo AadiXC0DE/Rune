@@ -206,9 +206,17 @@ impl Endpoint {
 /// Validates an endpoint URL.
 ///
 /// Requires HTTPS, except for a loopback address, where plain HTTP is the only
-/// thing a local server provides.
+/// thing a local server provides. The authority must contain a host. Control
+/// characters are refused even at the boundaries, before trimming whitespace.
 pub fn validate_url(url: &str) -> Result<()> {
     use rune_core::error::{ErrorCode, RuneError};
+
+    if url.chars().any(char::is_control) {
+        return Err(RuneError::invalid_field(
+            "base_url",
+            "contains a control character",
+        ));
+    }
 
     let trimmed = url.trim();
     if trimmed.is_empty() {
@@ -241,11 +249,11 @@ pub fn validate_url(url: &str) -> Result<()> {
         ));
     };
 
-    if rest.is_empty() {
+    if host_of(rest).is_empty() {
         return Err(RuneError::invalid_field("base_url", "has no host"));
     }
-    if trimmed.contains(' ') {
-        return Err(RuneError::invalid_field("base_url", "contains a space"));
+    if trimmed.chars().any(char::is_whitespace) {
+        return Err(RuneError::invalid_field("base_url", "contains whitespace"));
     }
     if trimmed.contains('@') {
         return Err(
@@ -2289,6 +2297,60 @@ mod tests {
     #[test]
     fn a_url_without_a_host_is_rejected() {
         assert!(validate_url("https://").is_err());
+    }
+
+    #[test]
+    fn a_url_with_an_empty_authority_or_host_is_rejected() {
+        for url in [
+            "https:///",
+            "https:///v1",
+            "https://?broken",
+            "https://:443/v1",
+            "https://[]:443/v1",
+        ] {
+            let err = validate_url(url).expect_err(url);
+            assert_eq!(err.code(), rune_core::error::ErrorCode::InvalidField);
+            assert!(err.message().contains("has no host"), "{err}");
+            assert!(Endpoint::new(url, "k").validate().is_err());
+        }
+    }
+
+    #[test]
+    fn url_controls_are_rejected_even_at_trimmed_boundaries() {
+        for control in ('\u{0}'..='\u{9f}').filter(|ch| ch.is_control()) {
+            for url in [
+                format!("https://example.com{control}header"),
+                format!("{control}https://example.com"),
+                format!("https://example.com{control}"),
+            ] {
+                let err = validate_url(&url).expect_err("control character rejected");
+                assert_eq!(err.code(), rune_core::error::ErrorCode::InvalidField);
+                assert!(err.message().contains("control character"), "{err}");
+            }
+        }
+    }
+
+    #[test]
+    fn url_whitespace_is_rejected_inside_the_url() {
+        for whitespace in [' ', '\u{a0}', '\u{2003}', '\u{2028}'] {
+            let url = format!("https://example.com/v1{whitespace}broken");
+            let err = validate_url(&url).expect_err("whitespace rejected");
+            assert_eq!(err.code(), rune_core::error::ErrorCode::InvalidField);
+        }
+    }
+
+    #[test]
+    fn valid_authorities_paths_and_queries_remain_accepted() {
+        for url in [
+            "https://example.com:8443/v1?key=value",
+            "https://[2001:db8::1]:443/v1",
+            "HTTPS://EXAMPLE.COM/v1",
+            "http://LOCALHOST:8080/v1",
+            "https://example.com/v1%20path?key=%0A",
+            " https://example.com/v1 ",
+        ] {
+            validate_url(url).unwrap_or_else(|err| panic!("rejected {url}: {err}"));
+        }
     }
 
     #[test]

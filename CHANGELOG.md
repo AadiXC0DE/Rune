@@ -122,6 +122,10 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Fixed
 
+- Provider endpoint validation rejects empty authorities or hosts, control
+  characters (including leading or trailing newlines), and embedded whitespace
+  before client creation. HTTPS and loopback HTTP endpoints remain accepted.
+
 - Offline provider requests return a nonretryable policy refusal, so generic
   turn hosts report the refusal immediately without backoff or outbound fetches.
   Model listing uses the same refusal, with the `permission_denied` error code.
