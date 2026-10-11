@@ -122,6 +122,36 @@ pub struct SessionState {
 }
 
 impl SessionState {
+    /// Finds saved conversation records by a case-insensitive literal fragment.
+    ///
+    /// Searches the authoritative frames, including records removed from model
+    /// context by compaction and saved streaming fragments. Matches retain their
+    /// original sequence, timestamp, schema and event content in log order.
+    /// Metadata and record identifiers are not searched.
+    pub fn search_records(&self, query: &str) -> Result<Vec<&EventFrame>> {
+        if query.trim().is_empty() {
+            return Err(RuneError::invalid_field("search", "search text is empty")
+                .with_hint("pass a message, tool argument, or tool result fragment"));
+        }
+        let query = query.to_lowercase();
+        let contains = |text: &str| text.to_lowercase().contains(&query);
+        Ok(self
+            .events
+            .iter()
+            .filter(|frame| match &frame.event {
+                SessionEvent::UserMessage { text }
+                | SessionEvent::AssistantMessage { text, .. }
+                | SessionEvent::AssistantDelta { text, .. } => contains(text),
+                SessionEvent::ToolCall {
+                    name, arguments, ..
+                } => contains(name) || contains(arguments),
+                SessionEvent::ToolResult { output, .. } => contains(output),
+                SessionEvent::Compaction { summary, .. } => contains(summary),
+                _ => false,
+            })
+            .collect())
+    }
+
     /// Writes the saved frames as stable schema-versioned JSONL in log order.
     ///
     /// Only typed event fields are serialized, excluding metadata, credentials,

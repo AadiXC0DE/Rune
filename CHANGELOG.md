@@ -6,6 +6,11 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Added
 
+- `rune session <last|id> --search <text>` searches saved messages, tool records,
+  and summaries, including original records removed from context by compaction.
+  Text and JSON results preserve original event content, sequence positions,
+  schema versions, and timestamps.
+
 - `rune sessions --search <text>` finds case-insensitive literal fragments in
   current session titles and recorded user messages, with workspace scoping,
   pagination, and JSON output preserved.

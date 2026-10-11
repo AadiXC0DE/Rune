@@ -212,6 +212,16 @@ to the current workspace unless `--all` is passed. `--limit`, `--cursor`, and
 `--json` work as for ordinary listings; repeat the same search and scope when
 continuing with a cursor.
 
+`rune session <last|id> --search "symbol"` searches the saved conversation,
+including original records removed from model context by compaction. It matches
+case-insensitive literal fragments in user and assistant messages, saved streaming
+fragments, tool names and arguments, tool results, and compaction summaries.
+Results contain each complete original event with its sequence position, schema
+version, and timestamp, in log order. `--json` returns `session_id`, `query`,
+`matches`, and `truncated_at`. `last` selects the current workspace's latest
+session; `--id <id>` selects an exact session. An incomplete final frame is omitted
+with a warning on stderr; other log corruption fails the search.
+
 `rune session export <last|id>` writes stable JSONL to stdout, one saved event
 per line in sequence order, with its schema version and original timestamp.
 Credentials, metadata, and transport headers are excluded. Recorded message

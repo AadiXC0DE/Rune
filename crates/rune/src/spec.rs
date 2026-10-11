@@ -276,13 +276,18 @@ pub const SESSIONS: &[CommandSpec] = &[
     CommandSpec {
         name: "session",
         aliases: &[],
-        summary: "Inspect, export, migrate, or recover one session",
-        usage: "rune session <last|id> [--json] | rune session --id <id> [--json] | rune session export <last|id> | rune session export --id <id> | rune session migrate <id> | rune session recover <id>",
+        summary: "Inspect, search, export, migrate, or recover one session",
+        usage: "rune session <last|id> [--search <text>] [--json] | rune session --id <id> [--search <text>] [--json] | rune session export <last|id> | rune session export --id <id> | rune session migrate <id> | rune session recover <id>",
         flags: &[
             option(
                 "--id",
                 "id",
-                "Inspect or export this exact session identifier, taking precedence over a positional selector.",
+                "Inspect, search, or export this exact session identifier, taking precedence over a positional selector.",
+            ),
+            option(
+                "--search",
+                "text",
+                "Search saved message, tool, and summary records, including compacted context, by a case-insensitive literal fragment. Return original records and sequence positions.",
             ),
             flag("--allow-large", "Permit migrating an oversized session."),
             flag(

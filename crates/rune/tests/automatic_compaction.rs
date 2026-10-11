@@ -135,7 +135,12 @@ provider_request_timeout_ms = 5000
         .expect("CLI");
     let mut input = child.stdin.take().expect("stdin");
     for turn in 1..=6 {
-        writeln!(input, "fixture question {turn}").expect("prompt");
+        let marker = if turn == 1 {
+            " REMOVED_SYMBOL_CAFÉ[x].*"
+        } else {
+            ""
+        };
+        writeln!(input, "fixture question {turn}{marker}").expect("prompt");
     }
     writeln!(input, "/quit").expect("quit");
     drop(input);
@@ -206,5 +211,57 @@ provider_request_timeout_ms = 5000
             .iter()
             .any(|message| message["role"] == "tool")),
         "the tool continuation reached the provider"
+    );
+
+    assert!(
+        !requests
+            .last()
+            .expect("last request")
+            .1
+            .to_string()
+            .contains("REMOVED_SYMBOL"),
+        "the symbol must have been removed from the live model context"
+    );
+    let search = Command::new(env!("CARGO_BIN_EXE_rune"))
+        .env_clear()
+        .env("HOME", dir.path())
+        .env("RUNE_HOME", dir.path().join("state"))
+        .env("XDG_CONFIG_HOME", dir.path().join("config"))
+        .env("XDG_DATA_HOME", dir.path().join("data"))
+        .current_dir(dir.path())
+        .args([
+            "session",
+            "last",
+            "--search",
+            "removed_symbol_café[x].*",
+            "--json",
+        ])
+        .output()
+        .expect("search compacted records");
+    assert!(search.status.success(), "{search:?}");
+    assert!(search.stderr.is_empty(), "{search:?}");
+    let found: Value = serde_json::from_slice(&search.stdout).expect("search JSON");
+    let matches = found["matches"].as_array().expect("matching records");
+    assert_eq!(matches.len(), 1);
+    assert_eq!(
+        matches[0]["event"]["text"],
+        "fixture question 1 REMOVED_SYMBOL_CAFÉ[x].*"
+    );
+    let session_id = found["session_id"].as_str().expect("session id");
+    let log = std::fs::read_to_string(
+        dir.path()
+            .join("state/sessions")
+            .join(session_id)
+            .join("events.jsonl"),
+    )
+    .expect("original log");
+    let original: Value = log
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).expect("frame"))
+        .find(|frame| frame["event"]["text"] == matches[0]["event"]["text"])
+        .expect("original record");
+    assert_eq!(
+        matches[0], original,
+        "search must preserve the original record and position"
     );
 }

@@ -808,7 +808,7 @@ fn run_tree(
     Ok(ExitCode::from(EXIT_OK))
 }
 
-/// Reports or exports one stored session.
+/// Reports, searches, or exports one stored session.
 fn run_session(
     paths: &Paths,
     launch: &Launch,
@@ -822,6 +822,13 @@ fn run_session(
     }
 
     let exporting = launch.args.first().map(String::as_str) == Some("export");
+    if exporting && launch.flag("--search").is_some() {
+        return Err(RuneError::invalid_field(
+            "search",
+            "search cannot be combined with session export",
+        )
+        .with_hint("run `rune session <last|id> --search <text>`"));
+    }
     let id = if let Some(raw) = launch.flag("--id") {
         raw.parse()?
     } else {
@@ -836,7 +843,28 @@ fn run_session(
     };
     let state = session_log::inspect(paths, &id)?;
 
-    if exporting {
+    if let Some(query) = launch.flag("--search") {
+        let matches = state.search_records(query)?;
+        if let Some(offset) = state.truncated_at {
+            eprintln!("warning: omitted incomplete session tail at byte {offset}");
+        }
+        if output.json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "session_id": state.id,
+                    "query": query,
+                    "matches": matches,
+                    "truncated_at": state.truncated_at,
+                }))?
+            );
+        } else {
+            println!("session {}: {} matching record(s)", state.id, matches.len());
+            for frame in matches {
+                println!("record {}: {}", frame.seq.0, frame.encode()?);
+            }
+        }
+    } else if exporting {
         if let Some(offset) = state.truncated_at {
             eprintln!("warning: omitted incomplete session tail at byte {offset}");
         }
