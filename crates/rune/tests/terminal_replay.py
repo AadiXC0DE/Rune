@@ -134,7 +134,7 @@ def controlling_terminal():
 
 
 scenario = sys.argv[2]
-assert scenario in {"resize", "narrow", "menu-resize", "completion-resize", "code", "transcript", "compact"}, scenario
+assert scenario in {"resize", "narrow", "menu-resize", "completion-resize", "code", "transcript", "compact", "help-40", "help-80"}, scenario
 with tempfile.TemporaryDirectory(prefix="rune-r034-") as directory:
     root = pathlib.Path(directory)
     config = root / "config" / "rune"
@@ -145,6 +145,16 @@ with tempfile.TemporaryDirectory(prefix="rune-r034-") as directory:
     if scenario == "transcript":
         (root / "transcript.txt").write_text(
             "\n".join(f"TOOL-{index:02}" for index in range(1, 31)) + "\n"
+        )
+    if scenario.startswith("help-"):
+        commands = root / ".rune" / "commands"
+        commands.mkdir(parents=True)
+        (commands / "wrap-fixture.md").write_text(
+            "---\ndescription: Recover this full custom description with 界e\u0301 "
+            "and its final words from scrollback.\n---\nFixture body.\n"
+        )
+        (commands / "long-fixture.md").write_text(
+            "---\ndescription: " + "W" * 140 + "END-COMMAND\n---\nFixture body.\n"
         )
     server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Provider)
     server.daemon_threads = True
@@ -174,7 +184,8 @@ with tempfile.TemporaryDirectory(prefix="rune-r034-") as directory:
         environment["RUNE_PERMISSION_MODE"] = "full-access"
     cols, rows = {"resize": (32, 24), "narrow": (12, 24),
                   "menu-resize": (80, 24), "completion-resize": (80, 24), "code": (32, 24),
-                  "transcript": (80, 24), "compact": (80, 4)}[scenario]
+                  "transcript": (80, 24), "compact": (80, 4),
+                  "help-40": (40, 24), "help-80": (80, 24)}[scenario]
     master, slave = pty.openpty()
     fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
     try:
@@ -227,7 +238,10 @@ with tempfile.TemporaryDirectory(prefix="rune-r034-") as directory:
         else:
             # At 12 columns the hint is deliberately clipped to this prefix.
             wait_for("ctrl-c cance")
-        if scenario == "resize":
+        if scenario.startswith("help-"):
+            capture("help-settled", b"/help\r")
+            assert not prompts, prompts
+        elif scenario == "resize":
             draft = "0123456789" * 5 + "VISIBLE-END"
             capture("narrow-draft", draft.encode(), "VISIBLE-END")
             # No key is sent on either resize. A stale draft must fail here.

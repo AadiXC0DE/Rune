@@ -200,6 +200,9 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Fixed
 
+- Settled slash-command output wraps at the terminal width, keeping full
+  `/help` descriptions and other command results available in scrollback.
+
 - Completion menus preserve the selected row across terminal resizes and
   ignored keys. Editing the draft still resets the selection for new matches.
 

@@ -223,6 +223,53 @@ fn completion_selection_survives_resize_and_ignored_keys_but_resets_on_edit() {
 }
 
 #[test]
+fn settled_help_preserves_every_command_description_in_scrollback_at_40_and_80_columns() {
+    for cols in [40, 80] {
+        let captures: Vec<Capture> = serde_json::from_slice(&record(
+            include_str!("terminal_replay.py"),
+            Some(&format!("help-{cols}")),
+        ))
+        .expect("help captures");
+        assert_eq!(captures.len(), 1);
+        let mut grid = Grid::new(cols, 24).expect("grid");
+        let mut scrollback = Vec::new();
+        for capture in captures {
+            assert_eq!(capture.cols, cols);
+            for byte in capture.bytes {
+                let top = grid.row_text(0);
+                let stats = grid.feed(&[byte]).expect("replay byte");
+                if stats.scrolled {
+                    assert_eq!(stats.scroll_rows, 1);
+                    scrollback.push(top);
+                }
+            }
+        }
+        // Recover the rows a user can copy, including those above the screen.
+        assert!(!scrollback.is_empty(), "help never reached scrollback");
+        let screen = grid.text();
+        let text = scrollback.join("\n") + "\n" + &screen;
+        let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        for line in rune_term::commands::render_help().lines().chain([
+            "/history clear  forget every recorded prompt",
+            "/wrap-fixture (project)  Recover this full custom description with 界e\u{301} and its final words from scrollback.",
+        ]) {
+            let expected = line.split_whitespace().collect::<Vec<_>>().join(" ");
+            assert!(
+                normalized.contains(&expected),
+                "{cols} columns lost help text {expected:?}:\n{text}"
+            );
+        }
+        // A word longer than either width must survive hard breaks as well.
+        let compact: String = text.chars().filter(|ch| !ch.is_whitespace()).collect();
+        let expected = "/long-fixture(project)".to_owned() + &"W".repeat(140) + "END-COMMAND";
+        assert!(compact.contains(&expected), "{cols} columns: {text}");
+        let cursor = grid.cursor();
+        assert_eq!(grid.row_text(cursor.row), ">");
+        assert_eq!(cursor.col, 2);
+    }
+}
+
+#[test]
 fn draft_resize_grids() {
     let actual = event_replay("resize");
     assert_eq!(

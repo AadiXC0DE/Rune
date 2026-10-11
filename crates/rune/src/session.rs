@@ -3734,7 +3734,7 @@ fn styled(open: &str, text: &str) -> String {
     format!("{open}{text}{RESET}")
 }
 
-/// Prints finished lines and leaves the prompt under them.
+/// Wraps finished command output and leaves the prompt under it.
 ///
 /// Every writer must go through the renderer: text written straight to the
 /// stream lands at the caret, which is inside the region the session repaints,
@@ -3744,12 +3744,21 @@ fn flush_lines(host: &SessionHost, sink: &mut LockedSink, lines: &[String]) -> R
     if lines.is_empty() {
         return Ok(());
     }
-    let labelled;
+    let rendered;
     let lines = if host.accessible {
-        labelled = transcript::accessible_lines(&[Entry::notice(lines.join("\n"))]);
-        &labelled
+        rendered = transcript::accessible_lines(&[Entry::notice(lines.join("\n"))]);
+        &rendered
     } else {
-        lines
+        // Inline expects display rows and clips anything wider. Captured
+        // command output still holds logical lines, so wrap at the terminal's
+        // current width before committing it to scrollback.
+        host.refresh_size();
+        let width = usize::from(host.width()).max(1);
+        rendered = lines
+            .iter()
+            .flat_map(|line| rune_term::width::wrap(line, width))
+            .collect::<Vec<_>>();
+        &rendered
     };
     let (prompt_row, caret) = host.idle_prompt();
     let painted = host.paint(lines, None, &prompt_row, &[], caret)?;
@@ -3760,7 +3769,7 @@ fn flush_lines(host: &SessionHost, sink: &mut LockedSink, lines: &[String]) -> R
     Ok(())
 }
 
-/// Splits captured command output into the lines the renderer commits.
+/// Splits captured command output into logical lines for [`flush_lines`].
 ///
 /// A trailing newline produces an empty final line, which would commit a blank
 /// row and move the prompt down for no reason, so it is dropped.
