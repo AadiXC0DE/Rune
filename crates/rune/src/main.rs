@@ -27,6 +27,7 @@ mod sandbox;
 mod session;
 mod session_log;
 mod spec;
+mod subagent;
 mod version;
 mod web_client;
 

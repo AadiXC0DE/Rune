@@ -206,6 +206,12 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Fixed
 
+- Interactive `subagent` calls run one synchronous child with separate history
+  and return its result to the parent. Children use only inherited, advertised
+  read-only tools under the parent's permission policy, with at most 16 model
+  steps (or a smaller parent cap) and the configured child-count limit. Named
+  roles, child messages, and nested delegation remain unavailable.
+
 - `rune ask` honors `provider_max_attempts` through the shared bounded retry
   policy, including `Retry-After` and configured request deadlines. Rejected
   credentials stop immediately, and retries do not consume extra model steps.

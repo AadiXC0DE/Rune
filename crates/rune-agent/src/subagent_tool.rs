@@ -109,6 +109,85 @@ impl Subagent {
         Self::new(Arc::new(Unsupported), authority)
     }
 
+    /// Executes using a delegate borrowed from the live host.
+    ///
+    /// This lets a synchronous child consult its parent's current policy and
+    /// tools without storing a reference cycle in the tool registry.
+    pub fn call_with_delegate(
+        &self,
+        arguments: &serde_json::Value,
+        context: &ExecutionContext,
+        delegate: &dyn Delegate,
+    ) -> Result<ToolOutput> {
+        context.check_cancelled()?;
+        let request = SubagentRequest::decode(arguments)?;
+
+        // The authority is re-derived from the context of this call rather than
+        // trusted from construction time, so a change between calls is caught
+        // instead of the child continuing with rights it no longer has.
+        let mut current = self.parent.authority.clone();
+        current.workspace.clone_from(&context.workspace);
+        current.roots = roots_of(context);
+        if let Err(err) = self.recheck(&current) {
+            return Ok(ToolOutput::failure(format!(
+                "the child was not started: {}",
+                err.message()
+            )));
+        }
+
+        let outcome = match request.action {
+            crate::subagent::SubagentAction::Message => {
+                let Some(name) = request.agent.as_deref() else {
+                    return Err(
+                        RuneError::missing_field("agent").with_hint("name the child to address")
+                    );
+                };
+                let Some(text) = request.message.as_deref() else {
+                    return Err(RuneError::missing_field("message"));
+                };
+                delegate.message(name, text)
+            }
+            crate::subagent::SubagentAction::Run => {
+                let mut started = self.started.lock().map_err(|_| {
+                    RuneError::new(ErrorCode::Internal, "the child list lock was poisoned")
+                })?;
+                if let Some(ChildKind::Named(name)) = request.child_kind()
+                    && started.iter().any(|label| label.as_str() == name)
+                {
+                    return Ok(ToolOutput::failure(format!(
+                        "a child named `{name}` is already running"
+                    )));
+                }
+                let outcome = delegate.delegate(&request, &self.parent.admission);
+                if let Ok(outcome) = &outcome
+                    && let Some(name) = outcome.name.clone()
+                {
+                    started.push(name);
+                }
+                outcome
+            }
+        };
+
+        match outcome {
+            Ok(outcome) => {
+                let name = outcome
+                    .name
+                    .as_deref()
+                    .map_or(String::new(), |name| format!(" ({name})"));
+                Ok(ToolOutput::success(format!(
+                    "child {}{name}: {}",
+                    outcome.label, outcome.summary
+                )))
+            }
+            // A delegation that could not run is a tool failure rather than an
+            // abort, so the parent can decide what to do next.
+            Err(err) => Ok(ToolOutput::failure(format!(
+                "delegation failed: {}",
+                err.message()
+            ))),
+        }
+    }
+
     /// Re-checks the parent's authority before a child acts.
     ///
     /// A child admitted under one authority and continued under another would be
@@ -182,73 +261,7 @@ impl Tool for Subagent {
         arguments: &serde_json::Value,
         context: &ExecutionContext,
     ) -> Result<ToolOutput> {
-        context.check_cancelled()?;
-        let request = SubagentRequest::decode(arguments)?;
-
-        // The authority is re-derived from the context of this call rather than
-        // trusted from construction time, so a change between calls is caught
-        // instead of the child continuing with rights it no longer has.
-        let mut current = self.parent.authority.clone();
-        current.workspace.clone_from(&context.workspace);
-        current.roots = roots_of(context);
-        if let Err(err) = self.recheck(&current) {
-            return Ok(ToolOutput::failure(format!(
-                "the child was not started: {}",
-                err.message()
-            )));
-        }
-
-        let outcome = match request.action {
-            crate::subagent::SubagentAction::Message => {
-                let Some(name) = request.agent.as_deref() else {
-                    return Err(
-                        RuneError::missing_field("agent").with_hint("name the child to address")
-                    );
-                };
-                let Some(text) = request.message.as_deref() else {
-                    return Err(RuneError::missing_field("message"));
-                };
-                self.delegate.message(name, text)
-            }
-            crate::subagent::SubagentAction::Run => {
-                let mut started = self.started.lock().map_err(|_| {
-                    RuneError::new(ErrorCode::Internal, "the child list lock was poisoned")
-                })?;
-                if let Some(ChildKind::Named(name)) = request.child_kind()
-                    && started.iter().any(|label| label.as_str() == name)
-                {
-                    return Ok(ToolOutput::failure(format!(
-                        "a child named `{name}` is already running"
-                    )));
-                }
-                let outcome = self.delegate.delegate(&request, &self.parent.admission);
-                if let Ok(outcome) = &outcome
-                    && let Some(name) = outcome.name.clone()
-                {
-                    started.push(name);
-                }
-                outcome
-            }
-        };
-
-        match outcome {
-            Ok(outcome) => {
-                let name = outcome
-                    .name
-                    .as_deref()
-                    .map_or(String::new(), |name| format!(" ({name})"));
-                Ok(ToolOutput::success(format!(
-                    "child {}{name}: {}",
-                    outcome.label, outcome.summary
-                )))
-            }
-            // A delegation that could not run is a tool failure rather than an
-            // abort, so the parent can decide what to do next.
-            Err(err) => Ok(ToolOutput::failure(format!(
-                "delegation failed: {}",
-                err.message()
-            ))),
-        }
+        self.call_with_delegate(arguments, context, self.delegate.as_ref())
     }
 }
 
@@ -373,6 +386,24 @@ mod tests {
             .expect("delegated");
         assert!(!output.is_error, "{}", output.text);
         assert_eq!(delegate.calls(), ["inspect the parser"]);
+    }
+
+    #[test]
+    fn a_borrowed_live_delegate_runs_through_the_same_authority_checks() {
+        let delegate = Recording::new();
+        let tool = Subagent::unsupported(authority());
+        let arguments = serde_json::json!({ "action": "run", "task": "read the fixture" });
+        let output = tool
+            .call_with_delegate(&arguments, &context(), &delegate)
+            .expect("live delegate");
+        assert!(!output.is_error, "{}", output.text);
+        assert_eq!(delegate.calls(), ["read the fixture"]);
+        let elsewhere = ExecutionContext::new(Utf8PathBuf::from("/other"));
+        let output = tool
+            .call_with_delegate(&arguments, &elsewhere, &delegate)
+            .expect("reported refusal");
+        assert!(output.is_error);
+        assert_eq!(delegate.calls().len(), 1);
     }
 
     #[test]

@@ -56,6 +56,7 @@ pub struct SessionConfig {
     pub dialect: Box<dyn Provider>,
     /// Tool registry.
     pub registry: Registry,
+    subagent: Option<Arc<crate::subagent::Bridge>>,
     /// Rules in force.
     pub rules: RuleSet,
     /// Question bridge, enabled only while terminal input is being polled.
@@ -245,6 +246,7 @@ struct SessionHost {
     limits: BudgetSet,
     context: ExecutionContext,
     registry: Registry,
+    subagent: Option<Arc<crate::subagent::Bridge>>,
     cancellation: Cancellation,
     steering: SteeringQueue,
     events: Arc<Mutex<Vec<Event>>>,
@@ -529,6 +531,11 @@ impl Host for SessionHost {
     }
 
     fn execute(&self, name: &str, arguments: &serde_json::Value) -> Result<ToolOutput> {
+        if name == "subagent"
+            && let Some(subagent) = &self.subagent
+        {
+            return subagent.call(self, &self.registry, arguments, &self.context);
+        }
         // Captured before the call so the bytes that were there can be put
         // back. A capture failure is not fatal: the call still runs, and `/undo`
         // reports that it had nothing to restore for this file.
@@ -1438,6 +1445,12 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
         (Vec::new(), Totals::default())
     };
     let recorder = Arc::new(Mutex::new(recorder));
+    let mut context = ExecutionContext::new(config.workspace.clone())
+        .with_offline(config.settings.offline)
+        .with_allow_unsandboxed(config.settings.allow_unsandboxed);
+    context
+        .additional_roots
+        .clone_from(&config.settings.additional_directories);
     let host = SessionHost {
         accessible: config.accessible,
         ascii: config.settings.ascii,
@@ -1452,10 +1465,9 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
         effort: config.settings.effort,
         fast_mode: config.settings.fast_mode,
         limits: limits.clone(),
-        context: ExecutionContext::new(config.workspace.clone())
-            .with_offline(config.settings.offline)
-            .with_allow_unsandboxed(config.settings.allow_unsandboxed),
+        context,
         registry: config.registry,
+        subagent: config.subagent,
         cancellation: config.questions.cancellation.clone(),
         steering: SteeringQueue::from_limits(&limits),
         events: Arc::new(Mutex::new(Vec::new())),
@@ -4777,22 +4789,21 @@ pub fn prepare(
         crate::web_client::backends(settings),
         questions.clone(),
     )?;
-    // The delegation tool lives with the authority model it enforces, and the
-    // tool registry cannot depend on that crate, so it is added here where both
-    // are visible.
-    registry.insert(Box::new(rune_agent::Subagent::unsupported(
-        rune_agent::Authority {
-            mode: settings.permission_mode,
-            rules: RuleSet::new(),
-            workspace: workspace.to_owned(),
-            roots: std::iter::once(workspace.to_owned())
-                .chain(settings.additional_directories.iter().cloned())
-                .collect(),
-            tools: registry.names().into_iter().map(str::to_owned).collect(),
-            mcp_view: None,
-            generation: 0,
-        },
-    )))?;
+    let rules = crate::permissions::validated(settings)?;
+    let mut tools: Vec<String> = registry.names().into_iter().map(str::to_owned).collect();
+    tools.push("subagent".to_owned());
+    let subagent = crate::subagent::Bridge::new(rune_agent::Authority {
+        mode: settings.permission_mode,
+        rules: rules.clone(),
+        workspace: workspace.to_owned(),
+        roots: std::iter::once(workspace.to_owned())
+            .chain(settings.additional_directories.iter().cloned())
+            .collect(),
+        tools,
+        mcp_view: None,
+        generation: 0,
+    });
+    registry.insert(subagent.registered())?;
 
     Ok(SessionConfig {
         accessible: false,
@@ -4808,11 +4819,12 @@ pub fn prepare(
         ),
         dialect,
         registry,
+        subagent: Some(subagent),
         // The rules that ship with the harness, so a fresh install has a usable
         // starting point: reads and in-workspace edits proceed, outbound traffic
         // is refused, and an unknown command resolves to the mode's default
         // rather than to nothing.
-        rules: crate::permissions::validated(settings)?,
+        rules,
         questions,
     })
 }
@@ -8501,6 +8513,7 @@ mod tests {
             endpoint: Endpoint::new("https://example.invalid", "k"),
             dialect: Box::new(rune_net::chat_completions::ChatCompletions),
             registry: Registry::new(),
+            subagent: None,
             rules: RuleSet::new(),
             questions: Arc::new(TerminalQuestions::default()),
         }
@@ -8659,6 +8672,7 @@ mod tests {
             limits: BudgetSet::new(),
             context: ExecutionContext::new(Utf8PathBuf::from("/tmp")),
             registry,
+            subagent: None,
             cancellation: questions.cancellation.clone(),
             steering: SteeringQueue::new(4),
             events: Arc::new(Mutex::new(Vec::new())),
