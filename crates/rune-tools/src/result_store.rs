@@ -16,6 +16,8 @@ use rune_core::error::{ErrorCode, Result, RuneError};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::workspace::truncate_to_bytes;
+
 /// Preview size shown to the model when a result is retained.
 pub const DEFAULT_PREVIEW_BYTES: usize = 4096;
 
@@ -249,6 +251,8 @@ impl Store {
     /// A result at or below the preview size is returned whole without retention
     /// metadata when rendered, because retaining it would waste a slot. Its
     /// stable identifier is not a readable handle.
+    /// Stored content includes any truncation marker within the result cap;
+    /// caps smaller than the marker retain only the marker prefix that fits.
     pub fn retain(
         &mut self,
         limits: &BudgetSet,
@@ -283,12 +287,10 @@ impl Store {
         // The retained content is itself bounded, so one enormous result cannot
         // exhaust memory on its own.
         let bounded: String = if content.len() > retained_limit {
-            let mut cut = retained_limit;
-            while cut > 0 && !content.is_char_boundary(cut) {
-                cut = cut.saturating_sub(1);
-            }
-            let mut text = content.get(..cut).unwrap_or_default().to_owned();
-            text.push_str("\n[truncated at the retention limit]");
+            let marker = truncate_to_bytes("\n[truncated at the retention limit]", retained_limit);
+            let mut text =
+                truncate_to_bytes(content, retained_limit.saturating_sub(marker.len())).to_owned();
+            text.push_str(marker);
             text
         } else {
             content.to_owned()
@@ -882,10 +884,104 @@ mod tests {
             .retain(&limits, "shell", "call-1", &content, false)
             .expect("retained");
         assert!(
-            preview.retained_bytes <= 8192 + 64,
+            preview.retained_bytes <= 8192,
             "retained {} bytes",
             preview.retained_bytes
         );
+    }
+
+    #[test]
+    fn retention_cap_includes_the_truncation_marker() {
+        let marker = "\n[truncated at the retention limit]";
+        for cap in [0, 1, 16, 34, 35, 36, 2048, 4096, 8192] {
+            let mut limits = limits();
+            limits
+                .set(
+                    LimitName::MaxToolResultBytes,
+                    rune_core::budget::Budget::Bounded(cap as u64),
+                    rune_core::config::Layer::User,
+                )
+                .expect("set");
+            let mut store = store();
+            let content = "x".repeat(cap + 1);
+            let preview = store
+                .retain(&limits, "shell", "call-1", &content, false)
+                .expect("retained");
+            let stored = store
+                .read(&preview.handle, 0, MAX_READ_BYTES)
+                .expect("read");
+
+            assert!(stored.text.len() <= cap, "cap {cap}: {stored:?}");
+            assert_eq!(stored.text.len(), cap);
+            assert_eq!(stored.total_bytes, cap as u64);
+            assert_eq!(preview.retained_bytes, stored.total_bytes);
+            assert_eq!(store.total_bytes(), cap);
+            assert_eq!(
+                store.describe(&preview.handle),
+                Some(("shell", cap as u64, false))
+            );
+            if cap >= marker.len() {
+                assert_eq!(
+                    stored.text,
+                    format!("{}{marker}", "x".repeat(cap - marker.len()))
+                );
+            } else {
+                assert_eq!(stored.text, &marker[..cap]);
+            }
+        }
+    }
+
+    #[test]
+    fn truncated_retention_preserves_utf8_within_the_cap() {
+        let mut limits = limits();
+        limits
+            .set(
+                LimitName::MaxToolResultBytes,
+                rune_core::budget::Budget::Bounded(8192),
+                rune_core::config::Layer::User,
+            )
+            .expect("set");
+        let mut store = store();
+        let content = format!("{}x", "é".repeat(4096));
+        let preview = store
+            .retain(&limits, "shell", "call-1", &content, false)
+            .expect("retained");
+        let stored = store
+            .read(&preview.handle, 0, MAX_READ_BYTES)
+            .expect("read");
+
+        assert_eq!(stored.text.len(), 8191);
+        assert_eq!(
+            stored.text,
+            format!("{}\n[truncated at the retention limit]", "é".repeat(4078))
+        );
+        assert_eq!(preview.retained_bytes, stored.total_bytes);
+        assert_eq!(store.total_bytes(), stored.text.len());
+    }
+
+    #[test]
+    fn retention_keeps_content_at_or_below_the_cap_unchanged() {
+        let mut limits = limits();
+        limits
+            .set(
+                LimitName::MaxToolResultBytes,
+                rune_core::budget::Budget::Bounded(8192),
+                rune_core::config::Layer::User,
+            )
+            .expect("set");
+        for content in ["x".repeat(8191), "é".repeat(4096)] {
+            let mut store = store();
+            let preview = store
+                .retain(&limits, "shell", "call-1", &content, false)
+                .expect("retained");
+            let stored = store
+                .read(&preview.handle, 0, MAX_READ_BYTES)
+                .expect("read");
+
+            assert_eq!(stored.text, content);
+            assert_eq!(preview.retained_bytes, content.len() as u64);
+            assert_eq!(store.total_bytes(), content.len());
+        }
     }
 
     #[test]

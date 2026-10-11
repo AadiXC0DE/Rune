@@ -102,6 +102,10 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Fixed
 
+- Retained tool results include the truncation marker within the configured
+  byte cap, preserving UTF-8 boundaries. Caps smaller than the marker keep
+  only the portion of the marker that fits.
+
 - Small tool-result previews returned without retention no longer advertise
   an unreadable handle or a `read_tool_result` instruction.
 
