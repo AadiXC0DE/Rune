@@ -102,6 +102,10 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Fixed
 
+- `grep_files` checks cancellation between buffered chunks within each file,
+  including oversized lines. Cancelled searches stop before scanning the rest
+  of the file and return a `cancelled` error without partial results.
+
 - `read_file` checks cancellation before file access and between buffered
   chunks while skipping, collecting, or counting lines, including oversized
   lines. Cancelled reads return a `cancelled` error without a partial page.

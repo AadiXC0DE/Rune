@@ -5,16 +5,16 @@ use std::fmt::Write as _;
 use std::io::{BufRead, BufReader};
 
 use camino::{Utf8Path, Utf8PathBuf};
-use rune_core::error::{Result, RuneError};
+use rune_core::error::{ErrorCode, Result, RuneError};
 
 use crate::contract::{Activity, ExecutionContext, Tool, ToolOutput, validate_closed_arguments};
 use crate::workspace::{
     FileLimits, MAX_MATCH_LINE_BYTES, Walker, bool_arg, compile_glob_as, default_root, display_in,
-    join_capped, read_line_bounded, resolve, roots, string_arg, summarize, truncate_line,
+    join_capped, read_line_bounded_checked, resolve, roots, string_arg, summarize, truncate_line,
     usize_arg, walk_notes,
 };
 
-/// How often a long search checks for cancellation.
+/// How often traversal checks for cancellation between files.
 const CANCEL_CHECK_INTERVAL: usize = 256;
 
 /// Bytes read to decide whether a file is binary.
@@ -129,6 +129,7 @@ impl Tool for GrepFiles {
         arguments: &serde_json::Value,
         context: &ExecutionContext,
     ) -> Result<ToolOutput> {
+        context.check_cancelled()?;
         validate_closed_arguments(arguments, &self.input_schema())?;
         let query = parse(self, arguments, context)?;
         let include = match query.include.as_deref() {
@@ -152,14 +153,23 @@ impl Tool for GrepFiles {
                 continue;
             }
             let display = display_in(&normalised, &entry.path);
-            if let Err(err) = scan(&entry.path, &display, &query, report.matches, &mut report) {
+            if let Err(err) = scan(
+                &entry.path,
+                &display,
+                &query,
+                report.matches,
+                &mut report,
+                context,
+            ) {
                 match err {
                     ScanError::Binary => report.binary.push(display),
                     ScanError::Unreadable(reason) => report.unreadable.push((display, reason)),
+                    ScanError::Cancelled(err) => return Err(err),
                 }
             }
         }
 
+        context.check_cancelled()?;
         Ok(ToolOutput::success(render(
             &query,
             &label,
@@ -299,11 +309,14 @@ struct Report {
 }
 
 /// Why a file was not searched.
+#[derive(Debug)]
 enum ScanError {
     /// The file is binary and was skipped.
     Binary,
     /// The file could not be read.
     Unreadable(String),
+    /// Cancellation stops the entire search rather than skipping the file.
+    Cancelled(RuneError),
 }
 
 /// Searches one file, folding whatever it found into the report.
@@ -317,11 +330,28 @@ fn scan(
     query: &Query,
     base: usize,
     report: &mut Report,
+    context: &ExecutionContext,
 ) -> std::result::Result<(), ScanError> {
+    context.check_cancelled().map_err(ScanError::Cancelled)?;
     let file = std::fs::File::open(path.as_std_path())
         .map_err(|err| ScanError::Unreadable(format!("`{display}` could not be read: {err}")))?;
     let mut reader = BufReader::with_capacity(PROBE_BYTES, file);
-    if reader.fill_buf().unwrap_or_default().contains(&0) {
+    scan_reader(&mut reader, display, query, base, report, context)
+}
+
+/// Scans buffered chunks with cancellation checks, including oversized lines.
+fn scan_reader<R: BufRead>(
+    reader: &mut R,
+    display: &str,
+    query: &Query,
+    base: usize,
+    report: &mut Report,
+    context: &ExecutionContext,
+) -> std::result::Result<(), ScanError> {
+    context.check_cancelled().map_err(ScanError::Cancelled)?;
+    let binary = reader.fill_buf().unwrap_or_default().contains(&0);
+    context.check_cancelled().map_err(ScanError::Cancelled)?;
+    if binary {
         return Err(ScanError::Binary);
     }
 
@@ -351,10 +381,16 @@ fn scan(
     let mut buffer = Vec::new();
 
     loop {
-        let line =
-            read_line_bounded(&mut reader, &mut buffer, MAX_MATCH_LINE_BYTES).map_err(|err| {
-                ScanError::Unreadable(format!("`{display}` could not be read: {err}"))
-            })?;
+        let line = read_line_bounded_checked(reader, &mut buffer, MAX_MATCH_LINE_BYTES, || {
+            context.check_cancelled()
+        })
+        .map_err(|err: RuneError| {
+            if err.code() == ErrorCode::Cancelled {
+                ScanError::Cancelled(err)
+            } else {
+                ScanError::Unreadable(format!("`{display}` could not be read: {}", err.message()))
+            }
+        })?;
         if line.consumed == 0 {
             break;
         }
@@ -557,10 +593,200 @@ fn render(query: &Query, label: &str, report: &Report, walker: &Walker, cap: usi
 
 #[cfg(test)]
 mod tests {
-    use rune_core::error::ErrorCode;
-
     use super::*;
+    use crate::contract::Cancellation;
     use crate::workspace::fixture::{MATCH_FILES, MATCH_LINES, Repo, budget_with_list_entries};
+
+    /// Cancels at a known byte boundary without relying on thread scheduling.
+    struct CancellingReader<R> {
+        inner: R,
+        cancellation: Cancellation,
+        cancel_after: usize,
+        consumed: usize,
+        fills: usize,
+    }
+
+    impl<R: std::io::Read> std::io::Read for CancellingReader<R> {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            self.inner.read(buffer)
+        }
+    }
+
+    impl<R: BufRead> BufRead for CancellingReader<R> {
+        fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+            self.fills = self.fills.checked_add(1).expect("buffer fills");
+            self.inner.fill_buf()
+        }
+
+        fn consume(&mut self, amount: usize) {
+            self.inner.consume(amount);
+            self.consumed = self.consumed.checked_add(amount).expect("consumed bytes");
+            if self.consumed >= self.cancel_after {
+                self.cancellation.cancel();
+            }
+        }
+    }
+
+    #[test]
+    fn a_cancelled_call_stops_before_accessing_the_file() {
+        let repo = Repo::new();
+        let context = repo.context();
+        context.cancellation().cancel();
+
+        for path in ["README.md", "absent.txt"] {
+            let error = GrepFiles::new()
+                .call(
+                    &serde_json::json!({ "pattern": "needle", "path": path }),
+                    &context,
+                )
+                .expect_err("cancelled before file access");
+            assert_eq!(error.code(), ErrorCode::Cancelled);
+        }
+    }
+
+    #[test]
+    fn a_cancelled_scan_does_no_io() {
+        let repo = Repo::new();
+        let context = repo.context();
+        let query = parse(
+            &GrepFiles::new(),
+            &serde_json::json!({ "pattern": "needle" }),
+            &context,
+        )
+        .expect("query");
+        context.cancellation().cancel();
+        let mut reader = CancellingReader {
+            inner: std::io::Cursor::new(b"needle\n"),
+            cancellation: context.cancellation(),
+            cancel_after: usize::MAX,
+            consumed: 0,
+            fills: 0,
+        };
+        let mut report = Report::default();
+
+        let error = scan_reader(&mut reader, "large.txt", &query, 0, &mut report, &context)
+            .expect_err("cancelled before reading");
+        assert!(matches!(error, ScanError::Cancelled(err) if err.code() == ErrorCode::Cancelled));
+        assert_eq!(reader.consumed, 0);
+        assert_eq!(reader.fills, 0);
+    }
+
+    #[test]
+    fn cancellation_stops_within_one_large_file_in_every_mode() {
+        let repo = Repo::new();
+        let body = "needle on a short line\n".repeat(64 * 1024);
+        repo.write("large.txt", &body);
+        for (mode, offset) in [
+            ("matches", 0),
+            ("matches", 100_000),
+            ("files_with_matches", 0),
+            ("count", 0),
+        ] {
+            let context = repo.context();
+            let query = parse(
+                &GrepFiles::new(),
+                &serde_json::json!({
+                    "pattern": "NEEDLE",
+                    "path": "large.txt",
+                    "case_insensitive": true,
+                    "mode": mode,
+                    "offset": offset,
+                    "head_limit": 1,
+                    "context_lines": 2,
+                }),
+                &context,
+            )
+            .expect("query");
+            let mut reader = CancellingReader {
+                inner: BufReader::with_capacity(
+                    PROBE_BYTES,
+                    std::fs::File::open(&query.root).expect("open"),
+                ),
+                cancellation: context.cancellation(),
+                cancel_after: 3 * PROBE_BYTES,
+                consumed: 0,
+                fills: 0,
+            };
+            let mut report = Report::default();
+
+            let error = scan_reader(&mut reader, "large.txt", &query, 0, &mut report, &context)
+                .expect_err("cancelled during a single-file search");
+            assert!(
+                matches!(error, ScanError::Cancelled(err) if err.code() == ErrorCode::Cancelled)
+            );
+            assert!(reader.consumed >= reader.cancel_after);
+            assert!(reader.consumed <= reader.cancel_after + PROBE_BYTES);
+            assert!(reader.consumed < body.len());
+            assert_eq!(report.matches, 0);
+            assert_eq!(report.files, 0);
+            assert!(report.hits.is_empty());
+            assert!(report.named.is_empty());
+        }
+    }
+
+    #[test]
+    fn cancellation_stops_while_discarding_an_oversized_line() {
+        let repo = Repo::new();
+        let context = repo.context();
+        let query = parse(
+            &GrepFiles::new(),
+            &serde_json::json!({ "pattern": "x" }),
+            &context,
+        )
+        .expect("query");
+        let body = "x".repeat(8 * MAX_MATCH_LINE_BYTES);
+        let mut reader = CancellingReader {
+            inner: BufReader::with_capacity(PROBE_BYTES, body.as_bytes()),
+            cancellation: context.cancellation(),
+            cancel_after: MAX_MATCH_LINE_BYTES + 3 * PROBE_BYTES,
+            consumed: 0,
+            fills: 0,
+        };
+        let mut report = Report::default();
+
+        let error = scan_reader(&mut reader, "large.txt", &query, 0, &mut report, &context)
+            .expect_err("cancelled while discarding a long line");
+        assert!(matches!(error, ScanError::Cancelled(err) if err.code() == ErrorCode::Cancelled));
+        assert_eq!(reader.consumed, reader.cancel_after);
+        assert!(reader.consumed < body.len());
+        assert_eq!(report.matches, 0);
+        assert!(report.hits.is_empty());
+    }
+
+    #[test]
+    fn cancellation_on_the_final_chunk_does_not_merge_partial_matches() {
+        let repo = Repo::new();
+        for body in [
+            b"needle\nlast line\n".as_slice(),
+            b"needle\nlast line".as_slice(),
+        ] {
+            let context = repo.context();
+            let query = parse(
+                &GrepFiles::new(),
+                &serde_json::json!({ "pattern": "needle" }),
+                &context,
+            )
+            .expect("query");
+            let mut reader = CancellingReader {
+                inner: BufReader::with_capacity(PROBE_BYTES, body),
+                cancellation: context.cancellation(),
+                cancel_after: body.len(),
+                consumed: 0,
+                fills: 0,
+            };
+            let mut report = Report::default();
+
+            let error = scan_reader(&mut reader, "large.txt", &query, 0, &mut report, &context)
+                .expect_err("cancelled at end of file");
+            assert!(
+                matches!(error, ScanError::Cancelled(err) if err.code() == ErrorCode::Cancelled)
+            );
+            assert_eq!(reader.consumed, body.len());
+            assert_eq!(report.matches, 0);
+            assert_eq!(report.files, 0);
+            assert!(report.hits.is_empty());
+        }
+    }
 
     /// Builds a search with a lowered listing cap.
     fn search(entries: usize) -> GrepFiles {
