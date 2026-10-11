@@ -917,6 +917,30 @@ fn prepare_call(
         Outcome::Allow => {}
     }
 
+    // Every image in a vision batch needs its own decision before the backend
+    // sees any of them. A grant for the first path cannot cover the rest.
+    if call.name == "vision"
+        && let Some(paths) = arguments.get("paths").and_then(serde_json::Value::as_array)
+    {
+        for path in paths.iter().skip(1).filter_map(serde_json::Value::as_str) {
+            let path = path.trim();
+            let (outcome, reason) = host.decide(&call.name, Some(path));
+            if outcome != Outcome::Allow {
+                host.emit(Event::ToolDenied {
+                    call: call.clone(),
+                    reason: reason.clone(),
+                });
+                return Err(CallResult {
+                    call: call.clone(),
+                    output: ToolOutput::failure(format!(
+                        "vision image `{path}` was not approved: {reason}"
+                    )),
+                    executed: false,
+                });
+            }
+        }
+    }
+
     // A rename changes both names. Neither path's grant may authorize the
     // other, so resolve the destination through the same host policy as the source.
     if call.name == "rename_file"

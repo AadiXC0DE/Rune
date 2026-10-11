@@ -410,6 +410,10 @@ pub struct UserConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub permission: Option<toml::Value>,
 
+    /// Image analysis model on the active provider and endpoint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vision_model: Option<String>,
+
     /// Model used for automatic permission review.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub review_model: Option<String>,
@@ -548,6 +552,8 @@ pub struct Settings {
     pub provider_order: Vec<String>,
     /// Whether to restrict requests to the listed providers.
     pub provider_strict: bool,
+    /// Image analysis model on the active provider and endpoint.
+    pub vision_model: Option<String>,
     /// Model used for automatic permission review.
     pub review_model: Option<String>,
     /// Where each value came from.
@@ -581,6 +587,7 @@ impl Default for Settings {
             limits: BudgetSet::new(),
             provider_order: Vec::new(),
             provider_strict: false,
+            vision_model: None,
             review_model: None,
             sources: MergeReport::default(),
             diagnostics: Vec::new(),
@@ -668,6 +675,12 @@ impl Settings {
             ),
             ("ascii", self.ascii.to_string()),
             ("web_tools", self.web_tools.to_string()),
+            (
+                "vision_model",
+                self.vision_model
+                    .clone()
+                    .unwrap_or_else(|| "unavailable".to_owned()),
+            ),
             ("auto_upgrade", self.auto_upgrade.to_string()),
             ("collapse_tool_calls", self.collapse_tool_calls.to_string()),
             ("session_titles", self.session_titles.to_string()),
@@ -870,6 +883,7 @@ const PROFILE_ONLY_KEYS: &[&str] = &[
     "session_titles",
     "additional_directories",
     "review_model",
+    "vision_model",
 ];
 
 /// Loads and merges every configuration layer.
@@ -1134,6 +1148,10 @@ fn apply_user(settings: &mut Settings, user: &UserConfig, layer: Layer) {
     if let Some(strict) = user.provider_strict {
         settings.provider_strict = strict;
         settings.sources.record("provider_strict", layer);
+    }
+    if let Some(model) = &user.vision_model {
+        settings.vision_model = Some(model.clone());
+        settings.sources.record("vision_model", layer);
     }
     if let Some(review) = &user.review_model {
         settings.review_model = Some(review.clone());
@@ -1528,6 +1546,7 @@ pub fn to_status_json(settings: &Settings, workspace: &Utf8Path) -> serde_json::
         "provider_order": settings.provider_order,
         "provider_strict": settings.provider_strict,
         "review_model": settings.review_model,
+        "vision_model": settings.vision_model,
         "workspace": workspace.as_str(),
         "diagnostics": settings.diagnostics,
     })
@@ -1611,6 +1630,38 @@ mod tests {
         assert_eq!(
             invalid.invalid_booleans,
             [("RUNE_ASCII", "invalid".to_owned())]
+        );
+    }
+
+    #[test]
+    fn vision_model_is_profile_owned_and_reported_with_its_source() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let user = write(&dir, "config.toml", "vision_model = 'image-fixture'\n");
+        let project = write(&dir, ".rune.toml", "vision_model = 'untrusted-model'\n");
+        let settings = load(
+            Some(&project),
+            Some(&user),
+            &EnvironmentOverrides::default(),
+        );
+        assert_eq!(settings.vision_model.as_deref(), Some("image-fixture"));
+        assert_eq!(settings.source_of("vision_model"), Layer::User);
+        assert!(
+            settings
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.key.as_deref() == Some("vision_model"))
+        );
+        assert!(
+            settings
+                .explain()
+                .iter()
+                .any(|entry| entry.key == "vision_model"
+                    && entry.value == "image-fixture"
+                    && entry.source == Layer::User)
+        );
+        assert_eq!(
+            to_status_json(&settings, Utf8Path::new("/fixture"))["vision_model"],
+            "image-fixture"
         );
     }
 

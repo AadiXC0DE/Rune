@@ -206,6 +206,13 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Fixed
 
+- `vision` uses the profile's `vision_model` with the active provider endpoint
+  and credential in interactive sessions, ask, and ACP. Permitted workspace
+  images reach the host as bounded inline bytes, and their analysis returns to
+  the calling model. Every batch path is checked before upload. Unconfigured
+  and offline runs explicitly advertise vision as unavailable. Session image
+  IDs remain unavailable in this host.
+
 - Interactive sessions and `rune ask` connect `capability_search` and `skill`
   to discovered workspace and user skills. Search returns declared names and
   loadable locations; loading returns exact instructions within `skill_file_bytes`

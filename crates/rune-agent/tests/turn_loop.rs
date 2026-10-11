@@ -2731,3 +2731,69 @@ fn input_sent_to_a_shell_session_is_judged_by_the_rules() {
         "no denial was reported"
     );
 }
+
+#[test]
+fn configured_vision_receives_only_permitted_images_from_the_host_inventory() {
+    use rune_tools::vision::RecordingBackend;
+
+    let directory = tempfile::tempdir().expect("workspace");
+    let workspace = Utf8PathBuf::from_path_buf(directory.path().to_owned()).expect("UTF-8");
+    for name in ["public.png", "secret.png"] {
+        std::fs::write(workspace.join(name), b"\x89PNG\r\n\x1a\nfixture").expect("image");
+    }
+    for paths in [
+        vec!["public.png"],
+        vec!["secret.png"],
+        vec!["public.png", "./secret.png"],
+        vec!["./secret.png", "public.png"],
+        vec![" secret.png "],
+        vec!["public.png", " secret.png "],
+    ] {
+        let backend = Arc::new(RecordingBackend::new());
+        backend.push_one(serde_json::json!({
+            "image_id": 1, "status": "ok", "summary": "VISION_HOST_RESULT",
+            "visible_text": [], "details": []
+        }));
+        let registry = rune_tools::inventory::builtin_with_vision(
+            &rune_tools::FileLimits::default(),
+            &BudgetSet::new(),
+            &workspace.join("skills"),
+            None,
+            Arc::new(rune_tools::ask_user::Unavailable),
+            Arc::new(rune_tools::skill::Empty),
+            Some(backend.clone()),
+        )
+        .expect("inventory");
+        let endpoint = MockEndpoint::start(vec![
+            Script::tool_call(
+                "vision_call",
+                "vision",
+                &serde_json::json!({"paths": paths}).to_string(),
+            ),
+            Script::text("Finished."),
+        ]);
+        let mut rules = RuleSet::new();
+        rules.push(Rule::allow("vision", "*", Layer::Default));
+        rules.push(Rule::deny("vision", "secret.png", Layer::User));
+        let mut host = TestHost::new(endpoint)
+            .with_tools(rune_tools::inventory::advertisement(&registry))
+            .with_rules(rules);
+        host.workspace = workspace.clone();
+        host.registry = Some(registry);
+        let mut history = rune_agent::History::new();
+        history.push_user("analyse the permitted image");
+        let outcome = run_turn(&mut history, &host).expect("turn");
+        let allowed = paths == ["public.png"];
+        assert_eq!(outcome.calls.len(), 1);
+        assert_eq!(outcome.calls[0].executed, allowed, "{paths:?}");
+        assert_eq!(outcome.calls[0].output.is_error, !allowed, "{paths:?}");
+        assert_eq!(backend.requests().len(), usize::from(allowed), "{paths:?}");
+        if allowed {
+            assert_eq!(backend.requests()[0].len(), 1);
+            assert!(outcome.calls[0].output.text.contains("VISION_HOST_RESULT"));
+            assert!(
+                matches!(&backend.requests()[0][0], rune_tools::VisionSource::File { path, .. } if path == &workspace.join("public.png"))
+            );
+        }
+    }
+}

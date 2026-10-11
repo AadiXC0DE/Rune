@@ -231,7 +231,8 @@ pub fn glob_match(pattern: &str, target: &str) -> bool {
 fn is_file_path_tool(tool: &str) -> bool {
     matches!(
         tool,
-        "read_file"
+        "vision"
+            | "read_file"
             | "write_file"
             | "edit_file"
             | "rename_file"

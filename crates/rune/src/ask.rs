@@ -322,13 +322,14 @@ pub fn run(
             rune_core::paths::home_directory().as_deref(),
             &paths.config_root,
         )?;
-        inventory::builtin_with_catalog(
+        inventory::builtin_with_vision(
             &rune_tools::FileLimits::from_budget(&limits),
             &limits,
             &paths.managed_skills_dir(),
             crate::web_client::backends(settings),
             std::sync::Arc::new(rune_tools::ask_user::Unavailable),
             std::sync::Arc::new(rune_tools::skill::Fixed::new(catalog)),
+            crate::vision_client::backend(settings, paths)?,
         )?
     } else {
         Registry::new()

@@ -149,6 +149,21 @@ pub fn builtin_with_catalog(
     answerer: std::sync::Arc<dyn Answerer>,
     catalog: std::sync::Arc<dyn crate::skill::Catalog>,
 ) -> Result<Registry> {
+    builtin_with_vision(limits, budget, skills_root, web, answerer, catalog, None)
+}
+
+/// Builds the inventory with an optional host image analysis backend.
+///
+/// An absent backend keeps the tool explicitly labelled unavailable.
+pub fn builtin_with_vision(
+    limits: &FileLimits,
+    budget: &rune_core::budget::BudgetSet,
+    skills_root: &camino::Utf8Path,
+    web: Option<WebBackends>,
+    answerer: std::sync::Arc<dyn Answerer>,
+    catalog: std::sync::Arc<dyn crate::skill::Catalog>,
+    vision: Option<std::sync::Arc<dyn crate::vision::VisionBackend>>,
+) -> Result<Registry> {
     let mut registry = Registry::new();
     registry.insert(Box::new(GlobFiles::with_limits(*limits)))?;
     registry.insert(Box::new(GrepFiles::with_limits(*limits)))?;
@@ -182,7 +197,11 @@ pub fn builtin_with_catalog(
         registry.insert(Box::new(WebFetch::unconfigured(budget)))?;
         registry.insert(Box::new(WebSearch::unconfigured(budget)))?;
     }
-    registry.insert(Box::new(Vision::unconfigured(budget)))?;
+    let vision = vision.map_or_else(
+        || Vision::unconfigured(budget),
+        |backend| Vision::new(backend, budget),
+    );
+    registry.insert(Box::new(vision))?;
     debug_assert_eq!(registry.len(), ADVERTISEMENT_ORDER.len());
     Ok(registry)
 }
@@ -513,6 +532,17 @@ mod tests {
             .insert(Box::new(ReadFile::new()))
             .expect_err("duplicate");
         assert_eq!(err.code(), rune_core::error::ErrorCode::AlreadyExists);
+    }
+
+    #[test]
+    fn unconfigured_vision_is_explicitly_unavailable_in_the_advertisement() {
+        let registry = builtin_default().expect("built");
+        let spec = advertisement(&registry)
+            .into_iter()
+            .find(|spec| spec.name == "vision")
+            .expect("vision schema");
+        assert!(spec.description.starts_with("Unavailable:"));
+        assert!(spec.description.contains("no image analysis backend"));
     }
 
     #[test]

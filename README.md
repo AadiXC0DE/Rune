@@ -94,6 +94,17 @@ them. Set `offline = true` in the user configuration to enable the
 [offline enforcement boundary](#offline-enforcement-boundary), including refusal
 of requests to the model.
 
+For image analysis, set `vision_model = "<image-capable-model>"` in the user
+configuration. Interactive sessions, `rune ask`, and ACP use that model with
+the active provider's endpoint and credential. A permitted `vision` call with
+`paths` uploads workspace images as inline bytes, capped at 8 MiB per image;
+every path in a batch must be allowed by policy before any upload. The configured
+`vision_batch_images` and `image_adapter_output_bytes` limits bound the batch
+and returned text. Main turn usage totals do not include vision helper requests.
+This host accepts file paths; session image IDs are unavailable. Without
+`vision_model`, or while offline, the advertised tool is explicitly labelled
+unavailable.
+
 A fetch with `allow_private = true` requests separate user approval for loopback,
 private, and link-local access, including redirects. Enabling web tools,
 full-access mode, and automatic model review do not grant this authority. The
@@ -363,6 +374,7 @@ and remote MCP refusals, so offline mode also blocks a locally hosted model.
 |---|---|---|
 | Model/provider requests and model discovery | Provider transport refuses before contacting the endpoint, with `permission_denied` and no retry delay. `rune models --offline` reports only the configured model. | [`an_offline_endpoint_refuses_before_any_network_call` and `an_offline_model_list_is_a_policy_refusal_before_any_network_call`](crates/rune-net/src/transport.rs); [`offline_mode_produces_no_connection`](crates/rune/tests/egress.rs); [`listing_models_offline_reports_the_configured_model_without_a_request`](crates/rune/tests/cli.rs); [`an_offline_turn_refuses_without_fetch_calls_or_retry_delay`](crates/rune-agent/tests/turn_loop.rs) |
 | Web fetch and search | The CLI installs neither web backend and keeps the tools denied, even with `web_tools = true`. | [`an_offline_run_gets_no_clients`](crates/rune/src/web_client.rs); [`an_offline_run_does_not_enable_the_web_tools`](crates/rune/src/permissions.rs) |
+| Image analysis | The CLI omits the vision backend and labels the tool unavailable, even with `vision_model` set. Configured tools also refuse an offline execution context before reading images. | [`absent_configuration_and_offline_runs_have_no_vision_client`](crates/rune/src/vision_client.rs); [`an_offline_context_does_not_reach_a_configured_backend`](crates/rune-tools/src/vision.rs) |
 | Remote MCP over HTTP or SSE | `rune mcp list` and `rune mcp check` skip remote declarations before resolving credentials or connecting, including approved loopback servers. The interactive CLI does not yet connect MCP servers. | [`pending_rejected_disabled_and_offline_servers_are_never_contacted` and `check_respects_trust_disabled_and_offline_states_without_contact_or_expansion`](crates/rune/tests/mcp_list.rs) |
 | Local MCP over stdio | Approved, enabled servers still start during offline listing and checking. These child processes do not use the shell sandbox; their own network traffic remains unrestricted by Rune offline mode. Project trust approval authorizes startup, not network isolation. | [`approved_stdio_can_start_during_offline_listing`, `check_local_stdio_works_offline_without_a_provider` and `offline_stdio_mcp_can_send_network_traffic`](crates/rune/tests/mcp_list.rs) |
 | Shell commands | Offline mode disables the sandbox's network grant, overriding external access and full-access permission mode. Linux uses a network namespace; macOS generates a network-denying Seatbelt profile. Without a usable sandbox, commands are refused unless `--allow-unsandboxed` permits fallback. That fallback has no network isolation, including offline. | [`offline_shell_policy_restricts_network_even_with_external_access` and `an_offline_full_access_shell_cannot_reach_a_local_fixture`](crates/rune-tools/src/shell.rs); [sandbox profile and argv tests](crates/rune-exec/src/sandbox.rs); [`offline_shell_fallback_requires_opt_in_and_applies_no_isolation`](crates/rune/tests/egress.rs) |

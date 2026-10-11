@@ -3596,11 +3596,9 @@ fn copy_to_clipboard(text: &str) -> std::io::Result<()> {
 
 /// Encodes bytes as standard base64 with padding.
 ///
-/// Written here rather than pulled from a crate: OSC 52 is the only base64 this
-/// program needs, and a dependency to replace twelve lines is not worth the
-/// build time or the supply chain.
+/// Shared by OSC 52 clipboard output and inline vision requests.
 #[must_use]
-fn base64_encode(bytes: &[u8]) -> String {
+pub(crate) fn base64_encode(bytes: &[u8]) -> String {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(bytes.len().div_ceil(3).saturating_mul(4));
     for chunk in bytes.chunks(3) {
@@ -4787,13 +4785,14 @@ pub fn prepare(
         rune_core::paths::home_directory().as_deref(),
         &paths.config_root,
     )?;
-    let mut registry = inventory::builtin_with_catalog(
+    let mut registry = inventory::builtin_with_vision(
         &rune_tools::workspace::FileLimits::from_budget(&settings.limits),
         &settings.limits,
         &paths.managed_skills_dir(),
         crate::web_client::backends(settings),
         questions.clone(),
         Arc::new(rune_tools::skill::Fixed::new(catalog)),
+        crate::vision_client::backend(settings, paths)?,
     )?;
     let rules = crate::permissions::validated(settings)?;
     let mut tools: Vec<String> = registry.names().into_iter().map(str::to_owned).collect();

@@ -29,6 +29,7 @@ mod session_log;
 mod spec;
 mod subagent;
 mod version;
+mod vision_client;
 mod web_client;
 
 use std::io::Write;
@@ -1221,11 +1222,14 @@ fn run_acp(
         _ => rune_acp::Dialect::ChatCompletions,
     };
 
-    let registry = rune_tools::inventory::builtin_with_web(
+    let registry = rune_tools::inventory::builtin_with_vision(
         &rune_tools::workspace::FileLimits::from_budget(&settings.limits),
         &settings.limits,
         &paths.managed_skills_dir(),
         web_client::backends(settings),
+        std::sync::Arc::new(rune_tools::ask_user::Unavailable),
+        std::sync::Arc::new(rune_tools::skill::Empty),
+        vision_client::backend(settings, paths)?,
     )?;
 
     let rules = rune_policy::rules::RuleSet::new();
