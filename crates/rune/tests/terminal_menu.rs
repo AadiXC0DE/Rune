@@ -4,6 +4,48 @@
 #![allow(clippy::expect_used)]
 
 #[test]
+fn an_unknown_tagged_model_can_be_picked_and_sent_while_invalid_ids_are_refused() {
+    let output = std::process::Command::new("python3")
+        .args([
+            "-c",
+            include_str!("terminal_menu.py"),
+            env!("CARGO_BIN_EXE_rune"),
+            "tagged-model",
+        ])
+        .output()
+        .expect("python3 is required for the Unix tagged model regression");
+    assert!(
+        output.status.success(),
+        "tagged model picker failed:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("terminal and request captures");
+    let requests = result["requests"].as_array().expect("provider requests");
+    assert!(!requests.is_empty());
+    for request in requests {
+        assert_eq!(request["model"], "qwen3:latest");
+    }
+    let captures: Vec<(String, Vec<u8>)> =
+        serde_json::from_value(result["captures"].clone()).expect("terminal captures");
+    assert_eq!(captures.len(), 5);
+    for (stage, bytes) in captures {
+        let mut grid = rune_term::Grid::new(80, 24).expect("grid");
+        grid.feed(&bytes).expect("frame");
+        let screen = grid.text();
+        let expected = match stage.as_str() {
+            "empty-catalog" => "no match for ``",
+            "invalid-tag" => "no match for `qwen3:`",
+            "typed-tag" => "> use qwen3:latest (not listed)",
+            "chosen-tag" => "model set to qwen3:latest",
+            _ => "TAGGED-MODEL-REPLY",
+        };
+        assert!(screen.contains(expected), "{stage}: {screen}");
+    }
+}
+
+#[test]
 fn completion_and_model_menus_fit_a_short_terminal_and_close_cleanly() {
     let output = std::process::Command::new("python3")
         .args([

@@ -3199,7 +3199,8 @@ fn draw_prompt(
 /// The list is drawn under the input line, so the transcript above stays
 /// readable while a choice is made. Typing narrows the list, the vertical
 /// arrows move the highlight, Enter accepts, and Escape abandons the choice
-/// without changing anything.
+/// without changing anything. A valid model identifier absent from the list
+/// can be typed and accepted verbatim.
 ///
 /// Returns `None` when the user cancelled or asked to leave.
 fn run_picker(
@@ -3207,6 +3208,7 @@ fn run_picker(
     host: &SessionHost,
     out: &LiveSink,
     mut picker: rune_term::picker::Picker,
+    catalog: &rune_net::catalog::Catalog,
 ) -> Result<Option<String>> {
     let marker = rune_term::shell::prompt();
     // Whatever was on the line is put back afterwards, so a half-typed prompt
@@ -3215,14 +3217,30 @@ fn run_picker(
     reader.clear();
 
     let chosen = loop {
-        let below = picker_menu(&mut picker, &host.theme, host.truecolor, host.menu_room());
+        let room = host.menu_room();
+        let mut below = picker_menu(&mut picker, &host.theme, host.truecolor, room);
+        let typed = if picker.selected().is_none() {
+            match catalog.choose(picker.query()) {
+                rune_net::catalog::ModelChoice::One(id) => Some(id),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        if let Some(id) = &typed
+            && let Some(row) = below.get_mut(usize::from(room >= 4))
+        {
+            *row = format!("> use {id} (not listed)");
+        }
         draw_prompt(reader, host, out, &below, marker)?;
 
         match reader.read_key() {
             // Tab and Enter both accept: the picker is the only thing on
             // screen, so there is no typed argument for Enter to mean.
             KeyAction::Submit | KeyAction::Complete => {
-                break picker.selected().map(str::to_owned);
+                if let Some(choice) = picker.selected().map(str::to_owned).or(typed) {
+                    break Some(choice);
+                }
             }
             KeyAction::Interrupt | KeyAction::Cancel | KeyAction::Escape => break None,
             // Both branches fall through to the redraw at the top of the loop.
@@ -3896,7 +3914,7 @@ fn choose_model(
     )
     .with_current(Some(current.as_str()));
 
-    let Some(chosen) = run_picker(reader, host, out, picker)? else {
+    let Some(chosen) = run_picker(reader, host, out, picker, &catalog)? else {
         // Cancelling reports nothing: the status line still names the model in
         // effect, which is the answer to the question that was asked.
         return Ok(());

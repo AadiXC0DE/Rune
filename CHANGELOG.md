@@ -200,6 +200,9 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Fixed
 
+- The model picker accepts unknown tagged IDs such as `qwen3:latest` and sends
+  the chosen ID unchanged. Empty and malformed typed IDs are refused.
+
 - Custom-tool permission targets resolve through the executing host's registry,
   so explicit target denials prevent execution, including when a custom tool
   replaces a built-in name.

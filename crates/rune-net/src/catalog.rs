@@ -289,24 +289,28 @@ impl Catalog {
 /// Returns true when a string is plausibly an endpoint model identifier.
 ///
 /// Accepts the letters, digits, and separators that appear in real identifiers,
-/// and rejects anything with whitespace or a shell metacharacter.
+/// including an optional nonempty `:tag` suffix, and rejects anything with
+/// whitespace or a shell metacharacter.
 fn looks_like_model_id(value: &str) -> bool {
     let value = value.trim();
     if value.is_empty() || value.len() > 256 {
         return false;
     }
-    if !value.contains('/') {
-        // A bare name is accepted only when it has no spaces.
-        return value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'));
-    }
-    value.split('/').all(|segment| {
+    let clean_segment = |segment: &str| {
         !segment.is_empty()
             && segment
                 .bytes()
                 .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
-    })
+    };
+    let name = if let Some((name, tag)) = value.split_once(':') {
+        if !clean_segment(tag) {
+            return false;
+        }
+        name
+    } else {
+        value
+    };
+    name.split('/').all(clean_segment)
 }
 
 /// Builds the catalog for a named connection from its declared model list.
@@ -655,6 +659,33 @@ mod tests {
             catalog.choose("local-llama"),
             ModelChoice::One("local-llama".to_owned())
         );
+    }
+
+    #[test]
+    fn unknown_tagged_identifiers_are_accepted_verbatim() {
+        let catalog = catalog_with(vec![ModelMetadata::new("qwen3:8b")]);
+        for id in ["qwen3:latest", "vendor/Qwen3:Q4_K-M", "org/team/model:1.2"] {
+            assert!(catalog.get(id).is_none());
+            assert_eq!(catalog.choose(id), ModelChoice::One(id.to_owned()));
+        }
+    }
+
+    #[test]
+    fn malformed_unknown_tagged_identifiers_are_refused() {
+        let catalog = Catalog::new("test");
+        for id in [
+            "",
+            " ",
+            ":latest",
+            "qwen3:",
+            "qwen3::latest",
+            "qwen3:bad tag",
+            "qwen3:tag/extra",
+            "vendor//qwen3:latest",
+            "qwen3:$(id)",
+        ] {
+            assert_eq!(catalog.choose(id), ModelChoice::None, "{id:?}");
+        }
     }
 
     #[test]

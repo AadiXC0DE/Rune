@@ -16,16 +16,31 @@ import threading
 import time
 
 
+requests = []
+
+
 class Provider(http.server.BaseHTTPRequestHandler):
     def log_message(self, *_args):
         pass
 
     def do_GET(self):
-        body = json.dumps({"data": [
+        body = json.dumps({"data": [] if tagged_model else [
             {"id": f"menu-model-{index:02}"} for index in range(1, 16)
         ]}).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_POST(self):
+        requests.append(json.loads(self.rfile.read(int(self.headers["Content-Length"]))))
+        body = ('data: ' + json.dumps({"choices": [{
+            "index": 0, "delta": {"content": "TAGGED-MODEL-REPLY"},
+            "finish_reason": "stop",
+        }]}) + '\n\ndata: [DONE]\n\n').encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -37,6 +52,7 @@ def controlling_terminal():
 
 
 custom_completion = len(sys.argv) > 2 and sys.argv[2] == "custom-completion"
+tagged_model = len(sys.argv) > 2 and sys.argv[2] == "tagged-model"
 
 with tempfile.TemporaryDirectory(prefix="rune-terminal-menu-") as directory:
     root = pathlib.Path(directory)
@@ -74,7 +90,7 @@ with tempfile.TemporaryDirectory(prefix="rune-terminal-menu-") as directory:
         "TERM": "xterm-256color",
     })
     master, slave = pty.openpty()
-    rows, columns = (24, 80) if custom_completion else (8, 32)
+    rows, columns = (24, 80) if custom_completion or tagged_model else (8, 32)
     fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", rows, columns, 0, 0))
     child = subprocess.Popen(
         [sys.argv[1]], stdin=slave, stdout=slave, stderr=slave,
@@ -107,7 +123,18 @@ with tempfile.TemporaryDirectory(prefix="rune-terminal-menu-") as directory:
 
     try:
         wait_for("ctrl-c cancel")
-        if custom_completion:
+        if tagged_model:
+            capture("empty-catalog", b"/model\r", "no match for ``")
+            # Empty and malformed IDs must leave the picker open. Typing a
+            # valid ID afterwards proves Enter did not silently dismiss it.
+            capture("invalid-tag", b"\rqwen3:", "no match for `qwen3:`")
+            capture("typed-tag", b"\rlatest", "> use qwen3:latest (not listed)")
+            capture("chosen-tag", b"\r", "model set to qwen3:latest")
+            capture("reply", b"respond using the selected model\r", "TAGGED-MODEL-REPLY")
+            assert requests, "no provider request was sent"
+            assert all(request["model"] == "qwen3:latest" for request in requests), requests
+            assert 'qwen3:latest' in config_file.read_text(), "choice was not saved"
+        elif custom_completion:
             capture("custom-menu-tab", b"/audit", "> /audit-command")
             capture("custom-tab", b"\t", "> /audit-command")
             capture("custom-menu-enter", b"\x15/audit", "> /audit-command")
@@ -122,7 +149,7 @@ with tempfile.TemporaryDirectory(prefix="rune-terminal-menu-") as directory:
             capture("model-closed", b"\x1b", "\x1b[?25h")
         os.write(master, b"/quit\r")
         assert child.wait(timeout=10) == 0
-        print(json.dumps(captures))
+        print(json.dumps({"captures": captures, "requests": requests} if tagged_model else captures))
     finally:
         if child.poll() is None:
             child.kill()
