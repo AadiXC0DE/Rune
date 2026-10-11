@@ -1840,6 +1840,40 @@ mod tests {
     }
 
     #[test]
+    fn tree_previews_escape_saved_newlines_and_controls_without_injecting_rows() {
+        let dir = tempfile::tempdir().expect("temp");
+        let root = Utf8Path::from_path(dir.path()).expect("utf8");
+        let paths = paths(root);
+        let key = id("sessionline1");
+        let mut recorder = Recorder::create(&paths, &key).expect("created");
+        recorder
+            .user_message("question\n999 injected\r\t\0\u{1b}[2J")
+            .expect("wrote");
+        recorder
+            .turn(&outcome("answer\r\nDONE\u{85}\u{2028}\u{2029} 世界"))
+            .expect("wrote");
+        drop(recorder);
+
+        let state = inspect(&paths, &key).expect("inspected");
+        let tree = tree_of(&state);
+        let previews = [
+            "question\\n999 injected\\r\\t\\u{0}\\u{1b}[2J",
+            "answer\\r\\nDONE\\u{85}\\u{2028}\\u{2029} 世界",
+        ];
+        let rendered = render_tree(&tree, &state);
+        let lines: Vec<_> = rendered.lines().collect();
+        // Session heading, branch summary, blank line, table heading, two nodes.
+        assert_eq!(lines.len(), 6, "{rendered}");
+        assert!(lines[1].ends_with(previews[1]), "{rendered}");
+        for (index, expected) in previews.into_iter().enumerate() {
+            let seq = u64::try_from(index + 1).expect("seq");
+            assert_eq!(tree.node(seq).expect("node").preview, expected);
+            assert!(lines[index + 4].ends_with(expected), "{rendered}");
+        }
+        assert!(!rendered.chars().any(|ch| ch.is_control() && ch != '\n'));
+    }
+
+    #[test]
     fn a_long_preview_is_truncated() {
         let dir = tempfile::tempdir().expect("temp");
         let root = Utf8Path::from_path(dir.path()).expect("utf8");

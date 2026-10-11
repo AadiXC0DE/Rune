@@ -200,6 +200,9 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Fixed
 
+- Session-tree previews and branch summaries escape newlines, control characters,
+  and Unicode line separators, keeping each preview on one logical table row.
+
 - Resuming a session restores `/cost` request counts and saved input/output
   token totals before a new request, including usage covered by compaction.
 
