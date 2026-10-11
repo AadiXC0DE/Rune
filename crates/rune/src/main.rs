@@ -761,6 +761,7 @@ fn run_session_migrate(paths: &Paths, launch: &Launch, output: &OutputFlags) -> 
 
 /// Reports the branch structure of a stored session.
 ///
+/// `--id` selects an exact session, taking precedence over a positional selector.
 /// Without an identifier, or with `last`, the most recent session in the current
 /// workspace is used.
 fn run_tree(
@@ -769,11 +770,15 @@ fn run_tree(
     workspace: &Utf8Path,
     output: &OutputFlags,
 ) -> Result<ExitCode> {
-    let id = match launch.args.first().map(String::as_str) {
-        None | Some("last") => {
-            session_log::resolve_target(&ResumeTarget::Latest, paths, workspace)?
+    let id = if let Some(raw) = launch.flag("--id") {
+        raw.parse()?
+    } else {
+        match launch.args.first().map(String::as_str) {
+            None | Some("last") => {
+                session_log::resolve_target(&ResumeTarget::Latest, paths, workspace)?
+            }
+            Some(raw) => raw.parse()?,
         }
-        Some(raw) => raw.parse()?,
     };
     let state = session_log::inspect(paths, &id)?;
     let tree = session_log::tree_of(&state);

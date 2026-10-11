@@ -102,6 +102,10 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Fixed
 
+- `rune tree --id <id>` shows that exact saved session's branch structure without
+  a positional argument, in text or JSON output. The flag takes precedence over
+  a positional selector.
+
 - `rune session --id <id>` inspects that exact saved session without a positional
   argument, in text or JSON output. The flag takes precedence over a positional
   inspection selector.

@@ -93,13 +93,13 @@ Inspect, migrate, or recover one session
 | `--id <id>` | Inspect this exact session identifier, taking precedence over a positional selector. |
 | `--allow-large` | Permit migrating an oversized session. |
 | `--json` | Emit JSON. |
-### `rune tree [last|id] [--json]`
+### `rune tree [last|id] [--json] | rune tree --id <id> [--json]`
 
 Show the branch structure of a session
 
 | Flag | Description |
 |---|---|
-| `--id <id>` | Read the argument as an exact identifier. |
+| `--id <id>` | Show the tree of this exact session identifier, taking precedence over a positional selector. |
 | `--json` | Emit JSON. |
 ### `rune usage [--period <24h|7d|30d>] [--json]`
 

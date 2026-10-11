@@ -289,9 +289,13 @@ pub const SESSIONS: &[CommandSpec] = &[
         name: "tree",
         aliases: &[],
         summary: "Show the branch structure of a session",
-        usage: "rune tree [last|id] [--json]",
+        usage: "rune tree [last|id] [--json] | rune tree --id <id> [--json]",
         flags: &[
-            option("--id", "id", "Read the argument as an exact identifier."),
+            option(
+                "--id",
+                "id",
+                "Show the tree of this exact session identifier, taking precedence over a positional selector.",
+            ),
             flag("--json", "Emit JSON."),
         ],
         requirements: Requirements::CONFIG,
