@@ -216,10 +216,28 @@ fn logout_alias_shows_status_until_given_a_logout_action() {
 }
 
 #[test]
-fn help_for_an_unknown_command_says_so() {
-    let out = run(&["help", "frobnicate"]);
-    assert!(out.stdout.contains("frobnicate"));
-    assert!(out.stdout.contains("rune help"));
+fn help_for_an_unknown_command_fails_with_a_hint() {
+    for args in [
+        &["help", "not-real"][..],
+        &["--help", "not-real"][..],
+        &["-h", "not-real"][..],
+    ] {
+        let out = run(args);
+        assert_eq!(out.status, Some(1), "{args:?}: {}", out.stdout);
+        assert!(out.stdout.contains("`not-real` is not a command"));
+        assert!(out.stdout.contains("run `rune help` to list the commands"));
+        assert!(out.stderr.is_empty(), "{args:?}: {}", out.stderr);
+    }
+}
+
+#[test]
+fn top_level_help_forms_exit_zero() {
+    for args in [&["help"][..], &["--help"][..], &["-h"][..]] {
+        let out = run(args);
+        assert_eq!(out.status, Some(0), "{args:?}: {}", out.stderr);
+        assert!(out.stdout.contains("Usage:"), "{args:?}: {}", out.stdout);
+        assert!(out.stderr.is_empty(), "{args:?}: {}", out.stderr);
+    }
 }
 
 #[test]

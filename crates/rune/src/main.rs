@@ -87,17 +87,21 @@ fn main() -> ExitCode {
 fn handle_runtime_free(launch: &Launch) -> Option<ExitCode> {
     match launch.command {
         Command::Help => {
-            let text = match launch.args.first() {
-                Some(name) => help::render_command(name).unwrap_or_else(|| {
-                    format!(
-                        "rune: `{name}` is not a command\n{}\n",
-                        help::unknown_command_hint()
-                    )
-                }),
-                None => help::render_top_level(),
+            let (text, code) = match launch.args.first() {
+                Some(name) => match help::render_command(name) {
+                    Some(text) => (text, EXIT_OK),
+                    None => (
+                        format!(
+                            "rune: `{name}` is not a command\n{}\n",
+                            help::unknown_command_hint()
+                        ),
+                        EXIT_FAILURE,
+                    ),
+                },
+                None => (help::render_top_level(), EXIT_OK),
             };
             print!("{text}");
-            Some(ExitCode::from(EXIT_OK))
+            Some(ExitCode::from(code))
         }
         Command::Version => {
             println!("{}", version::version_line());

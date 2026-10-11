@@ -102,6 +102,9 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Fixed
 
+- Help for an unknown command, such as `rune help not-real`, exits 1 while
+  preserving the diagnostic and hint. Valid command and top-level help exit 0.
+
 - `rune ask --json` prints a failed request's error once on stderr, followed by
   its hint when available, while preserving the JSON failure result on stdout.
 
