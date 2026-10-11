@@ -102,6 +102,9 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Fixed
 
+- `rune ask --json` prints a failed request's error once on stderr, followed by
+  its hint when available, while preserving the JSON failure result on stdout.
+
 - `rune tree --id <id>` shows that exact saved session's branch structure without
   a positional argument, in text or JSON output. The flag takes precedence over
   a positional selector.

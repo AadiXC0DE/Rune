@@ -27,6 +27,38 @@ fn isolated_command(dir: &tempfile::TempDir) -> Command {
 }
 
 #[test]
+fn ask_without_a_provider_reports_one_error_and_one_hint() {
+    for args in [
+        vec!["ask", "hello"],
+        vec!["ask", "--json", "hello"],
+        vec!["--json", "ask", "hello"],
+    ] {
+        let dir = tempfile::tempdir().expect("isolated state");
+        let output = isolated_command(&dir).args(&args).output().expect("ask");
+
+        assert_eq!(output.status.code(), Some(1), "{args:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(
+            stderr,
+            "rune: authentication_required: no model provider is connected\n\
+             hint: run `rune connect` to choose an endpoint and store a credential\n",
+            "{args:?}"
+        );
+        if args.contains(&"--json") {
+            let result: Value = serde_json::from_slice(&output.stdout).expect("one JSON result");
+            assert_eq!(result["exit_code"], 1);
+            assert_eq!(result["error_code"], "authentication_required");
+            assert_eq!(result["error"], "no model provider is connected");
+            assert_eq!(result["output"], "");
+            assert_eq!(result["final_output"], "");
+        } else {
+            assert!(output.stdout.is_empty());
+        }
+        assert!(!dir.path().join("state").exists());
+    }
+}
+
+#[test]
 fn ask_json_reports_an_empty_prompt_as_one_failure_object() {
     for args in [
         vec!["ask", "--json"],

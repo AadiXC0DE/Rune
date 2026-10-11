@@ -29,6 +29,7 @@ mod spec;
 mod version;
 mod web_client;
 
+use std::io::Write;
 use std::process::ExitCode;
 
 use camino::{Utf8Path, Utf8PathBuf};
@@ -288,7 +289,8 @@ fn run_ask(
             if options.json {
                 let result =
                     ask::JsonResult::failure(&settings.model, &err, i32::from(EXIT_FAILURE));
-                let _ = ask::report(&result, &options);
+                // The returned error is reported by main, including its hint.
+                let _ = writeln!(std::io::stdout().lock(), "{}", result.render()?);
             }
             Err(err)
         }
