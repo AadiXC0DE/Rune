@@ -59,7 +59,13 @@ pub fn builtin_rules(mode: &PermissionMode) -> RuleSet {
 
     // Reading is what an agent does constantly; asking each time would make the
     // default unusable.
-    for tool in ["read_file", "glob_files", "grep_files", "read_tool_result"] {
+    for tool in [
+        "read_file",
+        "glob_files",
+        "grep_files",
+        "read_tool_result",
+        "git_diff",
+    ] {
         rules.push(Rule::allow(tool, "*", Layer::Default));
     }
 
@@ -234,6 +240,29 @@ mod tests {
         let rules = builtin_rules(&PermissionMode::Auto);
         let decision = rules.evaluate("read_file", "src/main.rs", Outcome::Ask);
         assert_eq!(decision.outcome, Outcome::Allow);
+    }
+
+    #[test]
+    fn git_diff_is_allowed_by_default_and_user_denials_take_precedence() {
+        for mode in [PermissionMode::Auto, PermissionMode::Ask] {
+            let settings = Settings {
+                permission_mode: mode,
+                ..default_settings()
+            };
+            let defaults = builtin_rules(&mode);
+            assert_eq!(
+                defaults.evaluate("git_diff", "", Outcome::Ask).outcome,
+                Outcome::Allow
+            );
+            let mut extra = RuleSet::new();
+            extra.push(Rule::deny("git_diff", "*", Layer::User));
+            assert_eq!(
+                rules_for(&settings, &extra)
+                    .evaluate("git_diff", "", Outcome::Ask)
+                    .outcome,
+                Outcome::Deny
+            );
+        }
     }
 
     #[test]

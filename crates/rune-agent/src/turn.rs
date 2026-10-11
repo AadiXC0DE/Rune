@@ -919,7 +919,7 @@ fn execute_call(
 /// answer for presentation purposes.
 fn infer_activity(name: &str) -> Activity {
     match name {
-        "read_file" | "read_tool_result" => Activity::Read,
+        "read_file" | "read_tool_result" | "git_diff" => Activity::Read,
         "glob_files" => Activity::List,
         "grep_files" => Activity::Search,
         "write_file" | "rename_file" | "create_directory" => Activity::Write,
@@ -1273,6 +1273,7 @@ mod tests {
     #[test]
     fn activity_is_inferred_for_each_builtin_name() {
         assert_eq!(infer_activity("read_file"), Activity::Read);
+        assert_eq!(infer_activity("git_diff"), Activity::Read);
         assert_eq!(infer_activity("glob_files"), Activity::List);
         assert_eq!(infer_activity("grep_files"), Activity::Search);
         assert_eq!(infer_activity("write_file"), Activity::Write);

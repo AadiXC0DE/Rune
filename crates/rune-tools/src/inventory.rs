@@ -19,7 +19,7 @@ use crate::vision::Vision;
 use crate::web::{WebFetch, WebSearch};
 use crate::workspace::FileLimits;
 use crate::{
-    CreateDirectory, EditFile, GlobFiles, GrepFiles, ReadFile, ReadToolResult, RenameFile,
+    CreateDirectory, EditFile, GitDiff, GlobFiles, GrepFiles, ReadFile, ReadToolResult, RenameFile,
     WriteFile,
 };
 
@@ -32,6 +32,7 @@ pub const ADVERTISEMENT_ORDER: &[&str] = &[
     "grep_files",
     "read_file",
     "read_tool_result",
+    "git_diff",
     "write_file",
     "edit_file",
     "rename_file",
@@ -131,6 +132,7 @@ pub fn builtin_with_answerer(
     registry.insert(Box::new(GrepFiles::with_limits(*limits)))?;
     registry.insert(Box::new(ReadFile::with_limits(*limits)))?;
     registry.insert(Box::new(ReadToolResult::new(budget)))?;
+    registry.insert(Box::new(GitDiff::with_limits(*limits)))?;
     registry.insert(Box::new(WriteFile))?;
     registry.insert(Box::new(EditFile))?;
     registry.insert(Box::new(RenameFile))?;
@@ -455,7 +457,13 @@ mod tests {
     fn the_read_only_set_is_identified() {
         let registry = builtin_default().expect("built");
         let read_only = registry.read_only_names();
-        for name in ["glob_files", "grep_files", "read_file", "read_tool_result"] {
+        for name in [
+            "glob_files",
+            "grep_files",
+            "read_file",
+            "read_tool_result",
+            "git_diff",
+        ] {
             assert!(read_only.contains(&name), "`{name}` should be read only");
         }
         for name in ["write_file", "edit_file", "rename_file", "create_directory"] {

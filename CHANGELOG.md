@@ -6,6 +6,12 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Added
 
+- `git_diff` inspects staged or unstaged tracked changes under the workspace.
+  Output caps include the view label and truncation marker. Inspection disables
+  external diff commands, text conversion, clean filters, and optional index
+  writes. Partial-clone configurations are refused to prevent implicit fetches;
+  untracked files and submodules are excluded.
+
 - `create_directory` creates nested directories within permitted workspace roots,
   with policy checks and bounded summaries. Existing directories succeed without
   changes; files and paths outside permitted roots are refused. Each call creates
