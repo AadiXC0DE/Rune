@@ -2026,7 +2026,7 @@ Resource accumulation after cancellation, session holder handover and concurrent
 - [x] R-147 | T2 | fix | docs | Align repository links and document package version policy | acceptance: Cargo and README links must name the intended maintained repository; a check must enforce the documented independent-or-shared Node version policy.
 - [x] R-148 | T2 | fix | observability | Preserve typed I/O causes in RuneError | acceptance: A fixture permission-denied file write must retain its source error and report a filesystem failure rather than transport_failure.
 - [x] R-149 | T2 | fix | observability | Preserve provider codes and retry metadata in JSON errors | acceptance: Serve a fixture provider code and Retry-After and observe both retained in structured error detail with secrets redacted.
-- [ ] R-150 | T2 | fix | input | Preserve completion selection across resize events | acceptance: Select /new, resize from 80x24 to 32x10 and observe /new still selected.
+- [x] R-150 | T2 | fix | input | Preserve completion selection across resize events | acceptance: Select /new, resize from 80x24 to 32x10 and observe /new still selected.
 - [ ] R-151 | T2 | fix | tui | Wrap settled slash-command output | acceptance: Run /help at 40 and 80 columns and recover every full command description from scrollback.
 - [ ] R-152 | T2 | fix | input | Complete discovered custom slash commands | acceptance: Create .rune/commands/audit-command.md, type /audit and select the displayed /audit-command candidate.
 - [ ] R-153 | T2 | fix | sessions | Restore saved token totals for /cost | acceptance: Resume a three-turn fixture and observe /cost reporting its saved requests and tokens before a new request.

@@ -200,6 +200,9 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Fixed
 
+- Completion menus preserve the selected row across terminal resizes and
+  ignored keys. Editing the draft still resets the selection for new matches.
+
 - Provider JSON failures preserve redacted provider codes and retry delays in
   structured error detail. `rune ask --json` reports nonempty `error_detail`
   alongside its existing message and stable error code.

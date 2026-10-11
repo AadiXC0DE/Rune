@@ -176,6 +176,53 @@ fn short_menu_grids() {
 }
 
 #[test]
+fn completion_selection_survives_resize_and_ignored_keys_but_resets_on_edit() {
+    let captures: Vec<Capture> = serde_json::from_slice(&record(
+        include_str!("terminal_replay.py"),
+        Some("completion-resize"),
+    ))
+    .expect("completion resize captures");
+    assert_eq!(captures.len(), 7);
+    let mut grid = Grid::new(80, 24).expect("grid");
+    for capture in captures {
+        let size = if capture.stage == "completion-shrunk" {
+            (32, 10)
+        } else {
+            (80, 24)
+        };
+        assert_eq!((capture.cols, capture.rows), size);
+        grid.resize(capture.cols, capture.rows).expect("resize");
+        grid.feed(&capture.bytes).expect("replay");
+        let screen = grid.text();
+        let input = grid.row_text(grid.cursor().row);
+        match capture.stage.as_str() {
+            "completion-accepted" => assert_eq!(input, "> /new", "{screen}"),
+            "completion-edited" => {
+                assert_eq!(input, "> /m", "{screen}");
+                assert!(
+                    screen.lines().any(|row| row.starts_with("> /model ")),
+                    "{screen}"
+                );
+            }
+            "completion-cleared" => {
+                assert_eq!(input, ">", "{screen}");
+                assert!(!screen.contains("> /model"), "{screen}");
+            }
+            _ => {
+                assert_eq!(input, "> /", "{}: {screen}", capture.stage);
+                assert!(
+                    screen
+                        .lines()
+                        .any(|row| row == "> /new" || row.starts_with("> /new ")),
+                    "{}: {screen}",
+                    capture.stage
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn draft_resize_grids() {
     let actual = event_replay("resize");
     assert_eq!(

@@ -134,7 +134,7 @@ def controlling_terminal():
 
 
 scenario = sys.argv[2]
-assert scenario in {"resize", "narrow", "menu-resize", "code", "transcript", "compact"}, scenario
+assert scenario in {"resize", "narrow", "menu-resize", "completion-resize", "code", "transcript", "compact"}, scenario
 with tempfile.TemporaryDirectory(prefix="rune-r034-") as directory:
     root = pathlib.Path(directory)
     config = root / "config" / "rune"
@@ -173,7 +173,7 @@ with tempfile.TemporaryDirectory(prefix="rune-r034-") as directory:
     if scenario == "transcript":
         environment["RUNE_PERMISSION_MODE"] = "full-access"
     cols, rows = {"resize": (32, 24), "narrow": (12, 24),
-                  "menu-resize": (80, 24), "code": (32, 24),
+                  "menu-resize": (80, 24), "completion-resize": (80, 24), "code": (32, 24),
                   "transcript": (80, 24), "compact": (80, 4)}[scenario]
     master, slave = pty.openpty()
     fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
@@ -247,6 +247,18 @@ with tempfile.TemporaryDirectory(prefix="rune-r034-") as directory:
             capture("model-down", b"\x1b[B", "> replay-model-02")
             capture("model-closed", b"\x1b")
             capture("closed-grown", size=(80, 24))
+            assert not prompts, prompts
+        elif scenario == "completion-resize":
+            capture("completion-selected", b"/" + b"\x1b[B" * 8, "> /new")
+            # No key is sent on either resize. Rust checks the selected row.
+            capture("completion-shrunk", size=(32, 10))
+            capture("completion-grown", size=(80, 24))
+            # F2 has no binding and must leave the selection alone.
+            capture("completion-ignored", b"\x1bOQ")
+            capture("completion-accepted", b"\t")
+            # Editing must still reset the selection for the narrowed list.
+            capture("completion-edited", b"\x03/" + b"\x1b[B" * 8 + b"m", "> /model")
+            capture("completion-cleared", b"\x03")
             assert not prompts, prompts
         elif scenario == "code":
             # The provider pauses until each live frame has been captured,

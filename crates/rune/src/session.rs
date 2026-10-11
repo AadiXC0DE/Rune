@@ -2895,7 +2895,14 @@ fn await_submission(
         );
         draw_prompt(reader, host, out, &rows, marker)?;
 
+        let draft = reader.line().to_owned();
+        let caret = reader.cursor_byte();
         let key = reader.read_key();
+        // Resize and other non-edit events still redraw the prompt, but must
+        // not reset its completion selection or dismiss an open path menu.
+        if key == KeyAction::Ignored && reader.line() == draft && reader.cursor_byte() == caret {
+            continue;
+        }
         if key == KeyAction::Transcript {
             view_transcript(reader, host)?;
             continue;
