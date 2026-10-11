@@ -55,19 +55,29 @@ the validated object the binary printed, including `error` and `error_code`, or
 | --- | --- |
 | `ask(prompt, options)` | Runs one request, resolves with the parsed result object |
 | `resolveBinary(options)` | Returns the path the next `ask` would run |
-| `RuneError` | Base class, with a `code` of `BINARY_NOT_FOUND`, `EXIT`, `OUTPUT`, `TIMEOUT`, `ABORTED`, or `SIGNALED` |
+| `RuneError` | Base class, with a `code` of `BINARY_NOT_FOUND`, `EXIT`, `OUTPUT`, `OUTPUT_LIMIT`, `TIMEOUT`, `ABORTED`, or `SIGNALED` |
 | `RuneBinaryNotFoundError` | No executable through the option, `RUNE_BIN`, or `PATH` |
 | `RuneExitError` | Non-zero exit, with `exitCode`, `result`, and `stderr` |
 | `RuneOutputError` | Clean exit with no valid result object on standard output; names missing or invalid fields |
+| `RuneOutputLimitError` | Combined stdout and stderr exceeded the capture cap; carries `maxOutputBytes` and the `stream` that exceeded it |
 
 `options` accepts `bin`, `model`, `effort`, `cwd`, `env`, `noSave`, `timeoutMs`,
-and `signal`. Types for every field of the result object are in `index.d.ts`.
+`maxOutputBytes`, and `signal`. Types for every field of the result object are in
+`index.d.ts`.
 The binding validates required fields, token counts when present, and tool call
 names and statuses before returning a result. `resolved_provider` may be `null`,
 and unreported token counts and failure fields may be absent. Extra fields are
 preserved. Wrapper progress lines are allowed; the last valid result is used.
 `timeoutMs` must be a finite positive number at most 2,147,483,647 milliseconds.
 Invalid values throw `TypeError` before resolving or spawning the binary.
+
+Captured stdout and stderr share an 8 MiB byte cap by default, including wrapper
+progress lines and diagnostics. Set `maxOutputBytes` to a positive safe integer
+to change it. Exactly the cap is allowed; the next byte triggers
+`RuneOutputLimitError` with code `OUTPUT_LIMIT`, discards captured output, and
+kills the child. Further output is drained without retention while the child
+stops. A child that ignores SIGTERM is sent SIGKILL after a two-second grace.
+Invalid caps throw `TypeError` before resolving or spawning the binary.
 
 ## Running the tests
 

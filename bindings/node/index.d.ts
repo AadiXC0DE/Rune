@@ -21,6 +21,7 @@ export type RuneEffort =
  * - `BINARY_NOT_FOUND`: no executable through the option, `RUNE_BIN`, or `PATH`.
  * - `EXIT`: the binary exited non-zero.
  * - `OUTPUT`: the binary exited cleanly without printing a valid result object.
+ * - `OUTPUT_LIMIT`: combined stdout and stderr exceeded `maxOutputBytes`.
  * - `TIMEOUT`: the process was killed after `timeoutMs`.
  * - `ABORTED`: the caller aborted through `signal`.
  * - `SIGNALED`: the process was terminated by another signal.
@@ -29,6 +30,7 @@ export type RuneErrorCode =
   | "BINARY_NOT_FOUND"
   | "EXIT"
   | "OUTPUT"
+  | "OUTPUT_LIMIT"
   | "TIMEOUT"
   | "ABORTED"
   | "SIGNALED";
@@ -100,6 +102,8 @@ export interface AskOptions {
   noSave?: boolean;
   /** Kill the process after this many milliseconds; finite, positive, and at most 2147483647. */
   timeoutMs?: number;
+  /** Combined stdout/stderr capture cap in bytes; positive safe integer, defaults to 8388608 (8 MiB). */
+  maxOutputBytes?: number;
   /** Kill the process when this signal aborts. */
   signal?: AbortSignal;
 }
@@ -138,6 +142,15 @@ export class RuneOutputError extends RuneError {
   stderr: string;
 }
 
+/** Combined stdout and stderr exceeded the capture budget; the process is killed. */
+export class RuneOutputLimitError extends RuneError {
+  constructor(maxOutputBytes: number, stream: "stdout" | "stderr");
+  /** Configured combined byte cap. */
+  maxOutputBytes: number;
+  /** The stream whose next chunk exceeded the cap. */
+  stream: "stdout" | "stderr";
+}
+
 /**
  * Resolves the executable to run: the `bin` option, then `RUNE_BIN`, then an
  * executable named `rune` on `PATH`.
@@ -157,6 +170,7 @@ export function resolveBinary(options?: { bin?: string; cwd?: string }): string;
  * @throws {RuneExitError} When the process exits non-zero.
  * @throws {RuneOutputError} When the process exits cleanly without a valid object;
  * missing or invalid fields are named in the message.
+ * @throws {RuneOutputLimitError} When combined stdout and stderr exceed `maxOutputBytes`.
  * @throws {RuneError} With code `TIMEOUT`, `ABORTED`, or `SIGNALED`.
  */
 export function ask(prompt: string, options?: AskOptions): Promise<AskResult>;

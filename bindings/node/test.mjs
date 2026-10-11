@@ -20,6 +20,7 @@ import {
   RuneExitError,
   RuneError,
   RuneOutputError,
+  RuneOutputLimitError,
 } from "./index.js";
 
 // The binding drives a process, so these tests drive a stub instead of the real
@@ -271,8 +272,9 @@ const validResult = {
   tool_calls: [],
 };
 
-function askWithOutput(stdout, exitCode = 0) {
+function askWithOutput(stdout, exitCode = 0, options = {}) {
   return ask("hello", {
+    ...options,
     bin: stub,
     env: {
       RUNE_STUB_MODE: "result",
@@ -282,6 +284,174 @@ function askWithOutput(stdout, exitCode = 0) {
     },
   });
 }
+
+function nodeStub(name, source) {
+  const executable = join(first.directory, name);
+  writeFileSync(executable, `#!${process.execPath}\n${source}`, { mode: 0o755 });
+  chmodSync(executable, 0o755);
+  return executable;
+}
+
+test("stdout and stderr each trigger a typed output-limit failure in bytes", async (t) => {
+  for (const stream of ["stdout", "stderr"]) {
+    await t.test(stream, async () => {
+      // Fifty characters are 150 UTF-8 bytes, even though they fit in 100 code units.
+      const bin = nodeStub(`rune-large-${stream}`, `process.${stream}.write("界".repeat(50));`);
+      await assert.rejects(ask("hello", { bin, maxOutputBytes: 100 }), (error) => {
+        assert.ok(error instanceof RuneOutputLimitError);
+        assert.ok(error instanceof RuneError);
+        assert.equal(error.code, "OUTPUT_LIMIT");
+        assert.equal(error.name, "RuneOutputLimitError");
+        assert.equal(error.maxOutputBytes, 100);
+        assert.equal(error.stream, stream);
+        assert.match(error.message, /combined output limit of 100 bytes/);
+        return true;
+      });
+    });
+  }
+});
+
+test("the combined cap allows exactly the limit and rejects the next byte", async () => {
+  const result = { ...validResult, output: "界", final_output: "界" };
+  const stdout = JSON.stringify(result);
+  const maxOutputBytes = Buffer.byteLength(`${stdout}\nstub diagnostic`);
+  assert.deepEqual(await askWithOutput(stdout, 0, { maxOutputBytes }), result);
+  await assert.rejects(askWithOutput(stdout, 0, { maxOutputBytes: maxOutputBytes - 1 }), (error) => {
+    assert.ok(error instanceof RuneOutputLimitError);
+    assert.equal(error.maxOutputBytes, maxOutputBytes - 1);
+    assert.ok(["stdout", "stderr"].includes(error.stream));
+    return true;
+  });
+});
+
+test("the default output cap rejects oversized output without an option", async () => {
+  const bin = nodeStub("rune-default-cap", 'process.stderr.write(Buffer.alloc(9 * 1024 * 1024));');
+  await assert.rejects(ask("hello", { bin }), (error) => {
+    assert.ok(error instanceof RuneOutputLimitError);
+    assert.equal(error.maxOutputBytes, 8 * 1024 * 1024);
+    assert.equal(error.stream, "stderr");
+    return true;
+  });
+});
+
+test("output from an inherited pipe is bounded after the parent exits", { timeout: 10_000 }, async () => {
+  const writer = `
+    process.stdout.on("error", () => process.exit(0));
+    setTimeout(() => {
+      process.stdout.write(Buffer.alloc(1024));
+      setInterval(() => process.stdout.write("x"), 50);
+    }, 200);
+  `;
+  const bin = nodeStub("rune-inherited-output", `
+    const { spawn } = require("node:child_process");
+    spawn(process.execPath, ["-e", ${JSON.stringify(writer)}], { stdio: "inherit" }).unref();
+    process.exit(0);
+  `);
+  await assert.rejects(ask("hello", { bin, maxOutputBytes: 100, timeoutMs: 5000 }), (error) => {
+    assert.ok(error instanceof RuneOutputLimitError);
+    assert.equal(error.stream, "stdout");
+    return true;
+  });
+});
+
+test("invalid output caps fail before binary lookup or spawning", async () => {
+  const originalSpawn = childProcess.spawn;
+  let spawnCalls = 0;
+  childProcess.spawn = (...args) => {
+    spawnCalls += 1;
+    return originalSpawn(...args);
+  };
+  syncBuiltinESMExports();
+  try {
+    for (const maxOutputBytes of [0, -1, 0.5, Infinity, -Infinity, NaN, 2 ** 53, "100", null]) {
+      await assert.rejects(
+        ask("hello", { bin: join(first.directory, "absent"), maxOutputBytes }),
+        (error) => error instanceof TypeError && /maxOutputBytes/.test(error.message),
+      );
+    }
+    assert.equal(spawnCalls, 0);
+  } finally {
+    childProcess.spawn = originalSpawn;
+    syncBuiltinESMExports();
+  }
+});
+
+test("output-limit shutdown drains both streams with bounded retained memory", { timeout: 15_000 }, async (t) => {
+  const bin = nodeStub("rune-flood", `
+    process.on("SIGTERM", () => {});
+    const chunk = Buffer.alloc(64 * 1024);
+    async function flood() {
+      for (;;) {
+        await new Promise((resolve) => process.stdout.write(chunk, resolve));
+        await new Promise((resolve) => process.stderr.write(chunk, resolve));
+      }
+    }
+    flood();
+  `);
+  // Isolate the heap from other tests and collect before measuring retained
+  // buffers. The stub continues emitting far beyond the cap during SIGTERM grace.
+  const source = `
+    import assert from "node:assert/strict";
+    import childProcess from "node:child_process";
+    import { syncBuiltinESMExports } from "node:module";
+    import { ask, RuneOutputLimitError } from ${JSON.stringify(new URL("./index.js", import.meta.url).href)};
+    global.gc();
+    const baseline = process.memoryUsage().arrayBuffers;
+    const maxOutputBytes = 1024 * 1024;
+    let observed = 0;
+    let samples = 0;
+    let retained = 0;
+    let nextSample = 4 * 1024 * 1024;
+    const kills = [];
+    const originalSpawn = childProcess.spawn;
+    childProcess.spawn = (...args) => {
+      const child = originalSpawn(...args);
+      const originalKill = child.kill.bind(child);
+      child.kill = (signal) => {
+        kills.push(signal ?? "SIGTERM");
+        return originalKill(signal);
+      };
+      for (const stream of [child.stdout, child.stderr]) {
+        stream.on("data", (chunk) => {
+          observed += chunk.length;
+          if (observed < nextSample) return;
+          nextSample = observed + 4 * 1024 * 1024;
+          global.gc();
+          global.gc();
+          samples += 1;
+          retained = Math.max(retained, process.memoryUsage().arrayBuffers - baseline);
+        });
+      }
+      return child;
+    };
+    syncBuiltinESMExports();
+    await assert.rejects(ask("hello", { bin: ${JSON.stringify(bin)}, maxOutputBytes, timeoutMs: 6000 }), RuneOutputLimitError);
+    assert.deepEqual(kills, ["SIGTERM", "SIGKILL"]);
+    assert.ok(observed >= 32 * 1024 * 1024, "stub must emit well beyond the cap");
+    assert.ok(samples >= 8, "measure retained memory repeatedly during grace");
+    assert.ok(retained <= maxOutputBytes + 2 * 1024 * 1024, "retained buffers exceeded cap plus pipe allowance: " + retained);
+    console.log(JSON.stringify({ observed, samples, retained, maxOutputBytes }));
+  `;
+  const runner = childProcess.spawn(process.execPath, ["--expose-gc", "--input-type=module", "-e", source], {
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  let stdout = "";
+  let stderr = "";
+  runner.stdout.on("data", (chunk) => {
+    stdout += chunk;
+  });
+  runner.stderr.on("data", (chunk) => {
+    stderr += chunk;
+  });
+  const status = await new Promise((resolve, reject) => {
+    runner.once("error", reject);
+    runner.once("close", resolve);
+  });
+  assert.equal(status, 0, stderr);
+  const measurements = JSON.parse(stdout);
+  assert.ok(measurements.observed > measurements.maxOutputBytes);
+  t.diagnostic(JSON.stringify(measurements));
+});
 
 test("a result containing only output and exit_code names every missing field", async () => {
   const stdout = JSON.stringify({ output: "ok", exit_code: 0 });

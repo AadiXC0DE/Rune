@@ -2012,7 +2012,7 @@ Resource accumulation after cancellation, session holder handover and concurrent
 - [x] R-133 | T2 | fix | node | Resolve explicit relative binaries against options.cwd | acceptance: Place rune only in a scratch cwd, call ask with bin ./rune and observe the stub result.
 - [x] R-134 | T2 | fix | node | Reject nonfinite and overflowing timeout values | acceptance: Infinity, NaN and values beyond the timer range must fail validation without spawning a child or emitting TimeoutOverflowWarning.
 - [x] R-135 | T2 | fix | node | Validate every required ask-result field | acceptance: A stub returning only output and exit_code must raise RuneOutputError naming missing fields.
-- [ ] R-136 | T2 | fix | node | Bound captured child stdout and stderr | acceptance: Run a stub that writes beyond the configured output cap and observe a typed output-limit failure with bounded memory.
+- [x] R-136 | T2 | fix | node | Bound captured child stdout and stderr | acceptance: Run a stub that writes beyond the configured output cap and observe a typed output-limit failure with bounded memory.
 - [ ] R-137 | T2 | fix | node | Find rune.exe on Windows | acceptance: On Windows with only rune.exe in a fixture PATH, resolveBinary must return its executable path.
 - [ ] R-138 | T2 | feature | node | Expose provider and offline process options | acceptance: Call ask with provider and offline options and assert both flags reach the stub before the command delimiter.
 - [ ] R-139 | T2 | fix | xtask | Honor CARGO_TARGET_DIR in budget and release artifact lookup | acceptance: Build with a scratch CARGO_TARGET_DIR and observe budget and release read its binary rather than target/release.

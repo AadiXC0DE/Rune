@@ -19,6 +19,7 @@ const EFFORTS = ["auto", "none", "minimal", "low", "medium", "high", "xhigh", "m
 
 // Node clamps larger delays to 1 ms and emits TimeoutOverflowWarning.
 const MAX_TIMEOUT_MS = 2 ** 31 - 1;
+const DEFAULT_MAX_OUTPUT_BYTES = 8 * 1024 * 1024;
 
 /** Base class for every failure this module reports. */
 export class RuneError extends Error {
@@ -59,6 +60,19 @@ export class RuneOutputError extends RuneError {
     this.name = "RuneOutputError";
     this.stdout = stdout;
     this.stderr = stderr;
+  }
+}
+
+/** The child's combined stdout and stderr exceeded the capture budget. */
+export class RuneOutputLimitError extends RuneError {
+  constructor(maxOutputBytes, stream) {
+    super(
+      "OUTPUT_LIMIT",
+      `rune ask exceeded the combined output limit of ${maxOutputBytes} bytes while reading ${stream}`,
+    );
+    this.name = "RuneOutputLimitError";
+    this.maxOutputBytes = maxOutputBytes;
+    this.stream = stream;
   }
 }
 
@@ -131,7 +145,16 @@ export async function ask(prompt, options = {}) {
     throw new TypeError("the options must be an object");
   }
 
-  const { model, effort, cwd, env, noSave = false, timeoutMs, signal } = options;
+  const {
+    model,
+    effort,
+    cwd,
+    env,
+    noSave = false,
+    timeoutMs,
+    signal,
+    maxOutputBytes = DEFAULT_MAX_OUTPUT_BYTES,
+  } = options;
   if (model !== undefined && (typeof model !== "string" || model.length === 0)) {
     throw new TypeError("the model option must be a non-empty string");
   }
@@ -145,6 +168,9 @@ export async function ask(prompt, options = {}) {
     throw new TypeError(
       `the timeoutMs option must be a finite positive number no greater than ${MAX_TIMEOUT_MS}`,
     );
+  }
+  if (!(Number.isSafeInteger(maxOutputBytes) && maxOutputBytes > 0)) {
+    throw new TypeError("the maxOutputBytes option must be a positive safe integer");
   }
 
   const executable = resolveBinary(options);
@@ -167,8 +193,8 @@ export async function ask(prompt, options = {}) {
 
   const stdout = [];
   const stderr = [];
-  child.stdout.on("data", (chunk) => stdout.push(chunk));
-  child.stderr.on("data", (chunk) => stderr.push(chunk));
+  let capturedBytes = 0;
+  let outputLimitStream = null;
 
   let interruption = null;
   let grace = null;
@@ -181,6 +207,28 @@ export async function ask(prompt, options = {}) {
     grace = setTimeout(() => child.kill("SIGKILL"), 2000);
     grace.unref();
   };
+  const capture = (chunks, chunk, stream) => {
+    // Keep draining after interruption so an uncooperative child cannot block
+    // on a full pipe during the kill grace, but retain no more output.
+    if (interruption !== null) return;
+    if (chunk.length > maxOutputBytes - capturedBytes) {
+      outputLimitStream = stream;
+      stdout.length = 0;
+      stderr.length = 0;
+      interrupt("OUTPUT_LIMIT");
+      // Output may arrive after the parent exited while an inherited pipe
+      // remains open. In that case there will be no later exit event to await.
+      if (child.exitCode !== null || child.signalCode !== null) {
+        child.stdout.destroy();
+        child.stderr.destroy();
+      }
+      return;
+    }
+    capturedBytes += chunk.length;
+    chunks.push(chunk);
+  };
+  child.stdout.on("data", (chunk) => capture(stdout, chunk, "stdout"));
+  child.stderr.on("data", (chunk) => capture(stderr, chunk, "stderr"));
   const timer = timeoutMs === undefined ? null : setTimeout(() => interrupt("TIMEOUT"), timeoutMs);
   const onAbort = () => interrupt("ABORTED");
   if (signal !== undefined) {
@@ -225,9 +273,9 @@ export async function ask(prompt, options = {}) {
     if (signal !== undefined) signal.removeEventListener("abort", onAbort);
   }
 
-  const stdoutText = Buffer.concat(stdout).toString("utf8");
-  const stderrText = Buffer.concat(stderr).toString("utf8");
-
+  if (interruption === "OUTPUT_LIMIT") {
+    throw new RuneOutputLimitError(maxOutputBytes, outputLimitStream);
+  }
   if (interruption === "TIMEOUT") {
     throw new RuneError("TIMEOUT", `rune ask did not finish within ${timeoutMs} ms`);
   }
@@ -238,6 +286,8 @@ export async function ask(prompt, options = {}) {
     throw new RuneError("SIGNALED", `rune ask was terminated by signal ${term ?? "unknown"}`);
   }
 
+  const stdoutText = Buffer.concat(stdout).toString("utf8");
+  const stderrText = Buffer.concat(stderr).toString("utf8");
   const { result, detail } = parseResult(stdoutText);
   if (code !== 0) {
     throw new RuneExitError(code, result, stderrText);

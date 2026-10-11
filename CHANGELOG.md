@@ -182,6 +182,10 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Fixed
 
+- The Node binding bounds combined child stdout and stderr to 8 MiB by default,
+  configurable with `maxOutputBytes`. Exceeding the cap discards captured output,
+  kills the child, and raises `RuneOutputLimitError` with code `OUTPUT_LIMIT`.
+
 - The Node binding validates every required ask-result field, nested token counts
   and tool calls before returning JSON results. A clean exit with an incomplete
   or mistyped result raises `RuneOutputError` naming missing or invalid fields.
