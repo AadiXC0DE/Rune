@@ -523,6 +523,9 @@ Notable changes, newest first. Each entry describes what a user can observe.
 - Changing the model with `RUNE_MODEL` discards the previous model's declared
   context window and reports the default capacity and source. An override naming
   the same model preserves its declared window.
+- Changing the provider with `RUNE_PROVIDER` selects its configured model and
+  declared capacity, falling back to `models.default`. Without either entry,
+  the previous model and capacity are cleared. `RUNE_MODEL` takes precedence.
 - Resumed sessions initialize the context meter from saved usage or history
   bytes and label the estimate with its source until the next request.
 - README and budget help distinguish the audited 4.50 MiB stripped release

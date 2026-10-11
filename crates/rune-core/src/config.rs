@@ -502,7 +502,7 @@ pub struct Settings {
     pub provider: Provider,
     /// Effective model identifier for the active provider.
     pub model: String,
-    /// User-configured models retained for command-line provider selection.
+    /// User-configured models retained for environment and command-line provider selection.
     pub configured_models: BTreeMap<String, ModelEntry>,
     /// Whether the web tools may reach the network.
     pub web_tools: bool,
@@ -1272,7 +1272,30 @@ fn apply_environment(settings: &mut Settings, env: &EnvironmentOverrides) {
     let layer = Layer::Environment;
 
     if let Some(provider) = &env.provider {
-        settings.provider = parse_provider(provider);
+        let provider = parse_provider(provider);
+        if settings.provider != provider {
+            // Resolve the model and its capacity for the new provider before
+            // applying an explicit environment model override.
+            settings.model.clear();
+            settings.context_window = None;
+            for key in ["model", "context_window"] {
+                settings.sources.sources.remove(key);
+            }
+            let key = provider_key(&provider);
+            if let Some(model) = settings
+                .configured_models
+                .get(&key)
+                .or_else(|| settings.configured_models.get("default"))
+            {
+                model.id().clone_into(&mut settings.model);
+                settings.sources.record("model", Layer::User);
+                settings.context_window = model.context_window();
+                if settings.context_window.is_some() {
+                    settings.sources.record("context_window", Layer::User);
+                }
+            }
+        }
+        settings.provider = provider;
         settings.sources.record("provider", layer);
     }
     if let Some(model) = &env.model {
@@ -2301,6 +2324,117 @@ max_agent_steps = 50
         apply_user(&mut settings, &config, Layer::User);
         assert_eq!(settings.model, "m");
         assert_eq!(settings.context_window, Some(200_000));
+        assert_eq!(settings.source_of("context_window"), Layer::User);
+    }
+
+    #[test]
+    fn environment_provider_change_selects_its_configured_model_and_window() {
+        let dir = TempDir::new().expect("tempdir");
+        let user = write(
+            &dir,
+            "config.toml",
+            "provider = 'anthropic'\n\
+             [models.anthropic]\nid = 'wide'\ncontext_window = 2000000\n\
+             [models.chat_completions]\nid = 'chat'\ncontext_window = 64000\n",
+        );
+        for model in [None, Some("chat"), Some("custom"), Some("wide")] {
+            let env = EnvironmentOverrides::from_lookup(|key| match key {
+                "RUNE_PROVIDER" => Some("openai".to_owned()),
+                "RUNE_MODEL" => model.map(str::to_owned),
+                _ => None,
+            });
+
+            let settings = load(None, Some(&user), &env);
+            assert!(settings.diagnostics.is_empty());
+            assert_eq!(settings.provider, Provider::ChatCompletions);
+            assert_eq!(settings.source_of("provider"), Layer::Environment);
+            assert_eq!(settings.model, model.unwrap_or("chat"));
+            assert_eq!(
+                settings.source_of("model"),
+                if model.is_some() {
+                    Layer::Environment
+                } else {
+                    Layer::User
+                }
+            );
+            let (window, source) = if matches!(model, Some("custom" | "wide")) {
+                (None, Layer::Default)
+            } else {
+                (Some(64_000), Layer::User)
+            };
+            assert_eq!(settings.context_window, window);
+            assert_eq!(settings.source_of("context_window"), source);
+        }
+    }
+
+    #[test]
+    fn environment_provider_change_uses_fallback_or_clears_the_previous_model() {
+        let dir = TempDir::new().expect("tempdir");
+        for (declaration, model, window) in [
+            ("", "", None),
+            ("[models]\nchat_completions = 'chat'\n", "chat", None),
+            (
+                "[models.default]\nid = 'fallback'\ncontext_window = 32000\n",
+                "fallback",
+                Some(32_000),
+            ),
+        ] {
+            let user = write(
+                &dir,
+                "config.toml",
+                &format!(
+                    "provider = 'anthropic'\n{declaration}\
+                     [models.anthropic]\nid = 'wide'\ncontext_window = 2000000\n"
+                ),
+            );
+            let env = EnvironmentOverrides::from_lookup(|key| {
+                (key == "RUNE_PROVIDER").then(|| "openai".to_owned())
+            });
+
+            let settings = load(None, Some(&user), &env);
+            assert!(settings.diagnostics.is_empty());
+            assert_eq!(settings.provider, Provider::ChatCompletions);
+            assert_eq!(settings.model, model);
+            assert_eq!(settings.context_window, window);
+            assert_eq!(
+                settings.source_of("model"),
+                if model.is_empty() {
+                    Layer::Default
+                } else {
+                    Layer::User
+                }
+            );
+            assert_eq!(
+                settings.source_of("context_window"),
+                if window.is_some() {
+                    Layer::User
+                } else {
+                    Layer::Default
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn unchanged_environment_provider_preserves_the_configured_model_and_window() {
+        let dir = TempDir::new().expect("tempdir");
+        let user = write(
+            &dir,
+            "config.toml",
+            "provider = 'openai'\n\
+             [models.chat_completions]\nid = 'chat'\ncontext_window = 64000\n",
+        );
+        let env = EnvironmentOverrides::from_lookup(|key| {
+            (key == "RUNE_PROVIDER").then(|| "chat-completions".to_owned())
+        });
+
+        let settings = load(None, Some(&user), &env);
+        assert!(settings.diagnostics.is_empty());
+        assert_eq!(settings.provider, Provider::ChatCompletions);
+        assert_eq!(settings.source_of("provider"), Layer::Environment);
+        assert_eq!(settings.model, "chat");
+        assert_eq!(settings.source_of("model"), Layer::User);
+        assert_eq!(settings.context_window, Some(64_000));
         assert_eq!(settings.source_of("context_window"), Layer::User);
     }
 

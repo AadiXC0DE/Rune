@@ -133,6 +133,9 @@ context_window = 2000000
 ```
 
 A bare identifier still works for a model whose window the endpoint reports.
+Changing `RUNE_PROVIDER` selects the new provider's entry in `models`, falling
+back to `models.default`, together with that entry's declared window. If neither
+entry exists, no model is selected and the previous model's window is discarded.
 Setting `RUNE_MODEL` to a different identifier discards the configured model's
 declared window. Until the new model's capacity is resolved, configuration
 reports the default 128000-token window.
