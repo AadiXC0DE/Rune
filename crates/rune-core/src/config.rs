@@ -321,6 +321,7 @@ pub struct ModelSettings {
     /// Declared rather than assumed: a wrong window either truncates a
     /// conversation that would have fit or lets one grow past what the model
     /// accepts, and both are worse than being told.
+    /// Zero is rejected during loading with a field diagnostic and ignored.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_window: Option<u64>,
     /// Largest answer the model will produce.
@@ -1089,8 +1090,29 @@ fn apply_user(settings: &mut Settings, user: &UserConfig, layer: Layer) {
     }
     if let Some(models) = &user.models {
         settings.configured_models.clone_from(models);
+        for (provider, entry) in &mut settings.configured_models {
+            if let ModelEntry::Detailed(model) = entry
+                && model.context_window == Some(0)
+            {
+                model.context_window = None;
+                let key = format!("models.{provider}.context_window");
+                settings.diagnostics.push(
+                    Diagnostic::new(
+                        layer,
+                        ErrorCode::InvalidField,
+                        format!("`{key}` must be greater than zero; ignoring the declared window"),
+                    )
+                    .with_key(key)
+                    .with_hint("set a positive token count or omit context_window"),
+                );
+            }
+        }
         let key = provider_key(&settings.provider);
-        if let Some(model) = models.get(&key).or_else(|| models.get("default")) {
+        if let Some(model) = settings
+            .configured_models
+            .get(&key)
+            .or_else(|| settings.configured_models.get("default"))
+        {
             model.id().clone_into(&mut settings.model);
             settings.sources.record("model", layer);
             // The declared capacity travels with the model it describes, so a
@@ -2325,6 +2347,55 @@ max_agent_steps = 50
         assert_eq!(settings.model, "m");
         assert_eq!(settings.context_window, Some(200_000));
         assert_eq!(settings.source_of("context_window"), Layer::User);
+    }
+
+    #[test]
+    fn zero_context_windows_are_diagnosed_and_ignored_before_model_selection() {
+        let dir = TempDir::new().expect("tempdir");
+        for (provider, entry, override_provider) in [
+            ("anthropic", "anthropic", None),
+            ("local", "default", None),
+            ("anthropic", "chat_completions", Some("openai")),
+        ] {
+            let user = write(
+                &dir,
+                "config.toml",
+                &format!(
+                    "provider = '{provider}'\n[models.{entry}]\nid = 'small'\n\
+                     context_window = 0\nmax_output_tokens = 1234\n"
+                ),
+            );
+            let env = EnvironmentOverrides::from_lookup(|key| {
+                (key == "RUNE_PROVIDER")
+                    .then(|| override_provider.map(str::to_owned))
+                    .flatten()
+            });
+            let settings = load(None, Some(&user), &env);
+            assert_eq!(settings.model, "small");
+            assert_eq!(settings.context_window, None);
+            assert_eq!(settings.source_of("context_window"), Layer::Default);
+            let row = settings
+                .explain()
+                .into_iter()
+                .find(|row| row.key == "context_window")
+                .expect("context_window is reported");
+            assert_eq!(row.value, DEFAULT_CONTEXT_WINDOW.to_string());
+            assert_eq!(row.source, Layer::Default);
+
+            assert_eq!(settings.diagnostics.len(), 1);
+            let diagnostic = &settings.diagnostics[0];
+            let key = format!("models.{entry}.context_window");
+            assert_eq!(diagnostic.code, ErrorCode::InvalidField);
+            assert_eq!(diagnostic.layer, Layer::User);
+            assert_eq!(diagnostic.key.as_deref(), Some(key.as_str()));
+            assert!(diagnostic.message.contains(&key));
+
+            let ModelEntry::Detailed(model) = &settings.configured_models[entry] else {
+                panic!("model details must be preserved");
+            };
+            assert_eq!(model.context_window, None);
+            assert_eq!(model.max_output_tokens, Some(1234));
+        }
     }
 
     #[test]

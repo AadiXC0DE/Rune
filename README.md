@@ -133,6 +133,9 @@ context_window = 2000000
 ```
 
 A bare identifier still works for a model whose window the endpoint reports.
+`context_window` must be greater than zero. A zero value is ignored with an
+`invalid_field` diagnostic naming `models.<provider>.context_window`; the session
+uses the endpoint's reported capacity or the default 128000-token window.
 Changing `RUNE_PROVIDER` selects the new provider's entry in `models`, falling
 back to `models.default`, together with that entry's declared window. If neither
 entry exists, no model is selected and the previous model's window is discarded.

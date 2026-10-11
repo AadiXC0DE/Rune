@@ -206,6 +206,10 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Fixed
 
+- A zero configured `context_window` produces an `invalid_field` diagnostic
+  naming the model's field and is ignored. The session uses the endpoint's
+  reported capacity or the default window instead of a zero-capacity budget.
+
 - Manual and automatic compaction reject summaries stopped at the token limit,
   even when they contain usable text. An explicit incomplete-summary error keeps
   the original history intact and blocks the pending automatic request.

@@ -6655,6 +6655,30 @@ mod tests {
     }
 
     #[test]
+    fn a_loaded_zero_context_window_cannot_create_a_zero_capacity_session() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = Utf8PathBuf::from_path_buf(dir.path().join("config.toml")).expect("utf8");
+        std::fs::write(
+            &path,
+            "provider = 'anthropic'\n[models.anthropic]\nid = 'small'\ncontext_window = 0\n",
+        )
+        .expect("write");
+        let settings = rune_core::config::load(
+            None,
+            Some(&path),
+            &rune_core::config::EnvironmentOverrides::default(),
+        );
+        assert!(settings.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == ErrorCode::InvalidField
+                && diagnostic.key.as_deref() == Some("models.anthropic.context_window")
+        }));
+        assert_eq!(
+            context_limit(&settings, &settings.limits),
+            rune_core::config::DEFAULT_CONTEXT_WINDOW
+        );
+    }
+
+    #[test]
     fn the_catalog_budget_follows_the_window_it_is_given() {
         // A fixed budget is wrong at both ends, so the session sizes it from
         // the window the model reports.
