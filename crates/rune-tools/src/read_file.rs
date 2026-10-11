@@ -8,8 +8,8 @@ use rune_core::error::{ErrorCode, Result, RuneError};
 
 use crate::contract::{Activity, ExecutionContext, Tool, ToolOutput, validate_closed_arguments};
 use crate::workspace::{
-    FileLimits, SUMMARY_RESERVE_BYTES, display_path, join_capped, read_line_bounded, resolve,
-    string_arg, truncate_line, usize_arg,
+    FileLimits, SUMMARY_RESERVE_BYTES, display_path, join_capped, read_line_bounded_checked,
+    resolve, string_arg, truncate_line, usize_arg,
 };
 
 /// Bytes read to classify a file before any content is returned.
@@ -89,6 +89,7 @@ impl Tool for ReadFile {
         arguments: &serde_json::Value,
         context: &ExecutionContext,
     ) -> Result<ToolOutput> {
+        context.check_cancelled()?;
         validate_closed_arguments(arguments, &self.input_schema())?;
         let requested = string_arg(arguments, "path")?
             .ok_or_else(|| RuneError::missing_field("path"))?
@@ -107,11 +108,13 @@ impl Tool for ReadFile {
 
         let resolved = resolve(context, &requested)?;
         let display = display_path(context, &resolved.path);
+        context.check_cancelled()?;
         let file = open(&display, resolved.path.as_path())?;
         let size = file.metadata().map_or(0, |metadata| metadata.len());
 
         let mut reader = BufReader::with_capacity(PROBE_BYTES, file);
         let probe = reader.fill_buf().unwrap_or_default().to_vec();
+        context.check_cancelled()?;
         if let Some(format) = image_format(&probe) {
             return Ok(ToolOutput::success(image_description(
                 &display, format, size,
@@ -135,6 +138,7 @@ impl Tool for ReadFile {
             count,
             self.limits.line_bytes,
             byte_budget,
+            context,
         )?;
         if window.binary {
             return Ok(ToolOutput::failure(format!(
@@ -142,6 +146,7 @@ impl Tool for ReadFile {
             )));
         }
         let (body, footer) = render(&display, size, &window, self.limits.line_bytes);
+        context.check_cancelled()?;
         Ok(ToolOutput::success(join_capped(body, &footer, cap)))
     }
 }
@@ -210,6 +215,7 @@ fn collect<R: BufRead>(
     count: usize,
     line_bytes: usize,
     byte_budget: usize,
+    context: &ExecutionContext,
 ) -> Result<Window> {
     let mut window = Window {
         requested_start: start_line,
@@ -220,7 +226,9 @@ fn collect<R: BufRead>(
     let mut bytes = 0_usize;
 
     loop {
-        let line = read_line_bounded(reader, &mut buffer, line_bytes).map_err(RuneError::from)?;
+        let line = read_line_bounded_checked(reader, &mut buffer, line_bytes, || {
+            context.check_cancelled()
+        })?;
         if line.consumed == 0 {
             break;
         }
@@ -381,7 +389,146 @@ fn is_binary(bytes: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::contract::Cancellation;
     use crate::workspace::fixture::{Repo, binary};
+
+    /// Cancels at a known byte boundary without relying on thread scheduling.
+    struct CancellingReader<R> {
+        inner: R,
+        cancellation: Cancellation,
+        cancel_after: usize,
+        consumed: usize,
+        fills: usize,
+    }
+
+    impl<R: std::io::Read> std::io::Read for CancellingReader<R> {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            self.inner.read(buffer)
+        }
+    }
+
+    impl<R: BufRead> BufRead for CancellingReader<R> {
+        fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+            self.fills = self.fills.checked_add(1).expect("fill count");
+            self.inner.fill_buf()
+        }
+
+        fn consume(&mut self, amount: usize) {
+            self.inner.consume(amount);
+            self.consumed = self.consumed.checked_add(amount).expect("consumed bytes");
+            if self.consumed >= self.cancel_after {
+                self.cancellation.cancel();
+            }
+        }
+    }
+
+    #[test]
+    fn a_cancelled_call_stops_before_accessing_the_file() {
+        let repo = Repo::new();
+        let path = repo.path().join("large.txt");
+        std::fs::File::create(&path)
+            .expect("create")
+            .set_len(128 * 1024 * 1024)
+            .expect("large sparse file");
+        let context = repo.context();
+        context.cancellation().cancel();
+
+        for path in ["large.txt", "absent.txt"] {
+            let error = ReadFile::new()
+                .call(&serde_json::json!({ "path": path }), &context)
+                .expect_err("cancelled before file access");
+            assert_eq!(error.code(), ErrorCode::Cancelled);
+        }
+    }
+
+    #[test]
+    fn a_cancelled_collection_does_no_io() {
+        let repo = Repo::new();
+        let context = repo.context();
+        context.cancellation().cancel();
+        let mut reader = CancellingReader {
+            inner: std::io::Cursor::new(b"text\n"),
+            cancellation: context.cancellation(),
+            cancel_after: usize::MAX,
+            consumed: 0,
+            fills: 0,
+        };
+
+        let error =
+            collect(&mut reader, 1, 1, 32, 4096, &context).expect_err("cancelled before reading");
+        assert_eq!(error.code(), ErrorCode::Cancelled);
+        assert_eq!(reader.consumed, 0);
+        assert_eq!(reader.fills, 0);
+    }
+
+    #[test]
+    fn cancellation_bounds_work_while_skipping_collecting_and_counting_lines() {
+        let repo = Repo::new();
+        let body = "short text line\n".repeat(64 * 1024);
+        for (start, count, budget) in [
+            (100_000, 1, 4096),       // Skip to a requested page.
+            (1, 100_000, usize::MAX), // Collect a large window.
+            (1, 1, 4096),             // Count the tail after the line cap.
+            (1, 100_000, 1),          // Count the tail after the byte cap.
+        ] {
+            let context = repo.context();
+            let mut reader = CancellingReader {
+                inner: BufReader::with_capacity(PROBE_BYTES, body.as_bytes()),
+                cancellation: context.cancellation(),
+                cancel_after: 3 * PROBE_BYTES,
+                consumed: 0,
+                fills: 0,
+            };
+
+            let error = collect(&mut reader, start, count, 32, budget, &context)
+                .expect_err("cancelled during a paged read");
+            assert_eq!(error.code(), ErrorCode::Cancelled);
+            assert!(reader.consumed >= reader.cancel_after);
+            assert!(reader.consumed <= reader.cancel_after + PROBE_BYTES);
+            assert!(reader.consumed < body.len());
+        }
+    }
+
+    #[test]
+    fn cancellation_bounds_work_within_one_oversized_line() {
+        let repo = Repo::new();
+        let context = repo.context();
+        let body = "x".repeat(8 * 1024 * 1024);
+        let mut reader = CancellingReader {
+            inner: BufReader::with_capacity(PROBE_BYTES, body.as_bytes()),
+            cancellation: context.cancellation(),
+            cancel_after: 3 * PROBE_BYTES,
+            consumed: 0,
+            fills: 0,
+        };
+
+        let error = collect(&mut reader, 1, 1, 32, 4096, &context)
+            .expect_err("cancelled while discarding a long line");
+        assert_eq!(error.code(), ErrorCode::Cancelled);
+        assert_eq!(reader.consumed, reader.cancel_after);
+        assert_eq!(reader.fills, 3);
+    }
+
+    #[test]
+    fn cancellation_on_the_final_chunk_does_not_return_a_partial_window() {
+        let repo = Repo::new();
+        for body in [b"last line\n".as_slice(), b"last line".as_slice()] {
+            let context = repo.context();
+            let mut reader = CancellingReader {
+                inner: BufReader::with_capacity(PROBE_BYTES, body),
+                cancellation: context.cancellation(),
+                cancel_after: body.len(),
+                consumed: 0,
+                fills: 0,
+            };
+
+            let error = collect(&mut reader, 1, 1, 32, 4096, &context)
+                .expect_err("cancelled at end of file");
+            assert_eq!(error.code(), ErrorCode::Cancelled);
+            assert_eq!(reader.consumed, body.len());
+            assert_eq!(reader.fills, 1);
+        }
+    }
 
     /// Builds `count` numbered lines under a prefix.
     fn numbered(prefix: &str, first: usize, last: usize) -> String {

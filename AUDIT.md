@@ -1964,7 +1964,7 @@ Resource accumulation after cancellation, session holder handover and concurrent
 - [x] R-085 | T2 | fix | config | Replace policy settings atomically | acceptance: Interrupt a policy-settings write before replacement and observe a complete old or new rules file.
 - [x] R-086 | T2 | fix | tools | Validate closed tool schemas consistently | acceptance: Call read_file with a misspelled optional property and observe a schema error naming that property.
 - [x] R-087 | T2 | fix | tools | Preserve tool failure codes and repair hints | acceptance: Return NotFound with hint try other.txt from a fixture tool and observe the code and hint in the model result and session event.
-- [ ] R-088 | T2 | fix | tools | Check cancellation during paged file reads | acceptance: Cancel before and during a large read_file call and observe bounded work plus a cancelled result.
+- [x] R-088 | T2 | fix | tools | Check cancellation during paged file reads | acceptance: Cancel before and during a large read_file call and observe bounded work plus a cancelled result.
 - [ ] R-089 | T2 | fix | tools | Check cancellation within a single large grep input | acceptance: Cancel a grep over one large file and observe it stop before scanning the remaining file.
 - [ ] R-090 | T2 | fix | tools | Correct retained-result accounting on replacement | acceptance: Retain the same handle twice and observe total_bytes equal the actual stored bytes rather than twice that amount.
 - [ ] R-091 | T2 | fix | tools | Avoid advertising nonexistent handles for small results | acceptance: Render a small result preview and observe either its stored readable handle or no read_tool_result instruction.

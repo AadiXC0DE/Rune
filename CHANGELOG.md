@@ -102,6 +102,10 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Fixed
 
+- `read_file` checks cancellation before file access and between buffered
+  chunks while skipping, collecting, or counting lines, including oversized
+  lines. Cancelled reads return a `cancelled` error without a partial page.
+
 - Tool validation and execution failures preserve their stable error code,
   message, and diagnostic details, including repair hints, in the model's
   result and saved session output.

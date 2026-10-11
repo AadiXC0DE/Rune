@@ -360,16 +360,29 @@ pub fn read_line_bounded<R: BufRead>(
     buffer: &mut Vec<u8>,
     keep: usize,
 ) -> std::io::Result<LineRead> {
+    read_line_bounded_checked(reader, buffer, keep, || Ok(()))
+}
+
+/// Reads a bounded line, checking for cancellation before each buffered chunk
+/// and before returning. Work between checks is bounded by the reader's buffer
+/// capacity, including when discarding the rest of an oversized line.
+pub fn read_line_bounded_checked<R: BufRead, E: From<std::io::Error>>(
+    reader: &mut R,
+    buffer: &mut Vec<u8>,
+    keep: usize,
+    mut check: impl FnMut() -> std::result::Result<(), E>,
+) -> std::result::Result<LineRead, E> {
     buffer.clear();
     let mut read = LineRead::default();
     // Line terminators at the end of what has been seen so far, which are not
     // part of the line's length.
     let mut terminators = 0_usize;
     loop {
+        check()?;
         let available = match reader.fill_buf() {
             Ok(available) => available,
             Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(err) => return Err(err),
+            Err(err) => return Err(err.into()),
         };
         if available.is_empty() {
             break;
@@ -398,6 +411,7 @@ pub fn read_line_bounded<R: BufRead>(
             break;
         }
     }
+    check()?;
     read.length = read.consumed.saturating_sub(terminators);
     Ok(read)
 }
