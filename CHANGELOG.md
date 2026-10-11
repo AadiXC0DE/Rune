@@ -182,6 +182,12 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Fixed
 
+- SDK provider requests retry transient failures using the shared retry policy
+  and `provider_max_attempts`, honoring `Retry-After` from the default fetch or
+  a host's `post_with_retry_after`. Closing the agent or dropping the turn
+  interrupts retry delays. Failed attempts consume no extra agent steps and
+  do not enter conversation history or usage totals.
+
 - ACP rejects an entire prompt when any text block has missing or non-string
   `text`, returning `invalid_params` with the malformed block's field path
   instead of silently dropping it.

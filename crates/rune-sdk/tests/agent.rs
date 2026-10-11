@@ -16,7 +16,9 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+use rune_agent::turn::{Event, StopReason};
 
 use serde_json::json;
 
@@ -116,7 +118,7 @@ fn every_request_goes_through_the_fetch_the_embedder_supplied() {
         .expect("turn");
     let result = turn.result().expect("result");
 
-    assert_eq!(result.stop_reason, rune_agent::turn::StopReason::Completed);
+    assert_eq!(result.stop_reason, StopReason::Completed);
     assert!(result.text.contains("hello"), "{}", result.text);
     assert_eq!(fetch.hits(), 1, "one request, through the host fetch");
     assert_eq!(endpoint.request_count(), 1, "the endpoint saw exactly one");
@@ -154,7 +156,7 @@ fn a_checkpoint_carries_no_credential_and_no_instructions() {
         .prompt("and again", PromptOptions::default())
         .expect("turn");
     let result = turn.result().expect("result");
-    assert_eq!(result.stop_reason, rune_agent::turn::StopReason::Completed);
+    assert_eq!(result.stop_reason, StopReason::Completed);
 
     // The exchanged turns travel in the checkpoint; only the credential and
     // the instructions do not.
@@ -208,7 +210,7 @@ fn a_second_prompt_while_one_runs_is_refused() {
     );
 
     let result = turn.result().expect("result");
-    assert_eq!(result.stop_reason, rune_agent::turn::StopReason::Completed);
+    assert_eq!(result.stop_reason, StopReason::Completed);
 
     // The refusal left no trace: the next prompt is accepted.
     let mut turn = agent
@@ -228,13 +230,13 @@ fn replacing_a_finished_turn_handle_leaves_the_new_turn_running() {
 
     let mut turn = agent.prompt("one", PromptOptions::default()).expect("turn");
     let first = turn.result().expect("result");
-    assert_eq!(first.stop_reason, rune_agent::turn::StopReason::Completed);
+    assert_eq!(first.stop_reason, StopReason::Completed);
 
     // The assignment drops the finished handle while the new turn is waiting
     // on its request, which must cancel only the turn the handle belonged to.
     turn = agent.prompt("two", PromptOptions::default()).expect("turn");
     let second = turn.result().expect("result");
-    assert_eq!(second.stop_reason, rune_agent::turn::StopReason::Completed);
+    assert_eq!(second.stop_reason, StopReason::Completed);
     assert!(second.text.contains("late"), "{}", second.text);
 }
 
@@ -254,7 +256,7 @@ fn closing_during_a_turn_resolves_a_cancelled_result() {
     assert!(agent.is_closed());
 
     let result = turn.result().expect("result");
-    assert_eq!(result.stop_reason, rune_agent::turn::StopReason::Cancelled);
+    assert_eq!(result.stop_reason, StopReason::Cancelled);
 
     let err = agent
         .prompt("more", PromptOptions::default())
@@ -384,7 +386,7 @@ fn a_tool_that_fails_is_information_rather_than_the_end_of_the_turn() {
         .prompt("try it", PromptOptions::default())
         .expect("turn");
     let result = turn.result().expect("result");
-    assert_eq!(result.stop_reason, rune_agent::turn::StopReason::Completed);
+    assert_eq!(result.stop_reason, StopReason::Completed);
     assert!(result.calls[0].output.is_error);
     assert_eq!(result.steps, 2);
 }
@@ -406,7 +408,7 @@ fn a_step_limit_ends_the_turn_with_tool_calls_still_pending() {
         .prompt("loop", PromptOptions { max_steps: 2 })
         .expect("turn");
     let result = turn.result().expect("result");
-    assert_eq!(result.stop_reason, rune_agent::turn::StopReason::StepLimit);
+    assert_eq!(result.stop_reason, StopReason::StepLimit);
     assert_eq!(result.steps, 2);
 }
 
@@ -510,9 +512,9 @@ fn the_event_stream_reports_the_shape_of_the_turn() {
     let mut finished = false;
     for event in turn.events() {
         match event {
-            rune_agent::turn::Event::TurnStarted { step } => steps.push(step),
-            rune_agent::turn::Event::TextDelta { delta } => text.push_str(&delta),
-            rune_agent::turn::Event::Finished { .. } => finished = true,
+            Event::TurnStarted { step } => steps.push(step),
+            Event::TextDelta { delta } => text.push_str(&delta),
+            Event::Finished { .. } => finished = true,
             _ => {}
         }
     }
@@ -607,4 +609,326 @@ fn a_conversation_runs_on_from_a_checkpoint_in_a_new_process_like_agent() {
     assert!(messages.to_string().contains("one"), "{messages}");
     assert!(messages.to_string().contains("first answer"), "{messages}");
     assert!(messages.to_string().contains("two"), "{messages}");
+}
+
+/// Serves a real Retry-After header followed by a successful streamed response.
+fn rate_limit_endpoint() -> (String, std::thread::JoinHandle<Vec<Instant>>) {
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("listen");
+    let address = listener.local_addr().expect("address");
+    listener.set_nonblocking(true).expect("nonblocking");
+    let worker = std::thread::spawn(move || {
+        let Script::Frames(frames) = Script::text("retried") else {
+            panic!("expected frames");
+        };
+        let mut success = String::new();
+        for frame in frames {
+            success.push_str("data: ");
+            success.push_str(&frame);
+            success.push_str("\n\n");
+        }
+        let responses = [
+            (429, "retry-after: 1\r\n", "busy"),
+            (200, "", success.as_str()),
+        ];
+        let mut received = Vec::new();
+        let started = Instant::now();
+        for (status, headers, body) in responses {
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(
+                            started.elapsed() < Duration::from_secs(10),
+                            "request never arrived"
+                        );
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("accept: {error}"),
+                }
+            };
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("timeout");
+            let mut reader = BufReader::new(&mut stream);
+            let mut content_length = 0;
+            loop {
+                let mut line = String::new();
+                assert!(reader.read_line(&mut line).expect("header") > 0);
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some(length) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    content_length = length.trim().parse::<usize>().expect("length");
+                }
+            }
+            reader
+                .read_exact(&mut vec![0; content_length])
+                .expect("body");
+            received.push(Instant::now());
+            write!(stream,
+                "HTTP/1.1 {status} Response\r\n{headers}content-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            ).expect("response");
+        }
+        received
+    });
+    (format!("http://{address}/v1"), worker)
+}
+
+#[test]
+fn a_429_retry_after_is_honored_once_without_consuming_another_step() {
+    let (base_url, worker) = rate_limit_endpoint();
+    let mut agent_options = options(&base_url, Arc::new(CountingFetch::new()));
+    agent_options.fetch = None;
+    let mut agent = Agent::new(agent_options)
+        .expect("agent")
+        .with_limits(limit(LimitName::ProviderMaxAttempts, 2));
+    let mut turn = agent
+        .prompt("hello", PromptOptions { max_steps: 1 })
+        .expect("turn");
+    let result = turn.result().expect("retry succeeds");
+    let events: Vec<_> = turn.events().collect();
+    let received = worker.join().expect("endpoint");
+
+    assert_eq!(received.len(), 2);
+    assert!(received[1].duration_since(received[0]) >= Duration::from_secs(1));
+    assert_eq!(result.stop_reason, StopReason::Completed);
+    assert_eq!(result.text, "retried");
+    assert_eq!(result.steps, 1);
+    assert_eq!(result.usage.input_tokens, Some(10));
+    assert_eq!(agent.usage(), result.usage);
+    assert!(
+        matches!(events.iter().find(|event| matches!(event, Event::ProviderRetry { .. })),
+        Some(Event::ProviderRetry { step: 1, next_attempt: 2, max_attempts: 2, delay })
+        if *delay == Duration::from_secs(1))
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, Event::ProviderRetry { .. }))
+            .count(),
+        1
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, Event::StepRestarted { step: 1 }))
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, Event::ProviderRetryFinished { step: 1 }))
+    );
+}
+
+#[derive(Debug, Default)]
+struct RateLimitedFetch {
+    hits: AtomicUsize,
+}
+
+impl HostFetch for RateLimitedFetch {
+    fn post(&self, _request: FetchRequest) -> rune_core::error::Result<FetchResponse> {
+        self.hits.fetch_add(1, Ordering::SeqCst);
+        Ok(FetchResponse::new(429, "busy"))
+    }
+
+    fn post_with_retry_after(
+        &self,
+        request: FetchRequest,
+    ) -> rune_core::error::Result<(FetchResponse, Option<String>)> {
+        self.post(request)
+            .map(|response| (response, Some("60".to_owned())))
+    }
+}
+
+fn waiting_for_retry(turn: &mut rune_sdk::agent::Turn) {
+    loop {
+        if let Event::ProviderRetry { delay, .. } = turn.next_event().expect("retry event") {
+            assert_eq!(delay, Duration::from_secs(60));
+            return;
+        }
+    }
+}
+
+#[test]
+fn closing_interrupts_retry_after_and_preserves_a_usable_checkpoint() {
+    let fetch = Arc::new(RateLimitedFetch::default());
+    let mut agent =
+        Agent::new(options("https://example.invalid/v1", fetch.clone())).expect("agent");
+    let mut turn = agent
+        .prompt("work", PromptOptions::default())
+        .expect("turn");
+    waiting_for_retry(&mut turn);
+    let started = Instant::now();
+    agent.close().expect("close");
+    let result = turn.result().expect("cancelled result");
+    assert!(started.elapsed() < Duration::from_secs(1));
+    assert_eq!(result.stop_reason, StopReason::Cancelled);
+    assert_eq!(fetch.hits.load(Ordering::SeqCst), 1);
+    assert!(result.text.is_empty());
+    assert_eq!(result.usage, rune_net::stream::Usage::default());
+    agent.checkpoint().expect("settled checkpoint");
+}
+
+#[test]
+fn dropping_the_turn_interrupts_retry_after_and_releases_the_agent() {
+    let fetch = Arc::new(RateLimitedFetch::default());
+    let mut agent =
+        Agent::new(options("https://example.invalid/v1", fetch.clone())).expect("agent");
+    let mut turn = agent
+        .prompt("work", PromptOptions::default())
+        .expect("turn");
+    waiting_for_retry(&mut turn);
+    let started = Instant::now();
+    drop(turn);
+    assert!(started.elapsed() < Duration::from_secs(1));
+    assert_eq!(fetch.hits.load(Ordering::SeqCst), 1);
+    agent.checkpoint().expect("settled checkpoint");
+    let next = agent
+        .prompt("again", PromptOptions::default())
+        .expect("agent available");
+    drop(next);
+}
+
+#[test]
+fn retry_exhaustion_stops_at_the_configured_attempt_count() {
+    let endpoint = MockEndpoint::start(vec![Script::Status {
+        code: 503,
+        body: "busy".to_owned(),
+    }]);
+    let fetch = Arc::new(CountingFetch::new());
+    let mut agent = Agent::new(options(&endpoint.base_url(), fetch.clone()))
+        .expect("agent")
+        .with_limits(limit(LimitName::ProviderMaxAttempts, 2));
+    let mut turn = agent
+        .prompt("work", PromptOptions::default())
+        .expect("turn");
+    let error = turn.result().expect_err("exhausted");
+    assert_eq!(error.code(), ErrorCode::TransportFailure);
+    assert_eq!(fetch.hits(), 2);
+    assert_eq!(endpoint.request_count(), 2);
+    assert_eq!(
+        turn.events()
+            .filter(|event| matches!(event, Event::ProviderRetry { .. }))
+            .count(),
+        1
+    );
+    assert_eq!(agent.usage(), rune_net::stream::Usage::default());
+}
+
+#[test]
+fn permanent_provider_failures_are_never_retried() {
+    for status in [400, 401, 402, 403, 404] {
+        let endpoint = MockEndpoint::start(vec![Script::Status {
+            code: status,
+            body: "refused".to_owned(),
+        }]);
+        let fetch = Arc::new(CountingFetch::new());
+        let mut agent = Agent::new(options(&endpoint.base_url(), fetch.clone())).expect("agent");
+        let mut turn = agent
+            .prompt("work", PromptOptions::default())
+            .expect("turn");
+        turn.result().expect_err("permanent failure");
+        assert_eq!(fetch.hits(), 1, "status {status}");
+        assert!(
+            !turn
+                .events()
+                .any(|event| matches!(event, Event::ProviderRetry { .. }))
+        );
+    }
+}
+
+#[test]
+fn retrying_a_failed_stream_discards_its_partial_text_and_usage() {
+    let endpoint = MockEndpoint::start(vec![Script::truncated("discard me"), Script::text("kept")]);
+    let fetch = Arc::new(CountingFetch::new());
+    let mut agent = Agent::new(options(&endpoint.base_url(), fetch.clone())).expect("agent");
+    let mut turn = agent
+        .prompt("work", PromptOptions::default())
+        .expect("turn");
+    let result = turn.result().expect("retry succeeds");
+    let events: Vec<_> = turn.events().collect();
+    assert_eq!(fetch.hits(), 2);
+    assert_eq!(result.text, "kept");
+    assert_eq!(result.steps, 1);
+    assert_eq!(result.usage.input_tokens, Some(10));
+    let partial = events
+        .iter()
+        .position(|event| matches!(event, Event::TextDelta { delta } if delta == "discard me"))
+        .expect("partial text streamed");
+    let restart = events
+        .iter()
+        .position(|event| matches!(event, Event::StepRestarted { step: 1 }))
+        .expect("restart");
+    let kept = events
+        .iter()
+        .position(|event| matches!(event, Event::TextDelta { delta } if delta == "kept"))
+        .expect("new text");
+    assert!(partial < restart && restart < kept);
+    let checkpoint = String::from_utf8(agent.checkpoint().expect("checkpoint")).expect("utf8");
+    assert!(!checkpoint.contains("discard me"));
+    assert!(checkpoint.contains("kept"));
+}
+
+#[test]
+fn an_exhausted_retry_after_returns_without_waiting() {
+    let fetch = Arc::new(RateLimitedFetch::default());
+    let mut agent = Agent::new(options("https://example.invalid/v1", fetch.clone()))
+        .expect("agent")
+        .with_limits(limit(LimitName::ProviderMaxAttempts, 1));
+    let started = Instant::now();
+    let mut turn = agent
+        .prompt("work", PromptOptions::default())
+        .expect("turn");
+    assert_eq!(
+        turn.result().expect_err("exhausted").code(),
+        ErrorCode::RateLimited
+    );
+    assert!(started.elapsed() < Duration::from_secs(1));
+    assert_eq!(fetch.hits.load(Ordering::SeqCst), 1);
+    assert!(
+        !turn
+            .events()
+            .any(|event| matches!(event, Event::ProviderRetry { .. }))
+    );
+}
+
+#[derive(Debug)]
+struct FailingHostFetch {
+    code: ErrorCode,
+    hits: AtomicUsize,
+}
+
+impl HostFetch for FailingHostFetch {
+    fn post(&self, _request: FetchRequest) -> rune_core::error::Result<FetchResponse> {
+        self.hits.fetch_add(1, Ordering::SeqCst);
+        Err(rune_core::error::RuneError::new(self.code, "host failure").with_hint("host"))
+    }
+}
+
+#[test]
+fn host_transport_failures_retry_but_policy_refusals_keep_their_details() {
+    for (code, expected_hits) in [
+        (ErrorCode::TransportFailure, 2),
+        (ErrorCode::PermissionDenied, 1),
+    ] {
+        let fetch = Arc::new(FailingHostFetch {
+            code,
+            hits: AtomicUsize::new(0),
+        });
+        let mut agent = Agent::new(options("https://example.invalid/v1", fetch.clone()))
+            .expect("agent")
+            .with_limits(limit(LimitName::ProviderMaxAttempts, 2));
+        let mut turn = agent
+            .prompt("work", PromptOptions::default())
+            .expect("turn");
+        let error = turn.result().expect_err("host error");
+        assert_eq!(error.code(), code);
+        assert_eq!(error.hint(), Some("host"));
+        assert_eq!(error.message(), "host failure");
+        assert_eq!(fetch.hits.load(Ordering::SeqCst), expected_hits);
+    }
 }

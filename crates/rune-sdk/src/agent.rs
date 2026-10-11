@@ -19,12 +19,13 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
 
 use rune_agent::History;
+use rune_agent::retry::{self, RetryPolicy};
 use rune_agent::steering::Cancellation;
 use rune_agent::turn::{CallResult, Event, PreparedCall, StopReason, TurnOutcome};
 use rune_core::budget::{BudgetSet, LimitName};
 use rune_core::error::{ErrorCode, Result, RuneError};
 use rune_core::tool::ToolSpec;
-use rune_net::error::NetError;
+use rune_net::error::{FailureKind, NetError, parse_retry_after};
 use rune_net::message::{ContentPart, ImageRef, validate_tool_specs};
 use rune_net::provider::{Provider, RequestPlan, ToolChoice};
 use rune_net::redact;
@@ -133,6 +134,17 @@ pub trait HostFetch: Send + Sync {
     /// Returns as soon as the response head is known; the body is read from the
     /// returned reader, which is what keeps a streamed answer incremental.
     fn post(&self, request: FetchRequest) -> Result<FetchResponse>;
+
+    /// Performs a request and returns its optional `Retry-After` header.
+    ///
+    /// Hosts that expose response headers should override this method so the
+    /// retry policy can honor the endpoint's delay. Existing hosts use backoff.
+    fn post_with_retry_after(
+        &self,
+        request: FetchRequest,
+    ) -> Result<(FetchResponse, Option<String>)> {
+        self.post(request).map(|response| (response, None))
+    }
 }
 
 /// Performs one request over the workspace transport.
@@ -143,7 +155,7 @@ pub trait HostFetch: Send + Sync {
 fn dispatch(
     client: &rune_net::transport::UreqFetch,
     request: FetchRequest,
-) -> Result<FetchResponse> {
+) -> Result<(FetchResponse, Option<String>)> {
     let parsed = rune_net::fetch::FetchRequest {
         method: rune_net::fetch::Method::Post,
         url: request.url,
@@ -155,10 +167,13 @@ fn dispatch(
     };
     let response =
         rune_net::fetch::Fetch::send(client, parsed).map_err(|err| err.to_rune_error())?;
-    Ok(FetchResponse {
-        status: response.status,
-        body: response.body,
-    })
+    Ok((
+        FetchResponse {
+            status: response.status,
+            body: response.body,
+        },
+        response.retry_after,
+    ))
 }
 
 /// The fetch used when the embedder supplies none.
@@ -181,6 +196,13 @@ impl DefaultFetch {
 
 impl HostFetch for DefaultFetch {
     fn post(&self, request: FetchRequest) -> Result<FetchResponse> {
+        dispatch(&self.client, request).map(|(response, _)| response)
+    }
+
+    fn post_with_retry_after(
+        &self,
+        request: FetchRequest,
+    ) -> Result<(FetchResponse, Option<String>)> {
         dispatch(&self.client, request)
     }
 }
@@ -981,7 +1003,7 @@ fn run_turn(context: &TurnContext) -> Result<TurnProduct> {
         context.emit(Event::TurnStarted { step: acc.steps });
 
         let plan = context.plan()?;
-        let response = match request(context, provider.as_ref(), &plan) {
+        let response = match request_with_retry(context, provider.as_ref(), &plan, acc.steps) {
             Ok(response) => response,
             // A cancellation during the request settles the turn rather than
             // failing it: the caller asked for it, so it is not an error.
@@ -1103,12 +1125,93 @@ impl TurnContext {
     }
 }
 
+/// A request failure retains the original host error and the provider taxonomy
+/// needed for retry decisions, without converting away retry metadata first.
+struct RequestFailure {
+    error: RuneError,
+    kind: FailureKind,
+    retry_after_ms: Option<u64>,
+}
+
+impl From<NetError> for RequestFailure {
+    fn from(error: NetError) -> Self {
+        Self {
+            kind: error.kind(),
+            retry_after_ms: error.retry_after_ms(),
+            error: error.to_rune_error(),
+        }
+    }
+}
+
+impl From<RuneError> for RequestFailure {
+    fn from(error: RuneError) -> Self {
+        let kind = match error.code() {
+            ErrorCode::RateLimited => FailureKind::RateLimited,
+            ErrorCode::TransportFailure => FailureKind::Network,
+            ErrorCode::Timeout => FailureKind::Timeout,
+            ErrorCode::IncompleteStream => FailureKind::IncompleteStream,
+            ErrorCode::RequestRejected => FailureKind::ProviderError,
+            // Other host failures are permanent; keep their original detail.
+            _ => FailureKind::InvalidRequest,
+        };
+        Self {
+            error,
+            kind,
+            retry_after_ms: None,
+        }
+    }
+}
+
+/// Retries one model step without recording failed attempts in the conversation.
+fn request_with_retry(
+    context: &TurnContext,
+    provider: &dyn Provider,
+    plan: &RequestPlan,
+    step: u32,
+) -> Result<StreamOutcome> {
+    let max_attempts = context
+        .limits
+        .get_usize(LimitName::ProviderMaxAttempts)
+        .max(1);
+    let policy = RetryPolicy::new(max_attempts);
+    let mut attempt = 0_usize;
+    loop {
+        context.cancel.check()?;
+        if attempt > 0 {
+            context.emit(Event::StepRestarted { step });
+        }
+        attempt = attempt.saturating_add(1);
+        match request(context, provider, plan) {
+            Ok(response) => {
+                if attempt > 1 {
+                    context.emit(Event::ProviderRetryFinished { step });
+                }
+                return Ok(response);
+            }
+            Err(failure) => {
+                context.cancel.check()?;
+                let Some(delay) = policy.delay(attempt, failure.kind, failure.retry_after_ms)
+                else {
+                    return Err(failure.error);
+                };
+                context.emit(Event::ProviderRetry {
+                    step,
+                    next_attempt: attempt.saturating_add(1),
+                    max_attempts,
+                    delay,
+                });
+                retry::wait(delay, &context.cancel)?;
+            }
+        }
+    }
+}
+
 /// Sends one request and reduces its response stream.
 fn request(
     context: &TurnContext,
     provider: &dyn Provider,
     plan: &RequestPlan,
-) -> Result<StreamOutcome> {
+) -> std::result::Result<StreamOutcome, RequestFailure> {
     let started = std::time::Instant::now();
     let mut timeouts = rune_net::transport::RequestTimeouts::from_limits(&context.limits);
     context.cancel.check()?;
@@ -1130,9 +1233,9 @@ fn request(
     let request = FetchRequest {
         url: context.endpoint.url_for(provider.request_path()),
         headers,
-        body: serde_json::to_string(&body)?,
+        body: serde_json::to_string(&body).map_err(RuneError::from)?,
     };
-    let response = context.fetch.post(request)?;
+    let (response, retry_after) = context.fetch.post_with_retry_after(request)?;
 
     if response.status >= 400 {
         // Only enough of the body to explain the rejection; an endpoint that
@@ -1141,12 +1244,14 @@ fn request(
         let _ = response.body.take(64 * 1024).read_to_end(&mut raw);
         let text = String::from_utf8_lossy(&raw);
         let sanitized = redact::redact(&text);
-        return Err(NetError::classify_status(response.status, &sanitized)
-            .with_hint(format!(
-                "provider `{}` rejected the request",
-                provider.name()
-            ))
-            .to_rune_error());
+        let mut error = NetError::classify_status(response.status, &sanitized).with_hint(format!(
+            "provider `{}` rejected the request",
+            provider.name()
+        ));
+        if let Some(millis) = retry_after.as_deref().and_then(parse_retry_after) {
+            error = error.with_retry_after(millis);
+        }
+        return Err(error.into());
     }
 
     // Each event is handed back as it is decoded, so a host rendering the turn
@@ -1173,7 +1278,7 @@ fn request(
         &|| context.cancel.is_cancelled(),
         &mut observe,
     )
-    .map_err(|err| err.to_rune_error())
+    .map_err(RequestFailure::from)
 }
 
 /// One executed call, with the images it produced.

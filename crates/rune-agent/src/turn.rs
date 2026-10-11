@@ -30,6 +30,7 @@ use rune_tools::contract::{Activity, ExecutionContext, ToolOutput};
 use rune_tools::{Registry, Tool};
 
 use crate::history::History;
+use crate::retry::{self, RetryPolicy};
 use crate::steering::{Boundary, Cancellation, SteeringQueue};
 
 /// How a turn ended.
@@ -593,6 +594,7 @@ fn stream_with_retry(
     let steering = host.steering();
     let mut attempt = 0_usize;
     let mut last: Option<RuneError> = None;
+    let retry_policy = RetryPolicy::new(max_attempts);
 
     loop {
         cancellation.check()?;
@@ -662,46 +664,21 @@ fn stream_with_retry(
                 return Ok((outcome, !steering.is_empty()));
             }
             Err(err) => {
-                if !err.is_retryable() {
+                let Some(delay) = retry_policy.delay(attempt, err.kind(), err.retry_after_ms())
+                else {
                     return Err(err.to_rune_error());
-                }
-
-                // Steering may have arrived while the request was failing, and
-                // it can change the request enough that retrying is worth it.
-                let delay = err
-                    .retry_after_ms()
-                    .map_or_else(|| backoff(attempt), Duration::from_millis);
+                };
                 last = Some(err.to_rune_error());
-                if attempt < max_attempts {
-                    host.emit(Event::ProviderRetry {
-                        step,
-                        next_attempt: attempt.saturating_add(1),
-                        max_attempts,
-                        delay,
-                    });
-                }
-
-                // Sleep in small slices so a cancellation is noticed promptly
-                // rather than after the whole delay.
-                let started = std::time::Instant::now();
-                while started.elapsed() < delay {
-                    cancellation.check()?;
-                    std::thread::sleep(Duration::from_millis(25));
-                }
+                host.emit(Event::ProviderRetry {
+                    step,
+                    next_attempt: attempt.saturating_add(1),
+                    max_attempts,
+                    delay,
+                });
+                retry::wait(delay, cancellation)?;
             }
         }
     }
-}
-
-/// Returns the delay before an attempt.
-///
-/// Doubles from a small base and caps, so a short outage is retried promptly and
-/// a long one does not hammer the endpoint.
-fn backoff(attempt: usize) -> Duration {
-    let exponent = u32::try_from(attempt.saturating_sub(1)).unwrap_or(0).min(5);
-    let factor = 1_u64.checked_shl(exponent).unwrap_or(u64::MAX);
-    let millis = 250_u64.saturating_mul(factor);
-    Duration::from_millis(millis.min(8_000))
 }
 
 /// Resolves and executes a batch of tool calls.
@@ -1324,17 +1301,6 @@ mod tests {
         let bounded = bound_result(content, budget);
         assert!(bounded.len() <= budget, "{}", bounded.len());
         assert!(bounded.ends_with(RESULT_TRUNCATION_MARKER), "{bounded}");
-    }
-
-    #[test]
-    fn backoff_grows_then_caps() {
-        assert_eq!(backoff(1), Duration::from_millis(250));
-        assert_eq!(backoff(2), Duration::from_millis(500));
-        assert_eq!(backoff(3), Duration::from_millis(1000));
-        assert_eq!(backoff(4), Duration::from_millis(2000));
-        assert_eq!(backoff(5), Duration::from_millis(4000));
-        assert_eq!(backoff(6), Duration::from_millis(8000));
-        assert_eq!(backoff(20), Duration::from_millis(8000));
     }
 
     #[test]
