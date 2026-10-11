@@ -2010,7 +2010,7 @@ Resource accumulation after cancellation, session holder handover and concurrent
 - [x] R-131 | T2 | fix | sdk | Honor configured SDK max-agent-steps when prompt options omit it | acceptance: Set MaxAgentSteps=2 with default PromptOptions and observe the SDK stop after two model steps.
 - [x] R-132 | T2 | fix | sdk | Bound the SDK event queue for a stalled consumer | acceptance: Stream 100000 fixture deltas without consuming events and observe bounded memory plus an explicit backpressure outcome.
 - [x] R-133 | T2 | fix | node | Resolve explicit relative binaries against options.cwd | acceptance: Place rune only in a scratch cwd, call ask with bin ./rune and observe the stub result.
-- [ ] R-134 | T2 | fix | node | Reject nonfinite and overflowing timeout values | acceptance: Infinity, NaN and values beyond the timer range must fail validation without spawning a child or emitting TimeoutOverflowWarning.
+- [x] R-134 | T2 | fix | node | Reject nonfinite and overflowing timeout values | acceptance: Infinity, NaN and values beyond the timer range must fail validation without spawning a child or emitting TimeoutOverflowWarning.
 - [ ] R-135 | T2 | fix | node | Validate every required ask-result field | acceptance: A stub returning only output and exit_code must raise RuneOutputError naming missing fields.
 - [ ] R-136 | T2 | fix | node | Bound captured child stdout and stderr | acceptance: Run a stub that writes beyond the configured output cap and observe a typed output-limit failure with bounded memory.
 - [ ] R-137 | T2 | fix | node | Find rune.exe on Windows | acceptance: On Windows with only rune.exe in a fixture PATH, resolveBinary must return its executable path.

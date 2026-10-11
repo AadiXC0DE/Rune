@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import childProcess from "node:child_process";
 import {
   accessSync,
   chmodSync,
@@ -7,6 +8,7 @@ import {
   rmSync,
   writeFileSync,
 } from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
 import { delimiter, join, relative } from "node:path";
 import { after, test } from "node:test";
@@ -311,6 +313,77 @@ test("a bin option that is not executable is reported, not skipped", () => {
 
   assert.ok(error instanceof RuneBinaryNotFoundError);
   assert.match(error.message, new RegExp(`${missing} is not an executable file`));
+});
+
+test("invalid timeoutMs values fail before spawning and emit no overflow warnings", async (t) => {
+  const originalSpawn = childProcess.spawn;
+  let spawnCalls = 0;
+  const warnings = [];
+  const onWarning = (warning) => {
+    if (warning.name === "TimeoutOverflowWarning") warnings.push(warning);
+  };
+  childProcess.spawn = (...args) => {
+    spawnCalls += 1;
+    return originalSpawn(...args);
+  };
+  // Update the binding's named import so every spawn is observed.
+  syncBuiltinESMExports();
+  process.on("warning", onWarning);
+  try {
+    for (const timeoutMs of [
+      Infinity,
+      NaN,
+      -Infinity,
+      2 ** 31,
+      2 ** 31 - 0.5,
+      Number.MAX_VALUE,
+      0,
+      -1,
+      "1000",
+      null,
+    ]) {
+      await t.test(String(timeoutMs), async () => {
+        spawnCalls = 0;
+        warnings.length = 0;
+        const error = await ask("hello", { bin: stub, timeoutMs }).then(
+          () => null,
+          (thrown) => thrown,
+        );
+        // Node delivers timer warnings on a later tick.
+        await new Promise((resolve) => setImmediate(resolve));
+        assert.ok(error instanceof TypeError, `expected TypeError, got ${error}`);
+        assert.match(error.message, /timeoutMs/);
+        assert.equal(spawnCalls, 0);
+        assert.deepEqual(warnings, []);
+      });
+    }
+    await assert.rejects(
+      ask("hello", { bin: join(first.directory, "absent"), timeoutMs: Infinity }),
+      TypeError,
+    );
+  } finally {
+    childProcess.spawn = originalSpawn;
+    syncBuiltinESMExports();
+    process.removeListener("warning", onWarning);
+  }
+});
+
+test("timeoutMs accepts the timer limit and positive fractional values", async () => {
+  const warnings = [];
+  const onWarning = (warning) => {
+    if (warning.name === "TimeoutOverflowWarning") warnings.push(warning);
+  };
+  process.on("warning", onWarning);
+  try {
+    for (const timeoutMs of [2 ** 31 - 1, 1000.5]) {
+      const result = await ask("valid timeout", { bin: stub, timeoutMs });
+      assert.equal(result.output, "valid timeout");
+    }
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepEqual(warnings, []);
+  } finally {
+    process.removeListener("warning", onWarning);
+  }
 });
 
 test("timeoutMs bounds a binary that outlives it", async () => {

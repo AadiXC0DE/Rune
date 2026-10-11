@@ -17,6 +17,9 @@ import { delimiter, isAbsolute, join, resolve } from "node:path";
  */
 const EFFORTS = ["auto", "none", "minimal", "low", "medium", "high", "xhigh", "max"];
 
+// Node clamps larger delays to 1 ms and emits TimeoutOverflowWarning.
+const MAX_TIMEOUT_MS = 2 ** 31 - 1;
+
 /** Base class for every failure this module reports. */
 export class RuneError extends Error {
   constructor(code, message, options) {
@@ -135,8 +138,13 @@ export async function ask(prompt, options = {}) {
   if (effort !== undefined && !EFFORTS.includes(effort)) {
     throw new TypeError(`the effort option must be one of ${EFFORTS.join(", ")}`);
   }
-  if (timeoutMs !== undefined && !(typeof timeoutMs === "number" && timeoutMs > 0)) {
-    throw new TypeError("the timeoutMs option must be a positive number");
+  if (
+    timeoutMs !== undefined &&
+    !(Number.isFinite(timeoutMs) && timeoutMs > 0 && timeoutMs <= MAX_TIMEOUT_MS)
+  ) {
+    throw new TypeError(
+      `the timeoutMs option must be a finite positive number no greater than ${MAX_TIMEOUT_MS}`,
+    );
   }
 
   const executable = resolveBinary(options);

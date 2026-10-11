@@ -182,6 +182,10 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Fixed
 
+- The Node binding rejects nonfinite `timeoutMs` values and delays above
+  2,147,483,647 ms before binary lookup or spawning, without timer overflow
+  warnings. Positive fractional delays and the maximum timer delay remain valid.
+
 - The Node binding resolves explicit relative `bin` paths against `options.cwd`
   before checking and running the executable. Absolute paths and bare names
   searched on `PATH` keep their existing behavior.

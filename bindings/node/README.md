@@ -62,6 +62,8 @@ option, `RUNE_BIN`, and `PATH`.
 
 `options` accepts `bin`, `model`, `effort`, `cwd`, `env`, `noSave`, `timeoutMs`,
 and `signal`. Types for every field of the result object are in `index.d.ts`.
+`timeoutMs` must be a finite positive number at most 2,147,483,647 milliseconds.
+Invalid values throw `TypeError` before resolving or spawning the binary.
 
 ## Running the tests
 

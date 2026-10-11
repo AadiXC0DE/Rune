@@ -98,7 +98,7 @@ export interface AskOptions {
   env?: Record<string, string>;
   /** Pass `--no-save` so the run creates no session. */
   noSave?: boolean;
-  /** Kill the process after this many milliseconds. */
+  /** Kill the process after this many milliseconds; finite, positive, and at most 2147483647. */
   timeoutMs?: number;
   /** Kill the process when this signal aborts. */
   signal?: AbortSignal;
