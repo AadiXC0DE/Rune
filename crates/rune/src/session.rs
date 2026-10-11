@@ -398,12 +398,20 @@ impl Host for SessionHost {
     ) -> Result<()> {
         use rune_agent::compaction::{self, Trigger};
         let estimate = request_estimate(self, plan)?;
-        match compaction::trigger(&estimate, &self.limits) {
+        let compaction_plan = compaction::plan(history, &self.limits);
+        let retained_estimate = if let Some(cut) = &compaction_plan {
+            let mut retained_plan = plan.clone();
+            retained_plan.messages.drain(..cut.removed_turns);
+            request_estimate(self, &retained_plan)?
+        } else {
+            estimate
+        };
+        match compaction::trigger(&estimate, &retained_estimate, &self.limits) {
             Trigger::NotNeeded | Trigger::Approaching => return Ok(()),
             Trigger::Impossible => return Err(compaction::cannot_fit_error()),
             Trigger::Required => {}
         }
-        let Some(compaction_plan) = compaction::plan(history, &self.limits) else {
+        let Some(compaction_plan) = compaction_plan else {
             // A short conversation can cross the trigger while still fitting.
             return Ok(());
         };
@@ -6885,6 +6893,119 @@ mod tests {
         )
         .expect("next model request");
         assert_eq!(fetch.requests.lock().expect("requests").len(), 2);
+    }
+
+    #[test]
+    fn an_oversized_removable_prefix_compacts_with_a_small_retained_tail() {
+        let (host, _, mut plan) = compaction_fixture();
+        let mut history = History::new();
+        history.push_user("earlier task");
+        history.push_assistant(vec![rune_net::message::ContentPart::Text {
+            text: "old answer ".repeat(10_000),
+        }]);
+        for index in 0..4 {
+            history.push_user(format!("recent question {index}"));
+            history.push_assistant(vec![rune_net::message::ContentPart::Text {
+                text: "recent answer".to_owned(),
+            }]);
+        }
+        history.push_user("continue the fixture");
+        plan.messages = history.to_messages();
+        plan.instructions = "preserve the current task".to_owned();
+        plan.tools = inventory::advertisement(&host.registry);
+        plan.max_output_tokens = Some(128);
+        host.context_limit
+            .store(10_000, std::sync::atomic::Ordering::Relaxed);
+        let estimate = request_estimate(&host, &plan).expect("estimate");
+        assert!(estimate.input_tokens > estimate.capacity);
+        let cut = rune_agent::compaction::plan(&history, &host.limits).expect("cut");
+        let retained = history.to_messages()[cut.removed_turns..].to_vec();
+        let fetch = SummaryFixture::new(
+            "The earlier fixture exchanges established the task and its current progress.",
+        );
+
+        host.prepare_request(&mut history, &mut plan, &fetch)
+            .expect("the removable prefix can be compacted");
+
+        assert_eq!(fetch.requests.lock().expect("requests").len(), 1);
+        assert_eq!(&history.to_messages()[1..], retained);
+        assert_eq!(plan.messages, history.to_messages());
+        assert!(
+            request_estimate(&host, &plan)
+                .expect("estimate")
+                .input_tokens
+                <= estimate.capacity
+        );
+        assert!(matches!(
+            host.events.lock().expect("events").last(),
+            Some(Event::ContextCompacted { .. })
+        ));
+        history.validate().expect("valid retained tail");
+    }
+
+    #[test]
+    fn oversized_retained_requests_are_refused_before_summarizing() {
+        for overhead in ["tail", "instructions", "tools"] {
+            let (host, mut history, mut plan) = compaction_fixture();
+            plan.max_output_tokens = Some(128);
+            let cut = rune_agent::compaction::plan(&history, &host.limits).expect("cut");
+            let mut retained_plan = plan.clone();
+            retained_plan.messages.drain(..cut.removed_turns);
+            let tail_tokens = request_estimate(&host, &retained_plan)
+                .expect("tail estimate")
+                .input_tokens;
+            match overhead {
+                "instructions" => plan.instructions = "instructions ".repeat(1000),
+                "tools" => plan.tools = inventory::advertisement(&host.registry),
+                _ => {}
+            }
+            retained_plan.instructions.clone_from(&plan.instructions);
+            retained_plan.tools.clone_from(&plan.tools);
+            let retained_tokens = request_estimate(&host, &retained_plan)
+                .expect("retained request estimate")
+                .input_tokens;
+            if overhead != "tail" {
+                assert!(retained_tokens > tail_tokens);
+            }
+            host.context_limit.store(
+                retained_tokens - 1 + 128,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            let before = history.to_messages();
+            let fetch = SummaryFixture::new("unused");
+
+            let error = host
+                .prepare_request(&mut history, &mut plan, &fetch)
+                .expect_err("retained request cannot fit");
+
+            assert_eq!(error.code(), ErrorCode::TooLarge, "{overhead}");
+            assert!(fetch.requests.lock().expect("requests").is_empty());
+            assert_eq!(history.to_messages(), before);
+            assert_eq!(plan.messages, before);
+            assert!(host.events.lock().expect("events").is_empty());
+        }
+    }
+
+    #[test]
+    fn an_oversized_short_history_without_a_removable_prefix_is_refused() {
+        let (host, _, mut plan) = compaction_fixture();
+        let mut history = History::new();
+        history.push_user("large prompt ".repeat(1000));
+        plan.messages = history.to_messages();
+        host.context_limit
+            .store(1000, std::sync::atomic::Ordering::Relaxed);
+        assert!(rune_agent::compaction::plan(&history, &host.limits).is_none());
+        let before = history.to_messages();
+        let fetch = SummaryFixture::new("unused");
+
+        let error = host
+            .prepare_request(&mut history, &mut plan, &fetch)
+            .expect_err("no prefix can be removed");
+
+        assert_eq!(error.code(), ErrorCode::TooLarge);
+        assert!(fetch.requests.lock().expect("requests").is_empty());
+        assert_eq!(history.to_messages(), before);
+        assert_eq!(plan.messages, before);
     }
 
     #[test]

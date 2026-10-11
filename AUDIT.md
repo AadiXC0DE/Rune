@@ -1974,7 +1974,7 @@ Resource accumulation after cancellation, session holder handover and concurrent
 - [x] R-095 | T2 | feature | tools | Add a permission-checked file rename tool | acceptance: Rename a workspace fixture and observe one mutation event, while an outside-root destination is refused.
 - [x] R-096 | T2 | feature | tools | Add a permission-checked directory creation tool | acceptance: Create nested workspace directories and observe bounded, idempotent results plus an outside-root refusal.
 - [x] R-097 | T2 | feature | tools | Expose a bounded git diff inspection tool | acceptance: Read a fixture staged and unstaged diff with a byte cap and observe labelled truncation without invoking writable git operations.
-- [ ] R-098 | T2 | fix | context | Measure retained-tail capacity separately from full history | acceptance: A fixture with a large removable prefix and small retained tail must select compaction rather than Impossible.
+- [x] R-098 | T2 | fix | context | Measure retained-tail capacity separately from full history | acceptance: A fixture with a large removable prefix and small retained tail must select compaction rather than Impossible.
 - [ ] R-099 | T2 | fix | providers | Apply steering before a retry request is rebuilt | acceptance: Enqueue a correction during attempt one and assert attempt two contains it even when attempt one fails.
 - [ ] R-100 | T2 | fix | providers | Treat offline refusal as a nonretryable policy outcome | acceptance: Run a generic offline turn host and observe no retry delay and zero outbound fetch calls.
 - [ ] R-101 | T2 | fix | providers | Validate endpoint authority and control characters | acceptance: Reject https:///, https://?broken and a URL containing newline before creating a client.

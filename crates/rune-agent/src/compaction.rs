@@ -231,9 +231,13 @@ impl Trigger {
 }
 
 /// Decides whether a compaction should run.
+///
+/// The full request drives the trigger; the separately measured retained request
+/// determines whether compaction is impossible. Neither estimate includes the
+/// future summary, so the caller must check capacity again after installing it.
 #[must_use]
-pub fn trigger(estimate: &Estimate, limits: &BudgetSet) -> Trigger {
-    match decide_capacity(estimate, limits) {
+pub fn trigger(estimate: &Estimate, retained_estimate: &Estimate, limits: &BudgetSet) -> Trigger {
+    match decide_capacity(estimate, retained_estimate, limits) {
         CapacityDecision::Fits => Trigger::NotNeeded,
         CapacityDecision::Approaching => Trigger::Approaching,
         CapacityDecision::Compact => Trigger::Required,
@@ -486,16 +490,36 @@ mod tests {
     fn the_trigger_maps_from_the_capacity_decision() {
         let limits = BudgetSet::new();
         assert_eq!(
-            trigger(&Estimate::new(0, 10, 1000), &limits),
+            trigger(
+                &Estimate::new(0, 10, 1000),
+                &Estimate::new(0, 10, 1000),
+                &limits
+            ),
             Trigger::NotNeeded
         );
         assert_eq!(
-            trigger(&Estimate::new(0, 800, 1000), &limits),
+            trigger(
+                &Estimate::new(0, 800, 1000),
+                &Estimate::new(0, 800, 1000),
+                &limits
+            ),
             Trigger::Required
         );
         assert_eq!(
-            trigger(&Estimate::new(0, 1200, 1000), &limits),
+            trigger(
+                &Estimate::new(0, 1200, 1000),
+                &Estimate::new(0, 1200, 1000),
+                &limits
+            ),
             Trigger::Impossible
+        );
+        assert_eq!(
+            trigger(
+                &Estimate::new(0, 1200, 1000),
+                &Estimate::new(0, 100, 1000),
+                &limits
+            ),
+            Trigger::Required
         );
     }
 

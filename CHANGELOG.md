@@ -122,6 +122,10 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Fixed
 
+- Automatic compaction measures the retained tail with instructions, tool schemas,
+  and the output reserve before refusing an oversized request. A large removable
+  prefix can now be summarized when the retained request fits.
+
 - Tool events and transcript summaries use the registered tool's declared
   activity, so custom Read tools are labelled Reading instead of Running.
 

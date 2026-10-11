@@ -217,7 +217,9 @@ until a live provider count arrives. Prompts are remembered and recallable with
 so a team can ship a workflow with the code. Before each CLI session request,
 Rune estimates the serialized input, including instructions and tool schemas,
 and summarizes earlier turns at `compaction_trigger_percent` of usable input
-capacity. A failed summary preserves the conversation and stops that request.
+capacity. Requests above capacity remain eligible for compaction when the retained
+tail fits with instructions, tool schemas, and the output reserve. A failed summary
+preserves the conversation and stops that request.
 
 Run `rune help` for everything, or see [COMMANDS.md](COMMANDS.md) for the full
 reference.
