@@ -290,8 +290,8 @@ impl Store {
         let handle = Handle::derive(&self.session, tool_call, &bounded);
         let preview = Self::build_preview(&bounded, &handle, is_error, preview_bytes);
 
-        self.total_bytes = self.total_bytes.saturating_add(bounded.len());
-        self.entries.insert(
+        let retained_bytes = bounded.len();
+        let replaced = self.entries.insert(
             handle.clone(),
             Retained {
                 handle: handle.clone(),
@@ -300,6 +300,10 @@ impl Store {
                 is_error,
             },
         );
+        self.total_bytes = self
+            .total_bytes
+            .saturating_sub(replaced.map_or(0, |entry| entry.content.len()))
+            .saturating_add(retained_bytes);
 
         Ok(preview)
     }
@@ -495,6 +499,69 @@ mod tests {
         assert_eq!(store.len(), 1);
         assert!(preview.text.len() <= DEFAULT_PREVIEW_BYTES);
         assert_eq!(preview.retained_bytes, 50_000);
+    }
+
+    #[test]
+    fn retaining_the_same_handle_counts_its_bytes_once() {
+        let mut store = store();
+        let content = "é".repeat(2500);
+        let other = "y".repeat(6000);
+        store
+            .retain(&limits(), "shell", "other-call", &other, false)
+            .expect("other result retained");
+        let first = store
+            .retain(&limits(), "shell", "call-1", &content, false)
+            .expect("first retain");
+        let second = store
+            .retain(&limits(), "read_file", "call-1", &content, true)
+            .expect("replacement");
+
+        assert_eq!(first.handle, second.handle);
+        assert_eq!(store.len(), 2);
+        assert_eq!(store.total_bytes(), other.len() + content.len());
+        assert_eq!(
+            store
+                .read(&second.handle, 0, MAX_READ_BYTES)
+                .expect("read")
+                .text,
+            content
+        );
+        assert_eq!(
+            store.describe(&second.handle),
+            Some(("read_file", content.len() as u64, true))
+        );
+    }
+
+    #[test]
+    fn replacing_a_truncated_result_counts_the_stored_bytes_once() {
+        let mut limits = limits();
+        limits
+            .set(
+                LimitName::MaxToolResultBytes,
+                rune_core::budget::Budget::Bounded(8192),
+                rune_core::config::Layer::User,
+            )
+            .expect("set");
+        let mut store = store();
+        let prefix = "x".repeat(8192);
+        let first = store
+            .retain(&limits, "shell", "call-1", &format!("{prefix}first"), false)
+            .expect("first retain");
+        let second = store
+            .retain(
+                &limits,
+                "shell",
+                "call-1",
+                &format!("{prefix}second"),
+                false,
+            )
+            .expect("replacement");
+        let stored = store.read(&second.handle, 0, MAX_READ_BYTES).expect("read");
+
+        assert_eq!(first.handle, second.handle);
+        assert_eq!(store.len(), 1);
+        assert_eq!(store.total_bytes(), stored.text.len());
+        assert_eq!(second.retained_bytes, stored.total_bytes);
     }
 
     #[test]

@@ -102,6 +102,9 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Fixed
 
+- Retaining the same tool-result handle again counts its stored bytes once,
+  keeping the session's retained-byte total accurate on replacement.
+
 - `grep_files` checks cancellation between buffered chunks within each file,
   including oversized lines. Cancelled searches stop before scanning the rest
   of the file and return a `cancelled` error without partial results.
