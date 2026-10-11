@@ -271,7 +271,8 @@ failure within the available output budget.
   `--external-access`; offline mode overrides it. `--json` emits the same report.
   Refused commands apply no protections; an unsandboxed fallback has unrestricted
   access. This explains sandbox policy, independently of command approval.
-- **Offline mode.** `--offline` refuses every outbound request.
+- **Offline mode.** `--offline` refuses every outbound request. Provider requests
+  fail immediately with `permission_denied`, without retry delays.
 - **Local.** Sessions, usage, and credentials stay on the machine.
 
 ## Configuration

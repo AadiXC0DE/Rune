@@ -122,6 +122,10 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Fixed
 
+- Offline provider requests return a nonretryable policy refusal, so generic
+  turn hosts report the refusal immediately without backoff or outbound fetches.
+  Model listing uses the same refusal, with the `permission_denied` error code.
+
 - Steering submitted during a failed provider attempt or its retry delay is
   included when the next retry request is rebuilt, within the same step.
 

@@ -16,7 +16,9 @@
 //! test that stubbed the transport would not have caught the framing bug that
 //! shipped once.
 
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use camino::Utf8PathBuf;
 use rune_agent::steering::{Cancellation, SteeringQueue};
@@ -39,6 +41,8 @@ struct TestHost {
     /// listener, which would make every request fail with a refused connection.
     server: Option<MockEndpoint>,
     endpoint: Endpoint,
+    /// Counts outbound client calls in the offline regression.
+    offline_fetch_calls: Option<Arc<AtomicUsize>>,
     dialect: Box<dyn Provider>,
     model: String,
     tools: Vec<ToolSpec>,
@@ -74,6 +78,7 @@ impl TestHost {
         Self {
             server: Some(endpoint),
             endpoint: Endpoint::new(base, "test-key"),
+            offline_fetch_calls: None,
             dialect: Box::new(rune_net::chat_completions::ChatCompletions),
             model: "test/model".to_owned(),
             tools: Vec::new(),
@@ -195,6 +200,14 @@ impl Host for TestHost {
         Effort::Auto
     }
 
+    fn fetch(&self) -> Box<dyn rune_net::fetch::Fetch> {
+        if let Some(calls) = &self.offline_fetch_calls {
+            Box::new(CountingOfflineFetch(Arc::clone(calls)))
+        } else {
+            Box::new(rune_net::transport::UreqFetch::new())
+        }
+    }
+
     fn emit(&self, event: Event) {
         // Steering is submitted from inside the stream, which is the only way
         // to exercise the path a user typing mid-turn takes. Doing it here
@@ -301,6 +314,22 @@ impl Host for TestHost {
 
     fn steering(&self) -> &SteeringQueue {
         &self.steering
+    }
+}
+
+/// Records attempts at the Fetch seam without sending anything to a socket.
+struct CountingOfflineFetch(Arc<AtomicUsize>);
+
+impl rune_net::fetch::Fetch for CountingOfflineFetch {
+    fn send(
+        &self,
+        _request: rune_net::fetch::FetchRequest,
+    ) -> rune_net::error::NetResult<rune_net::fetch::FetchResponse> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Err(rune_net::error::NetError::new(
+            rune_net::error::FailureKind::Network,
+            "offline turn must not call Fetch::send",
+        ))
     }
 }
 
@@ -1451,6 +1480,46 @@ fn a_turn_stopped_at_the_step_limit_keeps_its_last_words() {
     let outcome = run_turn(&mut history, &host).expect("turn");
     assert_eq!(outcome.stop_reason, StopReason::StepLimit);
     assert_eq!(outcome.text, "Halfway there.");
+}
+
+#[test]
+fn an_offline_turn_refuses_without_fetch_calls_or_retry_delay() {
+    let mut host = TestHost::new(MockEndpoint::start(vec![Script::text("unused")]));
+    host.endpoint.offline = true;
+    let fetch_calls = Arc::new(AtomicUsize::new(0));
+    host.offline_fetch_calls = Some(Arc::clone(&fetch_calls));
+    host.limits
+        .set(
+            rune_core::LimitName::ProviderMaxAttempts,
+            rune_core::budget::Budget::Bounded(2),
+            rune_core::config::Layer::User,
+        )
+        .expect("limit");
+    let mut history = rune_agent::History::new();
+    history.push_user("hello");
+
+    let started = Instant::now();
+    let error = run_turn(&mut history, &host).expect_err("offline refusal");
+    let elapsed = started.elapsed();
+    assert_eq!(fetch_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(host.server.as_ref().expect("server").request_count(), 0);
+    assert!(
+        !host.events().iter().any(|event| matches!(
+            event,
+            Event::ProviderRetry { .. }
+                | Event::StepRestarted { .. }
+                | Event::ProviderRetryFinished { .. }
+        )),
+        "offline refusal must not schedule a retry"
+    );
+    assert!(elapsed < Duration::from_millis(250), "elapsed: {elapsed:?}");
+    assert_eq!(error.code(), rune_core::ErrorCode::PermissionDenied);
+    assert_eq!(error.message(), "outbound requests are disabled");
+    assert_eq!(
+        error.detail().hint.as_deref(),
+        Some("remove the offline setting to reach a provider")
+    );
+    history.validate().expect("valid history after refusal");
 }
 
 #[test]

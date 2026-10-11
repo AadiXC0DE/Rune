@@ -44,6 +44,8 @@ pub enum FailureKind {
     ProviderError,
     /// The provider blocked the request on policy grounds.
     ContentFiltered,
+    /// Local policy forbids the request, such as when offline mode is enabled.
+    PolicyDenied,
     /// The request was cancelled.
     Cancelled,
 }
@@ -67,14 +69,16 @@ impl FailureKind {
             Self::ProtocolViolation => "protocol_violation",
             Self::ProviderError => "provider_error",
             Self::ContentFiltered => "content_filtered",
+            Self::PolicyDenied => "policy_denied",
             Self::Cancelled => "cancelled",
         }
     }
 
     /// Returns true when repeating the identical request could succeed.
     ///
-    /// A cancellation and a malformed request are not retryable. A rate limit is
-    /// retryable only after the endpoint's own delay, which the caller applies.
+    /// A cancellation, policy refusal, and malformed request are not retryable.
+    /// A rate limit is retryable only after the endpoint's own delay, which the
+    /// caller applies.
     #[must_use]
     pub const fn is_retryable(self) -> bool {
         matches!(
@@ -118,6 +122,7 @@ impl FailureKind {
             Self::ProtocolViolation => ErrorCode::ProtocolViolation,
             Self::ProviderError => ErrorCode::RequestRejected,
             Self::ContentFiltered => ErrorCode::RequestRejected,
+            Self::PolicyDenied => ErrorCode::PermissionDenied,
             Self::Cancelled => ErrorCode::Cancelled,
         }
     }
@@ -395,6 +400,7 @@ impl From<RuneError> for NetError {
             ErrorCode::ProtocolViolation => FailureKind::ProtocolViolation,
             ErrorCode::Timeout => FailureKind::Timeout,
             ErrorCode::Cancelled => FailureKind::Cancelled,
+            ErrorCode::PermissionDenied => FailureKind::PolicyDenied,
             ErrorCode::TooLarge | ErrorCode::InvalidField => FailureKind::InvalidRequest,
             ErrorCode::RequestRejected => FailureKind::ProviderError,
             _ => FailureKind::Decode,
@@ -441,6 +447,7 @@ mod tests {
             FailureKind::ProtocolViolation,
             FailureKind::ProviderError,
             FailureKind::ContentFiltered,
+            FailureKind::PolicyDenied,
             FailureKind::Cancelled,
         ];
         let mut seen = std::collections::HashSet::new();
@@ -467,6 +474,7 @@ mod tests {
             FailureKind::Cancelled,
             FailureKind::ModelNotFound,
             FailureKind::ContentFiltered,
+            FailureKind::PolicyDenied,
         ] {
             assert!(!kind.is_retryable(), "{kind:?} must not be retried");
         }
@@ -476,6 +484,25 @@ mod tests {
     fn a_cancellation_is_never_retried() {
         // Retrying a cancellation would resurrect work the user stopped.
         assert!(!FailureKind::Cancelled.is_retryable());
+    }
+
+    #[test]
+    fn a_policy_refusal_preserves_its_nonretryable_kind_and_hint() {
+        let error = NetError::new(FailureKind::PolicyDenied, "outbound requests are disabled")
+            .with_hint("remove the offline setting to reach a provider");
+        assert!(!error.is_retryable());
+        assert!(!error.kind().is_request_fault());
+        assert_eq!(error.kind().as_str(), "policy_denied");
+        let converted = error.to_rune_error();
+        assert_eq!(converted.code(), ErrorCode::PermissionDenied);
+        assert_eq!(converted.message(), error.message());
+        assert_eq!(
+            converted.detail().hint.as_deref(),
+            Some("remove the offline setting to reach a provider")
+        );
+        let restored = NetError::from(converted);
+        assert_eq!(restored.kind(), FailureKind::PolicyDenied);
+        assert!(!restored.is_retryable());
     }
 
     #[test]
@@ -591,6 +618,7 @@ mod tests {
             FailureKind::ProviderError,
             FailureKind::Timeout,
             FailureKind::Cancelled,
+            FailureKind::PolicyDenied,
         ] {
             let converted = NetError::from(RuneError::new(kind.code(), "failed"));
             assert_eq!(converted.kind(), kind);

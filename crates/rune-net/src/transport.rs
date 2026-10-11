@@ -556,7 +556,7 @@ pub fn stream_completion_observed(
 ) -> NetResult<StreamOutcome> {
     if endpoint.offline {
         return Err(
-            NetError::new(FailureKind::Network, "outbound requests are disabled")
+            NetError::new(FailureKind::PolicyDenied, "outbound requests are disabled")
                 .with_hint("remove the offline setting to reach a provider"),
         );
     }
@@ -890,7 +890,7 @@ pub fn list_models(
 ) -> NetResult<String> {
     if endpoint.offline {
         return Err(
-            NetError::new(FailureKind::Network, "outbound requests are disabled")
+            NetError::new(FailureKind::PolicyDenied, "outbound requests are disabled")
                 .with_hint("remove the offline setting to reach a provider"),
         );
     }
@@ -2358,8 +2358,32 @@ mod tests {
             &|| false,
         )
         .expect_err("refused");
-        assert_eq!(err.kind(), FailureKind::Network);
+        assert_eq!(err.kind(), FailureKind::PolicyDenied);
+        assert!(!err.is_retryable());
         assert!(err.message().contains("disabled"));
+    }
+
+    #[test]
+    fn an_offline_model_list_is_a_policy_refusal_before_any_network_call() {
+        let endpoint = Endpoint::new("https://api.example.com", "k").offline(true);
+        let err = list_models(
+            &NoFetch,
+            &endpoint,
+            &crate::chat_completions::ChatCompletions,
+            DEFAULT_HEAD_TIMEOUT,
+        )
+        .expect_err("refused");
+        assert_eq!(err.kind(), FailureKind::PolicyDenied);
+        assert!(!err.is_retryable());
+        assert_eq!(
+            err.to_rune_error().code(),
+            rune_core::error::ErrorCode::PermissionDenied
+        );
+        assert_eq!(err.message(), "outbound requests are disabled");
+        assert_eq!(
+            err.to_rune_error().detail().hint.as_deref(),
+            Some("remove the offline setting to reach a provider")
+        );
     }
 
     #[test]
