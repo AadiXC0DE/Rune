@@ -122,6 +122,9 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Fixed
 
+- Setting `parallel_tool_calls = 1` disables parallel tool calls in provider
+  requests for Chat Completions, Responses, and Anthropic Messages.
+
 - Provider endpoint validation rejects empty authorities or hosts, control
   characters (including leading or trailing newlines), and embedded whitespace
   before client creation. HTTPS and loopback HTTP endpoints remain accepted.

@@ -904,6 +904,32 @@ fn the_request_carries_the_instructions_the_conversation_and_the_tools() {
 }
 
 #[test]
+fn the_request_honors_the_parallel_tool_call_limit() {
+    for limit in [None, Some(1), Some(2)] {
+        let endpoint = MockEndpoint::start(vec![Script::text("reply")]);
+        let mut host = TestHost::new(endpoint).with_tools(vec![read_tool()]);
+        if let Some(limit) = limit {
+            host.limits
+                .set(
+                    rune_core::LimitName::ParallelToolCalls,
+                    rune_core::budget::Budget::Bounded(limit),
+                    rune_core::config::Layer::User,
+                )
+                .expect("set parallel_tool_calls");
+        }
+        let mut history = rune_agent::History::new();
+        history.push_user("hello");
+
+        let outcome = run_turn(&mut history, &host).expect("turn");
+        assert_eq!(outcome.stop_reason, StopReason::Completed);
+        let server = host.server.as_ref().expect("server");
+        assert_eq!(server.request_count(), 1);
+        let body = server.last_body().expect("request body");
+        assert_eq!(body["parallel_tool_calls"], limit != Some(1));
+    }
+}
+
+#[test]
 fn private_web_requests_use_a_distinct_decision_before_any_backend_call() {
     use rune_tools::web::{Fetched, RecordingBackend, WebFetch};
     use std::sync::Arc;

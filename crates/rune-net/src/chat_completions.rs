@@ -114,9 +114,10 @@ impl Provider for ChatCompletions {
                 "tool_choice".to_owned(),
                 serde_json::json!(plan.tool_choice.as_str()),
             );
-            if plan.parallel_tool_calls {
-                body.insert("parallel_tool_calls".to_owned(), serde_json::json!(true));
-            }
+            body.insert(
+                "parallel_tool_calls".to_owned(),
+                serde_json::json!(plan.parallel_tool_calls),
+            );
         }
 
         if let Some(effort) = effort_wire(plan.effort) {
@@ -780,6 +781,26 @@ mod tests {
         );
         assert_eq!(body["tool_choice"], "auto");
         assert_eq!(body["parallel_tool_calls"], true);
+    }
+
+    #[test]
+    fn one_call_mode_is_explicitly_serialized() {
+        let mut plan = plan_with_user("hi");
+        plan.tools = vec![ToolSpec {
+            name: "read_file".to_owned(),
+            description: "Read a file".to_owned(),
+            input_schema: serde_json::json!({ "type": "object" }),
+        }];
+        plan.parallel_tool_calls = false;
+        let body = ChatCompletions.build_request(&plan).expect("build");
+        assert_eq!(body["parallel_tool_calls"], false);
+        assert_eq!(body["tool_choice"], "auto");
+
+        plan.tools.clear();
+        let body = ChatCompletions
+            .build_request(&plan)
+            .expect("build without tools");
+        assert!(body.get("parallel_tool_calls").is_none());
     }
 
     #[test]

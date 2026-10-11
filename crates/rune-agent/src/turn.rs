@@ -608,6 +608,8 @@ fn stream_with_retry(
         } else {
             ToolChoice::Auto
         };
+        plan.parallel_tool_calls =
+            host.limits().get(LimitName::ParallelToolCalls).value() != Some(1);
         plan.effort = host.effort();
         plan.fast_mode = host.fast_mode();
         plan.provider_order = host.provider_order();

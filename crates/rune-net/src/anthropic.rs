@@ -115,17 +115,18 @@ impl Provider for Anthropic {
                 })
                 .collect();
             body.insert("tools".to_owned(), serde_json::Value::Array(tools));
-            if plan.tool_choice != ToolChoice::Auto {
+            if plan.tool_choice != ToolChoice::Auto || !plan.parallel_tool_calls {
                 // The endpoint spells a required tool call `any`, not the
                 // `required` the OpenAI shapes use.
                 let choice = match plan.tool_choice {
                     ToolChoice::Required => "any",
                     other => other.as_str(),
                 };
-                body.insert(
-                    "tool_choice".to_owned(),
-                    serde_json::json!({ "type": choice }),
-                );
+                let mut choice = serde_json::json!({ "type": choice });
+                if !plan.parallel_tool_calls && plan.tool_choice != ToolChoice::None {
+                    choice["disable_parallel_tool_use"] = serde_json::json!(true);
+                }
+                body.insert("tool_choice".to_owned(), choice);
             }
         }
 
@@ -865,6 +866,36 @@ mod tests {
             input_schema: serde_json::json!({ "type": "object" }),
         }];
         let body = Anthropic.build_request(&plan).expect("build");
+        assert!(body.get("tool_choice").is_none());
+    }
+
+    #[test]
+    fn one_call_mode_disables_parallel_tool_use() {
+        let mut plan = plan_with_user("hi");
+        plan.tools = vec![ToolSpec {
+            name: "read_file".to_owned(),
+            description: "Read a file".to_owned(),
+            input_schema: serde_json::json!({ "type": "object" }),
+        }];
+        plan.parallel_tool_calls = false;
+        for (choice, wire) in [(ToolChoice::Auto, "auto"), (ToolChoice::Required, "any")] {
+            plan.tool_choice = choice;
+            let body = Anthropic.build_request(&plan).expect("build");
+            assert_eq!(
+                body["tool_choice"],
+                serde_json::json!({ "type": wire, "disable_parallel_tool_use": true })
+            );
+            assert!(body.get("parallel_tool_calls").is_none());
+        }
+
+        plan.tool_choice = ToolChoice::None;
+        let body = Anthropic
+            .build_request(&plan)
+            .expect("build without tool use");
+        assert_eq!(body["tool_choice"], serde_json::json!({ "type": "none" }));
+
+        plan.tools.clear();
+        let body = Anthropic.build_request(&plan).expect("build without tools");
         assert!(body.get("tool_choice").is_none());
     }
 

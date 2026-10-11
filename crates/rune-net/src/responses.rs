@@ -830,6 +830,26 @@ mod tests {
     }
 
     #[test]
+    fn one_call_mode_is_explicitly_serialized() {
+        let mut plan = plan_with_user("hi");
+        plan.tools = vec![ToolSpec {
+            name: "read_file".to_owned(),
+            description: "Read a file".to_owned(),
+            input_schema: serde_json::json!({ "type": "object" }),
+        }];
+        for parallel in [true, false] {
+            plan.parallel_tool_calls = parallel;
+            let body = Responses.build_request(&plan).expect("build");
+            assert_eq!(body["parallel_tool_calls"], parallel);
+            assert_eq!(body["tool_choice"], "auto");
+        }
+
+        plan.tools.clear();
+        let body = Responses.build_request(&plan).expect("build without tools");
+        assert!(body.get("parallel_tool_calls").is_none());
+    }
+
+    #[test]
     fn an_assistant_tool_call_becomes_a_function_call_item() {
         let mut plan = RequestPlan::new("m");
         plan.messages = vec![
