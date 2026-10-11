@@ -6,6 +6,11 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Added
 
+- `edit_file` accepts an `edits` array of up to 128 literal replacement hunks.
+  Hunks run in order against earlier results and commit in one atomic write.
+  A missing or ambiguous hunk leaves the entire file unchanged and returns a
+  repair hint identifying the failed hunk. Single-replacement calls still work.
+
 - Provider retries show the next attempt, attempt limit, and pending delay in
   the existing terminal status row. The delay disappears when the retry starts.
 
