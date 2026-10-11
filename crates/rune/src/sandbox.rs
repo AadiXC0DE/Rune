@@ -108,7 +108,7 @@ fn report(
     let protected_paths = paths.protected_paths.iter().map(|path| PathRule {
         path: path.to_string(),
         access: "read_only",
-        source: "sandbox PROTECTED_REPOSITORY_PATHS (existing paths under writable roots; Linux protects .git when hooks are absent)".into(),
+        source: "sandbox PROTECTED_REPOSITORY_PATHS (paths under writable roots; Linux protects .git when hooks are absent; macOS protects absent hooks destinations)".into(),
     }).chain(paths.credential_paths.iter().map(|path| PathRule {
         path: path.to_string(),
         access: "hidden",

@@ -1981,7 +1981,7 @@ Resource accumulation after cancellation, session holder handover and concurrent
 - [x] R-102 | T2 | fix | providers | Honor one-call mode in model request serialization | acceptance: Set parallel_tool_calls=1 and assert the provider request disables parallel tool calls.
 - [x] R-103 | T2 | feature | providers | Execute eligible read calls concurrently within the configured cap | acceptance: Use barrier-backed fixture reads to prove two run concurrently at cap 2 and never overlap a pending mutation.
 - [x] R-104 | T2 | fix | sandbox | Protect absent Linux git hooks destinations | acceptance: With .git/hooks absent, a sandboxed fixture command must fail to create an executable hook there.
-- [ ] R-105 | T2 | fix | sandbox | Protect absent macOS git hooks destinations | acceptance: On macOS with .git/hooks absent, a sandboxed fixture command must fail to create an executable hook there.
+- [x] R-105 | T2 | fix | sandbox | Protect absent macOS git hooks destinations | acceptance: On macOS with .git/hooks absent, a sandboxed fixture command must fail to create an executable hook there.
 - [ ] R-106 | T2 | fix | sandbox | Protect nested repositories within writable roots | acceptance: A sandboxed command must be refused when writing a nested repository's config or hooks, while normal source writes still work.
 - [ ] R-107 | T2 | fix | sessions | Write disposable session metadata atomically | acceptance: Kill during metadata replacement and observe valid old or new metadata and replayable authoritative events.
 - [ ] R-108 | T2 | fix | sessions | Distinguish durable append success from projection failure | acceptance: Force metadata write failure after event sync and observe a reported durable event with a repair warning rather than retry ambiguity.

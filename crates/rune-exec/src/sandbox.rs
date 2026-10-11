@@ -191,7 +191,7 @@ impl SandboxPolicy {
 pub struct PolicyPaths {
     /// Workspace followed by any additional writable roots.
     pub writable_roots: Vec<Utf8PathBuf>,
-    /// Existing repository paths whose writes are denied.
+    /// Repository paths whose writes are denied, including absent macOS hooks.
     pub protected_paths: Vec<Utf8PathBuf>,
     /// Existing credential locations masked by the backend.
     pub credential_paths: Vec<Utf8PathBuf>,
@@ -361,8 +361,10 @@ fn masked_paths(credentials: &[Utf8PathBuf], writable: &[Utf8PathBuf]) -> Vec<Ut
 
 /// Returns the repository paths under the writable roots that stay read-only.
 ///
-/// Only paths that exist are named, resolved the same way the roots are, since
-/// a rule about a missing path matches nothing and a `bwrap` bind of one fails.
+/// Existing paths are resolved the same way the roots are. On macOS, an absent
+/// hooks destination is joined to its resolved `.git` parent and denied as a
+/// subtree, without preventing writes to other Git metadata.
+/// A `bwrap` bind of a missing path fails.
 /// On Linux, an absent hooks directory is protected by binding its existing
 /// `.git` parent read-only. This also denies other metadata writes until hooks
 /// exist, but leaves source files writable and creates no host directories.
@@ -376,6 +378,12 @@ fn protected_paths(writable: &[Utf8PathBuf]) -> Vec<Utf8PathBuf> {
                     let git = root.join(".git");
                     if git.is_dir() {
                         return git.canonicalize_utf8();
+                    }
+                }
+                if cfg!(target_os = "macos") && relative == ".git/hooks" {
+                    let git = root.join(".git");
+                    if git.is_dir() {
+                        return git.canonicalize_utf8().map(|git| git.join("hooks"));
                     }
                 }
                 Err(error)
@@ -423,9 +431,10 @@ fn temporary_roots() -> Vec<Utf8PathBuf> {
 /// Returns the Seatbelt rule that covers a resolved path.
 ///
 /// A file is named literally, where a subpath rule would also cover a directory
-/// that happened to share its name.
+/// that happened to share its name. An absent protected directory needs a
+/// subpath rule so both its creation and future contents are covered.
 fn rule_for(resolved: &Utf8Path) -> &'static str {
-    if resolved.is_dir() {
+    if resolved.is_dir() || !resolved.exists() {
         "subpath"
     } else {
         "literal"
@@ -1590,6 +1599,100 @@ mod tests {
         let (_other, plain) = tempdir();
         let plain = plain.canonicalize_utf8().expect("plain");
         assert!(protected_paths(&[plain]).is_empty());
+    }
+
+    #[test]
+    fn an_absent_seatbelt_destination_is_protected_as_a_subtree() {
+        let (_guard, workspace) = tempdir();
+        let hooks = workspace
+            .canonicalize_utf8()
+            .expect("workspace")
+            .join("hooks");
+        assert!(!hooks.exists());
+        assert_eq!(
+            operand(&hooks).expect("operand"),
+            format!("(subpath {})", quote(&hooks).expect("quote"))
+        );
+        assert!(!hooks.exists(), "building the rule created hooks");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_seatbelt_profile_protects_absent_hooks_in_every_writable_root() {
+        let (_guard, root) = tempdir();
+        let workspace = root.join("workspace");
+        let extra = root.join("extra");
+        for directory in [&workspace, &extra] {
+            std::fs::create_dir_all(directory.join(".git")).expect("git directory");
+            std::fs::write(directory.join(".git/config"), "[core]\n").expect("config");
+        }
+        let policy = SandboxPolicy::new(workspace, vec![extra], false);
+        let profile = MacSandbox::profile_with(&policy, &[]).expect("profile");
+        let paths = policy.resolved_paths().expect("paths");
+        let last_write_grant = profile.rfind("(allow file-write*").expect("write grant");
+        for directory in &paths.writable_roots {
+            let git = directory.join(".git");
+            let hooks = git.join("hooks");
+            assert!(paths.protected_paths.contains(&hooks), "{paths:?}");
+            let deny = format!(
+                "(deny file-write* (subpath {}))",
+                quote(&hooks).expect("quote")
+            );
+            assert!(profile.find(&deny).expect("hooks deny") > last_write_grant);
+            assert!(!paths.protected_paths.contains(&git), "{paths:?}");
+            assert!(!hooks.exists(), "building the profile created hooks");
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_macos_sandboxed_command_cannot_create_an_absent_executable_hook() {
+        let sandbox = MacSandbox::detect();
+        if !sandbox.support().is_full() {
+            eprintln!(
+                "live macOS hooks regression skipped: {:?}",
+                sandbox.support()
+            );
+            return;
+        }
+        let (_guard, root) = tempdir();
+        let workspace = root.join("workspace");
+        let extra = root.join("extra");
+        for directory in [&workspace, &extra] {
+            std::fs::create_dir_all(directory.join(".git")).expect("git directory");
+            std::fs::write(directory.join(".git/config"), "[core]\n").expect("config");
+        }
+        let policy = SandboxPolicy::new(workspace.clone(), vec![extra.clone()], false);
+        for directory in [&workspace, &extra] {
+            let hooks = directory.join(".git/hooks");
+            assert!(!hooks.exists());
+            for (command, permitted) in [
+                ("printf source > kept.txt", true),
+                ("printf metadata > .git/index", true),
+                (
+                    "mkdir -p .git/hooks && printf '#!/bin/sh\\nexit 0\\n' > .git/hooks/pre-commit && chmod +x .git/hooks/pre-commit",
+                    false,
+                ),
+            ] {
+                let prepared = prepare(command, directory, None, environment()).expect("prepare");
+                let wrapped = sandbox.wrap(&prepared, &policy, false).expect("wrap");
+                let outcome = run(&wrapped, Duration::from_secs(20), &never).expect("run");
+                assert_eq!(
+                    outcome.exit.is_success(),
+                    permitted,
+                    "`{command}`: {outcome:?}"
+                );
+            }
+            assert_eq!(
+                std::fs::read_to_string(directory.join("kept.txt")).expect("source"),
+                "source"
+            );
+            assert_eq!(
+                std::fs::read_to_string(directory.join(".git/index")).expect("index"),
+                "metadata"
+            );
+            assert!(!hooks.exists(), "the sandboxed command created hooks");
+        }
     }
 
     #[cfg(target_os = "macos")]

@@ -106,6 +106,10 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Security
 
+- On macOS, sandboxed commands cannot create a previously absent `.git/hooks`
+  directory in a repository at a writable root. The hooks destination is denied
+  using its resolved `.git` parent; other Git metadata and source files remain
+  writable. Sandbox explanations include the absent hooks destination.
 - On Linux, sandboxed commands cannot create a previously absent `.git/hooks`
   directory in a repository at a writable root. Its existing `.git` parent
   stays read-only while hooks are absent, also blocking index and lock writes;

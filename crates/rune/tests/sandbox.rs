@@ -171,6 +171,35 @@ fn absent_hooks_report_the_read_only_git_parent_without_creating_hooks() {
     assert!(!git.join("hooks").exists(), "explanation created hooks");
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn absent_macos_hooks_report_the_destination_without_creating_hooks() {
+    let fixture = Fixture::new();
+    for root in ["workspace", "saved"] {
+        std::fs::remove_dir(fixture.dir.path().join(root).join(".git/hooks"))
+            .expect("remove hooks");
+    }
+    let report = fixture.json(&["sandbox", "explain", "--json", "--", "echo fixture"]);
+    let protected = report["protected_paths"].as_array().expect("protections");
+    for root in ["workspace", "saved"] {
+        let git = fixture.dir.path().join(root).join(".git");
+        let hooks = format!("{}/hooks", resolved(&git));
+        assert!(
+            protected.iter().any(|rule| {
+                rule["path"] == hooks
+                    && rule["access"] == "read_only"
+                    && rule["source"]
+                        .as_str()
+                        .expect("source")
+                        .contains("macOS protects absent hooks destinations")
+            }),
+            "{report}"
+        );
+        assert!(!protected.iter().any(|rule| rule["path"] == resolved(&git)));
+        assert!(!git.join("hooks").exists(), "explanation created hooks");
+    }
+}
+
 #[test]
 fn offline_overrides_an_explicit_context_grant_and_reports_its_source() {
     let fixture = Fixture::new();
