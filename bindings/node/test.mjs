@@ -8,7 +8,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { delimiter, join } from "node:path";
+import { delimiter, join, relative } from "node:path";
 import { after, test } from "node:test";
 
 import {
@@ -153,6 +153,47 @@ test("a successful run returns the result object", async () => {
   assert.deepEqual(result.tool_calls, [{ name: "read_file", status: "success" }]);
   assert.equal(result.error, undefined);
   assert.equal(result.error_code, undefined);
+});
+
+test("an explicit relative binary runs from options.cwd", async (t) => {
+  for (const cwd of [first.directory, relative(process.cwd(), first.directory)]) {
+    await t.test(`cwd ${cwd}`, async () => {
+      assert.equal(resolveBinary({ bin: "./rune", cwd }), stub);
+      const result = await ask("relative cwd stub", { bin: "./rune", cwd });
+      assert.equal(result.output, "relative cwd stub");
+      assert.equal(result.resolved_provider, "stub");
+    });
+  }
+});
+
+test("an explicit relative binary defaults to the caller's working directory", async () => {
+  const bin = `./${relative(process.cwd(), stub)}`;
+  const result = await ask("default cwd stub", { bin });
+  assert.equal(result.output, "default cwd stub");
+});
+
+test("a relative binary missing from cwd does not fall back to the caller's directory", () => {
+  const savedCwd = process.cwd();
+  try {
+    process.chdir(first.directory);
+    const error = capture(() => resolveBinary({ bin: "./rune", cwd: emptyPath }));
+    assert.ok(error instanceof RuneBinaryNotFoundError);
+    assert.equal(error.candidates[0].value, "./rune");
+  } finally {
+    process.chdir(savedCwd);
+  }
+});
+
+test("an absolute binary runs with a different cwd", async () => {
+  const result = await ask("absolute binary stub", { bin: stub, cwd: emptyPath });
+  assert.equal(result.output, "absolute binary stub");
+});
+
+test("a bare binary name still uses PATH with a different cwd", async () => {
+  const result = await withPath(first.directory, () =>
+    ask("PATH binary stub", { bin: "rune", cwd: emptyPath }),
+  );
+  assert.equal(result.output, "PATH binary stub");
 });
 
 test("the model and effort options reach the binary as global flags", async () => {

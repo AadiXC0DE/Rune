@@ -86,13 +86,13 @@ export interface AskResult {
 
 /** Options for `ask`. */
 export interface AskOptions {
-  /** Path to the executable, or a name to find on `PATH`. */
+  /** Path to the executable, relative to `cwd`, or a name to find on `PATH`. */
   bin?: string;
   /** Model override for this run, passed before the command name. */
   model?: string;
   /** Reasoning effort override for this run, passed before the command name. */
   effort?: RuneEffort;
-  /** Working directory for the process. */
+  /** Working directory for the process and relative `bin` paths; defaults to the current directory. */
   cwd?: string;
   /** Extra environment variables merged over the current environment. */
   env?: Record<string, string>;
@@ -141,11 +141,13 @@ export class RuneOutputError extends RuneError {
 /**
  * Resolves the executable to run: the `bin` option, then `RUNE_BIN`, then an
  * executable named `rune` on `PATH`.
+ * Explicit relative `bin` paths resolve against `cwd`, or the current directory
+ * when `cwd` is omitted.
  *
  * @throws {TypeError} When `bin` is not a non-empty string.
  * @throws {RuneBinaryNotFoundError} When no location holds an executable.
  */
-export function resolveBinary(options?: { bin?: string }): string;
+export function resolveBinary(options?: { bin?: string; cwd?: string }): string;
 
 /**
  * Runs one request and returns the parsed result object.

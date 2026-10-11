@@ -39,9 +39,10 @@ try {
 ```
 
 Point `bin` at `target/release/rune`, at `target/debug/rune` after
-`cargo build`, or at any `rune` on `PATH`. A relative `bin` resolves against the
-working directory, so run the example from the repository root, or pass an
-absolute path.
+`cargo build`, or at any `rune` on `PATH`. An explicit relative path such as
+`./rune` resolves against `options.cwd`, or the current working directory when
+`cwd` is omitted. This applies to both `ask` and `resolveBinary`. A bare name
+such as `rune` is searched on `PATH`.
 
 A run that exits non-zero throws `RuneExitError`, whose `result` field carries
 the same object the binary printed, including `error` and `error_code`. A

@@ -182,6 +182,10 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Fixed
 
+- The Node binding resolves explicit relative `bin` paths against `options.cwd`
+  before checking and running the executable. Absolute paths and bare names
+  searched on `PATH` keep their existing behavior.
+
 - SDK turns bound unread events to 1,024 entries. A stalled consumer that fills
   the queue cancels cooperative provider and tool work and receives an explicit
   `limit_exceeded` backpressure error with invariant `sdk_event_queue` from

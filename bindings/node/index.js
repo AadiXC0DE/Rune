@@ -7,7 +7,7 @@
 
 import { spawn } from "node:child_process";
 import { accessSync, constants, statSync } from "node:fs";
-import { delimiter, join } from "node:path";
+import { delimiter, isAbsolute, join, resolve } from "node:path";
 
 /**
  * Reasoning effort names the command line accepts.
@@ -65,8 +65,9 @@ export class RuneOutputError extends RuneError {
  * The `bin` option wins, then `RUNE_BIN`, then an executable named `rune` on
  * `PATH`. A source that is configured but unusable is an error rather than a
  * silent fallback, so a typo is reported instead of running another binary.
+ * Explicit relative `bin` paths are resolved against `cwd` when provided.
  *
- * @param {{ bin?: string }} [options]
+ * @param {{ bin?: string, cwd?: string }} [options]
  * @returns {string} Path to the executable.
  */
 export function resolveBinary(options = {}) {
@@ -81,7 +82,12 @@ export function resolveBinary(options = {}) {
 
   const candidates = binaryCandidates(bin);
   if (bin !== undefined) {
-    const found = findExecutable(bin);
+    // Check and spawn the same file even when the child changes directories.
+    const candidate =
+      options.cwd !== undefined && !isAbsolute(bin) && (bin.includes("/") || bin.includes("\\"))
+        ? resolve(options.cwd, bin)
+        : bin;
+    const found = findExecutable(candidate);
     if (found === null) {
       throw new RuneBinaryNotFoundError(candidates, `${bin} is not an executable file`);
     }
