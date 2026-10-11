@@ -102,6 +102,10 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Fixed
 
+- Built-in tools reject unknown arguments in closed schemas on both direct and
+  registry calls, naming misspelled fields such as `read_file.start_lien`
+  instead of silently using defaults.
+
 - Policy settings writes and updates replace the complete rules file atomically.
   An interrupted write leaves the old rules intact until replacement; backups
   and private file permissions are preserved.

@@ -3,7 +3,7 @@
 use rune_core::error::{Result, RuneError};
 use serde_json::json;
 
-use crate::contract::{Activity, ExecutionContext, Tool, ToolOutput};
+use crate::contract::{Activity, ExecutionContext, Tool, ToolOutput, validate_closed_arguments};
 use crate::mutation::{self, Occurrence};
 use crate::workspace::resolve;
 
@@ -80,6 +80,7 @@ impl Tool for EditFile {
         context: &ExecutionContext,
     ) -> Result<ToolOutput> {
         context.check_cancelled()?;
+        validate_closed_arguments(arguments, &self.input_schema())?;
         let tool = self.name();
         let raw = mutation::required_string(tool, arguments, "path")?;
         let old = mutation::required_string(tool, arguments, "old_string")?;

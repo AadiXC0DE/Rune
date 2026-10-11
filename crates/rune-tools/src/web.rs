@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 use rune_core::budget::{BudgetSet, LimitName};
 use rune_core::error::{ErrorCode, Result, RuneError};
 
-use crate::contract::{Activity, ExecutionContext, Tool, ToolOutput};
+use crate::contract::{Activity, ExecutionContext, Tool, ToolOutput, validate_closed_arguments};
 use crate::workspace::{bool_arg, string_arg, truncate_to_bytes, usize_arg};
 
 /// Longest URL accepted.
@@ -1105,6 +1105,7 @@ impl Tool for WebFetch {
         context: &ExecutionContext,
     ) -> Result<ToolOutput> {
         context.check_cancelled()?;
+        validate_closed_arguments(arguments, &self.input_schema())?;
         let raw = string_arg(arguments, "url")?.ok_or_else(|| RuneError::missing_field("url"))?;
         let allow_private = bool_arg(arguments, "allow_private")?.unwrap_or(false);
         if allow_private && !context.private_network_access {
@@ -1306,6 +1307,7 @@ impl Tool for WebSearch {
         context: &ExecutionContext,
     ) -> Result<ToolOutput> {
         context.check_cancelled()?;
+        validate_closed_arguments(arguments, &self.input_schema())?;
         let query = string_arg(arguments, "query")?
             .ok_or_else(|| RuneError::missing_field("query"))?
             .trim()

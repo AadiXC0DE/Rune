@@ -6,7 +6,7 @@ use std::io::{BufRead, BufReader};
 use camino::Utf8Path;
 use rune_core::error::{ErrorCode, Result, RuneError};
 
-use crate::contract::{Activity, ExecutionContext, Tool, ToolOutput};
+use crate::contract::{Activity, ExecutionContext, Tool, ToolOutput, validate_closed_arguments};
 use crate::workspace::{
     FileLimits, SUMMARY_RESERVE_BYTES, display_path, join_capped, read_line_bounded, resolve,
     string_arg, truncate_line, usize_arg,
@@ -89,6 +89,7 @@ impl Tool for ReadFile {
         arguments: &serde_json::Value,
         context: &ExecutionContext,
     ) -> Result<ToolOutput> {
+        validate_closed_arguments(arguments, &self.input_schema())?;
         let requested = string_arg(arguments, "path")?
             .ok_or_else(|| RuneError::missing_field("path"))?
             .to_owned();
@@ -439,6 +440,29 @@ mod tests {
             "{}",
             output.text
         );
+    }
+
+    #[test]
+    fn a_misspelled_optional_argument_is_rejected_before_reading() {
+        let repo = Repo::new();
+        let arguments = serde_json::json!({ "path": "README.md", "start_lien": 2 });
+        let err = ReadFile::new()
+            .call(&arguments, &repo.context())
+            .expect_err("unknown argument refused");
+        assert_eq!(err.code(), ErrorCode::InvalidField);
+        assert_eq!(err.detail().field.as_deref(), Some("start_lien"));
+        assert!(err.message().contains("start_lien"));
+
+        let mut registry = crate::registry::Registry::new();
+        registry
+            .insert(Box::new(ReadFile::new()))
+            .expect("registered");
+        let output = registry
+            .call("read_file", &arguments, &repo.context())
+            .expect("model-visible schema error");
+        assert!(output.is_error);
+        assert!(output.text.contains("start_lien"));
+        assert!(!output.text.contains("Rune fixture"));
     }
 
     #[test]

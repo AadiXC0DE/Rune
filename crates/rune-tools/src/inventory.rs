@@ -304,6 +304,69 @@ mod tests {
     }
 
     #[test]
+    fn every_closed_builtin_rejects_unknown_arguments_on_direct_and_registry_calls() {
+        let registry = builtin_default().expect("built");
+        let context = crate::contract::ExecutionContext::new(camino::Utf8PathBuf::from("/tmp"));
+        for name in ADVERTISEMENT_ORDER {
+            let tool = registry.get(name).expect("registered");
+            let schema = tool.input_schema();
+            assert_eq!(schema["additionalProperties"], false, "{name}");
+            let mut arguments = serde_json::json!({"misspelled_argument": true});
+            if let Some(required) = schema["required"].as_array() {
+                for field in required {
+                    arguments[field.as_str().expect("field name")] = serde_json::Value::Null;
+                }
+            }
+            // The retained-result reader validates inside call to keep errors
+            // within its response byte cap.
+            if *name != "read_tool_result" {
+                let err = tool
+                    .validate(&arguments)
+                    .expect_err("unknown field refused");
+                assert_eq!(
+                    err.code(),
+                    rune_core::error::ErrorCode::InvalidField,
+                    "{name}"
+                );
+                assert!(
+                    err.message().contains("misspelled_argument"),
+                    "{name}: {err}"
+                );
+            }
+            match tool.call(&arguments, &context) {
+                Err(err) => {
+                    assert_eq!(
+                        err.code(),
+                        rune_core::error::ErrorCode::InvalidField,
+                        "{name}"
+                    );
+                    assert!(
+                        err.message().contains("misspelled_argument"),
+                        "{name}: {err}"
+                    );
+                }
+                Ok(output) => {
+                    assert!(output.is_error, "{name}");
+                    assert!(
+                        output.text.contains("misspelled_argument"),
+                        "{name}: {}",
+                        output.text
+                    );
+                }
+            }
+            let output = registry
+                .call(name, &arguments, &context)
+                .expect("schema error");
+            assert!(output.is_error, "{name}");
+            assert!(
+                output.text.contains("misspelled_argument"),
+                "{name}: {}",
+                output.text
+            );
+        }
+    }
+
+    #[test]
     fn every_tool_describes_an_object_with_required_arguments() {
         let registry = builtin_default().expect("built");
         for spec in advertisement(&registry) {

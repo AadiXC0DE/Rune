@@ -15,7 +15,7 @@ use rune_context::skill_invocation::{self, SELF_REFERENCE};
 use rune_context::skills::Skill;
 use rune_core::error::{Result, RuneError};
 
-use crate::contract::{Activity, ExecutionContext, Tool, ToolOutput};
+use crate::contract::{Activity, ExecutionContext, Tool, ToolOutput, validate_closed_arguments};
 
 /// A source of skills, so the tool can be driven without a filesystem walk.
 pub trait Catalog: Send + Sync {
@@ -54,29 +54,6 @@ impl Catalog for Fixed {
     fn skills(&self) -> Vec<Skill> {
         self.skills.clone()
     }
-}
-
-/// Validates an argument object against a closed set of fields.
-///
-/// An unknown field is refused rather than ignored, because a misspelled argument
-/// would otherwise produce a call that silently did the wrong thing.
-fn require_only(arguments: &serde_json::Value, allowed: &[&str]) -> Result<()> {
-    let Some(object) = arguments.as_object() else {
-        return Err(RuneError::invalid_field(
-            "arguments",
-            "the tool expects an object",
-        ));
-    };
-    for key in object.keys() {
-        if !allowed.contains(&key.as_str()) {
-            return Err(RuneError::invalid_field(
-                key.as_str(),
-                format!("`{key}` is not an argument this tool accepts"),
-            )
-            .with_hint(format!("accepted arguments: {}", allowed.join(", "))));
-        }
-    }
-    Ok(())
 }
 
 /// Reads a required string argument.
@@ -148,7 +125,7 @@ impl Tool for LoadSkill {
         context: &ExecutionContext,
     ) -> Result<ToolOutput> {
         context.check_cancelled()?;
-        require_only(arguments, &["location", "reference"])?;
+        validate_closed_arguments(arguments, &self.input_schema())?;
         let location = required_string(arguments, "location")?;
         let skills = self.catalog.skills();
 
@@ -225,7 +202,7 @@ impl Tool for CapabilitySearch {
         context: &ExecutionContext,
     ) -> Result<ToolOutput> {
         context.check_cancelled()?;
-        require_only(arguments, &["query"])?;
+        validate_closed_arguments(arguments, &self.input_schema())?;
         let query = required_string(arguments, "query")?;
 
         let terms: Vec<String> = query
@@ -358,7 +335,7 @@ impl Tool for InstallSkill {
         context: &ExecutionContext,
     ) -> Result<ToolOutput> {
         context.check_cancelled()?;
-        require_only(arguments, &["name", "content"])?;
+        validate_closed_arguments(arguments, &self.input_schema())?;
         let name = required_string(arguments, "name")?;
         let content = required_string(arguments, "content")?;
 

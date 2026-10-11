@@ -16,7 +16,7 @@ use rune_core::LimitName;
 use rune_core::budget::BudgetSet;
 use rune_core::error::{ErrorCode, Result, RuneError};
 
-use crate::contract::{Activity, ExecutionContext, Tool, ToolOutput};
+use crate::contract::{Activity, ExecutionContext, Tool, ToolOutput, validate_closed_arguments};
 use crate::workspace::{FileLimits, bool_arg, resolve, string_arg, truncate_to_bytes, usize_arg};
 use rune_exec::command::Exit;
 use rune_exec::session::{Input, POLL_INTERVAL, Process};
@@ -485,6 +485,7 @@ impl Tool for Shell {
         context: &ExecutionContext,
     ) -> Result<ToolOutput> {
         context.check_cancelled()?;
+        validate_closed_arguments(arguments, &self.input_schema())?;
         let action = Action::parse(
             string_arg(arguments, "action")?.ok_or_else(|| RuneError::missing_field("action"))?,
         )?;

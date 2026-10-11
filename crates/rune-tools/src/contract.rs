@@ -358,9 +358,11 @@ pub trait Tool: Send + Sync {
     /// Validates arguments before execution.
     ///
     /// A failure here is returned to the model as a tool error, so a malformed
-    /// call teaches the model rather than ending the turn.
+    /// call teaches the model rather than ending the turn. Checks required
+    /// names and closed objects; argument types are decoded by the tool.
     fn validate(&self, arguments: &serde_json::Value) -> Result<()> {
         let schema = self.input_schema();
+        validate_closed_arguments(arguments, &schema)?;
         let Some(required) = schema.get("required").and_then(serde_json::Value::as_array) else {
             return Ok(());
         };
@@ -375,6 +377,80 @@ pub trait Tool: Send + Sync {
         }
         Ok(())
     }
+}
+
+/// Checks closed objects using the advertised fields, including nested objects
+/// and array items. Built-ins also call this before decoding so direct calls
+/// enforce the same contract as registry calls.
+pub(crate) fn validate_closed_arguments(
+    arguments: &serde_json::Value,
+    schema: &serde_json::Value,
+) -> Result<()> {
+    validate_closed_fields(arguments, schema, "")
+}
+
+fn validate_closed_fields(
+    arguments: &serde_json::Value,
+    schema: &serde_json::Value,
+    path: &str,
+) -> Result<()> {
+    let properties = schema
+        .get("properties")
+        .and_then(serde_json::Value::as_object);
+    if schema
+        .get("additionalProperties")
+        .and_then(serde_json::Value::as_bool)
+        == Some(false)
+    {
+        let object = arguments.as_object().ok_or_else(|| {
+            rune_core::error::RuneError::invalid_field(
+                if path.is_empty() { "arguments" } else { path },
+                "the tool expects an object",
+            )
+        })?;
+        for key in object.keys() {
+            if !properties.is_some_and(|fields| fields.contains_key(key)) {
+                let field = if path.is_empty() {
+                    key.clone()
+                } else {
+                    format!("{path}.{key}")
+                };
+                let accepted = properties
+                    .map(|fields| {
+                        fields
+                            .keys()
+                            .map(String::as_str)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    })
+                    .unwrap_or_default();
+                return Err(rune_core::error::RuneError::invalid_field(
+                    &field,
+                    format!("`{field}` is not an argument this tool accepts"),
+                )
+                .with_hint(format!("accepted arguments: {accepted}")));
+            }
+        }
+    }
+    if let Some(object) = arguments.as_object() {
+        for (key, value) in object {
+            if let Some(property) = properties.and_then(|fields| fields.get(key)) {
+                let field = if path.is_empty() {
+                    key.clone()
+                } else {
+                    format!("{path}.{key}")
+                };
+                validate_closed_fields(value, property, &field)?;
+            }
+        }
+    } else if let Some(array) = arguments.as_array()
+        && let Some(items) = schema.get("items")
+    {
+        for (index, value) in array.iter().enumerate() {
+            validate_closed_fields(value, items, &format!("{path}[{index}]"))?;
+        }
+    }
+    Ok(())
 }
 
 /// Largest description a tool may advertise.
@@ -514,6 +590,70 @@ mod tests {
     fn validation_passes_when_every_required_argument_is_present() {
         Echo.validate(&serde_json::json!({ "text": "x" }))
             .expect("valid");
+    }
+
+    #[test]
+    fn open_schemas_continue_to_accept_extra_arguments() {
+        let arguments = serde_json::json!({"text": "x", "extra": true});
+        Echo.validate(&arguments).expect("open by default");
+        for additional in [
+            serde_json::json!(true),
+            serde_json::json!({"type": "boolean"}),
+        ] {
+            let mut schema = Echo.input_schema();
+            schema["additionalProperties"] = additional;
+            validate_closed_arguments(&arguments, &schema).expect("extra fields permitted");
+        }
+    }
+
+    #[test]
+    fn closed_schemas_without_required_fields_still_reject_unknown_arguments() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {"optional": {"type": "string"}},
+            "additionalProperties": false
+        });
+        validate_closed_arguments(&serde_json::json!({}), &schema).expect("optional omitted");
+        validate_closed_arguments(&serde_json::json!({"optional": "value"}), &schema)
+            .expect("known optional field");
+        let err = validate_closed_arguments(&serde_json::json!({"optoinal": "value"}), &schema)
+            .expect_err("unknown optional field");
+        assert_eq!(err.code(), rune_core::error::ErrorCode::InvalidField);
+        assert_eq!(err.detail().field.as_deref(), Some("optoinal"));
+        assert_eq!(err.hint(), Some("accepted arguments: optional"));
+    }
+
+    #[test]
+    fn closed_schemas_without_properties_accept_only_empty_objects() {
+        let schema = serde_json::json!({"type": "object", "additionalProperties": false});
+        validate_closed_arguments(&serde_json::json!({}), &schema).expect("empty object");
+        let err = validate_closed_arguments(&serde_json::json!({"extra": 1}), &schema)
+            .expect_err("no declared properties");
+        assert_eq!(err.detail().field.as_deref(), Some("extra"));
+        for arguments in [
+            serde_json::json!(null),
+            serde_json::json!([]),
+            serde_json::json!(1),
+        ] {
+            let err = validate_closed_arguments(&arguments, &schema).expect_err("object expected");
+            assert_eq!(err.code(), rune_core::error::ErrorCode::InvalidField);
+            assert_eq!(err.detail().field.as_deref(), Some("arguments"));
+        }
+    }
+
+    #[test]
+    fn nested_closed_objects_report_the_unknown_property_path() {
+        let schema = crate::ask_user::AskUserQuestion::unavailable().input_schema();
+        let arguments = serde_json::json!({"questions": [{
+            "question": "Which?",
+            "options": [{"label": "One", "descriptoin": "First"}, {"label": "Two"}]
+        }]});
+        let err = validate_closed_arguments(&arguments, &schema).expect_err("nested typo refused");
+        assert_eq!(
+            err.detail().field.as_deref(),
+            Some("questions[0].options[0].descriptoin")
+        );
+        assert!(err.message().contains("descriptoin"));
     }
 
     #[test]

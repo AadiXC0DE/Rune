@@ -16,7 +16,7 @@ use rune_core::budget::{BudgetSet, LimitName};
 use rune_core::error::{ErrorCode, Result, RuneError};
 use serde::{Deserialize, Serialize};
 
-use crate::contract::{Activity, ExecutionContext, Tool, ToolOutput};
+use crate::contract::{Activity, ExecutionContext, Tool, ToolOutput, validate_closed_arguments};
 use crate::web::{UNTRUSTED_NOTICE, looks_like_instructions};
 use crate::workspace::{resolve, truncate_to_bytes};
 
@@ -272,6 +272,7 @@ impl Tool for Vision {
         context: &ExecutionContext,
     ) -> Result<ToolOutput> {
         context.check_cancelled()?;
+        validate_closed_arguments(arguments, &self.input_schema())?;
         // The bound is applied while decoding, so an oversized request is
         // refused before any file is read.
         let ids = id_argument(arguments, self.batch)?;

@@ -7,7 +7,7 @@ use std::io::{BufRead, BufReader};
 use camino::{Utf8Path, Utf8PathBuf};
 use rune_core::error::{Result, RuneError};
 
-use crate::contract::{Activity, ExecutionContext, Tool, ToolOutput};
+use crate::contract::{Activity, ExecutionContext, Tool, ToolOutput, validate_closed_arguments};
 use crate::workspace::{
     FileLimits, MAX_MATCH_LINE_BYTES, Walker, bool_arg, compile_glob_as, default_root, display_in,
     join_capped, read_line_bounded, resolve, roots, string_arg, summarize, truncate_line,
@@ -129,6 +129,7 @@ impl Tool for GrepFiles {
         arguments: &serde_json::Value,
         context: &ExecutionContext,
     ) -> Result<ToolOutput> {
+        validate_closed_arguments(arguments, &self.input_schema())?;
         let query = parse(self, arguments, context)?;
         let include = match query.include.as_deref() {
             Some(pattern) => Some(compile_glob_as("include", pattern)?),

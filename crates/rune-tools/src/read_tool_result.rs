@@ -3,7 +3,7 @@
 use rune_core::budget::{BudgetSet, LimitName};
 use rune_core::error::{ErrorCode, Result, RuneError};
 
-use crate::contract::{Activity, ExecutionContext, Tool, ToolOutput};
+use crate::contract::{Activity, ExecutionContext, Tool, ToolOutput, validate_closed_arguments};
 use crate::result_store::{Handle, MAX_READ_BYTES};
 use crate::workspace::{string_arg, truncate_to_bytes, usize_arg};
 
@@ -32,6 +32,7 @@ impl ReadToolResult {
     }
 
     fn read(&self, arguments: &serde_json::Value, context: &ExecutionContext) -> Result<String> {
+        validate_closed_arguments(arguments, &self.input_schema())?;
         let handle = Handle::parse(
             string_arg(arguments, "handle")?.ok_or_else(|| RuneError::missing_field("handle"))?,
         )?;
@@ -274,6 +275,31 @@ mod tests {
             .expect("unavailable");
         assert!(unavailable.is_error);
         assert!(unavailable.text.contains("no live conversation"));
+    }
+
+    #[test]
+    fn unknown_arguments_return_schema_errors_within_the_response_cap() {
+        let registry = inventory::builtin_default().expect("registry");
+        let arguments = json!({"handle": "unused", "ofset": 1});
+        for cap in [0, 16, 96] {
+            let context =
+                ExecutionContext::new(camino::Utf8PathBuf::from("/tmp")).with_output_cap(cap);
+            for output in [
+                ReadToolResult::default()
+                    .call(&arguments, &context)
+                    .expect("direct call"),
+                registry
+                    .call("read_tool_result", &arguments, &context)
+                    .expect("registry call"),
+            ] {
+                assert!(output.is_error);
+                assert!(output.text.len() <= cap);
+                if cap == 96 {
+                    assert!(output.text.contains("ofset"));
+                    assert!(output.text.contains("not an argument"));
+                }
+            }
+        }
     }
 
     #[test]

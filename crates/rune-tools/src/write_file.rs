@@ -3,7 +3,7 @@
 use rune_core::error::Result;
 use serde_json::json;
 
-use crate::contract::{Activity, ExecutionContext, Tool, ToolOutput};
+use crate::contract::{Activity, ExecutionContext, Tool, ToolOutput, validate_closed_arguments};
 use crate::mutation;
 use crate::workspace::resolve;
 
@@ -65,6 +65,7 @@ impl Tool for WriteFile {
         context: &ExecutionContext,
     ) -> Result<ToolOutput> {
         context.check_cancelled()?;
+        validate_closed_arguments(arguments, &self.input_schema())?;
         let raw = mutation::required_string(self.name(), arguments, "path")?;
         let content = mutation::required_string(self.name(), arguments, "content")?;
         // Resolved the way a read is, so a write cannot reach where a read of
