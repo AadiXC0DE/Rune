@@ -863,12 +863,8 @@ fn execute_call(
                 executed: false,
             };
         }
-        // The hint is part of the answer: it is what tells the model how
-        // to correct the call.
-        Err(err) => ToolOutput::failure(match err.hint() {
-            Some(hint) => format!("{}; {hint}", err.message()),
-            None => err.message().to_owned(),
-        }),
+        // Preserve the diagnostic even when the host bypasses the registry.
+        Err(err) => ToolOutput::from_error(&err),
     };
 
     host.emit(Event::ToolFinished {

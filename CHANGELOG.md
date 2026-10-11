@@ -102,6 +102,10 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Fixed
 
+- Tool validation and execution failures preserve their stable error code,
+  message, and diagnostic details, including repair hints, in the model's
+  result and saved session output.
+
 - Built-in tools reject unknown arguments in closed schemas on both direct and
   registry calls, naming misspelled fields such as `read_file.start_lien`
   instead of silently using defaults.

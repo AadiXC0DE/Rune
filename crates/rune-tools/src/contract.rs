@@ -133,6 +133,23 @@ impl ToolOutput {
         }
     }
 
+    /// Builds a failed result preserving the stable code, message, and detail.
+    ///
+    /// The diagnostic is JSON in the result text, so model requests and saved
+    /// session results carry the same repair hints and observed values without
+    /// requiring a separate event schema.
+    #[must_use]
+    pub fn from_error(error: &rune_core::error::RuneError) -> Self {
+        Self::failure(
+            serde_json::json!({
+                "code": error.code(),
+                "message": error.message(),
+                "detail": error.detail(),
+            })
+            .to_string(),
+        )
+    }
+
     /// Returns the result as a model-visible string.
     #[must_use]
     pub fn render(&self) -> String {

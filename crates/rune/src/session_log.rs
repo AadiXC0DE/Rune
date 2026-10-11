@@ -1294,6 +1294,96 @@ mod tests {
     }
 
     #[test]
+    fn registry_failure_code_and_hint_survive_session_recording_and_replay() {
+        use rune_tools::{Activity, ExecutionContext, Registry, Tool};
+
+        struct HintTool;
+
+        impl Tool for HintTool {
+            fn name(&self) -> &'static str {
+                "hint"
+            }
+
+            fn description(&self) -> &'static str {
+                "Return a missing file diagnostic."
+            }
+
+            fn input_schema(&self) -> serde_json::Value {
+                serde_json::json!({"type": "object"})
+            }
+
+            fn activity(&self) -> Activity {
+                Activity::Read
+            }
+
+            fn call(
+                &self,
+                _arguments: &serde_json::Value,
+                _context: &ExecutionContext,
+            ) -> Result<ToolOutput> {
+                Err(RuneError::new(ErrorCode::NotFound, "missing").with_hint("try other.txt"))
+            }
+        }
+
+        let dir = tempfile::tempdir().expect("temp");
+        let root = Utf8Path::from_path(dir.path()).expect("utf8");
+        let paths = paths(root);
+        let key = id("sessionhint1");
+        let mut registry = Registry::new();
+        registry.insert(Box::new(HintTool)).expect("register");
+        let output = registry
+            .call(
+                "hint",
+                &serde_json::json!({}),
+                &ExecutionContext::new(root.to_owned()),
+            )
+            .expect("repairable failure");
+        let expected = output.render();
+        let mut with_call = outcome("I can try the suggested file.");
+        with_call.calls.push(rune_agent::turn::CallResult {
+            call: PreparedCall {
+                id: "call_hint".to_owned(),
+                name: "hint".to_owned(),
+                arguments: "{}".to_owned(),
+            },
+            output,
+            executed: true,
+        });
+        let mut recorder = Recorder::create(&paths, &key).expect("created");
+        recorder.user_message("read missing.txt").expect("wrote");
+        recorder.turn(&with_call).expect("recorded");
+        drop(recorder);
+
+        let state = load_read_only(&paths.session_dir(&key)).expect("read saved events");
+        let saved = state
+            .events
+            .iter()
+            .find_map(|frame| match &frame.event {
+                SessionEvent::ToolResult {
+                    call_id,
+                    ok,
+                    output,
+                } if call_id == "call_hint" => {
+                    assert!(!ok);
+                    Some(output)
+                }
+                _ => None,
+            })
+            .expect("saved tool result");
+        assert_eq!(saved, &expected);
+        let diagnostic: serde_json::Value = serde_json::from_str(saved).expect("diagnostic JSON");
+        assert_eq!(diagnostic["code"], "not_found");
+        assert_eq!(diagnostic["message"], "missing");
+        assert_eq!(diagnostic["detail"]["hint"], "try other.txt");
+
+        let (_, history) = load(&paths, &key).expect("replay");
+        history.validate().expect("replayed failure has an answer");
+        assert!(history.turns().iter().flat_map(|turn| &turn.parts).any(|part| {
+            matches!(part, ContentPart::ToolResult { content, is_error: true, .. } if content == &expected)
+        }));
+    }
+
+    #[test]
     fn a_resumed_session_continues_its_turn_numbering() {
         let dir = tempfile::tempdir().expect("temp");
         let root = Utf8Path::from_path(dir.path()).expect("utf8");

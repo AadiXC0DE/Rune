@@ -23,7 +23,7 @@ use rune_agent::steering::{Cancellation, SteeringQueue};
 use rune_agent::turn::{Event, Host, StopReason, run_turn};
 use rune_core::budget::BudgetSet;
 use rune_core::config::{Effort, PermissionMode};
-use rune_core::error::Result;
+use rune_core::error::{Result, RuneError};
 use rune_net::message::ToolSpec;
 use rune_net::provider::Provider;
 use rune_net::transport::Endpoint;
@@ -47,6 +47,7 @@ struct TestHost {
     events: Mutex<Vec<Event>>,
     executed: Mutex<Vec<(String, serde_json::Value)>>,
     tool_response: Mutex<Option<ToolOutput>>,
+    tool_error: Option<RuneError>,
     /// Real tools used by regressions that must reach the implementation.
     registry: Option<Registry>,
     cancellation: Cancellation,
@@ -81,6 +82,7 @@ impl TestHost {
             events: Mutex::new(Vec::new()),
             executed: Mutex::new(Vec::new()),
             tool_response: Mutex::new(None),
+            tool_error: None,
             registry: None,
             cancellation: Cancellation::new(),
             steering: SteeringQueue::new(8),
@@ -214,6 +216,9 @@ impl Host for TestHost {
         }
         if let Some(registry) = &self.registry {
             return registry.call(name, arguments, &self.context());
+        }
+        if let Some(error) = &self.tool_error {
+            return Err(error.clone());
         }
         Ok(self
             .tool_response
@@ -1132,6 +1137,85 @@ fn a_tool_failure_does_not_end_the_turn() {
     assert_eq!(outcome.calls.len(), 1);
     assert!(outcome.calls[0].output.is_error);
     assert!(outcome.text.contains("does not exist"));
+}
+
+#[test]
+fn tool_failure_codes_and_hints_reach_the_provider_through_both_execution_paths() {
+    use rune_core::error::ErrorCode;
+    use rune_tools::{Activity, Tool};
+
+    struct HintTool;
+
+    impl Tool for HintTool {
+        fn name(&self) -> &'static str {
+            "hint"
+        }
+
+        fn description(&self) -> &'static str {
+            "Return a missing file diagnostic."
+        }
+
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+
+        fn activity(&self) -> Activity {
+            Activity::Read
+        }
+
+        fn call(
+            &self,
+            _arguments: &serde_json::Value,
+            _context: &ExecutionContext,
+        ) -> Result<ToolOutput> {
+            Err(RuneError::new(ErrorCode::NotFound, "missing").with_hint("try other.txt"))
+        }
+    }
+
+    for through_registry in [false, true] {
+        let endpoint = MockEndpoint::start(vec![
+            Script::tool_call("call_hint", "hint", "{}"),
+            Script::text("I can try the suggested file."),
+        ]);
+        let mut registry = Registry::new();
+        registry.insert(Box::new(HintTool)).expect("register");
+        let mut host = TestHost::new(endpoint).with_tools(registry.all_schemas());
+        if through_registry {
+            host.registry = Some(registry);
+        } else {
+            host.tool_error =
+                Some(RuneError::new(ErrorCode::NotFound, "missing").with_hint("try other.txt"));
+        }
+        let mut history = rune_agent::History::new();
+        history.push_user("read missing.txt");
+        let outcome = run_turn(&mut history, &host).expect("the turn continues");
+        assert_eq!(outcome.stop_reason, StopReason::Completed);
+        assert_eq!(outcome.calls.len(), 1);
+        assert!(outcome.calls[0].executed);
+        assert!(outcome.calls[0].output.is_error);
+        history.validate().expect("the failure has an answer");
+
+        let request = host
+            .server
+            .as_ref()
+            .expect("endpoint")
+            .last_body()
+            .expect("request");
+        let result = request["messages"]
+            .as_array()
+            .expect("messages")
+            .iter()
+            .find(|message| message["tool_call_id"] == "call_hint")
+            .expect("the provider received the failure");
+        assert_eq!(result["is_error"], true);
+        assert_eq!(result["content"], outcome.calls[0].output.text);
+        let diagnostic: serde_json::Value =
+            serde_json::from_str(result["content"].as_str().expect("result text"))
+                .expect("diagnostic JSON");
+        assert_eq!(diagnostic["code"], "not_found");
+        assert_eq!(diagnostic["message"], "missing");
+        assert_eq!(diagnostic["detail"]["hint"], "try other.txt");
+    }
 }
 
 #[test]
