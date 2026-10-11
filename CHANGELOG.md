@@ -6,6 +6,11 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Added
 
+- CI checks the dependency advisory and license policy in `deny.toml` with
+  `cargo deny check` and verifies that scratch policy violations are rejected.
+  The existing `webpki-roots` 1.0.9 trust-store data has a license exception
+  limited to that crate and version.
+
 - The Node binding accepts `provider` and `offline` options for `ask`, passing
   `--provider <name>` and `--offline` before the command name.
 

@@ -10,6 +10,25 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
+  dependencies:
+    name: dependency policy
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the pinned toolchain
+        run: rustup show
+
+      - name: Install cargo-deny
+        run: cargo install cargo-deny --version 0.19.9 --locked
+
+      - name: Check dependency advisories, licenses, bans, and sources
+        run: cargo deny check
+
+      - name: Test dependency policy enforcement
+        run: bash .github/scripts/test-dependency-policy.sh
+
   # Cheap lane: runs on every push. Format, lint, and the fast test set.
   fast:
     name: fast

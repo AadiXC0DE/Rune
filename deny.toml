@@ -36,6 +36,13 @@ allow = [
 ]
 confidence-threshold = 0.9
 
+[[licenses.exceptions]]
+# ureq's existing Mozilla trust-store data uses this permissive data license.
+# Keep the allowance specific to the currently locked crate and version.
+name = "webpki-roots"
+version = "=1.0.9"
+allow = ["CDLA-Permissive-2.0"]
+
 [bans]
 multiple-versions = "allow"
 wildcards = "deny"

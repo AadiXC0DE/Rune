@@ -418,6 +418,18 @@ cargo xtask gate       # the above plus the size and startup budgets
 `gate` checks formatting and lint first, then the size and startup budgets,
 then the workspace tests. A failed step stops the gate immediately.
 
+CI also runs `cargo deny check` against `deny.toml` for dependency advisories,
+licenses, bans, and sources. The existing `webpki-roots` 1.0.9 trust-store data
+has a specific `CDLA-Permissive-2.0` license exception; that license remains
+rejected for other crates. To run the same check and its scratch dependency
+policy test locally:
+
+```sh
+cargo install cargo-deny --version 0.19.9 --locked
+cargo deny check
+bash .github/scripts/test-dependency-policy.sh
+```
+
 `budget` and `release` honor `CARGO_TARGET_DIR` when locating built binaries.
 Relative values resolve from the command's working directory. Release archives
 are still staged under `target/dist`.
