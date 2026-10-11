@@ -102,6 +102,10 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Fixed
 
+- Policy settings writes and updates replace the complete rules file atomically.
+  An interrupted write leaves the old rules intact until replacement; backups
+  and private file permissions are preserved.
+
 - Settings writers recover automatically after a lock holder is killed. The
   OS releases the lock on process exit; the persistent `.lock` file no longer
   blocks later writers, while live holders retain the two-second wait limit.

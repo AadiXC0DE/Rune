@@ -156,7 +156,7 @@ pub enum WriteOutcome {
     },
 }
 
-/// Replaces the settings file.
+/// Atomically replaces the settings file with a complete, synced private file.
 ///
 /// `expected` is the fingerprint the caller read. A mismatch means another
 /// process or a person changed the file, which is reported rather than
@@ -202,7 +202,7 @@ pub fn write(path: &Utf8Path, body: &str, expected: Option<&Fingerprint>) -> Res
         _ => None,
     };
 
-    paths::write_private(path, body)?;
+    paths::write_private_atomic(path, body)?;
 
     // A widened mode would make the file unreadable by the next command, so the
     // write is verified rather than assumed.
@@ -242,7 +242,7 @@ where
         _ => None,
     };
 
-    paths::write_private(path, &replacement)?;
+    paths::write_private_atomic(path, &replacement)?;
     verify_private(path)?;
 
     Ok(WriteOutcome::Written {
@@ -422,6 +422,65 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             let mode = std::fs::metadata(&path).expect("meta").permissions().mode() & 0o777;
             assert_eq!(mode, 0o600);
+        }
+    }
+
+    #[test]
+    fn write_and_update_replace_rules_without_truncating_the_old_file() {
+        use std::io::Read;
+
+        const OLD_RULES: &str = "{\"rules\":[{\"tool\":\"shell\",\"decision\":\"ask\"}]}\n";
+        const NEW_RULES: &str = "{\"rules\":[{\"tool\":\"read_file\",\"decision\":\"allow\"}]}\n";
+
+        for use_update in [false, true] {
+            let dir = TempDir::new().expect("tempdir");
+            let path = settings_path(&dir);
+            paths::write_private(&path, OLD_RULES).expect("initial rules");
+            // A reader that opened the old file must retain a complete snapshot
+            // across replacement. An in-place truncate/write corrupts it.
+            let mut old_reader = std::fs::File::open(&path).expect("open old rules");
+            let outcome = if use_update {
+                update(&path, |current| {
+                    assert_eq!(current, Some(OLD_RULES));
+                    Ok(NEW_RULES.to_owned())
+                })
+            } else {
+                write(&path, NEW_RULES, Some(&Fingerprint::of(OLD_RULES)))
+            }
+            .expect("replace rules");
+
+            let mut old_body = String::new();
+            old_reader
+                .read_to_string(&mut old_body)
+                .expect("old snapshot");
+            assert_eq!(old_body, OLD_RULES);
+            let new_body = paths::read_private(&path, MAX_BYTES)
+                .expect("private new rules")
+                .expect("present");
+            assert_eq!(new_body, NEW_RULES);
+            for body in [&old_body, &new_body] {
+                serde_json::from_str::<serde_json::Value>(body).expect("complete rules JSON");
+            }
+            let WriteOutcome::Written { bytes, backup } = outcome;
+            assert_eq!(bytes, NEW_RULES.len());
+            let backup = backup.expect("backup of old rules");
+            assert_eq!(
+                paths::read_private(Utf8Path::new(&backup), MAX_BYTES)
+                    .expect("private backup")
+                    .as_deref(),
+                Some(OLD_RULES)
+            );
+            assert!(
+                std::fs::read_dir(dir.path())
+                    .expect("directory")
+                    .all(|entry| {
+                        !entry
+                            .expect("entry")
+                            .file_name()
+                            .to_string_lossy()
+                            .starts_with(".rune-private-")
+                    })
+            );
         }
     }
 

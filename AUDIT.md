@@ -1961,7 +1961,7 @@ Resource accumulation after cancellation, session holder handover and concurrent
 - [x] R-082 | T2 | fix | cli | Make unknown-command help return failure | acceptance: Run rune help not-real and observe a nonzero exit while valid help still exits 0.
 - [x] R-083 | T2 | fix | config | Validate legacy project limits instead of swallowing errors | acceptance: Load max_agent_steps=10001 and observe a named diagnostic rather than a silent unlimited default.
 - [x] R-084 | T2 | fix | config | Recover a settings lock after its writer is killed | acceptance: Kill a writer holding the settings lock and observe that the next writer completes without manually deleting a lock file.
-- [ ] R-085 | T2 | fix | config | Replace policy settings atomically | acceptance: Interrupt a policy-settings write before replacement and observe a complete old or new rules file.
+- [x] R-085 | T2 | fix | config | Replace policy settings atomically | acceptance: Interrupt a policy-settings write before replacement and observe a complete old or new rules file.
 - [ ] R-086 | T2 | fix | tools | Validate closed tool schemas consistently | acceptance: Call read_file with a misspelled optional property and observe a schema error naming that property.
 - [ ] R-087 | T2 | fix | tools | Preserve tool failure codes and repair hints | acceptance: Return NotFound with hint try other.txt from a fixture tool and observe the code and hint in the model result and session event.
 - [ ] R-088 | T2 | fix | tools | Check cancellation during paged file reads | acceptance: Cancel before and during a large read_file call and observe bounded work plus a cancelled result.
