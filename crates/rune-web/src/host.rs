@@ -274,6 +274,11 @@ impl Host for Session {
         self.registry.activity(name)
     }
 
+    #[cfg(not(target_family = "wasm"))]
+    fn concurrent_tool_host(&self, name: &str) -> Option<&(dyn Host + Sync)> {
+        self.registry.get(name)?.is_read_only().then_some(self)
+    }
+
     fn fetch(&self) -> Box<dyn Fetch> {
         Box::new(BridgeFetch::new(Arc::clone(&self.bridge)))
     }

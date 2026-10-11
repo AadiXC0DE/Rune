@@ -196,6 +196,15 @@ impl Host for TestHost {
         self.registry.as_ref()?.activity(name)
     }
 
+    #[cfg(not(target_family = "wasm"))]
+    fn concurrent_tool_host(&self, name: &str) -> Option<&(dyn Host + Sync)> {
+        self.registry
+            .as_ref()?
+            .get(name)?
+            .is_read_only()
+            .then_some(self)
+    }
+
     fn effort(&self) -> Effort {
         Effort::Auto
     }
@@ -927,6 +936,347 @@ fn the_request_honors_the_parallel_tool_call_limit() {
         let body = server.last_body().expect("request body");
         assert_eq!(body["parallel_tool_calls"], limit != Some(1));
     }
+}
+
+/// A bounded barrier for each fixture call. The test opens barriers explicitly,
+/// so overlap is observed while calls are pending, without timing tool work.
+#[derive(Default)]
+struct BatchBarriers {
+    state: Mutex<BatchBarrierState>,
+    changed: std::sync::Condvar,
+}
+
+#[derive(Default)]
+struct BatchBarrierState {
+    started: Vec<String>,
+    finished: Vec<String>,
+    released: std::collections::BTreeSet<String>,
+    reads: usize,
+    mutations: usize,
+    peak_reads: usize,
+    overlap: bool,
+}
+
+impl BatchBarriers {
+    fn wait_for(&self, keys: &[&str], finished: bool) {
+        let state = self.state.lock().expect("barrier lock");
+        let (state, timeout) = self
+            .changed
+            .wait_timeout_while(state, Duration::from_secs(5), |state| {
+                let observed = if finished {
+                    &state.finished
+                } else {
+                    &state.started
+                };
+                keys.iter()
+                    .any(|key| !observed.iter().any(|name| name == key))
+            })
+            .expect("barrier wait");
+        assert!(!timeout.timed_out(), "pending calls: {:?}", state.started);
+    }
+
+    fn release(&self, key: &str) {
+        self.state
+            .lock()
+            .expect("barrier lock")
+            .released
+            .insert(key.to_owned());
+        self.changed.notify_all();
+    }
+
+    fn assert_started(&self, keys: &[&str]) {
+        let state = self.state.lock().expect("barrier lock");
+        assert_eq!(state.started.len(), keys.len(), "{:?}", state.started);
+        assert!(
+            keys.iter()
+                .all(|key| state.started.iter().any(|name| name == key))
+        );
+    }
+}
+
+struct BarrierTool {
+    name: &'static str,
+    read_only: bool,
+    barriers: Arc<BatchBarriers>,
+    cancellation: Option<Cancellation>,
+}
+
+impl rune_tools::Tool for BarrierTool {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+    fn description(&self) -> &'static str {
+        "Wait at a fixture barrier."
+    }
+    fn input_schema(&self) -> serde_json::Value {
+        serde_json::json!({"type": "object", "properties": {"key": {"type": "string"}}, "required": ["key"]})
+    }
+    fn activity(&self) -> rune_tools::Activity {
+        if self.name == "fixture_mutation" {
+            rune_tools::Activity::Write
+        } else {
+            rune_tools::Activity::Read
+        }
+    }
+    fn is_read_only(&self) -> bool {
+        self.read_only
+    }
+    fn call(
+        &self,
+        arguments: &serde_json::Value,
+        _context: &ExecutionContext,
+    ) -> Result<ToolOutput> {
+        let key = arguments["key"].as_str().expect("fixture key");
+        let mutation = !self.read_only;
+        let mut state = self.barriers.state.lock().expect("barrier lock");
+        if mutation {
+            state.overlap |= state.reads > 0 || state.mutations > 0;
+            state.mutations = state.mutations.checked_add(1).expect("active calls");
+        } else {
+            state.overlap |= state.mutations > 0;
+            state.reads = state.reads.checked_add(1).expect("active calls");
+            state.peak_reads = state.peak_reads.max(state.reads);
+        }
+        state.started.push(key.to_owned());
+        self.barriers.changed.notify_all();
+        let (mut state, timeout) = self
+            .barriers
+            .changed
+            .wait_timeout_while(state, Duration::from_secs(5), |state| {
+                !state.released.contains(key)
+            })
+            .expect("fixture barrier");
+        if mutation {
+            state.mutations = state.mutations.checked_sub(1).expect("active calls");
+        } else {
+            state.reads = state.reads.checked_sub(1).expect("active calls");
+        }
+        state.finished.push(key.to_owned());
+        self.barriers.changed.notify_all();
+        if timeout.timed_out() {
+            return Err(RuneError::new(
+                rune_core::ErrorCode::Timeout,
+                "fixture barrier was not released",
+            ));
+        }
+        if let Some(cancellation) = &self.cancellation {
+            cancellation.cancel();
+            return Err(rune_agent::steering::cancelled_error());
+        }
+        Ok(ToolOutput::success(key.repeat(4096)))
+    }
+}
+
+fn barrier_host(calls: &[(&str, &str)], cap: u64) -> (TestHost, Arc<BatchBarriers>) {
+    let mut frames: Vec<_> = calls
+        .iter()
+        .enumerate()
+        .map(|(index, (name, key))| {
+            serde_json::json!({"choices": [{"index": 0, "delta": {"tool_calls": [{
+                "index": index, "id": key, "function": {"name": name,
+                "arguments": serde_json::json!({"key": key}).to_string()}
+            }]}}]})
+            .to_string()
+        })
+        .collect();
+    frames.push(r#"{"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#.to_owned());
+    frames.push("[DONE]".to_owned());
+    let endpoint = MockEndpoint::start(vec![Script::Frames(frames), Script::text("done")]);
+    let barriers = Arc::new(BatchBarriers::default());
+    let mut registry = Registry::new();
+    for (name, read_only) in [
+        ("fixture_read", true),
+        ("fixture_mutation", false),
+        ("fixture_unsafe_read", false),
+    ] {
+        registry
+            .insert(Box::new(BarrierTool {
+                name,
+                read_only,
+                barriers: Arc::clone(&barriers),
+                cancellation: None,
+            }))
+            .expect("fixture registration");
+    }
+    let mut host = TestHost::new(endpoint).with_tools(registry.all_schemas());
+    host.registry = Some(registry);
+    host.limits
+        .set(
+            rune_core::LimitName::ParallelToolCalls,
+            rune_core::budget::Budget::Bounded(cap),
+            rune_core::config::Layer::User,
+        )
+        .expect("concurrency cap");
+    (host, barriers)
+}
+
+#[test]
+fn reads_overlap_at_cap_two_and_drain_before_a_pending_mutation() {
+    let calls = [
+        ("fixture_read", "a"),
+        ("fixture_read", "b"),
+        ("fixture_read", "c"),
+        ("fixture_mutation", "mutation"),
+        ("fixture_read", "d"),
+        ("fixture_read", "e"),
+    ];
+    let (mut host, barriers) = barrier_host(&calls, 2);
+    set_result_caps(&mut host, 2048, 3000);
+    let mut history = rune_agent::History::new();
+    history.push_user("read, mutate, then read");
+    let outcome = std::thread::scope(|scope| {
+        let worker = scope.spawn(|| run_turn(&mut history, &host));
+        barriers.wait_for(&["a", "b"], false);
+        barriers.assert_started(&["a", "b"]);
+        // Finish the second call first. Results must still be retained in
+        // request order, and the mutation must wait for every earlier read.
+        barriers.release("b");
+        barriers.wait_for(&["b"], true);
+        barriers.release("a");
+        barriers.wait_for(&["a"], true);
+        barriers.wait_for(&["c"], false);
+        barriers.assert_started(&["a", "b", "c"]);
+        barriers.release("c");
+        barriers.wait_for(&["mutation"], false);
+        barriers.assert_started(&["a", "b", "c", "mutation"]);
+        barriers.release("mutation");
+        barriers.wait_for(&["d"], false);
+        barriers.assert_started(&["a", "b", "c", "mutation", "d"]);
+        barriers.release("d");
+        barriers.wait_for(&["e"], false);
+        barriers.release("e");
+        worker.join().expect("turn worker").expect("turn")
+    });
+    assert_eq!(outcome.stop_reason, StopReason::Completed);
+    assert_eq!(
+        outcome
+            .calls
+            .iter()
+            .map(|result| result.call.id.as_str())
+            .collect::<Vec<_>>(),
+        calls.iter().map(|(_, key)| *key).collect::<Vec<_>>()
+    );
+    assert!(
+        outcome
+            .calls
+            .iter()
+            .all(|result| result.executed && !result.output.is_error)
+    );
+    assert!(
+        outcome
+            .calls
+            .iter()
+            .all(|result| result.output.text.len() <= 2048)
+    );
+    assert!(
+        outcome
+            .calls
+            .iter()
+            .map(|result| result.output.text.len())
+            .sum::<usize>()
+            <= 3000
+    );
+    let first_handle = retained_handle(&outcome.calls[0].output.text);
+    let second_handle = retained_handle(&outcome.calls[1].output.text);
+    assert_ne!(first_handle, second_handle);
+    let state = barriers.state.lock().expect("barrier lock");
+    assert_eq!(state.peak_reads, 2);
+    assert!(!state.overlap, "a read overlapped a mutation");
+    assert_eq!(state.finished[..2], ["b", "a"]);
+    history.validate().expect("paired history");
+}
+
+#[test]
+fn one_call_mode_and_a_tool_overriding_read_only_keep_calls_sequential() {
+    for (cap, first) in [(1, "fixture_read"), (2, "fixture_unsafe_read")] {
+        let calls = [(first, "a"), ("fixture_read", "b"), ("fixture_read", "c")];
+        let (host, barriers) = barrier_host(&calls, cap);
+        let mut history = rune_agent::History::new();
+        history.push_user("read in order");
+        let outcome = std::thread::scope(|scope| {
+            let worker = scope.spawn(|| run_turn(&mut history, &host));
+            for (index, (_, key)) in calls.iter().enumerate() {
+                barriers.wait_for(&[key], false);
+                barriers.assert_started(
+                    &calls[..=index]
+                        .iter()
+                        .map(|(_, key)| *key)
+                        .collect::<Vec<_>>(),
+                );
+                barriers.release(key);
+            }
+            worker.join().expect("turn worker").expect("turn")
+        });
+        assert!(
+            outcome
+                .calls
+                .iter()
+                .all(|result| result.executed && !result.output.is_error)
+        );
+        let state = barriers.state.lock().expect("barrier lock");
+        assert_eq!(state.peak_reads, 1);
+        assert!(!state.overlap);
+        assert_eq!(state.started, state.finished);
+        history.validate().expect("paired history");
+    }
+}
+
+#[test]
+fn cancelling_concurrent_reads_answers_the_remaining_calls_without_running_them() {
+    let calls = [
+        ("fixture_read", "a"),
+        ("fixture_read", "b"),
+        ("fixture_read", "c"),
+        ("fixture_mutation", "mutation"),
+    ];
+    let (mut host, barriers) = barrier_host(&calls, 2);
+    let mut registry = Registry::new();
+    registry
+        .insert(Box::new(BarrierTool {
+            name: "fixture_read",
+            read_only: true,
+            barriers: Arc::clone(&barriers),
+            cancellation: Some(host.cancellation.clone()),
+        }))
+        .expect("fixture registration");
+    registry
+        .insert(Box::new(BarrierTool {
+            name: "fixture_mutation",
+            read_only: false,
+            barriers: Arc::clone(&barriers),
+            cancellation: None,
+        }))
+        .expect("fixture registration");
+    host.registry = Some(registry);
+    let mut history = rune_agent::History::new();
+    history.push_user("cancel pending reads");
+    let error = std::thread::scope(|scope| {
+        let worker = scope.spawn(|| run_turn(&mut history, &host));
+        barriers.wait_for(&["a", "b"], false);
+        barriers.release("a");
+        barriers.wait_for(&["a"], true);
+        barriers.release("b");
+        worker
+            .join()
+            .expect("turn worker")
+            .expect_err("cancelled turn")
+    });
+    assert_eq!(error.code(), rune_core::ErrorCode::Cancelled);
+    barriers.assert_started(&["a", "b"]);
+    let answers = history
+        .last()
+        .expect("results")
+        .parts
+        .iter()
+        .filter_map(|part| match part {
+            rune_net::message::ContentPart::ToolResult { content, .. } => Some(content),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(answers.len(), 4);
+    assert!(answers[2].contains("not run"));
+    assert!(answers[3].contains("not run"));
+    history.validate().expect("cancelled calls are paired");
 }
 
 #[test]

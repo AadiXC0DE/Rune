@@ -220,6 +220,17 @@ pub trait Host {
         None
     }
 
+    /// Offers a thread-safe executor for a registered read-only tool.
+    ///
+    /// Returning `Some(self)` opts this call into native concurrent execution.
+    /// Hosts must check the tool's read-only contract, rather than its name.
+    /// Policy and events stay on the turn thread; only execution is delegated.
+    /// Hosts without this capability and WebAssembly hosts execute in order.
+    #[cfg(not(target_family = "wasm"))]
+    fn concurrent_tool_host(&self, _name: &str) -> Option<&(dyn Host + Sync)> {
+        None
+    }
+
     /// Returns the reasoning effort to request.
     fn effort(&self) -> Effort {
         Effort::Auto
@@ -695,9 +706,9 @@ fn backoff(attempt: usize) -> Duration {
 
 /// Resolves and executes a batch of tool calls.
 ///
-/// Read-only calls at the front of the batch run concurrently; everything after
-/// the first mutating call runs in order, so a write can never race a read of
-/// the same file.
+/// Native hosts may run independent read-only calls at the front concurrently,
+/// within the configured cap. Retained-result reads and everything after the
+/// first mutating call run in order, so writes cannot race reads of the same file.
 ///
 /// Every call is answered, including those left unrun by a cancellation, so
 /// the history never holds a call without its result. A conversation in that
@@ -714,39 +725,126 @@ fn execute_batch(
     let offered: Vec<String> = host.tools().into_iter().map(|spec| spec.name).collect();
     let turn_cap = limits.get_usize(LimitName::MaxTurnResultBytes);
     let tool_cap = limits.get_usize(LimitName::MaxToolResultBytes);
-    for call in calls {
+    // Only the initial independent reads may overlap. Retained-result reads
+    // depend on earlier spills and on the exact remaining budget, so flush the
+    // prefix before them and keep the rest of the batch sequential.
+    // `off` still respects the documented hard concurrency ceiling.
+    #[cfg(not(target_family = "wasm"))]
+    let width = limits.get_usize(LimitName::ParallelToolCalls).clamp(1, 64);
+    #[cfg(not(target_family = "wasm"))]
+    let parallel_prefix = if width > 1 {
+        calls
+            .iter()
+            .take_while(|call| {
+                call.name != "read_tool_result" && host.concurrent_tool_host(&call.name).is_some()
+            })
+            .count()
+    } else {
+        0
+    };
+    #[cfg(target_family = "wasm")]
+    let parallel_prefix = 0;
+
+    #[cfg(not(target_family = "wasm"))]
+    for group in calls[..parallel_prefix].chunks(width) {
+        let group_results = std::thread::scope(|scope| {
+            let mut pending = Vec::with_capacity(group.len());
+            for call in group {
+                let prepared = prepare_call(call, host, &offered, &mut cancelled);
+                let execution = match prepared {
+                    Ok((arguments, context)) => {
+                        let executor = host.concurrent_tool_host(&call.name);
+                        scope.spawn(move || {
+                            let executor = executor.ok_or_else(|| {
+                                RuneError::new(ErrorCode::Internal, "read executor disappeared")
+                            })?;
+                            executor.cancellation().check()?;
+                            context.check_cancelled()?;
+                            executor.execute_with_context(&call.name, &arguments, &context)
+                        })
+                    }
+                    Err(result) => {
+                        pending.push((call, Err(result)));
+                        continue;
+                    }
+                };
+                pending.push((call, Ok(execution)));
+            }
+            pending
+                .into_iter()
+                .map(|(call, pending)| match pending {
+                    Err(result) => result,
+                    Ok(worker) => {
+                        let execution = match worker.join() {
+                            Ok(output) => output,
+                            Err(payload) => std::panic::resume_unwind(payload),
+                        };
+                        finish_call(call, host, execution, &mut cancelled)
+                    }
+                })
+                .collect::<Vec<_>>()
+        });
+        for result in group_results {
+            retain_result(
+                result,
+                history,
+                result_bytes,
+                turn_cap,
+                tool_cap,
+                &mut results,
+            );
+        }
+    }
+    for call in &calls[parallel_prefix..] {
         let cap = turn_cap.saturating_sub(*result_bytes).min(tool_cap);
-        let mut result = execute_call(call, host, &offered, &mut cancelled, history, cap);
-        // Charge each answer before the next call, so a reader in this batch
-        // receives the remaining budget and can read a preceding spilled result.
-        let text = std::mem::take(&mut result.output.text);
-        let bounded = if text.len() > cap {
-            spill_result(history, &result, text, cap)
-        } else {
-            text
-        };
-        *result_bytes = result_bytes.saturating_add(bounded.len());
-        result.output.text = bounded;
-        results.push(result);
+        let result = execute_call(call, host, &offered, &mut cancelled, history, cap);
+        retain_result(
+            result,
+            history,
+            result_bytes,
+            turn_cap,
+            tool_cap,
+            &mut results,
+        );
     }
     results
 }
 
-/// Executes one offered, policy-approved call and preserves batch cancellation.
-fn execute_call(
+/// Retains and charges answers in request order, regardless of execution order.
+fn retain_result(
+    mut result: CallResult,
+    history: &mut History,
+    result_bytes: &mut usize,
+    turn_cap: usize,
+    tool_cap: usize,
+    results: &mut Vec<CallResult>,
+) {
+    let cap = turn_cap.saturating_sub(*result_bytes).min(tool_cap);
+    let text = std::mem::take(&mut result.output.text);
+    let bounded = if text.len() > cap {
+        spill_result(history, &result, text, cap)
+    } else {
+        text
+    };
+    *result_bytes = result_bytes.saturating_add(bounded.len());
+    result.output.text = bounded;
+    results.push(result);
+}
+
+/// Resolves advertisement, arguments and authority on the turn thread.
+fn prepare_call(
     call: &PreparedCall,
     host: &dyn Host,
     offered: &[String],
     cancelled: &mut bool,
-    history: &History,
-    output_cap: usize,
-) -> CallResult {
-    if *cancelled {
-        return CallResult {
+) -> std::result::Result<(serde_json::Value, ExecutionContext), CallResult> {
+    if *cancelled || host.cancellation().is_cancelled() {
+        *cancelled = true;
+        return Err(CallResult {
             call: call.clone(),
             output: ToolOutput::failure("not run: the turn was cancelled"),
             executed: false,
-        };
+        });
     }
 
     if !offered.iter().any(|name| name == &call.name) {
@@ -759,11 +857,11 @@ fn execute_call(
             call: call.clone(),
             reason: reason.clone(),
         });
-        return CallResult {
+        return Err(CallResult {
             call: call.clone(),
             output: ToolOutput::failure(reason),
             executed: false,
-        };
+        });
     }
 
     let activity = host
@@ -777,11 +875,11 @@ fn execute_call(
                 "the arguments for `{}` are not valid JSON: {err}",
                 call.name
             ));
-            return CallResult {
+            return Err(CallResult {
                 call: call.clone(),
                 output,
                 executed: false,
-            };
+            });
         }
     };
 
@@ -794,14 +892,14 @@ fn execute_call(
                 call: call.clone(),
                 reason: reason.clone(),
             });
-            return CallResult {
+            return Err(CallResult {
                 call: call.clone(),
                 output: ToolOutput::failure(format!(
                     "`{}` was refused by policy: {reason}",
                     call.name
                 )),
                 executed: false,
-            };
+            });
         }
         Outcome::Ask => {
             // The host resolves an ask before reaching this point, so an
@@ -814,7 +912,7 @@ fn execute_call(
                 call: call.clone(),
                 reason: format!("{reason}; nothing in this session could approve it"),
             });
-            return CallResult {
+            return Err(CallResult {
                 call: call.clone(),
                 output: ToolOutput::failure(format!(
                     "`{}` was not run: no rule allows `{action}`, and this session has no \
@@ -823,7 +921,7 @@ fn execute_call(
                     call.name
                 )),
                 executed: false,
-            };
+            });
         }
         Outcome::Allow => {}
     }
@@ -841,13 +939,13 @@ fn execute_call(
                 call: call.clone(),
                 reason: reason.clone(),
             });
-            return CallResult {
+            return Err(CallResult {
                 call: call.clone(),
                 output: ToolOutput::failure(format!(
                     "rename destination `{destination}` was not approved: {reason}"
                 )),
                 executed: false,
-            };
+            });
         }
     }
 
@@ -863,13 +961,13 @@ fn execute_call(
                 call: call.clone(),
                 reason: reason.clone(),
             });
-            return CallResult {
+            return Err(CallResult {
                 call: call.clone(),
                 output: ToolOutput::failure(format!(
                     "private-network access was not approved: {reason}"
                 )),
                 executed: false,
-            };
+            });
         }
     }
     let context = host.context().with_private_network_access(private_access);
@@ -878,7 +976,22 @@ fn execute_call(
         call: call.clone(),
         activity,
     });
+    Ok((arguments, context))
+}
 
+/// Executes one offered, policy-approved call and preserves batch cancellation.
+fn execute_call(
+    call: &PreparedCall,
+    host: &dyn Host,
+    offered: &[String],
+    cancelled: &mut bool,
+    history: &History,
+    output_cap: usize,
+) -> CallResult {
+    let (arguments, context) = match prepare_call(call, host, offered, cancelled) {
+        Ok(prepared) => prepared,
+        Err(result) => return result,
+    };
     // Retained output is owned by the history rather than the host. Supply
     // that store only after advertisement and policy checks have passed.
     let execution = if call.name == "read_tool_result" {
@@ -892,6 +1005,16 @@ fn execute_call(
     } else {
         host.execute_with_context(&call.name, &arguments, &context)
     };
+    finish_call(call, host, execution, cancelled)
+}
+
+/// Reports execution and preserves a cancellation for calls still pending.
+fn finish_call(
+    call: &PreparedCall,
+    host: &dyn Host,
+    execution: Result<ToolOutput>,
+    cancelled: &mut bool,
+) -> CallResult {
     let output = match execution {
         Ok(output) => output,
         Err(err) if matches!(err.code(), ErrorCode::Cancelled) => {
@@ -905,12 +1028,10 @@ fn execute_call(
         // Preserve the diagnostic even when the host bypasses the registry.
         Err(err) => ToolOutput::from_error(&err),
     };
-
     host.emit(Event::ToolFinished {
         call: call.clone(),
         is_error: output.is_error,
     });
-
     CallResult {
         call: call.clone(),
         output,

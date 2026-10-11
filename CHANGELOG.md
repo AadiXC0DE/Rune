@@ -6,6 +6,12 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Added
 
+- Native turns execute eligible read-only calls at the front of a tool batch
+  concurrently, up to `parallel_tool_calls`. Mutations and subsequent calls run
+  in order after those reads finish. Retained-result readers stay sequential to
+  preserve spill dependencies and the remaining turn budget. Hosts opt in with
+  a thread-safe executor; WebAssembly turns keep executing calls in order.
+
 - `git_diff` inspects staged or unstaged tracked changes under the workspace.
   Output caps include the view label and truncation marker. Inspection disables
   external diff commands, text conversion, clean filters, and optional index

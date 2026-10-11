@@ -1105,6 +1105,16 @@ impl<W: Write + Send + 'static> Host for TurnHost<W> {
         self.server.config.registry.activity(name)
     }
 
+    #[cfg(not(target_family = "wasm"))]
+    fn concurrent_tool_host(&self, name: &str) -> Option<&(dyn Host + Sync)> {
+        self.server
+            .config
+            .registry
+            .get(name)?
+            .is_read_only()
+            .then_some(self)
+    }
+
     fn effort(&self) -> Effort {
         self.config.effort
     }

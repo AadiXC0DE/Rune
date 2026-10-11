@@ -382,6 +382,11 @@ impl Host for SessionHost {
         self.registry.activity(name)
     }
 
+    #[cfg(not(target_family = "wasm"))]
+    fn concurrent_tool_host(&self, name: &str) -> Option<&(dyn Host + Sync)> {
+        self.registry.get(name)?.is_read_only().then_some(self)
+    }
+
     fn effort(&self) -> Effort {
         self.effort
     }
