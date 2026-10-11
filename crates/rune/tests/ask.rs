@@ -135,9 +135,6 @@ fn run_fixture_with_options(
     json_output: bool,
     no_save: bool,
 ) -> (Output, tempfile::TempDir) {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind fixture");
-    listener.set_nonblocking(true).expect("nonblocking");
-    let address = listener.local_addr().expect("fixture address");
     let body = format!(
         "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
         json!({"choices": [{"delta": delta, "finish_reason": null}]}),
@@ -146,6 +143,24 @@ fn run_fixture_with_options(
             "usage": {"prompt_tokens": 11, "completion_tokens": 0}
         })
     );
+    run_response_fixture(
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        ),
+        json_output,
+        no_save,
+    )
+}
+
+fn run_response_fixture(
+    response: String,
+    json_output: bool,
+    no_save: bool,
+) -> (Output, tempfile::TempDir) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind fixture");
+    listener.set_nonblocking(true).expect("nonblocking");
+    let address = listener.local_addr().expect("fixture address");
     let server = std::thread::spawn(move || {
         let deadline = Instant::now()
             .checked_add(Duration::from_secs(10))
@@ -185,12 +200,9 @@ fn run_fixture_with_options(
         reader.read_exact(&mut request).expect("request body");
         drop(reader);
 
-        write!(
-            stream,
-            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-            body.len()
-        )
-        .expect("fixture response");
+        stream
+            .write_all(response.as_bytes())
+            .expect("fixture response");
     });
 
     let dir = tempfile::tempdir().expect("isolated state");
@@ -214,6 +226,49 @@ fn run_fixture_with_options(
         .expect("ask");
     server.join().expect("fixture server");
     (output, dir)
+}
+
+#[test]
+fn ask_json_preserves_provider_code_and_retry_delay_with_secrets_redacted() {
+    for code in ["rate_limit_exceeded", "sk-fixture-secret-code"] {
+        let secret = "sk-fixture-secret-message";
+        let body =
+            json!({"error": {"code": code, "message": format!("rejected {secret}")}}).to_string();
+        let (output, _) = run_response_fixture(
+            format!(
+                "HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\nRetry-After: 3\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            ),
+            true,
+            true,
+        );
+        assert_eq!(output.status.code(), Some(1));
+        let result: Value = serde_json::from_slice(&output.stdout).expect("one JSON result");
+        assert_eq!(result["error_code"], "rate_limited");
+        let detail = &result["error_detail"];
+        assert_eq!(
+            detail["provider_code"],
+            if code.starts_with("sk-") {
+                "[redacted]"
+            } else {
+                code
+            }
+        );
+        assert_eq!(detail["retry_after_ms"], 3_000);
+        assert_eq!(detail["observed"], "http 429");
+        assert!(
+            detail["hint"]
+                .as_str()
+                .expect("hint")
+                .contains("rejected the request")
+        );
+        for bytes in [&output.stdout, &output.stderr] {
+            let text = String::from_utf8_lossy(bytes);
+            assert!(!text.contains(secret), "{text}");
+            assert!(!text.contains("sk-fixture-secret-code"), "{text}");
+            assert!(text.contains("[redacted]"), "{text}");
+        }
+    }
 }
 
 fn tool_call_delta() -> Value {

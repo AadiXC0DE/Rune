@@ -227,6 +227,11 @@ Completed exchanges are saved as sessions for the current workspace, and
 `--json` reports their `session_id`. Pass `--no-save` to create no session and
 return an empty ID.
 
+`rune ask --json` failures include `error_detail` when structured context is available.
+Provider failures retain the redacted `provider_code` and numeric
+`retry_after_ms` from a supported `Retry-After` header, when reported, alongside
+the existing HTTP status in `observed` and repair `hint`.
+
 `rune sessions --search "fragment"` finds sessions by a case-insensitive literal
 fragment in their current title or any recorded user message. Results stay scoped
 to the current workspace unless `--all` is passed. `--limit`, `--cursor`, and

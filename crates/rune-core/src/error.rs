@@ -180,6 +180,12 @@ pub struct ErrorDetail {
     /// Observed value, already redacted of secrets.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub observed: Option<String>,
+    /// Provider error code, already redacted of secrets.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_code: Option<String>,
+    /// Delay requested by the provider before retrying, in milliseconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retry_after_ms: Option<u64>,
 }
 
 impl ErrorDetail {
@@ -191,6 +197,8 @@ impl ErrorDetail {
             invariant: None,
             hint: None,
             observed: None,
+            provider_code: None,
+            retry_after_ms: None,
         }
     }
 
@@ -201,6 +209,8 @@ impl ErrorDetail {
             && self.invariant.is_none()
             && self.hint.is_none()
             && self.observed.is_none()
+            && self.provider_code.is_none()
+            && self.retry_after_ms.is_none()
     }
 }
 
@@ -316,6 +326,20 @@ impl RuneError {
     #[must_use]
     pub fn with_observed(mut self, observed: impl Into<String>) -> Self {
         self.detail.observed = Some(observed.into());
+        self
+    }
+
+    /// Attaches the provider's error code, already redacted of secrets.
+    #[must_use]
+    pub fn with_provider_code(mut self, code: impl Into<String>) -> Self {
+        self.detail.provider_code = Some(code.into());
+        self
+    }
+
+    /// Attaches the retry delay requested by the provider, in milliseconds.
+    #[must_use]
+    pub fn with_retry_after(mut self, millis: u64) -> Self {
+        self.detail.retry_after_ms = Some(millis);
         self
     }
 
@@ -509,6 +533,26 @@ mod tests {
         let object = json.as_object().expect("object");
         assert!(object.contains_key("field"));
         assert!(!object.contains_key("invariant"));
+        assert!(!object.contains_key("provider_code"));
+        assert!(!object.contains_key("retry_after_ms"));
+    }
+
+    #[test]
+    fn provider_metadata_is_optional_in_stored_error_details() {
+        let old: ErrorDetail =
+            serde_json::from_str(r#"{"observed":"http 429"}"#).expect("old detail");
+        assert_eq!(old.provider_code, None);
+        assert_eq!(old.retry_after_ms, None);
+        for error in [
+            RuneError::new(ErrorCode::RateLimited, "slow")
+                .with_provider_code("rate_limit_exceeded"),
+            RuneError::new(ErrorCode::RateLimited, "slow").with_retry_after(0),
+        ] {
+            assert!(!error.detail().is_empty());
+            let json = serde_json::to_string(error.detail()).expect("serialize");
+            let restored: ErrorDetail = serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(&restored, error.detail());
+        }
     }
 
     #[test]

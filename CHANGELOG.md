@@ -200,6 +200,10 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Fixed
 
+- Provider JSON failures preserve redacted provider codes and retry delays in
+  structured error detail. `rune ask --json` reports nonempty `error_detail`
+  alongside its existing message and stable error code.
+
 - `RuneError` retains typed I/O causes through cloning and contextual file-write
   errors. Generic I/O failures report `io_failure` instead of `transport_failure`;
   filesystem permission denials keep `permission_denied` and their OS cause.

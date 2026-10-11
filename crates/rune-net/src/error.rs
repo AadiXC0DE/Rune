@@ -223,7 +223,8 @@ impl NetError {
         self.kind.is_retryable()
     }
 
-    /// Converts to the workspace error type, preserving the code and hint.
+    /// Converts to the workspace error type, preserving the code, hint and
+    /// provider metadata. Provider codes are redacted before being exposed.
     #[must_use]
     pub fn to_rune_error(&self) -> RuneError {
         let mut error = RuneError::new(self.kind.code(), self.message.clone());
@@ -232,6 +233,12 @@ impl NetError {
         }
         if let Some(status) = self.status {
             error = error.with_observed(format!("http {status}"));
+        }
+        if let Some(code) = &self.provider_code {
+            error = error.with_provider_code(crate::redact::redact(code));
+        }
+        if let Some(millis) = self.retry_after_ms {
+            error = error.with_retry_after(millis);
         }
         error
     }
@@ -574,6 +581,41 @@ mod tests {
         let converted = error.to_rune_error();
         assert_eq!(converted.code(), ErrorCode::RateLimited);
         assert_eq!(converted.detail().hint.as_deref(), Some("slow down"));
+    }
+
+    #[test]
+    fn converting_preserves_optional_provider_metadata_without_a_status() {
+        let error = NetError::new(FailureKind::ProviderError, "failed")
+            .with_provider_code("rate_limit_exceeded")
+            .with_retry_after(0);
+        let converted = RuneError::from(error);
+        let detail = serde_json::to_value(converted.detail()).expect("detail");
+        assert_eq!(
+            detail,
+            serde_json::json!({
+                "provider_code": "rate_limit_exceeded",
+                "retry_after_ms": 0
+            })
+        );
+        assert!(!converted.detail().is_empty());
+
+        let plain = NetError::new(FailureKind::Network, "failed").to_rune_error();
+        assert!(plain.detail().is_empty());
+        assert_eq!(
+            serde_json::to_value(plain.detail()).expect("detail"),
+            serde_json::json!({})
+        );
+    }
+
+    #[test]
+    fn converting_redacts_provider_codes_attached_by_a_caller() {
+        let error = NetError::new(FailureKind::ProviderError, "failed")
+            .with_provider_code("sk-fixture-secret-code");
+        let converted = error.to_rune_error();
+        assert_eq!(
+            converted.detail().provider_code.as_deref(),
+            Some("[redacted]")
+        );
     }
 
     #[test]

@@ -14,7 +14,7 @@
 use std::io::Write;
 
 use rune_core::config::Settings;
-use rune_core::error::{ErrorCode, Result, RuneError};
+use rune_core::error::{ErrorCode, ErrorDetail, Result, RuneError};
 use rune_core::id::SessionId;
 use rune_core::paths::Paths;
 use rune_net::message::Message;
@@ -83,6 +83,9 @@ pub struct JsonResult {
     /// Stable failure code, present only when the run failed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_code: Option<ErrorCode>,
+    /// Structured failure context, present only when nonempty.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_detail: Option<ErrorDetail>,
 }
 
 /// Token counts as reported.
@@ -112,6 +115,7 @@ impl JsonResult {
             tool_calls: Vec::new(),
             error: Some(error.message().to_owned()),
             error_code: Some(error.code()),
+            error_detail: (!error.detail().is_empty()).then(|| error.detail().clone()),
         }
     }
 
@@ -272,6 +276,10 @@ pub fn run(
         tool_calls,
         error: error.as_ref().map(|error| error.message().to_owned()),
         error_code: error.as_ref().map(RuneError::code),
+        error_detail: error
+            .as_ref()
+            .filter(|error| !error.detail().is_empty())
+            .map(|error| error.detail().clone()),
     })
 }
 
@@ -437,6 +445,7 @@ mod tests {
         assert_eq!(value["exit_code"], 1);
         assert_eq!(value["output"], "");
         assert_eq!(value["final_output"], "");
+        assert!(value.get("error_detail").is_none());
     }
 
     #[test]
@@ -503,11 +512,13 @@ mod tests {
             tool_calls: Vec::new(),
             error: None,
             error_code: None,
+            error_detail: None,
         };
         let json = result.render().expect("render");
         let value: serde_json::Value = serde_json::from_str(&json).expect("valid json");
         assert!(value.get("error").is_none());
         assert!(value.get("error_code").is_none());
+        assert!(value.get("error_detail").is_none());
     }
 
     #[test]
