@@ -74,6 +74,37 @@ jobs:
       - name: Test workspace including the real PTY replay gate
         run: cargo test --workspace
 
+  wasm:
+    name: WASM build and smoke test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install the pinned toolchain and WASI target
+        run: rustup target add wasm32-wasip1
+
+      - name: Cache the build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: wasm-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: wasm-${{ runner.os }}-
+
+      - name: Build rune-web for WASI
+        run: cargo build --release --locked -p rune-web --target wasm32-wasip1
+
+      - name: Smoke-test the exported WASM boundary with a fixture prompt
+        run: node .github/scripts/test-wasm.mjs target/wasm32-wasip1/release/rune_web.wasm
+
   # Gate lane: runs on a pull request. Adds budgets and every platform.
   budget:
     name: budget

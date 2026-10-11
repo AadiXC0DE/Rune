@@ -418,6 +418,20 @@ cargo xtask gate       # the above plus the size and startup budgets
 `gate` checks formatting and lint first, then the size and startup budgets,
 then the workspace tests. A failed step stops the gate immediately.
 
+CI also builds `rune-web` for `wasm32-wasip1` and runs a fixture prompt through
+`rune_alloc`, `rune_configure`, and `rune_prompt` with Node.js 22's WASI runtime.
+The smoke test checks the configured provider request, streamed UTF-8 answer,
+and completion event using synchronous fixture imports. It requires no API key
+or network access to a provider. This checks the compiled boundary; browser
+Promise Integration and the page UI still require browser testing. Run it locally
+with Node.js 22 or newer:
+
+```sh
+rustup target add wasm32-wasip1
+cargo build --release --locked -p rune-web --target wasm32-wasip1
+node .github/scripts/test-wasm.mjs target/wasm32-wasip1/release/rune_web.wasm
+```
+
 CI also runs `cargo deny check` against `deny.toml` for dependency advisories,
 licenses, bans, and sources. The existing `webpki-roots` 1.0.9 trust-store data
 has a specific `CDLA-Permissive-2.0` license exception; that license remains

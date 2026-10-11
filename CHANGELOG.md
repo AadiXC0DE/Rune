@@ -6,6 +6,10 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Added
 
+- CI builds `rune-web` for `wasm32-wasip1` and runs a configured fixture prompt
+  through its exported WASM boundary, checking the provider request, streamed
+  answer, and successful completion without a live provider.
+
 - CI runs `node --test bindings/node/test.mjs` with Node.js 22 on pushes to
   `main` and pull requests, failing the fast job when the binding contract breaks.
 

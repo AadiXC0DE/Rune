@@ -2019,7 +2019,7 @@ Resource accumulation after cancellation, session holder handover and concurrent
 - [x] R-140 | T2 | fix | xtask | Serialize release manifests as JSON | acceptance: Stage a channel containing a quote and observe valid JSON with the exact channel value, or reject it before writing.
 - [x] R-141 | T2 | feature | ci | Run the declared dependency advisory and license policy | acceptance: CI must run cargo deny check and fail on a scratch dependency violating the declared policy.
 - [x] R-142 | T2 | feature | ci | Run the Node binding tests in CI | acceptance: CI must execute node --test bindings/node/test.mjs and fail when its stub contract is intentionally broken.
-- [ ] R-143 | T2 | feature | ci | Build and smoke-test the WASM target in CI | acceptance: CI must compile rune-web for wasm32-wasip1 and run a configured fixture prompt through the exported boundary.
+- [x] R-143 | T2 | feature | ci | Build and smoke-test the WASM target in CI | acceptance: CI must compile rune-web for wasm32-wasip1 and run a configured fixture prompt through the exported boundary.
 - [ ] R-144 | T2 | feature | ci | Compare releases from two independent clean build directories | acceptance: Build the same source independently with two scratch target directories and assert extracted binaries and archives have equal hashes.
 - [ ] R-145 | T2 | fix | performance | Label startup minima and expose raw distribution metrics | acceptance: Budget output must label minimum-of-31, show raw median and p95, and distinguish baseline-subtracted work from process latency.
 - [ ] R-146 | T2 | fix | docs | Document the real offline enforcement boundary | acceptance: Documentation must map model, web, remote MCP, local MCP and shell traffic to their tested offline behavior.
