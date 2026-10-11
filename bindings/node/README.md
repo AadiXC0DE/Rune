@@ -4,6 +4,15 @@ Runs the `rune` binary as a subprocess and returns the result object that
 `rune ask --json` prints. The binary owns configuration, credentials, and the
 network path, so this package has no dependencies and no build step.
 
+## Version policy
+
+This package shares the Rust workspace version. Its `package.json` version must
+equal `workspace.package.version` in the root `Cargo.toml`; update both on every
+release, including binary-only changes. There is no independent Node version
+track. The maintained repository is
+[AadiXC0DE/Rune](https://github.com/AadiXC0DE/Rune).
+The test suite below checks version equality and repository links in CI.
+
 ## Building the binary
 
 Requires Rust 1.98 or newer.

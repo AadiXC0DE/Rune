@@ -200,6 +200,10 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Fixed
 
+- Cargo and Node package metadata now link to the maintained `AadiXC0DE/Rune`
+  repository. The Node package version is aligned with the Rust workspace;
+  the documented shared version policy and repository links are checked in CI.
+
 - Offline documentation now maps provider, web, remote MCP, local MCP and shell
   traffic to tested behavior. CLI help and the site describe the same boundary:
   local MCP children and an explicitly permitted unsandboxed shell fallback

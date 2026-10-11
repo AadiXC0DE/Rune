@@ -5,6 +5,7 @@ import {
   chmodSync,
   constants,
   mkdtempSync,
+  readFileSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
@@ -22,6 +23,100 @@ import {
   RuneOutputError,
   RuneOutputLimitError,
 } from "./index.js";
+
+// Release metadata is checked in the same suite CI runs for the binding.
+const maintainedRepository = "https://github.com/AadiXC0DE/Rune";
+const releaseMetadata = {
+  manifest: readFileSync(new URL("../../Cargo.toml", import.meta.url), "utf8"),
+  readme: readFileSync(new URL("../../README.md", import.meta.url), "utf8"),
+  nodePackage: JSON.parse(
+    readFileSync(new URL("./package.json", import.meta.url), "utf8"),
+  ),
+};
+
+function assertReleaseMetadata({ manifest, readme, nodePackage }) {
+  const workspacePackage = manifest.match(
+    /^\[workspace\.package\]\s*\n([\s\S]*?)(?=^\[|(?![\s\S]))/m,
+  )?.[1];
+  assert.ok(workspacePackage, "Cargo.toml must declare workspace.package");
+  const field = (name) =>
+    workspacePackage.match(
+      new RegExp(`^${name}\\s*=\\s*["']([^"']+)["']`, "m"),
+    )?.[1];
+  assert.equal(field("repository"), maintainedRepository, "Cargo repository");
+  assert.equal(
+    nodePackage.repository.url,
+    `${maintainedRepository}.git`,
+    "Node repository",
+  );
+  assert.equal(nodePackage.repository.directory, "bindings/node");
+  assert.equal(
+    readme.match(/^git clone (\S+)\r?$/m)?.[1],
+    maintainedRepository,
+    "README repository: source installation",
+  );
+  for (const suffix of ["", "/badge.svg"]) {
+    assert.ok(
+      readme.includes(`(${maintainedRepository}/actions/workflows/ci.yml${suffix})`),
+      "README repository: CI badge and workflow",
+    );
+  }
+  assert.ok(field("version"), "Cargo.toml must declare workspace.package.version");
+  assert.equal(
+    nodePackage.version,
+    field("version"),
+    "Shared version policy: Node version must equal workspace.package.version",
+  );
+}
+
+test("release metadata names the maintained repository and shares the workspace version", () => {
+  assertReleaseMetadata(releaseMetadata);
+});
+
+test("release metadata rejects a stale Node version", () => {
+  assert.throws(
+    () => assertReleaseMetadata({
+      ...releaseMetadata,
+      nodePackage: { ...releaseMetadata.nodePackage, version: "0.1.0" },
+    }),
+    /Shared version policy/,
+  );
+});
+
+test("release metadata accepts a synchronized version bump", () => {
+  assertReleaseMetadata({
+    ...releaseMetadata,
+    manifest: releaseMetadata.manifest.replace(
+      /^(version\s*=\s*)"[^"]+"/m,
+      '$1"1.2.3"',
+    ),
+    nodePackage: { ...releaseMetadata.nodePackage, version: "1.2.3" },
+  });
+});
+
+for (const source of ["Cargo", "Node", "README"]) {
+  test(`release metadata rejects a stale ${source} repository`, () => {
+    const stale = "https://github.com/rune-sh/rune";
+    const fixture = {
+      ...releaseMetadata,
+      nodePackage: {
+        ...releaseMetadata.nodePackage,
+        repository: { ...releaseMetadata.nodePackage.repository },
+      },
+    };
+    if (source === "Cargo") {
+      fixture.manifest = fixture.manifest.replace(maintainedRepository, stale);
+    } else if (source === "Node") {
+      fixture.nodePackage.repository.url = `${stale}.git`;
+    } else {
+      fixture.readme = fixture.readme.replaceAll(maintainedRepository, stale);
+    }
+    assert.throws(
+      () => assertReleaseMetadata(fixture),
+      new RegExp(`${source} repository`),
+    );
+  });
+}
 
 // The binding drives a process, so these tests drive a stub instead of the real
 // binary: no provider, no credential, and no network are involved.

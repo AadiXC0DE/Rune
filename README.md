@@ -430,6 +430,19 @@ prompts, and late approval replies are ignored. Zero expires immediately;
 
 A Node binding lives in [`bindings/node`](bindings/node).
 
+## Package versions
+
+The maintained repository is [AadiXC0DE/Rune](https://github.com/AadiXC0DE/Rune).
+Cargo package metadata, the Node package, and the installation and CI links
+all refer to that repository.
+
+The Rust workspace and `@rune-sh/node` use a shared version policy:
+`bindings/node/package.json`'s `version` must equal `Cargo.toml`'s
+`workspace.package.version`. Update both for every release, including releases
+that only change the binary. The Node package has no independent version track.
+`node --test bindings/node/test.mjs` enforces this policy and checks repository
+links in the existing CI fast job.
+
 ## Status
 
 Early development, and usable for a real session. The command surface,
