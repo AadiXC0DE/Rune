@@ -243,6 +243,14 @@ capacity. Requests above capacity remain eligible for compaction when the retain
 tail fits with instructions, tool schemas, and the output reserve. A failed summary
 preserves the conversation and stops that request.
 
+Use `/compact preview` to see the exact counts of conversation records that
+manual compaction would summarize and retain verbatim. Records are the current
+user, assistant, and tool-result turns, including an existing handoff summary;
+they exclude session metadata and turn boundary events. The preview uses the same
+cut as `/compact`, keeps tool calls with their results, and works offline without
+a model request or history changes. Retained counts exclude the new summary that
+`/compact` would insert. A short conversation reports zero records to summarize.
+
 Run `rune help` for everything, or see [COMMANDS.md](COMMANDS.md) for the full
 reference.
 

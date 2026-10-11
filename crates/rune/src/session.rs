@@ -1626,6 +1626,9 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                         // not compile for the right reason.
                         return compact_history(&host, &mut history, sink);
                     }
+                    Handled::CompactPreview => {
+                        return preview_compaction(&host, &history, sink);
+                    }
                     Handled::Rename(title) => {
                         // The input loop and stream observer share one recorder;
                         // its lock serializes every write to the session log.
@@ -3242,6 +3245,25 @@ fn picker_menu(
     rows
 }
 
+/// Reports the manual compaction plan without changing the conversation.
+fn preview_compaction(
+    host: &SessionHost,
+    history: &History,
+    sink: &mut LockedSink,
+) -> Result<Step> {
+    let (summarized, retained) = rune_agent::compaction::plan(history, &host.limits)
+        .map_or((0, history.len()), |plan| {
+            (plan.removed_turns, plan.kept_turns)
+        });
+    report(
+        host,
+        sink,
+        &format!(
+            "compaction preview (history unchanged)\n{summarized} record(s) would be summarized\n{retained} record(s) retained verbatim"
+        ),
+    )
+}
+
 /// Summarizes older turns and installs the summary.
 ///
 /// The summary is produced by the model, because nothing else can compress a
@@ -4071,6 +4093,8 @@ enum Handled {
     Undo,
     /// Summarize older turns to free the context window.
     Compact,
+    /// Show exact summarized and retained record counts without compacting.
+    CompactPreview,
     /// Put the last reply on the terminal's clipboard.
     Copy,
     /// Start a fresh conversation in this terminal.
@@ -4215,6 +4239,7 @@ fn handle_command<W: std::io::Write>(
             }
             Ok(Handled::SetModel(requested.to_owned()))
         }
+        "compact" if arguments.trim() == "preview" => Ok(Handled::CompactPreview),
         "compact" => Ok(Handled::Compact),
         // Read-only: the session log has no branch concept, so there is nothing
         // to fork or switch to. Reporting the shape is what can be done
@@ -6780,6 +6805,63 @@ mod tests {
         assert!(host.can_undo());
         host.undo().expect("undo");
         assert!(!host.can_undo());
+    }
+
+    #[test]
+    fn compaction_preview_matches_the_applied_plan_and_preserves_history() {
+        let (mut host, mut history, _) = compaction_fixture();
+        host.endpoint.offline = true;
+        let before = serde_json::to_value(&history).expect("history");
+        let plan = rune_agent::compaction::plan(&history, &host.limits).expect("plan");
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let mut sink = LockedSink {
+            stream: Arc::new(Mutex::new(SharedBuffer(Arc::clone(&captured)))),
+        };
+        preview_compaction(&host, &history, &mut sink).expect("preview");
+        let text = String::from_utf8(captured.lock().expect("lock").clone()).expect("utf8");
+        for line in [
+            "compaction preview (history unchanged)",
+            "6 record(s) would be summarized",
+            "3 record(s) retained verbatim",
+        ] {
+            assert!(text.contains(line), "{text}");
+        }
+        assert_eq!(serde_json::to_value(&history).expect("history"), before);
+        assert!(host.events.lock().expect("events").is_empty());
+        let retained = history.turns()[plan.removed_turns..].to_vec();
+        let removed = rune_agent::compaction::apply(&mut history, &plan, "test summary");
+        assert_eq!(removed, 6);
+        assert_eq!(history.len(), 3 + 1);
+        // Applying renumbers sequence positions, but retains content verbatim.
+        for (after, before) in history.turns()[1..].iter().zip(retained) {
+            assert_eq!(after.role, before.role);
+            assert_eq!(after.parts, before.parts);
+            assert_eq!(after.replay, before.replay);
+        }
+    }
+
+    #[test]
+    fn compact_preview_arguments_dispatch_without_starting_compaction() {
+        for (arguments, expected) in [
+            ("preview", Handled::CompactPreview),
+            ("  preview  ", Handled::CompactPreview),
+            ("", Handled::Compact),
+        ] {
+            let mut output = Vec::new();
+            assert_eq!(
+                handle_command(
+                    "compact",
+                    arguments,
+                    &empty_commands(),
+                    None,
+                    Utf8Path::new("/w"),
+                    &test_info(),
+                    &mut output,
+                )
+                .expect("handled"),
+                expected,
+            );
+        }
     }
 
     #[test]

@@ -44,8 +44,8 @@ pub const BUILTINS: &[Builtin] = &[
     },
     Builtin {
         name: "compact",
-        arguments: "",
-        summary: "summarize older turns to free the context window",
+        arguments: "[preview]",
+        summary: "summarize older turns, or preview record counts without changes",
     },
     Builtin {
         name: "undo",

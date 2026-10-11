@@ -6,6 +6,10 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Added
 
+- `/compact preview` reports exact conversation record counts to summarize and
+  retain using the manual compaction plan, without model requests or history
+  changes, including offline sessions.
+
 - `rune session <last|id> --search <text>` searches saved messages, tool records,
   and summaries, including original records removed from context by compaction.
   Text and JSON results preserve original event content, sequence positions,
