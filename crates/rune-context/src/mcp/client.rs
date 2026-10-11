@@ -53,6 +53,19 @@ const TERMINATE_GRACE: Duration = Duration::from_millis(500);
 /// Time between checks while waiting for a child to exit.
 const POLL_INTERVAL: Duration = Duration::from_millis(5);
 
+/// Time between cancellation checks during a stdio tool call.
+const CANCELLATION_POLL: Duration = Duration::from_millis(25);
+
+fn check_cancelled(cancelled: Option<&dyn Fn() -> bool>) -> Result<()> {
+    if cancelled.is_some_and(|cancelled| cancelled()) {
+        return Err(RuneError::new(
+            ErrorCode::Cancelled,
+            "the mcp call was cancelled",
+        ));
+    }
+    Ok(())
+}
+
 /// Programs that deliver a signal to a process group, tried in order.
 #[cfg(unix)]
 const KILL_PROGRAMS: [&str; 2] = ["/bin/kill", "kill"];
@@ -252,6 +265,29 @@ impl Client {
 
     /// Calls a tool by its projected name.
     pub fn call(&self, name: &str, arguments: &Value) -> Result<CallOutcome> {
+        self.call_inner(name, arguments, None)
+    }
+
+    /// Calls a tool, checking cancellation while waiting on a stdio server.
+    ///
+    /// Cancellation terminates the stdio process group. Remote transports keep
+    /// their configured operation timeout once a request has started.
+    pub fn call_cancellable(
+        &self,
+        name: &str,
+        arguments: &Value,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<CallOutcome> {
+        self.call_inner(name, arguments, Some(cancelled))
+    }
+
+    fn call_inner(
+        &self,
+        name: &str,
+        arguments: &Value,
+        cancelled: Option<&dyn Fn() -> bool>,
+    ) -> Result<CallOutcome> {
+        check_cancelled(cancelled)?;
         let mut state = self.lock()?;
         if state.shutdown {
             return Err(RuneError::new(
@@ -287,7 +323,7 @@ impl Client {
         // The parameters are built once so a retry replays the exact call the
         // server rejected rather than one rebuilt from the same arguments.
         let params = json!({ "name": server_tool, "arguments": arguments });
-        self.call_entry(entry, &params)
+        self.call_entry(entry, &params, cancelled)
     }
 
     /// Reconnects every configured server from scratch.
@@ -373,17 +409,24 @@ impl Client {
     }
 
     /// Runs one tool call, reconnecting once if the credential is rejected.
-    fn call_entry(&self, entry: &mut ServerEntry, params: &Value) -> Result<CallOutcome> {
+    fn call_entry(
+        &self,
+        entry: &mut ServerEntry,
+        params: &Value,
+        cancelled: Option<&dyn Fn() -> bool>,
+    ) -> Result<CallOutcome> {
         // A credential the server already reported as expired is refreshed
         // before the call, so the rejection is not paid for first.
         if entry.session.is_none() || !entry.credential().is_usable(now_ms()) {
             entry.establish(&self.limits, &self.variables)?;
         }
-        match entry.call(params, &self.limits) {
+        check_cancelled(cancelled)?;
+        match entry.call(params, &self.limits, cancelled) {
             Err(error) if error.code() == ErrorCode::AuthenticationRequired => {
                 Self::spend_restart(entry)?;
                 entry.establish(&self.limits, &self.variables)?;
-                match entry.call(params, &self.limits) {
+                check_cancelled(cancelled)?;
+                match entry.call(params, &self.limits, cancelled) {
                     // A credential rejected twice is not going to recover, so
                     // the session is closed rather than left half usable.
                     Err(again) if again.code() == ErrorCode::AuthenticationRequired => {
@@ -496,7 +539,12 @@ impl ServerEntry {
     }
 
     /// Runs a tool and reduces the result.
-    fn call(&mut self, params: &Value, limits: &BudgetSet) -> Result<CallOutcome> {
+    fn call(
+        &mut self,
+        params: &Value,
+        limits: &BudgetSet,
+        cancelled: Option<&dyn Fn() -> bool>,
+    ) -> Result<CallOutcome> {
         let name = self.config.name.clone();
         let tool = params
             .get("name")
@@ -510,7 +558,13 @@ impl ServerEntry {
                 format!("server `{name}` is not connected"),
             ));
         };
-        let result = session.request(TOOLS_CALL, Some(params), timeout)?;
+        let result = match session {
+            Session::Stdio(session) => {
+                session.request_cancellable(TOOLS_CALL, Some(params), timeout, cancelled)?
+            }
+            #[cfg(not(target_family = "wasm"))]
+            session => session.request(TOOLS_CALL, Some(params), timeout)?,
+        };
         let limit = limits.get_usize(LimitName::MaxToolResultBytes);
         Ok(reduce_result(&name, &tool, &result, limit))
     }
@@ -875,13 +929,35 @@ impl StdioSession {
         params: Option<&Value>,
         timeout: Duration,
     ) -> Result<Value> {
+        self.request_cancellable(method, params, timeout, None)
+    }
+
+    fn request_cancellable(
+        &mut self,
+        method: &str,
+        params: Option<&Value>,
+        timeout: Duration,
+        cancelled: Option<&dyn Fn() -> bool>,
+    ) -> Result<Value> {
+        check_cancelled(cancelled)?;
         let id = self.next_id;
         self.next_id = self.next_id.saturating_add(1);
         self.write(&protocol::request(id, method, params))?;
         let deadline = Instant::now().checked_add(timeout);
         loop {
-            let event = match self.frames.recv_timeout(remaining(deadline)) {
+            if let Err(error) = check_cancelled(cancelled) {
+                self.terminate();
+                return Err(error);
+            }
+            let time_left = remaining(deadline);
+            let wait = if cancelled.is_some() {
+                time_left.min(CANCELLATION_POLL)
+            } else {
+                time_left
+            };
+            let event = match self.frames.recv_timeout(wait) {
                 Ok(event) => event,
+                Err(RecvTimeoutError::Timeout) if !remaining(deadline).is_zero() => continue,
                 Err(RecvTimeoutError::Timeout) => {
                     self.terminate();
                     return Err(timeout_error(&self.server, method, timeout));

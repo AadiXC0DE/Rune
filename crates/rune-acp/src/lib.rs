@@ -3,8 +3,8 @@
 //! The server speaks JSON-RPC 2.0 over newline-delimited frames and drives the
 //! agent turn loop. Two properties matter most:
 //!
-//! - A prompt that arrives while a turn is running is admitted rather than
-//!   refused, so a message typed while the agent was working is never lost.
+//! - While protocol output is writable, a prompt that arrives during a turn
+//!   is admitted and queued. Output failure cancels work and discards the queue.
 //! - Standard output carries protocol frames and nothing else, so a client's
 //!   parser never has to distinguish a frame from a diagnostic.
 

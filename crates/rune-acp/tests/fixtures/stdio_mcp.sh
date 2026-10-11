@@ -13,6 +13,7 @@ while IFS= read -r line; do
             result='{"tools":[{"name":"greet","description":"Fixture greeting","inputSchema":{"type":"object","properties":{"who":{"type":"string"}},"required":[]}}]}' ;;
         *'"method":"tools/call"'*)
             case "$line" in
+                *'"who":"wait"'*) continue ;;
                 *'"who":"fail"'*) result='{"isError":true,"content":[{"type":"text","text":"fixture failure"}]}' ;;
                 *) result="{\"content\":[{\"type\":\"text\",\"text\":\"hello $ACP_MCP_GREETING\"}]}" ;;
             esac ;;

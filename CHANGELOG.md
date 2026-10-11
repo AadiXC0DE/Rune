@@ -172,6 +172,10 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Fixed
 
+- ACP cancels active provider and tool work when a protocol frame cannot be
+  written or flushed, releases pending permissions, and discards queued prompts.
+  Further input cannot start turns after output fails.
+
 - ACP saves model and reasoning effort selections in the session log and
   restores them when loading or resuming, including after reconnecting.
   Older sessions without saved selections use the connection defaults.

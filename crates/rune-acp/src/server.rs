@@ -10,15 +10,16 @@
 //! - Standard output carries frames and nothing else. Every diagnostic goes to
 //!   the configured log file, because a stray line on stdout is a malformed
 //!   frame as far as the client is concerned.
-//! - A prompt that arrives during a turn is admitted. It is queued, or refused
-//!   with a named reason once the queue is full. It is never dropped.
+//! - While protocol output is writable, a prompt that arrives during a turn is
+//!   admitted. It is queued, or refused with a named reason once the queue is
+//!   full. Output failure cancels the turn and discards its queue.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::fs::OpenOptions;
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -306,6 +307,8 @@ struct Active {
 pub struct Server<W: Write + Send + 'static> {
     config: ServerConfig,
     writer: Mutex<Writer<W>>,
+    /// A failed frame makes this connection unusable for any further work.
+    output_failed: AtomicBool,
     sessions: Mutex<Sessions>,
     /// Endpoint capacities, discovered when a turn first uses another model.
     model_catalog: OnceLock<Catalog>,
@@ -354,6 +357,7 @@ impl<W: Write + Send + 'static> Server<W> {
         Ok(Self {
             config,
             writer: Mutex::new(Writer::new(output)),
+            output_failed: AtomicBool::new(false),
             sessions: Mutex::new(sessions),
             model_catalog: OnceLock::new(),
             pending: Mutex::new(BTreeMap::new()),
@@ -365,13 +369,18 @@ impl<W: Write + Send + 'static> Server<W> {
         })
     }
 
-    /// Serves messages until the input ends.
+    /// Serves messages while the input and protocol output remain usable.
     ///
     /// A frame the reader could not accept is answered with an error and the
     /// connection carries on. Only a failure of the stream itself ends the loop.
+    /// Output failure cancels turn work immediately; a blocked input read still
+    /// waits for input or EOF before this method returns.
     pub fn run<R: BufRead>(self: &Arc<Self>, input: R) -> Result<()> {
         let mut reader = crate::jsonrpc::Reader::new(input);
         loop {
+            if self.output_failed.load(Ordering::SeqCst) {
+                break;
+            }
             match reader.read_message() {
                 Ok(None) => break,
                 Ok(Some(message)) => self.dispatch(message),
@@ -395,10 +404,33 @@ impl<W: Write + Send + 'static> Server<W> {
     /// Writes one frame.
     fn send(&self, message: &Message) {
         let outcome = match self.writer.lock() {
-            Ok(mut writer) => writer.write_message(message),
+            Ok(mut writer) => {
+                if self.output_failed.load(Ordering::SeqCst) {
+                    return;
+                }
+                let outcome = writer.write_message(message);
+                if outcome.is_err() {
+                    self.output_failed.store(true, Ordering::SeqCst);
+                }
+                outcome
+            }
             Err(_) => return,
         };
         if let Err(err) = outcome {
+            // This can run on the turn thread. Signal cancellation without
+            // waiting for that same thread to settle, or holding the writer.
+            if let Ok(mut active) = self.active.lock() {
+                active.queue.clear();
+                if let Some(cancellation) = &active.cancellation {
+                    cancellation.cancel();
+                }
+                if let Some(tools) = &active.tools {
+                    tools.cancel();
+                }
+            }
+            if let Ok(mut pending) = self.pending.lock() {
+                pending.clear();
+            }
             self.note(format_args!("could not write a frame: {err}"));
         }
     }
@@ -475,6 +507,9 @@ impl<W: Write + Send + 'static> Server<W> {
 
     /// Routes one incoming message.
     fn dispatch(self: &Arc<Self>, message: Message) {
+        if self.output_failed.load(Ordering::SeqCst) {
+            return;
+        }
         match message {
             Message::Response(response) => self.resolve(response),
             Message::Notification(notification) => {
@@ -741,6 +776,9 @@ impl<W: Write + Send + 'static> Server<W> {
             let Ok(mut active) = self.active.lock() else {
                 return Err(RpcError::internal("the session state is unavailable"));
             };
+            if self.output_failed.load(Ordering::SeqCst) {
+                return Err(RpcError::internal("the protocol output is unavailable"));
+            }
             if active.cancellation.is_some() {
                 {
                     if active.queue.len() >= self.queue_depth {
@@ -833,6 +871,9 @@ fn run_queued<W: Write + Send + 'static>(server: &Arc<Server<W>>, first: Queued)
             let Ok(mut active) = server.active.lock() else {
                 return;
             };
+            if server.output_failed.load(Ordering::SeqCst) {
+                active.queue.clear();
+            }
             if let Some(following) = active.queue.pop_front() {
                 active.cancellation = Some(Cancellation::new());
                 active.tools = None;
@@ -875,6 +916,13 @@ fn run_one<W: Write + Send + 'static>(server: &Arc<Server<W>>, queued: Queued) {
             .active
             .lock()
             .map(|mut active| {
+                // Output can fail before the turn registers its tool handle.
+                if server.output_failed.load(Ordering::SeqCst) {
+                    tools.cancel();
+                    if let Some(cancellation) = &active.cancellation {
+                        cancellation.cancel();
+                    }
+                }
                 active.tools = Some(tools);
                 active.cancellation.clone().unwrap_or_default()
             })
@@ -1259,7 +1307,9 @@ impl<W: Write + Send + 'static> Host for TurnHost<W> {
             && client.tools().iter().any(|tool| tool.name == name)
         {
             self.context.check_cancelled()?;
-            let output = match client.call(name, arguments) {
+            let output = match client
+                .call_cancellable(name, arguments, &|| self.context.check_cancelled().is_err())
+            {
                 Ok(outcome) => ToolOutput {
                     produced_bytes: outcome.text.len() as u64,
                     text: outcome.text,
@@ -1493,6 +1543,10 @@ fn push_block(target: &mut String, text: &str) {
     }
     target.push_str(text);
 }
+
+#[cfg(all(test, unix))]
+#[path = "output_failure_tests.rs"]
+mod output_failure_tests;
 
 #[cfg(test)]
 mod tests {
