@@ -220,6 +220,10 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Fixed
 
+- Review test fixtures fail explicitly when Git initialization, staging, or
+  commit setup fails, reporting the command, exit status, stdout, and stderr.
+  A failed initialization can no longer pass as an empty repository test.
+
 - A zero configured `context_window` produces an `invalid_field` diagnostic
   naming the model's field and is ignored. The session uses the endpoint's
   reported capacity or the default window instead of a zero-capacity budget.

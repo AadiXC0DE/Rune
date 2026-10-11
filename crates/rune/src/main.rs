@@ -1747,25 +1747,21 @@ mod tests {
     fn pending_changes_include_a_modified_and_an_untracked_file() {
         let dir = tempfile::tempdir().expect("temp");
         let root = Utf8Path::from_path(dir.path()).expect("utf8");
-        let ok = |arguments: &[&str]| {
-            std::process::Command::new("git")
-                .args(arguments)
-                .current_dir(root)
-                .output()
-                .expect("git")
-        };
-        ok(&["init", "-q", "."]);
+        setup_review_git(root, &["init", "-q", "."]);
         std::fs::write(root.join("tracked.txt"), "first\n").expect("write");
-        ok(&["add", "tracked.txt"]);
-        ok(&[
-            "-c",
-            "user.email=t@t",
-            "-c",
-            "user.name=t",
-            "commit",
-            "-qm",
-            "init",
-        ]);
+        setup_review_git(root, &["add", "tracked.txt"]);
+        setup_review_git(
+            root,
+            &[
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-qm",
+                "init",
+            ],
+        );
 
         std::fs::write(root.join("tracked.txt"), "first\nsecond\n").expect("write");
         std::fs::write(root.join("untracked.txt"), "new\n").expect("write");
@@ -1779,15 +1775,101 @@ mod tests {
     fn a_repository_with_no_commits_yields_no_changes() {
         let dir = tempfile::tempdir().expect("temp");
         let root = Utf8Path::from_path(dir.path()).expect("utf8");
-        std::process::Command::new("git")
-            .args(["init", "-q", "."])
-            .current_dir(root)
-            .output()
-            .expect("git");
+        setup_review_git(root, &["init", "-q", "."]);
         // `diff HEAD` fails without a commit, and reporting failure would make
         // a fresh repository look broken.
         let changes = pending_changes(root).expect("read");
         assert!(changes.trim().is_empty(), "{changes}");
+    }
+
+    /// Stops a review fixture before reading changes if its Git setup failed.
+    fn setup_review_git(root: &Utf8Path, arguments: &[&str]) {
+        let output = std::process::Command::new("git")
+            .args(arguments)
+            .current_dir(root)
+            .output()
+            .unwrap_or_else(|err| {
+                panic!("review fixture setup failed: git {arguments:?} could not run: {err}")
+            });
+        assert!(
+            output.status.success(),
+            "review fixture setup failed: git {arguments:?}\nstatus: {}\nstdout: {}\nstderr: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn review_fixtures_report_failed_git_setup() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().expect("stub directory");
+        let git = dir.path().join("git");
+        std::fs::write(
+            &git,
+            r#"#!/bin/sh
+for argument do
+    if [ "$argument" = "$RUNE_TEST_GIT_FAILURE" ]; then
+        echo 'stub setup stdout'
+        echo 'stub setup stderr' >&2
+        exit 42
+    fi
+done
+case "$1" in
+    init|add|-c) exit 0 ;;
+esac
+echo 'fatal: not a git repository (stub)' >&2
+exit 1
+"#,
+        )
+        .expect("write git stub");
+        std::fs::set_permissions(&git, std::fs::Permissions::from_mode(0o755))
+            .expect("executable git stub");
+
+        let executable = std::env::current_exe().expect("test executable");
+        for (fixture, command) in [
+            ("a_repository_with_no_commits_yields_no_changes", "init"),
+            (
+                "pending_changes_include_a_modified_and_an_untracked_file",
+                "init",
+            ),
+            (
+                "pending_changes_include_a_modified_and_an_untracked_file",
+                "add",
+            ),
+            (
+                "pending_changes_include_a_modified_and_an_untracked_file",
+                "commit",
+            ),
+        ] {
+            // Only the child sees the stub, so concurrent tests keep their PATH.
+            let output = std::process::Command::new(&executable)
+                .args(["--exact", &format!("tests::{fixture}"), "--nocapture"])
+                .env("PATH", dir.path())
+                .env("RUNE_TEST_GIT_FAILURE", command)
+                .output()
+                .expect("run review fixture with failing git");
+            let report = format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+            assert!(!output.status.success(), "{fixture} / {command}: {report}");
+            for diagnostic in [
+                "review fixture setup failed: git",
+                &format!("\"{command}\""),
+                "status: exit status: 42",
+                "stdout: stub setup stdout",
+                "stderr: stub setup stderr",
+            ] {
+                assert!(
+                    report.contains(diagnostic),
+                    "{fixture} / {command} missing {diagnostic:?}: {report}",
+                );
+            }
+        }
     }
 
     #[test]
