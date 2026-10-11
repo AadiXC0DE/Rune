@@ -122,6 +122,9 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Fixed
 
+- Steering submitted during a failed provider attempt or its retry delay is
+  included when the next retry request is rebuilt, within the same step.
+
 - Automatic compaction measures the retained tail with instructions, tool schemas,
   and the output reserve before refusing an oversized request. A large removable
   prefix can now be summarized when the retained request fits.

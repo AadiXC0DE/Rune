@@ -557,8 +557,8 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
             });
         }
 
-        // Drain steering that arrived during the request, then continue so the
-        // next attempt or the next step sees it.
+        // Drain steering that arrived during the successful request, then
+        // continue so the next step sees it.
         if steering_arrived {
             apply_steering(history, steering, Boundary::AfterFailure, host);
         }
@@ -567,9 +567,9 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
 
 /// Streams a request, retrying a transient failure within a bounded budget.
 ///
-/// Returns the outcome together with a flag saying whether steering arrived
-/// while the request was failing. The caller applies it, because the history is
-/// borrowed here to build each attempt.
+/// Applies queued steering before rebuilding a retry request. Returns the
+/// outcome together with a flag saying whether steering is queued after the
+/// successful attempt, for the caller to apply at the next boundary.
 fn stream_with_retry(
     client: &dyn Fetch,
     host: &dyn Host,
@@ -593,6 +593,9 @@ fn stream_with_retry(
         }
         if attempt > 0 {
             host.emit(Event::StepRestarted { step });
+            // Include corrections from the failed stream or retry delay before
+            // constructing the plan and preparing its context.
+            apply_steering(history, steering, Boundary::AfterFailure, host);
         }
         attempt = attempt.saturating_add(1);
 

@@ -1546,6 +1546,50 @@ fn a_truncated_stream_is_retried_rather_than_accepted() {
 }
 
 #[test]
+fn steering_during_a_failed_stream_reaches_the_retry_request() {
+    let endpoint = MockEndpoint::start(vec![
+        Script::truncated("partial answer"),
+        Script::text("corrected answer"),
+    ]);
+    let host = TestHost::new(endpoint)
+        .with_steering_mid_stream("actually do this instead")
+        .with_step_limit(1);
+    let mut history = rune_agent::History::new();
+    history.push_user("original request");
+
+    let outcome = run_turn(&mut history, &host).expect("turn");
+    let server = host.server.as_ref().expect("server");
+    assert_eq!(server.request_count(), 2);
+    let body = server.last_body().expect("retry request");
+    assert_eq!(
+        body["messages"],
+        serde_json::json!([
+            { "role": "system", "content": "You are a test assistant." },
+            { "role": "user", "content": "original request" },
+            {
+                "role": "user",
+                "content": "<user_steering>\nactually do this instead\n</user_steering>\n"
+            },
+        ]),
+        "the retry must include the correction without the failed attempt's partial answer"
+    );
+    assert_eq!(outcome.stop_reason, StopReason::Completed);
+    assert_eq!(outcome.steps, 1);
+    assert_eq!(outcome.text, "corrected answer");
+    assert!(host.steering.is_empty());
+    let applied: Vec<_> = host
+        .events()
+        .into_iter()
+        .filter_map(|event| match event {
+            Event::SteeringApplied { boundary, count } => Some((boundary, count)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(applied, [(rune_agent::Boundary::AfterFailure, 1)]);
+    history.validate().expect("valid history after retry");
+}
+
+#[test]
 fn a_retried_step_tells_the_host_to_drop_what_it_streamed() {
     // The failed attempt's text already reached the host, and the retry
     // streams the answer again from the start. Without a restart between them
