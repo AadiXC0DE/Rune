@@ -495,7 +495,7 @@ pub fn apply(prepared: Prepared) -> Result<Applied> {
     let directory = directory.to_owned();
     if !directory.exists() {
         std::fs::create_dir_all(directory.as_std_path())
-            .map_err(|err| io_error(&directory, &err))?;
+            .map_err(|err| io_error(&directory, err))?;
     }
     let (staged, mut file) = create_stage(&directory)?;
     let mut guard = StageGuard::new(staged.clone());
@@ -504,18 +504,18 @@ pub fn apply(prepared: Prepared) -> Result<Applied> {
         // carry over, and refusing the write for that would refuse every one.
         match file.set_permissions(permissions) {
             Err(err) if err.kind() != ErrorKind::Unsupported => {
-                return Err(io_error(&staged, &err));
+                return Err(io_error(&staged, err));
             }
             _ => {}
         }
     }
     file.write_all(&postimage)
-        .map_err(|err| io_error(&staged, &err))?;
-    file.sync_all().map_err(|err| io_error(&staged, &err))?;
+        .map_err(|err| io_error(&staged, err))?;
+    file.sync_all().map_err(|err| io_error(&staged, err))?;
     drop(file);
     revalidate(&resolved, identity.as_ref(), &hash)?;
     std::fs::rename(staged.as_std_path(), resolved.as_std_path())
-        .map_err(|err| io_error(&resolved, &err))?;
+        .map_err(|err| io_error(&resolved, err))?;
     guard.disarm();
     sync_directory(&directory);
     Ok(Applied {
@@ -530,9 +530,9 @@ pub fn apply(prepared: Prepared) -> Result<Applied> {
 
 /// Maps an I/O failure to a typed error that names the path involved.
 ///
-/// The generic conversion cannot know which path failed, and its fallback code
-/// describes a network stream rather than a file.
-fn io_error(path: &Utf8Path, err: &std::io::Error) -> RuneError {
+/// The generic conversion cannot know which path failed. Keep the filesystem
+/// context and retain the original cause rather than just its display text.
+fn io_error(path: &Utf8Path, err: std::io::Error) -> RuneError {
     let code = match err.kind() {
         ErrorKind::NotFound => ErrorCode::NotFound,
         ErrorKind::PermissionDenied => ErrorCode::PermissionDenied,
@@ -540,9 +540,11 @@ fn io_error(path: &Utf8Path, err: &std::io::Error) -> RuneError {
         ErrorKind::IsADirectory | ErrorKind::NotADirectory | ErrorKind::InvalidInput => {
             ErrorCode::InvalidField
         }
-        _ => ErrorCode::Internal,
+        _ => ErrorCode::IoFailure,
     };
-    RuneError::new(code, format!("`{path}`: {err}")).with_observed(err.to_string())
+    RuneError::new(code, format!("`{path}`: {err}"))
+        .with_observed(err.to_string())
+        .with_io_source(err)
 }
 
 /// Reads the current bytes of a file, or `None` when it does not exist.
@@ -558,7 +560,7 @@ fn read_preimage(path: &Utf8Path) -> Result<Option<Snapshot>> {
         Err(err) if matches!(err.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) => {
             return Ok(None);
         }
-        Err(err) => return Err(io_error(path, &err)),
+        Err(err) => return Err(io_error(path, err)),
     };
     if metadata.file_type().is_symlink() {
         return Err(
@@ -587,15 +589,15 @@ fn read_preimage(path: &Utf8Path) -> Result<Option<Snapshot>> {
             MAX_TOTAL_BYTES,
         ));
     }
-    let file = File::open(path.as_std_path()).map_err(|err| io_error(path, &err))?;
-    let metadata = file.metadata().map_err(|err| io_error(path, &err))?;
+    let file = File::open(path.as_std_path()).map_err(|err| io_error(path, err))?;
+    let metadata = file.metadata().map_err(|err| io_error(path, err))?;
     let identity = FileIdentity::of(&file);
     let permissions = metadata.permissions();
     let limit = u64::try_from(MAX_TOTAL_BYTES.saturating_add(1)).unwrap_or(u64::MAX);
     let mut bytes = Vec::with_capacity(observed.min(MAX_TOTAL_BYTES));
     file.take(limit)
         .read_to_end(&mut bytes)
-        .map_err(|err| io_error(path, &err))?;
+        .map_err(|err| io_error(path, err))?;
     if bytes.len() > MAX_TOTAL_BYTES {
         return Err(RuneError::too_large(
             path.as_str(),
@@ -619,13 +621,13 @@ fn identity_and_hash(path: &Utf8Path) -> Result<Option<(FileIdentity, [u8; 32])>
     let mut file = match File::open(path.as_std_path()) {
         Ok(file) => file,
         Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
-        Err(err) => return Err(io_error(path, &err)),
+        Err(err) => return Err(io_error(path, err)),
     };
     let identity = FileIdentity::of(&file);
     let mut hasher = Sha256::new();
     let mut buffer = vec![0u8; HASH_BUFFER_BYTES].into_boxed_slice();
     loop {
-        let read = file.read(&mut buffer).map_err(|err| io_error(path, &err))?;
+        let read = file.read(&mut buffer).map_err(|err| io_error(path, err))?;
         if read == 0 {
             break;
         }
@@ -670,7 +672,7 @@ fn create_stage(directory: &Utf8Path) -> Result<(Utf8PathBuf, File)> {
         match opened {
             Ok(file) => return Ok((candidate, file)),
             Err(err) if err.kind() == ErrorKind::AlreadyExists => {}
-            Err(err) => return Err(io_error(&candidate, &err)),
+            Err(err) => return Err(io_error(&candidate, err)),
         }
     }
     Err(RuneError::new(
@@ -1062,6 +1064,28 @@ mod tests {
             })
             .filter(|name| name.starts_with(STAGE_PREFIX))
             .collect()
+    }
+
+    #[test]
+    fn a_filesystem_io_failure_retains_its_cause_and_path() {
+        use std::error::Error as _;
+
+        let path = Utf8Path::new("fixture.txt");
+        let err = io_error(path, std::io::Error::other("fixture disk failure"));
+        assert_eq!(err.code(), ErrorCode::IoFailure);
+        assert_eq!(err.code().as_str(), "io_failure");
+        assert!(err.message().contains(path.as_str()));
+        assert_eq!(
+            err.detail().observed.as_deref(),
+            Some("fixture disk failure")
+        );
+        let source = err
+            .source()
+            .expect("filesystem cause")
+            .downcast_ref::<std::io::Error>()
+            .expect("typed filesystem cause");
+        assert_eq!(source.kind(), ErrorKind::Other);
+        assert_eq!(source.to_string(), "fixture disk failure");
     }
 
     #[test]

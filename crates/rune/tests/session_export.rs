@@ -265,6 +265,8 @@ fn invalid_selectors_and_corrupt_logs_fail_without_partial_stdout() {
 
 #[test]
 fn export_reports_output_write_failures() {
+    use std::error::Error as _;
+
     let fixture = Fixture::new();
     let store = SessionStore::open(&fixture.paths.session_dir(&fixture.id)).expect("open");
     store
@@ -275,5 +277,13 @@ fn export_reports_output_write_failures() {
     let err = state
         .export_jsonl(output.as_mut_slice())
         .expect_err("output too small");
-    assert_eq!(err.code(), ErrorCode::TransportFailure);
+    assert_eq!(err.code(), ErrorCode::IoFailure);
+    assert_eq!(
+        err.source()
+            .expect("output write cause")
+            .downcast_ref::<std::io::Error>()
+            .expect("typed output write cause")
+            .kind(),
+        std::io::ErrorKind::WriteZero
+    );
 }

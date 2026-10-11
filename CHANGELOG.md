@@ -200,6 +200,10 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Fixed
 
+- `RuneError` retains typed I/O causes through cloning and contextual file-write
+  errors. Generic I/O failures report `io_failure` instead of `transport_failure`;
+  filesystem permission denials keep `permission_denied` and their OS cause.
+
 - Cargo and Node package metadata now link to the maintained `AadiXC0DE/Rune`
   repository. The Node package version is aligned with the Rust workspace;
   the documented shared version policy and repository links are checked in CI.

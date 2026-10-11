@@ -6,6 +6,7 @@
 //! in documentation, so they never change once released.
 
 use std::fmt;
+use std::sync::Arc;
 
 /// Stable machine-readable error code.
 ///
@@ -47,6 +48,8 @@ pub enum ErrorCode {
     RequestRejected,
     /// The remote endpoint rate limited the request.
     RateLimited,
+    /// An I/O operation failed without a more specific classification.
+    IoFailure,
     /// A network request failed or timed out.
     TransportFailure,
     /// A response stream ended without a terminal event.
@@ -59,7 +62,7 @@ pub enum ErrorCode {
     Cancelled,
     /// A configured limit was reached.
     LimitExceeded,
-    /// A permission policy denied the action.
+    /// A permission policy or the operating system denied the action.
     PermissionDenied,
     /// The action requires approval that could not be collected.
     InputRequired,
@@ -97,6 +100,7 @@ impl ErrorCode {
             Self::AuthenticationRequired => "authentication_required",
             Self::RequestRejected => "request_rejected",
             Self::RateLimited => "rate_limited",
+            Self::IoFailure => "io_failure",
             Self::TransportFailure => "transport_failure",
             Self::IncompleteStream => "incomplete_stream",
             Self::ProtocolViolation => "protocol_violation",
@@ -133,6 +137,7 @@ impl ErrorCode {
             Self::AuthenticationRequired,
             Self::RequestRejected,
             Self::RateLimited,
+            Self::IoFailure,
             Self::TransportFailure,
             Self::IncompleteStream,
             Self::ProtocolViolation,
@@ -203,8 +208,9 @@ impl ErrorDetail {
 ///
 /// Deliberately not `#[non_exhaustive]`: callers inside the workspace match on
 /// the code, and adding a code is a deliberate act that updates
-/// `error_codes.md` and its consistency test.
-#[derive(Clone, PartialEq, Eq, Debug)]
+/// its wire representation and enumeration. Equality compares the code,
+/// message, and detail; underlying I/O causes are diagnostic context.
+#[derive(Clone, Debug)]
 pub struct RuneError {
     code: ErrorCode,
     message: String,
@@ -212,6 +218,8 @@ pub struct RuneError {
     /// present on most failures but rarely observed, so paying for it inline in
     /// every `Result` would be the wrong trade.
     detail: Box<ErrorDetail>,
+    /// Shared so cloning retains the original typed cause and its error chain.
+    io_source: Option<Arc<std::io::Error>>,
 }
 
 impl RuneError {
@@ -222,6 +230,7 @@ impl RuneError {
             code,
             message: message.into(),
             detail: Box::new(ErrorDetail::none()),
+            io_source: None,
         }
     }
 
@@ -236,6 +245,7 @@ impl RuneError {
                 field: Some(field),
                 ..ErrorDetail::none()
             }),
+            io_source: None,
         }
     }
 
@@ -250,6 +260,7 @@ impl RuneError {
                 field: Some(field),
                 ..ErrorDetail::none()
             }),
+            io_source: None,
         }
     }
 
@@ -264,6 +275,7 @@ impl RuneError {
                 invariant: Some(invariant),
                 ..ErrorDetail::none()
             }),
+            io_source: None,
         }
     }
 
@@ -280,7 +292,17 @@ impl RuneError {
                 hint: Some(format!("reduce to at most {limit} bytes")),
                 ..ErrorDetail::none()
             }),
+            io_source: None,
         }
+    }
+
+    /// Retains the original I/O cause, including its kind and OS error code.
+    ///
+    /// Use this when adding operation or path context to an I/O failure.
+    #[must_use]
+    pub fn with_io_source(mut self, source: std::io::Error) -> Self {
+        self.io_source = Some(Arc::new(source));
+        self
     }
 
     /// Attaches a repair hint.
@@ -352,7 +374,21 @@ impl fmt::Display for RuneError {
     }
 }
 
-impl std::error::Error for RuneError {}
+impl PartialEq for RuneError {
+    fn eq(&self, other: &Self) -> bool {
+        self.code == other.code && self.message == other.message && self.detail == other.detail
+    }
+}
+
+impl Eq for RuneError {}
+
+impl std::error::Error for RuneError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.io_source
+            .as_deref()
+            .map(|source| -> &(dyn std::error::Error + 'static) { source })
+    }
+}
 
 /// Result alias used across the workspace.
 pub type Result<T, E = RuneError> = std::result::Result<T, E>;
@@ -365,9 +401,19 @@ impl From<std::io::Error> for RuneError {
             std::io::ErrorKind::TimedOut => ErrorCode::Timeout,
             std::io::ErrorKind::Interrupted => ErrorCode::Cancelled,
             std::io::ErrorKind::PermissionDenied => ErrorCode::PermissionDenied,
-            _ => ErrorCode::TransportFailure,
+            std::io::ErrorKind::ConnectionRefused
+            | std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::NotConnected
+            | std::io::ErrorKind::AddrInUse
+            | std::io::ErrorKind::AddrNotAvailable
+            | std::io::ErrorKind::BrokenPipe
+            | std::io::ErrorKind::HostUnreachable
+            | std::io::ErrorKind::NetworkUnreachable
+            | std::io::ErrorKind::NetworkDown => ErrorCode::TransportFailure,
+            _ => ErrorCode::IoFailure,
         };
-        Self::new(code, err.to_string())
+        Self::new(code, err.to_string()).with_io_source(err)
     }
 }
 
@@ -474,7 +520,77 @@ mod tests {
         assert_eq!(RuneError::from(denied).code(), ErrorCode::PermissionDenied);
 
         let other = std::io::Error::other("?");
-        assert_eq!(RuneError::from(other).code(), ErrorCode::TransportFailure);
+        assert_eq!(RuneError::from(other).code(), ErrorCode::IoFailure);
+    }
+
+    #[test]
+    fn io_causes_keep_their_type_and_survive_cloning() {
+        use std::error::Error as _;
+
+        let inner = RuneError::new(ErrorCode::InvalidState, "fixture write failed");
+        let err = RuneError::from(std::io::Error::other(inner.clone()))
+            .with_hint("check the filesystem")
+            .with_observed("fixture.txt");
+        let cloned = err.clone();
+        let source = err
+            .source()
+            .expect("I/O cause")
+            .downcast_ref::<std::io::Error>()
+            .expect("typed I/O cause");
+        assert_eq!(source.kind(), std::io::ErrorKind::Other);
+        assert_eq!(
+            source
+                .get_ref()
+                .expect("inner cause")
+                .downcast_ref::<RuneError>(),
+            Some(&inner)
+        );
+        assert!(std::ptr::eq(
+            source,
+            cloned
+                .source()
+                .expect("cloned cause")
+                .downcast_ref::<std::io::Error>()
+                .expect("cloned typed cause")
+        ));
+        assert_eq!(err, cloned);
+        assert_eq!(err.hint(), Some("check the filesystem"));
+        assert_eq!(err.detail().observed.as_deref(), Some("fixture.txt"));
+    }
+
+    #[test]
+    fn network_io_failures_keep_the_transport_code_and_cause() {
+        use std::error::Error as _;
+
+        for kind in [
+            std::io::ErrorKind::ConnectionRefused,
+            std::io::ErrorKind::ConnectionReset,
+            std::io::ErrorKind::BrokenPipe,
+            std::io::ErrorKind::NetworkUnreachable,
+        ] {
+            let err = RuneError::from(std::io::Error::new(kind, "fixture network failure"));
+            assert_eq!(err.code(), ErrorCode::TransportFailure);
+            assert_eq!(
+                err.source()
+                    .expect("cause")
+                    .downcast_ref::<std::io::Error>()
+                    .expect("typed cause")
+                    .kind(),
+                kind
+            );
+        }
+    }
+
+    #[test]
+    fn errors_without_io_causes_preserve_diagnostic_equality() {
+        use std::error::Error as _;
+
+        let err = RuneError::new(ErrorCode::IoFailure, "fixture");
+        assert!(err.source().is_none());
+        assert_eq!(
+            err.clone().with_io_source(std::io::Error::other("cause")),
+            err
+        );
     }
 
     #[test]
