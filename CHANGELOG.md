@@ -172,6 +172,11 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Fixed
 
+- ACP loading and resuming apply the current `additionalDirectories` list
+  alongside configured roots, with shared roots kept once. Earlier client roots
+  are removed, including when the list is omitted, null, or empty. Invalid lists
+  are rejected before replacing the open session.
+
 - ACP session listings sort all matching sessions by most recent activity
   before applying the listing cap, so directory order cannot hide newer sessions.
 

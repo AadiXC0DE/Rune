@@ -129,7 +129,7 @@ pub struct Sessions {
     paths: Paths,
     workspace: Utf8PathBuf,
     defaults: SessionConfig,
-    /// Directories every new session may reach.
+    /// Directories every created or reopened session may reach.
     default_roots: Vec<Utf8PathBuf>,
     limits: BudgetSet,
     cap: usize,
@@ -178,17 +178,7 @@ impl Sessions {
         workspace: Utf8PathBuf,
         additional_roots: Vec<Utf8PathBuf>,
     ) -> Result<String> {
-        // Configured directories come first, so a session reaches what the user
-        // saved even when the client asks for none of its own. A root the client
-        // names as well is kept once, since the context would otherwise hold the
-        // same directory twice.
-        let mut roots = self.default_roots.clone();
-        for root in additional_roots {
-            if !roots.contains(&root) {
-                roots.push(root);
-            }
-        }
-        let additional_roots = roots;
+        let additional_roots = self.effective_roots(additional_roots);
         if self.entries.len() >= self.cap {
             return Err(RuneError::new(
                 ErrorCode::LimitExceeded,
@@ -253,23 +243,56 @@ impl Sessions {
     /// loads a conversation shows the transcript it missed, and a client that
     /// resumes already has one on screen.
     pub fn load(&mut self, id: &str) -> Result<Vec<Notification>> {
-        self.open(id)?;
+        self.load_with_roots(id, Vec::new())
+    }
+
+    /// Loads a saved session with the current request's additional roots.
+    ///
+    /// Configured roots remain available; roots from earlier requests are
+    /// replaced, including when the current request supplies none.
+    pub fn load_with_roots(
+        &mut self,
+        id: &str,
+        additional_roots: Vec<Utf8PathBuf>,
+    ) -> Result<Vec<Notification>> {
+        self.open(id, additional_roots)?;
         let session = self.get(id)?;
         Ok(replay_updates(&session.id, &session.history))
     }
 
     /// Reconnects to a saved session without replaying its history.
     pub fn resume(&mut self, id: &str) -> Result<()> {
-        self.open(id)?;
-        Ok(())
+        self.resume_with_roots(id, Vec::new())
+    }
+
+    /// Resumes with configured roots and only the current request's roots.
+    pub fn resume_with_roots(
+        &mut self,
+        id: &str,
+        additional_roots: Vec<Utf8PathBuf>,
+    ) -> Result<()> {
+        self.open(id, additional_roots)
+    }
+
+    /// Merges configured and requested roots in the same order for every
+    /// lifecycle request, retaining shared roots only once.
+    fn effective_roots(&self, additional_roots: Vec<Utf8PathBuf>) -> Vec<Utf8PathBuf> {
+        let mut roots = self.default_roots.clone();
+        for root in additional_roots {
+            if !roots.contains(&root) {
+                roots.push(root);
+            }
+        }
+        roots
     }
 
     /// Opens a stored session, replacing any entry already held for it.
     ///
     /// The previous entry holds the writer lock for the same directory, so it is
     /// dropped before the store is opened again.
-    fn open(&mut self, id: &str) -> Result<()> {
+    fn open(&mut self, id: &str, additional_roots: Vec<Utf8PathBuf>) -> Result<()> {
         let key: SessionId = id.parse()?;
+        let additional_roots = self.effective_roots(additional_roots);
         self.entries.remove(key.as_str());
         let store = SessionStore::open(&self.paths.session_dir(&key))?;
         let state = store.read()?;
@@ -292,7 +315,7 @@ impl Sessions {
                     .map_or_else(|| self.workspace.clone(), Utf8PathBuf::from),
                 history,
                 grants: RuleSet::new(),
-                additional_roots: Vec::new(),
+                additional_roots,
                 mcp: None,
                 store,
             },

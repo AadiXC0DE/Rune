@@ -576,11 +576,12 @@ impl<W: Write + Send + 'static> Server<W> {
     /// Answers `session/load`, replaying the stored conversation first.
     fn load_session(&self, params: &Value) -> std::result::Result<Value, RpcError> {
         let id = string_field(params, "sessionId")?;
+        let roots = additional_roots(params)?;
         let mcp = crate::mcp::connect(params, &self.config.limits)?;
         let updates = {
             let mut sessions = self.lock_sessions()?;
             let updates = sessions
-                .load(&id)
+                .load_with_roots(&id, roots)
                 .map_err(|err| RpcError::from_rune(&err))?;
             sessions
                 .set_mcp(&id, mcp)
@@ -596,10 +597,11 @@ impl<W: Write + Send + 'static> Server<W> {
     /// Answers `session/resume`, which replays nothing.
     fn resume_session(&self, params: &Value) -> std::result::Result<Value, RpcError> {
         let id = string_field(params, "sessionId")?;
+        let roots = additional_roots(params)?;
         let mcp = crate::mcp::connect(params, &self.config.limits)?;
         let mut sessions = self.lock_sessions()?;
         sessions
-            .resume(&id)
+            .resume_with_roots(&id, roots)
             .map_err(|err| RpcError::from_rune(&err))?;
         sessions
             .set_mcp(&id, mcp)
@@ -1533,6 +1535,112 @@ mod tests {
         let roots =
             additional_roots(&json!({ "additionalDirectories": [absolute] })).expect("roots");
         assert_eq!(roots.len(), 1);
+    }
+
+    #[test]
+    fn reopening_applies_only_configured_and_current_request_roots() {
+        for method in ["session/load", "session/resume"] {
+            for with_configured_root in [false, true] {
+                let root = tempfile::tempdir().expect("tempdir");
+                let path = |name: &str| {
+                    Utf8PathBuf::from_path_buf(root.path().join(name)).expect("UTF-8 path")
+                };
+                let workspace = path("workspace");
+                let configured = path("configured");
+                let original = path("original");
+                let requested = path("requested");
+                let replacement = path("replacement");
+                let mut config = ServerConfig::new(
+                    Paths {
+                        config_root: path("config"),
+                        state_root: path("state"),
+                        data_root: path("data"),
+                    },
+                    workspace.clone(),
+                    Endpoint::new("http://127.0.0.1:1", "test-key"),
+                    "test/model",
+                )
+                .expect("config");
+                if with_configured_root {
+                    config.additional_roots.push(configured.clone());
+                }
+                let defaults = config.additional_roots.clone();
+                let server = Arc::new(Server::new(config, Vec::new()).expect("server"));
+                let created = server
+                    .new_session(&json!({"additionalDirectories": [original]}))
+                    .expect("create");
+                let id = created["sessionId"].as_str().expect("session id");
+                server
+                    .close_session(&json!({"sessionId": id}))
+                    .expect("close");
+
+                let assert_roots = |additional: &[Utf8PathBuf]| {
+                    let sessions = server.lock_sessions().expect("sessions");
+                    let snapshot = sessions.snapshot(id).expect("snapshot");
+                    assert_eq!(snapshot.context.workspace(), workspace);
+                    assert_eq!(snapshot.context.additional_roots, additional);
+                    assert_eq!(
+                        sessions.get(id).expect("session").additional_roots(),
+                        additional
+                    );
+                };
+                let mut expected = defaults.clone();
+                expected.push(requested.clone());
+                let mut request_roots = expected.clone();
+                request_roots.push(requested.clone());
+                server
+                    .handle(
+                        method,
+                        &json!({"sessionId": id, "additionalDirectories": request_roots}),
+                        None,
+                    )
+                    .expect("reopen closed session");
+                assert_roots(&expected);
+
+                for invalid in [json!(["relative"]), json!([42]), json!("invalid")] {
+                    let error = server
+                        .handle(
+                            method,
+                            &json!({"sessionId": id, "additionalDirectories": invalid}),
+                            None,
+                        )
+                        .expect_err("invalid roots");
+                    assert_eq!(error.code, crate::jsonrpc::INVALID_PARAMS);
+                    assert_roots(&expected);
+                }
+
+                server
+                    .handle(
+                        method,
+                        &json!({"sessionId": id, "additionalDirectories": [replacement]}),
+                        None,
+                    )
+                    .expect("reopen held session");
+                expected = defaults.clone();
+                expected.push(replacement);
+                assert_roots(&expected);
+
+                for mut params in [
+                    json!({}),
+                    json!({"additionalDirectories": null}),
+                    json!({"additionalDirectories": []}),
+                ] {
+                    // Restore a request root before each removal check.
+                    server
+                        .handle(
+                            method,
+                            &json!({"sessionId": id, "additionalDirectories": [requested]}),
+                            None,
+                        )
+                        .expect("restore request root");
+                    params["sessionId"] = json!(id);
+                    server
+                        .handle(method, &params, None)
+                        .expect("clear request roots");
+                    assert_roots(&defaults);
+                }
+            }
+        }
     }
 
     #[test]
