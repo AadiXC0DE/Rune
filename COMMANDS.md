@@ -74,13 +74,14 @@ Aliases:
 
 ## Sessions and local records
 
-### `rune sessions [--all] [--limit <n>] [--cursor <c>]`
+### `rune sessions [--all] [--search <text>] [--limit <n>] [--cursor <c>]`
 
 List sessions
 
 | Flag | Description |
 |---|---|
 | `--all` | Include sessions from every workspace. |
+| `--search <text>` | Match a case-insensitive literal fragment in titles or user messages. |
 | `--limit <n>` | Page size, 1 to 100. |
 | `--cursor <c>` | Continue from a previous page. |
 | `--json` | Emit JSON. |

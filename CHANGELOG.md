@@ -6,6 +6,10 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Added
 
+- `rune sessions --search <text>` finds case-insensitive literal fragments in
+  current session titles and recorded user messages, with workspace scoping,
+  pagination, and JSON output preserved.
+
 - `rune session export <last|id>` emits stable, ordered JSONL event records with
   saved schema versions and timestamps, excluding credentials, metadata, and
   transport headers. Recorded message and tool content is preserved.

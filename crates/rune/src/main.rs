@@ -1114,7 +1114,10 @@ fn run_sessions(
     // Without `--all` the listing is scoped to this workspace, so `last` means
     // the latest session here rather than the latest anywhere.
     let scope = (!launch.has_flag("--all")).then_some(workspace);
-    let page = session_log::page(paths, scope, limit, cursor)?;
+    let page = match launch.flag("--search") {
+        Some(query) => session_log::search_page(paths, scope, query, limit, cursor)?,
+        None => session_log::page(paths, scope, limit, cursor)?,
+    };
     let rows = &page.rows;
     let entries: Vec<serde_json::Value> = rows
         .iter()

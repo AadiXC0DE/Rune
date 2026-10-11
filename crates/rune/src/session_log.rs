@@ -356,8 +356,30 @@ pub fn page(
     limit: usize,
     cursor: Option<&str>,
 ) -> Result<Page> {
+    paginate(list_scoped(paths, scope), limit, cursor)
+}
+
+/// Searches titles and recorded user messages by a case-insensitive literal fragment.
+///
+/// Workspace and child-session exclusions are the same as for an ordinary
+/// listing. Matching precedes the listing cap and pagination.
+pub fn search_page(
+    paths: &Paths,
+    scope: Option<&Utf8Path>,
+    query: &str,
+    limit: usize,
+    cursor: Option<&str>,
+) -> Result<Page> {
+    if query.trim().is_empty() {
+        return Err(RuneError::invalid_field("search", "search text is empty")
+            .with_hint("pass a title or user-message fragment"));
+    }
+    let query = query.to_lowercase();
+    paginate(list_matching(paths, scope, Some(&query)), limit, cursor)
+}
+
+fn paginate(all: Vec<Summary>, limit: usize, cursor: Option<&str>) -> Result<Page> {
     let limit = limit.clamp(1, MAX_PAGE);
-    let all = list_scoped(paths, scope);
 
     let start = match cursor {
         None => 0,
@@ -388,6 +410,10 @@ pub fn page(
 /// than assumed to belong to it, because guessing would attribute a session to a
 /// repository it may never have touched.
 pub fn list_scoped(paths: &Paths, scope: Option<&Utf8Path>) -> Vec<Summary> {
+    list_matching(paths, scope, None)
+}
+
+fn list_matching(paths: &Paths, scope: Option<&Utf8Path>, query: Option<&str>) -> Vec<Summary> {
     let wanted = scope.map(rune_policy::trust::canonical_workspace);
     let Ok(entries) = std::fs::read_dir(paths.sessions_dir()) else {
         return Vec::new();
@@ -410,6 +436,18 @@ pub fn list_scoped(paths: &Paths, scope: Option<&Utf8Path>) -> Vec<Summary> {
         // a conversation the user never started, and resuming it directly would
         // run it without the authority its parent had.
         if state.parent.is_some() {
+            continue;
+        }
+        if let Some(query) = query
+            && !state
+                .title
+                .as_deref()
+                .is_some_and(|title| title.to_lowercase().contains(query))
+            && !state.events.iter().any(|frame| {
+                matches!(&frame.event, SessionEvent::UserMessage { text }
+                    if text.to_lowercase().contains(query))
+            })
+        {
             continue;
         }
         out.push(summarize(&state, dir));

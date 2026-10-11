@@ -206,6 +206,12 @@ Completed exchanges are saved as sessions for the current workspace, and
 `--json` reports their `session_id`. Pass `--no-save` to create no session and
 return an empty ID.
 
+`rune sessions --search "fragment"` finds sessions by a case-insensitive literal
+fragment in their current title or any recorded user message. Results stay scoped
+to the current workspace unless `--all` is passed. `--limit`, `--cursor`, and
+`--json` work as for ordinary listings; repeat the same search and scope when
+continuing with a cursor.
+
 `rune session export <last|id>` writes stable JSONL to stdout, one saved event
 per line in sequence order, with its schema version and original timestamp.
 Credentials, metadata, and transport headers are excluded. Recorded message

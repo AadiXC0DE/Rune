@@ -1988,7 +1988,7 @@ Resource accumulation after cancellation, session holder handover and concurrent
 - [x] R-109 | T2 | fix | sessions | Clear lock-holder diagnostics before releasing the lock | acceptance: Race old-owner release with new-owner acquisition and observe the new holder's diagnostic record preserved.
 - [x] R-110 | T2 | fix | sessions | Cap event reads despite concurrent log growth | acceptance: Grow a log between metadata and read and observe bounded bytes plus a named size error.
 - [x] R-111 | T2 | feature | sessions | Export a session as a stable JSON stream | acceptance: Export a fixture twice and observe identical ordered event records without credentials or transport headers.
-- [ ] R-112 | T2 | feature | sessions | Search sessions by title and prompt text | acceptance: Find a fixture session using a title fragment and a user-message fragment with workspace scoping intact.
+- [x] R-112 | T2 | feature | sessions | Search sessions by title and prompt text | acceptance: Find a fixture session using a title fragment and a user-message fragment with workspace scoping intact.
 - [ ] R-113 | T2 | feature | context | Search archived compaction records | acceptance: Compact a fixture then search for a removed symbol and observe its original record and session position.
 - [ ] R-114 | T2 | feature | context | Preview the records a manual compaction would remove | acceptance: Invoke a compact preview and observe exact retained and summarized record counts without changing history.
 - [ ] R-115 | T2 | feature | context | Expose token-estimate provenance in status | acceptance: Observe provider-reported versus estimated counts labelled distinctly before and after the first fixture response.

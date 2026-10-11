@@ -258,9 +258,14 @@ pub const SESSIONS: &[CommandSpec] = &[
         name: "sessions",
         aliases: &[],
         summary: "List sessions",
-        usage: "rune sessions [--all] [--limit <n>] [--cursor <c>]",
+        usage: "rune sessions [--all] [--search <text>] [--limit <n>] [--cursor <c>]",
         flags: &[
             flag("--all", "Include sessions from every workspace."),
+            option(
+                "--search",
+                "text",
+                "Match a case-insensitive literal fragment in titles or user messages.",
+            ),
             option("--limit", "n", "Page size, 1 to 100."),
             option("--cursor", "c", "Continue from a previous page."),
             flag("--json", "Emit JSON."),
