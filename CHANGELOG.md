@@ -185,6 +185,9 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Fixed
 
+- `cargo xtask release` writes valid JSON manifests for channels containing
+  quotes, backslashes, or control characters, preserving their exact values.
+
 - `cargo xtask budget` and `cargo xtask release` read the freshly built binary
   from `CARGO_TARGET_DIR` when set, including relative paths, instead of using
   a stale binary under `target/release`.

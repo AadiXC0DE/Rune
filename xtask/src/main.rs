@@ -286,16 +286,19 @@ fn release(extra: &[String]) -> Result<(), String> {
         &format!("{directory}/{archive}.sha256"),
         &format!("{checksum}  {archive}\n"),
     )?;
-    write(
-        &format!("{directory}/manifest.json"),
-        &format!(
-            "{{\n  \"name\": \"rune\",\n  \"version\": \"{version}\",\n  \
-             \"channel\": \"{channel}\",\n  \"target\": \"{target}\",\n  \
-             \"archive\": \"{archive}\",\n  \"bytes\": {},\n  \
-             \"sha256\": \"{checksum}\"\n}}\n",
-            bytes.len()
-        ),
-    )?;
+    let manifest = serde_json::json!({
+        "name": "rune",
+        "version": version,
+        "channel": channel,
+        "target": target,
+        "archive": archive,
+        "bytes": bytes.len(),
+        "sha256": checksum,
+    });
+    let mut manifest_json = serde_json::to_string_pretty(&manifest)
+        .map_err(|err| format!("could not serialize the release manifest: {err}"))?;
+    manifest_json.push('\n');
+    write(&format!("{directory}/manifest.json"), &manifest_json)?;
 
     println!("staged   {archive_path}");
     println!("bytes    {}", bytes.len());

@@ -44,10 +44,10 @@ impl ScratchWorkspace {
         Self(path)
     }
 
-    fn task(&self, task: &str, target_dir: Option<&Path>) -> Output {
+    fn task(&self, args: &[&str], target_dir: Option<&Path>) -> Output {
         let mut command = Command::new(env!("CARGO_BIN_EXE_xtask"));
         command
-            .arg(task)
+            .args(args)
             .current_dir(&self.0)
             .env_remove("CARGO_TARGET_DIR")
             .env_remove("CARGO_BUILD_TARGET")
@@ -86,7 +86,7 @@ fn budget_measures_and_runs_the_binary_in_cargos_target_directory() {
         let workspace = ScratchWorkspace::new();
         let dirs = workspace.target_dirs();
         let directory = dirs[index].as_deref();
-        let output = workspace.task("budget", directory);
+        let output = workspace.task(&["budget"], directory);
         assert!(output.status.success(), "{directory:?}: {output:?}");
         let size = std::fs::metadata(workspace.binary(directory))
             .expect("read built binary metadata")
@@ -108,7 +108,7 @@ fn release_packages_the_binary_in_cargos_target_directory() {
         let workspace = ScratchWorkspace::new();
         let dirs = workspace.target_dirs();
         let directory = dirs[index].as_deref();
-        let output = workspace.task("release", directory);
+        let output = workspace.task(&["release"], directory);
         assert!(output.status.success(), "{directory:?}: {output:?}");
         let binary = std::fs::read(workspace.binary(directory)).expect("read built binary");
         let archive = workspace.0.join(format!(
@@ -126,6 +126,52 @@ fn release_packages_the_binary_in_cargos_target_directory() {
             &tar[512..end],
             binary,
             "the archive must contain the fresh build, not the stale default artifact"
+        );
+    }
+}
+
+#[test]
+fn release_manifest_preserves_channels_requiring_json_escaping() {
+    use sha2::{Digest, Sha256};
+
+    let workspace = ScratchWorkspace::new();
+    let version = "0.0.0-preview";
+    let target = env!("TARGET");
+    let archive = format!("rune-{version}-{target}.tar.gz");
+    let directory = workspace.0.join(format!("target/dist/rune-{target}"));
+    for channel in [
+        "dev",
+        "preview\"candidate",
+        "preview\\candidate\n\r\t\u{0001}",
+        "\", \"injected\": true, \"channel\": \"other",
+        "preview-\u{03bb}",
+        "",
+    ] {
+        let output = workspace.task(&["release", channel, version], None);
+        assert!(output.status.success(), "{channel:?}: {output:?}");
+        let contents =
+            std::fs::read(directory.join("manifest.json")).expect("read staged manifest");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&contents).expect("staged manifest must be valid JSON");
+        let bytes = std::fs::read(directory.join(&archive)).expect("read staged archive");
+        let checksum = format!("{:x}", Sha256::digest(&bytes));
+        assert_eq!(
+            manifest,
+            serde_json::json!({
+                "name": "rune",
+                "version": version,
+                "channel": channel,
+                "target": target,
+                "archive": archive,
+                "bytes": bytes.len(),
+                "sha256": checksum,
+            }),
+            "all manifest fields must retain their values and types"
+        );
+        assert_eq!(
+            std::fs::read_to_string(directory.join(format!("{archive}.sha256")))
+                .expect("read staged checksum"),
+            format!("{checksum}  {archive}\n")
         );
     }
 }
