@@ -286,34 +286,43 @@ fn save_exchange(
     let workspace = crate::current_workspace()?;
     let id = SessionId::generate();
     let store = SessionStore::create(paths, &id)?;
-    store.append(SessionEvent::WorkspaceSet {
+    let mut metadata_warning = None;
+    let mut append = |event| -> Result<()> {
+        let report = store.append(event)?;
+        metadata_warning = report.metadata_warning;
+        Ok(())
+    };
+    append(SessionEvent::WorkspaceSet {
         workspace: rune_policy::trust::canonical_workspace(&workspace).to_string(),
     })?;
-    store.append(SessionEvent::TitleSet {
+    append(SessionEvent::TitleSet {
         title: crate::session_log::derive_title(prompt),
     })?;
-    store.append(SessionEvent::UserMessage {
+    append(SessionEvent::UserMessage {
         text: prompt.to_owned(),
     })?;
-    store.append(SessionEvent::TurnStarted { turn: 1 })?;
+    append(SessionEvent::TurnStarted { turn: 1 })?;
     if !text.is_empty() {
-        store.append(SessionEvent::AssistantMessage {
+        append(SessionEvent::AssistantMessage {
             turn: 1,
             text: text.to_owned(),
         })?;
     }
     if let (Some(input_tokens), Some(output_tokens)) = (usage.input_tokens, usage.output_tokens) {
-        store.append(SessionEvent::UsageRecorded {
+        append(SessionEvent::UsageRecorded {
             input_tokens,
             output_tokens,
         })?;
     }
     if let Some(error) = error {
-        store.append(SessionEvent::TurnFailed {
+        append(SessionEvent::TurnFailed {
             turn: 1,
             code: error.code(),
             message: error.message().to_owned(),
         })?;
+    }
+    if let Some(warning) = metadata_warning {
+        let _ = writeln!(std::io::stderr(), "warning: {warning}");
     }
     Ok(id)
 }

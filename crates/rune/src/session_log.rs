@@ -74,6 +74,7 @@ pub struct Recorder {
     turn: u64,
     active_turn: bool,
     journal_error: Option<RuneError>,
+    metadata_warning: std::cell::RefCell<Option<RuneError>>,
     /// Initial estimate and its source, populated only when resuming.
     resumed_context: (u64, Option<&'static str>),
 }
@@ -87,8 +88,24 @@ impl Recorder {
             turn: 0,
             active_turn: false,
             journal_error: None,
+            metadata_warning: std::cell::RefCell::new(None),
             resumed_context: (0, None),
         })
+    }
+
+    /// Records an event while keeping projection warnings out of journal errors.
+    fn append(&self, event: SessionEvent) -> Result<()> {
+        let report = self.store.append(event)?;
+        // Keep one warning while a projection remains unavailable, even if
+        // many streamed deltas were synced. A later successful refresh repairs
+        // the summary and clears the pending warning.
+        *self.metadata_warning.borrow_mut() = report.metadata_warning;
+        Ok(())
+    }
+
+    /// Takes the pending metadata repair warning for display at a turn boundary.
+    pub fn take_metadata_warning(&self) -> Option<RuneError> {
+        self.metadata_warning.borrow_mut().take()
     }
 
     /// Marks this session as a child of another.
@@ -100,7 +117,7 @@ impl Recorder {
     /// with the other session marks.
     #[cfg(test)]
     pub fn set_parent(&self, parent: &SessionId) -> Result<()> {
-        self.store.append(SessionEvent::ChildOf {
+        self.append(SessionEvent::ChildOf {
             parent: parent.to_string(),
         })?;
         Ok(())
@@ -111,7 +128,7 @@ impl Recorder {
     /// Written once at the start, so a later listing can scope itself to a
     /// workspace without reading every session's contents.
     pub fn set_workspace(&self, workspace: &Utf8Path) -> Result<()> {
-        self.store.append(SessionEvent::WorkspaceSet {
+        self.append(SessionEvent::WorkspaceSet {
             workspace: rune_policy::trust::canonical_workspace(workspace).to_string(),
         })?;
         Ok(())
@@ -126,6 +143,7 @@ impl Recorder {
             turn,
             active_turn: false,
             journal_error: None,
+            metadata_warning: std::cell::RefCell::new(None),
             resumed_context: (0, None),
         })
     }
@@ -143,7 +161,7 @@ impl Recorder {
 
     /// Records the user's message.
     pub fn user_message(&self, text: &str) -> Result<()> {
-        self.store.append(SessionEvent::UserMessage {
+        self.append(SessionEvent::UserMessage {
             text: text.to_owned(),
         })?;
         Ok(())
@@ -153,7 +171,7 @@ impl Recorder {
     pub fn begin_turn(&mut self) -> Result<()> {
         if !self.active_turn {
             let turn = self.turn.saturating_add(1);
-            self.store.append(SessionEvent::TurnStarted { turn })?;
+            self.append(SessionEvent::TurnStarted { turn })?;
             self.turn = turn;
             self.active_turn = true;
         }
@@ -174,7 +192,7 @@ impl Recorder {
             while !remaining.is_char_boundary(end) {
                 end = end.saturating_sub(1);
             }
-            self.store.append(SessionEvent::AssistantDelta {
+            self.append(SessionEvent::AssistantDelta {
                 turn: self.turn,
                 text: remaining[..end].to_owned(),
             })?;
@@ -188,8 +206,7 @@ impl Recorder {
         if let Some(error) = &self.journal_error {
             return Err(error.clone());
         }
-        self.store
-            .append(SessionEvent::AssistantReset { turn: self.turn })?;
+        self.append(SessionEvent::AssistantReset { turn: self.turn })?;
         Ok(())
     }
 
@@ -218,14 +235,14 @@ impl Recorder {
         // batch. Writing them interleaved would leave a log that cannot be
         // replayed into the conversation the model actually saw.
         for call in &outcome.calls {
-            self.store.append(SessionEvent::ToolCall {
+            self.append(SessionEvent::ToolCall {
                 call_id: call.call.id.clone(),
                 name: call.call.name.clone(),
                 arguments: call.call.arguments.clone(),
             })?;
         }
         for call in &outcome.calls {
-            self.store.append(SessionEvent::ToolResult {
+            self.append(SessionEvent::ToolResult {
                 call_id: call.call.id.clone(),
                 ok: !call.output.is_error,
                 output: call.output.text.clone(),
@@ -233,7 +250,7 @@ impl Recorder {
         }
 
         if !outcome.text.is_empty() {
-            self.store.append(SessionEvent::AssistantMessage {
+            self.append(SessionEvent::AssistantMessage {
                 turn,
                 text: outcome.text.clone(),
             })?;
@@ -242,12 +259,12 @@ impl Recorder {
         if let (Some(input), Some(output)) =
             (outcome.usage.input_tokens, outcome.usage.output_tokens)
         {
-            self.store.append(SessionEvent::UsageRecorded {
+            self.append(SessionEvent::UsageRecorded {
                 input_tokens: input,
                 output_tokens: output,
             })?;
         }
-        self.store.append(SessionEvent::TurnFinished { turn })?;
+        self.append(SessionEvent::TurnFinished { turn })?;
         self.active_turn = false;
         Ok(())
     }
@@ -260,12 +277,12 @@ impl Recorder {
         self.begin_turn()?;
         let turn = self.turn;
         if !partial.trim().is_empty() {
-            self.store.append(SessionEvent::AssistantMessage {
+            self.append(SessionEvent::AssistantMessage {
                 turn,
                 text: partial.to_owned(),
             })?;
         }
-        self.store.append(SessionEvent::TurnCancelled { turn })?;
+        self.append(SessionEvent::TurnCancelled { turn })?;
         self.active_turn = false;
         Ok(())
     }
@@ -278,12 +295,12 @@ impl Recorder {
         self.begin_turn()?;
         let turn = self.turn;
         if !partial.trim().is_empty() {
-            self.store.append(SessionEvent::AssistantMessage {
+            self.append(SessionEvent::AssistantMessage {
                 turn,
                 text: partial.to_owned(),
             })?;
         }
-        self.store.append(SessionEvent::TurnFailed {
+        self.append(SessionEvent::TurnFailed {
             turn,
             code: error.code(),
             message: error.message().to_owned(),
@@ -303,7 +320,7 @@ impl Recorder {
     /// Called once, with the opening prompt, so a listing distinguishes
     /// sessions by what they were about rather than by identifier alone.
     pub fn set_title(&self, title: &str) -> Result<()> {
-        self.store.append(SessionEvent::TitleSet {
+        self.append(SessionEvent::TitleSet {
             title: title.to_owned(),
         })?;
         Ok(())
@@ -876,6 +893,32 @@ mod tests {
 
     fn id(raw: &str) -> SessionId {
         raw.parse().expect("id")
+    }
+
+    #[test]
+    fn a_later_successful_refresh_clears_the_pending_metadata_warning() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let root = Utf8Path::from_path(root.path()).expect("utf8");
+        let recorder = Recorder::create(&paths(root), &id("sessionaaaaa")).expect("create");
+        let metadata = recorder.store.metadata_path();
+        std::fs::remove_file(&metadata).expect("remove projection");
+        std::fs::create_dir(&metadata).expect("block projection");
+        recorder
+            .user_message("durable")
+            .expect("record despite projection failure");
+        assert!(recorder.metadata_warning.borrow().is_some());
+
+        std::fs::remove_dir(&metadata).expect("unblock projection");
+        recorder.set_title("repaired").expect("record and refresh");
+        assert!(recorder.take_metadata_warning().is_none());
+        assert_eq!(recorder.store.read().expect("replay").len(), 2);
+        assert_eq!(
+            serde_json::from_slice::<rune_session::Metadata>(
+                &std::fs::read(metadata).expect("projection")
+            )
+            .expect("parse projection"),
+            recorder.store.metadata()
+        );
     }
 
     fn outcome(text: &str) -> TurnOutcome {

@@ -958,10 +958,15 @@ pub const fn stop_reason(reason: StopReason) -> &'static str {
 impl<W: Write + Send + 'static> Server<W> {
     /// Appends one event to a session log, reporting a failure without stopping.
     fn record(&self, session: &str, event: SessionEvent) {
-        if let Ok(mut sessions) = self.sessions.lock()
-            && let Err(err) = sessions.record(session, event)
-        {
-            self.note(format_args!("could not record an event: {err}"));
+        if let Ok(mut sessions) = self.sessions.lock() {
+            match sessions.record(session, event) {
+                Ok(report) => {
+                    if let Some(warning) = report.metadata_warning {
+                        self.note(format_args!("warning: {warning}"));
+                    }
+                }
+                Err(err) => self.note(format_args!("could not record an event: {err}")),
+            }
         }
     }
 

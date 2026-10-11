@@ -2511,7 +2511,21 @@ fn close_turn(
     if let Ok(mut typed) = host.typed.lock() {
         *typed = (reader.line().to_owned(), reader.column());
     }
-    let painted = host.paint(lines, notice.as_deref(), &prompt_rows, &[], caret)?;
+    let mut lines = std::borrow::Cow::Borrowed(lines);
+    if let Some(recorder) = &host.recorder
+        && let Some(warning) = recorder
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take_metadata_warning()
+    {
+        let entry = Entry::notice(format!("warning: {warning}"));
+        host.transcript
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(entry.clone());
+        lines.to_mut().extend(render_entries(&[entry], host));
+    }
+    let painted = host.paint(&lines, notice.as_deref(), &prompt_rows, &[], caret)?;
     if !painted.is_empty() {
         sink.write_all(&painted)?;
         sink.flush()?;
@@ -4586,7 +4600,7 @@ mod tests {
     }
 
     #[test]
-    fn a_journal_write_failure_cancels_before_showing_unsaved_text() {
+    fn a_metadata_write_failure_keeps_showing_durable_text_and_reports_repair() {
         let root = tempfile::tempdir().expect("temp");
         let base = Utf8PathBuf::from_path_buf(root.path().to_owned()).expect("utf8");
         let paths = Paths {
@@ -4605,18 +4619,47 @@ mod tests {
         let mut host = test_host();
         host.recorder = Some(Arc::clone(&recorder));
         host.emit(Event::TextDelta {
-            delta: "unsaved".to_owned(),
+            delta: "durable".to_owned(),
         });
-        assert!(host.cancellation.is_cancelled());
-        assert!(host.partial_answer().is_empty());
-        let log = paths.session_dir(&id).join("events.jsonl");
-        let bytes = std::fs::read(&log).expect("log");
+        assert!(!host.cancellation.is_cancelled());
+        assert_eq!(host.partial_answer(), "durable");
         host.emit(Event::TextDelta {
-            delta: "more unsaved".to_owned(),
+            delta: " text".to_owned(),
         });
-        assert!(host.partial_answer().is_empty());
-        assert_eq!(std::fs::read(log).expect("log"), bytes);
-        assert!(recorder.lock().expect("lock").check_journal().is_err());
+        assert_eq!(host.partial_answer(), "durable text");
+        assert!(!host.cancellation.is_cancelled());
+        let state = rune_session::load_read_only(&paths.session_dir(&id)).expect("log");
+        assert_eq!(state.len(), 4);
+        assert!(matches!(
+            &state.events[2].event,
+            rune_session::SessionEvent::AssistantDelta { text, .. } if text == "durable"
+        ));
+        assert!(matches!(
+            &state.events[3].event,
+            rune_session::SessionEvent::AssistantDelta { text, .. } if text == " text"
+        ));
+        assert!(recorder.lock().expect("lock").check_journal().is_ok());
+
+        let sink = Arc::new(Mutex::new(Vec::new()));
+        let mut locked = LockedSink {
+            stream: Arc::new(Mutex::new(SharedSink(Arc::clone(&sink)))),
+        };
+        let mut reader = rune_term::input::KeyReader::line_mode();
+        close_turn(&host, &mut locked, &mut reader, &[], None, &[]).expect("close turn");
+        let output = String::from_utf8(sink.lock().expect("lock").clone()).expect("utf8");
+        let output = transcript::sanitize(&output)
+            .replace(['\r', '\n'], "")
+            .replace("][", " ");
+        assert!(output.contains("is durable"));
+        assert!(output.contains("metadata refresh failed"), "{output:?}");
+        assert!(output.contains("do not retry this event"));
+        assert!(
+            recorder
+                .lock()
+                .expect("lock")
+                .take_metadata_warning()
+                .is_none()
+        );
     }
 
     #[test]

@@ -134,7 +134,8 @@ fn killing_a_metadata_writer_leaves_complete_metadata_and_replayable_events() {
             .append(SessionEvent::UserMessage {
                 text: "after the crash".to_owned(),
             })
-            .expect("append after process death"),
+            .expect("append after process death")
+            .seq,
         EventSeq(durable_events + 1)
     );
     assert_eq!(

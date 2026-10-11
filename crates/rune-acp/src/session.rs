@@ -418,13 +418,12 @@ impl Sessions {
     }
 
     /// Appends one event to a session's log.
-    pub fn record(&mut self, id: &str, event: SessionEvent) -> Result<()> {
+    pub fn record(&mut self, id: &str, event: SessionEvent) -> Result<rune_session::AppendReport> {
         let session = self
             .entries
             .get_mut(id)
             .ok_or_else(|| unknown_session(id))?;
-        session.store.append(event)?;
-        Ok(())
+        session.store.append(event)
     }
 }
 
@@ -938,6 +937,42 @@ mod tests {
         sessions.load(&id).expect("load");
         let session = sessions.get(&id).expect("held");
         assert_eq!(session.history.turns().len(), 1);
+    }
+
+    #[test]
+    fn recording_reports_projection_failure_as_a_durable_event_with_a_warning() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let mut sessions = sessions(&root);
+        let id = sessions.create(Vec::new()).expect("create");
+        let store = &sessions.get(&id).expect("held").store;
+        let seq = store.next_seq();
+        let metadata = store.metadata_path();
+        let dir = store.dir().to_owned();
+        std::fs::remove_file(&metadata).expect("remove projection");
+        std::fs::create_dir(&metadata).expect("block projection writes");
+
+        let report = sessions
+            .record(
+                &id,
+                SessionEvent::UserMessage {
+                    text: "durable".to_owned(),
+                },
+            )
+            .expect("recorded");
+        assert_eq!(report.seq, seq);
+        assert!(
+            report
+                .metadata_warning
+                .expect("warning")
+                .message()
+                .contains("is durable")
+        );
+        let state = load_read_only(&dir).expect("read authority");
+        assert_eq!(state.last_seq(), Some(seq));
+        assert!(matches!(
+            &state.events.last().expect("event").event,
+            SessionEvent::UserMessage { text } if text == "durable"
+        ));
     }
 
     #[test]

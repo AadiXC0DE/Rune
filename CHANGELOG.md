@@ -143,6 +143,9 @@ Notable changes, newest first. Each entry describes what a user can observe.
 - Session metadata is replaced atomically after durable event appends. Killing
   a writer leaves complete old or new metadata; reopening rebuilds the summary
   from the authoritative event log.
+- A metadata refresh failure after an event sync reports the event as durable
+  with a repair warning. Recording continues without retrying or duplicating
+  the event, and interactive streaming keeps displaying the saved text.
 
 - Setting `parallel_tool_calls = 1` disables parallel tool calls in provider
   requests for Chat Completions, Responses, and Anthropic Messages.
