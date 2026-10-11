@@ -102,6 +102,9 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Fixed
 
+- Small tool-result previews returned without retention no longer advertise
+  an unreadable handle or a `read_tool_result` instruction.
+
 - Retaining the same tool-result handle again counts its stored bytes once,
   keeping the session's retained-byte total accurate on replacement.
 

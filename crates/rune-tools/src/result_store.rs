@@ -109,7 +109,9 @@ pub struct Preview {
     pub text: String,
     /// Total bytes retained.
     pub retained_bytes: u64,
-    /// The handle to read more.
+    /// Whether the result was stored and its handle can be read.
+    pub is_retained: bool,
+    /// A stable identifier, readable only when `is_retained` is true.
     pub handle: Handle,
     /// Whether the tool reported a failure.
     pub is_error: bool,
@@ -118,10 +120,13 @@ pub struct Preview {
 impl Preview {
     /// Renders the preview as the model-visible string.
     ///
-    /// States the retained size and the handle, and says how to read more, so
-    /// the model knows the result was truncated and what to do about it.
+    /// For stored results, states the retained size and readable handle.
+    /// Results returned whole without retention render as their original text.
     #[must_use]
     pub fn render(&self) -> String {
+        if !self.is_retained {
+            return self.text.clone();
+        }
         let mut out = String::new();
         out.push_str(&self.text);
         if !self.text.ends_with('\n') {
@@ -241,8 +246,9 @@ impl Store {
 
     /// Retains a result and returns its preview.
     ///
-    /// A result at or below the preview size is returned whole with no handle,
-    /// because retaining something the model already has wastes a slot.
+    /// A result at or below the preview size is returned whole without retention
+    /// metadata when rendered, because retaining it would waste a slot. Its
+    /// stable identifier is not a readable handle.
     pub fn retain(
         &mut self,
         limits: &BudgetSet,
@@ -259,7 +265,8 @@ impl Store {
             // a caller has a stable identifier, but nothing is stored.
             return Ok(Preview {
                 text: content.to_owned(),
-                retained_bytes: u64::try_from(content.len()).unwrap_or(u64::MAX),
+                retained_bytes: 0,
+                is_retained: false,
                 handle: Handle::derive(&self.session, tool_call, content),
                 is_error,
             });
@@ -322,6 +329,7 @@ impl Store {
         Preview {
             text: content.get(..cut).unwrap_or_default().to_owned(),
             retained_bytes: u64::try_from(content.len()).unwrap_or(u64::MAX),
+            is_retained: true,
             handle: handle.clone(),
             is_error,
         }
@@ -487,6 +495,59 @@ mod tests {
             .expect("retained");
         assert_eq!(preview.text, "small output");
         assert!(store.is_empty(), "a small result was stored unnecessarily");
+    }
+
+    #[test]
+    fn unretained_results_render_without_read_instructions() {
+        let limits = limits();
+        let mut store = store();
+        let at_preview_limit = "é".repeat(Store::preview_bytes(&limits) / 2);
+        for content in ["", "tiny", "tiny\n", at_preview_limit.as_str()] {
+            for is_error in [false, true] {
+                let preview = store
+                    .retain(&limits, "shell", "call-1", content, is_error)
+                    .expect("preview");
+
+                assert_eq!(preview.render(), content);
+                assert!(!preview.render().contains("read_tool_result"));
+                assert!(!preview.is_retained);
+                assert_eq!(preview.retained_bytes, 0);
+                assert_eq!(preview.is_error, is_error);
+                assert_eq!(
+                    store
+                        .read(&preview.handle, 0, 100)
+                        .expect_err("not stored")
+                        .code(),
+                    ErrorCode::NotFound
+                );
+            }
+        }
+        assert!(store.is_empty());
+        assert_eq!(store.total_bytes(), 0);
+    }
+
+    #[test]
+    fn small_spilled_results_advertise_a_readable_handle() {
+        for content in ["", "tiny"] {
+            let mut store = store();
+            let preview = store
+                .spill(
+                    "shell",
+                    "call-1",
+                    content.to_owned(),
+                    false,
+                    DEFAULT_PREVIEW_BYTES,
+                )
+                .expect("spilled");
+
+            assert!(preview.is_retained);
+            assert!(preview.render().contains("read_tool_result"));
+            assert!(preview.render().contains(preview.handle.as_str()));
+            assert_eq!(
+                store.read(&preview.handle, 0, 100).expect("stored").text,
+                content
+            );
+        }
     }
 
     #[test]
