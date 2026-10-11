@@ -153,7 +153,7 @@ export class RuneOutputLimitError extends RuneError {
 
 /**
  * Resolves the executable to run: the `bin` option, then `RUNE_BIN`, then an
- * executable named `rune` on `PATH`.
+ * executable named `rune` on `PATH` (also `rune.exe` on Windows).
  * Explicit relative `bin` paths resolve against `cwd`, or the current directory
  * when `cwd` is omitted.
  *

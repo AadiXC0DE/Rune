@@ -12,9 +12,10 @@ Requires Rust 1.98 or newer.
 cargo build --release
 ```
 
-That writes `target/release/rune`. The binding finds the binary through the
+That writes `target/release/rune` (`target/release/rune.exe` on Windows).
+The binding finds the binary through the
 `bin` option first, then the `RUNE_BIN` environment variable, then an executable
-named `rune` on `PATH`.
+named `rune` on `PATH`, also checking `rune.exe` on Windows.
 
 ## Using it
 
@@ -42,7 +43,7 @@ Point `bin` at `target/release/rune`, at `target/debug/rune` after
 `cargo build`, or at any `rune` on `PATH`. An explicit relative path such as
 `./rune` resolves against `options.cwd`, or the current working directory when
 `cwd` is omitted. This applies to both `ask` and `resolveBinary`. A bare name
-such as `rune` is searched on `PATH`.
+such as `rune` is searched on `PATH`, with an `.exe` fallback on Windows.
 
 A run that exits non-zero throws `RuneExitError`, whose `result` field carries
 the validated object the binary printed, including `error` and `error_code`, or

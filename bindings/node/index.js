@@ -7,7 +7,7 @@
 
 import { spawn } from "node:child_process";
 import { accessSync, constants, statSync } from "node:fs";
-import { delimiter, isAbsolute, join, resolve } from "node:path";
+import { delimiter, extname, isAbsolute, join, resolve } from "node:path";
 
 /**
  * Reasoning effort names the command line accepts.
@@ -80,8 +80,9 @@ export class RuneOutputLimitError extends RuneError {
  * Resolves the executable to run.
  *
  * The `bin` option wins, then `RUNE_BIN`, then an executable named `rune` on
- * `PATH`. A source that is configured but unusable is an error rather than a
- * silent fallback, so a typo is reported instead of running another binary.
+ * `PATH` (also `rune.exe` on Windows). A source that is configured but unusable
+ * is an error rather than a silent fallback, so a typo is reported instead of
+ * running another binary.
  * Explicit relative `bin` paths are resolved against `cwd` when provided.
  *
  * @param {{ bin?: string, cwd?: string }} [options]
@@ -344,10 +345,13 @@ function isExecutable(path) {
 
 function searchPath(name) {
   const pathValue = process.env.PATH ?? "";
+  const names = process.platform === "win32" && extname(name) === "" ? [name, `${name}.exe`] : [name];
   for (const directory of pathValue.split(delimiter)) {
     if (directory === "") continue;
-    const candidate = join(directory, name);
-    if (isExecutable(candidate)) return candidate;
+    for (const executableName of names) {
+      const candidate = join(directory, executableName);
+      if (isExecutable(candidate)) return candidate;
+    }
   }
   return null;
 }

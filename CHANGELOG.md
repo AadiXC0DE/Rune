@@ -182,6 +182,9 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Fixed
 
+- The Node binding finds `rune.exe` on Windows `PATH`, including when `bin`
+  or `RUNE_BIN` names `rune`. Exact names and PATH directory order retain priority.
+
 - The Node binding bounds combined child stdout and stderr to 8 MiB by default,
   configurable with `maxOutputBytes`. Exceeding the cap discards captured output,
   kills the child, and raises `RuneOutputLimitError` with code `OUTPUT_LIMIT`.
