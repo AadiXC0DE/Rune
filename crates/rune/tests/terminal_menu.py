@@ -1,4 +1,4 @@
-"""R-011: reach the last completion and model in a real 32x8 terminal."""
+"""Exercise completion and model menus through real terminal input."""
 
 import fcntl
 import http.server
@@ -36,8 +36,14 @@ def controlling_terminal():
     fcntl.ioctl(0, termios.TIOCSCTTY, 0)
 
 
-with tempfile.TemporaryDirectory(prefix="rune-r011-") as directory:
+custom_completion = len(sys.argv) > 2 and sys.argv[2] == "custom-completion"
+
+with tempfile.TemporaryDirectory(prefix="rune-terminal-menu-") as directory:
     root = pathlib.Path(directory)
+    if custom_completion:
+        commands = root / ".rune" / "commands"
+        commands.mkdir(parents=True)
+        (commands / "audit-command.md").write_text("Describe audit command files.")
     config = root / "config" / "rune"
     config.mkdir(parents=True, mode=0o700)
     config_file = config / "config.toml"
@@ -68,7 +74,8 @@ with tempfile.TemporaryDirectory(prefix="rune-r011-") as directory:
         "TERM": "xterm-256color",
     })
     master, slave = pty.openpty()
-    fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 8, 32, 0, 0))
+    rows, columns = (24, 80) if custom_completion else (8, 32)
+    fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", rows, columns, 0, 0))
     child = subprocess.Popen(
         [sys.argv[1]], stdin=slave, stdout=slave, stderr=slave,
         cwd=root, env=environment, preexec_fn=controlling_terminal,
@@ -100,11 +107,19 @@ with tempfile.TemporaryDirectory(prefix="rune-r011-") as directory:
 
     try:
         wait_for("ctrl-c cancel")
-        # Thirteen builtins, including the commands beyond the first window.
-        capture("completion-last", b"/" + b"\x1b[B" * 12, "> /quit")
-        capture("completion-closed", b"\x1b", "\x1b[?25h")
-        capture("model-last", b"/model\r" + b"\x1b[B" * 14, "> menu-model-15")
-        capture("model-closed", b"\x1b", "\x1b[?25h")
+        if custom_completion:
+            capture("custom-menu-tab", b"/audit", "> /audit-command")
+            capture("custom-tab", b"\t", "> /audit-command")
+            capture("custom-menu-enter", b"\x15/audit", "> /audit-command")
+            capture("custom-enter", b"\r", "> /audit-command")
+            capture("custom-expanded", b"\r", "/audit-command expanded; edit before sending")
+            os.write(master, b"\x15")
+        else:
+            # Thirteen builtins, including commands beyond the first window.
+            capture("completion-last", b"/" + b"\x1b[B" * 12, "> /quit")
+            capture("completion-closed", b"\x1b", "\x1b[?25h")
+            capture("model-last", b"/model\r" + b"\x1b[B" * 14, "> menu-model-15")
+            capture("model-closed", b"\x1b", "\x1b[?25h")
         os.write(master, b"/quit\r")
         assert child.wait(timeout=10) == 0
         print(json.dumps(captures))

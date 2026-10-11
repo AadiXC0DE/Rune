@@ -265,8 +265,12 @@ estimates. Fresh sessions and responses without complete token usage use a
 the initial estimate is labelled `saved usage` or `history bytes` until the next
 request. Prompts are remembered and recallable with
 `/history`. Custom slash commands live in `.rune/commands/*.md` in a repository,
-so a team can ship a workflow with the code. Before each CLI session request,
-Rune estimates the serialized input, including instructions and tool schemas,
+so a team can ship a workflow with the code. Discovered project and user commands
+appear alongside builtins in slash-command completion, with descriptions and
+argument hints. Up/Down selects a candidate; Tab or Enter completes a partial
+name. Enter on the complete name shows its expanded prompt for review.
+Before each CLI session request, Rune estimates the serialized input, including
+instructions and tool schemas,
 and summarizes earlier turns at `compaction_trigger_percent` of usable input
 capacity. Requests above capacity remain eligible for compaction when the retained
 tail fits with instructions, tool schemas, and the output reserve. A failed summary

@@ -1590,6 +1590,7 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
         completion_context = completion_context.with_root(root.clone());
     }
     let completion_limits = rune_tools::workspace::FileLimits::from_budget(&limits);
+    let completions = command_candidates(&commands.commands);
 
     // The prompts already recorded in this workspace, oldest first, which is
     // the order the up arrow walks backwards through. Refreshed after each
@@ -1911,6 +1912,7 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
         // line is finished.
         let mut reason = ExitReason::EndOfInput;
         while let Some(input) = await_submission(
+            &completions,
             &mut reader,
             &host,
             &out,
@@ -2858,6 +2860,7 @@ fn full_transcript_rows(entries: &[Entry], cols: u16, ascii: bool) -> Vec<String
 /// empty slice leaves those keys doing nothing, which is what a session with no
 /// recorded history wants.
 fn await_submission(
+    commands: &[CommandCandidate<'_>],
     reader: &mut rune_term::input::KeyReader,
     host: &SessionHost,
     out: &LiveSink,
@@ -2876,6 +2879,7 @@ fn await_submission(
         let rows = paths.as_ref().map_or_else(
             || {
                 completion_rows(
+                    commands,
                     reader.line(),
                     selected,
                     host.theme(),
@@ -2919,10 +2923,18 @@ fn await_submission(
             paths = None;
             continue;
         }
-        if path_key(key, reader, &mut paths, &mut selected, context, limits) {
+        if path_key(
+            commands,
+            key,
+            reader,
+            &mut paths,
+            &mut selected,
+            context,
+            limits,
+        ) {
             continue;
         }
-        match idle_key(key, reader, &mut selected, &rows, recall) {
+        match idle_key(commands, key, reader, &mut selected, &rows, recall) {
             Idle::Stay => {}
             Idle::Leave => return Ok(None),
             Idle::Submit(input) => return Ok(Some(input)),
@@ -2932,6 +2944,7 @@ fn await_submission(
 
 /// A filesystem menu is opened only by Tab and discarded when the draft changes.
 fn path_key(
+    commands: &[CommandCandidate<'_>],
     key: KeyAction,
     reader: &mut rune_term::input::KeyReader,
     paths: &mut Option<crate::path_completion::Paths>,
@@ -2968,7 +2981,7 @@ fn path_key(
         }
     }
     if key != KeyAction::Complete
-        || completion_matches(reader.line()) > 0
+        || completion_matches(commands, reader.line()) > 0
         || matches!(Input::parse(reader.line()), Input::Command { .. })
     {
         return false;
@@ -3041,6 +3054,7 @@ enum Idle {
 /// `selected` is the highlighted completion row, and `rows` are the rows drawn
 /// for the completions, empty when none are open.
 fn idle_key(
+    commands: &[CommandCandidate<'_>],
     key: KeyAction,
     reader: &mut rune_term::input::KeyReader,
     selected: &mut usize,
@@ -3052,7 +3066,7 @@ fn idle_key(
             // Enter takes the highlighted completion when the list is open
             // and the command is not yet complete, so a half-typed name is
             // never run. Once the name is complete, Enter runs it.
-            if let Some(chosen) = open_completion(reader.line(), rows, *selected)
+            if let Some(chosen) = open_completion(commands, reader.line(), rows, *selected)
                 && chosen.name != reader.line().trim_start_matches('/')
             {
                 reader.replace(&format!("/{}", chosen.name));
@@ -3093,7 +3107,7 @@ fn idle_key(
             // the number of matches, not the number of rows drawn: the rows
             // include a position line, so clamping on them would strand
             // every command past the first window.
-            let matches = completion_matches(reader.line());
+            let matches = completion_matches(commands, reader.line());
             if matches > 0 {
                 *selected = if response == KeyAction::Up {
                     selected.saturating_sub(1)
@@ -3110,7 +3124,7 @@ fn idle_key(
         // Tab completes the highlighted command, which is what every other
         // shell does and what a reader reaches for first.
         KeyAction::Complete => {
-            if let Some(chosen) = open_completion(reader.line(), rows, *selected) {
+            if let Some(chosen) = open_completion(commands, reader.line(), rows, *selected) {
                 reader.replace(&format!("/{}", chosen.name));
                 *selected = 0;
             }
@@ -3131,16 +3145,16 @@ fn idle_key(
 /// The rows are already rendered, so the count comes from the table rather than
 /// from the text of a row: a row carries styling and a description, and parsing
 /// either back out would be the wrong way round.
-fn open_completion(
+fn open_completion<'a>(
+    commands: &[CommandCandidate<'a>],
     line: &str,
     rows: &[String],
     selected: usize,
-) -> Option<&'static rune_term::commands::Builtin> {
+) -> Option<CommandCandidate<'a>> {
     if rows.is_empty() {
         return None;
     }
-    let word = line.strip_prefix('/').unwrap_or_default();
-    let matches = rune_term::commands::matching(word);
+    let matches = matching_commands(commands, line);
     matches.get(selected).copied()
 }
 
@@ -3618,10 +3632,56 @@ fn menu_window(count: usize, maximum: usize, room: usize) -> usize {
     window.min(room.saturating_sub(position_row))
 }
 
+/// A borrowed view of a builtin or discovered command for the idle menu.
+#[derive(Clone, Copy, Debug)]
+struct CommandCandidate<'a> {
+    name: &'a str,
+    arguments: &'a str,
+    summary: &'a str,
+}
+
+/// Keeps builtin order and appends discovered commands in discovery order.
+/// Builtins take precedence in the dispatcher, so do not offer their names twice.
+fn command_candidates(custom: &[rune_context::commands::Command]) -> Vec<CommandCandidate<'_>> {
+    rune_term::commands::BUILTINS
+        .iter()
+        .map(|command| CommandCandidate {
+            name: command.name,
+            arguments: command.arguments,
+            summary: command.summary,
+        })
+        .chain(
+            custom
+                .iter()
+                .filter(|command| rune_term::commands::find(&command.name).is_none())
+                .map(|command| CommandCandidate {
+                    name: &command.name,
+                    arguments: command.argument_hint.as_deref().unwrap_or_default(),
+                    summary: &command.description,
+                }),
+        )
+        .collect()
+}
+
+/// Rendering, navigation and acceptance all use the same prefix matches.
+fn matching_commands<'a>(
+    commands: &[CommandCandidate<'a>],
+    line: &str,
+) -> Vec<CommandCandidate<'a>> {
+    let Some(word) = slash_word(line) else {
+        return Vec::new();
+    };
+    commands
+        .iter()
+        .filter(|command| command.name.starts_with(word))
+        .copied()
+        .collect()
+}
+
 /// Returns the rows showing what can be typed next.
 ///
-/// Drawn while a slash command is being typed, from the same table the help
-/// text and the dispatcher use, so a command that is offered is one that works.
+/// Drawn while a slash command is being typed, from the builtins and discovered
+/// commands also used by help and the dispatcher.
 /// The row under the cursor is marked and coloured; every row carries the line
 /// that describes the command, which is what makes the list usable without
 /// trying each name.
@@ -3632,7 +3692,8 @@ fn menu_window(count: usize, maximum: usize, room: usize) -> usize {
 ///
 /// Returns an empty list when the line is not a command being typed, so a
 /// caller can pass every keystroke without checking first.
-pub fn completion_rows(
+fn completion_rows(
+    commands: &[CommandCandidate<'_>],
     line: &str,
     selected: usize,
     theme: &Theme,
@@ -3642,10 +3703,7 @@ pub fn completion_rows(
     if max_rows == 0 {
         return Vec::new();
     }
-    let Some(word) = slash_word(line) else {
-        return Vec::new();
-    };
-    let matches = rune_term::commands::matching(word);
+    let matches = matching_commands(commands, line);
     if matches.is_empty() {
         return Vec::new();
     }
@@ -3707,8 +3765,8 @@ pub fn completion_rows(
 /// Counted from the table rather than from the rendered rows, because the rows
 /// carry a position line that is not a command.
 #[must_use]
-fn completion_matches(line: &str) -> usize {
-    slash_word(line).map_or(0, |word| rune_term::commands::matching(word).len())
+fn completion_matches(commands: &[CommandCandidate<'_>], line: &str) -> usize {
+    matching_commands(commands, line).len()
 }
 
 /// Returns the word after a leading slash, when the line is one.
@@ -5308,27 +5366,56 @@ mod tests {
 
     #[test]
     fn escape_at_the_prompt_clears_the_line_and_never_leaves() {
+        let commands = command_candidates(&[]);
         // While a turn runs, Escape asks for a second press to cancel. A turn
         // that ends between the two presses hands the second to this prompt,
         // where it must not end the session.
         let mut reader = rune_term::input::KeyReader::new();
         let mut selected = 3;
         reader.replace("a draft");
-        let step = idle_key(KeyAction::Escape, &mut reader, &mut selected, &[], &[]);
+        let step = idle_key(
+            &commands,
+            KeyAction::Escape,
+            &mut reader,
+            &mut selected,
+            &[],
+            &[],
+        );
         assert!(matches!(step, Idle::Stay));
         assert_eq!(reader.line(), "");
         assert_eq!(selected, 0);
 
-        let step = idle_key(KeyAction::Escape, &mut reader, &mut selected, &[], &[]);
+        let step = idle_key(
+            &commands,
+            KeyAction::Escape,
+            &mut reader,
+            &mut selected,
+            &[],
+            &[],
+        );
         assert!(
             matches!(step, Idle::Stay),
             "escape on an empty line ended the session"
         );
 
         // Control-C and Control-D on an empty line are still the way out.
-        let step = idle_key(KeyAction::Cancel, &mut reader, &mut selected, &[], &[]);
+        let step = idle_key(
+            &commands,
+            KeyAction::Cancel,
+            &mut reader,
+            &mut selected,
+            &[],
+            &[],
+        );
         assert!(matches!(step, Idle::Leave));
-        let step = idle_key(KeyAction::Interrupt, &mut reader, &mut selected, &[], &[]);
+        let step = idle_key(
+            &commands,
+            KeyAction::Interrupt,
+            &mut reader,
+            &mut selected,
+            &[],
+            &[],
+        );
         assert!(matches!(step, Idle::Leave));
     }
 
@@ -7477,8 +7564,9 @@ mod tests {
 
     #[test]
     fn the_dropdown_offers_a_command_being_typed() {
+        let commands = command_candidates(&[]);
         let theme = Theme::no_color();
-        let rows = completion_rows("/mod", 0, &theme, false, usize::MAX);
+        let rows = completion_rows(&commands, "/mod", 0, &theme, false, usize::MAX);
         assert_eq!(rows.len(), 2, "{rows:?}");
         assert!(rows[0].starts_with("> /model"), "{rows:?}");
         assert!(rows[1].starts_with("  /models"), "{rows:?}");
@@ -7486,6 +7574,184 @@ mod tests {
         // usable without trying every name.
         assert!(rows[0].contains("choose a model"), "{rows:?}");
         assert!(rows[1].contains("same as"), "{rows:?}");
+    }
+
+    #[test]
+    fn discovered_custom_command_completes_and_expands_for_review() {
+        let temp = tempfile::tempdir().expect("workspace");
+        let root = Utf8PathBuf::from_path_buf(temp.path().to_owned()).expect("UTF-8");
+        std::fs::create_dir_all(root.join(".rune/commands")).expect("commands directory");
+        std::fs::write(
+            root.join(".rune/commands/audit-command.md"),
+            "Describe audit command files.",
+        )
+        .expect("command file");
+        let discovery = rune_context::commands::discover(&root, &root.join("config"))
+            .expect("discover commands");
+        assert!(discovery.warnings.is_empty());
+        let commands = command_candidates(&discovery.commands);
+        let theme = Theme::no_color();
+        let context = ExecutionContext::new(root.clone());
+        let limits = rune_tools::workspace::FileLimits::default();
+
+        for key in [KeyAction::Complete, KeyAction::Submit] {
+            let mut reader = rune_term::input::KeyReader::new();
+            reader.replace("/audit");
+            let mut selected = 0;
+            let rows = completion_rows(&commands, reader.line(), selected, &theme, false, 8);
+            assert_eq!(rows, ["> /audit-command  Describe audit command files."]);
+            assert_eq!(completion_matches(&commands, reader.line()), 1);
+            assert!(!path_key(
+                &commands,
+                key,
+                &mut reader,
+                &mut None,
+                &mut selected,
+                &context,
+                &limits,
+            ));
+            assert!(matches!(
+                idle_key(&commands, key, &mut reader, &mut selected, &rows, &[]),
+                Idle::Stay
+            ));
+            assert_eq!(reader.line(), "/audit-command");
+
+            let rows = completion_rows(&commands, reader.line(), selected, &theme, false, 8);
+            let Idle::Submit(Input::Command { name, arguments }) = idle_key(
+                &commands,
+                KeyAction::Submit,
+                &mut reader,
+                &mut selected,
+                &rows,
+                &[],
+            ) else {
+                panic!("a complete custom command must submit");
+            };
+            assert_eq!(name, "audit-command");
+            assert!(arguments.is_empty());
+            let result = handle_command(
+                &name,
+                &arguments,
+                &discovery,
+                None,
+                &root,
+                &test_info(),
+                &mut Vec::new(),
+            )
+            .expect("expand command");
+            assert_eq!(
+                result,
+                Handled::Expand("Describe audit command files.".to_owned())
+            );
+        }
+    }
+
+    #[test]
+    fn custom_completion_navigation_includes_project_and_user_commands() {
+        let temp = tempfile::tempdir().expect("workspace");
+        let root = Utf8PathBuf::from_path_buf(temp.path().to_owned()).expect("UTF-8");
+        std::fs::create_dir_all(root.join(".rune/commands")).expect("project commands");
+        std::fs::create_dir_all(root.join("config/commands")).expect("user commands");
+        for index in 0..8 {
+            std::fs::write(
+                root.join(format!(".rune/commands/audit-{index}.md")),
+                "Audit the workspace.",
+            )
+            .expect("project command");
+        }
+        std::fs::write(root.join(".rune/commands/model.md"), "Shadow the builtin.")
+            .expect("conflicting builtin name");
+        std::fs::write(
+            root.join("config/commands/model-notes.md"),
+            "---\ndescription: Describe a model\nargument-hint: <id>\n---\nDescribe $1.",
+        )
+        .expect("user command");
+        let discovery = rune_context::commands::discover(&root, &root.join("config"))
+            .expect("discover commands");
+        let commands = command_candidates(&discovery.commands);
+        assert_eq!(commands.len(), rune_term::commands::BUILTINS.len() + 9);
+        let theme = Theme::no_color();
+        let rows = completion_rows(&commands, "/mod", 2, &theme, false, 8);
+        assert_eq!(rows.len(), 3);
+        assert!(rows[0].starts_with("  /model [id]"));
+        assert!(rows[1].starts_with("  /models"));
+        assert!(rows[2].starts_with("> /model-notes <id>"));
+        assert!(rows[2].contains("Describe a model"));
+        assert_eq!(
+            open_completion(&commands, "/mod", &rows, 2)
+                .expect("user candidate")
+                .name,
+            "model-notes"
+        );
+        for line in ["/model-notes arg", "/audit-0 ", "/unknown", "prompt"] {
+            assert!(completion_rows(&commands, line, 0, &theme, false, 8).is_empty());
+            assert_eq!(completion_matches(&commands, line), 0);
+        }
+
+        // Arrows reach every candidate even when only one menu row fits.
+        for prefix in ["/", "/audit"] {
+            let matches = matching_commands(&commands, prefix);
+            for room in [1, 2, 8] {
+                let mut reader = rune_term::input::KeyReader::new();
+                reader.replace(prefix);
+                let mut selected = 0;
+                for expected in &matches {
+                    let rows = completion_rows(&commands, prefix, selected, &theme, false, room);
+                    assert!(rows.len() <= room);
+                    assert!(
+                        rows.iter()
+                            .any(|row| row.starts_with(&format!("> /{}", expected.name)))
+                    );
+                    assert_eq!(
+                        open_completion(&commands, prefix, &rows, selected)
+                            .expect("selected candidate")
+                            .name,
+                        expected.name
+                    );
+                    assert!(matches!(
+                        idle_key(
+                            &commands,
+                            KeyAction::Down,
+                            &mut reader,
+                            &mut selected,
+                            &rows,
+                            &[]
+                        ),
+                        Idle::Stay
+                    ));
+                    assert_eq!(reader.line(), prefix);
+                }
+                assert_eq!(selected, matches.len() - 1);
+                let rows = completion_rows(&commands, prefix, selected, &theme, false, room);
+                assert!(matches!(
+                    idle_key(
+                        &commands,
+                        KeyAction::Up,
+                        &mut reader,
+                        &mut selected,
+                        &rows,
+                        &[]
+                    ),
+                    Idle::Stay
+                ));
+                assert_eq!(selected, matches.len() - 2);
+                let rows = completion_rows(&commands, prefix, selected, &theme, false, room);
+                let expected = matches[selected].name;
+                assert!(matches!(
+                    idle_key(
+                        &commands,
+                        KeyAction::Complete,
+                        &mut reader,
+                        &mut selected,
+                        &rows,
+                        &[]
+                    ),
+                    Idle::Stay
+                ));
+                assert_eq!(reader.line(), format!("/{expected}"));
+                assert_eq!(selected, 0);
+            }
+        }
     }
 
     #[test]
@@ -7512,6 +7778,7 @@ mod tests {
 
     #[test]
     fn tab_completes_one_match_without_opening_a_menu_or_changing_slash_commands() {
+        let commands = command_candidates(&[]);
         let temp = tempfile::tempdir().expect("workspace");
         let root = Utf8PathBuf::from_path_buf(temp.path().to_owned()).expect("UTF-8");
         std::fs::write(root.join("fixture space.txt"), "fixture").expect("file");
@@ -7522,6 +7789,7 @@ mod tests {
         let mut selected = 0;
         reader.replace("read ./fi");
         assert!(path_key(
+            &commands,
             KeyAction::Complete,
             &mut reader,
             &mut paths,
@@ -7534,6 +7802,7 @@ mod tests {
         for line in ["/mod", "/help fixture", "/zzz"] {
             reader.replace(line);
             assert!(!path_key(
+                &commands,
                 KeyAction::Complete,
                 &mut reader,
                 &mut paths,
@@ -7547,11 +7816,12 @@ mod tests {
 
     #[test]
     fn a_bare_slash_offers_a_window_and_says_how_many_there_are() {
+        let commands = command_candidates(&[]);
         // Every command matches a bare slash. Drawing all of them would swallow
         // the screen for a list a reader only ever takes the top few rows of, so
         // a window is shown with a row saying how far through it is.
         let theme = Theme::no_color();
-        let rows = completion_rows("/", 0, &theme, false, usize::MAX);
+        let rows = completion_rows(&commands, "/", 0, &theme, false, usize::MAX);
         let total = rune_term::commands::BUILTINS.len();
         assert_eq!(rows.len(), COMPLETION_WINDOW.saturating_add(1), "{rows:?}");
         assert!(rows[0].starts_with("> /model"), "{rows:?}");
@@ -7567,8 +7837,9 @@ mod tests {
 
     #[test]
     fn a_list_that_fits_carries_no_position_row() {
+        let commands = command_candidates(&[]);
         let theme = Theme::no_color();
-        let rows = completion_rows("/mod", 0, &theme, false, usize::MAX);
+        let rows = completion_rows(&commands, "/mod", 0, &theme, false, usize::MAX);
         assert_eq!(rows.len(), 2, "{rows:?}");
         assert!(!rows.iter().any(|r| r.contains(" of ")), "{rows:?}");
     }
@@ -7607,12 +7878,13 @@ mod tests {
 
     #[test]
     fn the_highlight_is_always_inside_the_window() {
+        let commands = command_candidates(&[]);
         // A highlight scrolled out of view would make the list unusable: the
         // user is moving something they cannot see.
         let theme = Theme::no_color();
         let count = rune_term::commands::BUILTINS.len();
         for selected in 0..count {
-            let rows = completion_rows("/", selected, &theme, false, usize::MAX);
+            let rows = completion_rows(&commands, "/", selected, &theme, false, usize::MAX);
             let marked = rows.iter().filter(|r| r.starts_with('>')).count();
             assert_eq!(marked, 1, "selection {selected} marked {marked} rows");
         }
@@ -7620,13 +7892,14 @@ mod tests {
 
     #[test]
     fn short_completion_menus_keep_every_command_visible_and_selectable() {
+        let commands = command_candidates(&[]);
         let theme = Theme::no_color();
         let count = rune_term::commands::BUILTINS.len();
         for room in 1..=8 {
             for selected in 0..count {
-                let rows = completion_rows("/", selected, &theme, false, room);
+                let rows = completion_rows(&commands, "/", selected, &theme, false, room);
                 assert!(rows.len() <= room, "{rows:?}");
-                let chosen = open_completion("/", &rows, selected).expect("completion");
+                let chosen = open_completion(&commands, "/", &rows, selected).expect("completion");
                 assert!(
                     rows.iter()
                         .any(|row| row.starts_with(&format!("> /{}", chosen.name))),
@@ -7634,7 +7907,7 @@ mod tests {
                 );
             }
         }
-        assert!(completion_rows("/", 0, &theme, false, 0).is_empty());
+        assert!(completion_rows(&commands, "/", 0, &theme, false, 0).is_empty());
     }
 
     #[test]
@@ -7665,49 +7938,53 @@ mod tests {
 
     #[test]
     fn accepting_uses_the_selection_the_window_is_showing() {
+        let commands = command_candidates(&[]);
         // The position row must not be mistaken for a command.
         let theme = Theme::no_color();
-        let rows = completion_rows("/", 0, &theme, false, usize::MAX);
-        let chosen = open_completion("/", &rows, 0).expect("a completion");
+        let rows = completion_rows(&commands, "/", 0, &theme, false, usize::MAX);
+        let chosen = open_completion(&commands, "/", &rows, 0).expect("a completion");
         assert_eq!(chosen.name, "model");
         // Every command is reachable, including the ones past the first window:
         // clamping on the drawn rows instead of the matches left the tail of the
         // list unselectable.
         let last = rune_term::commands::BUILTINS.len().saturating_sub(1);
-        let rows = completion_rows("/", last, &theme, false, usize::MAX);
+        let rows = completion_rows(&commands, "/", last, &theme, false, usize::MAX);
         assert!(rows.iter().any(|r| r.starts_with('>')), "{rows:?}");
-        let chosen = open_completion("/", &rows, last).expect("a completion");
+        let chosen = open_completion(&commands, "/", &rows, last).expect("a completion");
         assert_eq!(chosen.name, "quit");
     }
 
     #[test]
     fn the_dropdown_is_absent_unless_a_command_is_being_typed() {
+        let commands = command_candidates(&[]);
         let theme = Theme::no_color();
         for line in ["", "hello", "/help me", "/model x", "a/b", "/zzz"] {
             assert!(
-                completion_rows(line, 0, &theme, false, usize::MAX).is_empty(),
+                completion_rows(&commands, line, 0, &theme, false, usize::MAX).is_empty(),
                 "{line:?} offered rows"
             );
         }
         // A whole command name is still offered, so the row does not vanish as
         // the last letter is typed.
-        assert!(!completion_rows("/help", 0, &theme, false, usize::MAX).is_empty());
+        assert!(!completion_rows(&commands, "/help", 0, &theme, false, usize::MAX).is_empty());
     }
 
     #[test]
     fn the_highlighted_row_is_the_one_the_arrows_moved_to() {
+        let commands = command_candidates(&[]);
         let theme = Theme::no_color();
-        let first = completion_rows("/mod", 0, &theme, false, usize::MAX);
+        let first = completion_rows(&commands, "/mod", 0, &theme, false, usize::MAX);
         assert!(first[0].starts_with('>'), "{first:?}");
-        let second = completion_rows("/mod", 1, &theme, false, usize::MAX);
+        let second = completion_rows(&commands, "/mod", 1, &theme, false, usize::MAX);
         assert!(second[1].starts_with('>'), "{second:?}");
         assert!(second[0].starts_with("  "), "{second:?}");
     }
 
     #[test]
     fn the_rows_line_up_their_descriptions() {
+        let commands = command_candidates(&[]);
         let theme = Theme::no_color();
-        let rows = completion_rows("/mod", 0, &theme, false, usize::MAX);
+        let rows = completion_rows(&commands, "/mod", 0, &theme, false, usize::MAX);
         let summaries = rune_term::commands::matching("mod");
         let columns: Vec<usize> = rows
             .iter()
@@ -7725,29 +8002,32 @@ mod tests {
 
     #[test]
     fn accepting_the_highlighted_row_names_it() {
+        let commands = command_candidates(&[]);
         // Tab completes to the highlighted command, and Enter takes it too when
         // the name is not yet whole, so a half-typed command is never run.
         let theme = Theme::no_color();
-        let rows = completion_rows("/mod", 0, &theme, false, usize::MAX);
-        let chosen = open_completion("/mod", &rows, 0).expect("a completion");
+        let rows = completion_rows(&commands, "/mod", 0, &theme, false, usize::MAX);
+        let chosen = open_completion(&commands, "/mod", &rows, 0).expect("a completion");
         assert_eq!(chosen.name, "model");
-        let rows = completion_rows("/mod", 1, &theme, false, usize::MAX);
-        let chosen = open_completion("/mod", &rows, 1).expect("a completion");
+        let rows = completion_rows(&commands, "/mod", 1, &theme, false, usize::MAX);
+        let chosen = open_completion(&commands, "/mod", &rows, 1).expect("a completion");
         assert_eq!(chosen.name, "models");
         // With no dropdown there is nothing to accept.
-        assert!(open_completion("hello", &[], 0).is_none());
+        assert!(open_completion(&commands, "hello", &[], 0).is_none());
     }
 
     #[test]
     fn a_colorless_theme_emits_no_escapes_in_the_dropdown() {
+        let commands = command_candidates(&[]);
         let theme = Theme::no_color();
-        let plain = completion_rows("/mod", 0, &theme, false, usize::MAX);
+        let plain = completion_rows(&commands, "/mod", 0, &theme, false, usize::MAX);
         assert!(!plain.is_empty(), "nothing matched");
         for row in plain {
             assert!(!row.contains('\u{1b}'), "{row:?}");
         }
         // A colored theme does style them.
-        let styled_rows = completion_rows("/mod", 0, &Theme::fx_dark(), true, usize::MAX);
+        let styled_rows =
+            completion_rows(&commands, "/mod", 0, &Theme::fx_dark(), true, usize::MAX);
         assert!(
             styled_rows.iter().any(|r| r.contains('\u{1b}')),
             "{styled_rows:?}"
@@ -8134,6 +8414,7 @@ mod tests {
 
     #[test]
     fn ascii_session_covers_status_menus_streaming_and_transcript() {
+        let commands = command_candidates(&[]);
         let mut host = test_host();
         let mut settings = Settings::default();
         let launch =
@@ -8149,7 +8430,7 @@ mod tests {
                 host.theme = theme.clone();
                 host.truecolor = truecolor;
                 assert!(host.status_line(100).is_ascii());
-                let rows = completion_rows("/", 0, &theme, truecolor, 8);
+                let rows = completion_rows(&commands, "/", 0, &theme, truecolor, 8);
                 assert!(rows.iter().all(|row| row.is_ascii()));
                 let paths = crate::path_completion::Paths {
                     // The values are content, while the selection is a decoration.

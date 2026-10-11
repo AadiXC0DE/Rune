@@ -2028,7 +2028,7 @@ Resource accumulation after cancellation, session holder handover and concurrent
 - [x] R-149 | T2 | fix | observability | Preserve provider codes and retry metadata in JSON errors | acceptance: Serve a fixture provider code and Retry-After and observe both retained in structured error detail with secrets redacted.
 - [x] R-150 | T2 | fix | input | Preserve completion selection across resize events | acceptance: Select /new, resize from 80x24 to 32x10 and observe /new still selected.
 - [x] R-151 | T2 | fix | tui | Wrap settled slash-command output | acceptance: Run /help at 40 and 80 columns and recover every full command description from scrollback.
-- [ ] R-152 | T2 | fix | input | Complete discovered custom slash commands | acceptance: Create .rune/commands/audit-command.md, type /audit and select the displayed /audit-command candidate.
+- [x] R-152 | T2 | fix | input | Complete discovered custom slash commands | acceptance: Create .rune/commands/audit-command.md, type /audit and select the displayed /audit-command candidate.
 - [ ] R-153 | T2 | fix | sessions | Restore saved token totals for /cost | acceptance: Resume a three-turn fixture and observe /cost reporting its saved requests and tokens before a new request.
 - [ ] R-154 | T2 | fix | sessions | Normalize session-tree previews to one logical line | acceptance: Inspect a fixture containing newline and control characters and observe one escaped preview per node with no injected table rows.
 - [ ] R-155 | T2 | fix | permissions | Resolve custom-tool targets through the host registry | acceptance: A custom tool with target secret.txt must reach policy with that exact target and be refused by its explicit denial.
