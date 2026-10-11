@@ -1147,6 +1147,166 @@ fn a_refused_tool_call_is_reported_as_failed_and_the_turn_continues() {
 }
 
 #[test]
+fn model_changes_update_usage_capacity_without_affecting_other_sessions() {
+    let listing = Script::Status {
+        code: 200,
+        body: json!({"data": [
+            {"id": "fixture/small", "context_window": 4096},
+            {"id": "fixture/large", "context_window": 65536},
+            {"id": "fixture/zero", "context_window": 0},
+        ]})
+        .to_string(),
+    };
+    let mut harness = Harness::start(
+        vec![Script::text("initial"), listing, Script::text("done")],
+        PermissionMode::Auto,
+    );
+    let session = harness.open_session();
+    let other = harness.client().call(3, "session/new", &json!({}))["result"]["sessionId"]
+        .as_str()
+        .expect("second session")
+        .to_owned();
+    let default = rune_net::catalog::DEFAULT_CONTEXT_WINDOW;
+    for (index, (id, model, capacity)) in [
+        (&session, "test/model", default),
+        (&session, "fixture/small", 4096),
+        (&session, "fixture/large", 65536),
+        (&other, "test/model", default),
+        (&session, "fixture/small", 4096),
+        (&session, "fixture/unknown", default),
+        (&session, "fixture/zero", default),
+        (&session, "test/model", default),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let request = 4 + i64::try_from(index).expect("small index") * 2;
+        let changed = harness.client().call(
+            request,
+            "session/set_config_option",
+            &json!({"sessionId": id, "configId": "model", "value": model}),
+        );
+        assert!(changed.get("error").is_none(), "{changed}");
+        let answered = harness.client().call(
+            request + 1,
+            "session/prompt",
+            &prompt(id, "report capacity"),
+        );
+        assert_eq!(answered["result"]["stopReason"], "end_turn");
+        let updates = harness.client().updates("usage_update");
+        assert_eq!(updates.len(), index + 1);
+        let last = updates.last().expect("usage update");
+        assert_eq!(last["params"]["sessionId"], id.as_str());
+        assert_eq!(last["params"]["update"]["size"], capacity, "{model}");
+        assert_eq!(last["params"]["update"]["used"], 15);
+        assert_eq!(
+            harness.mock.last_body().expect("provider request")["model"],
+            model
+        );
+    }
+    // One catalog request, with all subsequent model switches using its entries.
+    assert_eq!(harness.mock.request_count(), 9);
+}
+
+#[test]
+fn a_model_change_during_a_turn_keeps_that_turn_capacity() {
+    let mut harness = Harness::start_with(
+        vec![
+            Script::Status {
+                code: 200,
+                body: json!({"data": [
+                    {"id": "fixture/small", "context_window": 4096},
+                    {"id": "fixture/large", "context_window": 65536},
+                ]})
+                .to_string(),
+            },
+            Script::tool_call("c1", "read_file", r#"{"path":"notes.txt"}"#),
+            Script::text("done"),
+        ],
+        PermissionMode::Ask,
+        BudgetSet::new(),
+        vec![("notes.txt", "hello\n")],
+    );
+    let session = harness.open_session();
+    let changed = harness.client().call(
+        3,
+        "session/set_config_option",
+        &json!({"sessionId": session, "configId": "model", "value": "fixture/small"}),
+    );
+    assert!(changed.get("error").is_none(), "{changed}");
+    harness.client().approval = Approval::Ignore;
+    harness
+        .client()
+        .request(4, "session/prompt", &prompt(&session, "read it"));
+    let pending = harness.client().await_permission_request();
+    let changed = harness.client().call(
+        5,
+        "session/set_config_option",
+        &json!({"sessionId": session, "configId": "model", "value": "fixture/large"}),
+    );
+    assert!(changed.get("error").is_none(), "{changed}");
+    harness.client().send(&json!({
+        "jsonrpc": "2.0", "id": pending["id"],
+        "result": {"outcome": {"outcome": "selected", "optionId": "allow_once"}},
+    }));
+    assert_eq!(
+        harness.client().response(4)["result"]["stopReason"],
+        "end_turn"
+    );
+    assert_eq!(
+        harness.mock.last_body().expect("request")["model"],
+        "fixture/small"
+    );
+    let answered = harness
+        .client()
+        .call(6, "session/prompt", &prompt(&session, "next turn"));
+    assert_eq!(answered["result"]["stopReason"], "end_turn");
+    assert_eq!(
+        harness.mock.last_body().expect("request")["model"],
+        "fixture/large"
+    );
+    let updates = harness.client().updates("usage_update");
+    assert_eq!(updates.len(), 2);
+    assert_eq!(updates[0]["params"]["update"]["size"], 4096);
+    assert_eq!(updates[1]["params"]["update"]["size"], 65536);
+}
+
+#[test]
+fn unavailable_model_metadata_uses_a_conservative_capacity() {
+    for listing in [
+        Script::Status {
+            code: 503,
+            body: "unavailable".to_owned(),
+        },
+        Script::Status {
+            code: 200,
+            body: "invalid JSON".to_owned(),
+        },
+    ] {
+        let mut harness = Harness::start(vec![listing, Script::text("done")], PermissionMode::Auto);
+        let session = harness.open_session();
+        let changed = harness.client().call(
+            3,
+            "session/set_config_option",
+            &json!({"sessionId": session, "configId": "model", "value": "fixture/unknown"}),
+        );
+        assert!(changed.get("error").is_none(), "{changed}");
+        let answered =
+            harness
+                .client()
+                .call(4, "session/prompt", &prompt(&session, "keep working"));
+        assert_eq!(answered["result"]["stopReason"], "end_turn");
+        let updates = harness.client().updates("usage_update");
+        assert_eq!(updates.len(), 1);
+        assert_eq!(
+            updates[0]["params"]["update"]["size"],
+            rune_net::catalog::DEFAULT_CONTEXT_WINDOW
+        );
+        assert_eq!(harness.mock.request_count(), 2);
+    }
+}
+
+#[test]
 fn the_usage_update_reports_the_last_request_rather_than_the_turn_total() {
     // Two requests are billed 300 tokens between them, but the context holds
     // only what the last one sent and received.

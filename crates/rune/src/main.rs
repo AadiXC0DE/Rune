@@ -1248,7 +1248,9 @@ fn run_acp(
         effort: settings.effort,
         limits: settings.limits.clone(),
         log_file,
-        context_window: rune_net::catalog::DEFAULT_CONTEXT_WINDOW,
+        context_window: settings
+            .context_window
+            .unwrap_or(rune_net::catalog::DEFAULT_CONTEXT_WINDOW),
         additional_roots: settings.additional_directories.clone(),
     };
 

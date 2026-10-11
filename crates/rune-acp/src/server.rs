@@ -20,7 +20,7 @@ use std::io::{BufRead, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use camino::{Utf8Path, Utf8PathBuf};
@@ -62,6 +62,9 @@ const POLL: Duration = Duration::from_millis(25);
 
 /// Time an in-flight turn is given to stop once input ends.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+
+/// Capacity discovery runs on the turn thread, within a short request budget.
+const CONTEXT_LOOKUP_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Which dialect an endpoint speaks.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -143,7 +146,7 @@ pub struct ServerConfig {
     pub limits: BudgetSet,
     /// Where diagnostics go. Standard output is never used for them.
     pub log_file: Option<Utf8PathBuf>,
-    /// Usable context size of the active model, reported in usage updates.
+    /// Usable context size of the default model, reported in usage updates.
     pub context_window: u64,
     /// Directories every session may reach in addition to the workspace.
     pub additional_roots: Vec<Utf8PathBuf>,
@@ -267,7 +270,7 @@ impl ServerConfig {
         self
     }
 
-    /// Sets the context size reported in usage updates.
+    /// Sets the default model's context size reported in usage updates.
     #[must_use]
     pub const fn with_context_window(mut self, tokens: u64) -> Self {
         self.context_window = tokens;
@@ -304,6 +307,8 @@ pub struct Server<W: Write + Send + 'static> {
     config: ServerConfig,
     writer: Mutex<Writer<W>>,
     sessions: Mutex<Sessions>,
+    /// Endpoint capacities, discovered when a turn first uses another model.
+    model_catalog: OnceLock<Catalog>,
     /// Requests this server issued, by identifier, awaiting a client answer.
     pending: Mutex<BTreeMap<i64, std::sync::mpsc::Sender<Response>>>,
     next_request: AtomicI64,
@@ -350,6 +355,7 @@ impl<W: Write + Send + 'static> Server<W> {
             config,
             writer: Mutex::new(Writer::new(output)),
             sessions: Mutex::new(sessions),
+            model_catalog: OnceLock::new(),
             pending: Mutex::new(BTreeMap::new()),
             next_request: AtomicI64::new(1),
             log: Mutex::new(log),
@@ -898,6 +904,7 @@ fn run_one<W: Write + Send + 'static>(server: &Arc<Server<W>>, queued: Queued) {
     let host = TurnHost {
         server: Arc::clone(server),
         session: session.clone(),
+        context_window: server.context_window(&snapshot.config.model),
         config: snapshot.config.clone(),
         rules: Mutex::new(snapshot.rules),
         context: snapshot
@@ -983,6 +990,32 @@ pub const fn stop_reason(reason: StopReason) -> &'static str {
 }
 
 impl<W: Write + Send + 'static> Server<W> {
+    /// Resolves capacity for the model captured at the start of a turn.
+    ///
+    /// The default model retains its configured capacity. Changed models use
+    /// the endpoint's listing, or the conservative default when no capacity is
+    /// available. Discovery is deferred so startup and unchanged sessions do
+    /// not need an extra network request, and never holds the session lock.
+    fn context_window(&self, model: &str) -> u64 {
+        if model == self.config.model {
+            return self.config.context_window;
+        }
+        let catalog = self.model_catalog.get_or_init(|| {
+            rune_net::transport::list_models(
+                &rune_net::transport::agent(),
+                &self.config.endpoint,
+                self.config.dialect.provider(),
+                CONTEXT_LOOKUP_TIMEOUT,
+            )
+            .ok()
+            .and_then(|body| {
+                rune_net::catalog::from_endpoint_listing(self.config.dialect.name(), &body)
+            })
+            .unwrap_or_else(|| Catalog::new(self.config.dialect.name()))
+        });
+        catalog.metadata_or_default(model).usable_context()
+    }
+
     /// Appends one event to a session log, reporting a failure without stopping.
     fn record(&self, session: &str, event: SessionEvent) {
         if let Ok(mut sessions) = self.sessions.lock() {
@@ -1019,6 +1052,8 @@ struct TurnHost<W: Write + Send + 'static> {
     server: Arc<Server<W>>,
     session: String,
     config: SessionConfig,
+    /// Capacity belonging to this turn's model, unaffected by later changes.
+    context_window: u64,
     rules: Mutex<RuleSet>,
     context: ExecutionContext,
     cancellation: Cancellation,
@@ -1209,7 +1244,7 @@ impl<W: Write + Send + 'static> Host for TurnHost<W> {
                 self.server.send(&Message::Notification(usage_update(
                     &self.session,
                     reported_tokens(last_request),
-                    self.server.config.context_window,
+                    self.context_window,
                 )));
             }
             Event::SteeringApplied { .. }
@@ -1658,6 +1693,34 @@ mod tests {
         };
         assert_eq!(reported_tokens(usage), 15);
         assert_eq!(reported_tokens(Usage::default()), 0);
+    }
+
+    #[test]
+    fn a_configured_capacity_belongs_only_to_the_default_model_even_offline() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let path = Utf8PathBuf::from_path_buf(root.path().to_owned()).expect("UTF-8 path");
+        let mut endpoint = Endpoint::new("http://127.0.0.1:1", "test-key");
+        endpoint.offline = true;
+        let config = ServerConfig::new(
+            Paths {
+                config_root: path.join("config"),
+                state_root: path.join("state"),
+                data_root: path.join("data"),
+            },
+            path,
+            endpoint,
+            "test/model",
+        )
+        .expect("config")
+        .with_context_window(8192);
+        let server = Server::new(config, Vec::new()).expect("server");
+        assert_eq!(server.context_window("test/model"), 8192);
+        assert!(server.model_catalog.get().is_none());
+        assert_eq!(
+            server.context_window("other/model"),
+            rune_net::catalog::DEFAULT_CONTEXT_WINDOW
+        );
+        assert_eq!(server.context_window("test/model"), 8192);
     }
 
     #[test]

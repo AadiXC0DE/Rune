@@ -1999,7 +1999,7 @@ Resource accumulation after cancellation, session holder handover and concurrent
 - [x] R-120 | T2 | fix | acp | Filter session listings by stored workspace | acceptance: Create fixture sessions in A and B and observe each connection list only its intended workspace with truthful cwd.
 - [x] R-121 | T2 | fix | acp | Sort sessions before applying the listing cap | acceptance: Create more sessions than the cap in shuffled directory order and observe the newest sessions consistently returned.
 - [x] R-122 | T2 | fix | acp | Apply lifecycle root parameters when reopening a session | acceptance: Load a session with a new additional-root list and observe exactly that effective list, including removal when omitted.
-- [ ] R-123 | T2 | fix | acp | Update context capacity when the ACP model changes | acceptance: Switch between fixture models with different windows and observe matching subsequent usage-update size values.
+- [x] R-123 | T2 | fix | acp | Update context capacity when the ACP model changes | acceptance: Switch between fixture models with different windows and observe matching subsequent usage-update size values.
 - [ ] R-124 | T2 | fix | acp | Persist ACP model and effort changes for reopening | acceptance: Change model and effort, close and load the session and observe the chosen values restored.
 - [ ] R-125 | T2 | fix | acp | Stop turns when protocol output can no longer be written | acceptance: Close the client's output pipe mid-turn and observe provider and tool work cancelled within the shutdown grace.
 - [ ] R-126 | T2 | feature | acp | Bound unanswered client permission requests | acceptance: Leave a permission request unanswered and observe a configured deadline error plus a usable connection for a later prompt.

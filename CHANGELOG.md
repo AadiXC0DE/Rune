@@ -172,6 +172,11 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Fixed
 
+- ACP usage updates report the capacity of the model used for that turn after
+  a model switch, using the endpoint's model listing and a conservative fallback
+  when capacity is unavailable. The default model honors its configured window;
+  changes during a turn apply to subsequent turns without affecting other sessions.
+
 - ACP loading and resuming apply the current `additionalDirectories` list
   alongside configured roots, with shared roots kept once. Earlier client roots
   are removed, including when the list is omitted, null, or empty. Invalid lists
