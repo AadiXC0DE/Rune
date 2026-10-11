@@ -408,6 +408,44 @@ fn assert_mcp_stopped(log: &Path) {
 }
 
 #[test]
+fn a_malformed_text_block_rejects_the_entire_prompt_and_the_connection_survives() {
+    let mut harness = Harness::start(vec![Script::text("accepted")], PermissionMode::Auto);
+    let session = harness.open_session();
+    let response = harness.client().call(
+        3,
+        "session/prompt",
+        &json!({
+            "sessionId": session,
+            "prompt": [{"type": "text", "text": "must not be submitted"}, {"type": "text"}],
+        }),
+    );
+    assert_eq!(response["error"]["code"], rune_acp::jsonrpc::INVALID_PARAMS);
+    assert!(
+        response["error"]["message"]
+            .as_str()
+            .expect("error message")
+            .contains("prompt[1].text")
+    );
+    assert_eq!(harness.mock.request_count(), 0);
+    assert!(harness.client().updates("user_message_chunk").is_empty());
+
+    let response = harness
+        .client()
+        .call(4, "session/prompt", &prompt(&session, "valid prompt"));
+    assert_eq!(response["result"]["stopReason"], "end_turn");
+    assert_eq!(harness.mock.request_count(), 1);
+    let body = harness.mock.last_body().expect("provider request");
+    let user_messages: Vec<_> = body["messages"]
+        .as_array()
+        .expect("messages")
+        .iter()
+        .filter(|message| message["role"] == "user")
+        .collect();
+    assert_eq!(user_messages.len(), 1);
+    assert_eq!(user_messages[0]["content"], "valid prompt");
+}
+
+#[test]
 fn requested_stdio_mcp_is_advertised_callable_and_isolated_by_session() {
     let mut harness = Harness::start(
         vec![

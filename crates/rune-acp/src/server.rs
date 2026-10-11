@@ -1547,12 +1547,13 @@ fn prompt_text(params: &Value) -> std::result::Result<String, RpcError> {
         )));
     };
     let mut text = String::new();
-    for block in blocks {
+    for (index, block) in blocks.iter().enumerate() {
         match block.get("type").and_then(Value::as_str) {
             Some("text") => {
-                if let Some(part) = block.get("text").and_then(Value::as_str) {
-                    push_block(&mut text, part);
-                }
+                let part = block.get("text").and_then(Value::as_str).ok_or_else(|| {
+                    RpcError::invalid_params(format!("`prompt[{index}].text` must be a string"))
+                })?;
+                push_block(&mut text, part);
             }
             Some("resource") => {
                 if let Some(part) = block
@@ -1696,6 +1697,31 @@ mod tests {
     fn a_missing_prompt_is_rejected() {
         let error = prompt_text(&json!({})).expect_err("rejected");
         assert_eq!(error.code, crate::jsonrpc::INVALID_PARAMS);
+    }
+
+    #[test]
+    fn malformed_text_blocks_are_rejected_even_alongside_valid_text() {
+        for malformed in [
+            json!({"type": "text"}),
+            json!({"type": "text", "text": null}),
+            json!({"type": "text", "text": 42}),
+            json!({"type": "text", "text": true}),
+            json!({"type": "text", "text": []}),
+            json!({"type": "text", "text": {}}),
+        ] {
+            for index in 0..2 {
+                let valid = json!({"type": "text", "text": "valid"});
+                let blocks = if index == 0 {
+                    json!([malformed, valid])
+                } else {
+                    json!([valid, malformed])
+                };
+                let error = prompt_text(&json!({"prompt": blocks})).expect_err("rejected");
+                assert_eq!(error.code, crate::jsonrpc::INVALID_PARAMS);
+                assert!(error.message.contains(&format!("prompt[{index}].text")));
+                assert!(error.message.contains("must be a string"));
+            }
+        }
     }
 
     #[test]

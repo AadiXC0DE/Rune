@@ -177,6 +177,10 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Fixed
 
+- ACP rejects an entire prompt when any text block has missing or non-string
+  `text`, returning `invalid_params` with the malformed block's field path
+  instead of silently dropping it.
+
 - ACP cancels active provider and tool work when a protocol frame cannot be
   written or flushed, releases pending permissions, and discards queued prompts.
   Further input cannot start turns after output fails.
