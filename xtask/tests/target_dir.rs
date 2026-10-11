@@ -175,3 +175,119 @@ fn release_manifest_preserves_channels_requiring_json_escaping() {
         );
     }
 }
+
+// The reproducible CI job and its SHA-256 utility run on Linux.
+#[cfg(target_os = "linux")]
+mod reproducible_ci {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn check(mode: &str) -> Output {
+        let workspace = ScratchWorkspace::new();
+        let tools = workspace.0.join("tools");
+        std::fs::create_dir(&tools).expect("create tool directory");
+        let wrapper = tools.join("cargo");
+        std::fs::write(
+            &wrapper,
+            r#"#!/usr/bin/env bash
+set -euo pipefail
+if [[ "$1" != xtask ]]; then
+    exec "$RUNE_TEST_CARGO" "$@"
+fi
+[[ "$*" == 'xtask release dev' ]]
+[[ ! -e "$CARGO_TARGET_DIR" ]]
+printf '%s\n' "$CARGO_TARGET_DIR" >> build-directories
+case "$CARGO_TARGET_DIR" in
+    */build-2)
+        if [[ "$RUNE_TEST_MODE" == binary ]]; then
+            printf '%s\n' 'fn main() { println!("different second build"); }' > src/main.rs
+        fi
+        ;;
+esac
+shift
+"$RUNE_TEST_XTASK" "$@"
+[[ -f "$CARGO_TARGET_DIR/release/rune" ]]
+case "$CARGO_TARGET_DIR" in
+    */build-2)
+        if [[ "$RUNE_TEST_MODE" == archive ]]; then
+            # Alter only gzip's timestamp. The extracted binary stays identical.
+            for archive in target/dist/*/*.tar.gz; do
+                printf '\001' | dd of="$archive" bs=1 seek=4 count=1 conv=notrunc status=none
+            done
+        fi
+        ;;
+esac
+"#,
+        )
+        .expect("write cargo wrapper");
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755))
+            .expect("make cargo wrapper executable");
+        let path = std::env::join_paths(std::iter::once(tools).chain(std::env::split_paths(
+            &std::env::var_os("PATH").expect("PATH"),
+        )))
+        .expect("prepend test tools to PATH");
+        let output = Command::new("bash")
+            .arg(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../.github/scripts/check-reproducible-release.sh"
+            ))
+            .current_dir(&workspace.0)
+            .env("PATH", path)
+            .env("RUNE_TEST_CARGO", env!("CARGO"))
+            .env("RUNE_TEST_XTASK", env!("CARGO_BIN_EXE_xtask"))
+            .env("RUNE_TEST_MODE", mode)
+            .env("CARGO_NET_OFFLINE", "true")
+            .env_remove("CARGO_BUILD_TARGET")
+            .output()
+            .expect("run the CI reproducibility check");
+
+        let directories = std::fs::read_to_string(workspace.0.join("build-directories"))
+            .expect("read actual clean build directories");
+        let directories: Vec<_> = directories.lines().map(PathBuf::from).collect();
+        assert_eq!(directories.len(), 2, "{output:?}");
+        assert_ne!(directories[0], directories[1]);
+        for directory in directories {
+            assert!(directory.is_absolute());
+            assert!(!directory.exists(), "scratch builds must be cleaned up");
+        }
+        output
+    }
+
+    #[test]
+    fn ci_accepts_equal_binaries_and_archives_from_two_clean_builds() {
+        assert!(
+            include_str!("../../.github/workflows/ci.yml")
+                .contains("run: bash .github/scripts/check-reproducible-release.sh"),
+            "CI must execute the independent build check"
+        );
+        let output = check("equal");
+        assert!(output.status.success(), "{output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stdout)
+                .contains("Independent clean release builds have equal binary and archive hashes."),
+            "{output:?}"
+        );
+    }
+
+    #[test]
+    fn ci_rejects_different_independently_built_binaries() {
+        let output = check("binary");
+        assert!(!output.status.success(), "{output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("independently built release binaries have different hashes"),
+            "{output:?}"
+        );
+    }
+
+    #[test]
+    fn ci_rejects_different_archives_even_when_extracted_binaries_match() {
+        let output = check("archive");
+        assert!(!output.status.success(), "{output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("independently built release archives have different hashes"),
+            "{output:?}"
+        );
+    }
+}

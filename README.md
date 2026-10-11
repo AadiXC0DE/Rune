@@ -448,6 +448,15 @@ bash .github/scripts/test-dependency-policy.sh
 Relative values resolve from the command's working directory. Release archives
 are still staged under `target/dist`.
 
+The reproducible CI job builds the same source with two fresh scratch
+`CARGO_TARGET_DIR` directories, extracts each release, and compares SHA-256
+hashes of both the binaries and archives. Run this check on Linux from a
+workspace with no old releases in `target/dist`:
+
+```sh
+bash .github/scripts/check-reproducible-release.sh
+```
+
 On Unix, workspace tests also run the real PTY replay gate. It starts the built
 `rune` binary against an isolated local provider and compares captured grids
 and caret positions for long draft edits, 12-column output, short menus, and

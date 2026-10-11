@@ -6,6 +6,9 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Added
 
+- CI compares release binaries and archives from two independent clean builds
+  in scratch target directories, failing if either pair of SHA-256 hashes differs.
+
 - CI builds `rune-web` for `wasm32-wasip1` and runs a configured fixture prompt
   through its exported WASM boundary, checking the provider request, streamed
   answer, and successful completion without a live provider.
