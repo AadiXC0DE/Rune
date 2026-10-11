@@ -106,6 +106,10 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Security
 
+- On Linux, sandboxed commands cannot create a previously absent `.git/hooks`
+  directory in a repository at a writable root. Its existing `.git` parent
+  stays read-only while hooks are absent, also blocking index and lock writes;
+  source files remain writable. Sandbox explanations report the parent rule.
 - `Endpoint` debug formatting redacts the provider credential.
 - `rune upgrade` creates a unique staging file exclusively, so a preexisting
   staging symlink cannot overwrite another file or become the installed binary.

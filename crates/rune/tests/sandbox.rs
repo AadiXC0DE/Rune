@@ -149,6 +149,28 @@ fn fixture_command_reports_paths_and_sources_without_executing() {
     }
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn absent_hooks_report_the_read_only_git_parent_without_creating_hooks() {
+    let fixture = Fixture::new();
+    let git = fixture.dir.path().join("workspace/.git");
+    std::fs::remove_dir(git.join("hooks")).expect("remove hooks");
+    let report = fixture.json(&["sandbox", "explain", "--json", "--", "echo fixture"]);
+    let protected = report["protected_paths"].as_array().expect("protections");
+    assert!(
+        protected.iter().any(|rule| {
+            rule["path"] == resolved(&git)
+                && rule["access"] == "read_only"
+                && rule["source"]
+                    .as_str()
+                    .expect("source")
+                    .contains("Linux protects .git when hooks are absent")
+        }),
+        "{report}"
+    );
+    assert!(!git.join("hooks").exists(), "explanation created hooks");
+}
+
 #[test]
 fn offline_overrides_an_explicit_context_grant_and_reports_its_source() {
     let fixture = Fixture::new();

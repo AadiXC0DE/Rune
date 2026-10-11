@@ -363,12 +363,24 @@ fn masked_paths(credentials: &[Utf8PathBuf], writable: &[Utf8PathBuf]) -> Vec<Ut
 ///
 /// Only paths that exist are named, resolved the same way the roots are, since
 /// a rule about a missing path matches nothing and a `bwrap` bind of one fails.
+/// On Linux, an absent hooks directory is protected by binding its existing
+/// `.git` parent read-only. This also denies other metadata writes until hooks
+/// exist, but leaves source files writable and creates no host directories.
 fn protected_paths(writable: &[Utf8PathBuf]) -> Vec<Utf8PathBuf> {
     let mut paths = Vec::new();
     for root in writable {
         for relative in PROTECTED_REPOSITORY_PATHS {
             let path = root.join(relative);
-            if let Ok(resolved) = path.canonicalize_utf8()
+            let resolved = path.canonicalize_utf8().or_else(|error| {
+                if cfg!(target_os = "linux") && relative == ".git/hooks" {
+                    let git = root.join(".git");
+                    if git.is_dir() {
+                        return git.canonicalize_utf8();
+                    }
+                }
+                Err(error)
+            });
+            if let Ok(resolved) = resolved
                 && !paths.contains(&resolved)
             {
                 paths.push(resolved);
@@ -865,15 +877,15 @@ mod tests {
 
     use tempfile::TempDir;
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     use std::time::Duration;
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     use crate::command::run;
     use crate::command::{prepare, verify_unchanged};
 
     /// Returns a condition that never cancels.
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn never() -> bool {
         false
     }
@@ -1695,5 +1707,84 @@ mod tests {
                 "{path} is bound before the workspace, so it is writable"
             );
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_linux_argv_protects_absent_hooks_in_every_writable_root() {
+        let (_guard, root) = tempdir();
+        let workspace = root.join("workspace");
+        let extra = root.join("extra");
+        for directory in [&workspace, &extra] {
+            std::fs::create_dir_all(directory.join(".git")).expect("git directory");
+            std::fs::write(directory.join(".git/config"), "[core]\n").expect("config");
+        }
+        let policy = SandboxPolicy::new(workspace.clone(), vec![extra], false);
+        let prepared = prepare("echo fixture", &workspace, None, environment()).expect("prepare");
+        let sandbox = LinuxSandbox::with_helper(Utf8PathBuf::from("/usr/bin/bwrap"));
+        let wrapped = sandbox.wrap(&prepared, &policy, false).expect("wrap");
+        let paths = policy.resolved_paths().expect("paths");
+        let last_writable_bind = wrapped
+            .argv
+            .iter()
+            .rposition(|argument| argument == "--bind")
+            .expect("writable bind");
+        for directory in &paths.writable_roots {
+            let git = directory.join(".git");
+            assert!(paths.protected_paths.contains(&git), "{paths:?}");
+            let read_only = wrapped
+                .argv
+                .windows(3)
+                .position(|args| args == ["--ro-bind", git.as_str(), git.as_str()])
+                .expect("read-only git parent bind");
+            assert!(read_only > last_writable_bind, "{:?}", wrapped.argv);
+            assert!(!git.join("hooks").exists(), "wrapping created hooks");
+            assert!(
+                !wrapped
+                    .argv
+                    .iter()
+                    .any(|argument| argument == git.join("hooks").as_str())
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_linux_sandboxed_command_cannot_create_an_absent_executable_hook() {
+        let sandbox = LinuxSandbox::detect();
+        if !sandbox.support().is_full() {
+            eprintln!(
+                "live Linux hooks regression skipped: {:?}",
+                sandbox.support()
+            );
+            return;
+        }
+        let (_guard, workspace) = tempdir();
+        std::fs::create_dir(workspace.join(".git")).expect("git directory");
+        std::fs::write(workspace.join(".git/config"), "[core]\n").expect("config");
+        let hooks = workspace.join(".git/hooks");
+        assert!(!hooks.exists());
+        let policy = policy(&workspace);
+        for (command, permitted) in [
+            ("printf source > kept.txt", true),
+            (
+                "mkdir -p .git/hooks && printf '#!/bin/sh\\nexit 0\\n' > .git/hooks/pre-commit && chmod +x .git/hooks/pre-commit",
+                false,
+            ),
+        ] {
+            let prepared = prepare(command, &workspace, None, environment()).expect("prepare");
+            let wrapped = sandbox.wrap(&prepared, &policy, false).expect("wrap");
+            let outcome = run(&wrapped, Duration::from_secs(20), &never).expect("run");
+            assert_eq!(
+                outcome.exit.is_success(),
+                permitted,
+                "`{command}`: {outcome:?}"
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("kept.txt")).expect("source"),
+            "source"
+        );
+        assert!(!hooks.exists(), "the sandboxed command created hooks");
     }
 }
