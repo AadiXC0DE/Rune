@@ -140,6 +140,10 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Fixed
 
+- Session event reads stay bounded when a log grows after its size check.
+  Normal and recovery reads report `too_large` for `event_log` with the
+  `log_size` invariant rather than returning a partial log past the size cap.
+
 - Session lock handoffs preserve the new writer's diagnostic record. The
   previous writer clears its record before releasing the lock.
 
