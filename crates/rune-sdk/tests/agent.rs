@@ -473,6 +473,73 @@ fn a_tool_result_larger_than_its_bound_is_truncated_for_the_model() {
 }
 
 #[test]
+fn checkpoint_creation_obeys_the_serialized_history_bound() {
+    let endpoint = MockEndpoint::start(vec![Script::text("noted")]);
+    let fetch = Arc::new(CountingFetch::new());
+    let build = || options(&endpoint.base_url(), fetch.clone());
+    let mut agent = Agent::new(build()).expect("agent");
+    let input = "\n\"\\é".repeat(100);
+    let mut turn = agent
+        .prompt(&input, PromptOptions::default())
+        .expect("turn");
+    let result = turn.result().expect("result");
+    let bytes = agent.checkpoint().expect("checkpoint under default cap");
+    let raw_bytes = input.len() + result.text.len();
+    assert!(raw_bytes < bytes.len(), "JSON escaping and metadata count");
+
+    for cap in [0, raw_bytes, bytes.len() - 1] {
+        let limits = limit(LimitName::PromptHistoryBytes, cap as u64);
+        agent = agent.with_limits(limits.clone());
+        let err = agent
+            .checkpoint()
+            .map(|bytes| bytes.len())
+            .expect_err("oversized checkpoint creation");
+        assert_eq!(err.code(), ErrorCode::TooLarge);
+        assert_eq!(err.field(), Some("checkpoint"));
+        assert_eq!(err.detail().observed, Some(bytes.len().to_string()));
+        let restore_err = Agent::restore_with_limits(build(), &bytes, limits)
+            .expect_err("the same cap refuses restoration");
+        assert_eq!(err, restore_err);
+        assert_eq!(agent.usage(), result.usage, "refusal preserves usage");
+    }
+
+    let limits = limit(LimitName::PromptHistoryBytes, bytes.len() as u64);
+    agent = agent.with_limits(limits.clone());
+    assert_eq!(agent.checkpoint().expect("exact cap is allowed"), bytes);
+    let restored = Agent::restore_with_limits(build(), &bytes, limits)
+        .expect("checkpoint restores under the same cap");
+    assert_eq!(restored.checkpoint().expect("restored checkpoint"), bytes);
+    assert_eq!(restored.usage(), result.usage);
+}
+
+#[test]
+fn checkpoint_creation_obeys_the_default_history_bound() {
+    let endpoint = MockEndpoint::start(vec![Script::text("noted")]);
+    let fetch = Arc::new(CountingFetch::new());
+    let mut agent = Agent::new(options(&endpoint.base_url(), fetch)).expect("agent");
+    let cap = BudgetSet::new().get_usize(LimitName::PromptHistoryBytes);
+    let mut turn = agent
+        .prompt("x".repeat(cap), PromptOptions::default())
+        .expect("turn");
+    assert_eq!(
+        turn.result().expect("result").stop_reason,
+        StopReason::Completed
+    );
+
+    let err = agent
+        .checkpoint()
+        .map(|bytes| bytes.len())
+        .expect_err("default cap applies to creation");
+    assert_eq!(err.code(), ErrorCode::TooLarge);
+    assert_eq!(err.field(), Some("checkpoint"));
+
+    agent = agent.with_limits(limit(LimitName::PromptHistoryBytes, (cap * 2) as u64));
+    let bytes = agent.checkpoint().expect("raised cap allows creation");
+    assert!(bytes.len() > cap);
+    assert_eq!(err.detail().observed, Some(bytes.len().to_string()));
+}
+
+#[test]
 fn a_checkpoint_larger_than_the_history_bound_is_refused() {
     // Two mebibytes, past the one-mebibyte default history bound.
     let padded = format!(

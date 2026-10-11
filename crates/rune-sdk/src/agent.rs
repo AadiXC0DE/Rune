@@ -834,6 +834,9 @@ impl Agent {
     /// The format is versioned, and deliberately excludes the credential, the
     /// model, the instructions, and the tools: a checkpoint is data a host may
     /// store or move between processes, and none of those belong in it.
+    ///
+    /// The serialized bytes must fit within `PromptHistoryBytes`, the same cap
+    /// used by restoration. Exceeding it returns `TooLarge` for `checkpoint`.
     pub fn checkpoint(&self) -> Result<Vec<u8>> {
         if self.claim.load(Ordering::SeqCst) {
             return Err(RuneError::new(
@@ -855,7 +858,12 @@ impl Agent {
             history,
             usage: *lock(&self.conversation.usage),
         };
-        Ok(serde_json::to_vec(&body)?)
+        let checkpoint = serde_json::to_vec(&body)?;
+        let cap = self.limits.get_usize(LimitName::PromptHistoryBytes).max(1);
+        if checkpoint.len() > cap {
+            return Err(RuneError::too_large("checkpoint", checkpoint.len(), cap));
+        }
+        Ok(checkpoint)
     }
 
     /// Adopts the conversation a checkpoint carries.
