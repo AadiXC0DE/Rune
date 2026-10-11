@@ -6,6 +6,10 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Added
 
+- The footer and `/status` label provider-reported context counts distinctly
+  from byte-derived estimates, including before the first response and when a
+  provider omits token usage. Resume estimates retain their saved-history source.
+
 - `/compact preview` reports exact conversation record counts to summarize and
   retain using the manual compaction plan, without model requests or history
   changes, including offline sessions.
@@ -306,7 +310,7 @@ Notable changes, newest first. Each entry describes what a user can observe.
   context window and reports the default capacity and source. An override naming
   the same model preserves its declared window.
 - Resumed sessions initialize the context meter from saved usage or history
-  bytes and label the estimate with its source until live usage arrives.
+  bytes and label the estimate with its source until the next request.
 - README and budget help distinguish the audited 4.50 MiB stripped release
   build for `x86_64-unknown-linux-gnu` from the enforced 8 MiB binary size ceiling.
 - Concurrent credential updates and removals hold an OS lock across the full

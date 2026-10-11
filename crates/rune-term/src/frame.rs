@@ -898,7 +898,7 @@ mod tests {
         let composed = compose(&regions, 80, 24).expect("compose");
         assert_eq!(
             composed.row_text(23),
-            "claude-sonnet-4 | auto | ctx 12% (175.5k left) | /Users/dev/rune 9f2c1a7b"
+            "claude-sonnet-4 | auto | ctx 12% (provider-reported) (175.5k left) | /Users/dev/"
         );
         assert_eq!(composed.row_text(22), crate::footer::HINTS);
         assert_eq!(composed.row_text(21), ">");

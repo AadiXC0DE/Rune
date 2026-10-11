@@ -233,8 +233,11 @@ assistant text is journalled in bounded, durable frames before it is displayed.
 After process death, resume replays the partial answer once with an
 `[interrupted]` boundary, without inventing a completed turn or token usage.
 Interactive resume replays the saved exchanges above the composer before you
-type. Its context meter starts with an estimate labelled `saved usage` or `history bytes`
-until a live provider count arrives. Prompts are remembered and recallable with
+type. The footer and `/status` distinguish `provider-reported` counts from
+estimates. Fresh sessions and responses without complete token usage use a
+`request bytes` estimate that includes instructions and tool schemas. On resume,
+the initial estimate is labelled `saved usage` or `history bytes` until the next
+request. Prompts are remembered and recallable with
 `/history`. Custom slash commands live in `.rune/commands/*.md` in a repository,
 so a team can ship a workflow with the code. Before each CLI session request,
 Rune estimates the serialized input, including instructions and tool schemas,

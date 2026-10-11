@@ -250,9 +250,9 @@ struct SessionHost {
     events: Arc<Mutex<Vec<Event>>>,
     /// The pending or active retry, drawn only through the live footer.
     provider_retry: Mutex<Option<ProviderRetry>>,
-    /// Largest observed conversation size, initially estimated on resume.
+    /// Largest observed conversation size, estimated when usage is unavailable.
     context_used: std::sync::atomic::AtomicU64,
-    /// Present while the meter is seeded from saved history.
+    /// Present while the meter uses an estimate rather than provider usage.
     context_source: Mutex<Option<&'static str>>,
     /// Size of the context window, zero when the provider stated none.
     ///
@@ -403,6 +403,15 @@ impl Host for SessionHost {
     ) -> Result<()> {
         use rune_agent::compaction::{self, Trigger};
         let estimate = request_estimate(self, plan)?;
+        if self.context_used.load(std::sync::atomic::Ordering::Relaxed) == 0
+            || self
+                .context_source
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_some()
+        {
+            self.record_context_estimate(estimate.input_tokens);
+        }
         let compaction_plan = compaction::plan(history, &self.limits);
         let retained_estimate = if let Some(cut) = &compaction_plan {
             let mut retained_plan = plan.clone();
@@ -429,7 +438,9 @@ impl Host for SessionHost {
             remaining_turns: history.len(),
         });
         self.forget_context();
-        if request_estimate(self, plan)?.input_tokens > estimate.capacity {
+        let compacted_estimate = request_estimate(self, plan)?;
+        self.record_context_estimate(compacted_estimate.input_tokens);
+        if compacted_estimate.input_tokens > estimate.capacity {
             return Err(compaction::cannot_fit_error());
         }
         Ok(())
@@ -885,6 +896,60 @@ impl SessionHost {
         } else {
             self.context_used
                 .fetch_max(used, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Labels byte-derived readings separately from observed provider usage.
+    fn record_context_estimate(&self, used: u64) {
+        let mut source = self
+            .context_source
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.context_used
+            .store(used, std::sync::atomic::Ordering::Relaxed);
+        *source = Some("request bytes");
+    }
+
+    /// Estimates the current conversation, including instructions and tools.
+    fn estimate_context(&self, history: &History) -> Result<()> {
+        let mut plan = rune_net::provider::RequestPlan::new(self.model());
+        plan.instructions = self.instructions();
+        plan.messages = history.to_messages();
+        plan.tools = self.tools();
+        plan.tool_choice = if plan.tools.is_empty() {
+            rune_net::provider::ToolChoice::None
+        } else {
+            rune_net::provider::ToolChoice::Auto
+        };
+        plan.parallel_tool_calls = self
+            .limits
+            .get(rune_core::budget::LimitName::ParallelToolCalls)
+            .value()
+            != Some(1);
+        plan.effort = self.effort;
+        plan.fast_mode = self.fast_mode;
+        plan.provider_order.clone_from(&self.provider_order);
+        plan.provider_strict = self.provider_strict;
+        self.record_context_estimate(request_estimate(self, &plan)?.input_tokens);
+        Ok(())
+    }
+
+    /// Missing counts stay estimates; explicit zero usage is still a report.
+    fn record_context_usage(
+        &self,
+        history: &History,
+        usage: &rune_net::stream::Usage,
+    ) -> Result<()> {
+        if let (Some(input), Some(output)) = (usage.input_tokens, usage.output_tokens) {
+            let used = input.saturating_add(output);
+            if used == 0 {
+                self.forget_context();
+            } else {
+                self.record_context_size(used);
+            }
+            Ok(())
+        } else {
+            self.estimate_context(history)
         }
     }
 
@@ -1422,6 +1487,9 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
         approval_requests: Mutex::new(None),
         questions: config.questions,
     };
+    if context_source.is_none() {
+        host.estimate_context(&history)?;
+    }
 
     // The stream is shared: the loop writes to it, and the host writes to it
     // while a turn is running so streamed text appears as it arrives. Sharing
@@ -1617,6 +1685,7 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                         // just ended, so it is cleared rather than carried into
                         // a session that has sent nothing.
                         host.forget_context();
+                        host.estimate_context(&history)?;
                         note(format!("started session {id}"));
                     }
                     Handled::Undo => return Ok(Step::Undo),
@@ -1807,13 +1876,7 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                 // turn that ran after `/model` is billed to the model that ran.
                 record_usage(&config.paths, &host.model(), &outcome);
                 host.record_usage(&outcome.usage);
-                host.record_context_size(
-                    outcome
-                        .last_request
-                        .input_tokens
-                        .unwrap_or(0)
-                        .saturating_add(outcome.last_request.output_tokens.unwrap_or(0)),
-                );
+                host.record_context_usage(&history, &outcome.last_request)?;
                 host.clear_events();
                 // The streamed text has been superseded by the finished turn,
                 // so it is dropped before the render that replaces it.
@@ -3859,6 +3922,8 @@ fn render_status(info: &SessionInfo<'_>) -> String {
     }
     if let Some(source) = info.context_source {
         let _ = writeln!(out, "context source {source} (estimate)");
+    } else {
+        let _ = writeln!(out, "context source provider-reported");
     }
     out.trim_end().to_owned()
 }
@@ -4191,7 +4256,7 @@ struct SessionInfo<'a> {
     workspace: &'a str,
     /// Tokens spent from the context window.
     context_used: u64,
-    /// Source of the initial resume estimate, absent for live readings.
+    /// Source of an estimate, absent for live provider-reported readings.
     context_source: Option<&'static str>,
     /// Size of the context window, zero when none is known.
     context_limit: u64,
@@ -6226,6 +6291,66 @@ mod tests {
         let info = host.info("p", "e");
         assert_eq!(info.context_used, 0);
         assert_eq!(info.context_source, None);
+    }
+
+    #[test]
+    fn missing_or_partial_usage_is_estimated_and_explicit_zero_is_reported() {
+        use rune_net::stream::Usage;
+
+        let host = test_host();
+        let mut history = History::new();
+        host.estimate_context(&history).expect("initial estimate");
+        let initial = host.info("p", "e");
+        assert!(initial.context_used > 0);
+        assert_eq!(initial.context_source, Some("request bytes"));
+        assert!(render_status(&initial).contains("request bytes (estimate)"));
+        assert!(host.status_line(120).contains("(request bytes)"));
+
+        history.push_user("fixture question");
+        history.push_assistant(vec![rune_net::message::ContentPart::Text {
+            text: "fixture answer".to_owned(),
+        }]);
+        let reported = Usage {
+            input_tokens: Some(1234),
+            output_tokens: Some(66),
+            ..Usage::default()
+        };
+        host.record_context_usage(&history, &reported)
+            .expect("usage");
+        assert_eq!(host.info("p", "e").context_used, 1300);
+        assert!(render_status(&host.info("p", "e")).contains("context source provider-reported"));
+        assert!(host.status_line(120).contains("(provider-reported)"));
+
+        for usage in [
+            Usage::default(),
+            Usage {
+                input_tokens: Some(1234),
+                ..Usage::default()
+            },
+            Usage {
+                output_tokens: Some(66),
+                ..Usage::default()
+            },
+        ] {
+            host.record_context_usage(&history, &usage)
+                .expect("estimate");
+            let info = host.info("p", "e");
+            assert!(info.context_used > initial.context_used);
+            assert_eq!(info.context_source, Some("request bytes"));
+            assert!(!host.status_line(120).contains("provider-reported"));
+        }
+        host.record_context_usage(
+            &history,
+            &Usage {
+                input_tokens: Some(0),
+                output_tokens: Some(0),
+                ..Usage::default()
+            },
+        )
+        .expect("zero report");
+        assert_eq!(host.info("p", "e").context_used, 0);
+        assert_eq!(host.info("p", "e").context_source, None);
+        assert!(host.status_line(120).contains("(provider-reported)"));
     }
 
     #[test]

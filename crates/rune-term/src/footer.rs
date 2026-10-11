@@ -49,7 +49,7 @@ pub struct FooterState {
     pub workspace: String,
     /// Observed or estimated conversation tokens.
     pub context_used: u64,
-    /// Source of a resume estimate, absent for live provider readings.
+    /// Source of an estimate, absent for live provider-reported readings.
     pub context_source: Option<&'static str>,
     /// Size of the context window, zero when the provider did not state one.
     pub context_limit: u64,
@@ -299,7 +299,11 @@ fn context_field(state: &FooterState, theme: &Theme, truecolor: bool) -> String 
         }
     } else if state.context_limit == 0 {
         field.push_str(&paint(theme, Slot::Dim, truecolor, 0));
-        let _ = write!(field, "ctx {}", format_tokens(state.context_used));
+        let _ = write!(
+            field,
+            "ctx {} (provider-reported)",
+            format_tokens(state.context_used)
+        );
     } else {
         let slot = if state.context_is_tight() {
             Slot::Error
@@ -309,7 +313,7 @@ fn context_field(state: &FooterState, theme: &Theme, truecolor: bool) -> String 
         field.push_str(&paint(theme, slot, truecolor, 0));
         let _ = write!(
             field,
-            "ctx {}% ({} left)",
+            "ctx {}% (provider-reported) ({} left)",
             state.context_percent(),
             format_tokens(state.context_remaining())
         );
@@ -610,6 +614,25 @@ mod tests {
         let status = status_of(&unknown, 100);
         assert!(status.contains("ctx 4.2k"), "{status}");
         assert!(!status.contains('%'), "{status}");
+    }
+
+    #[test]
+    fn provider_readings_and_byte_estimates_have_distinct_labels() {
+        let mut state = state();
+        for window in [0, 200_000] {
+            state.context_limit = window;
+            state.context_source = None;
+            let reported = status_of(&state, 160);
+            assert!(reported.contains("(provider-reported)"), "{reported}");
+            assert!(!reported.contains('~'), "{reported}");
+            state.context_source = Some("request bytes");
+            let estimated = status_of(&state, 160);
+            assert!(
+                estimated.contains("ctx ~24.5k (request bytes)"),
+                "{estimated}"
+            );
+            assert!(!estimated.contains("provider-reported"), "{estimated}");
+        }
     }
 
     #[test]
