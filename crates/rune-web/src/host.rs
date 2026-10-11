@@ -274,6 +274,10 @@ impl Host for Session {
         self.registry.activity(name)
     }
 
+    fn tool_permission_target(&self, name: &str, arguments: &serde_json::Value) -> Option<String> {
+        turn::permission_target_for(&self.registry, name, arguments)
+    }
+
     #[cfg(not(target_family = "wasm"))]
     fn concurrent_tool_host(&self, name: &str) -> Option<&(dyn Host + Sync)> {
         self.registry.get(name)?.is_read_only().then_some(self)

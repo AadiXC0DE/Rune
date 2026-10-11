@@ -50,6 +50,7 @@ struct TestHost {
     mode: PermissionMode,
     events: Mutex<Vec<Event>>,
     executed: Mutex<Vec<(String, serde_json::Value)>>,
+    decisions: Mutex<Vec<(String, Option<String>)>>,
     tool_response: Mutex<Option<ToolOutput>>,
     tool_error: Option<RuneError>,
     /// Real tools used by regressions that must reach the implementation.
@@ -86,6 +87,7 @@ impl TestHost {
             mode: PermissionMode::Auto,
             events: Mutex::new(Vec::new()),
             executed: Mutex::new(Vec::new()),
+            decisions: Mutex::new(Vec::new()),
             tool_response: Mutex::new(None),
             tool_error: None,
             registry: None,
@@ -196,6 +198,17 @@ impl Host for TestHost {
         self.registry.as_ref()?.activity(name)
     }
 
+    fn tool_permission_target(&self, name: &str, arguments: &serde_json::Value) -> Option<String> {
+        match &self.registry {
+            Some(registry) => rune_agent::turn::permission_target_for(registry, name, arguments),
+            None => rune_agent::turn::permission_target_for(
+                &rune_tools::inventory::builtin_default().expect("built-in registry"),
+                name,
+                arguments,
+            ),
+        }
+    }
+
     #[cfg(not(target_family = "wasm"))]
     fn concurrent_tool_host(&self, name: &str) -> Option<&(dyn Host + Sync)> {
         self.registry
@@ -255,6 +268,10 @@ impl Host for TestHost {
     }
 
     fn decide(&self, name: &str, target: Option<&str>) -> (Outcome, String) {
+        self.decisions
+            .lock()
+            .expect("lock")
+            .push((name.to_owned(), target.map(str::to_owned)));
         let (outcome, reason) = rune_agent::turn::decide_call_in_workspace(
             &self.rules,
             self.mode,
@@ -1546,6 +1563,109 @@ fn a_tool_failure_does_not_end_the_turn() {
     assert_eq!(outcome.calls.len(), 1);
     assert!(outcome.calls[0].output.is_error);
     assert!(outcome.text.contains("does not exist"));
+}
+
+#[test]
+fn registered_permission_targets_reach_policy_and_explicit_denials_prevent_execution() {
+    use rune_tools::{Activity, Tool};
+
+    struct TargetTool {
+        name: &'static str,
+        activity: Activity,
+        has_target: bool,
+    }
+
+    impl Tool for TargetTool {
+        fn name(&self) -> &'static str {
+            self.name
+        }
+
+        fn description(&self) -> &'static str {
+            "Return fixture content for a declared target."
+        }
+
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+
+        fn activity(&self) -> Activity {
+            self.activity
+        }
+
+        fn permission_target(&self, arguments: &serde_json::Value) -> Option<String> {
+            self.has_target
+                .then(|| arguments["target"].as_str().expect("target").to_owned())
+        }
+
+        fn call(
+            &self,
+            _arguments: &serde_json::Value,
+            _context: &ExecutionContext,
+        ) -> Result<ToolOutput> {
+            Ok(ToolOutput::success("fixture content"))
+        }
+    }
+
+    // Cover both concurrent reads and sequential writes, replacement of a
+    // built-in name, and an authoritative declaration of no target.
+    for (name, activity, has_target) in [
+        ("custom_read", Activity::Read, true),
+        ("custom_write", Activity::Write, true),
+        ("read_file", Activity::Read, true),
+        ("read_file", Activity::Read, false),
+    ] {
+        let endpoint = MockEndpoint::start(vec![
+            Script::tool_call(
+                "call_fixture",
+                name,
+                r#"{"target":"secret.txt","path":"public.txt"}"#,
+            ),
+            Script::text("Finished."),
+        ]);
+        let mut registry = Registry::new();
+        registry
+            .insert(Box::new(TargetTool {
+                name,
+                activity,
+                has_target,
+            }))
+            .expect("register");
+        let mut rules = RuleSet::new();
+        rules.push(Rule::deny(name, "secret.txt", Layer::User));
+        let mut host = TestHost::new(endpoint)
+            .with_tools(registry.all_schemas())
+            .with_rules(rules);
+        host.registry = Some(registry);
+        let mut history = rune_agent::History::new();
+        history.push_user("read the fixture");
+
+        let outcome = run_turn(&mut history, &host).expect("turn");
+        assert_eq!(outcome.stop_reason, StopReason::Completed);
+        assert_eq!(outcome.calls.len(), 1);
+        assert_eq!(
+            *host.decisions.lock().expect("lock"),
+            vec![(name.to_owned(), has_target.then(|| "secret.txt".to_owned()))],
+            "policy must see the registered tool's exact target declaration",
+        );
+        assert_eq!(outcome.calls[0].executed, !has_target);
+        assert_eq!(outcome.calls[0].output.is_error, has_target);
+        assert_eq!(host.executed_calls().len(), usize::from(!has_target));
+        let denied: Vec<_> = host
+            .events()
+            .into_iter()
+            .filter_map(|event| match event {
+                Event::ToolDenied { reason, .. } => Some(reason),
+                _ => None,
+            })
+            .collect();
+        if has_target {
+            assert_eq!(denied.len(), 1);
+            assert!(denied[0].contains("secret.txt"), "{}", denied[0]);
+            assert!(outcome.calls[0].output.text.contains("refused by policy"));
+        } else {
+            assert!(denied.is_empty());
+        }
+    }
 }
 
 #[test]

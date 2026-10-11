@@ -221,6 +221,15 @@ pub trait Host {
         None
     }
 
+    /// Returns the permission target declared by the tool that will execute.
+    ///
+    /// Hosts with a registry should resolve through that registry, including
+    /// returning `None` when the registered tool declares no target. Hosts
+    /// without a registry retain the built-in target resolution by default.
+    fn tool_permission_target(&self, name: &str, arguments: &serde_json::Value) -> Option<String> {
+        infer_target(name, arguments)
+    }
+
     /// Offers a thread-safe executor for a registered read-only tool.
     ///
     /// Returning `Some(self)` opts this call into native concurrent execution.
@@ -860,7 +869,7 @@ fn prepare_call(
         }
     };
 
-    let target = infer_target(host, &call.name, &arguments);
+    let target = host.tool_permission_target(&call.name, &arguments);
     let (outcome, reason) = host.decide(&call.name, target.as_deref());
 
     match outcome {
@@ -1035,16 +1044,9 @@ fn infer_activity(name: &str) -> Activity {
     }
 }
 
-/// Returns the permission target for a call, when the tool names one.
-///
-/// Each tool declares its own target, so the loop asks the registry rather than
-/// keeping a second table that can drift from it. The host does not hand the
-/// loop its registry, so the built-in one answers, and it gives the same
-/// target: a tool's target depends only on its arguments and on state every
-/// instance reads, such as the command a shell session runs.
-fn infer_target(host: &dyn Host, name: &str, arguments: &serde_json::Value) -> Option<String> {
+/// Resolves built-in targets for hosts without a registry.
+fn infer_target(name: &str, arguments: &serde_json::Value) -> Option<String> {
     static BUILTIN: std::sync::OnceLock<Option<Registry>> = std::sync::OnceLock::new();
-    let _ = host;
     match BUILTIN.get_or_init(|| rune_tools::inventory::builtin_default().ok()) {
         Some(registry) => permission_target_for(registry, name, arguments),
         None => infer_target_standalone(name, arguments),
@@ -1164,16 +1166,19 @@ pub fn effective_outcome(mode: PermissionMode, decided: Outcome) -> Outcome {
 ///
 /// Present so the loop and the command surface agree on how a target is derived
 /// from arguments; a divergence between them would mean a rule matching one path
-/// in the loop and another outside it.
+/// in the loop and another outside it. Registered declarations, including no
+/// target, are authoritative. Unregistered built-in names use argument fallback.
 #[must_use]
 pub fn permission_target_for(
     registry: &Registry,
     name: &str,
     arguments: &serde_json::Value,
 ) -> Option<String> {
-    registry
-        .permission_target(name, arguments)
-        .or_else(|| infer_target_standalone(name, arguments))
+    if registry.contains(name) {
+        registry.permission_target(name, arguments)
+    } else {
+        infer_target_standalone(name, arguments)
+    }
 }
 
 /// Returns the permission target without a host.

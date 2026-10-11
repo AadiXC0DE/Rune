@@ -200,6 +200,10 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Fixed
 
+- Custom-tool permission targets resolve through the executing host's registry,
+  so explicit target denials prevent execution, including when a custom tool
+  replaces a built-in name.
+
 - Session-tree previews and branch summaries escape newlines, control characters,
   and Unicode line separators, keeping each preview on one logical table row.
 

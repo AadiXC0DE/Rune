@@ -1329,6 +1329,10 @@ impl<W: Write + Send + 'static> Host for TurnHost<W> {
         self.server.config.registry.activity(name)
     }
 
+    fn tool_permission_target(&self, name: &str, arguments: &Value) -> Option<String> {
+        rune_agent::turn::permission_target_for(&self.server.config.registry, name, arguments)
+    }
+
     #[cfg(not(target_family = "wasm"))]
     fn concurrent_tool_host(&self, name: &str) -> Option<&(dyn Host + Sync)> {
         self.server
