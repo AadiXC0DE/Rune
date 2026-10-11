@@ -200,6 +200,9 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Fixed
 
+- Resuming a session restores `/cost` request counts and saved input/output
+  token totals before a new request, including usage covered by compaction.
+
 - Slash-command completion includes discovered project and user commands, with
   descriptions and argument hints. Up/Down selects them; Tab or Enter completes
   a partial name before the existing command expansion for review.

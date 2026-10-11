@@ -1424,10 +1424,14 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
     let provider_name = config.settings.provider.to_string();
 
     let (initial_context, context_source) = recorder.resumed_context();
-    let transcript = if let Some(id) = &config.resume {
-        resumed_entries(&history, &session_log::inspect(&config.paths, id)?)
+    let (transcript, initial_totals) = if let Some(id) = &config.resume {
+        let state = session_log::inspect(&config.paths, id)?;
+        (
+            resumed_entries(&history, &state),
+            Totals::from_saved(&state),
+        )
     } else {
-        Vec::new()
+        (Vec::new(), Totals::default())
     };
     let recorder = Arc::new(Mutex::new(recorder));
     let host = SessionHost {
@@ -1481,7 +1485,7 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
         live_out: Arc::new(Mutex::new(None)),
         reasoning: Mutex::new(reasoning_escape),
         reviewer: crate::auto_review::build(&config.settings, &config.paths)?,
-        totals: Mutex::new(Totals::default()),
+        totals: Mutex::new(initial_totals),
         undo: Mutex::new(BTreeMap::new()),
         review_session: Arc::new(Mutex::new(ReviewSession::new(&limits))),
         approval_requests: Mutex::new(None),
@@ -4004,7 +4008,7 @@ fn render_status(info: &SessionInfo<'_>) -> String {
 
 /// Renders what this session has spent.
 ///
-/// Counted from the turns this session has run rather than read back from the
+/// Counted from saved and live turns rather than read back from the
 /// ledger, because the ledger records which model served a request but not
 /// which session asked for it, and a command that reported the machine's whole
 /// spend would be answering a different question.
@@ -4263,6 +4267,54 @@ struct Totals {
 }
 
 impl Totals {
+    /// Restores persisted counts without dropping usage covered by compaction.
+    fn from_saved(state: &rune_session::store::SessionState) -> Self {
+        use std::collections::BTreeSet;
+
+        use rune_session::event::SessionEvent;
+
+        // A legacy final message has no finish marker. Explicit boundaries
+        // and streaming journals prevent partial answers from counting as one.
+        let journalled: BTreeSet<_> = state
+            .events
+            .iter()
+            .filter_map(|frame| match frame.event {
+                SessionEvent::AssistantDelta { turn, .. }
+                | SessionEvent::AssistantReset { turn }
+                | SessionEvent::TurnFinished { turn }
+                | SessionEvent::TurnCancelled { turn }
+                | SessionEvent::TurnFailed { turn, .. }
+                | SessionEvent::TurnInterrupted { turn } => Some(turn),
+                _ => None,
+            })
+            .collect();
+        let mut requests = BTreeSet::new();
+        let mut current_turn = None;
+        for frame in &state.events {
+            match frame.event {
+                SessionEvent::TurnStarted { turn } => current_turn = Some(turn),
+                SessionEvent::TurnFinished { turn } => {
+                    requests.insert(turn);
+                }
+                SessionEvent::AssistantMessage { turn, .. } if !journalled.contains(&turn) => {
+                    requests.insert(turn);
+                }
+                SessionEvent::UsageRecorded { .. } => {
+                    if let Some(turn) = current_turn {
+                        requests.insert(turn);
+                    }
+                }
+                _ => {}
+            }
+        }
+        Self {
+            requests: u64::try_from(requests.len()).unwrap_or(u64::MAX),
+            input_tokens: state.usage.input_tokens,
+            output_tokens: state.usage.output_tokens,
+            ..Self::default()
+        }
+    }
+
     /// Adds one turn's usage.
     ///
     /// A provider that reports no count leaves that field as it was rather than
@@ -6822,6 +6874,48 @@ mod tests {
         assert!(rendered.contains("Requests: 2"), "{rendered}");
         assert!(rendered.contains("1.2k in"), "{rendered}");
         assert!(rendered.contains("500 out"), "{rendered}");
+    }
+
+    #[test]
+    fn new_usage_accumulates_onto_restored_cost_totals() {
+        use rune_session::{SessionEvent, SessionStore};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = Utf8Path::from_path(dir.path()).expect("utf8");
+        let paths = Paths {
+            state_root: root.join("state"),
+            config_root: root.join("config"),
+            data_root: root.join("data"),
+        };
+        let id = "restorecost1".parse().expect("id");
+        let store = SessionStore::create(&paths, &id).expect("session");
+        for turn in 1_u64..=3 {
+            store
+                .append(SessionEvent::TurnStarted { turn })
+                .expect("start");
+            store
+                .append(SessionEvent::UsageRecorded {
+                    input_tokens: turn.saturating_mul(100),
+                    output_tokens: turn.saturating_mul(10),
+                })
+                .expect("usage");
+            store
+                .append(SessionEvent::TurnFinished { turn })
+                .expect("finish");
+        }
+        drop(store);
+        let state = session_log::inspect(&paths, &id).expect("saved state");
+        let host = test_host();
+        *host.totals.lock().expect("totals") = Totals::from_saved(&state);
+        host.record_usage(&rune_net::stream::Usage {
+            input_tokens: Some(100),
+            output_tokens: Some(10),
+            ..rune_net::stream::Usage::default()
+        });
+        assert_eq!(
+            render_cost(&host.info("p", "e")),
+            "Requests: 4\nTokens:   700 in, 70 out"
+        );
     }
 
     #[test]
