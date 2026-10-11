@@ -6,6 +6,11 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Added
 
+- `rune ask --jsonl` streams flushed `start`, `text_delta`, and `final` JSON
+  records, with step boundaries and retry resets. Records are bounded to 1 MiB,
+  deltas are split at UTF-8 boundaries, and diagnostics stay on stderr.
+  An oversized final result emits a `too_large` failure and exits 1.
+
 - `rune ask` executes allowed built-in tools through the shared host loop and
   sends their results in subsequent requests. A positive `max_agent_steps`
   bounds the turn; otherwise ask uses 16 steps. Cap exhaustion exits 1 with

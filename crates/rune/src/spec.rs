@@ -195,6 +195,10 @@ pub const RUN: &[CommandSpec] = &[
         usage: "rune ask [flags] <prompt>",
         flags: &[
             flag("--json", "Print one JSON object instead of Markdown."),
+            flag(
+                "--jsonl",
+                "Stream bounded JSONL events (takes precedence over --json).",
+            ),
             flag("--no-save", "Do not create a session."),
         ],
         requirements: Requirements::FULL,

@@ -265,6 +265,22 @@ Completed exchanges are saved as sessions for the current workspace, and
 `--json` reports their `session_id`. Pass `--no-save` to create no session and
 return an empty ID.
 
+`rune ask --jsonl "prompt"` streams one JSON object per stdout line, flushing
+each record as it arrives. `--jsonl` takes precedence over `--json`. The stream
+begins with `{"type":"start"}` before prompt validation, then emits `step_start`
+with a `step` number and `text_delta` records with `step` and `delta`. A
+`step_restart` tells consumers to discard deltas from the failed attempt of
+that step. Deltas from earlier tool steps are intermediate text; the final
+answer is in the last record, `{"type":"final","result":{...}}`, whose `result`
+has the same fields as `--json`, including failures and saved session IDs.
+Diagnostics go only to stderr. Each record is capped at 1 MiB including its
+newline; deltas are split at UTF-8 boundaries into at most 8 KiB of raw text.
+Serialization stages at most one bounded record, and a slow stdout reader
+applies backpressure instead of growing an event queue. An oversized final
+result produces a small `too_large` final failure and exit 1, after any deltas
+already delivered. Its model and session ID are empty; a completed exchange
+may already have been saved unless `--no-save` was used.
+
 `rune ask --json` failures include `error_detail` when structured context is available.
 Provider failures retain the redacted `provider_code` and numeric
 `retry_after_ms` from a supported `Retry-After` header, when reported, alongside

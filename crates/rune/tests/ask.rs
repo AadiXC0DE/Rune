@@ -178,6 +178,22 @@ fn run_responses_fixture_with_setup(
     max_steps: Option<u64>,
     setup: impl FnOnce(&tempfile::TempDir),
 ) -> (Output, tempfile::TempDir, Vec<Value>) {
+    run_responses_fixture_with_format(
+        responses,
+        json_output.then_some("--json"),
+        no_save,
+        max_steps,
+        setup,
+    )
+}
+
+fn run_responses_fixture_with_format(
+    responses: Vec<String>,
+    output_flag: Option<&str>,
+    no_save: bool,
+    max_steps: Option<u64>,
+    setup: impl FnOnce(&tempfile::TempDir),
+) -> (Output, tempfile::TempDir, Vec<Value>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind fixture");
     listener.set_nonblocking(true).expect("nonblocking");
     let address = listener.local_addr().expect("fixture address");
@@ -262,8 +278,8 @@ fn run_responses_fixture_with_setup(
         .env("RUNE_API_KEY_ENV", "RUNE_ASK_TEST_KEY")
         .env("RUNE_ASK_TEST_KEY", "fixture-key")
         .arg("ask");
-    if json_output {
-        command.arg("--json");
+    if let Some(flag) = output_flag {
+        command.arg(flag);
     }
     if no_save {
         command.arg("--no-save");
@@ -870,4 +886,299 @@ fn ask_bounds_repeated_tool_requests_with_configured_and_default_step_caps() {
         );
         assert_eq!(result["usage"]["input_tokens"], expected_steps * 11);
     }
+}
+
+/// Holds the provider response open until stdout has delivered the early records.
+fn streaming_jsonl_fixture(delta: &str, complete: bool) -> (Vec<Value>, Output) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("streaming fixture");
+    let address = listener.local_addr().expect("address");
+    let (release, gate) = std::sync::mpsc::channel();
+    let first = format!(
+        "data: {}\n\n",
+        json!({"choices": [{"delta": {"content": delta}, "finish_reason": null}]})
+    );
+    let tail = if complete {
+        format!(
+            "data: {}\n\ndata: [DONE]\n\n",
+            json!({"choices": [{"delta": {}, "finish_reason": "stop"}], "usage": {"prompt_tokens": 11, "completion_tokens": 7}})
+        )
+    } else {
+        String::new()
+    };
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("request");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("read deadline");
+        stream
+            .set_write_timeout(Some(Duration::from_secs(10)))
+            .expect("write deadline");
+        let mut reader = std::io::BufReader::new(&mut stream);
+        let mut length = None;
+        loop {
+            let mut line = String::new();
+            assert!(reader.read_line(&mut line).expect("header") > 0);
+            if line == "\r\n" {
+                break;
+            }
+            if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                length = Some(value.trim().parse::<usize>().expect("length"));
+            }
+        }
+        let mut request = vec![0; length.expect("request length")];
+        reader.read_exact(&mut request).expect("body");
+        drop(reader);
+        write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{first}", first.len().saturating_add(tail.len()).saturating_add(usize::from(!complete))).expect("early delta");
+        stream.flush().expect("flush delta");
+        gate.recv_timeout(Duration::from_secs(10))
+            .expect("stdout observed before completion");
+        stream.write_all(tail.as_bytes()).expect("finish response");
+    });
+    let dir = tempfile::tempdir().expect("isolated state");
+    std::fs::create_dir_all(dir.path().join("config/rune")).expect("config directory");
+    write_retry_limits(&dir, 1);
+    let mut child = isolated_command(&dir)
+        .env("RUNE_PROVIDER", "chat_completions")
+        .env("RUNE_BASE_URL", format!("http://{address}/v1"))
+        .env("RUNE_MODEL", "fixture-model")
+        .env("RUNE_API_KEY_ENV", "RUNE_ASK_TEST_KEY")
+        .env("RUNE_ASK_TEST_KEY", "fixture-key")
+        .args(["ask", "--jsonl", "--json", "--no-save", "hello"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("ask JSONL");
+    let stdout = child.stdout.take().expect("stdout");
+    let (send, receive) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        for line in std::io::BufReader::new(stdout).lines() {
+            send.send(line.expect("stdout line"))
+                .expect("line consumer");
+        }
+    });
+    let mut events = Vec::new();
+    loop {
+        let line = receive
+            .recv_timeout(Duration::from_secs(5))
+            .expect("event before completion");
+        assert!(line.len() < 1024 * 1024, "bounded JSONL record");
+        let event: Value = serde_json::from_str(&line).expect("stdout contains only JSON objects");
+        let got_text = event["type"] == "text_delta";
+        events.push(event);
+        if got_text {
+            break;
+        }
+    }
+    assert_eq!(events[0], json!({"type": "start"}));
+    assert_eq!(events[1], json!({"type": "step_start", "step": 1}));
+    assert!(child.try_wait().expect("running status").is_none());
+    release.send(()).expect("release provider completion");
+    while let Ok(line) = receive.recv_timeout(Duration::from_secs(5)) {
+        assert!(line.len() < 1024 * 1024, "bounded JSONL record");
+        events.push(serde_json::from_str(&line).expect("JSON event"));
+    }
+    reader.join().expect("stdout reader");
+    let output = child.wait_with_output().expect("completion");
+    server.join().expect("provider fixture");
+    assert!(!dir.path().join("state/sessions").exists(), "no-save");
+    (events, output)
+}
+
+#[test]
+fn ask_jsonl_delivers_flushed_events_before_provider_completion() {
+    let delta = "STREAMED 🌱\n\"\0".repeat(3000);
+    let (events, output) = streaming_jsonl_fixture(&delta, true);
+    assert!(output.status.success(), "{:?}", output.stderr);
+    assert!(output.stderr.is_empty());
+    let chunks: Vec<_> = events
+        .iter()
+        .filter(|event| event["type"] == "text_delta")
+        .collect();
+    assert!(chunks.len() > 1);
+    let joined: String = chunks
+        .iter()
+        .map(|event| event["delta"].as_str().expect("delta"))
+        .collect();
+    assert_eq!(joined, delta);
+    assert!(chunks.iter().all(|event| event["step"] == 1));
+    let final_event = events.last().expect("final event");
+    assert_eq!(final_event["type"], "final");
+    let result = &final_event["result"];
+    assert_eq!(result["output"], delta);
+    assert_eq!(result["final_output"], delta);
+    assert_eq!(result["exit_code"], 0);
+    assert_eq!(result["steps"], 1);
+    assert_eq!(result["session_id"], "");
+    assert_eq!(
+        result["usage"],
+        json!({"input_tokens": 11, "output_tokens": 7})
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event["type"] == "final")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn ask_jsonl_bounds_the_final_record_and_reports_size_failure_on_stderr() {
+    let (events, output) = streaming_jsonl_fixture(&"a".repeat(600_000), true);
+    assert_eq!(output.status.code(), Some(1));
+    let final_event = events.last().expect("final");
+    assert_eq!(final_event["type"], "final");
+    assert_eq!(final_event["result"]["error_code"], "too_large");
+    assert_eq!(final_event["result"]["exit_code"], 1);
+    assert_eq!(final_event["result"]["output"], "");
+    assert!(String::from_utf8_lossy(&output.stderr).contains("jsonl_event"));
+}
+
+#[test]
+fn ask_jsonl_stream_failure_emits_a_final_failure_and_stderr_diagnostic() {
+    let (events, output) = streaming_jsonl_fixture("partial", false);
+    assert_eq!(output.status.code(), Some(1));
+    let final_event = events.last().expect("final");
+    assert_eq!(final_event["type"], "final");
+    assert_eq!(final_event["result"]["exit_code"], 1);
+    assert!(final_event["result"]["error_code"].is_string());
+    assert!(String::from_utf8_lossy(&output.stderr).starts_with("rune: "));
+}
+
+#[test]
+fn ask_jsonl_validation_failures_emit_start_and_final_only() {
+    for (args, code) in [
+        (vec!["ask", "--jsonl", "hello"], "authentication_required"),
+        (vec!["ask", "--jsonl"], "missing_field"),
+    ] {
+        let dir = tempfile::tempdir().expect("isolated state");
+        let output = isolated_command(&dir)
+            .args(args)
+            .stdin(Stdio::null())
+            .output()
+            .expect("ask");
+        assert_eq!(output.status.code(), Some(1));
+        let events: Vec<Value> = String::from_utf8(output.stdout)
+            .expect("UTF-8")
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("JSON event"))
+            .collect();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0], json!({"type": "start"}));
+        assert_eq!(events[1]["type"], "final");
+        assert_eq!(events[1]["result"]["error_code"], code);
+        assert_eq!(
+            String::from_utf8_lossy(&output.stderr)
+                .matches("rune: ")
+                .count(),
+            1
+        );
+    }
+}
+
+#[test]
+fn ask_jsonl_marks_retry_resets_and_keeps_the_recovered_final_result() {
+    let partial = format!(
+        "data: {}\n\n",
+        json!({"choices": [{"delta": {"content": "Discard this attempt."}, "finish_reason": null}]})
+    );
+    let incomplete = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{partial}",
+        partial.len()
+    );
+    let (output, _, requests) = run_responses_fixture_with_format(
+        vec![
+            incomplete,
+            completion_response(&json!({"content": "Recovered."}), "stop"),
+        ],
+        Some("--jsonl"),
+        true,
+        Some(1),
+        |dir| write_retry_limits(dir, 2),
+    );
+    assert!(output.status.success(), "{:?}", output.stderr);
+    assert!(output.stderr.is_empty());
+    assert_eq!(requests.len(), 2);
+    let events: Vec<Value> = std::str::from_utf8(&output.stdout)
+        .expect("UTF-8")
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("JSON event"))
+        .collect();
+    assert_eq!(
+        events
+            .iter()
+            .map(|event| event["type"].as_str().expect("type"))
+            .collect::<Vec<_>>(),
+        [
+            "start",
+            "step_start",
+            "text_delta",
+            "step_restart",
+            "text_delta",
+            "final"
+        ]
+    );
+    assert_eq!(events[2]["delta"], "Discard this attempt.");
+    assert_eq!(events[3]["step"], 1);
+    assert_eq!(events[4]["step"], 1);
+    assert_eq!(events[5]["result"]["final_output"], "Recovered.");
+    assert_eq!(events[5]["result"]["steps"], 1);
+}
+
+#[test]
+fn ask_jsonl_preserves_tool_steps_and_saved_exchange() {
+    let (output, dir, requests) = run_responses_fixture_with_format(
+        vec![
+            completion_response(
+                &json!({"content": "Reading.", "tool_calls": call_delta("read_file", r#"{"path":"fixture.txt"}"#)["tool_calls"]}),
+                "tool_calls",
+            ),
+            completion_response(&json!({"content": "Final answer."}), "stop"),
+        ],
+        Some("--jsonl"),
+        false,
+        Some(2),
+        |_| {},
+    );
+    assert!(output.status.success(), "{:?}", output.stderr);
+    assert!(output.stderr.is_empty());
+    assert_eq!(requests.len(), 2);
+    let events: Vec<Value> = std::str::from_utf8(&output.stdout)
+        .expect("UTF-8")
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("JSON event"))
+        .collect();
+    assert_eq!(
+        events
+            .iter()
+            .map(|event| event["type"].as_str().expect("type"))
+            .collect::<Vec<_>>(),
+        [
+            "start",
+            "step_start",
+            "text_delta",
+            "step_start",
+            "text_delta",
+            "final"
+        ]
+    );
+    assert_eq!(events[2]["step"], 1);
+    assert_eq!(events[2]["delta"], "Reading.");
+    assert_eq!(events[4]["step"], 2);
+    let result = &events[5]["result"];
+    assert_eq!(result["final_output"], "Final answer.");
+    assert_eq!(
+        result["tool_calls"],
+        json!([{"name": "read_file", "status": "success"}])
+    );
+    let session_dir = dir
+        .path()
+        .join("state/sessions")
+        .join(result["session_id"].as_str().expect("saved ID"));
+    let state = rune_session::load_read_only(
+        camino::Utf8Path::from_path(&session_dir).expect("UTF-8 path"),
+    )
+    .expect("saved JSONL exchange");
+    assert!(state.events.iter().any(|frame| matches!(&frame.event,
+        rune_session::SessionEvent::ToolResult { ok: true, output, .. } if output.contains("ALLOWED_READ_RESULT"))));
 }

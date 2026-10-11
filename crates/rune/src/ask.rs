@@ -2,7 +2,7 @@
 //!
 //! Runs a bounded turn, prints the assistant output to standard output and
 //! every diagnostic to standard error, and exits. With `--json` it prints one
-//! object instead, which is the contract scripts depend on. This path supports
+//! object instead; `--jsonl` streams bounded event records. This path supports
 //! host tools under the configured permission policy without interactive approval.
 //! Completed exchanges are saved unless `--no-save` is selected.
 //!
@@ -11,7 +11,7 @@
 //! provider did not report is `null`, and a reported zero stays `0`, because the
 //! difference matters to a caller summing them.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::io::Write;
 
 use rune_agent::history::History;
@@ -50,10 +50,124 @@ pub struct Options {
     pub prompt: String,
     /// Emit one JSON object instead of Markdown.
     pub json: bool,
+    /// Stream bounded JSONL records instead of Markdown or one JSON result.
+    pub jsonl: bool,
     /// Do not create or update a session.
     pub no_save: bool,
     /// Execute host tools in a bounded loop. The review command stays text-only.
     pub tool_loop: bool,
+}
+
+/// Hard cap for one JSONL record, including its terminating newline.
+pub const MAX_JSONL_EVENT_BYTES: usize = 1024 * 1024;
+
+/// Raw delta chunk cap, allowing even six-byte JSON escapes within the record cap.
+const MAX_JSONL_DELTA_BYTES: usize = 8 * 1024;
+
+#[derive(Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum JsonlEvent<'a> {
+    Start {},
+    StepStart { step: u32 },
+    StepRestart { step: u32 },
+    TextDelta { step: u32, delta: &'a str },
+    Final { result: &'a JsonResult },
+}
+
+/// Stages one complete record without ever growing beyond the wire cap.
+#[derive(Default)]
+struct JsonlBuffer {
+    bytes: Vec<u8>,
+    overflow: bool,
+}
+
+impl Write for JsonlBuffer {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if bytes.len() > (MAX_JSONL_EVENT_BYTES - 1).saturating_sub(self.bytes.len()) {
+            self.overflow = true;
+            return Err(std::io::Error::other("JSONL event exceeds its byte cap"));
+        }
+        let required = self.bytes.len().saturating_add(bytes.len());
+        if self.bytes.capacity() < required {
+            let capacity = self
+                .bytes
+                .capacity()
+                .saturating_mul(2)
+                .max(required)
+                .min(MAX_JSONL_EVENT_BYTES);
+            self.bytes
+                .reserve_exact(capacity.saturating_sub(self.bytes.len()));
+        }
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn write_jsonl(writer: &mut impl Write, event: &JsonlEvent<'_>) -> Result<()> {
+    let mut buffer = JsonlBuffer::default();
+    if let Err(error) = serde_json::to_writer(&mut buffer, event) {
+        return Err(if buffer.overflow {
+            RuneError::too_large(
+                "jsonl_event",
+                MAX_JSONL_EVENT_BYTES + 1,
+                MAX_JSONL_EVENT_BYTES,
+            )
+        } else {
+            RuneError::new(ErrorCode::Internal, error.to_string())
+        });
+    }
+    buffer.bytes.reserve_exact(1);
+    buffer.bytes.push(b'\n');
+    writer
+        .write_all(&buffer.bytes)
+        .and_then(|()| writer.flush())
+        .map_err(|error| RuneError::new(ErrorCode::IoFailure, error.to_string()))?;
+    Ok(())
+}
+
+fn write_text_deltas(writer: &mut impl Write, step: u32, mut delta: &str) -> Result<()> {
+    while !delta.is_empty() {
+        let mut end = delta.len().min(MAX_JSONL_DELTA_BYTES);
+        while !delta.is_char_boundary(end) {
+            end = end.saturating_sub(1);
+        }
+        write_jsonl(
+            writer,
+            &JsonlEvent::TextDelta {
+                step,
+                delta: &delta[..end],
+            },
+        )?;
+        delta = &delta[end..];
+    }
+    Ok(())
+}
+
+/// Starts the JSONL stream before prompt validation or provider setup.
+pub fn start_jsonl() -> Result<()> {
+    write_jsonl(&mut std::io::stdout().lock(), &JsonlEvent::Start {})
+}
+
+/// Emits a final record, replacing an oversized result with a bounded failure.
+/// Returns the effective exit code and prints any size diagnostic on stderr.
+pub fn final_jsonl(result: &JsonResult) -> Result<u8> {
+    match write_jsonl(&mut std::io::stdout().lock(), &JsonlEvent::Final { result }) {
+        Ok(()) => Ok(u8::try_from(result.exit_code).unwrap_or(EXIT_FAILURE)),
+        Err(error) if error.code() == ErrorCode::TooLarge => {
+            let failure = JsonResult::failure("", &error, i32::from(EXIT_FAILURE));
+            write_jsonl(
+                &mut std::io::stdout().lock(),
+                &JsonlEvent::Final { result: &failure },
+            )?;
+            let _ = writeln!(std::io::stderr().lock(), "rune: {error}");
+            Ok(EXIT_FAILURE)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 /// One tool call as reported in the JSON result.
@@ -174,6 +288,9 @@ struct AskHost<'a> {
     steering: SteeringQueue,
     cancellation: Cancellation,
     incomplete_tool_call: Cell<bool>,
+    jsonl: bool,
+    step: Cell<u32>,
+    emit_error: RefCell<Option<RuneError>>,
 }
 
 impl Host for AskHost<'_> {
@@ -227,7 +344,27 @@ impl Host for AskHost<'_> {
         );
     }
 
-    fn emit(&self, _event: Event) {}
+    fn emit(&self, event: Event) {
+        if !self.jsonl || self.emit_error.borrow().is_some() {
+            return;
+        }
+        let mut stdout = std::io::stdout().lock();
+        let result = match event {
+            Event::TurnStarted { step } => {
+                self.step.set(step);
+                write_jsonl(&mut stdout, &JsonlEvent::StepStart { step })
+            }
+            Event::StepRestarted { step } => {
+                write_jsonl(&mut stdout, &JsonlEvent::StepRestart { step })
+            }
+            Event::TextDelta { delta } => write_text_deltas(&mut stdout, self.step.get(), &delta),
+            _ => Ok(()),
+        };
+        if let Err(error) = result {
+            *self.emit_error.borrow_mut() = Some(error);
+            self.cancellation.cancel();
+        }
+    }
 
     fn execute(&self, name: &str, arguments: &serde_json::Value) -> Result<ToolOutput> {
         self.registry.call(name, arguments, &self.context)
@@ -271,8 +408,8 @@ impl Host for AskHost<'_> {
 
 /// Runs one bounded turn and returns the result to report.
 ///
-/// Performs no printing, so the caller decides the output shape and the tests
-/// can assert on the result directly.
+/// With JSONL enabled, emits deltas synchronously with bounded staging and
+/// stdout backpressure. The caller emits the start and final records.
 pub fn run(
     settings: &Settings,
     paths: &Paths,
@@ -362,9 +499,16 @@ pub fn run(
         steering: SteeringQueue::from_limits(&limits),
         cancellation: Cancellation::new(),
         incomplete_tool_call: Cell::new(false),
+        jsonl: options.jsonl,
+        step: Cell::new(0),
+        emit_error: RefCell::new(None),
         limits,
     };
-    let outcome = turn::run_turn(&mut history, &host)?;
+    let outcome = turn::run_turn(&mut history, &host);
+    if let Some(error) = host.emit_error.borrow_mut().take() {
+        return Err(error);
+    }
+    let outcome = outcome?;
     let error = if host.incomplete_tool_call.get() {
         Some(RuneError::new(
             ErrorCode::UnsupportedToolCall,
@@ -526,11 +670,16 @@ fn save_exchange(
 /// Markdown goes to standard output and diagnostics to standard error, so a
 /// pipeline can consume the answer while a human still sees progress.
 pub fn report(result: &JsonResult, options: &Options) -> Result<u8> {
-    if options.json {
+    let code = if options.jsonl {
+        final_jsonl(result)?
+    } else {
+        u8::try_from(result.exit_code).unwrap_or(EXIT_FAILURE)
+    };
+    if !options.jsonl && options.json {
         let mut stdout = std::io::stdout().lock();
         writeln!(stdout, "{}", result.render()?)
             .map_err(|err| RuneError::new(ErrorCode::Internal, err.to_string()))?;
-    } else if result.error.is_none() {
+    } else if !options.jsonl && result.error.is_none() {
         let mut stdout = std::io::stdout().lock();
         write!(stdout, "{}", result.final_output)
             .map_err(|err| RuneError::new(ErrorCode::Internal, err.to_string()))?;
@@ -544,7 +693,7 @@ pub fn report(result: &JsonResult, options: &Options) -> Result<u8> {
         let _ = writeln!(stderr, "rune: {error}");
     }
 
-    Ok(u8::try_from(result.exit_code).unwrap_or(EXIT_FAILURE))
+    Ok(code)
 }
 
 #[cfg(test)]
@@ -559,6 +708,81 @@ mod tests {
             base_url: Some("https://api.example.com".to_owned()),
             ..Settings::default()
         }
+    }
+
+    #[test]
+    fn jsonl_splits_escaped_unicode_deltas_and_flushes_each_record() {
+        #[derive(Default)]
+        struct Output {
+            bytes: Vec<u8>,
+            flushes: usize,
+        }
+        impl Write for Output {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.bytes.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                self.flushes += 1;
+                Ok(())
+            }
+        }
+        let delta = format!(
+            "{}{}",
+            "a".repeat(MAX_JSONL_DELTA_BYTES - 1),
+            "🌱\n\0\"".repeat(5000)
+        );
+        let mut output = Output::default();
+        write_text_deltas(&mut output, 2, &delta).expect("write deltas");
+        let lines = std::str::from_utf8(&output.bytes).expect("UTF-8");
+        let mut joined = String::new();
+        for line in lines.lines() {
+            assert!(line.len() < MAX_JSONL_EVENT_BYTES);
+            let event: serde_json::Value = serde_json::from_str(line).expect("JSON event");
+            assert_eq!(event["type"], "text_delta");
+            assert_eq!(event["step"], 2);
+            let chunk = event["delta"].as_str().expect("delta");
+            assert!(chunk.len() <= MAX_JSONL_DELTA_BYTES);
+            joined.push_str(chunk);
+        }
+        assert_eq!(joined, delta);
+        assert_eq!(output.flushes, lines.lines().count());
+        assert!(output.flushes > 1);
+    }
+
+    #[test]
+    fn jsonl_rejects_oversized_serialized_records_before_writing_stdout() {
+        let mut result = JsonResult::failure("m", &RuneError::new(ErrorCode::Internal, "x"), 1);
+        result.output = "\0".repeat(MAX_JSONL_EVENT_BYTES / 6);
+        let mut stdout = Vec::new();
+        let error = write_jsonl(&mut stdout, &JsonlEvent::Final { result: &result })
+            .expect_err("escaped record exceeds cap");
+        assert_eq!(error.code(), ErrorCode::TooLarge);
+        assert!(stdout.is_empty());
+        let mut buffer = JsonlBuffer::default();
+        buffer
+            .write_all(&vec![b'a'; MAX_JSONL_EVENT_BYTES - 1])
+            .expect("at cap");
+        assert!(buffer.write_all(b"b").is_err());
+        assert_eq!(buffer.bytes.len(), MAX_JSONL_EVENT_BYTES - 1);
+        buffer.bytes.reserve_exact(1);
+        buffer.bytes.push(b'\n');
+        assert!(buffer.bytes.capacity() <= MAX_JSONL_EVENT_BYTES);
+    }
+
+    #[test]
+    fn jsonl_propagates_output_failure() {
+        struct Closed;
+        impl Write for Closed {
+            fn write(&mut self, _bytes: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::ErrorKind::BrokenPipe.into())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let error = write_text_deltas(&mut Closed, 1, "hello").expect_err("closed pipe");
+        assert_eq!(error.code(), ErrorCode::IoFailure);
     }
 
     #[test]

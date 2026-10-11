@@ -277,9 +277,25 @@ fn run_ask(
     launch: &Launch,
     output: &OutputFlags,
 ) -> Result<ExitCode> {
+    let jsonl = launch.has_flag("--jsonl");
+    if jsonl {
+        ask::start_jsonl()?;
+    }
     let submitted: String = launch.args.join(" ");
     let prompt = if submitted.trim().is_empty() {
-        ask::read_stdin_prompt()?
+        match ask::read_stdin_prompt() {
+            Ok(prompt) => prompt,
+            Err(err) => {
+                if jsonl {
+                    ask::final_jsonl(&ask::JsonResult::failure(
+                        &settings.model,
+                        &err,
+                        i32::from(EXIT_FAILURE),
+                    ))?;
+                }
+                return Err(err);
+            }
+        }
     } else {
         submitted
     };
@@ -287,9 +303,13 @@ fn run_ask(
     if prompt.trim().is_empty() {
         let err = RuneError::missing_field("prompt")
             .with_hint("pass the prompt as an argument, or pipe it on standard input");
-        if output.json {
+        if jsonl || output.json {
             let result = ask::JsonResult::failure(&settings.model, &err, i32::from(EXIT_FAILURE));
-            println!("{}", result.render()?);
+            if jsonl {
+                ask::final_jsonl(&result)?;
+            } else {
+                println!("{}", result.render()?);
+            }
         }
         return Err(err);
     }
@@ -297,6 +317,7 @@ fn run_ask(
     let options = ask::Options {
         prompt,
         json: output.json,
+        jsonl,
         no_save: launch.has_flag("--no-save"),
         tool_loop: true,
     };
@@ -307,11 +328,15 @@ fn run_ask(
             Ok(ExitCode::from(code))
         }
         Err(err) => {
-            if options.json {
+            if options.jsonl || options.json {
                 let result =
                     ask::JsonResult::failure(&settings.model, &err, i32::from(EXIT_FAILURE));
                 // The returned error is reported by main, including its hint.
-                let _ = writeln!(std::io::stdout().lock(), "{}", result.render()?);
+                if options.jsonl {
+                    ask::final_jsonl(&result)?;
+                } else {
+                    let _ = writeln!(std::io::stdout().lock(), "{}", result.render()?);
+                }
             }
             Err(err)
         }
@@ -364,6 +389,7 @@ fn run_review(
     let options = ask::Options {
         prompt,
         json: output.json,
+        jsonl: false,
         no_save: false,
         tool_loop: false,
     };

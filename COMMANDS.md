@@ -41,6 +41,7 @@ Run one bounded turn without an interactive session
 | Flag | Description |
 |---|---|
 | `--json` | Print one JSON object instead of Markdown. |
+| `--jsonl` | Stream bounded JSONL events (takes precedence over --json). |
 | `--no-save` | Do not create a session. |
 ### `rune acp [--log-file <path>]`
 
