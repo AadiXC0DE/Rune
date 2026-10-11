@@ -468,7 +468,7 @@
     <div class="wrap">
       <div>
         <h1 class="rise">A coding agent in one <em>3&nbsp;MiB</em> binary.</h1>
-        <p class="lede rise">Native Rust, sandboxed, and model agnostic. It starts in about 2 ms, and every rule it applies names the file that set it.</p>
+        <p class="lede rise">Native Rust, sandboxed, and model agnostic. Startup work budgets are enforced in CI, and every rule it applies names the file that set it.</p>
         <div class="install rise">
           <div role="tablist" aria-label="Install with">
             <button role="tab" aria-selected="true" data-target="brew">brew</button>
@@ -488,7 +488,7 @@
             <button class="copy" data-copy="cmd-source">copy</button>
           </div>
         </div>
-        <p class="meta rise"><b>3.1 MiB</b> binary &nbsp;/&nbsp; <b>~2 ms</b> to start &nbsp;/&nbsp; Apache-2.0</p>
+        <p class="meta rise"><b>3.1 MiB</b> binary &nbsp;/&nbsp; <b>5 ms</b> version work ceiling &nbsp;/&nbsp; Apache-2.0</p>
       </div>
       <div class="glyph" aria-hidden="true"><canvas id="glyph"></canvas></div>
     </div>
@@ -558,7 +558,7 @@
       <h2 class="rise">Small on purpose, and held there.</h2>
       <p class="sub rise">Each of these is enforced by a test or a build step, not a promise.</p>
       <dl class="points">
-        <div class="rise"><dt>A budget, not an aspiration</dt><dd>Binary size and startup are measured on every pull request against a ceiling of 8 MiB and 5 ms. The build fails when either is crossed.</dd></div>
+        <div class="rise"><dt>A budget, not an aspiration</dt><dd>Every pull request checks an 8 MiB binary size ceiling and startup work ceilings of 5 ms for <code>--version</code> and 8 ms for <code>--help</code>. Work uses the baseline-subtracted minimum-of-31, or the raw minimum when no baseline is available. Budget output also reports raw process latency minimum, median and p95. The build fails when a ceiling is crossed.</dd></div>
         <div class="rise"><dt>Commands run in a sandbox</dt><dd>Seatbelt on macOS, bubblewrap on Linux. Writes stay in the workspace, credential files cannot be read, and <code>rune doctor</code> says what your machine enforces.</dd></div>
         <div class="rise"><dt>Every decision names its source</dt><dd>A limit, a rule, a setting: <code>rune permissions</code> and <code>rune config --explain</code> answer which file decided, rather than restating the value.</dd></div>
         <div class="rise"><dt>Steer a turn while it runs</dt><dd>Type while the model works and the correction reaches it at the next step. Escape twice cancels, and the session carries on.</dd></div>

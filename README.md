@@ -6,9 +6,9 @@
 
 The audited stripped release build measured 4.50 MiB for
 `x86_64-unknown-linux-gnu` (GNU/Linux). The build enforces an 8 MiB ceiling
-and startup budgets. Written in Rust, with about 2 ms to start. One binary for
-the terminal, for scripts, and for embedding in other systems. Every limit,
-rule, and setting names the source that set it.
+and startup work budgets based on baseline-subtracted minimum-of-31 measurements.
+Written in Rust. One binary for the terminal, for scripts, and for embedding
+in other systems. Every limit, rule, and setting names the source that set it.
 
 [![CI](https://github.com/AadiXC0DE/Rune/actions/workflows/ci.yml/badge.svg)](https://github.com/AadiXC0DE/Rune/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
@@ -417,6 +417,14 @@ cargo xtask gate       # the above plus the size and startup budgets
 
 `gate` checks formatting and lint first, then the size and startup budgets,
 then the workspace tests. A failed step stops the gate immediately.
+
+`budget` reports raw process latency for `--version` and `--help`, including
+minimum-of-31, median and p95 (nearest rank, the 30th sorted sample). Each run
+measures wall time from process spawn through exit with stdout and stderr discarded.
+The enforced work budgets are 5 ms for `--version` and 8 ms for `--help`: the
+minimum-of-31 minus the system `true` process baseline minimum-of-31, clamped to
+zero. If no baseline is available, the raw minimum is used and labeled accordingly.
+Baseline-subtracted work is an estimate of additional work, not process latency.
 
 CI also builds `rune-web` for `wasm32-wasip1` and runs a fixture prompt through
 `rune_alloc`, `rune_configure`, and `rune_prompt` with Node.js 22's WASI runtime.

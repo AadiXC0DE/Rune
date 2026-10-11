@@ -200,6 +200,10 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Fixed
 
+- Startup budget output labels minimum-of-31 measurements and reports raw
+  process latency median and p95 separately from baseline-subtracted work.
+  The existing 5 ms version and 8 ms help work budgets remain unchanged.
+
 - `cargo xtask release` writes valid JSON manifests for channels containing
   quotes, backslashes, or control characters, preserving their exact values.
 

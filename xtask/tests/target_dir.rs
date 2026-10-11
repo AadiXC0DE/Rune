@@ -96,8 +96,27 @@ fn budget_measures_and_runs_the_binary_in_cargos_target_directory() {
             stdout.contains(&format!("binary size  {size} bytes")),
             "{output:?}"
         );
-        assert!(stdout.contains("startup --version"), "{output:?}");
-        assert!(stdout.contains("startup --help"), "{output:?}");
+        for flag in ["--version", "--help"] {
+            let line = stdout
+                .lines()
+                .find(|line| line.starts_with(&format!("startup {flag}")))
+                .expect("startup metrics line");
+            assert!(
+                line.contains("raw process latency: minimum-of-31"),
+                "{line}"
+            );
+            assert!(line.contains(" ms, median "), "{line}");
+            assert!(line.contains(" ms, p95 "), "{line}");
+            if stdout.contains("process baseline unavailable") {
+                assert!(line.contains("work without baseline subtraction"), "{line}");
+            } else {
+                assert!(line.contains("baseline-subtracted work"), "{line}");
+                assert!(
+                    stdout.contains("process baseline minimum-of-31"),
+                    "{stdout}"
+                );
+            }
+        }
         assert!(workspace.0.join("ran-fixture").exists(), "{output:?}");
     }
 }

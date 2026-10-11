@@ -8,7 +8,7 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
-/// Runs per measurement. The fastest is kept, so more samples only reduce noise.
+/// Serial runs per measurement, used for the minimum, median and p95.
 const MEASUREMENT_SAMPLES: usize = 31;
 
 /// Enforced release budget ceilings, distinct from measured build results.
@@ -16,10 +16,10 @@ mod targets {
     /// Largest accepted stripped release binary, in bytes.
     pub const MAX_BINARY_BYTES: u64 = 8 * 1024 * 1024;
 
-    /// Median startup for `rune --version`, in milliseconds.
+    /// Baseline-subtracted minimum-of-31 work for `rune --version`, in milliseconds.
     pub const MAX_VERSION_MS: f64 = 5.0;
 
-    /// Median startup for `rune --help`, in milliseconds.
+    /// Baseline-subtracted minimum-of-31 work for `rune --help`, in milliseconds.
     pub const MAX_HELP_MS: f64 = 8.0;
 }
 
@@ -103,6 +103,15 @@ fn print_budget_help() {
         "  The enforced binary size budget is an {} MiB ceiling ({} bytes).",
         targets::MAX_BINARY_BYTES / (1024 * 1024),
         targets::MAX_BINARY_BYTES
+    );
+    println!("  Startup reports raw process latency: minimum-of-31, median and p95.");
+    println!("  p95 uses nearest rank (the 30th sorted sample of 31).");
+    println!("  Work is minimum-of-31 minus the system true process baseline minimum-of-31,");
+    println!("  clamped to zero, or the raw minimum when no baseline is available.");
+    println!(
+        "  Work budgets: --version {} ms, --help {} ms.",
+        targets::MAX_VERSION_MS,
+        targets::MAX_HELP_MS
     );
 }
 
@@ -445,14 +454,17 @@ fn write(path: &str, contents: &str) -> Result<(), String> {
 
 /// Measures startup for the help and version paths.
 ///
-/// Uses the fastest observed run rather than the median. On a busy machine the
-/// median mostly measures contention, while the minimum is the closest estimate
-/// of the work the binary must actually do. The process floor is measured the
-/// same way and subtracted, so the number reported is our work rather than the
-/// host's fork and loader cost.
+/// Reports the raw distribution of spawn-to-exit wall times. The budget uses
+/// the minimum of 31 runs minus the baseline minimum, clamped to zero. This
+/// adjusted work estimate is distinct from the observed raw process latency.
 fn check_startup(binary: &Path) -> Result<(), String> {
     let floor = measure_floor()?;
-    println!("process floor       {floor:.2} ms");
+    match floor {
+        Some(floor) => println!("process baseline minimum-of-31 {floor:.2} ms (true)"),
+        None => {
+            println!("process baseline unavailable; using raw minimum-of-31 for the work budget");
+        }
+    }
 
     let cases = [
         ("--version", targets::MAX_VERSION_MS),
@@ -462,15 +474,14 @@ fn check_startup(binary: &Path) -> Result<(), String> {
     let mut failures = Vec::new();
 
     for (flag, budget_ms) in cases {
-        let raw = fastest_startup_ms(binary, flag)?;
-        let work = (raw - floor).max(0.0);
-        println!(
-            "startup {flag:<10} {raw:.2} ms raw, {work:.2} ms work (budget {budget_ms:.0} ms)"
-        );
+        let raw = startup_metrics(binary, flag)?;
+        let work = raw.work_ms(floor);
+        println!("{}", raw.report(flag, floor, budget_ms));
 
         if work > budget_ms {
             failures.push(format!(
-                "{flag} took {work:.2} ms of work, budget is {budget_ms:.0} ms"
+                "{flag} took {work:.2} ms of {}, budget is {budget_ms:.0} ms",
+                work_label(floor)
             ));
         }
     }
@@ -484,17 +495,17 @@ fn check_startup(binary: &Path) -> Result<(), String> {
 
 /// Measures the cost of starting a trivial program.
 ///
-/// This is the fork and exec floor plus the dynamic loader for a system binary.
-/// Subtracting it isolates the work this binary does.
-fn measure_floor() -> Result<f64, String> {
+/// Includes spawn, execution and waiting for exit of a system `true` binary.
+/// Subtracting its minimum gives an estimate of additional work, not latency.
+fn measure_floor() -> Result<Option<f64>, String> {
     let candidates = ["/usr/bin/true", "/bin/true"];
     let Some(program) = candidates.iter().find(|path| Path::new(path).exists()) else {
         // Without a suitable baseline the raw measurement stands on its own.
-        return Ok(0.0);
+        return Ok(None);
     };
 
-    let mut samples = Vec::with_capacity(MEASUREMENT_SAMPLES);
-    for _ in 0..MEASUREMENT_SAMPLES {
+    let mut samples = [0.0; MEASUREMENT_SAMPLES];
+    for sample in &mut samples {
         let start = std::time::Instant::now();
         let status = Command::new(program)
             .stdout(std::process::Stdio::null())
@@ -504,21 +515,58 @@ fn measure_floor() -> Result<f64, String> {
         if !status.success() {
             return Err(format!("`{program}` exited with a failure"));
         }
-        samples.push(start.elapsed().as_secs_f64() * 1000.0);
+        *sample = start.elapsed().as_secs_f64() * 1000.0;
     }
-    Ok(fastest(samples))
+    Ok(Some(StartupMetrics::from_samples(samples).minimum))
 }
 
-/// Returns the smallest sample, the least noisy estimate of true cost.
-fn fastest(mut samples: Vec<f64>) -> f64 {
-    samples.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    samples.first().copied().unwrap_or(0.0)
+/// Raw spawn-to-exit wall times in milliseconds, without baseline subtraction.
+struct StartupMetrics {
+    minimum: f64,
+    median: f64,
+    p95: f64,
 }
 
-/// Returns the fastest wall time in milliseconds for one invocation path.
-fn fastest_startup_ms(binary: &Path, flag: &str) -> Result<f64, String> {
-    let mut samples = Vec::with_capacity(MEASUREMENT_SAMPLES);
-    for _ in 0..MEASUREMENT_SAMPLES {
+impl StartupMetrics {
+    fn from_samples(mut samples: [f64; MEASUREMENT_SAMPLES]) -> Self {
+        // Nearest rank: ceil(0.95 * 31) = 30, with a zero-based index of 29.
+        const P95_INDEX: usize = (95 * MEASUREMENT_SAMPLES).div_ceil(100) - 1;
+        samples.sort_by(f64::total_cmp);
+        Self {
+            minimum: samples[0],
+            median: samples[MEASUREMENT_SAMPLES / 2],
+            p95: samples[P95_INDEX],
+        }
+    }
+
+    fn work_ms(&self, floor: Option<f64>) -> f64 {
+        (self.minimum - floor.unwrap_or(0.0)).max(0.0)
+    }
+
+    fn report(&self, flag: &str, floor: Option<f64>, budget_ms: f64) -> String {
+        format!(
+            "startup {flag:<10} raw process latency: minimum-of-{MEASUREMENT_SAMPLES} {:.2} ms, median {:.2} ms, p95 {:.2} ms; {} {:.2} ms (budget {budget_ms:.0} ms)",
+            self.minimum,
+            self.median,
+            self.p95,
+            work_label(floor),
+            self.work_ms(floor)
+        )
+    }
+}
+
+fn work_label(floor: Option<f64>) -> &'static str {
+    if floor.is_some() {
+        "baseline-subtracted work"
+    } else {
+        "work without baseline subtraction"
+    }
+}
+
+/// Measures all 31 raw wall times for one invocation path.
+fn startup_metrics(binary: &Path, flag: &str) -> Result<StartupMetrics, String> {
+    let mut samples = [0.0; MEASUREMENT_SAMPLES];
+    for sample in &mut samples {
         let start = std::time::Instant::now();
         let status = Command::new(binary)
             .arg(flag)
@@ -532,10 +580,10 @@ fn fastest_startup_ms(binary: &Path, flag: &str) -> Result<f64, String> {
                 binary.display()
             ));
         }
-        samples.push(start.elapsed().as_secs_f64() * 1000.0);
+        *sample = start.elapsed().as_secs_f64() * 1000.0;
     }
 
-    Ok(fastest(samples))
+    Ok(StartupMetrics::from_samples(samples))
 }
 
 /// Crates whose duplicate versions are accepted, with the reason.
@@ -628,6 +676,44 @@ mod tests {
     #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 
     use super::*;
+
+    #[test]
+    fn startup_distribution_reports_raw_minimum_median_and_nearest_rank_p95() {
+        let samples = std::array::from_fn(|index| (MEASUREMENT_SAMPLES - index) as f64);
+        let metrics = StartupMetrics::from_samples(samples);
+        assert!((metrics.minimum - 1.0).abs() < f64::EPSILON);
+        assert!((metrics.median - 16.0).abs() < f64::EPSILON);
+        assert!((metrics.p95 - 30.0).abs() < f64::EPSILON);
+        // Tails above the budget must not change the existing minimum-based gate.
+        assert!(metrics.median > targets::MAX_VERSION_MS);
+        assert!(metrics.p95 > targets::MAX_VERSION_MS);
+        assert!(metrics.work_ms(Some(0.5)) <= targets::MAX_VERSION_MS);
+        assert_eq!(
+            metrics.report("--version", Some(0.5), targets::MAX_VERSION_MS),
+            "startup --version  raw process latency: minimum-of-31 1.00 ms, median 16.00 ms, p95 30.00 ms; baseline-subtracted work 0.50 ms (budget 5 ms)"
+        );
+    }
+
+    #[test]
+    fn startup_work_is_clamped_without_subtracting_from_raw_metrics() {
+        let metrics = StartupMetrics::from_samples([1.0; MEASUREMENT_SAMPLES]);
+        assert!(metrics.work_ms(Some(2.0)).abs() < f64::EPSILON);
+        assert_eq!(
+            metrics.report("--help", Some(2.0), targets::MAX_HELP_MS),
+            "startup --help     raw process latency: minimum-of-31 1.00 ms, median 1.00 ms, p95 1.00 ms; baseline-subtracted work 0.00 ms (budget 8 ms)"
+        );
+    }
+
+    #[test]
+    fn startup_without_a_baseline_labels_the_unadjusted_work_budget() {
+        let metrics = StartupMetrics::from_samples([9.0; MEASUREMENT_SAMPLES]);
+        assert!((metrics.work_ms(None) - 9.0).abs() < f64::EPSILON);
+        assert!(metrics.work_ms(None) > targets::MAX_HELP_MS);
+        assert_eq!(
+            metrics.report("--help", None, targets::MAX_HELP_MS),
+            "startup --help     raw process latency: minimum-of-31 9.00 ms, median 9.00 ms, p95 9.00 ms; work without baseline subtraction 9.00 ms (budget 8 ms)"
+        );
+    }
 
     /// Returns the tar header of an archive, for assertions about its fields.
     fn header_of(archive: &[u8]) -> &[u8] {
