@@ -1034,6 +1034,49 @@ fn cancelling_stops_the_active_turn_and_the_connection_stays_usable() {
 }
 
 #[test]
+fn model_and_effort_changes_survive_loading_and_resuming() {
+    let mut harness = Harness::start(
+        vec![Script::text("loaded"), Script::text("resumed")],
+        PermissionMode::Auto,
+    );
+    let session = harness.open_session();
+    for (id, option, value) in [
+        (3, "model", "fixture/first"),
+        (4, "effort", "low"),
+        (5, "model", " fixture/chosen "),
+        (6, "effort", "high"),
+    ] {
+        let response = harness.client().call(
+            id,
+            "session/set_config_option",
+            &json!({"sessionId": session, "configId": option, "value": value}),
+        );
+        assert!(response.get("error").is_none(), "{response}");
+    }
+
+    for (id, method) in [(7, "session/load"), (10, "session/resume")] {
+        let closed = harness
+            .client()
+            .call(id, "session/close", &json!({"sessionId": session}));
+        assert_eq!(closed["result"], json!({}));
+        let response = harness
+            .client()
+            .call(id + 1, method, &json!({"sessionId": session}));
+        let options = &response["result"]["configOptions"];
+        assert_eq!(options[0]["currentValue"], "fixture/chosen", "{method}");
+        assert_eq!(options[1]["currentValue"], "high", "{method}");
+        let answered =
+            harness
+                .client()
+                .call(id + 2, "session/prompt", &prompt(&session, "continue"));
+        assert_eq!(answered["result"]["stopReason"], "end_turn");
+        let body = harness.mock.last_body().expect("provider request");
+        assert_eq!(body["model"], "fixture/chosen");
+        assert_eq!(body["reasoning_effort"], "high");
+    }
+}
+
+#[test]
 fn loading_replays_a_stored_conversation_while_resuming_does_not() {
     let mut harness = Harness::start(vec![Script::text("answer")], PermissionMode::Auto);
     let session = harness.open_session();

@@ -55,6 +55,14 @@ impl SessionConfig {
             mode,
         }
     }
+
+    /// Records model settings together so changing one preserves the other.
+    fn model_event(&self) -> SessionEvent {
+        SessionEvent::ModelSet {
+            model: self.model.clone(),
+            effort: self.effort,
+        }
+    }
 }
 
 /// What `session/list` reports about one stored session.
@@ -205,6 +213,7 @@ impl Sessions {
                     store.append(SessionEvent::WorkspaceSet {
                         workspace: workspace.to_string(),
                     })?;
+                    store.append(self.defaults.model_event())?;
                     let name = id.to_string();
                     self.entries.insert(
                         name.clone(),
@@ -296,6 +305,17 @@ impl Sessions {
         self.entries.remove(key.as_str());
         let store = SessionStore::open(&self.paths.session_dir(&key))?;
         let state = store.read()?;
+        let mut config = self.defaults.clone();
+        if let Some((model, effort)) = state.events.iter().rev().find_map(|frame| {
+            if let SessionEvent::ModelSet { model, effort } = &frame.event {
+                Some((model, effort))
+            } else {
+                None
+            }
+        }) {
+            config.model.clone_from(model);
+            config.effort = *effort;
+        }
         let history = history_from_events(&state.events);
         history.validate().map_err(|err| {
             RuneError::invariant(
@@ -309,7 +329,7 @@ impl Sessions {
             name.clone(),
             Session {
                 id: name,
-                config: self.defaults.clone(),
+                config,
                 workspace: state
                     .workspace
                     .map_or_else(|| self.workspace.clone(), Utf8PathBuf::from),
@@ -387,12 +407,13 @@ impl Sessions {
         Ok(parsed.to_string())
     }
 
-    /// Changes a configuration option.
+    /// Saves a configuration option before applying it to subsequent turns.
     pub fn set_config_option(&mut self, id: &str, option: &str, value: &str) -> Result<()> {
         let session = self
             .entries
             .get_mut(id)
             .ok_or_else(|| unknown_session(id))?;
+        let mut config = session.config.clone();
         match option {
             "model" => {
                 let model = value.trim();
@@ -403,8 +424,7 @@ impl Sessions {
                 if model.len() > MAX_MODEL_BYTES {
                     return Err(RuneError::too_large("model", model.len(), MAX_MODEL_BYTES));
                 }
-                model.clone_into(&mut session.config.model);
-                Ok(())
+                model.clone_into(&mut config.model);
             }
             "effort" => {
                 let effort = parse_effort(value).ok_or_else(|| {
@@ -414,15 +434,19 @@ impl Sessions {
                     )
                     .with_hint("use auto, none, minimal, low, medium, high, xhigh, or max")
                 })?;
-                session.config.effort = effort;
-                Ok(())
+                config.effort = effort;
             }
-            other => Err(RuneError::new(
-                ErrorCode::NotFound,
-                format!("no configuration option named `{other}`"),
-            )
-            .with_hint("this server offers `model` and `effort`")),
+            other => {
+                return Err(RuneError::new(
+                    ErrorCode::NotFound,
+                    format!("no configuration option named `{other}`"),
+                )
+                .with_hint("this server offers `model` and `effort`"));
+            }
         }
+        session.store.append(config.model_event())?;
+        session.config = config;
+        Ok(())
     }
 
     /// Changes the permission mode.
@@ -689,6 +713,9 @@ pub fn history_from_events(frames: &[EventFrame]) -> History {
 
     for frame in rune_session::replay::replay_events(frames) {
         match &frame.event {
+            // Model settings are metadata, not conversation boundaries. A
+            // client may change them while a tool batch is still being saved.
+            SessionEvent::ModelSet { .. } => {}
             SessionEvent::ToolCall {
                 call_id,
                 name,
@@ -1239,6 +1266,96 @@ mod tests {
     }
 
     #[test]
+    fn saved_model_settings_survive_a_new_connection_with_different_defaults() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let mut original = sessions(&root);
+        let untouched = original.create(Vec::new()).expect("untouched session");
+        let model_only = original.create(Vec::new()).expect("model session");
+        original
+            .set_config_option(&model_only, "model", "chosen/model")
+            .expect("model");
+        let effort_only = original.create(Vec::new()).expect("effort session");
+        original
+            .set_config_option(&effort_only, "effort", "max")
+            .expect("effort");
+        drop(original);
+
+        let mut reconnected = Sessions::new(
+            paths_for(&root),
+            Utf8PathBuf::from("/tmp/work"),
+            SessionConfig::new("new/default", Effort::Low, PermissionMode::Ask),
+            &BudgetSet::new(),
+            Vec::new(),
+        );
+        for (id, model, effort) in [
+            (untouched, "test/model", Effort::Auto),
+            (model_only, "chosen/model", Effort::Auto),
+            (effort_only, "test/model", Effort::Max),
+        ] {
+            assert!(reconnected.load(&id).expect("load").is_empty());
+            let snapshot = reconnected.snapshot(&id).expect("snapshot");
+            assert_eq!(snapshot.config.model, model);
+            assert_eq!(snapshot.config.effort, effort);
+            assert_eq!(snapshot.config.mode, PermissionMode::Ask);
+        }
+    }
+
+    #[test]
+    fn sessions_without_saved_model_settings_use_connection_defaults() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let id = SessionId::generate();
+        drop(SessionStore::create(&paths_for(&root), &id).expect("legacy session"));
+        let mut sessions = sessions(&root);
+        assert!(sessions.load(id.as_str()).expect("load").is_empty());
+        assert_eq!(
+            sessions.get(id.as_str()).expect("session").config,
+            sessions.defaults
+        );
+    }
+
+    #[test]
+    fn invalid_config_changes_leave_saved_model_settings_intact() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let mut sessions = sessions(&root);
+        let id = sessions.create(Vec::new()).expect("create");
+        sessions
+            .set_config_option(&id, "model", "chosen/model")
+            .expect("model");
+        sessions
+            .set_config_option(&id, "effort", "high")
+            .expect("effort");
+        let saved = sessions
+            .get(&id)
+            .expect("session")
+            .store
+            .read()
+            .expect("saved log");
+        for (option, value) in [
+            ("model", " "),
+            ("model", &"a".repeat(MAX_MODEL_BYTES + 1)),
+            ("effort", "bogus"),
+            ("temperature", "1"),
+        ] {
+            assert!(sessions.set_config_option(&id, option, value).is_err());
+        }
+        assert_eq!(
+            sessions
+                .get(&id)
+                .expect("session")
+                .store
+                .read()
+                .expect("unchanged log")
+                .events,
+            saved.events
+        );
+        sessions.close(&id).expect("close");
+        sessions.load(&id).expect("load");
+        let config = sessions.get(&id).expect("session").config();
+        assert_eq!(config.model, "chosen/model");
+        assert_eq!(config.effort, Effort::High);
+    }
+
+    #[test]
     fn an_unknown_config_option_is_reported() {
         let root = tempfile::tempdir().expect("tempdir");
         let mut sessions = sessions(&root);
@@ -1301,6 +1418,45 @@ mod tests {
         grant(&mut rules, "shell", Some("ls"));
         grant(&mut rules, "shell", Some("rm"));
         assert_eq!(rules.len(), 2);
+    }
+
+    #[test]
+    fn model_changes_during_a_tool_batch_do_not_split_the_conversation() {
+        let frames: Vec<_> = [
+            SessionEvent::ToolCall {
+                call_id: "c1".to_owned(),
+                name: "read_file".to_owned(),
+                arguments: "{}".to_owned(),
+            },
+            SessionEvent::ModelSet {
+                model: "other/model".to_owned(),
+                effort: Effort::High,
+            },
+            SessionEvent::ToolCall {
+                call_id: "c2".to_owned(),
+                name: "read_file".to_owned(),
+                arguments: "{}".to_owned(),
+            },
+            SessionEvent::ToolResult {
+                call_id: "c1".to_owned(),
+                ok: true,
+                output: "first".to_owned(),
+            },
+            SessionEvent::ToolResult {
+                call_id: "c2".to_owned(),
+                ok: true,
+                output: "second".to_owned(),
+            },
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, event)| EventFrame::new(EventSeq(index as u64 + 1), 0, event))
+        .collect();
+        let history = history_from_events(&frames);
+        history.validate().expect("valid tool batch");
+        assert_eq!(history.turns().len(), 2);
+        assert_eq!(history.turns()[0].parts.len(), 2);
+        assert_eq!(history.turns()[1].parts.len(), 2);
     }
 
     #[test]

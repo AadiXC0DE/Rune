@@ -13,6 +13,7 @@
 //!   readable and the caller can decide whether to truncate or to recover.
 
 use camino::Utf8Path;
+use rune_core::config::Effort;
 use rune_core::error::{ErrorCode, Result, RuneError};
 use rune_core::id::EventSeq;
 use serde::{Deserialize, Serialize};
@@ -136,6 +137,13 @@ pub enum SessionEvent {
         /// Display title.
         title: String,
     },
+    /// The model settings for subsequent turns were saved.
+    ModelSet {
+        /// Selected model identifier.
+        model: String,
+        /// Selected reasoning effort.
+        effort: Effort,
+    },
     /// The session was created as a child of another.
     ///
     /// Recorded so the session can be kept out of ordinary discovery: a child is
@@ -175,6 +183,7 @@ impl SessionEvent {
             Self::Compaction { .. } => "compaction",
             Self::UsageRecorded { .. } => "usage_recorded",
             Self::TitleSet { .. } => "title_set",
+            Self::ModelSet { .. } => "model_set",
             Self::WorkspaceSet { .. } => "workspace_set",
             Self::ChildOf { .. } => "child_of",
         }
@@ -743,6 +752,10 @@ mod tests {
             },
             SessionEvent::TitleSet {
                 title: "tidy the parser".to_owned(),
+            },
+            SessionEvent::ModelSet {
+                model: "fixture/model".to_owned(),
+                effort: Effort::Max,
             },
         ];
 

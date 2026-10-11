@@ -172,6 +172,10 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Fixed
 
+- ACP saves model and reasoning effort selections in the session log and
+  restores them when loading or resuming, including after reconnecting.
+  Older sessions without saved selections use the connection defaults.
+
 - ACP usage updates report the capacity of the model used for that turn after
   a model switch, using the endpoint's model listing and a conservative fallback
   when capacity is unavailable. The default model honors its configured window;

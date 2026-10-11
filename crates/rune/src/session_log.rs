@@ -545,6 +545,7 @@ pub fn tree_of(state: &SessionState) -> Tree {
             | SessionEvent::Compaction { .. }
             | SessionEvent::UsageRecorded { .. }
             | SessionEvent::TitleSet { .. }
+            | SessionEvent::ModelSet { .. }
             | SessionEvent::WorkspaceSet { .. }
             | SessionEvent::ChildOf { .. } => continue,
         };
@@ -795,6 +796,7 @@ pub fn history_from(state: &SessionState) -> History {
             | SessionEvent::Compaction { .. }
             | SessionEvent::UsageRecorded { .. }
             | SessionEvent::TitleSet { .. }
+            | SessionEvent::ModelSet { .. }
             | SessionEvent::WorkspaceSet { .. }
             | SessionEvent::ChildOf { .. }
             | SessionEvent::TurnInterrupted { .. }
