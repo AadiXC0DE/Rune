@@ -1240,11 +1240,8 @@ fn run_acp(
         ),
         dialect,
         model: settings.model.clone(),
-        instructions: rune_context::prompt::instructions_for(
-            workspace,
-            &paths.config_root,
-            &settings.limits,
-        ),
+        instructions: String::new(),
+        instruction_loader: Some(rune_context::prompt::instructions_for),
         registry,
         rules,
         mode: settings.permission_mode,

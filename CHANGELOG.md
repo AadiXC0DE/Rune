@@ -172,6 +172,11 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Fixed
 
+- ACP uses the client-supplied session `cwd` for relative file operations,
+  workspace instructions and skills, and the cwd reported by session listings.
+  The workspace is saved for loading and resuming; an omitted cwd defaults to
+  the process's launch workspace.
+
 - Session event reads stay bounded when a log grows after its size check.
   Normal and recovery reads report `too_large` for `event_log` with the
   `log_size` invariant rather than returning a partial log past the size cap.

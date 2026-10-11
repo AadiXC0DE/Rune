@@ -23,7 +23,7 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-use camino::Utf8PathBuf;
+use camino::{Utf8Path, Utf8PathBuf};
 use rune_agent::history::History;
 use rune_agent::steering::{Cancellation, SteeringQueue};
 use rune_agent::turn::{Event, Host, StopReason, run_turn};
@@ -111,11 +111,14 @@ impl Dialect {
     }
 }
 
+/// Builds workspace-specific instructions using the host's existing loader.
+pub type InstructionLoader = fn(&Utf8Path, &Utf8Path, &BudgetSet) -> String;
+
 /// Everything one server process needs.
 pub struct ServerConfig {
     /// State layout, used to create and open sessions.
     pub paths: Paths,
-    /// Primary workspace every session is rooted at.
+    /// Default workspace when the client supplies no session cwd.
     pub workspace: Utf8PathBuf,
     /// Endpoint model requests go to.
     pub endpoint: Endpoint,
@@ -123,8 +126,10 @@ pub struct ServerConfig {
     pub dialect: Dialect,
     /// Model used unless a session overrides it.
     pub model: String,
-    /// System instructions for every turn.
+    /// Host instructions for every turn, independent of the session workspace.
     pub instructions: String,
+    /// Optional loader for project instructions and skills at the session cwd.
+    pub instruction_loader: Option<InstructionLoader>,
     /// Tool registry.
     pub registry: Registry,
     /// Rules in force before any session approval.
@@ -173,9 +178,8 @@ impl ServerConfig {
         let context_window = Catalog::new("acp")
             .metadata_or_default(&model)
             .usable_context();
-        let instructions = format!(
-            "You are Rune, a coding agent. The workspace is {workspace}. Inspect and change files with the tools."
-        );
+        let instructions =
+            "You are Rune, a coding agent. Inspect and change files with the tools.".to_owned();
         Ok(Self {
             paths,
             workspace,
@@ -183,6 +187,7 @@ impl ServerConfig {
             dialect: Dialect::default(),
             model,
             instructions,
+            instruction_loader: None,
             registry,
             rules: RuleSet::new(),
             mode: PermissionMode::default(),
@@ -233,6 +238,13 @@ impl ServerConfig {
     #[must_use]
     pub fn with_instructions(mut self, instructions: impl Into<String>) -> Self {
         self.instructions = instructions.into();
+        self
+    }
+
+    /// Sets the loader used to discover instructions at each session's cwd.
+    #[must_use]
+    pub const fn with_instruction_loader(mut self, loader: InstructionLoader) -> Self {
+        self.instruction_loader = Some(loader);
         self
     }
 
@@ -541,9 +553,9 @@ impl<W: Write + Send + 'static> Server<W> {
     /// Answers `session/new`.
     fn new_session(&self, params: &Value) -> std::result::Result<Value, RpcError> {
         let roots = additional_roots(params)?;
-        if let Some(cwd) = optional_string(params, "cwd")? {
-            require_absolute(&Utf8PathBuf::from(cwd), "cwd")?;
-        }
+        let workspace = optional_string(params, "cwd")?
+            .map_or_else(|| self.config.workspace.clone(), Utf8PathBuf::from);
+        require_absolute(&workspace, "cwd")?;
         if let Some(list) = params.get("mcpServers").and_then(Value::as_array)
             && !list.is_empty()
         {
@@ -556,7 +568,7 @@ impl<W: Write + Send + 'static> Server<W> {
         }
         let mut sessions = self.lock_sessions()?;
         let id = sessions
-            .create(roots)
+            .create_in(workspace, roots)
             .map_err(|err| RpcError::from_rune(&err))?;
         let session = sessions.get(&id).map_err(|err| RpcError::from_rune(&err))?;
         Ok(json!({
@@ -1099,7 +1111,20 @@ impl<W: Write + Send + 'static> Host for TurnHost<W> {
     }
 
     fn instructions(&self) -> String {
-        self.server.config.instructions.clone()
+        let config = &self.server.config;
+        let mut instructions = config.instructions.clone();
+        if let Some(loader) = config.instruction_loader {
+            instructions.push_str("\n\n");
+            instructions.push_str(&loader(
+                self.context.workspace(),
+                &config.paths.config_root,
+                &config.limits,
+            ));
+        }
+        instructions.push_str("\n\nThe workspace is ");
+        instructions.push_str(self.context.workspace().as_str());
+        instructions.push('.');
+        instructions
     }
 
     fn tools(&self) -> Vec<ToolSpec> {

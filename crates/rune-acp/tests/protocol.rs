@@ -276,7 +276,7 @@ struct Harness {
     /// Where the server writes its diagnostics.
     log_file: Utf8PathBuf,
     /// Held so the fixture directory outlives the server.
-    _root: tempfile::TempDir,
+    root: tempfile::TempDir,
 }
 
 impl Harness {
@@ -328,7 +328,7 @@ impl Harness {
             join: Some(join),
             mock,
             log_file,
-            _root: root,
+            root,
         }
     }
 
@@ -354,9 +354,12 @@ impl Harness {
             }),
         );
         assert_eq!(response["result"]["protocolVersion"], PROTOCOL_VERSION);
-        let response = self
-            .client()
-            .call(2, "session/new", &json!({"cwd": "/", "mcpServers": []}));
+        let workspace = self.root.path().join("workspace");
+        let response = self.client().call(
+            2,
+            "session/new",
+            &json!({"cwd": workspace, "mcpServers": []}),
+        );
         response["result"]["sessionId"]
             .as_str()
             .expect("a session id")
@@ -402,6 +405,32 @@ fn a_new_session_is_listed_with_its_identifier() {
     let listed = response["result"]["sessions"].as_array().expect("sessions");
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0]["sessionId"], session.as_str());
+}
+
+#[test]
+fn an_omitted_session_cwd_uses_the_launch_workspace() {
+    let mut harness = Harness::start(vec![Script::text("unused")], PermissionMode::Auto);
+    let expected = harness.root.path().join("workspace");
+    let created = harness.client().call(1, "session/new", &json!({}));
+    assert!(created["result"]["sessionId"].is_string(), "{created}");
+    let listed = harness.client().call(2, "session/list", &json!({}));
+    assert_eq!(
+        listed["result"]["sessions"][0]["cwd"],
+        expected.to_str().expect("utf8")
+    );
+}
+
+#[test]
+fn invalid_session_working_directories_are_rejected_without_creating_a_session() {
+    let mut harness = Harness::start(vec![Script::text("unused")], PermissionMode::Auto);
+    for cwd in [json!("relative"), json!(42)] {
+        let response = harness
+            .client()
+            .call(1, "session/new", &json!({"cwd": cwd}));
+        assert_eq!(response["error"]["code"], -32602, "{response}");
+    }
+    let listed = harness.client().call(2, "session/list", &json!({}));
+    assert_eq!(listed["result"]["sessions"], json!([]));
 }
 
 #[test]

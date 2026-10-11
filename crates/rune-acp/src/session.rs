@@ -5,9 +5,9 @@
 //! again reaches the same conversation, and a client that reconnects can be sent
 //! the whole transcript again as updates.
 //!
-//! Every session is rooted at the workspace the server was started in. One server
-//! process serves one primary workspace, so a session cannot silently operate
-//! somewhere else.
+//! Each session is rooted at the workspace requested by the client. The launch
+//! workspace is the default when no working directory was supplied, including
+//! for older stored sessions that have no recorded workspace.
 
 use std::collections::BTreeMap;
 
@@ -73,6 +73,7 @@ pub struct SessionSummary {
 pub struct Session {
     id: String,
     config: SessionConfig,
+    workspace: Utf8PathBuf,
     history: History,
     /// Rules granted by an approval for this session only.
     grants: RuleSet,
@@ -162,6 +163,15 @@ impl Sessions {
     /// limit, because a client that opens sessions in a loop would otherwise hold
     /// one writer lock per iteration.
     pub fn create(&mut self, additional_roots: Vec<Utf8PathBuf>) -> Result<String> {
+        self.create_in(self.workspace.clone(), additional_roots)
+    }
+
+    /// Creates a session rooted at the client-requested workspace.
+    pub fn create_in(
+        &mut self,
+        workspace: Utf8PathBuf,
+        additional_roots: Vec<Utf8PathBuf>,
+    ) -> Result<String> {
         // Configured directories come first, so a session reaches what the user
         // saved even when the client asks for none of its own. A root the client
         // names as well is kept once, since the context would otherwise hold the
@@ -196,12 +206,16 @@ impl Sessions {
             }
             match SessionStore::create(&self.paths, &id) {
                 Ok(store) => {
+                    store.append(SessionEvent::WorkspaceSet {
+                        workspace: workspace.to_string(),
+                    })?;
                     let name = id.to_string();
                     self.entries.insert(
                         name.clone(),
                         Session {
                             id: name.clone(),
                             config: self.defaults.clone(),
+                            workspace,
                             history: History::new(),
                             grants: RuleSet::new(),
                             additional_roots,
@@ -266,6 +280,9 @@ impl Sessions {
             Session {
                 id: name,
                 config: self.defaults.clone(),
+                workspace: state
+                    .workspace
+                    .map_or_else(|| self.workspace.clone(), Utf8PathBuf::from),
                 history,
                 grants: RuleSet::new(),
                 additional_roots: Vec::new(),
@@ -297,7 +314,9 @@ impl Sessions {
             };
             out.push(SessionSummary {
                 id: state.id.to_string(),
-                cwd: self.workspace.to_string(),
+                cwd: state
+                    .workspace
+                    .unwrap_or_else(|| self.workspace.to_string()),
                 title: state.title,
                 updated_at: state
                     .events
@@ -391,7 +410,7 @@ impl Sessions {
         let Some(session) = self.entries.get(&key) else {
             return Err(unknown_session(id));
         };
-        let mut context = ExecutionContext::new(self.workspace.clone())
+        let mut context = ExecutionContext::new(session.workspace.clone())
             .with_output_cap(self.limits.get_usize(LimitName::MaxToolResultBytes));
         for root in &session.additional_roots {
             context = context.with_root(root.clone());
@@ -892,6 +911,81 @@ mod tests {
         let snapshot = sessions.snapshot(&id).expect("snapshot");
         assert!(snapshot.history.is_empty());
         assert_eq!(snapshot.config.model, "test/model");
+    }
+
+    #[test]
+    fn session_workspaces_are_independent_and_survive_reopening() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let mut sessions = sessions(&root);
+        let requested = utf8_path(&root, "workspace-b");
+        let first = sessions.create(Vec::new()).expect("default session");
+        let second = sessions
+            .create_in(requested.clone(), Vec::new())
+            .expect("client session");
+        assert_eq!(
+            sessions
+                .snapshot(&first)
+                .expect("snapshot")
+                .context
+                .workspace(),
+            "/tmp/work"
+        );
+        assert_eq!(
+            sessions
+                .snapshot(&second)
+                .expect("snapshot")
+                .context
+                .workspace(),
+            requested
+        );
+
+        sessions.close(&second).expect("close");
+        assert_eq!(
+            sessions
+                .list()
+                .iter()
+                .find(|entry| entry.id == second)
+                .expect("listed")
+                .cwd,
+            requested
+        );
+        sessions.load(&second).expect("load");
+        assert_eq!(
+            sessions
+                .snapshot(&second)
+                .expect("snapshot")
+                .context
+                .workspace(),
+            requested
+        );
+        sessions.close(&second).expect("close");
+        sessions.resume(&second).expect("resume");
+        assert_eq!(
+            sessions
+                .snapshot(&second)
+                .expect("snapshot")
+                .context
+                .workspace(),
+            requested
+        );
+    }
+
+    #[test]
+    fn older_sessions_without_a_recorded_workspace_use_the_launch_workspace() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let mut sessions = sessions(&root);
+        let key = SessionId::generate();
+        drop(SessionStore::create(&paths_for(&root), &key).expect("legacy session"));
+        sessions.load(key.as_str()).expect("load");
+        assert_eq!(
+            sessions
+                .snapshot(key.as_str())
+                .expect("snapshot")
+                .context
+                .workspace(),
+            "/tmp/work"
+        );
+        assert_eq!(sessions.list().first().expect("listed").cwd, "/tmp/work");
     }
 
     #[test]
