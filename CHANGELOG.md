@@ -102,6 +102,10 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Fixed
 
+- Invalid legacy project limits, such as `max_agent_steps = 10001`, report
+  an `invalid_field` diagnostic naming the key and accepted range, matching
+  `[limits]` validation while preserving user-selected limits.
+
 - Help for an unknown command, such as `rune help not-real`, exits 1 while
   preserving the diagnostic and hint. Valid command and top-level help exit 0.
 

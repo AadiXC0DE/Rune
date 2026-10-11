@@ -1159,21 +1159,18 @@ fn apply_project(settings: &mut Settings, project: &ProjectConfig, layer: Layer)
         }
     }
 
-    if let Some(steps) = project
-        .max_agent_steps
-        .filter(|_| !user_set(&settings.limits, LimitName::MaxAgentSteps))
-    {
-        let _ = settings
-            .limits
-            .set(LimitName::MaxAgentSteps, Budget::Bounded(steps), layer);
-    }
-    if let Some(bytes) = project
-        .max_tool_result_bytes
-        .filter(|_| !user_set(&settings.limits, LimitName::MaxToolResultBytes))
-    {
-        let _ = settings
-            .limits
-            .set(LimitName::MaxToolResultBytes, Budget::Bounded(bytes), layer);
+    for (name, value) in [
+        (LimitName::MaxAgentSteps, project.max_agent_steps),
+        (LimitName::MaxToolResultBytes, project.max_tool_result_bytes),
+    ] {
+        if let Some(value) = value.filter(|_| !user_set(&settings.limits, name))
+            && let Err(err) = settings.limits.set(name, Budget::Bounded(value), layer)
+        {
+            settings.diagnostics.push(
+                Diagnostic::new(layer, err.code(), err.message().to_owned())
+                    .with_key(name.as_str()),
+            );
+        }
     }
     if let Some(context) = project
         .context
@@ -1864,6 +1861,89 @@ max_agent_steps = 50
             settings.limits.source(LimitName::MaxAgentSteps),
             Some(Layer::Project)
         );
+    }
+
+    #[test]
+    fn invalid_legacy_project_limit_is_reported_like_a_limit_table_value() {
+        let dir = TempDir::new().expect("tempdir");
+        for prefix in ["", "[limits]\n"] {
+            let project = write(
+                &dir,
+                ".rune.toml",
+                &format!(
+                    "context = false\n{prefix}max_agent_steps = 10001\nmax_tool_result_bytes = 1000\n"
+                ),
+            );
+            let settings = load(Some(&project), None, &empty_env());
+            assert_eq!(settings.diagnostics.len(), 1, "{prefix}");
+            let diagnostic = &settings.diagnostics[0];
+            assert_eq!(diagnostic.layer, Layer::Project);
+            assert_eq!(diagnostic.code, ErrorCode::InvalidField);
+            assert_eq!(diagnostic.key.as_deref(), Some("max_agent_steps"));
+            assert!(diagnostic.message.contains("10001"));
+            assert!(diagnostic.message.contains("0..10000"));
+            assert_eq!(
+                settings.limits.get(LimitName::MaxAgentSteps),
+                LimitName::MaxAgentSteps.default_value()
+            );
+            assert_eq!(settings.limits.source(LimitName::MaxAgentSteps), None);
+            assert_eq!(
+                settings.limits.get(LimitName::MaxToolResultBytes),
+                Budget::Bounded(1000)
+            );
+            assert_eq!(
+                settings.limits.source(LimitName::MaxToolResultBytes),
+                Some(Layer::Project)
+            );
+            assert!(!settings.context);
+            assert_eq!(settings.source_of("context"), Layer::Project);
+        }
+    }
+
+    #[test]
+    fn legacy_project_limits_accept_valid_boundaries() {
+        let dir = TempDir::new().expect("tempdir");
+        for steps in [0, 10_000] {
+            for bytes in [0, 65_536] {
+                let project = write(
+                    &dir,
+                    ".rune.toml",
+                    &format!("max_agent_steps = {steps}\nmax_tool_result_bytes = {bytes}\n"),
+                );
+                let settings = load(Some(&project), None, &empty_env());
+                assert!(settings.diagnostics.is_empty());
+                for (name, value) in [
+                    (LimitName::MaxAgentSteps, steps),
+                    (LimitName::MaxToolResultBytes, bytes),
+                ] {
+                    assert_eq!(settings.limits.get(name), Budget::Bounded(value));
+                    assert_eq!(settings.limits.source(name), Some(Layer::Project));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_project_limit_does_not_replace_or_diagnose_a_user_limit() {
+        let dir = TempDir::new().expect("tempdir");
+        let user = write(&dir, "config.toml", "[limits]\nmax_agent_steps = 50\n");
+        for prefix in ["", "[limits]\n"] {
+            let project = write(
+                &dir,
+                ".rune.toml",
+                &format!("{prefix}max_agent_steps = 10001\n"),
+            );
+            let settings = load(Some(&project), Some(&user), &empty_env());
+            assert!(settings.diagnostics.is_empty());
+            assert_eq!(
+                settings.limits.get(LimitName::MaxAgentSteps),
+                Budget::Bounded(50)
+            );
+            assert_eq!(
+                settings.limits.source(LimitName::MaxAgentSteps),
+                Some(Layer::User)
+            );
+        }
     }
 
     #[test]

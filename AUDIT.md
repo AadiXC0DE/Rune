@@ -1959,7 +1959,7 @@ Resource accumulation after cancellation, session holder handover and concurrent
 - [x] R-080 | T2 | fix | cli | Honor exact session selectors for tree | acceptance: Run rune tree --id with a valid fixture identifier and observe that session's tree.
 - [x] R-081 | T2 | fix | observability | Print each ask failure once | acceptance: Run an unauthenticated rune ask --json and observe exactly one stderr error line plus one hint.
 - [x] R-082 | T2 | fix | cli | Make unknown-command help return failure | acceptance: Run rune help not-real and observe a nonzero exit while valid help still exits 0.
-- [ ] R-083 | T2 | fix | config | Validate legacy project limits instead of swallowing errors | acceptance: Load max_agent_steps=10001 and observe a named diagnostic rather than a silent unlimited default.
+- [x] R-083 | T2 | fix | config | Validate legacy project limits instead of swallowing errors | acceptance: Load max_agent_steps=10001 and observe a named diagnostic rather than a silent unlimited default.
 - [ ] R-084 | T2 | fix | config | Recover a settings lock after its writer is killed | acceptance: Kill a writer holding the settings lock and observe that the next writer completes without manually deleting a lock file.
 - [ ] R-085 | T2 | fix | config | Replace policy settings atomically | acceptance: Interrupt a policy-settings write before replacement and observe a complete old or new rules file.
 - [ ] R-086 | T2 | fix | tools | Validate closed tool schemas consistently | acceptance: Call read_file with a misspelled optional property and observe a schema error naming that property.
