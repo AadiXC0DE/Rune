@@ -106,6 +106,10 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Security
 
+- Sandboxed commands protect `.git/config` and hooks in nested repositories
+  throughout the workspace and additional writable roots on Linux and macOS.
+  Normal source files remain writable, and sandbox explanations include these
+  nested protections. Discovery refuses directories it cannot inspect.
 - On macOS, sandboxed commands cannot create a previously absent `.git/hooks`
   directory in a repository at a writable root. The hooks destination is denied
   using its resolved `.git` parent; other Git metadata and source files remain

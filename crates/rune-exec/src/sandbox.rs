@@ -79,7 +79,7 @@ pub const CREDENTIAL_PATHS: [&str; 12] = [
     ".local/state/rune",
 ];
 
-/// Paths inside a writable root that stay read-only.
+/// Paths inside every repository under a writable root that stay read-only.
 ///
 /// Git runs a repository's hooks and configured helpers outside any sandbox: a
 /// hook on the next commit, a diff driver or file system monitor on the next
@@ -169,7 +169,7 @@ impl SandboxPolicy {
             .map(|path| resolve(path, "a writable path"))
             .collect::<Result<Vec<_>>>()?;
         Ok(PolicyPaths {
-            protected_paths: protected_paths(&writable_roots),
+            protected_paths: protected_paths(&writable_roots)?,
             credential_paths: masked_paths(credentials, &writable_roots),
             writable_roots,
         })
@@ -368,9 +368,16 @@ fn masked_paths(credentials: &[Utf8PathBuf], writable: &[Utf8PathBuf]) -> Vec<Ut
 /// On Linux, an absent hooks directory is protected by binding its existing
 /// `.git` parent read-only. This also denies other metadata writes until hooks
 /// exist, but leaves source files writable and creates no host directories.
-fn protected_paths(writable: &[Utf8PathBuf]) -> Vec<Utf8PathBuf> {
+/// Discovery includes nested repositories and fails closed if a source
+/// directory cannot be inspected. Symlinks and Git metadata are not traversed.
+fn protected_paths(writable: &[Utf8PathBuf]) -> Result<Vec<Utf8PathBuf>> {
     let mut paths = Vec::new();
-    for root in writable {
+    let mut pending = writable.to_vec();
+    let mut visited = std::collections::BTreeSet::new();
+    while let Some(root) = pending.pop() {
+        if !visited.insert(root.clone()) {
+            continue;
+        }
         for relative in PROTECTED_REPOSITORY_PATHS {
             let path = root.join(relative);
             let resolved = path.canonicalize_utf8().or_else(|error| {
@@ -394,8 +401,41 @@ fn protected_paths(writable: &[Utf8PathBuf]) -> Vec<Utf8PathBuf> {
                 paths.push(resolved);
             }
         }
+        // Inspect all source directories, including ignored and hidden ones.
+        // Git metadata itself needs no walk. Directory symlinks do not expand
+        // a writable grant: their targets are scanned through the real path
+        // when it is under a writable root. Skipping them also avoids cycles.
+        let inspection_error = |error: std::io::Error| {
+            RuneError::new(
+                ErrorCode::UnsafePath,
+                format!("cannot inspect `{root}` for nested repositories: {error}"),
+            )
+        };
+        let entries = std::fs::read_dir(&root).map_err(inspection_error)?;
+        let mut directories = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(inspection_error)?;
+            if entry.file_name() == ".git" {
+                continue;
+            }
+            if entry.file_type().map_err(inspection_error)?.is_dir() {
+                let directory = Utf8PathBuf::from_path_buf(entry.path()).map_err(|path| {
+                    RuneError::new(
+                        ErrorCode::UnsafePath,
+                        format!(
+                            "cannot inspect non-UTF-8 directory `{}` for nested repositories",
+                            path.display()
+                        ),
+                    )
+                })?;
+                directories.push(directory);
+            }
+        }
+        // Stable order keeps policy diagnostics and generated rules repeatable.
+        directories.sort();
+        pending.extend(directories.into_iter().rev());
     }
-    paths
+    Ok(paths)
 }
 
 /// Returns the temporary directories a command on macOS may write.
@@ -1590,7 +1630,7 @@ mod tests {
         std::fs::create_dir_all(workspace.join(".git/hooks")).expect("hooks");
         std::fs::write(workspace.join(".git/config"), "[core]\n").expect("config");
         let resolved = workspace.canonicalize_utf8().expect("workspace");
-        let protected = protected_paths(std::slice::from_ref(&resolved));
+        let protected = protected_paths(std::slice::from_ref(&resolved)).expect("protected paths");
         assert_eq!(
             protected,
             vec![resolved.join(".git/config"), resolved.join(".git/hooks")]
@@ -1598,7 +1638,156 @@ mod tests {
         // A workspace that is not a repository has nothing to protect.
         let (_other, plain) = tempdir();
         let plain = plain.canonicalize_utf8().expect("plain");
-        assert!(protected_paths(&[plain]).is_empty());
+        assert!(
+            protected_paths(&[plain])
+                .expect("protected paths")
+                .is_empty()
+        );
+    }
+
+    /// Includes a hidden, deeply nested repository, an overlapping grant, and
+    /// repositories with present and absent hooks in an additional root.
+    fn nested_repositories() -> (TempDir, SandboxPolicy, Vec<Utf8PathBuf>) {
+        let (guard, root) = tempdir();
+        let workspace = root.join("workspace");
+        let extra = root.join("extra");
+        let repositories = vec![
+            workspace.join("vendor/.hidden/deep"),
+            extra.join("child"),
+            extra.join("without-hooks"),
+        ];
+        for repository in &repositories {
+            std::fs::create_dir_all(repository.join(".git")).expect("git directory");
+            std::fs::write(repository.join(".git/config"), "[core]\n").expect("config");
+        }
+        for repository in &repositories[..2] {
+            std::fs::create_dir(repository.join(".git/hooks")).expect("hooks");
+            std::fs::write(repository.join(".git/hooks/pre-commit"), "original").expect("hook");
+        }
+        let overlap = workspace.join("vendor");
+        let policy = SandboxPolicy::new(workspace, vec![extra, overlap], false);
+        let repositories = repositories
+            .into_iter()
+            .map(|repository| repository.canonicalize_utf8().expect("repository"))
+            .collect();
+        (guard, policy, repositories)
+    }
+
+    #[test]
+    fn both_backends_protect_nested_repositories_after_every_write_grant() {
+        let (_guard, policy, repositories) = nested_repositories();
+        let paths = policy.resolved_paths().expect("paths");
+        let mut expected = Vec::new();
+        for repository in &repositories {
+            expected.push(repository.join(".git/config"));
+            let hooks = repository.join(".git/hooks");
+            if hooks.exists() || cfg!(target_os = "macos") {
+                expected.push(hooks);
+            } else if cfg!(target_os = "linux") {
+                expected.push(repository.join(".git"));
+            }
+        }
+        let mut actual = paths.protected_paths.clone();
+        actual.sort();
+        expected.sort();
+        assert_eq!(actual, expected, "missing or duplicate protections");
+
+        let profile = MacSandbox::profile_with(&policy, &[]).expect("profile");
+        let last_write_grant = profile.rfind("(allow file-write*").expect("write grant");
+        let prepared =
+            prepare("echo fixture", &policy.workspace, None, environment()).expect("prepare");
+        let argv =
+            LinuxSandbox::argv(Utf8Path::new("/fixture/bwrap"), &prepared, &policy).expect("argv");
+        let last_writable_bind = argv.iter().rposition(|arg| arg == "--bind").expect("bind");
+        for protected in &expected {
+            let deny = format!(
+                "(deny file-write* {})",
+                operand(protected).expect("operand")
+            );
+            assert!(profile.find(&deny).expect("deny") > last_write_grant);
+            let read_only = argv
+                .windows(3)
+                .position(|args| args == ["--ro-bind", protected.as_str(), protected.as_str()])
+                .expect("nested repository read-only bind");
+            assert!(read_only > last_writable_bind, "{argv:?}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn repository_discovery_skips_symlink_cycles_and_git_metadata() {
+        let (_guard, workspace) = tempdir();
+        let nested = workspace
+            .canonicalize_utf8()
+            .expect("workspace")
+            .join("nested");
+        std::fs::create_dir_all(nested.join(".git/hooks")).expect("hooks");
+        std::fs::write(nested.join(".git/config"), "[core]\n").expect("config");
+        std::fs::create_dir_all(nested.join(".git/objects/ignored/.git/hooks")).expect("metadata");
+        std::os::unix::fs::symlink(&workspace, nested.join("cycle")).expect("cycle");
+        let paths = policy(&workspace).resolved_paths().expect("paths");
+        assert_eq!(
+            paths.protected_paths,
+            vec![nested.join(".git/config"), nested.join(".git/hooks")]
+        );
+    }
+
+    #[test]
+    fn repository_discovery_refuses_an_uninspectable_directory() {
+        let (_guard, workspace) = tempdir();
+        let file = workspace.join("file");
+        std::fs::write(&file, "fixture").expect("file");
+        let error = policy(&file)
+            .resolved_paths()
+            .expect_err("cannot inspect a file");
+        assert_eq!(error.code(), ErrorCode::UnsafePath);
+        assert!(error.message().contains("cannot inspect"));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn sandboxed_commands_refuse_nested_config_and_hooks_but_allow_source_writes() {
+        let sandbox = detect();
+        let support = sandbox.support();
+        if !support.is_full() {
+            eprintln!("live nested repository regression skipped: {support:?}");
+            return;
+        }
+        let (_guard, policy, repositories) = nested_repositories();
+        for repository in &repositories {
+            for (command, permitted) in [
+                ("printf source > kept.txt", true),
+                ("printf changed > .git/config", false),
+                (
+                    "mkdir -p .git/hooks && printf changed > .git/hooks/pre-commit",
+                    false,
+                ),
+            ] {
+                let prepared = prepare(command, repository, None, environment()).expect("prepare");
+                let wrapped = sandbox.wrap(&prepared, &policy, false).expect("wrap");
+                let outcome = run(&wrapped, Duration::from_secs(20), &never).expect("run");
+                assert_eq!(
+                    outcome.exit.is_success(),
+                    permitted,
+                    "`{command}` in {repository}: {outcome:?}"
+                );
+            }
+            assert_eq!(
+                std::fs::read_to_string(repository.join("kept.txt")).expect("source"),
+                "source"
+            );
+            assert_eq!(
+                std::fs::read_to_string(repository.join(".git/config")).expect("config"),
+                "[core]\n"
+            );
+        }
+        for repository in &repositories[..2] {
+            assert_eq!(
+                std::fs::read_to_string(repository.join(".git/hooks/pre-commit")).expect("hook"),
+                "original"
+            );
+        }
+        assert!(!repositories[2].join(".git/hooks").exists());
     }
 
     #[test]

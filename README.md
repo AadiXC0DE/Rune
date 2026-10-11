@@ -264,9 +264,10 @@ failure within the available output budget.
 - **Sandboxed execution.** Commands run under the platform sandbox where one
   exists. `rune doctor` reports what your host can enforce.
   `rune sandbox explain -- 'git status'` previews the backend, writable roots,
-  network decision and protected paths with sources, including absent macOS
-  hooks destinations, without running the command. The preview uses the current
-  workspace and configured additional directories (`--add-dir` adds roots;
+  network decision and protected paths with sources, including nested repository
+  config and hooks and absent macOS hooks destinations, without running the
+  command. The preview uses the current workspace and configured additional
+  directories (`--add-dir` adds roots;
   `--no-additional-dirs` ignores saved roots).
   Network access requires an explicit shell context grant, previewed with
   `--external-access`; offline mode overrides it. `--json` emits the same report.

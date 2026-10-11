@@ -171,6 +171,32 @@ fn absent_hooks_report_the_read_only_git_parent_without_creating_hooks() {
     assert!(!git.join("hooks").exists(), "explanation created hooks");
 }
 
+#[test]
+fn nested_repository_protections_are_reported_in_workspace_and_additional_roots() {
+    let fixture = Fixture::new();
+    for root in ["workspace/vendor/child", "saved/child"] {
+        let repository = fixture.dir.path().join(root);
+        std::fs::create_dir_all(repository.join(".git/hooks")).expect("nested hooks");
+        std::fs::write(repository.join(".git/config"), "[core]\n").expect("nested config");
+    }
+    let report = fixture.json(&["sandbox", "explain", "--json", "--", "echo fixture"]);
+    let protected = report["protected_paths"].as_array().expect("protections");
+    for root in ["workspace/vendor/child", "saved/child"] {
+        for relative in [".git/config", ".git/hooks"] {
+            let path = resolved(&fixture.dir.path().join(root).join(relative));
+            assert!(
+                protected.iter().any(|rule| rule["path"] == path
+                    && rule["access"] == "read_only"
+                    && rule["source"]
+                        .as_str()
+                        .expect("source")
+                        .contains("PROTECTED_REPOSITORY_PATHS")),
+                "missing {path}: {report}"
+            );
+        }
+    }
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 fn absent_macos_hooks_report_the_destination_without_creating_hooks() {
