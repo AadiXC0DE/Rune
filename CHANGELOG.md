@@ -6,6 +6,10 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Added
 
+- `rune session export <last|id>` emits stable, ordered JSONL event records with
+  saved schema versions and timestamps, excluding credentials, metadata, and
+  transport headers. Recorded message and tool content is preserved.
+
 - Native turns execute eligible read-only calls at the front of a tool batch
   concurrently, up to `parallel_tool_calls`. Mutations and subsequent calls run
   in order after those reads finish. Retained-result readers stay sequential to

@@ -27,7 +27,7 @@ pub enum Command {
     Connect,
     /// List sessions.
     Sessions,
-    /// Inspect, migrate, or recover one session.
+    /// Inspect, export, migrate, or recover one session.
     Session,
     /// Show the session branch structure.
     Tree,

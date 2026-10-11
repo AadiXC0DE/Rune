@@ -122,6 +122,20 @@ pub struct SessionState {
 }
 
 impl SessionState {
+    /// Writes the saved frames as stable schema-versioned JSONL in log order.
+    ///
+    /// Only typed event fields are serialized, excluding metadata, credentials,
+    /// and unknown transport fields. Recorded message and tool content is kept
+    /// verbatim. No export-time values or synthesized replay events are added.
+    /// A torn tail, if present, is excluded as it is when reading the session.
+    pub fn export_jsonl(&self, mut writer: impl Write) -> Result<()> {
+        for frame in &self.events {
+            writeln!(writer, "{}", frame.encode()?)?;
+        }
+        writer.flush()?;
+        Ok(())
+    }
+
     /// Returns the last sequence number read.
     #[must_use]
     pub fn last_seq(&self) -> Option<EventSeq> {

@@ -271,16 +271,19 @@ pub const SESSIONS: &[CommandSpec] = &[
     CommandSpec {
         name: "session",
         aliases: &[],
-        summary: "Inspect, migrate, or recover one session",
-        usage: "rune session <last|id> [--json] | rune session --id <id> [--json] | rune session migrate <id> | rune session recover <id>",
+        summary: "Inspect, export, migrate, or recover one session",
+        usage: "rune session <last|id> [--json] | rune session --id <id> [--json] | rune session export <last|id> | rune session export --id <id> | rune session migrate <id> | rune session recover <id>",
         flags: &[
             option(
                 "--id",
                 "id",
-                "Inspect this exact session identifier, taking precedence over a positional selector.",
+                "Inspect or export this exact session identifier, taking precedence over a positional selector.",
             ),
             flag("--allow-large", "Permit migrating an oversized session."),
-            flag("--json", "Emit JSON."),
+            flag(
+                "--json",
+                "Emit JSON. Export always emits ordered JSONL event records.",
+            ),
         ],
         requirements: Requirements::CONFIG,
         supports_json: true,

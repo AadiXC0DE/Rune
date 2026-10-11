@@ -84,15 +84,15 @@ List sessions
 | `--limit <n>` | Page size, 1 to 100. |
 | `--cursor <c>` | Continue from a previous page. |
 | `--json` | Emit JSON. |
-### `rune session <last|id> [--json] | rune session --id <id> [--json] | rune session migrate <id> | rune session recover <id>`
+### `rune session <last|id> [--json] | rune session --id <id> [--json] | rune session export <last|id> | rune session export --id <id> | rune session migrate <id> | rune session recover <id>`
 
-Inspect, migrate, or recover one session
+Inspect, export, migrate, or recover one session
 
 | Flag | Description |
 |---|---|
-| `--id <id>` | Inspect this exact session identifier, taking precedence over a positional selector. |
+| `--id <id>` | Inspect or export this exact session identifier, taking precedence over a positional selector. |
 | `--allow-large` | Permit migrating an oversized session. |
-| `--json` | Emit JSON. |
+| `--json` | Emit JSON. Export always emits ordered JSONL event records. |
 ### `rune tree [last|id] [--json] | rune tree --id <id> [--json]`
 
 Show the branch structure of a session

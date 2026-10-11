@@ -206,6 +206,12 @@ Completed exchanges are saved as sessions for the current workspace, and
 `--json` reports their `session_id`. Pass `--no-save` to create no session and
 return an empty ID.
 
+`rune session export <last|id>` writes stable JSONL to stdout, one saved event
+per line in sequence order, with its schema version and original timestamp.
+Credentials, metadata, and transport headers are excluded. Recorded message
+and tool content is preserved verbatim. An incomplete final frame is omitted
+with a warning on stderr; other log corruption fails the export.
+
 Sessions are written as they run, so an interrupted session resumes. Interactive
 assistant text is journalled in bounded, durable frames before it is displayed.
 After process death, resume replays the partial answer once with an

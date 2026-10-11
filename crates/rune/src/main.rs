@@ -808,7 +808,7 @@ fn run_tree(
     Ok(ExitCode::from(EXIT_OK))
 }
 
-/// Reports one stored session.
+/// Reports or exports one stored session.
 fn run_session(
     paths: &Paths,
     launch: &Launch,
@@ -821,10 +821,11 @@ fn run_session(
         _ => {}
     }
 
+    let exporting = launch.args.first().map(String::as_str) == Some("export");
     let id = if let Some(raw) = launch.flag("--id") {
         raw.parse()?
     } else {
-        let raw = launch.args.first().ok_or_else(|| {
+        let raw = launch.args.get(usize::from(exporting)).ok_or_else(|| {
             RuneError::missing_field("session").with_hint("name a session, or run `rune sessions`")
         })?;
         if raw == "last" {
@@ -835,7 +836,12 @@ fn run_session(
     };
     let state = session_log::inspect(paths, &id)?;
 
-    if output.json {
+    if exporting {
+        if let Some(offset) = state.truncated_at {
+            eprintln!("warning: omitted incomplete session tail at byte {offset}");
+        }
+        state.export_jsonl(std::io::stdout().lock())?;
+    } else if output.json {
         println!(
             "{}",
             serde_json::to_string_pretty(&session_log::detail_json(&state))?
