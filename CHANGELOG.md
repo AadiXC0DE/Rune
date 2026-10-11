@@ -6,6 +6,10 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Added
 
+- Linux CI requires a live sandbox smoke check that refuses a socket connection
+  while allowing source editing, with working network controls. Missing or
+  unusable isolation fails declared runners and is reported explicitly locally.
+
 - `rune completion bash` generates a script for Bash to complete all declared
   commands, aliases, global flags, and command flags from the shared command
   table, including `resume`. Generation needs no configuration or network.

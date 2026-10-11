@@ -66,7 +66,18 @@ jobs:
 
       - name: Install the sandbox helper
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y bubblewrap
+        run: |
+          sudo apt-get update && sudo apt-get install -y bubblewrap
+          # Ubuntu's AppArmor user-namespace restriction can block bwrap.
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+
+      - name: Require live Linux network isolation and source editing
+        if: runner.os == 'Linux'
+        env:
+          RUNE_REQUIRE_LINUX_SANDBOX: '1'
+        run: cargo test -p rune-exec --test linux_network live_linux_network_isolation -- --exact --nocapture
 
       - name: Check PTY replay prerequisites
         run: python3 -c "import fcntl, pty, termios"
@@ -170,7 +181,18 @@ jobs:
 
       - name: Install the sandbox helper
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y bubblewrap
+        run: |
+          sudo apt-get update && sudo apt-get install -y bubblewrap
+          # Ubuntu's AppArmor user-namespace restriction can block bwrap.
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+
+      - name: Require live Linux network isolation and source editing
+        if: runner.os == 'Linux'
+        env:
+          RUNE_REQUIRE_LINUX_SANDBOX: '1'
+        run: cargo test -p rune-exec --test linux_network live_linux_network_isolation -- --exact --nocapture
 
       - name: Check PTY replay prerequisites
         if: runner.os != 'Windows'

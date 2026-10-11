@@ -444,8 +444,13 @@ and remote MCP refusals, so offline mode also blocks a locally hosted model.
 | Local MCP over stdio | Approved, enabled servers still start during offline listing, checking and interactive sessions. These child processes do not use the shell sandbox; their own network traffic remains unrestricted by Rune offline mode. Project trust approval authorizes startup, not network isolation. | [`approved_stdio_can_start_during_offline_listing`, `check_local_stdio_works_offline_without_a_provider` and `offline_stdio_mcp_can_send_network_traffic`](crates/rune/tests/mcp_list.rs); [interactive MCP fixture](crates/rune/tests/mcp_stdio.rs) |
 | Shell commands | Offline mode disables the sandbox's network grant, overriding external access and full-access permission mode. Linux uses a network namespace; macOS generates a network-denying Seatbelt profile. Without a usable sandbox, commands are refused unless `--allow-unsandboxed` permits fallback. That fallback has no network isolation, including offline. | [`offline_shell_policy_restricts_network_even_with_external_access` and `an_offline_full_access_shell_cannot_reach_a_local_fixture`](crates/rune-tools/src/shell.rs); [sandbox profile and argv tests](crates/rune-exec/src/sandbox.rs); [`offline_shell_fallback_requires_opt_in_and_applies_no_isolation`](crates/rune/tests/egress.rs) |
 
-The live Linux shell test runs only when a usable sandbox is detected; policy
-and generated-argument tests also run without one. Use `rune doctor` and
+Linux CI requires a live socket-connect smoke check with source editing:
+`RUNE_REQUIRE_LINUX_SANDBOX=1 cargo test -p rune-exec --test linux_network live_linux_network_isolation -- --exact --nocapture`.
+It proves the loopback fixture is reachable, refuses its connection in the
+sandbox, verifies a source edit, and checks an explicit sandbox network grant.
+Missing or unusable isolation fails this gate with its reason. Local runs without
+`RUNE_REQUIRE_LINUX_SANDBOX=1` report unavailable isolation and skip the live check;
+policy and generated-argument tests still run. Use `rune doctor` and
 `rune sandbox explain --json -- 'command'` to inspect your host's capability
 and the resolved policy. For isolation of local MCP processes or an unsandboxed
 fallback, apply an external OS/container network restriction.
