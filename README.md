@@ -225,7 +225,11 @@ It runs a bounded turn with the built-in host tools. Allowed calls run
 under the configured permission mode and workspace boundaries; calls requiring
 interactive approval return an error to the model without waiting for input.
 The next request includes the tool results. A positive `max_agent_steps` sets
-the request cap; zero or an unlimited setting uses a cap of 16 for `ask`.
+the model step cap; zero or an unlimited setting uses a cap of 16 for `ask`.
+Transient provider failures retry within each step up to `provider_max_attempts`,
+honoring `Retry-After` or using bounded backoff. Each attempt uses the configured
+`provider_head_timeout_ms` and `provider_request_timeout_ms` deadlines.
+Rejected credentials never retry. Retries consume no extra model steps or usage.
 Reaching the cap before a final answer exits 1 with `limit_exceeded` and an
 empty `final_output`. JSON reports the steps, summed usage, and each tool's
 `success` or `error` status.

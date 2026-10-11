@@ -89,6 +89,8 @@ fn ask_enforces_the_configured_total_deadline_for_success_and_error_bodies() {
         let (base, server) = slow_endpoint(status);
         let dir = tempfile::tempdir().expect("isolated state");
         let started = Instant::now();
+        // Isolate the per-attempt deadline from the retry policy, which also
+        // retries timeouts when more attempts are configured.
         let output = Command::new(env!("CARGO_BIN_EXE_rune"))
             .env_clear()
             .env("HOME", dir.path())
@@ -108,6 +110,8 @@ fn ask_enforces_the_configured_total_deadline_for_success_and_error_bodies() {
                 "provider_request_timeout_ms=1000",
                 "--limit",
                 "provider_head_timeout_ms=10000",
+                "--limit",
+                "provider_max_attempts=1",
                 "respond slowly",
             ])
             .output()

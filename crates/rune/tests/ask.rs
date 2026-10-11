@@ -181,16 +181,20 @@ fn run_responses_fixture_with_setup(
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind fixture");
     listener.set_nonblocking(true).expect("nonblocking");
     let address = listener.local_addr().expect("fixture address");
+    let (finished, completion) = std::sync::mpsc::channel();
     let server = std::thread::spawn(move || {
         let deadline = Instant::now()
             .checked_add(Duration::from_secs(10))
             .expect("fixture deadline");
         let mut requests = Vec::new();
-        for response in responses {
+        loop {
             let mut stream = loop {
                 match listener.accept() {
                     Ok((stream, _)) => break stream,
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if completion.try_recv().is_ok() {
+                            return requests;
+                        }
                         assert!(Instant::now() < deadline, "no provider request arrived");
                         std::thread::sleep(Duration::from_millis(10));
                     }
@@ -221,13 +225,18 @@ fn run_responses_fixture_with_setup(
             let mut request = vec![0; content_length.expect("request content length")];
             reader.read_exact(&mut request).expect("request body");
             drop(reader);
+            // Keep serving until the child exits so an unexpected retry is
+            // counted, rather than hidden by a closed fixture endpoint.
+            let response = responses
+                .get(requests.len())
+                .or_else(|| responses.last())
+                .expect("fixture response");
             requests.push(serde_json::from_slice(&request).expect("request JSON"));
 
             stream
                 .write_all(response.as_bytes())
                 .expect("fixture response");
         }
-        requests
     });
 
     let dir = tempfile::tempdir().expect("isolated state");
@@ -263,6 +272,7 @@ fn run_responses_fixture_with_setup(
         .arg("run the fixture command")
         .output()
         .expect("ask");
+    finished.send(()).expect("stop fixture server");
     let requests = server.join().expect("fixture server");
     (output, dir, requests)
 }
@@ -273,14 +283,17 @@ fn ask_json_preserves_provider_code_and_retry_delay_with_secrets_redacted() {
         let secret = "sk-fixture-secret-message";
         let body =
             json!({"error": {"code": code, "message": format!("rejected {secret}")}}).to_string();
-        let (output, _) = run_response_fixture(
-            format!(
+        let (output, _, requests) = run_responses_fixture_with_setup(
+            vec![format!(
                 "HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\nRetry-After: 3\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                 body.len()
-            ),
+            )],
             true,
             true,
+            Some(1),
+            |dir| write_retry_limits(dir, 1),
         );
+        assert_eq!(requests.len(), 1);
         assert_eq!(output.status.code(), Some(1));
         let result: Value = serde_json::from_slice(&output.stdout).expect("one JSON result");
         assert_eq!(result["error_code"], "rate_limited");
@@ -561,6 +574,92 @@ fn completion_response(delta: &Value, finish: &str) -> String {
         "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     )
+}
+
+fn write_retry_limits(dir: &tempfile::TempDir, attempts: u64) {
+    std::fs::write(
+        dir.path().join("config/rune/config.toml"),
+        format!(
+            "[limits]\nmax_agent_steps = 1\nprovider_max_attempts = {attempts}\n\
+             provider_head_timeout_ms = 5000\nprovider_request_timeout_ms = 5000\n"
+        ),
+    )
+    .expect("retry limits");
+}
+
+fn error_response(status: &str, retry_after: u64) -> String {
+    let body = json!({"error": {"message": "Fixture rejection."}}).to_string();
+    format!(
+        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\n\
+         Retry-After: {retry_after}\r\nContent-Length: {}\r\n\
+         Connection: close\r\n\r\n{body}",
+        body.len()
+    )
+}
+
+#[test]
+fn ask_retries_a_rate_limit_after_the_requested_delay_within_the_configured_deadline() {
+    let started = Instant::now();
+    let (output, _, requests) = run_responses_fixture_with_setup(
+        vec![
+            error_response("429 Too Many Requests", 1),
+            completion_response(&json!({"content": "Recovered answer."}), "stop"),
+        ],
+        true,
+        true,
+        Some(1),
+        |dir| write_retry_limits(dir, 2),
+    );
+    let elapsed = started.elapsed();
+    assert!(output.status.success(), "{output:?}");
+    assert!(output.stderr.is_empty(), "{output:?}");
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0], requests[1]);
+    assert!(elapsed >= Duration::from_secs(1), "{elapsed:?}");
+    assert!(elapsed < Duration::from_secs(5), "{elapsed:?}");
+    let result: Value = serde_json::from_slice(&output.stdout).expect("ask JSON");
+    assert_eq!(result["final_output"], "Recovered answer.");
+    assert_eq!(result["steps"], 1);
+    assert_eq!(
+        result["usage"],
+        json!({"input_tokens": 11, "output_tokens": 2})
+    );
+}
+
+#[test]
+fn ask_stops_rate_limit_retries_at_the_configured_attempt_cap() {
+    for attempts in [1, 2, 3] {
+        let (output, _, requests) = run_responses_fixture_with_setup(
+            vec![error_response("429 Too Many Requests", 0)],
+            true,
+            true,
+            Some(1),
+            |dir| write_retry_limits(dir, attempts),
+        );
+        assert_eq!(output.status.code(), Some(1));
+        assert_eq!(requests.len() as u64, attempts);
+        let result: Value = serde_json::from_slice(&output.stdout).expect("ask JSON");
+        assert_eq!(result["error_code"], "rate_limited");
+        assert_eq!(result["final_output"], "");
+    }
+}
+
+#[test]
+fn ask_never_retries_an_invalid_credential_even_with_retry_after() {
+    for status in ["401 Unauthorized", "403 Forbidden"] {
+        let (output, _, requests) = run_responses_fixture_with_setup(
+            vec![error_response(status, 1)],
+            true,
+            true,
+            Some(1),
+            |dir| write_retry_limits(dir, 3),
+        );
+        assert_eq!(output.status.code(), Some(1));
+        assert_eq!(requests.len(), 1, "{status}");
+        let result: Value = serde_json::from_slice(&output.stdout).expect("ask JSON");
+        assert_eq!(result["error_code"], "authentication_required");
+        assert_eq!(result["final_output"], "");
+    }
 }
 
 fn call_delta(name: &str, arguments: &str) -> Value {

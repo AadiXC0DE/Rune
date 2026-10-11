@@ -206,6 +206,10 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Fixed
 
+- `rune ask` honors `provider_max_attempts` through the shared bounded retry
+  policy, including `Retry-After` and configured request deadlines. Rejected
+  credentials stop immediately, and retries do not consume extra model steps.
+
 - `rune ask` includes the resolved instructions from `rune prompt --show` in
   every request, including workspace rules, system prompt overrides, and
   configured instruction limits.

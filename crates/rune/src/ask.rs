@@ -316,12 +316,6 @@ pub fn run(
         Budget::Bounded(step_cap),
         Layer::CommandLine,
     )?;
-    // Retry behavior remains one attempt per step in the ask path.
-    limits.set(
-        LimitName::ProviderMaxAttempts,
-        Budget::Bounded(1),
-        Layer::CommandLine,
-    )?;
     let registry = if options.tool_loop {
         inventory::builtin_with_web(
             &rune_tools::FileLimits::from_budget(&limits),
