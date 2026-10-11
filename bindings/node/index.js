@@ -49,12 +49,12 @@ export class RuneExitError extends RuneError {
   }
 }
 
-/** The binary exited cleanly without printing the result object. */
+/** The binary exited cleanly without printing a valid result object. */
 export class RuneOutputError extends RuneError {
-  constructor(stdout, stderr) {
+  constructor(stdout, stderr, detail = null) {
     super(
       "OUTPUT",
-      `rune ask exited cleanly without printing the result object; standard output was ${describe(stdout)}`,
+      `rune ask exited cleanly without printing a valid result object${detail === null ? "" : `; ${detail}`}; standard output was ${describe(stdout)}`,
     );
     this.name = "RuneOutputError";
     this.stdout = stdout;
@@ -238,12 +238,12 @@ export async function ask(prompt, options = {}) {
     throw new RuneError("SIGNALED", `rune ask was terminated by signal ${term ?? "unknown"}`);
   }
 
-  const result = parseResult(stdoutText);
+  const { result, detail } = parseResult(stdoutText);
   if (code !== 0) {
     throw new RuneExitError(code, result, stderrText);
   }
   if (result === null) {
-    throw new RuneOutputError(stdoutText, stderrText);
+    throw new RuneOutputError(stdoutText, stderrText, detail);
   }
   return result;
 }
@@ -305,34 +305,83 @@ function searchPath(name) {
 /** Reads the result object out of standard output. */
 function parseResult(text) {
   const trimmed = text.trim();
-  if (trimmed === "") return null;
+  if (trimmed === "") return { result: null, detail: null };
 
   const whole = asResult(trimmed);
-  if (whole !== null) return whole;
+  if (whole !== null && whole.result !== null) return whole;
 
   // A wrapper script around the binary may print its own progress lines before
-  // the object, so the last line that parses is used.
+  // the object, so the last line with a valid result is used. Retain validation
+  // details from the last object when no valid result was printed.
   const lines = trimmed.split("\n");
+  let invalid = whole;
   for (let index = lines.length - 1; index >= 0; index -= 1) {
     const line = lines[index].trim();
     if (line === "") continue;
     const value = asResult(line);
-    if (value !== null) return value;
+    if (value === null) continue;
+    if (value.result !== null) return value;
+    invalid ??= value;
   }
-  return null;
+  return invalid ?? { result: null, detail: null };
 }
 
 function asResult(text) {
+  let value;
   try {
-    const value = JSON.parse(text);
-    const isObject = typeof value === "object" && value !== null && !Array.isArray(value);
-    if (!isObject || typeof value.output !== "string" || typeof value.exit_code !== "number") {
-      return null;
-    }
-    return value;
+    value = JSON.parse(text);
   } catch {
     return null;
   }
+  if (!isObject(value)) return null;
+
+  const missing = [];
+  const invalid = [];
+  const check = (object, field, accepts, prefix = "", required = true) => {
+    const path = `${prefix}${field}`;
+    if (!Object.hasOwn(object, field)) {
+      if (required) missing.push(path);
+    } else if (!accepts(object[field])) {
+      invalid.push(path);
+    }
+  };
+  const isString = (entry) => typeof entry === "string";
+  check(value, "output", isString);
+  check(value, "final_output", isString);
+  check(value, "exit_code", Number.isFinite);
+  check(value, "model", isString);
+  check(value, "resolved_provider", (entry) => entry === null || isString(entry));
+  check(value, "session_id", isString);
+  check(value, "steps", Number.isFinite);
+  check(value, "usage", isObject);
+  check(value, "tool_calls", Array.isArray);
+  check(value, "error", isString, "", false);
+  check(value, "error_code", isString, "", false);
+  if (isObject(value.usage)) {
+    check(value.usage, "input_tokens", Number.isFinite, "usage.", false);
+    check(value.usage, "output_tokens", Number.isFinite, "usage.", false);
+  }
+  if (Array.isArray(value.tool_calls)) {
+    value.tool_calls.forEach((call, index) => {
+      const path = `tool_calls[${index}]`;
+      if (!isObject(call)) {
+        invalid.push(path);
+        return;
+      }
+      check(call, "name", isString, `${path}.`);
+      check(call, "status", (entry) => entry === "success" || entry === "error", `${path}.`);
+    });
+  }
+  const details = [];
+  if (missing.length > 0) details.push(`missing fields: ${missing.join(", ")}`);
+  if (invalid.length > 0) details.push(`invalid fields: ${invalid.join(", ")}`);
+  return details.length === 0
+    ? { result: value, detail: null }
+    : { result: null, detail: details.join("; ") };
+}
+
+function isObject(value) {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function exitMessage(exitCode, result, stderr) {

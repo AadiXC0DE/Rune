@@ -182,6 +182,10 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Fixed
 
+- The Node binding validates every required ask-result field, nested token counts
+  and tool calls before returning JSON results. A clean exit with an incomplete
+  or mistyped result raises `RuneOutputError` naming missing or invalid fields.
+
 - The Node binding rejects nonfinite `timeoutMs` values and delays above
   2,147,483,647 ms before binary lookup or spawning, without timer overflow
   warnings. Positive fractional delays and the maximum timer delay remain valid.

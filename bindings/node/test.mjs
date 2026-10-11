@@ -54,6 +54,11 @@ for argument in "$@"; do
   prompt="$prompt$separator$argument"
   separator=" "
 done
+if [ "\${RUNE_STUB_MODE:-ok}" = "result" ]; then
+  printf '%s\\n' "$RUNE_STUB_STDOUT"
+  printf '%s' "$RUNE_STUB_STDERR" >&2
+  exit "\${RUNE_STUB_EXIT_CODE:-0}"
+fi
 if [ "\${RUNE_STUB_MODE:-ok}" = "fail" ]; then
   echo "rune: no model provider is connected" >&2
   printf '{"output":"","final_output":"","exit_code":1,"model":"%s","resolved_provider":null,"session_id":"","steps":0,"usage":{},"tool_calls":[],"error":"no model provider is connected","error_code":"authentication_required"}\\n' "$model"
@@ -252,6 +257,135 @@ test("a clean exit with no result object becomes a typed error", async () => {
 
   assert.ok(error instanceof RuneOutputError, `expected RuneOutputError, got ${error}`);
   assert.equal(error.code, "OUTPUT");
+});
+
+const validResult = {
+  output: "ok",
+  final_output: "ok",
+  exit_code: 0,
+  model: "stub-model",
+  resolved_provider: null,
+  session_id: "",
+  steps: 1,
+  usage: {},
+  tool_calls: [],
+};
+
+function askWithOutput(stdout, exitCode = 0) {
+  return ask("hello", {
+    bin: stub,
+    env: {
+      RUNE_STUB_MODE: "result",
+      RUNE_STUB_STDOUT: stdout,
+      RUNE_STUB_STDERR: "stub diagnostic",
+      RUNE_STUB_EXIT_CODE: String(exitCode),
+    },
+  });
+}
+
+test("a result containing only output and exit_code names every missing field", async () => {
+  const stdout = JSON.stringify({ output: "ok", exit_code: 0 });
+  await assert.rejects(askWithOutput(stdout), (error) => {
+    assert.ok(error instanceof RuneOutputError);
+    assert.equal(error.code, "OUTPUT");
+    assert.equal(error.stdout, `${stdout}\n`);
+    assert.equal(error.stderr, "stub diagnostic");
+    assert.match(
+      error.message,
+      /missing fields: final_output, model, resolved_provider, session_id, steps, usage, tool_calls/,
+    );
+    return true;
+  });
+});
+
+test("every required result field is checked for presence", async (t) => {
+  for (const field of Object.keys(validResult)) {
+    await t.test(field, async () => {
+      const result = { ...validResult };
+      delete result[field];
+      await assert.rejects(askWithOutput(JSON.stringify(result)), (error) => {
+        assert.ok(error instanceof RuneOutputError);
+        assert.ok(error.message.includes(`missing fields: ${field}`));
+        return true;
+      });
+    });
+  }
+});
+
+test("result fields must have their declared types", async (t) => {
+  const cases = [
+    ["output", null],
+    ["final_output", 0],
+    ["exit_code", "0"],
+    ["model", null],
+    ["resolved_provider", 3],
+    ["session_id", false],
+    ["steps", "1"],
+    ["usage", null],
+    ["usage", []],
+    ["tool_calls", {}],
+    ["error", null],
+    ["error_code", 0],
+    ["usage.input_tokens", { usage: { input_tokens: "3" } }],
+    ["usage.output_tokens", { usage: { output_tokens: null } }],
+    ["tool_calls[0]", { tool_calls: [null] }],
+    ["tool_calls[0].name", { tool_calls: [{ status: "success" }] }],
+    ["tool_calls[0].name", { tool_calls: [{ name: 0, status: "success" }] }],
+    ["tool_calls[0].status", { tool_calls: [{ name: "read_file" }] }],
+    ["tool_calls[0].status", { tool_calls: [{ name: "read_file", status: "pending" }] }],
+  ];
+  for (const [field, value] of cases) {
+    await t.test(field, async () => {
+      const override = field.includes(".") || field.includes("[") ? value : { [field]: value };
+      const result = { ...validResult, ...override };
+      await assert.rejects(askWithOutput(JSON.stringify(result)), (error) => {
+        assert.ok(error instanceof RuneOutputError);
+        assert.ok(error.message.split("; standard output")[0].includes(field));
+        return true;
+      });
+    });
+  }
+  for (const field of ["exit_code", "steps", "usage.input_tokens", "usage.output_tokens"]) {
+    await t.test(`nonfinite ${field}`, async () => {
+      const result = field.startsWith("usage.")
+        ? { ...validResult, usage: { [field.slice(6)]: "OVERFLOW" } }
+        : { ...validResult, [field]: "OVERFLOW" };
+      const stdout = JSON.stringify(result).replace('"OVERFLOW"', "1e400");
+      await assert.rejects(askWithOutput(stdout), (error) => {
+        assert.ok(error instanceof RuneOutputError);
+        assert.ok(error.message.split("; standard output")[0].includes(field));
+        return true;
+      });
+    });
+  }
+});
+
+test("valid results preserve optional fields and wrapper output parsing", async () => {
+  const extended = {
+    ...validResult,
+    resolved_provider: "stub",
+    usage: { input_tokens: 0, output_tokens: 5 },
+    tool_calls: [{ name: "read_file", status: "error" }],
+    error: "tool failed",
+    error_code: "tool_execution_failed",
+    extra: true,
+  };
+  for (const result of [validResult, extended]) {
+    assert.deepEqual(await askWithOutput(JSON.stringify(result, null, 2)), result);
+    const stdout = `wrapper progress\n${JSON.stringify(result)}\n{"output":"partial","exit_code":0}\n`;
+    assert.deepEqual(await askWithOutput(stdout), result);
+  }
+});
+
+test("an invalid result on a failed exit preserves RuneExitError and stderr", async () => {
+  await assert.rejects(askWithOutput('{"output":"partial","exit_code":3}', 3), (error) => {
+    assert.ok(error instanceof RuneExitError);
+    assert.equal(error.exitCode, 3);
+    assert.equal(error.result, null);
+    assert.equal(error.stderr, "stub diagnostic");
+    assert.equal(error.message, "rune ask exited with code 3: stub diagnostic");
+    return true;
+  });
 });
 
 test("a failed exit with nothing on either stream is reported without a gap", async () => {

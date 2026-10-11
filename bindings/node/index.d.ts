@@ -20,7 +20,7 @@ export type RuneEffort =
  *
  * - `BINARY_NOT_FOUND`: no executable through the option, `RUNE_BIN`, or `PATH`.
  * - `EXIT`: the binary exited non-zero.
- * - `OUTPUT`: the binary exited cleanly without printing the result object.
+ * - `OUTPUT`: the binary exited cleanly without printing a valid result object.
  * - `TIMEOUT`: the process was killed after `timeoutMs`.
  * - `ABORTED`: the caller aborted through `signal`.
  * - `SIGNALED`: the process was terminated by another signal.
@@ -123,15 +123,15 @@ export class RuneExitError extends RuneError {
   constructor(exitCode: number, result: AskResult | null, stderr: string);
   /** Exit code reported by the process. */
   exitCode: number;
-  /** The parsed result object, or null when standard output held none. */
+  /** The validated result object, or null when standard output held none. */
   result: AskResult | null;
   /** Everything the process wrote to standard error. */
   stderr: string;
 }
 
-/** The binary exited cleanly without printing the result object. */
+/** The binary exited cleanly without printing a valid result object. */
 export class RuneOutputError extends RuneError {
-  constructor(stdout: string, stderr: string);
+  constructor(stdout: string, stderr: string, detail?: string | null);
   /** Everything the process wrote to standard output. */
   stdout: string;
   /** Everything the process wrote to standard error. */
@@ -155,7 +155,8 @@ export function resolveBinary(options?: { bin?: string; cwd?: string }): string;
  * @throws {TypeError} When an argument is outside its accepted range.
  * @throws {RuneBinaryNotFoundError} When the executable cannot be found or run.
  * @throws {RuneExitError} When the process exits non-zero.
- * @throws {RuneOutputError} When the process exits cleanly without the object.
+ * @throws {RuneOutputError} When the process exits cleanly without a valid object;
+ * missing or invalid fields are named in the message.
  * @throws {RuneError} With code `TIMEOUT`, `ABORTED`, or `SIGNALED`.
  */
 export function ask(prompt: string, options?: AskOptions): Promise<AskResult>;

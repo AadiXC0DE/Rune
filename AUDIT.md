@@ -2011,7 +2011,7 @@ Resource accumulation after cancellation, session holder handover and concurrent
 - [x] R-132 | T2 | fix | sdk | Bound the SDK event queue for a stalled consumer | acceptance: Stream 100000 fixture deltas without consuming events and observe bounded memory plus an explicit backpressure outcome.
 - [x] R-133 | T2 | fix | node | Resolve explicit relative binaries against options.cwd | acceptance: Place rune only in a scratch cwd, call ask with bin ./rune and observe the stub result.
 - [x] R-134 | T2 | fix | node | Reject nonfinite and overflowing timeout values | acceptance: Infinity, NaN and values beyond the timer range must fail validation without spawning a child or emitting TimeoutOverflowWarning.
-- [ ] R-135 | T2 | fix | node | Validate every required ask-result field | acceptance: A stub returning only output and exit_code must raise RuneOutputError naming missing fields.
+- [x] R-135 | T2 | fix | node | Validate every required ask-result field | acceptance: A stub returning only output and exit_code must raise RuneOutputError naming missing fields.
 - [ ] R-136 | T2 | fix | node | Bound captured child stdout and stderr | acceptance: Run a stub that writes beyond the configured output cap and observe a typed output-limit failure with bounded memory.
 - [ ] R-137 | T2 | fix | node | Find rune.exe on Windows | acceptance: On Windows with only rune.exe in a fixture PATH, resolveBinary must return its executable path.
 - [ ] R-138 | T2 | feature | node | Expose provider and offline process options | acceptance: Call ask with provider and offline options and assert both flags reach the stub before the command delimiter.

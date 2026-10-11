@@ -45,9 +45,9 @@ Point `bin` at `target/release/rune`, at `target/debug/rune` after
 such as `rune` is searched on `PATH`.
 
 A run that exits non-zero throws `RuneExitError`, whose `result` field carries
-the same object the binary printed, including `error` and `error_code`. A
-lookup that finds no binary throws `RuneBinaryNotFoundError`, which names the
-option, `RUNE_BIN`, and `PATH`.
+the validated object the binary printed, including `error` and `error_code`, or
+`null` if no valid result was printed. A lookup that finds no binary throws
+`RuneBinaryNotFoundError`, which names the option, `RUNE_BIN`, and `PATH`.
 
 ## API
 
@@ -58,10 +58,14 @@ option, `RUNE_BIN`, and `PATH`.
 | `RuneError` | Base class, with a `code` of `BINARY_NOT_FOUND`, `EXIT`, `OUTPUT`, `TIMEOUT`, `ABORTED`, or `SIGNALED` |
 | `RuneBinaryNotFoundError` | No executable through the option, `RUNE_BIN`, or `PATH` |
 | `RuneExitError` | Non-zero exit, with `exitCode`, `result`, and `stderr` |
-| `RuneOutputError` | Clean exit with no result object on standard output |
+| `RuneOutputError` | Clean exit with no valid result object on standard output; names missing or invalid fields |
 
 `options` accepts `bin`, `model`, `effort`, `cwd`, `env`, `noSave`, `timeoutMs`,
 and `signal`. Types for every field of the result object are in `index.d.ts`.
+The binding validates required fields, token counts when present, and tool call
+names and statuses before returning a result. `resolved_provider` may be `null`,
+and unreported token counts and failure fields may be absent. Extra fields are
+preserved. Wrapper progress lines are allowed; the last valid result is used.
 `timeoutMs` must be a finite positive number at most 2,147,483,647 milliseconds.
 Invalid values throw `TypeError` before resolving or spawning the binary.
 
