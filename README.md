@@ -304,8 +304,9 @@ Before each CLI session request, Rune estimates the serialized input, including
 instructions and tool schemas,
 and summarizes earlier turns at `compaction_trigger_percent` of usable input
 capacity. Requests above capacity remain eligible for compaction when the retained
-tail fits with instructions, tool schemas, and the output reserve. A failed summary
-preserves the conversation and stops that request.
+tail fits with instructions, tool schemas, and the output reserve. A failed summary,
+including one stopped at the token limit, preserves the conversation and stops
+that request with an explicit error.
 
 Use `/compact preview` to see the exact counts of conversation records that
 manual compaction would summarize and retain verbatim. Records are the current

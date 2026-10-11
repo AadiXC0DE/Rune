@@ -3534,6 +3534,12 @@ fn summarize_history(
             format!("compaction failed, nothing was changed: {err}"),
         )
     })?;
+    if outcome.finish == Some(rune_net::stream::FinishReason::MaxTokens) {
+        return Err(RuneError::new(
+            ErrorCode::InvalidState,
+            "compaction produced an incomplete summary: the summarizer reached the token limit; nothing was changed",
+        ));
+    }
     let summary = outcome.text();
     rune_agent::compaction::validate_summary(&summary).map_err(|err| {
         RuneError::new(
@@ -7293,6 +7299,7 @@ mod tests {
     struct SummaryFixture {
         reply: String,
         status: u16,
+        finish_reason: &'static str,
         requests: Mutex<Vec<serde_json::Value>>,
         events: Option<Arc<Mutex<Vec<Event>>>>,
     }
@@ -7302,6 +7309,7 @@ mod tests {
             Self {
                 reply: reply.to_owned(),
                 status: 200,
+                finish_reason: "stop",
                 requests: Mutex::new(Vec::new()),
                 events: None,
             }
@@ -7333,7 +7341,7 @@ mod tests {
             let body = format!(
                 "data: {}\n\ndata: [DONE]\n\n",
                 serde_json::json!({
-                    "choices": [{"delta": {"content": self.reply}, "finish_reason": "stop"}]
+                    "choices": [{"delta": {"content": self.reply}, "finish_reason": self.finish_reason}]
                 })
             );
             Ok(rune_net::fetch::FetchResponse {
@@ -7577,6 +7585,39 @@ mod tests {
             assert_eq!(history.to_messages(), before);
             assert_eq!(plan.messages, before);
             assert!(host.events.lock().expect("events").is_empty());
+        }
+    }
+
+    #[test]
+    fn max_tokens_compaction_summary_preserves_history_with_an_incomplete_summary_error() {
+        for automatic in [false, true] {
+            let (host, mut history, mut request_plan) = compaction_fixture();
+            let reply =
+                "This summary was stopped halfway through its account of the work completed.";
+            rune_agent::compaction::validate_summary(reply).expect("otherwise usable summary");
+            let mut fetch = SummaryFixture::new(reply);
+            fetch.finish_reason = "length";
+            let before = history.clone();
+            let error = if automatic {
+                host.prepare_request(&mut history, &mut request_plan, &fetch)
+                    .expect_err("automatic compaction must reject a truncated summary")
+            } else {
+                let plan = rune_agent::compaction::plan(&history, &host.limits).expect("plan");
+                summarize_history(&host, &mut history, &plan, &fetch, &|| false)
+                    .expect_err("the shared summarizer must reject a truncated summary")
+            };
+            assert_eq!(error.code(), ErrorCode::InvalidState);
+            assert!(error.message().contains("incomplete summary"), "{error}");
+            assert!(error.message().contains("token limit"), "{error}");
+            assert!(error.message().contains("nothing was changed"), "{error}");
+            assert_eq!(history.turns(), before.turns());
+            assert_eq!(request_plan.messages, before.to_messages());
+            assert_eq!(fetch.requests.lock().expect("requests").len(), 1);
+            assert!(host.events.lock().expect("events").is_empty());
+            assert_eq!(
+                *host.transcript.lock().expect("transcript"),
+                history_entries(before.turns()),
+            );
         }
     }
 

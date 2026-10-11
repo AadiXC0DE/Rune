@@ -206,6 +206,10 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Fixed
 
+- Manual and automatic compaction reject summaries stopped at the token limit,
+  even when they contain usable text. An explicit incomplete-summary error keeps
+  the original history intact and blocks the pending automatic request.
+
 - Interactive sessions connect trusted, enabled project stdio MCP servers,
   advertise their discovered schemas, and execute model calls through the
   existing permission checks. Startup and calls obey MCP timeouts, cancellation
