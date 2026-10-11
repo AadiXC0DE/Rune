@@ -6,6 +6,9 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Added
 
+- The Node binding accepts `provider` and `offline` options for `ask`, passing
+  `--provider <name>` and `--offline` before the command name.
+
 - ACP negotiates protocol version 1 and requires compatible initialization
   before session methods can run. Unsupported versions receive the supported
   version but leave sessions blocked until a version 1 retry; malformed versions

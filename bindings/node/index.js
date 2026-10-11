@@ -147,6 +147,8 @@ export async function ask(prompt, options = {}) {
   }
 
   const {
+    provider,
+    offline = false,
     model,
     effort,
     cwd,
@@ -156,6 +158,12 @@ export async function ask(prompt, options = {}) {
     signal,
     maxOutputBytes = DEFAULT_MAX_OUTPUT_BYTES,
   } = options;
+  if (provider !== undefined && (typeof provider !== "string" || provider.length === 0)) {
+    throw new TypeError("the provider option must be a non-empty string");
+  }
+  if (typeof offline !== "boolean") {
+    throw new TypeError("the offline option must be a boolean");
+  }
   if (model !== undefined && (typeof model !== "string" || model.length === 0)) {
     throw new TypeError("the model option must be a non-empty string");
   }
@@ -178,6 +186,8 @@ export async function ask(prompt, options = {}) {
   const args = [];
   // Options that apply to the whole process are only read before the command
   // name; everything after it belongs to the command.
+  if (provider !== undefined) args.push("--provider", provider);
+  if (offline) args.push("--offline");
   if (model !== undefined) args.push("--model", model);
   if (effort !== undefined) args.push("--effort", effort);
   args.push("ask", "--json");

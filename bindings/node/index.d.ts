@@ -90,6 +90,10 @@ export interface AskResult {
 export interface AskOptions {
   /** Path to the executable, relative to `cwd`, or a name to find on `PATH`. */
   bin?: string;
+  /** Provider override for this run; non-empty string passed before the command name. */
+  provider?: string;
+  /** Pass `--offline` before the command name when true; defaults to false. */
+  offline?: boolean;
   /** Model override for this run, passed before the command name. */
   model?: string;
   /** Reasoning effort override for this run, passed before the command name. */

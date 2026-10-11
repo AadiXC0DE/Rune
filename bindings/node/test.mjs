@@ -226,6 +226,55 @@ test("a prompt starting with a dash stays the prompt", async () => {
   assert.equal(result.model, "");
 });
 
+test("provider and offline options reach the stub before the command and delimiter", async () => {
+  const bin = nodeStub("rune-process-options", `
+    console.log(JSON.stringify({ ...${JSON.stringify(validResult)}, args: process.argv.slice(2) }));
+  `);
+  const prompt = "--provider prompt-provider --offline";
+  const provider = "custom provider; $(echo literal)";
+  const result = await ask(prompt, {
+    bin,
+    provider,
+    offline: true,
+    model: "stub-model",
+    effort: "high",
+    noSave: true,
+  });
+  assert.deepEqual(result.args, [
+    "--provider", provider,
+    "--offline",
+    "--model", "stub-model",
+    "--effort", "high",
+    "ask", "--json", "--no-save", "--", prompt,
+  ]);
+
+  for (const options of [{}, { offline: false }, { offline: undefined }]) {
+    assert.deepEqual((await ask(prompt, { bin, ...options })).args, ["ask", "--json", "--", prompt]);
+  }
+  assert.deepEqual((await ask(prompt, { bin, provider, offline: false })).args, [
+    "--provider", provider, "ask", "--json", "--", prompt,
+  ]);
+  assert.deepEqual((await ask(prompt, { bin, offline: true })).args, [
+    "--offline", "ask", "--json", "--", prompt,
+  ]);
+});
+
+test("invalid provider and offline options fail before binary lookup", async () => {
+  const bin = join(first.directory, "absent");
+  for (const provider of ["", null, false, 123, {}, []]) {
+    await assert.rejects(ask("hello", { bin, provider }), {
+      name: "TypeError",
+      message: "the provider option must be a non-empty string",
+    });
+  }
+  for (const offline of [null, "true", "false", 0, 1, {}, []]) {
+    await assert.rejects(ask("hello", { bin, offline }), {
+      name: "TypeError",
+      message: "the offline option must be a boolean",
+    });
+  }
+});
+
 test("a non-zero exit becomes a typed error carrying the result", async () => {
   const error = await ask("hello", {
     bin: stub,

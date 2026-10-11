@@ -62,9 +62,15 @@ the validated object the binary printed, including `error` and `error_code`, or
 | `RuneOutputError` | Clean exit with no valid result object on standard output; names missing or invalid fields |
 | `RuneOutputLimitError` | Combined stdout and stderr exceeded the capture cap; carries `maxOutputBytes` and the `stream` that exceeded it |
 
-`options` accepts `bin`, `model`, `effort`, `cwd`, `env`, `noSave`, `timeoutMs`,
-`maxOutputBytes`, and `signal`. Types for every field of the result object are in
-`index.d.ts`.
+`options` accepts `bin`, `provider`, `offline`, `model`, `effort`, `cwd`, `env`,
+`noSave`, `timeoutMs`, `maxOutputBytes`, and `signal`. Types for every field of
+the result object are in `index.d.ts`.
+Set `provider` to a non-empty provider name to pass `--provider <name>`.
+Set `offline: true` to pass `--offline`; false or omission adds no offline flag
+and leaves the binary's configured offline setting in effect. Both flags are
+passed before `ask`, as are `model` and `effort`. Invalid provider values and
+non-boolean offline values throw `TypeError` before resolving or spawning the
+binary.
 The binding validates required fields, token counts when present, and tool call
 names and statuses before returning a result. `resolved_provider` may be `null`,
 and unreported token counts and failure fields may be absent. Extra fields are
