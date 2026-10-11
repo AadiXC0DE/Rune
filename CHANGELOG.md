@@ -206,6 +206,10 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Fixed
 
+- `rune ask` includes the resolved instructions from `rune prompt --show` in
+  every request, including workspace rules, system prompt overrides, and
+  configured instruction limits.
+
 - The model picker accepts unknown tagged IDs such as `qwen3:latest` and sends
   the chosen ID unchanged. Empty and malformed typed IDs are refused.
 

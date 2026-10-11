@@ -168,6 +168,16 @@ fn run_responses_fixture(
     no_save: bool,
     max_steps: Option<u64>,
 ) -> (Output, tempfile::TempDir, Vec<Value>) {
+    run_responses_fixture_with_setup(responses, json_output, no_save, max_steps, |_| {})
+}
+
+fn run_responses_fixture_with_setup(
+    responses: Vec<String>,
+    json_output: bool,
+    no_save: bool,
+    max_steps: Option<u64>,
+    setup: impl FnOnce(&tempfile::TempDir),
+) -> (Output, tempfile::TempDir, Vec<Value>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind fixture");
     listener.set_nonblocking(true).expect("nonblocking");
     let address = listener.local_addr().expect("fixture address");
@@ -234,6 +244,7 @@ fn run_responses_fixture(
         )
         .expect("step cap");
     }
+    setup(&dir);
     let mut command = isolated_command(&dir);
     command
         .env("RUNE_PROVIDER", "chat_completions")
@@ -560,6 +571,71 @@ fn call_delta(name: &str, arguments: &str) -> Value {
 }
 
 #[test]
+fn ask_sends_the_resolved_instructions_shown_by_prompt_show() {
+    for variant in ["workspace", "override", "bounded"] {
+        let (output, dir, requests) = run_responses_fixture_with_setup(
+            vec![
+                completion_response(
+                    &call_delta("read_file", r#"{"path":"fixture.txt"}"#),
+                    "tool_calls",
+                ),
+                completion_response(&json!({"content": "Fixture answer."}), "stop"),
+            ],
+            true,
+            true,
+            Some(2),
+            |dir| {
+                std::fs::write(
+                    dir.path().join("AGENTS.md"),
+                    format!(
+                        "AUDIT_INSTRUCTION_MUST_BE_SENT\n{}",
+                        "workspace rules\n".repeat(100)
+                    ),
+                )
+                .expect("workspace instructions");
+                if variant == "override" {
+                    std::fs::write(
+                        dir.path().join("config/rune/SYSTEM.md"),
+                        "Fixture system override.",
+                    )
+                    .expect("system prompt override");
+                } else if variant == "bounded" {
+                    std::fs::write(
+                        dir.path().join("config/rune/config.toml"),
+                        "[limits]\nmax_agent_steps = 2\nproject_instructions_total_bytes = 512\n",
+                    )
+                    .expect("instruction limit");
+                }
+            },
+        );
+        assert!(output.status.success(), "{variant}: {output:?}");
+        assert!(output.stderr.is_empty(), "{variant}: {output:?}");
+        let shown = isolated_command(&dir)
+            .args(["prompt", "--show"])
+            .output()
+            .expect("inspect resolved prompt");
+        assert!(shown.status.success(), "{shown:?}");
+        let shown = String::from_utf8(shown.stdout).expect("UTF-8 prompt");
+        assert!(shown.contains("AUDIT_INSTRUCTION_MUST_BE_SENT"), "{shown}");
+        if variant == "override" {
+            assert!(shown.starts_with("Fixture system override."), "{shown}");
+        } else if variant == "bounded" {
+            assert!(
+                shown.contains("truncated at the configured limit"),
+                "{shown}"
+            );
+        }
+        assert_eq!(requests.len(), 2);
+        for request in requests {
+            assert_eq!(request["messages"][0]["role"], "system");
+            assert_eq!(request["messages"][0]["content"], shown.trim_end());
+            assert_eq!(request["messages"][1]["role"], "user");
+            assert_eq!(request["messages"][1]["content"], "run the fixture command");
+        }
+    }
+}
+
+#[test]
 fn ask_reads_an_allowed_file_and_sends_its_result_before_the_final_answer() {
     for json_output in [true, false] {
         let (output, dir, requests) = run_responses_fixture(
@@ -590,13 +666,14 @@ fn ask_reads_an_allowed_file_and_sends_its_result_before_the_final_answer() {
         let messages = requests[1]["messages"]
             .as_array()
             .expect("second request messages");
-        assert_eq!(messages.len(), 3);
-        assert_eq!(messages[1]["role"], "assistant");
-        assert_eq!(messages[1]["tool_calls"][0]["id"], "call-fixture");
-        assert_eq!(messages[2]["role"], "tool");
-        assert_eq!(messages[2]["tool_call_id"], "call-fixture");
+        assert_eq!(messages.len(), 4);
+        assert_eq!(messages[0]["role"], "system");
+        assert_eq!(messages[2]["role"], "assistant");
+        assert_eq!(messages[2]["tool_calls"][0]["id"], "call-fixture");
+        assert_eq!(messages[3]["role"], "tool");
+        assert_eq!(messages[3]["tool_call_id"], "call-fixture");
         assert!(
-            messages[2]["content"]
+            messages[3]["content"]
                 .as_str()
                 .expect("read result")
                 .contains("ALLOWED_READ_RESULT")
@@ -660,7 +737,7 @@ fn ask_returns_denied_unknown_and_malformed_calls_to_the_model_without_running_t
             result["tool_calls"],
             json!([{"name": name, "status": "error"}])
         );
-        let tool_result = requests[1]["messages"][2]["content"]
+        let tool_result = requests[1]["messages"][3]["content"]
             .as_str()
             .expect("failure feedback");
         assert!(tool_result.contains(expected), "{tool_result}");

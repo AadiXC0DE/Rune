@@ -219,7 +219,9 @@ Unicode grapheme deletion and pasted text. Alt-R reapplies an undone edit and
 restores its caret. Repeated presses redo later edits; a new edit clears redo
 history. Press Alt with lowercase `r`.
 
-`rune ask` runs a bounded turn with the built-in host tools. Allowed calls run
+`rune ask` sends the resolved instructions shown by `rune prompt --show`, including
+workspace instruction files and the configured system prompt, on every request.
+It runs a bounded turn with the built-in host tools. Allowed calls run
 under the configured permission mode and workspace boundaries; calls requiring
 interactive approval return an error to the model without waiting for input.
 The next request includes the tool results. A positive `max_agent_steps` sets

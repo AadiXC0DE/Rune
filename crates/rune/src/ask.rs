@@ -164,6 +164,7 @@ pub fn read_stdin_prompt() -> Result<String> {
 /// Noninteractive composition of the shared agent loop and built-in tools.
 struct AskHost<'a> {
     settings: &'a Settings,
+    instructions: String,
     dialect: Box<dyn Provider>,
     endpoint: Endpoint,
     registry: Registry,
@@ -189,7 +190,7 @@ impl Host for AskHost<'_> {
     }
 
     fn instructions(&self) -> String {
-        String::new()
+        self.instructions.clone()
     }
 
     fn tools(&self) -> Vec<ToolSpec> {
@@ -341,6 +342,11 @@ pub fn run(
         .clone_from(&settings.additional_directories);
     let host = AskHost {
         settings,
+        instructions: rune_context::prompt::instructions_for(
+            context.workspace(),
+            &paths.config_root,
+            &settings.limits,
+        ),
         dialect,
         endpoint: crate::provider_setup::endpoint(
             &settings.provider,
