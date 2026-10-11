@@ -32,7 +32,7 @@ pub const MAX_EXPANSION_BYTES: usize = 256 * 1024;
 ///
 /// A conflict is reported rather than resolved: a command that silently replaced
 /// a built-in would make the built-in unreachable with no way to notice.
-pub const RESERVED: &[&str] = &["help", "quit", "exit", "clear", "compact"];
+pub const RESERVED: &[&str] = &["help", "quit", "exit", "clear", "compact", "goal"];
 
 /// Where a command came from.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize, Deserialize)]

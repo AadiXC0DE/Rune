@@ -291,8 +291,15 @@ Credentials, metadata, and transport headers are excluded. Recorded message
 and tool content is preserved verbatim. An incomplete final frame is omitted
 with a warning on stderr; other log corruption fails the export.
 
-Sessions are written as they run, so an interrupted session resumes. Interactive
-assistant text is journalled in bounded, durable frames before it is displayed.
+Sessions are written as they run, so an interrupted session resumes. Use
+`/goal <objective>` in an interactive session to explicitly set or replace the
+active objective. `/goal` shows it without changing the log. The exact objective is
+restored on resume and included in subsequent model instructions, independently
+of conversation compaction. Ordinary prompts create no objective; `/new` starts
+a session without one.
+
+Interactive assistant text is journalled in bounded, durable frames before it is
+displayed.
 After process death, resume replays the partial answer once with an
 `[interrupted]` boundary, without inventing a completed turn or token usage.
 Interactive resume replays the saved exchanges above the composer before you

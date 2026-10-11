@@ -376,7 +376,17 @@ impl Host for SessionHost {
     }
 
     fn instructions(&self) -> String {
-        self.instructions.clone()
+        let mut instructions = self.instructions.clone();
+        if let Some(recorder) = &self.recorder {
+            let recorder = recorder
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(objective) = recorder.objective() {
+                instructions.push_str("\n\nActive session objective:\n");
+                instructions.push_str(objective);
+            }
+        }
+        instructions
     }
 
     fn tools(&self) -> Vec<ToolSpec> {
@@ -1777,6 +1787,18 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                             .unwrap_or_else(std::sync::PoisonError::into_inner)
                             .set_title(&session_log::derive_title(&title))?;
                         note(format!("renamed this session to {title}"));
+                    }
+                    Handled::Goal(objective) => {
+                        let mut recorder = recorder
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        if let Some(objective) = objective {
+                            recorder.set_objective(&objective)?;
+                        }
+                        note(recorder.objective().map_or_else(
+                            || "no active objective".to_owned(),
+                            |objective| format!("active objective: {objective}"),
+                        ));
                     }
                     Handled::SetModel(model) => {
                         // Named inline, so no catalog entry describes it and the
@@ -4332,6 +4354,8 @@ enum Handled {
     NewSession,
     /// Give the session a new title.
     Rename(String),
+    /// Set an explicit objective, or inspect the current one without changes.
+    Goal(Option<String>),
 }
 
 /// Token and request totals for one session.
@@ -4539,6 +4563,12 @@ fn handle_command<W: std::io::Write>(
                 return Ok(Handled::Continue);
             }
             Ok(Handled::Rename(title.to_owned()))
+        }
+        "goal" => {
+            let objective = arguments.trim();
+            Ok(Handled::Goal(
+                (!objective.is_empty()).then(|| objective.to_owned()),
+            ))
         }
         "status" => {
             let _ = writeln!(output, "{}", render_status(info));
@@ -4894,6 +4924,42 @@ pub fn prepare(
 mod tests {
     use super::*;
     use rune_term::shell::{ScriptedSource, Shell};
+
+    #[test]
+    fn the_active_objective_is_in_model_instructions_after_restart() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let base = Utf8PathBuf::from_path_buf(root.path().to_owned()).expect("utf8");
+        let paths = Paths {
+            config_root: base.join("config"),
+            state_root: base.join("state"),
+            data_root: base.join("data"),
+        };
+        let id = SessionId::generate();
+        let recorder = Recorder::create(&paths, &id).expect("create");
+        let mut host = test_host();
+        host.instructions = "Workspace instructions".to_owned();
+        host.recorder = Some(Arc::new(Mutex::new(recorder)));
+        assert_eq!(host.instructions(), "Workspace instructions");
+        host.recorder
+            .as_ref()
+            .expect("recorder")
+            .lock()
+            .expect("lock")
+            .set_objective("Fix café parsing")
+            .expect("goal");
+        let expected = "Workspace instructions\n\nActive session objective:\nFix café parsing";
+        assert_eq!(host.instructions(), expected);
+        assert_eq!(host.instructions(), expected);
+        host.recorder = None;
+        host.recorder = Some(Arc::new(Mutex::new(
+            Recorder::open(&paths, &id).expect("restart"),
+        )));
+        assert_eq!(host.instructions(), expected);
+        host.recorder = None;
+        let fresh = Recorder::create(&paths, &SessionId::generate()).expect("new session");
+        host.recorder = Some(Arc::new(Mutex::new(fresh)));
+        assert_eq!(host.instructions(), "Workspace instructions");
+    }
 
     /// A writer that appends to a shared buffer, for asserting on what a draw
     /// actually wrote.

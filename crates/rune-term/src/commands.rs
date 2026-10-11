@@ -73,6 +73,11 @@ pub const BUILTINS: &[Builtin] = &[
         summary: "name this session",
     },
     Builtin {
+        name: "goal",
+        arguments: "[objective]",
+        summary: "set or show the active session objective",
+    },
+    Builtin {
         name: "history",
         arguments: "[here|session-id|clear]",
         summary: "show recorded prompts",

@@ -137,6 +137,11 @@ pub enum SessionEvent {
         /// Display title.
         title: String,
     },
+    /// The user explicitly set the active session objective.
+    ObjectiveSet {
+        /// Objective text, retained independently of conversation compaction.
+        objective: String,
+    },
     /// The model settings for subsequent turns were saved.
     ModelSet {
         /// Selected model identifier.
@@ -183,6 +188,7 @@ impl SessionEvent {
             Self::Compaction { .. } => "compaction",
             Self::UsageRecorded { .. } => "usage_recorded",
             Self::TitleSet { .. } => "title_set",
+            Self::ObjectiveSet { .. } => "objective_set",
             Self::ModelSet { .. } => "model_set",
             Self::WorkspaceSet { .. } => "workspace_set",
             Self::ChildOf { .. } => "child_of",

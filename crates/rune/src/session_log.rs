@@ -71,6 +71,7 @@ pub struct Summary {
 #[derive(Debug)]
 pub struct Recorder {
     store: SessionStore,
+    objective: Option<String>,
     turn: u64,
     active_turn: bool,
     journal_error: Option<RuneError>,
@@ -85,6 +86,7 @@ impl Recorder {
         let store = SessionStore::create(paths, id)?;
         Ok(Self {
             store,
+            objective: None,
             turn: 0,
             active_turn: false,
             journal_error: None,
@@ -138,8 +140,16 @@ impl Recorder {
     pub fn open(paths: &Paths, id: &SessionId) -> Result<Self> {
         let store = SessionStore::open(&paths.session_dir(id))?;
         let turn = store.turns();
+        let objective = store.read()?.events.iter().rev().find_map(|frame| {
+            if let SessionEvent::ObjectiveSet { objective } = &frame.event {
+                Some(objective.clone())
+            } else {
+                None
+            }
+        });
         Ok(Self {
             store,
+            objective,
             turn,
             active_turn: false,
             journal_error: None,
@@ -157,6 +167,23 @@ impl Recorder {
     #[must_use]
     pub fn id(&self) -> SessionId {
         self.store.id()
+    }
+
+    /// Returns the explicitly set objective, absent for ordinary conversations.
+    pub fn objective(&self) -> Option<&str> {
+        self.objective.as_deref()
+    }
+
+    /// Persists an explicit objective before making it active in memory.
+    pub fn set_objective(&mut self, objective: &str) -> Result<()> {
+        if objective.trim().is_empty() {
+            return Err(RuneError::invalid_field("objective", "objective is empty"));
+        }
+        self.append(SessionEvent::ObjectiveSet {
+            objective: objective.to_owned(),
+        })?;
+        self.objective = Some(objective.to_owned());
+        Ok(())
     }
 
     /// Records the user's message.
@@ -545,6 +572,7 @@ pub fn tree_of(state: &SessionState) -> Tree {
             | SessionEvent::Compaction { .. }
             | SessionEvent::UsageRecorded { .. }
             | SessionEvent::TitleSet { .. }
+            | SessionEvent::ObjectiveSet { .. }
             | SessionEvent::ModelSet { .. }
             | SessionEvent::WorkspaceSet { .. }
             | SessionEvent::ChildOf { .. } => continue,
@@ -796,6 +824,7 @@ pub fn history_from(state: &SessionState) -> History {
             | SessionEvent::Compaction { .. }
             | SessionEvent::UsageRecorded { .. }
             | SessionEvent::TitleSet { .. }
+            | SessionEvent::ObjectiveSet { .. }
             | SessionEvent::ModelSet { .. }
             | SessionEvent::WorkspaceSet { .. }
             | SessionEvent::ChildOf { .. }
@@ -2123,5 +2152,38 @@ mod tests {
             timestamp(1_704_164_645_000).as_deref(),
             Some("2024-01-02T03:04:05Z")
         );
+    }
+
+    #[test]
+    fn explicit_objectives_survive_reopen_and_compaction_without_entering_history() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let root = Utf8Path::from_path(root.path()).expect("utf8");
+        let paths = paths(root);
+        let id = id("objective001");
+        let mut recorder = Recorder::create(&paths, &id).expect("create");
+        assert_eq!(recorder.objective(), None);
+        recorder
+            .user_message("Set a goal to fix this")
+            .expect("prompt");
+        assert_eq!(recorder.objective(), None);
+        assert!(recorder.set_objective(" \n ").is_err());
+        assert_eq!(recorder.store.read().expect("state").len(), 1);
+        recorder.set_objective("superseded").expect("first goal");
+        let objective = "Fix the café parser\nPreserve \"quoted\" inputs and 日本語";
+        recorder.set_objective(objective).expect("goal");
+        recorder
+            .append(SessionEvent::Compaction {
+                through: 3,
+                summary: "Earlier conversation".to_owned(),
+            })
+            .expect("compaction");
+        std::fs::remove_file(recorder.store.metadata_path()).expect("remove projection");
+        drop(recorder);
+
+        let (recorder, history) = load(&paths, &id).expect("restart");
+        assert_eq!(recorder.objective(), Some(objective));
+        assert_eq!(history.len(), 1);
+        assert_eq!(history.turns()[0].text(), "Set a goal to fix this");
+        assert_eq!(recorder.store.read().expect("state").turns, 0);
     }
 }

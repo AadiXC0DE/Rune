@@ -769,6 +769,7 @@ pub fn history_from_events(frames: &[EventFrame]) -> History {
             | SessionEvent::Compaction { .. }
             | SessionEvent::UsageRecorded { .. }
             | SessionEvent::TitleSet { .. }
+            | SessionEvent::ObjectiveSet { .. }
             | SessionEvent::WorkspaceSet { .. }
             | SessionEvent::ChildOf { .. } => {
                 flush_calls(&mut history, &mut calls);
