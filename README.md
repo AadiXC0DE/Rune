@@ -356,6 +356,14 @@ rune prompt --show          # the exact instructions the model receives
 can drive a session. `rune-sdk` is the library an embedder links against: the
 host supplies the credential, the tools, and the network path.
 
+SDK turns retain at most 1,024 unread events (`EVENT_QUEUE_CAPACITY`). Consume
+`Turn::events()` or `Turn::next_event()` while a long response runs. If the
+queue fills, the SDK cancels provider and tool work cooperatively and
+`Turn::result()` returns `limit_exceeded` with invariant `sdk_event_queue` and
+a backpressure message. Queued events remain readable; draining them later
+does not clear the failure. Calling only `result()` works for turns whose
+events fit in the queue.
+
 ACP clients must send an `initialize` request with an integer `protocolVersion`.
 Rune supports version 1 and returns `protocolVersion: 1`, its `agentInfo`,
 `agentCapabilities`, and an empty `authMethods` list. It advertises session

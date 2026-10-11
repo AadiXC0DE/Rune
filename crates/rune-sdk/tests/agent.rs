@@ -14,6 +14,7 @@
     clippy::indexing_slicing
 )]
 
+use std::io::{Cursor, Read};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -26,8 +27,8 @@ use rune_core::budget::{Budget, BudgetSet, LimitName};
 use rune_core::config::Layer;
 use rune_core::error::ErrorCode;
 use rune_sdk::agent::{
-    Agent, AgentOptions, Dialect, FetchRequest, FetchResponse, HostFetch, HostImage, HostTool,
-    PromptOptions, TurnResult,
+    Agent, AgentOptions, Dialect, EVENT_QUEUE_CAPACITY, FetchRequest, FetchResponse, HostFetch,
+    HostImage, HostTool, PromptOptions, TurnResult,
 };
 use rune_testkit::{MockEndpoint, Script};
 
@@ -1069,4 +1070,302 @@ fn host_transport_failures_retry_but_policy_refusals_keep_their_details() {
         assert_eq!(error.message(), "host failure");
         assert_eq!(fetch.hits.load(Ordering::SeqCst), expected_hits);
     }
+}
+
+/// Generates repeated SSE frames without allocating the complete response.
+#[derive(Debug)]
+struct RepeatingFrame {
+    frame: Vec<u8>,
+    offset: usize,
+    bytes_read: Arc<AtomicUsize>,
+    gate: Option<std::sync::mpsc::Receiver<()>>,
+}
+
+impl Read for RepeatingFrame {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        let buffer = if let Some(gate) = &self.gate {
+            if buffer.is_empty() {
+                return Ok(0);
+            }
+            gate.recv()
+                .map_err(|_| std::io::Error::from(std::io::ErrorKind::BrokenPipe))?;
+            let count = buffer
+                .len()
+                .min(self.frame.len().saturating_sub(self.offset));
+            &mut buffer[..count]
+        } else {
+            buffer
+        };
+        let mut written = 0_usize;
+        while written < buffer.len() {
+            let count = self
+                .frame
+                .len()
+                .saturating_sub(self.offset)
+                .min(buffer.len().saturating_sub(written));
+            let end = written.saturating_add(count);
+            let frame_end = self.offset.saturating_add(count);
+            buffer[written..end].copy_from_slice(&self.frame[self.offset..frame_end]);
+            self.offset = if frame_end == self.frame.len() {
+                0
+            } else {
+                frame_end
+            };
+            written = end;
+        }
+        self.bytes_read.fetch_add(written, Ordering::SeqCst);
+        Ok(written)
+    }
+}
+
+#[derive(Debug)]
+struct DeltaFetch {
+    deltas: usize,
+    delta: String,
+    bytes_read: Arc<AtomicUsize>,
+    hits: AtomicUsize,
+    gate: std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+}
+
+impl DeltaFetch {
+    fn new(deltas: usize, delta_bytes: usize) -> Self {
+        Self {
+            deltas,
+            delta: "x".repeat(delta_bytes),
+            bytes_read: Arc::new(AtomicUsize::new(0)),
+            hits: AtomicUsize::new(0),
+            gate: std::sync::Mutex::new(None),
+        }
+    }
+
+    fn frame(&self) -> Vec<u8> {
+        format!(
+            "data: {}\n\n",
+            json!({"choices": [{"index": 0, "delta": {"content": self.delta}}]})
+        )
+        .into_bytes()
+    }
+}
+
+impl HostFetch for DeltaFetch {
+    fn post(&self, _request: FetchRequest) -> rune_core::error::Result<FetchResponse> {
+        if self.hits.fetch_add(1, Ordering::SeqCst) > 0 {
+            return Ok(FetchResponse::new(
+                200,
+                "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"recovered\"}}]}\n\ndata: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+            ));
+        }
+        let frame = self.frame();
+        let bytes = self.deltas.saturating_mul(frame.len());
+        let reader = RepeatingFrame {
+            frame,
+            offset: 0,
+            bytes_read: self.bytes_read.clone(),
+            gate: self.gate.lock().expect("gate").take(),
+        };
+        Ok(FetchResponse {
+            status: 200,
+            body: Box::new(reader.take(bytes as u64).chain(Cursor::new(
+                b"data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+            ))),
+        })
+    }
+}
+
+#[test]
+fn a_stalled_consumer_bounds_100000_deltas_and_reports_backpressure() {
+    // Both many tiny events and larger payloads must stop after the same
+    // queue bound. The fixture itself holds only one frame at a time.
+    for delta_bytes in [1, 4096] {
+        let fetch = Arc::new(DeltaFetch::new(100_000, delta_bytes));
+        let mut agent =
+            Agent::new(options("https://example.invalid/v1", fetch.clone())).expect("agent");
+        let mut turn = agent
+            .prompt("stream", PromptOptions::default())
+            .expect("turn");
+        let (send, receive) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let result = turn.result();
+            send.send((turn, result)).expect("send result");
+        });
+        // No events are consumed until the worker has settled. In particular,
+        // waiting for just the result must not deadlock on a full queue.
+        let (mut turn, result) = receive
+            .recv_timeout(Duration::from_secs(5))
+            .expect("a stalled event consumer must not block completion");
+        worker.join().expect("worker");
+        let error = result.expect_err("backpressure");
+        assert_eq!(error.code(), ErrorCode::LimitExceeded);
+        assert_eq!(error.detail().invariant.as_deref(), Some("sdk_event_queue"));
+        assert_eq!(error.detail().observed.as_deref(), Some("1024"));
+        assert!(error.message().contains("backpressure"));
+        assert!(error.hint().expect("repair hint").contains("consume"));
+
+        // Bound the retained payload directly, without allocator/RSS noise.
+        let events: Vec<_> = turn.events().collect();
+        assert_eq!(events.len(), EVENT_QUEUE_CAPACITY);
+        assert!(matches!(events.first(), Some(Event::TurnStarted { .. })));
+        let queued_bytes: usize = events
+            .iter()
+            .map(|event| match event {
+                Event::TextDelta { delta } => delta.len(),
+                _ => 0,
+            })
+            .sum();
+        assert_eq!(
+            queued_bytes,
+            EVENT_QUEUE_CAPACITY
+                .saturating_sub(1)
+                .saturating_mul(delta_bytes)
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, Event::Finished { .. }))
+        );
+        // Decoding can finish the current 16 KiB chunk; the existing transport
+        // helper can read ahead by eight chunks plus its pending read.
+        let read_bound = EVENT_QUEUE_CAPACITY
+            .saturating_mul(fetch.frame().len())
+            .saturating_add(16 * 1024 * 16);
+        assert!(fetch.bytes_read.load(Ordering::SeqCst) <= read_bound);
+        assert_eq!(
+            fetch.hits.load(Ordering::SeqCst),
+            1,
+            "no retry on backpressure"
+        );
+        assert_eq!(
+            turn.result().expect_err("failure stays explicit").code(),
+            ErrorCode::LimitExceeded
+        );
+
+        // The failure releases the conversation and does not poison the next
+        // turn's cancellation flag, even when the old handle is dropped.
+        let mut next = agent
+            .prompt("again", PromptOptions::default())
+            .expect("next turn");
+        drop(turn);
+        assert_eq!(next.result().expect("recovered").text, "recovered");
+    }
+}
+
+#[test]
+fn a_result_only_turn_keeps_all_events_up_to_the_queue_capacity() {
+    // TurnStarted and Finished each occupy one slot as well as the deltas.
+    let deltas = EVENT_QUEUE_CAPACITY.saturating_sub(2);
+    let fetch = Arc::new(DeltaFetch::new(deltas, 1));
+    let mut agent = Agent::new(options("https://example.invalid/v1", fetch)).expect("agent");
+    let mut turn = agent
+        .prompt("stream", PromptOptions::default())
+        .expect("turn");
+    let result = turn.result().expect("fits exactly");
+    assert_eq!(result.stop_reason, StopReason::Completed);
+    assert_eq!(result.text, "x".repeat(deltas));
+    let events: Vec<_> = turn.events().collect();
+    assert_eq!(events.len(), EVENT_QUEUE_CAPACITY);
+    assert!(matches!(events.first(), Some(Event::TurnStarted { .. })));
+    assert!(matches!(
+        events.last(),
+        Some(Event::Finished {
+            reason: StopReason::Completed,
+            ..
+        })
+    ));
+    assert_eq!(
+        events
+            .iter()
+            .filter_map(|event| match event {
+                Event::TextDelta { delta } => Some(delta.as_str()),
+                _ => None,
+            })
+            .collect::<String>(),
+        result.text
+    );
+}
+
+#[test]
+fn overflow_of_the_finished_event_is_still_an_explicit_failure() {
+    let fetch = Arc::new(DeltaFetch::new(EVENT_QUEUE_CAPACITY.saturating_sub(1), 1));
+    let mut agent = Agent::new(options("https://example.invalid/v1", fetch)).expect("agent");
+    let mut turn = agent
+        .prompt("stream", PromptOptions::default())
+        .expect("turn");
+    let error = turn
+        .result()
+        .expect_err("the terminal event cannot be silently lost");
+    assert_eq!(error.code(), ErrorCode::LimitExceeded);
+    assert_eq!(error.detail().invariant.as_deref(), Some("sdk_event_queue"));
+    assert_eq!(turn.events().count(), EVENT_QUEUE_CAPACITY);
+}
+
+#[test]
+fn consuming_events_allows_a_response_larger_than_the_queue() {
+    let deltas = EVENT_QUEUE_CAPACITY.saturating_mul(2);
+    let fetch = Arc::new(DeltaFetch::new(deltas, 1));
+    let (advance, gate) = std::sync::mpsc::channel();
+    *fetch.gate.lock().expect("gate") = Some(gate);
+    // Pace the host reader with consumption, so the producer cannot race
+    // ahead because of test-machine scheduling.
+    advance.send(()).expect("first frame");
+    let mut agent = Agent::new(options("https://example.invalid/v1", fetch)).expect("agent");
+    let mut turn = agent
+        .prompt("stream", PromptOptions::default())
+        .expect("turn");
+    let mut text = String::new();
+    let mut finished = false;
+    for event in turn.events() {
+        match event {
+            Event::TextDelta { delta } => {
+                text.push_str(&delta);
+                if text.len() < deltas {
+                    advance.send(()).expect("next frame");
+                }
+            }
+            Event::Finished { reason, .. } => {
+                assert_eq!(reason, StopReason::Completed);
+                finished = true;
+            }
+            _ => {}
+        }
+    }
+    let result = turn.result().expect("completed");
+    assert!(finished);
+    assert_eq!(text, "x".repeat(deltas));
+    assert_eq!(result.text, text);
+    assert_eq!(result.stop_reason, StopReason::Completed);
+}
+
+#[test]
+fn backpressure_on_tool_started_prevents_the_host_tool_from_running() {
+    let mut frames = vec![
+        json!({"choices": [{"index": 0, "delta": {"content": "x"}}]}).to_string();
+        EVENT_QUEUE_CAPACITY.saturating_sub(1)
+    ];
+    let Script::Frames(tool_frames) = Script::tool_call("call_1", "lookup", "{}") else {
+        panic!("tool fixture must stream frames");
+    };
+    frames.extend(tool_frames);
+    let endpoint = MockEndpoint::start(vec![Script::Frames(frames)]);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let tool_calls = calls.clone();
+    let mut agent_options = options(&endpoint.base_url(), Arc::new(CountingFetch::new()));
+    agent_options.tools.push(HostTool::new(
+        "lookup",
+        "Looks a key up.",
+        json!({"type": "object", "properties": {}}),
+        move |_, _| {
+            tool_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(rune_sdk::agent::HostToolResult::text("value"))
+        },
+    ));
+    let mut agent = Agent::new(agent_options).expect("agent");
+    let mut turn = agent
+        .prompt("lookup", PromptOptions::default())
+        .expect("turn");
+    let error = turn.result().expect_err("ToolStarted overflow");
+    assert_eq!(error.code(), ErrorCode::LimitExceeded);
+    assert_eq!(error.detail().invariant.as_deref(), Some("sdk_event_queue"));
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert_eq!(endpoint.request_count(), 1);
+    assert_eq!(turn.events().count(), EVENT_QUEUE_CAPACITY);
 }

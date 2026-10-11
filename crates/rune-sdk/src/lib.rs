@@ -16,9 +16,9 @@ pub mod agent;
 pub mod plugin;
 
 pub use agent::{
-    Agent, AgentOptions, CHECKPOINT_VERSION, CancelFlag, Dialect, Events, FetchRequest,
-    FetchResponse, HostFetch, HostImage, HostTool, HostToolContext, HostToolResult, PromptOptions,
-    Turn, TurnResult,
+    Agent, AgentOptions, CHECKPOINT_VERSION, CancelFlag, Dialect, EVENT_QUEUE_CAPACITY, Events,
+    FetchRequest, FetchResponse, HostFetch, HostImage, HostTool, HostToolContext, HostToolResult,
+    PromptOptions, Turn, TurnResult,
 };
 pub use plugin::{
     MANIFEST_FILE, MAX_FRAME_BYTES, PLUGIN_PROTOCOL_VERSION, PluginHost, PluginManifest,

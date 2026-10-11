@@ -182,6 +182,12 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Fixed
 
+- SDK turns bound unread events to 1,024 entries. A stalled consumer that fills
+  the queue cancels cooperative provider and tool work and receives an explicit
+  `limit_exceeded` backpressure error with invariant `sdk_event_queue` from
+  `Turn::result()`. Event delivery never blocks shutdown, and queued events
+  remain readable after the failure.
+
 - SDK prompts with default options honor the agent's configured
   `max_agent_steps` limit. A nonzero `PromptOptions.max_steps` overrides that
   limit for the turn; zero or `off` in the agent limits still allows unlimited

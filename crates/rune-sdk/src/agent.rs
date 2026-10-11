@@ -14,7 +14,7 @@
 use std::fmt;
 use std::io::Read;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
 
@@ -35,6 +35,12 @@ use rune_tools::contract::{Activity, ToolOutput};
 
 /// Version of the checkpoint format written by [`Agent::checkpoint`].
 pub const CHECKPOINT_VERSION: u32 = 1;
+
+/// Maximum number of unread events retained by a turn.
+///
+/// A full queue cancels the turn. [`Turn::result`] then returns `LimitExceeded`
+/// with the `sdk_event_queue` invariant, even if the caller later drains it.
+pub const EVENT_QUEUE_CAPACITY: usize = 1024;
 
 /// Which endpoint shape the agent speaks.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -526,7 +532,8 @@ impl Turn {
     /// Returns the next event, waiting for one when the turn is still running.
     ///
     /// Returns `None` once the turn has ended. A caller that only needs the
-    /// outcome can skip this and call [`Turn::result`].
+    /// outcome can skip this and call [`Turn::result`], provided the turn emits
+    /// no more than [`EVENT_QUEUE_CAPACITY`] events.
     pub fn next_event(&mut self) -> Option<Event> {
         self.events.recv().ok()
     }
@@ -543,6 +550,10 @@ impl Turn {
     /// Waiting here is what makes the caller's lifetime the turn's lifetime: the
     /// worker stops, and any cancellation requested while it ran is reflected in
     /// the stop reason.
+    ///
+    /// If the unread event queue filled, returns `LimitExceeded` with the
+    /// `sdk_event_queue` invariant. Consume events as the turn runs to avoid
+    /// this backpressure failure on long responses.
     pub fn result(&mut self) -> Result<TurnResult> {
         self.join();
         let product = self.completion.wait()?;
@@ -763,11 +774,12 @@ impl Agent {
 
         lock(&self.conversation.history).push_user(input.into());
 
-        let (events, receiver) = mpsc::channel();
+        let (events, receiver) = mpsc::sync_channel(EVENT_QUEUE_CAPACITY);
         let context = TurnContext {
             conversation: Arc::clone(&self.conversation),
             cancel: self.cancel.clone(),
             events,
+            backpressured: AtomicBool::new(false),
             model: self.model.clone(),
             instructions: self.instructions.clone(),
             endpoint: self.endpoint.clone(),
@@ -795,6 +807,22 @@ impl Agent {
             .spawn(move || {
                 let settled = guard;
                 let product = run_turn(&context);
+                // Backpressure uses cancellation to stop cooperative work, but
+                // must remain an explicit failure rather than a cancelled or
+                // successful result, including overflow of the final event.
+                let product = if context.backpressured.load(Ordering::SeqCst) {
+                    Err(RuneError::new(
+                        ErrorCode::LimitExceeded,
+                        format!(
+                            "SDK event queue backpressure: {EVENT_QUEUE_CAPACITY} unread events"
+                        ),
+                    )
+                    .with_invariant("sdk_event_queue")
+                    .with_observed(EVENT_QUEUE_CAPACITY.to_string())
+                    .with_hint("consume Turn::events or Turn::next_event while the turn runs"))
+                } else {
+                    product
+                };
                 settled.publish(product);
             });
 
@@ -940,7 +968,8 @@ fn highest_image(history: &History) -> u64 {
 struct TurnContext {
     conversation: Arc<Conversation>,
     cancel: Cancellation,
-    events: Sender<Event>,
+    events: SyncSender<Event>,
+    backpressured: AtomicBool,
     model: String,
     instructions: String,
     endpoint: Endpoint,
@@ -955,10 +984,16 @@ struct TurnContext {
 impl TurnContext {
     /// Reports an event.
     ///
-    /// A dropped receiver means the caller discarded the turn handle; the turn
-    /// still runs to a settled result.
+    /// Never waits for the consumer. Once full, the queue fails the turn and
+    /// stops retaining events; cooperative cancellation stops provider/tools.
     fn emit(&self, event: Event) {
-        let _ = self.events.send(event);
+        if self.backpressured.load(Ordering::SeqCst) {
+            return;
+        }
+        if let Err(TrySendError::Full(_)) = self.events.try_send(event) {
+            self.backpressured.store(true, Ordering::SeqCst);
+            self.cancel.cancel();
+        }
     }
 
     /// Adds one request's usage to the conversation's total.
@@ -1350,6 +1385,15 @@ fn execute(context: &TurnContext, calls: &[PreparedCall]) -> (Vec<Executed>, boo
             call: call.clone(),
             activity: Activity::Execute,
         });
+        // A full event queue must stop a tool before invoking host code.
+        if context.cancel.is_cancelled() {
+            cancelled = true;
+            results.push(failed(
+                call,
+                "the turn was cancelled before this call ran".to_owned(),
+            ));
+            continue;
+        }
         let host_context = HostToolContext {
             signal: context.cancel.clone().into(),
         };
