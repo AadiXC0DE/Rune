@@ -98,8 +98,15 @@ pub trait Provider: Send + Sync {
     /// Serializes a request body.
     fn build_request(&self, plan: &RequestPlan) -> Result<serde_json::Value>;
 
-    /// Returns the path appended to the endpoint base URL.
+    /// Returns the fixed request path, or the resource prefix for a dialect
+    /// whose path depends on the model. Completions use [`Self::completion_path`].
     fn request_path(&self) -> &'static str;
+
+    /// Returns the completion path for this plan, including a model when the
+    /// endpoint places it in the URL. Fixed-path dialects keep their path.
+    fn completion_path(&self, _plan: &RequestPlan) -> Result<String> {
+        Ok(self.request_path().to_owned())
+    }
 
     /// Returns the path that lists the models this endpoint serves.
     ///

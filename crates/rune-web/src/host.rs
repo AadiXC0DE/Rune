@@ -134,6 +134,10 @@ impl Session {
                 AuthStyle::ApiKeyHeader,
             ),
             "responses" => (Box::new(rune_net::responses::Responses), AuthStyle::Bearer),
+            "gemini" | "google" => (
+                Box::new(rune_net::gemini::Gemini),
+                AuthStyle::GoogleApiKeyHeader,
+            ),
             "chat_completions" => (
                 Box::new(rune_net::chat_completions::ChatCompletions),
                 AuthStyle::Bearer,

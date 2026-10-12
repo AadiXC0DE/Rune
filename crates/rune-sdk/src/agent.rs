@@ -52,6 +52,8 @@ pub enum Dialect {
     Anthropic,
     /// The responses API.
     Responses,
+    /// The native Gemini Generate Content API.
+    Gemini,
 }
 
 impl Dialect {
@@ -62,6 +64,7 @@ impl Dialect {
             Self::ChatCompletions => Box::new(rune_net::chat_completions::ChatCompletions),
             Self::Anthropic => Box::new(rune_net::anthropic::Anthropic),
             Self::Responses => Box::new(rune_net::responses::Responses),
+            Self::Gemini => Box::new(rune_net::gemini::Gemini),
         }
     }
 
@@ -70,6 +73,7 @@ impl Dialect {
     const fn auth(self) -> AuthStyle {
         match self {
             Self::Anthropic => AuthStyle::ApiKeyHeader,
+            Self::Gemini => AuthStyle::GoogleApiKeyHeader,
             Self::ChatCompletions | Self::Responses => AuthStyle::Bearer,
         }
     }
@@ -1302,7 +1306,7 @@ fn request(
     }
 
     let request = FetchRequest {
-        url: context.endpoint.url_for(provider.request_path()),
+        url: context.endpoint.url_for(&provider.completion_path(plan)?),
         headers,
         body: serde_json::to_string(&body).map_err(RuneError::from)?,
     };

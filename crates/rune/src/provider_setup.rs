@@ -321,6 +321,7 @@ pub fn fetch_catalog(
     let dialect: Box<dyn rune_net::provider::Provider> = match settings.provider {
         Provider::Anthropic => Box::new(rune_net::anthropic::Anthropic),
         Provider::Responses => Box::new(rune_net::responses::Responses),
+        Provider::Gemini => Box::new(rune_net::gemini::Gemini),
         _ => Box::new(rune_net::chat_completions::ChatCompletions),
     };
 
@@ -521,11 +522,12 @@ pub fn inherited_endpoint(
 /// Returns how a provider expects its credential to be presented.
 ///
 /// Anthropic reads the key from its own header and refuses a bearer token for
-/// it, while every other dialect this build speaks takes a bearer token.
+/// it. Gemini uses `x-goog-api-key`; other dialects take a bearer token.
 #[must_use]
 pub const fn auth_style(provider: &Provider) -> rune_net::transport::AuthStyle {
     match provider {
         Provider::Anthropic => rune_net::transport::AuthStyle::ApiKeyHeader,
+        Provider::Gemini => rune_net::transport::AuthStyle::GoogleApiKeyHeader,
         _ => rune_net::transport::AuthStyle::Bearer,
     }
 }
@@ -654,6 +656,18 @@ mod tests {
         use rune_net::transport::AuthStyle;
 
         assert_eq!(auth_style(&Provider::Anthropic), AuthStyle::ApiKeyHeader);
+        assert_eq!(auth_style(&Provider::Gemini), AuthStyle::GoogleApiKeyHeader);
+        let gemini = endpoint(
+            &Provider::Gemini,
+            "https://example.invalid/v1beta",
+            "k",
+            false,
+        );
+        assert_eq!(gemini.auth.header(), "x-goog-api-key");
+        assert_eq!(
+            default_base_url(&Provider::Gemini),
+            Some("https://generativelanguage.googleapis.com/v1beta")
+        );
         for provider in [
             Provider::ChatCompletions,
             Provider::Responses,

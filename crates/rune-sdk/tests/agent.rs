@@ -109,6 +109,70 @@ fn options(base_url: &str, fetch: Arc<dyn HostFetch>) -> AgentOptions {
 }
 
 #[test]
+fn native_gemini_executes_a_host_tool_and_replays_its_signature() {
+    struct GeminiFetch(AtomicUsize);
+    impl HostFetch for GeminiFetch {
+        fn post(&self, request: FetchRequest) -> rune_core::error::Result<FetchResponse> {
+            assert_eq!(
+                request.url,
+                "https://example.invalid/v1beta/models/gemini-fixture:streamGenerateContent?alt=sse"
+            );
+            assert_eq!(
+                request.header("x-goog-api-key"),
+                Some("sk-embedder-credential-9271")
+            );
+            assert!(request.header("authorization").is_none());
+            let body: serde_json::Value = serde_json::from_str(&request.body).expect("body");
+            let frame = if self.0.fetch_add(1, Ordering::SeqCst) == 0 {
+                assert_eq!(
+                    body["tools"][0]["functionDeclarations"][0]["name"],
+                    "lookup"
+                );
+                json!({"candidates": [{"content": {"parts": [{"text": "looking up"}, {"functionCall": {"name": "lookup", "args": {"key": "alpha"}}, "thoughtSignature": "signed-call"}]}, "finishReason": "STOP"}], "usageMetadata": {"promptTokenCount": 12, "candidatesTokenCount": 3}})
+            } else {
+                assert_eq!(
+                    body["contents"][1]["parts"][1]["thoughtSignature"],
+                    "signed-call"
+                );
+                assert_eq!(
+                    body["contents"][2]["parts"][0]["functionResponse"]["response"]["output"],
+                    "value for alpha"
+                );
+                json!({"candidates": [{"content": {"parts": [{"text": "found it"}]}, "finishReason": "STOP"}], "usageMetadata": {"promptTokenCount": 20, "candidatesTokenCount": 4}})
+            };
+            Ok(FetchResponse {
+                status: 200,
+                body: Box::new(Cursor::new(format!("data: {frame}\n\n").into_bytes())),
+            })
+        }
+    }
+    let fetch = Arc::new(GeminiFetch(AtomicUsize::new(0)));
+    let mut opts = options("https://example.invalid/v1beta", fetch.clone());
+    opts.model = Some("gemini-fixture".to_owned());
+    opts.dialect = Dialect::Gemini;
+    opts.tools.push(HostTool::new(
+        "lookup",
+        "Look up a key",
+        json!({"type": "object", "properties": {"key": {"type": "string"}}}),
+        |args, _| {
+            assert_eq!(args["key"], "alpha");
+            Ok(rune_sdk::agent::HostToolResult::text("value for alpha"))
+        },
+    ));
+    let mut agent = Agent::new(opts).expect("agent");
+    let mut turn = agent
+        .prompt("look up alpha", PromptOptions::default())
+        .expect("turn");
+    let result = turn.result().expect("result");
+    assert_eq!(result.text, "looking upfound it");
+    assert_eq!(result.calls.len(), 1);
+    assert!(result.calls[0].executed);
+    assert_eq!(result.usage.input_tokens, Some(32));
+    assert_eq!(result.usage.output_tokens, Some(7));
+    assert_eq!(fetch.0.load(Ordering::SeqCst), 2);
+}
+
+#[test]
 fn an_explicitly_anonymous_agent_completes_without_authentication_headers() {
     struct AnonymousFetch(CountingFetch);
     impl HostFetch for AnonymousFetch {

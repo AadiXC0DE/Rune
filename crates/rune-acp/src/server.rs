@@ -77,6 +77,8 @@ pub enum Dialect {
     Responses,
     /// An Anthropic Messages endpoint.
     Anthropic,
+    /// A native Gemini Generate Content endpoint.
+    Gemini,
 }
 
 impl Dialect {
@@ -87,10 +89,12 @@ impl Dialect {
             rune_net::chat_completions::ChatCompletions;
         static RESPONSES: rune_net::responses::Responses = rune_net::responses::Responses;
         static ANTHROPIC: rune_net::anthropic::Anthropic = rune_net::anthropic::Anthropic;
+        static GEMINI: rune_net::gemini::Gemini = rune_net::gemini::Gemini;
         match self {
             Self::ChatCompletions => &CHAT,
             Self::Responses => &RESPONSES,
             Self::Anthropic => &ANTHROPIC,
+            Self::Gemini => &GEMINI,
         }
     }
 
@@ -101,6 +105,7 @@ impl Dialect {
             Self::ChatCompletions => "chat_completions",
             Self::Responses => "responses",
             Self::Anthropic => "anthropic",
+            Self::Gemini => "gemini",
         }
     }
 
@@ -111,6 +116,7 @@ impl Dialect {
             "chat_completions" | "chat-completions" | "openai" => Some(Self::ChatCompletions),
             "responses" => Some(Self::Responses),
             "anthropic" | "messages" => Some(Self::Anthropic),
+            "gemini" | "google" => Some(Self::Gemini),
             _ => None,
         }
     }
@@ -1730,6 +1736,7 @@ mod tests {
             Dialect::ChatCompletions,
             Dialect::Responses,
             Dialect::Anthropic,
+            Dialect::Gemini,
         ] {
             assert_eq!(Dialect::from_name(dialect.name()), Some(dialect));
             assert!(!dialect.provider().name().is_empty());

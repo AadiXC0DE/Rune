@@ -375,6 +375,15 @@ pub fn from_endpoint_listing(provider: &str, body: &str) -> Option<Catalog> {
     let mut catalog = Catalog::new(provider);
     catalog.source = CatalogSource::Endpoint;
     for entry in entries {
+        let native_gemini = matches!(provider, "gemini" | "google");
+        if native_gemini
+            && entry
+                .get("supportedGenerationMethods")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|methods| !methods.iter().any(|method| method == "generateContent"))
+        {
+            continue;
+        }
         let id = entry
             .get("id")
             .or_else(|| entry.get("name"))
@@ -384,6 +393,11 @@ pub fn from_endpoint_listing(provider: &str, body: &str) -> Option<Catalog> {
         if id.is_empty() {
             continue;
         }
+        let id = if native_gemini {
+            id.strip_prefix("models/").unwrap_or(id)
+        } else {
+            id
+        };
         let mut model = ModelMetadata::new(id);
         // An endpoint that states a capacity is believed. Discarding it left
         // every session budgeting against a compiled default, which understates
@@ -398,6 +412,16 @@ pub fn from_endpoint_listing(provider: &str, body: &str) -> Option<Catalog> {
             .and_then(serde_json::Value::as_str)
             .filter(|name| *name != id)
             .map(str::to_owned);
+        if native_gemini {
+            model.context_window = number(entry, &["inputTokenLimit"]).or(model.context_window);
+            model.max_output_tokens =
+                number(entry, &["outputTokenLimit"]).or(model.max_output_tokens);
+            model.display_name = entry
+                .get("displayName")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+                .or(model.display_name);
+        }
         catalog.models.push(model);
     }
     Some(catalog)
@@ -418,6 +442,20 @@ fn number(entry: &serde_json::Value, keys: &[&str]) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_gemini_listing_keeps_reported_windows_and_generation_models() {
+        let body = serde_json::json!({"models": [
+            {"name": "models/gemini-fixture", "displayName": "Gemini Fixture", "inputTokenLimit": 1_000_000, "outputTokenLimit": 8192, "supportedGenerationMethods": ["generateContent", "countTokens"]},
+            {"name": "models/embedding-fixture", "supportedGenerationMethods": ["embedContent"]}
+        ]}).to_string();
+        let catalog = from_endpoint_listing("gemini", &body).expect("catalog");
+        assert_eq!(catalog.models.len(), 1);
+        let model = catalog.get("gemini-fixture").expect("generation model");
+        assert_eq!(model.display_name.as_deref(), Some("Gemini Fixture"));
+        assert_eq!(model.context_window, Some(1_000_000));
+        assert_eq!(model.max_output_tokens, Some(8192));
+    }
 
     fn catalog_with(entries: Vec<ModelMetadata>) -> Catalog {
         Catalog {

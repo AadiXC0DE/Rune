@@ -188,6 +188,8 @@ pub enum Provider {
     Responses,
     /// An Anthropic Messages endpoint.
     Anthropic,
+    /// A native Gemini Generate Content endpoint.
+    Gemini,
     /// A named endpoint declared in the user configuration.
     Named(String),
 }
@@ -228,6 +230,7 @@ impl Provider {
             Self::ChatCompletions => "chat_completions",
             Self::Responses => "responses",
             Self::Anthropic => "anthropic",
+            Self::Gemini => "gemini",
             Self::Named(name) => name.as_str(),
         }
     }
@@ -1526,6 +1529,7 @@ pub fn provider_key(provider: &Provider) -> String {
         Provider::ChatCompletions => "chat_completions".to_owned(),
         Provider::Responses => "responses".to_owned(),
         Provider::Anthropic => "anthropic".to_owned(),
+        Provider::Gemini => "gemini".to_owned(),
         Provider::Named(name) => name.clone(),
     }
 }
@@ -1541,6 +1545,7 @@ pub fn parse_provider(raw: &str) -> Provider {
         "chat_completions" | "chat-completions" | "openai" => Provider::ChatCompletions,
         "responses" => Provider::Responses,
         "anthropic" => Provider::Anthropic,
+        "gemini" | "google" => Provider::Gemini,
         other => Provider::Named(other.to_owned()),
     }
 }
@@ -2773,6 +2778,14 @@ max_agent_steps = 50
         );
         assert_eq!(parse_provider("openai"), Provider::ChatCompletions);
         assert_eq!(parse_provider("ANTHROPIC"), Provider::Anthropic);
+        assert_eq!(parse_provider("GOOGLE"), Provider::Gemini);
+        assert_eq!(parse_provider("gemini"), Provider::Gemini);
+        assert_eq!(provider_key(&Provider::Gemini), "gemini");
+        let encoded = serde_json::to_string(&Provider::Gemini).expect("encode");
+        assert_eq!(
+            serde_json::from_str::<Provider>(&encoded).expect("decode"),
+            Provider::Gemini
+        );
         assert_eq!(
             parse_provider("chat-completions"),
             Provider::ChatCompletions

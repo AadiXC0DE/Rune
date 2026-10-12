@@ -94,6 +94,8 @@ pub enum AuthStyle {
     Bearer,
     /// `x-api-key: <value>`, used by one dialect.
     ApiKeyHeader,
+    /// `x-goog-api-key: <value>`, used by the native Gemini API.
+    GoogleApiKeyHeader,
 }
 
 impl AuthStyle {
@@ -104,6 +106,7 @@ impl AuthStyle {
             Self::Anonymous => "",
             Self::Bearer => "authorization",
             Self::ApiKeyHeader => "x-api-key",
+            Self::GoogleApiKeyHeader => "x-goog-api-key",
         }
     }
 
@@ -113,7 +116,7 @@ impl AuthStyle {
         match self {
             Self::Anonymous => String::new(),
             Self::Bearer => format!("Bearer {credential}"),
-            Self::ApiKeyHeader => credential.to_owned(),
+            Self::ApiKeyHeader | Self::GoogleApiKeyHeader => credential.to_owned(),
         }
     }
 }
@@ -619,7 +622,10 @@ pub fn stream_completion_observed(
         .build_request(plan)
         .map_err(|err| NetError::new(FailureKind::InvalidRequest, err.message().to_owned()))?;
 
-    let url = endpoint.url_for(provider.request_path());
+    let path = provider
+        .completion_path(plan)
+        .map_err(|err| NetError::new(FailureKind::InvalidRequest, err.message().to_owned()))?;
+    let url = endpoint.url_for(&path);
     let encoded = serde_json::to_string(&body)?;
     let timeouts = timeouts.into();
 

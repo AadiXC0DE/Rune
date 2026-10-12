@@ -258,6 +258,7 @@ fn from_env(name: &str) -> Option<Credential> {
 pub fn default_variables(provider: &str) -> &'static [&'static str] {
     match provider {
         "anthropic" => &["ANTHROPIC_API_KEY"],
+        "gemini" | "google" => &["GEMINI_API_KEY", "GOOGLE_API_KEY"],
         "chat_completions" | "openai" => &["OPENAI_API_KEY"],
         "responses" => &["OPENAI_API_KEY"],
         "opencode" | "opencode-go" => &["OPENCODE_API_KEY"],

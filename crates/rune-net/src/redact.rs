@@ -19,6 +19,7 @@ const SECRET_NAMES: &[&str] = &[
     "api_key",
     "api-key",
     "apikey",
+    "x-goog-api-key",
     "authorization",
     "auth_token",
     "bearer",
@@ -207,6 +208,11 @@ fn placeholder() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_native_gemini_key_header_is_redacted_even_for_short_keys() {
+        assert!(!redact("x-goog-api-key: shortkey").contains("shortkey"));
+    }
 
     #[test]
     fn an_api_key_assignment_is_redacted() {

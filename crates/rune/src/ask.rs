@@ -427,6 +427,7 @@ pub fn run(
     let dialect: Box<dyn Provider> = match settings.provider {
         rune_core::config::Provider::Anthropic => Box::new(rune_net::anthropic::Anthropic),
         rune_core::config::Provider::Responses => Box::new(rune_net::responses::Responses),
+        rune_core::config::Provider::Gemini => Box::new(rune_net::gemini::Gemini),
         _ => Box::new(rune_net::chat_completions::ChatCompletions),
     };
 

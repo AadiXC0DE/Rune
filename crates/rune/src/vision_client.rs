@@ -80,6 +80,7 @@ impl VisionBackend for NetworkVision {
             let dialect: Box<dyn Provider> = match self.kind {
                 ProviderKind::Anthropic => Box::new(rune_net::anthropic::Anthropic),
                 ProviderKind::Responses => Box::new(rune_net::responses::Responses),
+                ProviderKind::Gemini => Box::new(rune_net::gemini::Gemini),
                 _ => Box::new(rune_net::chat_completions::ChatCompletions),
             };
             let provider = ImageRequest { dialect, image };
@@ -182,6 +183,9 @@ impl Provider for ImageRequest {
     fn request_path(&self) -> &'static str {
         self.dialect.request_path()
     }
+    fn completion_path(&self, plan: &RequestPlan) -> Result<String> {
+        self.dialect.completion_path(plan)
+    }
     fn reducer(&self) -> Box<dyn StreamReducer> {
         self.dialect.reducer()
     }
@@ -203,6 +207,12 @@ impl Provider for ImageRequest {
         let url = format!("data:{};base64,{}", self.image.media_type, self.image.data);
         let text = serde_json::json!({"type": "text", "text": "Describe this image."});
         match self.dialect.name() {
+            "gemini" => {
+                body["contents"][0]["parts"] = serde_json::json!([
+                    {"text": "Describe this image."},
+                    {"inlineData": {"mimeType": self.image.media_type, "data": self.image.data}}
+                ]);
+            }
             "anthropic" => {
                 body["messages"][0]["content"] = serde_json::json!([text, {
                     "type": "image", "source": {"type": "base64", "media_type": self.image.media_type, "data": self.image.data}
@@ -274,6 +284,28 @@ mod tests {
             assert!(!body.to_string().contains("image-ref:"));
             assert_eq!(body["model"], "vision-fixture");
         }
+    }
+
+    #[test]
+    fn native_gemini_helper_embeds_image_bytes_and_delegates_the_model_path() {
+        let provider = ImageRequest {
+            dialect: Box::new(rune_net::gemini::Gemini),
+            image: EncodedImage {
+                media_type: "image/png".to_owned(),
+                data: "aW1hZ2U=".to_owned(),
+            },
+        };
+        let mut plan = RequestPlan::new("vision-fixture");
+        plan.messages = vec![Message::user("Describe this image.")];
+        let body = provider.build_request(&plan).expect("request");
+        assert_eq!(
+            body["contents"][0]["parts"][1]["inlineData"],
+            serde_json::json!({"mimeType": "image/png", "data": "aW1hZ2U="})
+        );
+        assert_eq!(
+            provider.completion_path(&plan).expect("path"),
+            "/models/vision-fixture:streamGenerateContent?alt=sse"
+        );
     }
 
     #[test]

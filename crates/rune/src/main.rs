@@ -1296,6 +1296,7 @@ fn run_acp(
     let dialect = match settings.provider {
         Provider::Anthropic => rune_acp::Dialect::Anthropic,
         Provider::Responses => rune_acp::Dialect::Responses,
+        Provider::Gemini => rune_acp::Dialect::Gemini,
         _ => rune_acp::Dialect::ChatCompletions,
     };
 

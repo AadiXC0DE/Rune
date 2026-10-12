@@ -60,6 +60,92 @@ fn version_prints_one_line_and_exits_zero() {
 }
 
 #[test]
+fn ask_selects_native_gemini_from_configuration_and_environment_credentials() {
+    use std::io::{BufRead as _, Read as _, Write as _};
+    use std::time::{Duration, Instant};
+
+    let frame = serde_json::json!({"candidates": [{"content": {"role": "model", "parts": [{"text": "native answer"}]}, "finishReason": "STOP"}], "usageMetadata": {"promptTokenCount": 5, "candidatesTokenCount": 2}});
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    listener.set_nonblocking(true).expect("nonblocking");
+    let address = listener.local_addr().expect("address");
+    let server = std::thread::spawn(move || {
+        let started = Instant::now();
+        let mut stream = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break stream,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(started.elapsed() < Duration::from_secs(10), "no request");
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("accept: {error}"),
+            }
+        };
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("read timeout");
+        stream
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .expect("write timeout");
+        let mut reader = std::io::BufReader::new(&mut stream);
+        let mut line = String::new();
+        reader.read_line(&mut line).expect("request line");
+        assert_eq!(
+            line,
+            "POST /v1beta/models/gemini-fixture:streamGenerateContent?alt=sse HTTP/1.1\r\n"
+        );
+        let mut length = 0;
+        let mut authenticated = false;
+        loop {
+            line.clear();
+            assert!(reader.read_line(&mut line).expect("header") > 0);
+            if line == "\r\n" {
+                break;
+            }
+            if let Some((name, value)) = line.split_once(':') {
+                assert!(!name.eq_ignore_ascii_case("authorization"));
+                if name.eq_ignore_ascii_case("content-length") {
+                    length = value.trim().parse().expect("length");
+                }
+                if name.eq_ignore_ascii_case("x-goog-api-key") {
+                    assert_eq!(value.trim(), "fixture-key");
+                    authenticated = true;
+                }
+            }
+        }
+        assert!(authenticated);
+        let mut body = vec![0; length];
+        reader.read_exact(&mut body).expect("body");
+        drop(reader);
+        let response = format!("data: {frame}\n\n");
+        write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}", response.len()).expect("response");
+        serde_json::from_slice::<serde_json::Value>(&body).expect("request JSON")
+    });
+    let dir = tempfile::tempdir().expect("isolated state");
+    let output = Command::new(binary())
+        .env_clear()
+        .env("HOME", dir.path())
+        .env("RUNE_HOME", dir.path().join("state"))
+        .env("XDG_CONFIG_HOME", dir.path().join("config"))
+        .env("XDG_DATA_HOME", dir.path().join("data"))
+        .env("RUNE_PROVIDER", "google")
+        .env("RUNE_BASE_URL", format!("http://{address}/v1beta"))
+        .env("RUNE_MODEL", "gemini-fixture")
+        .env("GEMINI_API_KEY", "fixture-key")
+        .current_dir(dir.path())
+        .args(["ask", "--json", "hello"])
+        .output()
+        .expect("ask");
+    assert!(output.status.success(), "{output:?}");
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).expect("result");
+    assert_eq!(result["output"], "native answer");
+    assert_eq!(result["usage"]["input_tokens"], 5);
+    assert_eq!(result["usage"]["output_tokens"], 2);
+    let body = server.join().expect("native fixture");
+    assert_eq!(body["contents"][0]["role"], "user");
+    assert!(body.get("messages").is_none());
+}
+
+#[test]
 fn version_short_flag_matches_long_flag() {
     assert_eq!(run(&["-v"]).stdout, run(&["--version"]).stdout);
     assert_eq!(run(&["version"]).stdout, run(&["--version"]).stdout);

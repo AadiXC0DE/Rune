@@ -6,6 +6,11 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Added
 
+- `rune connect gemini` selects Google's native Generate Content API, using
+  `GEMINI_API_KEY` or `GOOGLE_API_KEY`. Streaming text, function calls and
+  results, thought signatures, reported usage, and cancellation work through
+  the shared transport. The Rust SDK exposes `Dialect::Gemini`.
+
 - User config can explicitly select `anonymous = true` for loopback model
   endpoints. Connecting, listing models, and completing requests skip credential
   lookup and storage and omit authentication headers. The Rust SDK provides

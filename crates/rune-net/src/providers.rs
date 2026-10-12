@@ -62,7 +62,7 @@ impl KnownProvider {
 
 /// Providers a fresh install offers, in the order they are shown.
 ///
-/// Ordered with the two that need nothing but a key first, then the generic
+/// Ordered with native APIs that need nothing but a key first, then the generic
 /// OpenAI-compatible dialect, which needs an endpoint, and finally the
 /// providers that are recognized by name so a configuration written by hand
 /// reads back correctly.
@@ -81,6 +81,15 @@ pub const KNOWN_PROVIDERS: &[KnownProvider] = &[
         summary: "OpenAI Responses API",
         base_url: Some("https://api.openai.com/v1"),
         key_variable: Some("OPENAI_API_KEY"),
+        credential: CredentialKind::ApiKey,
+        implemented: true,
+        required_headers: &[],
+    },
+    KnownProvider {
+        name: "gemini",
+        summary: "Google Gemini Generate Content API",
+        base_url: Some("https://generativelanguage.googleapis.com/v1beta"),
+        key_variable: Some("GEMINI_API_KEY"),
         credential: CredentialKind::ApiKey,
         implemented: true,
         required_headers: &[],
@@ -145,6 +154,7 @@ pub fn lookup(name: &str) -> Option<&'static KnownProvider> {
 pub fn aliases(name: &str) -> &'static [&'static str] {
     match name {
         "openai" => &["responses"],
+        "gemini" => &["google"],
         "chat_completions" => &["chat-completions"],
         "opencode" => &["zen", "opencode-zen"],
         "opencode-go" => &["go", "zen-go"],

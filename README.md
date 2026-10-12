@@ -88,6 +88,7 @@ the list:
 
 ```sh
 rune connect anthropic
+rune connect gemini         # native Google Gemini API
 rune connect opencode-go    # a subscription over the OpenAI-compatible route
 rune connect chat_completions
 ```
@@ -204,6 +205,7 @@ The providers that ship in the table are:
 |---|---|
 | `anthropic` | Anthropic Messages API |
 | `openai` | OpenAI Responses API |
+| `gemini` | Native Google Gemini Generate Content API |
 | `opencode` | OpenCode Zen, pay-per-use |
 | `opencode-go` | OpenCode Go, a subscription |
 | `chat_completions` | Any OpenAI-compatible endpoint, with the URL you give |
@@ -211,8 +213,18 @@ The providers that ship in the table are:
 Anything else is reachable by naming it and giving its endpoint, which is what
 `chat_completions` does with a URL and what a self-hosted gateway needs. A
 credential is read from the provider's own variable when it is already exported
-(`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `OPENCODE_API_KEY`), and pasted
+(`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`, `OPENCODE_API_KEY`), and pasted
 otherwise.
+
+`gemini` (alias `google`) uses the native
+[Generate Content API](https://ai.google.dev/api/generate-content) at
+`https://generativelanguage.googleapis.com/v1beta`, with the key in
+`x-goog-api-key`. `GOOGLE_API_KEY` is also accepted when `GEMINI_API_KEY` is
+unset. Set `models.gemini` to the model identifier, with or without `models/`.
+Text, function calls and results, thought-signature replay, and reported token
+usage use the native wire format. The Rust SDK selects it with `Dialect::Gemini`.
+This dialect uses the model's automatic thinking settings; explicit reasoning
+effort and fast mode currently return `unsupported`.
 
 ## Use
 
