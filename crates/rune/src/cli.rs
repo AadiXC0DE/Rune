@@ -37,6 +37,8 @@ pub enum Command {
     Auth,
     /// List models.
     Models,
+    /// Check provider capabilities before running a turn.
+    Capabilities,
     /// List or check project MCP servers without an agent turn.
     Mcp,
     /// Show permission state.
@@ -90,6 +92,7 @@ impl Command {
             Self::Usage => "usage",
             Self::Auth => "auth",
             Self::Models => "models",
+            Self::Capabilities => "capabilities",
             Self::Mcp => "mcp",
             Self::Permissions => "permissions",
             Self::Sandbox => "sandbox",
@@ -328,6 +331,7 @@ pub fn parse(args: Vec<OsString>, benchmark: bool) -> Result<Launch> {
                 "usage" => Command::Usage,
                 "auth" => Command::Auth,
                 "models" => Command::Models,
+                "capabilities" => Command::Capabilities,
                 "mcp" => Command::Mcp,
                 "permissions" => Command::Permissions,
                 "sandbox" => Command::Sandbox,

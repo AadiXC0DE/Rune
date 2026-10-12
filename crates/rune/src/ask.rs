@@ -417,19 +417,14 @@ pub fn run(
 ) -> std::result::Result<JsonResult, RuneError> {
     // Validate before touching the network so a missing credential or an
     // unselected model is reported immediately and names the remedy.
-    settings.require_model()?;
+    crate::provider_setup::validate_selection(settings)?;
 
     // Configuration is validated before a credential is looked up, so a user
     // who has not set an endpoint is told that rather than being told about a
     // credential for an endpoint that does not exist.
     let endpoint = crate::provider_setup::configured_endpoint(settings, paths)?;
 
-    let dialect: Box<dyn Provider> = match settings.provider {
-        rune_core::config::Provider::Anthropic => Box::new(rune_net::anthropic::Anthropic),
-        rune_core::config::Provider::Responses => Box::new(rune_net::responses::Responses),
-        rune_core::config::Provider::Gemini => Box::new(rune_net::gemini::Gemini),
-        _ => Box::new(rune_net::chat_completions::ChatCompletions),
-    };
+    let dialect = crate::provider_setup::dialect_for(&settings.provider);
 
     let mut limits = settings.limits.clone();
     let step_cap = limits

@@ -358,6 +358,25 @@ pub const ACCOUNT: &[CommandSpec] = &[
         supports_json: true,
     },
     CommandSpec {
+        name: "capabilities",
+        aliases: &[],
+        summary: "Check provider capabilities and context provenance before a turn",
+        usage: "rune capabilities [--require-images] [--require-tool-streaming] [--json]",
+        flags: &[
+            flag(
+                "--require-images",
+                "Require image content support in the dialect.",
+            ),
+            flag(
+                "--require-tool-streaming",
+                "Require incremental tool argument streaming.",
+            ),
+            flag("--json", "Emit JSON."),
+        ],
+        requirements: Requirements::NETWORK,
+        supports_json: true,
+    },
+    CommandSpec {
         name: "models",
         aliases: &[],
         summary: "List the models of the connected provider",

@@ -12,6 +12,7 @@
 
 mod ask;
 mod auto_review;
+mod capabilities;
 mod cli;
 mod compaction_archive;
 mod completion;
@@ -192,6 +193,18 @@ fn run(launch: &Launch) -> Result<ExitCode> {
         Command::Auth => run_auth(&settings, &paths, launch, &output_flags),
         Command::Connect => run_connect(&settings, &paths, launch, &output_flags),
         Command::Models => run_models(&settings, &paths, &output_flags),
+        Command::Capabilities => {
+            let check = capabilities::check(&settings, &paths, launch)?;
+            if output_flags.json {
+                println!("{}", serde_json::to_string_pretty(&check.report)?);
+            } else {
+                print!("{}", capabilities::render(&check.report));
+            }
+            if let Some(error) = check.error {
+                return Err(error);
+            }
+            Ok(ExitCode::from(EXIT_OK))
+        }
         Command::Mcp => {
             let report = mcp::run(&settings, &paths, launch, &workspace)?;
             if output_flags.json {
@@ -1292,7 +1305,7 @@ fn run_acp(
     workspace: &Utf8Path,
     launch: &Launch,
 ) -> Result<ExitCode> {
-    settings.require_model()?;
+    provider_setup::validate_selection(settings)?;
 
     let endpoint = provider_setup::configured_endpoint(settings, paths)?;
 

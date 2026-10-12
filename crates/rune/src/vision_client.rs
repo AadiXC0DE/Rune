@@ -180,6 +180,9 @@ impl Provider for ImageRequest {
     fn name(&self) -> &'static str {
         self.dialect.name()
     }
+    fn capabilities(&self) -> rune_net::provider::ProviderCapabilities {
+        self.dialect.capabilities()
+    }
     fn request_path(&self) -> &'static str {
         self.dialect.request_path()
     }

@@ -6,6 +6,11 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Added
 
+- `rune capabilities` checks dialect support for effort, images, tool streaming,
+  fast mode, and routing before a turn, with text or JSON context provenance.
+  Unsupported selections fail preflight and are refused before HTTP requests.
+  Offline checks use configuration and cached capacity without a completion.
+
 - `rune connect ollama` imports a local endpoint without storing a credential.
   Model discovery uses its native `/api/tags` and `/api/show` endpoints, reports
   the endpoint and context-field provenance in terminal and JSON listings,

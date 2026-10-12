@@ -24,6 +24,15 @@ impl Provider for Gemini {
         "gemini"
     }
 
+    fn capabilities(&self) -> crate::provider::ProviderCapabilities {
+        crate::provider::ProviderCapabilities {
+            efforts: &[Effort::Auto],
+            images: true,
+            tool_streaming: crate::provider::ToolStreaming::CompleteCalls,
+            fast_mode: false,
+        }
+    }
+
     fn request_path(&self) -> &'static str {
         "/models"
     }
@@ -55,14 +64,6 @@ impl Provider for Gemini {
     fn build_request(&self, plan: &RequestPlan) -> Result<Value> {
         self.validate(plan)?;
         self.completion_path(plan)?;
-        // Thinking controls vary by Gemini model family. Use the native model
-        // default until an explicit effort can be represented without guessing.
-        if plan.effort != Effort::Auto || plan.fast_mode {
-            return Err(RuneError::new(
-                ErrorCode::Unsupported,
-                "the Gemini dialect currently supports automatic effort and standard speed",
-            ));
-        }
         let mut instructions = Vec::new();
         if !plan.instructions.is_empty() {
             instructions.push(json!({"text": plan.instructions}));

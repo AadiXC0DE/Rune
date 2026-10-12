@@ -1329,6 +1329,43 @@ mod tests {
         }
     }
 
+    #[test]
+    fn unsupported_capability_selections_never_reach_the_http_client() {
+        use rune_core::config::Effort;
+        let endpoint = Endpoint::new("https://fixture.invalid", "unused");
+        let selections: [(&dyn Provider, Effort, bool, &str); 3] = [
+            (&crate::gemini::Gemini, Effort::High, false, "effort"),
+            (
+                &crate::anthropic::Anthropic,
+                Effort::Auto,
+                true,
+                "fast_mode",
+            ),
+            (
+                &crate::chat_completions::ChatCompletions,
+                Effort::Auto,
+                true,
+                "fast_mode",
+            ),
+        ];
+        for (dialect, effort, fast_mode, field) in selections {
+            let mut plan = RequestPlan::new("fixture");
+            plan.effort = effort;
+            plan.fast_mode = fast_mode;
+            let error = stream_completion(
+                &NoFetch,
+                &endpoint,
+                dialect,
+                &plan,
+                Duration::from_secs(1),
+                &|| false,
+            )
+            .expect_err("unsupported selection");
+            assert_eq!(error.kind(), FailureKind::InvalidRequest);
+            assert!(error.message().contains(field), "{error}");
+        }
+    }
+
     /// A response body that serves scripted parts, each after its own delay.
     struct PacedBody {
         parts: std::collections::VecDeque<(Duration, Vec<u8>)>,

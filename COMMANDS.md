@@ -131,6 +131,15 @@ Aliases:
 | Flag | Description |
 |---|---|
 | `--json` | Emit JSON. |
+### `rune capabilities [--require-images] [--require-tool-streaming] [--json]`
+
+Check provider capabilities and context provenance before a turn
+
+| Flag | Description |
+|---|---|
+| `--require-images` | Require image content support in the dialect. |
+| `--require-tool-streaming` | Require incremental tool argument streaming. |
+| `--json` | Emit JSON. |
 ### `rune models [--json]`
 
 List the models of the connected provider

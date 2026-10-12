@@ -309,6 +309,41 @@ pub fn catalog_for(settings: &Settings) -> Catalog {
     catalog
 }
 
+/// Selects the wire dialect used for this provider's requests and diagnostics.
+pub fn dialect_for(provider: &Provider) -> Box<dyn rune_net::provider::Provider> {
+    match provider {
+        Provider::Anthropic => Box::new(rune_net::anthropic::Anthropic),
+        Provider::Responses => Box::new(rune_net::responses::Responses),
+        Provider::Gemini => Box::new(rune_net::gemini::Gemini),
+        _ => Box::new(rune_net::chat_completions::ChatCompletions),
+    }
+}
+
+/// Checks configured controls without creating a conversation or using credentials.
+pub fn validate_selection(settings: &Settings) -> Result<()> {
+    settings.require_model()?;
+    validate_controls(settings)
+}
+
+/// Validates controls even when an interactive model picker has yet to run.
+pub fn validate_controls(settings: &Settings) -> Result<()> {
+    let mut plan = selection_plan(settings);
+    if plan.model.trim().is_empty() {
+        "unselected".clone_into(&mut plan.model);
+    }
+    dialect_for(&settings.provider).validate(&plan)
+}
+
+/// Projects the selected controls onto an empty preflight request.
+pub fn selection_plan(settings: &Settings) -> rune_net::provider::RequestPlan {
+    let mut plan = rune_net::provider::RequestPlan::new(&settings.model);
+    plan.effort = settings.effort;
+    plan.fast_mode = settings.fast_mode;
+    plan.provider_order.clone_from(&settings.provider_order);
+    plan.provider_strict = settings.provider_strict;
+    plan
+}
+
 /// Fetches the models the configured endpoint serves.
 ///
 /// The list comes from the endpoint rather than a compiled table, because the
@@ -327,12 +362,7 @@ pub fn fetch_catalog(
             .map_err(|err| err.to_rune_error());
     }
 
-    let dialect: Box<dyn rune_net::provider::Provider> = match settings.provider {
-        Provider::Anthropic => Box::new(rune_net::anthropic::Anthropic),
-        Provider::Responses => Box::new(rune_net::responses::Responses),
-        Provider::Gemini => Box::new(rune_net::gemini::Gemini),
-        _ => Box::new(rune_net::chat_completions::ChatCompletions),
-    };
+    let dialect = dialect_for(&settings.provider);
 
     let body = rune_net::transport::list_models(
         &rune_net::transport::agent(),
@@ -382,6 +412,9 @@ pub fn enrich_with_capacity(settings: &Settings, paths: &Paths, catalog: &mut Ca
         };
         if model.context_window.is_none() {
             model.context_window = limit.context;
+            if limit.context.is_some() {
+                model.context_source = Some("models.dev:limit.context".to_owned());
+            }
         }
         if model.max_output_tokens.is_none() {
             model.max_output_tokens = limit.output;

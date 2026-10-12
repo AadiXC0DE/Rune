@@ -39,6 +39,15 @@ impl Provider for Responses {
         NAME
     }
 
+    fn capabilities(&self) -> crate::provider::ProviderCapabilities {
+        crate::provider::ProviderCapabilities {
+            efforts: crate::provider::ALL_EFFORTS,
+            images: true,
+            tool_streaming: crate::provider::ToolStreaming::Incremental,
+            fast_mode: true,
+        }
+    }
+
     fn request_path(&self) -> &'static str {
         PATH
     }

@@ -7,9 +7,9 @@
 //! disturb the agent loop.
 
 use rune_core::config::Effort;
-use rune_core::error::{Result, RuneError};
+use rune_core::error::{ErrorCode, Result, RuneError};
 
-use crate::message::{Message, ToolSpec};
+use crate::message::{ContentPart, Message, ToolSpec};
 use crate::stream::{Limit, StreamReducer};
 
 /// What the model should do with tools on this request.
@@ -90,6 +90,87 @@ impl RequestPlan {
     }
 }
 
+/// Rune effort selections expressible by the full reasoning dialects.
+pub const ALL_EFFORTS: &[Effort] = &[
+    Effort::Auto,
+    Effort::None,
+    Effort::Minimal,
+    Effort::Low,
+    Effort::Medium,
+    Effort::High,
+    Effort::Xhigh,
+    Effort::Max,
+];
+
+/// How tool arguments arrive in this dialect's response stream.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolStreaming {
+    /// This dialect cannot carry tool calls in its stream.
+    Unsupported,
+    /// Arguments arrive as incremental fragments.
+    Incremental,
+    /// Complete calls arrive inside stream frames, without argument fragments.
+    CompleteCalls,
+}
+
+/// Controls and content expressible by a dialect, independent of model support.
+///
+/// A server or model can impose further restrictions. These diagnostics describe
+/// Rune's wire implementation, not a claim inferred from a model identifier.
+#[derive(Clone, Copy, Debug, serde::Serialize)]
+pub struct ProviderCapabilities {
+    /// Accepted Rune effort selections, including automatic provider defaults.
+    pub efforts: &'static [Effort],
+    /// The dialect can serialize image content.
+    pub images: bool,
+    /// How tool calls are decoded while streaming.
+    pub tool_streaming: ToolStreaming,
+    /// The dialect can express fast mode.
+    pub fast_mode: bool,
+}
+
+impl Default for ProviderCapabilities {
+    fn default() -> Self {
+        Self {
+            efforts: &[Effort::Auto],
+            images: false,
+            tool_streaming: ToolStreaming::Unsupported,
+            fast_mode: false,
+        }
+    }
+}
+
+impl ProviderCapabilities {
+    /// Rejects selections this dialect cannot express before any request is sent.
+    pub fn validate(self, dialect: &str, plan: &RequestPlan) -> Result<()> {
+        let unsupported = |field: &str| {
+            RuneError::new(
+                ErrorCode::Unsupported,
+                format!("the `{dialect}` dialect does not support the selected `{field}`"),
+            )
+            .with_hint("run `rune capabilities` to inspect supported selections")
+        };
+        if !self.efforts.contains(&plan.effort) {
+            return Err(unsupported("effort"));
+        }
+        if plan.fast_mode && !self.fast_mode {
+            return Err(unsupported("fast_mode"));
+        }
+        if !self.images
+            && plan.messages.iter().any(|message| {
+                message
+                    .parts
+                    .iter()
+                    .any(|part| matches!(part, ContentPart::Image { .. }))
+            })
+        {
+            return Err(unsupported("images"));
+        }
+        Ok(())
+    }
+}
+
 /// A dialect.
 pub trait Provider: Send + Sync {
     /// Short name, used in diagnostics and in the model key.
@@ -126,6 +207,11 @@ pub trait Provider: Send + Sync {
         Vec::new()
     }
 
+    /// Reports the features this implementation can express on the wire.
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities::default()
+    }
+
     /// Returns an error when the plan cannot be expressed in this dialect.
     fn validate(&self, plan: &RequestPlan) -> Result<()> {
         if plan.model.trim().is_empty() {
@@ -133,6 +219,7 @@ pub trait Provider: Send + Sync {
         }
         crate::message::validate(&plan.messages)?;
         crate::message::validate_tool_specs(&plan.tools)?;
+        self.capabilities().validate(self.name(), plan)?;
         validate_order(&plan.provider_order)?;
         // A dialect that cannot express the preference must refuse it, because
         // accepting a control and dropping it leaves the caller believing
@@ -146,6 +233,12 @@ pub trait Provider: Send + Sync {
                 ),
             )
             .with_hint("remove the provider order, or use a dialect that supports it"));
+        }
+        if plan.provider_strict && plan.provider_order.is_empty() {
+            return Err(RuneError::invalid_field(
+                "provider_strict",
+                "a strict provider selection requires a nonempty provider_order",
+            ));
         }
         Ok(())
     }
@@ -400,6 +493,14 @@ mod routing_tests {
         let anthropic = crate::anthropic::Anthropic;
         anthropic.validate(&plan(&[], false)).expect("accepted");
     }
+
+    #[test]
+    fn a_strict_selection_without_an_order_is_refused() {
+        let error = crate::chat_completions::ChatCompletions
+            .validate(&plan(&[], true))
+            .expect_err("a restriction needs providers");
+        assert_eq!(error.field(), Some("provider_strict"));
+    }
 }
 
 #[cfg(test)]
@@ -484,7 +585,7 @@ mod tests {
         let dialect = FakeDialect;
         let plan = RequestPlan::new("");
         let err = dialect.validate(&plan).expect_err("rejected");
-        assert_eq!(err.code(), rune_core::error::ErrorCode::MissingField);
+        assert_eq!(err.code(), ErrorCode::MissingField);
     }
 
     #[test]
@@ -514,6 +615,66 @@ mod tests {
     }
 
     #[test]
+    fn built_in_diagnostics_match_expressible_effort_and_speed_selections() {
+        let dialects: Vec<Box<dyn Provider>> = vec![
+            Box::new(crate::anthropic::Anthropic),
+            Box::new(crate::chat_completions::ChatCompletions),
+            Box::new(crate::responses::Responses),
+            Box::new(crate::gemini::Gemini),
+        ];
+        for dialect in dialects {
+            let capabilities = dialect.capabilities();
+            assert!(capabilities.images);
+            assert_ne!(capabilities.tool_streaming, ToolStreaming::Unsupported);
+            for effort in ALL_EFFORTS {
+                let mut plan = RequestPlan::new("fixture");
+                plan.effort = *effort;
+                let accepted = capabilities.efforts.contains(effort);
+                assert_eq!(
+                    dialect.validate(&plan).is_ok(),
+                    accepted,
+                    "{}: {effort}",
+                    dialect.name()
+                );
+                if accepted {
+                    dialect.build_request(&plan).expect("expressible effort");
+                }
+            }
+            let mut plan = RequestPlan::new("fixture");
+            plan.fast_mode = true;
+            assert_eq!(
+                dialect.validate(&plan).is_ok(),
+                capabilities.fast_mode,
+                "{}",
+                dialect.name()
+            );
+            if capabilities.fast_mode {
+                assert_eq!(
+                    dialect.build_request(&plan).expect("fast mode")["service_tier"],
+                    "priority"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_undeclared_image_capability_is_rejected() {
+        let mut plan = RequestPlan::new("fixture");
+        let mut message = Message::user("describe");
+        message.parts.push(ContentPart::Image {
+            image: crate::message::ImageRef {
+                id: 1,
+                media_type: "image/png".to_owned(),
+                encoded_bytes: 4,
+            },
+        });
+        plan.messages.push(message);
+        let error = FakeDialect.validate(&plan).expect_err("images unsupported");
+        assert_eq!(error.code(), ErrorCode::Unsupported);
+        assert!(error.message().contains("images"));
+    }
+
+    #[test]
     fn a_truncated_stream_is_an_error_not_a_success() {
         let mut reducer = FakeReducer { finished: false };
         let mut events = Vec::new();
@@ -521,7 +682,7 @@ mod tests {
         assert_eq!(events.len(), 1);
 
         let err = reducer.finish().expect_err("truncated");
-        assert_eq!(err.code(), rune_core::error::ErrorCode::IncompleteStream);
+        assert_eq!(err.code(), ErrorCode::IncompleteStream);
     }
 
     #[test]

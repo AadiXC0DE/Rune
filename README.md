@@ -99,6 +99,23 @@ asks the endpoint rather than a table compiled into the binary, so a model
 released after this build still appears. Add `--offline` to report the configured
 model without contacting anything.
 
+Run `rune capabilities` before the first turn to inspect accepted Rune effort
+selections, image content, tool streaming, fast mode, routing, and the context
+window's source. Add `--json` for a machine-readable report. Configured context
+windows take precedence; otherwise the check uses endpoint discovery and the
+published catalog, falling back to the compiled default. `--offline` uses only
+configuration and the existing catalog cache. The check creates no conversation
+and sends no completion request.
+
+Capabilities describe Rune's dialect implementation. Individual servers and
+models may impose further restrictions. Gemini reports complete tool calls in
+stream frames; the other dialects support incremental tool arguments. Use
+`--require-images` or `--require-tool-streaming` to require image content or
+incremental tool arguments. An unsupported requirement or selected control,
+such as `rune capabilities --provider gemini --effort high`, exits 1 and reports
+the rejection. Actual requests reject unsupported effort, fast mode, image
+content, and routing selections before sending them.
+
 For Ollama, `rune connect ollama` selects the local endpoint
 `http://127.0.0.1:11434/v1` and saves anonymous loopback mode without a key.
 To import another local endpoint, put `provider = "ollama"` and its `/v1`

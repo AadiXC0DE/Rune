@@ -4873,15 +4873,11 @@ pub fn prepare(
     // happens for a caller that cannot be asked, because a turn sent with an
     // empty identifier fails at the endpoint with nothing to act on.
     settings.require_provider()?;
+    crate::provider_setup::validate_controls(settings)?;
 
     let endpoint = crate::provider_setup::configured_endpoint(settings, paths)?;
 
-    let dialect: Box<dyn Provider> = match settings.provider {
-        rune_core::config::Provider::Anthropic => Box::new(rune_net::anthropic::Anthropic),
-        rune_core::config::Provider::Responses => Box::new(rune_net::responses::Responses),
-        rune_core::config::Provider::Gemini => Box::new(rune_net::gemini::Gemini),
-        _ => Box::new(rune_net::chat_completions::ChatCompletions),
-    };
+    let dialect = crate::provider_setup::dialect_for(&settings.provider);
 
     let questions = Arc::new(TerminalQuestions::default());
     let catalog = rune_context::skills::discover(
