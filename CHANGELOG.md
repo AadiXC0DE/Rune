@@ -376,6 +376,11 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Fixed
 
+- The WASM page bridge rejects body lengths larger than the supplied buffer
+  capacity with an `InvalidData` I/O error before consumers slice the buffer.
+  The failed response handle is released and the page receives a named
+  `transport_failure` error.
+
 - Review test fixtures fail explicitly when Git initialization, staging, or
   commit setup fails, reporting the command, exit status, stdout, and stderr.
   A failed initialization can no longer pass as an empty repository test.

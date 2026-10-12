@@ -77,12 +77,19 @@ impl Bridge for PageBridge {
         // SAFETY: the page writes at most `buffer.len()` bytes into `buffer`,
         // which is exclusively borrowed for the call.
         let read = unsafe { read(handle, buffer.as_mut_ptr(), buffer.len()) };
-        usize::try_from(read).map_err(|_| {
+        let read = usize::try_from(read).map_err(|_| {
             io::Error::new(
                 io::ErrorKind::ConnectionAborted,
                 "the page ended the response",
             )
-        })
+        })?;
+        if read > buffer.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "the page returned a body length larger than the buffer capacity",
+            ));
+        }
+        Ok(read)
     }
 
     fn close(&self, handle: i32) {

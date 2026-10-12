@@ -737,7 +737,9 @@ The WASM module has separate unsafe FFI sites in its
 [page imports and exported entry points](crates/rune-web/src/exports.rs),
 compiled only for [WASM targets](crates/rune-web/src/lib.rs). Imports pass raw
 pointers and lengths: the host must copy input bytes before returning, retain
-no pointers, and keep writes and reported read lengths within buffer capacity.
+no pointers, and keep writes within buffer capacity. A reported body length
+larger than that capacity returns an `InvalidData` I/O error before consumers
+can slice the buffer.
 Staged replies use `take` to copy into an allocated buffer. Exported string
 arguments must come from `rune_alloc` with exactly the allocated length;
 `argument` takes ownership and frees them once, so the host must not reuse them.
@@ -1001,8 +1003,9 @@ Baseline-subtracted work is an estimate of additional work, not process latency.
 CI also builds `rune-web` for `wasm32-wasip1` and runs a fixture prompt through
 `rune_alloc`, `rune_configure`, and `rune_prompt` with Node.js 22's WASI runtime.
 The smoke test checks the configured provider request, streamed UTF-8 answer,
-and completion event using synchronous fixture imports. It requires no API key
-or network access to a provider. This checks the compiled boundary; browser
+completion event, and rejection of oversized host-returned body lengths using
+synchronous fixture imports. It requires no API key or network access to a
+provider. This checks the compiled boundary; browser
 Promise Integration and the page UI still require browser testing. Run it locally
 with Node.js 22 or newer:
 

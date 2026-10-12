@@ -9,7 +9,7 @@ import { WASI } from 'node:wasi';
 assert.equal(process.argv.length, 3, 'usage: node .github/scripts/test-wasm.mjs <rune_web.wasm>');
 const wasmPath = process.argv[2];
 
-test('configured fixture prompt crosses WASM exports and host imports', async () => {
+async function fixturePrompt(readLength, expectedError) {
   const workspace = await mkdtemp(join(tmpdir(), 'rune-wasm-smoke-'));
   try {
     const wasi = new WASI({
@@ -68,11 +68,15 @@ test('configured fixture prompt crosses WASM exports and host imports', async ()
         read(handle, pointer, capacity) {
           assert.equal(handle, 1);
           assert.equal(closed, false);
+          reads++;
+          if (readLength) {
+            assert.equal(reads, 1, 'an invalid body length must not reach a second read');
+            return readLength(capacity);
+          }
           // Split SSE frames and multibyte text across reads.
           const count = Math.min(capacity, 7, body.length - offset);
           bytes().set(body.subarray(offset, offset + count), pointer);
           offset += count;
-          reads++;
           return count;
         },
         close(handle) {
@@ -106,11 +110,22 @@ test('configured fixture prompt crosses WASM exports and host imports', async ()
       workspace: '/workspace',
       max_steps: 1,
     }))), 0, `configuration failed: ${JSON.stringify(events)}`);
-    assert.equal(exports.rune_prompt(...pass(prompt)), 0, `prompt failed: ${JSON.stringify(events)}`);
+    assert.equal(exports.rune_prompt(...pass(prompt)), expectedError ? 1 : 0,
+      `unexpected prompt result: ${JSON.stringify(events)}`);
     assert.equal(requests, 1);
-    assert.ok(reads > 1, 'the response must stream through the read import');
     assert.equal(closed, true, 'the response handle must be released');
     assert.equal(staged, undefined, 'the response head must cross the take import');
+    if (expectedError) {
+      assert.equal(reads, 1, 'an invalid body length must stop the first read');
+      const errors = events.filter((event) => event.kind === 'error');
+      assert.equal(errors.length, 1);
+      assert.equal(errors[0].code, 'transport_failure');
+      assert.ok(errors[0].message.includes(expectedError), JSON.stringify(errors[0]));
+      assert.deepEqual(events.filter((event) => event.kind === 'text'), []);
+      assert.deepEqual(events.filter((event) => event.kind === 'finished'), []);
+      return;
+    }
+    assert.ok(reads > 1, 'the response must stream through the read import');
     assert.deepEqual(events.filter((event) => event.kind === 'error'), []);
     assert.equal(events.filter((event) => event.kind === 'text').map((event) => event.delta).join(''), answer);
     const finished = events.filter((event) => event.kind === 'finished');
@@ -121,4 +136,15 @@ test('configured fixture prompt crosses WASM exports and host imports', async ()
   } finally {
     await rm(workspace, { recursive: true, force: true });
   }
-});
+}
+
+test('configured fixture prompt crosses WASM exports and host imports', () => fixturePrompt());
+test('WASM rejects a body length one byte above capacity before slicing', () => fixturePrompt(
+  (capacity) => capacity + 1, 'the page returned a body length larger than the buffer capacity',
+));
+test('WASM rejects the maximum positive imported body length before slicing', () => fixturePrompt(
+  () => 0x7fffffff, 'the page returned a body length larger than the buffer capacity',
+));
+test('WASM preserves the error for negative imported body lengths', () => fixturePrompt(
+  () => -1, 'the page ended the response',
+));
