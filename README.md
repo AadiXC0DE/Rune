@@ -178,6 +178,19 @@ bounded termination grace. HTTP servers are skipped with `--offline`, including
 loopback endpoints, before resolving credentials or connecting. SSE servers are
 not connected by interactive sessions.
 
+Native Rust hosts can validate OAuth discovery responses with
+`rune_context::mcp::oauth::ProtectedResourceMetadata::validate(&config, &document)`.
+This binds the metadata's `resource` to the configured HTTP or SSE URL using
+the exact comparison required by [RFC 9728](https://www.rfc-editor.org/rfc/rfc9728.html#section-3.3).
+Select an issuer from `authorization_servers()`, then call
+`validate_authorization_server(issuer, &document)` before opening authorization
+or registering a client. It checks the exact discovery issuer and every
+authorization, token, and optional registration endpoint. All URLs require
+HTTPS, with HTTP allowed for `localhost`, IPv4 loopback addresses, and `::1`.
+Credentials in URLs, fragments, and malformed endpoints are refused. These
+APIs perform no network requests; discovery, browser login, callbacks, and token
+storage are not implemented by the CLI yet.
+
 The web tools are off until asked for. `rune doctor` reports what this machine
 supports, and turning them on is one setting:
 

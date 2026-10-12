@@ -6,6 +6,12 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Added
 
+- Native Rust MCP hosts can preflight OAuth discovery metadata with
+  `mcp::oauth::ProtectedResourceMetadata`. Resource and issuer identifiers must
+  match exactly; authorization, token, and registration endpoints require HTTPS
+  or loopback HTTP. Validated endpoints are exposed only after all checks pass.
+  Browser authorization and token exchange are not implemented yet.
+
 - `rune permissions --simulate <file>` dry-runs a recorded JSON sequence of
   tool names and permission targets. Text and JSON reports preserve call order
   and name the deciding rule, layer and outcome for every call without executing
