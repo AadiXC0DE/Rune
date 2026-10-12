@@ -2065,7 +2065,7 @@ Resource accumulation after cancellation, session holder handover and concurrent
 - [x] R-186 | T3 | feature | sessions | Preview an undo as a per-file diff | acceptance: Preview an undo and observe affected file paths and diffs without changing bytes or the mutation journal.
 - [x] R-187 | T3 | feature | sessions | Fork a saved session at an explicit event boundary | acceptance: Fork a fixture at a completed tool-pair boundary and observe independent branches with unchanged original history.
 - [x] R-188 | T3 | feature | sessions | Export usage as JSONL with stable dimensions | acceptance: Export fixture usage and reconcile main, review and vision counts to the original ledger without fabricated missing values.
-- [ ] R-189 | T3 | feature | tools | Add a supervised PTY shell mode on Linux | acceptance: Run a Linux fixture that requires a tty, send input, resize and cancel its complete process group.
+- [x] R-189 | T3 | feature | tools | Add a supervised PTY shell mode on Linux | acceptance: Run a Linux fixture that requires a tty, send input, resize and cancel its complete process group.
 - [x] R-190 | T3 | feature | tools | Add image attachment input to rune ask | acceptance: Attach a fixture PNG to ask and assert one image content part reaches a supporting dialect with a size error for oversized input.
 - [x] R-191 | T3 | feature | tools | Expose a model-callable plan update tool | acceptance: Update a three-step fixture plan and observe versioned status events without file mutations or duplicate steps.
 - [x] R-192 | T3 | feature | tools | Expose a syntax diagnostic tool for Rust fixtures | acceptance: Request diagnostics for a fixture Rust file and observe file, line and message from a supervised local checker.

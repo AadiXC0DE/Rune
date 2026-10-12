@@ -250,7 +250,16 @@ impl Shell {
             Some(raw) => Some(resolve(context, raw)?.path),
             None => None,
         };
-        let input = if bool_arg(arguments, "interactive")?.unwrap_or(false) {
+        let dimensions = terminal_dimensions(arguments)?;
+        let input = if bool_arg(arguments, "pty")?.unwrap_or(false) {
+            let (rows, cols) = dimensions.unwrap_or((24, 80));
+            Input::Pty { rows, cols }
+        } else if dimensions.is_some() {
+            return Err(RuneError::invalid_field(
+                "pty",
+                "rows and cols require PTY mode",
+            ));
+        } else if bool_arg(arguments, "interactive")?.unwrap_or(false) {
             Input::Piped
         } else {
             Input::Closed
@@ -289,6 +298,7 @@ impl Shell {
             .ok_or_else(|| RuneError::missing_field("session_id"))?
             .to_owned();
         let chars = string_arg(arguments, "chars")?;
+        let dimensions = terminal_dimensions(arguments)?;
         let window = yield_window(arguments, DEFAULT_INTERACT_MS)?;
         let cap = self.limits.output_cap(context);
         let held = {
@@ -304,28 +314,49 @@ impl Shell {
         // answers straight away satisfies the wait rather than being waited on
         // for the whole window.
         let baseline = produced(&session.process);
-        if let Some(chars) = chars {
-            if session.input == Input::Closed {
-                return Err(RuneError::new(
-                    ErrorCode::InvalidState,
-                    format!("session `{id}` was started without input"),
-                )
-                .with_hint("start the command with `interactive` set to send it input"));
-            }
-            let limit = window.clamp(MIN_INPUT_WINDOW, MAX_INPUT_WINDOW);
-            session
-                .process
-                .write(chars.as_bytes(), limit)
-                .map_err(|err| {
+        let interaction = (|| {
+            if let Some((rows, cols)) = dimensions {
+                session.process.resize(rows, cols).map_err(|err| {
                     RuneError::new(
                         ErrorCode::InvalidState,
-                        format!("session `{id}` did not accept input: {err}"),
+                        format!("session `{id}` could not resize: {err}"),
                     )
                 })?;
-        }
+            }
+            if let Some(chars) = chars {
+                if session.input == Input::Closed {
+                    return Err(RuneError::new(
+                        ErrorCode::InvalidState,
+                        format!("session `{id}` was started without input"),
+                    )
+                    .with_hint("start the command with `interactive` set to send it input"));
+                }
+                let limit = window.clamp(MIN_INPUT_WINDOW, MAX_INPUT_WINDOW);
+                session
+                    .process
+                    .write(chars.as_bytes(), limit)
+                    .map_err(|err| {
+                        RuneError::new(
+                            ErrorCode::InvalidState,
+                            format!("session `{id}` did not accept input: {err}"),
+                        )
+                    })?;
+            }
 
-        if session.process.exit().is_none() {
-            wait_for_progress(&session.process, window, baseline, context)?;
+            if session.process.exit().is_none() {
+                wait_for_progress(&session.process, window, baseline, context)?;
+            }
+            if matches!(session.input, Input::Pty { .. }) {
+                context.check_cancelled()?;
+            }
+            Ok(())
+        })();
+        if let Err(err) = interaction {
+            if context.is_cancelled() && matches!(session.input, Input::Pty { .. }) {
+                session.process.terminate(true);
+                let _ = lock(&self.state).sessions.remove(&id);
+            }
+            return Err(err);
         }
         let ended = session.process.exit();
         if ended.is_some() {
@@ -401,7 +432,9 @@ impl Tool for Shell {
         "Run a command under a shell. `run` starts it and returns either the finished output and \
          its exit status, or a session for a command that is still working. `interact` then reads \
          what a session produced since the last read, and sends input when chars is given to a \
-         session started with `interactive`. `stop` ends a session and everything it started."
+         session started with `interactive` or `pty`. Linux `pty` mode supplies a controlling \
+         terminal with merged stdout/stderr; `interact` can resize it using rows and cols. \
+         `stop` ends a session and everything it started."
     }
 
     fn input_schema(&self) -> serde_json::Value {
@@ -423,7 +456,23 @@ impl Tool for Shell {
                 },
                 "interactive": {
                     "type": "boolean",
-                    "description": "Keep standard input open so `interact` can send chars. Otherwise the command reads end of input at once, so one that reads standard input finishes instead of waiting.",
+                    "description": "Pipe standard input so `interact` can send chars. Input defaults to closed unless `pty` is true.",
+                },
+                "pty": {
+                    "type": "boolean",
+                    "description": "Linux only: allocate a controlling terminal and accept input. Output streams are merged. Default false; does not require interactive.",
+                },
+                "rows": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 65535,
+                    "description": "PTY rows, paired with cols. Run defaults to 24; interact resizes a PTY session.",
+                },
+                "cols": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 65535,
+                    "description": "PTY columns, paired with rows. Run defaults to 80; interact resizes a PTY session.",
                 },
                 "session_id": {
                     "type": "string",
@@ -497,6 +546,33 @@ impl Tool for Shell {
     }
 }
 
+/// Parses a complete terminal size, refusing partial or out-of-range values.
+fn terminal_dimensions(arguments: &serde_json::Value) -> Result<Option<(u16, u16)>> {
+    let rows = usize_arg(arguments, "rows")?;
+    let cols = usize_arg(arguments, "cols")?;
+    match (rows, cols) {
+        (None, None) => Ok(None),
+        (Some(rows), Some(cols)) => {
+            let dimension = |value, name| {
+                u16::try_from(value)
+                    .ok()
+                    .filter(|value| *value > 0)
+                    .ok_or_else(|| {
+                        RuneError::invalid_field(
+                            name,
+                            "terminal dimensions must be between 1 and 65535",
+                        )
+                    })
+            };
+            Ok(Some((dimension(rows, "rows")?, dimension(cols, "cols")?)))
+        }
+        _ => Err(RuneError::invalid_field(
+            "rows",
+            "rows and cols must be supplied together",
+        )),
+    }
+}
+
 /// Mints the id for one session.
 ///
 /// The process id is part of the name, so a transcript from one run cannot be
@@ -541,7 +617,12 @@ fn start(
     // Reaching outside the workspace and skipping the sandbox are different
     // questions, so the second is read from its own field rather than borrowed
     // from the first.
-    let wrapped = rune_exec::detect().wrap(&prepared, &policy, context.allow_unsandboxed)?;
+    let backend = rune_exec::detect();
+    let wrapped = if matches!(input, Input::Pty { .. }) {
+        backend.wrap_pty(&prepared, &policy, context.allow_unsandboxed)?
+    } else {
+        backend.wrap(&prepared, &policy, context.allow_unsandboxed)?
+    };
 
     // The working directory is the resolved workspace, which is the path the
     // sandbox rule was built from. Starting in the path as written would leave
@@ -1113,6 +1194,235 @@ mod tests {
             context,
             &serde_json::json!({ "action": "stop", "session_id": id }),
         )
+    }
+
+    /// Exercises the public tool, not just the terminal syscall wrappers.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_linux_pty_accepts_input_resizes_and_cancels_its_complete_group() {
+        let tool = Shell::default();
+        let (dir, context) = workspace();
+        std::fs::write(
+            dir.path().join("pty.sh"),
+            include_str!("../tests/fixtures/pty.sh"),
+        )
+        .expect("fixture");
+        let mut started = text(
+            &tool,
+            &context,
+            &serde_json::json!({
+                "action": "run", "command": "/bin/sh pty.sh", "pty": true,
+                "rows": 27, "cols": 91, "yield_time_ms": 200,
+            }),
+        );
+        let (id, group) = running(&started);
+        assert!(
+            wait_until(
+                || {
+                    if started.contains("initial:27 91") {
+                        return true;
+                    }
+                    started.push_str(&text(
+                        &tool,
+                        &context,
+                        &serde_json::json!({
+                            "action": "interact", "session_id": id, "yield_time_ms": 100,
+                        }),
+                    ));
+                    false
+                },
+                Duration::from_secs(10)
+            ),
+            "{started}"
+        );
+        let mut observed = text(
+            &tool,
+            &context,
+            &serde_json::json!({
+                "action": "interact", "session_id": id, "rows": 42, "cols": 110,
+                "chars": "hello terminal\n", "yield_time_ms": 200,
+            }),
+        );
+        assert!(
+            wait_until(
+                || {
+                    if dir.path().join("ready").exists() && observed.contains("stderr-marker") {
+                        return true;
+                    }
+                    observed.push_str(&text(
+                        &tool,
+                        &context,
+                        &serde_json::json!({
+                            "action": "interact", "session_id": id, "yield_time_ms": 100,
+                        }),
+                    ));
+                    false
+                },
+                Duration::from_secs(10)
+            ),
+            "{observed}"
+        );
+        assert!(observed.contains("input:hello terminal"), "{observed}");
+        assert!(observed.contains("resized:42 110"), "{observed}");
+        let child = std::fs::read_to_string(dir.path().join("child.pid")).expect("child pid");
+        let grandchild =
+            std::fs::read_to_string(dir.path().join("grandchild.pid")).expect("grandchild pid");
+        assert!(alive(child.trim()) && alive(grandchild.trim()));
+        let held = lock(&tool.state)
+            .sessions
+            .get(&id)
+            .map(Arc::clone)
+            .expect("session");
+        assert_eq!(
+            held.process.stderr().totals(),
+            (0, 0),
+            "PTY streams must be merged"
+        );
+        let cancelled = context.cancellation();
+        let err = std::thread::scope(|scope| {
+            let pending = scope.spawn(|| {
+                tool.call(
+                    &serde_json::json!({
+                        "action": "interact", "session_id": id, "yield_time_ms": 10_000,
+                    }),
+                    &context,
+                )
+            });
+            std::thread::sleep(Duration::from_millis(100));
+            cancelled.cancel();
+            pending
+                .join()
+                .expect("interaction thread")
+                .expect_err("cancelled")
+        });
+        assert_eq!(err.code(), ErrorCode::Cancelled);
+        assert!(held.process.exit().is_some(), "leader not reaped");
+        assert_eq!(tool.live_sessions(), 0);
+        let group = group.strip_prefix("process group ").expect("group id");
+        assert!(
+            wait_until(
+                || !alive(child.trim()) && !alive(grandchild.trim()) && !group_alive(group),
+                Duration::from_secs(10)
+            ),
+            "descendants outlived cancellation"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pty_stop_and_drop_end_sessions_and_output_remains_bounded() {
+        for force in [false, true] {
+            let tool = shell(1, TEST_CAP);
+            let (_dir, context) = workspace();
+            let started = text(
+                &tool,
+                &context,
+                &serde_json::json!({
+                    "action": "run", "command": "stty size; yes x & wait", "pty": true,
+                    "yield_time_ms": 100,
+                }),
+            );
+            let (id, group) = running(&started);
+            assert!(started.contains("24 80"), "{started}");
+            let held = lock(&tool.state)
+                .sessions
+                .get(&id)
+                .map(Arc::clone)
+                .expect("session");
+            assert!(wait_until(
+                || held.process.stdout().totals().1 > TEST_CAP as u64,
+                Duration::from_secs(10)
+            ));
+            assert_eq!(held.process.stdout().totals().0, TEST_CAP);
+            assert!(started.len() <= TEST_CAP);
+            text(
+                &tool,
+                &context,
+                &serde_json::json!({
+                    "action": "stop", "session_id": id, "force": force,
+                }),
+            );
+            let group = group.strip_prefix("process group ").expect("group id");
+            assert!(wait_until(|| !group_alive(group), Duration::from_secs(10)));
+        }
+        let tool = Shell::default();
+        let (_dir, context) = workspace();
+        let started = text(
+            &tool,
+            &context,
+            &serde_json::json!({
+                "action": "run", "command": "sleep 30 & wait", "pty": true, "yield_time_ms": 100,
+            }),
+        );
+        let (_, group) = running(&started);
+        drop(tool);
+        let group = group.strip_prefix("process group ").expect("group id");
+        assert!(wait_until(|| !group_alive(group), Duration::from_secs(10)));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sandboxed_pty_keeps_its_controlling_terminal_and_workspace_restrictions() {
+        let Some((dir, context)) = sandboxed_workspace() else {
+            return;
+        };
+        let tool = Shell::default();
+        let forbidden = tempfile::tempdir().expect("outside workspace");
+        let target = forbidden.path().join("must-not-exist");
+        // Paths generated by tempfile contain no shell quotes.
+        let command = format!(
+            "test -t 0 && test -t 1 && test -t 2 && stty size </dev/tty; \
+             if touch '{}' 2>/dev/null; then exit 99; fi",
+            target.display()
+        );
+        let result = text(
+            &tool,
+            &context,
+            &serde_json::json!({
+                "action": "run", "command": command, "pty": true, "yield_time_ms": 10_000,
+            }),
+        );
+        assert!(result.contains("24 80"), "{result}");
+        assert!(result.contains("exited with status 0"), "{result}");
+        assert!(!target.exists());
+        assert_eq!(tool.live_sessions(), 0);
+        assert!(dir.path().exists());
+    }
+
+    #[test]
+    fn terminal_dimensions_are_validated_before_spawning() {
+        let tool = Shell::default();
+        let (dir, context) = workspace();
+        for arguments in [
+            serde_json::json!({"pty": true, "rows": 0, "cols": 80}),
+            serde_json::json!({"pty": true, "rows": 24, "cols": 65536}),
+            serde_json::json!({"pty": true, "rows": 24}),
+            serde_json::json!({"rows": 24, "cols": 80}),
+        ] {
+            let mut arguments = arguments;
+            arguments["action"] = "run".into();
+            arguments["command"] = "touch spawned".into();
+            assert!(tool.call(&arguments, &context).is_err(), "{arguments}");
+        }
+        assert!(!dir.path().join("spawned").exists());
+        assert_eq!(tool.live_sessions(), 0);
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn pty_shell_mode_is_explicitly_unsupported_off_linux() {
+        let tool = Shell::default();
+        let (_dir, context) = workspace();
+        let err = tool
+            .call(
+                &serde_json::json!({
+                    "action": "run", "command": "echo hello", "pty": true,
+                }),
+                &context,
+            )
+            .expect_err("Linux only");
+        assert_eq!(err.code(), ErrorCode::Unsupported);
+        assert_eq!(tool.live_sessions(), 0);
     }
 
     #[test]

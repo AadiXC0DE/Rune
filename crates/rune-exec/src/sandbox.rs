@@ -220,6 +220,20 @@ pub trait Sandbox {
         Vec::new()
     }
 
+    /// Wraps a Linux PTY command whose launcher creates a dedicated session.
+    /// The host terminal is never inherited; backends must preserve that PTY.
+    fn wrap_pty(
+        &self,
+        _prepared: &PreparedCommand,
+        _policy: &SandboxPolicy,
+        _allow_unsandboxed: bool,
+    ) -> Result<PreparedCommand> {
+        Err(RuneError::new(
+            ErrorCode::Unsupported,
+            "PTY shell mode is only supported on Linux",
+        ))
+    }
+
     /// Returns the command that runs under the restriction.
     ///
     /// The returned command keeps the working directory, the environment, and
@@ -845,6 +859,29 @@ impl Sandbox for LinuxSandbox {
         self.support.clone()
     }
 
+    fn wrap_pty(
+        &self,
+        prepared: &PreparedCommand,
+        policy: &SandboxPolicy,
+        allow_unsandboxed: bool,
+    ) -> Result<PreparedCommand> {
+        let mut wrapped = self.wrap(prepared, policy, allow_unsandboxed)?;
+        if self.support.is_full() {
+            // The launcher already detached from Rune's terminal and assigned
+            // a dedicated PTY. A second setsid would discard its controlling
+            // terminal. Remove only our helper flag, before the argv separator.
+            if let Some(index) = wrapped
+                .argv
+                .iter()
+                .take_while(|arg| *arg != "--")
+                .position(|arg| arg == "--new-session")
+            {
+                wrapped.argv.remove(index);
+            }
+        }
+        Ok(wrapped)
+    }
+
     fn wrap(
         &self,
         prepared: &PreparedCommand,
@@ -971,6 +1008,30 @@ mod tests {
     /// Returns a policy over one workspace.
     fn policy(workspace: &Utf8Path) -> SandboxPolicy {
         SandboxPolicy::new(workspace.to_owned(), Vec::new(), false)
+    }
+
+    #[test]
+    fn pty_wrapping_preserves_namespaces_without_detaching_the_terminal() {
+        let dir = tempfile::tempdir().expect("workspace");
+        let cwd = Utf8PathBuf::from_path_buf(dir.path().to_owned()).expect("UTF-8");
+        let prepared = crate::prepare_shell("echo --new-session", &cwd, None, BTreeMap::new())
+            .expect("prepare");
+        let policy = SandboxPolicy::new(cwd, Vec::new(), false);
+        let sandbox = LinuxSandbox::with_helper(Utf8PathBuf::from("/fixture/bwrap"));
+        let normal = sandbox.wrap(&prepared, &policy, false).expect("wrap");
+        let pty = sandbox
+            .wrap_pty(&prepared, &policy, false)
+            .expect("PTY wrap");
+        let mut expected = normal.argv;
+        let index = expected
+            .iter()
+            .position(|arg| arg == "--new-session")
+            .expect("session flag");
+        expected.remove(index);
+        assert_eq!(pty.argv, expected);
+        assert!(pty.argv.iter().any(|arg| arg == "--unshare-pid"));
+        assert!(pty.argv.iter().any(|arg| arg == "--unshare-net"));
+        assert_eq!(pty.reviewed, prepared.reviewed);
     }
 
     #[test]

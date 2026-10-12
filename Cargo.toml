@@ -90,7 +90,7 @@ tempfile = "3"
 [workspace.lints.rust]
 # Denied rather than forbidden, so reviewed boundaries can permit it locally.
 # The native binary on Unix has one unsafe call site: pre_exec resource-limit
-# setup in crates/rune-exec/src/command.rs, between fork and exec.
+# and Linux PTY setup in crates/rune-exec/src/command.rs, between fork and exec.
 # WASM has separate unsafe FFI sites in crates/rune-web/src/exports.rs.
 # See README.md's "Unsafe code boundaries" for links and safety contracts.
 unsafe_code = "deny"

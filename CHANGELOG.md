@@ -6,6 +6,12 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Added
 
+- Linux shell calls can set `pty: true` for a controlling terminal, send input
+  with `interact`, and resize with paired `rows` and `cols` (initially 24 by 80).
+  PTY output merges stdout and stderr under the existing byte cap. Stop,
+  cancellation, and handle cleanup end the supervised process group; sandbox
+  policy, environment filtering, and resource ceilings still apply.
+
 - ACP accepts inline PNG, JPEG, GIF, and WebP image blocks for the session's
   selected model, including retries and tool follow-ups. Image advertisement
   follows dialect support; unsupported dialects return a named `unsupported`

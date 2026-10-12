@@ -697,9 +697,10 @@ documented exceptions at the reviewed boundaries below. This describes Rune's
 own code, not unsafe code inside dependencies.
 
 The native binary on Unix has one unsafe call site:
-[`pre_exec` resource-limit setup](crates/rune-exec/src/command.rs). It runs in
+[`pre_exec` child setup](crates/rune-exec/src/command.rs). It runs in
 the child between fork and exec under an async-signal-safe contract: resource
-limit syscalls, no allocation, and an error returned if setup fails. This site
+limit syscalls and, for Linux PTY sessions, `setsid` and controlling-terminal
+setup, no allocation or locks, and an error returned if setup fails. This site
 is excluded on non-Unix targets.
 
 The WASM module has separate unsafe FFI sites in its

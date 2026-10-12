@@ -138,6 +138,9 @@ pub enum Input {
     Closed,
     /// A pipe that [`Process::write`] feeds.
     Piped,
+    /// A Linux PTY with a controlling terminal and merged output streams.
+    /// Unsupported platforms refuse this mode before spawning a command.
+    Pty { rows: u16, cols: u16 },
 }
 
 /// A child process in its own group, with the bytes it produced.
@@ -150,11 +153,58 @@ pub struct Process {
 #[derive(Debug)]
 enum Stdin {
     /// Open and free for the next write.
-    Ready(ChildStdin),
+    Ready(Writer),
     /// Held by a write the process has not finished reading.
     Writing,
     /// Never opened, or closed by a failed write.
     Closed,
+}
+
+/// A pipe or the write side of a Linux terminal.
+#[derive(Debug)]
+enum Writer {
+    Pipe(ChildStdin),
+    #[cfg(target_os = "linux")]
+    Terminal(std::fs::File),
+}
+
+impl Writer {
+    /// Pipe behavior stays blocking; terminal writes poll so shutdown can end
+    /// a write even when Linux does not wake it after the slave closes.
+    fn write_input(&mut self, bytes: &[u8], inner: &Inner) -> io::Result<()> {
+        #[cfg(not(target_os = "linux"))]
+        let _ = inner;
+        match self {
+            Self::Pipe(pipe) => pipe.write_all(bytes).and_then(|()| pipe.flush()),
+            #[cfg(target_os = "linux")]
+            Self::Terminal(master) => {
+                let mut remaining = bytes;
+                while !remaining.is_empty() {
+                    if lock(&inner.exit).is_some() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::BrokenPipe,
+                            "the terminal process ended",
+                        ));
+                    }
+                    match master.write(remaining) {
+                        Ok(0) => {
+                            return Err(io::Error::new(
+                                io::ErrorKind::WriteZero,
+                                "the terminal accepted no input",
+                            ));
+                        }
+                        Ok(written) => remaining = &remaining[written..],
+                        Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(POLL_INTERVAL);
+                        }
+                        Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
+                        Err(err) => return Err(err),
+                    }
+                }
+                Ok(())
+            }
+        }
+    }
 }
 
 /// State shared with the threads that watch one child.
@@ -174,6 +224,8 @@ struct Inner {
     stderr: Buffer,
     /// Group to signal. The child leads its own group, so this is the child id.
     group: u32,
+    #[cfg(target_os = "linux")]
+    terminal: Option<std::fs::File>,
 }
 
 impl Process {
@@ -228,6 +280,15 @@ impl Process {
         let stdin = match input {
             Input::Closed => Stdio::null(),
             Input::Piped => Stdio::piped(),
+            Input::Pty { .. } => {
+                #[cfg(not(target_os = "linux"))]
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "PTY shell mode is only supported on Linux",
+                ));
+                #[cfg(target_os = "linux")]
+                Stdio::null()
+            }
         };
         let mut spec = Command::new(program);
         add_arguments(&mut spec, program, arguments);
@@ -239,16 +300,40 @@ impl Process {
         if let Some(cwd) = cwd {
             spec.current_dir(cwd);
         }
-        own_group(&mut spec);
-        // A long-lived process is subject to the same ceiling as a one-shot
-        // command: it is the one that runs longest, so it is the one most able
-        // to exhaust a resource before the supervisor notices.
-        apply_limits(&mut spec, resource_limits());
+        #[cfg(target_os = "linux")]
+        let terminal = if let Input::Pty { rows, cols } = input {
+            Some(crate::pty::configure(&mut spec, rows, cols)?)
+        } else {
+            None
+        };
+        // Long-lived commands use the same resource ceilings as one-shot runs.
+        // The PTY path applies them together with controlling-terminal setup.
+        if !matches!(input, Input::Pty { .. }) {
+            own_group(&mut spec);
+            apply_limits(&mut spec, resource_limits());
+        }
+        // Clone before spawning so a descriptor error cannot leak a child.
+        #[cfg(target_os = "linux")]
+        let terminal_reader = terminal
+            .as_ref()
+            .map(std::fs::File::try_clone)
+            .transpose()?;
+        #[cfg(target_os = "linux")]
+        let terminal_writer = terminal
+            .as_ref()
+            .map(std::fs::File::try_clone)
+            .transpose()?;
         let mut child = spec.spawn()?;
+        // Command holds the parent's slave descriptors until dropped. Keeping
+        // them open would prevent EOF when the child's terminal closes.
+        drop(spec);
         let group = child.id();
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
-        let stdin = child.stdin.take().map_or(Stdin::Closed, Stdin::Ready);
+        let stdin = child.stdin.take().map(Writer::Pipe);
+        #[cfg(target_os = "linux")]
+        let stdin = terminal_writer.map(Writer::Terminal).or(stdin);
+        let stdin = stdin.map_or(Stdin::Closed, Stdin::Ready);
         let inner = Arc::new(Inner {
             child: Mutex::new(Some(child)),
             stdin: Mutex::new(stdin),
@@ -257,8 +342,15 @@ impl Process {
             stdout: Buffer::new(capture_bytes),
             stderr: Buffer::new(capture_bytes),
             group,
+            #[cfg(target_os = "linux")]
+            terminal,
         });
 
+        #[cfg(target_os = "linux")]
+        if let Err(err) = attach(&inner, terminal_reader, Pipe::Output) {
+            inner.shutdown();
+            return Err(err);
+        }
         let started = spawn_waiter(Arc::clone(&inner))
             .and_then(|()| attach(&inner, stdout, Pipe::Output))
             .and_then(|()| attach(&inner, stderr, Pipe::Error));
@@ -301,6 +393,22 @@ impl Process {
         &self.inner.stderr
     }
 
+    /// Resizes a Linux PTY. Pipe sessions and unsupported hosts refuse it.
+    pub fn resize(&self, rows: u16, cols: u16) -> io::Result<()> {
+        #[cfg(target_os = "linux")]
+        if let Some(terminal) = &self.inner.terminal {
+            if !self.is_running() {
+                return Err(io::Error::other("the terminal process has ended"));
+            }
+            return crate::pty::resize(terminal, rows, cols);
+        }
+        let _ = (rows, cols);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "resizing requires a Linux PTY session",
+        ))
+    }
+
     /// Writes bytes to the child's standard input, waiting at most `limit`.
     ///
     /// A pipe holds only so much, and a process that is not reading leaves a
@@ -331,7 +439,7 @@ impl Process {
         let spawned = std::thread::Builder::new()
             .name(String::from("rune-shell-stdin"))
             .spawn(move || {
-                let written = stdin.write_all(&bytes).and_then(|()| stdin.flush());
+                let written = stdin.write_input(&bytes, &inner);
                 *lock(&inner.stdin) = if written.is_ok() {
                     Stdin::Ready(stdin)
                 } else {
@@ -553,8 +661,16 @@ fn start_pump<R: Read + Send + 'static>(
             let mut chunk = [0_u8; CHUNK_BYTES];
             loop {
                 match stream.read(&mut chunk) {
-                    Ok(0) | Err(_) => break,
+                    Ok(0) => break,
                     Ok(read) => buffer.append(&chunk[..read]),
+                    Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                        if lock(&inner.exit).is_some() {
+                            break;
+                        }
+                        std::thread::sleep(POLL_INTERVAL);
+                    }
+                    Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
+                    Err(_) => break,
                 }
             }
         })
@@ -815,6 +931,101 @@ mod tests {
         .expect("start");
         assert!(exit_of(&process).is_success());
         assert_eq!(text(process.stdout()).trim(), "\"a b\"");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pty_input_that_is_never_read_has_a_bounded_wait_and_cleans_up() {
+        let process = Process::start(
+            "stty raw -echo; echo ready; sleep 30",
+            None,
+            CAPTURE_BYTES,
+            Input::Pty { rows: 24, cols: 80 },
+        )
+        .expect("PTY start");
+        assert!(wait_until(
+            || text(process.stdout()).contains("ready"),
+            Duration::from_secs(10)
+        ));
+        let err = process
+            .write(&vec![b'x'; 1024 * 1024], Duration::from_millis(100))
+            .expect_err("terminal input must not block the caller");
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(
+            process
+                .write(b"more", WRITE_LIMIT)
+                .expect_err("busy")
+                .kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert!(process.terminate(true));
+        assert!(
+            wait_until(
+                || matches!(*lock(&process.inner.stdin), Stdin::Closed),
+                Duration::from_secs(10)
+            ),
+            "terminal writer outlived cancellation: {:?}",
+            *lock(&process.inner.stdin)
+        );
+        process.drain_output(Duration::from_secs(1));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn resizing_a_pty_delivers_winch_to_its_foreground_group() {
+        let process = Process::start(
+            "trap 'echo winch; stty size' WINCH; echo ready; while :; do sleep 1; done",
+            None,
+            CAPTURE_BYTES,
+            Input::Pty { rows: 24, cols: 80 },
+        )
+        .expect("PTY start");
+        assert!(wait_until(
+            || text(process.stdout()).contains("ready"),
+            Duration::from_secs(10)
+        ));
+        assert!(process.resize(0, 80).is_err());
+        process.resize(41, 109).expect("resize");
+        assert!(
+            wait_until(
+                || text(process.stdout()).contains("winch\r\n41 109"),
+                Duration::from_secs(10)
+            ),
+            "foreground group never received SIGWINCH"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pty_exit_drains_output_and_refuses_invalid_sizes() {
+        let process = Process::start(
+            "printf final-output; printf error-output >&2; exit 7",
+            None,
+            CAPTURE_BYTES,
+            Input::Pty { rows: 24, cols: 80 },
+        )
+        .expect("PTY start");
+        assert_eq!(exit_of(&process), Exit::Code(7));
+        process.drain_output(Duration::from_secs(1));
+        assert_eq!(text(process.stdout()), "final-outputerror-output");
+        assert_eq!(process.stderr().totals(), (0, 0));
+        assert!(process.resize(40, 100).is_err());
+        assert!(
+            Process::start(
+                "sleep 30",
+                None,
+                CAPTURE_BYTES,
+                Input::Pty { rows: 0, cols: 80 }
+            )
+            .is_err()
+        );
+        let pipe = Process::start("sleep 30", None, CAPTURE_BYTES, Input::Piped).expect("pipe");
+        assert_eq!(
+            pipe.resize(40, 100)
+                .expect_err("pipe has no terminal")
+                .kind(),
+            io::ErrorKind::Unsupported
+        );
     }
 
     #[test]
