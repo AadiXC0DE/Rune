@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
 mod macos;
+mod windows;
 
 /// Serial runs per measurement, used for the minimum, median and p95.
 const MEASUREMENT_SAMPLES: usize = 31;
@@ -278,7 +279,8 @@ fn release(extra: &[String]) -> Result<(), String> {
         .map(|identity| macos::sign(&binary, identity))
         .transpose()?;
     let name = executable_name(&target);
-    let archive = format!("rune-{version}-{target}.tar.gz");
+    let extension = archive_extension(&target);
+    let archive = format!("rune-{version}-{target}.{extension}");
     let archive_path = format!("{directory}/{archive}");
 
     // Measure the exact bytes that will be archived. A cross-built executable
@@ -298,7 +300,11 @@ fn release(extra: &[String]) -> Result<(), String> {
     // the other rejects, and an unpinned timestamp makes two runs over identical
     // input produce different archives. Writing it means the bytes depend on the
     // binary alone.
-    let packed = archive_bytes(&name, &binary_bytes)?;
+    let packed = if extension == "zip" {
+        windows::archive(&binary_bytes)?
+    } else {
+        archive_bytes(&name, &binary_bytes)?
+    };
     if let Some(signature) = &signature {
         // Check an extracted copy of the archive, not just the build output.
         macos::verify_archive(&packed, signature, &measurements["binary"])?;
@@ -440,6 +446,14 @@ pub fn tar_single(name: &str, contents: &[u8]) -> Vec<u8> {
 /// machine which sniffs the format.
 fn archive_bytes(name: &str, binary: &[u8]) -> Result<Vec<u8>, String> {
     gzip(&tar_single(name, binary))
+}
+
+fn archive_extension(target: &str) -> &'static str {
+    if target.contains("-windows-") {
+        "zip"
+    } else {
+        "tar.gz"
+    }
 }
 
 /// Compresses an archive, as the `.tar.gz` name promises.

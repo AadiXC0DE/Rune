@@ -169,6 +169,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Set up Python for Windows archive tests
+        if: runner.os == 'Windows'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
       - name: Install the pinned toolchain
         run: rustup show
 
@@ -209,6 +215,11 @@ jobs:
         run: |
           rm -rf target/dist
           cargo xtask release dev
+
+      - name: Extract Windows ZIP and smoke-test executable replacement
+        if: runner.os == 'Windows'
+        shell: bash
+        run: python .github/scripts/test-windows-release.py target/dist/*/*.zip
 
       - name: Publish measured release artifacts
         uses: actions/upload-artifact@v4

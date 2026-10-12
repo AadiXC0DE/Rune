@@ -5,6 +5,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+const ARCHIVE_EXTENSION: &str = if cfg!(windows) { "zip" } else { "tar.gz" };
+
 struct ScratchWorkspace(PathBuf);
 
 impl ScratchWorkspace {
@@ -136,19 +138,33 @@ fn release_packages_the_binary_in_cargos_target_directory() {
         assert!(output.status.success(), "{directory:?}: {output:?}");
         let binary = std::fs::read(workspace.binary(directory)).expect("read built binary");
         let archive = workspace.0.join(format!(
-            "target/dist/rune-{0}/rune-0.0.0-{0}.tar.gz",
-            env!("TARGET")
+            "target/dist/rune-{0}/rune-0.0.0-{0}.{ARCHIVE_EXTENSION}",
+            env!("TARGET"),
         ));
-        let compressed = std::fs::read(archive).expect("read staged archive");
-        let mut tar = Vec::new();
-        flate2::read::GzDecoder::new(compressed.as_slice())
-            .read_to_end(&mut tar)
-            .expect("decompress staged archive");
-        let end = 512_usize.saturating_add(binary.len());
-        assert!(tar.len() >= end, "the fresh binary must fit in the archive");
+        let compressed = std::fs::read(&archive).expect("read staged archive");
+        let mut unpacked = Vec::new();
+        let contents = if cfg!(windows) {
+            let output = Command::new("python")
+                .args(["-c", "import sys,zipfile; z=zipfile.ZipFile(sys.argv[1]); assert z.namelist()==['rune.exe']; sys.stdout.buffer.write(z.read('rune.exe'))"])
+                .arg(&archive)
+                .output()
+                .expect("extract staged ZIP");
+            assert!(output.status.success(), "{output:?}");
+            unpacked = output.stdout;
+            unpacked.as_slice()
+        } else {
+            flate2::read::GzDecoder::new(compressed.as_slice())
+                .read_to_end(&mut unpacked)
+                .expect("decompress staged archive");
+            let end = 512_usize.saturating_add(binary.len());
+            assert!(
+                unpacked.len() >= end,
+                "the fresh binary must fit in the archive"
+            );
+            &unpacked[512..end]
+        };
         assert_eq!(
-            &tar[512..end],
-            binary,
+            contents, binary,
             "the archive must contain the fresh build, not the stale default artifact"
         );
         let manifest: serde_json::Value = serde_json::from_slice(
@@ -165,7 +181,7 @@ fn release_packages_the_binary_in_cargos_target_directory() {
         let extracted = workspace
             .0
             .join(format!("extracted{}", std::env::consts::EXE_SUFFIX));
-        std::fs::write(&extracted, &tar[512..end]).expect("extract executable");
+        std::fs::write(&extracted, contents).expect("extract executable");
         std::fs::set_permissions(
             &extracted,
             std::fs::metadata(workspace.binary(directory))
@@ -272,7 +288,7 @@ fn release_manifest_preserves_channels_requiring_json_escaping() {
     let workspace = ScratchWorkspace::new();
     let version = "0.0.0-preview";
     let target = env!("TARGET");
-    let archive = format!("rune-{version}-{target}.tar.gz");
+    let archive = format!("rune-{version}-{target}.{ARCHIVE_EXTENSION}");
     let directory = workspace.0.join(format!("target/dist/rune-{target}"));
     for channel in [
         "dev",

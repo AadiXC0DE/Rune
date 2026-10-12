@@ -65,6 +65,36 @@ binary while preserving configuration, credentials, and sessions:
 "$prefix/bin/rune" uninstall --target "$prefix/bin/rune" --keep-state
 ```
 
+Windows releases contain a single `rune.exe` in a `.zip` archive. Download the
+ZIP and its `.sha256` sidecar for your target. In PowerShell, verify and extract
+the release, then run its version command:
+
+```powershell
+$archive = (Resolve-Path '.\rune-<version>-<target>.zip').Path
+$checksum = (Get-Content "$archive.sha256" -Raw).Trim().Split(' ')[0]
+if ((Get-FileHash $archive -Algorithm SHA256).Hash -ne $checksum) { throw 'Checksum mismatch' }
+$extracted = Join-Path $env:TEMP ([guid]::NewGuid().ToString())
+Expand-Archive -LiteralPath $archive -DestinationPath $extracted
+& "$extracted\rune.exe" --version
+```
+
+To upgrade an existing Windows installation, close its running processes and
+run the extracted executable with an explicit target:
+
+```powershell
+$target = Join-Path $env:LOCALAPPDATA 'Rune\rune.exe'
+New-Item -ItemType Directory -Force (Split-Path $target) | Out-Null
+& "$extracted\rune.exe" upgrade --from $archive --checksum $checksum --target $target
+& $target --version
+Remove-Item -Recurse -Force $extracted
+```
+
+Windows locks running executables, so use the separate extracted copy to replace
+the stopped target. `upgrade` verifies the archive checksum, decodes its one
+regular executable member, and stages it beside the target before replacement.
+Rune's ZIP decoder accepts the single-member Deflate format emitted by release
+staging, without ZIP64, extra fields, comments, encryption, or data descriptors.
+
 From source:
 
 ```sh
@@ -999,7 +1029,9 @@ Relative values resolve from the command's working directory. Release archives
 are still staged under `target/dist`.
 
 `cargo xtask release <channel> [version] [target]` writes a target-specific
-`manifest.json` beside the archive and checksum. Its existing `bytes` and
+`manifest.json` beside the archive and checksum. Windows targets use reproducible
+Deflate ZIP archives with a root `rune.exe` and a fixed 1980-01-01 timestamp;
+Linux and macOS targets use the existing tar.gz format. Its `bytes` and
 `sha256` describe the compressed archive. `binary.name`, `binary.bytes` and
 `binary.sha256` describe the exact uncompressed executable in that archive.
 `startup` records the measurement host target, OS and architecture, the benchmark
@@ -1082,6 +1114,19 @@ stay unchanged after both install and uninstall. Run it on a staged archive:
 cargo xtask release dev
 python3 .github/scripts/test-archive-install.py target/dist/*/*.tar.gz
 ```
+
+Windows CI extracts the staged ZIP, checks its version, compiles and runs an old
+disposable executable, upgrades it from the verified archive, and runs the new
+version. A wrong checksum must preserve the old executable. The smoke check
+requires Python 3 and the pinned Rust toolchain. Run it on Windows with:
+
+```sh
+cargo xtask release dev
+python .github/scripts/test-windows-release.py target/dist/*/*.zip
+```
+
+Portable workspace tests exercise the ZIP reader and smoke harness with native
+executables. Windows CI supplies the native PE execution and replacement check.
 
 On Unix, workspace tests also run the real PTY replay gate. It starts the built
 `rune` binary against an isolated local provider and compares captured grids

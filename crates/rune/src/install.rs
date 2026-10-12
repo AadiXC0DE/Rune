@@ -18,6 +18,8 @@ use rune_core::error::{ErrorCode, Result, RuneError};
 use sha2::{Digest, Sha256};
 use std::io::Read as _;
 
+mod zip;
+
 /// Largest artifact accepted, in bytes.
 pub const MAX_ARTIFACT_BYTES: u64 = 512 * 1024 * 1024;
 
@@ -141,10 +143,14 @@ pub fn digest_of(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
-/// Decodes only the single-file tar format used by release staging. No archive
+/// Decodes only the single-file archive formats used by release staging. No archive
 /// path is ever used as a filesystem destination.
 fn release_binary(bytes: &[u8]) -> Result<std::borrow::Cow<'_, [u8]>> {
     const MAX_TRAILER_BYTES: u64 = 20 * 512;
+
+    if bytes.starts_with(b"PK") {
+        return zip::release_binary(bytes).map(std::borrow::Cow::Owned);
+    }
 
     if !bytes.starts_with(&[0x1f, 0x8b]) {
         return Ok(std::borrow::Cow::Borrowed(bytes));

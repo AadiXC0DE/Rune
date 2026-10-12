@@ -6,6 +6,11 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Added
 
+- Windows releases use reproducible Deflate ZIP archives containing `rune.exe`.
+  `rune upgrade` verifies and extracts their executable before replacing a
+  stopped target. Windows CI extracts a release, runs its version command,
+  upgrades a disposable old executable, and runs the new version.
+
 - macOS release staging supports certificate-pinned signing with hardened runtime
   and a secure timestamp. Signed manifests publish the identity, and
   `cargo xtask verify-release <manifest-path> <certificate SHA-1>` checks the
