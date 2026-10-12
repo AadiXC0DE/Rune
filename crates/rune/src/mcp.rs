@@ -3,6 +3,7 @@
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
+use std::io::Read as _;
 
 use camino::Utf8Path;
 use rune_context::mcp::{Client, ServerConfig};
@@ -16,6 +17,50 @@ use serde::Serialize;
 use serde_json::{Value, json};
 
 use crate::cli::Launch;
+
+/// Reads one external config and returns project JSON without writing or
+/// connecting. The bounded read also catches a file growing after it is opened.
+pub fn import(settings: &Settings, launch: &Launch) -> Result<String> {
+    let [action, format, path] = launch.args.as_slice() else {
+        return Err(RuneError::invalid_field(
+            "import",
+            "expected `rune mcp import claude-desktop <file>`",
+        ));
+    };
+    if action != "import" || format != "claude-desktop" {
+        return Err(RuneError::invalid_field(
+            "import",
+            "the supported import format is `claude-desktop`",
+        ));
+    }
+    if !std::fs::metadata(path)?.is_file() {
+        return Err(RuneError::invalid_field(
+            "import",
+            "expected a regular file",
+        ));
+    }
+    let file = std::fs::File::open(path)?;
+    let cap = mcp_trust::MAX_PROJECT_BYTES;
+    let mut bytes = Vec::new();
+    file.take(cap.saturating_add(1)).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > cap {
+        return Err(RuneError::too_large("import", bytes.len(), cap as usize));
+    }
+    let text = std::str::from_utf8(&bytes)
+        .map_err(|_| RuneError::invalid_field("import", "expected UTF-8 JSON"))?;
+    let document = rune_context::mcp::config::import_claude_desktop(
+        text,
+        settings.limits.get_usize(LimitName::ListEntries),
+    )?;
+    let output = serde_json::to_string_pretty(&document)?;
+    // Include println's newline. A compact source can become larger after
+    // formatting; every emitted document must fit Rune's project file limit.
+    let output_bytes = output.len().saturating_add(1);
+    if output_bytes > cap as usize {
+        return Err(RuneError::too_large("import", output_bytes, cap as usize));
+    }
+    Ok(output)
+}
 
 /// Owned by the interactive host. Dropping the client stops its stdio children.
 pub struct Connection {
@@ -243,7 +288,7 @@ pub fn run(
         _ => {
             return Err(RuneError::invalid_field(
                 "action",
-                "expected `rune mcp list` or `rune mcp check [server]`",
+                "expected `rune mcp list`, `rune mcp check [server]`, or `rune mcp import claude-desktop <file>`",
             ));
         }
     };

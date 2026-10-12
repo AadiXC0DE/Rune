@@ -405,11 +405,11 @@ pub const ACCOUNT: &[CommandSpec] = &[
     CommandSpec {
         name: "mcp",
         aliases: &[],
-        summary: "List or check MCP servers without an agent turn",
-        usage: "rune mcp list [--json] | rune mcp check [server] [--json]",
+        summary: "List, check, or import MCP servers without an agent turn",
+        usage: "rune mcp list [--json] | rune mcp check [server] [--json] | rune mcp import claude-desktop <file>",
         flags: &[flag(
             "--json",
-            "Emit JSON without secret headers or environment values.",
+            "Emit JSON diagnostics without secrets. Import always emits full configuration JSON.",
         )],
         requirements: Requirements::NETWORK,
         supports_json: true,

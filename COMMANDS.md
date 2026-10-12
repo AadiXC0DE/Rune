@@ -149,13 +149,13 @@ List the models of the connected provider
 | Flag | Description |
 |---|---|
 | `--json` | Emit JSON. |
-### `rune mcp list [--json] | rune mcp check [server] [--json]`
+### `rune mcp list [--json] | rune mcp check [server] [--json] | rune mcp import claude-desktop <file>`
 
-List or check MCP servers without an agent turn
+List, check, or import MCP servers without an agent turn
 
 | Flag | Description |
 |---|---|
-| `--json` | Emit JSON without secret headers or environment values. |
+| `--json` | Emit JSON diagnostics without secrets. Import always emits full configuration JSON. |
 ### `rune permissions [--explain <target> | --simulate <file>] [--json]`
 
 Show the permission mode and rules

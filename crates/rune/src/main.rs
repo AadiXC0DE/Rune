@@ -207,6 +207,10 @@ fn run(launch: &Launch) -> Result<ExitCode> {
             Ok(ExitCode::from(EXIT_OK))
         }
         Command::Mcp => {
+            if launch.args.first().is_some_and(|action| action == "import") {
+                println!("{}", mcp::import(&settings, launch)?);
+                return Ok(ExitCode::from(EXIT_OK));
+            }
             let report = mcp::run(&settings, &paths, launch, &workspace)?;
             if output_flags.json {
                 println!("{}", serde_json::to_string_pretty(&report)?);

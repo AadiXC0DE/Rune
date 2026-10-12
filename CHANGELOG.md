@@ -6,6 +6,11 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Added
 
+- `rune mcp import claude-desktop <file>` prints a validated project config for
+  review from local stdio `mcpServers` entries. It preserves commands, arguments,
+  and environment values without executing commands or writing trust records.
+  Saving the output as `.mcp.json` retains the normal project trust requirement.
+
 - Native Rust MCP hosts can preflight OAuth discovery metadata with
   `mcp::oauth::ProtectedResourceMetadata`. Resource and issuer identifiers must
   match exactly; authorization, token, and registration endpoints require HTTPS

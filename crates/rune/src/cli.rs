@@ -39,7 +39,7 @@ pub enum Command {
     Models,
     /// Check provider capabilities before running a turn.
     Capabilities,
-    /// List or check project MCP servers without an agent turn.
+    /// List, check, or import project MCP servers without an agent turn.
     Mcp,
     /// Show permission state.
     Permissions,

@@ -147,6 +147,26 @@ accepts only `127.0.0.1`, `localhost`, or `::1`; project config cannot enable it
 The Rust SDK exposes `Agent::new_anonymous` with an empty `api_key` for the same
 explicit loopback mode. `Agent::new` continues to require a credential.
 
+`rune mcp import claude-desktop <file>` converts Claude Desktop's local stdio
+`mcpServers` JSON into a validated Rune project configuration printed to stdout.
+The supported entries contain a string `command`, optional string-array `args`,
+and optional string-valued `env` map. Other Desktop settings are omitted;
+unsupported server fields and remote entries are refused without partial output.
+Input and output are capped at 1 MiB, with at most `list_entries` servers.
+Rune project template syntax (`${...}`) is refused to preserve Desktop's
+literal string semantics.
+The output includes environment values, so review it before saving or sharing:
+
+```sh
+rune mcp import claude-desktop claude_desktop_config.json > mcp-review.json
+# Review mcp-review.json, then save the chosen declarations in .mcp.json.
+```
+
+Import neither runs commands nor writes configuration or trust records. A saved
+project configuration uses the normal project trust gate, including in
+full-access mode. Existing workspace approvals still apply; in a new workspace,
+commands remain blocked until `rune projects approve`.
+
 `rune mcp list --json` lists the workspace's `.mcp.json` declarations in name
 order with transport, trust, enabled/required flags, startup status and errors.
 It attempts each approved, enabled server independently, then closes it; no
