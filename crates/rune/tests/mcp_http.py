@@ -121,7 +121,11 @@ def run_fixture(scenario, terminal=False):
         config.mkdir(parents=True, mode=0o700)
         (config / "config.toml").write_text(
             "auto_upgrade = false\n[limits]\nmax_agent_steps = 4\nprovider_max_attempts = 1\n"
-            "mcp_startup_timeout_ms = 1000\nmcp_operation_timeout_ms = 1000\n"
+            # Generous, because these bound the fixture's own handshakes rather than testing a
+            # timeout. At one second the MCP initialize handshake exceeded the deadline whenever
+            # the full workspace suite was loading the machine, which dropped the connection and
+            # failed the run for reasons that had nothing to do with the branch.
+            "mcp_startup_timeout_ms = 30000\nmcp_operation_timeout_ms = 30000\n"
         )
         (config / "config.toml").chmod(0o600)
         server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Server)
@@ -183,7 +187,7 @@ def run_fixture(scenario, terminal=False):
                 transcript = bytearray()
 
                 def wait_for(marker):
-                    deadline = time.monotonic() + 10
+                    deadline = time.monotonic() + 30
                     while marker not in transcript:
                         assert child.poll() is None, (child.returncode, transcript)
                         assert time.monotonic() < deadline, transcript
@@ -194,7 +198,7 @@ def run_fixture(scenario, terminal=False):
                 os.write(master, b"echo through HTTP MCP\r")
                 wait_for(b"HTTP_MCP_PASSED")
                 os.write(master, b"/quit\r")
-                assert child.wait(timeout=5) == 0, transcript
+                assert child.wait(timeout=30) == 0, transcript
                 stdout, stderr = bytes(transcript), b""
             else:
                 prompt = b"echo through HTTP MCP\n" + (b"no\n" if scenario == "policy" else b"")
