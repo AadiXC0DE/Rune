@@ -156,13 +156,14 @@ List or check MCP servers without an agent turn
 | Flag | Description |
 |---|---|
 | `--json` | Emit JSON without secret headers or environment values. |
-### `rune permissions [--explain <target>] [--json]`
+### `rune permissions [--explain <target> | --simulate <file>] [--json]`
 
 Show the permission mode and rules
 
 | Flag | Description |
 |---|---|
 | `--explain <target>` | Explain one tool:target action, such as shell:pwd. JSON includes the outcome, deciding rule and layer. |
+| `--simulate <file>` | Dry-run a JSON array of {tool, target} calls in order, without execution or approval writes. |
 | `--json` | Emit JSON. |
 ### `rune sandbox explain [--external-access] [--json] -- <command>`
 

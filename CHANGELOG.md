@@ -6,6 +6,11 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Added
 
+- `rune permissions --simulate <file>` dry-runs a recorded JSON sequence of
+  tool names and permission targets. Text and JSON reports preserve call order
+  and name the deciding rule, layer and outcome for every call without executing
+  tools or writing approvals. JSON also shows mode overrides and considered rules.
+
 - `rune review` can use read-only tools in the bounded host loop. The named
   `read-only review` rule refuses file mutations, shell commands, and skill
   installation before normal permission evaluation, including in full-access

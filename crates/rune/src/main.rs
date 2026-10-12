@@ -219,7 +219,7 @@ fn run(launch: &Launch) -> Result<ExitCode> {
                 EXIT_OK
             }))
         }
-        Command::Permissions => run_permissions(&settings, launch, &output_flags),
+        Command::Permissions => run_permissions(&settings, launch, &output_flags, &workspace),
         Command::Sandbox => {
             let report = sandbox::explain(&settings, saved_directory_source, launch, &workspace)?;
             if output_flags.json {
@@ -1294,8 +1294,34 @@ fn run_reference(launch: &Launch) -> Result<ExitCode> {
 }
 
 /// Reports the permission rules in force.
-fn run_permissions(settings: &Settings, launch: &Launch, output: &OutputFlags) -> Result<ExitCode> {
+fn run_permissions(
+    settings: &Settings,
+    launch: &Launch,
+    output: &OutputFlags,
+    workspace: &Utf8Path,
+) -> Result<ExitCode> {
     let rules = permissions::validated(settings)?;
+
+    if let Some(file) = launch.flag("--simulate") {
+        if launch.has_flag("--explain") || !launch.args.is_empty() {
+            return Err(RuneError::invalid_field(
+                "simulate",
+                "--simulate cannot be combined with --explain or positional actions",
+            ));
+        }
+        let report = permissions::simulate_file(
+            &rules,
+            settings.permission_mode,
+            Utf8Path::new(file),
+            workspace,
+        )?;
+        if output.json {
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        } else {
+            print!("{}", report.render());
+        }
+        return Ok(ExitCode::from(EXIT_OK));
+    }
 
     let action = if let Some(raw) = launch.flag("--explain") {
         let (tool, target) = raw

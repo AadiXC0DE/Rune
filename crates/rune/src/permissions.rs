@@ -4,11 +4,131 @@
 //! refusal can be traced to the layer that produced it.
 
 use std::fmt::Write as _;
+use std::io::Read as _;
 
+use camino::Utf8Path;
 use rune_core::config::{PermissionMode, Settings};
-use rune_core::error::Result;
-use rune_policy::decision::{Layer, Outcome};
+use rune_core::error::{Result, RuneError};
+use rune_policy::decision::{Decision, Layer, Outcome};
 use rune_policy::rules::{Rule, RuleSet};
+use serde::{Deserialize, Serialize};
+
+/// A recording stores policy targets, not executable tool arguments. Empty
+/// targets represent calls whose tool declares no permission target.
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RecordedCall {
+    tool: String,
+    target: String,
+}
+
+#[derive(Debug, Serialize)]
+struct SimulatedCall {
+    index: usize,
+    #[serde(flatten)]
+    call: RecordedCall,
+    outcome: Outcome,
+    from_rule: bool,
+    decision: Decision,
+}
+
+/// Ordered policy results. An `ask` is reported without resolving an approval.
+#[derive(Debug, Serialize)]
+pub struct Simulation {
+    dry_run: bool,
+    mode: &'static str,
+    calls: Vec<SimulatedCall>,
+}
+
+impl Simulation {
+    pub fn render(&self) -> String {
+        let mut out = format!("dry run: mode {}\n", self.mode);
+        for call in &self.calls {
+            let _ = writeln!(
+                out,
+                "{}: {} `{}`: {} ({})",
+                call.index,
+                call.call.tool,
+                call.call.target,
+                call.outcome,
+                call.decision.explain(),
+            );
+        }
+        if self.calls.is_empty() {
+            out.push_str("no calls\n");
+        }
+        out
+    }
+}
+
+/// Reads a recording without constructing an executor, reviewer, or approval
+/// store. Bound the read itself, including when a file grows while being read.
+pub fn simulate_file(
+    rules: &RuleSet,
+    mode: PermissionMode,
+    file: &Utf8Path,
+    workspace: &Utf8Path,
+) -> Result<Simulation> {
+    const MAX_BYTES: usize = 1024 * 1024;
+    if !std::fs::metadata(file)?.is_file() {
+        return Err(RuneError::invalid_field(
+            "simulate",
+            "expected a regular file",
+        ));
+    }
+    let mut bytes = Vec::new();
+    std::fs::File::open(file)?
+        .take((MAX_BYTES as u64).saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > MAX_BYTES {
+        return Err(RuneError::too_large("simulate", bytes.len(), MAX_BYTES));
+    }
+    let calls: Vec<RecordedCall> = serde_json::from_slice(&bytes).map_err(|err| {
+        RuneError::invalid_field(
+            "simulate",
+            format!("expected a JSON array of {{tool, target}} calls: {err}"),
+        )
+    })?;
+    simulate(rules, mode, calls, workspace)
+}
+
+/// Evaluates every call against the same rules. Earlier questions do not grant
+/// permission to later calls, and no recorded action is executed.
+fn simulate(
+    rules: &RuleSet,
+    mode: PermissionMode,
+    calls: Vec<RecordedCall>,
+    workspace: &Utf8Path,
+) -> Result<Simulation> {
+    let mut results = Vec::with_capacity(calls.len());
+    for (position, call) in calls.into_iter().enumerate() {
+        let index = position.saturating_add(1);
+        if call.tool.trim().is_empty() {
+            return Err(RuneError::invalid_field(
+                "simulate",
+                format!("call {index} has an empty tool name"),
+            ));
+        }
+        let decision = rules.evaluate_in_workspace(
+            &call.tool,
+            &call.target,
+            rune_policy::decision::mode_default(mode),
+            workspace,
+        );
+        results.push(SimulatedCall {
+            index,
+            outcome: rune_agent::turn::effective_outcome(mode, decision.outcome),
+            from_rule: decision.from_rule,
+            call,
+            decision,
+        });
+    }
+    Ok(Simulation {
+        dry_run: true,
+        mode: mode.as_str(),
+        calls: results,
+    })
+}
 
 /// One rule as the surface reports it.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -233,6 +353,72 @@ pub fn validated(settings: &Settings) -> Result<RuleSet> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn simulation_preserves_order_rule_provenance_and_workspace_matching() {
+        let workspace = Utf8Path::new("/workspace");
+        let mut rules = builtin_rules(&PermissionMode::Auto);
+        rules.push(Rule::allow("read_file", "secrets/*", Layer::Project));
+        rules.push(Rule::deny("read_file", "secrets/*", Layer::User));
+        rules.push(Rule::allow("read_file", "secrets/public", Layer::Session));
+        let calls = serde_json::from_value(serde_json::json!([
+            {"tool": "read_file", "target": "/workspace/secrets/key"},
+            {"tool": "read_file", "target": "./secrets/public"},
+            {"tool": "shell", "target": "rm -rf output"},
+            {"tool": "shell", "target": "rm -rf output"},
+            {"tool": "shell", "target": "pwd; rm -rf output"},
+        ]))
+        .expect("recording");
+        let report = simulate(&rules, PermissionMode::Auto, calls, workspace).expect("simulate");
+        assert_eq!(report.calls.len(), 5);
+        for (position, call) in report.calls.iter().enumerate() {
+            assert_eq!(call.index, position.saturating_add(1));
+            let (outcome, reason) = rune_agent::turn::decide_call_in_workspace(
+                &rules,
+                PermissionMode::Auto,
+                &call.call.tool,
+                Some(&call.call.target),
+                workspace,
+            );
+            assert_eq!(call.outcome, outcome);
+            assert_eq!(call.decision.explain(), reason);
+        }
+        assert_eq!(report.calls[0].outcome, Outcome::Deny);
+        assert_eq!(report.calls[0].decision.rule, "read_file secrets/*");
+        assert_eq!(report.calls[0].decision.layer, Layer::User);
+        assert!(report.calls[0].from_rule);
+        assert!(report.calls[0].decision.considered.iter().any(|rule| {
+            rule.layer == Layer::Project && rule.matched && rule.outcome == Outcome::Allow
+        }));
+        assert_eq!(report.calls[1].outcome, Outcome::Allow);
+        assert_eq!(report.calls[1].decision.layer, Layer::Session);
+        // Repeated asks remain asks; simulation must never create a grant.
+        for call in &report.calls[2..] {
+            assert_eq!(call.outcome, Outcome::Ask);
+            assert!(!call.from_rule);
+        }
+    }
+
+    #[test]
+    fn simulation_reports_policy_denials_and_full_access_overrides_separately() {
+        let mut rules = RuleSet::new();
+        rules.push(Rule::deny("write_file", "*", Layer::User));
+        let report = simulate(
+            &rules,
+            PermissionMode::FullAccess,
+            vec![RecordedCall {
+                tool: "write_file".into(),
+                target: "result.txt".into(),
+            }],
+            Utf8Path::new("/workspace"),
+        )
+        .expect("simulate");
+        let json = serde_json::to_value(&report).expect("report");
+        assert_eq!(json["mode"], "full_access");
+        assert_eq!(json["calls"][0]["outcome"], "allow");
+        assert_eq!(json["calls"][0]["decision"]["outcome"], "deny");
+        assert_eq!(json["calls"][0]["decision"]["rule"], "write_file *");
+    }
 
     fn default_settings() -> Settings {
         Settings::default()

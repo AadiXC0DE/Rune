@@ -592,6 +592,17 @@ failure within the available output budget.
   result limits still apply to what is recorded.
 - **Permission first.** Every sensitive action passes a policy gate, and
   `rune permissions` explains exactly which rule decided it.
+  `rune permissions --simulate sequence.json` replays an ordered JSON array of
+  recorded policy calls, for example
+  `[{"tool":"read_file","target":"src/main.rs"},{"tool":"shell","target":"pwd"}]`.
+  Each entry supplies the tool name and its resolved permission target, with
+  `""` for tools without a target. The simulator reports every outcome, deciding
+  rule and layer without running tools, prompting, reviewing, or writing
+  approvals or session state. `--json` includes the considered rules and both
+  the policy decision and effective outcome, including full-access overrides.
+  Calls use the current workspace, mode and rules; earlier calls create no
+  grants. This previews permission policy only, not sandbox enforcement or tool
+  argument validation. Recordings must be regular JSON files of at most 1 MiB.
   Interactive requests show the complete scope with Run once and Deny choices.
   Use Up/Down and Enter to answer; Escape, Control-C, or Control-D cancels the
   turn. Run once approves only the displayed call.

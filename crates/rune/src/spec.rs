@@ -418,12 +418,17 @@ pub const ACCOUNT: &[CommandSpec] = &[
         name: "permissions",
         aliases: &[],
         summary: "Show the permission mode and rules",
-        usage: "rune permissions [--explain <target>] [--json]",
+        usage: "rune permissions [--explain <target> | --simulate <file>] [--json]",
         flags: &[
             option(
                 "--explain",
                 "target",
                 "Explain one tool:target action, such as shell:pwd. JSON includes the outcome, deciding rule and layer.",
+            ),
+            option(
+                "--simulate",
+                "file",
+                "Dry-run a JSON array of {tool, target} calls in order, without execution or approval writes.",
             ),
             flag("--json", "Emit JSON."),
         ],
