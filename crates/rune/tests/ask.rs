@@ -1681,3 +1681,140 @@ fn model_plan_updates_emit_versioned_events_without_duplicates_or_workspace_muta
         ["config", "fixture.txt"].map(std::ffi::OsString::from)
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn user_pre_tool_hook_veto_preserves_the_pair_and_reports_its_named_reason() {
+    let arguments = json!({"path": "fixture.txt", "content": "MUST_NOT_WRITE"}).to_string();
+    let (output, dir, requests) = run_responses_fixture_command(
+        vec![
+            completion_response(&call_delta("write_file", &arguments), "tool_calls"),
+            completion_response(&json!({"content": "The guard refused the write."}), "stop"),
+        ],
+        Some("--json"),
+        false,
+        Some(2),
+        (&["--permission-mode", "full-access", "ask"], &[]),
+        |dir| {
+            std::fs::write(
+                dir.path().join("guard.sh"),
+                r#"printf '%s' "$RUNE_PRE_TOOL_CALL" >> hook-input.json
+printf '%s' "${RUNE_ASK_TEST_KEY-unset}" > hook-key.txt
+printf '%s' '{"decision":"veto","reason":"protected fixture"}'
+"#,
+            )
+            .expect("hook script");
+            let config = dir.path().join("config/rune/config.toml");
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(config)
+                .expect("config");
+            writeln!(
+                file,
+                "\n[pre_tool_hook]\nname = 'fixture guard'\nargv = ['/bin/sh', 'guard.sh']"
+            )
+            .expect("configure hook");
+        },
+    );
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("fixture.txt")).expect("file"),
+        "ALLOWED_READ_RESULT"
+    );
+    let input: Value = serde_json::from_slice(
+        &std::fs::read(dir.path().join("hook-input.json")).expect("hook input"),
+    )
+    .expect("exactly one invocation");
+    assert_eq!(
+        input,
+        json!({"event":"pre_tool", "id":"call-fixture", "name":"write_file", "arguments":serde_json::from_str::<Value>(&arguments).expect("arguments")})
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("hook-key.txt")).expect("environment"),
+        "unset"
+    );
+    assert_eq!(requests.len(), 2);
+    let messages = requests[1]["messages"].as_array().expect("messages");
+    let call = messages
+        .iter()
+        .find(|message| message["role"] == "assistant")
+        .expect("assistant call");
+    assert_eq!(call["tool_calls"][0]["id"], "call-fixture");
+    let result = messages.last().expect("tool result");
+    assert_eq!(result["role"], "tool");
+    assert_eq!(result["tool_call_id"], "call-fixture");
+    assert_eq!(
+        result["content"],
+        "pre-tool hook `fixture guard` vetoed: protected fixture"
+    );
+    let result: Value = serde_json::from_slice(&output.stdout).expect("ask JSON");
+    assert_eq!(
+        result["tool_calls"],
+        json!([{"name":"write_file", "status":"error"}])
+    );
+    let session_dir = dir
+        .path()
+        .join("state/sessions")
+        .join(result["session_id"].as_str().expect("session ID"));
+    let saved = rune_session::load_read_only(
+        camino::Utf8Path::from_path(&session_dir).expect("UTF-8 path"),
+    )
+    .expect("saved session");
+    assert!(saved.events.iter().any(|frame| matches!(&frame.event,
+        rune_session::SessionEvent::ToolResult { ok: false, output, .. }
+            if output == "pre-tool hook `fixture guard` vetoed: protected fixture")));
+}
+
+#[cfg(unix)]
+#[test]
+fn pre_tool_allow_runs_the_tool_and_hook_failures_hold_it() {
+    for (script, timeout_ms, expected) in [
+        (
+            r#"printf '%s' '{"decision":"allow"}'"#,
+            5000,
+            "ALLOWED_READ_RESULT",
+        ),
+        ("exit 1", 5000, "exited with status 1"),
+        ("printf garbage", 5000, "hook failed"),
+        ("sleep 10", 20, "exceeded its deadline"),
+        ("head -c 5000 /dev/zero", 5000, "output exceeds 4096 bytes"),
+    ] {
+        let (output, dir, requests) = run_responses_fixture_with_setup(
+            vec![
+                completion_response(
+                    &call_delta("read_file", r#"{"path":"fixture.txt"}"#),
+                    "tool_calls",
+                ),
+                completion_response(&json!({"content":"done"}), "stop"),
+            ],
+            true,
+            true,
+            Some(2),
+            |dir| {
+                std::fs::write(dir.path().join("guard.sh"), script).expect("hook script");
+                let config = dir.path().join("config/rune/config.toml");
+                let mut file = std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(config)
+                    .expect("config");
+                writeln!(file, "\n[pre_tool_hook]\nname = 'fixture guard'\nargv = ['/bin/sh', 'guard.sh']\ntimeout_ms = {timeout_ms}").expect("configure hook");
+            },
+        );
+        assert!(output.status.success(), "{script}: {output:?}");
+        let result = requests[1]["messages"]
+            .as_array()
+            .expect("messages")
+            .last()
+            .expect("tool result");
+        let text = result["content"].as_str().expect("output");
+        assert!(text.contains(expected), "{script}: {text}");
+        if expected != "ALLOWED_READ_RESULT" {
+            assert!(text.contains("pre-tool hook `fixture guard`"), "{text}");
+            assert!(!text.contains("ALLOWED_READ_RESULT"), "tool ran: {text}");
+        }
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("fixture.txt")).expect("file"),
+            "ALLOWED_READ_RESULT"
+        );
+    }
+}

@@ -85,6 +85,15 @@ pub struct PreparedCall {
     pub arguments: String,
 }
 
+/// A pre-tool hook's named refusal. Hooks can only narrow existing authority.
+#[derive(Clone, Debug)]
+pub struct HookVeto {
+    /// User-defined hook name.
+    pub name: String,
+    /// Explanation sent to the model and reported in the denial event.
+    pub reason: String,
+}
+
 /// How a tool call was resolved.
 #[derive(Clone, Debug)]
 pub struct CallResult {
@@ -158,11 +167,11 @@ pub enum Event {
         /// Complete replacement snapshot with its monotonically increasing version.
         update: rune_tools::PlanUpdate,
     },
-    /// A tool call was refused by policy.
+    /// A tool call was refused by policy, a pre-tool hook, or a turn guard.
     ToolDenied {
         /// The call.
         call: PreparedCall,
-        /// The rule that decided it.
+        /// The deciding rule, hook, or guard and its explanation.
         reason: String,
     },
     /// Steering was drained at a boundary.
@@ -302,6 +311,16 @@ pub trait Host {
 
     /// Reports an event.
     fn emit(&self, event: Event);
+
+    /// Runs a user-authorized veto hook after all policy checks, before execution.
+    ///
+    /// Called once on the turn thread for each eligible call, including concurrent
+    /// reads and retained-result reads. Returning a veto or an error prevents
+    /// execution and preserves the matching error result. The default allows
+    /// the call to continue. Hosts must bound external hook execution themselves.
+    fn pre_tool(&self, _call: &PreparedCall) -> Result<Option<HookVeto>> {
+        Ok(None)
+    }
 
     /// Executes a tool call, after policy has allowed it.
     fn execute(&self, name: &str, arguments: &serde_json::Value) -> Result<ToolOutput>;
@@ -1090,6 +1109,40 @@ fn prepare_call(
                 executed: false,
             });
         }
+    }
+    let veto = match host.pre_tool(call) {
+        Ok(veto) => {
+            veto.map(|veto| format!("pre-tool hook `{}` vetoed: {}", veto.name, veto.reason))
+        }
+        Err(error) if error.code() == ErrorCode::Cancelled => {
+            *cancelled = true;
+            return Err(CallResult {
+                call: call.clone(),
+                output: ToolOutput::failure("not run: the turn was cancelled"),
+                executed: false,
+            });
+        }
+        Err(error) => Some(format!("pre-tool hook failed: {error}")),
+    };
+    if let Some(reason) = veto {
+        host.emit(Event::ToolDenied {
+            call: call.clone(),
+            reason: reason.clone(),
+        });
+        return Err(CallResult {
+            call: call.clone(),
+            output: ToolOutput::failure(reason),
+            executed: false,
+        });
+    }
+    // A hook may have observed cancellation while deciding to allow the call.
+    if host.cancellation().is_cancelled() {
+        *cancelled = true;
+        return Err(CallResult {
+            call: call.clone(),
+            output: ToolOutput::failure("not run: the turn was cancelled"),
+            executed: false,
+        });
     }
     let context = host.context().with_private_network_access(private_access);
 

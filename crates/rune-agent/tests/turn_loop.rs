@@ -53,6 +53,8 @@ struct TestHost {
     decisions: Mutex<Vec<(String, Option<String>)>>,
     tool_response: Mutex<Option<ToolOutput>>,
     tool_error: Option<RuneError>,
+    hook_veto: Option<rune_agent::turn::HookVeto>,
+    hook_calls: Mutex<Vec<String>>,
     /// Real tools used by regressions that must reach the implementation.
     registry: Option<Registry>,
     cancellation: Cancellation,
@@ -90,6 +92,8 @@ impl TestHost {
             decisions: Mutex::new(Vec::new()),
             tool_response: Mutex::new(None),
             tool_error: None,
+            hook_veto: None,
+            hook_calls: Mutex::new(Vec::new()),
             registry: None,
             cancellation: Cancellation::new(),
             steering: SteeringQueue::new(8),
@@ -242,6 +246,17 @@ impl Host for TestHost {
             self.steering.submit(text).expect("queued");
         }
         self.events.lock().expect("lock").push(event);
+    }
+
+    fn pre_tool(
+        &self,
+        call: &rune_agent::turn::PreparedCall,
+    ) -> Result<Option<rune_agent::turn::HookVeto>> {
+        self.hook_calls
+            .lock()
+            .expect("hook calls")
+            .push(call.id.clone());
+        Ok(self.hook_veto.clone())
     }
 
     fn execute(&self, name: &str, arguments: &serde_json::Value) -> Result<ToolOutput> {
@@ -3168,4 +3183,89 @@ fn live_plans_survive_turns_and_compaction_but_are_isolated_from_new_histories()
     );
     assert_eq!(updates[0].plan, updates[2].plan);
     assert!(updates.iter().all(|update| update.plan.len() == 3));
+}
+
+#[test]
+fn pre_tool_veto_answers_sequential_and_concurrent_calls_without_execution() {
+    for cap in [1, 2] {
+        let calls = [
+            ("fixture_read", "a"),
+            ("fixture_read", "b"),
+            ("fixture_mutation", "c"),
+        ];
+        let (mut host, barriers) = barrier_host(&calls, cap);
+        host.mode = PermissionMode::FullAccess;
+        host.hook_veto = Some(rune_agent::turn::HookVeto {
+            name: "fixture guard".to_owned(),
+            reason: "maintenance window".to_owned(),
+        });
+        let mut history = rune_agent::History::new();
+        history.push_user("attempt the guarded calls");
+        let outcome = run_turn(&mut history, &host).expect("turn");
+        assert_eq!(outcome.stop_reason, StopReason::Completed);
+        assert_eq!(*host.hook_calls.lock().expect("calls"), ["a", "b", "c"]);
+        assert!(host.executed_calls().is_empty());
+        barriers.assert_started(&[]);
+        assert_eq!(outcome.calls.len(), 3);
+        for result in outcome.calls {
+            assert!(!result.executed);
+            assert!(result.output.is_error);
+            assert_eq!(
+                result.output.text,
+                "pre-tool hook `fixture guard` vetoed: maintenance window"
+            );
+        }
+        assert_eq!(
+            host.events()
+                .iter()
+                .filter(|event| matches!(event, Event::ToolDenied { reason, .. }
+            if reason == "pre-tool hook `fixture guard` vetoed: maintenance window"))
+                .count(),
+            3
+        );
+        assert!(!host.events().iter().any(|event| matches!(
+            event,
+            Event::ToolStarted { .. } | Event::ToolFinished { .. }
+        )));
+        history.validate().expect("paired history");
+        let request = host
+            .server
+            .as_ref()
+            .expect("server")
+            .last_body()
+            .expect("request");
+        let results = request["messages"]
+            .as_array()
+            .expect("messages")
+            .iter()
+            .filter(|message| message["role"] == "tool")
+            .collect::<Vec<_>>();
+        assert_eq!(results.len(), 3);
+        for (result, id) in results.iter().zip(["a", "b", "c"]) {
+            assert_eq!(result["tool_call_id"], id);
+            assert_eq!(
+                result["content"],
+                "pre-tool hook `fixture guard` vetoed: maintenance window"
+            );
+        }
+    }
+}
+
+#[test]
+fn pre_tool_hooks_cannot_override_a_policy_denial() {
+    let endpoint = MockEndpoint::start(vec![
+        Script::tool_call("blocked", "read_file", r#"{"path":"secret.txt"}"#),
+        Script::text("done"),
+    ]);
+    let mut rules = RuleSet::new();
+    rules.push(Rule::deny("read_file", "secret.txt", Layer::User));
+    let host = TestHost::new(endpoint)
+        .with_tools(vec![read_tool()])
+        .with_rules(rules);
+    let mut history = rune_agent::History::new();
+    history.push_user("read secret");
+    let outcome = run_turn(&mut history, &host).expect("turn");
+    assert!(!outcome.calls[0].executed);
+    assert!(host.hook_calls.lock().expect("hook calls").is_empty());
+    history.validate().expect("paired history");
 }

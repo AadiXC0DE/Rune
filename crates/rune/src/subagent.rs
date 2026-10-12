@@ -251,6 +251,10 @@ impl Host for ChildHost<'_> {
         }
         self.parent.decide(name, target)
     }
+    fn pre_tool(&self, call: &turn::PreparedCall) -> Result<Option<turn::HookVeto>> {
+        self.parent.pre_tool(call)
+    }
+
     fn execute(&self, name: &str, arguments: &serde_json::Value) -> Result<ToolOutput> {
         self.execute_with_context(name, arguments, &self.context)
     }

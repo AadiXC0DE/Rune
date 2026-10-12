@@ -332,10 +332,31 @@ pub struct ModelSettings {
     pub max_output_tokens: Option<u64>,
 }
 
+/// A user-authorized command that may veto an otherwise allowed tool call.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PreToolHook {
+    /// Name reported with a veto or hook failure.
+    pub name: String,
+    /// Explicit program and arguments, without implicit shell interpretation.
+    pub argv: Vec<String>,
+    /// Deadline in milliseconds, from 1 to 60,000.
+    #[serde(default = "default_hook_timeout")]
+    pub timeout_ms: u64,
+}
+
+const fn default_hook_timeout() -> u64 {
+    5_000
+}
+
 /// A user configuration file as parsed.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct UserConfig {
+    /// Pre-tool veto command. Only the user configuration may set this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pre_tool_hook: Option<PreToolHook>,
+
     /// Active provider.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<Provider>,
@@ -506,6 +527,8 @@ impl MergeReport {
 /// Fully resolved configuration.
 #[derive(Clone, Debug)]
 pub struct Settings {
+    /// User-authorized pre-tool veto command, absent by default.
+    pub pre_tool_hook: Option<PreToolHook>,
     /// Active provider.
     pub provider: Provider,
     /// Effective model identifier for the active provider.
@@ -578,6 +601,7 @@ impl Default for Settings {
             provider: Provider::default(),
             model: String::new(),
             configured_models: BTreeMap::new(),
+            pre_tool_hook: None,
             web_tools: false,
             context_window: None,
             base_url: None,
@@ -687,6 +711,12 @@ impl Settings {
             ),
             ("ascii", self.ascii.to_string()),
             ("web_tools", self.web_tools.to_string()),
+            (
+                "pre_tool_hook",
+                self.pre_tool_hook
+                    .as_ref()
+                    .map_or_else(|| "disabled".to_owned(), |hook| hook.name.clone()),
+            ),
             (
                 "vision_model",
                 self.vision_model
@@ -878,6 +908,7 @@ const PROJECT_SAFE_KEYS: &[&str] = &[
 
 /// Profile-owned keys. Present in a project file, they are ignored and reported.
 const PROFILE_ONLY_KEYS: &[&str] = &[
+    "pre_tool_hook",
     "provider",
     "models",
     "model",
@@ -1077,6 +1108,10 @@ fn read_bounded(path: &Utf8Path, layer: Layer) -> std::result::Result<Option<Str
 
 /// Applies a user configuration to the settings.
 fn apply_user(settings: &mut Settings, user: &UserConfig, layer: Layer) {
+    if let Some(hook) = &user.pre_tool_hook {
+        settings.pre_tool_hook = Some(hook.clone());
+        settings.sources.record("pre_tool_hook", layer);
+    }
     if let Some(offline) = user.offline {
         settings.offline = offline;
         settings.sources.record("offline", layer);
@@ -1610,6 +1645,7 @@ pub fn to_status_json(settings: &Settings, workspace: &Utf8Path) -> serde_json::
         "provider_strict": settings.provider_strict,
         "review_model": settings.review_model,
         "vision_model": settings.vision_model,
+        "pre_tool_hook": settings.pre_tool_hook,
         "workspace": workspace.as_str(),
         "diagnostics": settings.diagnostics,
     })
@@ -1726,6 +1762,39 @@ mod tests {
             to_status_json(&settings, Utf8Path::new("/fixture"))["vision_model"],
             "image-fixture"
         );
+    }
+
+    #[test]
+    fn pre_tool_hooks_are_user_owned_and_keep_their_provenance() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let definition = "[pre_tool_hook]\nname = 'fixture guard'\nargv = ['/bin/false']\n";
+        let project = write(&dir, ".rune.toml", definition);
+        let settings = load(Some(&project), None, &empty_env());
+        assert!(settings.pre_tool_hook.is_none());
+        assert!(
+            settings
+                .diagnostics
+                .iter()
+                .any(|diagnostic| { diagnostic.code == ErrorCode::KeyNotAllowedInScope })
+        );
+        let user = write(&dir, "config.toml", definition);
+        let settings = load(Some(&project), Some(&user), &empty_env());
+        let hook = settings.pre_tool_hook.as_ref().expect("user hook");
+        assert_eq!(hook.name, "fixture guard");
+        assert_eq!(hook.argv, ["/bin/false"]);
+        assert_eq!(hook.timeout_ms, 5_000);
+        assert_eq!(settings.source_of("pre_tool_hook"), Layer::User);
+        assert!(
+            settings
+                .explain()
+                .iter()
+                .any(|row| row.key == "pre_tool_hook"
+                    && row.value == "fixture guard"
+                    && row.source == Layer::User)
+        );
+        let encoded =
+            toml::to_string(&read_user(&user).expect("read").expect("config")).expect("serialize");
+        assert!(encoded.contains("pre_tool_hook"));
     }
 
     #[test]

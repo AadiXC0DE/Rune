@@ -227,6 +227,7 @@ impl Answerer for TerminalQuestions {
 
 /// Host state for a turn.
 struct SessionHost {
+    pre_tool_hook: Option<rune_core::config::PreToolHook>,
     accessible: bool,
     ascii: bool,
     recorder: Option<Arc<Mutex<Recorder>>>,
@@ -547,6 +548,15 @@ impl Host for SessionHost {
         if let Ok(mut events) = self.events.lock() {
             events.push(event);
         }
+    }
+
+    fn pre_tool(&self, call: &turn::PreparedCall) -> Result<Option<turn::HookVeto>> {
+        crate::pre_tool_hook::run(
+            self.pre_tool_hook.as_ref(),
+            call,
+            &self.context,
+            &self.cancellation,
+        )
     }
 
     fn execute(&self, name: &str, arguments: &serde_json::Value) -> Result<ToolOutput> {
@@ -1546,6 +1556,7 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
         .additional_roots
         .clone_from(&config.settings.additional_directories);
     let host = SessionHost {
+        pre_tool_hook: config.settings.pre_tool_hook.clone(),
         accessible: config.accessible,
         ascii: config.settings.ascii,
         recorder: Some(Arc::clone(&recorder)),
@@ -9403,6 +9414,7 @@ mod tests {
             .expect("registered");
         let questions = Arc::new(TerminalQuestions::default());
         SessionHost {
+            pre_tool_hook: None,
             accessible: false,
             ascii: false,
             recorder: None,

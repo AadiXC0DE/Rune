@@ -379,6 +379,15 @@ impl Host for AskHost<'_> {
         }
     }
 
+    fn pre_tool(&self, call: &turn::PreparedCall) -> Result<Option<turn::HookVeto>> {
+        crate::pre_tool_hook::run(
+            self.settings.pre_tool_hook.as_ref(),
+            call,
+            &self.context,
+            &self.cancellation,
+        )
+    }
+
     fn execute(&self, name: &str, arguments: &serde_json::Value) -> Result<ToolOutput> {
         self.registry.call(name, arguments, &self.context)
     }

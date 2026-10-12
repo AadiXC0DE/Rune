@@ -6,6 +6,12 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Added
 
+- User configuration can define a named `pre_tool_hook` command to veto
+  policy-approved tool calls in interactive sessions, ask, review, and delegated
+  children. Vetoes preserve the call/result pair and report the hook's reason.
+  Hook commands use supervised execution with cancellation, a deadline, and
+  bounded output; failures hold the tool call. Project files cannot enable hooks.
+
 - `rune mcp import claude-desktop <file>` prints a validated project config for
   review from local stdio `mcpServers` entries. It preserves commands, arguments,
   and environment values without executing commands or writing trust records.

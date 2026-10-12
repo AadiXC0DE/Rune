@@ -735,6 +735,34 @@ rune limits --json          # every limit and its source
 rune prompt --show          # the exact instructions the model receives
 ```
 
+A user-defined pre-tool hook can veto an otherwise policy-approved call in
+interactive sessions, `rune ask`, review, and delegated child calls. Configure
+one command in the user file; project `.rune.toml` cannot enable it:
+
+```toml
+[pre_tool_hook]
+name = "protect generated files"
+argv = ["/usr/local/bin/rune-tool-guard"]
+timeout_ms = 5000
+```
+
+Rune invokes the explicit argv in the workspace directory, without an implicit
+shell, once per eligible call before tool execution, including concurrent reads.
+The command receives `RUNE_PRE_TOOL_CALL`, a JSON object with `event` set to
+`pre_tool`, the call `id`, tool `name`, and decoded `arguments`. Input is limited
+to 32 KiB. The command gets the normal minimal command environment, excluding
+provider credentials, and closed stdin. It runs with the user's authority;
+only configure commands you trust.
+
+Exit successfully and print exactly one JSON decision on stdout:
+`{"decision":"allow"}` or `{"decision":"veto","reason":"generated file"}`.
+A veto prevents execution and records an error result paired with the original
+call, naming the hook and its reason in the result and denial event. A hook
+cannot override policy refusals. Invalid output, nonzero exit, oversized stdout
+(over 4 KiB), or a deadline failure also holds the call with the hook's name.
+The deadline defaults to 5 seconds and accepts 1 to 60,000 milliseconds.
+Cancellation stops a running hook through the existing process supervisor.
+
 ## Embedding
 
 `rune-acp` serves the Agent Client Protocol over stdin and stdout, so an editor
