@@ -1177,7 +1177,7 @@ fn finish_call(
 /// answer for presentation purposes.
 fn infer_activity(name: &str) -> Activity {
     match name {
-        "read_file" | "read_tool_result" | "git_diff" => Activity::Read,
+        "read_file" | "read_tool_result" | "git_diff" | "syntax_diagnostics" => Activity::Read,
         "glob_files" => Activity::List,
         "grep_files" => Activity::Search,
         "write_file" | "rename_file" | "create_directory" => Activity::Write,
@@ -1332,7 +1332,7 @@ pub fn permission_target_for(
 fn infer_target_standalone(name: &str, arguments: &serde_json::Value) -> Option<String> {
     match name {
         "read_file" | "write_file" | "edit_file" | "rename_file" | "create_directory"
-        | "glob_files" | "grep_files" => arguments
+        | "glob_files" | "grep_files" | "syntax_diagnostics" => arguments
             .get("path")
             .and_then(serde_json::Value::as_str)
             .map(str::to_owned),
@@ -1518,6 +1518,7 @@ mod tests {
     fn activity_is_inferred_for_each_builtin_name() {
         assert_eq!(infer_activity("read_file"), Activity::Read);
         assert_eq!(infer_activity("git_diff"), Activity::Read);
+        assert_eq!(infer_activity("syntax_diagnostics"), Activity::Read);
         assert_eq!(infer_activity("glob_files"), Activity::List);
         assert_eq!(infer_activity("grep_files"), Activity::Search);
         assert_eq!(infer_activity("write_file"), Activity::Write);
@@ -1541,6 +1542,10 @@ mod tests {
         );
         assert_eq!(
             infer_target_standalone("edit_file", &arguments).as_deref(),
+            Some("src/main.rs")
+        );
+        assert_eq!(
+            infer_target_standalone("syntax_diagnostics", &arguments).as_deref(),
             Some("src/main.rs")
         );
     }

@@ -1,7 +1,7 @@
 narrow-draft: 32x24, caret 31,3
 00|session ************|
 01|ctrl-c cancel  /help commands  e|
-02|replay-fixture | auto | ctx ~4.3|
+02|replay-fixture | auto | ctx ~4.6|
 03|> 234567890123456789VISIBLE-END|
 04||
 05||
@@ -26,7 +26,7 @@ narrow-draft: 32x24, caret 31,3
 grown-draft: 80x24, caret 63,3
 00|session ************|
 01|ctrl-c cancel  /help commands  esc clear|
-02|replay-fixture | auto | ctx ~4.3k (request bytes) (123.6k left)|
+02|replay-fixture | auto | ctx ~4.6k (request bytes) (123.3k left)|
 03|> 01234567890123456789012345678901234567890123456789VISIBLE-END|
 04||
 05||
@@ -76,7 +76,7 @@ shrunk-draft: 20x24, caret 19,3
 grown-again: 80x24, caret 63,3
 00|session ************|
 01|ctrl-c cancel  /help commands  esc clear|
-02|replay-fixture | auto | ctx ~4.3k (request bytes) (123.6k left)|
+02|replay-fixture | auto | ctx ~4.6k (request bytes) (123.3k left)|
 03|> 01234567890123456789012345678901234567890123456789VISIBLE-END|
 04||
 05||

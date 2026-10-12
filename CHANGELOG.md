@@ -6,6 +6,11 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Added
 
+- Models can call `syntax_diagnostics` for one Rust file and receive syntax
+  messages with file, line, and column from local `rustfmt`. The checker runs
+  under process supervision with cancellation, a 30-second deadline, resource
+  limits, and bounded output. It leaves files unchanged and skips child modules.
+
 - Models can call `update_plan` to replace a bounded in-memory step plan with
   pending, in_progress, and completed statuses. Changed snapshots produce
   versioned status events, including `plan_updated` in `rune ask --jsonl`.

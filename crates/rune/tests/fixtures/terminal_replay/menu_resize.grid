@@ -1,7 +1,7 @@
 model-open: 80x24, caret 2,3
 00|session ************|
 01|ctrl-c cancel  /help commands  esc clear|
-02|replay-model-01 | auto | ctx ~4.3k (request bytes) (123.6k left)|
+02|replay-model-01 | auto | ctx ~4.6k (request bytes) (123.3k left)|
 03|>|
 04|models from chat_completions|
 05|> replay-model-01 (current)|
@@ -53,7 +53,7 @@ model-closed: 32x8, caret 2,3
 closed-grown: 80x24, caret 2,3
 00|session ************|
 01|ctrl-c cancel  /help commands  esc clear|
-02|replay-model-01 | auto | ctx ~4.3k (request bytes) (123.6k left)|
+02|replay-model-01 | auto | ctx ~4.6k (request bytes) (123.3k left)|
 03|>|
 04||
 05||

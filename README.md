@@ -540,6 +540,18 @@ Plans are bounded to 64 steps, 1024 bytes per description, and 4096 bytes per
 explanation. Plan state stays in memory across live turns and compaction,
 changes no workspace files, and resets for a new or reopened conversation.
 
+Models can call `syntax_diagnostics` with `{"path": "fixtures/example.rs"}`
+to check one Rust file using local `rustfmt` on PATH. Results include syntax
+messages with file, line, and column; syntax errors return a tool error. Valid
+syntax reports no diagnostics even if the file needs formatting. The optional
+`edition` is `2015`, `2018`, `2021`, or `2024` (default). This checks syntax,
+without type checking, compilation, procedural macro expansion, or child module
+inspection. Rustfmt configuration is ignored and files stay unchanged. Workspace
+path permissions apply. The checker uses the existing process supervisor with
+resource limits, cancellation, a 30-second deadline, and bounded output. Optional
+`max_bytes` lowers the host output budget; incomplete output has a truncation
+marker. Missing rustfmt returns an explicit checker startup error.
+
 The shared agent turn loop spills tool output exceeding `max_tool_result_bytes`
 or the remaining `max_turn_result_bytes` into the live conversation's memory.
 The model receives a bounded preview with the retained byte count and handle,

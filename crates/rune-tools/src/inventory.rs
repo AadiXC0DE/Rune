@@ -20,7 +20,7 @@ use crate::web::{WebFetch, WebSearch};
 use crate::workspace::FileLimits;
 use crate::{
     CreateDirectory, EditFile, GitDiff, GlobFiles, GrepFiles, ReadFile, ReadToolResult, RenameFile,
-    UpdatePlan, WriteFile,
+    SyntaxDiagnostics, UpdatePlan, WriteFile,
 };
 
 /// Names of every tool this build ships, in advertisement order.
@@ -33,6 +33,7 @@ pub const ADVERTISEMENT_ORDER: &[&str] = &[
     "read_file",
     "read_tool_result",
     "git_diff",
+    "syntax_diagnostics",
     "write_file",
     "edit_file",
     "rename_file",
@@ -171,6 +172,7 @@ pub fn builtin_with_vision(
     registry.insert(Box::new(ReadFile::with_limits(*limits)))?;
     registry.insert(Box::new(ReadToolResult::new(budget)))?;
     registry.insert(Box::new(GitDiff::with_limits(*limits)))?;
+    registry.insert(Box::new(SyntaxDiagnostics::with_limits(*limits)))?;
     registry.insert(Box::new(WriteFile))?;
     registry.insert(Box::new(EditFile))?;
     registry.insert(Box::new(RenameFile))?;
@@ -502,6 +504,7 @@ mod tests {
             "read_file",
             "read_tool_result",
             "git_diff",
+            "syntax_diagnostics",
         ] {
             assert!(read_only.contains(&name), "`{name}` should be read only");
         }
