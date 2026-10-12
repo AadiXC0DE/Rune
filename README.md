@@ -822,6 +822,26 @@ sessions, and delegated child calls support it.
 can drive a session. `rune-sdk` is the library an embedder links against: the
 host supplies the credential, the tools, and the network path.
 
+Rust hosts can call `Agent::diagnostics()` before the first turn, without a
+network request, and serialize the snapshot with `serde_json::to_string`.
+It reports dialect capabilities (effort, images, tool streaming, fast mode,
+and routing), their `dialect_implementation` source, and provenance for host
+inputs, including whether fetch is host supplied or built in. Capabilities
+describe Rune's wire implementation; individual servers and models may impose
+further restrictions.
+
+The snapshot lists the seven limits consumed by the SDK, with configured values,
+defaults, units, original configuration layers, and `host_supplied` or
+`compiled_default` origins. Each `effective` value reflects the operational
+fallback or emergency ceiling; `null` means unlimited. Zero agent steps means
+unlimited, unbounded head timeout falls back to 120 seconds, and checkpoint
+capacity has a one-byte minimum. A nonzero `PromptOptions::max_steps` overrides
+the reported agent step limit for that turn. `ParallelToolCalls` controls the
+request's parallel-call permission; host tools execute sequentially. The fixed
+event queue capacity is also reported. Diagnostics omit credentials, endpoint
+URLs, model identifiers, instruction text, tool definitions, and conversation
+data. They do not infer model context capacity or host implementation policies.
+
 Cooperative Rust SDK network hosts override
 `HostFetch::post_with_context(request, context)`. Each attempt receives a
 `FetchContext` with the turn's `signal`, an absolute response `head_deadline`,

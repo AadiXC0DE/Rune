@@ -6,6 +6,11 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Added
 
+- Rust SDK `Agent::diagnostics` exposes effective SDK limits, their configuration
+  layers and host/default origins, dialect capabilities and input provenance.
+  The serializable snapshot makes no network requests and excludes credentials,
+  endpoint URLs, model identifiers, instructions, tools, and conversation data.
+
 - Rust SDK `HostFetch::post_with_context` receives per-attempt cancellation and
   absolute response-head and total deadlines. Cooperative hosts can stop silent
   sends and body reads, including when decoding ends before the total deadline.

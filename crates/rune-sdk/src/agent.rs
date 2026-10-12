@@ -24,12 +24,12 @@ use rune_agent::compaction;
 use rune_agent::retry::{self, RetryPolicy};
 use rune_agent::steering::Cancellation;
 use rune_agent::turn::{CallResult, Event, PreparedCall, StopReason, TurnOutcome};
-use rune_core::budget::{BudgetSet, LimitName};
+use rune_core::budget::{BudgetSet, LimitDescription, LimitName};
 use rune_core::error::{ErrorCode, Result, RuneError};
 use rune_core::tool::ToolSpec;
 use rune_net::error::{FailureKind, NetError, parse_retry_after};
 use rune_net::message::{ContentPart, ImageRef, validate_tool_specs};
-use rune_net::provider::{Provider, RequestPlan, ToolChoice};
+use rune_net::provider::{Provider, ProviderCapabilities, RequestPlan, Routing, ToolChoice};
 use rune_net::redact;
 use rune_net::stream::{FinishReason, ProviderEvent, Usage};
 use rune_net::transport::{AuthStyle, Endpoint, StreamOutcome};
@@ -43,6 +43,70 @@ pub const CHECKPOINT_VERSION: u32 = 1;
 /// A full queue cancels the turn. [`Turn::result`] then returns `LimitExceeded`
 /// with the `sdk_event_queue` invariant, even if the caller later drains it.
 pub const EVENT_QUEUE_CAPACITY: usize = 1024;
+
+/// Where a diagnostic value comes from, without host data or credentials.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiagnosticSource {
+    /// A default compiled into Rune.
+    CompiledDefault,
+    /// An option or limit supplied by the embedding host.
+    HostSupplied,
+    /// The selected Rune wire implementation, independent of server support.
+    DialectImplementation,
+}
+
+/// Provenance of the agent's inputs. Values and host implementations are omitted.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct AgentSources {
+    /// The model identifier is required from the host.
+    pub model: DiagnosticSource,
+    /// The endpoint is required from the host; its URL is never reported.
+    pub endpoint: DiagnosticSource,
+    /// The dialect selection comes from the host's options.
+    pub dialect: DiagnosticSource,
+    /// Explicit host instructions, or `None` when the option was absent.
+    pub instructions: Option<DiagnosticSource>,
+    /// The tool list, including an empty list, comes from the host.
+    pub tools: DiagnosticSource,
+    /// Whether the host supplied network access or Rune's client is used.
+    pub fetch: DiagnosticSource,
+}
+
+/// One limit used by the SDK, including its configured and operational values.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct SdkLimit {
+    /// Configured value, compiled default, unit, range, and host-provided layer.
+    #[serde(flatten)]
+    pub configured: LimitDescription,
+    /// An explicit override is host supplied even if its layer is `Default`.
+    pub origin: DiagnosticSource,
+    /// Operational value in the configured unit; `None` means unlimited.
+    /// Accounts for emergency ceilings and the SDK's fallbacks. For
+    /// `ParallelToolCalls`, this controls wire permission for parallel calls;
+    /// host tools themselves execute sequentially.
+    pub effective: Option<u64>,
+}
+
+/// Credential-free snapshot returned by [`Agent::diagnostics`].
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct AgentDiagnostics {
+    /// Name of the selected Rune dialect implementation.
+    pub dialect: &'static str,
+    /// Wire features, which a particular server or model may further restrict.
+    /// These describe the dialect, not additional SDK prompt options.
+    pub capabilities: ProviderCapabilities,
+    /// Capabilities are obtained from the dialect, without network discovery.
+    pub capability_source: DiagnosticSource,
+    /// Whether the dialect can express upstream provider preferences.
+    pub routing: bool,
+    /// Only limits consumed by the SDK; host tool internals have their own policy.
+    pub limits: Vec<SdkLimit>,
+    /// Fixed maximum unread events per turn.
+    pub event_queue_capacity: usize,
+    /// Sources of host inputs, without their contents.
+    pub sources: AgentSources,
+}
 
 /// Which endpoint shape the agent speaks.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -726,6 +790,7 @@ pub struct Agent {
     tools: Arc<Vec<HostTool>>,
     specs: Arc<Vec<ToolSpec>>,
     limits: BudgetSet,
+    sources: AgentSources,
     conversation: Arc<Conversation>,
     /// Cancellation for the turn started last, which is the only one that can
     /// still be running.
@@ -809,6 +874,22 @@ impl Agent {
             .clone()
             .unwrap_or_else(|| Arc::new(DefaultFetch::new()));
 
+        let sources = AgentSources {
+            model: DiagnosticSource::HostSupplied,
+            endpoint: DiagnosticSource::HostSupplied,
+            dialect: DiagnosticSource::HostSupplied,
+            instructions: options
+                .instructions
+                .as_ref()
+                .map(|_| DiagnosticSource::HostSupplied),
+            tools: DiagnosticSource::HostSupplied,
+            fetch: if options.fetch.is_some() {
+                DiagnosticSource::HostSupplied
+            } else {
+                DiagnosticSource::CompiledDefault
+            },
+        };
+
         let mut history = History::new();
         history.set_instructions(instructions.clone());
 
@@ -821,6 +902,7 @@ impl Agent {
             specs: Arc::new(specs),
             tools: Arc::new(options.tools),
             limits: BudgetSet::new(),
+            sources,
             conversation: Arc::new(Conversation {
                 history: Mutex::new(history),
                 ..Conversation::default()
@@ -860,6 +942,59 @@ impl Agent {
     pub fn with_limits(mut self, limits: BudgetSet) -> Self {
         self.limits = limits;
         self
+    }
+
+    /// Reports effective SDK limits, dialect capabilities, and input sources.
+    ///
+    /// Makes no network requests and includes no credentials, URLs, model
+    /// identifiers, instructions, tool definitions, or conversation data.
+    /// Limits describe the agent; a nonzero [`PromptOptions::max_steps`] may
+    /// override `MaxAgentSteps` for an individual turn. SDK diagnostics do not
+    /// infer model context capacity or policies inside host tools and fetches.
+    #[must_use]
+    pub fn diagnostics(&self) -> AgentDiagnostics {
+        let provider = self.dialect.provider();
+        let timeouts = rune_net::transport::RequestTimeouts::from_limits(&self.limits);
+        let limits = self
+            .limits
+            .describe()
+            .into_iter()
+            .filter_map(|configured| {
+                let name = configured.name;
+                let effective = match name {
+                    LimitName::MaxAgentSteps => configured.value.value().filter(|value| *value > 0),
+                    LimitName::ProviderHeadTimeoutMs => Some(timeouts.head.as_millis() as u64),
+                    LimitName::ProviderRequestTimeoutMs => {
+                        timeouts.total.map(|timeout| timeout.as_millis() as u64)
+                    }
+                    LimitName::ProviderMaxAttempts | LimitName::PromptHistoryBytes => {
+                        Some(self.limits.get_usize(name).max(1) as u64)
+                    }
+                    LimitName::MaxToolResultBytes | LimitName::ParallelToolCalls => {
+                        Some(self.limits.get_usize(name) as u64)
+                    }
+                    _ => return None,
+                };
+                Some(SdkLimit {
+                    origin: if configured.source.is_some() {
+                        DiagnosticSource::HostSupplied
+                    } else {
+                        DiagnosticSource::CompiledDefault
+                    },
+                    configured,
+                    effective,
+                })
+            })
+            .collect();
+        AgentDiagnostics {
+            dialect: provider.name(),
+            capabilities: provider.capabilities(),
+            capability_source: DiagnosticSource::DialectImplementation,
+            routing: provider.routing() == Routing::Supported,
+            limits,
+            event_queue_capacity: EVENT_QUEUE_CAPACITY,
+            sources: self.sources.clone(),
+        }
     }
 
     /// Returns the model identifier.
