@@ -638,25 +638,31 @@ fn run_connect(
         Err(_) => connect_flow::ask_endpoint(&name)?,
     };
 
-    let from_environment =
-        provider_setup::environment_credential(&name, settings.api_key_env.as_deref());
-    match from_environment {
-        Some(value) => provider_setup::connect(paths, &name, &value)?,
-        // A machine caller supplies the variable rather than blocking on a
-        // terminal that will not answer. Without it, a credential this provider
-        // already has is kept; with neither, the connection is refused rather
-        // than reported as made when no request could succeed.
-        None if output.json => {
-            if rune_net::auth::resolve(paths, &name, settings.api_key_env.as_deref())?.is_none() {
-                return Err(rune_net::auth::missing_credential_error(
-                    &name,
-                    settings.api_key_env.as_deref(),
-                ));
+    let anonymous = settings.anonymous && settings.provider.as_str() == name;
+    if anonymous {
+        rune_net::transport::Endpoint::anonymous(&base_url)?;
+    } else {
+        let from_environment =
+            provider_setup::environment_credential(&name, settings.api_key_env.as_deref());
+        match from_environment {
+            Some(value) => provider_setup::connect(paths, &name, &value)?,
+            // A machine caller supplies the variable rather than blocking on a
+            // terminal that will not answer. Without it, a credential this provider
+            // already has is kept; with neither, the connection is refused rather
+            // than reported as made when no request could succeed.
+            None if output.json => {
+                if rune_net::auth::resolve(paths, &name, settings.api_key_env.as_deref())?.is_none()
+                {
+                    return Err(rune_net::auth::missing_credential_error(
+                        &name,
+                        settings.api_key_env.as_deref(),
+                    ));
+                }
             }
-        }
-        None => {
-            let value = connect_flow::ask_credential(&name)?;
-            provider_setup::connect(paths, &name, &value)?;
+            None => {
+                let value = connect_flow::ask_credential(&name)?;
+                provider_setup::connect(paths, &name, &value)?;
+            }
         }
     }
 
@@ -1285,18 +1291,7 @@ fn run_acp(
 ) -> Result<ExitCode> {
     settings.require_model()?;
 
-    let provider_name = settings.provider.to_string();
-    let base_url = provider_setup::require_base_url(settings)?;
-    rune_net::transport::validate_url(&base_url)?;
-
-    let credential =
-        rune_net::auth::resolve(paths, &provider_name, settings.api_key_env.as_deref())?
-            .ok_or_else(|| {
-                rune_net::auth::missing_credential_error(
-                    &provider_name,
-                    settings.api_key_env.as_deref(),
-                )
-            })?;
+    let endpoint = provider_setup::configured_endpoint(settings, paths)?;
 
     let dialect = match settings.provider {
         Provider::Anthropic => rune_acp::Dialect::Anthropic,
@@ -1321,12 +1316,7 @@ fn run_acp(
     let config = rune_acp::ServerConfig {
         paths: paths.clone(),
         workspace: workspace.to_owned(),
-        endpoint: provider_setup::endpoint(
-            &settings.provider,
-            &base_url,
-            credential.expose(),
-            settings.offline,
-        ),
+        endpoint,
         dialect,
         model: settings.model.clone(),
         instructions: String::new(),

@@ -1,7 +1,7 @@
 //! Connecting a provider and listing the models it offers.
 //!
-//! Connecting writes the credential to the profile file with private permissions
-//! and never echoes it. The endpoint, the model, and the variable a credential
+//! Authenticated connections write credentials to the private profile file
+//! without echoing them. The endpoint, the model, and the variable a credential
 //! comes from are reported, so a user can see what the harness will use without
 //! reading the stored secret.
 
@@ -55,6 +55,29 @@ pub fn require_base_url(settings: &Settings) -> Result<String> {
         )
         .with_hint("set `base_url` in the user config, or run `rune connect`")
     })
+}
+
+/// Resolves the configured endpoint, skipping all credential sources when anonymous.
+pub fn configured_endpoint(
+    settings: &Settings,
+    paths: &Paths,
+) -> Result<rune_net::transport::Endpoint> {
+    let base_url = require_base_url(settings)?;
+    rune_net::transport::validate_url(&base_url)?;
+    if settings.anonymous {
+        let mut anonymous = rune_net::transport::Endpoint::anonymous(&base_url)?;
+        anonymous.headers = endpoint(&settings.provider, &base_url, "", settings.offline).headers;
+        return Ok(anonymous.offline(settings.offline));
+    }
+    let provider = settings.provider.as_str();
+    let credential = auth::resolve(paths, provider, settings.api_key_env.as_deref())?
+        .ok_or_else(|| auth::missing_credential_error(provider, settings.api_key_env.as_deref()))?;
+    Ok(endpoint(
+        &settings.provider,
+        &base_url,
+        credential.expose(),
+        settings.offline,
+    ))
 }
 
 /// Reads a credential from the environment for a provider.
@@ -138,6 +161,9 @@ pub fn save_selection(paths: &Paths, selection: &Selection) -> Result<()> {
         _ => toml::Table::new(),
     };
 
+    if document.get("provider").and_then(toml::Value::as_str) != Some(selection.provider.as_str()) {
+        document.remove("anonymous");
+    }
     document.insert(
         "provider".to_owned(),
         toml::Value::String(selection.provider.clone()),
@@ -222,6 +248,10 @@ pub fn render_connection(settings: &Settings, paths: &Paths) -> String {
         }
     }
 
+    if settings.anonymous {
+        let _ = writeln!(out, "credential anonymous (loopback only)");
+        return out.trim_end().to_owned();
+    }
     let resolved = auth::resolve(paths, &provider, settings.api_key_env.as_deref())
         .ok()
         .flatten();
@@ -286,25 +316,13 @@ pub fn fetch_catalog(
     timeout: std::time::Duration,
 ) -> Result<Catalog> {
     let provider_name = settings.provider.to_string();
-    let base_url = require_base_url(settings)?;
-
-    let credential = auth::resolve(paths, &provider_name, settings.api_key_env.as_deref())?
-        .ok_or_else(|| {
-            auth::missing_credential_error(&provider_name, settings.api_key_env.as_deref())
-        })?;
+    let endpoint = configured_endpoint(settings, paths)?;
 
     let dialect: Box<dyn rune_net::provider::Provider> = match settings.provider {
         Provider::Anthropic => Box::new(rune_net::anthropic::Anthropic),
         Provider::Responses => Box::new(rune_net::responses::Responses),
         _ => Box::new(rune_net::chat_completions::ChatCompletions),
     };
-
-    let endpoint = endpoint(
-        &settings.provider,
-        &base_url,
-        credential.expose(),
-        settings.offline,
-    );
 
     let body = rune_net::transport::list_models(
         &rune_net::transport::agent(),
@@ -861,6 +879,51 @@ mod tests {
         let root = camino::Utf8Path::from_path(dir.path()).expect("utf8");
         let err = connect(&paths(root), "anthropic", "   ").expect_err("refused");
         assert_eq!(err.code(), ErrorCode::InvalidField);
+    }
+
+    #[test]
+    fn anonymous_endpoint_ignores_stored_credentials_and_survives_model_selection() {
+        let dir = tempfile::tempdir().expect("temp");
+        let root = camino::Utf8Path::from_path(dir.path()).expect("utf8");
+        let paths = paths(root);
+        rune_core::paths::create_dir_private(&paths.state_root).expect("state");
+        rune_core::paths::write_private(&paths.credentials_file(), "invalid JSON")
+            .expect("unreadable credential record");
+        let settings = Settings {
+            provider: Provider::ChatCompletions,
+            base_url: Some("http://127.0.0.1:8000/v1".to_owned()),
+            anonymous: true,
+            ..Settings::default()
+        };
+        let endpoint = configured_endpoint(&settings, &paths).expect("no credential lookup");
+        assert_eq!(endpoint.auth, rune_net::transport::AuthStyle::Anonymous);
+        assert!(endpoint.credential.is_empty());
+        assert_eq!(
+            std::fs::read_to_string(paths.credentials_file()).expect("record"),
+            "invalid JSON"
+        );
+
+        rune_core::paths::create_dir_private(&paths.config_root).expect("config root");
+        let file = paths.config_file(None);
+        rune_core::paths::write_private(
+            &file,
+            "provider = \"chat_completions\"\nanonymous = true\n",
+        )
+        .expect("config");
+        let mut selection = Selection {
+            provider: "chat_completions".to_owned(),
+            model: Some("local-model".to_owned()),
+            base_url: None,
+        };
+        save_selection(&paths, &selection).expect("model selected");
+        let config: rune_core::config::UserConfig =
+            toml::from_str(&std::fs::read_to_string(&file).expect("config")).expect("parsed");
+        assert_eq!(config.anonymous, Some(true));
+        selection.provider = "anthropic".to_owned();
+        save_selection(&paths, &selection).expect("provider switched");
+        let config: rune_core::config::UserConfig =
+            toml::from_str(&std::fs::read_to_string(&file).expect("config")).expect("parsed");
+        assert_eq!(config.anonymous, None);
     }
 
     #[test]

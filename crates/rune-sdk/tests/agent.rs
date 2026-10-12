@@ -109,6 +109,66 @@ fn options(base_url: &str, fetch: Arc<dyn HostFetch>) -> AgentOptions {
 }
 
 #[test]
+fn an_explicitly_anonymous_agent_completes_without_authentication_headers() {
+    struct AnonymousFetch(CountingFetch);
+    impl HostFetch for AnonymousFetch {
+        fn post(&self, request: FetchRequest) -> rune_core::error::Result<FetchResponse> {
+            assert!(
+                !request
+                    .headers
+                    .iter()
+                    .any(|(name, _)| name.eq_ignore_ascii_case("authorization")
+                        || name.eq_ignore_ascii_case("x-api-key"))
+            );
+            self.0.post(request)
+        }
+    }
+    let endpoint = MockEndpoint::start(vec![Script::text("anonymous response")]);
+    let fetch = Arc::new(AnonymousFetch(CountingFetch::new()));
+    let mut options = options(&endpoint.base_url(), fetch);
+    options.api_key.clear();
+    let mut agent = Agent::new_anonymous(options).expect("anonymous agent");
+    let result = agent
+        .prompt("hello", PromptOptions::default())
+        .expect("turn")
+        .result()
+        .expect("response");
+    assert_eq!(result.stop_reason, StopReason::Completed);
+    assert_eq!(result.text, "anonymous response");
+    assert_eq!(endpoint.request_count(), 1);
+}
+
+#[test]
+fn anonymity_is_explicit_and_refuses_remote_endpoints_or_credentials() {
+    let fetch = Arc::new(CountingFetch::new());
+    let mut local = options("http://127.0.0.1:8000/v1", fetch.clone());
+    local.api_key.clear();
+    assert_eq!(
+        Agent::new(local)
+            .expect_err("credential still required")
+            .field(),
+        Some("api_key")
+    );
+
+    let mut remote = options("https://example.com/v1", fetch.clone());
+    remote.api_key.clear();
+    assert_eq!(
+        Agent::new_anonymous(remote)
+            .expect_err("remote refused")
+            .field(),
+        Some("anonymous")
+    );
+    let local = options("http://127.0.0.1:8000/v1", fetch.clone());
+    assert_eq!(
+        Agent::new_anonymous(local)
+            .expect_err("credential refused")
+            .field(),
+        Some("api_key")
+    );
+    assert_eq!(fetch.hits(), 0);
+}
+
+#[test]
 fn every_request_goes_through_the_fetch_the_embedder_supplied() {
     let endpoint = MockEndpoint::start(vec![Script::text("hello")]);
     let fetch = Arc::new(CountingFetch::new());

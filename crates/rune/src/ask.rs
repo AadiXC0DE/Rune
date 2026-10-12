@@ -25,7 +25,7 @@ use rune_core::paths::Paths;
 use rune_net::message::{ContentPart, ToolSpec};
 use rune_net::provider::Provider;
 use rune_net::stream::{FinishReason, Usage};
-use rune_net::transport::{self, Endpoint, StreamOutcome};
+use rune_net::transport::{Endpoint, StreamOutcome};
 use rune_policy::{Outcome, RuleSet};
 use rune_session::{SessionEvent, SessionStore};
 use rune_tools::{ExecutionContext, Registry, ToolOutput, inventory};
@@ -422,18 +422,7 @@ pub fn run(
     // Configuration is validated before a credential is looked up, so a user
     // who has not set an endpoint is told that rather than being told about a
     // credential for an endpoint that does not exist.
-    let provider_name = settings.provider.to_string();
-    let base_url = crate::provider_setup::require_base_url(settings)?;
-    transport::validate_url(&base_url)?;
-
-    let credential =
-        rune_net::auth::resolve(paths, &provider_name, settings.api_key_env.as_deref())?
-            .ok_or_else(|| {
-                rune_net::auth::missing_credential_error(
-                    &provider_name,
-                    settings.api_key_env.as_deref(),
-                )
-            })?;
+    let endpoint = crate::provider_setup::configured_endpoint(settings, paths)?;
 
     let dialect: Box<dyn Provider> = match settings.provider {
         rune_core::config::Provider::Anthropic => Box::new(rune_net::anthropic::Anthropic),
@@ -487,12 +476,7 @@ pub fn run(
             &settings.limits,
         ),
         dialect,
-        endpoint: crate::provider_setup::endpoint(
-            &settings.provider,
-            &base_url,
-            credential.expose(),
-            settings.offline,
-        ),
+        endpoint,
         registry,
         rules: crate::permissions::validated(settings)?,
         context,

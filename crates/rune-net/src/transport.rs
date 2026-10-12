@@ -88,6 +88,8 @@ impl From<Duration> for RequestTimeouts {
 /// How a request is authenticated.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum AuthStyle {
+    /// No authentication header, for explicitly anonymous loopback endpoints.
+    Anonymous,
     /// `Authorization: Bearer <value>`.
     Bearer,
     /// `x-api-key: <value>`, used by one dialect.
@@ -95,10 +97,11 @@ pub enum AuthStyle {
 }
 
 impl AuthStyle {
-    /// Returns the header name this style sets.
+    /// Returns the header name, or an empty string for anonymous requests.
     #[must_use]
     pub const fn header(self) -> &'static str {
         match self {
+            Self::Anonymous => "",
             Self::Bearer => "authorization",
             Self::ApiKeyHeader => "x-api-key",
         }
@@ -108,6 +111,7 @@ impl AuthStyle {
     #[must_use]
     pub fn value(self, credential: &str) -> String {
         match self {
+            Self::Anonymous => String::new(),
             Self::Bearer => format!("Bearer {credential}"),
             Self::ApiKeyHeader => credential.to_owned(),
         }
@@ -149,6 +153,13 @@ impl fmt::Debug for Endpoint {
 }
 
 impl Endpoint {
+    /// Builds an explicitly anonymous loopback endpoint without a credential.
+    pub fn anonymous(base_url: impl Into<String>) -> Result<Self> {
+        let endpoint = Self::new(base_url, "").with_auth(AuthStyle::Anonymous);
+        endpoint.validate()?;
+        Ok(endpoint)
+    }
+
     /// Builds an endpoint.
     #[must_use]
     pub fn new(base_url: impl Into<String>, credential: impl Into<String>) -> Self {
@@ -191,9 +202,40 @@ impl Endpoint {
         self
     }
 
-    /// Validates the base URL.
+    /// Validates the base URL and anonymous loopback restrictions.
     pub fn validate(&self) -> Result<()> {
-        validate_url(&self.base_url)
+        use rune_core::error::RuneError;
+
+        validate_url(&self.base_url)?;
+        if self.auth == AuthStyle::Anonymous {
+            let lower = self.base_url.trim().to_ascii_lowercase();
+            let rest = lower.split_once("://").map_or("", |(_, rest)| rest);
+            if !is_loopback_host(host_of(rest)) {
+                return Err(RuneError::invalid_field(
+                    "anonymous",
+                    "anonymous endpoints must use a loopback host",
+                ));
+            }
+            if !self.credential.is_empty() {
+                return Err(RuneError::invalid_field(
+                    "credential",
+                    "an anonymous endpoint must not have a credential",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Adds authentication only for credential-bearing endpoints.
+    fn authenticate(&self, request: FetchRequest) -> NetResult<FetchRequest> {
+        if self.auth == AuthStyle::Anonymous {
+            self.validate().map_err(|err| {
+                NetError::new(FailureKind::InvalidRequest, err.message().to_owned())
+            })?;
+            Ok(request)
+        } else {
+            Ok(request.with_header(self.auth.header(), self.auth.value(&self.credential)))
+        }
     }
 
     /// Joins a request path onto the base URL.
@@ -581,15 +623,13 @@ pub fn stream_completion_observed(
     let encoded = serde_json::to_string(&body)?;
     let timeouts = timeouts.into();
 
-    let mut request = FetchRequest::post(url, encoded.into_bytes())
-        .with_head_timeout(Some(timeouts.head))
-        .with_timeout(timeouts.total)
-        .with_header("content-type", "application/json")
-        .with_header("accept", "text/event-stream")
-        .with_header(
-            endpoint.auth.header(),
-            endpoint.auth.value(&endpoint.credential),
-        );
+    let mut request = endpoint.authenticate(
+        FetchRequest::post(url, encoded.into_bytes())
+            .with_head_timeout(Some(timeouts.head))
+            .with_timeout(timeouts.total)
+            .with_header("content-type", "application/json")
+            .with_header("accept", "text/event-stream"),
+    )?;
 
     // The endpoint's own headers come after the dialect's, so an endpoint that
     // names a header the dialect also sets wins rather than being overwritten.
@@ -914,12 +954,9 @@ pub fn list_models(
         .with_hint("the model is used as given; check the provider's documentation")
     })?;
 
-    let mut request = FetchRequest::get(endpoint.url_for(path))
-        .with_header("accept", "application/json")
-        .with_header(
-            endpoint.auth.header(),
-            endpoint.auth.value(&endpoint.credential),
-        );
+    let mut request = endpoint.authenticate(
+        FetchRequest::get(endpoint.url_for(path)).with_header("accept", "application/json"),
+    )?;
     for (name, value) in provider
         .extra_headers()
         .into_iter()
@@ -2285,6 +2322,29 @@ mod tests {
         let url = format!("https://example.com/{}", "x".repeat(MAX_URL_BYTES));
         let err = validate_url(&url).expect_err("rejected");
         assert_eq!(err.code(), rune_core::error::ErrorCode::TooLarge);
+    }
+
+    #[test]
+    fn anonymous_endpoints_accept_only_loopback_without_a_credential() {
+        for url in [
+            "http://127.0.0.1:8000/v1",
+            "http://localhost/v1",
+            "https://[::1]/v1",
+        ] {
+            let endpoint = Endpoint::anonymous(url).expect("anonymous loopback");
+            assert_eq!(endpoint.auth, AuthStyle::Anonymous);
+            assert!(endpoint.credential.is_empty());
+        }
+        for url in [
+            "https://example.com/v1",
+            "https://localhost.example/v1",
+            "http://192.168.1.1/v1",
+        ] {
+            assert!(Endpoint::anonymous(url).is_err(), "{url}");
+        }
+        let mut endpoint = Endpoint::anonymous("http://localhost/v1").expect("endpoint");
+        endpoint.credential = "secret".to_owned();
+        assert!(endpoint.validate().is_err());
     }
 
     #[test]

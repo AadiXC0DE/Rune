@@ -6,6 +6,11 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Added
 
+- User config can explicitly select `anonymous = true` for loopback model
+  endpoints. Connecting, listing models, and completing requests skip credential
+  lookup and storage and omit authentication headers. The Rust SDK provides
+  `Agent::new_anonymous` for the same mode.
+
 - Unix release archives have a documented checksum, install, and uninstall
   path. CI runs those commands in a disposable prefix, checks the installed
   version, and verifies that configuration, credentials, and sessions survive

@@ -98,6 +98,23 @@ asks the endpoint rather than a table compiled into the binary, so a model
 released after this build still appears. Add `--offline` to report the configured
 model without contacting anything.
 
+For a local server that needs no credential, explicitly set `anonymous = true`
+in the user config alongside its provider and loopback endpoint:
+
+```toml
+provider = "chat_completions"
+base_url = "http://127.0.0.1:11434/v1"
+anonymous = true
+[models]
+chat_completions = "qwen3:latest"
+```
+
+Then `rune connect chat_completions --json`, `rune models`, and `rune ask` skip
+credential lookup and storage and send no authentication header. Anonymous mode
+accepts only `127.0.0.1`, `localhost`, or `::1`; project config cannot enable it.
+The Rust SDK exposes `Agent::new_anonymous` with an empty `api_key` for the same
+explicit loopback mode. `Agent::new` continues to require a credential.
+
 `rune mcp list --json` lists the workspace's `.mcp.json` declarations in name
 order with transport, trust, enabled/required flags, startup status and errors.
 It attempts each approved, enabled server independently, then closes it; no

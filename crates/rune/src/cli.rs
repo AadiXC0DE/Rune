@@ -647,7 +647,14 @@ pub fn apply_to_settings(launch: &Launch, settings: &mut rune_core::config::Sett
             settings.context_window = None;
             settings.base_url = None;
             settings.api_key_env = None;
-            for key in ["model", "context_window", "base_url", "api_key_env"] {
+            settings.anonymous = false;
+            for key in [
+                "model",
+                "context_window",
+                "base_url",
+                "api_key_env",
+                "anonymous",
+            ] {
                 settings.sources.sources.remove(key);
             }
             let key = rune_core::config::provider_key(&provider);
@@ -1155,6 +1162,23 @@ mod tests {
         apply_to_settings(&launch, &mut settings);
         assert_eq!(settings.model, "m");
         assert_eq!(settings.source_of("model"), Layer::CommandLine);
+    }
+
+    #[test]
+    fn provider_override_does_not_inherit_an_anonymous_connection() {
+        let mut settings = rune_core::config::Settings {
+            provider: rune_core::config::Provider::ChatCompletions,
+            anonymous: true,
+            base_url: Some("http://localhost:8000/v1".to_owned()),
+            ..rune_core::config::Settings::default()
+        };
+        let launch = parse_list(&["--provider", "chat_completions"]).expect("parse");
+        apply_to_settings(&launch, &mut settings);
+        assert!(settings.anonymous);
+        let launch = parse_list(&["--provider", "anthropic"]).expect("parse");
+        apply_to_settings(&launch, &mut settings);
+        assert!(!settings.anonymous);
+        assert!(settings.base_url.is_none());
     }
 
     #[test]

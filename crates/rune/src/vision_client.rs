@@ -38,27 +38,10 @@ pub fn backend(settings: &Settings, paths: &Paths) -> Result<Option<Arc<dyn Visi
             "image analysis model is empty",
         ));
     }
-    let credential = rune_net::auth::resolve(
-        paths,
-        settings.provider.as_str(),
-        settings.api_key_env.as_deref(),
-    )?
-    .ok_or_else(|| {
-        rune_net::auth::missing_credential_error(
-            settings.provider.as_str(),
-            settings.api_key_env.as_deref(),
-        )
-    })?;
-    let base_url = crate::provider_setup::require_base_url(settings)?;
-    transport::validate_url(&base_url)?;
+    let endpoint = crate::provider_setup::configured_endpoint(settings, paths)?;
     Ok(Some(Arc::new(NetworkVision {
         kind: settings.provider.clone(),
-        endpoint: crate::provider_setup::endpoint(
-            &settings.provider,
-            &base_url,
-            credential.expose(),
-            false,
-        ),
+        endpoint,
         model: model.to_owned(),
         timeouts: RequestTimeouts::from_limits(&settings.limits),
         provider_order: settings.provider_order.clone(),

@@ -44,14 +44,15 @@ pub fn build(settings: &Settings, paths: &Paths) -> Result<Option<Box<dyn Review
         return Ok(None);
     }
 
-    let provider_name = settings.provider.to_string();
-    let Some(base_url) = crate::provider_setup::configured_base_url(settings) else {
+    if crate::provider_setup::configured_base_url(settings).is_none() {
         return Ok(None);
-    };
-    let Some(credential) =
-        rune_net::auth::resolve(paths, &provider_name, settings.api_key_env.as_deref())?
-    else {
-        return Ok(None);
+    }
+    let endpoint = match crate::provider_setup::configured_endpoint(settings, paths) {
+        Ok(endpoint) => endpoint,
+        Err(error) if error.code() == rune_core::error::ErrorCode::AuthenticationRequired => {
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
     };
 
     let dialect: Box<dyn Provider> = match settings.provider {
@@ -63,12 +64,7 @@ pub fn build(settings: &Settings, paths: &Paths) -> Result<Option<Box<dyn Review
     Ok(Some(Box::new(ModelReviewer {
         model,
         dialect,
-        endpoint: crate::provider_setup::endpoint(
-            &settings.provider,
-            &base_url,
-            credential.expose(),
-            settings.offline,
-        ),
+        endpoint,
         timeout: Duration::from_millis(
             settings
                 .limits

@@ -638,6 +638,16 @@ impl Drop for Agent {
 impl Agent {
     /// Builds an agent over one empty conversation.
     pub fn new(options: AgentOptions) -> Result<Self> {
+        Self::build(options, false)
+    }
+
+    /// Builds an agent for an explicitly anonymous loopback endpoint.
+    /// `api_key` must be empty; no authentication header is sent.
+    pub fn new_anonymous(options: AgentOptions) -> Result<Self> {
+        Self::build(options, true)
+    }
+
+    fn build(options: AgentOptions, anonymous: bool) -> Result<Self> {
         let model = options
             .model
             .as_ref()
@@ -648,11 +658,22 @@ impl Agent {
                 RuneError::missing_field("model").with_hint("set `model` in the agent options")
             );
         }
-        if options.api_key.trim().is_empty() {
+        if !anonymous && options.api_key.trim().is_empty() {
             return Err(RuneError::missing_field("api_key")
                 .with_hint("set the credential for the endpoint"));
         }
         rune_net::transport::validate_url(&options.base_url)?;
+        let endpoint = if anonymous {
+            if !options.api_key.is_empty() {
+                return Err(RuneError::invalid_field(
+                    "api_key",
+                    "an anonymous endpoint must not have a credential",
+                ));
+            }
+            Endpoint::anonymous(options.base_url)?
+        } else {
+            Endpoint::new(options.base_url, options.api_key).with_auth(options.dialect.auth())
+        };
 
         let specs: Vec<ToolSpec> = options.tools.iter().map(HostTool::spec).collect();
         validate_tool_specs(&specs)?;
@@ -674,8 +695,7 @@ impl Agent {
         Ok(Self {
             model,
             instructions,
-            endpoint: Endpoint::new(options.base_url, options.api_key)
-                .with_auth(options.dialect.auth()),
+            endpoint,
             dialect: options.dialect,
             fetch,
             specs: Arc::new(specs),

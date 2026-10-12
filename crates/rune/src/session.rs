@@ -4874,18 +4874,7 @@ pub fn prepare(
     // empty identifier fails at the endpoint with nothing to act on.
     settings.require_provider()?;
 
-    let provider_name = settings.provider.to_string();
-    let base_url = crate::provider_setup::require_base_url(settings)?;
-    rune_net::transport::validate_url(&base_url)?;
-
-    let credential =
-        rune_net::auth::resolve(paths, &provider_name, settings.api_key_env.as_deref())?
-            .ok_or_else(|| {
-                rune_net::auth::missing_credential_error(
-                    &provider_name,
-                    settings.api_key_env.as_deref(),
-                )
-            })?;
+    let endpoint = crate::provider_setup::configured_endpoint(settings, paths)?;
 
     let dialect: Box<dyn Provider> = match settings.provider {
         rune_core::config::Provider::Anthropic => Box::new(rune_net::anthropic::Anthropic),
@@ -4930,12 +4919,7 @@ pub fn prepare(
         paths: paths.clone(),
         resume,
         workspace: workspace.to_owned(),
-        endpoint: crate::provider_setup::endpoint(
-            &settings.provider,
-            &base_url,
-            credential.expose(),
-            settings.offline,
-        ),
+        endpoint,
         dialect,
         registry,
         subagent: Some(subagent),

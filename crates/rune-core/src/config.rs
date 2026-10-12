@@ -363,6 +363,10 @@ pub struct UserConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key_env: Option<String>,
 
+    /// Connect to a loopback model endpoint without resolving a credential.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anonymous: Option<bool>,
+
     /// Effective permission mode.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub permission_mode: Option<PermissionMode>,
@@ -517,6 +521,8 @@ pub struct Settings {
     pub base_url: Option<String>,
     /// Environment variable holding the credential.
     pub api_key_env: Option<String>,
+    /// Whether the loopback model endpoint is explicitly anonymous.
+    pub anonymous: bool,
     /// Effective permission mode.
     pub permission_mode: PermissionMode,
     /// Whether a command may run without a sandbox.
@@ -573,6 +579,7 @@ impl Default for Settings {
             context_window: None,
             base_url: None,
             api_key_env: None,
+            anonymous: false,
             permission_mode: PermissionMode::default(),
             allow_unsandboxed: false,
             effort: Effort::default(),
@@ -668,6 +675,7 @@ impl Settings {
                     .unwrap_or_else(|| "default".to_owned()),
             ),
             ("permission_mode", self.permission_mode.to_string()),
+            ("anonymous", self.anonymous.to_string()),
             ("effort", self.effort.to_string()),
             ("fast_mode", self.fast_mode.to_string()),
             (
@@ -872,6 +880,7 @@ const PROFILE_ONLY_KEYS: &[&str] = &[
     "model",
     "base_url",
     "api_key_env",
+    "anonymous",
     "permission_mode",
     "permission",
     "effort",
@@ -1087,6 +1096,10 @@ fn apply_user(settings: &mut Settings, user: &UserConfig, layer: Layer) {
     if let Some(api_key_env) = &user.api_key_env {
         settings.api_key_env = Some(api_key_env.clone());
         settings.sources.record("api_key_env", layer);
+    }
+    if let Some(anonymous) = user.anonymous {
+        settings.anonymous = anonymous;
+        settings.sources.record("anonymous", layer);
     }
     if let Some(models) = &user.models {
         settings.configured_models.clone_from(models);
@@ -1728,6 +1741,35 @@ mod tests {
             assert_eq!(settings.web_tools, !enabled);
             assert_eq!(settings.source_of("web_tools"), Layer::Environment);
         }
+    }
+
+    #[test]
+    fn anonymous_endpoints_require_a_profile_choice() {
+        let dir = TempDir::new().expect("tempdir");
+        let user = write(&dir, "config.toml", "anonymous = true\n");
+        let project = write(&dir, ".rune.toml", "anonymous = true\n");
+        let settings = load(None, Some(&user), &empty_env());
+        assert!(settings.anonymous);
+        assert_eq!(settings.source_of("anonymous"), Layer::User);
+        assert!(settings.diagnostics.is_empty());
+        assert!(
+            settings
+                .explain()
+                .iter()
+                .any(|entry| entry.key == "anonymous"
+                    && entry.value == "true"
+                    && entry.source == Layer::User)
+        );
+
+        let settings = load(Some(&project), None, &empty_env());
+        assert!(!settings.anonymous);
+        assert!(
+            settings
+                .diagnostics
+                .iter()
+                .any(|entry| entry.key.as_deref() == Some("anonymous")
+                    && entry.code == ErrorCode::KeyNotAllowedInScope)
+        );
     }
 
     #[test]
