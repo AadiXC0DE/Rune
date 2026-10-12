@@ -740,6 +740,10 @@ pointers and lengths: the host must copy input bytes before returning, retain
 no pointers, and keep writes within buffer capacity. A reported body length
 larger than that capacity returns an `InvalidData` I/O error before consumers
 can slice the buffer.
+Staged response heads and shell replies are checked before allocation against
+the WASM configuration's `max_bridge_bytes` cap (default 1 MiB per reply).
+Oversized heads return a `transport_failure`; oversized shell replies produce
+a failed tool result with exit status 127. Rejected replies never reach `take`.
 Staged replies use `take` to copy into an allocated buffer. Exported string
 arguments must come from `rune_alloc` with exactly the allocated length;
 `argument` takes ownership and frees them once, so the host must not reuse them.

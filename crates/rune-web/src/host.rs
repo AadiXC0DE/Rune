@@ -37,6 +37,9 @@ use crate::shell::PageShell;
 /// that ends and says why.
 pub const DEFAULT_STEPS: u64 = 16;
 
+/// Maximum bytes copied from one staged WASM response head or shell reply.
+pub const DEFAULT_BRIDGE_BYTES: usize = 1024 * 1024;
+
 /// Commands the page's shell offers that only read.
 ///
 /// They are allowed without asking, as the binary allows the same ones. Any
@@ -77,6 +80,14 @@ pub struct Config {
     /// Steps a turn may take.
     #[serde(default)]
     pub max_steps: Option<u64>,
+    /// Byte cap for one staged reply from the WASM page's imports.
+    /// Native hosts supply their own bridge and enforce their own limits.
+    #[serde(default = "default_bridge_bytes")]
+    pub max_bridge_bytes: usize,
+}
+
+fn default_bridge_bytes() -> usize {
+    DEFAULT_BRIDGE_BYTES
 }
 
 fn default_workspace() -> String {
@@ -617,6 +628,7 @@ mod tests {
             headers: Vec::new(),
             workspace: workspace.to_string(),
             max_steps: None,
+            max_bridge_bytes: DEFAULT_BRIDGE_BYTES,
         };
         let page = Arc::clone(page);
         let bridge: Arc<dyn Bridge> = page;
@@ -762,6 +774,7 @@ mod tests {
             headers: Vec::new(),
             workspace: root.to_string(),
             max_steps: None,
+            max_bridge_bytes: DEFAULT_BRIDGE_BYTES,
         };
         let bridge: Arc<dyn Bridge> = page;
         let err = Session::new(&config, bridge, Arc::new(Control::default())).expect_err("refused");

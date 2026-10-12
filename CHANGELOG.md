@@ -376,6 +376,11 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Fixed
 
+- The WASM page bridge checks staged response heads and shell replies against
+  `max_bridge_bytes` (default 1 MiB) before allocating or copying host bytes.
+  Oversized replies report a transport error or a failed shell result instead
+  of attempting an unbounded allocation.
+
 - The WASM page bridge rejects body lengths larger than the supplied buffer
   capacity with an `InvalidData` I/O error before consumers slice the buffer.
   The failed response handle is released and the page receives a named

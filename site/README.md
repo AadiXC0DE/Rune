@@ -43,6 +43,12 @@ export with `WebAssembly.promising` (JavaScript Promise Integration), which is
 what lets blocking Rust drive an asynchronous tab. Chrome and Edge 137+,
 Firefox 153+, and Safari 27+ have it; the page says so where it is missing.
 
+The harness configuration accepts `max_bridge_bytes`, defaulting to 1 MiB.
+This caps each staged response head or shell reply before WASM allocates its
+copy. An oversized head reports a transport error; an oversized shell reply
+returns a failed tool result with exit status 127. Streamed body chunks use
+the separate read buffer capacity.
+
 Rebuild the module after changing any crate it links:
 
 ```sh
