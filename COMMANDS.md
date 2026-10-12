@@ -296,6 +296,7 @@ Every limit takes a count, or `off` to remove it. A hard ceiling still applies t
 | `mcp_selected_schema_bytes` | 65536 | bytes | 0 to unbounded | Schema size for one explicitly selected MCP tool. |
 | `project_instruction_file_bytes` | 65536 | bytes | 0 to unbounded | Size of one project instruction file. |
 | `project_instructions_total_bytes` | 131072 | bytes | 0 to unbounded | Combined size of all applicable project instructions. |
+| `repository_map_bytes` | 8192 | bytes | 0 to unbounded | Rendered Rust repository symbol map bytes; zero disables it. |
 | `image_adapter_output_bytes` | 20480 | bytes | 0 to unbounded | Text produced by an image analysis adapter. |
 | `command_output_bytes` | 65536 | bytes | 0 to unbounded | Bytes retained from one command's output. |
 | `read_file_lines` | 2000 | items | 0 to unbounded | Lines returned by one file read. |

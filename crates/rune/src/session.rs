@@ -376,7 +376,8 @@ impl Host for SessionHost {
     }
 
     fn instructions(&self) -> String {
-        let mut instructions = self.instructions.clone();
+        let mut instructions =
+            prompt::with_repository_map(&self.instructions, self.context.workspace(), &self.limits);
         if let Some(recorder) = &self.recorder {
             let recorder = recorder
                 .lock()
@@ -4849,7 +4850,7 @@ fn render_entries(entries: &[Entry], host: &SessionHost) -> Vec<String> {
 
 /// Builds the prompt for a session.
 fn build_prompt(workspace: &Utf8Path, config_root: &Utf8Path, limits: &BudgetSet) -> Prompt {
-    let instructions = prompt::instructions_for(workspace, config_root, limits);
+    let instructions = prompt::base_instructions_for(workspace, config_root, limits);
     Prompt {
         instructions,
         included: Vec::new(),

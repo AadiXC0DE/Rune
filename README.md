@@ -352,7 +352,20 @@ history. Press Alt with lowercase `r`.
 
 `rune ask` sends the resolved instructions shown by `rune prompt --show`, including
 workspace instruction files and the configured system prompt, on every request.
-It runs a bounded turn with the built-in host tools. Allowed calls run
+
+Workspaces containing `Cargo.toml` also receive a Rust repository symbol map with
+declaration locations and lexical identifier references. The map refreshes before
+each model request, including after tool edits. It respects `.gitignore`,
+`.git/info/exclude`, ancestor ignore rules and `.ignore`, and skips symlinks.
+References do not resolve Rust scopes, types, or macro expansion; comments and
+literals are excluded. The default output cap is 8192 bytes, including its
+incomplete-map notice. Configure `repository_map_bytes` in `[limits]` or with
+`--limit repository_map_bytes=N`; zero disables the map. Scans stop at 4096
+entries, 128 source files, 128 KiB per file, 1 MiB of total source, 1024
+declarations, depth 32, and eight reference locations per symbol. These work caps
+remain in force when the output limit is raised or set to `off`.
+
+`rune ask` runs a bounded turn with the built-in host tools. Allowed calls run
 under the configured permission mode and workspace boundaries; calls requiring
 interactive approval return an error to the model without waiting for input.
 The shared host loop allows three consecutive failures of the same tool name

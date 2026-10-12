@@ -290,8 +290,41 @@ pub fn instructions_for(
     config_root: &Utf8Path,
     limits: &BudgetSet,
 ) -> String {
+    with_repository_map(
+        &base_instructions_for(workspace, config_root, limits),
+        workspace,
+        limits,
+    )
+}
+
+/// Builds instructions without the repository map. Long-lived hosts retain this
+/// base and call [`with_repository_map`] before each request so edits are visible.
+pub fn base_instructions_for(
+    workspace: &Utf8Path,
+    config_root: &Utf8Path,
+    limits: &BudgetSet,
+) -> String {
     let home = rune_core::paths::home_directory();
     instructions_under(workspace, home.as_deref(), config_root, limits)
+}
+
+/// Adds the current bounded Rust symbol map to a host's base instructions.
+pub fn with_repository_map(base: &str, workspace: &Utf8Path, limits: &BudgetSet) -> String {
+    let map = crate::symbol_map::generate(
+        workspace,
+        crate::symbol_map::Limits {
+            bytes: limits.get_usize(LimitName::RepositoryMapBytes),
+            ..crate::symbol_map::Limits::default()
+        },
+    );
+    let mut instructions = base.to_owned();
+    if !map.text.is_empty() {
+        if !instructions.is_empty() {
+            instructions.push_str("\n\n");
+        }
+        instructions.push_str(map.text.trim_end());
+    }
+    instructions
 }
 
 /// Builds the system instructions with an explicit home directory.

@@ -751,6 +751,96 @@ fn ask_sends_the_resolved_instructions_shown_by_prompt_show() {
 }
 
 #[test]
+fn ask_refreshes_a_capped_repository_map_after_an_edit() {
+    let edit = json!({"path": "src/main.rs", "old_string": "alpha();", "new_string": "beta(); "})
+        .to_string();
+    let (output, dir, requests) = run_responses_fixture_with_setup(
+        vec![
+            completion_response(&call_delta("edit_file", &edit), "tool_calls"),
+            completion_response(&json!({"content": "Updated."}), "stop"),
+        ],
+        true,
+        true,
+        Some(2),
+        |dir| {
+            std::fs::create_dir(dir.path().join("src")).expect("sources");
+            std::fs::write(
+                dir.path().join("Cargo.toml"),
+                "[package]\nname = 'fixture'\nversion = '0.1.0'\n",
+            )
+            .expect("manifest");
+            std::fs::write(dir.path().join(".gitignore"), "ignored.rs\n").expect("ignore rule");
+            std::fs::write(
+                dir.path().join("ignored.rs"),
+                "fn ignored_secret() { alpha(); }\n",
+            )
+            .expect("ignored source");
+            let extra = (0..100).fold(String::new(), |mut text, index| {
+                use std::fmt::Write as _;
+                writeln!(text, "fn z{index:03}() {{}}").expect("format source");
+                text
+            });
+            std::fs::write(
+                dir.path().join("src/lib.rs"),
+                format!("pub fn alpha() {{}}\npub fn beta() {{}}\n{extra}"),
+            )
+            .expect("definitions");
+            std::fs::write(dir.path().join("src/main.rs"), "fn main() { alpha(); }\n")
+                .expect("references");
+            std::fs::write(
+                dir.path().join("config/rune/config.toml"),
+                "[limits]\nmax_agent_steps = 2\nrepository_map_bytes = 512\n",
+            )
+            .expect("map cap");
+        },
+    );
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(requests.len(), 2);
+    let before = requests[0]["messages"][0]["content"]
+        .as_str()
+        .expect("initial instructions");
+    let after = requests[1]["messages"][0]["content"]
+        .as_str()
+        .expect("refreshed instructions");
+    assert!(
+        before.contains("src/lib.rs:1 fn alpha <- src/main.rs:1"),
+        "{before}"
+    );
+    assert!(after.contains("src/lib.rs:1 fn alpha\n"), "{after}");
+    assert!(
+        after.contains("src/lib.rs:2 fn beta <- src/main.rs:1"),
+        "{after}"
+    );
+    for instructions in [before, after] {
+        let map = instructions
+            .split("Repository symbol map")
+            .nth(1)
+            .expect("map section");
+        assert!(map.len() + "Repository symbol map".len() <= 512);
+        assert!(map.contains("map incomplete"));
+        assert!(!instructions.contains("ignored_secret"));
+        assert!(!instructions.contains("ignored.rs"));
+    }
+    let shown = isolated_command(&dir)
+        .args(["prompt", "--show"])
+        .output()
+        .expect("prompt preview");
+    assert!(shown.status.success(), "{shown:?}");
+    assert_eq!(
+        String::from_utf8(shown.stdout)
+            .expect("UTF-8 preview")
+            .trim_end(),
+        after
+    );
+    let disabled = isolated_command(&dir)
+        .args(["--limit", "repository_map_bytes=0", "prompt", "--show"])
+        .output()
+        .expect("disable map");
+    assert!(disabled.status.success(), "{disabled:?}");
+    assert!(!String::from_utf8_lossy(&disabled.stdout).contains("Repository symbol map"));
+}
+
+#[test]
 fn ask_reads_an_allowed_file_and_sends_its_result_before_the_final_answer() {
     for json_output in [true, false] {
         let (output, dir, requests) = run_responses_fixture(

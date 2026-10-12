@@ -181,7 +181,7 @@ impl Session {
         registry.insert(Box::new(PageShell::new(Arc::clone(&bridge))))?;
         let tools = rune_tools::inventory::advertisement(&registry);
 
-        let instructions = rune_context::prompt::instructions_for(
+        let instructions = rune_context::prompt::base_instructions_for(
             &workspace,
             camino::Utf8Path::new("/config"),
             &limits,
@@ -224,8 +224,8 @@ impl Session {
 
     /// Returns the instructions the model receives, for `/prompt`.
     #[must_use]
-    pub fn instructions_text(&self) -> &str {
-        &self.instructions
+    pub fn instructions_text(&self) -> String {
+        self.instructions()
     }
 }
 
@@ -267,7 +267,11 @@ impl Host for Session {
     }
 
     fn instructions(&self) -> String {
-        self.instructions.clone()
+        rune_context::prompt::with_repository_map(
+            &self.instructions,
+            self.context.workspace(),
+            &self.limits,
+        )
     }
 
     fn tools(&self) -> Vec<ToolSpec> {

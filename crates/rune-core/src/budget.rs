@@ -214,6 +214,8 @@ pub enum LimitName {
     ProjectInstructionFileBytes,
     /// Combined size of all applicable project instructions.
     ProjectInstructionsTotalBytes,
+    /// Rendered repository symbol map bytes. Zero disables the map.
+    RepositoryMapBytes,
     /// Text produced by an image analysis adapter.
     ImageAdapterOutputBytes,
     /// Bytes retained from one command's output.
@@ -286,6 +288,7 @@ impl LimitName {
             Self::McpSelectedSchemaBytes,
             Self::ProjectInstructionFileBytes,
             Self::ProjectInstructionsTotalBytes,
+            Self::RepositoryMapBytes,
             Self::ImageAdapterOutputBytes,
             Self::CommandOutputBytes,
             Self::ReadFileLines,
@@ -332,6 +335,7 @@ impl LimitName {
             Self::McpSelectedSchemaBytes => "mcp_selected_schema_bytes",
             Self::ProjectInstructionFileBytes => "project_instruction_file_bytes",
             Self::ProjectInstructionsTotalBytes => "project_instructions_total_bytes",
+            Self::RepositoryMapBytes => "repository_map_bytes",
             Self::ImageAdapterOutputBytes => "image_adapter_output_bytes",
             Self::CommandOutputBytes => "command_output_bytes",
             Self::ReadFileLines => "read_file_lines",
@@ -379,6 +383,7 @@ impl LimitName {
             Self::McpSelectedSchemaBytes => Budget::Bounded(64 * 1024),
             Self::ProjectInstructionFileBytes => Budget::Bounded(64 * 1024),
             Self::ProjectInstructionsTotalBytes => Budget::Bounded(128 * 1024),
+            Self::RepositoryMapBytes => Budget::Bounded(8192),
             Self::ImageAdapterOutputBytes => Budget::Bounded(20 * 1024),
             Self::CommandOutputBytes => Budget::Bounded(64 * 1024),
             Self::ReadFileLines => Budget::Bounded(2000),
@@ -513,6 +518,9 @@ impl LimitName {
             Self::ProjectInstructionFileBytes => "Size of one project instruction file.",
             Self::ProjectInstructionsTotalBytes => {
                 "Combined size of all applicable project instructions."
+            }
+            Self::RepositoryMapBytes => {
+                "Rendered Rust repository symbol map bytes; zero disables it."
             }
             Self::ImageAdapterOutputBytes => "Text produced by an image analysis adapter.",
             Self::CommandOutputBytes => "Bytes retained from one command's output.",

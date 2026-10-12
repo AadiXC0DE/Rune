@@ -6,6 +6,11 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Added
 
+- Rust workspaces receive a bounded repository symbol map with declaration and
+  lexical reference locations, refreshed before model requests after edits.
+  Ignore rules exclude files; scan and output caps mark incomplete maps.
+  `repository_map_bytes` defaults to 8192 bytes and zero disables the map.
+
 - Rust SDK hosts can call `Agent::compact` with their own synchronous summarizer.
   It preserves recent tool pairs, provider replay data, usage, and checkpoint
   restoration. Failed or unusable summaries leave the conversation intact;

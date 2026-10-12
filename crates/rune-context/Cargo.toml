@@ -20,6 +20,8 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 camino = { workspace = true }
 sha2 = { workspace = true }
+# Reuse the workspace's ignore-aware walker; no parser or new package is needed.
+ignore = { workspace = true }
 
 # The blocking client the remote MCP transports speak through. Absent where a
 # socket cannot be opened, because nothing there compiles it.

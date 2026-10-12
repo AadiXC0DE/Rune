@@ -307,7 +307,11 @@ impl Host for AskHost<'_> {
     }
 
     fn instructions(&self) -> String {
-        self.instructions.clone()
+        rune_context::prompt::with_repository_map(
+            &self.instructions,
+            self.context.workspace(),
+            &self.limits,
+        )
     }
 
     fn tools(&self) -> Vec<ToolSpec> {
@@ -466,7 +470,7 @@ pub fn run(
         .clone_from(&settings.additional_directories);
     let host = AskHost {
         settings,
-        instructions: rune_context::prompt::instructions_for(
+        instructions: rune_context::prompt::base_instructions_for(
             context.workspace(),
             &paths.config_root,
             &settings.limits,
