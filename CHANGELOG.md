@@ -6,6 +6,11 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Added
 
+- `rune review` can use read-only tools in the bounded host loop. The named
+  `read-only review` rule refuses file mutations, shell commands, and skill
+  installation before normal permission evaluation, including in full-access
+  mode. Reads remain subject to the configured policy, and tool results are saved.
+
 - Models can call `syntax_diagnostics` for one Rust file and receive syntax
   messages with file, line, and column from local `rustfmt`. The checker runs
   under process supervision with cancellation, a 30-second deadline, resource

@@ -56,8 +56,10 @@ pub struct Options {
     pub jsonl: bool,
     /// Do not create or update a session.
     pub no_save: bool,
-    /// Execute host tools in a bounded loop. The review command stays text-only.
+    /// Execute host tools in a bounded loop.
     pub tool_loop: bool,
+    /// Refuse tools that do not declare themselves read-only, before policy grants.
+    pub read_only: bool,
 }
 
 /// Hard cap for one JSONL record, including its terminating newline.
@@ -285,6 +287,7 @@ struct AskHost<'a> {
     dialect: Box<dyn Provider>,
     endpoint: Endpoint,
     registry: Registry,
+    read_only: bool,
     rules: RuleSet,
     context: ExecutionContext,
     limits: BudgetSet,
@@ -390,6 +393,19 @@ impl Host for AskHost<'_> {
     }
 
     fn decide(&self, name: &str, target: Option<&str>) -> (Outcome, String) {
+        if self.read_only
+            && !self
+                .registry
+                .get(name)
+                .is_some_and(rune_tools::Tool::is_read_only)
+        {
+            let decision = rune_policy::decision::Decision::matched(
+                Outcome::Deny,
+                rune_policy::decision::Layer::Session,
+                "read-only review",
+            );
+            return (decision.outcome, decision.explain());
+        }
         turn::decide_call_in_workspace(
             &self.rules,
             self.settings.permission_mode,
@@ -489,6 +505,7 @@ pub fn run(
         dialect,
         endpoint,
         registry,
+        read_only: options.read_only,
         rules: crate::permissions::validated(settings)?,
         context,
         steering: SteeringQueue::from_limits(&limits),
@@ -518,7 +535,7 @@ pub fn run(
             .join(", ");
         Some(RuneError::new(
             ErrorCode::UnsupportedToolCall,
-            format!("tool calls are unsupported in the text-only review path: {names}"),
+            format!("tool calls are unsupported when the tool loop is disabled: {names}"),
         ))
     } else if outcome.stop_reason == StopReason::StepLimit {
         Some(RuneError::new(

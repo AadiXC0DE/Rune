@@ -205,6 +205,24 @@ fn run_responses_fixture_with_images(
     images: &[&str],
     setup: impl FnOnce(&tempfile::TempDir),
 ) -> (Output, tempfile::TempDir, Vec<Value>) {
+    run_responses_fixture_command(
+        responses,
+        output_flag,
+        no_save,
+        max_steps,
+        (&["ask"], images),
+        setup,
+    )
+}
+
+fn run_responses_fixture_command(
+    responses: Vec<String>,
+    output_flag: Option<&str>,
+    no_save: bool,
+    max_steps: Option<u64>,
+    (arguments, images): (&[&str], &[&str]),
+    setup: impl FnOnce(&tempfile::TempDir),
+) -> (Output, tempfile::TempDir, Vec<Value>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind fixture");
     listener.set_nonblocking(true).expect("nonblocking");
     let address = listener.local_addr().expect("fixture address");
@@ -288,7 +306,7 @@ fn run_responses_fixture_with_images(
         .env("RUNE_MODEL", "fixture-model")
         .env("RUNE_API_KEY_ENV", "RUNE_ASK_TEST_KEY")
         .env("RUNE_ASK_TEST_KEY", "fixture-key")
-        .arg("ask");
+        .args(arguments);
     if let Some(flag) = output_flag {
         command.arg(flag);
     }
@@ -697,6 +715,130 @@ fn call_delta(name: &str, arguments: &str) -> Value {
         "index": 0, "id": "call-fixture", "type": "function",
         "function": {"name": name, "arguments": arguments}
     }]})
+}
+
+#[test]
+fn review_refuses_mutations_by_a_named_rule_and_still_reads_in_every_permission_mode() {
+    let denied = [
+        (
+            "write_file",
+            json!({"path": "fixture.txt", "content": "changed"}),
+        ),
+        (
+            "edit_file",
+            json!({"path": "fixture.txt", "old_string": "ALLOWED_READ_RESULT", "new_string": "changed"}),
+        ),
+        (
+            "rename_file",
+            json!({"path": "fixture.txt", "new_path": "renamed.txt"}),
+        ),
+        ("create_directory", json!({"path": "new-directory"})),
+        (
+            "shell",
+            json!({"action": "run", "command": "printf changed > fixture.txt"}),
+        ),
+        (
+            "install_skill",
+            json!({"name": "fixture-skill", "content": "---\nname: fixture-skill\ndescription: Fixture\n---\nFixture body."}),
+        ),
+        ("web_fetch", json!({"url": "https://example.com"})),
+        (
+            "update_plan",
+            json!({"steps": [{"step": "Change files", "status": "pending"}]}),
+        ),
+    ];
+    for mode in ["ask", "auto", "full-access"] {
+        let calls: Vec<Value> = denied
+            .iter()
+            .enumerate()
+            .map(|(index, (name, arguments))| {
+                json!({
+                    "index": index, "id": format!("denied-{index}"), "type": "function",
+                    "function": {"name": name, "arguments": arguments.to_string()}
+                })
+            })
+            .collect();
+        let (output, dir, requests) = run_responses_fixture_command(
+            vec![
+                completion_response(&json!({"tool_calls": calls}), "tool_calls"),
+                completion_response(
+                    &call_delta("read_file", r#"{"path":"fixture.txt"}"#),
+                    "tool_calls",
+                ),
+                completion_response(&json!({"content": "Review complete."}), "stop"),
+            ],
+            Some("--json"),
+            false,
+            Some(3),
+            (&["--permission-mode", mode, "review"], &[]),
+            |dir| {
+                let git = Command::new("git")
+                    .args(["init", "-q"])
+                    .current_dir(dir.path())
+                    .output()
+                    .expect("initialize review repository");
+                assert!(git.status.success(), "review fixture setup failed: {git:?}");
+            },
+        );
+        assert!(output.status.success(), "{mode}: {output:?}");
+        assert_eq!(requests.len(), 3, "{mode}");
+        let messages = requests[1]["messages"].as_array().expect("tool feedback");
+        let results: Vec<&Value> = messages
+            .iter()
+            .filter(|message| message["role"] == "tool")
+            .collect();
+        assert_eq!(results.len(), denied.len());
+        for (index, result) in results.iter().enumerate() {
+            assert_eq!(result["tool_call_id"], format!("denied-{index}"));
+            let text = result["content"].as_str().expect("refusal");
+            assert!(text.contains("refused by policy"), "{text}");
+            assert!(
+                text.contains("matched `read-only review` at the session layer"),
+                "{text}"
+            );
+        }
+        let read = requests[2]["messages"]
+            .as_array()
+            .expect("read feedback")
+            .last()
+            .expect("read result");
+        assert_eq!(read["role"], "tool");
+        assert!(
+            read["content"]
+                .as_str()
+                .expect("read content")
+                .contains("ALLOWED_READ_RESULT")
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("fixture.txt")).expect("unchanged file"),
+            "ALLOWED_READ_RESULT"
+        );
+        assert!(!dir.path().join("renamed.txt").exists());
+        assert!(!dir.path().join("new-directory").exists());
+        assert!(!dir.path().join("config/rune/skills/fixture-skill").exists());
+        let result: Value = serde_json::from_slice(&output.stdout).expect("review JSON");
+        assert_eq!(result["final_output"], "Review complete.");
+        let reports = result["tool_calls"].as_array().expect("call reports");
+        for (report, (name, _)) in reports.iter().zip(&denied) {
+            assert_eq!(report, &json!({"name": name, "status": "error"}));
+        }
+        assert_eq!(reports.len(), denied.len() + 1);
+        assert_eq!(
+            reports.last(),
+            Some(&json!({"name": "read_file", "status": "success"}))
+        );
+        let session_dir = dir
+            .path()
+            .join("state/sessions")
+            .join(result["session_id"].as_str().expect("session ID"));
+        let saved = rune_session::load_read_only(
+            camino::Utf8Path::from_path(&session_dir).expect("UTF-8 session path"),
+        )
+        .expect("saved review");
+        let refusals = saved.events.iter().filter(|frame| matches!(&frame.event,
+            rune_session::SessionEvent::ToolResult { ok: false, output, .. } if output.contains("read-only review"))).count();
+        assert_eq!(refusals, denied.len());
+    }
 }
 
 #[test]

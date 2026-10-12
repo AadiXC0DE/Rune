@@ -349,6 +349,7 @@ fn run_ask(
         jsonl,
         no_save: launch.has_flag("--no-save"),
         tool_loop: true,
+        read_only: false,
         images: launch
             .flags
             .iter()
@@ -426,7 +427,8 @@ fn run_review(
         json: output.json,
         jsonl: false,
         no_save: false,
-        tool_loop: false,
+        tool_loop: true,
+        read_only: true,
         images: Vec::new(),
     };
 

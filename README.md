@@ -266,6 +266,12 @@ rune review                 # review the pending changes in this repository
 rune resume last            # continue the most recent session here
 ```
 
+`rune review` can read files and search the workspace through a bounded tool
+loop. Its named `read-only review` rule refuses tools that do not declare
+themselves read-only, including file mutations, shell commands, and skill
+installation. This restriction applies even in full-access mode; ordinary
+permission rules still apply to reads. The review exchange is saved in session state.
+
 Enable Bash completion for command names, aliases, and flags in the current
 shell with `source <(rune completion bash)`. To keep it across shells, save
 `rune completion bash > ~/.rune-completion.bash` and source that file from
