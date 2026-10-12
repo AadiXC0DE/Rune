@@ -1,4 +1,4 @@
-"""R-160: synchronous children, inherited tools, isolated history and bounds."""
+"""R-160 and R-199: bounded children and project roles with inherited authority."""
 
 import http.server
 import json
@@ -48,43 +48,63 @@ def run_fixture(case):
                             "instructions": "CHILD_BRIEF_MARKER", "effort": "low"}
                     if case == "named":
                         task["agent"] = "unsupported-role"
+                    elif case == "role":
+                        assert "agent" in next(tool["function"]["parameters"]["properties"]
+                                               for tool in request["tools"]
+                                               if tool["function"]["name"] == "subagent")
+                        task["agent"] = "reviewer"
                     delta = {"tool_calls": [call("subagent", task)]}
+                    if case == "role":
+                        delta["tool_calls"].append(call("subagent", task, 1))
                 elif is_child:
                     offered = {tool["function"]["name"] for tool in request["tools"]}
                     assert "read_file" in offered, offered
                     assert not {"write_file", "shell", "subagent", "ask_user_question"} & offered
                     assert "WORKSPACE_INSTRUCTION_MARKER" in json.dumps(request)
                     assert "CHILD_BRIEF_MARKER" in json.dumps(request)
+                    if case == "role":
+                        assert offered == {"read_file"}, offered
+                        assert "ROLE_INSTRUCTION_MARKER" in json.dumps(request)
                     assert "PARENT_PRIVATE_HISTORY" not in json.dumps(request), "child inherited parent history"
                     assert request["reasoning_effort"] == "low", request
                     if last["role"] == "user" or case == "cap":
                         calls = [call("read_file", {"path": "fixture.txt"})]
-                        if case == "success":
+                        if case in ["success", "role"]:
                             calls += [
                                 call("write_file", {"path": "forbidden.txt", "content": "BAD"}, 1),
                                 call("shell", {"action": "run", "command": "touch shell-ran"}, 2),
                                 call("subagent", {"action": "run", "task": "recurse"}, 3),
                                 call("read_file", {"path": "../outside.txt"}, 4),
                             ]
+                            if case == "role":
+                                calls.append(call("glob_files", {"pattern": "*"}, 5))
                         delta = {"tool_calls": calls}
                     else:
                         results = [msg for msg in request["messages"] if msg["role"] == "tool"]
-                        assert len(results) == 5, results
+                        assert len(results) == (6 if case == "role" else 5), results
                         assert "ALLOWED_CHILD_READ" in results[0]["content"], results
                         for result in results[1:4]:
                             assert "there is no tool named" in result["content"], result
                         assert "OUTSIDE_SECRET_MARKER" not in results[4]["content"], results[4]
                         assert "outside" in results[4]["content"], results[4]
+                        if case == "role":
+                            assert "there is no tool named" in results[5]["content"], results[5]
                         delta = {"content": "CHILD_READ_RESULT: ALLOWED_CHILD_READ"}
                 else:
                     assert last["role"] == "tool", last
                     result = last["content"]
-                    if case == "success":
+                    if case == "role":
+                        results = [msg["content"] for msg in request["messages"]
+                                   if msg["role"] == "tool"]
+                        assert len(results) == 2, results
+                        for index, result in enumerate(results, 1):
+                            assert f"child child-{index}: CHILD_READ_RESULT: ALLOWED_CHILD_READ" in result, result
+                    elif case == "success":
                         assert "child child-1: CHILD_READ_RESULT: ALLOWED_CHILD_READ" in result, result
                     elif case == "cap":
                         assert "child stopped: max_model_turns" in result, result
                     else:
-                        assert "named agents are unavailable" in result, result
+                        assert "subagent role `unsupported-role` was not found" in result, result
                     delta = {"content": f"PARENT_RECEIVED_{case}"}
                 finish = "tool_calls" if "tool_calls" in delta else "stop"
                 body = "".join("data: " + json.dumps({"choices": [choice]}) + "\n\n"
@@ -104,6 +124,13 @@ def run_fixture(case):
         (base / "outside.txt").write_text("OUTSIDE_SECRET_MARKER")
         (root / "fixture.txt").write_text("ALLOWED_CHILD_READ")
         (root / "AGENTS.md").write_text("WORKSPACE_INSTRUCTION_MARKER")
+        if case == "role":
+            roles = root / ".rune" / "agents"
+            roles.mkdir(parents=True)
+            (roles / "reviewer.json").write_text(json.dumps({
+                "instructions": "ROLE_INSTRUCTION_MARKER: summarize the delegated read.",
+                "tools": ["read_file"],
+            }))
         config = base / "config" / "rune"
         config.mkdir(parents=True, mode=0o700)
         (config / "config.toml").write_text(
@@ -136,7 +163,7 @@ def run_fixture(case):
             assert output.returncode == 0, output.stderr
             assert not errors, errors
             assert f"PARENT_RECEIVED_{case}".encode() in output.stdout, output.stdout
-            assert len(requests) == (2 if case == "named" else 4), requests
+            assert len(requests) == {"named": 2, "role": 6}.get(case, 4), requests
             assert not (root / "forbidden.txt").exists(), "child wrote outside its allowlist"
             assert not (root / "shell-ran").exists(), "child executed shell"
         finally:
@@ -145,6 +172,6 @@ def run_fixture(case):
             thread.join(timeout=5)
 
 
-for case in ["success", "cap", "named"]:
+for case in ["success", "cap", "named", "role"]:
     run_fixture(case)
-print("Child read reached parent; write, shell, nested delegation and outside-root read blocked; step cap and named-role refusal passed")
+print("Child read reached parent; project role instructions and narrowed tools loaded; write, shell, nested delegation and outside-root read blocked; step cap and missing-role refusal passed")

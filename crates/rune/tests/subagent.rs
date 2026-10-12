@@ -1,4 +1,4 @@
-//! R-160 regression through the real CLI and an isolated local provider.
+//! R-160 and R-199 acceptance through the real CLI and an isolated local provider.
 
 #![allow(clippy::expect_used)]
 

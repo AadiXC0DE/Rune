@@ -3,6 +3,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use rune_agent::subagent_role::SubagentRole;
 use rune_agent::subagent_tool::{ChildOutcome, Delegate};
 use rune_agent::turn::{self, Event, Host, StopReason};
 use rune_agent::{
@@ -64,7 +65,7 @@ impl Tool for Registered {
         "subagent"
     }
     fn description(&self) -> &'static str {
-        "Run one synchronous read-only child task and return its result. The child inherits the parent's permissions and only its advertised read-only tools. Named agents, messages, and nested delegation are unavailable."
+        "Run one synchronous read-only child task and return its result. Select an optional project role with agent. Role instructions and tools come from .rune/agents/<agent>.json and can only narrow inherited permissions. Messages and nested delegation are unavailable."
     }
     fn input_schema(&self) -> serde_json::Value {
         let mut schema = self.0.tool.input_schema();
@@ -72,8 +73,10 @@ impl Tool for Registered {
         schema["properties"]["action"]["description"] =
             serde_json::json!("Run a synchronous child task.");
         if let Some(properties) = schema["properties"].as_object_mut() {
-            properties.remove("agent");
             properties.remove("message");
+            properties["agent"]["description"] = serde_json::json!(
+                "Optional project role name loaded from .rune/agents/<agent>.json."
+            );
         }
         schema
     }
@@ -96,12 +99,13 @@ struct Runner<'a> {
 }
 
 impl Runner<'_> {
-    fn tools(&self, admission: &Admission) -> Vec<ToolSpec> {
+    fn tools(&self, admission: &Admission, role: Option<&SubagentRole>) -> Vec<ToolSpec> {
         self.parent
             .tools()
             .into_iter()
             .filter(|spec| {
                 admission.tool_names.contains(&spec.name)
+                    && role.is_none_or(|role| role.tools.contains(&spec.name))
                     && self
                         .registry
                         .get(&spec.name)
@@ -113,13 +117,12 @@ impl Runner<'_> {
 
 impl Delegate for Runner<'_> {
     fn delegate(&self, request: &SubagentRequest, admission: &Admission) -> Result<ChildOutcome> {
-        if request.agent.is_some() {
-            return Err(RuneError::new(
-                ErrorCode::Unsupported,
-                "named agents are unavailable in synchronous delegation",
-            ));
-        }
         self.parent.cancellation().check()?;
+        let role = request
+            .agent
+            .as_deref()
+            .map(|name| SubagentRole::load(&admission.workspace, name))
+            .transpose()?;
         let mut limits = self.parent.limits();
         let cap = limits
             .get(LimitName::SubagentChildren)
@@ -143,16 +146,23 @@ impl Delegate for Runner<'_> {
             Budget::Bounded(steps),
             Layer::CommandLine,
         )?;
-        let tools = self.tools(admission);
+        let tools = self.tools(admission, role.as_ref());
         let brief = request.instructions.as_deref().unwrap_or(
             "Complete the delegated read task and report a concise result to the parent.",
         );
+        let mut instructions = self.parent.instructions();
+        if let Some(role) = &role {
+            instructions.push_str("\n\n");
+            instructions.push_str(&role.instructions);
+        }
+        instructions.push_str("\n\n");
+        instructions.push_str(brief);
         let child = ChildHost {
             parent: self.parent,
             tools,
             model: request.model.clone().unwrap_or_else(|| self.parent.model()),
             effort: request.effort.unwrap_or_else(|| self.parent.effort()),
-            instructions: format!("{}\n\n{brief}", self.parent.instructions()),
+            instructions,
             context: self.parent.context(),
             steering: SteeringQueue::from_limits(&limits),
             limits,
@@ -178,6 +188,7 @@ impl Delegate for Runner<'_> {
         Ok(ChildOutcome {
             id,
             label: format!("child-{seq}"),
+            // A role is reusable; it is not the name of a persistent child.
             name: None,
             summary: outcome.text,
         })
@@ -442,7 +453,7 @@ mod tests {
             children: &children,
         };
         *parent.tools.lock().expect("tools") = registry.all_schemas();
-        let offered = runner.tools(&Admission::capture(&authority));
+        let offered = runner.tools(&Admission::capture(&authority), None);
         assert_eq!(
             offered
                 .iter()
@@ -451,14 +462,106 @@ mod tests {
             ["read_file"]
         );
         authority.tools.retain(|name| name != "read_file");
-        assert!(runner.tools(&Admission::capture(&authority)).is_empty());
+        assert!(
+            runner
+                .tools(&Admission::capture(&authority), None)
+                .is_empty()
+        );
         authority.tools.push("read_file".to_owned());
         parent
             .tools
             .lock()
             .expect("tools")
             .retain(|spec| spec.name != "read_file");
-        assert!(runner.tools(&Admission::capture(&authority)).is_empty());
+        assert!(
+            runner
+                .tools(&Admission::capture(&authority), None)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn fixture_role_can_only_narrow_inherited_tools_and_keeps_parent_policy() {
+        let temp = tempfile::tempdir().expect("workspace");
+        let root = Utf8PathBuf::from_path_buf(temp.path().to_owned()).expect("UTF-8");
+        std::fs::create_dir_all(root.join(".rune/agents")).expect("roles");
+        std::fs::write(
+            root.join(".rune/agents/reviewer.json"),
+            r#"{"instructions":"Review without changing files.","tools":["read_file","write_file","glob_files","subagent"]}"#,
+        )
+        .expect("fixture role");
+        let role = SubagentRole::load(&root, "reviewer").expect("role");
+        let parent = parent();
+        let mut registry = Registry::new();
+        registry
+            .insert(Box::new(rune_tools::ReadFile::new()))
+            .expect("read");
+        registry
+            .insert(Box::new(rune_tools::WriteFile::new()))
+            .expect("write");
+        registry
+            .insert(Box::new(rune_tools::GlobFiles::new()))
+            .expect("glob");
+        *parent.tools.lock().expect("tools") = registry.all_schemas();
+        let authority = Authority {
+            mode: PermissionMode::Auto,
+            rules: RuleSet::new(),
+            workspace: parent.context.workspace.clone(),
+            roots: vec![parent.context.workspace.clone()],
+            // glob_files is registered and read-only, but not inherited.
+            tools: vec!["read_file".to_owned(), "write_file".to_owned()],
+            mcp_view: None,
+            generation: 0,
+        };
+        let children = AtomicU64::new(0);
+        let runner = Runner {
+            parent: &parent,
+            registry: &registry,
+            children: &children,
+        };
+        let admission = Admission::capture(&authority);
+        let tools = runner.tools(&admission, Some(&role));
+        assert_eq!(
+            tools
+                .iter()
+                .map(|tool| tool.name.as_str())
+                .collect::<Vec<_>>(),
+            ["read_file"]
+        );
+        let child = ChildHost {
+            parent: &parent,
+            tools,
+            model: parent.model(),
+            effort: Effort::Auto,
+            instructions: role.instructions.clone(),
+            context: parent.context(),
+            limits: parent.limits(),
+            steering: SteeringQueue::new(4),
+        };
+        assert_eq!(
+            child.decide("read_file", Some("secret.txt")).0,
+            Outcome::Deny
+        );
+        assert_eq!(
+            child.decide("read_file", Some("public.txt")).0,
+            Outcome::Allow
+        );
+        for name in ["write_file", "glob_files", "subagent"] {
+            assert_eq!(child.decide(name, None).0, Outcome::Deny);
+            assert_eq!(
+                child
+                    .execute(name, &serde_json::json!({}))
+                    .expect_err("role cannot grant")
+                    .code(),
+                ErrorCode::PermissionDenied
+            );
+        }
+        assert_eq!(parent.executed.load(Ordering::Relaxed), 0);
+        let empty_role = SubagentRole {
+            instructions: "Think only".to_owned(),
+            tools: Vec::new(),
+        };
+        assert!(runner.tools(&admission, Some(&empty_role)).is_empty());
     }
 
     #[test]

@@ -6,6 +6,12 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Added
 
+- Interactive `subagent` calls can select a project role with `agent`, loading
+  instructions and an explicit tool allowlist from `.rune/agents/<name>.json`.
+  Role tools intersect inherited read-only tools and remain subject to parent
+  policy. Unsafe paths, linked definitions, oversized files, and fields that
+  attempt to configure commands or permissions are refused.
+
 - User configuration can define a named `post_tool_hook` observer that receives
   each finalized tool result once as a bounded, redacted JSON event. Supervised
   deadlines and cancellation stop hook processes; failures warn without changing
@@ -364,8 +370,9 @@ Notable changes, newest first. Each entry describes what a user can observe.
 - Interactive `subagent` calls run one synchronous child with separate history
   and return its result to the parent. Children use only inherited, advertised
   read-only tools under the parent's permission policy, with at most 16 model
-  steps (or a smaller parent cap) and the configured child-count limit. Named
-  roles, child messages, and nested delegation remain unavailable.
+  steps (or a smaller parent cap) and the configured child-count limit. Project
+  roles can narrow the tool set; child messages and nested delegation remain
+  unavailable.
 
 - `rune ask` honors `provider_max_attempts` through the shared bounded retry
   policy, including `Retry-After` and configured request deadlines. Rejected

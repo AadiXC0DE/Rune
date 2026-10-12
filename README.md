@@ -735,6 +735,32 @@ rune limits --json          # every limit and its source
 rune prompt --show          # the exact instructions the model receives
 ```
 
+Interactive `subagent` calls can select a project role using
+`{"action":"run","agent":"reviewer","task":"Review the parser"}`. Save its
+definition in `.rune/agents/reviewer.json` in the active workspace:
+
+```json
+{
+  "instructions": "Review the requested code and report findings without edits.",
+  "tools": ["read_file", "grep_files", "glob_files"]
+}
+```
+
+Both fields are required. Role instructions are appended to the parent's
+instructions, followed by the call's optional `instructions` brief. Tool names
+intersect the parent's advertised tools, the tools captured at admission, and
+the registered read-only tools. A role cannot grant permissions, expand roots,
+enable shell commands, or bypass parent policy or hooks; `tools: []` permits no
+tools. Each call starts a separate synchronous child, so a role can be reused.
+Child messages and nested delegation are unavailable.
+
+Role names use 1 to 64 ASCII letters, digits, hyphens, or underscores. Definitions
+must be regular UTF-8 JSON files under real `.rune/agents` directories; symbolic
+links, missing roles, malformed files, and unknown fields are refused before
+starting a child. Files are capped at 32 KiB, instructions at 16 KiB, and tool
+lists at 128 unique names of at most 128 ASCII bytes each. Definitions only supply
+instructions and a tool ceiling; they cannot configure executable hooks or policy.
+
 A user-defined pre-tool hook can veto an otherwise policy-approved call in
 interactive sessions, `rune ask`, review, and delegated child calls. Configure
 one command in the user file; project `.rune.toml` cannot enable it:
