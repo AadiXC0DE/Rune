@@ -322,6 +322,13 @@ pub trait Host {
         Ok(None)
     }
 
+    /// Observes each finalized result once on the turn thread, in request order.
+    ///
+    /// Includes refused calls, concurrent reads, and retained-result reads after
+    /// result budgets are applied. Hosts must redact data and bound external
+    /// execution. This notification cannot change the tool result.
+    fn post_tool(&self, _result: &CallResult) {}
+
     /// Executes a tool call, after policy has allowed it.
     fn execute(&self, name: &str, arguments: &serde_json::Value) -> Result<ToolOutput>;
 
@@ -584,6 +591,7 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
 
         let mut result_parts = Vec::new();
         for result in &results {
+            host.post_tool(result);
             result_parts.push(ContentPart::ToolResult {
                 id: rune_core::id::ToolCallId::new(result.call.id.clone())?,
                 name: result.call.name.clone(),

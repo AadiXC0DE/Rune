@@ -388,6 +388,18 @@ impl Host for AskHost<'_> {
         )
     }
 
+    fn post_tool(&self, result: &turn::CallResult) {
+        if let Some(message) = crate::post_tool_hook::notify(
+            self.settings.post_tool_hook.as_ref(),
+            result,
+            &self.context,
+            &self.cancellation,
+            &self.endpoint.credential,
+        ) {
+            let _ = writeln!(std::io::stderr(), "warning: {message}");
+        }
+    }
+
     fn execute(&self, name: &str, arguments: &serde_json::Value) -> Result<ToolOutput> {
         self.registry.call(name, arguments, &self.context)
     }

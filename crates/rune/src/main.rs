@@ -24,6 +24,7 @@ mod install;
 mod mcp;
 mod path_completion;
 mod permissions;
+mod post_tool_hook;
 mod pre_tool_hook;
 mod prompt_history;
 mod provider_setup;

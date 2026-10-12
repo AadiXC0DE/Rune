@@ -255,6 +255,10 @@ impl Host for ChildHost<'_> {
         self.parent.pre_tool(call)
     }
 
+    fn post_tool(&self, result: &turn::CallResult) {
+        self.parent.post_tool(result);
+    }
+
     fn execute(&self, name: &str, arguments: &serde_json::Value) -> Result<ToolOutput> {
         self.execute_with_context(name, arguments, &self.context)
     }

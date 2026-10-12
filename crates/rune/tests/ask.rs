@@ -1818,3 +1818,162 @@ fn pre_tool_allow_runs_the_tool_and_hook_failures_hold_it() {
         );
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn user_post_tool_hook_receives_one_redacted_result_without_changing_the_tool_pair() {
+    let original = "ordinary result\nfixture-key\nsk-private-fixture\npassword=short\n";
+    let (output, dir, requests) = run_responses_fixture_command(
+        vec![
+            completion_response(
+                &call_delta("read_file", r#"{"path":"fixture.txt"}"#),
+                "tool_calls",
+            ),
+            completion_response(&json!({"content": "done"}), "stop"),
+        ],
+        Some("--json"),
+        false,
+        Some(2),
+        (&["ask"], &[]),
+        |dir| {
+            std::fs::write(dir.path().join("fixture.txt"), original).expect("fixture");
+            std::fs::write(
+                dir.path().join("observer.sh"),
+                r#"printf '%s' "$RUNE_POST_TOOL_RESULT" >> hook-input.json
+printf '%s' "${RUNE_ASK_TEST_KEY-unset}" > hook-key.txt
+printf '%s' 'ignored hook output'
+"#,
+            )
+            .expect("script");
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(dir.path().join("config/rune/config.toml"))
+                .expect("config");
+            writeln!(
+                file,
+                "\n[post_tool_hook]\nname = 'fixture observer'\nargv = ['/bin/sh', 'observer.sh']"
+            )
+            .expect("configure hook");
+        },
+    );
+    assert!(output.status.success(), "{output:?}");
+    let event_bytes = std::fs::read(dir.path().join("hook-input.json")).expect("hook event");
+    let event: Value = serde_json::from_slice(&event_bytes).expect("exactly one JSON event");
+    assert_eq!(event["event"], "post_tool");
+    assert_eq!(event["id"], "call-fixture");
+    assert_eq!(event["name"], "read_file");
+    assert_eq!(event["executed"], true);
+    assert_eq!(event["is_error"], false);
+    assert_eq!(event["output_truncated"], false);
+    assert!(
+        event["output"]
+            .as_str()
+            .expect("output")
+            .contains("ordinary result")
+    );
+    let text = String::from_utf8(event_bytes).expect("UTF-8");
+    for secret in ["fixture-key", "sk-private-fixture", "short"] {
+        assert!(!text.contains(secret), "leaked {secret}: {text}");
+    }
+    assert!(!event.as_object().expect("event").contains_key("arguments"));
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("hook-key.txt")).expect("environment"),
+        "unset"
+    );
+    assert_eq!(requests.len(), 2);
+    let result = requests[1]["messages"]
+        .as_array()
+        .expect("messages")
+        .last()
+        .expect("result");
+    assert_eq!(result["role"], "tool");
+    assert_eq!(result["tool_call_id"], "call-fixture");
+    assert!(original.lines().all(|line| {
+        result["content"]
+            .as_str()
+            .expect("tool text")
+            .contains(line)
+    }));
+    assert!(
+        !result["content"]
+            .as_str()
+            .expect("tool text")
+            .contains("ignored hook output")
+    );
+    let result: Value = serde_json::from_slice(&output.stdout).expect("ask JSON");
+    let session_dir = dir
+        .path()
+        .join("state/sessions")
+        .join(result["session_id"].as_str().expect("session"));
+    let saved =
+        rune_session::load_read_only(camino::Utf8Path::from_path(&session_dir).expect("UTF-8"))
+            .expect("session");
+    assert_eq!(saved.events.iter().filter(|frame| matches!(&frame.event,
+        rune_session::SessionEvent::ToolResult { ok: true, output, .. } if original.lines().all(|line| output.contains(line)))).count(), 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn post_tool_timeout_and_nonzero_exit_preserve_completed_results_and_continue() {
+    for (script, timeout_ms, expected) in [
+        (
+            "printf '%s' \"$RUNE_POST_TOOL_RESULT\" >> hook-input.json; sleep 30",
+            100,
+            "exceeded its deadline",
+        ),
+        (
+            "printf '%s' \"$RUNE_POST_TOOL_RESULT\" >> hook-input.json; exit 7",
+            5000,
+            "exited with status 7",
+        ),
+    ] {
+        let started = Instant::now();
+        let (output, dir, requests) = run_responses_fixture_with_setup(
+            vec![
+                completion_response(
+                    &call_delta("read_file", r#"{"path":"fixture.txt"}"#),
+                    "tool_calls",
+                ),
+                completion_response(&json!({"content":"done"}), "stop"),
+            ],
+            true,
+            true,
+            Some(2),
+            |dir| {
+                std::fs::write(dir.path().join("observer.sh"), script).expect("script");
+                let mut file = std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(dir.path().join("config/rune/config.toml"))
+                    .expect("config");
+                writeln!(file, "\n[post_tool_hook]\nname = 'fixture observer'\nargv = ['/bin/sh', 'observer.sh']\ntimeout_ms = {timeout_ms}").expect("configure hook");
+            },
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "hook was not bounded"
+        );
+        assert!(output.status.success(), "{output:?}");
+        let event: Value = serde_json::from_slice(
+            &std::fs::read(dir.path().join("hook-input.json")).expect("event"),
+        )
+        .expect("exactly once");
+        assert_eq!(event["is_error"], false);
+        let stderr = String::from_utf8(output.stderr).expect("stderr");
+        assert!(
+            stderr.contains("post-tool hook `fixture observer` failed"),
+            "{stderr}"
+        );
+        assert!(stderr.contains(expected), "{stderr}");
+        let result = requests[1]["messages"]
+            .as_array()
+            .expect("messages")
+            .last()
+            .expect("result");
+        assert!(
+            result["content"]
+                .as_str()
+                .expect("output")
+                .contains("ALLOWED_READ_RESULT")
+        );
+    }
+}

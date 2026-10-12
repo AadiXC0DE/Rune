@@ -55,6 +55,7 @@ struct TestHost {
     tool_error: Option<RuneError>,
     hook_veto: Option<rune_agent::turn::HookVeto>,
     hook_calls: Mutex<Vec<String>>,
+    post_results: Mutex<Vec<(rune_agent::turn::CallResult, std::thread::ThreadId)>>,
     /// Real tools used by regressions that must reach the implementation.
     registry: Option<Registry>,
     cancellation: Cancellation,
@@ -94,6 +95,7 @@ impl TestHost {
             tool_error: None,
             hook_veto: None,
             hook_calls: Mutex::new(Vec::new()),
+            post_results: Mutex::new(Vec::new()),
             registry: None,
             cancellation: Cancellation::new(),
             steering: SteeringQueue::new(8),
@@ -257,6 +259,13 @@ impl Host for TestHost {
             .expect("hook calls")
             .push(call.id.clone());
         Ok(self.hook_veto.clone())
+    }
+
+    fn post_tool(&self, result: &rune_agent::turn::CallResult) {
+        self.post_results
+            .lock()
+            .expect("post results")
+            .push((result.clone(), std::thread::current().id()));
     }
 
     fn execute(&self, name: &str, arguments: &serde_json::Value) -> Result<ToolOutput> {
@@ -3267,5 +3276,74 @@ fn pre_tool_hooks_cannot_override_a_policy_denial() {
     let outcome = run_turn(&mut history, &host).expect("turn");
     assert!(!outcome.calls[0].executed);
     assert!(host.hook_calls.lock().expect("hook calls").is_empty());
+    history.validate().expect("paired history");
+}
+
+#[test]
+fn post_tool_observes_finalized_concurrent_and_denied_results_once_in_order() {
+    let calls = [
+        ("fixture_read", "a"),
+        ("fixture_read", "b"),
+        ("fixture_mutation", "c"),
+    ];
+    let (mut host, barriers) = barrier_host(&calls, 2);
+    host.mode = PermissionMode::Ask;
+    host.rules
+        .push(Rule::allow("fixture_read", "*", Layer::User));
+    host.rules
+        .push(Rule::deny("fixture_mutation", "*", Layer::User));
+    // Exercise result retention before notification.
+    set_result_caps(&mut host, 128, 256);
+    let mut history = rune_agent::History::new();
+    history.push_user("read and attempt a denied mutation");
+    let (outcome, turn_thread) = std::thread::scope(|scope| {
+        let worker = scope.spawn(|| (run_turn(&mut history, &host), std::thread::current().id()));
+        barriers.wait_for(&["a", "b"], false);
+        barriers.release("b");
+        barriers.wait_for(&["b"], true);
+        barriers.release("a");
+        let (outcome, thread) = worker.join().expect("worker");
+        (outcome.expect("turn"), thread)
+    });
+    let observed = host.post_results.lock().expect("post results");
+    assert_eq!(observed.len(), 3);
+    for ((result, thread), expected) in observed.iter().zip(&outcome.calls) {
+        assert_eq!(*thread, turn_thread);
+        assert_eq!(result.call.id, expected.call.id);
+        assert_eq!(result.output, expected.output);
+        assert_eq!(result.executed, expected.executed);
+    }
+    assert_eq!(observed[0].0.call.id, "a");
+    assert_eq!(observed[1].0.call.id, "b");
+    assert!(!observed[2].0.executed);
+    assert!(observed[2].0.output.is_error);
+    history.validate().expect("paired history");
+}
+
+#[test]
+fn post_tool_observes_retained_result_reads_and_tool_errors_once() {
+    let mut history = rune_agent::History::new();
+    let content = "full output".repeat(300);
+    let handle = rune_tools::Handle::derive(history.result_store().session(), "fixture", &content);
+    let endpoint = MockEndpoint::start(vec![
+        Script::tool_call("fixture", "read_file", r#"{"path":"fixture.txt"}"#),
+        result_read_batch(&handle, &[(0, 100)]),
+        Script::tool_call("error", "read_file", "malformed"),
+        Script::text("done"),
+    ]);
+    let mut host = TestHost::new(endpoint)
+        .with_tools(vec![read_tool(), result_reader_spec()])
+        .with_tool_response(ToolOutput::success(content));
+    set_result_caps(&mut host, 1024, 4096);
+    history.push_user("retain and read");
+    let outcome = run_turn(&mut history, &host).expect("turn");
+    let observed = host.post_results.lock().expect("post results");
+    assert_eq!(observed.len(), 3);
+    assert_eq!(observed[1].0.call.name, "read_tool_result");
+    assert!(observed[1].0.executed);
+    assert!(observed[2].0.output.is_error);
+    for ((result, _), expected) in observed.iter().zip(&outcome.calls) {
+        assert_eq!(result.output, expected.output);
+    }
     history.validate().expect("paired history");
 }

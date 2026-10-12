@@ -228,6 +228,7 @@ impl Answerer for TerminalQuestions {
 /// Host state for a turn.
 struct SessionHost {
     pre_tool_hook: Option<rune_core::config::PreToolHook>,
+    post_tool_hook: Option<rune_core::config::PostToolHook>,
     accessible: bool,
     ascii: bool,
     recorder: Option<Arc<Mutex<Recorder>>>,
@@ -557,6 +558,18 @@ impl Host for SessionHost {
             &self.context,
             &self.cancellation,
         )
+    }
+
+    fn post_tool(&self, result: &turn::CallResult) {
+        if let Some(message) = crate::post_tool_hook::notify(
+            self.post_tool_hook.as_ref(),
+            result,
+            &self.context,
+            &self.cancellation,
+            &self.endpoint.credential,
+        ) {
+            self.draw_notice(&message);
+        }
     }
 
     fn execute(&self, name: &str, arguments: &serde_json::Value) -> Result<ToolOutput> {
@@ -1557,6 +1570,7 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
         .clone_from(&config.settings.additional_directories);
     let host = SessionHost {
         pre_tool_hook: config.settings.pre_tool_hook.clone(),
+        post_tool_hook: config.settings.post_tool_hook.clone(),
         accessible: config.accessible,
         ascii: config.settings.ascii,
         recorder: Some(Arc::clone(&recorder)),
@@ -9415,6 +9429,7 @@ mod tests {
         let questions = Arc::new(TerminalQuestions::default());
         SessionHost {
             pre_tool_hook: None,
+            post_tool_hook: None,
             accessible: false,
             ascii: false,
             recorder: None,

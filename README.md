@@ -763,6 +763,33 @@ cannot override policy refusals. Invalid output, nonzero exit, oversized stdout
 The deadline defaults to 5 seconds and accepts 1 to 60,000 milliseconds.
 Cancellation stops a running hook through the existing process supervisor.
 
+A user-defined post-tool hook observes each finalized result once, in request
+order, including concurrent reads, retained-result reads, refused calls, and
+errors. Configure it in the user file; project files cannot enable it:
+
+```toml
+[post_tool_hook]
+name = "record tool activity"
+argv = ["/usr/local/bin/rune-tool-observer"]
+timeout_ms = 5000
+```
+
+The command receives `RUNE_POST_TOOL_RESULT`, a JSON object containing `event`
+(`post_tool`), `id`, `name`, `executed`, `is_error`, `output`, and
+`output_truncated`. Rune applies result budgets first, redacts the active provider
+credential and credential-shaped content, and truncates the redacted output to
+4 KiB at a UTF-8 boundary. JSON results also redact nested credential fields.
+Arguments are omitted. The complete event is limited to 32 KiB.
+
+Post-tool commands use the same workspace directory, explicit argv, minimal
+environment, closed stdin, and user authority as pre-tool commands. Their output
+is captured with a 4 KiB bound per pipe and ignored. Nonzero exits, invalid hook
+configuration, and timeouts report a named warning without changing the tool
+result or retrying the hook. The deadline defaults to 5 seconds and accepts
+1 to 60,000 milliseconds; timeout and cancellation stop the supervised process
+group. Cancellation also skips hooks for pending results. Ask, review, interactive
+sessions, and delegated child calls support it.
+
 ## Embedding
 
 `rune-acp` serves the Agent Client Protocol over stdin and stdout, so an editor

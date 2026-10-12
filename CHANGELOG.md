@@ -6,6 +6,11 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Added
 
+- User configuration can define a named `post_tool_hook` observer that receives
+  each finalized tool result once as a bounded, redacted JSON event. Supervised
+  deadlines and cancellation stop hook processes; failures warn without changing
+  tool results. Project files cannot enable the hook.
+
 - User configuration can define a named `pre_tool_hook` command to veto
   policy-approved tool calls in interactive sessions, ask, review, and delegated
   children. Vetoes preserve the call/result pair and report the hook's reason.
