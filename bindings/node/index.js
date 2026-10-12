@@ -1,9 +1,9 @@
 // Drives the `rune` binary as a subprocess.
 //
 // The binary owns configuration, credentials, and the network path; this module
-// only builds an argument list, runs it, and returns the result object that
-// `rune ask --json` prints. No provider, credential, or session state is read
-// or written here.
+// only builds an argument list, runs it, and returns the result object or
+// streams the JSONL events that `rune ask` prints. No provider, credential,
+// or session state is read or written here.
 
 import { spawn } from "node:child_process";
 import { accessSync, constants, statSync } from "node:fs";
@@ -20,6 +20,7 @@ const EFFORTS = ["auto", "none", "minimal", "low", "medium", "high", "xhigh", "m
 // Node clamps larger delays to 1 ms and emits TimeoutOverflowWarning.
 const MAX_TIMEOUT_MS = 2 ** 31 - 1;
 const DEFAULT_MAX_OUTPUT_BYTES = 8 * 1024 * 1024;
+const MAX_JSONL_EVENT_BYTES = 1024 * 1024;
 
 /** Base class for every failure this module reports. */
 export class RuneError extends Error {
@@ -50,12 +51,12 @@ export class RuneExitError extends RuneError {
   }
 }
 
-/** The binary exited cleanly without printing a valid result object. */
+/** Invalid result output or a malformed JSONL stream. */
 export class RuneOutputError extends RuneError {
-  constructor(stdout, stderr, detail = null) {
+  constructor(stdout, stderr, detail = null, format = "result") {
     super(
       "OUTPUT",
-      `rune ask exited cleanly without printing a valid result object${detail === null ? "" : `; ${detail}`}; standard output was ${describe(stdout)}`,
+      `${format === "jsonl" ? "rune ask printed an invalid JSONL stream" : "rune ask exited cleanly without printing a valid result object"}${detail === null ? "" : `; ${detail}`}; standard output was ${describe(stdout)}`,
     );
     this.name = "RuneOutputError";
     this.stdout = stdout;
@@ -63,16 +64,17 @@ export class RuneOutputError extends RuneError {
   }
 }
 
-/** The child's combined stdout and stderr exceeded the capture budget. */
+/** Combined output or one streaming record exceeded its byte budget. */
 export class RuneOutputLimitError extends RuneError {
-  constructor(maxOutputBytes, stream) {
+  constructor(maxOutputBytes, stream, scope = "combined") {
     super(
       "OUTPUT_LIMIT",
-      `rune ask exceeded the combined output limit of ${maxOutputBytes} bytes while reading ${stream}`,
+      `rune ask exceeded the ${scope === "record" ? "JSONL record" : "combined output"} limit of ${maxOutputBytes} bytes while reading ${stream}`,
     );
     this.name = "RuneOutputLimitError";
     this.maxOutputBytes = maxOutputBytes;
     this.stream = stream;
+    this.scope = scope;
   }
 }
 
@@ -139,62 +141,8 @@ export function resolveBinary(options = {}) {
  * @returns {Promise<object>} The parsed `rune ask --json` object.
  */
 export async function ask(prompt, options = {}) {
-  if (typeof prompt !== "string" || prompt.trim().length === 0) {
-    throw new TypeError("the prompt must be a non-empty string");
-  }
-  if (typeof options !== "object" || options === null) {
-    throw new TypeError("the options must be an object");
-  }
-
-  const {
-    provider,
-    offline = false,
-    model,
-    effort,
-    cwd,
-    env,
-    noSave = false,
-    timeoutMs,
-    signal,
-    maxOutputBytes = DEFAULT_MAX_OUTPUT_BYTES,
-  } = options;
-  if (provider !== undefined && (typeof provider !== "string" || provider.length === 0)) {
-    throw new TypeError("the provider option must be a non-empty string");
-  }
-  if (typeof offline !== "boolean") {
-    throw new TypeError("the offline option must be a boolean");
-  }
-  if (model !== undefined && (typeof model !== "string" || model.length === 0)) {
-    throw new TypeError("the model option must be a non-empty string");
-  }
-  if (effort !== undefined && !EFFORTS.includes(effort)) {
-    throw new TypeError(`the effort option must be one of ${EFFORTS.join(", ")}`);
-  }
-  if (
-    timeoutMs !== undefined &&
-    !(Number.isFinite(timeoutMs) && timeoutMs > 0 && timeoutMs <= MAX_TIMEOUT_MS)
-  ) {
-    throw new TypeError(
-      `the timeoutMs option must be a finite positive number no greater than ${MAX_TIMEOUT_MS}`,
-    );
-  }
-  if (!(Number.isSafeInteger(maxOutputBytes) && maxOutputBytes > 0)) {
-    throw new TypeError("the maxOutputBytes option must be a positive safe integer");
-  }
-
-  const executable = resolveBinary(options);
-  const args = [];
-  // Options that apply to the whole process are only read before the command
-  // name; everything after it belongs to the command.
-  if (provider !== undefined) args.push("--provider", provider);
-  if (offline) args.push("--offline");
-  if (model !== undefined) args.push("--model", model);
-  if (effort !== undefined) args.push("--effort", effort);
-  args.push("ask", "--json");
-  if (noSave) args.push("--no-save");
-  // A bare `--` ends flag parsing, so a prompt starting with a dash is read as
-  // the prompt.
-  args.push("--", prompt);
+  const { executable, args, cwd, env, timeoutMs, signal, maxOutputBytes } =
+    prepareAsk(prompt, options, "--json");
 
   const child = spawn(executable, args, {
     cwd,
@@ -307,6 +255,318 @@ export async function ask(prompt, options = {}) {
     throw new RuneOutputError(stdoutText, stderrText, detail);
   }
   return result;
+}
+
+/**
+ * Streams JSONL events on demand. The process starts on the first next() call.
+ * Returning from the iterator kills the child, including when a loop breaks.
+ */
+export function askStream(prompt, options = {}) {
+  let cancel = () => {};
+  const iterator = streamAsk(prompt, options, (handler) => { cancel = handler; });
+  const returnIterator = iterator.return.bind(iterator);
+  // Native async generators queue return() behind a pending next(). Stop the
+  // process first so a silent pipe cannot keep that pending pull alive forever.
+  iterator.return = (value) => {
+    cancel();
+    return returnIterator(value);
+  };
+  return iterator;
+}
+
+async function* streamAsk(prompt, options, setCancel) {
+  const { executable, args, cwd, env, timeoutMs, signal, maxOutputBytes } =
+    prepareAsk(prompt, options, "--jsonl");
+  const { maxEventBytes = MAX_JSONL_EVENT_BYTES } = options;
+  if (signal?.aborted) {
+    throw new RuneError("ABORTED", "rune ask was aborted before it finished");
+  }
+
+  const child = spawn(executable, args, {
+    cwd,
+    env: env === undefined ? process.env : { ...process.env, ...env },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  const stderr = [];
+  let capturedBytes = 0;
+  let interruption = null;
+  let grace = null;
+  let timer = null;
+  let settled = false;
+  let spawnError = null;
+  const onAbort = () =>
+    interrupt(new RuneError("ABORTED", "rune ask was aborted before it finished"));
+  const cleanup = () => {
+    clearTimeout(timer);
+    clearTimeout(grace);
+    signal?.removeEventListener("abort", onAbort);
+  };
+  let finish;
+  // Always resolve, even if the caller is suspended at a yield. A spawn error
+  // must not become an unhandled rejection before the next iterator pull.
+  const completion = new Promise((resolve) => {
+    finish = resolve;
+  });
+  const settle = (status) => {
+    if (settled) return;
+    settled = true;
+    cleanup();
+    finish(status);
+  };
+  const interrupt = (error) => {
+    if (interruption !== null) return;
+    interruption = error;
+    stderr.length = 0;
+    child.stdout.destroy();
+    child.stderr.destroy();
+    child.kill();
+    if (child.exitCode !== null || child.signalCode !== null || settled) {
+      settle({ code: child.exitCode, signal: child.signalCode });
+    } else {
+      grace = setTimeout(() => child.kill("SIGKILL"), 2000);
+      grace.unref();
+    }
+  };
+  const count = (chunk, stream) => {
+    if (interruption !== null) return;
+    if (chunk.length > maxOutputBytes - capturedBytes) {
+      interrupt(new RuneOutputLimitError(maxOutputBytes, stream));
+    } else {
+      capturedBytes += chunk.length;
+    }
+  };
+  const checkInterruption = () => {
+    // The process can close while records from the current chunk still await
+    // consumption. Honor cancellation of those records after listener cleanup.
+    if (signal?.aborted) onAbort();
+    if (interruption !== null) throw interruption;
+  };
+  child.once("error", (error) => {
+    spawnError = error;
+    child.stdout.destroy();
+    child.stderr.destroy();
+    settle({ error });
+  });
+  child.once("close", (code, term) => settle({ code, signal: term }));
+  child.once("exit", (code, term) => {
+    if (interruption !== null) settle({ code, signal: term });
+  });
+  child.stderr.on("data", (chunk) => {
+    count(chunk, "stderr");
+    if (interruption === null) stderr.push(chunk);
+  });
+  if (timeoutMs !== undefined) {
+    timer = setTimeout(() => {
+      interrupt(new RuneError("TIMEOUT", `rune ask did not finish within ${timeoutMs} ms`));
+    }, timeoutMs);
+  }
+  signal?.addEventListener("abort", onAbort, { once: true });
+  // Catch an abort that occurred between the pre-spawn check and registration.
+  if (signal?.aborted) onAbort();
+
+  let result = null;
+  let started = false;
+  let completed = false;
+  setCancel(() => {
+    if (!completed) {
+      interrupt(new RuneError("ABORTED", "rune ask iterator was closed before it finished"));
+    }
+  });
+  const record = Buffer.allocUnsafe(Math.min(maxEventBytes, maxOutputBytes));
+  let recordBytes = 0;
+  const outputError = (text, detail) =>
+    new RuneOutputError(text, Buffer.concat(stderr).toString("utf8"), detail, "jsonl");
+  const parseEvent = (text) => {
+    let event;
+    try {
+      event = JSON.parse(text);
+    } catch {
+      throw outputError(text, "invalid JSONL event");
+    }
+    if (!isObject(event) || typeof event.type !== "string") {
+      throw outputError(text, "missing JSONL event type");
+    }
+    if (result !== null) throw outputError(text, "event after final result");
+    if (!started && event.type !== "start") throw outputError(text, "expected start event");
+    switch (event.type) {
+      case "start":
+        if (started) throw outputError(text, "duplicate start event");
+        started = true;
+        break;
+      case "step_start":
+      case "step_restart":
+      case "text_delta":
+        if (!(Number.isSafeInteger(event.step) && event.step > 0)) {
+          throw outputError(text, "invalid event step");
+        }
+        if (event.type === "text_delta" && typeof event.delta !== "string") {
+          throw outputError(text, "invalid text delta");
+        }
+        break;
+      case "plan_updated": {
+        const update = event.update;
+        if (
+          !isObject(update) || !(Number.isSafeInteger(update.version) && update.version > 0) ||
+          !(update.explanation === null || typeof update.explanation === "string") ||
+          !Array.isArray(update.plan) || !update.plan.every((entry) =>
+            isObject(entry) && typeof entry.step === "string" &&
+            ["pending", "in_progress", "completed"].includes(entry.status))
+        ) {
+          throw outputError(text, "invalid plan update");
+        }
+        break;
+      }
+      case "final": {
+        const parsed = asResult(JSON.stringify(event.result));
+        if (parsed?.result == null) throw outputError(text, parsed?.detail ?? "invalid final result");
+        result = parsed.result;
+        break;
+      }
+      default:
+        throw outputError(text, `unknown JSONL event type: ${event.type}`);
+    }
+    return event;
+  };
+  try {
+    // Pull one pipe chunk at a time. Each yield suspends parsing and reading,
+    // leaving only one chunk, one bounded record and Node's pipe buffer.
+    for await (const chunk of child.stdout) {
+      count(chunk, "stdout");
+      checkInterruption();
+      let offset = 0;
+      while (offset < chunk.length) {
+        checkInterruption();
+        const newline = chunk.indexOf(10, offset);
+        const end = newline < 0 ? chunk.length : newline + 1;
+        const length = end - offset;
+        if (length > maxEventBytes - recordBytes) {
+          throw new RuneOutputLimitError(maxEventBytes, "stdout", "record");
+        }
+        chunk.copy(record, recordBytes, offset, end);
+        recordBytes += length;
+        offset = end;
+        if (newline >= 0) {
+          const text = record.subarray(0, recordBytes).toString("utf8");
+          recordBytes = 0;
+          const event = parseEvent(text);
+          // Validate process completion before exposing a successful final.
+          if (event.type !== "final") yield event;
+        }
+      }
+    }
+    const status = await completion;
+    checkInterruption();
+    if (status.error) throw status.error;
+    const stderrText = Buffer.concat(stderr).toString("utf8");
+    if (status.code === null) {
+      throw new RuneError("SIGNALED", `rune ask was terminated by signal ${status.signal ?? "unknown"}`);
+    }
+    if (status.code !== 0) throw new RuneExitError(status.code, result, stderrText);
+    if (recordBytes !== 0 || result === null) {
+      throw outputError(
+        record.subarray(0, recordBytes).toString("utf8"),
+        "incomplete JSONL stream or missing final result",
+      );
+    }
+    completed = true;
+    yield { type: "final", result };
+  } catch (error) {
+    if (interruption !== null) throw interruption;
+    if (spawnError?.code === "ENOENT") {
+      throw new RuneBinaryNotFoundError(
+        binaryCandidates(options.bin), `${executable} could not be executed`,
+      );
+    }
+    if (spawnError !== null) throw spawnError;
+    throw error;
+  } finally {
+    if (!completed) {
+      interrupt(new RuneError("ABORTED", "rune ask iterator was closed before it finished"));
+    }
+    await completion;
+    cleanup();
+    setCancel(() => {});
+  }
+}
+
+/** Validates common options and builds the subprocess arguments. */
+function prepareAsk(prompt, options, format) {
+  if (typeof prompt !== "string" || prompt.trim().length === 0) {
+    throw new TypeError("the prompt must be a non-empty string");
+  }
+  if (typeof options !== "object" || options === null) {
+    throw new TypeError("the options must be an object");
+  }
+
+  const {
+    provider,
+    offline = false,
+    model,
+    effort,
+    cwd,
+    env,
+    noSave = false,
+    timeoutMs,
+    signal,
+    maxOutputBytes = DEFAULT_MAX_OUTPUT_BYTES,
+  } = options;
+  if (provider !== undefined && (typeof provider !== "string" || provider.length === 0)) {
+    throw new TypeError("the provider option must be a non-empty string");
+  }
+  if (typeof offline !== "boolean") {
+    throw new TypeError("the offline option must be a boolean");
+  }
+  if (model !== undefined && (typeof model !== "string" || model.length === 0)) {
+    throw new TypeError("the model option must be a non-empty string");
+  }
+  if (effort !== undefined && !EFFORTS.includes(effort)) {
+    throw new TypeError(`the effort option must be one of ${EFFORTS.join(", ")}`);
+  }
+  if (
+    timeoutMs !== undefined &&
+    !(Number.isFinite(timeoutMs) && timeoutMs > 0 && timeoutMs <= MAX_TIMEOUT_MS)
+  ) {
+    throw new TypeError(
+      `the timeoutMs option must be a finite positive number no greater than ${MAX_TIMEOUT_MS}`,
+    );
+  }
+  if (!(Number.isSafeInteger(maxOutputBytes) && maxOutputBytes > 0)) {
+    throw new TypeError("the maxOutputBytes option must be a positive safe integer");
+  }
+
+  if (format === "--jsonl") {
+    const { maxEventBytes = MAX_JSONL_EVENT_BYTES } = options;
+    if (!(
+      Number.isSafeInteger(maxEventBytes) && maxEventBytes > 0 &&
+      maxEventBytes <= MAX_JSONL_EVENT_BYTES
+    )) {
+      throw new TypeError(
+        `the maxEventBytes option must be a positive integer no greater than ${MAX_JSONL_EVENT_BYTES}`,
+      );
+    }
+    if (signal !== undefined && (
+      signal === null || typeof signal.aborted !== "boolean" ||
+      typeof signal.addEventListener !== "function" || typeof signal.removeEventListener !== "function"
+    )) {
+      throw new TypeError("the signal option must be an AbortSignal");
+    }
+  }
+
+  const executable = resolveBinary(options);
+  const args = [];
+  // Options that apply to the whole process are only read before the command
+  // name; everything after it belongs to the command.
+  if (provider !== undefined) args.push("--provider", provider);
+  if (offline) args.push("--offline");
+  if (model !== undefined) args.push("--model", model);
+  if (effort !== undefined) args.push("--effort", effort);
+  args.push("ask", format);
+  if (noSave) args.push("--no-save");
+  // A bare `--` ends flag parsing, so a prompt starting with a dash is read as
+  // the prompt.
+  args.push("--", prompt);
+
+  return { executable, args, cwd, env, timeoutMs, signal, maxOutputBytes };
 }
 
 /** Collects the three locations the executable is looked up in, in order. */

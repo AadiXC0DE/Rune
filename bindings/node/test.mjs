@@ -16,6 +16,7 @@ import { after, test } from "node:test";
 
 import {
   ask,
+  askStream,
   resolveBinary,
   RuneBinaryNotFoundError,
   RuneExitError,
@@ -853,4 +854,261 @@ test("timeoutMs bounds a binary that outlives it", async () => {
   // A sleep of thirty seconds must not hold the caller: the reported bound is
   // the point of the option.
   assert.ok(elapsed < 10_000, `settled after ${elapsed} ms, past the bound`);
+});
+
+function streamFixture(name, body) {
+  return nodeStub(name, `
+    const result = ${JSON.stringify(validResult)};
+    const emit = (event) => process.stdout.write(JSON.stringify(event) + "\\n");
+    ${body}
+  `);
+}
+
+async function collectEvents(iterator) {
+  const events = [];
+  for await (const event of iterator) events.push(event);
+  return events;
+}
+
+test("askStream exposes incremental UTF-8 text before the fixture can finish", { timeout: 10_000 }, async () => {
+  const gate = join(first.directory, "stream-gate");
+  const bin = streamFixture("rune-stream-incremental", `
+    const { existsSync } = require("node:fs");
+    emit({ type: "start" });
+    emit({ type: "step_start", step: 1 });
+    const delta = Buffer.from(JSON.stringify({ type: "text_delta", step: 1, delta: "界" }) + "\\n");
+    const split = delta.indexOf(Buffer.from("界")) + 1;
+    process.stdout.write(delta.subarray(0, split));
+    setTimeout(() => process.stdout.write(delta.subarray(split)), 20);
+    const poll = setInterval(() => {
+      if (!existsSync(${JSON.stringify(gate)})) return;
+      clearInterval(poll);
+      emit({ type: "text_delta", step: 1, delta: " next" });
+      emit({ type: "step_restart", step: 1 });
+      emit({ type: "plan_updated", update: { version: 1, explanation: null, plan: [{ step: "Check", status: "completed" }] } });
+      emit({ type: "final", result: { ...result, output: "界 next", final_output: "界 next", args: process.argv.slice(2) } });
+    }, 10);
+  `);
+  const stream = askStream("--prompt", {
+    bin, provider: "fixture", offline: true, model: "model", effort: "high", noSave: true,
+  });
+  try {
+    assert.deepEqual((await stream.next()).value, { type: "start" });
+    assert.deepEqual((await stream.next()).value, { type: "step_start", step: 1 });
+    assert.deepEqual((await stream.next()).value, { type: "text_delta", step: 1, delta: "界" });
+    // The child cannot emit the remaining text or final until this file exists.
+    writeFileSync(gate, "continue");
+    const rest = await collectEvents(stream);
+    assert.deepEqual(rest.map((event) => event.type), ["text_delta", "step_restart", "plan_updated", "final"]);
+    assert.equal(rest[0].delta, " next");
+    assert.equal(rest[2].update.plan[0].status, "completed");
+    assert.equal(rest[3].result.output, "界 next");
+    assert.deepEqual(rest[3].result.args, [
+      "--provider", "fixture", "--offline", "--model", "model", "--effort", "high",
+      "ask", "--jsonl", "--no-save", "--", "--prompt",
+    ]);
+  } finally {
+    await stream.return();
+  }
+});
+
+test("askStream validates final results and JSONL framing", async (t) => {
+  const start = JSON.stringify({ type: "start" }) + "\n";
+  const final = JSON.stringify({ type: "final", result: validResult }) + "\n";
+  const bin = streamFixture("rune-stream-output", `process.stdout.write(process.env.FIXTURE_OUTPUT);`);
+  for (const [name, output, detail] of [
+    ["invalid JSON", start + "garbage\n", /invalid JSONL/],
+    ["missing start", final, /expected start/],
+    ["duplicate start", start + start, /duplicate start/],
+    ["invalid delta", start + '{"type":"text_delta","step":1,"delta":3}\n', /invalid text delta/],
+    ["invalid step", start + '{"type":"step_start","step":0}\n', /invalid event step/],
+    ["invalid plan", start + '{"type":"plan_updated","update":{}}\n', /invalid plan update/],
+    ["unknown event", start + '{"type":"unknown"}\n', /unknown JSONL/],
+    ["invalid final", start + '{"type":"final","result":{"output":"ok"}}\n', /missing fields/],
+    ["event after final", start + final + start, /event after final/],
+    ["missing final", start, /missing final/],
+    ["unterminated final", start + final.trimEnd(), /incomplete JSONL/],
+    ["empty stream", "", /missing final/],
+  ]) {
+    await t.test(name, async () => {
+      await assert.rejects(collectEvents(askStream("hello", { bin, env: { FIXTURE_OUTPUT: output } })),
+        (error) => error instanceof RuneOutputError && detail.test(error.message));
+    });
+  }
+  assert.deepEqual(await collectEvents(askStream("hello", { bin, env: { FIXTURE_OUTPUT: start + final } })), [
+    { type: "start" }, { type: "final", result: validResult },
+  ]);
+});
+
+test("askStream preserves a failed final result and stderr on a non-zero exit", async () => {
+  const result = { ...validResult, exit_code: 3, error: "fixture failed", error_code: "fixture_error" };
+  const bin = streamFixture("rune-stream-failure", `
+    emit({ type: "start" });
+    emit({ type: "final", result: ${JSON.stringify(result)} });
+    process.stderr.write("fixture diagnostic");
+    process.exitCode = 3;
+  `);
+  await assert.rejects(collectEvents(askStream("hello", { bin })), (error) => {
+    assert.ok(error instanceof RuneExitError);
+    assert.equal(error.exitCode, 3);
+    assert.deepEqual(error.result, result);
+    assert.equal(error.stderr, "fixture diagnostic");
+    return true;
+  });
+});
+
+test("askStream bounds records, including unterminated lines, and combined output", async (t) => {
+  const bin = streamFixture("rune-stream-limits", `
+    process.stdout.write(process.env.FIXTURE_OUTPUT);
+    process.stderr.write(process.env.FIXTURE_STDERR || "");
+  `);
+  const output = JSON.stringify({ type: "start" }) + "\n" + JSON.stringify({ type: "final", result: validResult }) + "\n";
+  const bytes = Buffer.byteLength(output);
+  const events = await collectEvents(askStream("hello", { bin, maxOutputBytes: bytes, env: { FIXTURE_OUTPUT: output } }));
+  assert.equal(events.at(-1).type, "final");
+  for (const [name, options] of [
+    ["combined cap", { maxOutputBytes: bytes, env: { FIXTURE_OUTPUT: output, FIXTURE_STDERR: "x" } }],
+    ["stdout cap", { maxOutputBytes: bytes - 1, env: { FIXTURE_OUTPUT: output } }],
+    ["stderr cap", { maxOutputBytes: 10, env: { FIXTURE_OUTPUT: "", FIXTURE_STDERR: "界".repeat(10) } }],
+    ["record with newline", { maxEventBytes: 16, env: { FIXTURE_OUTPUT: '{"type":"start"}\n' } }],
+    ["unterminated record", { maxEventBytes: 16, env: { FIXTURE_OUTPUT: "x".repeat(17) } }],
+  ]) {
+    await t.test(name, async () => {
+      await assert.rejects(collectEvents(askStream("hello", { bin, ...options })), (error) => {
+        assert.ok(error instanceof RuneOutputLimitError);
+        assert.equal(error.scope, options.maxEventBytes === undefined ? "combined" : "record");
+        assert.equal(error.maxOutputBytes, options.maxEventBytes ?? options.maxOutputBytes);
+        return true;
+      });
+    });
+  }
+  const exact = await collectEvents(askStream("hello", {
+    bin, maxEventBytes: Buffer.byteLength(output.split("\n")[1]) + 1, env: { FIXTURE_OUTPUT: output },
+  }));
+  assert.equal(exact.at(-1).type, "final");
+});
+
+test("askStream validates options before spawning and never spawns for an already aborted signal", async () => {
+  const absent = join(first.directory, "absent-stream");
+  for (const maxEventBytes of [0, -1, 1.5, Infinity, NaN, 1048577, "16", null]) {
+    await assert.rejects(askStream("hello", { bin: absent, maxEventBytes }).next(),
+      (error) => error instanceof TypeError && /maxEventBytes/.test(error.message));
+  }
+  await assert.rejects(askStream("", { bin: absent }).next(), TypeError);
+  await assert.rejects(askStream("hello", { bin: absent, timeoutMs: 0 }).next(), TypeError);
+  await assert.rejects(askStream("hello", { bin: absent, maxOutputBytes: 0 }).next(), TypeError);
+  for (const signal of [null, {}, "abort", { aborted: false }]) {
+    await assert.rejects(askStream("hello", { bin: absent, signal }).next(), TypeError);
+  }
+  const marker = join(first.directory, "aborted-stream-spawn");
+  const bin = streamFixture("rune-stream-aborted", `require("node:fs").writeFileSync(${JSON.stringify(marker)}, "spawned");`);
+  const controller = new AbortController();
+  controller.abort();
+  await assert.rejects(askStream("hello", { bin, signal: controller.signal }).next(), { code: "ABORTED" });
+  assert.throws(() => readFileSync(marker), { code: "ENOENT" });
+  const iterator = askStream("hello", { bin });
+  await iterator.return();
+  assert.throws(() => readFileSync(marker), { code: "ENOENT" });
+});
+
+test("askStream reports a missing script interpreter as binary-not-found", async () => {
+  const bin = join(first.directory, "rune-stream-no-interpreter");
+  writeFileSync(bin, "#!/no/such/interpreter\n", { mode: 0o755 });
+  await assert.rejects(collectEvents(askStream("hello", { bin })), RuneBinaryNotFoundError);
+});
+
+test("askStream cancels a pending pull and bounds a silent child with a timeout", { timeout: 10_000 }, async () => {
+  const bin = streamFixture("rune-stream-silent", `emit({ type: "start" }); setInterval(() => {}, 1000);`);
+  const controller = new AbortController();
+  const stream = askStream("hello", { bin, signal: controller.signal });
+  assert.equal((await stream.next()).value.type, "start");
+  const pending = stream.next();
+  controller.abort();
+  await assert.rejects(pending, { code: "ABORTED" });
+  await assert.rejects(collectEvents(askStream("hello", { bin, timeoutMs: 300 })), { code: "TIMEOUT" });
+});
+
+test("askStream return cancels a pending pull from a silent child", { timeout: 10_000 }, async () => {
+  const bin = streamFixture("rune-stream-pending-return", `emit({ type: "start" }); setInterval(() => {}, 1000);`);
+  const stream = askStream("hello", { bin });
+  assert.equal((await stream.next()).value.type, "start");
+  const pending = assert.rejects(stream.next(), { code: "ABORTED" });
+  assert.deepEqual(await stream.return(), { value: undefined, done: true });
+  await pending;
+});
+
+test("askStream honors abort before consuming buffered records from an exited child", async () => {
+  const bin = streamFixture("rune-stream-buffered-abort", `
+    emit({ type: "start" });
+    emit({ type: "text_delta", step: 1, delta: "buffered" });
+    emit({ type: "final", result });
+  `);
+  const controller = new AbortController();
+  const stream = askStream("hello", { bin, signal: controller.signal });
+  assert.equal((await stream.next()).value.type, "start");
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  controller.abort();
+  await assert.rejects(stream.next(), { code: "ABORTED" });
+});
+
+test("askStream applies backpressure to a stalled consumer and kills the child on loop break", { timeout: 10_000 }, async () => {
+  const progress = join(first.directory, "stream-progress");
+  const pidFile = join(first.directory, "stream-pid");
+  const bin = streamFixture("rune-stream-backpressure", `
+    const { writeFileSync } = require("node:fs");
+    writeFileSync(${JSON.stringify(pidFile)}, String(process.pid));
+    emit({ type: "start" });
+    const line = JSON.stringify({ type: "text_delta", step: 1, delta: "x".repeat(4000) }) + "\\n";
+    (async () => {
+      for (let count = 1; count <= 10000; count++) {
+        await new Promise((resolve) => process.stdout.write(line, resolve));
+        writeFileSync(${JSON.stringify(progress)}, String(count));
+      }
+      emit({ type: "final", result });
+    })();
+  `);
+  let countBefore;
+  for await (const event of askStream("hello", { bin, maxOutputBytes: 64 * 1024 * 1024 })) {
+    assert.equal(event.type, "start");
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    countBefore = Number(readFileSync(progress, "utf8"));
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    assert.equal(Number(readFileSync(progress, "utf8")), countBefore, "producer must stop when the iterator stops pulling");
+    assert.ok(countBefore > 0 && countBefore < 512, `unexpected buffered records: ${countBefore}`);
+    break;
+  }
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  assert.equal(Number(readFileSync(progress, "utf8")), countBefore, "loop break must stop the producer");
+  assert.throws(() => process.kill(Number(readFileSync(pidFile, "utf8")), 0), { code: "ESRCH" });
+});
+
+test("askStream aborts while suspended at yield and escalates for a child ignoring SIGTERM", { timeout: 10_000 }, async () => {
+  const bin = streamFixture("rune-stream-ignore-term", `
+    process.on("SIGTERM", () => {});
+    emit({ type: "start" });
+    setInterval(() => {}, 1000);
+  `);
+  const originalSpawn = childProcess.spawn;
+  let child;
+  const kills = [];
+  childProcess.spawn = (...args) => {
+    child = originalSpawn(...args);
+    const originalKill = child.kill.bind(child);
+    child.kill = (signal) => { kills.push(signal ?? "SIGTERM"); return originalKill(signal); };
+    return child;
+  };
+  syncBuiltinESMExports();
+  try {
+    const controller = new AbortController();
+    const stream = askStream("hello", { bin, signal: controller.signal });
+    assert.equal((await stream.next()).value.type, "start");
+    const exited = new Promise((resolve) => child.once("exit", resolve));
+    controller.abort();
+    await exited; // No next() call is needed to kill the process.
+    assert.deepEqual(kills, ["SIGTERM", "SIGKILL"]);
+    await assert.rejects(stream.next(), { code: "ABORTED" });
+  } finally {
+    childProcess.spawn = originalSpawn;
+    syncBuiltinESMExports();
+  }
 });

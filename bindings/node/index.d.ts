@@ -20,8 +20,8 @@ export type RuneEffort =
  *
  * - `BINARY_NOT_FOUND`: no executable through the option, `RUNE_BIN`, or `PATH`.
  * - `EXIT`: the binary exited non-zero.
- * - `OUTPUT`: the binary exited cleanly without printing a valid result object.
- * - `OUTPUT_LIMIT`: combined stdout and stderr exceeded `maxOutputBytes`.
+ * - `OUTPUT`: invalid result output or a malformed JSONL stream.
+ * - `OUTPUT_LIMIT`: combined output exceeded `maxOutputBytes` or a record exceeded `maxEventBytes`.
  * - `TIMEOUT`: the process was killed after `timeoutMs`.
  * - `ABORTED`: the caller aborted through `signal`.
  * - `SIGNALED`: the process was terminated by another signal.
@@ -112,6 +112,27 @@ export interface AskOptions {
   signal?: AbortSignal;
 }
 
+/** Options for the pull-based JSONL event iterator. */
+export interface AskStreamOptions extends AskOptions {
+  /** Per-record byte cap including newline; positive integer at most 1048576, the default. */
+  maxEventBytes?: number;
+}
+
+/** Wire events emitted by `rune ask --jsonl`. */
+export type AskEvent =
+  | { type: "start" }
+  | { type: "step_start" | "step_restart"; step: number }
+  | { type: "text_delta"; step: number; delta: string }
+  | {
+      type: "plan_updated";
+      update: {
+        version: number;
+        explanation: string | null;
+        plan: { step: string; status: "pending" | "in_progress" | "completed" }[];
+      };
+    }
+  | { type: "final"; result: AskResult };
+
 /** Base class for every failure the binding reports. */
 export class RuneError extends Error {
   constructor(code: RuneErrorCode, message: string, options?: { cause?: unknown });
@@ -137,22 +158,24 @@ export class RuneExitError extends RuneError {
   stderr: string;
 }
 
-/** The binary exited cleanly without printing a valid result object. */
+/** Invalid result output or a malformed JSONL stream. */
 export class RuneOutputError extends RuneError {
-  constructor(stdout: string, stderr: string, detail?: string | null);
-  /** Everything the process wrote to standard output. */
+  constructor(stdout: string, stderr: string, detail?: string | null, format?: "result" | "jsonl");
+  /** Captured standard output, or the offending JSONL record for streaming errors. */
   stdout: string;
   /** Everything the process wrote to standard error. */
   stderr: string;
 }
 
-/** Combined stdout and stderr exceeded the capture budget; the process is killed. */
+/** Combined output or one streaming record exceeded its byte budget; the process is killed. */
 export class RuneOutputLimitError extends RuneError {
-  constructor(maxOutputBytes: number, stream: "stdout" | "stderr");
-  /** Configured combined byte cap. */
+  constructor(maxOutputBytes: number, stream: "stdout" | "stderr", scope?: "combined" | "record");
+  /** Configured byte cap for the indicated scope. */
   maxOutputBytes: number;
   /** The stream whose next chunk exceeded the cap. */
   stream: "stdout" | "stderr";
+  /** Whether the cap applies to total output or one JSONL record. */
+  scope: "combined" | "record";
 }
 
 /**
@@ -178,3 +201,13 @@ export function resolveBinary(options?: { bin?: string; cwd?: string }): string;
  * @throws {RuneError} With code `TIMEOUT`, `ABORTED`, or `SIGNALED`.
  */
 export function ask(prompt: string, options?: AskOptions): Promise<AskResult>;
+
+/**
+ * Starts the process on first next() and yields events as the caller pulls them.
+ * Successful completion yields a validated final result after process exit.
+ * Failures throw the same errors as ask(); a failed final is in RuneExitError.result.
+ * A malformed or incomplete JSONL stream throws RuneOutputError.
+ * Total stdout/stderr bytes are capped by maxOutputBytes; each record is capped
+ * by maxEventBytes. Early return or a for-await loop break kills the child.
+ */
+export function askStream(prompt: string, options?: AskStreamOptions): AsyncGenerator<AskEvent, void, unknown>;

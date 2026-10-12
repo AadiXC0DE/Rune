@@ -6,6 +6,11 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Added
 
+- Node `askStream` exposes ask JSONL events through a pull-based async iterator,
+  including incremental text and a validated final result. Record and combined
+  output byte caps bound buffering; abort, timeout, and early iterator exit stop
+  the subprocess, with SIGKILL after a two-second grace if needed.
+
 - Rust SDK `Agent::diagnostics` exposes effective SDK limits, their configuration
   layers and host/default origins, dialect capabilities and input provenance.
   The serializable snapshot makes no network requests and excludes credentials,
