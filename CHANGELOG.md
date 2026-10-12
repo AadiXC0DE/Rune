@@ -6,6 +6,13 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Added
 
+- macOS release staging supports certificate-pinned signing with hardened runtime
+  and a secure timestamp. Signed manifests publish the identity, and
+  `cargo xtask verify-release <manifest-path> <certificate SHA-1>` checks the
+  archived signature and rejects tampered code even with recomputed checksums.
+  A manual macOS workflow imports signing credentials into a temporary keychain
+  and uploads verified signed artifacts.
+
 - Release manifests publish the target's uncompressed executable size and hash,
   raw startup samples and distribution statistics, measurement host and method.
   `cargo xtask benchmark <executable-path>` repeats the method on an extracted

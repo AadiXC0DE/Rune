@@ -8,6 +8,8 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
+mod macos;
+
 /// Serial runs per measurement, used for the minimum, median and p95.
 const MEASUREMENT_SAMPLES: usize = 31;
 
@@ -51,6 +53,7 @@ fn main() -> ExitCode {
         "budget" => budget(),
         "gate" => gate(),
         "release" => release(&extra),
+        "verify-release" => macos::verify_release(&extra),
         "benchmark" => benchmark(&extra),
         "web" => web(),
         "help" | "--help" | "-h" => {
@@ -87,9 +90,15 @@ fn print_help() {
     println!("  gate     format, lint, budget, and the full workspace test suite");
     println!("  release  stage a release artifact, its checksum, and a manifest");
     println!("  benchmark  print raw size and startup JSON for an existing executable");
+    println!("  verify-release  check a signed macOS archive against a trusted identity");
     println!("  web      build the harness for the landing page into site/demo/rune.wasm");
     println!();
-    println!("  release takes: cargo xtask release <channel> [version] [target]");
+    println!(
+        "  release takes: cargo xtask release <channel> [version] [target] [--sign-identity <certificate SHA-1>]"
+    );
+    println!(
+        "  verify-release takes: cargo xtask verify-release <manifest-path> <certificate SHA-1>"
+    );
     println!("  benchmark takes: cargo xtask benchmark <executable-path>");
     println!();
     print_budget_help();
@@ -231,6 +240,7 @@ fn target_directory() -> PathBuf {
 /// measurements require a runner that can execute the resulting artifact. The
 /// artifact is named after the target, with a checksum and a measured manifest.
 fn release(extra: &[String]) -> Result<(), String> {
+    let (extra, signing_identity) = macos::release_args(extra)?;
     let channel = extra.first().map_or("dev", String::as_str);
     let version = match extra.get(1) {
         Some(value) => value.clone(),
@@ -244,6 +254,9 @@ fn release(extra: &[String]) -> Result<(), String> {
         .cloned()
         .unwrap_or_else(|| env!("TARGET").to_owned());
     let directory = format!("target/dist/rune-{target}");
+    if signing_identity.is_some() && !target.ends_with("-apple-darwin") {
+        return Err("--sign-identity requires a macOS release target".to_owned());
+    }
 
     if target == env!("TARGET") {
         cargo(&["build", "--release", "--locked", "-p", "rune"])?;
@@ -260,6 +273,10 @@ fn release(extra: &[String]) -> Result<(), String> {
     }
 
     let binary = binary_path(&target);
+    let signature = signing_identity
+        .as_deref()
+        .map(|identity| macos::sign(&binary, identity))
+        .transpose()?;
     let name = executable_name(&target);
     let archive = format!("rune-{version}-{target}.tar.gz");
     let archive_path = format!("{directory}/{archive}");
@@ -281,7 +298,12 @@ fn release(extra: &[String]) -> Result<(), String> {
     // the other rejects, and an unpinned timestamp makes two runs over identical
     // input produce different archives. Writing it means the bytes depend on the
     // binary alone.
-    std::fs::write(&archive_path, archive_bytes(&name, &binary_bytes)?)
+    let packed = archive_bytes(&name, &binary_bytes)?;
+    if let Some(signature) = &signature {
+        // Check an extracted copy of the archive, not just the build output.
+        macos::verify_archive(&packed, signature, &measurements["binary"])?;
+    }
+    std::fs::write(&archive_path, &packed)
         .map_err(|err| format!("could not write {archive_path}: {err}"))?;
 
     let bytes = std::fs::read(&archive_path)
@@ -292,7 +314,7 @@ fn release(extra: &[String]) -> Result<(), String> {
     // publish a digest that does not describe the file.
     let reread = std::fs::read(&archive_path)
         .map_err(|err| format!("could not re-read {archive_path}: {err}"))?;
-    if digest(&reread) != checksum {
+    if digest(&reread) != checksum || (signature.is_some() && reread != packed) {
         return Err(format!("{archive_path} changed while it was being staged"));
     }
 
@@ -300,7 +322,7 @@ fn release(extra: &[String]) -> Result<(), String> {
         &format!("{directory}/{archive}.sha256"),
         &format!("{checksum}  {archive}\n"),
     )?;
-    let manifest = serde_json::json!({
+    let mut manifest = serde_json::json!({
         "name": "rune",
         "version": version,
         "channel": channel,
@@ -311,6 +333,9 @@ fn release(extra: &[String]) -> Result<(), String> {
         "binary": measurements["binary"],
         "startup": measurements["startup"],
     });
+    if let Some(signature) = signature {
+        manifest["signature"] = signature;
+    }
     let mut manifest_json = serde_json::to_string_pretty(&manifest)
         .map_err(|err| format!("could not serialize the release manifest: {err}"))?;
     manifest_json.push('\n');

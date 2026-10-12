@@ -1024,6 +1024,46 @@ on Linux, macOS and Windows and uploads each archive, checksum and manifest
 together. Benchmark timings can vary between runs; binary and archive hashes
 remain the reproducibility checks.
 
+For a signed macOS release, install a code-signing certificate and its private
+key in the runner's keychain, then use its 40-digit SHA-1 certificate fingerprint
+(from `security find-identity -v -p codesigning`):
+
+```sh
+cargo xtask release stable --sign-identity "$MACOS_SIGNING_IDENTITY"
+cargo xtask verify-release target/dist/rune-*/manifest.json "$MACOS_SIGNING_IDENTITY"
+```
+
+Signing uses `codesign` with hardened runtime and a secure timestamp before
+measurements, hashing and archiving. Staging verifies an extracted copy before
+publishing it. The manifest's `signature` publishes the certificate fingerprint,
+format and code identifier. `verify-release` requires an independently trusted
+publisher fingerprint, checks the archive and executable hashes, and verifies
+the actual signature against that certificate and Rune's identifier. Recomputed
+checksums cannot make altered signed code pass. Verification needs macOS and
+never executes the extracted code. SHA-1 identifies the certificate in Apple's
+requirement language; artifact checksums remain SHA-256. Certificate rotation
+requires publishing and trusting the new fingerprint.
+
+The manual `signed macOS release` workflow requires the repository variable
+`MACOS_SIGNING_IDENTITY`, the base64 PKCS#12 secret
+`MACOS_SIGNING_CERTIFICATE_P12`, and secret `MACOS_SIGNING_CERTIFICATE_PASSWORD`.
+Use a Developer ID Application certificate for distribution. The workflow
+imports it into a temporary keychain, stages and verifies the signed archive,
+and uploads the archive, checksum and manifest together. Ordinary development
+CI archives remain unsigned. Missing credentials or failed verification prevent
+signed artifact upload. The workflow runs the native certificate and tampering
+acceptance test with its release identity. To run that test on a configured Mac:
+
+```sh
+RUNE_SIGNING_IDENTITY="$MACOS_SIGNING_IDENTITY" cargo test -p xtask --test macos_signing -- --include-ignored
+```
+
+The credential-dependent test is ignored in the ordinary workspace suite; the
+portable packaging tests run without credentials. This signs the executable;
+it does not notarize releases
+or claim Gatekeeper acceptance. Timestamped signatures can differ between runs;
+reproducibility comparisons use unsigned builds.
+
 The reproducible CI job builds the same source with two fresh scratch
 `CARGO_TARGET_DIR` directories, extracts each release, and compares SHA-256
 hashes of both the binaries and archives. Run this check on Linux from a
