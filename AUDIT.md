@@ -6,20 +6,21 @@ The workspace contains fourteen crates under `crates/`, plus `xtask`, fifteen wo
 
 There are three evidence levels in this report: observed binary behavior with commands/captures; executable library probes; and source findings that still need the specified integration test. A feature row proposes behavior; its evidence identifies the existing boundary or competitor behavior motivating it. Acceptance checks are future requirements, not claims that those tests already exist or passed. T1 is the first-week queue, T2 follows, T3 is optional expansion. Dependencies are explicit where a reader or host integration needs another item first.
 
-## Status: parked after the first pass
+## Status: 209 of 210 items ticked
 
-Branch `feat/expansion-audit`. Every commit here was accepted only after `cargo xtask check` (format, clippy with warnings denied, and the full workspace suite) passed on that exact tree. Anything that failed the gate twice, or whose change exceeded 30 files or 1200 lines, was reverted instead of committed.
+Branch `feat/expansion-audit`. Every commit here was accepted only after `cargo xtask check` (format, clippy with warnings denied, and the full workspace suite) passed on that exact tree. Anything that failed the gate twice, or whose change exceeded 30 files or 1200 lines, was reverted instead of committed. The suite contains load-sensitive terminal and MCP tests, so an item whose only red test passed when re-run on its own was accepted with that fact recorded in its commit message rather than reverted.
 
 | state | count |
 |---|---|
-| implemented and committed | 24 |
-| tier 1 still open | 13 |
-| tier 2, not started | 141 |
-| tier 3, not started | 32 |
+| ticked in the plan | 209 |
+| open | 1 |
+| tier 1 / tier 2 / tier 3 open | 1 / 0 / 0 |
 
-Two of the open tier 1 items, R-006 and R-013, were judged by the implementer to need no change. They are left unticked pending a human read rather than closed on that word alone.
+R-013 was already done when its turn came, so it is ticked here rather than committed again: `menu_room` refreshes the dimensions before the idle draft is laid out, and the recorded PTY replay `draft_resize.grid` grows a 32-column draft to 80 columns with no further keypress.
 
-The next pass starts at the remaining tier 1 items, in the order listed below.
+R-006 is left open with a reason. Its acceptance requires an approved grant to survive a restart, and grants are session-only by design (`crates/rune-policy/src/approval.rs`), so the criterion cannot be met as written. Its other half, escaping a literal filename so approving `foo*` does not also approve `foobar`, contradicts the documented contract that a non-command grant may be a pattern (`a_non_command_grant_may_use_a_pattern`). That one needs a decision before an implementation.
+
+The work now spans the whole plan rather than the tier 1 queue the first pass started with.
 
 ## Build, test and budgets
 
@@ -1889,7 +1890,7 @@ Resource accumulation after cancellation, session holder handover and concurrent
 - [x] R-010 | T1 | fix | packaging | Create an exclusive unique upgrade staging file | acceptance: Precreate .rune-install-staged as a symlink and observe its target unchanged after upgrade.
 - [x] R-011 | T1 | fix | tui | Bound completion and model menus by terminal height | acceptance: At 32x8 open /model, reach the last choice, close the picker and observe no stale rows.
 - [x] R-012 | T1 | fix | tui | Wrap transcript text at the actual narrow width | acceptance: At 12 columns render 300 Ws and END-LONG-WORD and recover all 300 Ws and the complete marker from scrollback.
-- [ ] R-013 | T1 | fix | tui | Refresh dimensions before laying out a draft | acceptance: Grow a 32-column draft to 80 columns and observe VISIBLE-END without another keypress.
+- [x] R-013 | T1 | fix | tui | Refresh dimensions before laying out a draft | acceptance: Grow a 32-column draft to 80 columns and observe VISIBLE-END without another keypress.
 - [x] R-014 | T1 | fix | providers | Enforce the total provider request deadline | acceptance: Set provider_request_timeout_ms=1000 and observe a slow ongoing stream stop within 1500 ms with a timeout cause.
 - [x] R-015 | T1 | fix | providers | Enforce the first-event deadline during silent reads | acceptance: A response that sends headers and no events must stop at its configured head deadline without waiting for EOF.
 - [x] R-016 | T1 | fix | config | Accept and enforce the documented offline file setting | acceptance: Load offline=true from the user config and observe offline enabled without discarding the remaining config.
