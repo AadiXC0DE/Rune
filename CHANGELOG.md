@@ -6,6 +6,11 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Added
 
+- `rune usage export` writes retained usage records as stable, versioned JSONL,
+  with an optional `--period` filter. Main, permission review, and vision usage
+  keep their recorded model, timestamp, request counts, and reported values;
+  missing measurements stay absent and cost strings retain their precision.
+
 - `rune session fork <last|id> --at <seq>` creates an independently resumable
   saved branch through an inclusive event boundary, with recorded provenance.
   Unanswered tool calls and partial result groups are refused; the original

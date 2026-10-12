@@ -1060,8 +1060,32 @@ fn run_session_fork(
     Ok(ExitCode::from(EXIT_OK))
 }
 
-/// Reports token usage over a period.
+/// Reports token usage over a period or exports the retained ledger as JSONL.
 fn run_usage(paths: &Paths, launch: &Launch, output: &OutputFlags) -> Result<ExitCode> {
+    if launch.args.first().map(String::as_str) == Some("export") {
+        if launch.args.len() != 1 {
+            return Err(RuneError::invalid_field(
+                "usage export",
+                "use `rune usage export [--period <24h|7d|30d>]`",
+            ));
+        }
+        let period = launch
+            .flag("--period")
+            .map(str::parse::<Period>)
+            .transpose()?;
+        let mut read = Ledger::from_paths(paths).read()?;
+        if let Some(period) = period {
+            let now = now_ms();
+            let since = now.saturating_sub(period.duration_ms());
+            read.records
+                .retain(|record| record.created_at_ms >= since && record.created_at_ms <= now);
+        }
+        if read.tail_incomplete {
+            eprintln!("omitted incomplete usage ledger tail");
+        }
+        read.export_jsonl(std::io::stdout().lock())?;
+        return Ok(ExitCode::from(EXIT_OK));
+    }
     let period = period_from(
         launch
             .flag("--period")

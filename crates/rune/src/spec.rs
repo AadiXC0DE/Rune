@@ -337,11 +337,18 @@ pub const SESSIONS: &[CommandSpec] = &[
             "cost",
             "Same as `rune usage`; reports token usage recorded on this machine.",
         )],
-        summary: "Report token usage recorded on this machine",
-        usage: "rune usage [--period <24h|7d|30d>] [--json]",
+        summary: "Report or export token usage recorded on this machine",
+        usage: "rune usage [--period <24h|7d|30d>] [--json] | rune usage export [--period <24h|7d|30d>]",
         flags: &[
-            option("--period", "span", "One of 24h, 7d, or 30d."),
-            flag("--json", "Emit JSON."),
+            option(
+                "--period",
+                "span",
+                "One of 24h, 7d, or 30d. Export defaults to all retained records.",
+            ),
+            flag(
+                "--json",
+                "Emit JSON. Export always emits ordered JSONL usage records.",
+            ),
         ],
         requirements: Requirements::CONFIG,
         supports_json: true,

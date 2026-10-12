@@ -442,6 +442,17 @@ Credentials, metadata, and transport headers are excluded. Recorded message
 and tool content is preserved verbatim. An incomplete final frame is omitted
 with a warning on stderr; other log corruption fails the export.
 
+`rune usage export` writes the global usage ledger to stdout as versioned JSONL,
+one retained record per line in ledger order. `--period <24h|7d|30d>` selects
+the same inclusive time window as the usage report; without it all retained
+records are exported. Each line uses `schema_version: 1`, `created_at_ms`,
+`model`, `helper` (`main`, `permission_review`, or `vision`), and `request_count`.
+Reported token counts and the exact `total_cost` string are included; unreported
+values stay absent and reported zeroes stay zero. No session or provider
+dimensions are inferred. An incomplete ledger tail is omitted with a warning
+on stderr; other ledger corruption fails before writing any records. Export
+does not rewrite or lock the ledger. `rune usage --json` remains a summary.
+
 `rune session fork <last|id> --at <seq>` creates an independent saved branch
 through the selected event, inclusive. Use sequence positions from `session
 export` or `session --search`, rather than tree turn numbers. `--id <id>` also

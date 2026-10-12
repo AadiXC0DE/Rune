@@ -106,9 +106,9 @@ Show the branch structure of a session
 |---|---|
 | `--id <id>` | Show the tree of this exact session identifier, taking precedence over a positional selector. |
 | `--json` | Emit JSON. |
-### `rune usage [--period <24h|7d|30d>] [--json]`
+### `rune usage [--period <24h|7d|30d>] [--json] | rune usage export [--period <24h|7d|30d>]`
 
-Report token usage recorded on this machine
+Report or export token usage recorded on this machine
 
 Aliases:
 
@@ -116,8 +116,8 @@ Aliases:
 
 | Flag | Description |
 |---|---|
-| `--period <span>` | One of 24h, 7d, or 30d. |
-| `--json` | Emit JSON. |
+| `--period <span>` | One of 24h, 7d, or 30d. Export defaults to all retained records. |
+| `--json` | Emit JSON. Export always emits ordered JSONL usage records. |
 
 ## Account and configuration
 
