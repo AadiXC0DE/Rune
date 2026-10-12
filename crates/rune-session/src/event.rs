@@ -142,6 +142,11 @@ pub enum SessionEvent {
         /// Objective text, retained independently of conversation compaction.
         objective: String,
     },
+    /// The user explicitly pinned a constraint for subsequent provider requests.
+    ConstraintPinned {
+        /// Exact text, independent of conversation compaction.
+        text: String,
+    },
     /// The model settings for subsequent turns were saved.
     ModelSet {
         /// Selected model identifier.
@@ -189,6 +194,7 @@ impl SessionEvent {
             Self::UsageRecorded { .. } => "usage_recorded",
             Self::TitleSet { .. } => "title_set",
             Self::ObjectiveSet { .. } => "objective_set",
+            Self::ConstraintPinned { .. } => "constraint_pinned",
             Self::ModelSet { .. } => "model_set",
             Self::WorkspaceSet { .. } => "workspace_set",
             Self::ChildOf { .. } => "child_of",

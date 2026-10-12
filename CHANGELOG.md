@@ -6,6 +6,11 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Added
 
+- `/pin <constraint>` and Rust SDK `Agent::pin_constraint` keep explicit user
+  constraints verbatim in subsequent provider requests across repeated
+  compaction and session or checkpoint restoration. `/pin` lists current pins;
+  `/new` starts without them. Pins count toward request capacity.
+
 - Rust workspaces receive a bounded repository symbol map with declaration and
   lexical reference locations, refreshed before model requests after edits.
   Ignore rules exclude files; scan and output caps mark incomplete maps.

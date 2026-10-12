@@ -771,10 +771,33 @@ impl Agent {
         self.closed
     }
 
+    /// Pins an explicit user constraint verbatim in every subsequent request.
+    ///
+    /// Pins survive compaction and checkpoint restoration. Exact duplicates
+    /// return false. Empty constraints, closed agents, running turns, and pins
+    /// exceeding the checkpoint's `PromptHistoryBytes` bound are refused
+    /// without changing the conversation.
+    pub fn pin_constraint(&mut self, text: impl Into<String>) -> Result<bool> {
+        if self.closed || self.claim.load(Ordering::SeqCst) {
+            return Err(RuneError::new(
+                ErrorCode::InvalidState,
+                "pinning requires an open agent at a settled turn boundary",
+            ));
+        }
+        let mut history = lock(&self.conversation.history).clone();
+        let added = history.pin_constraint(text)?;
+        if added {
+            self.serialize_checkpoint(history.clone())?;
+            *lock(&self.conversation.history) = history;
+        }
+        Ok(added)
+    }
+
     /// Summarizes an older prefix of the conversation at a settled turn boundary.
     ///
     /// The synchronous host callback receives summary instructions and only the
-    /// prefix being removed, including tool activity. It must return a complete
+    /// prefix being removed, including tool activity, plus explicit pinned user
+    /// constraints kept independently of its output. It must return a complete
     /// summary or an error, including when its work is cancelled or truncated.
     /// No provider request is made by the SDK itself.
     ///

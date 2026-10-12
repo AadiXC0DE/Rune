@@ -9,6 +9,8 @@
 //!   assistant turn otherwise.
 //! - A failed or cancelled compaction leaves the history exactly as it was, so
 //!   a summary is never partially installed.
+//! - Explicitly pinned user constraints live outside the turn list. They are
+//!   sent verbatim with subsequent requests regardless of what the summary says.
 
 use std::fmt::Write as _;
 
@@ -113,12 +115,20 @@ pub fn recent_target_turns(limits: &BudgetSet) -> usize {
 
 /// Renders the request sent to the summarizer.
 ///
-/// Contains only the turns being removed, so the summarizer cannot see and then
-/// paraphrase content that is being retained.
+/// Contains the turns being removed and the separately pinned user constraints.
+/// Retained turns are excluded; pins remain independent of the returned summary.
 #[must_use]
 pub fn render_summary_request(history: &History, plan: &Plan) -> String {
     let mut out = String::new();
     out.push_str(SUMMARY_INSTRUCTIONS);
+    if !history.pinned_constraints().is_empty() {
+        out.push_str("\n\n<pinned_user_constraints>\nThese user constraints remain active and will be carried forward verbatim, independently of your summary.\n");
+        for text in history.pinned_constraints() {
+            out.push_str(text);
+            out.push('\n');
+        }
+        out.push_str("</pinned_user_constraints>");
+    }
     out.push_str("\n\n<conversation>\n");
     for turn in history.turns() {
         if turn.seq >= plan.cut_at {
@@ -561,6 +571,58 @@ mod tests {
         let target = recent_target_turns(&limits);
         assert!(target >= 2, "target was {target}");
         assert!(target <= 16, "target was {target}");
+    }
+
+    #[test]
+    fn pinned_constraints_survive_repeated_compaction_without_summary_help() {
+        let constraints = [
+            "Do not add dependencies.",
+            "Keep café and 日本語 text unchanged.\nPreserve \\\"quotes\\\".",
+            "  Never commit, push, or stash.  ",
+        ];
+        let mut history = long_history();
+        assert!(
+            history.pinned_constraints().is_empty(),
+            "ordinary user and tool content is not pinned"
+        );
+        for text in constraints {
+            assert!(history.pin_constraint(text).expect("pin"));
+            assert!(!history.pin_constraint(text).expect("duplicate"));
+        }
+        assert!(history.pin_constraint(" \n ").is_err());
+        for _ in 0..3 {
+            let plan = plan(&history, &BudgetSet::new()).expect("plan");
+            let request = render_summary_request(&history, &plan);
+            for text in constraints {
+                assert!(
+                    request.contains(text),
+                    "summarizer also receives exact pins"
+                );
+            }
+            apply(
+                &mut history,
+                &plan,
+                "A summary that omits every user constraint.",
+            );
+            history.validate().expect("valid history");
+            let messages = history.to_messages();
+            let pinned = messages.first().expect("pins");
+            assert_eq!(pinned.role, Role::User);
+            for text in constraints {
+                assert!(pinned.parts.iter().any(|part| part.as_text() == Some(text)));
+            }
+            for index in 0..6 {
+                history.push_user(format!("new question {index}"));
+                history.push_assistant(vec![ContentPart::Text {
+                    text: "new answer".to_owned(),
+                }]);
+            }
+        }
+        let json = serde_json::to_vec(&history).expect("serialize");
+        let restored: History = serde_json::from_slice(&json).expect("restore");
+        assert_eq!(restored.pinned_constraints(), constraints);
+        assert_eq!(restored.branch_at(1).pinned_constraints(), constraints);
+        assert!(History::new().pinned_constraints().is_empty());
     }
 
     #[test]

@@ -480,6 +480,13 @@ cut as `/compact`, keeps tool calls with their results, and works offline withou
 a model request or history changes. Retained counts exclude the new summary that
 `/compact` would insert. A short conversation reports zero records to summarize.
 
+Use `/pin <constraint>` to retain an explicit user constraint verbatim in every
+following model request, including after repeated manual or automatic compaction
+and session restart. `/pin` lists the current pins. Exact duplicates are ignored;
+ordinary prompts, assistant responses, and tool results are never pinned
+automatically. Pins remain user content and count toward request capacity.
+`/new` starts a conversation without the previous pins.
+
 Run `rune help` for everything, or see [COMMANDS.md](COMMANDS.md) for the full
 reference.
 
@@ -624,7 +631,8 @@ host supplies the credential, the tools, and the network path.
 
 At a settled turn boundary, `Agent::compact(|request| summarizer(request))`
 explicitly summarizes an older conversation prefix. The host callback receives
-summary instructions and the removed records, including tool activity, and
+summary instructions, the removed records including tool activity, and explicit
+pinned user constraints kept independently of its output. The callback
 returns `Result<String>` containing a complete summary. Report cancellation or
 truncation as an error. The synchronous operation returns the removed record
 count, or zero without calling the host for a short conversation. It retains
@@ -632,6 +640,12 @@ recent tool calls with their results, signed provider replay data, and accumulat
 usage. Errors and unusable or oversized summaries leave the conversation intact.
 Closed agents and running turns refuse compaction. Compacted checkpoints restore
 through the existing checkpoint API and obey the same `PromptHistoryBytes` cap.
+
+`Agent::pin_constraint(text)` pins an explicit user constraint without changing
+its text. It returns true for a new pin and false for an exact duplicate. Pins
+survive compaction and checkpoint restoration and appear as user content in each
+provider request. Empty pins, running turns, closed agents, and additions that
+exceed `PromptHistoryBytes` are refused without changing the conversation.
 
 SDK turns retain at most 1,024 unread events (`EVENT_QUEUE_CAPACITY`). Consume
 `Turn::events()` or `Turn::next_event()` while a long response runs. If the

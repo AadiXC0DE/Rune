@@ -142,8 +142,8 @@ with tempfile.TemporaryDirectory(prefix="rune-terminal-menu-") as directory:
             capture("custom-expanded", b"\r", "/audit-command expanded; edit before sending")
             os.write(master, b"\x15")
         else:
-            # Fourteen builtins, including commands beyond the first window.
-            capture("completion-last", b"/" + b"\x1b[B" * 13, "> /quit")
+            # Fifteen builtins, including /pin and commands beyond the first window.
+            capture("completion-last", b"/" + b"\x1b[B" * 14, "> /quit")
             capture("completion-closed", b"\x1b", "\x1b[?25h")
             capture("model-last", b"/model\r" + b"\x1b[B" * 14, "> menu-model-15")
             capture("model-closed", b"\x1b", "\x1b[?25h")

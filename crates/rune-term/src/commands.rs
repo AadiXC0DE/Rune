@@ -48,6 +48,11 @@ pub const BUILTINS: &[Builtin] = &[
         summary: "summarize older turns, or preview record counts without changes",
     },
     Builtin {
+        name: "pin",
+        arguments: "[constraint]",
+        summary: "pin a user constraint across compaction, or list current pins",
+    },
+    Builtin {
         name: "undo",
         arguments: "",
         summary: "put back the files the last turn changed",

@@ -435,7 +435,9 @@ impl Host for SessionHost {
         let compaction_plan = compaction::plan(history, &self.limits);
         let retained_estimate = if let Some(cut) = &compaction_plan {
             let mut retained_plan = plan.clone();
-            retained_plan.messages.drain(..cut.removed_turns);
+            let mut retained_history = history.clone();
+            retained_history.keep_from(cut.cut_at);
+            retained_plan.messages = retained_history.to_messages();
             request_estimate(self, &retained_plan)?
         } else {
             estimate
@@ -1780,6 +1782,28 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                     }
                     Handled::CompactPreview => {
                         return preview_compaction(&host, &history, sink);
+                    }
+                    Handled::Pin(constraint) => {
+                        if let Some(constraint) = constraint {
+                            let mut candidate = history.clone();
+                            if candidate.pin_constraint(&constraint)? {
+                                recorder
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                    .pin_constraint(&constraint)?;
+                                history = candidate;
+                                host.forget_context();
+                                host.estimate_context(&history)?;
+                            }
+                        }
+                        if history.pinned_constraints().is_empty() {
+                            note("no pinned constraints; usage: /pin <constraint>".to_owned());
+                        } else {
+                            note(format!(
+                                "pinned constraints:\n{}",
+                                history.pinned_constraints().join("\n")
+                            ));
+                        }
                     }
                     Handled::Rename(title) => {
                         // The input loop and stream observer share one recorder;
@@ -4377,6 +4401,8 @@ enum Handled {
     Compact,
     /// Show exact summarized and retained record counts without compacting.
     CompactPreview,
+    /// Pin an explicit user constraint, or list current pins.
+    Pin(Option<String>),
     /// Put the last reply on the terminal's clipboard.
     Copy,
     /// Start a fresh conversation in this terminal.
@@ -4573,6 +4599,9 @@ fn handle_command<W: std::io::Write>(
         }
         "compact" if arguments.trim() == "preview" => Ok(Handled::CompactPreview),
         "compact" => Ok(Handled::Compact),
+        "pin" => Ok(Handled::Pin(
+            (!arguments.trim().is_empty()).then(|| arguments.to_owned()),
+        )),
         // Read-only: the session log has no branch concept, so there is nothing
         // to fork or switch to. Reporting the shape is what can be done
         // truthfully.
@@ -7522,6 +7551,118 @@ mod tests {
             *host.transcript.lock().expect("transcript"),
             history_entries(before.turns())
         );
+    }
+
+    #[test]
+    fn pin_dispatch_preserves_exact_arguments_and_supports_listing() {
+        for arguments in ["", "  Keep café and 日本語.\nNever commit.  "] {
+            let mut output = Vec::new();
+            assert_eq!(
+                handle_command(
+                    "pin",
+                    arguments,
+                    &empty_commands(),
+                    None,
+                    Utf8Path::new("/w"),
+                    &test_info(),
+                    &mut output,
+                )
+                .expect("dispatch"),
+                Handled::Pin((!arguments.is_empty()).then(|| arguments.to_owned()))
+            );
+        }
+        assert!(rune_term::commands::find("pin").is_some());
+    }
+
+    #[test]
+    fn automatic_compaction_keeps_three_exact_pins_in_every_following_provider_request() {
+        let constraints = [
+            "Never commit.",
+            "Preserve café and 日本語.\nKeep whitespace.",
+            "  No new dependencies.  ",
+        ];
+        let (host, mut history, mut plan) = compaction_fixture();
+        for constraint in constraints {
+            history.pin_constraint(constraint).expect("pin");
+        }
+        let mut fetch = SummaryFixture::new(
+            "Earlier exchanges established progress. Continue using the retained conversation.",
+        );
+        fetch.events = Some(Arc::clone(&host.events));
+        for round in 0..3 {
+            if round > 0 {
+                for index in 0..4 {
+                    history.push_user(format!("round {round} question {index}"));
+                    history.push_assistant(vec![rune_net::message::ContentPart::Text {
+                        text: "earlier answer ".repeat(100),
+                    }]);
+                }
+                history.push_user("continue the fixture");
+            }
+            plan.messages = history.to_messages();
+            let before = fetch.requests.lock().expect("requests").len();
+            host.prepare_request(&mut history, &mut plan, &fetch)
+                .expect("automatic compaction");
+            assert_eq!(fetch.requests.lock().expect("requests").len(), before + 1);
+            for constraint in constraints {
+                let requests = fetch.requests.lock().expect("requests");
+                let messages = requests.last().expect("summary request")["messages"]
+                    .as_array()
+                    .expect("summary messages");
+                assert!(messages.iter().any(|message| {
+                    message["role"] == "user"
+                        && message["content"]
+                            .as_str()
+                            .is_some_and(|text| text.contains(constraint))
+                }));
+            }
+            assert_eq!(history.pinned_constraints(), constraints);
+            rune_net::transport::stream_completion(
+                &fetch,
+                &host.endpoint,
+                host.dialect.as_ref(),
+                &plan,
+                rune_net::transport::RequestTimeouts::from_limits(&host.limits),
+                &|| false,
+            )
+            .expect("following provider request");
+            let requests = fetch.requests.lock().expect("requests");
+            let messages = requests.last().expect("following request")["messages"]
+                .as_array()
+                .expect("messages");
+            let user_text: Vec<&str> = messages
+                .iter()
+                .filter(|message| message["role"] == "user")
+                .filter_map(|message| message["content"].as_str())
+                .collect();
+            for constraint in constraints {
+                assert!(
+                    user_text.iter().any(|text| text.contains(constraint)),
+                    "missing exact pin: {constraint}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn pins_that_exceed_retained_capacity_block_compaction_without_dropping_constraints() {
+        let (host, mut history, mut plan) = compaction_fixture();
+        history
+            .pin_constraint("exact pinned text ".repeat(2_000))
+            .expect("pin");
+        plan.messages = history.to_messages();
+        let before = history.to_messages();
+        let fetch =
+            SummaryFixture::new("An unused summary because the pins cannot fit in the window.");
+        assert_eq!(
+            host.prepare_request(&mut history, &mut plan, &fetch)
+                .expect_err("pins exceed capacity")
+                .code(),
+            ErrorCode::TooLarge
+        );
+        assert!(fetch.requests.lock().expect("requests").is_empty());
+        assert_eq!(history.to_messages(), before);
+        assert_eq!(plan.messages, before);
     }
 
     #[test]

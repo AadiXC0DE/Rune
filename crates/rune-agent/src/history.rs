@@ -118,6 +118,9 @@ impl Turn {
 pub struct History {
     /// System instructions, separate from the turn list.
     instructions: String,
+    /// Explicit user constraints, retained independently of summarized turns.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pinned_constraints: Vec<String>,
     /// Turns in order.
     turns: Vec<Turn>,
     /// Next sequence number.
@@ -136,6 +139,7 @@ impl Default for History {
     fn default() -> Self {
         Self {
             instructions: String::default(),
+            pinned_constraints: Vec::new(),
             turns: Vec::default(),
             next_seq: u64::default(),
             result_store: new_result_store(),
@@ -149,6 +153,7 @@ impl History {
     pub fn new() -> Self {
         Self {
             instructions: String::new(),
+            pinned_constraints: Vec::new(),
             turns: Vec::new(),
             next_seq: 1,
             result_store: new_result_store(),
@@ -181,6 +186,32 @@ impl History {
     #[must_use]
     pub fn instructions(&self) -> &str {
         &self.instructions
+    }
+
+    /// Pins an explicit user constraint verbatim until this conversation ends.
+    ///
+    /// Empty constraints are rejected. Exact duplicates are a no-op; returns
+    /// true when a new constraint was added. No constraints are inferred from
+    /// ordinary user messages, assistant responses, or tool results.
+    pub fn pin_constraint(&mut self, text: impl Into<String>) -> Result<bool> {
+        let text = text.into();
+        if text.trim().is_empty() {
+            return Err(RuneError::invalid_field(
+                "constraint",
+                "constraint is empty",
+            ));
+        }
+        if self.pinned_constraints.contains(&text) {
+            return Ok(false);
+        }
+        self.pinned_constraints.push(text);
+        Ok(true)
+    }
+
+    /// Returns the exact user constraints in insertion order.
+    #[must_use]
+    pub fn pinned_constraints(&self) -> &[String] {
+        &self.pinned_constraints
     }
 
     /// Returns every turn.
@@ -272,16 +303,43 @@ impl History {
     /// Projects the history into the message list a provider expects.
     ///
     /// The system lane is returned separately rather than as a message, because
-    /// every dialect places instructions in its own field.
+    /// every dialect places instructions in its own field. Pinned constraints
+    /// precede the turns as user content and are never replaced by a summary.
     pub fn to_messages(&self) -> Vec<Message> {
-        self.turns
+        let pinned = (!self.pinned_constraints.is_empty()).then(|| Message {
+            role: Role::User,
+            parts: std::iter::once(ContentPart::Text {
+                text: "Explicit user constraints (preserve verbatim across context compaction):\n"
+                    .to_owned(),
+            })
+            .chain(self.pinned_constraints.iter().cloned().flat_map(|text| {
+                [
+                    ContentPart::Text { text },
+                    ContentPart::Text {
+                        text: "\n".to_owned(),
+                    },
+                ]
+            }))
+            .collect(),
+            replay: None,
+        });
+        let mut messages: Vec<Message> = self
+            .turns
             .iter()
             .map(|turn| Message {
                 role: turn.role,
                 parts: turn.parts.clone(),
                 replay: turn.replay.clone(),
             })
-            .collect()
+            .collect();
+        if let Some(pinned) = pinned {
+            let index = messages
+                .iter()
+                .take_while(|message| message.role == Role::System)
+                .count();
+            messages.insert(index, pinned);
+        }
+        messages
     }
 
     /// Validates the ordering rules a request depends on.
@@ -292,9 +350,13 @@ impl History {
     /// Estimates the total byte size of the conversation.
     #[must_use]
     pub fn byte_len(&self) -> usize {
-        self.turns
+        let pinned_bytes = self
+            .pinned_constraints
             .iter()
-            .fold(0_usize, |total, turn| total.saturating_add(turn.byte_len()))
+            .fold(0_usize, |total, text| total.saturating_add(text.len()));
+        self.turns.iter().fold(pinned_bytes, |total, turn| {
+            total.saturating_add(turn.byte_len())
+        })
     }
 
     /// Truncates to the first `count` turns.
@@ -406,6 +468,7 @@ impl History {
         let next_seq = u64::try_from(turns.len()).unwrap_or(0).saturating_add(1);
         Self {
             instructions: self.instructions.clone(),
+            pinned_constraints: self.pinned_constraints.clone(),
             turns,
             next_seq,
             result_store: self.result_store.clone(),

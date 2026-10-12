@@ -716,6 +716,9 @@ pub fn history_from_events(frames: &[EventFrame]) -> History {
             // Model settings are metadata, not conversation boundaries. A
             // client may change them while a tool batch is still being saved.
             SessionEvent::ModelSet { .. } => {}
+            SessionEvent::ConstraintPinned { text } => {
+                let _ = history.pin_constraint(text.clone());
+            }
             SessionEvent::ToolCall {
                 call_id,
                 name,
@@ -1500,6 +1503,32 @@ mod tests {
         let history = history_from_events(&frames);
         history.validate().expect("valid");
         assert_eq!(history.turns().len(), 4);
+    }
+
+    #[test]
+    fn history_rebuild_preserves_explicit_pins_outside_turns() {
+        let text = "  Preserve café and 日本語.\nNever commit.  ";
+        let frames = vec![
+            EventFrame::new(
+                EventSeq(1),
+                0,
+                SessionEvent::ConstraintPinned {
+                    text: text.to_owned(),
+                },
+            ),
+            EventFrame::new(
+                EventSeq(2),
+                0,
+                SessionEvent::UserMessage {
+                    text: "continue".to_owned(),
+                },
+            ),
+        ];
+        let history = history_from_events(&frames);
+        assert_eq!(history.pinned_constraints(), [text]);
+        assert_eq!(history.len(), 1);
+        assert!(history.to_messages()[0].text().contains(text));
+        history.validate().expect("valid pinned history");
     }
 
     #[test]

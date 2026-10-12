@@ -194,6 +194,20 @@ impl Recorder {
         Ok(())
     }
 
+    /// Persists an explicit user constraint before the live history adopts it.
+    pub fn pin_constraint(&self, text: &str) -> Result<()> {
+        if text.trim().is_empty() {
+            return Err(RuneError::invalid_field(
+                "constraint",
+                "constraint is empty",
+            ));
+        }
+        self.append(SessionEvent::ConstraintPinned {
+            text: text.to_owned(),
+        })?;
+        Ok(())
+    }
+
     /// Starts an exchange before the provider can produce visible text.
     pub fn begin_turn(&mut self) -> Result<()> {
         if !self.active_turn {
@@ -578,6 +592,7 @@ pub fn tree_of(state: &SessionState) -> Tree {
             | SessionEvent::UsageRecorded { .. }
             | SessionEvent::TitleSet { .. }
             | SessionEvent::ObjectiveSet { .. }
+            | SessionEvent::ConstraintPinned { .. }
             | SessionEvent::ModelSet { .. }
             | SessionEvent::WorkspaceSet { .. }
             | SessionEvent::ChildOf { .. } => continue,
@@ -780,6 +795,11 @@ pub fn history_from(state: &SessionState) -> History {
 
     for frame in rune_session::replay::replay_events(&state.events) {
         match &frame.event {
+            SessionEvent::ConstraintPinned { text } => {
+                // Empty pins are refused at write time. Keep replay compatible
+                // with a hand-edited log without changing its ordinary turns.
+                let _ = history.pin_constraint(text.clone());
+            }
             SessionEvent::UserMessage { text } => {
                 flush(&mut history, &mut calls, &mut results);
                 history.push_user(text.clone());
@@ -2157,6 +2177,47 @@ mod tests {
             timestamp(1_704_164_645_000).as_deref(),
             Some("2024-01-02T03:04:05Z")
         );
+    }
+
+    #[test]
+    fn explicit_pins_survive_restart_and_compaction_events_verbatim() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let paths = paths(Utf8Path::from_path(root.path()).expect("utf8"));
+        let id = id("pinned000001");
+        let recorder = Recorder::create(&paths, &id).expect("create");
+        let constraints = [
+            "Never commit.",
+            "Preserve café and 日本語.\nKeep \"quotes\".",
+            "  No dependencies.  ",
+        ];
+        assert!(recorder.pin_constraint(" \n ").is_err());
+        recorder.user_message("an ordinary prompt").expect("prompt");
+        for text in constraints {
+            recorder.pin_constraint(text).expect("persist pin");
+        }
+        for _ in 0..3 {
+            recorder
+                .append(SessionEvent::Compaction {
+                    through: 1,
+                    summary: "A summary that omits every constraint.".to_owned(),
+                })
+                .expect("compaction event");
+        }
+        std::fs::remove_file(recorder.store.metadata_path()).expect("remove projection");
+        drop(recorder);
+        let (_, history) = load(&paths, &id).expect("restart");
+        assert_eq!(history.pinned_constraints(), constraints);
+        assert_eq!(history.len(), 1, "pins do not become summarizable turns");
+        assert_eq!(history.turns()[0].text(), "an ordinary prompt");
+        history.validate().expect("valid replay");
+        for text in constraints {
+            assert!(
+                history
+                    .to_messages()
+                    .iter()
+                    .any(|message| message.text().contains(text))
+            );
+        }
     }
 
     #[test]

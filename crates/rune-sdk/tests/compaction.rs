@@ -112,6 +112,99 @@ fn checkpoint_history(bytes: &[u8]) -> History {
 }
 
 #[test]
+fn three_pinned_constraints_reach_every_request_after_repeated_compaction_and_restore() {
+    let constraints = [
+        "Do not run git add, git commit, git push, or git stash.",
+        "Preserve café and 日本語.\nKeep \"quotes\" and \\slashes.",
+        "  Change only the requested item.  ",
+    ];
+    let fetch = Arc::new(FixtureFetch::default());
+    let mut agent = Agent::restore(options(fetch.clone()), &fixture(false)).expect("fixture");
+    for text in constraints {
+        assert!(agent.pin_constraint(text).expect("pin"));
+        assert!(!agent.pin_constraint(text).expect("duplicate"));
+    }
+    for _ in 0..3 {
+        assert!(
+            agent
+                .compact(|request| {
+                    for text in constraints {
+                        assert!(request.contains(text), "summarizer receives exact pins");
+                    }
+                    Ok(SUMMARY.to_owned())
+                })
+                .expect("compact")
+                > 0
+        );
+        let bytes = agent.checkpoint().expect("checkpoint");
+        agent = Agent::restore(options(fetch.clone()), &bytes).expect("restore pins");
+        assert_eq!(checkpoint_history(&bytes).pinned_constraints(), constraints);
+        for _ in 0..3 {
+            agent
+                .prompt("continue", PromptOptions::default())
+                .expect("turn")
+                .result()
+                .expect("result");
+            let requests = fetch.requests.lock().expect("requests");
+            let body = requests.last().expect("provider request");
+            assert_eq!(body["system"], "fixture host instructions");
+            let user_blocks: Vec<&Value> = body["messages"]
+                .as_array()
+                .expect("messages")
+                .iter()
+                .filter(|message| message["role"] == "user")
+                .flat_map(|message| message["content"].as_array().expect("blocks"))
+                .collect();
+            for text in constraints {
+                assert_eq!(
+                    user_blocks
+                        .iter()
+                        .filter(|block| block["text"] == text)
+                        .count(),
+                    1,
+                    "exact constraint missing or duplicated: {text}"
+                );
+            }
+        }
+    }
+    assert_eq!(fetch.requests.lock().expect("requests").len(), 9);
+}
+
+#[test]
+fn invalid_or_oversized_pins_leave_the_checkpoint_unchanged() {
+    let fetch = Arc::new(FixtureFetch::default());
+    let mut agent = Agent::new(options(fetch)).expect("agent");
+    let before = agent.checkpoint().expect("checkpoint");
+    assert_eq!(
+        agent.pin_constraint(" \n ").expect_err("empty pin").code(),
+        ErrorCode::InvalidField
+    );
+    let mut limits = BudgetSet::new();
+    limits
+        .set(
+            LimitName::PromptHistoryBytes,
+            Budget::Bounded(before.len() as u64),
+            Layer::User,
+        )
+        .expect("limit");
+    agent = agent.with_limits(limits);
+    assert_eq!(
+        agent
+            .pin_constraint("Retain this constraint.")
+            .expect_err("over cap")
+            .code(),
+        ErrorCode::TooLarge
+    );
+    assert_eq!(agent.checkpoint().expect("unchanged"), before);
+    agent.close().expect("close");
+    assert_eq!(
+        agent.pin_constraint("closed").expect_err("closed").code(),
+        ErrorCode::InvalidState
+    );
+    assert_eq!(agent.checkpoint().expect("unchanged"), before);
+}
+
+#[test]
 fn compact_preserves_tool_pairs_signed_replay_and_checkpoint_continuation() {
     for single_prompt in [false, true] {
         let fetch = Arc::new(FixtureFetch::default());
@@ -321,6 +414,13 @@ fn running_turns_and_closed_agents_refuse_compaction_before_calling_the_host() {
         agent
             .compact(|_| panic!("running turn"))
             .expect_err("refused")
+            .code(),
+        ErrorCode::InvalidState
+    );
+    assert_eq!(
+        agent
+            .pin_constraint("during a turn")
+            .expect_err("running turn")
             .code(),
         ErrorCode::InvalidState
     );

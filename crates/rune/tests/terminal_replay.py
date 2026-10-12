@@ -263,7 +263,7 @@ with tempfile.TemporaryDirectory(prefix="rune-r034-") as directory:
             capture("closed-grown", size=(80, 24))
             assert not prompts, prompts
         elif scenario == "completion-resize":
-            capture("completion-selected", b"/" + b"\x1b[B" * 8, "> /new")
+            capture("completion-selected", b"/" + b"\x1b[B" * 9, "> /new")
             # No key is sent on either resize. Rust checks the selected row.
             capture("completion-shrunk", size=(32, 10))
             capture("completion-grown", size=(80, 24))
@@ -271,7 +271,7 @@ with tempfile.TemporaryDirectory(prefix="rune-r034-") as directory:
             capture("completion-ignored", b"\x1bOQ")
             capture("completion-accepted", b"\t")
             # Editing must still reset the selection for the narrowed list.
-            capture("completion-edited", b"\x03/" + b"\x1b[B" * 8 + b"m", "> /model")
+            capture("completion-edited", b"\x03/" + b"\x1b[B" * 9 + b"m", "> /model")
             capture("completion-cleared", b"\x03")
             assert not prompts, prompts
         elif scenario == "code":
