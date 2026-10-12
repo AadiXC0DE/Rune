@@ -16,6 +16,8 @@ use rune_core::config::Provider;
 pub enum CredentialKind {
     /// A key the provider issues, pasted by the user.
     ApiKey,
+    /// An explicitly selected local provider, without a credential.
+    AnonymousLoopback,
 }
 
 /// One provider a user can connect.
@@ -56,6 +58,7 @@ impl KnownProvider {
     pub fn credential_label(self) -> &'static str {
         match self.credential {
             CredentialKind::ApiKey => "API key",
+            CredentialKind::AnonymousLoopback => "no credential (loopback only)",
         }
     }
 }
@@ -64,8 +67,7 @@ impl KnownProvider {
 ///
 /// Ordered with native APIs that need nothing but a key first, then the generic
 /// OpenAI-compatible dialect, which needs an endpoint, and finally the
-/// providers that are recognized by name so a configuration written by hand
-/// reads back correctly.
+/// local Ollama endpoint, which uses anonymous loopback mode.
 pub const KNOWN_PROVIDERS: &[KnownProvider] = &[
     KnownProvider {
         name: "anthropic",
@@ -121,6 +123,15 @@ pub const KNOWN_PROVIDERS: &[KnownProvider] = &[
         base_url: None,
         key_variable: Some("OPENAI_API_KEY"),
         credential: CredentialKind::ApiKey,
+        implemented: true,
+        required_headers: &[],
+    },
+    KnownProvider {
+        name: "ollama",
+        summary: "Local Ollama models, native discovery and Chat Completions requests",
+        base_url: Some("http://127.0.0.1:11434/v1"),
+        key_variable: None,
+        credential: CredentialKind::AnonymousLoopback,
         implemented: true,
         required_headers: &[],
     },

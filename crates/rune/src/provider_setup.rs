@@ -164,6 +164,11 @@ pub fn save_selection(paths: &Paths, selection: &Selection) -> Result<()> {
     if document.get("provider").and_then(toml::Value::as_str) != Some(selection.provider.as_str()) {
         document.remove("anonymous");
     }
+    if providers::lookup(&selection.provider)
+        .is_some_and(|entry| entry.credential == providers::CredentialKind::AnonymousLoopback)
+    {
+        document.insert("anonymous".to_owned(), toml::Value::Boolean(true));
+    }
     document.insert(
         "provider".to_owned(),
         toml::Value::String(selection.provider.clone()),
@@ -317,6 +322,10 @@ pub fn fetch_catalog(
 ) -> Result<Catalog> {
     let provider_name = settings.provider.to_string();
     let endpoint = configured_endpoint(settings, paths)?;
+    if provider_name == "ollama" {
+        return rune_net::ollama::fetch_catalog(&rune_net::transport::agent(), &endpoint, timeout)
+            .map_err(|err| err.to_rune_error());
+    }
 
     let dialect: Box<dyn rune_net::provider::Provider> = match settings.provider {
         Provider::Anthropic => Box::new(rune_net::anthropic::Anthropic),
@@ -463,16 +472,25 @@ pub fn render_catalog(catalog: &Catalog) -> String {
             "no models are declared for provider `{}`",
             catalog.provider
         );
+        if let Some(endpoint) = &catalog.endpoint {
+            let _ = writeln!(out, "endpoint  {endpoint}");
+        }
         let _ = writeln!(out, "the configured model is used as given");
         return out;
     }
 
     let mut out = String::new();
     let _ = writeln!(out, "{}", catalog.provider);
+    if let Some(endpoint) = &catalog.endpoint {
+        let _ = writeln!(out, "endpoint  {endpoint}");
+    }
     for model in &catalog.models {
         let _ = write!(out, "  {}", model.id);
         if let Some(window) = model.context_window {
             let _ = write!(out, "  context {window}");
+        }
+        if let Some(source) = &model.context_source {
+            let _ = write!(out, "  context source {source}");
         }
         if let Some(max) = model.max_output_tokens {
             let _ = write!(out, "  max output {max}");

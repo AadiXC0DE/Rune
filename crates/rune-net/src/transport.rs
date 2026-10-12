@@ -230,7 +230,7 @@ impl Endpoint {
     }
 
     /// Adds authentication only for credential-bearing endpoints.
-    fn authenticate(&self, request: FetchRequest) -> NetResult<FetchRequest> {
+    pub(crate) fn authenticate(&self, request: FetchRequest) -> NetResult<FetchRequest> {
         if self.auth == AuthStyle::Anonymous {
             self.validate().map_err(|err| {
                 NetError::new(FailureKind::InvalidRequest, err.message().to_owned())

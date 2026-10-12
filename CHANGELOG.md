@@ -6,6 +6,11 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Added
 
+- `rune connect ollama` imports a local endpoint without storing a credential.
+  Model discovery uses its native `/api/tags` and `/api/show` endpoints, reports
+  the endpoint and context-field provenance in terminal and JSON listings,
+  and skips remote catalogs. Requests use the existing Chat Completions dialect.
+
 - `rune connect gemini` selects Google's native Generate Content API, using
   `GEMINI_API_KEY` or `GOOGLE_API_KEY`. Streaming text, function calls and
   results, thought signatures, reported usage, and cancellation work through

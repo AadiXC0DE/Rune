@@ -638,7 +638,10 @@ fn run_connect(
         Err(_) => connect_flow::ask_endpoint(&name)?,
     };
 
-    let anonymous = settings.anonymous && settings.provider.as_str() == name;
+    let anonymous = (settings.anonymous && settings.provider.as_str() == name)
+        || rune_net::providers::lookup(&name).is_some_and(|entry| {
+            entry.credential == rune_net::providers::CredentialKind::AnonymousLoopback
+        });
     if anonymous {
         rune_net::transport::Endpoint::anonymous(&base_url)?;
     } else {

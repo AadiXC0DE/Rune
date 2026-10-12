@@ -61,6 +61,9 @@ pub struct ModelMetadata {
     /// Input capacity, when the catalog reports one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_window: Option<u64>,
+    /// Field or fallback that supplied an imported Ollama context window.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_source: Option<String>,
     /// Output ceiling, when the catalog reports one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_output_tokens: Option<u64>,
@@ -80,6 +83,7 @@ impl ModelMetadata {
             id: id.into(),
             display_name: None,
             context_window: None,
+            context_source: None,
             max_output_tokens: None,
             reasoning_efforts: Vec::new(),
             capabilities: Capabilities::unknown(),
@@ -158,6 +162,9 @@ pub use rune_core::config::DEFAULT_CONTEXT_WINDOW;
 pub struct Catalog {
     /// Provider the catalog describes.
     pub provider: String,
+    /// Explicit endpoint used to import a local Ollama catalog.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
     /// Entries, in the order the endpoint reported them.
     pub models: Vec<ModelMetadata>,
     /// Whether the entries came from the endpoint or a compiled fallback.
@@ -183,6 +190,7 @@ impl Catalog {
     pub fn new(provider: impl Into<String>) -> Self {
         Self {
             provider: provider.into(),
+            endpoint: None,
             models: Vec::new(),
             source: CatalogSource::Endpoint,
         }
@@ -232,11 +240,15 @@ impl Catalog {
     /// Returns the catalog as the value printed by `models --json`.
     #[must_use]
     pub fn to_json(&self) -> serde_json::Value {
-        serde_json::json!({
+        let mut value = serde_json::json!({
             "provider": self.provider,
             "source": self.source,
             "models": self.models,
-        })
+        });
+        if let Some(endpoint) = &self.endpoint {
+            value["endpoint"] = serde_json::Value::String(endpoint.clone());
+        }
+        value
     }
 }
 
@@ -460,6 +472,7 @@ mod tests {
     fn catalog_with(entries: Vec<ModelMetadata>) -> Catalog {
         Catalog {
             provider: "test".to_owned(),
+            endpoint: None,
             models: entries,
             source: CatalogSource::Endpoint,
         }
@@ -470,6 +483,7 @@ mod tests {
             id: "vendor/full".to_owned(),
             display_name: Some("Full".to_owned()),
             context_window: Some(200_000),
+            context_source: None,
             max_output_tokens: Some(8192),
             reasoning_efforts: vec!["low".to_owned(), "medium".to_owned(), "high".to_owned()],
             capabilities: Capabilities {

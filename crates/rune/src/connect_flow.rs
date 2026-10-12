@@ -2,8 +2,8 @@
 //!
 //! Connecting is a conversation rather than an argument list, because a user who
 //! has just installed the harness does not know which providers exist or what
-//! each one needs. The command lists them, takes a choice, and takes the
-//! credential, so nothing has to be read from documentation first.
+//! each one needs. The command lists them, takes a choice, and takes any
+//! required credential, so nothing has to be read from documentation first.
 //!
 //! Every prompt reads standard input, so the whole flow can be driven by a pipe
 //! or a test. Nothing here decides whether to be interactive: the caller does,
@@ -179,14 +179,16 @@ pub fn run(paths: &Paths, entry: &KnownProvider) -> Result<String> {
         None => ask_endpoint(&name)?,
     };
 
-    // The environment is consulted first, so a user with the key already
-    // exported is not asked to paste it.
-    let from_environment = provider_setup::environment_credential(&name, None);
-    let credential = match from_environment {
-        Some(value) => value,
-        None => ask_credential(&name)?,
-    };
-    provider_setup::connect(paths, &name, &credential)?;
+    if entry.credential == providers::CredentialKind::AnonymousLoopback {
+        rune_net::transport::Endpoint::anonymous(&endpoint)?;
+    } else {
+        // An exported key avoids another credential prompt.
+        let credential = match provider_setup::environment_credential(&name, None) {
+            Some(value) => value,
+            None => ask_credential(&name)?,
+        };
+        provider_setup::connect(paths, &name, &credential)?;
+    }
 
     provider_setup::save_selection(
         paths,

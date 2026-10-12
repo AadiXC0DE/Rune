@@ -83,8 +83,8 @@ rune doctor                 # check what your machine supports
 ```
 
 Running `connect` with no argument lists the providers and takes a choice, then
-asks for the credential, so nothing has to be looked up first. Name one to skip
-the list:
+asks for any required credential, so nothing has to be looked up first. Name one
+to skip the list:
 
 ```sh
 rune connect anthropic
@@ -98,6 +98,20 @@ by `rune auth`. The models the endpoint serves are listed by `rune models`, whic
 asks the endpoint rather than a table compiled into the binary, so a model
 released after this build still appears. Add `--offline` to report the configured
 model without contacting anything.
+
+For Ollama, `rune connect ollama` selects the local endpoint
+`http://127.0.0.1:11434/v1` and saves anonymous loopback mode without a key.
+To import another local endpoint, put `provider = "ollama"` and its `/v1`
+`base_url` in the user config before connecting. Select a model with
+`rune --model qwen3:latest` or set `models.ollama` in the config.
+
+`rune models` discovers Ollama models through `/api/tags` and `/api/show`,
+without a remote catalog request. Terminal and JSON listings include the
+endpoint and each model's `context_source`: an explicit `parameters.num_ctx`
+when present, otherwise the architecture's `model_info` context length.
+An absent or invalid window stays unknown and names the compiled fallback.
+Architecture metadata describes the model's window, not a measurement of the
+server's running context allocation. See the [Ollama model details API](https://github.com/ollama/ollama/blob/main/docs/api.md#show-model-information).
 
 For a local server that needs no credential, explicitly set `anonymous = true`
 in the user config alongside its provider and loopback endpoint:
