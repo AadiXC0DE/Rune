@@ -89,7 +89,7 @@ impl Provider for ChatCompletions {
                 messages.extend(encode_tool_messages(message));
                 continue;
             }
-            messages.push(encode_message(message)?);
+            messages.push(encode_message(message, plan)?);
         }
 
         let mut body = serde_json::Map::new();
@@ -148,13 +148,13 @@ impl Provider for ChatCompletions {
 }
 
 /// Encodes one message into the dialect's shape.
-fn encode_message(message: &Message) -> Result<serde_json::Value> {
+fn encode_message(message: &Message, plan: &RequestPlan) -> Result<serde_json::Value> {
     match message.role {
         Role::System => Err(RuneError::invalid_field(
             "messages",
             "system content must be supplied as instructions, not as a message",
         )),
-        Role::User => Ok(encode_user(message)),
+        Role::User => Ok(encode_user(message, plan)),
         Role::Assistant => Ok(encode_assistant(message)),
         // Tool results are expanded before this point, because one message can
         // carry several of them and this returns a single message.
@@ -166,7 +166,7 @@ fn encode_message(message: &Message) -> Result<serde_json::Value> {
 }
 
 /// Encodes a user message, using content parts when images are present.
-fn encode_user(message: &Message) -> serde_json::Value {
+fn encode_user(message: &Message, plan: &RequestPlan) -> serde_json::Value {
     let has_image = message
         .parts
         .iter()
@@ -186,7 +186,10 @@ fn encode_user(message: &Message) -> serde_json::Value {
             })),
             ContentPart::Image { image } => Some(serde_json::json!({
                 "type": "image_url",
-                "image_url": { "url": format!("image-ref:{}", image.id) },
+                "image_url": { "url": plan.image_data.get(&image.id).map_or_else(
+                    || format!("image-ref:{}", image.id),
+                    |data| format!("data:{};base64,{data}", image.media_type),
+                ) },
             })),
             _ => None,
         })

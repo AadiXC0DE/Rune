@@ -48,6 +48,8 @@ pub const DEFAULT_MAX_STEPS: u64 = 16;
 pub struct Options {
     /// The prompt text.
     pub prompt: String,
+    /// Explicit local image paths to attach to the user prompt.
+    pub images: Vec<std::path::PathBuf>,
     /// Emit one JSON object instead of Markdown.
     pub json: bool,
     /// Stream bounded JSONL records instead of Markdown or one JSON result.
@@ -428,7 +430,8 @@ pub fn run(
     // credential for an endpoint that does not exist.
     let endpoint = crate::provider_setup::configured_endpoint(settings, paths)?;
 
-    let dialect = crate::provider_setup::dialect_for(&settings.provider);
+    let attachments = crate::attachments::Attachments::read(&options.images)?;
+    let dialect = attachments.provider(crate::provider_setup::dialect_for(&settings.provider));
 
     let mut limits = settings.limits.clone();
     let step_cap = limits
@@ -461,7 +464,11 @@ pub fn run(
         Registry::new()
     };
     let mut history = History::new();
-    history.push_user(options.prompt.clone());
+    let mut parts = vec![ContentPart::Text {
+        text: options.prompt.clone(),
+    }];
+    parts.extend(attachments.parts());
+    history.prepend(rune_net::message::Role::User, parts);
     let mut context = ExecutionContext::new(crate::current_workspace()?)
         .with_offline(settings.offline)
         .with_allow_unsandboxed(settings.allow_unsandboxed);

@@ -350,6 +350,14 @@ Unicode grapheme deletion and pasted text. Alt-R reapplies an undone edit and
 restores its caret. Repeated presses redo later edits; a new edit clears redo
 history. Press Alt with lowercase `r`.
 
+`rune ask --image screenshot.png "Describe this screenshot"` attaches a local
+image to the prompt for the selected model. Repeat `--image <path>` to attach
+several files, including when the prompt comes from stdin. PNG, JPEG, GIF, and
+WebP signatures are accepted, with at most 16 images and 8 MiB of total file
+bytes per turn. Oversized input fails with `too_large` before any model request.
+Attachments remain available across tool steps in this ask turn. Saved sessions
+retain the prompt and response text; image bytes are not retained for replay.
+
 `rune ask` sends the resolved instructions shown by `rune prompt --show`, including
 workspace instruction files and the configured system prompt, on every request.
 

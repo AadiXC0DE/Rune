@@ -43,6 +43,7 @@ Run one bounded turn without an interactive session
 | `--json` | Print one JSON object instead of Markdown. |
 | `--jsonl` | Stream bounded JSONL events (takes precedence over --json). |
 | `--no-save` | Do not create a session. |
+| `--image <path>` | Attach a PNG, JPEG, GIF, or WebP file. Repeatable; 8 MiB total, at most 16 images. |
 ### `rune acp [--log-file <path>]`
 
 Serve the Agent Client Protocol over standard input and output

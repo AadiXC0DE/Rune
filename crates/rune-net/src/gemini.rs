@@ -76,7 +76,7 @@ impl Provider for Gemini {
                 instructions.push(json!({"text": message.text()}));
                 continue;
             }
-            let parts = encode_parts(message, &mut call_ids)?;
+            let parts = encode_parts(message, plan, &mut call_ids)?;
             if parts.is_empty() {
                 continue;
             }
@@ -128,6 +128,7 @@ impl Provider for Gemini {
 
 fn encode_parts(
     message: &Message,
+    plan: &RequestPlan,
     call_ids: &mut std::collections::HashMap<String, Option<String>>,
 ) -> Result<Vec<Value>> {
     if message.role == Role::Assistant
@@ -199,11 +200,16 @@ fn encode_parts(
                 }
                 parts.push(json!({"functionResponse": call}));
             }
-            ContentPart::Image { .. } => {
-                return Err(RuneError::new(
-                    ErrorCode::Unsupported,
-                    "Gemini image references require inline bytes from the image store",
-                ));
+            ContentPart::Image { image } => {
+                let data = plan.image_data.get(&image.id).ok_or_else(|| {
+                    RuneError::new(
+                        ErrorCode::Unsupported,
+                        "Gemini image references require inline bytes from the image store",
+                    )
+                })?;
+                parts.push(
+                    json!({"inlineData": {"mimeType": image.media_type, "data": data.as_ref()}}),
+                );
             }
         }
     }

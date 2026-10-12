@@ -64,7 +64,7 @@ impl Provider for Responses {
         let mut input: Vec<serde_json::Value> = Vec::new();
 
         for message in &plan.messages {
-            encode_message(message, &mut input)?;
+            encode_message(message, plan, &mut input)?;
         }
 
         let instructions = if plan.instructions.is_empty() {
@@ -128,14 +128,18 @@ impl Provider for Responses {
 }
 
 /// Encodes one message into one or more input items.
-fn encode_message(message: &Message, out: &mut Vec<serde_json::Value>) -> Result<()> {
+fn encode_message(
+    message: &Message,
+    plan: &RequestPlan,
+    out: &mut Vec<serde_json::Value>,
+) -> Result<()> {
     match message.role {
         Role::System => Err(RuneError::invalid_field(
             "messages",
             "system content must be supplied as instructions, not as a message",
         )),
         Role::User => {
-            out.push(encode_user(message));
+            out.push(encode_user(message, plan));
             Ok(())
         }
         Role::Assistant => {
@@ -150,7 +154,7 @@ fn encode_message(message: &Message, out: &mut Vec<serde_json::Value>) -> Result
 }
 
 /// Encodes a user message.
-fn encode_user(message: &Message) -> serde_json::Value {
+fn encode_user(message: &Message, plan: &RequestPlan) -> serde_json::Value {
     let content: Vec<serde_json::Value> = message
         .parts
         .iter()
@@ -162,7 +166,10 @@ fn encode_user(message: &Message) -> serde_json::Value {
             ContentPart::Image { image } => Some(serde_json::json!({
                 "type": "input_image",
                 "detail": "auto",
-                "image_url": format!("image-ref:{}", image.id),
+                "image_url": plan.image_data.get(&image.id).map_or_else(
+                    || format!("image-ref:{}", image.id),
+                    |data| format!("data:{};base64,{data}", image.media_type),
+                ),
             })),
             _ => None,
         })

@@ -11,6 +11,7 @@
 #![cfg_attr(test, allow(clippy::expect_used, clippy::unwrap_used, clippy::panic))]
 
 mod ask;
+mod attachments;
 mod auto_review;
 mod capabilities;
 mod cli;
@@ -348,6 +349,12 @@ fn run_ask(
         jsonl,
         no_save: launch.has_flag("--no-save"),
         tool_loop: true,
+        images: launch
+            .flags
+            .iter()
+            .filter(|(name, _)| name == "--image")
+            .filter_map(|(_, value)| value.as_ref().map(std::path::PathBuf::from))
+            .collect(),
     };
 
     match ask::run(settings, paths, &options) {
@@ -420,6 +427,7 @@ fn run_review(
         jsonl: false,
         no_save: false,
         tool_loop: false,
+        images: Vec::new(),
     };
 
     match ask::run(settings, paths, &options) {

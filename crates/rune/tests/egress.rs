@@ -67,6 +67,7 @@ fn send(endpoint: &Endpoint, dialect: &dyn Dialect) -> Result<(), rune_core::err
         model: "test/model".to_owned(),
         instructions: String::new(),
         messages: rune_net::transport::one_shot_messages("hello"),
+        image_data: std::collections::BTreeMap::new(),
         tools: Vec::<ToolSpec>::new(),
         tool_choice: rune_net::provider::ToolChoice::Auto,
         parallel_tool_calls: false,

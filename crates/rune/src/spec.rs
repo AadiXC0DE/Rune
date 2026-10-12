@@ -200,6 +200,11 @@ pub const RUN: &[CommandSpec] = &[
                 "Stream bounded JSONL events (takes precedence over --json).",
             ),
             flag("--no-save", "Do not create a session."),
+            option(
+                "--image",
+                "path",
+                "Attach a PNG, JPEG, GIF, or WebP file. Repeatable; 8 MiB total, at most 16 images.",
+            ),
         ],
         requirements: Requirements::FULL,
         supports_json: true,

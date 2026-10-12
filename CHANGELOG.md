@@ -6,6 +6,11 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Added
 
+- `rune ask --image <path>` attaches local PNG, JPEG, GIF, or WebP images to the
+  selected model's user message, including subsequent tool steps. Repeatable
+  attachments are bounded to 16 files and 8 MiB total; oversized input returns
+  `too_large` before upload. Image bytes are retained only for the ask turn.
+
 - `rune usage export` writes retained usage records as stable, versioned JSONL,
   with an optional `--period` filter. Main, permission review, and vision usage
   keep their recorded model, timestamp, request counts, and reported values;

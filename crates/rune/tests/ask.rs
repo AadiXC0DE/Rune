@@ -194,6 +194,17 @@ fn run_responses_fixture_with_format(
     max_steps: Option<u64>,
     setup: impl FnOnce(&tempfile::TempDir),
 ) -> (Output, tempfile::TempDir, Vec<Value>) {
+    run_responses_fixture_with_images(responses, output_flag, no_save, max_steps, &[], setup)
+}
+
+fn run_responses_fixture_with_images(
+    responses: Vec<String>,
+    output_flag: Option<&str>,
+    no_save: bool,
+    max_steps: Option<u64>,
+    images: &[&str],
+    setup: impl FnOnce(&tempfile::TempDir),
+) -> (Output, tempfile::TempDir, Vec<Value>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind fixture");
     listener.set_nonblocking(true).expect("nonblocking");
     let address = listener.local_addr().expect("fixture address");
@@ -283,6 +294,9 @@ fn run_responses_fixture_with_format(
     }
     if no_save {
         command.arg("--no-save");
+    }
+    for image in images {
+        command.arg("--image").arg(image);
     }
     let output = command
         .arg("run the fixture command")
@@ -1271,4 +1285,145 @@ fn ask_jsonl_preserves_tool_steps_and_saved_exchange() {
     .expect("saved JSONL exchange");
     assert!(state.events.iter().any(|frame| matches!(&frame.event,
         rune_session::SessionEvent::ToolResult { ok: true, output, .. } if output.contains("ALLOWED_READ_RESULT"))));
+}
+
+const ATTACHMENT_PNG: &[u8] = include_bytes!("fixtures/attachment.png");
+const ATTACHMENT_PNG_BASE64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==";
+
+#[test]
+fn ask_attaches_one_png_content_part_on_every_tool_step() {
+    let (output, _, requests) = run_responses_fixture_with_images(
+        vec![
+            completion_response(
+                &json!({"tool_calls": [{"index": 0, "id": "read-image-context", "type": "function", "function": {"name": "read_file", "arguments": "{\"path\":\"fixture.txt\"}"}}]}),
+                "tool_calls",
+            ),
+            completion_response(&json!({"content": "image received"}), "stop"),
+        ],
+        Some("--json"),
+        true,
+        Some(2),
+        &["attachment.png"],
+        |dir| {
+            std::fs::write(dir.path().join("attachment.png"), ATTACHMENT_PNG).expect("fixture PNG");
+        },
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(requests.len(), 2);
+    for request in requests {
+        let users: Vec<_> = request["messages"]
+            .as_array()
+            .expect("messages")
+            .iter()
+            .filter(|message| message["role"] == "user")
+            .collect();
+        assert_eq!(users.len(), 1);
+        assert_eq!(
+            users[0]["content"],
+            json!([
+                {"type": "text", "text": "run the fixture command"},
+                {"type": "image_url", "image_url": {"url": format!("data:image/png;base64,{ATTACHMENT_PNG_BASE64}")}}
+            ])
+        );
+    }
+    let result: Value = serde_json::from_slice(&output.stdout).expect("JSON result");
+    assert_eq!(result["final_output"], "image received");
+}
+
+#[test]
+fn ask_repeated_image_flags_preserve_attachment_order() {
+    let (output, _, requests) = run_responses_fixture_with_images(
+        vec![completion_response(
+            &json!({"content": "two images"}),
+            "stop",
+        )],
+        None,
+        true,
+        Some(1),
+        &["first.png", "second.gif"],
+        |dir| {
+            std::fs::write(dir.path().join("first.png"), ATTACHMENT_PNG).expect("fixture PNG");
+            std::fs::write(dir.path().join("second.gif"), b"GIF89a").expect("signature fixture");
+        },
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(requests.len(), 1);
+    let user = requests[0]["messages"]
+        .as_array()
+        .expect("messages")
+        .iter()
+        .find(|message| message["role"] == "user")
+        .expect("user");
+    assert_eq!(user["content"].as_array().expect("parts").len(), 3);
+    assert_eq!(
+        user["content"][1]["image_url"]["url"],
+        format!("data:image/png;base64,{ATTACHMENT_PNG_BASE64}")
+    );
+    assert_eq!(
+        user["content"][2]["image_url"]["url"],
+        "data:image/gif;base64,R0lGODlh"
+    );
+}
+
+#[test]
+fn ask_oversized_image_and_batch_fail_before_any_provider_request() {
+    const CAP: u64 = 8 * 1024 * 1024;
+    for (images, size, format) in [
+        (vec!["large.png"], CAP + 1, "--json"),
+        (vec!["large.png"], CAP + 1, "--jsonl"),
+        (vec!["attachment.png", "large.png"], CAP, "--json"),
+    ] {
+        let (output, dir, requests) = run_responses_fixture_with_images(
+            vec![completion_response(
+                &json!({"content": "must not be requested"}),
+                "stop",
+            )],
+            Some(format),
+            false,
+            Some(1),
+            &images,
+            |dir| {
+                std::fs::write(dir.path().join("attachment.png"), ATTACHMENT_PNG)
+                    .expect("fixture PNG");
+                let mut file =
+                    std::fs::File::create(dir.path().join("large.png")).expect("oversized fixture");
+                file.write_all(ATTACHMENT_PNG).expect("PNG header");
+                file.set_len(size).expect("sparse oversized image");
+            },
+        );
+        assert_eq!(output.status.code(), Some(1));
+        assert!(requests.is_empty(), "oversized input must not be uploaded");
+        let result: Value = if format == "--jsonl" {
+            let records: Vec<Value> = String::from_utf8(output.stdout)
+                .expect("JSONL")
+                .lines()
+                .map(|line| serde_json::from_str(line).expect("record"))
+                .collect();
+            assert_eq!(records.len(), 2);
+            assert_eq!(records[0]["type"], "start");
+            assert_eq!(records[1]["type"], "final");
+            records[1]["result"].clone()
+        } else {
+            serde_json::from_slice(&output.stdout).expect("JSON result")
+        };
+        assert_eq!(result["error_code"], "too_large");
+        assert_eq!(result["error_detail"]["field"], "image");
+        assert_eq!(result["steps"], 0);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("too_large") && stderr.contains("8388608"),
+            "{stderr}"
+        );
+        assert!(!dir.path().join("state/sessions").exists());
+    }
 }

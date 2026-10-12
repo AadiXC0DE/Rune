@@ -46,6 +46,9 @@ pub struct RequestPlan {
     pub instructions: String,
     /// Conversation messages, excluding the system lane.
     pub messages: Vec<Message>,
+    /// Base64 image bytes, keyed by the image references in `messages`.
+    /// Shared so projecting a request does not copy the attachment payloads.
+    pub image_data: std::collections::BTreeMap<u64, std::sync::Arc<str>>,
     /// Advertised tools.
     pub tools: Vec<ToolSpec>,
     /// Tool choice for this request.
@@ -72,6 +75,7 @@ impl RequestPlan {
             model: model.into(),
             instructions: String::new(),
             messages: Vec::new(),
+            image_data: std::collections::BTreeMap::new(),
             tools: Vec::new(),
             tool_choice: ToolChoice::Auto,
             parallel_tool_calls: true,
@@ -383,6 +387,7 @@ mod routing_tests {
             model: "test/model".to_owned(),
             instructions: String::new(),
             messages: Vec::new(),
+            image_data: std::collections::BTreeMap::new(),
             tools: Vec::new(),
             tool_choice: ToolChoice::Auto,
             parallel_tool_calls: false,

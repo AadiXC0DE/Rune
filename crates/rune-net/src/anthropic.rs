@@ -64,7 +64,7 @@ impl Provider for Anthropic {
         let mut messages: Vec<serde_json::Value> = Vec::new();
 
         for message in &plan.messages {
-            let encoded = encode_message(message)?;
+            let encoded = encode_message(message, plan)?;
             merge_adjacent(&mut messages, encoded);
         }
 
@@ -144,7 +144,7 @@ impl Provider for Anthropic {
 }
 
 /// Encodes one message into a role with content blocks.
-fn encode_message(message: &Message) -> Result<serde_json::Value> {
+fn encode_message(message: &Message, plan: &RequestPlan) -> Result<serde_json::Value> {
     match message.role {
         Role::System => Err(RuneError::invalid_field(
             "messages",
@@ -152,7 +152,7 @@ fn encode_message(message: &Message) -> Result<serde_json::Value> {
         )),
         Role::User => Ok(serde_json::json!({
             "role": "user",
-            "content": encode_user_blocks(message),
+            "content": encode_user_blocks(message, plan),
         })),
         Role::Assistant => Ok(serde_json::json!({
             "role": "assistant",
@@ -181,7 +181,7 @@ fn replay_blocks(message: &Message) -> Vec<serde_json::Value> {
 }
 
 /// Encodes user content blocks.
-fn encode_user_blocks(message: &Message) -> Vec<serde_json::Value> {
+fn encode_user_blocks(message: &Message, plan: &RequestPlan) -> Vec<serde_json::Value> {
     let mut blocks = replay_blocks(message);
     for part in &message.parts {
         match part {
@@ -189,14 +189,13 @@ fn encode_user_blocks(message: &Message) -> Vec<serde_json::Value> {
                 "type": "text",
                 "text": text,
             })),
-            ContentPart::Image { image } => blocks.push(serde_json::json!({
-                "type": "image",
-                "source": {
-                    "type": "image_ref",
-                    "media_type": image.media_type,
-                    "id": image.id,
-                },
-            })),
+            ContentPart::Image { image } => {
+                let source = plan.image_data.get(&image.id).map_or_else(
+                    || serde_json::json!({"type": "image_ref", "media_type": image.media_type, "id": image.id}),
+                    |data| serde_json::json!({"type": "base64", "media_type": image.media_type, "data": data.as_ref()}),
+                );
+                blocks.push(serde_json::json!({"type": "image", "source": source}));
+            }
             _ => {}
         }
     }
