@@ -1500,9 +1500,9 @@ fn resolve_endpoint(base: &str, endpoint: &str) -> String {
     format!("{}/{}", base.trim_end_matches('/'), endpoint)
 }
 
-/// Builds the HTTP agent shared by the remote transports.
+/// Builds the HTTP agent shared by the remote transports and OAuth exchange.
 #[cfg(not(target_family = "wasm"))]
-fn http_agent() -> ureq::Agent {
+pub(super) fn http_agent() -> ureq::Agent {
     let config = ureq::Agent::config_builder()
         .http_status_as_error(false)
         .build();

@@ -1036,6 +1036,7 @@ name = "rune-context"
 version = "0.1.16"
 dependencies = [
  "camino",
+ "getrandom 0.2.17",
  "ignore",
  "rune-core",
  "rune-exec",

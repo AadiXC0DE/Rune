@@ -27,6 +27,8 @@ ignore = { workspace = true }
 # socket cannot be opened, because nothing there compiles it.
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 ureq = { workspace = true }
+# OAuth state and PKCE require OS entropy, with no identifier fallback.
+getrandom = { workspace = true }
 
 [dev-dependencies]
 tempfile.workspace = true

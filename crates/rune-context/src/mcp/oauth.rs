@@ -1,4 +1,4 @@
-//! OAuth metadata preflight, independent of discovery and token exchange.
+//! OAuth metadata preflight and single-use native loopback authorization.
 //!
 //! Hosts must validate resource metadata before using its issuers for discovery,
 //! then validate authorization server metadata before opening a browser or
@@ -15,6 +15,9 @@ use ureq::http::Uri;
 use rune_core::error::{Result, RuneError};
 
 use super::config::{ServerConfig, Transport};
+
+mod loopback;
+pub use loopback::{LoopbackAuthorization, OAuthTokenStore, OAuthTokens};
 
 /// Protected resource metadata bound to a configured MCP endpoint.
 #[derive(Clone, Debug)]

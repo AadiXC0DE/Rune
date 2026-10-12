@@ -238,8 +238,25 @@ or registering a client. It checks the exact discovery issuer and every
 authorization, token, and optional registration endpoint. All URLs require
 HTTPS, with HTTP allowed for `localhost`, IPv4 loopback addresses, and `::1`.
 Credentials in URLs, fragments, and malformed endpoints are refused. These
-APIs perform no network requests; discovery, browser login, callbacks, and token
-storage are not implemented by the CLI yet.
+metadata APIs perform no network requests.
+
+Native hosts can then call `LoopbackAuthorization::start(&metadata, client_id,
+scope, timeout)` from the same module. It binds an ephemeral loopback port and
+generates state and an S256 PKCE challenge using OS entropy. Open its
+`authorization_url()` in the browser, then call `complete(&token_store)` with
+an `OAuthTokenStore::new(private_directory)` outside project and session files.
+The client must already be registered for a loopback redirect with a variable
+port. Completion checks the callback target and state, exchanges the code using
+the original verifier without following redirects, and stores bounded tokens
+atomically in mode 0600 files inside a mode 0700 directory on Unix. Files are
+bound to the resource, issuer, and client; widened permissions and links are
+refused. Invalid callbacks may be retried until the original deadline; a
+state-matched callback consumes the flow even if exchange or storage fails.
+`load(&metadata, client_id)` returns tokens with explicit credential accessors
+and redacted debug output. `expires_in()` is the lifetime reported at exchange,
+not the remaining lifetime at load. Discovery, client registration, browser
+launch, and token refresh remain host responsibilities; the CLI does not yet
+offer OAuth login.
 
 The web tools are off until asked for. `rune doctor` reports what this machine
 supports, and turning them on is one setting:

@@ -6,6 +6,13 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Added
 
+- Native Rust MCP hosts can complete OAuth through `LoopbackAuthorization`:
+  ephemeral loopback callbacks check generated state and exchange codes with
+  S256 PKCE. Matched callbacks are single-use, including failed exchanges.
+  `OAuthTokenStore` stores bounded tokens atomically in private files bound to
+  resource, issuer, and client, with redacted diagnostics. Hosts supply client
+  registration and browser launch; the CLI does not yet offer OAuth login.
+
 - `/goal --budget <tokens> <objective>` sets an explicit objective token budget.
   Accounted input/output usage persists across resume and compaction. Conversation
   requests, retries, delegated children, and summaries stop requesting further
@@ -82,7 +89,7 @@ Notable changes, newest first. Each entry describes what a user can observe.
   `mcp::oauth::ProtectedResourceMetadata`. Resource and issuer identifiers must
   match exactly; authorization, token, and registration endpoints require HTTPS
   or loopback HTTP. Validated endpoints are exposed only after all checks pass.
-  Browser authorization and token exchange are not implemented yet.
+  Discovery and client registration remain host responsibilities.
 
 - `rune permissions --simulate <file>` dry-runs a recorded JSON sequence of
   tool names and permission targets. Text and JSON reports preserve call order
