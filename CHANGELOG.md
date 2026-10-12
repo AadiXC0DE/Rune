@@ -6,6 +6,12 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Added
 
+- ACP accepts inline PNG, JPEG, GIF, and WebP image blocks for the session's
+  selected model, including retries and tool follow-ups. Image advertisement
+  follows dialect support; unsupported dialects return a named `unsupported`
+  error. Prompts accept up to 16 images within the 8 MiB frame cap, validate
+  MIME types and base64, and retain image bytes only during that prompt.
+
 - Node `askStream` exposes ask JSONL events through a pull-based async iterator,
   including incremental text and a validated final result. Record and combined
   output byte caps bound buffering; abort, timeout, and early iterator exit stop

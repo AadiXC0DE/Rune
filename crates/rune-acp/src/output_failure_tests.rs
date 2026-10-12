@@ -329,7 +329,11 @@ fn output_loss_before_tool_registration_prevents_provider_and_tool_work() {
         Queued {
             id: Id::Number(2),
             session,
-            text: "work".to_owned(),
+            prompt: Prompt::parse(
+                &json!({"prompt": [{"type": "text", "text": "work"}]}),
+                Dialect::ChatCompletions.provider(),
+            )
+            .expect("prompt"),
         },
     );
     assert_settled(&server, started);

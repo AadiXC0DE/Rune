@@ -13,6 +13,7 @@
 
 pub mod jsonrpc;
 mod mcp;
+mod prompt;
 pub mod server;
 pub mod session;
 

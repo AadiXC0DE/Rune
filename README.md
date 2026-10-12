@@ -886,7 +886,17 @@ ACP clients must send an `initialize` request with an integer `protocolVersion`.
 Rune supports version 1 and returns `protocolVersion: 1`, its `agentInfo`,
 `agentCapabilities`, and an empty `authMethods` list. It advertises session
 loading, listing, resuming, and closing; text and embedded context prompts;
-and stdio MCP support. Image, audio, HTTP MCP, and SSE MCP support are false.
+and stdio MCP support. Image support follows the configured dialect's image
+capability. Chat Completions, Responses, Anthropic, and Gemini accept inline
+image blocks with `data` containing standard base64 and `mimeType` set to
+`image/png`, `image/jpeg`, `image/gif`, or `image/webp`. Up to 16 images fit
+within the existing 8 MiB JSON frame limit, including base64 and framing.
+Images reach the session's selected model in block order, including retries
+and tool follow-ups. Image-only prompts are accepted. Image bytes are scoped
+to that prompt; later turns and loaded sessions retain only the prompt text
+(or `[Image attached]` for image-only prompts). Unsupported dialects return
+`data.code: "unsupported"` naming the dialect and `images` before submission.
+Audio, HTTP MCP, and SSE MCP support are false.
 Omitted client capabilities are treated as unsupported; Rune uses its own
 filesystem and shell tools.
 

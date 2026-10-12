@@ -292,6 +292,16 @@ impl Harness {
         limits: BudgetSet,
         files: Vec<(&str, &str)>,
     ) -> Self {
+        Self::start_dialect(scripts, mode, limits, files, Dialect::ChatCompletions)
+    }
+
+    fn start_dialect(
+        scripts: Vec<Script>,
+        mode: PermissionMode,
+        limits: BudgetSet,
+        files: Vec<(&str, &str)>,
+        dialect: Dialect,
+    ) -> Self {
         let root = tempfile::tempdir().expect("tempdir");
         let workspace =
             Utf8PathBuf::from_path_buf(root.path().join("workspace")).expect("utf8 workspace");
@@ -310,7 +320,7 @@ impl Harness {
             "test/model",
         )
         .expect("config")
-        .with_dialect(Dialect::ChatCompletions)
+        .with_dialect(dialect)
         .with_mode(mode)
         .with_limits(limits)
         .expect("limits")
@@ -448,6 +458,215 @@ fn a_malformed_text_block_rejects_the_entire_prompt_and_the_connection_survives(
         .collect();
     assert_eq!(user_messages.len(), 1);
     assert_eq!(user_messages[0]["content"], "valid prompt");
+}
+
+// Real 1x1 GIFs with different palettes, carried unchanged through ACP and HTTP.
+const IMAGE_2: &str = "R0lGODlhAQABAIAAAP8AAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7";
+const IMAGE: &str = "R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7";
+
+fn image_block() -> Value {
+    json!({"type": "image", "mimeType": "image/gif", "data": IMAGE})
+}
+
+#[test]
+fn advertised_images_reach_the_selected_model_in_every_acp_dialect() {
+    for dialect in [
+        Dialect::ChatCompletions,
+        Dialect::Responses,
+        Dialect::Anthropic,
+        Dialect::Gemini,
+    ] {
+        let script = match dialect {
+            Dialect::ChatCompletions => Script::text("seen"),
+            Dialect::Responses => Script::Frames(vec![r#"{"type":"response.completed","response":{"status":"completed","output":[]}}"#.to_owned()]),
+            Dialect::Anthropic => Script::Frames(vec![
+                r#"{"type":"message_start","message":{"id":"msg","usage":{"input_tokens":10}}}"#.to_owned(),
+                r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}"#.to_owned(),
+                r#"{"type":"message_stop"}"#.to_owned(),
+            ]),
+            Dialect::Gemini => Script::Frames(vec![r#"{"candidates":[{"content":{"parts":[{"text":"seen"}]},"finishReason":"STOP"}]}"#.to_owned()]),
+        };
+        let mut harness = Harness::start_dialect(
+            vec![script],
+            PermissionMode::Auto,
+            BudgetSet::new(),
+            Vec::new(),
+            dialect,
+        );
+        let session = harness.open_session();
+        let initialization = harness
+            .client()
+            .responses
+            .iter()
+            .find(|response| response["id"] == 1)
+            .expect("initialize response");
+        assert_eq!(
+            initialization["result"]["agentCapabilities"]["promptCapabilities"]["image"],
+            true
+        );
+        let selected = "fixture-image-model";
+        let response = harness.client().call(
+            3,
+            "session/set_config_option",
+            &json!({"sessionId": session, "configId": "model", "value": selected}),
+        );
+        assert!(response.get("error").is_none(), "{response}");
+        // Mix two images and text to prove block ordering and distinct references.
+        let response = harness.client().call(4, "session/prompt", &json!({"sessionId": session, "prompt": [image_block(), {"type": "text", "text": "compare"}, {"type": "image", "mimeType": "image/gif", "data": IMAGE_2}]}));
+        assert_eq!(
+            response["result"]["stopReason"], "end_turn",
+            "{dialect:?}: {response}"
+        );
+        let body = harness.mock.last_body().expect("request body");
+        if dialect == Dialect::Gemini {
+            assert_eq!(
+                harness.mock.last_path().expect("model request target"),
+                format!("/v1/models/{selected}:streamGenerateContent?alt=sse")
+            );
+        } else {
+            assert_eq!(body["model"], selected);
+        }
+        let messages = match dialect {
+            Dialect::Responses => &body["input"],
+            Dialect::Gemini => &body["contents"],
+            _ => &body["messages"],
+        };
+        let user = messages
+            .as_array()
+            .expect("messages")
+            .iter()
+            .find(|message| message["role"] == "user")
+            .expect("user message");
+        let content = if dialect == Dialect::Gemini {
+            &user["parts"]
+        } else {
+            &user["content"]
+        };
+        assert_eq!(content.as_array().expect("parts").len(), 3);
+        assert_eq!(content[1]["text"], "compare");
+        for (index, image) in [(0, IMAGE), (2, IMAGE_2)] {
+            match dialect {
+                Dialect::ChatCompletions => assert_eq!(
+                    content[index]["image_url"]["url"],
+                    format!("data:image/gif;base64,{image}")
+                ),
+                Dialect::Responses => assert_eq!(
+                    content[index]["image_url"],
+                    format!("data:image/gif;base64,{image}")
+                ),
+                Dialect::Anthropic => assert_eq!(
+                    content[index]["source"],
+                    json!({"type": "base64", "media_type": "image/gif", "data": image})
+                ),
+                Dialect::Gemini => assert_eq!(
+                    content[index]["inlineData"],
+                    json!({"mimeType": "image/gif", "data": image})
+                ),
+            }
+        }
+        assert!(!body.to_string().contains("image-ref:"));
+    }
+}
+
+#[test]
+fn images_survive_retries_and_tool_steps_but_are_not_replayed_on_later_prompts() {
+    let mut harness = Harness::start(
+        vec![
+            Script::tool_call("read", "read_file", r#"{"path":"image.txt"}"#),
+            Script::text("seen"),
+            Script::text("next"),
+        ],
+        PermissionMode::Auto,
+    );
+    std::fs::write(harness.root.path().join("workspace/image.txt"), "fixture").expect("file");
+    let session = harness.open_session();
+    harness.mock.fail_first(1);
+    let response = harness.client().call(
+        3,
+        "session/prompt",
+        &json!({"sessionId": session, "prompt": [image_block()]}),
+    );
+    assert_eq!(response["result"]["stopReason"], "end_turn");
+    assert_eq!(harness.mock.request_count(), 3);
+    let body = harness.mock.last_body().expect("tool follow-up request");
+    let user = body["messages"]
+        .as_array()
+        .expect("messages")
+        .iter()
+        .find(|message| message["role"] == "user")
+        .expect("user message");
+    assert_eq!(
+        user["content"][0]["image_url"]["url"],
+        format!("data:image/gif;base64,{IMAGE}")
+    );
+    let response = harness
+        .client()
+        .call(4, "session/prompt", &prompt(&session, "next"));
+    assert_eq!(response["result"]["stopReason"], "end_turn");
+    let body = harness.mock.last_body().expect("next request").to_string();
+    assert!(!body.contains(IMAGE));
+    assert!(!body.contains("image-ref:"));
+    // Reopen from disk as well, proving persisted history has no image payload.
+    assert!(
+        harness
+            .client()
+            .call(5, "session/close", &json!({"sessionId": session}))
+            .get("error")
+            .is_none()
+    );
+    assert!(
+        harness
+            .client()
+            .call(6, "session/load", &json!({"sessionId": session}))
+            .get("error")
+            .is_none()
+    );
+    let response = harness
+        .client()
+        .call(7, "session/prompt", &prompt(&session, "after load"));
+    assert_eq!(response["result"]["stopReason"], "end_turn");
+    let body = harness
+        .mock
+        .last_body()
+        .expect("loaded request")
+        .to_string();
+    assert!(!body.contains(IMAGE));
+    assert!(!body.contains("image-ref:"));
+}
+
+#[test]
+fn malformed_image_blocks_reject_the_whole_prompt_before_provider_or_session_changes() {
+    let mut harness = Harness::start(vec![Script::text("valid")], PermissionMode::Auto);
+    let session = harness.open_session();
+    for (index, block) in [
+        json!({"type": "image", "mimeType": "image/png"}),
+        json!({"type": "image", "data": IMAGE}),
+        json!({"type": "image", "mimeType": "image/png", "data": 42}),
+        json!({"type": "image", "mimeType": "text/plain", "data": IMAGE}),
+        json!({"type": "image", "mimeType": "image/png", "data": "invalid!"}),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let response = harness.client().call(10_i64.saturating_add(i64::try_from(index).expect("fixture index")), "session/prompt", &json!({"sessionId": session, "prompt": [{"type": "text", "text": "must not reach model"}, block]}));
+        assert_eq!(response["error"]["code"], rune_acp::jsonrpc::INVALID_PARAMS);
+        assert_eq!(response["error"]["data"]["code"], "invalid_field");
+    }
+    assert_eq!(harness.mock.request_count(), 0);
+    assert!(harness.client().updates("user_message_chunk").is_empty());
+    let response = harness
+        .client()
+        .call(20, "session/prompt", &prompt(&session, "valid"));
+    assert_eq!(response["result"]["stopReason"], "end_turn");
+    assert_eq!(
+        harness.mock.last_body().expect("request")["messages"]
+            .as_array()
+            .expect("messages")
+            .iter()
+            .filter(|message| message["role"] == "user")
+            .count(),
+        1
+    );
 }
 
 #[test]
@@ -890,7 +1109,7 @@ fn initialize_advertises_this_protocol_version_and_capabilities() {
     assert_eq!(response["result"]["authMethods"], json!([]));
     assert_eq!(
         response["result"]["agentCapabilities"]["promptCapabilities"],
-        json!({"image": false, "audio": false, "embeddedContext": true})
+        json!({"image": true, "audio": false, "embeddedContext": true})
     );
     assert_eq!(
         response["result"]["agentCapabilities"]["mcpCapabilities"],

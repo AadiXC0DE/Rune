@@ -35,7 +35,7 @@ use rune_core::error::{ErrorCode, Result, RuneError};
 use rune_core::paths::Paths;
 use rune_net::catalog::Catalog;
 use rune_net::message::ToolSpec;
-use rune_net::provider::Provider;
+use rune_net::provider::{Provider, RequestPlan};
 use rune_net::stream::Usage;
 use rune_net::transport::Endpoint;
 use rune_policy::decision::Outcome;
@@ -47,6 +47,7 @@ use rune_tools::workspace::FileLimits;
 use serde_json::{Value, json};
 
 use crate::jsonrpc::{FrameError, Id, Message, Request, Response, RpcError, Writer};
+use crate::prompt::Prompt;
 use crate::session::{
     SessionConfig, Sessions, config_options, kind_for_name, message_chunk, modes, tool_call,
     tool_call_update, tool_title, usage_update,
@@ -289,7 +290,7 @@ impl ServerConfig {
 struct Queued {
     id: Id,
     session: String,
-    text: String,
+    prompt: Prompt,
 }
 
 /// The state of the one turn a connection may be running.
@@ -636,7 +637,7 @@ impl<W: Write + Send + 'static> Server<W> {
             "agentCapabilities": {
                 "loadSession": true,
                 "promptCapabilities": {
-                    "image": false,
+                    "image": self.config.dialect.provider().capabilities().images,
                     "audio": false,
                     "embeddedContext": true,
                 },
@@ -827,7 +828,7 @@ impl<W: Write + Send + 'static> Server<W> {
             ));
         };
         let session = string_field(params, "sessionId")?;
-        let text = prompt_text(params)?;
+        let prompt = Prompt::parse(params, self.config.dialect.provider())?;
         {
             let sessions = self.lock_sessions()?;
             sessions
@@ -835,7 +836,11 @@ impl<W: Write + Send + 'static> Server<W> {
                 .map_err(|err| RpcError::from_rune(&err))?;
         }
 
-        let arriving = Queued { id, session, text };
+        let arriving = Queued {
+            id,
+            session,
+            prompt,
+        };
         let running = {
             let Ok(mut active) = self.active.lock() else {
                 return Err(RpcError::internal("the session state is unavailable"));
@@ -1013,13 +1018,13 @@ fn run_one<W: Write + Send + 'static>(server: &Arc<Server<W>>, queued: Queued) {
     server.record(
         &session,
         SessionEvent::UserMessage {
-            text: queued.text.clone(),
+            text: queued.prompt.text.clone(),
         },
     );
     server.send(&Message::Notification(message_chunk(
         &session,
         "user_message_chunk",
-        &queued.text,
+        &queued.prompt.text,
     )));
 
     let mut tools = server.config.registry.all_schemas();
@@ -1030,8 +1035,12 @@ fn run_one<W: Write + Send + 'static>(server: &Arc<Server<W>>, queued: Queued) {
             input_schema: tool.input_schema,
         }));
     }
+    let mut history = snapshot.history;
+    let prompt_seq = history.push_user(queued.prompt.text.clone());
     let host = TurnHost {
         server: Arc::clone(server),
+        prompt: queued.prompt,
+        prompt_seq,
         session: session.clone(),
         context_window: server.context_window(&snapshot.config.model),
         config: snapshot.config.clone(),
@@ -1049,8 +1058,6 @@ fn run_one<W: Write + Send + 'static>(server: &Arc<Server<W>>, queued: Queued) {
         permission_timeout: OnceLock::new(),
     };
 
-    let mut history = snapshot.history;
-    history.push_user(queued.text.clone());
     let outcome = run_turn(&mut history, &host);
     // The host cancels work when an approval expires. Preserve the deadline
     // error so the prompt reports a timeout rather than a user cancellation.
@@ -1186,6 +1193,8 @@ impl<W: Write + Send + 'static> Server<W> {
 
 /// The host a turn runs against.
 struct TurnHost<W: Write + Send + 'static> {
+    prompt: Prompt,
+    prompt_seq: u64,
     server: Arc<Server<W>>,
     session: String,
     config: SessionConfig,
@@ -1298,6 +1307,16 @@ impl<W: Write + Send + 'static> TurnHost<W> {
 }
 
 impl<W: Write + Send + 'static> Host for TurnHost<W> {
+    fn prepare_request(
+        &self,
+        history: &mut History,
+        plan: &mut RequestPlan,
+        _client: &dyn rune_net::fetch::Fetch,
+    ) -> Result<()> {
+        self.prompt.hydrate(self.prompt_seq, history, plan);
+        Ok(())
+    }
+
     fn dialect(&self) -> &dyn Provider {
         self.server.config.dialect.provider()
     }
@@ -1603,65 +1622,9 @@ fn require_absolute(path: &Utf8PathBuf, field: &str) -> std::result::Result<(), 
     )))
 }
 
-/// Extracts the text of a prompt.
-///
-/// Text blocks and embedded resources carry text; every other block type is
-/// refused by name, because this server advertises support for none of them.
+#[cfg(test)]
 fn prompt_text(params: &Value) -> std::result::Result<String, RpcError> {
-    let Some(blocks) = params.get("prompt") else {
-        return Err(RpcError::from_rune(&RuneError::missing_field("prompt")));
-    };
-    let Some(blocks) = blocks.as_array() else {
-        return Err(RpcError::from_rune(&RuneError::invalid_field(
-            "prompt",
-            "must be an array of content blocks",
-        )));
-    };
-    let mut text = String::new();
-    for (index, block) in blocks.iter().enumerate() {
-        match block.get("type").and_then(Value::as_str) {
-            Some("text") => {
-                let part = block.get("text").and_then(Value::as_str).ok_or_else(|| {
-                    RpcError::invalid_params(format!("`prompt[{index}].text` must be a string"))
-                })?;
-                push_block(&mut text, part);
-            }
-            Some("resource") => {
-                if let Some(part) = block
-                    .get("resource")
-                    .and_then(|resource| resource.get("text"))
-                    .and_then(Value::as_str)
-                {
-                    push_block(&mut text, part);
-                }
-            }
-            Some(other) => {
-                return Err(RpcError::invalid_params(format!(
-                    "this server does not accept `{other}` content in a prompt"
-                )));
-            }
-            None => {
-                return Err(RpcError::invalid_params(
-                    "a prompt block must declare its type",
-                ));
-            }
-        }
-    }
-    if text.trim().is_empty() {
-        return Err(RpcError::from_rune(&RuneError::invalid_field(
-            "prompt",
-            "must contain some text",
-        )));
-    }
-    Ok(text)
-}
-
-/// Appends one block's text, separating blocks with a blank line.
-fn push_block(target: &mut String, text: &str) {
-    if !target.is_empty() {
-        target.push_str("\n\n");
-    }
-    target.push_str(text);
+    Prompt::parse(params, Dialect::ChatCompletions.provider()).map(|prompt| prompt.text)
 }
 
 #[cfg(all(test, unix))]
@@ -1810,7 +1773,7 @@ mod tests {
 
     #[test]
     fn an_unsupported_block_type_is_reported() {
-        let error = prompt_text(&json!({"prompt": [{"type": "image", "data": "x"}]}))
+        let error = prompt_text(&json!({"prompt": [{"type": "audio", "data": "x"}]}))
             .expect_err("rejected");
         assert_eq!(error.code, crate::jsonrpc::INVALID_PARAMS);
     }
