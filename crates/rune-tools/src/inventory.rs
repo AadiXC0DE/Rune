@@ -20,7 +20,7 @@ use crate::web::{WebFetch, WebSearch};
 use crate::workspace::FileLimits;
 use crate::{
     CreateDirectory, EditFile, GitDiff, GlobFiles, GrepFiles, ReadFile, ReadToolResult, RenameFile,
-    WriteFile,
+    UpdatePlan, WriteFile,
 };
 
 /// Names of every tool this build ships, in advertisement order.
@@ -39,6 +39,7 @@ pub const ADVERTISEMENT_ORDER: &[&str] = &[
     "create_directory",
     "shell",
     "ask_user_question",
+    "update_plan",
     "web_fetch",
     "web_search",
     "vision",
@@ -176,6 +177,7 @@ pub fn builtin_with_vision(
     registry.insert(Box::new(CreateDirectory::with_limits(*limits)))?;
     registry.insert(Box::new(Shell::new(budget)))?;
     registry.insert(Box::new(AskUserQuestion::new(answerer)))?;
+    registry.insert(Box::new(UpdatePlan))?;
 
     let context_limits = rune_context::limits::Limits::resolve(budget)?;
     registry.insert(Box::new(LoadSkill::new(

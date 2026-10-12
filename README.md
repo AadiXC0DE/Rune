@@ -529,6 +529,17 @@ files that cannot be read show a per-file error. Shell changes are not tracked.
 Run `rune help` for everything, or see [COMMANDS.md](COMMANDS.md) for the full
 reference.
 
+Models can call `update_plan` with the complete ordered `plan` array of
+`{"step": "description", "status": "pending"}` objects and an optional
+`explanation`. Status is `pending`, `in_progress`, or `completed`; at most one
+step can be in progress. Steps must be distinct after trimming whitespace.
+Updates replace the previous plan, and an empty array clears it. Changed
+snapshots emit versioned status events, including `plan_updated` records in
+`rune ask --jsonl`; identical retries retain the version and emit no update.
+Plans are bounded to 64 steps, 1024 bytes per description, and 4096 bytes per
+explanation. Plan state stays in memory across live turns and compaction,
+changes no workspace files, and resets for a new or reopened conversation.
+
 The shared agent turn loop spills tool output exceeding `max_tool_result_bytes`
 or the remaining `max_turn_result_bytes` into the live conversation's memory.
 The model receives a bounded preview with the retained byte count and handle,

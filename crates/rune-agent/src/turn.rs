@@ -153,6 +153,11 @@ pub enum Event {
         /// Whether the tool reported a failure.
         is_error: bool,
     },
+    /// The live plan changed after an allowed tool call.
+    PlanUpdated {
+        /// Complete replacement snapshot with its monotonically increasing version.
+        update: rune_tools::PlanUpdate,
+    },
     /// A tool call was refused by policy.
     ToolDenied {
         /// The call.
@@ -317,7 +322,7 @@ pub trait Host {
     }
 
     /// Executes with the per-call authority resolved by the loop.
-    /// Hosts running web tools must pass this context to their implementation.
+    /// Hosts running web or plan tools must pass this context to their implementation.
     fn execute_with_context(
         &self,
         name: &str,
@@ -1119,7 +1124,11 @@ fn execute_call(
                 .with_result_store(history.shared_result_store()),
         )
     } else {
-        host.execute_with_context(&call.name, &arguments, &context)
+        host.execute_with_context(
+            &call.name,
+            &arguments,
+            &context.with_live_plan(history.shared_live_plan()),
+        )
     };
     finish_call(call, host, execution, cancelled)
 }
@@ -1144,6 +1153,13 @@ fn finish_call(
         // Preserve the diagnostic even when the host bypasses the registry.
         Err(err) => ToolOutput::from_error(&err),
     };
+    if !output.is_error
+        && let Some(update) = &output.plan_update
+    {
+        host.emit(Event::PlanUpdated {
+            update: update.clone(),
+        });
+    }
     host.emit(Event::ToolFinished {
         call: call.clone(),
         is_error: output.is_error,
@@ -1170,6 +1186,7 @@ fn infer_activity(name: &str) -> Activity {
         "web_fetch" | "web_search" => Activity::Network,
         "subagent" => Activity::Delegate,
         "ask_user_question" => Activity::Interact,
+        "update_plan" => Activity::Plan,
         _ => Activity::Execute,
     }
 }

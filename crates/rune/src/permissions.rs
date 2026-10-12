@@ -69,6 +69,9 @@ pub fn builtin_rules(mode: &PermissionMode) -> RuleSet {
         rules.push(Rule::allow(tool, "*", Layer::Default));
     }
 
+    // Updating the live plan only changes in-memory session state.
+    rules.push(Rule::allow("update_plan", "*", Layer::Default));
+
     // A write inside the workspace is recoverable; a command is not.
     rules.push(Rule::allow("write_file", "*", Layer::Default));
     rules.push(Rule::allow("edit_file", "*", Layer::Default));

@@ -293,6 +293,7 @@ fn render(label: &str, reading: &Reading, cap: usize, failed: bool) -> ToolOutpu
             .max(text.len() as u64),
         text,
         is_error: failed,
+        plan_update: None,
     }
 }
 

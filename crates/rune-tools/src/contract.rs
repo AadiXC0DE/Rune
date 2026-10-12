@@ -36,6 +36,8 @@ pub enum Activity {
     Delegate,
     /// Asking the user something.
     Interact,
+    /// Updating the live in-memory plan.
+    Plan,
 }
 
 impl Activity {
@@ -52,6 +54,7 @@ impl Activity {
             Self::Network => "network",
             Self::Delegate => "delegate",
             Self::Interact => "interact",
+            Self::Plan => "plan",
         }
     }
 
@@ -74,6 +77,7 @@ impl Activity {
             Self::Network => "Fetching",
             Self::Delegate => "Delegating",
             Self::Interact => "Asking",
+            Self::Plan => "Updating plan",
         }
     }
 
@@ -90,6 +94,7 @@ impl Activity {
             Self::Network => "Fetched",
             Self::Delegate => "Delegated",
             Self::Interact => "Asked",
+            Self::Plan => "Updated plan",
         }
     }
 }
@@ -104,6 +109,8 @@ pub struct ToolOutput {
     /// Bytes the tool produced before any truncation, for the retained-result
     /// accounting.
     pub produced_bytes: u64,
+    /// Changed plan snapshot for the host to report as a status event.
+    pub plan_update: Option<crate::update_plan::PlanUpdate>,
 }
 
 impl ToolOutput {
@@ -115,6 +122,7 @@ impl ToolOutput {
             produced_bytes: text.len() as u64,
             text,
             is_error: false,
+            plan_update: None,
         }
     }
 
@@ -130,6 +138,7 @@ impl ToolOutput {
             produced_bytes: text.len() as u64,
             text,
             is_error: true,
+            plan_update: None,
         }
     }
 
@@ -183,6 +192,8 @@ pub struct ExecutionContext {
     pub max_output_bytes: usize,
     /// Retained output from the live conversation, supplied by its owner.
     result_store: Option<Arc<crate::result_store::Store>>,
+    /// In-memory plan for this conversation, shared by per-call contexts.
+    live_plan: Arc<std::sync::Mutex<crate::update_plan::PlanUpdate>>,
     /// Composite cancellation flag, checked between steps of long work.
     cancelled: Arc<AtomicBool>,
 }
@@ -200,6 +211,7 @@ impl ExecutionContext {
             allow_unsandboxed: false,
             max_output_bytes: 64 * 1024,
             result_store: None,
+            live_plan: Arc::default(),
             cancelled: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -253,6 +265,20 @@ impl ExecutionContext {
         self
     }
 
+    /// Supplies the conversation-owned live plan for this call.
+    #[must_use]
+    pub fn with_live_plan(
+        mut self,
+        plan: Arc<std::sync::Mutex<crate::update_plan::PlanUpdate>>,
+    ) -> Self {
+        self.live_plan = plan;
+        self
+    }
+
+    pub(crate) fn live_plan(&self) -> &std::sync::Mutex<crate::update_plan::PlanUpdate> {
+        &self.live_plan
+    }
+
     /// Returns the retained output this call may read.
     #[must_use]
     pub fn result_store(&self) -> Option<&crate::result_store::Store> {
@@ -274,6 +300,7 @@ impl ExecutionContext {
             allow_unsandboxed: self.allow_unsandboxed,
             max_output_bytes: self.max_output_bytes,
             result_store: self.result_store.clone(),
+            live_plan: Arc::clone(&self.live_plan),
             cancelled: Arc::clone(&self.cancelled),
         }
     }
@@ -570,6 +597,7 @@ mod tests {
             Activity::Network,
             Activity::Delegate,
             Activity::Interact,
+            Activity::Plan,
         ];
         for activity in activities {
             assert!(!activity.running_label().is_empty(), "{activity:?}");

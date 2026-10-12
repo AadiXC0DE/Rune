@@ -308,6 +308,13 @@ impl Host for TestHost {
         arguments: &serde_json::Value,
         context: &ExecutionContext,
     ) -> Result<ToolOutput> {
+        if name == "update_plan" {
+            return self
+                .registry
+                .as_ref()
+                .expect("plan registry")
+                .call(name, arguments, context);
+        }
         if name == "web_fetch" {
             assert_eq!(
                 context.private_network_access,
@@ -3096,4 +3103,69 @@ fn cancellation_of_identical_calls_preserves_the_cancellation_outcome() {
     assert_eq!(error.code(), rune_core::ErrorCode::Cancelled);
     assert_eq!(host.executed_calls().len(), 1);
     history.validate().expect("all cancelled calls answered");
+}
+
+#[test]
+fn live_plans_survive_turns_and_compaction_but_are_isolated_from_new_histories() {
+    let initial = serde_json::json!({"plan": [
+        {"step": "Inspect", "status": "in_progress"},
+        {"step": "Implement", "status": "pending"},
+        {"step": "Verify", "status": "pending"}
+    ]});
+    let progress = serde_json::json!({"plan": [
+        {"step": "Inspect", "status": "completed"},
+        {"step": "Implement", "status": "in_progress"},
+        {"step": "Verify", "status": "pending"}
+    ]});
+    let endpoint = MockEndpoint::start(vec![
+        Script::tool_call("plan-1", "update_plan", &initial.to_string()),
+        Script::text("Started."),
+        Script::tool_call("plan-2", "update_plan", &progress.to_string()),
+        Script::text("Progressed."),
+        Script::tool_call("plan-retry", "update_plan", &progress.to_string()),
+        Script::text("Unchanged."),
+        Script::tool_call("plan-new", "update_plan", &initial.to_string()),
+        Script::text("New plan."),
+        Script::tool_call("plan-reopen", "update_plan", &initial.to_string()),
+        Script::text("Reopened plan."),
+    ]);
+    let registry = rune_tools::inventory::builtin_default().expect("registry");
+    let mut host = TestHost::new(endpoint)
+        .with_tools(registry.schemas(&["update_plan"]))
+        .with_mode(PermissionMode::FullAccess);
+    host.registry = Some(registry);
+    let mut history = rune_agent::History::new();
+    history.push_user("Plan this work.");
+    run_turn(&mut history, &host).expect("initial turn");
+    // ACP uses a cloned history snapshot for the next turn.
+    let mut history = history.clone();
+    history.push_user("Update progress.");
+    run_turn(&mut history, &host).expect("progress turn");
+    history.replace_with_summary("Work progressed.", u64::MAX);
+    history.push_user("Repeat the last plan.");
+    run_turn(&mut history, &host).expect("retry after compaction");
+    let mut separate = rune_agent::History::new();
+    separate.push_user("Start a separate plan in the same registry.");
+    run_turn(&mut separate, &host).expect("new conversation");
+    let saved = serde_json::to_string(&history).expect("serialized history");
+    let mut reopened: rune_agent::History = serde_json::from_str(&saved).expect("reopened history");
+    reopened.push_user("Start a plan after reopening.");
+    run_turn(&mut reopened, &host).expect("reopened conversation");
+    let updates: Vec<_> = host
+        .events()
+        .into_iter()
+        .filter_map(|event| match event {
+            Event::PlanUpdated { update } => Some(update),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        updates
+            .iter()
+            .map(|update| update.version)
+            .collect::<Vec<_>>(),
+        [1, 2, 1, 1]
+    );
+    assert_eq!(updates[0].plan, updates[2].plan);
+    assert!(updates.iter().all(|update| update.plan.len() == 3));
 }

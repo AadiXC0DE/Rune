@@ -172,6 +172,7 @@ impl Session {
 
         let file_limits = FileLimits::from_budget(&limits);
         let mut registry = Registry::new();
+        registry.insert(Box::new(rune_tools::UpdatePlan))?;
         registry.insert(Box::new(GlobFiles::with_limits(file_limits)))?;
         registry.insert(Box::new(GrepFiles::with_limits(file_limits)))?;
         registry.insert(Box::new(ReadFile::with_limits(file_limits)))?;
@@ -238,6 +239,7 @@ impl Session {
 fn rules() -> RuleSet {
     let mut rules = RuleSet::new();
     for tool in [
+        "update_plan",
         "read_file",
         "read_tool_result",
         "glob_files",
@@ -363,6 +365,18 @@ impl Host for Session {
         }
     }
 
+    fn execute_with_context(
+        &self,
+        name: &str,
+        arguments: &serde_json::Value,
+        context: &ExecutionContext,
+    ) -> Result<ToolOutput> {
+        if name == "update_plan" {
+            return self.registry.call(name, arguments, context);
+        }
+        self.execute(name, arguments)
+    }
+
     fn context(&self) -> ExecutionContext {
         self.context.fork()
     }
@@ -399,6 +413,7 @@ fn encode(event: &Event) -> serde_json::Value {
         Event::ProviderRetryFinished { step } => {
             json!({ "kind": "provider_retry_finished", "step": step })
         }
+        Event::PlanUpdated { update } => json!({ "kind": "plan_updated", "update": update }),
         Event::TextDelta { delta } => json!({ "kind": "text", "delta": delta }),
         Event::ReasoningDelta { delta } => json!({ "kind": "reasoning", "delta": delta }),
         Event::ToolStarted { call, activity } => json!({

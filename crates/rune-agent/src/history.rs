@@ -129,6 +129,9 @@ pub struct History {
     /// part of a provider request or a serialized transcript.
     #[serde(skip, default = "new_result_store")]
     result_store: Arc<Store>,
+    /// Plan state shares the lifetime of this live conversation, not its registry.
+    #[serde(skip)]
+    live_plan: Arc<std::sync::Mutex<rune_tools::PlanUpdate>>,
 }
 
 fn new_result_store() -> Arc<Store> {
@@ -143,6 +146,7 @@ impl Default for History {
             turns: Vec::default(),
             next_seq: u64::default(),
             result_store: new_result_store(),
+            live_plan: Arc::default(),
         }
     }
 }
@@ -157,6 +161,7 @@ impl History {
             turns: Vec::new(),
             next_seq: 1,
             result_store: new_result_store(),
+            live_plan: Arc::default(),
         }
     }
 
@@ -175,6 +180,10 @@ impl History {
 
     pub(crate) fn shared_result_store(&self) -> Arc<Store> {
         Arc::clone(&self.result_store)
+    }
+
+    pub(crate) fn shared_live_plan(&self) -> Arc<std::sync::Mutex<rune_tools::PlanUpdate>> {
+        Arc::clone(&self.live_plan)
     }
 
     /// Sets the system instructions.
@@ -472,6 +481,7 @@ impl History {
             turns,
             next_seq,
             result_store: self.result_store.clone(),
+            live_plan: Arc::default(),
         }
     }
 

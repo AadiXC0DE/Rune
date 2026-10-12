@@ -73,6 +73,7 @@ enum JsonlEvent<'a> {
     StepStart { step: u32 },
     StepRestart { step: u32 },
     TextDelta { step: u32, delta: &'a str },
+    PlanUpdated { update: &'a rune_tools::PlanUpdate },
     Final { result: &'a JsonResult },
 }
 
@@ -362,6 +363,9 @@ impl Host for AskHost<'_> {
             }
             Event::StepRestarted { step } => {
                 write_jsonl(&mut stdout, &JsonlEvent::StepRestart { step })
+            }
+            Event::PlanUpdated { update } => {
+                write_jsonl(&mut stdout, &JsonlEvent::PlanUpdated { update: &update })
             }
             Event::TextDelta { delta } => write_text_deltas(&mut stdout, self.step.get(), &delta),
             _ => Ok(()),

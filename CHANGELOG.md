@@ -6,6 +6,12 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Added
 
+- Models can call `update_plan` to replace a bounded in-memory step plan with
+  pending, in_progress, and completed statuses. Changed snapshots produce
+  versioned status events, including `plan_updated` in `rune ask --jsonl`.
+  Duplicate steps are refused, identical retries keep the version, and workspace
+  files are unchanged. Plans last for the live conversation and reset on reopening.
+
 - `rune ask --image <path>` attaches local PNG, JPEG, GIF, or WebP images to the
   selected model's user message, including subsequent tool steps. Repeatable
   attachments are bounded to 16 files and 8 MiB total; oversized input returns

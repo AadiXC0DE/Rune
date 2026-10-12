@@ -533,6 +533,9 @@ impl Host for SessionHost {
                 }
                 self.draw_stream();
             }
+            Event::PlanUpdated { update } => {
+                self.draw_notice(&plan_summary(update));
+            }
             Event::ContextCompacted {
                 removed_turns,
                 remaining_turns,
@@ -562,6 +565,7 @@ impl Host for SessionHost {
                     produced_bytes: outcome.text.len() as u64,
                     text: outcome.text,
                     is_error: outcome.is_error,
+                    plan_update: None,
                 }),
                 Err(error) if error.code() == ErrorCode::Cancelled => Err(error),
                 Err(error) => Ok(ToolOutput::from_error(&error)),
@@ -611,7 +615,7 @@ impl Host for SessionHost {
         arguments: &serde_json::Value,
         context: &ExecutionContext,
     ) -> Result<ToolOutput> {
-        if name == "web_fetch" {
+        if matches!(name, "web_fetch" | "update_plan") {
             return self.registry.call(name, arguments, context);
         }
         self.execute(name, arguments)
@@ -4828,6 +4832,20 @@ fn handle_command<W: std::io::Write>(
     }
 }
 
+/// Returns a human-readable headline for the current plan.
+fn plan_summary(update: &rune_tools::PlanUpdate) -> String {
+    let completed = update
+        .plan
+        .iter()
+        .filter(|step| step.status == rune_tools::update_plan::Status::Completed)
+        .count();
+    format!(
+        "plan version {}: {completed}/{} steps completed",
+        update.version,
+        update.plan.len()
+    )
+}
+
 /// Returns the one line that stands for a finished tool call.
 ///
 /// A tool result already opens with a headline naming what it found, because
@@ -4835,6 +4853,12 @@ fn handle_command<W: std::io::Write>(
 /// needs while skimming, and the body stays available to the model and in the
 /// session log.
 fn tool_summary(name: &str, output: &ToolOutput) -> String {
+    if name == "update_plan"
+        && !output.is_error
+        && let Ok(update) = serde_json::from_str::<rune_tools::PlanUpdate>(&output.text)
+    {
+        return plan_summary(&update);
+    }
     let headline = output
         .text
         .lines()

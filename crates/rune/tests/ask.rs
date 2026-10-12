@@ -1427,3 +1427,115 @@ fn ask_oversized_image_and_batch_fail_before_any_provider_request() {
         assert!(!dir.path().join("state/sessions").exists());
     }
 }
+
+#[test]
+fn model_plan_updates_emit_versioned_events_without_duplicates_or_workspace_mutations() {
+    let initial = json!({"plan": [
+        {"step": "Inspect", "status": "in_progress"},
+        {"step": "Implement", "status": "pending"},
+        {"step": "Verify", "status": "pending"}
+    ]});
+    let progress = json!({"explanation": "Inspection finished", "plan": [
+        {"step": "Inspect", "status": "completed"},
+        {"step": "Implement", "status": "in_progress"},
+        {"step": "Verify", "status": "pending"}
+    ]});
+    let duplicate = json!({"plan": [
+        {"step": "Inspect", "status": "completed"},
+        {"step": " Inspect ", "status": "pending"}
+    ]});
+    let completed = json!({"plan": [
+        {"step": "Inspect", "status": "completed"},
+        {"step": "Implement", "status": "completed"},
+        {"step": "Verify", "status": "completed"}
+    ]});
+    let mut responses: Vec<_> = [&initial, &progress, &progress, &duplicate, &completed]
+        .into_iter()
+        .enumerate()
+        .map(|(index, arguments)| {
+            let mut delta = call_delta("update_plan", &arguments.to_string());
+            delta["tool_calls"][0]["id"] = json!(format!("plan-{index}"));
+            completion_response(&delta, "tool_calls")
+        })
+        .collect();
+    responses.push(completion_response(
+        &json!({"content": "Plan finished."}),
+        "stop",
+    ));
+    let (output, dir, requests) =
+        run_responses_fixture_with_format(responses, Some("--jsonl"), true, Some(6), |_| {});
+    assert!(output.status.success(), "{:?}", output.stderr);
+    assert!(output.stderr.is_empty());
+    assert_eq!(requests.len(), 6);
+    assert!(
+        requests[0]["tools"]
+            .as_array()
+            .expect("tools")
+            .iter()
+            .any(|tool| tool["function"]["name"] == "update_plan")
+    );
+    let events: Vec<Value> = std::str::from_utf8(&output.stdout)
+        .expect("UTF-8")
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("JSON event"))
+        .collect();
+    let updates: Vec<_> = events
+        .iter()
+        .filter(|event| event["type"] == "plan_updated")
+        .collect();
+    assert_eq!(
+        updates.len(),
+        3,
+        "retry and rejected update must emit no event"
+    );
+    for (index, update) in updates.iter().enumerate() {
+        assert_eq!(update["update"]["version"], index + 1);
+        assert_eq!(update["update"]["plan"].as_array().expect("steps").len(), 3);
+        assert_eq!(update["update"]["plan"][0]["step"], "Inspect");
+        assert_eq!(update["update"]["plan"][1]["step"], "Implement");
+        assert_eq!(update["update"]["plan"][2]["step"], "Verify");
+    }
+    assert_eq!(updates[0]["update"]["plan"], initial["plan"]);
+    assert_eq!(updates[1]["update"]["plan"], progress["plan"]);
+    assert_eq!(updates[2]["update"]["plan"], completed["plan"]);
+    for (index, version) in [(1, 1), (2, 2), (3, 2), (5, 3)] {
+        let result = requests[index]["messages"]
+            .as_array()
+            .expect("messages")
+            .last()
+            .expect("tool result");
+        assert_eq!(result["role"], "tool");
+        let snapshot: Value =
+            serde_json::from_str(result["content"].as_str().expect("result")).expect("snapshot");
+        assert_eq!(snapshot["version"], version);
+        assert_eq!(snapshot["plan"].as_array().expect("steps").len(), 3);
+    }
+    let rejected = requests[4]["messages"]
+        .as_array()
+        .expect("messages")
+        .last()
+        .expect("error");
+    assert!(
+        rejected["content"]
+            .as_str()
+            .expect("error text")
+            .contains("distinct")
+    );
+    assert_eq!(
+        events.last().expect("final")["result"]["final_output"],
+        "Plan finished."
+    );
+    assert_eq!(
+        std::fs::read(dir.path().join("fixture.txt")).expect("unchanged fixture"),
+        b"ALLOWED_READ_RESULT"
+    );
+    let mut files: Vec<_> = std::fs::read_dir(dir.path())
+        .expect("workspace")
+        .map(|entry| entry.expect("entry").file_name())
+        .collect();
+    files.sort();
+    assert_eq!(
+        files,
+        ["config", "fixture.txt"].map(std::ffi::OsString::from)
+    );
+}

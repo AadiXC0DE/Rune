@@ -1509,6 +1509,7 @@ fn execute(context: &TurnContext, calls: &[PreparedCall]) -> (Vec<Executed>, boo
                             text: bound_text(&result.text, cap),
                             is_error: result.is_error,
                             produced_bytes: produced,
+                            plan_update: None,
                         },
                         executed: true,
                     },

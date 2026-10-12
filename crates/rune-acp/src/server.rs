@@ -1400,7 +1400,8 @@ impl<W: Write + Send + 'static> Host for TurnHost<W> {
                     self.context_window,
                 )));
             }
-            Event::SteeringApplied { .. }
+            Event::PlanUpdated { .. }
+            | Event::SteeringApplied { .. }
             | Event::ContextCompacted { .. }
             | Event::ProviderRetry { .. }
             | Event::ProviderRetryFinished { .. } => {}
@@ -1419,6 +1420,7 @@ impl<W: Write + Send + 'static> Host for TurnHost<W> {
                     produced_bytes: outcome.text.len() as u64,
                     text: outcome.text,
                     is_error: outcome.is_error,
+                    plan_update: None,
                 },
                 Err(err) => ToolOutput::from_error(&err),
             };
@@ -1450,6 +1452,18 @@ impl<W: Write + Send + 'static> Host for TurnHost<W> {
             Outcome::Ask => self.request_permission(name, target),
             resolved => (resolved, reason),
         }
+    }
+
+    fn execute_with_context(
+        &self,
+        name: &str,
+        arguments: &Value,
+        context: &ExecutionContext,
+    ) -> Result<ToolOutput> {
+        if name == "update_plan" {
+            return self.server.config.registry.call(name, arguments, context);
+        }
+        self.execute(name, arguments)
     }
 
     fn context(&self) -> ExecutionContext {
