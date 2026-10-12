@@ -6,6 +6,11 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Added
 
+- Release manifests publish the target's uncompressed executable size and hash,
+  raw startup samples and distribution statistics, measurement host and method.
+  `cargo xtask benchmark <executable-path>` repeats the method on an extracted
+  artifact. CI uploads measured native releases for Linux, macOS and Windows.
+
 - Linux shell calls can set `pty: true` for a controlling terminal, send input
   with `interact`, and resize with paired `rows` and `cols` (initially 24 by 80).
   PTY output merges stdout and stderr under the existing byte cap. Stop,

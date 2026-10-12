@@ -998,6 +998,32 @@ bash .github/scripts/test-dependency-policy.sh
 Relative values resolve from the command's working directory. Release archives
 are still staged under `target/dist`.
 
+`cargo xtask release <channel> [version] [target]` writes a target-specific
+`manifest.json` beside the archive and checksum. Its existing `bytes` and
+`sha256` describe the compressed archive. `binary.name`, `binary.bytes` and
+`binary.sha256` describe the exact uncompressed executable in that archive.
+`startup` records the measurement host target, OS and architecture, the benchmark
+method, and raw milliseconds for all 31 runs of each of `--version` and `--help`,
+plus minimum, median and nearest-rank p95. These measurements use no baseline
+subtraction. They run serially with no warmup, stdout and stderr discarded,
+and inherited stdin, environment and working directory. Caches are uncontrolled;
+these are host-specific process timings, not a cold-start guarantee.
+
+To repeat the method without rebuilding, extract the archive and run from this
+repository, using the extracted executable's path (use `rune.exe` on Windows):
+
+```sh
+cargo xtask benchmark /path/to/extracted/rune
+```
+
+The command prints the same `binary` and `startup` JSON fields. Compare binary
+hashes before comparing timings. Release staging requires both commands to run
+successfully on the artifact itself; a cross target that cannot execute on the
+build machine must be staged on a compatible runner. CI stages native releases
+on Linux, macOS and Windows and uploads each archive, checksum and manifest
+together. Benchmark timings can vary between runs; binary and archive hashes
+remain the reproducibility checks.
+
 The reproducible CI job builds the same source with two fresh scratch
 `CARGO_TARGET_DIR` directories, extracts each release, and compares SHA-256
 hashes of both the binaries and archives. Run this check on Linux from a

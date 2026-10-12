@@ -29,7 +29,12 @@ impl ScratchWorkspace {
         .expect("write scratch lockfile");
         std::fs::write(
             path.join("src/main.rs"),
-            "fn main() { std::fs::write(\"ran-fixture\", b\"fixture\").unwrap(); }\n",
+            r#"fn main() {
+    use std::io::Write;
+    let mut log = std::fs::OpenOptions::new().create(true).append(true).open("ran-fixture").unwrap();
+    writeln!(log, "{}", std::env::args().nth(1).unwrap()).unwrap();
+}
+"#,
         )
         .expect("write scratch source");
         // A stale default artifact must never be measured or packaged when
@@ -146,7 +151,118 @@ fn release_packages_the_binary_in_cargos_target_directory() {
             binary,
             "the archive must contain the fresh build, not the stale default artifact"
         );
+        let manifest: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(archive_directory(&workspace).join("manifest.json"))
+                .expect("read manifest"),
+        )
+        .expect("parse manifest");
+        assert_eq!(manifest["target"], env!("TARGET"));
+        assert_measurements(&manifest, &binary);
+        assert_invocations(&workspace);
+
+        // Repeat the published method on bytes extracted from the archive,
+        // even with a bare relative filename and a different build directory.
+        let extracted = workspace
+            .0
+            .join(format!("extracted{}", std::env::consts::EXE_SUFFIX));
+        std::fs::write(&extracted, &tar[512..end]).expect("extract executable");
+        std::fs::set_permissions(
+            &extracted,
+            std::fs::metadata(workspace.binary(directory))
+                .expect("binary metadata")
+                .permissions(),
+        )
+        .expect("set executable permissions");
+        std::fs::remove_file(workspace.0.join("ran-fixture")).expect("clear invocation log");
+        let output = workspace.task(
+            &[
+                "benchmark",
+                extracted
+                    .file_name()
+                    .expect("filename")
+                    .to_str()
+                    .expect("UTF-8"),
+            ],
+            directory,
+        );
+        assert!(output.status.success(), "{output:?}");
+        let repeated: serde_json::Value =
+            serde_json::from_slice(&output.stdout).expect("benchmark JSON");
+        assert_measurements(&repeated, &binary);
+        assert_eq!(repeated["startup"]["method"], manifest["startup"]["method"]);
+        assert_invocations(&workspace);
     }
+}
+
+fn archive_directory(workspace: &ScratchWorkspace) -> PathBuf {
+    workspace
+        .0
+        .join(format!("target/dist/rune-{}", env!("TARGET")))
+}
+
+fn assert_invocations(workspace: &ScratchWorkspace) {
+    let log = std::fs::read_to_string(workspace.0.join("ran-fixture")).expect("invocation log");
+    let expected = format!("{}{}", "--version\n".repeat(31), "--help\n".repeat(31));
+    assert_eq!(log, expected, "measure exactly 31 serial runs of each flag");
+}
+
+fn assert_measurements(measurements: &serde_json::Value, binary: &[u8]) {
+    use sha2::{Digest, Sha256};
+
+    assert_eq!(measurements["binary"]["bytes"], binary.len());
+    assert_eq!(
+        measurements["binary"]["sha256"],
+        format!("{:x}", Sha256::digest(binary))
+    );
+    let startup = &measurements["startup"];
+    assert_eq!(startup["host"]["target"], env!("TARGET"));
+    assert_eq!(startup["host"]["os"], std::env::consts::OS);
+    assert_eq!(startup["host"]["arch"], std::env::consts::ARCH);
+    assert_eq!(startup["method"]["sample_count"], 31);
+    assert_eq!(startup["method"]["baseline_subtracted"], false);
+    assert_eq!(startup["method"]["warmup_runs"], 0);
+    assert_eq!(
+        startup["method"]["reproduce"],
+        serde_json::json!(["cargo", "xtask", "benchmark", "<extracted executable path>"])
+    );
+    for flag in ["--version", "--help"] {
+        let raw = &startup["measurements"][flag];
+        let mut samples: Vec<f64> = raw["samples_ms"]
+            .as_array()
+            .expect("raw samples")
+            .iter()
+            .map(|value| value.as_f64().expect("milliseconds"))
+            .collect();
+        assert_eq!(samples.len(), 31);
+        assert!(
+            samples
+                .iter()
+                .all(|value| value.is_finite() && *value >= 0.0)
+        );
+        samples.sort_by(f64::total_cmp);
+        assert_eq!(raw["minimum_ms"], samples[0]);
+        assert_eq!(raw["median_ms"], samples[15]);
+        assert_eq!(raw["p95_ms"], samples[29]);
+    }
+}
+
+#[test]
+fn failed_artifact_benchmark_prevents_release_publication() {
+    let workspace = ScratchWorkspace::new();
+    std::fs::write(
+        workspace.0.join("src/main.rs"),
+        r#"fn main() {
+        if std::env::args().nth(1).as_deref() == Some("--help") { std::process::exit(9); }
+    }"#,
+    )
+    .expect("write failing artifact");
+    let output = workspace.task(&["release"], None);
+    assert!(!output.status.success(), "{output:?}");
+    assert!(String::from_utf8_lossy(&output.stderr).contains("--help` exited with a failure"));
+    assert!(
+        !archive_directory(&workspace).exists(),
+        "failed measurements must not stage a release"
+    );
 }
 
 #[test]
@@ -170,10 +286,22 @@ fn release_manifest_preserves_channels_requiring_json_escaping() {
         assert!(output.status.success(), "{channel:?}: {output:?}");
         let contents =
             std::fs::read(directory.join("manifest.json")).expect("read staged manifest");
-        let manifest: serde_json::Value =
+        let mut manifest: serde_json::Value =
             serde_json::from_slice(&contents).expect("staged manifest must be valid JSON");
         let bytes = std::fs::read(directory.join(&archive)).expect("read staged archive");
         let checksum = format!("{:x}", Sha256::digest(&bytes));
+        assert_measurements(
+            &manifest,
+            &std::fs::read(workspace.binary(None)).expect("binary"),
+        );
+        manifest
+            .as_object_mut()
+            .expect("manifest object")
+            .remove("binary");
+        manifest
+            .as_object_mut()
+            .expect("manifest object")
+            .remove("startup");
         assert_eq!(
             manifest,
             serde_json::json!({

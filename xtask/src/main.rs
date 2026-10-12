@@ -51,6 +51,7 @@ fn main() -> ExitCode {
         "budget" => budget(),
         "gate" => gate(),
         "release" => release(&extra),
+        "benchmark" => benchmark(&extra),
         "web" => web(),
         "help" | "--help" | "-h" => {
             print_help();
@@ -85,9 +86,11 @@ fn print_help() {
     println!("  budget   build the release profile and check size and startup");
     println!("  gate     format, lint, budget, and the full workspace test suite");
     println!("  release  stage a release artifact, its checksum, and a manifest");
+    println!("  benchmark  print raw size and startup JSON for an existing executable");
     println!("  web      build the harness for the landing page into site/demo/rune.wasm");
     println!();
     println!("  release takes: cargo xtask release <channel> [version] [target]");
+    println!("  benchmark takes: cargo xtask benchmark <executable-path>");
     println!();
     print_budget_help();
 }
@@ -224,11 +227,9 @@ fn target_directory() -> PathBuf {
 
 /// Stages a release artifact for the host that is building it.
 ///
-/// One target is staged at a time: a machine can only build the platform it is
-/// running on without a cross-compilation toolchain, so a matrix is produced by
-/// running this once per machine. The artifact is named after the target, and a
-/// checksum and a manifest are written beside it, because an artifact without a
-/// published checksum cannot be verified by whoever downloads it.
+/// One target is staged at a time. Cross-compilation is supported, but startup
+/// measurements require a runner that can execute the resulting artifact. The
+/// artifact is named after the target, with a checksum and a measured manifest.
 fn release(extra: &[String]) -> Result<(), String> {
     let channel = extra.first().map_or("dev", String::as_str);
     let version = match extra.get(1) {
@@ -263,6 +264,12 @@ fn release(extra: &[String]) -> Result<(), String> {
     let archive = format!("rune-{version}-{target}.tar.gz");
     let archive_path = format!("{directory}/{archive}");
 
+    // Measure the exact bytes that will be archived. A cross-built executable
+    // must run on this machine; host measurements cannot stand in for it.
+    let binary_bytes = std::fs::read(&binary)
+        .map_err(|err| format!("could not read {}: {err}", binary.display()))?;
+    let measurements = artifact_measurements(&binary, &binary_bytes)?;
+
     std::fs::create_dir_all(&directory)
         .map_err(|err| format!("could not create {directory}: {err}"))?;
 
@@ -274,8 +281,6 @@ fn release(extra: &[String]) -> Result<(), String> {
     // the other rejects, and an unpinned timestamp makes two runs over identical
     // input produce different archives. Writing it means the bytes depend on the
     // binary alone.
-    let binary_bytes = std::fs::read(&binary)
-        .map_err(|err| format!("could not read {}: {err}", binary.display()))?;
     std::fs::write(&archive_path, archive_bytes(&name, &binary_bytes)?)
         .map_err(|err| format!("could not write {archive_path}: {err}"))?;
 
@@ -303,6 +308,8 @@ fn release(extra: &[String]) -> Result<(), String> {
         "archive": archive,
         "bytes": bytes.len(),
         "sha256": checksum,
+        "binary": measurements["binary"],
+        "startup": measurements["startup"],
     });
     let mut manifest_json = serde_json::to_string_pretty(&manifest)
         .map_err(|err| format!("could not serialize the release manifest: {err}"))?;
@@ -314,6 +321,72 @@ fn release(extra: &[String]) -> Result<(), String> {
     println!("sha256   {checksum}");
     println!("manifest {directory}/manifest.json");
     Ok(())
+}
+
+/// Repeats release measurements on an extracted executable without rebuilding it.
+fn benchmark(extra: &[String]) -> Result<(), String> {
+    let [path] = extra else {
+        return Err("usage: cargo xtask benchmark <executable-path>".to_owned());
+    };
+    let binary = Path::new(path);
+    let bytes = std::fs::read(binary)
+        .map_err(|err| format!("could not read {}: {err}", binary.display()))?;
+    let measurements = artifact_measurements(binary, &bytes)?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&measurements)
+            .map_err(|err| format!("could not serialize measurements: {err}"))?
+    );
+    Ok(())
+}
+
+/// Records raw measurements and enough method detail to repeat them.
+fn artifact_measurements(binary: &Path, bytes: &[u8]) -> Result<serde_json::Value, String> {
+    // Resolve relative paths, including a bare filename, rather than searching PATH.
+    let executable = std::fs::canonicalize(binary)
+        .map_err(|err| format!("could not resolve {}: {err}", binary.display()))?;
+    let version = startup_metrics(&executable, "--version")?;
+    let help = startup_metrics(&executable, "--help")?;
+    let reread = std::fs::read(&executable)
+        .map_err(|err| format!("could not re-read {}: {err}", executable.display()))?;
+    if reread != bytes {
+        return Err(format!("{} changed during benchmarking", binary.display()));
+    }
+    Ok(serde_json::json!({
+        "binary": {
+            "name": binary.file_name().ok_or("executable path has no filename")?.to_string_lossy(),
+            "bytes": bytes.len(),
+            "sha256": digest(bytes),
+        },
+        "startup": {
+            "host": {
+                "target": env!("TARGET"),
+                "os": std::env::consts::OS,
+                "arch": std::env::consts::ARCH,
+            },
+            "method": {
+                "reproduce": ["cargo", "xtask", "benchmark", "<extracted executable path>"],
+                "sample_count": MEASUREMENT_SAMPLES,
+                "commands": [["--version"], ["--help"]],
+                "clock": "std::time::Instant",
+                "timing": "wall time from before process spawn through successful exit",
+                "execution": "serial, --version samples followed by --help samples",
+                "warmup_runs": 0,
+                "cache": "uncontrolled; no cache flushing or cold-start guarantee",
+                "stdin": "inherited",
+                "stdout": "discarded",
+                "stderr": "discarded",
+                "environment": "inherited from benchmark process",
+                "working_directory": "inherited from benchmark process",
+                "baseline_subtracted": false,
+                "percentile": "nearest rank: p95 is the 30th sorted sample of 31",
+            },
+            "measurements": {
+                "--version": version.raw_json(),
+                "--help": help.raw_json(),
+            },
+        },
+    }))
 }
 
 /// Builds a tar archive holding one file.
@@ -522,21 +595,33 @@ fn measure_floor() -> Result<Option<f64>, String> {
 
 /// Raw spawn-to-exit wall times in milliseconds, without baseline subtraction.
 struct StartupMetrics {
+    samples: [f64; MEASUREMENT_SAMPLES],
     minimum: f64,
     median: f64,
     p95: f64,
 }
 
 impl StartupMetrics {
-    fn from_samples(mut samples: [f64; MEASUREMENT_SAMPLES]) -> Self {
+    fn from_samples(samples: [f64; MEASUREMENT_SAMPLES]) -> Self {
         // Nearest rank: ceil(0.95 * 31) = 30, with a zero-based index of 29.
         const P95_INDEX: usize = (95 * MEASUREMENT_SAMPLES).div_ceil(100) - 1;
-        samples.sort_by(f64::total_cmp);
+        let mut sorted = samples;
+        sorted.sort_by(f64::total_cmp);
         Self {
-            minimum: samples[0],
-            median: samples[MEASUREMENT_SAMPLES / 2],
-            p95: samples[P95_INDEX],
+            samples,
+            minimum: sorted[0],
+            median: sorted[MEASUREMENT_SAMPLES / 2],
+            p95: sorted[P95_INDEX],
         }
+    }
+
+    fn raw_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "samples_ms": self.samples.as_slice(),
+            "minimum_ms": self.minimum,
+            "median_ms": self.median,
+            "p95_ms": self.p95,
+        })
     }
 
     fn work_ms(&self, floor: Option<f64>) -> f64 {

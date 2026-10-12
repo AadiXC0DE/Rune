@@ -203,3 +203,16 @@ jobs:
 
       - name: Test workspace including the real PTY replay gate on Unix
         run: cargo test --workspace
+
+      - name: Stage native release with artifact size and startup measurements
+        shell: bash
+        run: |
+          rm -rf target/dist
+          cargo xtask release dev
+
+      - name: Publish measured release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: rune-${{ runner.os }}-${{ runner.arch }}
+          path: target/dist/rune-*/*
+          if-no-files-found: error
