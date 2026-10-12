@@ -873,6 +873,38 @@ impl SessionHost {
             .is_empty()
     }
 
+    /// Describes the current-to-original changes without consuming undo records.
+    fn preview_undo(&self) -> Vec<String> {
+        let undo = self
+            .undo
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if undo.is_empty() {
+            return vec!["nothing to undo: this session has not changed any file".to_owned()];
+        }
+        let mut lines = vec!["undo preview (files and mutation journal unchanged)".to_owned()];
+        for (path, original) in undo.iter() {
+            let current = match std::fs::read(path) {
+                Ok(bytes) => Some(bytes),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+                Err(err) => {
+                    lines.push(format!("`{path}` could not be previewed: {err}"));
+                    continue;
+                }
+            };
+            lines.push(format!(
+                "would {} {path}",
+                if original.is_some() {
+                    "restore"
+                } else {
+                    "remove"
+                }
+            ));
+            lines.extend(undo_diff(path, current.as_deref(), original.as_deref()));
+        }
+        lines
+    }
+
     /// Puts every changed file back and forgets the record.
     ///
     /// Returns one line per file, describing what was done, or a failure
@@ -1774,6 +1806,10 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                         note(format!("started session {id}"));
                     }
                     Handled::Undo => return Ok(Step::Undo),
+                    Handled::UndoPreview => {
+                        flush_lines(&host, sink, &host.preview_undo())?;
+                        return Ok(Step::Continue);
+                    }
                     Handled::Compact => {
                         // Handled here because this closure already mutably
                         // borrows the conversation, and a second borrower would
@@ -3681,6 +3717,82 @@ fn report_undo(host: &SessionHost, sink: &mut LockedSink) -> Result<()> {
     Ok(())
 }
 
+/// A unified diff in the direction undo applies, with three context lines.
+///
+/// One hunk covers the changed region. Common leading and trailing lines are
+/// kept as context, so work is linear even for large, unrelated file contents.
+fn undo_diff(path: &Utf8Path, current: Option<&[u8]>, original: Option<&[u8]>) -> Vec<String> {
+    if current == original {
+        return vec!["no byte changes".to_owned()];
+    }
+    let old_label = current.map_or_else(|| "/dev/null".to_owned(), |_| path.to_string());
+    let new_label = original.map_or_else(|| "/dev/null".to_owned(), |_| path.to_string());
+    let mut lines = vec![format!("--- {old_label}"), format!("+++ {new_label}")];
+    let old_bytes = current.unwrap_or_default();
+    let new_bytes = original.unwrap_or_default();
+    let text = std::str::from_utf8(old_bytes)
+        .ok()
+        .zip(std::str::from_utf8(new_bytes).ok());
+    let Some((old, new)) = text.filter(|_| !old_bytes.contains(&0) && !new_bytes.contains(&0))
+    else {
+        lines.push(format!(
+            "binary contents differ ({} -> {} bytes)",
+            old_bytes.len(),
+            new_bytes.len()
+        ));
+        return lines;
+    };
+    let old: Vec<_> = old.split_inclusive('\n').collect();
+    let new: Vec<_> = new.split_inclusive('\n').collect();
+    let prefix = old.iter().zip(&new).take_while(|(a, b)| a == b).count();
+    let suffix = old[prefix..]
+        .iter()
+        .rev()
+        .zip(new[prefix..].iter().rev())
+        .take_while(|(a, b)| a == b)
+        .count();
+    let start = prefix.saturating_sub(3);
+    let context_end = suffix.min(3);
+    let old_end = old.len().saturating_sub(suffix);
+    let new_end = new.len().saturating_sub(suffix);
+    let old_hunk_end = old_end.saturating_add(context_end);
+    let new_hunk_end = new_end.saturating_add(context_end);
+    let old_count = old_hunk_end.saturating_sub(start);
+    let new_count = new_hunk_end.saturating_sub(start);
+    lines.push(format!(
+        "@@ -{},{} +{},{} @@",
+        if old_count == 0 {
+            start
+        } else {
+            start.saturating_add(1)
+        },
+        old_count,
+        if new_count == 0 {
+            start
+        } else {
+            start.saturating_add(1)
+        },
+        new_count,
+    ));
+    for (marker, body) in [
+        (' ', &old[start..prefix]),
+        ('-', &old[prefix..old_end]),
+        ('+', &new[prefix..new_end]),
+        (' ', &old[old_end..old_hunk_end]),
+    ] {
+        for line in body {
+            lines.push(format!(
+                "{marker}{}",
+                line.strip_suffix('\n').unwrap_or(line)
+            ));
+            if !line.ends_with('\n') {
+                lines.push("\\ No newline at end of file".to_owned());
+            }
+        }
+    }
+    lines
+}
+
 /// Returns the model's most recent reply, as plain text.
 ///
 /// Read from the conversation rather than from the screen: what is on screen has
@@ -4397,6 +4509,8 @@ enum Handled {
     PickModel,
     /// Put back the files the session changed.
     Undo,
+    /// Show per-file diffs without changing files or undo records.
+    UndoPreview,
     /// Summarize older turns to free the context window.
     Compact,
     /// Show exact summarized and retained record counts without compacting.
@@ -4613,6 +4727,7 @@ fn handle_command<W: std::io::Write>(
         }
         "copy" => Ok(Handled::Copy),
         "new" => Ok(Handled::NewSession),
+        "undo" if arguments.trim() == "preview" => Ok(Handled::UndoPreview),
         "undo" => Ok(Handled::Undo),
         "rename" => {
             let title = arguments.trim();
@@ -7184,6 +7299,242 @@ mod tests {
         )
         .expect("handled");
         assert_eq!(action, Handled::Undo);
+    }
+
+    #[test]
+    fn undo_preview_arguments_dispatch_without_applying_undo() {
+        for arguments in ["preview", "  preview  "] {
+            let mut output = Vec::new();
+            assert_eq!(
+                handle_command(
+                    "undo",
+                    arguments,
+                    &empty_commands(),
+                    None,
+                    Utf8Path::new("/w"),
+                    &test_info(),
+                    &mut output,
+                )
+                .expect("handled"),
+                Handled::UndoPreview,
+            );
+            assert!(output.is_empty());
+        }
+    }
+
+    #[test]
+    fn undo_preview_shows_file_diffs_and_preserves_bytes_and_journals() {
+        for accessible in [false, true] {
+            let dir = tempfile::tempdir().expect("temp");
+            let root = Utf8Path::from_path(dir.path()).expect("utf8");
+            let paths = Paths {
+                config_root: root.join("config"),
+                state_root: root.join("state"),
+                data_root: root.join("data"),
+            };
+            let id = SessionId::generate();
+            let mut host = test_host();
+            host.accessible = accessible;
+            host.endpoint.offline = true;
+            host.context = ExecutionContext::new(root.to_owned());
+            host.recorder = Some(Arc::new(Mutex::new(
+                Recorder::create(&paths, &id).expect("recorder"),
+            )));
+            host.registry
+                .insert(Box::new(rune_tools::WriteFile::new()))
+                .expect("registered");
+            let changed = root.join("changed.txt");
+            let created = root.join("created.txt");
+            std::fs::write(&changed, "original café\n").expect("fixture");
+            for (path, content) in [
+                (&changed, "intermediate\n"),
+                (&changed, "latest 界"),
+                (&created, "created\n"),
+            ] {
+                let output = host
+                    .execute(
+                        "write_file",
+                        &serde_json::json!({"path": path, "content": content}),
+                    )
+                    .expect("write");
+                assert!(!output.is_error, "{}", output.text);
+            }
+            let journal = host.undo.lock().expect("lock").clone();
+            let events = host.events.lock().expect("lock").len();
+            let log_path = paths
+                .sessions_dir()
+                .join(id.as_str())
+                .join(rune_session::store::EVENTS_FILE);
+            let log = std::fs::read(&log_path).expect("journal");
+            let expected = host.preview_undo();
+            let captured = Arc::new(Mutex::new(Vec::new()));
+            let mut sink = LockedSink {
+                stream: Arc::new(Mutex::new(SharedBuffer(Arc::clone(&captured)))),
+            };
+            for _ in 0..2 {
+                let preview = host.preview_undo();
+                assert_eq!(
+                    preview, expected,
+                    "preview consumed or changed undo records"
+                );
+                flush_lines(&host, &mut sink, &preview).expect("display preview");
+            }
+            let text = String::from_utf8(captured.lock().expect("lock").clone()).expect("utf8");
+            for fragment in [
+                "undo preview (files and mutation journal unchanged)",
+                changed.as_str(),
+                created.as_str(),
+                "-latest 界",
+                "+original café",
+                "-created",
+                "+++ /dev/null",
+                "\\ No newline at end of file",
+            ] {
+                assert!(text.contains(fragment), "missing {fragment:?}: {text}");
+            }
+            assert!(!text.contains("intermediate"));
+            assert_eq!(
+                std::fs::read(&changed).expect("read"),
+                "latest 界".as_bytes()
+            );
+            assert_eq!(std::fs::read(&created).expect("read"), b"created\n");
+            assert_eq!(*host.undo.lock().expect("lock"), journal);
+            assert_eq!(host.events.lock().expect("lock").len(), events);
+            assert_eq!(std::fs::read(&log_path).expect("journal"), log);
+            host.undo().expect("undo remains available");
+            assert_eq!(
+                std::fs::read(&changed).expect("read"),
+                "original café\n".as_bytes()
+            );
+            assert!(!created.exists());
+            assert!(!host.can_undo());
+        }
+    }
+
+    #[test]
+    fn undo_preview_of_a_rename_shows_restoration_and_removal_without_applying_them() {
+        let dir = tempfile::tempdir().expect("temp");
+        let root = Utf8Path::from_path(dir.path()).expect("utf8");
+        let mut host = test_host();
+        host.context = ExecutionContext::new(root.to_owned());
+        host.registry
+            .insert(Box::new(rune_tools::RenameFile))
+            .expect("registered");
+        let source = root.join("source");
+        let destination = root.join("destination");
+        std::fs::write(&source, "body\n").expect("fixture");
+        assert!(
+            !host
+                .execute(
+                    "rename_file",
+                    &serde_json::json!({"path": "source", "new_path": "destination"}),
+                )
+                .expect("rename")
+                .is_error
+        );
+        let journal = host.undo.lock().expect("lock").clone();
+        let preview = host.preview_undo().join("\n");
+        for fragment in [
+            format!("would restore {source}\n--- /dev/null\n+++ {source}\n@@ -0,0 +1,1 @@\n+body"),
+            format!(
+                "would remove {destination}\n--- {destination}\n+++ /dev/null\n@@ -1,1 +0,0 @@\n-body"
+            ),
+        ] {
+            assert!(preview.contains(&fragment), "{preview}");
+        }
+        assert!(!source.exists());
+        assert_eq!(std::fs::read(&destination).expect("read"), b"body\n");
+        assert_eq!(*host.undo.lock().expect("lock"), journal);
+        host.undo().expect("undo");
+        assert_eq!(std::fs::read(&source).expect("read"), b"body\n");
+        assert!(!destination.exists());
+    }
+
+    #[test]
+    fn undo_preview_reports_read_errors_and_keeps_all_records() {
+        let dir = tempfile::tempdir().expect("temp");
+        let root = Utf8Path::from_path(dir.path()).expect("utf8");
+        let host = test_host();
+        assert!(host.preview_undo()[0].contains("nothing to undo"));
+        let unreadable = root.join("directory");
+        let readable = root.join("readable");
+        std::fs::write(&unreadable, "original").expect("fixture");
+        host.remember(&unreadable);
+        std::fs::remove_file(&unreadable).expect("remove");
+        std::fs::create_dir(&unreadable).expect("directory");
+        host.remember(&readable);
+        std::fs::write(&readable, "body\n").expect("fixture");
+        let journal = host.undo.lock().expect("lock").clone();
+        let preview = host.preview_undo().join("\n");
+        assert!(
+            preview.contains(&format!("`{unreadable}` could not be previewed:")),
+            "{preview}"
+        );
+        assert!(
+            preview.contains(&format!("would remove {readable}")),
+            "{preview}"
+        );
+        assert!(preview.contains("-body"), "{preview}");
+        assert_eq!(*host.undo.lock().expect("lock"), journal);
+        assert!(unreadable.is_dir());
+        assert_eq!(std::fs::read(&readable).expect("read"), b"body\n");
+    }
+
+    #[test]
+    fn undo_diffs_cover_context_newlines_binary_empty_and_unchanged_files() {
+        let path = Utf8Path::new("file");
+        assert_eq!(
+            undo_diff(path, Some(b"same\n"), Some(b"same\n")),
+            ["no byte changes"]
+        );
+        assert_eq!(undo_diff(path, None, None), ["no byte changes"]);
+        assert_eq!(
+            undo_diff(path, Some(b""), None),
+            ["--- file", "+++ /dev/null", "@@ -0,0 +0,0 @@"]
+        );
+        assert_eq!(
+            undo_diff(path, None, Some(b"")),
+            ["--- /dev/null", "+++ file", "@@ -0,0 +0,0 @@"]
+        );
+        assert_eq!(
+            undo_diff(path, Some(b"line"), Some(b"line\n")),
+            [
+                "--- file",
+                "+++ file",
+                "@@ -1,1 +1,1 @@",
+                "-line",
+                "\\ No newline at end of file",
+                "+line",
+            ]
+        );
+        for bytes in [&b"\xff"[..], &b"\0"[..]] {
+            assert_eq!(
+                undo_diff(path, Some(bytes), Some(b"a")),
+                [
+                    "--- file",
+                    "+++ file",
+                    "binary contents differ (1 -> 1 bytes)",
+                ]
+            );
+        }
+        let old = b"1\n2\n3\n4\n5\ncurrent\n7\n8\n9\n10\n";
+        let new = b"1\n2\n3\n4\n5\noriginal\n7\n8\n9\n10\n";
+        assert_eq!(
+            undo_diff(path, Some(old), Some(new)),
+            [
+                "--- file",
+                "+++ file",
+                "@@ -3,7 +3,7 @@",
+                " 3",
+                " 4",
+                " 5",
+                "-current",
+                "+original",
+                " 7",
+                " 8",
+                " 9",
+            ]
+        );
     }
 
     #[test]

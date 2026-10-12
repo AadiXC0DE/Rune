@@ -6,6 +6,10 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Added
 
+- `/undo preview` shows affected paths and per-file diffs before restoring the
+  session's file changes, without changing file bytes or the mutation journal.
+  Created files and rename paths are included; binary changes show byte counts.
+
 - `/pin <constraint>` and Rust SDK `Agent::pin_constraint` keep explicit user
   constraints verbatim in subsequent provider requests across repeated
   compaction and session or checkpoint restoration. `/pin` lists current pins;

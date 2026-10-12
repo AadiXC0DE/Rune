@@ -487,6 +487,13 @@ ordinary prompts, assistant responses, and tool results are never pinned
 automatically. Pins remain user content and count toward request capacity.
 `/new` starts a conversation without the previous pins.
 
+Use `/undo preview` to see affected file paths and diffs from current contents
+to the bytes `/undo` would restore. It leaves files and the mutation journal
+unchanged and works offline. `/undo` restores each recorded file to its state
+before this session first changed it, removing files the session created.
+Renames show both paths. Binary files show a difference notice and byte counts;
+files that cannot be read show a per-file error. Shell changes are not tracked.
+
 Run `rune help` for everything, or see [COMMANDS.md](COMMANDS.md) for the full
 reference.
 
