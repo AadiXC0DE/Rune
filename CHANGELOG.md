@@ -6,6 +6,11 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Added
 
+- Rust SDK hosts can call `Agent::compact` with their own synchronous summarizer.
+  It preserves recent tool pairs, provider replay data, usage, and checkpoint
+  restoration. Failed or unusable summaries leave the conversation intact;
+  closed agents and running turns refuse compaction.
+
 - `rune capabilities` checks dialect support for effort, images, tool streaming,
   fast mode, and routing before a turn, with text or JSON context provenance.
   Unsupported selections fail preflight and are refused before HTTP requests.

@@ -609,6 +609,17 @@ rune prompt --show          # the exact instructions the model receives
 can drive a session. `rune-sdk` is the library an embedder links against: the
 host supplies the credential, the tools, and the network path.
 
+At a settled turn boundary, `Agent::compact(|request| summarizer(request))`
+explicitly summarizes an older conversation prefix. The host callback receives
+summary instructions and the removed records, including tool activity, and
+returns `Result<String>` containing a complete summary. Report cancellation or
+truncation as an error. The synchronous operation returns the removed record
+count, or zero without calling the host for a short conversation. It retains
+recent tool calls with their results, signed provider replay data, and accumulated
+usage. Errors and unusable or oversized summaries leave the conversation intact.
+Closed agents and running turns refuse compaction. Compacted checkpoints restore
+through the existing checkpoint API and obey the same `PromptHistoryBytes` cap.
+
 SDK turns retain at most 1,024 unread events (`EVENT_QUEUE_CAPACITY`). Consume
 `Turn::events()` or `Turn::next_event()` while a long response runs. If the
 queue fills, the SDK cancels provider and tool work cooperatively and

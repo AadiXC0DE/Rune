@@ -19,6 +19,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
 
 use rune_agent::History;
+use rune_agent::compaction;
 use rune_agent::retry::{self, RetryPolicy};
 use rune_agent::steering::Cancellation;
 use rune_agent::turn::{CallResult, Event, PreparedCall, StopReason, TurnOutcome};
@@ -770,6 +771,52 @@ impl Agent {
         self.closed
     }
 
+    /// Summarizes an older prefix of the conversation at a settled turn boundary.
+    ///
+    /// The synchronous host callback receives summary instructions and only the
+    /// prefix being removed, including tool activity. It must return a complete
+    /// summary or an error, including when its work is cancelled or truncated.
+    /// No provider request is made by the SDK itself.
+    ///
+    /// Uses the shared compaction planner and this agent's limits to retain recent
+    /// turns without splitting tool calls from their results. Returns the number
+    /// of records removed, or zero without calling the summarizer when there is
+    /// no prefix to compact. Closed agents and running turns are refused.
+    ///
+    /// Callback errors, unusable summaries, invalid tool pairs, and checkpoints
+    /// exceeding `PromptHistoryBytes` leave the conversation and usage unchanged.
+    /// Successful compaction preserves usage and retained provider replay data.
+    pub fn compact(&mut self, summarizer: impl FnOnce(&str) -> Result<String>) -> Result<usize> {
+        if self.closed {
+            return Err(
+                RuneError::new(ErrorCode::InvalidState, "the agent is closed")
+                    .with_hint("build a new agent, or restore one from a checkpoint"),
+            );
+        }
+        if self.claim.load(Ordering::SeqCst) {
+            return Err(RuneError::new(
+                ErrorCode::InvalidState,
+                "a turn is running, so the conversation cannot be compacted",
+            )
+            .with_hint("wait for the running turn, or drop its handle to cancel it"));
+        }
+
+        let mut history = lock(&self.conversation.history).clone();
+        history.validate()?;
+        let Some(plan) = compaction::plan(&history, &self.limits) else {
+            return Ok(0);
+        };
+        let summary = summarizer(&compaction::render_summary_request(&history, &plan))?;
+        compaction::validate_summary(&summary)?;
+        let removed = compaction::apply(&mut history, &plan, compaction::wrap_summary(&summary));
+        history.validate()?;
+        // Check replayability before installing anything. A host may compact
+        // precisely because the current checkpoint is too large.
+        self.serialize_checkpoint(history.clone())?;
+        *lock(&self.conversation.history) = history;
+        Ok(removed)
+    }
+
     /// Runs one turn.
     ///
     /// Only one turn runs at a time. A second prompt while one is in flight is
@@ -906,13 +953,15 @@ impl Agent {
             .with_hint("wait for the turn to settle, or close the agent to cancel it"));
         }
 
-        let history = {
-            let mut history = lock(&self.conversation.history).clone();
-            // The instructions are a property of the host, not of the
-            // conversation, and they never enter the checkpoint.
-            history.set_instructions(String::new());
-            history
-        };
+        let history = lock(&self.conversation.history).clone();
+        self.serialize_checkpoint(history)
+    }
+
+    /// Serializes a candidate history under the same bound as restoration.
+    fn serialize_checkpoint(&self, mut history: History) -> Result<Vec<u8>> {
+        // The instructions are a property of the host, not of the
+        // conversation, and they never enter the checkpoint.
+        history.set_instructions(String::new());
         let body = CheckpointBody {
             version: CHECKPOINT_VERSION,
             history,
