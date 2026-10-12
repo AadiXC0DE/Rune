@@ -822,6 +822,20 @@ sessions, and delegated child calls support it.
 can drive a session. `rune-sdk` is the library an embedder links against: the
 host supplies the credential, the tools, and the network path.
 
+Cooperative Rust SDK network hosts override
+`HostFetch::post_with_context(request, context)`. Each attempt receives a
+`FetchContext` with the turn's `signal`, an absolute response `head_deadline`,
+and an optional total `deadline` from `ProviderRequestTimeoutMs`. Use
+`context.check_head()` during sending and clone the context into the returned
+body reader, using `context.check()` during reads. Both operations must poll
+or interrupt blocked I/O within a bound documented by the host, including when
+the endpoint sends no bytes. A deadline returns `timeout`; cancellation returns
+`cancelled`. `context.is_cancelled()` also becomes true when the attempt ends,
+so a first-event timeout or completed stream releases retained readers without
+cancelling a later retry. Every retry gets fresh deadlines. Existing `post`
+and `post_with_retry_after` implementations remain supported, but their blocking
+work cannot be interrupted by the SDK unless they adopt this contract.
+
 At a settled turn boundary, `Agent::compact(|request| summarizer(request))`
 explicitly summarizes an older conversation prefix. The host callback receives
 summary instructions, the removed records including tool activity, and explicit

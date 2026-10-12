@@ -6,6 +6,11 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Added
 
+- Rust SDK `HostFetch::post_with_context` receives per-attempt cancellation and
+  absolute response-head and total deadlines. Cooperative hosts can stop silent
+  sends and body reads, including when decoding ends before the total deadline.
+  Existing host fetch methods remain compatible.
+
 - Interactive `subagent` calls can select a project role with `agent`, loading
   instructions and an explicit tool allowlist from `.rune/agents/<name>.json`.
   Role tools intersect inherited read-only tools and remain subject to parent

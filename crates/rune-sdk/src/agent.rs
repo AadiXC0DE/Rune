@@ -8,8 +8,8 @@
 //!
 //! A turn runs on its own thread, so the caller can close the agent, or drop the
 //! turn handle, while the turn is in flight. Cancellation is cooperative: every
-//! network step and every tool call sees the same flag, and a tool that ignores
-//! it delays the cancellation rather than preventing it.
+//! network step and every tool call sees the same flag. Host fetches and tools
+//! that ignore it delay cancellation until their blocking work returns.
 
 use std::fmt;
 use std::io::Read;
@@ -17,6 +17,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
+use std::time::Instant;
 
 use rune_agent::History;
 use rune_agent::compaction;
@@ -134,6 +135,78 @@ impl FetchResponse {
     }
 }
 
+/// Cancellation and deadlines for one host fetch attempt, including its body.
+///
+/// Clone this context into the returned reader and check it during bounded
+/// waits, including when no bytes arrive. The SDK cannot interrupt an arbitrary
+/// blocking host operation. A cooperative host must release its network work
+/// and reader within its documented polling or interruption bound.
+#[derive(Clone, Debug)]
+pub struct FetchContext {
+    /// The turn's cancellation signal, shared with its host tools.
+    pub signal: CancelFlag,
+    /// Absolute deadline for sending the request and reading its entire body.
+    /// `None` means `provider_request_timeout_ms` is unlimited.
+    pub deadline: Option<Instant>,
+    /// Absolute deadline for obtaining the HTTP response head.
+    /// Once headers arrive, the SDK separately bounds initial stream output.
+    pub head_deadline: Instant,
+    /// Set when this attempt ends, without cancelling the rest of the turn.
+    stopped: CancelFlag,
+}
+
+impl FetchContext {
+    /// Returns true if the turn was cancelled or this attempt has ended.
+    ///
+    /// Use this rather than only `signal` when interrupting a body reader: a
+    /// first-event timeout or a completed stream also ends the attempt.
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        self.signal.is_cancelled() || self.stopped.is_cancelled()
+    }
+
+    /// Checks cancellation and the total request deadline.
+    ///
+    /// Suitable for both sending and body reads. Deadline expiry is `Timeout`;
+    /// a cancelled turn or an ended attempt is `Cancelled`.
+    pub fn check(&self) -> Result<()> {
+        self.signal.check()?;
+        self.stopped.check()?;
+        if self
+            .deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            return Err(RuneError::new(
+                ErrorCode::Timeout,
+                "host fetch exceeded the total request deadline",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Also checks the response-head deadline, for use until headers arrive.
+    /// Do not use this for the body, whose bound is the total deadline.
+    pub fn check_head(&self) -> Result<()> {
+        self.check()?;
+        if Instant::now() >= self.head_deadline {
+            return Err(RuneError::new(
+                ErrorCode::Timeout,
+                "host fetch exceeded the response head deadline",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Stops retained host readers on every exit from an attempt, including errors.
+struct FetchStopGuard(CancelFlag);
+
+impl Drop for FetchStopGuard {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
+
 /// Network access, owned by the embedder.
 ///
 /// The agent routes every request through this trait: a host that needs to run
@@ -156,6 +229,28 @@ pub trait HostFetch: Send + Sync {
     ) -> Result<(FetchResponse, Option<String>)> {
         self.post(request).map(|response| (response, None))
     }
+
+    /// Performs one attempt with cancellation, deadlines and `Retry-After`.
+    ///
+    /// The SDK calls this method for every attempt. Cooperative hosts override
+    /// it, use `context.check_head()` while sending, and retain a context clone
+    /// in the body to call `context.check()` during reads. `is_cancelled()` also
+    /// signals when decoding ends, so a silent reader can release its resources
+    /// even if the total deadline is disabled.
+    ///
+    /// The default preserves existing `post` and `post_with_retry_after` hosts.
+    /// It checks before and after sending, but cannot bound their blocking send
+    /// or interrupt their body. Such hosts must migrate to honor the contract.
+    fn post_with_context(
+        &self,
+        request: FetchRequest,
+        context: FetchContext,
+    ) -> Result<(FetchResponse, Option<String>)> {
+        context.check_head()?;
+        let response = self.post_with_retry_after(request)?;
+        context.check_head()?;
+        Ok(response)
+    }
 }
 
 /// Performs one request over the workspace transport.
@@ -166,14 +261,26 @@ pub trait HostFetch: Send + Sync {
 fn dispatch(
     client: &rune_net::transport::UreqFetch,
     request: FetchRequest,
+    context: Option<&FetchContext>,
 ) -> Result<(FetchResponse, Option<String>)> {
+    if let Some(context) = context {
+        context.check_head()?;
+    }
     let parsed = rune_net::fetch::FetchRequest {
         method: rune_net::fetch::Method::Post,
         url: request.url,
         headers: request.headers,
         body: request.body.into_bytes(),
-        timeout: None,
-        head_timeout: None,
+        timeout: context.and_then(|context| {
+            context
+                .deadline
+                .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+        }),
+        head_timeout: context.map(|context| {
+            context
+                .head_deadline
+                .saturating_duration_since(Instant::now())
+        }),
         follow_redirects: true,
     };
     let response =
@@ -207,18 +314,26 @@ impl DefaultFetch {
 
 impl HostFetch for DefaultFetch {
     fn post(&self, request: FetchRequest) -> Result<FetchResponse> {
-        dispatch(&self.client, request).map(|(response, _)| response)
+        dispatch(&self.client, request, None).map(|(response, _)| response)
     }
 
     fn post_with_retry_after(
         &self,
         request: FetchRequest,
     ) -> Result<(FetchResponse, Option<String>)> {
-        dispatch(&self.client, request)
+        dispatch(&self.client, request, None)
+    }
+
+    fn post_with_context(
+        &self,
+        request: FetchRequest,
+        context: FetchContext,
+    ) -> Result<(FetchResponse, Option<String>)> {
+        dispatch(&self.client, request, Some(&context))
     }
 }
 
-/// The cancellation signal handed to a host tool.
+/// The cancellation signal handed to host tools and fetches.
 ///
 /// Named here rather than reusing the loop's type so the embedding surface and
 /// the loop can change independently.
@@ -1359,8 +1474,26 @@ fn request(
     provider: &dyn Provider,
     plan: &RequestPlan,
 ) -> std::result::Result<StreamOutcome, RequestFailure> {
-    let started = std::time::Instant::now();
+    let started = Instant::now();
     let mut timeouts = rune_net::transport::RequestTimeouts::from_limits(&context.limits);
+    let deadline_error = || {
+        RuneError::new(
+            ErrorCode::InvalidConfiguration,
+            "host fetch deadline is out of range",
+        )
+    };
+    let fetch_context = FetchContext {
+        signal: context.cancel.clone().into(),
+        deadline: timeouts
+            .total
+            .map(|total| started.checked_add(total).ok_or_else(deadline_error))
+            .transpose()?,
+        head_deadline: started
+            .checked_add(timeouts.head)
+            .ok_or_else(deadline_error)?,
+        stopped: CancelFlag::new(),
+    };
+    let _fetch_stop = FetchStopGuard(fetch_context.stopped.clone());
     context.cancel.check()?;
     provider.validate(plan)?;
     let body = provider.build_request(plan)?;
@@ -1382,13 +1515,17 @@ fn request(
         headers,
         body: serde_json::to_string(&body).map_err(RuneError::from)?,
     };
-    let (response, retry_after) = context.fetch.post_with_retry_after(request)?;
+    let (response, retry_after) = context
+        .fetch
+        .post_with_context(request, fetch_context.clone())?;
+    fetch_context.check_head()?;
 
     if response.status >= 400 {
         // Only enough of the body to explain the rejection; an endpoint that
         // answers with an error page must not be able to exhaust memory here.
         let mut raw = Vec::new();
         let _ = response.body.take(64 * 1024).read_to_end(&mut raw);
+        fetch_context.check()?;
         let text = String::from_utf8_lossy(&raw);
         let sanitized = redact::redact(&text);
         let mut error = NetError::classify_status(response.status, &sanitized).with_hint(format!(
