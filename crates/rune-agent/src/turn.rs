@@ -10,7 +10,7 @@
 //!
 //! - A malformed tool call or a tool failure is information for the model, not
 //!   an error that ends the turn. Only a policy denial, a cancellation, or an
-//!   exhausted retry budget or consecutive identical failure cap stops it.
+//!   exhausted retry/objective budget or consecutive identical failure cap stops it.
 //! - Finalization happens exactly once, so a session cannot record a turn twice.
 
 use std::time::Duration;
@@ -40,6 +40,8 @@ pub enum StopReason {
     Completed,
     /// The model stopped asking for tools at the step limit.
     StepLimit,
+    /// The active objective exhausted its accounted token budget.
+    ObjectiveBudget,
     /// The response hit the output token limit.
     OutputLimit,
     /// The model declined.
@@ -59,6 +61,7 @@ impl StopReason {
         match self {
             Self::Completed => "end_turn",
             Self::StepLimit => "max_model_turns",
+            Self::ObjectiveBudget => "objective_token_budget",
             Self::OutputLimit => "max_output_tokens",
             Self::Refused => "refused",
             Self::Cancelled => "cancelled",
@@ -366,6 +369,18 @@ pub trait Host {
         BudgetSet::new()
     }
 
+    /// Remaining input plus output tokens for an explicitly budgeted objective.
+    /// `None` leaves ordinary conversations and unbudgeted objectives unlimited.
+    fn objective_tokens_remaining(&self) -> Option<u64> {
+        None
+    }
+
+    /// Durably charges one provider attempt, including attempts that failed.
+    /// Called before another request can start. Persistence failure stops the turn.
+    fn account_objective_tokens(&self, _tokens: u64) -> Result<()> {
+        Ok(())
+    }
+
     /// Returns the cancellation flag for this turn.
     fn cancellation(&self) -> Cancellation;
 
@@ -433,9 +448,16 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
         cancellation.check()?;
 
         // A step limit of zero means unlimited, which is the documented default.
-        if step_limit > 0 && u64::from(steps) >= step_limit {
+        let stop_reason = if host.objective_tokens_remaining() == Some(0) {
+            Some(StopReason::ObjectiveBudget)
+        } else if step_limit > 0 && u64::from(steps) >= step_limit {
+            Some(StopReason::StepLimit)
+        } else {
+            None
+        };
+        if let Some(stop_reason) = stop_reason {
             let outcome = TurnOutcome {
-                stop_reason: StopReason::StepLimit,
+                stop_reason,
                 text,
                 reasoning,
                 usage,
@@ -444,7 +466,7 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
                 calls,
             };
             host.emit(Event::Finished {
-                reason: StopReason::StepLimit,
+                reason: stop_reason,
                 usage,
                 last_request,
                 steps,
@@ -547,19 +569,23 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
             // It is drained here rather than left for the next model boundary,
             // so it is recorded and reported once, at the boundary it actually
             // arrived at.
-            if !steering.is_empty() {
+            if !steering.is_empty() && host.objective_tokens_remaining() != Some(0) {
                 apply_steering(history, steering, Boundary::Finalizing, host);
                 continue;
             }
-            let reason = match finish {
-                FinishReason::Stop => StopReason::Completed,
-                FinishReason::MaxTokens => StopReason::OutputLimit,
-                FinishReason::Refused => StopReason::Refused,
-                FinishReason::ContentFilter => StopReason::ContentFilter,
-                FinishReason::Cancelled => StopReason::Cancelled,
-                FinishReason::ToolCalls => StopReason::Completed,
-                FinishReason::MaxModelTurns => StopReason::StepLimit,
-                FinishReason::ProviderError => StopReason::ProviderFailure,
+            let reason = if host.objective_tokens_remaining() == Some(0) {
+                StopReason::ObjectiveBudget
+            } else {
+                match finish {
+                    FinishReason::Stop => StopReason::Completed,
+                    FinishReason::MaxTokens => StopReason::OutputLimit,
+                    FinishReason::Refused => StopReason::Refused,
+                    FinishReason::ContentFilter => StopReason::ContentFilter,
+                    FinishReason::Cancelled => StopReason::Cancelled,
+                    FinishReason::ToolCalls => StopReason::Completed,
+                    FinishReason::MaxModelTurns => StopReason::StepLimit,
+                    FinishReason::ProviderError => StopReason::ProviderFailure,
+                }
             };
             host.emit(Event::Finished {
                 reason,
@@ -638,6 +664,121 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
     }
 }
 
+/// Refuses another provider request once the objective budget is exhausted.
+pub fn check_objective_budget(host: &dyn Host) -> Result<()> {
+    if host.objective_tokens_remaining() == Some(0) {
+        return Err(RuneError::new(
+            ErrorCode::LimitExceeded,
+            "the active objective exhausted its token budget",
+        )
+        .with_invariant("objective_token_budget"));
+    }
+    Ok(())
+}
+
+/// Accounting for one provider attempt, shared with context summarization.
+/// Missing counts use rounded-up request/output bytes divided by four. Cache
+/// details are added only for dialects that exclude them from input totals;
+/// reasoning details already included in output are not added again.
+#[derive(Debug)]
+pub struct ObjectiveAccounting {
+    input_estimate: Option<u64>,
+    output_bytes: u64,
+    argument_bytes: std::collections::BTreeMap<rune_core::id::ToolCallId, u64>,
+    usage: Usage,
+}
+
+impl ObjectiveAccounting {
+    /// Checks the budget and narrows an existing output ceiling when applicable.
+    pub fn begin(host: &dyn Host, plan: &mut RequestPlan) -> Result<Self> {
+        check_objective_budget(host)?;
+        let input_estimate = if let Some(remaining) = host.objective_tokens_remaining() {
+            host.dialect().validate(plan)?;
+            let body = host.dialect().build_request(plan)?;
+            let ceiling = ["max_tokens", "max_completion_tokens", "max_output_tokens"]
+                .iter()
+                .find_map(|key| body.get(key).and_then(serde_json::Value::as_u64));
+            plan.max_output_tokens = Some(
+                plan.max_output_tokens
+                    .or(ceiling)
+                    .map_or(remaining, |cap| cap.min(remaining)),
+            );
+            let body = host.dialect().build_request(plan)?;
+            let bytes = serde_json::to_vec(&body)
+                .map_err(|err| RuneError::new(ErrorCode::Internal, err.to_string()))?
+                .len() as u64;
+            Some(
+                bytes
+                    .div_ceil(crate::tokens::DEFAULT_BYTES_PER_TOKEN)
+                    .max(1),
+            )
+        } else {
+            None
+        };
+        Ok(Self {
+            input_estimate,
+            output_bytes: 0,
+            argument_bytes: std::collections::BTreeMap::new(),
+            usage: Usage::default(),
+        })
+    }
+
+    /// Tracks partial counts even when the transport later fails or is cancelled.
+    pub fn observe(&mut self, event: &rune_net::stream::ProviderEvent) {
+        use rune_net::stream::ProviderEvent;
+        if self.input_estimate.is_none() {
+            return;
+        }
+        match event {
+            ProviderEvent::Usage(usage) => self.usage = self.usage.merge_max(*usage),
+            ProviderEvent::TextDelta { delta } | ProviderEvent::ReasoningDelta { delta } => {
+                self.output_bytes = self.output_bytes.saturating_add(delta.len() as u64);
+            }
+            ProviderEvent::ToolCallStart { name, .. } => {
+                self.output_bytes = self.output_bytes.saturating_add(name.len() as u64);
+            }
+            ProviderEvent::ToolCallDelta { id, delta } => {
+                let bytes = self.argument_bytes.entry(id.clone()).or_default();
+                *bytes = bytes.saturating_add(delta.len() as u64);
+                self.output_bytes = self.output_bytes.saturating_add(delta.len() as u64);
+            }
+            ProviderEvent::ToolCallEnd { id, arguments } => {
+                let streamed = self.argument_bytes.remove(id).unwrap_or(0);
+                self.output_bytes = self
+                    .output_bytes
+                    .saturating_add((arguments.len() as u64).saturating_sub(streamed));
+            }
+            _ => {}
+        }
+    }
+
+    /// Persists the charge before the next request or tool execution.
+    pub fn finish(self, host: &dyn Host, reported: Option<Usage>) -> Result<()> {
+        // An offline refusal never reached a provider and consumes no tokens.
+        if host.endpoint().offline {
+            return Ok(());
+        }
+        let Some(input_estimate) = self.input_estimate else {
+            return Ok(());
+        };
+        let usage = self.usage.merge_max(reported.unwrap_or_default());
+        let input = usage.input_tokens.map_or(input_estimate, |input| {
+            if host.dialect().name() == rune_net::anthropic::NAME {
+                input
+                    .saturating_add(usage.cache_read_tokens.unwrap_or(0))
+                    .saturating_add(usage.cache_write_tokens.unwrap_or(0))
+            } else {
+                input
+            }
+        });
+        let output = usage.output_tokens.unwrap_or_else(|| {
+            self.output_bytes
+                .div_ceil(crate::tokens::DEFAULT_BYTES_PER_TOKEN)
+        });
+        host.account_objective_tokens(input.saturating_add(output))
+    }
+}
+
 /// Streams a request, retrying a transient failure within a bounded budget.
 ///
 /// Applies queued steering before rebuilding a retry request. Returns the
@@ -660,6 +801,7 @@ fn stream_with_retry(
     loop {
         cancellation.check()?;
 
+        check_objective_budget(host)?;
         if attempt >= max_attempts {
             return Err(last.unwrap_or_else(|| {
                 RuneError::new(ErrorCode::TransportFailure, "the request did not succeed")
@@ -690,26 +832,30 @@ fn stream_with_retry(
         plan.provider_strict = host.provider_strict();
         host.prepare_request(history, &mut plan, client)?;
         cancellation.check()?;
+        let mut accounting = ObjectiveAccounting::begin(host, &mut plan)?;
 
         // Each event is handed to the host as it is decoded, so text appears
         // while it is being produced rather than once the response has ended.
         // A retry re-sends the request, so the host is told the step restarted
         // and the partial text of the failed attempt is dropped.
-        let mut observe = |event: &rune_net::stream::ProviderEvent| match event {
-            rune_net::stream::ProviderEvent::TextDelta { delta } => {
-                host.emit(Event::TextDelta {
-                    delta: delta.clone(),
-                });
+        let mut observe = |event: &rune_net::stream::ProviderEvent| {
+            accounting.observe(event);
+            match event {
+                rune_net::stream::ProviderEvent::TextDelta { delta } => {
+                    host.emit(Event::TextDelta {
+                        delta: delta.clone(),
+                    });
+                }
+                rune_net::stream::ProviderEvent::ReasoningDelta { delta } => {
+                    host.emit(Event::ReasoningDelta {
+                        delta: delta.clone(),
+                    });
+                }
+                _ => {}
             }
-            rune_net::stream::ProviderEvent::ReasoningDelta { delta } => {
-                host.emit(Event::ReasoningDelta {
-                    delta: delta.clone(),
-                });
-            }
-            _ => {}
         };
 
-        match transport::stream_completion_observed(
+        let response = transport::stream_completion_observed(
             client,
             host.endpoint(),
             host.dialect(),
@@ -717,7 +863,9 @@ fn stream_with_retry(
             timeouts,
             &|| cancellation.is_cancelled(),
             &mut observe,
-        ) {
+        );
+        accounting.finish(host, response.as_ref().ok().map(|outcome| outcome.usage))?;
+        match response {
             Ok(outcome) => {
                 if attempt > 1 {
                     host.emit(Event::ProviderRetryFinished { step });
@@ -729,6 +877,7 @@ fn stream_with_retry(
                 else {
                     return Err(err.to_rune_error());
                 };
+                check_objective_budget(host)?;
                 last = Some(err.to_rune_error());
                 host.emit(Event::ProviderRetry {
                     step,

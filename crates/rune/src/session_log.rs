@@ -72,6 +72,8 @@ pub struct Summary {
 pub struct Recorder {
     store: SessionStore,
     objective: Option<String>,
+    objective_budget: Option<u64>,
+    objective_tokens: u64,
     turn: u64,
     active_turn: bool,
     journal_error: Option<RuneError>,
@@ -87,6 +89,8 @@ impl Recorder {
         Ok(Self {
             store,
             objective: None,
+            objective_budget: None,
+            objective_tokens: 0,
             turn: 0,
             active_turn: false,
             journal_error: None,
@@ -140,16 +144,35 @@ impl Recorder {
     pub fn open(paths: &Paths, id: &SessionId) -> Result<Self> {
         let store = SessionStore::open(&paths.session_dir(id))?;
         let turn = store.turns();
-        let objective = store.read()?.events.iter().rev().find_map(|frame| {
-            if let SessionEvent::ObjectiveSet { objective } = &frame.event {
-                Some(objective.clone())
-            } else {
-                None
+        let mut objective = None;
+        let mut objective_budget = None;
+        let mut objective_tokens = 0_u64;
+        for frame in &store.read()?.events {
+            match &frame.event {
+                SessionEvent::ObjectiveSet { objective: text } => {
+                    objective = Some(text.clone());
+                    objective_budget = None;
+                    objective_tokens = 0;
+                }
+                SessionEvent::ObjectiveBudgetSet {
+                    objective: text,
+                    token_budget,
+                } => {
+                    objective = Some(text.clone());
+                    objective_budget = Some(*token_budget);
+                    objective_tokens = 0;
+                }
+                SessionEvent::ObjectiveTokensRecorded { tokens } if objective_budget.is_some() => {
+                    objective_tokens = objective_tokens.saturating_add(*tokens);
+                }
+                _ => {}
             }
-        });
+        }
         Ok(Self {
             store,
             objective,
+            objective_budget,
+            objective_tokens,
             turn,
             active_turn: false,
             journal_error: None,
@@ -183,6 +206,44 @@ impl Recorder {
             objective: objective.to_owned(),
         })?;
         self.objective = Some(objective.to_owned());
+        self.objective_budget = None;
+        self.objective_tokens = 0;
+        Ok(())
+    }
+
+    /// Atomically replaces the objective and its accounting with an explicit budget.
+    pub fn set_budgeted_objective(&mut self, objective: &str, token_budget: u64) -> Result<()> {
+        if objective.trim().is_empty() {
+            return Err(RuneError::invalid_field("objective", "objective is empty"));
+        }
+        if token_budget == 0 {
+            return Err(RuneError::invalid_field(
+                "token_budget",
+                "token budget must be positive",
+            ));
+        }
+        self.append(SessionEvent::ObjectiveBudgetSet {
+            objective: objective.to_owned(),
+            token_budget,
+        })?;
+        self.objective = Some(objective.to_owned());
+        self.objective_budget = Some(token_budget);
+        self.objective_tokens = 0;
+        Ok(())
+    }
+
+    /// Budget and accounted usage of the current objective, when explicitly set.
+    pub fn objective_budget(&self) -> Option<(u64, u64)> {
+        self.objective_budget
+            .map(|budget| (budget, self.objective_tokens))
+    }
+
+    /// Persists a provider attempt before allowing another continuation.
+    pub fn account_objective_tokens(&mut self, tokens: u64) -> Result<()> {
+        if self.objective_budget.is_some() {
+            self.append(SessionEvent::ObjectiveTokensRecorded { tokens })?;
+            self.objective_tokens = self.objective_tokens.saturating_add(tokens);
+        }
         Ok(())
     }
 
@@ -591,6 +652,8 @@ pub fn tree_of(state: &SessionState) -> Tree {
             | SessionEvent::UsageRecorded { .. }
             | SessionEvent::TitleSet { .. }
             | SessionEvent::ObjectiveSet { .. }
+            | SessionEvent::ObjectiveBudgetSet { .. }
+            | SessionEvent::ObjectiveTokensRecorded { .. }
             | SessionEvent::ConstraintPinned { .. }
             | SessionEvent::ModelSet { .. }
             | SessionEvent::WorkspaceSet { .. }
@@ -850,6 +913,8 @@ pub fn history_from(state: &SessionState) -> History {
             | SessionEvent::UsageRecorded { .. }
             | SessionEvent::TitleSet { .. }
             | SessionEvent::ObjectiveSet { .. }
+            | SessionEvent::ObjectiveBudgetSet { .. }
+            | SessionEvent::ObjectiveTokensRecorded { .. }
             | SessionEvent::ModelSet { .. }
             | SessionEvent::WorkspaceSet { .. }
             | SessionEvent::ForkedFrom { .. }
@@ -2311,5 +2376,50 @@ mod tests {
         assert_eq!(history.len(), 1);
         assert_eq!(history.turns()[0].text(), "Set a goal to fix this");
         assert_eq!(recorder.store.read().expect("state").turns, 0);
+    }
+    #[test]
+    fn objective_budget_usage_survives_compaction_and_resets_only_on_replacement() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let paths = paths(Utf8Path::from_path(root.path()).expect("utf8"));
+        let id = id("budget000001");
+        let mut recorder = Recorder::create(&paths, &id).expect("create");
+        recorder
+            .account_objective_tokens(99)
+            .expect("ordinary prompt");
+        assert_eq!(recorder.objective_budget(), None);
+        assert!(recorder.set_budgeted_objective("work", 0).is_err());
+        assert!(recorder.set_budgeted_objective(" ", 10).is_err());
+        recorder.set_budgeted_objective("work", 30).expect("goal");
+        recorder
+            .account_objective_tokens(15)
+            .expect("first request");
+        recorder
+            .append(SessionEvent::Compaction {
+                through: 2,
+                summary: "Earlier work".to_owned(),
+            })
+            .expect("compaction");
+        drop(recorder);
+        let mut recorder = Recorder::open(&paths, &id).expect("resume");
+        assert_eq!(recorder.objective(), Some("work"));
+        assert_eq!(recorder.objective_budget(), Some((30, 15)));
+        recorder
+            .account_objective_tokens(u64::MAX)
+            .expect("saturating usage");
+        drop(recorder);
+        let mut recorder = Recorder::open(&paths, &id).expect("resume exhausted");
+        assert_eq!(recorder.objective_budget(), Some((30, u64::MAX)));
+        recorder
+            .set_budgeted_objective("new work", 20)
+            .expect("replace");
+        assert_eq!(recorder.objective_budget(), Some((20, 0)));
+        recorder.set_objective("unbudgeted work").expect("replace");
+        recorder
+            .account_objective_tokens(50)
+            .expect("unbudgeted request");
+        drop(recorder);
+        let recorder = Recorder::open(&paths, &id).expect("resume unbudgeted");
+        assert_eq!(recorder.objective(), Some("unbudgeted work"));
+        assert_eq!(recorder.objective_budget(), None);
     }
 }

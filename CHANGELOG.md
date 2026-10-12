@@ -6,6 +6,12 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Added
 
+- `/goal --budget <tokens> <objective>` sets an explicit objective token budget.
+  Accounted input/output usage persists across resume and compaction. Conversation
+  requests, retries, delegated children, and summaries stop requesting further
+  model continuation once the budget is exhausted. `/goal` shows usage and
+  remaining tokens; missing provider counts use byte estimates.
+
 - Windows releases use reproducible Deflate ZIP archives containing `rune.exe`.
   `rune upgrade` verifies and extracts their executable before replacing a
   stopped target. Windows CI extracts a release, runs its version command,

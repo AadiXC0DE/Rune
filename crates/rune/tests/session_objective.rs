@@ -130,3 +130,69 @@ fn an_ordinary_prompt_creates_no_objective_even_when_it_mentions_a_goal() {
     );
     assert_eq!(fixture.log(), before);
 }
+
+#[test]
+fn an_explicit_budget_is_persisted_displayed_and_enforced_by_the_cli() {
+    let fixture = Fixture::new();
+    let first = fixture.run("/goal --budget 30 Fix café parsing\n/quit\n");
+    assert!(
+        first.contains("Notice: objective tokens: 0/30; 30 remaining"),
+        "{first}"
+    );
+    let state =
+        rune_session::load_read_only(&fixture.paths.session_dir(&fixture.id)).expect("state");
+    assert_eq!(
+        state.events.last().expect("budget event").event,
+        SessionEvent::ObjectiveBudgetSet {
+            objective: "Fix café parsing".to_owned(),
+            token_budget: 30,
+        }
+    );
+    let before = fixture.log();
+    let invalid = fixture.run("/goal --budget 0 work\n/goal --budget 30\n/quit\n");
+    assert!(
+        invalid.contains("usage: /goal --budget <positive tokens> <objective>"),
+        "{invalid}"
+    );
+    assert_eq!(
+        fixture.log(),
+        before,
+        "invalid budgets must not replace the goal"
+    );
+    for used in [15, 30] {
+        let store = SessionStore::open(&fixture.paths.session_dir(&fixture.id)).expect("store");
+        store
+            .append(SessionEvent::ObjectiveTokensRecorded { tokens: 15 })
+            .expect("fixture usage");
+        drop(store);
+        let before = fixture.log();
+        let restarted = fixture.run("/goal\n/quit\n");
+        assert!(
+            restarted.contains(&format!(
+                "Notice: objective tokens: {used}/30; {} remaining",
+                30 - used
+            )),
+            "{restarted}"
+        );
+        assert_eq!(fixture.log(), before, "queries must not change accounting");
+    }
+    let stopped = fixture.run("continue\n/quit\n");
+    assert!(
+        stopped.contains("exhausted the objective token budget"),
+        "{stopped}"
+    );
+    let state =
+        rune_session::load_read_only(&fixture.paths.session_dir(&fixture.id)).expect("state");
+    assert!(
+        state
+            .events
+            .iter()
+            .all(|frame| !matches!(frame.event, SessionEvent::TurnFailed { .. })),
+        "the budget must stop before the offline provider refusal"
+    );
+    let replaced = fixture.run("/goal --budget 20 New objective\n/quit\n");
+    assert!(
+        replaced.contains("Notice: objective tokens: 0/20; 20 remaining"),
+        "{replaced}"
+    );
+}

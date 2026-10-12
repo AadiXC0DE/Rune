@@ -292,6 +292,12 @@ impl Host for ChildHost<'_> {
     fn context(&self) -> ExecutionContext {
         self.context.fork()
     }
+    fn objective_tokens_remaining(&self) -> Option<u64> {
+        self.parent.objective_tokens_remaining()
+    }
+    fn account_objective_tokens(&self, tokens: u64) -> Result<()> {
+        self.parent.account_objective_tokens(tokens)
+    }
     fn limits(&self) -> BudgetSet {
         self.limits.clone()
     }
@@ -319,6 +325,7 @@ mod tests {
         cancellation: Cancellation,
         steering: SteeringQueue,
         limits: BudgetSet,
+        objective_remaining: Mutex<Option<u64>>,
     }
 
     impl Host for Parent {
@@ -358,6 +365,15 @@ mod tests {
         fn limits(&self) -> BudgetSet {
             self.limits.clone()
         }
+        fn objective_tokens_remaining(&self) -> Option<u64> {
+            *self.objective_remaining.lock().expect("budget")
+        }
+        fn account_objective_tokens(&self, tokens: u64) -> Result<()> {
+            if let Some(remaining) = self.objective_remaining.lock().expect("budget").as_mut() {
+                *remaining = remaining.saturating_sub(tokens);
+            }
+            Ok(())
+        }
         fn cancellation(&self) -> Cancellation {
             self.cancellation.clone()
         }
@@ -379,7 +395,43 @@ mod tests {
             cancellation: Cancellation::new(),
             steering: SteeringQueue::new(4),
             limits: BudgetSet::new(),
+            objective_remaining: Mutex::new(None),
         }
+    }
+
+    #[test]
+    fn a_child_charges_the_parent_objective_and_cannot_continue_after_exhaustion() {
+        let parent = parent();
+        *parent.objective_remaining.lock().expect("budget") = Some(15);
+        let child = ChildHost {
+            parent: &parent,
+            tools: parent.tools(),
+            model: parent.model(),
+            effort: Effort::Auto,
+            instructions: String::new(),
+            context: parent.context(),
+            limits: parent.limits(),
+            steering: SteeringQueue::new(4),
+        };
+        assert_eq!(child.objective_tokens_remaining(), Some(15));
+        let mut plan = rune_net::provider::RequestPlan::new(child.model());
+        let accounting = turn::ObjectiveAccounting::begin(&child, &mut plan).expect("begin");
+        accounting
+            .finish(
+                &child,
+                Some(rune_net::stream::Usage {
+                    input_tokens: Some(10),
+                    output_tokens: Some(5),
+                    ..rune_net::stream::Usage::default()
+                }),
+            )
+            .expect("shared charge");
+        assert_eq!(parent.objective_tokens_remaining(), Some(0));
+        let mut history = History::new();
+        history.push_user("continue");
+        let outcome = turn::run_turn(&mut history, &child).expect("no provider request");
+        assert_eq!(outcome.stop_reason, StopReason::ObjectiveBudget);
+        assert_eq!(outcome.steps, 0);
     }
 
     #[test]

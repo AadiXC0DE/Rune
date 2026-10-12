@@ -142,6 +142,18 @@ pub enum SessionEvent {
         /// Objective text, retained independently of conversation compaction.
         objective: String,
     },
+    /// The user explicitly replaced the objective with a positive token budget.
+    ObjectiveBudgetSet {
+        /// Exact objective text.
+        objective: String,
+        /// Maximum accounted input plus output tokens across provider attempts.
+        token_budget: u64,
+    },
+    /// One provider attempt was charged to the active budgeted objective.
+    ObjectiveTokensRecorded {
+        /// Accounted input plus output tokens, including estimates when absent.
+        tokens: u64,
+    },
     /// The user explicitly pinned a constraint for subsequent provider requests.
     ConstraintPinned {
         /// Exact text, independent of conversation compaction.
@@ -201,6 +213,8 @@ impl SessionEvent {
             Self::UsageRecorded { .. } => "usage_recorded",
             Self::TitleSet { .. } => "title_set",
             Self::ObjectiveSet { .. } => "objective_set",
+            Self::ObjectiveBudgetSet { .. } => "objective_budget_set",
+            Self::ObjectiveTokensRecorded { .. } => "objective_tokens_recorded",
             Self::ConstraintPinned { .. } => "constraint_pinned",
             Self::ModelSet { .. } => "model_set",
             Self::WorkspaceSet { .. } => "workspace_set",

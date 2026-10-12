@@ -2085,7 +2085,7 @@ Resource accumulation after cancellation, session holder handover and concurrent
 - [x] R-206 | T3 | feature | packaging | Add a Windows archive format and replacement smoke test | acceptance: Extract a Windows release, run its version command, upgrade a disposable executable and run the new version.
 - [x] R-207 | T3 | fix | web | Validate host-returned WASM body lengths | acceptance: Have the page bridge return a length larger than buffer capacity and observe a named I/O error before any slice is constructed.
 - [x] R-208 | T3 | fix | web | Bound foreign WASM staging allocations | acceptance: Return a staged length beyond the configured bridge cap and observe a controlled error without allocating that length.
-- [ ] R-209 | T3 | feature | context | Enforce an explicit objective token budget | acceptance: Set a fixture goal budget, consume it over multiple turns and observe no further continuation once the accounted budget is exhausted.
+- [x] R-209 | T3 | feature | context | Enforce an explicit objective token budget | acceptance: Set a fixture goal budget, consume it over multiple turns and observe no further continuation once the accounted budget is exhausted.
 - [ ] R-210 | T3 | feature | mcp | Complete an OAuth loopback callback with state and PKCE | acceptance: Reject wrong state, reused callback and incorrect verifier; one correct fixture exchange stores tokens privately without diagnostic leakage.
 
 ## Honest assessment

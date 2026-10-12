@@ -773,6 +773,8 @@ pub fn history_from_events(frames: &[EventFrame]) -> History {
             | SessionEvent::UsageRecorded { .. }
             | SessionEvent::TitleSet { .. }
             | SessionEvent::ObjectiveSet { .. }
+            | SessionEvent::ObjectiveBudgetSet { .. }
+            | SessionEvent::ObjectiveTokensRecorded { .. }
             | SessionEvent::WorkspaceSet { .. }
             | SessionEvent::ForkedFrom { .. }
             | SessionEvent::ChildOf { .. } => {

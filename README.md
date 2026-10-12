@@ -548,7 +548,19 @@ Sessions are written as they run, so an interrupted session resumes. Use
 active objective. `/goal` shows it without changing the log. The exact objective is
 restored on resume and included in subsequent model instructions, independently
 of conversation compaction. Ordinary prompts create no objective; `/new` starts
-a session without one.
+a session without one. Use `/goal --budget <positive tokens> <objective>` to
+set an explicit input plus output token budget. `/goal` also shows accounted
+usage and remaining tokens. Each conversation request, retry, delegated child
+request, and compaction summary charges the budget before another request can
+start. Reported input/output counts take precedence; missing counts use request
+or output bytes divided by four, rounded up. Anthropic cache counts are added to
+its uncached input count; cache/reasoning counters already included in totals are
+not added again. Usage persists across resume and compaction; replacing the
+objective resets its accounting. An exhausted budget stops further model
+continuation with `objective_token_budget`, including subsequent prompts, until
+you explicitly replace the objective. A request already in flight can exceed the
+remaining budget; this is a continuation limit rather than a provider billing
+cap. Ordinary prompts and `/goal <objective>` have no token budget.
 
 Interactive assistant text is journalled in bounded, durable frames before it is
 displayed.

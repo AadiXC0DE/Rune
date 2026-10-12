@@ -392,6 +392,27 @@ impl Host for SessionHost {
         instructions
     }
 
+    fn objective_tokens_remaining(&self) -> Option<u64> {
+        let recorder = self
+            .recorder
+            .as_ref()?
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        recorder
+            .objective_budget()
+            .map(|(budget, tokens)| budget.saturating_sub(tokens))
+    }
+
+    fn account_objective_tokens(&self, tokens: u64) -> Result<()> {
+        if let Some(recorder) = &self.recorder {
+            recorder
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .account_objective_tokens(tokens)?;
+        }
+        Ok(())
+    }
+
     fn tools(&self) -> Vec<ToolSpec> {
         self.tools.clone()
     }
@@ -1140,6 +1161,9 @@ impl SessionHost {
     #[must_use]
     pub fn activity_line(outcome: &turn::TurnOutcome) -> Option<String> {
         match outcome.stop_reason {
+            StopReason::ObjectiveBudget => {
+                Some(String::from("exhausted the objective token budget"))
+            }
             StopReason::StepLimit => Some(String::from("reached the step limit")),
             StopReason::Cancelled => Some(String::from("cancelled")),
             _ => None,
@@ -1883,13 +1907,23 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                         let mut recorder = recorder
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        if let Some(objective) = objective {
-                            recorder.set_objective(&objective)?;
+                        if let Some((objective, budget)) = objective {
+                            if let Some(budget) = budget {
+                                recorder.set_budgeted_objective(&objective, budget)?;
+                            } else {
+                                recorder.set_objective(&objective)?;
+                            }
                         }
                         note(recorder.objective().map_or_else(
                             || "no active objective".to_owned(),
                             |objective| format!("active objective: {objective}"),
                         ));
+                        if let Some((budget, tokens)) = recorder.objective_budget() {
+                            note(format!(
+                                "\nobjective tokens: {tokens}/{budget}; {} remaining",
+                                budget.saturating_sub(tokens)
+                            ));
+                        }
                     }
                     Handled::SetModel(model) => {
                         // Named inline, so no catalog entry describes it and the
@@ -3633,11 +3667,13 @@ fn summarize_history(
     archive: bool,
     cancelled: &dyn Fn() -> bool,
 ) -> Result<usize> {
+    turn::check_objective_budget(host)?;
     let request = rune_agent::compaction::render_summary_request(history, plan);
     let mut request_plan = rune_net::provider::RequestPlan::new(host.model());
     rune_agent::compaction::SUMMARY_INSTRUCTIONS.clone_into(&mut request_plan.instructions);
     request_plan.messages = rune_net::transport::one_shot_messages(&request);
-    let outcome = rune_net::transport::stream_completion(
+    let mut accounting = turn::ObjectiveAccounting::begin(host, &mut request_plan)?;
+    let response = rune_net::transport::stream_completion_observed(
         client,
         &host.endpoint,
         host.dialect.as_ref(),
@@ -3647,8 +3683,10 @@ fn summarize_history(
             ..rune_net::transport::RequestTimeouts::from_limits(&host.limits)
         },
         cancelled,
-    )
-    .map_err(|err| {
+        &mut |event| accounting.observe(event),
+    );
+    accounting.finish(host, response.as_ref().ok().map(|outcome| outcome.usage))?;
+    let outcome = response.map_err(|err| {
         RuneError::new(
             err.kind().code(),
             format!("compaction failed, nothing was changed: {err}"),
@@ -4553,7 +4591,7 @@ enum Handled {
     /// Give the session a new title.
     Rename(String),
     /// Set an explicit objective, or inspect the current one without changes.
-    Goal(Option<String>),
+    Goal(Option<(String, Option<u64>)>),
 }
 
 /// Token and request totals for one session.
@@ -4766,10 +4804,31 @@ fn handle_command<W: std::io::Write>(
             Ok(Handled::Rename(title.to_owned()))
         }
         "goal" => {
-            let objective = arguments.trim();
-            Ok(Handled::Goal(
-                (!objective.is_empty()).then(|| objective.to_owned()),
-            ))
+            let arguments = arguments.trim();
+            if arguments.is_empty() {
+                return Ok(Handled::Goal(None));
+            }
+            let mut words = arguments.splitn(2, char::is_whitespace);
+            if words.next() == Some("--budget") {
+                let rest = words.next().unwrap_or_default().trim();
+                let mut words = rest.splitn(2, char::is_whitespace);
+                let budget = words
+                    .next()
+                    .unwrap_or_default()
+                    .parse::<u64>()
+                    .ok()
+                    .filter(|value| *value > 0);
+                let objective = words.next().unwrap_or_default().trim();
+                if let Some(budget) = budget.filter(|_| !objective.is_empty()) {
+                    return Ok(Handled::Goal(Some((objective.to_owned(), Some(budget)))));
+                }
+                let _ = writeln!(
+                    output,
+                    "usage: /goal --budget <positive tokens> <objective>"
+                );
+                return Ok(Handled::Continue);
+            }
+            Ok(Handled::Goal(Some((arguments.to_owned(), None))))
         }
         "status" => {
             let _ = writeln!(output, "{}", render_status(info));
@@ -4930,6 +4989,9 @@ fn report_turn(outcome: &turn::TurnOutcome, host: &SessionHost) -> Result<Vec<St
     }
 
     match outcome.stop_reason {
+        StopReason::ObjectiveBudget => {
+            entries.push(Entry::notice("exhausted the objective token budget"));
+        }
         StopReason::StepLimit => entries.push(Entry::notice("reached the model step limit")),
         StopReason::Cancelled => entries.push(Entry::notice("cancelled")),
         _ => {}
@@ -5161,6 +5223,171 @@ mod tests {
         let fresh = Recorder::create(&paths, &SessionId::generate()).expect("new session");
         host.recorder = Some(Arc::new(Mutex::new(fresh)));
         assert_eq!(host.instructions(), "Workspace instructions");
+    }
+
+    #[test]
+    fn budgeted_goal_dispatch_requires_an_explicit_positive_budget_and_objective() {
+        for (arguments, expected) in [
+            ("", Handled::Goal(None)),
+            (
+                "Fix café parsing",
+                Handled::Goal(Some(("Fix café parsing".to_owned(), None))),
+            ),
+            (
+                "--budget 30 Fix café parsing",
+                Handled::Goal(Some(("Fix café parsing".to_owned(), Some(30)))),
+            ),
+            ("--budget 0 work", Handled::Continue),
+            ("--budget -1 work", Handled::Continue),
+            ("--budget 18446744073709551616 work", Handled::Continue),
+            ("--budget nope work", Handled::Continue),
+            ("--budget 30", Handled::Continue),
+        ] {
+            let mut output = Vec::new();
+            assert_eq!(
+                handle_command(
+                    "goal",
+                    arguments,
+                    &empty_commands(),
+                    None,
+                    Utf8Path::new("/w"),
+                    &test_info(),
+                    &mut output
+                )
+                .expect("command"),
+                expected
+            );
+            assert_eq!(!output.is_empty(), expected == Handled::Continue);
+        }
+    }
+
+    #[test]
+    fn objective_budget_stops_real_session_requests_after_resume() {
+        use std::io::{BufRead, BufReader, Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("listener");
+        let address = listener.local_addr().expect("address");
+        let server = std::thread::spawn(move || {
+            let mut requests = Vec::new();
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().expect("accept");
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .expect("timeout");
+                let mut reader = BufReader::new(&mut stream);
+                let mut line = String::new();
+                let mut length = 0;
+                loop {
+                    line.clear();
+                    reader.read_line(&mut line).expect("header");
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        length = value.trim().parse().expect("length");
+                    }
+                }
+                let mut body = vec![0; length];
+                reader.read_exact(&mut body).expect("request body");
+                requests.push(serde_json::from_slice::<serde_json::Value>(&body).expect("JSON"));
+                let response = concat!(
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"answer\"},\"finish_reason\":\"stop\"}]}\n\n",
+                    "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5}}\n\n",
+                    "data: [DONE]\n\n"
+                );
+                write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}", response.len()).expect("response");
+            }
+            requests
+        });
+        let root = tempfile::tempdir().expect("root");
+        let base = Utf8PathBuf::from_path_buf(root.path().to_owned()).expect("utf8");
+        let paths = Paths {
+            config_root: base.join("config"),
+            state_root: base.join("state"),
+            data_root: base.join("data"),
+        };
+        let id = SessionId::generate();
+        let mut recorder = Recorder::create(&paths, &id).expect("create");
+        recorder
+            .set_budgeted_objective("fixture objective", 30)
+            .expect("goal");
+        let mut host = test_host();
+        host.endpoint = Endpoint::new(format!("http://{address}/v1"), "test-key");
+        host.recorder = Some(Arc::new(Mutex::new(recorder)));
+        let mut history = History::new();
+        for index in 1..=2 {
+            let recorder = host.recorder.as_ref().expect("recorder");
+            {
+                let mut recorder = recorder.lock().expect("lock");
+                recorder.user_message("work").expect("user");
+                recorder.begin_turn().expect("begin");
+            }
+            history.push_user("work");
+            let outcome = turn::run_turn(&mut history, &host).expect("turn");
+            assert_eq!(
+                outcome.stop_reason,
+                if index == 1 {
+                    StopReason::Completed
+                } else {
+                    StopReason::ObjectiveBudget
+                }
+            );
+            recorder.lock().expect("lock").turn(&outcome).expect("save");
+            host.recorder = None;
+            let (recorder, resumed) = session_log::load(&paths, &id).expect("resume");
+            assert_eq!(recorder.objective_budget(), Some((30, index * 15)));
+            host.recorder = Some(Arc::new(Mutex::new(recorder)));
+            history = resumed;
+        }
+        history.push_user("continue");
+        let stopped = turn::run_turn(&mut history, &host).expect("stop before fetch");
+        assert_eq!(stopped.stop_reason, StopReason::ObjectiveBudget);
+        assert_eq!(stopped.steps, 0);
+        assert!(
+            report_turn(&stopped, &host)
+                .expect("notice")
+                .join("\n")
+                .contains("exhausted the objective token budget")
+        );
+        let requests = server.join().expect("server");
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0]["max_tokens"], 30);
+        assert_eq!(requests[1]["max_tokens"], 15);
+        assert!(
+            requests
+                .iter()
+                .all(|body| body.to_string().contains("fixture objective"))
+        );
+    }
+
+    #[test]
+    fn compaction_charges_the_objective_and_refuses_an_exhausted_budget() {
+        let (mut host, mut history, _) = compaction_fixture();
+        let root = tempfile::tempdir().expect("root");
+        let base = Utf8PathBuf::from_path_buf(root.path().to_owned()).expect("utf8");
+        let paths = Paths {
+            config_root: base.join("config"),
+            state_root: base.join("state"),
+            data_root: base.join("data"),
+        };
+        let mut recorder = Recorder::create(&paths, &SessionId::generate()).expect("create");
+        recorder.set_budgeted_objective("work", 1).expect("goal");
+        host.recorder = Some(Arc::new(Mutex::new(recorder)));
+        let client = SummaryFixture::new(
+            "Earlier fixture work has been summarized. Continue the remaining task.",
+        );
+        let plan = rune_agent::compaction::plan(&history, &host.limits).expect("plan");
+        summarize_history(&host, &mut history, &plan, &client, false, &|| false).expect("summary");
+        assert_eq!(host.objective_tokens_remaining(), Some(0));
+        let err = summarize_history(&host, &mut history, &plan, &client, false, &|| false)
+            .expect_err("blocked summary");
+        assert_eq!(
+            err.detail().invariant.as_deref(),
+            Some("objective_token_budget")
+        );
+        assert_eq!(client.requests.lock().expect("requests").len(), 1);
+        let outcome = turn::run_turn(&mut history, &host).expect("blocked model");
+        assert_eq!(outcome.stop_reason, StopReason::ObjectiveBudget);
+        assert_eq!(outcome.steps, 0);
     }
 
     /// A writer that appends to a shared buffer, for asserting on what a draw

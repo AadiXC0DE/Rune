@@ -1126,7 +1126,7 @@ pub const fn stop_reason(reason: StopReason) -> &'static str {
     match reason {
         StopReason::Completed => "end_turn",
         StopReason::StepLimit => "max_turn_requests",
-        StopReason::OutputLimit => "max_tokens",
+        StopReason::OutputLimit | StopReason::ObjectiveBudget => "max_tokens",
         StopReason::Refused | StopReason::ContentFilter => "refusal",
         StopReason::Cancelled => "cancelled",
         StopReason::ProviderFailure => "end_turn",

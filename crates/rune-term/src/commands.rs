@@ -79,8 +79,8 @@ pub const BUILTINS: &[Builtin] = &[
     },
     Builtin {
         name: "goal",
-        arguments: "[objective]",
-        summary: "set or show the active session objective",
+        arguments: "[--budget <tokens>] [objective]",
+        summary: "set or show the active objective and optional token budget",
     },
     Builtin {
         name: "history",

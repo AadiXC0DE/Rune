@@ -62,6 +62,7 @@ struct TestHost {
     steering: SteeringQueue,
     workspace: Utf8PathBuf,
     limits: BudgetSet,
+    objective_budget: Mutex<Option<(u64, u64)>>,
     /// Models what a host does with an unresolved call in `auto` mode: review
     /// it and, when nothing is concerning, allow it. A host that cannot review
     /// leaves the call unresolved, which the loop reports rather than running.
@@ -101,6 +102,7 @@ impl TestHost {
             steering: SteeringQueue::new(8),
             workspace: Utf8PathBuf::from("/tmp/rune-test"),
             limits: BudgetSet::new(),
+            objective_budget: Mutex::new(None),
             resolve_ask: true,
             private_authority: None,
             private_decisions: Mutex::new(Vec::new()),
@@ -234,6 +236,20 @@ impl Host for TestHost {
         } else {
             Box::new(rune_net::transport::UreqFetch::new())
         }
+    }
+
+    fn objective_tokens_remaining(&self) -> Option<u64> {
+        self.objective_budget
+            .lock()
+            .expect("budget")
+            .map(|(budget, used)| budget.saturating_sub(used))
+    }
+
+    fn account_objective_tokens(&self, tokens: u64) -> Result<()> {
+        if let Some((_, used)) = self.objective_budget.lock().expect("budget").as_mut() {
+            *used = used.saturating_add(tokens);
+        }
+        Ok(())
     }
 
     fn emit(&self, event: Event) {
@@ -3346,4 +3362,232 @@ fn post_tool_observes_retained_result_reads_and_tool_errors_once() {
         assert_eq!(result.output, expected.output);
     }
     history.validate().expect("paired history");
+}
+
+#[test]
+fn objective_budget_is_consumed_across_turns_and_blocks_further_requests() {
+    let endpoint = MockEndpoint::start(vec![Script::text("answer")]);
+    let host = TestHost::new(endpoint);
+    *host.objective_budget.lock().expect("budget") = Some((30, 0));
+    let mut history = rune_agent::History::new();
+    for (index, remaining, reason) in [
+        (1, 15, StopReason::Completed),
+        (2, 0, StopReason::ObjectiveBudget),
+        (3, 0, StopReason::ObjectiveBudget),
+    ] {
+        history.push_user(format!("turn {index}"));
+        let outcome = run_turn(&mut history, &host).expect("turn");
+        assert_eq!(outcome.stop_reason, reason);
+        assert_eq!(host.objective_tokens_remaining(), Some(remaining));
+        if index == 3 {
+            assert_eq!(outcome.steps, 0);
+            assert!(outcome.usage.is_empty());
+            assert!(outcome.text.is_empty());
+        }
+    }
+    let server = host.server.as_ref().expect("server");
+    assert_eq!(server.request_count(), 2);
+    assert_eq!(server.last_body().expect("body")["max_tokens"], 15);
+    assert_eq!(
+        *host.objective_budget.lock().expect("budget"),
+        Some((30, 30))
+    );
+    assert_eq!(
+        host.events()
+            .iter()
+            .filter(|event| matches!(event, Event::Finished { .. }))
+            .count(),
+        3
+    );
+}
+
+#[test]
+fn exhausted_objective_blocks_tool_and_steering_continuations() {
+    for tools in [false, true] {
+        let mut script = if tools {
+            Script::tool_call("read", "read_file", r#"{"path":"x"}"#)
+        } else {
+            Script::text("answer")
+        };
+        if tools && let Script::Frames(frames) = &mut script {
+            frames.insert(
+                frames.len() - 1,
+                r#"{"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":5}}"#.to_owned(),
+            );
+        }
+        let endpoint = MockEndpoint::start(vec![script, Script::text("should not be requested")]);
+        let host = TestHost::new(endpoint).with_tools(vec![read_tool()]);
+        *host.objective_budget.lock().expect("budget") = Some((15, 0));
+        if !tools {
+            *host.submit_on_first_delta.lock().expect("steering") = Some("also do this".to_owned());
+        }
+        let mut history = rune_agent::History::new();
+        history.push_user("work");
+        let outcome = run_turn(&mut history, &host).expect("turn");
+        assert_eq!(outcome.stop_reason, StopReason::ObjectiveBudget);
+        assert_eq!(outcome.steps, 1);
+        assert_eq!(host.server.as_ref().expect("server").request_count(), 1);
+        history.validate().expect("paired tool results");
+        if tools {
+            assert_eq!(outcome.calls.len(), 1);
+        } else {
+            assert!(
+                !host.steering.is_empty(),
+                "unanswered steering must remain queued"
+            );
+        }
+    }
+}
+
+#[test]
+fn missing_usage_and_failed_attempts_cannot_bypass_an_objective_budget() {
+    for script in [
+        Script::truncated("partial response"),
+        Script::Status {
+            code: 503,
+            body: "unavailable".to_owned(),
+        },
+        Script::Frames(vec![
+            r#"{"choices":[{"delta":{"content":"answer"},"finish_reason":"stop"}]}"#.to_owned(),
+            "[DONE]".to_owned(),
+        ]),
+    ] {
+        let host = TestHost::new(MockEndpoint::start(vec![
+            script,
+            Script::text("unexpected retry"),
+        ]));
+        *host.objective_budget.lock().expect("budget") = Some((1, 0));
+        let mut history = rune_agent::History::new();
+        history.push_user("work");
+        match run_turn(&mut history, &host) {
+            Ok(outcome) => assert_eq!(outcome.stop_reason, StopReason::ObjectiveBudget),
+            Err(error) => {
+                assert_eq!(error.code(), rune_core::ErrorCode::LimitExceeded);
+                assert_eq!(
+                    error.detail().invariant.as_deref(),
+                    Some("objective_token_budget")
+                );
+            }
+        }
+        assert_eq!(host.objective_tokens_remaining(), Some(0));
+        assert_eq!(host.server.as_ref().expect("server").request_count(), 1);
+        assert!(
+            !host
+                .events()
+                .iter()
+                .any(|event| matches!(event, Event::ProviderRetry { .. }))
+        );
+    }
+}
+
+#[test]
+fn objective_accounting_preserves_zero_reports_and_does_not_double_count_usage() {
+    use rune_agent::turn::ObjectiveAccounting;
+    use rune_net::stream::{ProviderEvent, Usage};
+    let host = TestHost::new(MockEndpoint::start(vec![Script::text("unused")]));
+    *host.objective_budget.lock().expect("budget") = Some((u64::MAX, 0));
+    let mut plan = rune_net::provider::RequestPlan::new("test");
+    plan.max_output_tokens = Some(42);
+    let mut accounting = ObjectiveAccounting::begin(&host, &mut plan).expect("begin");
+    assert_eq!(plan.max_output_tokens, Some(42));
+    let usage = Usage {
+        input_tokens: Some(10),
+        output_tokens: Some(5),
+        cache_read_tokens: Some(3),
+        reasoning_tokens: Some(2),
+        ..Usage::default()
+    };
+    accounting.observe(&ProviderEvent::Usage(usage));
+    accounting.observe(&ProviderEvent::Usage(usage));
+    accounting.finish(&host, Some(usage)).expect("account");
+    assert_eq!(
+        *host.objective_budget.lock().expect("budget"),
+        Some((u64::MAX, 15))
+    );
+    let mut accounting = ObjectiveAccounting::begin(&host, &mut plan).expect("begin");
+    accounting.observe(&ProviderEvent::TextDelta {
+        delta: "not an estimate".to_owned(),
+    });
+    accounting
+        .finish(
+            &host,
+            Some(Usage {
+                input_tokens: Some(0),
+                output_tokens: Some(0),
+                ..Usage::default()
+            }),
+        )
+        .expect("zero usage");
+    assert_eq!(
+        *host.objective_budget.lock().expect("budget"),
+        Some((u64::MAX, 15))
+    );
+    host.account_objective_tokens(u64::MAX)
+        .expect("saturating charge");
+    assert_eq!(host.objective_tokens_remaining(), Some(0));
+}
+
+#[test]
+fn objective_estimates_count_complete_calls_and_anthropic_cache_tokens() {
+    use rune_agent::turn::ObjectiveAccounting;
+    use rune_net::stream::{ProviderEvent, Usage};
+    let mut host = TestHost::new(MockEndpoint::start(vec![Script::text("unused")]));
+    *host.objective_budget.lock().expect("budget") = Some((10_000, 0));
+    let mut plan = rune_net::provider::RequestPlan::new("test");
+    for streamed in [false, true] {
+        let mut accounting = ObjectiveAccounting::begin(&host, &mut plan).expect("begin");
+        let id = rune_core::id::ToolCallId::new("call").expect("id");
+        accounting.observe(&ProviderEvent::ToolCallStart {
+            id: id.clone(),
+            name: "read".to_owned(),
+        });
+        if streamed {
+            accounting.observe(&ProviderEvent::ToolCallDelta {
+                id: id.clone(),
+                delta: "12345678".to_owned(),
+            });
+        }
+        accounting.observe(&ProviderEvent::ToolCallEnd {
+            id,
+            arguments: "12345678".to_owned(),
+        });
+        accounting
+            .finish(
+                &host,
+                Some(Usage {
+                    input_tokens: Some(10),
+                    ..Usage::default()
+                }),
+            )
+            .expect("charge");
+    }
+    assert_eq!(
+        *host.objective_budget.lock().expect("budget"),
+        Some((10_000, 26))
+    );
+    host.dialect = Box::new(rune_net::anthropic::Anthropic);
+    plan.max_output_tokens = None;
+    let accounting = ObjectiveAccounting::begin(&host, &mut plan).expect("anthropic begin");
+    assert_eq!(
+        plan.max_output_tokens,
+        Some(rune_net::anthropic::DEFAULT_MAX_TOKENS),
+        "retain the dialect's default ceiling"
+    );
+    accounting
+        .finish(
+            &host,
+            Some(Usage {
+                input_tokens: Some(10),
+                output_tokens: Some(5),
+                cache_read_tokens: Some(3),
+                cache_write_tokens: Some(7),
+                reasoning_tokens: Some(2),
+            }),
+        )
+        .expect("charge caches");
+    assert_eq!(
+        *host.objective_budget.lock().expect("budget"),
+        Some((10_000, 51))
+    );
+    assert_eq!(host.server.as_ref().expect("server").request_count(), 0);
 }
