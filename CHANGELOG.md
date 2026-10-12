@@ -6,6 +6,11 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Added
 
+- Unix release archives have a documented checksum, install, and uninstall
+  path. CI runs those commands in a disposable prefix, checks the installed
+  version, and verifies that configuration, credentials, and sessions survive
+  unchanged.
+
 - Linux CI requires a live sandbox smoke check that refuses a socket connection
   while allowing source editing, with working network controls. Missing or
   unusable isolation fails declared runners and is reported explicitly locally.

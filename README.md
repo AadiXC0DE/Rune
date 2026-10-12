@@ -28,6 +28,43 @@ Homebrew:
 brew install aadixc0de/tap/rune
 ```
 
+From a release archive on Linux or macOS: download the `.tar.gz` for your
+target and its `.sha256` sidecar from the same release. Set `archive` to its
+absolute path and `prefix` to a writable installation directory, for example:
+
+```sh
+archive="$PWD/rune-<version>-<target>.tar.gz"
+prefix="$HOME/.local"
+```
+
+Verify the checksum before extracting, then install the executable:
+
+<!-- archive-install -->
+```sh
+(
+    set -eu
+    if command -v sha256sum >/dev/null 2>&1; then
+        (cd "$(dirname "$archive")" && sha256sum -c "$(basename "$archive").sha256")
+    else
+        (cd "$(dirname "$archive")" && shasum -a 256 -c "$(basename "$archive").sha256")
+    fi
+    extracted=$(mktemp -d)
+    trap 'rm -rf "$extracted"' EXIT
+    tar -xzf "$archive" -C "$extracted"
+    mkdir -p "$prefix/bin"
+    install -m 755 "$extracted/rune" "$prefix/bin/rune"
+    "$prefix/bin/rune" --version
+)
+```
+
+Add `$prefix/bin` to your `PATH` to run `rune` by name. To uninstall this
+binary while preserving configuration, credentials, and sessions:
+
+<!-- archive-uninstall -->
+```sh
+"$prefix/bin/rune" uninstall --target "$prefix/bin/rune" --keep-state
+```
+
 From source:
 
 ```sh
@@ -632,6 +669,16 @@ workspace with no old releases in `target/dist`:
 
 ```sh
 bash .github/scripts/check-reproducible-release.sh
+```
+
+CI also installs the staged Unix release using the archive commands above,
+checks `rune --version`, and uninstalls in a disposable prefix. It isolates
+HOME and XDG paths and checks that seeded user files, contents, and permissions
+stay unchanged after both install and uninstall. Run it on a staged archive:
+
+```sh
+cargo xtask release dev
+python3 .github/scripts/test-archive-install.py target/dist/*/*.tar.gz
 ```
 
 On Unix, workspace tests also run the real PTY replay gate. It starts the built
