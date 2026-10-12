@@ -4716,9 +4716,8 @@ fn handle_command<W: std::io::Write>(
         "pin" => Ok(Handled::Pin(
             (!arguments.trim().is_empty()).then(|| arguments.to_owned()),
         )),
-        // Read-only: the session log has no branch concept, so there is nothing
-        // to fork or switch to. Reporting the shape is what can be done
-        // truthfully.
+        // Read-only view of this saved branch. CLI forks create independent
+        // sessions that can be selected with resume.
         "tree" => {
             let state = session_log::inspect(&Paths::from_process(), &info.session_id.parse()?)?;
             let tree = session_log::tree_of(&state);

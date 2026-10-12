@@ -774,6 +774,7 @@ pub fn history_from_events(frames: &[EventFrame]) -> History {
             | SessionEvent::TitleSet { .. }
             | SessionEvent::ObjectiveSet { .. }
             | SessionEvent::WorkspaceSet { .. }
+            | SessionEvent::ForkedFrom { .. }
             | SessionEvent::ChildOf { .. } => {
                 flush_calls(&mut history, &mut calls);
                 flush_results(&mut history, &mut results);

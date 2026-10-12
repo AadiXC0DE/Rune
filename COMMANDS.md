@@ -86,13 +86,14 @@ List sessions
 | `--limit <n>` | Page size, 1 to 100. |
 | `--cursor <c>` | Continue from a previous page. |
 | `--json` | Emit JSON. |
-### `rune session <last|id> [--search <text> | --record <id|all>] [--json] | rune session --id <id> [--search <text> | --record <id|all>] [--json] | rune session export <last|id> | rune session export --id <id> | rune session migrate <id> | rune session recover <id>`
+### `rune session <last|id> [--search <text> | --record <id|all>] [--json] | rune session --id <id> [--search <text> | --record <id|all>] [--json] | rune session export <last|id> | rune session export --id <id> | rune session fork <last|id> --at <seq> [--json] | rune session fork --id <id> --at <seq> [--json] | rune session migrate <id> | rune session recover <id>`
 
-Inspect, search, export, migrate, or recover one session
+Inspect, search, export, fork, migrate, or recover one session
 
 | Flag | Description |
 |---|---|
-| `--id <id>` | Inspect, search, or export this exact session identifier, taking precedence over a positional selector. |
+| `--id <id>` | Inspect, search, export, or fork this exact session identifier, taking precedence over a positional selector. |
+| `--at <seq>` | Fork through this inclusive saved event sequence. All tool calls must have results. |
 | `--search <text>` | Search saved message, tool, and summary records, including compacted context, by a case-insensitive literal fragment. Return original records and sequence positions. |
 | `--allow-large` | Permit migrating an oversized session. |
 | `--record <id|all>` | Retrieve exact original messages archived by manual compaction. IDs are stable within the session; all lists every archived record. |

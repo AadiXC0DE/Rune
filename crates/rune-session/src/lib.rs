@@ -14,6 +14,7 @@
 #![cfg_attr(test, allow(clippy::expect_used, clippy::unwrap_used, clippy::panic))]
 
 pub mod event;
+pub mod fork;
 pub mod recovery;
 pub mod replay;
 pub mod report;

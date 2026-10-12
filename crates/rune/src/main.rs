@@ -896,9 +896,13 @@ fn run_session(
     workspace: &Utf8Path,
     output: &OutputFlags,
 ) -> Result<ExitCode> {
+    if launch.flag("--at").is_some() && launch.args.first().map(String::as_str) != Some("fork") {
+        return Err(RuneError::invalid_field("at", "--at requires session fork"));
+    }
     match launch.args.first().map(String::as_str) {
         Some("recover") => return run_session_recover(paths, launch, output),
         Some("migrate") => return run_session_migrate(paths, launch, output),
+        Some("fork") => return run_session_fork(paths, launch, workspace, output),
         _ => {}
     }
 
@@ -1001,6 +1005,57 @@ fn run_session(
             "{}",
             session_log::render_detail(&state, &paths.session_dir(&id))
         );
+    }
+    Ok(ExitCode::from(EXIT_OK))
+}
+
+/// Creates a separately resumable branch at an inclusive journal position.
+fn run_session_fork(
+    paths: &Paths,
+    launch: &Launch,
+    workspace: &Utf8Path,
+    output: &OutputFlags,
+) -> Result<ExitCode> {
+    if launch.flag("--search").is_some()
+        || launch.flag("--record").is_some()
+        || launch.has_flag("--allow-large")
+        || launch.args.len() > 2
+    {
+        return Err(RuneError::invalid_field(
+            "fork",
+            "unexpected fork arguments",
+        ));
+    }
+    let raw = launch
+        .flag("--id")
+        .or_else(|| launch.args.get(1).map(String::as_str))
+        .ok_or_else(|| RuneError::missing_field("session"))?;
+    let source = if raw == "last" {
+        session_log::resolve_target(&ResumeTarget::Latest, paths, workspace)?
+    } else {
+        raw.parse()?
+    };
+    let at = launch
+        .flag("--at")
+        .ok_or_else(|| RuneError::missing_field("at"))?
+        .parse::<u64>()
+        .ok()
+        .filter(|seq| *seq > 0)
+        .ok_or_else(|| RuneError::invalid_field("at", "expected a positive event sequence"))?;
+    let destination = rune_core::id::SessionId::generate();
+    rune_session::fork::fork(paths, &source, &destination, rune_core::id::EventSeq(at))?;
+    if output.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "id": destination,
+                "source": source,
+                "through": at,
+            }))?
+        );
+    } else {
+        println!("forked {source} through event {at} into {destination}");
+        println!("resume with `rune resume {destination}`");
     }
     Ok(ExitCode::from(EXIT_OK))
 }

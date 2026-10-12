@@ -164,6 +164,13 @@ pub enum SessionEvent {
         /// Session that created this one.
         parent: String,
     },
+    /// This independent session copied another session's inclusive prefix.
+    ForkedFrom {
+        /// Source session identifier.
+        session: String,
+        /// Last source event copied, using journal sequence positions.
+        through: u64,
+    },
     /// The workspace the session ran in was recorded.
     ///
     /// Written once, when the session is created, so a later listing can scope
@@ -198,6 +205,7 @@ impl SessionEvent {
             Self::ModelSet { .. } => "model_set",
             Self::WorkspaceSet { .. } => "workspace_set",
             Self::ChildOf { .. } => "child_of",
+            Self::ForkedFrom { .. } => "forked_from",
         }
     }
 }

@@ -442,6 +442,19 @@ Credentials, metadata, and transport headers are excluded. Recorded message
 and tool content is preserved verbatim. An incomplete final frame is omitted
 with a warning on stderr; other log corruption fails the export.
 
+`rune session fork <last|id> --at <seq>` creates an independent saved branch
+through the selected event, inclusive. Use sequence positions from `session
+export` or `session --search`, rather than tree turn numbers. `--id <id>` also
+selects an exact source; `--json` returns the new `id`, `source`, and `through`.
+Resume either session by its ID. The copied events retain their sequence numbers
+and timestamps, followed by a `forked_from` provenance event. The original is
+never rewritten. Boundaries that leave any tool call unanswered are refused,
+including partial result groups; choose the final result of the group or a later
+event. Child sessions cannot be forked. An unfinished assistant answer retains
+the usual interrupted replay behavior. Forking copies journal history only,
+without changing workspace files or copying undo journals, manual compaction
+archives, or global usage ledger entries.
+
 Sessions are written as they run, so an interrupted session resumes. Use
 `/goal <objective>` in an interactive session to explicitly set or replace the
 active objective. `/goal` shows it without changing the log. The exact objective is

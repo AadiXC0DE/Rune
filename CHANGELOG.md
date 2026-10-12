@@ -6,6 +6,11 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Added
 
+- `rune session fork <last|id> --at <seq>` creates an independently resumable
+  saved branch through an inclusive event boundary, with recorded provenance.
+  Unanswered tool calls and partial result groups are refused; the original
+  session history and workspace files stay unchanged.
+
 - `/undo preview` shows affected paths and per-file diffs before restoring the
   session's file changes, without changing file bytes or the mutation journal.
   Created files and rename paths are included; binary changes show byte counts.

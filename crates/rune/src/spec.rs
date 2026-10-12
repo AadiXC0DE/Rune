@@ -283,13 +283,18 @@ pub const SESSIONS: &[CommandSpec] = &[
     CommandSpec {
         name: "session",
         aliases: &[],
-        summary: "Inspect, search, export, migrate, or recover one session",
-        usage: "rune session <last|id> [--search <text> | --record <id|all>] [--json] | rune session --id <id> [--search <text> | --record <id|all>] [--json] | rune session export <last|id> | rune session export --id <id> | rune session migrate <id> | rune session recover <id>",
+        summary: "Inspect, search, export, fork, migrate, or recover one session",
+        usage: "rune session <last|id> [--search <text> | --record <id|all>] [--json] | rune session --id <id> [--search <text> | --record <id|all>] [--json] | rune session export <last|id> | rune session export --id <id> | rune session fork <last|id> --at <seq> [--json] | rune session fork --id <id> --at <seq> [--json] | rune session migrate <id> | rune session recover <id>",
         flags: &[
             option(
                 "--id",
                 "id",
-                "Inspect, search, or export this exact session identifier, taking precedence over a positional selector.",
+                "Inspect, search, export, or fork this exact session identifier, taking precedence over a positional selector.",
+            ),
+            option(
+                "--at",
+                "seq",
+                "Fork through this inclusive saved event sequence. All tool calls must have results.",
             ),
             option(
                 "--search",

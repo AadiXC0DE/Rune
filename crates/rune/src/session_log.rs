@@ -562,9 +562,8 @@ pub fn render_detail(state: &SessionState, dir: &Utf8Path) -> String {
 
 /// Builds the branch tree of a stored session.
 ///
-/// Every stored session is a single chain, so the tree is built by following the
-/// log in order. It exists so the shape is reported from the log rather than
-/// assumed, which is what lets a branch show up here when branching lands.
+/// Each saved branch has its own session log, so this view follows that log in
+/// order. Fork provenance is available in the exported journal.
 #[must_use]
 pub fn tree_of(state: &SessionState) -> Tree {
     use rune_session::tree::Role;
@@ -595,6 +594,7 @@ pub fn tree_of(state: &SessionState) -> Tree {
             | SessionEvent::ConstraintPinned { .. }
             | SessionEvent::ModelSet { .. }
             | SessionEvent::WorkspaceSet { .. }
+            | SessionEvent::ForkedFrom { .. }
             | SessionEvent::ChildOf { .. } => continue,
         };
         let node = Node::new(
@@ -852,6 +852,7 @@ pub fn history_from(state: &SessionState) -> History {
             | SessionEvent::ObjectiveSet { .. }
             | SessionEvent::ModelSet { .. }
             | SessionEvent::WorkspaceSet { .. }
+            | SessionEvent::ForkedFrom { .. }
             | SessionEvent::ChildOf { .. }
             | SessionEvent::TurnInterrupted { .. }
             | SessionEvent::TurnCancelled { .. }
@@ -987,6 +988,65 @@ mod tests {
 
     fn id(raw: &str) -> SessionId {
         raw.parse().expect("id")
+    }
+
+    #[test]
+    fn forked_tool_pair_replays_as_a_valid_history_and_continues_with_the_next_turn() {
+        let temp = tempfile::tempdir().expect("temp");
+        let paths = paths(Utf8Path::from_path(temp.path()).expect("utf8"));
+        let source = SessionId::generate();
+        let branch = SessionId::generate();
+        let store = SessionStore::create(&paths, &source).expect("store");
+        for event in [
+            SessionEvent::ConstraintPinned {
+                text: "keep exact text".into(),
+            },
+            SessionEvent::TurnStarted { turn: 1 },
+            SessionEvent::UserMessage {
+                text: "read it".into(),
+            },
+            SessionEvent::ToolCall {
+                call_id: "read".into(),
+                name: "read_file".into(),
+                arguments: "{}".into(),
+            },
+            SessionEvent::ToolResult {
+                call_id: "read".into(),
+                ok: true,
+                output: "complete original result".into(),
+            },
+            SessionEvent::AssistantMessage {
+                turn: 1,
+                text: "later source answer".into(),
+            },
+            SessionEvent::TurnFinished { turn: 1 },
+        ] {
+            store.append(event).expect("event");
+        }
+        rune_session::fork::fork(&paths, &source, &branch, rune_core::id::EventSeq(5))
+            .expect("fork");
+        let (mut recorder, history) = load(&paths, &branch).expect("resume fork");
+        history.validate().expect("tool pair is sendable");
+        assert_eq!(history.pinned_constraints(), &["keep exact text"]);
+        assert_eq!(history.len(), 3);
+        assert!(
+            matches!(&history.turns()[2].parts[0], ContentPart::ToolResult { content, is_error: false, .. } if content == "complete original result")
+        );
+        recorder.user_message("branch continuation").expect("user");
+        recorder.turn(&outcome("branch answer")).expect("next turn");
+        drop(recorder);
+        let (recorder, history) = load(&paths, &branch).expect("reopen");
+        history.validate().expect("continued history is sendable");
+        assert_eq!(recorder.turn, 2);
+        let source_state = store.read().expect("source");
+        assert_eq!(source_state.events.len(), 7);
+        assert_eq!(
+            source_state.events[5].event,
+            SessionEvent::AssistantMessage {
+                turn: 1,
+                text: "later source answer".into()
+            }
+        );
     }
 
     #[test]
