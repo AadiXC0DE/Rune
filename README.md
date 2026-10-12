@@ -461,6 +461,31 @@ offline switch: hosts must filter remote configurations before `connect_all`
 and arrange any isolation required for stdio children. Host-supplied backends
 and child processes do not acquire offline enforcement merely by using Rune.
 
+## Unsafe code boundaries
+
+The [workspace lint](Cargo.toml) denies unsafe code by default and permits
+documented exceptions at the reviewed boundaries below. This describes Rune's
+own code, not unsafe code inside dependencies.
+
+The native binary on Unix has one unsafe call site:
+[`pre_exec` resource-limit setup](crates/rune-exec/src/command.rs). It runs in
+the child between fork and exec under an async-signal-safe contract: resource
+limit syscalls, no allocation, and an error returned if setup fails. This site
+is excluded on non-Unix targets.
+
+The WASM module has separate unsafe FFI sites in its
+[page imports and exported entry points](crates/rune-web/src/exports.rs),
+compiled only for [WASM targets](crates/rune-web/src/lib.rs). Imports pass raw
+pointers and lengths: the host must copy input bytes before returning, retain
+no pointers, and keep writes and reported read lengths within buffer capacity.
+Staged replies use `take` to copy into an allocated buffer. Exported string
+arguments must come from `rune_alloc` with exactly the allocated length;
+`argument` takes ownership and frees them once, so the host must not reuse them.
+The module's local unsafe allowance, per-call safety comments, and exported
+safety contracts document this boundary. Native tests do not validate these
+WASM FFI obligations; the WASM fixture smoke check and its browser-testing
+limits are described under [Contributing](#contributing).
+
 ## Configuration
 
 Five layers, highest first: command-line flags, `RUNE_*` environment variables,

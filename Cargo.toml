@@ -88,9 +88,11 @@ insta = { version = "1", features = ["json"] }
 tempfile = "3"
 
 [workspace.lints.rust]
-# Denied rather than forbidden, so a crate can permit it in one place and say
-# why. Exactly one call site does: setting a child's resource limits, which is
-# only possible between fork and exec.
+# Denied rather than forbidden, so reviewed boundaries can permit it locally.
+# The native binary on Unix has one unsafe call site: pre_exec resource-limit
+# setup in crates/rune-exec/src/command.rs, between fork and exec.
+# WASM has separate unsafe FFI sites in crates/rune-web/src/exports.rs.
+# See README.md's "Unsafe code boundaries" for links and safety contracts.
 unsafe_code = "deny"
 unused_qualifications = "warn"
 elided_lifetimes_in_paths = "warn"
