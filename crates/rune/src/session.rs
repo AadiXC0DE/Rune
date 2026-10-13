@@ -638,7 +638,10 @@ impl Host for SessionHost {
             // a refused directory or destination cannot pollute `/undo`.
             let source = rune_tools::resolve(&self.context, source)?.path;
             let destination = rune_tools::resolve(&self.context, destination)?.path;
-            let before = std::fs::read(&source).ok();
+            let before = match rename_snapshot(&source) {
+                Ok(bytes) => Some(bytes),
+                Err(error) => return Ok(ToolOutput::from_error(&error)),
+            };
             let output = self.registry.call(name, arguments, &self.context)?;
             if !output.is_error {
                 let mut undo = self
@@ -4703,6 +4706,40 @@ fn mutating_path<'a>(name: &str, arguments: &'a serde_json::Value) -> Option<&'a
         .map(Utf8Path::new)
 }
 
+/// Refuse a rename before mutation if its undo preimage cannot be captured.
+fn rename_snapshot(path: &Utf8Path) -> Result<Vec<u8>> {
+    use std::io::Read as _;
+    let cap = rune_tools::mutation::MAX_WRITE_BYTES;
+    if !std::fs::symlink_metadata(path)?.file_type().is_file() {
+        return Err(RuneError::new(
+            ErrorCode::UnsafePath,
+            "rename source must be a regular file",
+        ));
+    }
+    let file = std::fs::File::open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(RuneError::new(
+            ErrorCode::UnsafePath,
+            "rename source must be a regular file",
+        ));
+    }
+    if metadata.len() > cap as u64 {
+        return Err(RuneError::too_large(
+            "rename snapshot",
+            metadata.len() as usize,
+            cap,
+        ));
+    }
+    let mut bytes = Vec::new();
+    file.take((cap as u64).saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > cap {
+        return Err(RuneError::too_large("rename snapshot", bytes.len(), cap));
+    }
+    Ok(bytes)
+}
+
 /// What the read-only commands report about the running session.
 ///
 /// A struct rather than a list of arguments so adding a field does not change
@@ -7880,6 +7917,85 @@ mod tests {
         std::fs::write(&created, "created by the session").expect("write");
         host.undo().expect("undo");
         assert!(!created.exists(), "the created file was left behind");
+    }
+
+    #[test]
+    fn oversized_rename_snapshot_refuses_mutation_and_undo_records() {
+        let dir = tempfile::tempdir().expect("workspace");
+        let root = Utf8Path::from_path(dir.path()).expect("utf8");
+        let mut host = test_host();
+        host.context = ExecutionContext::new(root.to_owned());
+        host.registry
+            .insert(Box::new(rune_tools::RenameFile))
+            .expect("tool");
+        let source = root.join("source");
+        let file = std::fs::File::create(&source).expect("source");
+        file.set_len(rune_tools::mutation::MAX_WRITE_BYTES as u64 + 1)
+            .expect("size");
+        let output = host
+            .execute(
+                "rename_file",
+                &serde_json::json!({"path":"source","new_path":"destination"}),
+            )
+            .expect("result");
+        assert!(output.is_error);
+        assert!(source.exists());
+        assert!(!root.join("destination").exists());
+        assert!(!host.can_undo());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fifo_rename_snapshot_is_refused_without_opening_it() {
+        let dir = tempfile::tempdir().expect("workspace");
+        let path = dir.path().join("fifo");
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&path)
+                .status()
+                .expect("mkfifo")
+                .success()
+        );
+        assert_eq!(
+            rename_snapshot(Utf8Path::from_path(&path).expect("utf8"))
+                .expect_err("regular files only")
+                .code(),
+            ErrorCode::UnsafePath
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_rename_source_is_not_recorded_as_absent() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().expect("workspace");
+        let root = Utf8Path::from_path(dir.path()).expect("utf8");
+        let source = root.join("source");
+        std::fs::write(&source, "only copy").expect("source");
+        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o000))
+            .expect("permissions");
+        // Privileged test runners can still read mode-000 files.
+        if std::fs::File::open(&source).is_ok() {
+            return;
+        }
+        let mut host = test_host();
+        host.context = ExecutionContext::new(root.to_owned());
+        host.registry
+            .insert(Box::new(rune_tools::RenameFile))
+            .expect("tool");
+        let output = host
+            .execute(
+                "rename_file",
+                &serde_json::json!({"path":"source","new_path":"destination"}),
+            )
+            .expect("result");
+        assert!(output.is_error);
+        assert!(source.exists());
+        assert!(!root.join("destination").exists());
+        assert!(!host.can_undo());
+        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o600))
+            .expect("permissions");
+        assert_eq!(std::fs::read(&source).expect("retained"), b"only copy");
     }
 
     #[test]

@@ -1,6 +1,7 @@
 """R-164: real interactive CLI against isolated model and HTTP MCP servers."""
 
 import fcntl
+import http.client
 import http.server
 import json
 import os
@@ -39,6 +40,7 @@ def run_fixture(scenario, terminal=False):
             self.send_response(status)
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(body)))
+            self.send_header("Connection", "close")
             self.end_headers()
             self.wfile.write(body)
 
@@ -132,6 +134,15 @@ def run_fixture(scenario, terminal=False):
         server.daemon_threads = True
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
+        # Assert the wire contract that prevents reuse before Python closes the socket.
+        probe = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=5)
+        probe.request("GET", "/v1/models")
+        response = probe.getresponse()
+        assert response.getheader("Connection") == "close"
+        response.read()
+        probe.close()
+        http_requests.clear()
+
         environment = {
             "HOME": directory, "PATH": "/usr/bin:/bin", "NO_COLOR": "1", "TERM": "xterm-256color",
             "XDG_CONFIG_HOME": str(base / "config"), "XDG_DATA_HOME": str(base / "data"),

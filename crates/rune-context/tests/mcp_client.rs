@@ -137,6 +137,30 @@ fn missing_config(name: &str) -> ServerConfig {
 }
 
 #[test]
+fn cancelled_stdio_transport_reconnects_on_the_next_call() {
+    let fixture = Fixture::new("standard");
+    let client = Client::new(&budget());
+    client
+        .connect_all(&[fixture.config("fixture")])
+        .expect("connect");
+    let checks = std::cell::Cell::new(0);
+    let error = client
+        .call_cancellable("mcp_fixture_greet", &json!({"who":"world"}), &|| {
+            checks.set(checks.get() + 1);
+            // Cancel in the receive loop, after the request was written.
+            checks.get() >= 4
+        })
+        .expect_err("cancelled");
+    assert_eq!(error.code(), ErrorCode::Cancelled);
+    assert!(!client.server("fixture").expect("status").connected);
+    let outcome = client
+        .call("mcp_fixture_greet", &json!({"who":"world"}))
+        .expect("reconnected");
+    assert_eq!(outcome.text, "hello from the fixture");
+    assert_eq!(client.server("fixture").expect("status").restarts, 1);
+}
+
+#[test]
 fn a_stdio_server_connects_lists_tools_and_executes_one() {
     let fixture = Fixture::new("standard");
     let client = Client::new(&budget());

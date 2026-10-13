@@ -421,6 +421,9 @@ impl Client {
     ) -> Result<CallOutcome> {
         // A credential the server already reported as expired is refreshed
         // before the call, so the rejection is not paid for first.
+        if entry.session.is_none() && entry.last_error.is_some() {
+            Self::spend_restart(entry)?;
+        }
         if entry.session.is_none() || !entry.credential().is_usable(now_ms()) {
             entry.establish(&self.limits, &self.variables)?;
         }
@@ -564,11 +567,22 @@ impl ServerEntry {
         };
         let result = match session {
             Session::Stdio(session) => {
-                session.request_cancellable(TOOLS_CALL, Some(params), timeout, cancelled)?
+                session.request_cancellable(TOOLS_CALL, Some(params), timeout, cancelled)
             }
             #[cfg(not(target_family = "wasm"))]
-            session => session.request(TOOLS_CALL, Some(params), timeout)?,
+            session => session.request(TOOLS_CALL, Some(params), timeout),
         };
+        if let Err(error) = &result
+            && matches!(
+                error.code(),
+                ErrorCode::Cancelled | ErrorCode::Timeout | ErrorCode::TransportFailure
+            )
+        {
+            // Keep discovery for dispatch of the next call, but discard the dead transport.
+            self.session.take();
+            self.last_error = Some(error.message().to_owned());
+        }
+        let result = result?;
         let limit = limits.get_usize(LimitName::MaxToolResultBytes);
         Ok(reduce_result(&name, &tool, &result, limit))
     }

@@ -6,7 +6,7 @@ fn assert_size_claims(text: &str) {
     let text = text.replace('`', "");
     let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
     assert!(text.contains("audited stripped release build"), "{text}");
-    assert!(text.contains("measured 4.50 MiB"), "{text}");
+    assert!(text.contains("measured 5.40 MiB"), "{text}");
     assert!(text.contains("x86_64-unknown-linux-gnu"), "{text}");
     assert!(text.contains("8 MiB ceiling"), "{text}");
     assert!(!text.contains("About 3 MiB"), "{text}");

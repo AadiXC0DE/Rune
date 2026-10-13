@@ -238,6 +238,7 @@ fn is_file_path_tool(tool: &str) -> bool {
             | "rename_file"
             | "create_directory"
             | "grep_files"
+            | "syntax_diagnostics"
     )
 }
 
@@ -815,6 +816,7 @@ mod tests {
             "edit_file",
             "grep_files",
             "create_directory",
+            "syntax_diagnostics",
         ] {
             for target in [
                 ".env",

@@ -94,9 +94,13 @@ impl Tool for RenameFile {
             }
         }
         context.check_cancelled()?;
-        std::fs::rename(&path, &new_path).map_err(|err| {
+        rename_no_replace(&path, &new_path).map_err(|err| {
             RuneError::new(
-                ErrorCode::UnsafePath,
+                if err.kind() == std::io::ErrorKind::AlreadyExists {
+                    ErrorCode::AlreadyExists
+                } else {
+                    ErrorCode::UnsafePath
+                },
                 format!("cannot rename `{path}` to `{new_path}`: {err}"),
             )
             .with_hint(
@@ -109,10 +113,42 @@ impl Tool for RenameFile {
     }
 }
 
+// Creating the destination link is atomic and cannot replace an existing name.
+// If unlinking fails, retain both names rather than risk deleting the only copy.
+fn rename_no_replace(
+    source: &camino::Utf8Path,
+    destination: &camino::Utf8Path,
+) -> std::io::Result<()> {
+    std::fs::hard_link(source, destination)?;
+    std::fs::remove_file(source)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use camino::Utf8Path;
+
+    #[test]
+    fn destination_created_after_precheck_is_preserved() {
+        let dir = tempfile::tempdir().expect("workspace");
+        let root = Utf8Path::from_path(dir.path()).expect("utf8");
+        let source = root.join("source");
+        let destination = root.join("destination");
+        std::fs::write(&source, "source").expect("source");
+        assert!(!destination.exists());
+        std::fs::write(&destination, "concurrent").expect("concurrent destination");
+        assert_eq!(
+            rename_no_replace(&source, &destination)
+                .expect_err("no overwrite")
+                .kind(),
+            std::io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(std::fs::read(&source).expect("source"), b"source");
+        assert_eq!(
+            std::fs::read(&destination).expect("destination"),
+            b"concurrent"
+        );
+    }
 
     #[test]
     fn a_rename_preserves_binary_contents_and_permissions() {
