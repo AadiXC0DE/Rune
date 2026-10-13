@@ -710,12 +710,23 @@ pub fn history_from_events(frames: &[EventFrame]) -> History {
     let mut history = History::new();
     let mut calls: Vec<ContentPart> = Vec::new();
     let mut results: Vec<ContentPart> = Vec::new();
+    let mut native_assistant = false;
 
     for frame in rune_session::replay::replay_events(frames) {
         match &frame.event {
             // Model settings are metadata, not conversation boundaries. A
             // client may change them while a tool batch is still being saved.
             SessionEvent::ModelSet { .. } => {}
+            SessionEvent::AssistantContent { message } => {
+                flush_calls(&mut history, &mut calls);
+                flush_results(&mut history, &mut results);
+                if let Ok(message) = serde_json::from_str::<rune_net::message::Message>(message) {
+                    history.push_assistant_with_replay(message.parts, message.replay);
+                    native_assistant = true;
+                }
+            }
+            SessionEvent::ToolCall { .. } | SessionEvent::AssistantMessage { .. }
+                if native_assistant => {}
             SessionEvent::ConstraintPinned { text } => {
                 let _ = history.pin_constraint(text.clone());
             }
@@ -744,13 +755,20 @@ pub fn history_from_events(frames: &[EventFrame]) -> History {
                 if let Ok(id) = ToolCallId::new(call_id.clone()) {
                     results.push(ContentPart::ToolResult {
                         id,
-                        name: String::new(),
+                        name: history
+                            .turns()
+                            .iter()
+                            .rev()
+                            .flat_map(rune_agent::history::Turn::tool_calls)
+                            .find(|(called, _, _)| called.as_str() == call_id)
+                            .map_or_else(String::new, |(_, name, _)| name.to_owned()),
                         content: output.clone(),
                         is_error: !ok,
                     });
                 }
             }
             SessionEvent::UserMessage { text } => {
+                native_assistant = false;
                 flush_calls(&mut history, &mut calls);
                 flush_results(&mut history, &mut results);
                 history.push_user(text.clone());

@@ -781,6 +781,10 @@ safety contracts document this boundary. Native tests do not validate these
 WASM FFI obligations; the WASM fixture smoke check and its browser-testing
 limits are described under [Contributing](#contributing).
 
+On Windows, [atomic file moves](crates/rune-exec/src/rename.rs) call
+`MoveFileExW` with live, NUL-terminated UTF-16 path buffers and zero flags.
+This keeps no-replace renames atomic without enabling copy/delete fallback.
+
 ## Configuration
 
 Five layers, highest first: command-line flags, `RUNE_*` environment variables,

@@ -160,6 +160,11 @@ export async function ask(prompt, options = {}) {
   const interrupt = (reason) => {
     if (interruption !== null) return;
     interruption = reason;
+    if (child.exitCode !== null || child.signalCode !== null) {
+      child.stdout.destroy();
+      child.stderr.destroy();
+      return;
+    }
     child.kill();
     // A process that ignores SIGTERM would otherwise leave the promise pending
     // forever.

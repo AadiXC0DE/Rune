@@ -8,7 +8,8 @@
 // Unsafe code is denied rather than forbidden, so that the one call that needs
 // it can say so where it is written. Child limits and a controlling tty are set
 // between fork and exec, which is `CommandExt::pre_exec`, and that is
-// unsafe by its own contract. Everywhere else in this crate the denial applies.
+// unsafe by its own contract. Windows file moves have a separate documented
+// FFI boundary in rename.rs. Everywhere else the denial applies.
 #![deny(unsafe_code)]
 // Tests assert by panicking. The guards that forbid panicking apply to the
 // shipped build, where a panic on user input is a defect.
@@ -16,6 +17,11 @@
 
 #[cfg(target_os = "linux")]
 mod pty;
+
+#[cfg(windows)]
+mod rename;
+#[cfg(windows)]
+pub use rename::rename_no_replace;
 
 pub mod command;
 pub mod sandbox;

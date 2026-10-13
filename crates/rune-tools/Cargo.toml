@@ -25,5 +25,8 @@ globset = { workspace = true }
 regex = { workspace = true }
 sha2 = { workspace = true }
 
+[target.'cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))'.dependencies]
+rustix = { workspace = true, features = ["fs"] }
+
 [dev-dependencies]
 tempfile.workspace = true

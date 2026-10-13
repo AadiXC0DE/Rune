@@ -113,20 +113,79 @@ impl Tool for RenameFile {
     }
 }
 
-// Creating the destination link is atomic and cannot replace an existing name.
-// If unlinking fails, retain both names rather than risk deleting the only copy.
+// Both names change in one filesystem operation. Never emulate this with
+// link/unlink: the source pathname may be replaced between those operations.
 fn rename_no_replace(
     source: &camino::Utf8Path,
     destination: &camino::Utf8Path,
 ) -> std::io::Result<()> {
-    std::fs::hard_link(source, destination)?;
-    std::fs::remove_file(source)
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    {
+        rustix::fs::renameat_with(
+            rustix::fs::CWD,
+            source.as_std_path(),
+            rustix::fs::CWD,
+            destination.as_std_path(),
+            rustix::fs::RenameFlags::NOREPLACE,
+        )
+        .map_err(Into::into)
+    }
+    #[cfg(windows)]
+    {
+        rune_exec::rename_no_replace(source.as_std_path(), destination.as_std_path())
+    }
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_vendor = "apple",
+        windows
+    )))]
+    {
+        let _ = (source, destination);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "atomic no-replace rename is unavailable on this platform",
+        ))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use camino::Utf8Path;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn rename_changes_both_names_atomically() {
+        use rustix::fs::inotify;
+        let dir = tempfile::tempdir().expect("workspace");
+        let root = Utf8Path::from_path(dir.path()).expect("utf8");
+        let source = root.join("source");
+        let destination = root.join("destination");
+        std::fs::write(&source, "original").expect("source");
+        let watch = inotify::init(inotify::CreateFlags::NONBLOCK).expect("inotify");
+        inotify::add_watch(&watch, dir.path(), inotify::WatchFlags::ALL_EVENTS).expect("watch");
+        rename_no_replace(&source, &destination).expect("rename");
+        // A link/unlink implementation produces CREATE and DELETE instead of
+        // the paired move events from one atomic operation.
+        let mut buffer = [std::mem::MaybeUninit::uninit(); 1024];
+        let mut events = inotify::Reader::new(watch, &mut buffer);
+        let from = events.next().expect("source event");
+        assert!(from.events().contains(inotify::ReadFlags::MOVED_FROM));
+        let cookie = from.cookie();
+        let to = events.next().expect("destination event");
+        assert!(to.events().contains(inotify::ReadFlags::MOVED_TO));
+        assert_eq!(to.cookie(), cookie);
+        std::fs::write(&source, "replacement").expect("concurrent replacement");
+        assert_eq!(
+            std::fs::read(&source).expect("replacement survives"),
+            b"replacement"
+        );
+        assert_eq!(
+            std::fs::read(&destination).expect("destination"),
+            b"original"
+        );
+    }
 
     #[test]
     fn destination_created_after_precheck_is_preserved() {

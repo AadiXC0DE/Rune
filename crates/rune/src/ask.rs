@@ -650,35 +650,11 @@ fn save_exchange(
     })?;
     append(SessionEvent::TurnStarted { turn: 1 })?;
     for turn in history.turns().iter().skip(1) {
-        let text = turn.text();
-        if !text.is_empty() {
-            append(SessionEvent::AssistantMessage { turn: 1, text })?;
-        }
-        for part in &turn.parts {
-            match part {
-                ContentPart::ToolCall {
-                    id,
-                    name,
-                    arguments,
-                } => append(SessionEvent::ToolCall {
-                    call_id: id.to_string(),
-                    name: name.clone(),
-                    arguments: arguments.clone(),
-                })?,
-                ContentPart::ToolResult {
-                    id,
-                    content,
-                    is_error,
-                    ..
-                } => append(SessionEvent::ToolResult {
-                    call_id: id.to_string(),
-                    ok: !is_error,
-                    output: content.clone(),
-                })?,
-                _ => {}
-            }
+        for event in crate::session_log::message_events(turn, 1)? {
+            append(event)?;
         }
     }
+
     if let (Some(input_tokens), Some(output_tokens)) = (usage.input_tokens, usage.output_tokens) {
         append(SessionEvent::UsageRecorded {
             input_tokens,
@@ -741,6 +717,54 @@ mod tests {
             base_url: Some("https://api.example.com".to_owned()),
             ..Settings::default()
         }
+    }
+
+    #[test]
+    fn saved_ask_preserves_native_assistant_replay() {
+        use rune_net::provider::{Provider as _, RequestPlan};
+        let temp = tempfile::tempdir().expect("temp");
+        let root = camino::Utf8Path::from_path(temp.path()).expect("utf8");
+        let paths = Paths {
+            config_root: root.join("config"),
+            state_root: root.join("state"),
+            data_root: root.join("data"),
+        };
+        let mut history = History::new();
+        history.push_user("lookup");
+        let id = rune_core::id::ToolCallId::new("local").expect("id");
+        let parts = serde_json::json!([{ "functionCall": { "id": "native", "name": "lookup", "args": {} }, "thoughtSignature": "signature" }]);
+        history.push_assistant_with_replay(
+            vec![ContentPart::ToolCall {
+                id: id.clone(),
+                name: "lookup".into(),
+                arguments: "{}".into(),
+            }],
+            Some(serde_json::json!({"gemini_parts": parts}).to_string()),
+        );
+        history.push_tool_results(vec![ContentPart::ToolResult {
+            id,
+            name: "lookup".into(),
+            content: "found".into(),
+            is_error: false,
+        }]);
+        let saved =
+            save_exchange(&paths, "lookup", &history, &Usage::default(), None).expect("save");
+        let (_, restored) = crate::session_log::load(&paths, &saved).expect("resume");
+        restored.validate().expect("history");
+        let mut plan = RequestPlan::new("gemini-fixture");
+        plan.messages = restored.to_messages();
+        let body = rune_net::gemini::Gemini
+            .build_request(&plan)
+            .expect("request");
+        assert_eq!(body["contents"][1]["parts"], parts);
+        assert_eq!(
+            body["contents"][2]["parts"][0]["functionResponse"]["name"],
+            "lookup"
+        );
+        assert_eq!(
+            body["contents"][2]["parts"][0]["functionResponse"]["id"],
+            "native"
+        );
     }
 
     #[test]

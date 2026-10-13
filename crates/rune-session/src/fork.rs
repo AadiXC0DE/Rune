@@ -39,11 +39,25 @@ pub fn fork(
         })?;
     let prefix = &state.events[..=end];
     let mut pending = BTreeSet::new();
+    let mut content_calls = BTreeSet::new();
     let mut partial_results = false;
     for frame in prefix {
         match &frame.event {
+            SessionEvent::AssistantContent { message }
+                if pending.is_empty() && content_calls.is_empty() =>
+            {
+                let message: serde_json::Value = serde_json::from_str(message)?;
+                if let Some(parts) = message["parts"].as_array() {
+                    for part in parts.iter().filter(|part| part["type"] == "tool_call") {
+                        if let Some(id) = part["id"].as_str() {
+                            content_calls.insert(id.to_owned());
+                        }
+                    }
+                }
+            }
             SessionEvent::ToolCall { call_id, .. } => {
                 rune_core::id::ToolCallId::new(call_id.clone())?;
+                content_calls.remove(call_id);
                 if partial_results {
                     return Err(RuneError::invalid_field(
                         "at",
@@ -68,6 +82,7 @@ pub fn fork(
             }
             SessionEvent::UserMessage { .. }
             | SessionEvent::AssistantMessage { .. }
+            | SessionEvent::AssistantContent { .. }
             | SessionEvent::TurnStarted { .. }
             | SessionEvent::TurnFinished { .. }
             | SessionEvent::TurnCancelled { .. }
@@ -83,7 +98,7 @@ pub fn fork(
             _ => {}
         }
     }
-    if !pending.is_empty() {
+    if !pending.is_empty() || !content_calls.is_empty() {
         return Err(
             RuneError::invalid_field("at", "fork boundary leaves unanswered tool calls")
                 .with_hint("choose an event after all results in the tool group are saved"),

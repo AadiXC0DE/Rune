@@ -76,6 +76,7 @@ pub struct Recorder {
     objective_tokens: u64,
     turn: u64,
     active_turn: bool,
+    responses: Vec<rune_agent::history::Turn>,
     journal_error: Option<RuneError>,
     metadata_warning: std::cell::RefCell<Option<RuneError>>,
     /// Initial estimate and its source, populated only when resuming.
@@ -93,6 +94,7 @@ impl Recorder {
             objective_tokens: 0,
             turn: 0,
             active_turn: false,
+            responses: Vec::new(),
             journal_error: None,
             metadata_warning: std::cell::RefCell::new(None),
             resumed_context: (0, None),
@@ -175,6 +177,7 @@ impl Recorder {
             objective_tokens,
             turn,
             active_turn: false,
+            responses: Vec::new(),
             journal_error: None,
             metadata_warning: std::cell::RefCell::new(None),
             resumed_context: (0, None),
@@ -276,6 +279,7 @@ impl Recorder {
             self.append(SessionEvent::TurnStarted { turn })?;
             self.turn = turn;
             self.active_turn = true;
+            self.responses.clear();
         }
         Ok(())
     }
@@ -324,6 +328,34 @@ impl Recorder {
         self.journal_error.take().map_or(Ok(()), Err)
     }
 
+    /// Retains completed provider responses until their tool results are saved.
+    /// This is independent of model history, which can compact between steps.
+    pub fn response(&mut self, outcome: &rune_net::transport::StreamOutcome) -> Result<()> {
+        self.begin_turn()?;
+        let mut parts = Vec::new();
+        let text = outcome.text();
+        if !text.is_empty() {
+            parts.push(ContentPart::Text { text });
+        }
+        let reasoning = outcome.reasoning();
+        if !reasoning.is_empty() {
+            parts.push(ContentPart::Reasoning { text: reasoning });
+        }
+        for (id, name, arguments) in outcome.tool_calls() {
+            parts.push(ContentPart::ToolCall {
+                id: rune_core::id::ToolCallId::new(id)?,
+                name,
+                arguments,
+            });
+        }
+        let mut message = rune_agent::history::Turn::assistant(0, parts);
+        message.replay.clone_from(&outcome.replay);
+        if !message.parts.is_empty() {
+            self.responses.push(message);
+        }
+        Ok(())
+    }
+
     /// Records a turn and everything it produced.
     ///
     /// A streamed exchange keeps the number assigned before its request. A
@@ -333,29 +365,50 @@ impl Recorder {
         self.begin_turn()?;
         let turn = self.turn;
 
-        // The calls of one step are a batch, and their results follow the whole
-        // batch. Writing them interleaved would leave a log that cannot be
-        // replayed into the conversation the model actually saw.
-        for call in &outcome.calls {
-            self.append(SessionEvent::ToolCall {
-                call_id: call.call.id.clone(),
-                name: call.call.name.clone(),
-                arguments: call.call.arguments.clone(),
-            })?;
-        }
-        for call in &outcome.calls {
-            self.append(SessionEvent::ToolResult {
-                call_id: call.call.id.clone(),
-                ok: !call.output.is_error,
-                output: call.output.text.clone(),
-            })?;
-        }
+        if self.responses.is_empty() {
+            // The calls of one step are a batch, and their results follow the whole
+            // batch. Writing them interleaved would leave a log that cannot be
+            // replayed into the conversation the model actually saw.
+            for call in &outcome.calls {
+                self.append(SessionEvent::ToolCall {
+                    call_id: call.call.id.clone(),
+                    name: call.call.name.clone(),
+                    arguments: call.call.arguments.clone(),
+                })?;
+            }
+            for call in &outcome.calls {
+                self.append(SessionEvent::ToolResult {
+                    call_id: call.call.id.clone(),
+                    ok: !call.output.is_error,
+                    output: call.output.text.clone(),
+                })?;
+            }
 
-        if !outcome.text.is_empty() {
-            self.append(SessionEvent::AssistantMessage {
-                turn,
-                text: outcome.text.clone(),
-            })?;
+            if !outcome.text.is_empty() {
+                self.append(SessionEvent::AssistantMessage {
+                    turn,
+                    text: outcome.text.clone(),
+                })?;
+            }
+        } else {
+            let mut results = outcome.calls.iter();
+            for message in std::mem::take(&mut self.responses) {
+                for event in message_events(&message, turn)? {
+                    self.append(event)?;
+                }
+                for (id, _, _) in message.tool_calls() {
+                    if let Some(result) = results
+                        .next()
+                        .filter(|result| result.call.id == id.as_str())
+                    {
+                        self.append(SessionEvent::ToolResult {
+                            call_id: result.call.id.clone(),
+                            ok: !result.output.is_error,
+                            output: result.output.text.clone(),
+                        })?;
+                    }
+                }
+            }
         }
 
         if let (Some(input), Some(output)) =
@@ -644,7 +697,8 @@ pub fn tree_of(state: &SessionState) -> Tree {
             }
             SessionEvent::ToolResult { output, .. } => (Role::Tool, output.as_str()),
             SessionEvent::ToolCall { name, .. } => (Role::Assistant, name.as_str()),
-            SessionEvent::AssistantDelta { .. }
+            SessionEvent::AssistantContent { .. }
+            | SessionEvent::AssistantDelta { .. }
             | SessionEvent::AssistantReset { .. }
             | SessionEvent::TurnStarted { .. }
             | SessionEvent::TurnFinished { .. }
@@ -846,6 +900,53 @@ pub fn load(paths: &Paths, id: &SessionId) -> Result<(Recorder, History)> {
     Ok((recorder, history))
 }
 
+/// Encodes one history message without flattening provider response boundaries.
+pub fn message_events(message: &rune_agent::history::Turn, turn: u64) -> Result<Vec<SessionEvent>> {
+    let mut events = Vec::new();
+    if message.role == rune_net::message::Role::Assistant {
+        events.push(SessionEvent::AssistantContent {
+            message: serde_json::to_string(&rune_net::message::Message {
+                role: message.role,
+                parts: message.parts.clone(),
+                replay: message.replay.clone(),
+            })?,
+        });
+        let text = message.text();
+        if !text.is_empty() {
+            events.push(SessionEvent::AssistantMessage { turn, text });
+        }
+    } else if message.role == rune_net::message::Role::User {
+        events.push(SessionEvent::UserMessage {
+            text: message.text(),
+        });
+    }
+    for part in &message.parts {
+        match part {
+            ContentPart::ToolCall {
+                id,
+                name,
+                arguments,
+            } => events.push(SessionEvent::ToolCall {
+                call_id: id.to_string(),
+                name: name.clone(),
+                arguments: arguments.clone(),
+            }),
+            ContentPart::ToolResult {
+                id,
+                content,
+                is_error,
+                ..
+            } => events.push(SessionEvent::ToolResult {
+                call_id: id.to_string(),
+                ok: !is_error,
+                output: content.clone(),
+            }),
+            _ => {}
+        }
+    }
+    Ok(events)
+}
+
 /// The result a replayed call is given when the log holds none for it.
 const INTERRUPTED_CALL: &str = "the session stopped before this call returned, so it has no result";
 
@@ -855,6 +956,7 @@ pub fn history_from(state: &SessionState) -> History {
     let mut history = History::new();
     let mut calls: Vec<ContentPart> = Vec::new();
     let mut results: Vec<ContentPart> = Vec::new();
+    let mut assistant: Option<rune_net::message::Message> = None;
 
     for frame in rune_session::replay::replay_events(&state.events) {
         match &frame.event {
@@ -864,15 +966,30 @@ pub fn history_from(state: &SessionState) -> History {
                 let _ = history.pin_constraint(text.clone());
             }
             SessionEvent::UserMessage { text } => {
-                flush(&mut history, &mut calls, &mut results);
+                flush(&mut history, &mut calls, &mut results, &mut assistant);
                 history.push_user(text.clone());
             }
+            SessionEvent::AssistantContent { message } => {
+                flush(&mut history, &mut calls, &mut results, &mut assistant);
+                assistant = serde_json::from_str(message).ok();
+                if let Some(message) = &assistant {
+                    calls.extend(
+                        message
+                            .parts
+                            .iter()
+                            .filter(|part| matches!(part, ContentPart::ToolCall { .. }))
+                            .cloned(),
+                    );
+                }
+            }
+            SessionEvent::AssistantMessage { .. } if assistant.is_some() => {}
             SessionEvent::AssistantMessage { text, .. } => {
-                flush(&mut history, &mut calls, &mut results);
+                flush(&mut history, &mut calls, &mut results, &mut assistant);
                 if !text.is_empty() {
                     history.push_assistant(vec![ContentPart::Text { text: text.clone() }]);
                 }
             }
+            SessionEvent::ToolCall { .. } if assistant.is_some() && results.is_empty() => {}
             SessionEvent::ToolCall {
                 call_id,
                 name,
@@ -881,7 +998,7 @@ pub fn history_from(state: &SessionState) -> History {
                 // A tool result run always follows the calls it answers, so a
                 // new call closes the previous group.
                 if !results.is_empty() {
-                    flush(&mut history, &mut calls, &mut results);
+                    flush(&mut history, &mut calls, &mut results, &mut assistant);
                 }
                 if let Ok(id) = rune_core::id::ToolCallId::new(call_id.clone()) {
                     calls.push(ContentPart::ToolCall {
@@ -925,7 +1042,7 @@ pub fn history_from(state: &SessionState) -> History {
         }
     }
 
-    flush(&mut history, &mut calls, &mut results);
+    flush(&mut history, &mut calls, &mut results, &mut assistant);
     history
 }
 
@@ -935,7 +1052,12 @@ pub fn history_from(state: &SessionState) -> History {
 /// are all written before any of its results, so a process that stopped between
 /// the two leaves calls that were never answered, and a conversation holding
 /// one is refused by every request that follows.
-fn flush(history: &mut History, calls: &mut Vec<ContentPart>, results: &mut Vec<ContentPart>) {
+fn flush(
+    history: &mut History,
+    calls: &mut Vec<ContentPart>,
+    results: &mut Vec<ContentPart>,
+    assistant: &mut Option<rune_net::message::Message>,
+) {
     if !calls.is_empty() {
         for call in calls.iter() {
             let ContentPart::ToolCall { id, name, .. } = call else {
@@ -953,7 +1075,23 @@ fn flush(history: &mut History, calls: &mut Vec<ContentPart>, results: &mut Vec<
                 });
             }
         }
-        history.push_assistant(std::mem::take(calls));
+        for result in results.iter_mut() {
+            if let ContentPart::ToolResult { id, name, .. } = result
+                && let Some(ContentPart::ToolCall { name: called, .. }) = calls.iter().find(
+                    |call| matches!(call, ContentPart::ToolCall { id: called, .. } if called == id),
+                )
+            {
+                name.clone_from(called);
+            }
+        }
+        if assistant.is_none() {
+            history.push_assistant(std::mem::take(calls));
+        } else {
+            calls.clear();
+        }
+    }
+    if let Some(message) = assistant.take() {
+        history.push_assistant_with_replay(message.parts, message.replay);
     }
     if !results.is_empty() {
         history.push_tool_results(std::mem::take(results));
@@ -1053,6 +1191,144 @@ mod tests {
 
     fn id(raw: &str) -> SessionId {
         raw.parse().expect("id")
+    }
+
+    #[test]
+    fn gemini_responses_survive_the_journal_resume_and_fork() {
+        use rune_net::provider::{Provider, RequestPlan};
+        use rune_net::stream::StreamReducer;
+        use serde_json::json;
+        let temp = tempfile::tempdir().expect("temp");
+        let paths = paths(Utf8Path::from_path(temp.path()).expect("utf8"));
+        let id = SessionId::generate();
+        let mut recorder = Recorder::create(&paths, &id).expect("recorder");
+        recorder.user_message("lookup twice").expect("prompt");
+        let mut completed = outcome("done");
+        let mut native_parts = Vec::new();
+        for step in 0..3 {
+            let parts = if step < 2 {
+                json!([
+                    {"text": "thinking", "thought": true, "thoughtSignature": format!("thought-{step}")},
+                    {"functionCall": {"name": "lookup", "args": {"step": step}}, "thoughtSignature": format!("call-{step}")}
+                ])
+            } else {
+                json!([{"text": "done", "thoughtSignature": "final-signature"}])
+            };
+            let mut reducer = rune_net::gemini::Reducer::default();
+            let mut events = Vec::new();
+            reducer.apply(Some(&json!({"candidates": [{"content": {"parts": parts}, "finishReason": "STOP"}]}).to_string()), &mut events).expect("frame");
+            reducer.apply(None, &mut events).expect("finish");
+            let response = rune_net::transport::StreamOutcome {
+                events,
+                replay: reducer.replay(),
+                finish: Some(reducer.finish().expect("reason")),
+                ..Default::default()
+            };
+            recorder.response(&response).expect("response");
+            for (id, name, arguments) in response.tool_calls() {
+                completed.calls.push(rune_agent::turn::CallResult {
+                    call: PreparedCall {
+                        id,
+                        name,
+                        arguments,
+                    },
+                    output: ToolOutput::success(format!("result-{step}")),
+                    executed: true,
+                });
+            }
+            native_parts.push(parts);
+        }
+        recorder.turn(&completed).expect("save");
+        let mut interrupted = recorder.store.read().expect("state");
+        let content = interrupted
+            .events
+            .iter()
+            .position(|frame| matches!(frame.event, SessionEvent::AssistantContent { .. }))
+            .expect("native content");
+        interrupted.events.truncate(content + 1);
+        history_from(&interrupted)
+            .validate()
+            .expect("unfinished calls receive interrupted results");
+        assert!(
+            rune_session::fork::fork(
+                &paths,
+                &id,
+                &SessionId::generate(),
+                interrupted.events[content].seq
+            )
+            .is_err()
+        );
+        let boundary = recorder
+            .store
+            .read()
+            .expect("state")
+            .events
+            .last()
+            .expect("last")
+            .seq;
+        drop(recorder);
+        let branch = SessionId::generate();
+        rune_session::fork::fork(&paths, &id, &branch, boundary).expect("fork");
+        for saved in [id, branch] {
+            let (_, history) = load(&paths, &saved).expect("resume");
+            history.validate().expect("paired history");
+            let mut plan = RequestPlan::new("gemini-fixture");
+            plan.messages = history.to_messages();
+            let request = rune_net::gemini::Gemini
+                .build_request(&plan)
+                .expect("request");
+            assert_eq!(request["contents"].as_array().expect("contents").len(), 6);
+            let state = load_read_only(&paths.session_dir(&saved)).expect("saved events");
+            plan.messages = rune_acp::session::history_from_events(&state.events).to_messages();
+            assert_eq!(
+                rune_net::gemini::Gemini
+                    .build_request(&plan)
+                    .expect("ACP request"),
+                request
+            );
+            for (step, parts) in native_parts.iter().enumerate() {
+                assert_eq!(&request["contents"][step * 2 + 1]["parts"], parts);
+                if step < 2 {
+                    let response =
+                        &request["contents"][step * 2 + 2]["parts"][0]["functionResponse"];
+                    assert_eq!(response["name"], "lookup");
+                    assert_eq!(response["response"]["output"], format!("result-{step}"));
+                    assert!(response.get("id").is_none());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_tool_results_recover_their_function_names() {
+        use rune_net::provider::{Provider, RequestPlan};
+        let temp = tempfile::tempdir().expect("temp");
+        let paths = paths(Utf8Path::from_path(temp.path()).expect("utf8"));
+        let id = SessionId::generate();
+        let mut recorder = Recorder::create(&paths, &id).expect("recorder");
+        recorder.user_message("lookup").expect("prompt");
+        let mut completed = outcome("done");
+        completed.calls.push(rune_agent::turn::CallResult {
+            call: PreparedCall {
+                id: "legacy".into(),
+                name: "lookup".into(),
+                arguments: "{}".into(),
+            },
+            output: ToolOutput::success("found"),
+            executed: true,
+        });
+        recorder.turn(&completed).expect("save legacy format");
+        drop(recorder);
+        let (_, history) = load(&paths, &id).expect("resume");
+        let mut plan = RequestPlan::new("gemini-fixture");
+        plan.messages = history.to_messages();
+        let request = rune_net::gemini::Gemini
+            .build_request(&plan)
+            .expect("request");
+        assert_eq!(
+            request["contents"][2]["parts"][0]["functionResponse"]["name"],
+            "lookup"
+        );
     }
 
     #[test]

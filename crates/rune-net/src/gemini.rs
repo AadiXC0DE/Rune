@@ -283,7 +283,7 @@ impl Reducer {
                 ));
             }
             let raw_id = call.get("id").and_then(Value::as_str).map_or_else(
-                || format!("gemini_call_{}", self.parts.len()),
+                || format!("gemini_call_{}", rune_core::id::SessionId::generate()),
                 str::to_owned,
             );
             if !self.ids.insert(raw_id.clone()) {
@@ -415,6 +415,33 @@ mod tests {
 
     fn feed(reducer: &mut Reducer, frame: &Value, out: &mut Vec<ProviderEvent>) -> Result<()> {
         reducer.apply(Some(&frame.to_string()), out)
+    }
+
+    #[test]
+    fn generated_call_ids_are_unique_across_responses() {
+        let frame = json!({"candidates": [{"content": {"parts": [
+            {"functionCall": {"name": "lookup", "args": {}}},
+            {"functionCall": {"name": "lookup", "args": {}}}
+        ]}, "finishReason": "STOP"}]});
+        let mut ids = std::collections::HashSet::new();
+        for _ in 0..3 {
+            let mut reducer = Reducer::default();
+            let mut events = Vec::new();
+            feed(&mut reducer, &frame, &mut events).expect("response");
+            for event in events {
+                if let ProviderEvent::ToolCallStart { id, .. } = event {
+                    assert!(ids.insert(id));
+                }
+            }
+            let replay: Value =
+                serde_json::from_str(&reducer.replay().expect("replay")).expect("JSON");
+            assert!(
+                replay["gemini_parts"][0]["functionCall"]
+                    .get("id")
+                    .is_none()
+            );
+        }
+        assert_eq!(ids.len(), 6);
     }
 
     #[test]

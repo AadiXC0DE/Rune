@@ -1072,6 +1072,7 @@ dependencies = [
  "rune-core",
  "rustix",
  "tempfile",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1173,6 +1174,7 @@ dependencies = [
  "rune-core",
  "rune-exec",
  "rune-policy",
+ "rustix",
  "same-file",
  "serde",
  "serde_json",

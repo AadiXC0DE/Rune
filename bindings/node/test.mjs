@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
 import childProcess from "node:child_process";
+import { EventEmitter } from "node:events";
+import { PassThrough } from "node:stream";
 import {
   accessSync,
   chmodSync,
@@ -499,6 +501,54 @@ test("output from an inherited pipe is bounded after the parent exits", { timeou
   });
 });
 
+test("timeout and abort settle after exit with inherited pipes still open", { timeout: 5000 }, async () => {
+  const originalSpawn = childProcess.spawn;
+  const bin = nodeStub("rune-exited-pipes", "process.exit(0);");
+  try {
+    for (const reason of ["TIMEOUT", "ABORTED"]) {
+      const child = new EventEmitter();
+      child.stdout = new PassThrough();
+      child.stderr = new PassThrough();
+      child.exitCode = null;
+      child.signalCode = null;
+      child.kill = () => false;
+      let closed = 0;
+      for (const stream of [child.stdout, child.stderr]) {
+        stream.once("close", () => {
+          if (++closed === 2) child.emit("close", 0, null);
+        });
+      }
+      childProcess.spawn = () => child;
+      syncBuiltinESMExports();
+      const controller = new AbortController();
+      const pending = ask("hello", {
+        bin,
+        ...(reason === "TIMEOUT" ? { timeoutMs: 20 } : { signal: controller.signal }),
+      });
+      child.exitCode = 0;
+      child.emit("exit", 0, null);
+      if (reason === "ABORTED") controller.abort();
+      let watchdog;
+      try {
+        await assert.rejects(Promise.race([
+          pending,
+          new Promise((_, reject) => {
+            watchdog = setTimeout(() => reject(new Error("interruption did not settle")), 500);
+          }),
+        ]), { code: reason });
+        assert.ok(child.stdout.destroyed && child.stderr.destroyed);
+      } finally {
+        clearTimeout(watchdog);
+        child.stdout.destroy();
+        child.stderr.destroy();
+      }
+    }
+  } finally {
+    childProcess.spawn = originalSpawn;
+    syncBuiltinESMExports();
+  }
+});
+
 test("invalid output caps fail before binary lookup or spawning", async () => {
   const originalSpawn = childProcess.spawn;
   let spawnCalls = 0;
@@ -538,6 +588,8 @@ test("output-limit shutdown drains both streams with bounded retained memory", {
   const source = `
     import assert from "node:assert/strict";
     import childProcess from "node:child_process";
+import { EventEmitter } from "node:events";
+import { PassThrough } from "node:stream";
     import { syncBuiltinESMExports } from "node:module";
     import { ask, RuneOutputLimitError } from ${JSON.stringify(new URL("./index.js", import.meta.url).href)};
     global.gc();

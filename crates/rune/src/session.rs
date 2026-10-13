@@ -491,6 +491,17 @@ impl Host for SessionHost {
         Ok(())
     }
 
+    fn observe_response(&self, outcome: &rune_net::transport::StreamOutcome) {
+        if let Some(recorder) = &self.recorder {
+            let mut recorder = recorder
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Err(error) = recorder.response(outcome) {
+                recorder.journal_failed(error);
+            }
+        }
+    }
+
     fn emit(&self, event: Event) {
         // Text is accumulated as it arrives and drawn straight away, which is
         // what makes an answer appear while it is being written rather than

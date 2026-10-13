@@ -74,7 +74,7 @@ fn compact_restart_and_retrieve_every_removed_message_and_complete_tool_batch() 
                 .expect("result");
             results.push(ContentPart::ToolResult {
                 id: rune_core::id::ToolCallId::new(call_id).expect("call ID"),
-                name: String::new(),
+                name: "read_file".to_owned(),
                 content: output,
                 is_error: tool != 1,
             });

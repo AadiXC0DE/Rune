@@ -81,6 +81,11 @@ pub enum SessionEvent {
         /// Message text.
         text: String,
     },
+    /// Complete assistant content accompanying the following display and tool records.
+    AssistantContent {
+        /// Serialized provider-neutral message, including native replay state.
+        message: String,
+    },
     /// Visible assistant text durably saved while a turn is still running.
     /// A final message or outcome supersedes these deltas during replay.
     AssistantDelta {
@@ -204,6 +209,7 @@ impl SessionEvent {
             Self::TurnFailed { .. } => "turn_failed",
             Self::UserMessage { .. } => "user_message",
             Self::AssistantMessage { .. } => "assistant_message",
+            Self::AssistantContent { .. } => "assistant_content",
             Self::AssistantDelta { .. } => "assistant_delta",
             Self::AssistantReset { .. } => "assistant_reset",
             Self::TurnInterrupted { .. } => "turn_interrupted",
