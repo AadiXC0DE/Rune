@@ -181,7 +181,7 @@ fn inspect(
 ) -> Result<(Exit, Reading)> {
     context.check_cancelled()?;
     let started = Instant::now();
-    let mut environment = minimal_environment();
+    let mut environment = checker_environment(minimal_environment())?;
     // A rustup proxy must use an installed checker, even when a workspace
     // requests another toolchain. Inspection must not download or install one.
     environment.insert("RUSTUP_AUTO_INSTALL".to_owned(), "0".to_owned());
@@ -216,6 +216,59 @@ fn inspect(
     context.check_cancelled()?;
     // Dropping a running Process ends its group on timeout and cancellation.
     Ok((exit, process.stderr().since(0)))
+}
+
+// Pin the proxy before entering the workspace. Neither rust-toolchain files nor
+// directory overrides may select an executable for this read-only tool.
+fn checker_environment(
+    mut environment: std::collections::BTreeMap<String, String>,
+) -> Result<std::collections::BTreeMap<String, String>> {
+    if environment
+        .get("RUSTUP_TOOLCHAIN")
+        .is_none_or(String::is_empty)
+    {
+        let home = environment
+            .get("RUSTUP_HOME")
+            .map(std::path::PathBuf::from)
+            .or_else(|| {
+                environment
+                    .get(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
+                    .map(|home| std::path::PathBuf::from(home).join(".rustup"))
+            });
+        let mut toolchain = "stable".to_owned();
+        if let Some(home) = home {
+            match std::fs::File::open(home.join("settings.toml")) {
+                Ok(file) => {
+                    use std::io::Read as _;
+                    let mut contents = String::new();
+                    file.take(65537).read_to_string(&mut contents)?;
+                    if contents.len() > 65536 {
+                        return Err(RuneError::new(
+                            ErrorCode::TooLarge,
+                            "rustup settings exceed 64 KiB",
+                        ));
+                    }
+                    let settings: toml::Table = toml::from_str(&contents).map_err(|_| {
+                        RuneError::new(
+                            ErrorCode::InvalidConfiguration,
+                            "invalid user rustup settings",
+                        )
+                    })?;
+                    if let Some(default) = settings
+                        .get("default_toolchain")
+                        .and_then(toml::Value::as_str)
+                        .filter(|value| !value.is_empty())
+                    {
+                        default.clone_into(&mut toolchain);
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        environment.insert("RUSTUP_TOOLCHAIN".to_owned(), toolchain);
+    }
+    Ok(environment)
 }
 
 fn render(exit: Exit, stderr: &Reading, path: &str, cap: usize) -> ToolOutput {
@@ -254,6 +307,87 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn project_toolchain_cannot_select_the_checker() {
+        use std::os::unix::fs::PermissionsExt as _;
+        // Run the public tool in a subprocess so removing an inherited
+        // RUSTUP_TOOLCHAIN cannot race other tests' process environment.
+        if let Ok(root) = std::env::var("RUNE_SYNTAX_TEST_WORKSPACE") {
+            let output = SyntaxDiagnostics::default()
+                .call(
+                    &json!({"path": "broken.rs"}),
+                    &ExecutionContext::new(root.into()),
+                )
+                .expect("syntax check");
+            assert!(
+                output.is_error,
+                "project checker bypassed syntax validation: {output:?}"
+            );
+            assert!(!output.text.contains("PROJECT_CHECKER"));
+            return;
+        }
+        let directory = tempfile::tempdir().expect("workspace");
+        let root = directory.path();
+        let toolchain = root.join("evil");
+        std::fs::create_dir_all(toolchain.join("bin")).expect("bin");
+        std::fs::create_dir_all(toolchain.join("lib")).expect("lib");
+        for name in ["rustc", "rustfmt"] {
+            let path = toolchain.join("bin").join(name);
+            std::fs::write(&path, "#!/bin/sh\nprintf PROJECT_CHECKER >&2\nexit 0\n")
+                .expect("checker");
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
+                .expect("executable");
+        }
+        std::fs::write(
+            root.join("rust-toolchain.toml"),
+            format!(
+                "[toolchain]\npath = {}\n",
+                toml::Value::String(toolchain.to_string_lossy().into_owned())
+            ),
+        )
+        .expect("project override");
+        let mut environment = minimal_environment();
+        environment.remove("RUSTUP_TOOLCHAIN");
+        environment.insert("RUSTUP_AUTO_INSTALL".to_owned(), "0".to_owned());
+        let run = |environment: &std::collections::BTreeMap<String, String>| {
+            std::process::Command::new("rustfmt")
+                .arg("--version")
+                .current_dir(root)
+                .env_clear()
+                .envs(environment)
+                .output()
+                .expect("rustfmt proxy")
+        };
+        let unpinned = run(&environment);
+        assert!(
+            String::from_utf8_lossy(&unpinned.stderr).contains("PROJECT_CHECKER"),
+            "fixture must exercise project executable selection: {unpinned:?}"
+        );
+        std::fs::write(root.join("broken.rs"), "fn broken( {").expect("invalid Rust");
+        let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args([
+                "--exact",
+                "syntax_diagnostics::tests::project_toolchain_cannot_select_the_checker",
+                "--nocapture",
+            ])
+            .env_remove("RUSTUP_TOOLCHAIN")
+            .env("RUNE_SYNTAX_TEST_WORKSPACE", root)
+            .output()
+            .expect("isolated tool call");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        let mut explicit = environment;
+        explicit.insert("RUSTUP_TOOLCHAIN".to_owned(), "user-selected".to_owned());
+        assert_eq!(
+            checker_environment(explicit).expect("explicit")["RUSTUP_TOOLCHAIN"],
+            "user-selected"
+        );
+    }
 
     #[test]
     fn empty_configuration_is_private_unique_and_removed_on_drop() {

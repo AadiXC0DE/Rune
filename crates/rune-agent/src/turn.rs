@@ -771,10 +771,21 @@ impl ObjectiveAccounting {
                 input
             }
         });
-        let output = usage.output_tokens.unwrap_or_else(|| {
-            self.output_bytes
-                .div_ceil(crate::tokens::DEFAULT_BYTES_PER_TOKEN)
-        });
+        let output = usage.output_tokens.map_or_else(
+            || {
+                self.output_bytes
+                    .div_ceil(crate::tokens::DEFAULT_BYTES_PER_TOKEN)
+            },
+            |output| {
+                // Gemini reports thinking separately from candidate output. Other
+                // dialects already include reasoning in their output totals.
+                if host.dialect().name() == "gemini" {
+                    output.saturating_add(usage.reasoning_tokens.unwrap_or(0))
+                } else {
+                    output
+                }
+            },
+        );
         host.account_objective_tokens(input.saturating_add(output))
     }
 }

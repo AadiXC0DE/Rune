@@ -3591,3 +3591,31 @@ fn objective_estimates_count_complete_calls_and_anthropic_cache_tokens() {
     );
     assert_eq!(host.server.as_ref().expect("server").request_count(), 0);
 }
+
+#[test]
+fn gemini_thinking_tokens_exhaust_the_objective_before_another_request() {
+    use rune_agent::turn::ObjectiveAccounting;
+    use rune_net::stream::{ProviderEvent, Usage};
+    let mut host = TestHost::new(MockEndpoint::start(vec![Script::text("unused")]));
+    host.dialect = Box::new(rune_net::gemini::Gemini);
+    *host.objective_budget.lock().expect("budget") = Some((1000, 0));
+    let mut plan = rune_net::provider::RequestPlan::new("test");
+    let mut accounting = ObjectiveAccounting::begin(&host, &mut plan).expect("begin");
+    let usage = Usage {
+        input_tokens: Some(100),
+        output_tokens: Some(10),
+        reasoning_tokens: Some(1000),
+        ..Usage::default()
+    };
+    accounting.observe(&ProviderEvent::Usage(usage));
+    accounting.finish(&host, Some(usage)).expect("charge once");
+    assert_eq!(
+        *host.objective_budget.lock().expect("budget"),
+        Some((1000, 1110))
+    );
+    let mut history = rune_agent::History::new();
+    history.push_user("continue");
+    let outcome = run_turn(&mut history, &host).expect("budget stop");
+    assert_eq!(outcome.stop_reason, StopReason::ObjectiveBudget);
+    assert_eq!(host.server.as_ref().expect("server").request_count(), 0);
+}

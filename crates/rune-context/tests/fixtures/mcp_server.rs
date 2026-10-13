@@ -32,6 +32,14 @@ fn main() {
     let scenario = arguments.next().unwrap_or_default();
     let marker = arguments.next();
 
+    if scenario == "recover-startup"
+        && marker
+            .as_ref()
+            .is_some_and(|path| std::path::Path::new(path).exists())
+    {
+        return;
+    }
+
     // The descendant writes an increasing count to the file it is given, so a
     // test can tell it is running without asking the platform for a process
     // list, which is not available everywhere.
@@ -91,7 +99,7 @@ fn respond(scenario: &str, request: &Value) -> Reply {
         .unwrap_or_default();
 
     match scenario {
-        "standard" => standard(method),
+        "standard" | "recover-startup" => standard(method),
         "grouped" => standard(method),
         "paged" => paged(request, method),
         "mixed" => match method {

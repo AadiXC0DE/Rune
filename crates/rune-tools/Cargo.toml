@@ -17,6 +17,7 @@ rune-exec = { workspace = true }
 rune-context = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+toml = { workspace = true }
 thiserror = { workspace = true }
 camino = { workspace = true }
 same-file = { workspace = true }

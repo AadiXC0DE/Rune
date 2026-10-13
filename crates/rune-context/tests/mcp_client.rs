@@ -137,6 +137,46 @@ fn missing_config(name: &str) -> ServerConfig {
 }
 
 #[test]
+fn failed_reconnect_keeps_discovery_until_the_restart_budget_is_spent() {
+    let mut fixture = Fixture::new("recover-startup");
+    let marker = fixture.directory.path().join("fail-startup");
+    fixture.marker = Some(marker.to_string_lossy().into_owned());
+    let mut config = fixture.config("fixture");
+    config.restart_limit = 3;
+    let client = Client::new(&budget());
+    client.connect_all(&[config]).expect("connect");
+    let checks = std::cell::Cell::new(0);
+    assert_eq!(
+        client
+            .call_cancellable("mcp_fixture_greet", &json!({}), &|| {
+                checks.set(checks.get() + 1);
+                checks.get() >= 4
+            })
+            .expect_err("cancel transport")
+            .code(),
+        ErrorCode::Cancelled
+    );
+    std::fs::write(&marker, "fail").expect("fail next startup");
+    assert!(client.call("mcp_fixture_greet", &json!({})).is_err());
+    assert_eq!(client.server("fixture").expect("status").restarts, 1);
+    assert!(
+        client
+            .tools()
+            .iter()
+            .any(|tool| tool.name == "mcp_fixture_greet")
+    );
+    std::fs::remove_file(&marker).expect("recover startup");
+    assert_eq!(
+        client
+            .call("mcp_fixture_greet", &json!({}))
+            .expect("recover")
+            .text,
+        "hello from the fixture"
+    );
+    assert_eq!(client.server("fixture").expect("status").restarts, 2);
+}
+
+#[test]
 fn cancelled_stdio_transport_reconnects_on_the_next_call() {
     let fixture = Fixture::new("standard");
     let client = Client::new(&budget());
