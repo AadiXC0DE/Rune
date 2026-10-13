@@ -312,6 +312,9 @@ pub trait Host {
     /// Hosts may retain finish metadata needed by their output contract.
     fn observe_response(&self, _outcome: &StreamOutcome) {}
 
+    /// Records delegated provider usage without adding child conversation events.
+    fn record_child_usage(&self, _model: &str, _usage: &Usage) {}
+
     /// Reports an event.
     fn emit(&self, event: Event);
 

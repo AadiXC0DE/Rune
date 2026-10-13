@@ -111,6 +111,16 @@ impl<'a> Slot<'a> {
     /// running processes and reserved starts occupy the bound.
     fn reserve(shell: &'a Shell) -> Result<(Self, String)> {
         let mut state = lock(&shell.state);
+        // Bound retained output as well as running processes. Never evict unread output.
+        if state.sessions.len().saturating_add(state.starting)
+            >= shell.max_sessions.saturating_mul(2)
+        {
+            return Err(RuneError::new(
+                ErrorCode::LimitExceeded,
+                "shell session retention limit reached",
+            )
+            .with_hint("poll or stop a retained session before starting another"));
+        }
         let live = state
             .sessions
             .values()
@@ -2327,6 +2337,43 @@ mod tests {
             wait_until(|| !group_alive(&group), Duration::from_secs(10)),
             "the group survived the escalation"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn completed_sessions_obey_retention_limit() {
+        let tool = shell(1, 1024);
+        let (_dir, context) = workspace();
+        let mut ids = Vec::new();
+        for _ in 0..2 {
+            let started = text(
+                &tool,
+                &context,
+                &serde_json::json!({"action":"run", "command":"read line; echo LAST", "interactive":true, "yield_time_ms":0}),
+            );
+            let (id, _) = running(&started);
+            let held = Arc::clone(lock(&tool.state).sessions.get(&id).expect("session"));
+            held.process
+                .write(b"go\n", Duration::from_secs(2))
+                .expect("release");
+            assert!(wait_until(
+                || !held.process.is_running(),
+                Duration::from_secs(10)
+            ));
+            ids.push(id);
+        }
+        assert_eq!(
+            Slot::reserve(&tool).expect_err("retention full").code(),
+            ErrorCode::LimitExceeded
+        );
+        assert_eq!(tool.live_sessions(), 2);
+        let output = text(
+            &tool,
+            &context,
+            &serde_json::json!({"action":"interact", "session_id":ids[0], "yield_time_ms":0}),
+        );
+        assert!(output.contains("LAST"));
+        assert!(Slot::reserve(&tool).is_ok());
     }
 
     #[cfg(unix)]

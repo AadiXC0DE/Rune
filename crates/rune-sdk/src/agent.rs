@@ -1636,11 +1636,13 @@ fn request(
     let mut headers = vec![
         ("content-type".to_owned(), "application/json".to_owned()),
         ("accept".to_owned(), "text/event-stream".to_owned()),
-        (
+    ];
+    if context.endpoint.auth != AuthStyle::Anonymous {
+        headers.push((
             context.endpoint.auth.header().to_owned(),
             context.endpoint.auth.value(&context.endpoint.credential),
-        ),
-    ];
+        ));
+    }
     for (name, value) in provider.extra_headers() {
         headers.push((name.to_owned(), value));
     }

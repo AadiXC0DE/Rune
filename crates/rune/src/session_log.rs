@@ -424,6 +424,17 @@ impl Recorder {
         Ok(())
     }
 
+    /// Adds child usage without child messages or turn boundaries.
+    pub fn child_usage(&self, usage: &rune_net::stream::Usage) -> Result<()> {
+        if let (Some(input), Some(output)) = (usage.input_tokens, usage.output_tokens) {
+            self.append(SessionEvent::UsageRecorded {
+                input_tokens: input,
+                output_tokens: output,
+            })?;
+        }
+        Ok(())
+    }
+
     /// Records the visible answer and boundary of a cancelled exchange.
     ///
     /// A cancellation is numbered even when no text arrived. Unknown usage is

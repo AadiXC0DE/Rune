@@ -177,13 +177,9 @@ fn an_explicitly_anonymous_agent_completes_without_authentication_headers() {
     struct AnonymousFetch(CountingFetch);
     impl HostFetch for AnonymousFetch {
         fn post(&self, request: FetchRequest) -> rune_core::error::Result<FetchResponse> {
-            assert!(
-                !request
-                    .headers
-                    .iter()
-                    .any(|(name, _)| name.eq_ignore_ascii_case("authorization")
-                        || name.eq_ignore_ascii_case("x-api-key"))
-            );
+            assert!(!request.headers.iter().any(|(name, _)| name.is_empty()
+                || name.eq_ignore_ascii_case("authorization")
+                || name.eq_ignore_ascii_case("x-api-key")));
             self.0.post(request)
         }
     }
@@ -198,6 +194,22 @@ fn an_explicitly_anonymous_agent_completes_without_authentication_headers() {
         .result()
         .expect("response");
     assert_eq!(result.stop_reason, StopReason::Completed);
+    assert_eq!(result.text, "anonymous response");
+    assert_eq!(endpoint.request_count(), 1);
+}
+
+#[test]
+fn anonymous_agent_uses_default_transport() {
+    let endpoint = MockEndpoint::start(vec![Script::text("anonymous response")]);
+    let mut options = options(&endpoint.base_url(), Arc::new(CountingFetch::new()));
+    options.api_key.clear();
+    options.fetch = None;
+    let mut agent = Agent::new_anonymous(options).expect("agent");
+    let result = agent
+        .prompt("hello", PromptOptions::default())
+        .expect("turn")
+        .result()
+        .expect("response");
     assert_eq!(result.text, "anonymous response");
     assert_eq!(endpoint.request_count(), 1);
 }

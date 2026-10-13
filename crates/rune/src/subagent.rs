@@ -223,6 +223,9 @@ impl Host for ChildHost<'_> {
     fn fetch(&self) -> Box<dyn rune_net::fetch::Fetch> {
         self.parent.fetch()
     }
+    fn observe_response(&self, outcome: &rune_net::transport::StreamOutcome) {
+        self.parent.record_child_usage(&self.model, &outcome.usage);
+    }
     fn model(&self) -> String {
         self.model.clone()
     }

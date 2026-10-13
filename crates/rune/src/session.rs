@@ -227,6 +227,7 @@ impl Answerer for TerminalQuestions {
 
 /// Host state for a turn.
 struct SessionHost {
+    usage_paths: Option<Paths>,
     pre_tool_hook: Option<rune_core::config::PreToolHook>,
     post_tool_hook: Option<rune_core::config::PostToolHook>,
     accessible: bool,
@@ -489,6 +490,29 @@ impl Host for SessionHost {
             return Err(compaction::cannot_fit_error());
         }
         Ok(())
+    }
+
+    fn record_child_usage(&self, model: &str, usage: &rune_net::stream::Usage) {
+        self.record_usage(usage);
+        if let Some(paths) = &self.usage_paths {
+            let mut record = UsageRecord::new(now_ms(), model, HelperKind::Main);
+            record.input_tokens = usage.input_tokens;
+            record.output_tokens = usage.output_tokens;
+            record.cache_read_tokens = usage.cache_read_tokens;
+            record.cache_write_tokens = usage.cache_write_tokens;
+            record.reasoning_tokens = usage.reasoning_tokens;
+            if let Err(error) = Ledger::from_paths(paths).append(&record) {
+                self.draw_notice(&format!("child usage was not recorded: {error}"));
+            }
+        }
+        if let Some(recorder) = &self.recorder {
+            let mut recorder = recorder
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Err(error) = recorder.child_usage(usage) {
+                recorder.journal_failed(error);
+            }
+        }
     }
 
     fn observe_response(&self, outcome: &rune_net::transport::StreamOutcome) {
@@ -946,9 +970,8 @@ impl SessionHost {
         }
         let mut lines = vec!["undo preview (files and mutation journal unchanged)".to_owned()];
         for (path, original) in undo.iter() {
-            let current = match std::fs::read(path) {
-                Ok(bytes) => Some(bytes),
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+            let current = match preview_snapshot(path) {
+                Ok(bytes) => bytes,
                 Err(err) => {
                     lines.push(format!("`{path}` could not be previewed: {err}"));
                     continue;
@@ -1607,6 +1630,7 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
         .additional_roots
         .clone_from(&config.settings.additional_directories);
     let host = SessionHost {
+        usage_paths: Some(config.paths.clone()),
         pre_tool_hook: config.settings.pre_tool_hook.clone(),
         post_tool_hook: config.settings.post_tool_hook.clone(),
         accessible: config.accessible,
@@ -4717,6 +4741,44 @@ fn mutating_path<'a>(name: &str, arguments: &'a serde_json::Value) -> Option<&'a
         .map(Utf8Path::new)
 }
 
+fn preview_snapshot(path: &Utf8Path) -> Result<Option<Vec<u8>>> {
+    use std::io::Read as _;
+    let cap = rune_tools::mutation::MAX_WRITE_BYTES;
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    if !metadata.is_file() {
+        return Err(RuneError::new(
+            ErrorCode::UnsafePath,
+            "undo preview requires a regular file",
+        ));
+    }
+    let file = std::fs::File::open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(RuneError::new(
+            ErrorCode::UnsafePath,
+            "undo preview requires a regular file",
+        ));
+    }
+    if metadata.len() > cap as u64 {
+        return Err(RuneError::too_large(
+            "undo preview",
+            cap.saturating_add(1),
+            cap,
+        ));
+    }
+    let mut bytes = Vec::new();
+    file.take((cap as u64).saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > cap {
+        return Err(RuneError::too_large("undo preview", bytes.len(), cap));
+    }
+    Ok(Some(bytes))
+}
+
 /// Refuse a rename before mutation if its undo preimage cannot be captured.
 fn rename_snapshot(path: &Utf8Path) -> Result<Vec<u8>> {
     use std::io::Read as _;
@@ -7804,6 +7866,42 @@ mod tests {
     }
 
     #[test]
+    fn undo_preview_refuses_large_files_without_consuming_records() {
+        let dir = tempfile::tempdir().expect("temp");
+        let path = Utf8Path::from_path(dir.path()).expect("utf8").join("large");
+        let host = test_host();
+        host.remember(&path);
+        std::fs::File::create(&path)
+            .expect("file")
+            .set_len(rune_tools::mutation::MAX_WRITE_BYTES as u64 + 1)
+            .expect("length");
+        assert!(
+            host.preview_undo()
+                .join("\n")
+                .contains("could not be previewed")
+        );
+        assert!(host.can_undo());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn undo_preview_refuses_fifo() {
+        let dir = tempfile::tempdir().expect("temp");
+        let path = Utf8Path::from_path(dir.path()).expect("utf8").join("fifo");
+        let host = test_host();
+        host.remember(&path);
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&path)
+                .status()
+                .expect("mkfifo")
+                .success()
+        );
+        assert!(host.preview_undo().join("\n").contains("regular file"));
+        assert!(host.can_undo());
+    }
+
+    #[test]
     fn undo_diffs_cover_context_newlines_binary_empty_and_unchanged_files() {
         let path = Utf8Path::new("file");
         assert_eq!(
@@ -9782,6 +9880,7 @@ mod tests {
             .expect("registered");
         let questions = Arc::new(TerminalQuestions::default());
         SessionHost {
+            usage_paths: None,
             pre_tool_hook: None,
             post_tool_hook: None,
             accessible: false,

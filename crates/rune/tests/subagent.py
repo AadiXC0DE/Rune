@@ -111,7 +111,10 @@ def run_fixture(case):
                                for choice in [
                                    {"index": 0, "delta": delta, "finish_reason": None},
                                    {"index": 0, "delta": {}, "finish_reason": finish},
-                               ]) + "data: [DONE]\n\n"
+                               ]) + "data: " + json.dumps({"choices": [], "usage": {
+                                   "prompt_tokens": 11 if is_child else 3,
+                                   "completion_tokens": 7 if is_child else 2,
+                               }}) + "\n\ndata: [DONE]\n\n"
                 self.reply(body.encode(), "text/event-stream")
             except Exception as error:
                 errors.append(repr(error))
@@ -157,13 +160,30 @@ def run_fixture(case):
         try:
             output = subprocess.run(
                 [sys.argv[1], "--permission-mode", "full-access"],
-                input=b"PARENT_PRIVATE_HISTORY\n/quit\n", stdout=subprocess.PIPE,
+                input=b"PARENT_PRIVATE_HISTORY\n/cost\n/quit\n", stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE, cwd=root, env=environment, timeout=20,
             )
             assert output.returncode == 0, output.stderr
             assert not errors, errors
             assert f"PARENT_RECEIVED_{case}".encode() in output.stdout, output.stdout
             assert len(requests) == {"named": 2, "role": 6}.get(case, 4), requests
+            usage = subprocess.run([sys.argv[1], "usage", "export"], cwd=root,
+                                   env=environment, stdout=subprocess.PIPE,
+                                   stderr=subprocess.PIPE, timeout=10)
+            assert usage.returncode == 0, usage.stderr
+            records = [json.loads(line) for line in usage.stdout.splitlines()]
+            children = [record for record in records if record["model"] == "child-model"]
+            child_count = sum(request["model"] == "child-model" for request in requests)
+            assert len(children) == child_count, records
+            assert sum(record["input_tokens"] for record in children) == 11 * child_count
+            assert sum(record["output_tokens"] for record in children) == 7 * child_count
+            expected_cost = f"{6 + 11 * child_count} in, {4 + 7 * child_count} out".encode()
+            assert expected_cost in output.stdout, output.stdout
+            resumed = subprocess.run([sys.argv[1], "--offline", "--accessible", "resume", "last"],
+                                     input=b"/cost\n/quit\n", cwd=root, env=environment,
+                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10)
+            assert resumed.returncode == 0, resumed.stderr
+            assert expected_cost in resumed.stdout, resumed.stdout
             assert not (root / "forbidden.txt").exists(), "child wrote outside its allowlist"
             assert not (root / "shell-ran").exists(), "child executed shell"
         finally:
