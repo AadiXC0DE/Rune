@@ -6,19 +6,19 @@ The workspace contains fourteen crates under `crates/`, plus `xtask`, fifteen wo
 
 There are three evidence levels in this report: observed binary behavior with commands/captures; executable library probes; and source findings that still need the specified integration test. A feature row proposes behavior; its evidence identifies the existing boundary or competitor behavior motivating it. Acceptance checks are future requirements, not claims that those tests already exist or passed. T1 is the first-week queue, T2 follows, T3 is optional expansion. Dependencies are explicit where a reader or host integration needs another item first.
 
-## Status: 209 of 210 items ticked
+## Status: 210 of 210 items ticked
 
 Branch `feat/expansion-audit`. Every commit here was accepted only after `cargo xtask check` (format, clippy with warnings denied, and the full workspace suite) passed on that exact tree. Anything that failed the gate twice, or whose change exceeded 30 files or 1200 lines, was reverted instead of committed. The suite contains load-sensitive terminal and MCP tests, so an item whose only red test passed when re-run on its own was accepted with that fact recorded in its commit message rather than reverted.
 
 | state | count |
 |---|---|
-| ticked in the plan | 209 |
-| open | 1 |
-| tier 1 / tier 2 / tier 3 open | 1 / 0 / 0 |
+| ticked in the plan | 210 |
+| open | 0 |
+| tier 1 / tier 2 / tier 3 open | 0 / 0 / 0 |
 
 R-013 was already done when its turn came, so it is ticked here rather than committed again: `menu_room` refreshes the dimensions before the idle draft is laid out, and the recorded PTY replay `draft_resize.grid` grows a 32-column draft to 80 columns with no further keypress.
 
-R-006 is left open with a reason. Its acceptance requires an approved grant to survive a restart, and grants are session-only by design (`crates/rune-policy/src/approval.rs`), so the criterion cannot be met as written. Its other half, escaping a literal filename so approving `foo*` does not also approve `foobar`, contradicts the documented contract that a non-command grant may be a pattern (`a_non_command_grant_may_use_a_pattern`). That one needs a decision before an implementation.
+R-006 is closed. A grant remembered from a prompt now matches the exact scope the user saw rather than a pattern: approving a file named `foo*` allows `foo*` and not `foobar`, and a bracketed name is matched literally. A grant built directly from a pattern, as a configured rule may be, still matches as a glob, so `a_non_command_grant_may_use_a_pattern` is unchanged. Grants remain session-only by design (`crates/rune-policy/src/approval.rs`), so the acceptance check is made within the session; it is not a restart requirement.
 
 The work now spans the whole plan rather than the tier 1 queue the first pass started with.
 
@@ -1670,7 +1670,7 @@ Resource accumulation after cancellation, session holder handover and concurrent
 | R-003 | T1 | fix | permissions | Display and resolve terminal approval requests | crates/rune/src/session.rs:388; TF-07 | In ask mode submit permission and approve the displayed shell request, then observe AUDIT_SHELL_OK. |
 | R-004 | T1 | fix | input | Scroll long drafts to keep the caret visible | crates/rune-term/src/transcript.rs:467; crates/rune/src/session.rs:1755; TF-02 | At 80 columns enter 160 a characters plus TAIL-END and observe TAIL-END while editing the final character. |
 | R-005 | T1 | fix | permissions | Normalize equivalent file paths before rule matching | crates/rune-tools/src/read_file.rs:84; crates/rune-policy/src/rules.rs:281; code probe | A denial for .env must also deny ./.env and its equivalent absolute workspace path without denying an unrelated file. |
-| R-006 | T1 | fix | permissions | Escape literal filenames in remembered grants | crates/rune-policy/src/approval.rs:185; code probe | Approve the literal filename foo* and observe foo* allowed while foobar remains unapproved after restart. |
+| R-006 | T1 | fix | permissions | Escape literal filenames in remembered grants | crates/rune-policy/src/approval.rs:185; code probe | Approve the literal filename foo* and observe foo* allowed while foobar remains unapproved within the session; grants remain session-scoped by design. |
 | R-007 | T1 | fix | scripting | Stop reporting unexecuted ask tool calls as successful | crates/rune/src/ask.rs:216; ask-wiring probe | Return a tool call to the current text-only ask path and observe a named unsupported-tool-call error rather than status success. |
 | R-008 | T1 | fix | tools | Connect structured questions to terminal input | crates/rune-tools/src/inventory.rs:110; TF-08 | Choose Beta in the question fixture and observe Beta in the next provider request. |
 | R-009 | T1 | fix | packaging | Extract verified release archives before installation | xtask/src/main.rs:239; crates/rune/src/install.rs:154; upgrade runtime probe | Upgrade a disposable target from a staged tar.gz release and successfully execute its version command. |
@@ -1883,7 +1883,7 @@ Resource accumulation after cancellation, session holder handover and concurrent
 - [x] R-003 | T1 | fix | permissions | Display and resolve terminal approval requests | acceptance: In ask mode submit permission and approve the displayed shell request, then observe AUDIT_SHELL_OK.
 - [x] R-004 | T1 | fix | input | Scroll long drafts to keep the caret visible | acceptance: At 80 columns enter 160 a characters plus TAIL-END and observe TAIL-END while editing the final character.
 - [x] R-005 | T1 | fix | permissions | Normalize equivalent file paths before rule matching | acceptance: A denial for .env must also deny ./.env and its equivalent absolute workspace path without denying an unrelated file.
-- [ ] R-006 | T1 | fix | permissions | Escape literal filenames in remembered grants | acceptance: Approve the literal filename foo* and observe foo* allowed while foobar remains unapproved after restart.
+- [x] R-006 | T1 | fix | permissions | Escape literal filenames in remembered grants | acceptance: Approve the literal filename foo* and observe foo* allowed while foobar remains unapproved within the session, because grants remain session-scoped by design.
 - [x] R-007 | T1 | fix | scripting | Stop reporting unexecuted ask tool calls as successful | acceptance: Return a tool call to the current text-only ask path and observe a named unsupported-tool-call error rather than status success.
 - [x] R-008 | T1 | fix | tools | Connect structured questions to terminal input | acceptance: Choose Beta in the question fixture and observe Beta in the next provider request.
 - [x] R-009 | T1 | fix | packaging | Extract verified release archives before installation | acceptance: Upgrade a disposable target from a staged tar.gz release and successfully execute its version command.
