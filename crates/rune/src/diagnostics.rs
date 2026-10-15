@@ -167,8 +167,12 @@ pub fn run(settings: &Settings, paths: &Paths, workspace: &Utf8Path) -> Report {
 /// cannot be restricted is a fact the user needs before trusting one.
 fn check_sandbox() -> Check {
     let backend = rune_exec::sandbox::detect();
-    let name = backend.name();
-    match backend.support() {
+    sandbox_check(backend.name(), backend.support())
+}
+
+/// Describes enforcement from the backend probe, including fail-closed refusal.
+fn sandbox_check(name: &str, support: rune_exec::sandbox::Support) -> Check {
+    match support {
         rune_exec::sandbox::Support::Full => Check::ok(
             "sandbox",
             format!("{name} restricts every process the command starts"),
@@ -177,12 +181,12 @@ fn check_sandbox() -> Check {
             "sandbox",
             format!("{name} cannot restrict every thread: {reason}"),
         )
-        .with_hint("commands run without full enforcement; pass the override to accept that"),
+        .with_hint("shell commands are refused on this host; pass `--allow-unsandboxed` to run without sandbox enforcement"),
         rune_exec::sandbox::Support::Unsupported { reason } => Check::warn(
             "sandbox",
             format!("{name} cannot restrict commands here: {reason}"),
         )
-        .with_hint("commands run unrestricted; an explicit override is required to run one"),
+        .with_hint("shell commands are refused on this host; pass `--allow-unsandboxed` to run without sandbox enforcement"),
     }
 }
 
@@ -451,6 +455,28 @@ mod tests {
             .expect("workspace check");
         assert_eq!(check.outcome, Outcome::Fail);
         assert!(check.code.is_some());
+    }
+
+    #[test]
+    fn partial_and_unsupported_sandboxes_name_the_refusal_and_override() {
+        for support in [
+            rune_exec::sandbox::Support::Partial {
+                reason: "cannot restrict every thread".to_owned(),
+            },
+            rune_exec::sandbox::Support::Unsupported {
+                reason: "bwrap is not on PATH".to_owned(),
+            },
+        ] {
+            let check = sandbox_check("namespaces", support);
+            assert_eq!(check.outcome, Outcome::Warn);
+            let hint = check.hint.expect("refusal and override");
+            assert!(
+                hint.contains("shell commands are refused on this host"),
+                "{hint}"
+            );
+            assert!(hint.contains("--allow-unsandboxed"), "{hint}");
+            assert!(!hint.contains("commands run unrestricted"), "{hint}");
+        }
     }
 
     #[test]
