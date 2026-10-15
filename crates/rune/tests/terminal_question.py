@@ -160,6 +160,16 @@ with tempfile.TemporaryDirectory(prefix="rune-r008-") as directory:
                 transcript.extend(os.read(master, 65536))
         assert not errors, errors
 
+    def wait_for_committed(text, start=0):
+        # The answer streams as a live row before the turn ends, and that row
+        # carries escape sequences between the text and the line break. close_turn
+        # prints the same text again as a settled line, where a CRLF follows the
+        # text directly, once the turn has ended and the next line is a new turn
+        # rather than steering for the one still running. Waiting for the streamed
+        # row instead lets the next keystroke become steering, so the prompt the
+        # test sent is consumed by the previous turn instead of starting one.
+        wait_for(text + "\r\n", start)
+
     def send(data):
         os.write(master, data)
 
@@ -177,14 +187,14 @@ with tempfile.TemporaryDirectory(prefix="rune-r008-") as directory:
         start = question()
         assert not results, "question answered before confirmation"
         send(b"\x1b[B\r")
-        wait_for("QUESTION_REPLY_1", start)
+        wait_for_committed("QUESTION_REPLY_1", start)
         assert results[0]["tool_call_id"] == "question-1", results
         assert results[0]["content"] == "Which choice should Rune use?\nAnswer: Beta", results
 
         # An explicit Enter may confirm the initially highlighted choice.
         start = question()
         send(b"\r")
-        wait_for("QUESTION_REPLY_2", start)
+        wait_for_committed("QUESTION_REPLY_2", start)
         assert results[1]["content"].endswith("Answer: Alpha"), results
 
         # Every supported question and option is reachable in one tool call.
@@ -193,7 +203,7 @@ with tempfile.TemporaryDirectory(prefix="rune-r008-") as directory:
         for index in range(1, 5):
             wait_for(f"answer required ({index}/4)", start)
             send(b"\x1b[B" * 5 + b"\r")
-        wait_for("QUESTION_REPLY_3", start)
+        wait_for_committed("QUESTION_REPLY_3", start)
         assert results[2]["content"] == "\n".join(
             f"Which choice for question {index}?\nAnswer: Option 6"
             for index in range(1, 5)
@@ -206,7 +216,7 @@ with tempfile.TemporaryDirectory(prefix="rune-r008-") as directory:
             wait_for("cancelled", start)
             start = len(transcript)
             send(b"after-cancel\r")
-            wait_for("SESSION_STILL_USABLE", start)
+            wait_for_committed("SESSION_STILL_USABLE", start)
             assert len(results) == 3, "cancelled question sent an answer"
 
         # Choice keys and pasted text preserve the correction and its caret.
@@ -218,11 +228,11 @@ with tempfile.TemporaryDirectory(prefix="rune-r008-") as directory:
         release_draft.set()
         wait_for("answer required (1/1)", start)
         send(b"\x1b[200~SHOULD_NOT_STEER\x1b[201~\x15\x1b[B\r")
-        wait_for("QUESTION_REPLY_4", start)
+        wait_for_committed("QUESTION_REPLY_4", start)
         assert results[3]["content"].endswith("Answer: Beta"), results
         start = len(transcript)
         send(b"X\r")
-        wait_for("SESSION_STILL_USABLE", start)
+        wait_for_committed("SESSION_STILL_USABLE", start)
         assert prompts[-1] == "correctXion", prompts
         assert all("SHOULD_NOT_STEER" not in prompt for prompt in prompts), prompts
 
