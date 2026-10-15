@@ -18,6 +18,7 @@ import time
 
 errors = []
 tool_results = []
+finish_reply = threading.Event()
 
 
 class Provider(http.server.BaseHTTPRequestHandler):
@@ -60,7 +61,16 @@ class Provider(http.server.BaseHTTPRequestHandler):
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
-            self.wfile.write(body)
+            if finish == "stop":
+                # Deliberately expose the final text while the stream is still
+                # open: seeing it does not mean the turn has settled its tools.
+                boundary = body.index(b"\n\n") + 2
+                self.wfile.write(body[:boundary])
+                self.wfile.flush()
+                assert finish_reply.wait(10), "driver did not observe the streamed reply"
+                self.wfile.write(body[boundary:])
+            else:
+                self.wfile.write(body)
         except Exception as error:
             errors.append(repr(error))
             self.send_error(500)
@@ -114,6 +124,11 @@ def capture(binary, root, environment, arguments):
         drain()
         os.write(master, b"\x03\x1b[200~fixture\nsecond\x1b[201~\r")
         wait_for(b"ASCII_REPLY_END")
+        finish_reply.set()
+        # Tool summaries are settled after stream completion and journal writes.
+        # A quiet PTY after a streamed delta is not a completion signal.
+        wait_for(b"read_file")
+        wait_for(b"    > ")
         drain()
         assert b"read_file" in transcript, "tool summary was not displayed"
         assert b"    > " in transcript, "code continuation was not displayed"
@@ -179,6 +194,7 @@ try:
             if setting == "environment":
                 environment["RUNE_ASCII"] = "true"
                 environment["NO_COLOR"] = "1"
+            finish_reply.clear()
             capture(sys.argv[1], root, environment, ["--ascii"] if setting == "flag" else [])
     assert len(tool_results) == 3, tool_results
     assert all("ASCII_TOOL_CONTENT" in result for result in tool_results), tool_results
