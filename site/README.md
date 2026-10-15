@@ -86,3 +86,9 @@ under `prefers-color-scheme`. The terminal stays dark in both. One accent,
 square corners throughout, and motion that stops under
 `prefers-reduced-motion`: the mark is drawn once and left still, and sections
 appear without rising.
+
+Run the demo's permission/composer UI regressions from the repository root:
+
+```sh
+node --experimental-vm-modules --test site/demo/demo.test.mjs
+```
