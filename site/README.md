@@ -13,7 +13,7 @@ python3 -m http.server 8099 --directory site
 | `sitemap.xml` | The site's single canonical page; demo and install are sections on it |
 | `llms.txt` | A short overview linking the page's sections and repository documentation |
 | `fonts/` | IBM Plex Mono, three weights, latin subset, self-hosted (SIL OFL, see `fonts/OFL.txt`) |
-| `demo/rune.wasm` | The harness, compiled to WebAssembly by `cargo xtask web` |
+| `demo/rune.wasm` | The harness, compiled to WebAssembly by `cargo xtask web`; `cargo xtask verify-web` fails if it drifts |
 | `demo/harness.js` | Loads the module and gives it a filesystem, a transport, a shell, and a prompt |
 | `demo/demo.js` | The terminal: draws events, reads keys, and holds the model picker |
 | `demo/models.js` | The scripted model and the transport for an endpoint the visitor names |
@@ -56,6 +56,14 @@ Rebuild the module after changing any crate it links:
 
 ```sh
 cargo xtask web
+```
+
+CI builds the module the same way and fails when the committed
+`site/demo/rune.wasm` differs, so a linked source change cannot land without
+the rebuilt module. Check it by hand, without writing the file:
+
+```sh
+cargo xtask verify-web
 ```
 
 ## Models

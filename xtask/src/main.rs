@@ -57,6 +57,7 @@ fn main() -> ExitCode {
         "verify-release" => macos::verify_release(&extra),
         "benchmark" => benchmark(&extra),
         "web" => web(),
+        "verify-web" => verify_web(&extra),
         "help" | "--help" | "-h" => {
             print_help();
             Ok(())
@@ -93,6 +94,7 @@ fn print_help() {
     println!("  benchmark  print raw size and startup JSON for an existing executable");
     println!("  verify-release  check a signed macOS archive against a trusted identity");
     println!("  web      build the harness for the landing page into site/demo/rune.wasm");
+    println!("  verify-web  fail unless site/demo/rune.wasm matches a fresh build");
     println!();
     println!(
         "  release takes: cargo xtask release <channel> [version] [target] [--sign-identity <certificate SHA-1>]"
@@ -152,21 +154,16 @@ fn cargo(args: &[&str]) -> Result<(), String> {
     run("cargo", args)
 }
 
+/// The target the landing page's harness is built for.
+const WEB_TARGET: &str = "wasm32-wasip1";
+
 /// Builds the harness for the browser and places it where the page loads it.
 ///
 /// The page is served as static files with no build step of its own, so the
 /// module is committed beside it, and this is the one command that makes it.
 fn web() -> Result<(), String> {
-    const TARGET: &str = "wasm32-wasip1";
-    cargo(&["build", "--release", "-p", "rune-web", "--target", TARGET])?;
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .ok_or("the xtask crate has no parent directory")?
-        .to_path_buf();
-    let target =
-        std::env::var_os("CARGO_TARGET_DIR").map_or_else(|| root.join("target"), PathBuf::from);
-    let built = target.join(TARGET).join("release").join("rune_web.wasm");
-    let placed = root.join("site").join("demo").join("rune.wasm");
+    let built = build_web()?;
+    let placed = web_module_path()?;
     std::fs::copy(&built, &placed).map_err(|err| {
         format!(
             "could not copy {} to {}: {err}",
@@ -179,6 +176,126 @@ fn web() -> Result<(), String> {
         .len();
     println!("site/demo/rune.wasm: {bytes} bytes");
     Ok(())
+}
+
+/// Fails unless the committed landing-page module is what the source builds.
+///
+/// An optional argument names the copy to check, so a caller can point at a
+/// copy outside the working tree.
+fn verify_web(extra: &[String]) -> Result<(), String> {
+    let placed = match extra {
+        [] => web_module_path()?,
+        [path] => PathBuf::from(path),
+        _ => return Err("usage: cargo xtask verify-web [committed-module-path]".to_owned()),
+    };
+    let built = build_web()?;
+    let expected = std::fs::read(&placed)
+        .map_err(|err| format!("could not read {}: {err}", placed.display()))?;
+    let actual = std::fs::read(&built)
+        .map_err(|err| format!("could not read {}: {err}", built.display()))?;
+    if expected != actual {
+        return Err(format!(
+            "{} is stale: the source builds {} bytes ({}), the committed module is {} bytes ({}); run `cargo xtask web` and commit the result",
+            placed.display(),
+            actual.len(),
+            digest(&actual),
+            expected.len(),
+            digest(&expected),
+        ));
+    }
+    println!(
+        "{} matches the current source ({} bytes, {})",
+        placed.display(),
+        actual.len(),
+        digest(&actual)
+    );
+    Ok(())
+}
+
+/// Builds the browser harness and returns the module the build produced.
+///
+/// Registry sources are remapped out of the module. Rust records the source
+/// path of every panic site, so the build would otherwise embed the builder's
+/// `CARGO_HOME` and two machines could never produce equal bytes.
+fn build_web() -> Result<PathBuf, String> {
+    let root = workspace_root()?;
+    cargo_with_rustflags(
+        &[
+            "build",
+            "--release",
+            "--locked",
+            "-p",
+            "rune-web",
+            "--target",
+            WEB_TARGET,
+        ],
+        &web_rustflags(&root, cargo_home().as_deref()),
+    )?;
+    let target =
+        std::env::var_os("CARGO_TARGET_DIR").map_or_else(|| root.join("target"), PathBuf::from);
+    Ok(target
+        .join(WEB_TARGET)
+        .join("release")
+        .join("rune_web.wasm"))
+}
+
+/// Returns the path the committed landing-page module is served from.
+fn web_module_path() -> Result<PathBuf, String> {
+    Ok(workspace_root()?
+        .join("site")
+        .join("demo")
+        .join("rune.wasm"))
+}
+
+/// Returns the workspace root, the parent of the xtask crate.
+fn workspace_root() -> Result<PathBuf, String> {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .map(Path::to_path_buf)
+        .ok_or_else(|| "the xtask crate has no parent directory".to_owned())
+}
+
+/// Returns the directory Cargo keeps registry sources in, when it is known.
+///
+/// Cargo defaults to `$HOME/.cargo` when `CARGO_HOME` is unset, and CI sets the
+/// variable explicitly.
+fn cargo_home() -> Option<PathBuf> {
+    std::env::var_os("CARGO_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| Path::new(&home).join(".cargo")))
+}
+
+/// Returns the rebuild flags that keep machine-specific paths out of the module.
+///
+/// Workspace sources are recorded relative to the root, but dependency sources
+/// are absolute and live under `CARGO_HOME`, which differs per machine.
+fn web_rustflags(root: &Path, cargo_home: Option<&Path>) -> String {
+    let mut flags = vec![format!("--remap-path-prefix={}=/rune", root.display())];
+    if let Some(cargo_home) = cargo_home {
+        flags.push(format!(
+            "--remap-path-prefix={}=/cargo",
+            cargo_home.display()
+        ));
+    }
+    flags.join(" ")
+}
+
+/// Runs cargo with `RUSTFLAGS` set, inheriting stdio.
+///
+/// An inherited `CARGO_ENCODED_RUSTFLAGS` would take precedence and drop the
+/// remaps, so it is removed.
+fn cargo_with_rustflags(args: &[&str], rustflags: &str) -> Result<(), String> {
+    let status = Command::new("cargo")
+        .args(args)
+        .env("RUSTFLAGS", rustflags)
+        .env_remove("CARGO_ENCODED_RUSTFLAGS")
+        .status()
+        .map_err(|err| format!("could not run `cargo`: {err}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("`cargo {}` failed", args.join(" ")))
+    }
 }
 
 /// Runs a program with the given arguments, inheriting stdio.
@@ -999,5 +1116,26 @@ mod tests {
         assert_eq!(executable_name("x86_64-pc-windows-msvc"), "rune.exe");
         assert_eq!(executable_name("aarch64-apple-darwin"), "rune");
         assert_eq!(executable_name("x86_64-unknown-linux-musl"), "rune");
+    }
+
+    #[test]
+    fn the_web_rebuild_remaps_the_workspace_and_cargo_home() {
+        // Both paths are machine-specific, so leaving either in the module
+        // would stop the committed bytes from ever matching a rebuild.
+        assert_eq!(
+            web_rustflags(
+                Path::new("/work/rune"),
+                Some(Path::new("/home/user/.cargo"))
+            ),
+            "--remap-path-prefix=/work/rune=/rune --remap-path-prefix=/home/user/.cargo=/cargo"
+        );
+    }
+
+    #[test]
+    fn the_web_rebuild_remaps_the_workspace_without_a_known_cargo_home() {
+        assert_eq!(
+            web_rustflags(Path::new("/work/rune"), None),
+            "--remap-path-prefix=/work/rune=/rune"
+        );
     }
 }
