@@ -600,6 +600,29 @@ pub fn sandbox_policy(context: &ExecutionContext) -> rune_exec::SandboxPolicy {
     )
 }
 
+/// Returns the command to run, wrapped by `backend` unless the context says no
+/// sandbox applies.
+///
+/// The decision is split out from [`start`] so both the confined and the
+/// unconfined path can be exercised with an injected backend, without depending
+/// on whether the host has a sandbox helper installed.
+fn confined(
+    prepared: &rune_exec::PreparedCommand,
+    policy: &rune_exec::SandboxPolicy,
+    context: &ExecutionContext,
+    input: Input,
+    backend: &dyn rune_exec::Sandbox,
+) -> Result<rune_exec::PreparedCommand> {
+    if !context.sandboxed {
+        return Ok(prepared.clone());
+    }
+    if matches!(input, Input::Pty { .. }) {
+        backend.wrap_pty(prepared, policy, context.allow_unsandboxed)
+    } else {
+        backend.wrap(prepared, policy, context.allow_unsandboxed)
+    }
+}
+
 /// Starts a command in a process group of its own, under the host sandbox.
 ///
 /// The command string is prepared first so the argv that runs is the one that
@@ -626,13 +649,10 @@ fn start(
     let policy = sandbox_policy(context);
     // Reaching outside the workspace and skipping the sandbox are different
     // questions, so the second is read from its own field rather than borrowed
-    // from the first.
+    // from the first. A context that is not unconfined still goes through the
+    // host backend, which is the path production takes.
     let backend = rune_exec::detect();
-    let wrapped = if matches!(input, Input::Pty { .. }) {
-        backend.wrap_pty(&prepared, &policy, context.allow_unsandboxed)?
-    } else {
-        backend.wrap(&prepared, &policy, context.allow_unsandboxed)?
-    };
+    let wrapped = confined(&prepared, &policy, context, input, &*backend)?;
 
     // The working directory is the resolved workspace, which is the path the
     // sandbox rule was built from. Starting in the path as written would leave
@@ -909,14 +929,19 @@ mod tests {
     ///
     /// The sandbox is left off, because a host that cannot sandbox would
     /// otherwise fail every one of these for a reason that has nothing to do
-    /// with what they assert. The tests that do assert the sandbox build their
-    /// own context.
+    /// with what they assert. A host that *can* sandbox would wrap the command
+    /// in a PID namespace and a new session, which would change the very
+    /// process-group and signal behaviour these tests observe, so the context
+    /// is unconfined rather than merely permitted to fall back. The tests that
+    /// do assert the sandbox build their own context.
     fn workspace() -> (tempfile::TempDir, ExecutionContext) {
         let dir = tempfile::tempdir().expect("a temporary directory");
         let path = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).expect("a UTF-8 path");
         (
             dir,
-            ExecutionContext::new(path).with_allow_unsandboxed(true),
+            ExecutionContext::new(path)
+                .with_allow_unsandboxed(true)
+                .unconfined(),
         )
     }
 
@@ -2096,6 +2121,76 @@ mod tests {
                 wrapped.argv.iter().any(|arg| arg == "--unshare-net"),
                 restricted,
                 "external_access={external_access}, offline={offline}"
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_confined_command_goes_through_the_sandbox_backend() {
+        let dir = tempfile::tempdir().expect("workspace");
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).expect("utf8");
+        let context = ExecutionContext::new(root.clone());
+        assert!(context.sandboxed, "a default context must be confined");
+        let prepared = rune_exec::command::prepare_shell(
+            "printf probe",
+            &root,
+            None,
+            rune_exec::minimal_environment(),
+        )
+        .expect("prepare");
+        let policy = sandbox_policy(&context);
+        // A full backend is injected, so the test does not depend on whether
+        // this host has a sandbox helper installed.
+        let backend = rune_exec::LinuxSandbox::with_helper(Utf8PathBuf::from("/usr/bin/bwrap"));
+        let wrapped =
+            confined(&prepared, &policy, &context, Input::Closed, &backend).expect("wrap");
+        assert_ne!(
+            wrapped.argv, prepared.argv,
+            "a confined command was not wrapped"
+        );
+        assert_eq!(
+            wrapped.argv.first().map(String::as_str),
+            Some("/usr/bin/bwrap")
+        );
+    }
+
+    /// A shell test's context is unconfined, so a command runs directly even on
+    /// a host that could sandbox it.
+    ///
+    /// This is the regression the Ubuntu runner exposed: a sandbox wrapper runs
+    /// the command in a PID namespace and a new session, so the host PIDs the
+    /// process-group tests read are not the running processes, and a signal that
+    /// ends the inner command is seen by Rune only as the wrapper's exit code.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_unconfined_command_skips_the_sandbox_even_when_one_is_available() {
+        let (_dir, context) = workspace();
+        assert!(
+            !context.sandboxed,
+            "a shell test context must be unconfined"
+        );
+        let prepared = rune_exec::command::prepare_shell(
+            "printf probe",
+            &context.workspace,
+            None,
+            rune_exec::minimal_environment(),
+        )
+        .expect("prepare");
+        let policy = sandbox_policy(&context);
+        let backend = rune_exec::LinuxSandbox::with_helper(Utf8PathBuf::from("/usr/bin/bwrap"));
+        // PTY and piped/closed input both have to pass through: the PTY case
+        // is the one the old helper would have refused with a foreign-backend
+        // error.
+        for input in [
+            Input::Closed,
+            Input::Piped,
+            Input::Pty { rows: 24, cols: 80 },
+        ] {
+            let wrapped = confined(&prepared, &policy, &context, input, &backend).expect("wrap");
+            assert_eq!(
+                wrapped.argv, prepared.argv,
+                "an unconfined command was wrapped in the sandbox"
             );
         }
     }
