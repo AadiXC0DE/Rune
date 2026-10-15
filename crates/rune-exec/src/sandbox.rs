@@ -23,6 +23,11 @@
 //! - Linux builds a mount and network namespace through the `bwrap` helper. The
 //!   helper restricts the process tree as a whole, which is the every-thread
 //!   guarantee an in-process restriction would have to ask for explicitly.
+//! - Windows has no backend. A Seatbelt profile cannot name a Windows path, and
+//!   `bwrap` is a Linux helper, so [`detect`] returns [`NullSandbox`], which
+//!   refuses a command unless `allow_unsandboxed` is passed. The refusal names
+//!   the operating system rather than inventing a restriction, because there is
+//!   no Windows sandbox to fall back to.
 
 use std::fmt::Write as _;
 use std::process::{Command, Output, Stdio};
@@ -1050,28 +1055,34 @@ mod tests {
         assert_eq!(paths.writable_roots.len(), 2);
         assert_eq!(paths.protected_paths.len(), 4);
         assert_eq!(paths.credential_paths, credentials);
-        let profile = MacSandbox::profile_with(&policy, &credentials).expect("profile");
-        for path in &paths.writable_roots {
-            assert!(profile.contains(&format!(
-                "(allow file-write* {})",
-                operand(path).expect("operand")
-            )));
-        }
-        for path in &paths.protected_paths {
-            assert!(profile.contains(&format!(
-                "(deny file-write* {})",
-                operand(path).expect("operand")
-            )));
-        }
-        for path in &paths.credential_paths {
-            assert!(profile.contains(&format!(
-                "(deny file-read* {})",
-                operand(path).expect("operand")
-            )));
-            assert!(profile.contains(&format!(
-                "(deny file-write* {})",
-                operand(path).expect("operand")
-            )));
+        // The Seatbelt profile quotes each operand and refuses a path with a
+        // backslash, so the rules it expresses are only buildable where a path
+        // has none. Windows is the only platform where that is not the case.
+        #[cfg(not(windows))]
+        {
+            let profile = MacSandbox::profile_with(&policy, &credentials).expect("profile");
+            for path in &paths.writable_roots {
+                assert!(profile.contains(&format!(
+                    "(allow file-write* {})",
+                    operand(path).expect("operand")
+                )));
+            }
+            for path in &paths.protected_paths {
+                assert!(profile.contains(&format!(
+                    "(deny file-write* {})",
+                    operand(path).expect("operand")
+                )));
+            }
+            for path in &paths.credential_paths {
+                assert!(profile.contains(&format!(
+                    "(deny file-read* {})",
+                    operand(path).expect("operand")
+                )));
+                assert!(profile.contains(&format!(
+                    "(deny file-write* {})",
+                    operand(path).expect("operand")
+                )));
+            }
         }
         let prepared =
             prepare("echo fixture", &policy.workspace, None, environment()).expect("prepare");

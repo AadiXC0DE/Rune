@@ -735,7 +735,7 @@ fn normalize(path: &Utf8Path) -> Utf8PathBuf {
     for component in path.components() {
         match component {
             Utf8Component::Prefix(prefix) => out.push(prefix.as_str()),
-            Utf8Component::RootDir => out.push("/"),
+            Utf8Component::RootDir => out.push(std::path::MAIN_SEPARATOR_STR),
             Utf8Component::CurDir => {}
             Utf8Component::ParentDir => {
                 let _ = out.pop();

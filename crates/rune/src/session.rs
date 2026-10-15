@@ -286,6 +286,13 @@ struct SessionHost {
     width: std::sync::atomic::AtomicU16,
     /// Terminal height, kept for the layout the status line is solved in.
     height: std::sync::atomic::AtomicU16,
+    /// Terminal size a test draws for, when it pins one.
+    ///
+    /// A real session leaves this `None` and reads the size from the terminal on
+    /// every frame. A test pins it, because the terminal that runs the test
+    /// reports a size that has nothing to do with the fixed grid the test
+    /// replays the frame into.
+    pinned_size: Option<(u16, u16)>,
     /// Draws the live region and owns every write to the terminal.
     inline: Mutex<rune_term::inline::Inline>,
     /// Held across a whole frame, paint and write together.
@@ -1218,7 +1225,7 @@ impl SessionHost {
     /// Read every frame rather than once, because a resized window would
     /// otherwise keep a layout measured for the old width.
     fn refresh_size(&self) {
-        let Some((cols, rows)) = rune_term::shell::terminal_size() else {
+        let Some((cols, rows)) = self.pinned_size.or_else(rune_term::shell::terminal_size) else {
             return;
         };
         if cols == 0 || rows == 0 {
@@ -1671,6 +1678,7 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
         // resized while the session runs is picked up.
         width: std::sync::atomic::AtomicU16::new(terminal_width()),
         height: std::sync::atomic::AtomicU16::new(terminal_height()),
+        pinned_size: None,
         inline: Mutex::new(rune_term::inline::Inline::new(terminal_width())),
         frame: Mutex::new(()),
         transcript: Mutex::new(transcript),
@@ -9915,6 +9923,7 @@ mod tests {
             truecolor: false,
             width: std::sync::atomic::AtomicU16::new(80),
             height: std::sync::atomic::AtomicU16::new(24),
+            pinned_size: Some((80, 24)),
             inline: Mutex::new(rune_term::inline::Inline::new(80)),
             frame: Mutex::new(()),
             transcript: Mutex::new(Vec::new()),
