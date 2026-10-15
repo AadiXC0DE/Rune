@@ -261,10 +261,17 @@ def run_fixture(scenario, terminal=False):
                 wait_for(b"ctrl-c cancel")
                 os.write(master, b"echo through MCP\r")
                 if scenario == "cancel":
+                    # Keep draining the terminal while the call is in flight.
+                    # The process writes its repaints to the PTY whether or not
+                    # anyone reads them, so on a platform with a small PTY
+                    # buffer (macOS) a driver that only sleeps here lets the
+                    # buffer fill, blocks the process mid-frame, and the Enter
+                    # never reaches the turn: tools/call never gets logged.
+                    # Pumping lets the call be dispatched at all.
                     deadline = time.monotonic() + 10
                     while "tools/call" not in (root / "local.jsonl").read_text():
                         assert time.monotonic() < deadline, transcript
-                        time.sleep(0.02)
+                        pump(0.02)
                     cancelled = time.monotonic()
                     os.write(master, b"\x03")
                     wait_for(b"[cancelled]")
