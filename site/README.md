@@ -9,6 +9,9 @@ python3 -m http.server 8099 --directory site
 | Path | What it is |
 |---|---|
 | `index.html` | The page: markup, styles, and the small scripts for the install tabs and the mark |
+| `robots.txt` | Crawler access and the canonical sitemap URL |
+| `sitemap.xml` | The site's single canonical page; demo and install are sections on it |
+| `llms.txt` | A short overview linking the page's sections and repository documentation |
 | `fonts/` | IBM Plex Mono, three weights, latin subset, self-hosted (SIL OFL, see `fonts/OFL.txt`) |
 | `demo/rune.wasm` | The harness, compiled to WebAssembly by `cargo xtask web` |
 | `demo/harness.js` | Loads the module and gives it a filesystem, a transport, a shell, and a prompt |
@@ -74,10 +77,11 @@ cargo xtask web
 
 ## What loads when
 
-Page load fetches the document and the fonts, about 60 KB. The harness (1.7 MB,
-about 540 KB as served) is fetched when the demo section comes near the viewport,
-and plays when it is mostly in view. Nothing else is fetched unless the
-visitor picks a model that needs it.
+Page load fetches the document and the fonts. The harness is fetched when the
+demo section comes near the viewport, and plays when it is mostly in view.
+The page reports transfer sizes from the browser's Resource Timing data when
+available, in KiB. Nothing else is fetched unless the visitor picks a model
+that needs it.
 
 ## Editing
 

@@ -110,7 +110,7 @@ fn print_budget_help() {
     println!("usage: cargo xtask budget [--help]");
     println!();
     println!("  Builds the release profile and checks size and startup.");
-    println!("  The audited stripped release build measured 5.40 MiB for");
+    println!("  The audited stripped release build measured 5.43 MiB for");
     println!("  x86_64-unknown-linux-gnu (GNU/Linux).");
     println!(
         "  The enforced binary size budget is an {} MiB ceiling ({} bytes).",

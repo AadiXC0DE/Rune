@@ -1,0 +1,21 @@
+# Rune
+
+> A tiny, native coding agent harness in Rust. One binary for interactive terminal sessions, scripts, and embedding.
+
+Rune connects to the model provider you choose. Permission rules, configuration,
+and limits report their sources. Shell commands use the platform sandbox where
+available. The landing page includes a WebAssembly demo of the harness.
+
+## Website
+
+- [Home](https://rune.heyaadi.com/): Overview of Rune.
+- [Demo](https://rune.heyaadi.com/#demo): Run the harness in the page.
+- [Features](https://rune.heyaadi.com/#why): Build budgets, sandboxing, permissions, and supported hosts.
+- [Install](https://rune.heyaadi.com/#start): Install and connect a provider.
+
+## Repository documentation
+
+- [README](https://github.com/AadiXC0DE/Rune/blob/main/README.md): Installation, usage, configuration, and embedding.
+- [Command reference](https://github.com/AadiXC0DE/Rune/blob/main/COMMANDS.md): Generated command, flag, and limit documentation.
+- [Source](https://github.com/AadiXC0DE/Rune): Rust workspace and development instructions.
+- [Releases](https://github.com/AadiXC0DE/Rune/releases): Native release artifacts.
