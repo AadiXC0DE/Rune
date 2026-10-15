@@ -1908,6 +1908,7 @@ name = "xtask"
 version = "0.1.16"
 dependencies = [
  "flate2",
+ "rune-core",
  "serde_json",
  "sha2",
 ]

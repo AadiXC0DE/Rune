@@ -26,10 +26,28 @@ fn assert_startup_claims(text: &str) {
     assert!(!text.contains("about 2 ms to start"), "{text}");
 }
 
+fn assert_prompt_claims(text: &str) {
+    let text = text.replace('`', "");
+    let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(text.contains("assembled system prompt"), "{text}");
+    assert!(text.contains("6144 byte ceiling"), "{text}");
+    assert!(text.contains("4 bytes per token"), "{text}");
+    assert!(text.contains("not a tokenizer count"), "{text}");
+}
+
 #[test]
 fn readme_distinguishes_the_measured_gnu_build_from_the_ceiling() {
     assert_size_claims(include_str!("../../README.md"));
     assert_startup_claims(include_str!("../../README.md"));
+    let readme = include_str!("../../README.md")
+        .replace('`', "")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        readme.contains("6 KiB ceiling on the assembled per-turn prompt"),
+        "{readme}"
+    );
 }
 
 #[test]
@@ -54,6 +72,7 @@ fn landing_page_size_claims_and_work_ceilings_match_the_audit() {
     assert!(page.contains("8 ms for <code>--help</code>"));
     assert!(page.contains("baseline-subtracted minimum-of-31"));
     assert!(page.contains("raw process latency minimum, median and p95"));
+    assert!(page.contains("checks it against a 6 KiB per-turn ceiling"));
 }
 
 #[test]
@@ -70,5 +89,6 @@ fn help_distinguishes_the_measured_gnu_build_from_the_ceiling_without_building()
         let help = String::from_utf8(output.stdout).expect("UTF-8 help");
         assert_size_claims(&help);
         assert_startup_claims(&help);
+        assert_prompt_claims(&help);
     }
 }

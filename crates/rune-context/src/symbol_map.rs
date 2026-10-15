@@ -29,7 +29,7 @@ pub struct Limits {
 impl Default for Limits {
     fn default() -> Self {
         Self {
-            bytes: 8192,
+            bytes: 4096,
             entries: 4096,
             files: 128,
             file_bytes: 128 * 1024,
@@ -87,18 +87,27 @@ pub fn generate(workspace: &Utf8Path, limits: Limits) -> RepositoryMap {
     let mut count = 0_usize;
     for (file, source) in sources.iter().enumerate() {
         let mut kind = None;
+        let mut depth = 0_usize;
         for token in Lexer::new(&source.text) {
-            if !token.raw
+            // Only declarations at module scope orient a reader. A method, an
+            // associated constant, or a type nested in a function body is not a
+            // landmark, and the map is a per-turn cost, so nesting is skipped.
+            match token.text {
+                "{" => {
+                    depth = depth.saturating_add(1);
+                    continue;
+                }
+                "}" => {
+                    depth = depth.saturating_sub(1);
+                    continue;
+                }
+                _ => {}
+            }
+            if depth == 0
+                && !token.raw
                 && matches!(
                     token.text,
-                    "fn" | "struct"
-                        | "enum"
-                        | "trait"
-                        | "type"
-                        | "const"
-                        | "static"
-                        | "mod"
-                        | "union"
+                    "fn" | "struct" | "enum" | "trait" | "type" | "mod" | "union"
                 )
             {
                 kind = Some(token.text);
@@ -163,7 +172,15 @@ fn read_sources(workspace: &Utf8Path, limits: Limits, truncated: &mut bool) -> V
         .follow_links(false)
         .max_depth(Some(32))
         .sort_by_file_path(std::path::Path::cmp)
-        .filter_entry(|entry| entry.file_name() != std::ffi::OsStr::new(".git"));
+        .filter_entry(|entry| {
+            let name = entry.file_name();
+            // Test-only trees and files orient nobody. A coding agent does not
+            // need fixture and mock names to find the production declarations,
+            // and the map is a per-turn cost, so the noise is dropped at the
+            // walk rather than paid for on every request.
+            !matches!(name.to_str(), Some(".git" | "tests" | "benches"))
+                && !name.to_string_lossy().ends_with("_tests.rs")
+        });
     let mut sources = Vec::new();
     let mut remaining = limits.source_bytes;
     let mut files = 0_usize;
@@ -213,6 +230,15 @@ fn read_sources(workspace: &Utf8Path, limits: Limits, truncated: &mut bool) -> V
             *truncated = true;
             continue;
         }
+        let Ok(text) = String::from_utf8(bytes) else {
+            *truncated = true;
+            continue;
+        };
+        // Test items inside a source file are removed before the scan in the
+        // same way a test tree is skipped at the walk, so a `#[cfg(test)]` mock
+        // cannot crowd a production declaration out of the byte budget.
+        let mut bytes = text.into_bytes();
+        blank_test_items(&mut bytes);
         let Ok(text) = String::from_utf8(bytes) else {
             *truncated = true;
             continue;
@@ -469,6 +495,126 @@ impl<'a> Iterator for Lexer<'a> {
     }
 }
 
+/// Blanks test-only items in a source before the scan.
+///
+/// The bytes are replaced with spaces rather than removed so that every line
+/// number a reference reports still points at the original line. Newlines are
+/// kept for the same reason. The text has already been validated as UTF-8, and
+/// only ASCII bytes are written, so the result stays valid.
+fn blank_test_items(bytes: &mut [u8]) {
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        return;
+    };
+    let ranges = test_item_ranges(text);
+    for range in ranges {
+        for byte in &mut bytes[range] {
+            if *byte != b'\n' {
+                *byte = b' ';
+            }
+        }
+    }
+}
+
+/// Returns the byte ranges of `#[cfg(test)]` items in a source.
+fn test_item_ranges(text: &str) -> Vec<std::ops::Range<usize>> {
+    let tokens: Vec<Token<'_>> = Lexer::new(text).collect();
+    let mut ranges = Vec::new();
+    let mut index = 0_usize;
+    while index < tokens.len() {
+        if let Some(end) = test_item_end(&tokens, index) {
+            ranges.push(tokens[index].offset..end);
+        }
+        index = index.saturating_add(1);
+    }
+    ranges
+}
+
+/// Returns the offset past the item a test attribute at `index` guards.
+///
+/// Handles `#[cfg(test)]` and the `#[cfg(all(test, ...))]` / `#[cfg(any(test,
+/// ...))]` forms. `#[cfg(not(test))]` is production code and is left alone.
+fn test_item_end(tokens: &[Token<'_>], index: usize) -> Option<usize> {
+    if tokens.get(index)?.text != "#" {
+        return None;
+    }
+    let bracket = index.saturating_add(1);
+    let cfg = index.saturating_add(2);
+    let paren = index.saturating_add(3);
+    if tokens.get(bracket)?.text != "[" || tokens.get(cfg)?.text != "cfg" {
+        return None;
+    }
+    if tokens.get(paren)?.text != "(" {
+        return None;
+    }
+    let open = paren.saturating_add(1);
+    let close = grouped_end(tokens, paren)?;
+    let is_test = match tokens.get(open)?.text {
+        "test" => true,
+        "all" | "any" => tokens
+            .get(open..close)?
+            .iter()
+            .any(|token| token.text == "test"),
+        _ => false,
+    };
+    if !is_test || tokens.get(close.saturating_add(1))?.text != "]" {
+        return None;
+    }
+    item_end(tokens.get(close.saturating_add(2)..)?)
+}
+
+/// Returns the index of the `)` matching the `(` at `open`.
+fn grouped_end(tokens: &[Token<'_>], open: usize) -> Option<usize> {
+    let mut depth = 0_usize;
+    for (offset, token) in tokens[open..].iter().enumerate() {
+        match token.text {
+            "(" => depth = depth.saturating_add(1),
+            ")" => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return Some(open.saturating_add(offset));
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Returns the offset past the item that follows an attribute.
+///
+/// A block ends at its matching `}`, and a declaration without a block ends at
+/// its `;` or, for a struct field or enum variant, its `,`. Nesting is tracked
+/// so a delimiter inside the item does not end it early.
+fn item_end(tokens: &[Token<'_>]) -> Option<usize> {
+    let mut opened = false;
+    let mut braces = 0_usize;
+    let mut parens = 0_usize;
+    let mut brackets = 0_usize;
+    for token in tokens {
+        match token.text {
+            "{" => {
+                opened = true;
+                braces = braces.saturating_add(1);
+            }
+            "}" if opened => {
+                braces = braces.saturating_sub(1);
+                if braces == 0 {
+                    return Some(token.offset.saturating_add(token.text.len()));
+                }
+            }
+            "(" => parens = parens.saturating_add(1),
+            ")" => parens = parens.saturating_sub(1),
+            "[" => brackets = brackets.saturating_add(1),
+            "]" => brackets = brackets.saturating_sub(1),
+            ";" | "," if !opened && parens == 0 && brackets == 0 => {
+                return Some(token.offset.saturating_add(token.text.len()));
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -617,6 +763,78 @@ fn c_literals() { let _ = c"actual()"; let _ = cr#"actual()"#; }
         for name in ["comment", "block", "fake", "raw_fake"] {
             assert!(!map.text.contains(name), "{}", map.text);
         }
+    }
+
+    #[test]
+    fn test_trees_files_and_cfg_test_items_stay_out_of_the_map() {
+        // A coding agent does not orient itself with fixture or mock names, and
+        // the map is a per-turn cost. Integration trees, `*_tests.rs` files, and
+        // `#[cfg(test)]` items inside a source file are all test-only.
+        let (_dir, root) = fixture();
+        write(&root, "src/mock_support_tests.rs", "pub struct MockOnly;\n");
+        write(
+            &root,
+            "tests/integration.rs",
+            "pub const FIXTURE: u8 = 1;\n",
+        );
+        write(
+            &root,
+            "src/lib.rs",
+            "pub fn production() {}\n\n#[cfg(test)]\nmod tests {\n    pub struct MockThing;\n    pub fn mock_helper() { production(); }\n}\npub fn after() {}\n",
+        );
+        let map = generate(&root, Limits::default());
+        // The blanked test module keeps later line numbers where they were.
+        assert!(
+            map.text.contains("src/lib.rs:1 fn production\n"),
+            "{}",
+            map.text
+        );
+        assert!(map.text.contains("src/lib.rs:8 fn after\n"), "{}", map.text);
+        for absent in ["MockOnly", "FIXTURE", "MockThing", "mock_helper"] {
+            assert!(!map.text.contains(absent), "{absent} leaked: {}", map.text);
+        }
+    }
+
+    #[test]
+    fn only_top_level_declarations_are_landmarks() {
+        // Methods, associated constants, and items nested in a module are not
+        // landmarks for orientation. Types, functions, traits, and modules at
+        // module scope are.
+        let (_dir, root) = fixture();
+        write(
+            &root,
+            "src/lib.rs",
+            "pub struct Outer;\nimpl Outer {\n    pub fn method(&self) {}\n    pub const VALUE: u32 = 1;\n}\npub fn free() {}\nmod nested {\n    pub fn inner() {}\n}\n",
+        );
+        let map = generate(&root, Limits::default());
+        for kept in [
+            "src/lib.rs:1 struct Outer",
+            "src/lib.rs:6 fn free",
+            "src/lib.rs:7 mod nested",
+        ] {
+            assert!(map.text.contains(kept), "{kept} missing: {}", map.text);
+        }
+        for absent in ["method", "VALUE", "inner"] {
+            assert!(!map.text.contains(absent), "{absent} leaked: {}", map.text);
+        }
+    }
+
+    #[test]
+    fn the_byte_cap_is_honoured_and_truncation_is_visible() {
+        let (_dir, root) = fixture();
+        let body: String = (0..200).fold(String::new(), |mut text, index| {
+            writeln!(text, "pub fn symbol_{index:03}() {{}}").expect("format source");
+            text
+        });
+        write(&root, "src/lib.rs", &body);
+        let limits = Limits {
+            bytes: 512,
+            ..Limits::default()
+        };
+        let map = generate(&root, limits);
+        assert!(map.text.len() <= limits.bytes, "{}", map.text.len());
+        assert!(map.truncated, "{}", map.text);
+        assert!(map.text.contains("map incomplete"), "{}", map.text);
     }
 
     #[test]

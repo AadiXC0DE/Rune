@@ -24,6 +24,18 @@ mod targets {
 
     /// Baseline-subtracted minimum-of-31 work for `rune --help`, in milliseconds.
     pub const MAX_HELP_MS: f64 = 8.0;
+
+    /// Largest accepted assembled system prompt, in bytes.
+    ///
+    /// Shared with the crate that compiles the prompt, so the gate and the
+    /// compiled-in floor cannot drift apart.
+    pub const MAX_PROMPT_BYTES: usize = rune_core::budget::PROMPT_CEILING_BYTES;
+
+    /// Divisor used to turn prompt bytes into an estimated token count.
+    ///
+    /// Four is the estimator's working bytes-per-token figure, not a tokenizer:
+    /// the number printed beside the byte count is an estimate at this divisor.
+    pub const PROMPT_BYTES_PER_TOKEN: usize = 4;
 }
 
 fn main() -> ExitCode {
@@ -127,6 +139,15 @@ fn print_budget_help() {
         "  Work budgets: --version {} ms, --help {} ms.",
         targets::MAX_VERSION_MS,
         targets::MAX_HELP_MS
+    );
+    println!("  The assembled system prompt is measured from this working tree and its");
+    println!(
+        "  fixed per-request cost is checked against a {} byte ceiling.",
+        targets::MAX_PROMPT_BYTES
+    );
+    println!(
+        "  Tokens are estimated at {} bytes per token, not a tokenizer count.",
+        targets::PROMPT_BYTES_PER_TOKEN
     );
 }
 
@@ -330,8 +351,58 @@ fn budget() -> Result<(), String> {
     }
 
     check_startup(&binary)?;
+    check_prompt(&binary)?;
     check_duplicate_dependencies()?;
     Ok(())
+}
+
+/// Measures the assembled system prompt and enforces its ceiling.
+///
+/// The prompt is assembled from the working tree, so its size depends on the
+/// repository contents and the effective limits. The release binary is run the
+/// way a turn would run it. User configuration and user skills are excluded, so
+/// the measurement reflects the checkout rather than the machine.
+fn check_prompt(binary: &Path) -> Result<(), String> {
+    let isolated = std::env::temp_dir().join(format!("rune-budget-{}", std::process::id()));
+    std::fs::create_dir_all(&isolated)
+        .map_err(|err| format!("could not create {}: {err}", isolated.display()))?;
+    let output = Command::new(binary)
+        .args(["prompt", "--show"])
+        .env("HOME", &isolated)
+        .env("RUNE_HOME", &isolated)
+        .env("XDG_CONFIG_HOME", &isolated)
+        .env("XDG_STATE_HOME", &isolated)
+        .env("XDG_DATA_HOME", &isolated)
+        .output()
+        .map_err(|err| format!("could not run {}: {err}", binary.display()))?;
+    // `prompt --show` prints the prompt and then a newline when the text does
+    // not end with one, so the trailing byte the CLI adds is not part of it.
+    let bytes = output
+        .stdout
+        .strip_suffix(b"\n")
+        .map_or(output.stdout.len(), <[u8]>::len);
+    if !output.status.success() {
+        return Err("`rune prompt --show` failed while measuring the prompt".to_owned());
+    }
+    let tokens = bytes / targets::PROMPT_BYTES_PER_TOKEN;
+    println!(
+        "prompt bytes  {bytes} bytes ({tokens} estimated tokens at {} bytes/token)",
+        targets::PROMPT_BYTES_PER_TOKEN
+    );
+    match prompt_ceiling_failure(bytes) {
+        Some(message) => Err(message),
+        None => Ok(()),
+    }
+}
+
+/// Returns the failure message for an assembled prompt over its ceiling.
+fn prompt_ceiling_failure(bytes: usize) -> Option<String> {
+    (bytes > targets::MAX_PROMPT_BYTES).then(|| {
+        format!(
+            "assembled prompt exceeds the {} byte ceiling",
+            targets::MAX_PROMPT_BYTES
+        )
+    })
 }
 
 /// Format, lint, budget, and the full suite, for a pull request.
@@ -954,6 +1025,16 @@ mod tests {
             metrics.report("--help", None, targets::MAX_HELP_MS),
             "startup --help     raw process latency: minimum-of-31 9.00 ms, median 9.00 ms, p95 9.00 ms; work without baseline subtraction 9.00 ms (budget 8 ms)"
         );
+    }
+
+    #[test]
+    fn the_prompt_ceiling_fails_only_above_it() {
+        // The gate must pass at the ceiling and fail one byte past it, so a
+        // prompt that grows past the floor is caught rather than reported.
+        assert!(prompt_ceiling_failure(targets::MAX_PROMPT_BYTES).is_none());
+        let message = prompt_ceiling_failure(targets::MAX_PROMPT_BYTES + 1)
+            .expect("one byte over the ceiling was accepted");
+        assert!(message.contains("assembled prompt exceeds"), "{message}");
     }
 
     /// Returns the tar header of an archive, for assertions about its fields.
