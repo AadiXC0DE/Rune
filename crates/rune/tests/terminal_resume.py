@@ -151,7 +151,15 @@ with tempfile.TemporaryDirectory(prefix="rune-r038-") as directory:
 
     try:
         saved = json.loads(run_pipe("ask", "--json", "saved prompt"))
-        session_id = saved["session_id"]
+        # Pin the flag-shaped ID that previously made explicit resume fail
+        # randomly (generated base64url IDs can start with a dash).
+        session_id = "-resumeFixed"
+        sessions = root / "state" / "sessions"
+        (sessions / saved["session_id"]).rename(sessions / session_id)
+        metadata_path = sessions / session_id / "session.json"
+        metadata = json.loads(metadata_path.read_text())
+        metadata["id"] = session_id
+        metadata_path.write_text(json.dumps(metadata))
         log = root / "state" / "sessions" / session_id / "events.jsonl"
         original_log = log.read_bytes()
         assert len(requests) == 1

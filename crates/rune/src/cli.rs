@@ -286,7 +286,7 @@ pub fn parse(args: Vec<OsString>, benchmark: bool) -> Result<Launch> {
                     .get(index.saturating_add(1))
                     .cloned()
                     .unwrap_or_default();
-                if next.is_empty() || next.starts_with('-') {
+                if next.is_empty() || (next.starts_with('-') && !flag_shaped_session_id(&next)) {
                     launch.resume = Some(ResumeTarget::Latest);
                     index = index.saturating_add(1);
                 } else {
@@ -365,17 +365,25 @@ pub fn parse(args: Vec<OsString>, benchmark: bool) -> Result<Launch> {
         }
     }
 
-    // `resume` may carry a target as its first positional argument.
+    // `resume_requested` distinguishes an explicit resume from the default
+    // interactive launch, which is used by resume handling in a later phase.
+    let _ = resume_requested;
+    let mut launch = finish(launch, &tokens, index)?;
+    // Classify after flags have been consumed, including identifiers beginning
+    // with a dash and targets following global options.
     if launch.command == Command::Resume
-        && let Some(token) = tokens.get(index).filter(|token| !token.starts_with('-'))
+        && let Some(token) = launch.args.first()
     {
         launch.resume = Some(classify_resume(token));
     }
+    Ok(launch)
+}
 
-    // `resume_requested` distinguishes an explicit resume from the default
-    // interactive launch, which is used by the resume handling in a later phase.
-    let _ = resume_requested;
-    finish(launch, &tokens, index)
+/// Session identifiers use base64url, so their first character may be a dash.
+/// Recognized global flags retain precedence even if they have the same length.
+fn flag_shaped_session_id(raw: &str) -> bool {
+    raw.parse::<rune_core::id::SessionId>().is_ok()
+        && !spec::GLOBAL_FLAGS.iter().any(|flag| flag.name == raw)
 }
 
 /// Applies one flag that changes a setting for the whole process.
@@ -560,6 +568,15 @@ fn finish(mut launch: Launch, tokens: &[String], mut index: usize) -> Result<Lau
             continue;
         }
         if take_global(&mut launch, tokens, &mut index)? {
+            continue;
+        }
+        if matches!(
+            launch.command,
+            Command::Session | Command::Tree | Command::Resume
+        ) && flag_shaped_session_id(&token)
+        {
+            launch.args.push(token);
+            index = index.saturating_add(1);
             continue;
         }
         if text_started || lenient {
@@ -813,6 +830,32 @@ mod tests {
             parse_list(&["sessions"]).expect("parse").command,
             Command::Sessions
         );
+    }
+
+    #[test]
+    fn dash_prefixed_session_ids_are_positional_and_known_flags_keep_precedence() {
+        for id in ["-fixedchild0", "--fixedchild"] {
+            for command in ["session", "tree", "resume"] {
+                let launch =
+                    parse_list(&[command, "--accessible", id, "--json"]).expect("identifier");
+                assert_eq!(launch.args, [id]);
+                assert!(launch.accessible);
+                assert!(launch.json || launch.has_flag("--json"));
+                if command == "resume" {
+                    assert_eq!(launch.resume, Some(ResumeTarget::Exact(id.to_owned())));
+                }
+            }
+            let fork = parse_list(&["session", "fork", id, "--at", "10", "--json"]).expect("fork");
+            assert_eq!(fork.args, ["fork", id]);
+            assert_eq!(fork.flag("--at"), Some("10"));
+            assert_eq!(
+                parse_list(&["--resume", id]).expect("resume flag").resume,
+                Some(ResumeTarget::Exact(id.to_owned()))
+            );
+        }
+        let launch = parse_list(&["--resume", "--accessible"]).expect("global flag");
+        assert_eq!(launch.resume, Some(ResumeTarget::Latest));
+        assert!(launch.accessible);
     }
 
     #[test]

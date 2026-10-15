@@ -18,6 +18,10 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
+        Self::with_id(SessionId::generate())
+    }
+
+    fn with_id(id: SessionId) -> Self {
         let temp = tempfile::tempdir().expect("tempdir");
         let root =
             Utf8PathBuf::from_path_buf(temp.path().canonicalize().expect("root")).expect("utf8");
@@ -26,7 +30,6 @@ impl Fixture {
             config_root: root.join("config/rune"),
             data_root: root.join("data/rune"),
         };
-        let id = SessionId::generate();
         let store = SessionStore::create(&paths, &id).expect("session");
         for event in [
             SessionEvent::WorkspaceSet {
@@ -306,37 +309,42 @@ fn last_and_exact_id_select_the_source_and_require_an_explicit_boundary() {
 
 #[test]
 fn child_sessions_and_existing_destinations_are_refused() {
-    let fixture = Fixture::new();
-    let before = fixture.files(&fixture.id);
-    assert!(
-        rune_session::fork::fork(&fixture.paths, &fixture.id, &fixture.id, EventSeq(10)).is_err()
-    );
-    assert_eq!(fixture.files(&fixture.id), before);
-    let destination = SessionId::generate();
-    std::fs::create_dir(fixture.paths.session_dir(&destination)).expect("reserve");
-    assert!(
-        rune_session::fork::fork(&fixture.paths, &fixture.id, &destination, EventSeq(10)).is_err()
-    );
-    assert_eq!(
-        std::fs::read_dir(fixture.paths.session_dir(&destination))
-            .expect("empty")
-            .count(),
-        0
-    );
-    let store = SessionStore::open(&fixture.paths.session_dir(&fixture.id)).expect("store");
-    store
-        .append(SessionEvent::ChildOf {
-            parent: SessionId::generate().to_string(),
-        })
-        .expect("child");
-    drop(store);
-    let output = fixture.fork(fixture.id.as_str(), "10");
-    assert!(!output.status.success(), "{output:?}");
-    assert!(
-        String::from_utf8(output.stderr)
-            .expect("error")
-            .contains("child session")
-    );
+    // Exercise both possible flag-shaped prefixes deterministically.
+    for id in ["-fixedchild0", "--fixedchild"] {
+        let fixture = Fixture::with_id(id.parse().expect("fixed id"));
+        let before = fixture.files(&fixture.id);
+        assert!(
+            rune_session::fork::fork(&fixture.paths, &fixture.id, &fixture.id, EventSeq(10))
+                .is_err()
+        );
+        assert_eq!(fixture.files(&fixture.id), before);
+        let destination = SessionId::generate();
+        std::fs::create_dir(fixture.paths.session_dir(&destination)).expect("reserve");
+        assert!(
+            rune_session::fork::fork(&fixture.paths, &fixture.id, &destination, EventSeq(10))
+                .is_err()
+        );
+        assert_eq!(
+            std::fs::read_dir(fixture.paths.session_dir(&destination))
+                .expect("empty")
+                .count(),
+            0
+        );
+        let store = SessionStore::open(&fixture.paths.session_dir(&fixture.id)).expect("store");
+        store
+            .append(SessionEvent::ChildOf {
+                parent: SessionId::generate().to_string(),
+            })
+            .expect("child");
+        drop(store);
+        let output = fixture.fork(fixture.id.as_str(), "10");
+        assert!(!output.status.success(), "{output:?}");
+        assert!(
+            String::from_utf8(output.stderr)
+                .expect("error")
+                .contains("child session")
+        );
+    }
 }
 
 #[test]
