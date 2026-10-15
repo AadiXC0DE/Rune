@@ -209,14 +209,54 @@ def run_fixture(scenario, terminal=False):
                                          cwd=root, env=environment, preexec_fn=controlling_terminal)
                 os.close(slave)
                 transcript = bytearray()
+                closed = False
 
-                def wait_for(marker):
-                    deadline = time.monotonic() + 10
+                def pump(timeout):
+                    # Read whatever the child has written, waiting at most
+                    # `timeout` seconds for the first byte. The master is drained
+                    # while the child shuts down too, so a small platform PTY
+                    # buffer cannot leave the child blocked in write.
+                    nonlocal closed
+                    if closed:
+                        time.sleep(min(timeout, 0.01))
+                        return
+                    readable, _, _ = select.select([master], [], [], timeout)
+                    if not readable:
+                        return
+                    try:
+                        transcript.extend(os.read(master, 65536))
+                    except OSError:
+                        # The slave side is gone, so there is nothing left to
+                        # read; the exit check will report the status.
+                        closed = True
+
+                def wait_for(marker, timeout=10):
+                    deadline = time.monotonic() + timeout
                     while marker not in transcript:
-                        assert child.poll() is None, (child.returncode, transcript)
-                        assert time.monotonic() < deadline, transcript
-                        if select.select([master], [], [], 0.05)[0]:
-                            transcript.extend(os.read(master, 65536))
+                        assert child.poll() is None, (
+                            f"session exited (status {child.returncode}) before printing {marker!r}:\n"
+                            + transcript.decode(errors="replace")
+                        )
+                        remaining = deadline - time.monotonic()
+                        assert remaining > 0, (
+                            f"waited {timeout}s for the terminal to print {marker!r}:\n"
+                            + transcript.decode(errors="replace")
+                        )
+                        pump(min(remaining, 0.1))
+
+                def wait_for_exit(timeout=10):
+                    deadline = time.monotonic() + timeout
+                    while child.poll() is None:
+                        remaining = deadline - time.monotonic()
+                        assert remaining > 0, (
+                            f"session did not exit within {timeout}s of /quit:\n"
+                            + transcript.decode(errors="replace")
+                        )
+                        pump(min(remaining, 0.1))
+                    assert child.returncode == 0, (
+                        f"session exited with status {child.returncode}:\n"
+                        + transcript.decode(errors="replace")
+                    )
 
                 wait_for(b"ctrl-c cancel")
                 os.write(master, b"echo through MCP\r")
@@ -230,9 +270,12 @@ def run_fixture(scenario, terminal=False):
                     wait_for(b"[cancelled]")
                     assert time.monotonic() - cancelled < 2, transcript
                 else:
-                    wait_for(b"MCP_FIXTURE_PASSED")
+                    # Wait for the committed reply, not the streamed delta: an
+                    # Enter sent mid-turn is queued as steering, so /quit would
+                    # never reach command handling.
+                    wait_for(b"MCP_FIXTURE_PASSED\r\n")
                 os.write(master, b"/quit\r")
-                assert child.wait(timeout=5) == 0, transcript
+                wait_for_exit()
                 stdout, stderr = bytes(transcript), b""
             else:
                 prompt = b"echo through MCP\n" + (b"no\n" if scenario == "policy" else b"")

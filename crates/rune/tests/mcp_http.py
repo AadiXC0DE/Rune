@@ -134,8 +134,12 @@ def run_fixture(scenario, terminal=False):
         server.daemon_threads = True
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
+        # Read the bound address back from the listening socket and connect to
+        # exactly that, so the bind and every client agree on one address on every
+        # platform instead of one resolving a name the other never bound.
+        host, port = server.server_address[:2]
         # Assert the wire contract that prevents reuse before Python closes the socket.
-        probe = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=5)
+        probe = http.client.HTTPConnection(host, port, timeout=5)
         probe.request("GET", "/v1/models")
         response = probe.getresponse()
         assert response.getheader("Connection") == "close"
@@ -148,12 +152,12 @@ def run_fixture(scenario, terminal=False):
             "XDG_CONFIG_HOME": str(base / "config"), "XDG_DATA_HOME": str(base / "data"),
             "XDG_STATE_HOME": str(base / "xdg-state"), "RUNE_HOME": str(base / "state"),
             "RUNE_PROVIDER": "chat_completions", "RUNE_MODEL": "mcp-fixture",
-            "RUNE_BASE_URL": f"http://127.0.0.1:{server.server_port}/v1",
+            "RUNE_BASE_URL": f"http://{host}:{port}/v1",
             "RUNE_API_KEY_ENV": "RUNE_HTTP_MODEL_KEY", "RUNE_HTTP_MODEL_KEY": "provider-only-secret",
             "RUNE_HTTP_MCP_SECRET": "http-only-secret",
         })
         entries = {"remote": {
-            "type": "http", "url": f"http://127.0.0.1:{server.server_port}/mcp",
+            "type": "http", "url": f"http://{host}:{port}/mcp",
             "headers": {"x-fixture-secret": "${RUNE_HTTP_MCP_SECRET}"},
         }}
         if scenario == "disabled":
@@ -164,7 +168,7 @@ def run_fixture(scenario, terminal=False):
             entries["remote"]["headers"]["x-unused"] = "${UNSET_BLOCKED_SECRET}"
         if scenario == "partial":
             entries["untrusted"] = {
-                "url": f"http://127.0.0.1:{server.server_port}/untrusted",
+                "url": f"http://{host}:{port}/untrusted",
                 "headers": {"x-unused": "${UNSET_UNTRUSTED_SECRET}"}, "required": True,
             }
         if scenario == "implicit-http":
@@ -196,20 +200,65 @@ def run_fixture(scenario, terminal=False):
                                          cwd=root, env=environment, preexec_fn=controlling_terminal)
                 os.close(slave)
                 transcript = bytearray()
+                closed = False
 
-                def wait_for(marker):
-                    deadline = time.monotonic() + 30
+                def pump(timeout):
+                    # Read whatever the child has written, waiting at most
+                    # `timeout` seconds for the first byte. The master is drained
+                    # while the child shuts down too, so a small platform PTY
+                    # buffer cannot leave the child blocked in write.
+                    nonlocal closed
+                    if closed:
+                        time.sleep(min(timeout, 0.01))
+                        return
+                    readable, _, _ = select.select([master], [], [], timeout)
+                    if not readable:
+                        return
+                    try:
+                        transcript.extend(os.read(master, 65536))
+                    except OSError:
+                        # The slave side is gone, so there is nothing left to
+                        # read; the exit check will report the status.
+                        closed = True
+
+                def wait_for(marker, timeout=30):
+                    deadline = time.monotonic() + timeout
                     while marker not in transcript:
-                        assert child.poll() is None, (child.returncode, transcript)
-                        assert time.monotonic() < deadline, transcript
-                        if select.select([master], [], [], 0.05)[0]:
-                            transcript.extend(os.read(master, 65536))
+                        assert child.poll() is None, (
+                            f"session exited (status {child.returncode}) before printing {marker!r}:\n"
+                            + transcript.decode(errors="replace")
+                        )
+                        remaining = deadline - time.monotonic()
+                        assert remaining > 0, (
+                            f"waited {timeout}s for the terminal to print {marker!r}:\n"
+                            + transcript.decode(errors="replace")
+                        )
+                        pump(min(remaining, 0.1))
+
+                def wait_for_exit(timeout=30):
+                    deadline = time.monotonic() + timeout
+                    while child.poll() is None:
+                        remaining = deadline - time.monotonic()
+                        assert remaining > 0, (
+                            f"session did not exit within {timeout}s of /quit:\n"
+                            + transcript.decode(errors="replace")
+                        )
+                        pump(min(remaining, 0.1))
+                    assert child.returncode == 0, (
+                        f"session exited with status {child.returncode}:\n"
+                        + transcript.decode(errors="replace")
+                    )
 
                 wait_for(b"ctrl-c cancel")
                 os.write(master, b"echo through HTTP MCP\r")
-                wait_for(b"HTTP_MCP_PASSED")
+                # Wait for the committed reply, not the streamed delta. While a
+                # turn is running the keyboard feeds the steering queue, so an
+                # Enter sent on the first sight of the text is swallowed by the
+                # turn and never reaches command handling; the \r\n appears only
+                # once report_turn has committed the finished reply.
+                wait_for(b"HTTP_MCP_PASSED\r\n")
                 os.write(master, b"/quit\r")
-                assert child.wait(timeout=30) == 0, transcript
+                wait_for_exit()
                 stdout, stderr = bytes(transcript), b""
             else:
                 prompt = b"echo through HTTP MCP\n" + (b"no\n" if scenario == "policy" else b"")
