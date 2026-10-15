@@ -172,7 +172,11 @@ pub fn ask_endpoint(name: &str) -> Result<String> {
 ///
 /// Returns the provider name that was connected, so the caller can report it
 /// without deciding again which one that was.
-pub fn run(paths: &Paths, entry: &KnownProvider) -> Result<String> {
+pub fn run(
+    paths: &Paths,
+    settings: &rune_core::config::Settings,
+    entry: &KnownProvider,
+) -> Result<String> {
     let name = entry.name.to_owned();
     let endpoint = match entry.base_url {
         Some(url) => url.to_owned(),
@@ -190,21 +194,79 @@ pub fn run(paths: &Paths, entry: &KnownProvider) -> Result<String> {
         provider_setup::connect(paths, &name, &credential)?;
     }
 
-    provider_setup::save_selection(
-        paths,
-        &provider_setup::Selection {
-            provider: name.clone(),
-            model: None,
-            base_url: Some(endpoint.clone()),
-        },
-    )?;
+    let mut selection = provider_setup::Selection {
+        provider: name.clone(),
+        model: settings
+            .configured_models
+            .get(&name)
+            .or_else(|| settings.configured_models.get("default"))
+            .map(|model| model.id().to_owned()),
+        base_url: Some(endpoint.clone()),
+    };
+    offer_model(paths, settings, &mut selection)?;
+    provider_setup::save_selection(paths, &selection)?;
 
     println!();
     println!("connected {name}");
     println!("endpoint  {endpoint}");
-    println!();
-    println!("Run `rune models` to see the model in use, or `rune connect` again to add another.");
+    if let Some(model) = &selection.model {
+        println!("model     {model}");
+    } else {
+        println!("{}", model_next_step(&name));
+    }
     Ok(name)
+}
+
+/// Gives a complete, valid command when a connection has no model yet.
+pub fn model_next_step(provider: &str) -> String {
+    format!(
+        "No model is selected. Run `rune models` to list the endpoint's models, then `rune connect {provider} --model <id>` to select one (stored in the `models` table)."
+    )
+}
+
+/// Offers the endpoint's current models before saving an interactive connection.
+pub fn offer_model(
+    paths: &Paths,
+    settings: &rune_core::config::Settings,
+    selection: &mut provider_setup::Selection,
+) -> Result<()> {
+    if selection.model.is_some() {
+        return Ok(());
+    }
+    let mut settings = settings.clone();
+    settings.provider = rune_core::config::parse_provider(&selection.provider);
+    settings.base_url.clone_from(&selection.base_url);
+    settings.anonymous = providers::lookup(&selection.provider)
+        .is_some_and(|entry| entry.credential == providers::CredentialKind::AnonymousLoopback);
+    let catalog = match provider_setup::fetch_catalog(&settings, paths, crate::MODELS_TIMEOUT) {
+        Ok(catalog) => catalog,
+        Err(error) => {
+            println!("Could not list the endpoint's models: {error}");
+            return Ok(());
+        }
+    };
+    if catalog.models.is_empty() {
+        return Ok(());
+    }
+    println!("Choose a model (or press Enter to select it later):");
+    for (index, model) in catalog.models.iter().enumerate() {
+        println!("  {}  {}", index.saturating_add(1), model.id);
+    }
+    let answer = read_line("model: ")?;
+    if answer.is_empty() {
+        return Ok(());
+    }
+    let chosen = answer
+        .parse::<usize>()
+        .ok()
+        .and_then(|index| index.checked_sub(1))
+        .and_then(|index| catalog.models.get(index))
+        .or_else(|| catalog.models.iter().find(|model| model.id == answer))
+        .ok_or_else(|| {
+            RuneError::invalid_field("model", "choose a listed model by number or identifier")
+        })?;
+    selection.model = Some(chosen.id.clone());
+    Ok(())
 }
 
 #[cfg(test)]

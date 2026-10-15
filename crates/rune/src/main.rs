@@ -544,7 +544,7 @@ fn run_interactive(
         // The flow writes the selection itself, so the only thing left is to
         // read it back rather than patch the values in by hand: the session then
         // runs on exactly what a later run would load.
-        connect_flow::run(paths, entry)?;
+        connect_flow::run(paths, &settings, entry)?;
         settings = config::load(
             Some(&workspace.join(".rune.toml")),
             Some(&paths.config_file(std::env::var("RUNE_CONFIG").ok().as_deref())),
@@ -639,7 +639,7 @@ fn run_connect(
     let named = launch.args.first().map(|value| value.trim().to_owned());
     if named.is_none() && !output.json {
         let entry = connect_flow::choose_provider()?;
-        connect_flow::run(paths, entry)?;
+        connect_flow::run(paths, settings, entry)?;
         return Ok(ExitCode::from(EXIT_OK));
     }
 
@@ -698,22 +698,31 @@ fn run_connect(
         }
     }
 
-    let selection = provider_setup::Selection {
+    let mut selection = provider_setup::Selection {
         provider: name.clone(),
         model: (!settings.model.trim().is_empty()).then(|| settings.model.clone()),
         base_url: Some(base_url),
     };
+    if !output.json {
+        connect_flow::offer_model(paths, settings, &mut selection)?;
+    }
     provider_setup::save_selection(paths, &selection)?;
 
     if output.json {
-        let value = serde_json::json!({
+        let mut value = serde_json::json!({
             "provider": selection.provider,
             "model": selection.model,
             "base_url": selection.base_url,
         });
+        if selection.model.is_none() {
+            value["next_step"] = connect_flow::model_next_step(&name).into();
+        }
         println!("{}", serde_json::to_string_pretty(&value)?);
     } else {
         println!("connected {name}");
+        if selection.model.is_none() {
+            println!("{}", connect_flow::model_next_step(&name));
+        }
     }
     Ok(ExitCode::from(EXIT_OK))
 }

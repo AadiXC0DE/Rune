@@ -673,7 +673,7 @@ impl Settings {
                 ErrorCode::InvalidConfiguration,
                 format!("no model is selected for provider `{}`", self.provider),
             )
-            .with_hint("set `model` in the user config, or pass `--model <id>`"));
+            .with_hint("set the provider entry in the `models` table, or pass `--model <id>`"));
         }
         Ok(())
     }
@@ -1638,7 +1638,7 @@ pub fn unconfigured_model_error() -> RuneError {
         ErrorCode::InvalidConfiguration,
         "no model is selected",
     )
-    .with_hint("run `rune models` to list the ones the endpoint serves, and `rune connect <provider> <model>` to set one")
+    .with_hint("run `rune models` to list the ones the endpoint serves, and `rune connect <provider> --model <id>` to set one")
 }
 
 /// Renders the project configuration keys, for documentation consistency tests.

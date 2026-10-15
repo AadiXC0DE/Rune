@@ -1709,6 +1709,9 @@ fn provider_selection_preserves_the_override_and_leaves_the_default_unchanged() 
         .output()
         .expect("connect");
     assert!(out.status.success(), "{out:?}");
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).expect("report");
+    assert_eq!(report["model"], "saved-model");
+    assert!(report.get("next_step").is_none());
     let stored: toml::Table =
         toml::from_str(&std::fs::read_to_string(&path).expect("active config"))
             .expect("parse config");
@@ -2061,6 +2064,13 @@ fn connecting_with_the_key_exported_succeeds() {
     assert_eq!(out.status, Some(0), "stderr: {}", out.stderr);
     let value: serde_json::Value = serde_json::from_str(&out.stdout).expect("valid json");
     assert_eq!(value["provider"], "anthropic");
+    assert!(value["model"].is_null());
+    assert!(
+        value["next_step"]
+            .as_str()
+            .expect("next step")
+            .contains("rune connect anthropic --model <id>")
+    );
     assert!(!out.stdout.contains("sk-ant-test"), "{}", out.stdout);
 }
 
@@ -2257,4 +2267,59 @@ fn a_flag_the_command_does_not_take_is_refused() {
         out.stderr
     );
     assert!(out.stderr.contains("hint:"), "{}", out.stderr);
+}
+
+#[test]
+fn interactive_connect_offers_endpoint_models_and_saves_the_choice() {
+    use std::io::{Read as _, Write as _};
+    use std::process::Stdio;
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("listener");
+    let address = listener.local_addr().expect("address");
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("request");
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .expect("timeout");
+        let mut request = [0; 4096];
+        let read = stream.read(&mut request).expect("read request");
+        assert!(String::from_utf8_lossy(&request[..read]).starts_with("GET /v1/models "));
+        let body = r#"{"data":[{"id":"first-model"},{"id":"chosen-model"}]}"#;
+        write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).expect("response");
+    });
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = camino::Utf8Path::from_path(dir.path()).expect("utf8");
+    let mut child = config_mutation_command(root)
+        .args(["connect", "chat_completions"])
+        .env("RUNE_BASE_URL", format!("http://{address}/v1"))
+        .env("RUNE_PROVIDER", "chat_completions")
+        .env("OPENAI_API_KEY", "test-key")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("connect");
+    child
+        .stdin
+        .take()
+        .expect("input")
+        .write_all(b"2\n")
+        .expect("choice");
+    let out = child.wait_with_output().expect("output");
+    assert!(out.status.success(), "{out:?}");
+    server.join().expect("server");
+    let text = String::from_utf8(out.stdout).expect("text");
+    assert!(
+        text.contains("first-model") && text.contains("chosen-model"),
+        "{text}"
+    );
+    assert!(!text.contains("No model is selected"), "{text}");
+    let stored: toml::Table = toml::from_str(
+        &std::fs::read_to_string(root.join("config/rune/config.toml")).expect("config"),
+    )
+    .expect("toml");
+    assert_eq!(
+        stored["models"]["chat_completions"].as_str(),
+        Some("chosen-model")
+    );
 }

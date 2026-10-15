@@ -266,7 +266,7 @@ fn check_provider(settings: &Settings) -> Check {
             "provider",
             format!("{} connected but no model is selected", settings.provider),
         )
-        .with_hint("set `model` in the user config, or pass `--model <id>`");
+        .with_hint("set the provider entry in the `models` table, or pass `--model <id>`");
     }
 
     Check::ok(
