@@ -58,7 +58,7 @@ data leak, a pre-authentication 1 GiB allocation, a ServerHello downgrade); depe
 is `UNVERIFIED` (`04` F-2), but the crate is in the binary and the policy job treats it as blocking.
 Impact: the HTTPS path to every provider, web fetch and MCP HTTP. Smallest fix:
 `cargo update -p rustls --precise 0.23.46`, commit the lockfile, confirm `cargo deny check` passes;
-`ureq = "3"` accepts the bump.
+`ureq = "3"` accepts the bump. (See the 16 Oct update in section 6.)
 
 **3. The per-turn prompt floor is 9,108 bytes, and 89 percent is one crate's symbol map (F-3).**
 `rune prompt --show` emits 9,108 bytes over 62 lines: a 994-byte `SYSTEM_PROMPT`, an 8,114-byte
@@ -72,7 +72,7 @@ a synthetic fixture (`04` F-3). Impact: every turn of every session pays about 2
 own bytes-divided-by-four estimate (`README.md:577`), most of it a slice of a single crate. Smallest
 fix: add an assembled-prompt byte assertion to `xtask budget`, and allocate the declaration budget
 round-robin or per crate instead of "first 1,024 in path order". A fix exists uncommitted on the audit
-host but is uncommitted and unbuilt (`04` addendum).
+host but is uncommitted and unbuilt (`04` addendum). (See the 16 Oct update in section 6.)
 
 **4. Ubuntu CI fails 5 process-group shell tests that pass locally (F-4).** The `fast` and
 `ubuntu-latest` jobs fail 484 passed / 5 failed, all in `crates/rune-tools/src/shell.rs`
@@ -80,17 +80,20 @@ host but is uncommitted and unbuilt (`04` addendum).
 137]`, and two expect a forked child that never started. The same suite is 489 passed locally on the
 same revision. Owning files `shell.rs:950-979,1009-1023,1161-1179` and the five tests at `:1280`,
 `:1664`, `:1730`, `:2282`, `:2335`. The root cause is `UNVERIFIED` (three ranked hypotheses in
-`04` F-4). Impact: the primary platform's CI is red on a step that is documented as the PTY gate.
+`04` F-4; see the 16 Oct update in section 6). Impact: the primary platform's CI is red on a step that is
+documented as the PTY gate.
 Smallest fix: first make the tests print the observed pid, `ps` output and raw exit status, and
 serialize them, so the next run yields a diagnosis; do not `#[ignore]` without a tracked issue.
 
-**5. macOS CI never exits after `/exit` (F-5).** `interactive_http_mcp_obeys_trust_policy_and_offline_mode`
-times out after 5 seconds and the PTY child never terminates; a sibling test failed the same way
-(`00` cause 3, `04` F-5). Owning files `crates/rune/tests/mcp_http.rs:7,16` and
-`crates/rune/tests/terminal_accessible.rs:16`, with the `/exit` handler in `crates/rune/src/session.rs`.
-Whether this is a product bug or a harness artifact is `UNVERIFIED` (`04` F-5). Impact: macOS CI is red;
-if it is the product, a macOS user cannot leave a PTY session. Smallest fix: instrument and raise the
-wait to decide product versus harness, then fix the correct side.
+**5. macOS CI times out 76 seconds in one interactive MCP HTTP test (F-5).**
+`interactive_http_mcp_obeys_trust_policy_and_offline_mode` panicked at
+`crates/rune/tests/mcp_http.rs:16:5`; the single test took 76.18s to fail (`0 passed; 1 failed; 0 ignored;
+0 measured; 0 filtered out; finished in 76.18s`; `00` cause 3, `04` F-5). Every other test in the same job
+passed, including a sibling in the same file, which printed `startup-error: passed`. Owning file
+`crates/rune/tests/mcp_http.rs:16`. The cause is `UNVERIFIED`. Impact: macOS CI is red, and one test costs
+76 seconds. Smallest fix: instrument what the test waits for and why it does not arrive on macOS, with the
+strongest candidate being `localhost` resolving to `::1` before `127.0.0.1`, then fix the side the evidence
+names.
 
 **6. Windows CI fails 5 tests, including a sandbox report that says "refused" where the test expects
 "enforced" (F-6).** The five failures are in `permissions`, `sandbox` and three `session` tests
@@ -127,10 +130,10 @@ Smallest fix: one documentation pass.
 
 **Unproven, not broken.** `04` section 4 lists what could not be established on the audit host and
 should not be read as clean: macOS and Windows runtime behavior (root causes above are `Inferred`),
-the Ubuntu shell-test root cause (`UNVERIFIED`), whether the macOS exit hang is a product bug
-(`UNVERIFIED`), exploitability of the rustls advisories, paid-provider behavior, real browser WASM
-execution, legacy-session migration, and fault injection for the resource-accumulation, session-holder
-and concurrent-log paths in `AUDIT.md:1660`.
+the Ubuntu shell-test root cause (`UNVERIFIED`; see the 16 Oct update in section 6), whether the macOS
+MCP HTTP test timeout is a product bug (`UNVERIFIED`), exploitability of the rustls advisories,
+paid-provider behavior, real browser WASM execution, legacy-session migration, and fault injection for the
+resource-accumulation, session-holder and concurrent-log paths in `AUDIT.md:1660`.
 
 ## 3. How it compares
 
@@ -252,8 +255,8 @@ anything later.
   `[runner]` to fetch and verify; the manifest edit itself is `[local]`.
 - A2. Instrument the five Ubuntu shell tests to print pid, `ps` and raw exit status, serialize them,
   and land a root-cause fix (F-4). `[runner]`.
-- A3. Decide and fix the macOS `/exit` hang (F-5). `[runner]` plus `[owner]` on whether it is product
-  or harness.
+- A3. Decide and fix the macOS interactive MCP HTTP test timeout (F-5). `[runner]` plus `[owner]` on
+  whether it is product or harness.
 - A4. Normalize `\` in `quote` or `#[cfg(unix)]`-gate the macOS sandbox test entry, then instrument and
   fix the other four Windows failures (F-6). `[runner]`.
 - A5. Make `terminal_question` wait on an idle marker (F-7). `[local]`, verified `[runner]`.
@@ -301,6 +304,22 @@ anything later.
 - Acceptance: no published number disagrees with a measurement, and the site's differentiators
   match the four anti-gaps.
 
+**Update, 16 Oct, after this document was written.** Three branches landed after the above was written.
+
+- `fix/ci-ubuntu-pty` found and fixed the cause of the five shell and PTY failures: the ubuntu runner has
+  bubblewrap installed and user namespaces allowed, so the sandbox runs commands with
+  `--unshare-pid --new-session`, which hides host PIDs, process groups and signal death from the tests. The
+  test helper called `with_allow_unsandboxed(true)` believing it disabled sandboxing, but that flag is only
+  honoured when support is not full. The fix adds a `#[cfg(test)]` unconfined constructor and makes the test
+  workspace unconfined, with production semantics unchanged. So item 4's root cause is no longer
+  `UNVERIFIED`.
+- `fix/dependency-advisories` patches the TLS stack, rustls 0.23.45 to 0.23.46, which is the four
+  advisories; the gate evidence lives in that branch's notes.
+- `perf/prompt-floor` cuts the per-turn floor from 9,107 bytes to 4,943, the map from 40 entries to 20, the
+  default `repository_map_bytes` from 8192 to 4096, and adds a 6144-byte `PROMPT_CEILING_BYTES` enforced by
+  `cargo xtask budget` plus a unit test. These numbers come from the branch's own before/after measurement
+  and are confirmed by the reviewer's gate run, not by a CI run.
+
 ## 7. Open decisions for the owner
 
 **R-006, escaping literal filenames in remembered grants.** `AUDIT.md:21,1673`. The acceptance asks
@@ -334,8 +353,8 @@ both, accepting the cost.
 reproducible; Claw-SWE-Bench is the strongest SWE-bench-native option but needs Docker, iptables and an
 SNI proxy; FrontierHarness needs a matched control. Recommendation: openbench first.
 
-**The macOS `/exit` hang.** `04` F-5. Is it a product bug or a harness artifact? Recommendation:
-instrument before committing engineering time, since the local Linux PTY paths pass.
+**The macOS interactive MCP HTTP test timeout.** `04` F-5. Is it a product bug or a harness artifact?
+Recommendation: instrument before committing engineering time, since the local Linux PTY paths pass.
 
 **Is the 5.40 MiB CHANGELOG line a typo or a policy?** `04` F-9a. Recommendation: treat 5.43 as
 canonical because it matches the measured binary and the README, and correct the changelog line.
