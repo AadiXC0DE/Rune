@@ -38,9 +38,9 @@ pub struct FetchRequest {
     pub body: Vec<u8>,
     /// Budget for the whole request, head and body.
     ///
-    /// `None` leaves the body unbounded in time, which a streaming completion
-    /// needs: a generation legitimately runs for minutes, and the head timeout
-    /// bounds the part that can hang.
+    /// `None` leaves the body unbounded in time. Provider requests resolve this
+    /// budget from `provider_request_timeout_ms`, independently of the head
+    /// timeout.
     pub timeout: Option<Duration>,
     /// Time allowed for the response head to arrive once the request is sent.
     ///

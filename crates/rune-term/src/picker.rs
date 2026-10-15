@@ -109,6 +109,12 @@ impl Picker {
         self.offset = 0;
     }
 
+    /// Resizes the choice window, keeping the current highlight visible.
+    pub fn set_window(&mut self, window: usize) {
+        self.window = window.max(1);
+        self.follow();
+    }
+
     /// Returns the positions in `items` that match the query, in list order.
     #[must_use]
     pub fn matches(&self) -> Vec<usize> {
@@ -407,6 +413,20 @@ mod tests {
         }
         assert_eq!(picker.cursor(), 5);
         assert_eq!(picker.offset, 5);
+    }
+
+    #[test]
+    fn resizing_the_window_keeps_the_highlight_visible() {
+        let theme = Theme::no_color();
+        let mut picker = Picker::new("models", items(20), DEFAULT_WINDOW);
+        picker.to(9);
+        for window in [1, 4, DEFAULT_WINDOW, 0] {
+            picker.set_window(window);
+            let rows = picker.rows(&theme, false);
+            assert_eq!(picker.selected(), Some("item-9"));
+            assert!(rows.iter().any(|row| row == "> item-9"), "{rows:?}");
+            assert!(rows.len() <= window.max(1).saturating_add(1));
+        }
     }
 
     #[test]

@@ -44,13 +44,18 @@ pub const BUILTINS: &[Builtin] = &[
     },
     Builtin {
         name: "compact",
-        arguments: "",
-        summary: "summarize older turns to free the context window",
+        arguments: "[preview]",
+        summary: "summarize older turns, or preview record counts without changes",
+    },
+    Builtin {
+        name: "pin",
+        arguments: "[constraint]",
+        summary: "pin a user constraint across compaction, or list current pins",
     },
     Builtin {
         name: "undo",
-        arguments: "",
-        summary: "put back the files the last turn changed",
+        arguments: "[preview]",
+        summary: "restore files changed in this session, or preview per-file diffs",
     },
     Builtin {
         name: "tree",
@@ -73,6 +78,11 @@ pub const BUILTINS: &[Builtin] = &[
         summary: "name this session",
     },
     Builtin {
+        name: "goal",
+        arguments: "[--budget <tokens>] [objective]",
+        summary: "set or show the active objective and optional token budget",
+    },
+    Builtin {
         name: "history",
         arguments: "[here|session-id|clear]",
         summary: "show recorded prompts",
@@ -80,7 +90,7 @@ pub const BUILTINS: &[Builtin] = &[
     Builtin {
         name: "help",
         arguments: "",
-        summary: "list the commands, and any this project defines",
+        summary: "list commands and active keyboard bindings",
     },
     Builtin {
         name: "quit",

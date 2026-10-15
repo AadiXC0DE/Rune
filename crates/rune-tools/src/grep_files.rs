@@ -5,16 +5,16 @@ use std::fmt::Write as _;
 use std::io::{BufRead, BufReader};
 
 use camino::{Utf8Path, Utf8PathBuf};
-use rune_core::error::{Result, RuneError};
+use rune_core::error::{ErrorCode, Result, RuneError};
 
-use crate::contract::{Activity, ExecutionContext, Tool, ToolOutput};
+use crate::contract::{Activity, ExecutionContext, Tool, ToolOutput, validate_closed_arguments};
 use crate::workspace::{
     FileLimits, MAX_MATCH_LINE_BYTES, Walker, bool_arg, compile_glob_as, default_root, display_in,
-    join_capped, read_line_bounded, resolve, roots, string_arg, summarize, truncate_line,
+    join_capped, read_line_bounded_observed, resolve, roots, string_arg, summarize, truncate_line,
     usize_arg, walk_notes,
 };
 
-/// How often a long search checks for cancellation.
+/// How often traversal checks for cancellation between files.
 const CANCEL_CHECK_INTERVAL: usize = 256;
 
 /// Bytes read to decide whether a file is binary.
@@ -22,6 +22,9 @@ const PROBE_BYTES: usize = 8 * 1024;
 
 /// Names listed before a footer says how many more there are.
 const MAX_LISTED_NAMES: usize = 20;
+
+/// Largest context window a model may request, bounding the ring allocation.
+const MAX_CONTEXT_LINES: usize = 1000;
 
 /// Characters that make a pattern look like a regular expression.
 ///
@@ -100,6 +103,7 @@ impl Tool for GrepFiles {
                 "context_lines": {
                     "type": "integer",
                     "minimum": 0,
+                    "maximum": MAX_CONTEXT_LINES,
                     "description": "Lines shown before and after each match, in matches mode.",
                 },
             },
@@ -125,6 +129,8 @@ impl Tool for GrepFiles {
         arguments: &serde_json::Value,
         context: &ExecutionContext,
     ) -> Result<ToolOutput> {
+        context.check_cancelled()?;
+        validate_closed_arguments(arguments, &self.input_schema())?;
         let query = parse(self, arguments, context)?;
         let include = match query.include.as_deref() {
             Some(pattern) => Some(compile_glob_as("include", pattern)?),
@@ -147,14 +153,23 @@ impl Tool for GrepFiles {
                 continue;
             }
             let display = display_in(&normalised, &entry.path);
-            if let Err(err) = scan(&entry.path, &display, &query, report.matches, &mut report) {
+            if let Err(err) = scan(
+                &entry.path,
+                &display,
+                &query,
+                report.matches,
+                &mut report,
+                context,
+            ) {
                 match err {
                     ScanError::Binary => report.binary.push(display),
                     ScanError::Unreadable(reason) => report.unreadable.push((display, reason)),
+                    ScanError::Cancelled(err) => return Err(err),
                 }
             }
         }
 
+        context.check_cancelled()?;
         Ok(ToolOutput::success(render(
             &query,
             &label,
@@ -198,6 +213,15 @@ fn parse(
         ));
     }
 
+    let context_lines = usize_arg(arguments, "context_lines")?.unwrap_or(0);
+    if context_lines > MAX_CONTEXT_LINES {
+        return Err(RuneError::invalid_field(
+            "context_lines",
+            format!("`context_lines` must be at most {MAX_CONTEXT_LINES}"),
+        )
+        .with_observed(context_lines.to_string()));
+    }
+
     let root = match string_arg(arguments, "path")? {
         Some(raw) => resolve(context, raw)?.path,
         None => default_root(context)?.path,
@@ -221,7 +245,7 @@ fn parse(
         mode: Mode::of(arguments)?,
         head_limit,
         offset: usize_arg(arguments, "offset")?.unwrap_or(0),
-        context_lines: usize_arg(arguments, "context_lines")?.unwrap_or(0),
+        context_lines,
     })
 }
 
@@ -285,11 +309,14 @@ struct Report {
 }
 
 /// Why a file was not searched.
+#[derive(Debug)]
 enum ScanError {
     /// The file is binary and was skipped.
     Binary,
     /// The file could not be read.
     Unreadable(String),
+    /// Cancellation stops the entire search rather than skipping the file.
+    Cancelled(RuneError),
 }
 
 /// Searches one file, folding whatever it found into the report.
@@ -303,11 +330,28 @@ fn scan(
     query: &Query,
     base: usize,
     report: &mut Report,
+    context: &ExecutionContext,
 ) -> std::result::Result<(), ScanError> {
+    context.check_cancelled().map_err(ScanError::Cancelled)?;
     let file = std::fs::File::open(path.as_std_path())
         .map_err(|err| ScanError::Unreadable(format!("`{display}` could not be read: {err}")))?;
     let mut reader = BufReader::with_capacity(PROBE_BYTES, file);
-    if reader.fill_buf().unwrap_or_default().contains(&0) {
+    scan_reader(&mut reader, display, query, base, report, context)
+}
+
+/// Scans buffered chunks with cancellation checks, including oversized lines.
+fn scan_reader<R: BufRead>(
+    reader: &mut R,
+    display: &str,
+    query: &Query,
+    base: usize,
+    report: &mut Report,
+    context: &ExecutionContext,
+) -> std::result::Result<(), ScanError> {
+    context.check_cancelled().map_err(ScanError::Cancelled)?;
+    let binary = reader.fill_buf().unwrap_or_default().contains(&0);
+    context.check_cancelled().map_err(ScanError::Cancelled)?;
+    if binary {
         return Err(ScanError::Binary);
     }
 
@@ -316,6 +360,7 @@ fn scan(
     } else {
         query.pattern.clone()
     };
+    let matcher = LiteralMatcher::new(&needle, query.case_insensitive)?;
 
     // Findings are staged locally and merged only when the whole file has been
     // read, so a file rejected partway through leaves no trace in the report.
@@ -337,10 +382,21 @@ fn scan(
     let mut buffer = Vec::new();
 
     loop {
-        let line =
-            read_line_bounded(&mut reader, &mut buffer, MAX_MATCH_LINE_BYTES).map_err(|err| {
-                ScanError::Unreadable(format!("`{display}` could not be read: {err}"))
-            })?;
+        let mut matching = matcher.line();
+        let line = read_line_bounded_observed(
+            reader,
+            &mut buffer,
+            MAX_MATCH_LINE_BYTES,
+            || context.check_cancelled(),
+            |chunk| matching.feed(chunk),
+        )
+        .map_err(|err: RuneError| {
+            if err.code() == ErrorCode::Cancelled {
+                ScanError::Cancelled(err)
+            } else {
+                ScanError::Unreadable(format!("`{display}` could not be read: {}", err.message()))
+            }
+        })?;
         if line.consumed == 0 {
             break;
         }
@@ -352,14 +408,9 @@ fn scan(
         number = number.saturating_add(1);
         let text = String::from_utf8_lossy(&buffer);
         let text = text.trim_end_matches(['\n', '\r']);
+        // All source chunks are searched independently of the retained head.
+        let matched = matching.finish();
         let shown = truncate_line(text, line.length, MAX_MATCH_LINE_BYTES);
-        let haystack = if query.case_insensitive {
-            shown.to_lowercase()
-        } else {
-            shown.clone()
-        };
-
-        let matched = haystack.contains(&needle);
         let mut recorded = false;
         if matched {
             found.matches = found.matches.saturating_add(1);
@@ -432,6 +483,198 @@ struct Found {
     matches: usize,
     /// Hits to report, already limited to the page.
     hits: Vec<Hit>,
+}
+
+/// A streaming literal search. The prefix table bounds both memory and work
+/// even for patterns longer than the reader's buffer or with repeated prefixes.
+struct LiteralMatcher {
+    needle: Vec<u8>,
+    prefixes: Vec<usize>,
+    case_insensitive: bool,
+    /// Lowercasing Greek sigma depends on surrounding cased characters, ignoring
+    /// case-ignorable characters. Other lowercase mappings are per character.
+    sigma_context: Option<(regex::Regex, regex::Regex)>,
+}
+
+impl LiteralMatcher {
+    fn new(needle: &str, case_insensitive: bool) -> std::result::Result<Self, ScanError> {
+        let sigma_context = if case_insensitive && needle.contains(['σ', 'ς']) {
+            let compile = |pattern| {
+                regex::Regex::new(pattern)
+                    .map_err(|err| ScanError::Unreadable(format!("Unicode matcher: {err}")))
+            };
+            Some((
+                compile(r"\A\p{Cased}\z")?,
+                compile(r"\A\p{Case_Ignorable}\z")?,
+            ))
+        } else {
+            None
+        };
+        let needle = needle.as_bytes().to_vec();
+        let mut prefixes = vec![0; needle.len()];
+        let mut prefix = 0;
+        for index in 1..needle.len() {
+            while prefix > 0 && needle[index] != needle[prefix] {
+                prefix = prefixes[prefix.saturating_sub(1)];
+            }
+            if needle[index] == needle[prefix] {
+                prefix = prefix.saturating_add(1);
+            }
+            prefixes[index] = prefix;
+        }
+        Ok(Self {
+            needle,
+            prefixes,
+            case_insensitive,
+            sigma_context,
+        })
+    }
+
+    fn line(&self) -> MatchingLine<'_> {
+        MatchingLine {
+            matcher: self,
+            state: MatchState::default(),
+            final_sigma: None,
+            preceding_cased: false,
+            undecoded: Vec::new(),
+        }
+    }
+
+    fn advance(&self, state: &mut MatchState, bytes: &[u8]) {
+        for byte in bytes {
+            if state.matched {
+                return;
+            }
+            while state.prefix > 0 && *byte != self.needle[state.prefix] {
+                state.prefix = self.prefixes[state.prefix.saturating_sub(1)];
+            }
+            if *byte == self.needle[state.prefix] {
+                state.prefix = state.prefix.saturating_add(1);
+            }
+            state.matched = state.prefix == self.needle.len();
+        }
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct MatchState {
+    prefix: usize,
+    matched: bool,
+}
+
+/// Per-line state holds only the matcher prefix, incomplete UTF-8, and two
+/// possible sigma states until its following context decides the lowercase form.
+struct MatchingLine<'a> {
+    matcher: &'a LiteralMatcher,
+    state: MatchState,
+    final_sigma: Option<MatchState>,
+    preceding_cased: bool,
+    undecoded: Vec<u8>,
+}
+
+impl MatchingLine<'_> {
+    fn feed(&mut self, chunk: &[u8]) {
+        if self.state.matched && self.final_sigma.is_none() {
+            return;
+        }
+        // Carry incomplete UTF-8 into the next chunk. Invalid sequences have
+        // exactly the same replacement characters as from_utf8_lossy on a line.
+        if self.undecoded.is_empty() {
+            self.decode(chunk);
+        } else {
+            let mut bytes = std::mem::take(&mut self.undecoded);
+            bytes.extend_from_slice(chunk);
+            self.decode(&bytes);
+        }
+    }
+
+    fn decode(&mut self, mut rest: &[u8]) {
+        while !rest.is_empty() {
+            match std::str::from_utf8(rest) {
+                Ok(text) => {
+                    self.text(text);
+                    rest = &[];
+                }
+                Err(err) => {
+                    let valid = err.valid_up_to();
+                    if let Ok(text) = std::str::from_utf8(&rest[..valid]) {
+                        self.text(text);
+                    }
+                    rest = &rest[valid..];
+                    if let Some(invalid) = err.error_len() {
+                        self.character('�');
+                        rest = &rest[invalid..];
+                    } else {
+                        break;
+                    }
+                }
+            }
+        }
+        self.undecoded.extend_from_slice(rest);
+    }
+
+    fn text(&mut self, text: &str) {
+        if self.matcher.case_insensitive {
+            for character in text.chars() {
+                self.character(character);
+                if self.state.matched && self.final_sigma.is_none() {
+                    break;
+                }
+            }
+        } else {
+            self.matcher.advance(&mut self.state, text.as_bytes());
+        }
+    }
+
+    fn character(&mut self, character: char) {
+        let mut encoded = [0; 4];
+        if let Some((cased, ignorable)) = &self.matcher.sigma_context {
+            let text = character.encode_utf8(&mut encoded);
+            let (is_cased, is_ignorable) = if character.is_ascii_alphabetic() {
+                (true, false)
+            } else {
+                (cased.is_match(text), ignorable.is_match(text))
+            };
+            if !is_ignorable
+                && let Some(final_sigma) = self.final_sigma.take()
+                && !is_cased
+            {
+                self.state = final_sigma;
+            }
+            if character == 'Σ' && self.preceding_cased {
+                let mut alternate = self.state;
+                self.matcher.advance(&mut alternate, "ς".as_bytes());
+                self.final_sigma = Some(alternate);
+                self.matcher.advance(&mut self.state, "σ".as_bytes());
+                self.preceding_cased = true;
+                return;
+            }
+            if !is_ignorable {
+                self.preceding_cased = is_cased;
+            }
+        }
+        if self.matcher.case_insensitive {
+            for lower in character.to_lowercase() {
+                self.advance(lower.encode_utf8(&mut encoded).as_bytes());
+            }
+        } else {
+            self.advance(character.encode_utf8(&mut encoded).as_bytes());
+        }
+    }
+
+    fn advance(&mut self, bytes: &[u8]) {
+        self.matcher.advance(&mut self.state, bytes);
+        if let Some(alternate) = &mut self.final_sigma {
+            self.matcher.advance(alternate, bytes);
+        }
+    }
+
+    fn finish(mut self) -> bool {
+        if !self.undecoded.is_empty() {
+            self.character('�');
+        }
+        self.final_sigma.unwrap_or(self.state).matched
+    }
 }
 
 /// Renders the report for the model.
@@ -544,10 +787,200 @@ fn render(query: &Query, label: &str, report: &Report, walker: &Walker, cap: usi
 
 #[cfg(test)]
 mod tests {
-    use rune_core::error::ErrorCode;
-
     use super::*;
+    use crate::contract::Cancellation;
     use crate::workspace::fixture::{MATCH_FILES, MATCH_LINES, Repo, budget_with_list_entries};
+
+    /// Cancels at a known byte boundary without relying on thread scheduling.
+    struct CancellingReader<R> {
+        inner: R,
+        cancellation: Cancellation,
+        cancel_after: usize,
+        consumed: usize,
+        fills: usize,
+    }
+
+    impl<R: std::io::Read> std::io::Read for CancellingReader<R> {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            self.inner.read(buffer)
+        }
+    }
+
+    impl<R: BufRead> BufRead for CancellingReader<R> {
+        fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+            self.fills = self.fills.checked_add(1).expect("buffer fills");
+            self.inner.fill_buf()
+        }
+
+        fn consume(&mut self, amount: usize) {
+            self.inner.consume(amount);
+            self.consumed = self.consumed.checked_add(amount).expect("consumed bytes");
+            if self.consumed >= self.cancel_after {
+                self.cancellation.cancel();
+            }
+        }
+    }
+
+    #[test]
+    fn a_cancelled_call_stops_before_accessing_the_file() {
+        let repo = Repo::new();
+        let context = repo.context();
+        context.cancellation().cancel();
+
+        for path in ["README.md", "absent.txt"] {
+            let error = GrepFiles::new()
+                .call(
+                    &serde_json::json!({ "pattern": "needle", "path": path }),
+                    &context,
+                )
+                .expect_err("cancelled before file access");
+            assert_eq!(error.code(), ErrorCode::Cancelled);
+        }
+    }
+
+    #[test]
+    fn a_cancelled_scan_does_no_io() {
+        let repo = Repo::new();
+        let context = repo.context();
+        let query = parse(
+            &GrepFiles::new(),
+            &serde_json::json!({ "pattern": "needle" }),
+            &context,
+        )
+        .expect("query");
+        context.cancellation().cancel();
+        let mut reader = CancellingReader {
+            inner: std::io::Cursor::new(b"needle\n"),
+            cancellation: context.cancellation(),
+            cancel_after: usize::MAX,
+            consumed: 0,
+            fills: 0,
+        };
+        let mut report = Report::default();
+
+        let error = scan_reader(&mut reader, "large.txt", &query, 0, &mut report, &context)
+            .expect_err("cancelled before reading");
+        assert!(matches!(error, ScanError::Cancelled(err) if err.code() == ErrorCode::Cancelled));
+        assert_eq!(reader.consumed, 0);
+        assert_eq!(reader.fills, 0);
+    }
+
+    #[test]
+    fn cancellation_stops_within_one_large_file_in_every_mode() {
+        let repo = Repo::new();
+        let body = "needle on a short line\n".repeat(64 * 1024);
+        repo.write("large.txt", &body);
+        for (mode, offset) in [
+            ("matches", 0),
+            ("matches", 100_000),
+            ("files_with_matches", 0),
+            ("count", 0),
+        ] {
+            let context = repo.context();
+            let query = parse(
+                &GrepFiles::new(),
+                &serde_json::json!({
+                    "pattern": "NEEDLE",
+                    "path": "large.txt",
+                    "case_insensitive": true,
+                    "mode": mode,
+                    "offset": offset,
+                    "head_limit": 1,
+                    "context_lines": 2,
+                }),
+                &context,
+            )
+            .expect("query");
+            let mut reader = CancellingReader {
+                inner: BufReader::with_capacity(
+                    PROBE_BYTES,
+                    std::fs::File::open(&query.root).expect("open"),
+                ),
+                cancellation: context.cancellation(),
+                cancel_after: 3 * PROBE_BYTES,
+                consumed: 0,
+                fills: 0,
+            };
+            let mut report = Report::default();
+
+            let error = scan_reader(&mut reader, "large.txt", &query, 0, &mut report, &context)
+                .expect_err("cancelled during a single-file search");
+            assert!(
+                matches!(error, ScanError::Cancelled(err) if err.code() == ErrorCode::Cancelled)
+            );
+            assert!(reader.consumed >= reader.cancel_after);
+            assert!(reader.consumed <= reader.cancel_after + PROBE_BYTES);
+            assert!(reader.consumed < body.len());
+            assert_eq!(report.matches, 0);
+            assert_eq!(report.files, 0);
+            assert!(report.hits.is_empty());
+            assert!(report.named.is_empty());
+        }
+    }
+
+    #[test]
+    fn cancellation_stops_while_discarding_an_oversized_line() {
+        let repo = Repo::new();
+        let context = repo.context();
+        let query = parse(
+            &GrepFiles::new(),
+            &serde_json::json!({ "pattern": "x" }),
+            &context,
+        )
+        .expect("query");
+        let body = "x".repeat(8 * MAX_MATCH_LINE_BYTES);
+        let mut reader = CancellingReader {
+            inner: BufReader::with_capacity(PROBE_BYTES, body.as_bytes()),
+            cancellation: context.cancellation(),
+            cancel_after: MAX_MATCH_LINE_BYTES + 3 * PROBE_BYTES,
+            consumed: 0,
+            fills: 0,
+        };
+        let mut report = Report::default();
+
+        let error = scan_reader(&mut reader, "large.txt", &query, 0, &mut report, &context)
+            .expect_err("cancelled while discarding a long line");
+        assert!(matches!(error, ScanError::Cancelled(err) if err.code() == ErrorCode::Cancelled));
+        assert_eq!(reader.consumed, reader.cancel_after);
+        assert!(reader.consumed < body.len());
+        assert_eq!(report.matches, 0);
+        assert!(report.hits.is_empty());
+    }
+
+    #[test]
+    fn cancellation_on_the_final_chunk_does_not_merge_partial_matches() {
+        let repo = Repo::new();
+        for body in [
+            b"needle\nlast line\n".as_slice(),
+            b"needle\nlast line".as_slice(),
+        ] {
+            let context = repo.context();
+            let query = parse(
+                &GrepFiles::new(),
+                &serde_json::json!({ "pattern": "needle" }),
+                &context,
+            )
+            .expect("query");
+            let mut reader = CancellingReader {
+                inner: BufReader::with_capacity(PROBE_BYTES, body),
+                cancellation: context.cancellation(),
+                cancel_after: body.len(),
+                consumed: 0,
+                fills: 0,
+            };
+            let mut report = Report::default();
+
+            let error = scan_reader(&mut reader, "large.txt", &query, 0, &mut report, &context)
+                .expect_err("cancelled at end of file");
+            assert!(
+                matches!(error, ScanError::Cancelled(err) if err.code() == ErrorCode::Cancelled)
+            );
+            assert_eq!(reader.consumed, body.len());
+            assert_eq!(report.matches, 0);
+            assert_eq!(report.files, 0);
+            assert!(report.hits.is_empty());
+        }
+    }
 
     /// Builds a search with a lowered listing cap.
     fn search(entries: usize) -> GrepFiles {
@@ -859,6 +1292,73 @@ mod tests {
         assert!(output.text.contains("-before"), "{}", output.text);
         assert!(output.text.contains("-after"), "{}", output.text);
         assert!(output.text.contains(":needle here"), "{}", output.text);
+    }
+
+    #[test]
+    fn an_extreme_context_argument_returns_a_validation_error() {
+        let repo = Repo::new();
+        repo.write("fixture.txt", "x\n");
+        let arguments = serde_json::from_str(
+            r#"{"pattern":"x","path":"fixture.txt","context_lines":18446744073709551615}"#,
+        )
+        .expect("arguments");
+        let err = GrepFiles::default()
+            .call(&arguments, &repo.context())
+            .expect_err("context must be bounded before allocation");
+        assert_eq!(err.code(), ErrorCode::InvalidField);
+        assert_eq!(err.detail().field.as_deref(), Some("context_lines"));
+    }
+
+    #[test]
+    fn context_over_the_maximum_is_rejected_in_every_mode() {
+        let repo = Repo::new();
+        repo.write("fixture.txt", "x\n");
+        for mode in ["matches", "files_with_matches", "count"] {
+            let err = GrepFiles::default()
+                .call(
+                    &serde_json::json!({
+                        "pattern": "x",
+                        "path": "fixture.txt",
+                        "mode": mode,
+                        "context_lines": MAX_CONTEXT_LINES.saturating_add(1),
+                    }),
+                    &repo.context(),
+                )
+                .expect_err("context exceeds the maximum");
+            assert_eq!(err.code(), ErrorCode::InvalidField);
+            assert_eq!(err.detail().field.as_deref(), Some("context_lines"));
+            assert!(
+                err.message().contains(&MAX_CONTEXT_LINES.to_string()),
+                "{err}"
+            );
+        }
+    }
+
+    #[test]
+    fn zero_and_maximum_context_windows_are_accepted_without_clamping() {
+        let repo = Repo::new();
+        let before = "before\n".repeat(MAX_CONTEXT_LINES);
+        let after = "after\n".repeat(MAX_CONTEXT_LINES);
+        repo.write("fixture.txt", &format!("{before}x\n{after}"));
+        for context_lines in [0, MAX_CONTEXT_LINES] {
+            let output = GrepFiles::default()
+                .call(
+                    &serde_json::json!({
+                        "pattern": "x",
+                        "path": "fixture.txt",
+                        "context_lines": context_lines,
+                    }),
+                    &repo.context(),
+                )
+                .expect("valid context");
+            assert!(!output.is_error);
+            assert_eq!(
+                lines_for(&output.text, "fixture.txt").len(),
+                context_lines.saturating_mul(2).saturating_add(1),
+                "{}",
+                output.text
+            );
+        }
     }
 
     /// Returns the lines a search printed for one file, in order.
@@ -1196,6 +1696,253 @@ mod tests {
     }
 
     #[test]
+    fn streaming_search_preserves_whole_line_text_at_chunk_boundaries() {
+        let repo = Repo::new();
+        let cases: &[(&[u8], &[&str])] = &[
+            (
+                "prefix Éİ🦀 ΟΣ ΟΣΑ Σ AΣ' AΣ'B AΣ\u{301} AΣ\u{301}B\r\n".as_bytes(),
+                &[
+                    "Éİ🦀",
+                    "éİ🦀",
+                    "ΟΣ",
+                    "οσ",
+                    "ος",
+                    "σ",
+                    "ς",
+                    "aς'",
+                    "aσ'b",
+                    "aς\u{301}",
+                    "aσ\u{301}b",
+                ],
+            ),
+            (b"a\xffb\xe2\x82c\xf0\x9f", &["a�b", "b�c�", "�", "absent"]),
+            (b"ababababac\n", &["ababac", "abababad", "abac"]),
+            (b"hidden\nneedle\n", &["hiddenneedle"]),
+        ];
+        for (bytes, patterns) in cases {
+            repo.write_bytes("chunks.txt", bytes);
+            for pattern in *patterns {
+                for case_insensitive in [false, true] {
+                    let source = String::from_utf8_lossy(bytes);
+                    let expected = source
+                        .lines()
+                        .filter(|line| {
+                            if case_insensitive {
+                                line.to_lowercase().contains(&pattern.to_lowercase())
+                            } else {
+                                line.contains(pattern)
+                            }
+                        })
+                        .count();
+                    let context = repo.context();
+                    let query = parse(
+                        &GrepFiles::new(),
+                        &serde_json::json!({ "pattern": pattern, "case_insensitive": case_insensitive }),
+                        &context,
+                    ).expect("query");
+                    for capacity in [1, 2, 3, 7, PROBE_BYTES] {
+                        let mut reader = BufReader::with_capacity(capacity, *bytes);
+                        let mut report = Report::default();
+                        scan_reader(&mut reader, "chunks.txt", &query, 0, &mut report, &context)
+                            .expect("scan");
+                        assert_eq!(
+                            report.matches, expected,
+                            "pattern={pattern:?}, insensitive={case_insensitive}, capacity={capacity}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn long_line_matches_span_chunks_and_the_retained_head_boundary() {
+        let repo = Repo::new();
+        for start in [
+            MAX_MATCH_LINE_BYTES - 5,
+            MAX_MATCH_LINE_BYTES + PROBE_BYTES - 5,
+        ] {
+            for ending in ["\n", "\r\n", ""] {
+                repo.write(
+                    "long.txt",
+                    &format!("{}hiddenneedle{ending}", "a".repeat(start)),
+                );
+                let output = GrepFiles::new().call(
+                    &serde_json::json!({ "pattern": "hiddenneedle", "path": "long.txt", "mode": "count" }),
+                    &repo.context(),
+                ).expect("call");
+                assert!(summary(&output.text).contains("1 matching lines in 1 files"));
+            }
+        }
+        let pattern = format!("{}b", "a".repeat(MAX_MATCH_LINE_BYTES + 1));
+        repo.write("long.txt", &format!("aaaa{pattern}\n"));
+        let output = GrepFiles::new()
+            .call(
+                &serde_json::json!({ "pattern": pattern, "path": "long.txt", "mode": "count" }),
+                &repo.context(),
+            )
+            .expect("call");
+        assert!(summary(&output.text).contains("1 matching lines in 1 files"));
+    }
+
+    #[test]
+    fn long_line_tail_matches_keep_pagination_context_and_binary_detection() {
+        let repo = Repo::new();
+        let line = format!("{}hiddenneedle", "a".repeat(MAX_MATCH_LINE_BYTES + 1));
+        repo.write(
+            "long.txt",
+            &format!("hiddenneedle\nbefore\n{line}\nafter\n"),
+        );
+        let context = repo.context().with_output_cap(4096);
+        let output = GrepFiles::new()
+            .call(
+                &serde_json::json!({
+                    "pattern": "hiddenneedle", "path": "long.txt",
+                    "head_limit": 1, "offset": 1, "context_lines": 1,
+                }),
+                &context,
+            )
+            .expect("call");
+        assert!(summary(&output.text).contains("2 matching lines in 1 files"));
+        assert!(output.text.contains("long.txt:     2-before"));
+        assert!(output.text.contains("long.txt:     3:"));
+        assert!(!output.text.contains("long.txt:     1:"));
+        assert!(output.text.len() <= 4096);
+
+        // Finding a match does not stop reading or checking the rest of a file.
+        repo.write_bytes("long.txt", format!("{line}\0\n").as_bytes());
+        for mode in ["matches", "files_with_matches", "count"] {
+            let output = GrepFiles::new().call(
+                &serde_json::json!({ "pattern": "hiddenneedle", "path": "long.txt", "mode": mode }),
+                &context,
+            ).expect("call");
+            assert!(summary(&output.text).contains("0 matching lines in 0 files"));
+            assert!(output.text.contains("1 binary files skipped"));
+        }
+    }
+
+    #[test]
+    fn matches_past_the_retained_line_head_are_counted_in_every_mode() {
+        let repo = Repo::new();
+        repo.write(
+            "long.txt",
+            &format!(
+                "{}hiddenneedle hiddenneedle\n",
+                "a".repeat(MAX_MATCH_LINE_BYTES + 1)
+            ),
+        );
+        let context = repo.context().with_output_cap(4096);
+        for mode in ["matches", "files_with_matches", "count"] {
+            for case_insensitive in [false, true] {
+                let output = GrepFiles::new()
+                    .call(
+                        &serde_json::json!({
+                            "pattern": if case_insensitive { "HIDDENNEEDLE" } else { "hiddenneedle" },
+                            "path": "long.txt",
+                            "mode": mode,
+                            "case_insensitive": case_insensitive,
+                        }),
+                        &context,
+                    )
+                    .expect("call");
+                assert!(!output.is_error);
+                assert!(summary(&output.text).contains("1 matching lines in 1 files"));
+                assert!(output.text.len() <= 4096);
+                if mode == "matches" {
+                    assert!(output.text.contains("long.txt:     1:"));
+                    assert!(output.text.contains("output truncated at the byte cap"));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_long_line_truncation_annotation_is_not_searched() {
+        let repo = Repo::new();
+        let line = format!("wideword {}\n", "q".repeat(MAX_MATCH_LINE_BYTES + 1));
+        assert!(!line.contains("line truncated"));
+        repo.write("wide/one.txt", &line);
+
+        let cap = 2 * MAX_MATCH_LINE_BYTES;
+        let context = repo.context().with_output_cap(cap);
+        let tool = GrepFiles::with_limits(FileLimits {
+            output_bytes: cap,
+            ..FileLimits::default()
+        });
+        let rendered = tool
+            .call(
+                &serde_json::json!({ "pattern": "wideword", "path": "wide/one.txt" }),
+                &context,
+            )
+            .expect("call");
+        assert!(!rendered.is_error);
+        assert!(rendered.text.contains("... [line truncated, the line is "));
+        assert!(summary(&rendered.text).contains("1 matching lines in 1 files"));
+        assert!(rendered.text.len() <= cap);
+
+        for mode in ["matches", "files_with_matches", "count"] {
+            for case_insensitive in [false, true] {
+                let pattern = if case_insensitive {
+                    "LINE TRUNCATED"
+                } else {
+                    "line truncated"
+                };
+                let output = tool
+                    .call(
+                        &serde_json::json!({
+                            "pattern": pattern,
+                            "path": "wide/one.txt",
+                            "mode": mode,
+                            "case_insensitive": case_insensitive,
+                        }),
+                        &context,
+                    )
+                    .expect("call");
+                assert!(!output.is_error);
+                assert!(
+                    summary(&output.text).contains("0 matching lines in 0 files"),
+                    "mode={mode}, case_insensitive={case_insensitive}: {}",
+                    summary(&output.text)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_literal_truncation_phrase_in_a_long_line_still_matches() {
+        let repo = Repo::new();
+        let line = format!("LINE TRUNCATED {}\n", "q".repeat(MAX_MATCH_LINE_BYTES + 1));
+        repo.write("wide/one.txt", &line);
+
+        for mode in ["matches", "files_with_matches", "count"] {
+            for case_insensitive in [false, true] {
+                let pattern = if case_insensitive {
+                    "line truncated"
+                } else {
+                    "LINE TRUNCATED"
+                };
+                let output = GrepFiles::default()
+                    .call(
+                        &serde_json::json!({
+                            "pattern": pattern,
+                            "path": "wide/one.txt",
+                            "mode": mode,
+                            "case_insensitive": case_insensitive,
+                        }),
+                        &repo.context(),
+                    )
+                    .expect("call");
+                assert!(!output.is_error);
+                assert!(
+                    summary(&output.text).contains("1 matching lines in 1 files"),
+                    "mode={mode}, case_insensitive={case_insensitive}: {}",
+                    summary(&output.text)
+                );
+            }
+        }
+    }
+
+    #[test]
     fn a_walk_cap_is_reported_in_the_result() {
         let repo = Repo::new();
         for index in 0..70 {
@@ -1310,6 +2057,11 @@ mod tests {
         let schema = GrepFiles::default().input_schema();
         assert_eq!(schema["required"][0], "pattern");
         assert_eq!(schema["additionalProperties"], false);
+        assert_eq!(schema["properties"]["context_lines"]["minimum"], 0);
+        assert_eq!(
+            schema["properties"]["context_lines"]["maximum"],
+            MAX_CONTEXT_LINES
+        );
         assert_eq!(
             schema["properties"]["mode"]["enum"],
             serde_json::json!(["matches", "files_with_matches", "count"])

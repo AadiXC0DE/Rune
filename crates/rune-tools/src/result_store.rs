@@ -2,8 +2,8 @@
 //!
 //! A large result stays out of the model's context but remains fully
 //! inspectable. The model receives a bounded preview, the retained byte count,
-//! and an opaque handle; `read_tool_result` reads a byte range or searches for a
-//! literal through that handle.
+//! and an opaque handle. The store API reads a byte range or searches for a
+//! literal through that handle; a model-callable reader is not yet registered.
 //!
 //! A handle is scoped to one session and is not guessable from another, so one
 //! session cannot read another's retained output.
@@ -11,10 +11,12 @@
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
-use rune_core::budget::{BudgetSet, LimitName};
+use rune_core::budget::{BudgetSet, EMERGENCY_CEILING_BYTES, LimitName};
 use rune_core::error::{ErrorCode, Result, RuneError};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+
+use crate::workspace::truncate_to_bytes;
 
 /// Preview size shown to the model when a result is retained.
 pub const DEFAULT_PREVIEW_BYTES: usize = 4096;
@@ -109,7 +111,9 @@ pub struct Preview {
     pub text: String,
     /// Total bytes retained.
     pub retained_bytes: u64,
-    /// The handle to read more.
+    /// Whether the result was stored and its handle can be read.
+    pub is_retained: bool,
+    /// A stable identifier, readable only when `is_retained` is true.
     pub handle: Handle,
     /// Whether the tool reported a failure.
     pub is_error: bool,
@@ -118,10 +122,13 @@ pub struct Preview {
 impl Preview {
     /// Renders the preview as the model-visible string.
     ///
-    /// States the retained size and the handle, and says how to read more, so
-    /// the model knows the result was truncated and what to do about it.
+    /// For stored results, states the retained size and readable handle.
+    /// Results returned whole without retention render as their original text.
     #[must_use]
     pub fn render(&self) -> String {
+        if !self.is_retained {
+            return self.text.clone();
+        }
         let mut out = String::new();
         out.push_str(&self.text);
         if !self.text.ends_with('\n') {
@@ -137,7 +144,7 @@ impl Preview {
 }
 
 /// The session-scoped store of retained results.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct Store {
     session: String,
     entries: BTreeMap<Handle, Retained>,
@@ -187,10 +194,65 @@ impl Store {
         cap.min(DEFAULT_PREVIEW_BYTES)
     }
 
+    /// Spills a full result that would otherwise be cut from the conversation.
+    ///
+    /// Unlike `retain`, the model's per-result cap does not cut the stored body.
+    /// The session's emergency byte ceiling and entry bound still apply. A
+    /// failure leaves the store unchanged so the caller can report that the
+    /// result could not be retained.
+    pub fn spill(
+        &mut self,
+        tool: &str,
+        tool_call: &str,
+        content: String,
+        is_error: bool,
+        preview_bytes: usize,
+    ) -> Result<Preview> {
+        let handle = Handle::derive(&self.session, tool_call, &content);
+        let replaced_bytes = self
+            .entries
+            .get(&handle)
+            .map_or(0, |entry| entry.content.len());
+        let total_bytes = self
+            .total_bytes
+            .saturating_sub(replaced_bytes)
+            .saturating_add(content.len());
+        if (self.entries.len() >= MAX_RETAINED_RESULTS && !self.entries.contains_key(&handle))
+            || u64::try_from(total_bytes).unwrap_or(u64::MAX) > EMERGENCY_CEILING_BYTES
+        {
+            return Err(RuneError::new(
+                ErrorCode::LimitExceeded,
+                "the session's retained tool result store is full",
+            )
+            .with_hint("start a new session to retain more"));
+        }
+
+        let preview = Self::build_preview(
+            &content,
+            &handle,
+            is_error,
+            preview_bytes.min(DEFAULT_PREVIEW_BYTES),
+        );
+        self.entries.insert(
+            handle.clone(),
+            Retained {
+                handle,
+                tool: tool.to_owned(),
+                content,
+                is_error,
+            },
+        );
+        self.total_bytes = total_bytes;
+        Ok(preview)
+    }
+
     /// Retains a result and returns its preview.
     ///
-    /// A result at or below the preview size is returned whole with no handle,
-    /// because retaining something the model already has wastes a slot.
+    /// A result at or below the preview size is returned whole without retention
+    /// metadata when rendered, because retaining it would waste a slot. Its
+    /// stable identifier is not a readable handle.
+    /// Stored content includes any truncation marker within the result cap;
+    /// caps smaller than the marker retain only the marker prefix that fits.
     pub fn retain(
         &mut self,
         limits: &BudgetSet,
@@ -207,7 +269,8 @@ impl Store {
             // a caller has a stable identifier, but nothing is stored.
             return Ok(Preview {
                 text: content.to_owned(),
-                retained_bytes: u64::try_from(content.len()).unwrap_or(u64::MAX),
+                retained_bytes: 0,
+                is_retained: false,
                 handle: Handle::derive(&self.session, tool_call, content),
                 is_error,
             });
@@ -224,12 +287,10 @@ impl Store {
         // The retained content is itself bounded, so one enormous result cannot
         // exhaust memory on its own.
         let bounded: String = if content.len() > retained_limit {
-            let mut cut = retained_limit;
-            while cut > 0 && !content.is_char_boundary(cut) {
-                cut = cut.saturating_sub(1);
-            }
-            let mut text = content.get(..cut).unwrap_or_default().to_owned();
-            text.push_str("\n[truncated at the retention limit]");
+            let marker = truncate_to_bytes("\n[truncated at the retention limit]", retained_limit);
+            let mut text =
+                truncate_to_bytes(content, retained_limit.saturating_sub(marker.len())).to_owned();
+            text.push_str(marker);
             text
         } else {
             content.to_owned()
@@ -238,8 +299,8 @@ impl Store {
         let handle = Handle::derive(&self.session, tool_call, &bounded);
         let preview = Self::build_preview(&bounded, &handle, is_error, preview_bytes);
 
-        self.total_bytes = self.total_bytes.saturating_add(bounded.len());
-        self.entries.insert(
+        let retained_bytes = bounded.len();
+        let replaced = self.entries.insert(
             handle.clone(),
             Retained {
                 handle: handle.clone(),
@@ -248,6 +309,10 @@ impl Store {
                 is_error,
             },
         );
+        self.total_bytes = self
+            .total_bytes
+            .saturating_sub(replaced.map_or(0, |entry| entry.content.len()))
+            .saturating_add(retained_bytes);
 
         Ok(preview)
     }
@@ -266,6 +331,7 @@ impl Store {
         Preview {
             text: content.get(..cut).unwrap_or_default().to_owned(),
             retained_bytes: u64::try_from(content.len()).unwrap_or(u64::MAX),
+            is_retained: true,
             handle: handle.clone(),
             is_error,
         }
@@ -434,6 +500,59 @@ mod tests {
     }
 
     #[test]
+    fn unretained_results_render_without_read_instructions() {
+        let limits = limits();
+        let mut store = store();
+        let at_preview_limit = "é".repeat(Store::preview_bytes(&limits) / 2);
+        for content in ["", "tiny", "tiny\n", at_preview_limit.as_str()] {
+            for is_error in [false, true] {
+                let preview = store
+                    .retain(&limits, "shell", "call-1", content, is_error)
+                    .expect("preview");
+
+                assert_eq!(preview.render(), content);
+                assert!(!preview.render().contains("read_tool_result"));
+                assert!(!preview.is_retained);
+                assert_eq!(preview.retained_bytes, 0);
+                assert_eq!(preview.is_error, is_error);
+                assert_eq!(
+                    store
+                        .read(&preview.handle, 0, 100)
+                        .expect_err("not stored")
+                        .code(),
+                    ErrorCode::NotFound
+                );
+            }
+        }
+        assert!(store.is_empty());
+        assert_eq!(store.total_bytes(), 0);
+    }
+
+    #[test]
+    fn small_spilled_results_advertise_a_readable_handle() {
+        for content in ["", "tiny"] {
+            let mut store = store();
+            let preview = store
+                .spill(
+                    "shell",
+                    "call-1",
+                    content.to_owned(),
+                    false,
+                    DEFAULT_PREVIEW_BYTES,
+                )
+                .expect("spilled");
+
+            assert!(preview.is_retained);
+            assert!(preview.render().contains("read_tool_result"));
+            assert!(preview.render().contains(preview.handle.as_str()));
+            assert_eq!(
+                store.read(&preview.handle, 0, 100).expect("stored").text,
+                content
+            );
+        }
+    }
+
+    #[test]
     fn a_large_result_is_retained_and_previewed() {
         let mut store = store();
         let content = "x".repeat(50_000);
@@ -443,6 +562,139 @@ mod tests {
         assert_eq!(store.len(), 1);
         assert!(preview.text.len() <= DEFAULT_PREVIEW_BYTES);
         assert_eq!(preview.retained_bytes, 50_000);
+    }
+
+    #[test]
+    fn retaining_the_same_handle_counts_its_bytes_once() {
+        let mut store = store();
+        let content = "é".repeat(2500);
+        let other = "y".repeat(6000);
+        store
+            .retain(&limits(), "shell", "other-call", &other, false)
+            .expect("other result retained");
+        let first = store
+            .retain(&limits(), "shell", "call-1", &content, false)
+            .expect("first retain");
+        let second = store
+            .retain(&limits(), "read_file", "call-1", &content, true)
+            .expect("replacement");
+
+        assert_eq!(first.handle, second.handle);
+        assert_eq!(store.len(), 2);
+        assert_eq!(store.total_bytes(), other.len() + content.len());
+        assert_eq!(
+            store
+                .read(&second.handle, 0, MAX_READ_BYTES)
+                .expect("read")
+                .text,
+            content
+        );
+        assert_eq!(
+            store.describe(&second.handle),
+            Some(("read_file", content.len() as u64, true))
+        );
+    }
+
+    #[test]
+    fn replacing_a_truncated_result_counts_the_stored_bytes_once() {
+        let mut limits = limits();
+        limits
+            .set(
+                LimitName::MaxToolResultBytes,
+                rune_core::budget::Budget::Bounded(8192),
+                rune_core::config::Layer::User,
+            )
+            .expect("set");
+        let mut store = store();
+        let prefix = "x".repeat(8192);
+        let first = store
+            .retain(&limits, "shell", "call-1", &format!("{prefix}first"), false)
+            .expect("first retain");
+        let second = store
+            .retain(
+                &limits,
+                "shell",
+                "call-1",
+                &format!("{prefix}second"),
+                false,
+            )
+            .expect("replacement");
+        let stored = store.read(&second.handle, 0, MAX_READ_BYTES).expect("read");
+
+        assert_eq!(first.handle, second.handle);
+        assert_eq!(store.len(), 1);
+        assert_eq!(store.total_bytes(), stored.text.len());
+        assert_eq!(second.retained_bytes, stored.total_bytes);
+    }
+
+    #[test]
+    fn spilling_keeps_the_full_body_even_with_a_zero_byte_preview() {
+        let mut store = store();
+        let content = format!("{}TAIL", "é".repeat(40_000));
+        let preview = store
+            .spill("shell", "spill", content.clone(), true, 0)
+            .expect("spilled");
+        assert!(preview.text.is_empty());
+        assert_eq!(preview.retained_bytes, content.len() as u64);
+        assert_eq!(store.total_bytes(), content.len());
+        assert_eq!(
+            store
+                .read(&preview.handle, content.len() - 4, 4)
+                .expect("tail")
+                .text,
+            "TAIL"
+        );
+        assert_eq!(
+            store.describe(&preview.handle),
+            Some(("shell", content.len() as u64, true))
+        );
+    }
+
+    #[test]
+    fn spilling_refuses_a_full_store_without_losing_existing_results() {
+        let mut store = store();
+        let mut first = None;
+        for index in 0..MAX_RETAINED_RESULTS {
+            let preview = store
+                .spill("shell", &index.to_string(), "kept".to_owned(), false, 4)
+                .expect("spilled");
+            first.get_or_insert(preview.handle);
+        }
+        let err = store
+            .spill("shell", "overflow", "lost".to_owned(), false, 4)
+            .expect_err("full");
+        assert_eq!(err.code(), ErrorCode::LimitExceeded);
+        assert_eq!(store.len(), MAX_RETAINED_RESULTS);
+        assert_eq!(store.total_bytes(), 4 * MAX_RETAINED_RESULTS);
+        assert_eq!(
+            store
+                .read(&first.expect("first"), 0, 4)
+                .expect("existing output")
+                .text,
+            "kept"
+        );
+    }
+
+    #[test]
+    fn spilled_bytes_cannot_exceed_the_session_emergency_ceiling() {
+        let mut store = store();
+        let ceiling = usize::try_from(EMERGENCY_CEILING_BYTES).expect("ceiling fits");
+        let preview = store
+            .spill("shell", "full", "x".repeat(ceiling), false, 8)
+            .expect("at ceiling");
+        let err = store
+            .spill("shell", "overflow", "x".to_owned(), false, 1)
+            .expect_err("past ceiling");
+        assert_eq!(err.code(), ErrorCode::LimitExceeded);
+        assert_eq!(store.len(), 1);
+        assert_eq!(store.total_bytes(), ceiling);
+        assert_eq!(
+            store
+                .read(&preview.handle, ceiling - 1, 1)
+                .expect("existing tail")
+                .text,
+            "x"
+        );
     }
 
     #[test]
@@ -632,10 +884,104 @@ mod tests {
             .retain(&limits, "shell", "call-1", &content, false)
             .expect("retained");
         assert!(
-            preview.retained_bytes <= 8192 + 64,
+            preview.retained_bytes <= 8192,
             "retained {} bytes",
             preview.retained_bytes
         );
+    }
+
+    #[test]
+    fn retention_cap_includes_the_truncation_marker() {
+        let marker = "\n[truncated at the retention limit]";
+        for cap in [0, 1, 16, 34, 35, 36, 2048, 4096, 8192] {
+            let mut limits = limits();
+            limits
+                .set(
+                    LimitName::MaxToolResultBytes,
+                    rune_core::budget::Budget::Bounded(cap as u64),
+                    rune_core::config::Layer::User,
+                )
+                .expect("set");
+            let mut store = store();
+            let content = "x".repeat(cap + 1);
+            let preview = store
+                .retain(&limits, "shell", "call-1", &content, false)
+                .expect("retained");
+            let stored = store
+                .read(&preview.handle, 0, MAX_READ_BYTES)
+                .expect("read");
+
+            assert!(stored.text.len() <= cap, "cap {cap}: {stored:?}");
+            assert_eq!(stored.text.len(), cap);
+            assert_eq!(stored.total_bytes, cap as u64);
+            assert_eq!(preview.retained_bytes, stored.total_bytes);
+            assert_eq!(store.total_bytes(), cap);
+            assert_eq!(
+                store.describe(&preview.handle),
+                Some(("shell", cap as u64, false))
+            );
+            if cap >= marker.len() {
+                assert_eq!(
+                    stored.text,
+                    format!("{}{marker}", "x".repeat(cap - marker.len()))
+                );
+            } else {
+                assert_eq!(stored.text, &marker[..cap]);
+            }
+        }
+    }
+
+    #[test]
+    fn truncated_retention_preserves_utf8_within_the_cap() {
+        let mut limits = limits();
+        limits
+            .set(
+                LimitName::MaxToolResultBytes,
+                rune_core::budget::Budget::Bounded(8192),
+                rune_core::config::Layer::User,
+            )
+            .expect("set");
+        let mut store = store();
+        let content = format!("{}x", "é".repeat(4096));
+        let preview = store
+            .retain(&limits, "shell", "call-1", &content, false)
+            .expect("retained");
+        let stored = store
+            .read(&preview.handle, 0, MAX_READ_BYTES)
+            .expect("read");
+
+        assert_eq!(stored.text.len(), 8191);
+        assert_eq!(
+            stored.text,
+            format!("{}\n[truncated at the retention limit]", "é".repeat(4078))
+        );
+        assert_eq!(preview.retained_bytes, stored.total_bytes);
+        assert_eq!(store.total_bytes(), stored.text.len());
+    }
+
+    #[test]
+    fn retention_keeps_content_at_or_below_the_cap_unchanged() {
+        let mut limits = limits();
+        limits
+            .set(
+                LimitName::MaxToolResultBytes,
+                rune_core::budget::Budget::Bounded(8192),
+                rune_core::config::Layer::User,
+            )
+            .expect("set");
+        for content in ["x".repeat(8191), "é".repeat(4096)] {
+            let mut store = store();
+            let preview = store
+                .retain(&limits, "shell", "call-1", &content, false)
+                .expect("retained");
+            let stored = store
+                .read(&preview.handle, 0, MAX_READ_BYTES)
+                .expect("read");
+
+            assert_eq!(stored.text, content);
+            assert_eq!(preview.retained_bytes, content.len() as u64);
+            assert_eq!(store.total_bytes(), content.len());
+        }
     }
 
     #[test]

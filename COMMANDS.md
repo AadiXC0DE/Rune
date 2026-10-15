@@ -17,9 +17,11 @@ Accepted anywhere on the command line.
 | `--limit` | `name=value` | Override one limit. Repeatable. Use off to disable a limit. |
 | `--add-dir` | `path` | Add a workspace directory for this process. Repeatable. |
 | `--no-additional-dirs` | - | Ignore saved additional directories for this process. |
-| `--offline` | - | Refuse every outbound network request. |
+| `--offline` | - | Refuse provider requests, disable web tools, skip remote MCP checks and restrict sandboxed shell networking. Local MCP and unsandboxed commands can still use the network. |
 | `--allow-unsandboxed` | - | Run commands where the host has no sandbox backend. Without this, such a host refuses them. |
 | `--json` | - | Emit machine-readable output where supported. |
+| `--accessible` | - | Use append-only labelled session output and line input for screen readers. |
+| `--ascii` | - | Use ASCII terminal decorations, preserving message text. |
 | `--theme` | `name` | Override the theme for this process. |
 | `--provider-order` | `a,b` | Prefer these upstream providers in order. |
 | `--provider-strict` | - | Restrict requests to the listed providers. |
@@ -28,14 +30,20 @@ Accepted anywhere on the command line.
 
 ## Run
 
+### `rune resume [last|id]`
+
+Resume a saved session, defaulting to the latest in this workspace
+
 ### `rune ask [flags] <prompt>`
 
-Run one request without an interactive session
+Run one bounded turn without an interactive session
 
 | Flag | Description |
 |---|---|
 | `--json` | Print one JSON object instead of Markdown. |
+| `--jsonl` | Stream bounded JSONL events (takes precedence over --json). |
 | `--no-save` | Do not create a session. |
+| `--image <path>` | Attach a PNG, JPEG, GIF, or WebP file. Repeatable; 8 MiB total, at most 16 images. |
 ### `rune acp [--log-file <path>]`
 
 Serve the Agent Client Protocol over standard input and output
@@ -47,9 +55,20 @@ Serve the Agent Client Protocol over standard input and output
 
 Review the pending changes in the workspace
 
+Aliases:
+
+- `pr`: Same as `rune review`; reviews pending workspace changes with optional context.
+- `issue`: Same as `rune review`; reviews pending workspace changes with optional context.
+
 ### `rune connect [<name>] [--json]`
 
 Connect a model provider, choosing from a list
+
+Aliases:
+
+- `login`: Same as `rune connect`; connects a provider, choosing from a list when no name is given.
+- `setup`: Same as `rune connect`; connects a provider, choosing from a list when no name is given.
+- `provider`: Same as `rune connect`; connects a provider, choosing from a list when no name is given.
 
 | Flag | Description |
 |---|---|
@@ -57,41 +76,49 @@ Connect a model provider, choosing from a list
 
 ## Sessions and local records
 
-### `rune sessions [--all] [--limit <n>] [--cursor <c>]`
+### `rune sessions [--all] [--search <text>] [--limit <n>] [--cursor <c>]`
 
 List sessions
 
 | Flag | Description |
 |---|---|
 | `--all` | Include sessions from every workspace. |
+| `--search <text>` | Match a case-insensitive literal fragment in titles or user messages. |
 | `--limit <n>` | Page size, 1 to 100. |
 | `--cursor <c>` | Continue from a previous page. |
 | `--json` | Emit JSON. |
-### `rune session <last|id> [--json] | rune session migrate <id> | rune session recover <id>`
+### `rune session <last|id> [--search <text> | --record <id|all>] [--json] | rune session --id <id> [--search <text> | --record <id|all>] [--json] | rune session export <last|id> | rune session export --id <id> | rune session fork <last|id> --at <seq> [--json] | rune session fork --id <id> --at <seq> [--json] | rune session migrate <id> | rune session recover <id>`
 
-Inspect, migrate, or recover one session
+Inspect, search, export, fork, migrate, or recover one session
 
 | Flag | Description |
 |---|---|
-| `--id <id>` | Read the argument as an exact session identifier. |
+| `--id <id>` | Inspect, search, export, or fork this exact session identifier, taking precedence over a positional selector. |
+| `--at <seq>` | Fork through this inclusive saved event sequence. All tool calls must have results. |
+| `--search <text>` | Search saved message, tool, and summary records, including compacted context, by a case-insensitive literal fragment. Return original records and sequence positions. |
 | `--allow-large` | Permit migrating an oversized session. |
-| `--json` | Emit JSON. |
-### `rune tree [last|id] [--json]`
+| `--record <id|all>` | Retrieve exact original messages archived by manual compaction. IDs are stable within the session; all lists every archived record. |
+| `--json` | Emit JSON. Export always emits ordered JSONL event records. |
+### `rune tree [last|id] [--json] | rune tree --id <id> [--json]`
 
 Show the branch structure of a session
 
 | Flag | Description |
 |---|---|
-| `--id <id>` | Read the argument as an exact identifier. |
+| `--id <id>` | Show the tree of this exact session identifier, taking precedence over a positional selector. |
 | `--json` | Emit JSON. |
-### `rune usage [--period <24h|7d|30d>] [--json]`
+### `rune usage [--period <24h|7d|30d>] [--json] | rune usage export [--period <24h|7d|30d>]`
 
-Report token usage recorded on this machine
+Report or export token usage recorded on this machine
+
+Aliases:
+
+- `cost`: Same as `rune usage`; reports token usage recorded on this machine.
 
 | Flag | Description |
 |---|---|
-| `--period <span>` | One of 24h, 7d, or 30d. |
-| `--json` | Emit JSON. |
+| `--period <span>` | One of 24h, 7d, or 30d. Export defaults to all retained records. |
+| `--json` | Emit JSON. Export always emits ordered JSONL usage records. |
 
 ## Account and configuration
 
@@ -99,8 +126,21 @@ Report token usage recorded on this machine
 
 Show or manage stored credentials
 
+Aliases:
+
+- `logout`: Same as `rune auth`; without an action, shows connection status. Use `rune auth logout` to remove the stored credential.
+
 | Flag | Description |
 |---|---|
+| `--json` | Emit JSON. |
+### `rune capabilities [--require-images] [--require-tool-streaming] [--json]`
+
+Check provider capabilities and context provenance before a turn
+
+| Flag | Description |
+|---|---|
+| `--require-images` | Require image content support in the dialect. |
+| `--require-tool-streaming` | Require incremental tool argument streaming. |
 | `--json` | Emit JSON. |
 ### `rune models [--json]`
 
@@ -109,13 +149,29 @@ List the models of the connected provider
 | Flag | Description |
 |---|---|
 | `--json` | Emit JSON. |
-### `rune permissions [--explain <target>] [--json]`
+### `rune mcp list [--json] | rune mcp check [server] [--json] | rune mcp import claude-desktop <file>`
+
+Manage MCP servers: mcp list, mcp check, mcp import
+
+| Flag | Description |
+|---|---|
+| `--json` | Emit JSON diagnostics without secrets. Import always emits full configuration JSON; save it as `.mcp.json` at the workspace root. |
+### `rune permissions [--explain <target> | --simulate <file>] [--json]`
 
 Show the permission mode and rules
 
 | Flag | Description |
 |---|---|
-| `--explain <target>` | Explain the decision for one target. |
+| `--explain <target>` | Explain one tool:target action, such as shell:pwd. JSON includes the outcome, deciding rule and layer. |
+| `--simulate <file>` | Dry-run a JSON array of {tool, target} calls in order, without execution or approval writes. |
+| `--json` | Emit JSON. |
+### `rune sandbox [explain] [--external-access] [--json] -- <command>`
+
+Explain command policy: sandbox [explain] -- <command>
+
+| Flag | Description |
+|---|---|
+| `--external-access` | Preview an explicit external-access grant to the shell context. |
 | `--json` | Emit JSON. |
 ### `rune projects [status|approve|reject|reset]`
 
@@ -127,6 +183,10 @@ Inspect or change workspace trust
 ### `rune config [--explain] [--json]`
 
 Show the resolved configuration and where each value came from
+
+Aliases:
+
+- `settings`: Same as `rune config`; shows resolved configuration and value sources.
 
 | Flag | Description |
 |---|---|
@@ -190,6 +250,10 @@ Remove the installed binary and, on request, local state
 | `--keep-state` | Leave the state directory in place. |
 | `--yes` | Confirm removal of the state directory. |
 | `--json` | Emit JSON. |
+### `rune completion bash`
+
+Generate shell completion from the command table
+
 ### `rune reference [--write <path>]`
 
 Print the generated command reference
@@ -201,13 +265,19 @@ Print the generated command reference
 
 Print help
 
-Aliases: `-h`, `--help`
+Aliases:
+
+- `-h`: Same as `rune help`.
+- `--help`: Same as `rune help`.
 
 ### `rune version`
 
 Print the version
 
-Aliases: `-v`, `--version`
+Aliases:
+
+- `-v`: Same as `rune version`.
+- `--version`: Same as `rune version`.
 
 
 ## Limits
@@ -217,6 +287,7 @@ Every limit takes a count, or `off` to remove it. A hard ceiling still applies t
 | Name | Default | Unit | Range | Description |
 |---|---|---|---|---|
 | `max_agent_steps` | 0 | items | 0 to 10000 | Maximum model tool-loop steps per turn; zero means unlimited. |
+| `max_consecutive_tool_failures` | 3 | items | 1 to 10000 | Consecutive identical tool failures allowed before stopping the next duplicate. |
 | `max_tool_result_bytes` | 65536 | bytes | 0 to unbounded | Bytes retained from one tool result before spilling. |
 | `max_turn_result_bytes` | 8388608 | bytes | 0 to unbounded | Tool-result bytes one turn retains across its steps. |
 | `skill_catalog_bytes` | 32768 | bytes | 0 to unbounded | Combined size of the skill catalog placed in the prompt. |
@@ -228,6 +299,7 @@ Every limit takes a count, or `off` to remove it. A hard ceiling still applies t
 | `mcp_selected_schema_bytes` | 65536 | bytes | 0 to unbounded | Schema size for one explicitly selected MCP tool. |
 | `project_instruction_file_bytes` | 65536 | bytes | 0 to unbounded | Size of one project instruction file. |
 | `project_instructions_total_bytes` | 131072 | bytes | 0 to unbounded | Combined size of all applicable project instructions. |
+| `repository_map_bytes` | 8192 | bytes | 0 to unbounded | Rendered Rust repository symbol map bytes; zero disables it. |
 | `image_adapter_output_bytes` | 20480 | bytes | 0 to unbounded | Text produced by an image analysis adapter. |
 | `command_output_bytes` | 65536 | bytes | 0 to unbounded | Bytes retained from one command's output. |
 | `read_file_lines` | 2000 | items | 0 to unbounded | Lines returned by one file read. |
@@ -238,6 +310,7 @@ Every limit takes a count, or `off` to remove it. A hard ceiling still applies t
 | `provider_head_timeout_ms` | 120000 | ms | 1000 to 3600000 | Time to wait for a model response head. |
 | `provider_request_timeout_ms` | 600000 | ms | 1000 to 7200000 | Total time allowed for one model request attempt. |
 | `provider_max_attempts` | 10 | bytes | 1 to 20 | Provider attempts before the turn fails. |
+| `acp_permission_timeout_ms` | 120000 | ms | 0 to unbounded | Time allowed for a client to answer an ACP permission request. |
 | `mcp_operation_timeout_ms` | 60000 | ms | 0 to unbounded | Time allowed for one MCP operation. |
 | `mcp_startup_timeout_ms` | 30000 | ms | 0 to unbounded | Time allowed for an MCP server to start and be discovered. |
 | `mcp_restart_limit` | 1 | items | 0 to 10 | Automatic restarts permitted for a local MCP server. |

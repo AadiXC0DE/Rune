@@ -2,7 +2,8 @@
 //!
 //! Strings cross the boundary as a pointer and a length into this module's
 //! memory. A value the page returns is staged on its side: the import reports
-//! its length, this side allocates that much, and `take` copies it in.
+//! its length, this side checks the configured byte cap before allocating,
+//! and `take` copies it in.
 //!
 //! The imports that wait, `open`, `read`, `ask`, and `run`, are wrapped by the
 //! page as suspending functions, and `rune_prompt` is exported through
@@ -38,17 +39,31 @@ unsafe extern "C" {
 }
 
 /// The bridge over the page's imports.
-struct PageBridge;
+struct PageBridge {
+    max_staged_bytes: usize,
+}
 
 impl PageBridge {
     /// Copies the value the page staged for the last call.
-    fn staged(length: i32) -> Option<String> {
-        let length = usize::try_from(length).ok()?;
-        let mut buffer = vec![0_u8; length];
+    fn staged(&self, length: i32) -> Result<Option<String>, String> {
+        let Ok(length) = usize::try_from(length) else {
+            return Ok(None);
+        };
+        if length > self.max_staged_bytes {
+            return Err(format!(
+                "the page returned a staged length {length} larger than the bridge byte cap {}",
+                self.max_staged_bytes
+            ));
+        }
+        let mut buffer = Vec::new();
+        buffer
+            .try_reserve_exact(length)
+            .map_err(|_| String::from("the page's staged reply could not be allocated"))?;
+        buffer.resize(length, 0_u8);
         // SAFETY: the buffer is `length` bytes and owned here; the page writes
         // at most that many bytes into it and keeps no reference afterwards.
         unsafe { take(buffer.as_mut_ptr(), length) };
-        String::from_utf8(buffer).ok()
+        Ok(String::from_utf8(buffer).ok())
     }
 }
 
@@ -64,7 +79,9 @@ impl Bridge for PageBridge {
         // SAFETY: as for `emit`; the page stages its reply rather than writing
         // into this memory during the call.
         let length = unsafe { open(encoded.as_ptr(), encoded.len()) };
-        let reply = Self::staged(length).ok_or_else(|| String::from("the page sent no reply"))?;
+        let reply = self
+            .staged(length)?
+            .ok_or_else(|| String::from("the page sent no reply"))?;
         let value: serde_json::Value =
             serde_json::from_str(&reply).map_err(|err| format!("the page's reply: {err}"))?;
         if let Some(error) = value.get("error").and_then(serde_json::Value::as_str) {
@@ -77,12 +94,19 @@ impl Bridge for PageBridge {
         // SAFETY: the page writes at most `buffer.len()` bytes into `buffer`,
         // which is exclusively borrowed for the call.
         let read = unsafe { read(handle, buffer.as_mut_ptr(), buffer.len()) };
-        usize::try_from(read).map_err(|_| {
+        let read = usize::try_from(read).map_err(|_| {
             io::Error::new(
                 io::ErrorKind::ConnectionAborted,
                 "the page ended the response",
             )
-        })
+        })?;
+        if read > buffer.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "the page returned a body length larger than the buffer capacity",
+            ));
+        }
+        Ok(read)
     }
 
     fn close(&self, handle: i32) {
@@ -99,10 +123,14 @@ impl Bridge for PageBridge {
         let encoded = serde_json::json!({ "command": command, "cwd": cwd }).to_string();
         // SAFETY: as for `open`.
         let length = unsafe { run(encoded.as_ptr(), encoded.len()) };
-        Self::staged(length)
-            .and_then(|reply| serde_json::from_str(&reply).ok())
-            .unwrap_or_else(|| Ran {
-                output: String::from("the page's shell did not answer"),
+        self.staged(length)
+            .and_then(|reply| {
+                reply
+                    .and_then(|reply| serde_json::from_str(&reply).ok())
+                    .ok_or_else(|| String::from("the page's shell did not answer"))
+            })
+            .unwrap_or_else(|output| Ran {
+                output,
                 exit_code: 127,
             })
     }
@@ -144,7 +172,10 @@ fn busy() -> rune_core::error::RuneError {
 }
 
 fn report(err: &rune_core::error::RuneError) {
-    PageBridge.emit(&encode_error(err).to_string());
+    PageBridge {
+        max_staged_bytes: crate::host::DEFAULT_BRIDGE_BYTES,
+    }
+    .emit(&encode_error(err).to_string());
 }
 
 /// Allocates memory for the page to write an argument into.
@@ -172,7 +203,10 @@ pub unsafe extern "C" fn rune_configure(pointer: *mut u8, length: usize) -> i32 
             return 1;
         }
     };
-    let session = match Session::new(&config, Arc::new(PageBridge), Arc::clone(control())) {
+    let bridge = PageBridge {
+        max_staged_bytes: config.max_bridge_bytes,
+    };
+    let session = match Session::new(&config, Arc::new(bridge), Arc::clone(control())) {
         Ok(session) => session,
         Err(err) => {
             report(&err);

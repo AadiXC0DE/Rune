@@ -20,6 +20,94 @@ use serde_json::Value;
 use rune_core::budget::{EMERGENCY_CEILING_BYTES, LimitName};
 use rune_core::error::{Result, RuneError};
 
+/// Imports Claude Desktop's stdio `mcpServers` JSON into a reviewable Rune
+/// project document. Only `command`, `args`, and `env` are supported per server;
+/// unrelated Desktop settings are omitted. No environment is read, command is
+/// started, or trust decision is created. Existing workspace trust still applies
+/// when the returned document is saved as `.mcp.json`.
+///
+/// Desktop strings are literal. Rune project template syntax is refused rather
+/// than silently giving an imported literal a different meaning after approval.
+pub fn import_claude_desktop(text: &str, max_servers: usize) -> Result<Value> {
+    let max_bytes = crate::mcp_trust::MAX_PROJECT_BYTES as usize;
+    if text.len() > max_bytes {
+        return Err(RuneError::too_large("import", text.len(), max_bytes));
+    }
+    let document: DesktopConfig = serde_json::from_str(text).map_err(|_| {
+        // Deserialization errors can quote credentials from malformed values.
+        RuneError::invalid_field(
+            "import",
+            "expected Claude Desktop JSON with mcpServers and stdio command, args, env fields",
+        )
+    })?;
+    if document.servers.len() > max_servers {
+        return Err(RuneError::too_large(
+            "mcpServers",
+            document.servers.len(),
+            max_servers,
+        ));
+    }
+    let mut servers = serde_json::Map::new();
+    for (name, entry) in document.servers {
+        let mut command = vec![entry.command.clone()];
+        command.extend(entry.args.iter().cloned());
+        if command
+            .iter()
+            .chain(entry.env.values())
+            .any(|value| value.contains("${") || value.contains('\0'))
+        {
+            return Err(RuneError::invalid_field(
+                "import",
+                "imported values cannot contain project template syntax or null bytes",
+            ));
+        }
+        let config = ServerConfig {
+            name: name.clone(),
+            transport: Transport::Stdio {
+                command,
+                environment: entry.env.clone(),
+            },
+            enabled: default_enabled(),
+            required: default_required(),
+            startup_timeout_ms: default_startup_timeout_ms(),
+            operation_timeout_ms: default_operation_timeout_ms(),
+            restart_limit: default_restart_limit(),
+        };
+        config.validate().map_err(|_| {
+            RuneError::invalid_field(
+                "import",
+                "invalid imported server name, command, or environment",
+            )
+        })?;
+        servers.insert(
+            name,
+            serde_json::json!({
+                "type": "stdio",
+                "command": entry.command,
+                "args": entry.args,
+                "env": entry.env,
+            }),
+        );
+    }
+    Ok(serde_json::json!({"mcpServers": servers}))
+}
+
+#[derive(Deserialize)]
+struct DesktopConfig {
+    #[serde(rename = "mcpServers")]
+    servers: BTreeMap<String, DesktopServer>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DesktopServer {
+    command: String,
+    #[serde(default)]
+    args: Vec<String>,
+    #[serde(default)]
+    env: BTreeMap<String, String>,
+}
+
 /// Longest accepted server name.
 ///
 /// Bounded because the name prefixes every tool the server contributes and a

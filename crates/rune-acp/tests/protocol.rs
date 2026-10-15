@@ -276,7 +276,7 @@ struct Harness {
     /// Where the server writes its diagnostics.
     log_file: Utf8PathBuf,
     /// Held so the fixture directory outlives the server.
-    _root: tempfile::TempDir,
+    root: tempfile::TempDir,
 }
 
 impl Harness {
@@ -291,6 +291,16 @@ impl Harness {
         mode: PermissionMode,
         limits: BudgetSet,
         files: Vec<(&str, &str)>,
+    ) -> Self {
+        Self::start_dialect(scripts, mode, limits, files, Dialect::ChatCompletions)
+    }
+
+    fn start_dialect(
+        scripts: Vec<Script>,
+        mode: PermissionMode,
+        limits: BudgetSet,
+        files: Vec<(&str, &str)>,
+        dialect: Dialect,
     ) -> Self {
         let root = tempfile::tempdir().expect("tempdir");
         let workspace =
@@ -310,7 +320,7 @@ impl Harness {
             "test/model",
         )
         .expect("config")
-        .with_dialect(Dialect::ChatCompletions)
+        .with_dialect(dialect)
         .with_mode(mode)
         .with_limits(limits)
         .expect("limits")
@@ -328,7 +338,7 @@ impl Harness {
             join: Some(join),
             mock,
             log_file,
-            _root: root,
+            root,
         }
     }
 
@@ -342,10 +352,10 @@ impl Harness {
         self.client.as_mut().expect("client")
     }
 
-    /// Initializes the connection and opens a session, returning its identifier.
-    fn open_session(&mut self) -> String {
+    /// Establishes protocol compatibility for this connection.
+    fn initialize(&mut self, id: i64) {
         let response = self.client().call(
-            1,
+            id,
             "initialize",
             &json!({
                 "protocolVersion": PROTOCOL_VERSION,
@@ -354,9 +364,17 @@ impl Harness {
             }),
         );
         assert_eq!(response["result"]["protocolVersion"], PROTOCOL_VERSION);
-        let response = self
-            .client()
-            .call(2, "session/new", &json!({"cwd": "/", "mcpServers": []}));
+    }
+
+    /// Initializes the connection and opens a session, returning its identifier.
+    fn open_session(&mut self) -> String {
+        self.initialize(1);
+        let workspace = self.root.path().join("workspace");
+        let response = self.client().call(
+            2,
+            "session/new",
+            &json!({"cwd": workspace, "mcpServers": []}),
+        );
         response["result"]["sessionId"]
             .as_str()
             .expect("a session id")
@@ -375,6 +393,704 @@ impl Drop for Harness {
     }
 }
 
+fn stdio_server(log: &Path, greeting: &str) -> Value {
+    json!({
+        "name": "fixture",
+        "command": "/bin/sh",
+        "args": [concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/stdio_mcp.sh"), log, "--fixture"],
+        "env": [{"name": "ACP_MCP_GREETING", "value": greeting}],
+    })
+}
+
+fn assert_mcp_stopped(log: &Path) {
+    let pid = std::fs::read_to_string(log.with_extension("pid")).expect("fixture PID");
+    let deadline = Instant::now()
+        .checked_add(Duration::from_secs(3))
+        .expect("deadline");
+    while std::process::Command::new("/bin/kill")
+        .args(["-0", pid.trim()])
+        .stderr(std::process::Stdio::null())
+        .status()
+        .expect("check child")
+        .success()
+    {
+        assert!(
+            Instant::now() < deadline,
+            "MCP child still running after close"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn a_malformed_text_block_rejects_the_entire_prompt_and_the_connection_survives() {
+    let mut harness = Harness::start(vec![Script::text("accepted")], PermissionMode::Auto);
+    let session = harness.open_session();
+    let response = harness.client().call(
+        3,
+        "session/prompt",
+        &json!({
+            "sessionId": session,
+            "prompt": [{"type": "text", "text": "must not be submitted"}, {"type": "text"}],
+        }),
+    );
+    assert_eq!(response["error"]["code"], rune_acp::jsonrpc::INVALID_PARAMS);
+    assert!(
+        response["error"]["message"]
+            .as_str()
+            .expect("error message")
+            .contains("prompt[1].text")
+    );
+    assert_eq!(harness.mock.request_count(), 0);
+    assert!(harness.client().updates("user_message_chunk").is_empty());
+
+    let response = harness
+        .client()
+        .call(4, "session/prompt", &prompt(&session, "valid prompt"));
+    assert_eq!(response["result"]["stopReason"], "end_turn");
+    assert_eq!(harness.mock.request_count(), 1);
+    let body = harness.mock.last_body().expect("provider request");
+    let user_messages: Vec<_> = body["messages"]
+        .as_array()
+        .expect("messages")
+        .iter()
+        .filter(|message| message["role"] == "user")
+        .collect();
+    assert_eq!(user_messages.len(), 1);
+    assert_eq!(user_messages[0]["content"], "valid prompt");
+}
+
+// Real 1x1 GIFs with different palettes, carried unchanged through ACP and HTTP.
+const IMAGE_2: &str = "R0lGODlhAQABAIAAAP8AAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7";
+const IMAGE: &str = "R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7";
+
+fn image_block() -> Value {
+    json!({"type": "image", "mimeType": "image/gif", "data": IMAGE})
+}
+
+#[test]
+fn advertised_images_reach_the_selected_model_in_every_acp_dialect() {
+    for dialect in [
+        Dialect::ChatCompletions,
+        Dialect::Responses,
+        Dialect::Anthropic,
+        Dialect::Gemini,
+    ] {
+        let script = match dialect {
+            Dialect::ChatCompletions => Script::text("seen"),
+            Dialect::Responses => Script::Frames(vec![r#"{"type":"response.completed","response":{"status":"completed","output":[]}}"#.to_owned()]),
+            Dialect::Anthropic => Script::Frames(vec![
+                r#"{"type":"message_start","message":{"id":"msg","usage":{"input_tokens":10}}}"#.to_owned(),
+                r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}"#.to_owned(),
+                r#"{"type":"message_stop"}"#.to_owned(),
+            ]),
+            Dialect::Gemini => Script::Frames(vec![r#"{"candidates":[{"content":{"parts":[{"text":"seen"}]},"finishReason":"STOP"}]}"#.to_owned()]),
+        };
+        let mut harness = Harness::start_dialect(
+            vec![script],
+            PermissionMode::Auto,
+            BudgetSet::new(),
+            Vec::new(),
+            dialect,
+        );
+        let session = harness.open_session();
+        let initialization = harness
+            .client()
+            .responses
+            .iter()
+            .find(|response| response["id"] == 1)
+            .expect("initialize response");
+        assert_eq!(
+            initialization["result"]["agentCapabilities"]["promptCapabilities"]["image"],
+            true
+        );
+        let selected = "fixture-image-model";
+        let response = harness.client().call(
+            3,
+            "session/set_config_option",
+            &json!({"sessionId": session, "configId": "model", "value": selected}),
+        );
+        assert!(response.get("error").is_none(), "{response}");
+        // Mix two images and text to prove block ordering and distinct references.
+        let response = harness.client().call(4, "session/prompt", &json!({"sessionId": session, "prompt": [image_block(), {"type": "text", "text": "compare"}, {"type": "image", "mimeType": "image/gif", "data": IMAGE_2}]}));
+        assert_eq!(
+            response["result"]["stopReason"], "end_turn",
+            "{dialect:?}: {response}"
+        );
+        let body = harness.mock.last_body().expect("request body");
+        if dialect == Dialect::Gemini {
+            assert_eq!(
+                harness.mock.last_path().expect("model request target"),
+                format!("/v1/models/{selected}:streamGenerateContent?alt=sse")
+            );
+        } else {
+            assert_eq!(body["model"], selected);
+        }
+        let messages = match dialect {
+            Dialect::Responses => &body["input"],
+            Dialect::Gemini => &body["contents"],
+            _ => &body["messages"],
+        };
+        let user = messages
+            .as_array()
+            .expect("messages")
+            .iter()
+            .find(|message| message["role"] == "user")
+            .expect("user message");
+        let content = if dialect == Dialect::Gemini {
+            &user["parts"]
+        } else {
+            &user["content"]
+        };
+        assert_eq!(content.as_array().expect("parts").len(), 3);
+        assert_eq!(content[1]["text"], "compare");
+        for (index, image) in [(0, IMAGE), (2, IMAGE_2)] {
+            match dialect {
+                Dialect::ChatCompletions => assert_eq!(
+                    content[index]["image_url"]["url"],
+                    format!("data:image/gif;base64,{image}")
+                ),
+                Dialect::Responses => assert_eq!(
+                    content[index]["image_url"],
+                    format!("data:image/gif;base64,{image}")
+                ),
+                Dialect::Anthropic => assert_eq!(
+                    content[index]["source"],
+                    json!({"type": "base64", "media_type": "image/gif", "data": image})
+                ),
+                Dialect::Gemini => assert_eq!(
+                    content[index]["inlineData"],
+                    json!({"mimeType": "image/gif", "data": image})
+                ),
+            }
+        }
+        assert!(!body.to_string().contains("image-ref:"));
+    }
+}
+
+#[test]
+fn images_survive_retries_and_tool_steps_but_are_not_replayed_on_later_prompts() {
+    let mut harness = Harness::start(
+        vec![
+            Script::tool_call("read", "read_file", r#"{"path":"image.txt"}"#),
+            Script::text("seen"),
+            Script::text("next"),
+        ],
+        PermissionMode::Auto,
+    );
+    std::fs::write(harness.root.path().join("workspace/image.txt"), "fixture").expect("file");
+    let session = harness.open_session();
+    harness.mock.fail_first(1);
+    let response = harness.client().call(
+        3,
+        "session/prompt",
+        &json!({"sessionId": session, "prompt": [image_block()]}),
+    );
+    assert_eq!(response["result"]["stopReason"], "end_turn");
+    assert_eq!(harness.mock.request_count(), 3);
+    let body = harness.mock.last_body().expect("tool follow-up request");
+    let user = body["messages"]
+        .as_array()
+        .expect("messages")
+        .iter()
+        .find(|message| message["role"] == "user")
+        .expect("user message");
+    assert_eq!(
+        user["content"][0]["image_url"]["url"],
+        format!("data:image/gif;base64,{IMAGE}")
+    );
+    let response = harness
+        .client()
+        .call(4, "session/prompt", &prompt(&session, "next"));
+    assert_eq!(response["result"]["stopReason"], "end_turn");
+    let body = harness.mock.last_body().expect("next request").to_string();
+    assert!(!body.contains(IMAGE));
+    assert!(!body.contains("image-ref:"));
+    // Reopen from disk as well, proving persisted history has no image payload.
+    assert!(
+        harness
+            .client()
+            .call(5, "session/close", &json!({"sessionId": session}))
+            .get("error")
+            .is_none()
+    );
+    assert!(
+        harness
+            .client()
+            .call(6, "session/load", &json!({"sessionId": session}))
+            .get("error")
+            .is_none()
+    );
+    let response = harness
+        .client()
+        .call(7, "session/prompt", &prompt(&session, "after load"));
+    assert_eq!(response["result"]["stopReason"], "end_turn");
+    let body = harness
+        .mock
+        .last_body()
+        .expect("loaded request")
+        .to_string();
+    assert!(!body.contains(IMAGE));
+    assert!(!body.contains("image-ref:"));
+}
+
+#[test]
+fn malformed_image_blocks_reject_the_whole_prompt_before_provider_or_session_changes() {
+    let mut harness = Harness::start(vec![Script::text("valid")], PermissionMode::Auto);
+    let session = harness.open_session();
+    for (index, block) in [
+        json!({"type": "image", "mimeType": "image/png"}),
+        json!({"type": "image", "data": IMAGE}),
+        json!({"type": "image", "mimeType": "image/png", "data": 42}),
+        json!({"type": "image", "mimeType": "text/plain", "data": IMAGE}),
+        json!({"type": "image", "mimeType": "image/png", "data": "invalid!"}),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let response = harness.client().call(10_i64.saturating_add(i64::try_from(index).expect("fixture index")), "session/prompt", &json!({"sessionId": session, "prompt": [{"type": "text", "text": "must not reach model"}, block]}));
+        assert_eq!(response["error"]["code"], rune_acp::jsonrpc::INVALID_PARAMS);
+        assert_eq!(response["error"]["data"]["code"], "invalid_field");
+    }
+    assert_eq!(harness.mock.request_count(), 0);
+    assert!(harness.client().updates("user_message_chunk").is_empty());
+    let response = harness
+        .client()
+        .call(20, "session/prompt", &prompt(&session, "valid"));
+    assert_eq!(response["result"]["stopReason"], "end_turn");
+    assert_eq!(
+        harness.mock.last_body().expect("request")["messages"]
+            .as_array()
+            .expect("messages")
+            .iter()
+            .filter(|message| message["role"] == "user")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn requested_stdio_mcp_is_advertised_callable_and_isolated_by_session() {
+    let mut harness = Harness::start(
+        vec![
+            Script::tool_call("greeting", "mcp_fixture_greet", r#"{"who":"Ada"}"#),
+            Script::text("greeted"),
+            Script::text("no MCP here"),
+            Script::tool_call("other", "mcp_fixture_greet", "{}"),
+            Script::text("other greeted"),
+        ],
+        PermissionMode::Ask,
+    );
+    let plain = harness.open_session();
+    let workspace = harness.root.path().join("workspace");
+    let log = harness.root.path().join("mcp-requests");
+    let created = harness.client().call(
+        3,
+        "session/new",
+        &json!({
+            "cwd": workspace, "mcpServers": [stdio_server(&log, "first")],
+        }),
+    );
+    assert!(created.get("error").is_none(), "{created}");
+    let session = created["result"]["sessionId"].as_str().expect("session");
+    let response = harness
+        .client()
+        .call(4, "session/prompt", &prompt(session, "greet"));
+    assert_eq!(response["result"]["stopReason"], "end_turn");
+    let body = harness.mock.last_body().expect("provider request");
+    let tool = body["tools"]
+        .as_array()
+        .expect("tools")
+        .iter()
+        .find(|tool| tool["function"]["name"] == "mcp_fixture_greet")
+        .expect("requested MCP tool advertised to model");
+    assert_eq!(
+        tool["function"]["parameters"],
+        json!({
+            "type": "object", "properties": {"who": {"type": "string"}}, "required": [],
+        })
+    );
+    assert!(body["messages"].as_array().expect("messages").iter().any(
+        |message| message["tool_call_id"] == "greeting" && message["content"] == "hello first"
+    ));
+    assert_eq!(
+        harness.client().approvals.len(),
+        1,
+        "MCP uses permission checks"
+    );
+    assert_eq!(
+        harness.client().approvals[0]["params"]["toolCall"]["title"],
+        "Running mcp_fixture_greet"
+    );
+    let requests = std::fs::read_to_string(&log).expect("MCP transcript");
+    assert!(
+        requests.contains(r#""name":"greet","arguments":{"who":"Ada"}"#),
+        "{requests}"
+    );
+
+    harness
+        .client()
+        .call(5, "session/prompt", &prompt(&plain, "plain session"));
+    let body = harness.mock.last_body().expect("plain provider request");
+    assert!(
+        !body["tools"]
+            .as_array()
+            .expect("tools")
+            .iter()
+            .any(|tool| tool["function"]["name"] == "mcp_fixture_greet")
+    );
+
+    let other_log = harness.root.path().join("other-mcp-requests");
+    let created = harness.client().call(
+        6,
+        "session/new",
+        &json!({
+            "cwd": workspace, "mcpServers": [stdio_server(&other_log, "second")],
+        }),
+    );
+    let other = created["result"]["sessionId"]
+        .as_str()
+        .expect("other session");
+    harness
+        .client()
+        .call(7, "session/prompt", &prompt(other, "other greeting"));
+    let body = harness.mock.last_body().expect("other provider request");
+    assert!(
+        body["messages"]
+            .as_array()
+            .expect("messages")
+            .iter()
+            .any(|message| message["tool_call_id"] == "other"
+                && message["content"] == "hello second")
+    );
+    harness
+        .client()
+        .call(8, "session/close", &json!({"sessionId": session}));
+    assert_mcp_stopped(&log);
+    harness
+        .client()
+        .to_server
+        .shutdown(std::net::Shutdown::Both)
+        .expect("disconnect");
+    harness
+        .join
+        .take()
+        .expect("server thread")
+        .join()
+        .expect("server shutdown");
+    assert_mcp_stopped(&other_log);
+}
+
+#[test]
+fn loaded_and_resumed_sessions_connect_the_requested_stdio_servers() {
+    let mut harness = Harness::start(
+        vec![
+            Script::tool_call("failed", "mcp_fixture_greet", r#"{"who":"fail"}"#),
+            Script::text("failure observed"),
+            Script::tool_call("resumed", "mcp_fixture_greet", "{}"),
+            Script::text("resumed greeting"),
+        ],
+        PermissionMode::FullAccess,
+    );
+    let session = harness.open_session();
+    harness
+        .client()
+        .call(3, "session/close", &json!({"sessionId": session}));
+    let log = harness.root.path().join("loaded-mcp");
+    let response = harness.client().call(
+        4,
+        "session/load",
+        &json!({
+            "sessionId": session, "mcpServers": [stdio_server(&log, "loaded")],
+        }),
+    );
+    assert!(response.get("error").is_none(), "{response}");
+    harness
+        .client()
+        .call(5, "session/prompt", &prompt(&session, "fail greeting"));
+    let body = harness.mock.last_body().expect("provider request");
+    assert!(
+        body["messages"]
+            .as_array()
+            .expect("messages")
+            .iter()
+            .any(|message| message["tool_call_id"] == "failed"
+                && message["content"] == "fixture failure")
+    );
+    assert!(
+        harness
+            .client()
+            .updates("tool_call_update")
+            .iter()
+            .any(|frame| frame["params"]["update"]["toolCallId"] == "failed"
+                && frame["params"]["update"]["status"] == "failed")
+    );
+    harness
+        .client()
+        .call(6, "session/close", &json!({"sessionId": session}));
+    assert_mcp_stopped(&log);
+    let resumed_log = harness.root.path().join("resumed-mcp");
+    let response = harness.client().call(
+        7,
+        "session/resume",
+        &json!({
+            "sessionId": session, "mcpServers": [stdio_server(&resumed_log, "resumed")],
+        }),
+    );
+    assert!(response.get("error").is_none(), "{response}");
+    harness
+        .client()
+        .call(8, "session/prompt", &prompt(&session, "resumed greeting"));
+    let body = harness.mock.last_body().expect("resumed provider request");
+    assert!(body["messages"].as_array().expect("messages").iter().any(
+        |message| message["tool_call_id"] == "resumed" && message["content"] == "hello resumed"
+    ));
+}
+
+#[test]
+fn denied_mcp_calls_never_reach_the_stdio_server() {
+    let mut harness = Harness::start(
+        vec![
+            Script::tool_call("denied", "mcp_fixture_greet", "{}"),
+            Script::text("denied greeting"),
+        ],
+        PermissionMode::Ask,
+    );
+    let session = harness.open_session();
+    let log = harness.root.path().join("denied-mcp");
+    harness.client().call(
+        3,
+        "session/load",
+        &json!({
+            "sessionId": session, "mcpServers": [stdio_server(&log, "denied")],
+        }),
+    );
+    harness.client().approval = Approval::Refuse;
+    harness
+        .client()
+        .call(4, "session/prompt", &prompt(&session, "greet"));
+    assert_eq!(harness.client().approvals.len(), 1);
+    assert!(
+        !std::fs::read_to_string(&log)
+            .expect("MCP transcript")
+            .contains("tools/call")
+    );
+}
+
+#[test]
+fn invalid_or_failed_mcp_setup_does_not_create_a_session_or_leak_children() {
+    let mut limits = BudgetSet::new();
+    limits
+        .set(
+            LimitName::McpStartupTimeoutMs,
+            Budget::Bounded(500),
+            Layer::CommandLine,
+        )
+        .expect("startup limit");
+    let mut harness = Harness::start_with(
+        vec![Script::text("unused")],
+        PermissionMode::Auto,
+        limits,
+        Vec::new(),
+    );
+    harness.initialize(1000);
+    let workspace = harness.root.path().join("workspace");
+    let log = harness.root.path().join("validated-mcp");
+    let valid = stdio_server(&log, "valid");
+    let mut relative = valid.clone();
+    relative["command"] = json!("relative-server");
+    let mut bad_env = valid.clone();
+    bad_env["env"] = json!([{"name": "INVALID=NAME", "value": "fixture"}]);
+    let mut unsupported = valid.clone();
+    unsupported["type"] = json!("http");
+    for (index, servers) in [
+        json!({}),
+        json!([{"name": "missing-command"}]),
+        json!([relative]),
+        json!([bad_env]),
+        json!([unsupported]),
+        json!([valid.clone(), valid.clone()]),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let response = harness.client().call(
+            i64::try_from(index).expect("index"),
+            "session/new",
+            &json!({
+                "cwd": workspace, "mcpServers": servers,
+            }),
+        );
+        assert_eq!(response["error"]["code"], -32602, "{response}");
+        assert!(
+            !log.exists(),
+            "invalid declarations must not start any child"
+        );
+    }
+    let mut missing = valid.clone();
+    missing["name"] = json!("missing");
+    missing["command"] = json!(harness.root.path().join("no-such-server"));
+    let response = harness.client().call(
+        20,
+        "session/new",
+        &json!({
+            "cwd": workspace, "mcpServers": [valid, missing],
+        }),
+    );
+    assert!(
+        response.get("error").is_some(),
+        "startup failure: {response}"
+    );
+    assert_mcp_stopped(&log);
+    let silent_log = harness.root.path().join("silent-mcp");
+    let response = harness.client().call(
+        21,
+        "session/new",
+        &json!({
+            "cwd": workspace, "mcpServers": [stdio_server(&silent_log, "silent")],
+        }),
+    );
+    assert!(
+        response.get("error").is_some(),
+        "startup timeout: {response}"
+    );
+    assert!(
+        response["error"]["message"]
+            .as_str()
+            .expect("timeout message")
+            .contains("initialize"),
+        "{response}"
+    );
+    assert_mcp_stopped(&silent_log);
+    let listed = harness.client().call(22, "session/list", &json!({}));
+    assert_eq!(listed["result"]["sessions"], json!([]));
+    assert_eq!(harness.mock.request_count(), 0);
+}
+
+#[test]
+fn session_methods_require_compatible_initialization_before_any_work() {
+    let methods = [
+        "session/new",
+        "session/load",
+        "session/resume",
+        "session/close",
+        "session/list",
+        "session/set_config_option",
+        "session/set_mode",
+        "session/cancel",
+        "session/prompt",
+    ];
+    for version in [None, Some(0), Some(2)] {
+        let mut harness = Harness::start(vec![], PermissionMode::Auto);
+        if let Some(version) = version {
+            let response =
+                harness
+                    .client()
+                    .call(1, "initialize", &json!({"protocolVersion": version}));
+            assert_eq!(response["result"]["protocolVersion"], PROTOCOL_VERSION);
+            assert!(response.get("error").is_none(), "{response}");
+        }
+        // Valid creation params include an MCP fixture, so a missing guard
+        // would create a persisted session and launch a child process.
+        let log = harness.root.path().join("uninitialized-mcp");
+        let workspace = harness.root.path().join("workspace");
+        let params = json!({
+            "cwd": workspace,
+            "mcpServers": [stdio_server(&log, "must not start")],
+            "sessionId": "aaaaaaaaaaaa",
+            "configId": "model",
+            "value": "test/model",
+            "modeId": "default",
+            "prompt": [{"type": "text", "text": "must not run"}],
+        });
+        for (id, method) in (10..).zip(methods) {
+            let response = harness.client().call(id, method, &params);
+            assert_eq!(response["error"]["code"], -32600, "{method}: {response}");
+            assert_eq!(response["error"]["data"]["code"], "not_initialized");
+            assert_eq!(
+                response["error"]["data"]["protocolVersion"],
+                PROTOCOL_VERSION
+            );
+        }
+        harness.client().notify("session/new", &params);
+        harness.client().notify("session/prompt", &params);
+        let response = harness.client().call(
+            3,
+            "initialize",
+            &json!({"protocolVersion": PROTOCOL_VERSION}),
+        );
+        assert_eq!(response["result"]["protocolVersion"], PROTOCOL_VERSION);
+        let listed = harness.client().call(4, "session/list", &json!({}));
+        assert_eq!(listed["result"]["sessions"], json!([]));
+        assert!(!log.exists(), "MCP started before initialization");
+        assert!(!harness.root.path().join("state/sessions").exists());
+        assert_eq!(harness.mock.request_count(), 0);
+        let response = harness
+            .client()
+            .call(5, "session/new", &json!({"cwd": workspace}));
+        assert!(response["result"]["sessionId"].is_string(), "{response}");
+    }
+}
+
+#[test]
+fn malformed_initialize_requests_leave_the_connection_uninitialized() {
+    let mut harness = Harness::start(vec![], PermissionMode::Auto);
+    for (id, params) in (10_i64..).zip([
+        json!({}),
+        json!(null),
+        json!({"protocolVersion": null}),
+        json!({"protocolVersion": "1"}),
+        json!({"protocolVersion": true}),
+        json!({"protocolVersion": -1}),
+        json!({"protocolVersion": 1.5}),
+    ]) {
+        let response = harness.client().call(id, "initialize", &params);
+        assert_eq!(response["error"]["code"], -32602, "{params}: {response}");
+        assert_eq!(response["error"]["data"]["field"], "protocolVersion");
+        let response = harness
+            .client()
+            .call(id.saturating_add(100), "session/list", &json!({}));
+        assert_eq!(response["error"]["data"]["code"], "not_initialized");
+    }
+    let session = harness.open_session();
+    assert_eq!(session.len(), 12);
+}
+
+#[test]
+fn initialize_notifications_cannot_establish_compatibility() {
+    let mut harness = Harness::start(vec![], PermissionMode::Auto);
+    harness
+        .client()
+        .notify("initialize", &json!({"protocolVersion": PROTOCOL_VERSION}));
+    let response = harness.client().call(10, "session/list", &json!({}));
+    assert_eq!(response["error"]["data"]["code"], "not_initialized");
+    assert!(harness.logs().contains("initialize must be a request"));
+    let session = harness.open_session();
+    assert_eq!(session.len(), 12);
+}
+
+#[test]
+fn repeated_initialization_is_refused_without_revoking_compatibility() {
+    let mut harness = Harness::start(
+        vec![Script::text("still initialized")],
+        PermissionMode::Auto,
+    );
+    let session = harness.open_session();
+    for (id, version) in (3..).zip([PROTOCOL_VERSION, 2]) {
+        let response =
+            harness
+                .client()
+                .call(id, "initialize", &json!({"protocolVersion": version}));
+        assert_eq!(response["error"]["code"], -32600);
+        assert_eq!(response["error"]["data"]["code"], "already_initialized");
+    }
+    let response = harness
+        .client()
+        .call(5, "session/prompt", &prompt(&session, "continue"));
+    assert_eq!(response["result"]["stopReason"], "end_turn");
+    assert_eq!(harness.mock.request_count(), 1);
+}
+
 #[test]
 fn initialize_advertises_this_protocol_version_and_capabilities() {
     let mut harness = Harness::start(vec![Script::text("unused")], PermissionMode::Auto);
@@ -391,6 +1107,19 @@ fn initialize_advertises_this_protocol_version_and_capabilities() {
     );
     assert_eq!(response["result"]["agentInfo"]["name"], "rune");
     assert_eq!(response["result"]["authMethods"], json!([]));
+    assert_eq!(
+        response["result"]["agentCapabilities"]["promptCapabilities"],
+        json!({"image": true, "audio": false, "embeddedContext": true})
+    );
+    assert_eq!(
+        response["result"]["agentCapabilities"]["mcpCapabilities"],
+        json!({"http": false, "sse": false})
+    );
+    assert_eq!(response["result"]["agentInfo"]["title"], "Rune");
+    assert_eq!(
+        response["result"]["agentInfo"]["version"],
+        env!("CARGO_PKG_VERSION")
+    );
 }
 
 #[test]
@@ -402,6 +1131,96 @@ fn a_new_session_is_listed_with_its_identifier() {
     let listed = response["result"]["sessions"].as_array().expect("sessions");
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0]["sessionId"], session.as_str());
+}
+
+#[test]
+fn connections_list_only_sessions_with_their_stored_workspace() {
+    use rune_core::id::SessionId;
+    use rune_session::event::SessionEvent;
+    use rune_session::store::SessionStore;
+
+    let root = tempfile::tempdir().expect("shared session storage");
+    let paths = paths_for(root.path());
+    let workspaces = ["workspace-a", "workspace-b"].map(|name| {
+        let path = Utf8PathBuf::from_path_buf(root.path().join(name)).expect("UTF-8 workspace");
+        std::fs::create_dir(&path).expect("workspace");
+        path
+    });
+    let ids = workspaces.each_ref().map(|workspace| {
+        let id = SessionId::generate();
+        let store = SessionStore::create(&paths, &id).expect("fixture session");
+        store
+            .append(SessionEvent::WorkspaceSet {
+                workspace: workspace.to_string(),
+            })
+            .expect("record workspace");
+        id
+    });
+    let legacy = SessionId::generate();
+    drop(SessionStore::create(&paths, &legacy).expect("unscoped session"));
+    let mock = MockEndpoint::start(vec![Script::text("unused")]);
+
+    for (workspace, id) in workspaces.into_iter().zip(ids) {
+        let config = ServerConfig::new(
+            paths.clone(),
+            workspace.clone(),
+            Endpoint::new(mock.base_url(), "test-key"),
+            "test/model",
+        )
+        .expect("config");
+        let (server_side, client_side) = UnixStream::pair().expect("socket pair");
+        let output = server_side.try_clone().expect("output");
+        let server = Arc::new(Server::new(config, output).expect("server"));
+        let join = std::thread::spawn(move || {
+            let _ = server.run(BufReader::new(server_side));
+        });
+        let mut client = Client::new(client_side);
+        client.call(
+            1,
+            "initialize",
+            &json!({"protocolVersion": PROTOCOL_VERSION}),
+        );
+        let response = client.call(2, "session/list", &json!({}));
+        client
+            .to_server
+            .shutdown(std::net::Shutdown::Both)
+            .expect("disconnect");
+        join.join().expect("server stopped");
+
+        let listed = response["result"]["sessions"].as_array().expect("sessions");
+        assert_eq!(listed.len(), 1, "{response}");
+        assert_eq!(listed[0]["sessionId"], id.as_str());
+        assert_eq!(listed[0]["cwd"], workspace.as_str());
+    }
+    assert_eq!(mock.request_count(), 0);
+}
+
+#[test]
+fn an_omitted_session_cwd_uses_the_launch_workspace() {
+    let mut harness = Harness::start(vec![Script::text("unused")], PermissionMode::Auto);
+    harness.initialize(1000);
+    let expected = harness.root.path().join("workspace");
+    let created = harness.client().call(1, "session/new", &json!({}));
+    assert!(created["result"]["sessionId"].is_string(), "{created}");
+    let listed = harness.client().call(2, "session/list", &json!({}));
+    assert_eq!(
+        listed["result"]["sessions"][0]["cwd"],
+        expected.to_str().expect("utf8")
+    );
+}
+
+#[test]
+fn invalid_session_working_directories_are_rejected_without_creating_a_session() {
+    let mut harness = Harness::start(vec![Script::text("unused")], PermissionMode::Auto);
+    harness.initialize(1000);
+    for cwd in [json!("relative"), json!(42)] {
+        let response = harness
+            .client()
+            .call(1, "session/new", &json!({"cwd": cwd}));
+        assert_eq!(response["error"]["code"], -32602, "{response}");
+    }
+    let listed = harness.client().call(2, "session/list", &json!({}));
+    assert_eq!(listed["result"]["sessions"], json!([]));
 }
 
 #[test]
@@ -574,6 +1393,99 @@ fn the_prompt_queue_is_bounded() {
 }
 
 #[test]
+fn unanswered_permissions_time_out_without_blocking_later_prompts_or_granting_access() {
+    let mut limits = BudgetSet::new();
+    limits
+        .set(
+            LimitName::AcpPermissionTimeoutMs,
+            Budget::Bounded(1000),
+            Layer::User,
+        )
+        .expect("permission deadline");
+    let mut harness = Harness::start_with(
+        vec![
+            Script::tool_call(
+                "c1",
+                "write_file",
+                r#"{"path":"notes.txt","content":"unapproved"}"#,
+            ),
+            Script::text("after the timeout"),
+            Script::tool_call(
+                "c2",
+                "write_file",
+                r#"{"path":"notes.txt","content":"approved"}"#,
+            ),
+            Script::text("done"),
+        ],
+        PermissionMode::Ask,
+        limits,
+        vec![("notes.txt", "original")],
+    );
+    harness.client().approval = Approval::Ignore;
+    let session = harness.open_session();
+    let started = Instant::now();
+    harness
+        .client()
+        .request(3, "session/prompt", &prompt(&session, "write it"));
+    let expired = harness.client().await_permission_request();
+    harness
+        .client()
+        .request(4, "session/prompt", &prompt(&session, "queued prompt"));
+
+    let timed_out = harness.client().response(3);
+    assert_eq!(timed_out["error"]["data"]["code"], "timeout");
+    assert!(
+        timed_out["error"]["message"]
+            .as_str()
+            .expect("deadline message")
+            .contains("1000 ms (`acp_permission_timeout_ms`)")
+    );
+    assert!(started.elapsed() >= Duration::from_millis(1000));
+    assert!(started.elapsed() < Duration::from_secs(5));
+    assert_eq!(
+        std::fs::read_to_string(harness.root.path().join("workspace/notes.txt"))
+            .expect("unchanged file"),
+        "original"
+    );
+    assert!(harness.client().updates("tool_call").is_empty());
+    assert_eq!(
+        harness.client().response(4)["result"]["stopReason"],
+        "end_turn",
+        "the queued prompt runs after the expired permission"
+    );
+    assert_eq!(harness.mock.request_count(), 2);
+
+    // A late session grant must not authorize this tool in the following turn.
+    harness.client().send(&json!({
+        "jsonrpc": "2.0", "id": expired["id"],
+        "result": {"outcome": {"outcome": "selected", "optionId": "allow_always"}},
+    }));
+    harness
+        .client()
+        .request(5, "session/prompt", &prompt(&session, "try again"));
+    let pending = harness.client().update_until(|frame| {
+        frame.get("method").and_then(Value::as_str) == Some("session/request_permission")
+            && frame["id"] != expired["id"]
+    });
+    assert_ne!(pending["id"], expired["id"]);
+    harness.client().send(&json!({
+        "jsonrpc": "2.0", "id": pending["id"],
+        "result": {"outcome": {"outcome": "selected", "optionId": "allow_once"}},
+    }));
+    assert_eq!(
+        harness.client().response(5)["result"]["stopReason"],
+        "end_turn"
+    );
+    assert_eq!(
+        std::fs::read_to_string(harness.root.path().join("workspace/notes.txt"))
+            .expect("approved write"),
+        "approved"
+    );
+    assert_eq!(harness.mock.request_count(), 4);
+    assert_eq!(harness.client().errors.len(), 1);
+}
+
+#[test]
 fn cancelling_stops_the_active_turn_and_the_connection_stays_usable() {
     // The turn blocks on an approval the client never answers, so it is provably
     // in flight when the cancel arrives.
@@ -614,6 +1526,49 @@ fn cancelling_stops_the_active_turn_and_the_connection_stays_usable() {
     assert_eq!(again["result"]["stopReason"], "end_turn");
     let alive = harness.client().call(6, "session/list", &json!({}));
     assert!(alive["result"]["sessions"].is_array());
+}
+
+#[test]
+fn model_and_effort_changes_survive_loading_and_resuming() {
+    let mut harness = Harness::start(
+        vec![Script::text("loaded"), Script::text("resumed")],
+        PermissionMode::Auto,
+    );
+    let session = harness.open_session();
+    for (id, option, value) in [
+        (3, "model", "fixture/first"),
+        (4, "effort", "low"),
+        (5, "model", " fixture/chosen "),
+        (6, "effort", "high"),
+    ] {
+        let response = harness.client().call(
+            id,
+            "session/set_config_option",
+            &json!({"sessionId": session, "configId": option, "value": value}),
+        );
+        assert!(response.get("error").is_none(), "{response}");
+    }
+
+    for (id, method) in [(7, "session/load"), (10, "session/resume")] {
+        let closed = harness
+            .client()
+            .call(id, "session/close", &json!({"sessionId": session}));
+        assert_eq!(closed["result"], json!({}));
+        let response = harness
+            .client()
+            .call(id + 1, method, &json!({"sessionId": session}));
+        let options = &response["result"]["configOptions"];
+        assert_eq!(options[0]["currentValue"], "fixture/chosen", "{method}");
+        assert_eq!(options[1]["currentValue"], "high", "{method}");
+        let answered =
+            harness
+                .client()
+                .call(id + 2, "session/prompt", &prompt(&session, "continue"));
+        assert_eq!(answered["result"]["stopReason"], "end_turn");
+        let body = harness.mock.last_body().expect("provider request");
+        assert_eq!(body["model"], "fixture/chosen");
+        assert_eq!(body["reasoning_effort"], "high");
+    }
 }
 
 #[test]
@@ -727,6 +1682,166 @@ fn a_refused_tool_call_is_reported_as_failed_and_the_turn_continues() {
         !harness.client().updates("agent_message_chunk").is_empty(),
         "the model was told the call was refused and carried on"
     );
+}
+
+#[test]
+fn model_changes_update_usage_capacity_without_affecting_other_sessions() {
+    let listing = Script::Status {
+        code: 200,
+        body: json!({"data": [
+            {"id": "fixture/small", "context_window": 4096},
+            {"id": "fixture/large", "context_window": 65536},
+            {"id": "fixture/zero", "context_window": 0},
+        ]})
+        .to_string(),
+    };
+    let mut harness = Harness::start(
+        vec![Script::text("initial"), listing, Script::text("done")],
+        PermissionMode::Auto,
+    );
+    let session = harness.open_session();
+    let other = harness.client().call(3, "session/new", &json!({}))["result"]["sessionId"]
+        .as_str()
+        .expect("second session")
+        .to_owned();
+    let default = rune_net::catalog::DEFAULT_CONTEXT_WINDOW;
+    for (index, (id, model, capacity)) in [
+        (&session, "test/model", default),
+        (&session, "fixture/small", 4096),
+        (&session, "fixture/large", 65536),
+        (&other, "test/model", default),
+        (&session, "fixture/small", 4096),
+        (&session, "fixture/unknown", default),
+        (&session, "fixture/zero", default),
+        (&session, "test/model", default),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let request = 4 + i64::try_from(index).expect("small index") * 2;
+        let changed = harness.client().call(
+            request,
+            "session/set_config_option",
+            &json!({"sessionId": id, "configId": "model", "value": model}),
+        );
+        assert!(changed.get("error").is_none(), "{changed}");
+        let answered = harness.client().call(
+            request + 1,
+            "session/prompt",
+            &prompt(id, "report capacity"),
+        );
+        assert_eq!(answered["result"]["stopReason"], "end_turn");
+        let updates = harness.client().updates("usage_update");
+        assert_eq!(updates.len(), index + 1);
+        let last = updates.last().expect("usage update");
+        assert_eq!(last["params"]["sessionId"], id.as_str());
+        assert_eq!(last["params"]["update"]["size"], capacity, "{model}");
+        assert_eq!(last["params"]["update"]["used"], 15);
+        assert_eq!(
+            harness.mock.last_body().expect("provider request")["model"],
+            model
+        );
+    }
+    // One catalog request, with all subsequent model switches using its entries.
+    assert_eq!(harness.mock.request_count(), 9);
+}
+
+#[test]
+fn a_model_change_during_a_turn_keeps_that_turn_capacity() {
+    let mut harness = Harness::start_with(
+        vec![
+            Script::Status {
+                code: 200,
+                body: json!({"data": [
+                    {"id": "fixture/small", "context_window": 4096},
+                    {"id": "fixture/large", "context_window": 65536},
+                ]})
+                .to_string(),
+            },
+            Script::tool_call("c1", "read_file", r#"{"path":"notes.txt"}"#),
+            Script::text("done"),
+        ],
+        PermissionMode::Ask,
+        BudgetSet::new(),
+        vec![("notes.txt", "hello\n")],
+    );
+    let session = harness.open_session();
+    let changed = harness.client().call(
+        3,
+        "session/set_config_option",
+        &json!({"sessionId": session, "configId": "model", "value": "fixture/small"}),
+    );
+    assert!(changed.get("error").is_none(), "{changed}");
+    harness.client().approval = Approval::Ignore;
+    harness
+        .client()
+        .request(4, "session/prompt", &prompt(&session, "read it"));
+    let pending = harness.client().await_permission_request();
+    let changed = harness.client().call(
+        5,
+        "session/set_config_option",
+        &json!({"sessionId": session, "configId": "model", "value": "fixture/large"}),
+    );
+    assert!(changed.get("error").is_none(), "{changed}");
+    harness.client().send(&json!({
+        "jsonrpc": "2.0", "id": pending["id"],
+        "result": {"outcome": {"outcome": "selected", "optionId": "allow_once"}},
+    }));
+    assert_eq!(
+        harness.client().response(4)["result"]["stopReason"],
+        "end_turn"
+    );
+    assert_eq!(
+        harness.mock.last_body().expect("request")["model"],
+        "fixture/small"
+    );
+    let answered = harness
+        .client()
+        .call(6, "session/prompt", &prompt(&session, "next turn"));
+    assert_eq!(answered["result"]["stopReason"], "end_turn");
+    assert_eq!(
+        harness.mock.last_body().expect("request")["model"],
+        "fixture/large"
+    );
+    let updates = harness.client().updates("usage_update");
+    assert_eq!(updates.len(), 2);
+    assert_eq!(updates[0]["params"]["update"]["size"], 4096);
+    assert_eq!(updates[1]["params"]["update"]["size"], 65536);
+}
+
+#[test]
+fn unavailable_model_metadata_uses_a_conservative_capacity() {
+    for listing in [
+        Script::Status {
+            code: 503,
+            body: "unavailable".to_owned(),
+        },
+        Script::Status {
+            code: 200,
+            body: "invalid JSON".to_owned(),
+        },
+    ] {
+        let mut harness = Harness::start(vec![listing, Script::text("done")], PermissionMode::Auto);
+        let session = harness.open_session();
+        let changed = harness.client().call(
+            3,
+            "session/set_config_option",
+            &json!({"sessionId": session, "configId": "model", "value": "fixture/unknown"}),
+        );
+        assert!(changed.get("error").is_none(), "{changed}");
+        let answered =
+            harness
+                .client()
+                .call(4, "session/prompt", &prompt(&session, "keep working"));
+        assert_eq!(answered["result"]["stopReason"], "end_turn");
+        let updates = harness.client().updates("usage_update");
+        assert_eq!(updates.len(), 1);
+        assert_eq!(
+            updates[0]["params"]["update"]["size"],
+            rune_net::catalog::DEFAULT_CONTEXT_WINDOW
+        );
+        assert_eq!(harness.mock.request_count(), 2);
+    }
 }
 
 #[test]

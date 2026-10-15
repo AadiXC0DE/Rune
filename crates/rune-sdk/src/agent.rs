@@ -8,26 +8,28 @@
 //!
 //! A turn runs on its own thread, so the caller can close the agent, or drop the
 //! turn handle, while the turn is in flight. Cancellation is cooperative: every
-//! network step and every tool call sees the same flag, and a tool that ignores
-//! it delays the cancellation rather than preventing it.
+//! network step and every tool call sees the same flag. Host fetches and tools
+//! that ignore it delay cancellation until their blocking work returns.
 
 use std::fmt;
 use std::io::Read;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::Instant;
 
 use rune_agent::History;
+use rune_agent::compaction;
+use rune_agent::retry::{self, RetryPolicy};
 use rune_agent::steering::Cancellation;
 use rune_agent::turn::{CallResult, Event, PreparedCall, StopReason, TurnOutcome};
-use rune_core::budget::{BudgetSet, LimitName};
+use rune_core::budget::{BudgetSet, LimitDescription, LimitName};
 use rune_core::error::{ErrorCode, Result, RuneError};
 use rune_core::tool::ToolSpec;
-use rune_net::error::NetError;
+use rune_net::error::{FailureKind, NetError, parse_retry_after};
 use rune_net::message::{ContentPart, ImageRef, validate_tool_specs};
-use rune_net::provider::{Provider, RequestPlan, ToolChoice};
+use rune_net::provider::{Provider, ProviderCapabilities, RequestPlan, Routing, ToolChoice};
 use rune_net::redact;
 use rune_net::stream::{FinishReason, ProviderEvent, Usage};
 use rune_net::transport::{AuthStyle, Endpoint, StreamOutcome};
@@ -35,6 +37,76 @@ use rune_tools::contract::{Activity, ToolOutput};
 
 /// Version of the checkpoint format written by [`Agent::checkpoint`].
 pub const CHECKPOINT_VERSION: u32 = 1;
+
+/// Maximum number of unread events retained by a turn.
+///
+/// A full queue cancels the turn. [`Turn::result`] then returns `LimitExceeded`
+/// with the `sdk_event_queue` invariant, even if the caller later drains it.
+pub const EVENT_QUEUE_CAPACITY: usize = 1024;
+
+/// Where a diagnostic value comes from, without host data or credentials.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiagnosticSource {
+    /// A default compiled into Rune.
+    CompiledDefault,
+    /// An option or limit supplied by the embedding host.
+    HostSupplied,
+    /// The selected Rune wire implementation, independent of server support.
+    DialectImplementation,
+}
+
+/// Provenance of the agent's inputs. Values and host implementations are omitted.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct AgentSources {
+    /// The model identifier is required from the host.
+    pub model: DiagnosticSource,
+    /// The endpoint is required from the host; its URL is never reported.
+    pub endpoint: DiagnosticSource,
+    /// The dialect selection comes from the host's options.
+    pub dialect: DiagnosticSource,
+    /// Explicit host instructions, or `None` when the option was absent.
+    pub instructions: Option<DiagnosticSource>,
+    /// The tool list, including an empty list, comes from the host.
+    pub tools: DiagnosticSource,
+    /// Whether the host supplied network access or Rune's client is used.
+    pub fetch: DiagnosticSource,
+}
+
+/// One limit used by the SDK, including its configured and operational values.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct SdkLimit {
+    /// Configured value, compiled default, unit, range, and host-provided layer.
+    #[serde(flatten)]
+    pub configured: LimitDescription,
+    /// An explicit override is host supplied even if its layer is `Default`.
+    pub origin: DiagnosticSource,
+    /// Operational value in the configured unit; `None` means unlimited.
+    /// Accounts for emergency ceilings and the SDK's fallbacks. For
+    /// `ParallelToolCalls`, this controls wire permission for parallel calls;
+    /// host tools themselves execute sequentially.
+    pub effective: Option<u64>,
+}
+
+/// Credential-free snapshot returned by [`Agent::diagnostics`].
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct AgentDiagnostics {
+    /// Name of the selected Rune dialect implementation.
+    pub dialect: &'static str,
+    /// Wire features, which a particular server or model may further restrict.
+    /// These describe the dialect, not additional SDK prompt options.
+    pub capabilities: ProviderCapabilities,
+    /// Capabilities are obtained from the dialect, without network discovery.
+    pub capability_source: DiagnosticSource,
+    /// Whether the dialect can express upstream provider preferences.
+    pub routing: bool,
+    /// Only limits consumed by the SDK; host tool internals have their own policy.
+    pub limits: Vec<SdkLimit>,
+    /// Fixed maximum unread events per turn.
+    pub event_queue_capacity: usize,
+    /// Sources of host inputs, without their contents.
+    pub sources: AgentSources,
+}
 
 /// Which endpoint shape the agent speaks.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -46,6 +118,8 @@ pub enum Dialect {
     Anthropic,
     /// The responses API.
     Responses,
+    /// The native Gemini Generate Content API.
+    Gemini,
 }
 
 impl Dialect {
@@ -56,6 +130,7 @@ impl Dialect {
             Self::ChatCompletions => Box::new(rune_net::chat_completions::ChatCompletions),
             Self::Anthropic => Box::new(rune_net::anthropic::Anthropic),
             Self::Responses => Box::new(rune_net::responses::Responses),
+            Self::Gemini => Box::new(rune_net::gemini::Gemini),
         }
     }
 
@@ -64,6 +139,7 @@ impl Dialect {
     const fn auth(self) -> AuthStyle {
         match self {
             Self::Anthropic => AuthStyle::ApiKeyHeader,
+            Self::Gemini => AuthStyle::GoogleApiKeyHeader,
             Self::ChatCompletions | Self::Responses => AuthStyle::Bearer,
         }
     }
@@ -123,6 +199,78 @@ impl FetchResponse {
     }
 }
 
+/// Cancellation and deadlines for one host fetch attempt, including its body.
+///
+/// Clone this context into the returned reader and check it during bounded
+/// waits, including when no bytes arrive. The SDK cannot interrupt an arbitrary
+/// blocking host operation. A cooperative host must release its network work
+/// and reader within its documented polling or interruption bound.
+#[derive(Clone, Debug)]
+pub struct FetchContext {
+    /// The turn's cancellation signal, shared with its host tools.
+    pub signal: CancelFlag,
+    /// Absolute deadline for sending the request and reading its entire body.
+    /// `None` means `provider_request_timeout_ms` is unlimited.
+    pub deadline: Option<Instant>,
+    /// Absolute deadline for obtaining the HTTP response head.
+    /// Once headers arrive, the SDK separately bounds initial stream output.
+    pub head_deadline: Instant,
+    /// Set when this attempt ends, without cancelling the rest of the turn.
+    stopped: CancelFlag,
+}
+
+impl FetchContext {
+    /// Returns true if the turn was cancelled or this attempt has ended.
+    ///
+    /// Use this rather than only `signal` when interrupting a body reader: a
+    /// first-event timeout or a completed stream also ends the attempt.
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        self.signal.is_cancelled() || self.stopped.is_cancelled()
+    }
+
+    /// Checks cancellation and the total request deadline.
+    ///
+    /// Suitable for both sending and body reads. Deadline expiry is `Timeout`;
+    /// a cancelled turn or an ended attempt is `Cancelled`.
+    pub fn check(&self) -> Result<()> {
+        self.signal.check()?;
+        self.stopped.check()?;
+        if self
+            .deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            return Err(RuneError::new(
+                ErrorCode::Timeout,
+                "host fetch exceeded the total request deadline",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Also checks the response-head deadline, for use until headers arrive.
+    /// Do not use this for the body, whose bound is the total deadline.
+    pub fn check_head(&self) -> Result<()> {
+        self.check()?;
+        if Instant::now() >= self.head_deadline {
+            return Err(RuneError::new(
+                ErrorCode::Timeout,
+                "host fetch exceeded the response head deadline",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Stops retained host readers on every exit from an attempt, including errors.
+struct FetchStopGuard(CancelFlag);
+
+impl Drop for FetchStopGuard {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
+
 /// Network access, owned by the embedder.
 ///
 /// The agent routes every request through this trait: a host that needs to run
@@ -134,6 +282,39 @@ pub trait HostFetch: Send + Sync {
     /// Returns as soon as the response head is known; the body is read from the
     /// returned reader, which is what keeps a streamed answer incremental.
     fn post(&self, request: FetchRequest) -> Result<FetchResponse>;
+
+    /// Performs a request and returns its optional `Retry-After` header.
+    ///
+    /// Hosts that expose response headers should override this method so the
+    /// retry policy can honor the endpoint's delay. Existing hosts use backoff.
+    fn post_with_retry_after(
+        &self,
+        request: FetchRequest,
+    ) -> Result<(FetchResponse, Option<String>)> {
+        self.post(request).map(|response| (response, None))
+    }
+
+    /// Performs one attempt with cancellation, deadlines and `Retry-After`.
+    ///
+    /// The SDK calls this method for every attempt. Cooperative hosts override
+    /// it, use `context.check_head()` while sending, and retain a context clone
+    /// in the body to call `context.check()` during reads. `is_cancelled()` also
+    /// signals when decoding ends, so a silent reader can release its resources
+    /// even if the total deadline is disabled.
+    ///
+    /// The default preserves existing `post` and `post_with_retry_after` hosts.
+    /// It checks before and after sending, but cannot bound their blocking send
+    /// or interrupt their body. Such hosts must migrate to honor the contract.
+    fn post_with_context(
+        &self,
+        request: FetchRequest,
+        context: FetchContext,
+    ) -> Result<(FetchResponse, Option<String>)> {
+        context.check_head()?;
+        let response = self.post_with_retry_after(request)?;
+        context.check_head()?;
+        Ok(response)
+    }
 }
 
 /// Performs one request over the workspace transport.
@@ -144,22 +325,37 @@ pub trait HostFetch: Send + Sync {
 fn dispatch(
     client: &rune_net::transport::UreqFetch,
     request: FetchRequest,
-) -> Result<FetchResponse> {
+    context: Option<&FetchContext>,
+) -> Result<(FetchResponse, Option<String>)> {
+    if let Some(context) = context {
+        context.check_head()?;
+    }
     let parsed = rune_net::fetch::FetchRequest {
         method: rune_net::fetch::Method::Post,
         url: request.url,
         headers: request.headers,
         body: request.body.into_bytes(),
-        timeout: None,
-        head_timeout: None,
+        timeout: context.and_then(|context| {
+            context
+                .deadline
+                .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+        }),
+        head_timeout: context.map(|context| {
+            context
+                .head_deadline
+                .saturating_duration_since(Instant::now())
+        }),
         follow_redirects: true,
     };
     let response =
         rune_net::fetch::Fetch::send(client, parsed).map_err(|err| err.to_rune_error())?;
-    Ok(FetchResponse {
-        status: response.status,
-        body: response.body,
-    })
+    Ok((
+        FetchResponse {
+            status: response.status,
+            body: response.body,
+        },
+        response.retry_after,
+    ))
 }
 
 /// The fetch used when the embedder supplies none.
@@ -182,11 +378,26 @@ impl DefaultFetch {
 
 impl HostFetch for DefaultFetch {
     fn post(&self, request: FetchRequest) -> Result<FetchResponse> {
-        dispatch(&self.client, request)
+        dispatch(&self.client, request, None).map(|(response, _)| response)
+    }
+
+    fn post_with_retry_after(
+        &self,
+        request: FetchRequest,
+    ) -> Result<(FetchResponse, Option<String>)> {
+        dispatch(&self.client, request, None)
+    }
+
+    fn post_with_context(
+        &self,
+        request: FetchRequest,
+        context: FetchContext,
+    ) -> Result<(FetchResponse, Option<String>)> {
+        dispatch(&self.client, request, Some(&context))
     }
 }
 
-/// The cancellation signal handed to a host tool.
+/// The cancellation signal handed to host tools and fetches.
 ///
 /// Named here rather than reusing the loop's type so the embedding surface and
 /// the loop can change independently.
@@ -382,7 +593,8 @@ impl fmt::Debug for AgentOptions {
 /// Options for one prompt.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct PromptOptions {
-    /// Model steps allowed for this turn. Zero means unlimited.
+    /// Model steps allowed for this turn. A nonzero value overrides the agent's
+    /// `MaxAgentSteps` limit. Zero uses that limit, which is unlimited by default.
     pub max_steps: u64,
 }
 
@@ -504,7 +716,8 @@ impl Turn {
     /// Returns the next event, waiting for one when the turn is still running.
     ///
     /// Returns `None` once the turn has ended. A caller that only needs the
-    /// outcome can skip this and call [`Turn::result`].
+    /// outcome can skip this and call [`Turn::result`], provided the turn emits
+    /// no more than [`EVENT_QUEUE_CAPACITY`] events.
     pub fn next_event(&mut self) -> Option<Event> {
         self.events.recv().ok()
     }
@@ -521,6 +734,10 @@ impl Turn {
     /// Waiting here is what makes the caller's lifetime the turn's lifetime: the
     /// worker stops, and any cancellation requested while it ran is reflected in
     /// the stop reason.
+    ///
+    /// If the unread event queue filled, returns `LimitExceeded` with the
+    /// `sdk_event_queue` invariant. Consume events as the turn runs to avoid
+    /// this backpressure failure on long responses.
     pub fn result(&mut self) -> Result<TurnResult> {
         self.join();
         let product = self.completion.wait()?;
@@ -573,6 +790,7 @@ pub struct Agent {
     tools: Arc<Vec<HostTool>>,
     specs: Arc<Vec<ToolSpec>>,
     limits: BudgetSet,
+    sources: AgentSources,
     conversation: Arc<Conversation>,
     /// Cancellation for the turn started last, which is the only one that can
     /// still be running.
@@ -605,6 +823,16 @@ impl Drop for Agent {
 impl Agent {
     /// Builds an agent over one empty conversation.
     pub fn new(options: AgentOptions) -> Result<Self> {
+        Self::build(options, false)
+    }
+
+    /// Builds an agent for an explicitly anonymous loopback endpoint.
+    /// `api_key` must be empty; no authentication header is sent.
+    pub fn new_anonymous(options: AgentOptions) -> Result<Self> {
+        Self::build(options, true)
+    }
+
+    fn build(options: AgentOptions, anonymous: bool) -> Result<Self> {
         let model = options
             .model
             .as_ref()
@@ -615,11 +843,22 @@ impl Agent {
                 RuneError::missing_field("model").with_hint("set `model` in the agent options")
             );
         }
-        if options.api_key.trim().is_empty() {
+        if !anonymous && options.api_key.trim().is_empty() {
             return Err(RuneError::missing_field("api_key")
                 .with_hint("set the credential for the endpoint"));
         }
         rune_net::transport::validate_url(&options.base_url)?;
+        let endpoint = if anonymous {
+            if !options.api_key.is_empty() {
+                return Err(RuneError::invalid_field(
+                    "api_key",
+                    "an anonymous endpoint must not have a credential",
+                ));
+            }
+            Endpoint::anonymous(options.base_url)?
+        } else {
+            Endpoint::new(options.base_url, options.api_key).with_auth(options.dialect.auth())
+        };
 
         let specs: Vec<ToolSpec> = options.tools.iter().map(HostTool::spec).collect();
         validate_tool_specs(&specs)?;
@@ -635,19 +874,35 @@ impl Agent {
             .clone()
             .unwrap_or_else(|| Arc::new(DefaultFetch::new()));
 
+        let sources = AgentSources {
+            model: DiagnosticSource::HostSupplied,
+            endpoint: DiagnosticSource::HostSupplied,
+            dialect: DiagnosticSource::HostSupplied,
+            instructions: options
+                .instructions
+                .as_ref()
+                .map(|_| DiagnosticSource::HostSupplied),
+            tools: DiagnosticSource::HostSupplied,
+            fetch: if options.fetch.is_some() {
+                DiagnosticSource::HostSupplied
+            } else {
+                DiagnosticSource::CompiledDefault
+            },
+        };
+
         let mut history = History::new();
         history.set_instructions(instructions.clone());
 
         Ok(Self {
             model,
             instructions,
-            endpoint: Endpoint::new(options.base_url, options.api_key)
-                .with_auth(options.dialect.auth()),
+            endpoint,
             dialect: options.dialect,
             fetch,
             specs: Arc::new(specs),
             tools: Arc::new(options.tools),
             limits: BudgetSet::new(),
+            sources,
             conversation: Arc::new(Conversation {
                 history: Mutex::new(history),
                 ..Conversation::default()
@@ -689,6 +944,59 @@ impl Agent {
         self
     }
 
+    /// Reports effective SDK limits, dialect capabilities, and input sources.
+    ///
+    /// Makes no network requests and includes no credentials, URLs, model
+    /// identifiers, instructions, tool definitions, or conversation data.
+    /// Limits describe the agent; a nonzero [`PromptOptions::max_steps`] may
+    /// override `MaxAgentSteps` for an individual turn. SDK diagnostics do not
+    /// infer model context capacity or policies inside host tools and fetches.
+    #[must_use]
+    pub fn diagnostics(&self) -> AgentDiagnostics {
+        let provider = self.dialect.provider();
+        let timeouts = rune_net::transport::RequestTimeouts::from_limits(&self.limits);
+        let limits = self
+            .limits
+            .describe()
+            .into_iter()
+            .filter_map(|configured| {
+                let name = configured.name;
+                let effective = match name {
+                    LimitName::MaxAgentSteps => configured.value.value().filter(|value| *value > 0),
+                    LimitName::ProviderHeadTimeoutMs => Some(timeouts.head.as_millis() as u64),
+                    LimitName::ProviderRequestTimeoutMs => {
+                        timeouts.total.map(|timeout| timeout.as_millis() as u64)
+                    }
+                    LimitName::ProviderMaxAttempts | LimitName::PromptHistoryBytes => {
+                        Some(self.limits.get_usize(name).max(1) as u64)
+                    }
+                    LimitName::MaxToolResultBytes | LimitName::ParallelToolCalls => {
+                        Some(self.limits.get_usize(name) as u64)
+                    }
+                    _ => return None,
+                };
+                Some(SdkLimit {
+                    origin: if configured.source.is_some() {
+                        DiagnosticSource::HostSupplied
+                    } else {
+                        DiagnosticSource::CompiledDefault
+                    },
+                    configured,
+                    effective,
+                })
+            })
+            .collect();
+        AgentDiagnostics {
+            dialect: provider.name(),
+            capabilities: provider.capabilities(),
+            capability_source: DiagnosticSource::DialectImplementation,
+            routing: provider.routing() == Routing::Supported,
+            limits,
+            event_queue_capacity: EVENT_QUEUE_CAPACITY,
+            sources: self.sources.clone(),
+        }
+    }
+
     /// Returns the model identifier.
     #[must_use]
     pub fn model(&self) -> &str {
@@ -711,6 +1019,75 @@ impl Agent {
     #[must_use]
     pub const fn is_closed(&self) -> bool {
         self.closed
+    }
+
+    /// Pins an explicit user constraint verbatim in every subsequent request.
+    ///
+    /// Pins survive compaction and checkpoint restoration. Exact duplicates
+    /// return false. Empty constraints, closed agents, running turns, and pins
+    /// exceeding the checkpoint's `PromptHistoryBytes` bound are refused
+    /// without changing the conversation.
+    pub fn pin_constraint(&mut self, text: impl Into<String>) -> Result<bool> {
+        if self.closed || self.claim.load(Ordering::SeqCst) {
+            return Err(RuneError::new(
+                ErrorCode::InvalidState,
+                "pinning requires an open agent at a settled turn boundary",
+            ));
+        }
+        let mut history = lock(&self.conversation.history).clone();
+        let added = history.pin_constraint(text)?;
+        if added {
+            self.serialize_checkpoint(history.clone())?;
+            *lock(&self.conversation.history) = history;
+        }
+        Ok(added)
+    }
+
+    /// Summarizes an older prefix of the conversation at a settled turn boundary.
+    ///
+    /// The synchronous host callback receives summary instructions and only the
+    /// prefix being removed, including tool activity, plus explicit pinned user
+    /// constraints kept independently of its output. It must return a complete
+    /// summary or an error, including when its work is cancelled or truncated.
+    /// No provider request is made by the SDK itself.
+    ///
+    /// Uses the shared compaction planner and this agent's limits to retain recent
+    /// turns without splitting tool calls from their results. Returns the number
+    /// of records removed, or zero without calling the summarizer when there is
+    /// no prefix to compact. Closed agents and running turns are refused.
+    ///
+    /// Callback errors, unusable summaries, invalid tool pairs, and checkpoints
+    /// exceeding `PromptHistoryBytes` leave the conversation and usage unchanged.
+    /// Successful compaction preserves usage and retained provider replay data.
+    pub fn compact(&mut self, summarizer: impl FnOnce(&str) -> Result<String>) -> Result<usize> {
+        if self.closed {
+            return Err(
+                RuneError::new(ErrorCode::InvalidState, "the agent is closed")
+                    .with_hint("build a new agent, or restore one from a checkpoint"),
+            );
+        }
+        if self.claim.load(Ordering::SeqCst) {
+            return Err(RuneError::new(
+                ErrorCode::InvalidState,
+                "a turn is running, so the conversation cannot be compacted",
+            )
+            .with_hint("wait for the running turn, or drop its handle to cancel it"));
+        }
+
+        let mut history = lock(&self.conversation.history).clone();
+        history.validate()?;
+        let Some(plan) = compaction::plan(&history, &self.limits) else {
+            return Ok(0);
+        };
+        let summary = summarizer(&compaction::render_summary_request(&history, &plan))?;
+        compaction::validate_summary(&summary)?;
+        let removed = compaction::apply(&mut history, &plan, compaction::wrap_summary(&summary));
+        history.validate()?;
+        // Check replayability before installing anything. A host may compact
+        // precisely because the current checkpoint is too large.
+        self.serialize_checkpoint(history.clone())?;
+        *lock(&self.conversation.history) = history;
+        Ok(removed)
     }
 
     /// Runs one turn.
@@ -741,11 +1118,12 @@ impl Agent {
 
         lock(&self.conversation.history).push_user(input.into());
 
-        let (events, receiver) = mpsc::channel();
+        let (events, receiver) = mpsc::sync_channel(EVENT_QUEUE_CAPACITY);
         let context = TurnContext {
             conversation: Arc::clone(&self.conversation),
             cancel: self.cancel.clone(),
             events,
+            backpressured: AtomicBool::new(false),
             model: self.model.clone(),
             instructions: self.instructions.clone(),
             endpoint: self.endpoint.clone(),
@@ -754,7 +1132,14 @@ impl Agent {
             tools: Arc::clone(&self.tools),
             specs: Arc::clone(&self.specs),
             limits: self.limits.clone(),
-            max_steps: options.max_steps,
+            max_steps: if options.max_steps == 0 {
+                self.limits
+                    .get(LimitName::MaxAgentSteps)
+                    .value()
+                    .unwrap_or(0)
+            } else {
+                options.max_steps
+            },
         };
 
         let guard = WorkerGuard {
@@ -766,6 +1151,22 @@ impl Agent {
             .spawn(move || {
                 let settled = guard;
                 let product = run_turn(&context);
+                // Backpressure uses cancellation to stop cooperative work, but
+                // must remain an explicit failure rather than a cancelled or
+                // successful result, including overflow of the final event.
+                let product = if context.backpressured.load(Ordering::SeqCst) {
+                    Err(RuneError::new(
+                        ErrorCode::LimitExceeded,
+                        format!(
+                            "SDK event queue backpressure: {EVENT_QUEUE_CAPACITY} unread events"
+                        ),
+                    )
+                    .with_invariant("sdk_event_queue")
+                    .with_observed(EVENT_QUEUE_CAPACITY.to_string())
+                    .with_hint("consume Turn::events or Turn::next_event while the turn runs"))
+                } else {
+                    product
+                };
                 settled.publish(product);
             });
 
@@ -813,6 +1214,9 @@ impl Agent {
     /// The format is versioned, and deliberately excludes the credential, the
     /// model, the instructions, and the tools: a checkpoint is data a host may
     /// store or move between processes, and none of those belong in it.
+    ///
+    /// The serialized bytes must fit within `PromptHistoryBytes`, the same cap
+    /// used by restoration. Exceeding it returns `TooLarge` for `checkpoint`.
     pub fn checkpoint(&self) -> Result<Vec<u8>> {
         if self.claim.load(Ordering::SeqCst) {
             return Err(RuneError::new(
@@ -822,19 +1226,26 @@ impl Agent {
             .with_hint("wait for the turn to settle, or close the agent to cancel it"));
         }
 
-        let history = {
-            let mut history = lock(&self.conversation.history).clone();
-            // The instructions are a property of the host, not of the
-            // conversation, and they never enter the checkpoint.
-            history.set_instructions(String::new());
-            history
-        };
+        let history = lock(&self.conversation.history).clone();
+        self.serialize_checkpoint(history)
+    }
+
+    /// Serializes a candidate history under the same bound as restoration.
+    fn serialize_checkpoint(&self, mut history: History) -> Result<Vec<u8>> {
+        // The instructions are a property of the host, not of the
+        // conversation, and they never enter the checkpoint.
+        history.set_instructions(String::new());
         let body = CheckpointBody {
             version: CHECKPOINT_VERSION,
             history,
             usage: *lock(&self.conversation.usage),
         };
-        Ok(serde_json::to_vec(&body)?)
+        let checkpoint = serde_json::to_vec(&body)?;
+        let cap = self.limits.get_usize(LimitName::PromptHistoryBytes).max(1);
+        if checkpoint.len() > cap {
+            return Err(RuneError::too_large("checkpoint", checkpoint.len(), cap));
+        }
+        Ok(checkpoint)
     }
 
     /// Adopts the conversation a checkpoint carries.
@@ -903,7 +1314,8 @@ fn highest_image(history: &History) -> u64 {
 struct TurnContext {
     conversation: Arc<Conversation>,
     cancel: Cancellation,
-    events: Sender<Event>,
+    events: SyncSender<Event>,
+    backpressured: AtomicBool,
     model: String,
     instructions: String,
     endpoint: Endpoint,
@@ -918,10 +1330,16 @@ struct TurnContext {
 impl TurnContext {
     /// Reports an event.
     ///
-    /// A dropped receiver means the caller discarded the turn handle; the turn
-    /// still runs to a settled result.
+    /// Never waits for the consumer. Once full, the queue fails the turn and
+    /// stops retaining events; cooperative cancellation stops provider/tools.
     fn emit(&self, event: Event) {
-        let _ = self.events.send(event);
+        if self.backpressured.load(Ordering::SeqCst) {
+            return;
+        }
+        if let Err(TrySendError::Full(_)) = self.events.try_send(event) {
+            self.backpressured.store(true, Ordering::SeqCst);
+            self.cancel.cancel();
+        }
     }
 
     /// Adds one request's usage to the conversation's total.
@@ -982,7 +1400,7 @@ fn run_turn(context: &TurnContext) -> Result<TurnProduct> {
         context.emit(Event::TurnStarted { step: acc.steps });
 
         let plan = context.plan()?;
-        let response = match request(context, provider.as_ref(), &plan) {
+        let response = match request_with_retry(context, provider.as_ref(), &plan, acc.steps) {
             Ok(response) => response,
             // A cancellation during the request settles the turn rather than
             // failing it: the caller asked for it, so it is not an error.
@@ -1104,12 +1522,113 @@ impl TurnContext {
     }
 }
 
+/// A request failure retains the original host error and the provider taxonomy
+/// needed for retry decisions, without converting away retry metadata first.
+struct RequestFailure {
+    error: RuneError,
+    kind: FailureKind,
+    retry_after_ms: Option<u64>,
+}
+
+impl From<NetError> for RequestFailure {
+    fn from(error: NetError) -> Self {
+        Self {
+            kind: error.kind(),
+            retry_after_ms: error.retry_after_ms(),
+            error: error.to_rune_error(),
+        }
+    }
+}
+
+impl From<RuneError> for RequestFailure {
+    fn from(error: RuneError) -> Self {
+        let kind = match error.code() {
+            ErrorCode::RateLimited => FailureKind::RateLimited,
+            ErrorCode::TransportFailure => FailureKind::Network,
+            ErrorCode::Timeout => FailureKind::Timeout,
+            ErrorCode::IncompleteStream => FailureKind::IncompleteStream,
+            ErrorCode::RequestRejected => FailureKind::ProviderError,
+            // Other host failures are permanent; keep their original detail.
+            _ => FailureKind::InvalidRequest,
+        };
+        Self {
+            error,
+            kind,
+            retry_after_ms: None,
+        }
+    }
+}
+
+/// Retries one model step without recording failed attempts in the conversation.
+fn request_with_retry(
+    context: &TurnContext,
+    provider: &dyn Provider,
+    plan: &RequestPlan,
+    step: u32,
+) -> Result<StreamOutcome> {
+    let max_attempts = context
+        .limits
+        .get_usize(LimitName::ProviderMaxAttempts)
+        .max(1);
+    let policy = RetryPolicy::new(max_attempts);
+    let mut attempt = 0_usize;
+    loop {
+        context.cancel.check()?;
+        if attempt > 0 {
+            context.emit(Event::StepRestarted { step });
+        }
+        attempt = attempt.saturating_add(1);
+        match request(context, provider, plan) {
+            Ok(response) => {
+                if attempt > 1 {
+                    context.emit(Event::ProviderRetryFinished { step });
+                }
+                return Ok(response);
+            }
+            Err(failure) => {
+                context.cancel.check()?;
+                let Some(delay) = policy.delay(attempt, failure.kind, failure.retry_after_ms)
+                else {
+                    return Err(failure.error);
+                };
+                context.emit(Event::ProviderRetry {
+                    step,
+                    next_attempt: attempt.saturating_add(1),
+                    max_attempts,
+                    delay,
+                });
+                retry::wait(delay, &context.cancel)?;
+            }
+        }
+    }
+}
+
 /// Sends one request and reduces its response stream.
 fn request(
     context: &TurnContext,
     provider: &dyn Provider,
     plan: &RequestPlan,
-) -> Result<StreamOutcome> {
+) -> std::result::Result<StreamOutcome, RequestFailure> {
+    let started = Instant::now();
+    let mut timeouts = rune_net::transport::RequestTimeouts::from_limits(&context.limits);
+    let deadline_error = || {
+        RuneError::new(
+            ErrorCode::InvalidConfiguration,
+            "host fetch deadline is out of range",
+        )
+    };
+    let fetch_context = FetchContext {
+        signal: context.cancel.clone().into(),
+        deadline: timeouts
+            .total
+            .map(|total| started.checked_add(total).ok_or_else(deadline_error))
+            .transpose()?,
+        head_deadline: started
+            .checked_add(timeouts.head)
+            .ok_or_else(deadline_error)?,
+        stopped: CancelFlag::new(),
+    };
+    let _fetch_stop = FetchStopGuard(fetch_context.stopped.clone());
     context.cancel.check()?;
     provider.validate(plan)?;
     let body = provider.build_request(plan)?;
@@ -1117,35 +1636,43 @@ fn request(
     let mut headers = vec![
         ("content-type".to_owned(), "application/json".to_owned()),
         ("accept".to_owned(), "text/event-stream".to_owned()),
-        (
+    ];
+    if context.endpoint.auth != AuthStyle::Anonymous {
+        headers.push((
             context.endpoint.auth.header().to_owned(),
             context.endpoint.auth.value(&context.endpoint.credential),
-        ),
-    ];
+        ));
+    }
     for (name, value) in provider.extra_headers() {
         headers.push((name.to_owned(), value));
     }
 
     let request = FetchRequest {
-        url: context.endpoint.url_for(provider.request_path()),
+        url: context.endpoint.url_for(&provider.completion_path(plan)?),
         headers,
-        body: serde_json::to_string(&body)?,
+        body: serde_json::to_string(&body).map_err(RuneError::from)?,
     };
-    let response = context.fetch.post(request)?;
+    let (response, retry_after) = context
+        .fetch
+        .post_with_context(request, fetch_context.clone())?;
+    fetch_context.check_head()?;
 
     if response.status >= 400 {
         // Only enough of the body to explain the rejection; an endpoint that
         // answers with an error page must not be able to exhaust memory here.
         let mut raw = Vec::new();
         let _ = response.body.take(64 * 1024).read_to_end(&mut raw);
+        fetch_context.check()?;
         let text = String::from_utf8_lossy(&raw);
         let sanitized = redact::redact(&text);
-        return Err(NetError::classify_status(response.status, &sanitized)
-            .with_hint(format!(
-                "provider `{}` rejected the request",
-                provider.name()
-            ))
-            .to_rune_error());
+        let mut error = NetError::classify_status(response.status, &sanitized).with_hint(format!(
+            "provider `{}` rejected the request",
+            provider.name()
+        ));
+        if let Some(millis) = retry_after.as_deref().and_then(parse_retry_after) {
+            error = error.with_retry_after(millis);
+        }
+        return Err(error.into());
     }
 
     // Each event is handed back as it is decoded, so a host rendering the turn
@@ -1160,21 +1687,19 @@ fn request(
         _ => {}
     };
 
-    let head_timeout = Duration::from_millis(
-        context
-            .limits
-            .get(LimitName::ProviderHeadTimeoutMs)
-            .value()
-            .unwrap_or(120_000),
-    );
+    // HostFetch owns the blocking send. Its elapsed time still consumes the
+    // total budget available to the shared stream reader.
+    timeouts.total = timeouts
+        .total
+        .map(|total| total.saturating_sub(started.elapsed()));
     rune_net::transport::read_stream(
         response.body,
         provider,
-        head_timeout,
+        timeouts,
         &|| context.cancel.is_cancelled(),
         &mut observe,
     )
-    .map_err(|err| err.to_rune_error())
+    .map_err(RequestFailure::from)
 }
 
 /// One executed call, with the images it produced.
@@ -1230,6 +1755,15 @@ fn execute(context: &TurnContext, calls: &[PreparedCall]) -> (Vec<Executed>, boo
             call: call.clone(),
             activity: Activity::Execute,
         });
+        // A full event queue must stop a tool before invoking host code.
+        if context.cancel.is_cancelled() {
+            cancelled = true;
+            results.push(failed(
+                call,
+                "the turn was cancelled before this call ran".to_owned(),
+            ));
+            continue;
+        }
         let host_context = HostToolContext {
             signal: context.cancel.clone().into(),
         };
@@ -1249,6 +1783,7 @@ fn execute(context: &TurnContext, calls: &[PreparedCall]) -> (Vec<Executed>, boo
                             text: bound_text(&result.text, cap),
                             is_error: result.is_error,
                             produced_bytes: produced,
+                            plan_update: None,
                         },
                         executed: true,
                     },

@@ -48,6 +48,15 @@ impl Provider for ChatCompletions {
         crate::provider::Routing::Supported
     }
 
+    fn capabilities(&self) -> crate::provider::ProviderCapabilities {
+        crate::provider::ProviderCapabilities {
+            efforts: crate::provider::ALL_EFFORTS,
+            images: true,
+            tool_streaming: crate::provider::ToolStreaming::Incremental,
+            fast_mode: false,
+        }
+    }
+
     fn request_path(&self) -> &'static str {
         PATH
     }
@@ -80,7 +89,7 @@ impl Provider for ChatCompletions {
                 messages.extend(encode_tool_messages(message));
                 continue;
             }
-            messages.push(encode_message(message)?);
+            messages.push(encode_message(message, plan)?);
         }
 
         let mut body = serde_json::Map::new();
@@ -114,9 +123,14 @@ impl Provider for ChatCompletions {
                 "tool_choice".to_owned(),
                 serde_json::json!(plan.tool_choice.as_str()),
             );
-            if plan.parallel_tool_calls {
-                body.insert("parallel_tool_calls".to_owned(), serde_json::json!(true));
-            }
+            body.insert(
+                "parallel_tool_calls".to_owned(),
+                serde_json::json!(plan.parallel_tool_calls),
+            );
+        }
+
+        if let Some(effort) = effort_wire(plan.effort) {
+            body.insert("reasoning_effort".to_owned(), serde_json::json!(effort));
         }
 
         if let Some(max) = plan.max_output_tokens {
@@ -134,13 +148,13 @@ impl Provider for ChatCompletions {
 }
 
 /// Encodes one message into the dialect's shape.
-fn encode_message(message: &Message) -> Result<serde_json::Value> {
+fn encode_message(message: &Message, plan: &RequestPlan) -> Result<serde_json::Value> {
     match message.role {
         Role::System => Err(RuneError::invalid_field(
             "messages",
             "system content must be supplied as instructions, not as a message",
         )),
-        Role::User => Ok(encode_user(message)),
+        Role::User => Ok(encode_user(message, plan)),
         Role::Assistant => Ok(encode_assistant(message)),
         // Tool results are expanded before this point, because one message can
         // carry several of them and this returns a single message.
@@ -152,7 +166,7 @@ fn encode_message(message: &Message) -> Result<serde_json::Value> {
 }
 
 /// Encodes a user message, using content parts when images are present.
-fn encode_user(message: &Message) -> serde_json::Value {
+fn encode_user(message: &Message, plan: &RequestPlan) -> serde_json::Value {
     let has_image = message
         .parts
         .iter()
@@ -172,7 +186,10 @@ fn encode_user(message: &Message) -> serde_json::Value {
             })),
             ContentPart::Image { image } => Some(serde_json::json!({
                 "type": "image_url",
-                "image_url": { "url": format!("image-ref:{}", image.id) },
+                "image_url": { "url": plan.image_data.get(&image.id).map_or_else(
+                    || format!("image-ref:{}", image.id),
+                    |data| format!("data:{};base64,{data}", image.media_type),
+                ) },
             })),
             _ => None,
         })
@@ -779,6 +796,26 @@ mod tests {
     }
 
     #[test]
+    fn one_call_mode_is_explicitly_serialized() {
+        let mut plan = plan_with_user("hi");
+        plan.tools = vec![ToolSpec {
+            name: "read_file".to_owned(),
+            description: "Read a file".to_owned(),
+            input_schema: serde_json::json!({ "type": "object" }),
+        }];
+        plan.parallel_tool_calls = false;
+        let body = ChatCompletions.build_request(&plan).expect("build");
+        assert_eq!(body["parallel_tool_calls"], false);
+        assert_eq!(body["tool_choice"], "auto");
+
+        plan.tools.clear();
+        let body = ChatCompletions
+            .build_request(&plan)
+            .expect("build without tools");
+        assert!(body.get("parallel_tool_calls").is_none());
+    }
+
+    #[test]
     fn no_tool_fields_are_emitted_without_tools() {
         let body = ChatCompletions
             .build_request(&plan_with_user("hi"))
@@ -969,6 +1006,32 @@ mod tests {
         plan.tool_choice = ToolChoice::Required;
         let body = ChatCompletions.build_request(&plan).expect("build");
         assert_eq!(body["tool_choice"], "required");
+    }
+
+    #[test]
+    fn auto_effort_preserves_provider_defaults() {
+        let body = ChatCompletions
+            .build_request(&plan_with_user("hi"))
+            .expect("build");
+        assert!(body.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn explicit_efforts_are_serialized_in_the_request() {
+        for (effort, wire) in [
+            (Effort::None, "none"),
+            (Effort::Minimal, "minimal"),
+            (Effort::Low, "low"),
+            (Effort::Medium, "medium"),
+            (Effort::High, "high"),
+            (Effort::Xhigh, "xhigh"),
+            (Effort::Max, "max"),
+        ] {
+            let mut plan = plan_with_user("hi");
+            plan.effort = effort;
+            let body = ChatCompletions.build_request(&plan).expect("build");
+            assert_eq!(body["reasoning_effort"], wire, "{effort}");
+        }
     }
 
     #[test]

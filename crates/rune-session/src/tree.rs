@@ -24,7 +24,7 @@ pub const SCHEMA_VERSION: u32 = 1;
 /// Branch a session starts on.
 pub const MAIN_BRANCH: &str = "main";
 
-/// Longest preview kept for one turn, in characters.
+/// Longest escaped preview kept for one turn, in characters.
 pub const MAX_PREVIEW_CHARS: usize = 200;
 
 /// Longest accepted branch name, in bytes.
@@ -89,7 +89,7 @@ pub struct Node {
     pub branch: String,
     /// Who produced the turn.
     pub role: Role,
-    /// One-line preview of the turn.
+    /// One-line preview of the turn, with controls and line separators escaped.
     pub preview: String,
     /// Encoded size of the turn's payload.
     pub bytes: usize,
@@ -106,7 +106,7 @@ impl Node {
             parent: None,
             branch: String::new(),
             role,
-            preview: bounded_preview(preview.into()),
+            preview: bounded_preview(&preview.into()),
             bytes,
             created_at_ms,
         }
@@ -324,7 +324,7 @@ impl Tree {
         node.seq = seq;
         node.parent = parent;
         node.branch.clone_from(&branch);
-        node.preview = bounded_preview(node.preview);
+        node.preview = bounded_preview(&node.preview);
         self.nodes.insert(seq, node);
 
         match parent {
@@ -511,13 +511,14 @@ impl Tree {
     /// Rebuilds the maps and checks that every reference resolves.
     fn assemble(wire: WireTree) -> Result<Self> {
         let mut nodes: BTreeMap<u64, Node> = BTreeMap::new();
-        for node in wire.nodes {
+        for mut node in wire.nodes {
             if node.seq == 0 {
                 return Err(
                     RuneError::invariant("tree_sequence", "a tree turn has sequence 0")
                         .with_observed("seq 0"),
                 );
             }
+            node.preview = bounded_preview(&node.preview);
             if nodes.insert(node.seq, node).is_some() {
                 return Err(RuneError::invariant(
                     "tree_sequence",
@@ -762,12 +763,31 @@ fn checked_branch_name(raw: &str) -> Result<&str> {
     Ok(name)
 }
 
-/// Truncates a preview to the bound, leaving a short one alone.
-fn bounded_preview(text: String) -> String {
-    if text.chars().count() <= MAX_PREVIEW_CHARS {
-        return text;
+/// Escapes controls and line separators, bounding the result at whole escapes.
+///
+/// Printable text, including backslashes, is kept as-is so normalizing a stored
+/// preview again does not double its escapes.
+fn bounded_preview(text: &str) -> String {
+    let mut preview = String::with_capacity(text.len().min(MAX_PREVIEW_CHARS));
+    let mut chars = 0_usize;
+    for ch in text.chars() {
+        if ch.is_control() || matches!(ch, '\u{2028}' | '\u{2029}') {
+            let escaped = ch.escape_default();
+            let len = escaped.len();
+            if chars.saturating_add(len) > MAX_PREVIEW_CHARS {
+                break;
+            }
+            preview.extend(escaped);
+            chars = chars.saturating_add(len);
+        } else {
+            if chars == MAX_PREVIEW_CHARS {
+                break;
+            }
+            preview.push(ch);
+            chars = chars.saturating_add(1);
+        }
     }
-    text.chars().take(MAX_PREVIEW_CHARS).collect()
+    preview
 }
 
 /// Converts a length to the type used in totals.
@@ -1055,6 +1075,63 @@ mod tests {
         assert_eq!(err.code(), ErrorCode::AlreadyExists);
         let err = tree.fork(1, "not a name").expect_err("refused");
         assert_eq!(err.code(), ErrorCode::InvalidField);
+    }
+
+    #[test]
+    fn previews_escape_controls_without_changing_printable_unicode() {
+        let raw = "世界 😀 e\u{301}\\path\nrow\r\t\0\u{1b}[31m\u{7f}\u{85}\u{2028}\u{2029}";
+        let expected =
+            "世界 😀 e\u{301}\\path\\nrow\\r\\t\\u{0}\\u{1b}[31m\\u{7f}\\u{85}\\u{2028}\\u{2029}";
+        for &role in Role::all() {
+            let node = Node::new(role, raw, raw.len(), 0);
+            assert_eq!(node.preview, expected);
+            assert_eq!(node.bytes, raw.len());
+            let mut tree = Tree::new();
+            tree.append(None, node).expect("append");
+            assert_eq!(tree.node(1).expect("node").preview, expected);
+            assert_eq!(tree.branch(MAIN_BRANCH).expect("branch").summary, expected);
+        }
+    }
+
+    #[test]
+    fn previews_are_normalized_when_appended_or_decoded_from_old_trees() {
+        let mut tree = Tree::new();
+        let mut node = user("safe");
+        node.preview = "first\nsecond\u{1b}[2J".to_owned();
+        tree.append(None, node).expect("append");
+        assert_eq!(
+            tree.node(1).expect("node").preview,
+            "first\\nsecond\\u{1b}[2J"
+        );
+
+        let mut wire: serde_json::Value =
+            serde_json::from_str(&tree.encode().expect("encode")).expect("wire");
+        wire["nodes"][0]["preview"] = serde_json::json!("old\r\nrow\t");
+        let decoded = Tree::decode(&wire.to_string()).expect("decode legacy preview");
+        assert_eq!(decoded.node(1).expect("node").preview, "old\\r\\nrow\\t");
+        assert_eq!(
+            Tree::decode(&decoded.encode().expect("encode")).expect("decode"),
+            decoded
+        );
+    }
+
+    #[test]
+    fn previews_bound_the_escaped_text_without_splitting_an_escape() {
+        for (control, escaped) in [
+            ("\n", "\\n"),
+            ("\u{1b}", "\\u{1b}"),
+            ("\u{2028}", "\\u{2028}"),
+        ] {
+            let prefix = "書".repeat(MAX_PREVIEW_CHARS - escaped.len());
+            let node = user(&format!("{prefix}{control}tail"));
+            assert_eq!(node.preview, format!("{prefix}{escaped}"));
+            assert_eq!(node.preview.chars().count(), MAX_PREVIEW_CHARS);
+
+            let prefix = "書".repeat(MAX_PREVIEW_CHARS - escaped.len() + 1);
+            assert_eq!(user(&format!("{prefix}{control}tail")).preview, prefix);
+        }
+        let node = user(&"\n".repeat(MAX_PREVIEW_CHARS));
+        assert_eq!(node.preview, "\\n".repeat(MAX_PREVIEW_CHARS / 2));
     }
 
     #[test]

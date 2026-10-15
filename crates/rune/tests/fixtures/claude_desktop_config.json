@@ -1,0 +1,13 @@
+{
+  "preferences": { "unrelated": true },
+  "mcpServers": {
+    "fixture": {
+      "command": "sh",
+      "args": [
+        "-c",
+        "printf '%s' \"$IMPORT_NOTE\" > import-started; printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2024-11-05\"}}' '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[]}}'; cat >/dev/null"
+      ],
+      "env": { "IMPORT_NOTE": "fixture environment with spaces" }
+    }
+  }
+}

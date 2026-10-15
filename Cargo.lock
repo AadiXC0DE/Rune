@@ -974,6 +974,7 @@ name = "rune"
 version = "0.1.16"
 dependencies = [
  "camino",
+ "flate2",
  "jiff",
  "rune-acp",
  "rune-agent",
@@ -1000,6 +1001,7 @@ dependencies = [
  "camino",
  "jiff",
  "rune-agent",
+ "rune-context",
  "rune-core",
  "rune-net",
  "rune-policy",
@@ -1034,6 +1036,8 @@ name = "rune-context"
 version = "0.1.16"
 dependencies = [
  "camino",
+ "getrandom 0.2.17",
+ "ignore",
  "rune-core",
  "rune-exec",
  "serde",
@@ -1068,6 +1072,7 @@ dependencies = [
  "rune-core",
  "rustix",
  "tempfile",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1169,12 +1174,14 @@ dependencies = [
  "rune-core",
  "rune-exec",
  "rune-policy",
+ "rustix",
  "same-file",
  "serde",
  "serde_json",
  "sha2",
  "tempfile",
  "thiserror",
+ "toml",
 ]
 
 [[package]]

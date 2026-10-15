@@ -45,9 +45,10 @@ pub fn render_command(name: &str) -> Option<String> {
     out.push('\n');
 
     if !item.aliases.is_empty() {
-        out.push_str("\nAliases:\n  ");
-        out.push_str(&item.aliases.join(", "));
-        out.push('\n');
+        out.push_str("\nAliases:\n");
+        for alias in item.aliases {
+            let _ = writeln!(out, "  {}: {}", alias.name, alias.description);
+        }
     }
 
     if !item.flags.is_empty() {

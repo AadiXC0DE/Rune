@@ -1,9 +1,9 @@
 //! Command entry point.
 //!
-//! The order here is deliberate. Argument parsing, help, and version run before
-//! anything else touches configuration, the filesystem, or a runtime, which is
-//! what keeps the startup path free of that cost. A command only loads what its
-//! specification declares it needs.
+//! The order here is deliberate. Argument parsing, help, version, and completion
+//! generation run before anything else touches configuration, the filesystem,
+//! or a runtime, which is what keeps the startup path free of that cost. A
+//! command only loads what its specification declares it needs.
 
 #![forbid(unsafe_code)]
 // Tests assert by panicking. The guards that forbid panicking apply to the
@@ -11,22 +11,34 @@
 #![cfg_attr(test, allow(clippy::expect_used, clippy::unwrap_used, clippy::panic))]
 
 mod ask;
+mod attachments;
 mod auto_review;
+mod capabilities;
 mod cli;
+mod compaction_archive;
+mod completion;
 mod connect_flow;
 mod diagnostics;
 mod help;
 mod install;
+mod mcp;
+mod path_completion;
 mod permissions;
+mod post_tool_hook;
+mod pre_tool_hook;
 mod prompt_history;
 mod provider_setup;
 mod reference;
+mod sandbox;
 mod session;
 mod session_log;
 mod spec;
+mod subagent;
 mod version;
+mod vision_client;
 mod web_client;
 
+use std::io::Write;
 use std::process::ExitCode;
 
 use camino::{Utf8Path, Utf8PathBuf};
@@ -84,21 +96,38 @@ fn main() -> ExitCode {
 fn handle_runtime_free(launch: &Launch) -> Option<ExitCode> {
     match launch.command {
         Command::Help => {
-            let text = match launch.args.first() {
-                Some(name) => help::render_command(name).unwrap_or_else(|| {
-                    format!(
-                        "rune: `{name}` is not a command\n{}\n",
-                        help::unknown_command_hint()
-                    )
-                }),
-                None => help::render_top_level(),
+            let (text, code) = match launch.args.first() {
+                Some(name) => match help::render_command(name) {
+                    Some(text) => (text, EXIT_OK),
+                    None => (
+                        format!(
+                            "rune: `{name}` is not a command\n{}\n",
+                            help::unknown_command_hint()
+                        ),
+                        EXIT_FAILURE,
+                    ),
+                },
+                None => (help::render_top_level(), EXIT_OK),
             };
             print!("{text}");
-            Some(ExitCode::from(EXIT_OK))
+            Some(ExitCode::from(code))
         }
         Command::Version => {
             println!("{}", version::version_line());
             Some(ExitCode::from(EXIT_OK))
+        }
+        Command::Completion => {
+            let code = match completion::render(&launch.args) {
+                Ok(text) => {
+                    print!("{text}");
+                    EXIT_OK
+                }
+                Err(err) => {
+                    report_error(&err);
+                    EXIT_FAILURE
+                }
+            };
+            Some(ExitCode::from(code))
         }
         _ => None,
     }
@@ -127,6 +156,8 @@ fn run(launch: &Launch) -> Result<ExitCode> {
     } else {
         Settings::default()
     };
+
+    let saved_directory_source = settings.source_of("additional_directories");
 
     // Command-line flags sit above every file and environment layer.
     cli::apply_to_settings(launch, &mut settings);
@@ -160,12 +191,50 @@ fn run(launch: &Launch) -> Result<ExitCode> {
         Command::Prompt => run_prompt(&settings, launch, &output_flags),
         Command::Sessions => run_sessions(&paths, launch, &workspace, &output_flags),
         Command::Tree => run_tree(&paths, launch, &workspace, &output_flags),
-        Command::Session => run_session(&paths, launch, &output_flags),
+        Command::Session => run_session(&paths, launch, &workspace, &output_flags),
         Command::Usage => run_usage(&paths, launch, &output_flags),
         Command::Auth => run_auth(&settings, &paths, launch, &output_flags),
         Command::Connect => run_connect(&settings, &paths, launch, &output_flags),
         Command::Models => run_models(&settings, &paths, &output_flags),
-        Command::Permissions => run_permissions(&settings, launch, &output_flags),
+        Command::Capabilities => {
+            let check = capabilities::check(&settings, &paths, launch)?;
+            if output_flags.json {
+                println!("{}", serde_json::to_string_pretty(&check.report)?);
+            } else {
+                print!("{}", capabilities::render(&check.report));
+            }
+            if let Some(error) = check.error {
+                return Err(error);
+            }
+            Ok(ExitCode::from(EXIT_OK))
+        }
+        Command::Mcp => {
+            if launch.args.first().is_some_and(|action| action == "import") {
+                println!("{}", mcp::import(&settings, launch)?);
+                return Ok(ExitCode::from(EXIT_OK));
+            }
+            let report = mcp::run(&settings, &paths, launch, &workspace)?;
+            if output_flags.json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                print!("{}", report.render());
+            }
+            Ok(ExitCode::from(if report.check_failed() {
+                EXIT_FAILURE
+            } else {
+                EXIT_OK
+            }))
+        }
+        Command::Permissions => run_permissions(&settings, launch, &output_flags, &workspace),
+        Command::Sandbox => {
+            let report = sandbox::explain(&settings, saved_directory_source, launch, &workspace)?;
+            if output_flags.json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                print!("{}", sandbox::render(&report));
+            }
+            Ok(ExitCode::from(EXIT_OK))
+        }
         Command::Projects => run_projects(&paths, launch, &workspace, &output_flags),
         Command::Workspace => run_workspace(&settings, &paths, launch, &output_flags),
         Command::Ask => run_ask(&settings, &paths, launch, &output_flags),
@@ -177,7 +246,7 @@ fn run(launch: &Launch) -> Result<ExitCode> {
         Command::Upgrade => run_upgrade(launch, &output_flags),
         Command::Uninstall => run_uninstall(&paths, launch, &output_flags),
         Command::Reference => run_reference(launch),
-        Command::Help | Command::Version => Ok(ExitCode::from(EXIT_OK)),
+        Command::Help | Command::Version | Command::Completion => Ok(ExitCode::from(EXIT_OK)),
     }
 }
 
@@ -243,22 +312,56 @@ fn run_ask(
     launch: &Launch,
     output: &OutputFlags,
 ) -> Result<ExitCode> {
+    let jsonl = launch.has_flag("--jsonl");
+    if jsonl {
+        ask::start_jsonl()?;
+    }
     let submitted: String = launch.args.join(" ");
     let prompt = if submitted.trim().is_empty() {
-        ask::read_stdin_prompt()?
+        match ask::read_stdin_prompt() {
+            Ok(prompt) => prompt,
+            Err(err) => {
+                if jsonl {
+                    ask::final_jsonl(&ask::JsonResult::failure(
+                        &settings.model,
+                        &err,
+                        i32::from(EXIT_FAILURE),
+                    ))?;
+                }
+                return Err(err);
+            }
+        }
     } else {
         submitted
     };
 
     if prompt.trim().is_empty() {
-        return Err(RuneError::missing_field("prompt")
-            .with_hint("pass the prompt as an argument, or pipe it on standard input"));
+        let err = RuneError::missing_field("prompt")
+            .with_hint("pass the prompt as an argument, or pipe it on standard input");
+        if jsonl || output.json {
+            let result = ask::JsonResult::failure(&settings.model, &err, i32::from(EXIT_FAILURE));
+            if jsonl {
+                ask::final_jsonl(&result)?;
+            } else {
+                println!("{}", result.render()?);
+            }
+        }
+        return Err(err);
     }
 
     let options = ask::Options {
         prompt,
         json: output.json,
+        jsonl,
         no_save: launch.has_flag("--no-save"),
+        tool_loop: true,
+        read_only: false,
+        images: launch
+            .flags
+            .iter()
+            .filter(|(name, _)| name == "--image")
+            .filter_map(|(_, value)| value.as_ref().map(std::path::PathBuf::from))
+            .collect(),
     };
 
     match ask::run(settings, paths, &options) {
@@ -267,10 +370,15 @@ fn run_ask(
             Ok(ExitCode::from(code))
         }
         Err(err) => {
-            if options.json {
+            if options.jsonl || options.json {
                 let result =
                     ask::JsonResult::failure(&settings.model, &err, i32::from(EXIT_FAILURE));
-                let _ = ask::report(&result, &options);
+                // The returned error is reported by main, including its hint.
+                if options.jsonl {
+                    ask::final_jsonl(&result)?;
+                } else {
+                    let _ = writeln!(std::io::stdout().lock(), "{}", result.render()?);
+                }
             }
             Err(err)
         }
@@ -289,6 +397,7 @@ fn run_review(
     workspace: &Utf8Path,
     output: &OutputFlags,
 ) -> Result<ExitCode> {
+    settings.require_valid_user_config()?;
     let changes = pending_changes(workspace)?;
     if changes.trim().is_empty() {
         // Reviewing nothing would produce an invented report, so the condition
@@ -323,7 +432,11 @@ fn run_review(
     let options = ask::Options {
         prompt,
         json: output.json,
+        jsonl: false,
         no_save: false,
+        tool_loop: true,
+        read_only: true,
+        images: Vec::new(),
     };
 
     match ask::run(settings, paths, &options) {
@@ -426,13 +539,14 @@ fn run_interactive(
     // is a terminal to answer, the connection flow runs first, so `rune` alone
     // reaches a working session. A piped or machine invocation is not asked
     // anything: the error it already gets names what to do.
+    settings.require_valid_user_config()?;
     let mut settings = settings.clone();
-    if settings.provider == Provider::Unconfigured && interactive_stdin() {
+    if settings.provider == Provider::Unconfigured && interactive_stdin() && !launch.accessible {
         let entry = connect_flow::choose_provider()?;
         // The flow writes the selection itself, so the only thing left is to
         // read it back rather than patch the values in by hand: the session then
         // runs on exactly what a later run would load.
-        connect_flow::run(paths, entry)?;
+        connect_flow::run(paths, &settings, entry)?;
         settings = config::load(
             Some(&workspace.join(".rune.toml")),
             Some(&paths.config_file(std::env::var("RUNE_CONFIG").ok().as_deref())),
@@ -448,7 +562,8 @@ fn run_interactive(
         Some(target) => Some(session_log::resolve_target(target, paths, workspace)?),
         None => None,
     };
-    let config = session::prepare(&settings, paths, workspace, resume)?;
+    let mut config = session::prepare(&settings, paths, workspace, resume)?;
+    config.accessible = launch.accessible;
     let stdin = std::io::stdin();
     let input = std::io::BufReader::new(stdin.lock());
     let code = session::run(config, input, std::io::stdout())?;
@@ -468,6 +583,7 @@ fn run_auth(
     launch: &Launch,
     output: &OutputFlags,
 ) -> Result<ExitCode> {
+    settings.require_valid_user_config()?;
     let action = launch.args.first().map(String::as_str);
     match action {
         Some("remove" | "logout") => {
@@ -482,14 +598,7 @@ fn run_auth(
                 println!("no credential was stored for {provider}");
             }
         }
-        Some(other) => {
-            return Err(RuneError::new(
-                ErrorCode::InvalidField,
-                format!("`{other}` is not an action for auth"),
-            )
-            .with_hint("run `rune auth` to inspect, or `rune auth remove` to clear"));
-        }
-        None => {
+        None | Some("status") => {
             if output.json {
                 let value = serde_json::json!({
                     "provider": settings.provider.to_string(),
@@ -500,6 +609,13 @@ fn run_auth(
             } else {
                 println!("{}", provider_setup::render_connection(settings, paths));
             }
+        }
+        Some(other) => {
+            return Err(RuneError::new(
+                ErrorCode::InvalidField,
+                format!("`{other}` is not an action for auth"),
+            )
+            .with_hint("run `rune auth` to inspect, or `rune auth remove` to clear"));
         }
     }
     Ok(ExitCode::from(EXIT_OK))
@@ -523,10 +639,11 @@ fn run_connect(
     launch: &Launch,
     output: &OutputFlags,
 ) -> Result<ExitCode> {
+    settings.require_valid_user_config()?;
     let named = launch.args.first().map(|value| value.trim().to_owned());
     if named.is_none() && !output.json {
         let entry = connect_flow::choose_provider()?;
-        connect_flow::run(paths, entry)?;
+        connect_flow::run(paths, settings, entry)?;
         return Ok(ExitCode::from(EXIT_OK));
     }
 
@@ -554,44 +671,62 @@ fn run_connect(
         Err(_) => connect_flow::ask_endpoint(&name)?,
     };
 
-    let from_environment =
-        provider_setup::environment_credential(&name, settings.api_key_env.as_deref());
-    match from_environment {
-        Some(value) => provider_setup::connect(paths, &name, &value)?,
-        // A machine caller supplies the variable rather than blocking on a
-        // terminal that will not answer. Without it, a credential this provider
-        // already has is kept; with neither, the connection is refused rather
-        // than reported as made when no request could succeed.
-        None if output.json => {
-            if rune_net::auth::resolve(paths, &name, settings.api_key_env.as_deref())?.is_none() {
-                return Err(rune_net::auth::missing_credential_error(
-                    &name,
-                    settings.api_key_env.as_deref(),
-                ));
+    let anonymous = (settings.anonymous && settings.provider.as_str() == name)
+        || rune_net::providers::lookup(&name).is_some_and(|entry| {
+            entry.credential == rune_net::providers::CredentialKind::AnonymousLoopback
+        });
+    if anonymous {
+        rune_net::transport::Endpoint::anonymous(&base_url)?;
+    } else {
+        let from_environment =
+            provider_setup::environment_credential(&name, settings.api_key_env.as_deref());
+        match from_environment {
+            Some(value) => provider_setup::connect(paths, &name, &value)?,
+            // A machine caller supplies the variable rather than blocking on a
+            // terminal that will not answer. Without it, a credential this provider
+            // already has is kept; with neither, the connection is refused rather
+            // than reported as made when no request could succeed.
+            None if output.json => {
+                if rune_net::auth::resolve(paths, &name, settings.api_key_env.as_deref())?.is_none()
+                {
+                    return Err(rune_net::auth::missing_credential_error(
+                        &name,
+                        settings.api_key_env.as_deref(),
+                    ));
+                }
             }
-        }
-        None => {
-            let value = connect_flow::ask_credential(&name)?;
-            provider_setup::connect(paths, &name, &value)?;
+            None => {
+                let value = connect_flow::ask_credential(&name)?;
+                provider_setup::connect(paths, &name, &value)?;
+            }
         }
     }
 
-    let selection = provider_setup::Selection {
+    let mut selection = provider_setup::Selection {
         provider: name.clone(),
         model: (!settings.model.trim().is_empty()).then(|| settings.model.clone()),
         base_url: Some(base_url),
     };
+    if !output.json {
+        connect_flow::offer_model(paths, settings, &mut selection)?;
+    }
     provider_setup::save_selection(paths, &selection)?;
 
     if output.json {
-        let value = serde_json::json!({
+        let mut value = serde_json::json!({
             "provider": selection.provider,
             "model": selection.model,
             "base_url": selection.base_url,
         });
+        if selection.model.is_none() {
+            value["next_step"] = connect_flow::model_next_step(&name).into();
+        }
         println!("{}", serde_json::to_string_pretty(&value)?);
     } else {
         println!("connected {name}");
+        if selection.model.is_none() {
+            println!("{}", connect_flow::model_next_step(&name));
+        }
     }
     Ok(ExitCode::from(EXIT_OK))
 }
@@ -742,17 +877,24 @@ fn run_session_migrate(paths: &Paths, launch: &Launch, output: &OutputFlags) -> 
 
 /// Reports the branch structure of a stored session.
 ///
-/// Without an identifier the most recent session is used, because that is what a
-/// user means by "the current one".
+/// `--id` selects an exact session, taking precedence over a positional selector.
+/// Without an identifier, or with `last`, the most recent session in the current
+/// workspace is used.
 fn run_tree(
     paths: &Paths,
     launch: &Launch,
     workspace: &Utf8Path,
     output: &OutputFlags,
 ) -> Result<ExitCode> {
-    let id = match launch.args.first() {
-        Some(raw) => raw.parse()?,
-        None => session_log::resolve_target(&ResumeTarget::Latest, paths, workspace)?,
+    let id = if let Some(raw) = launch.flag("--id") {
+        raw.parse()?
+    } else {
+        match launch.args.first().map(String::as_str) {
+            None | Some("last") => {
+                session_log::resolve_target(&ResumeTarget::Latest, paths, workspace)?
+            }
+            Some(raw) => raw.parse()?,
+        }
     };
     let state = session_log::inspect(paths, &id)?;
     let tree = session_log::tree_of(&state);
@@ -776,21 +918,113 @@ fn run_tree(
     Ok(ExitCode::from(EXIT_OK))
 }
 
-/// Reports one stored session.
-fn run_session(paths: &Paths, launch: &Launch, output: &OutputFlags) -> Result<ExitCode> {
+/// Reports, searches, or exports one stored session.
+fn run_session(
+    paths: &Paths,
+    launch: &Launch,
+    workspace: &Utf8Path,
+    output: &OutputFlags,
+) -> Result<ExitCode> {
+    if launch.flag("--at").is_some() && launch.args.first().map(String::as_str) != Some("fork") {
+        return Err(RuneError::invalid_field("at", "--at requires session fork"));
+    }
     match launch.args.first().map(String::as_str) {
         Some("recover") => return run_session_recover(paths, launch, output),
         Some("migrate") => return run_session_migrate(paths, launch, output),
+        Some("fork") => return run_session_fork(paths, launch, workspace, output),
         _ => {}
     }
 
-    let raw = launch.args.first().ok_or_else(|| {
-        RuneError::missing_field("session").with_hint("name a session, or run `rune sessions`")
-    })?;
-    let id: rune_core::id::SessionId = raw.parse()?;
+    let exporting = launch.args.first().map(String::as_str) == Some("export");
+    if launch.flag("--record").is_some() && (exporting || launch.flag("--search").is_some()) {
+        return Err(RuneError::invalid_field(
+            "record",
+            "record retrieval cannot be combined with search or export",
+        ));
+    }
+    if exporting && launch.flag("--search").is_some() {
+        return Err(RuneError::invalid_field(
+            "search",
+            "search cannot be combined with session export",
+        )
+        .with_hint("run `rune session <last|id> --search <text>`"));
+    }
+    let id = if let Some(raw) = launch.flag("--id") {
+        raw.parse()?
+    } else {
+        let raw = launch.args.get(usize::from(exporting)).ok_or_else(|| {
+            RuneError::missing_field("session").with_hint("name a session, or run `rune sessions`")
+        })?;
+        if raw == "last" {
+            session_log::resolve_target(&ResumeTarget::Latest, paths, workspace)?
+        } else {
+            raw.parse()?
+        }
+    };
     let state = session_log::inspect(paths, &id)?;
 
-    if output.json {
+    if let Some(selector) = launch.flag("--record") {
+        let mut records = compaction_archive::read(&paths.session_dir(&id))?;
+        if selector != "all" {
+            let record_id = selector
+                .parse::<u64>()
+                .ok()
+                .filter(|id| *id > 0)
+                .ok_or_else(|| {
+                    RuneError::invalid_field("record", "expected a positive record ID or `all`")
+                })?;
+            records.retain(|record| record.id == record_id);
+            if records.is_empty() {
+                return Err(RuneError::new(
+                    ErrorCode::NotFound,
+                    format!("no archived record `{record_id}` in session `{id}`"),
+                ));
+            }
+        }
+        if output.json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "session_id": state.id,
+                    "records": records,
+                }))?
+            );
+        } else {
+            for record in records {
+                println!(
+                    "record {}: {}",
+                    record.id,
+                    serde_json::to_string(&record.message)?
+                );
+            }
+        }
+    } else if let Some(query) = launch.flag("--search") {
+        let matches = state.search_records(query)?;
+        if let Some(offset) = state.truncated_at {
+            eprintln!("warning: omitted incomplete session tail at byte {offset}");
+        }
+        if output.json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "session_id": state.id,
+                    "query": query,
+                    "matches": matches,
+                    "truncated_at": state.truncated_at,
+                }))?
+            );
+        } else {
+            println!("session {}: {} matching record(s)", state.id, matches.len());
+            for frame in matches {
+                println!("record {}: {}", frame.seq.0, frame.encode()?);
+            }
+        }
+    } else if exporting {
+        if let Some(offset) = state.truncated_at {
+            eprintln!("warning: omitted incomplete session tail at byte {offset}");
+        }
+        state.export_jsonl(std::io::stdout().lock())?;
+    } else if output.json {
         println!(
             "{}",
             serde_json::to_string_pretty(&session_log::detail_json(&state))?
@@ -804,9 +1038,88 @@ fn run_session(paths: &Paths, launch: &Launch, output: &OutputFlags) -> Result<E
     Ok(ExitCode::from(EXIT_OK))
 }
 
-/// Reports token usage over a period.
+/// Creates a separately resumable branch at an inclusive journal position.
+fn run_session_fork(
+    paths: &Paths,
+    launch: &Launch,
+    workspace: &Utf8Path,
+    output: &OutputFlags,
+) -> Result<ExitCode> {
+    if launch.flag("--search").is_some()
+        || launch.flag("--record").is_some()
+        || launch.has_flag("--allow-large")
+        || launch.args.len() > 2
+    {
+        return Err(RuneError::invalid_field(
+            "fork",
+            "unexpected fork arguments",
+        ));
+    }
+    let raw = launch
+        .flag("--id")
+        .or_else(|| launch.args.get(1).map(String::as_str))
+        .ok_or_else(|| RuneError::missing_field("session"))?;
+    let source = if raw == "last" {
+        session_log::resolve_target(&ResumeTarget::Latest, paths, workspace)?
+    } else {
+        raw.parse()?
+    };
+    let at = launch
+        .flag("--at")
+        .ok_or_else(|| RuneError::missing_field("at"))?
+        .parse::<u64>()
+        .ok()
+        .filter(|seq| *seq > 0)
+        .ok_or_else(|| RuneError::invalid_field("at", "expected a positive event sequence"))?;
+    let destination = rune_core::id::SessionId::generate();
+    rune_session::fork::fork(paths, &source, &destination, rune_core::id::EventSeq(at))?;
+    if output.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "id": destination,
+                "source": source,
+                "through": at,
+            }))?
+        );
+    } else {
+        println!("forked {source} through event {at} into {destination}");
+        println!("resume with `rune resume {destination}`");
+    }
+    Ok(ExitCode::from(EXIT_OK))
+}
+
+/// Reports token usage over a period or exports the retained ledger as JSONL.
 fn run_usage(paths: &Paths, launch: &Launch, output: &OutputFlags) -> Result<ExitCode> {
-    let period = period_from(launch.args.first().map(String::as_str))?;
+    if launch.args.first().map(String::as_str) == Some("export") {
+        if launch.args.len() != 1 {
+            return Err(RuneError::invalid_field(
+                "usage export",
+                "use `rune usage export [--period <24h|7d|30d>]`",
+            ));
+        }
+        let period = launch
+            .flag("--period")
+            .map(str::parse::<Period>)
+            .transpose()?;
+        let mut read = Ledger::from_paths(paths).read()?;
+        if let Some(period) = period {
+            let now = now_ms();
+            let since = now.saturating_sub(period.duration_ms());
+            read.records
+                .retain(|record| record.created_at_ms >= since && record.created_at_ms <= now);
+        }
+        if read.tail_incomplete {
+            eprintln!("omitted incomplete usage ledger tail");
+        }
+        read.export_jsonl(std::io::stdout().lock())?;
+        return Ok(ExitCode::from(EXIT_OK));
+    }
+    let period = period_from(
+        launch
+            .flag("--period")
+            .or_else(|| launch.args.first().map(String::as_str)),
+    )?;
 
     let ledger = Ledger::from_paths(paths);
     let read = ledger.read()?;
@@ -1000,19 +1313,61 @@ fn run_reference(launch: &Launch) -> Result<ExitCode> {
 }
 
 /// Reports the permission rules in force.
-fn run_permissions(settings: &Settings, launch: &Launch, output: &OutputFlags) -> Result<ExitCode> {
+fn run_permissions(
+    settings: &Settings,
+    launch: &Launch,
+    output: &OutputFlags,
+    workspace: &Utf8Path,
+) -> Result<ExitCode> {
     let rules = permissions::validated(settings)?;
 
-    // An action given as a positional argument is explained rather than listed,
-    // because that is the question a user actually has.
-    if let Some(action) = launch.args.first() {
-        let text = permissions::explain(
+    if let Some(file) = launch.flag("--simulate") {
+        if launch.has_flag("--explain") || !launch.args.is_empty() {
+            return Err(RuneError::invalid_field(
+                "simulate",
+                "--simulate cannot be combined with --explain or positional actions",
+            ));
+        }
+        let report = permissions::simulate_file(
             &rules,
             settings.permission_mode,
-            action,
-            launch.args.get(1).map_or("", String::as_str),
-        );
-        println!("{text}");
+            Utf8Path::new(file),
+            workspace,
+        )?;
+        if output.json {
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        } else {
+            print!("{}", report.render());
+        }
+        return Ok(ExitCode::from(EXIT_OK));
+    }
+
+    let action = if let Some(raw) = launch.flag("--explain") {
+        let (tool, target) = raw
+            .split_once(':')
+            .filter(|(tool, target)| !tool.is_empty() && !target.is_empty())
+            .ok_or_else(|| {
+                RuneError::invalid_field("explain", "expected a tool:target action")
+                    .with_hint("use `rune permissions --explain shell:pwd`")
+            })?;
+        Some((tool, target))
+    } else {
+        // Preserve the existing positional tool and target syntax.
+        launch
+            .args
+            .first()
+            .map(|tool| (tool.as_str(), launch.args.get(1).map_or("", String::as_str)))
+    };
+    if let Some((tool, target)) = action {
+        if output.json {
+            let value = permissions::explain_json(&rules, settings.permission_mode, tool, target);
+            println!("{}", serde_json::to_string_pretty(&value)?);
+        } else {
+            println!(
+                "{}",
+                permissions::explain(&rules, settings.permission_mode, tool, target)
+            );
+        }
         return Ok(ExitCode::from(EXIT_OK));
     }
 
@@ -1043,7 +1398,10 @@ fn run_sessions(
     // Without `--all` the listing is scoped to this workspace, so `last` means
     // the latest session here rather than the latest anywhere.
     let scope = (!launch.has_flag("--all")).then_some(workspace);
-    let page = session_log::page(paths, scope, limit, cursor)?;
+    let page = match launch.flag("--search") {
+        Some(query) => session_log::search_page(paths, scope, query, limit, cursor)?,
+        None => session_log::page(paths, scope, limit, cursor)?,
+    };
     let rows = &page.rows;
     let entries: Vec<serde_json::Value> = rows
         .iter()
@@ -1081,32 +1439,25 @@ fn run_acp(
     workspace: &Utf8Path,
     launch: &Launch,
 ) -> Result<ExitCode> {
-    settings.require_model()?;
+    provider_setup::validate_selection(settings)?;
 
-    let provider_name = settings.provider.to_string();
-    let base_url = provider_setup::require_base_url(settings)?;
-    rune_net::transport::validate_url(&base_url)?;
-
-    let credential =
-        rune_net::auth::resolve(paths, &provider_name, settings.api_key_env.as_deref())?
-            .ok_or_else(|| {
-                rune_net::auth::missing_credential_error(
-                    &provider_name,
-                    settings.api_key_env.as_deref(),
-                )
-            })?;
+    let endpoint = provider_setup::configured_endpoint(settings, paths)?;
 
     let dialect = match settings.provider {
         Provider::Anthropic => rune_acp::Dialect::Anthropic,
         Provider::Responses => rune_acp::Dialect::Responses,
+        Provider::Gemini => rune_acp::Dialect::Gemini,
         _ => rune_acp::Dialect::ChatCompletions,
     };
 
-    let registry = rune_tools::inventory::builtin_with_web(
+    let registry = rune_tools::inventory::builtin_with_vision(
         &rune_tools::workspace::FileLimits::from_budget(&settings.limits),
         &settings.limits,
         &paths.managed_skills_dir(),
         web_client::backends(settings),
+        std::sync::Arc::new(rune_tools::ask_user::Unavailable),
+        std::sync::Arc::new(rune_tools::skill::Empty),
+        vision_client::backend(settings, paths)?,
     )?;
 
     let rules = rune_policy::rules::RuleSet::new();
@@ -1116,26 +1467,20 @@ fn run_acp(
     let config = rune_acp::ServerConfig {
         paths: paths.clone(),
         workspace: workspace.to_owned(),
-        endpoint: provider_setup::endpoint(
-            &settings.provider,
-            &base_url,
-            credential.expose(),
-            settings.offline,
-        ),
+        endpoint,
         dialect,
         model: settings.model.clone(),
-        instructions: rune_context::prompt::instructions_for(
-            workspace,
-            &paths.config_root,
-            &settings.limits,
-        ),
+        instructions: String::new(),
+        instruction_loader: Some(rune_context::prompt::instructions_for),
         registry,
         rules,
         mode: settings.permission_mode,
         effort: settings.effort,
         limits: settings.limits.clone(),
         log_file,
-        context_window: rune_net::catalog::DEFAULT_CONTEXT_WINDOW,
+        context_window: settings
+            .context_window
+            .unwrap_or(rune_net::catalog::DEFAULT_CONTEXT_WINDOW),
         additional_roots: settings.additional_directories.clone(),
     };
 
@@ -1315,7 +1660,7 @@ fn run_workspace_edit(
 ) -> Result<ExitCode> {
     let stored = config::load(
         None,
-        Some(&paths.config_file(None)),
+        Some(&paths.config_file(std::env::var("RUNE_CONFIG").ok().as_deref())),
         &EnvironmentOverrides::default(),
     );
     let mut directories: Vec<String> = stored
@@ -1367,7 +1712,8 @@ fn run_workspace_edit(
             }
         }
         _ => {
-            write_directories(paths, &Vec::new())?;
+            directories.clear();
+            write_directories(paths, &directories)?;
             if !output.json {
                 println!("cleared the additional directories");
             }
@@ -1542,25 +1888,21 @@ mod tests {
     fn pending_changes_include_a_modified_and_an_untracked_file() {
         let dir = tempfile::tempdir().expect("temp");
         let root = Utf8Path::from_path(dir.path()).expect("utf8");
-        let ok = |arguments: &[&str]| {
-            std::process::Command::new("git")
-                .args(arguments)
-                .current_dir(root)
-                .output()
-                .expect("git")
-        };
-        ok(&["init", "-q", "."]);
+        setup_review_git(root, &["init", "-q", "."]);
         std::fs::write(root.join("tracked.txt"), "first\n").expect("write");
-        ok(&["add", "tracked.txt"]);
-        ok(&[
-            "-c",
-            "user.email=t@t",
-            "-c",
-            "user.name=t",
-            "commit",
-            "-qm",
-            "init",
-        ]);
+        setup_review_git(root, &["add", "tracked.txt"]);
+        setup_review_git(
+            root,
+            &[
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-qm",
+                "init",
+            ],
+        );
 
         std::fs::write(root.join("tracked.txt"), "first\nsecond\n").expect("write");
         std::fs::write(root.join("untracked.txt"), "new\n").expect("write");
@@ -1574,15 +1916,101 @@ mod tests {
     fn a_repository_with_no_commits_yields_no_changes() {
         let dir = tempfile::tempdir().expect("temp");
         let root = Utf8Path::from_path(dir.path()).expect("utf8");
-        std::process::Command::new("git")
-            .args(["init", "-q", "."])
-            .current_dir(root)
-            .output()
-            .expect("git");
+        setup_review_git(root, &["init", "-q", "."]);
         // `diff HEAD` fails without a commit, and reporting failure would make
         // a fresh repository look broken.
         let changes = pending_changes(root).expect("read");
         assert!(changes.trim().is_empty(), "{changes}");
+    }
+
+    /// Stops a review fixture before reading changes if its Git setup failed.
+    fn setup_review_git(root: &Utf8Path, arguments: &[&str]) {
+        let output = std::process::Command::new("git")
+            .args(arguments)
+            .current_dir(root)
+            .output()
+            .unwrap_or_else(|err| {
+                panic!("review fixture setup failed: git {arguments:?} could not run: {err}")
+            });
+        assert!(
+            output.status.success(),
+            "review fixture setup failed: git {arguments:?}\nstatus: {}\nstdout: {}\nstderr: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn review_fixtures_report_failed_git_setup() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().expect("stub directory");
+        let git = dir.path().join("git");
+        std::fs::write(
+            &git,
+            r#"#!/bin/sh
+for argument do
+    if [ "$argument" = "$RUNE_TEST_GIT_FAILURE" ]; then
+        echo 'stub setup stdout'
+        echo 'stub setup stderr' >&2
+        exit 42
+    fi
+done
+case "$1" in
+    init|add|-c) exit 0 ;;
+esac
+echo 'fatal: not a git repository (stub)' >&2
+exit 1
+"#,
+        )
+        .expect("write git stub");
+        std::fs::set_permissions(&git, std::fs::Permissions::from_mode(0o755))
+            .expect("executable git stub");
+
+        let executable = std::env::current_exe().expect("test executable");
+        for (fixture, command) in [
+            ("a_repository_with_no_commits_yields_no_changes", "init"),
+            (
+                "pending_changes_include_a_modified_and_an_untracked_file",
+                "init",
+            ),
+            (
+                "pending_changes_include_a_modified_and_an_untracked_file",
+                "add",
+            ),
+            (
+                "pending_changes_include_a_modified_and_an_untracked_file",
+                "commit",
+            ),
+        ] {
+            // Only the child sees the stub, so concurrent tests keep their PATH.
+            let output = std::process::Command::new(&executable)
+                .args(["--exact", &format!("tests::{fixture}"), "--nocapture"])
+                .env("PATH", dir.path())
+                .env("RUNE_TEST_GIT_FAILURE", command)
+                .output()
+                .expect("run review fixture with failing git");
+            let report = format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+            assert!(!output.status.success(), "{fixture} / {command}: {report}");
+            for diagnostic in [
+                "review fixture setup failed: git",
+                &format!("\"{command}\""),
+                "status: exit status: 42",
+                "stdout: stub setup stdout",
+                "stderr: stub setup stderr",
+            ] {
+                assert!(
+                    report.contains(diagnostic),
+                    "{fixture} / {command} missing {diagnostic:?}: {report}",
+                );
+            }
+        }
     }
 
     #[test]

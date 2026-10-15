@@ -10,13 +10,40 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
-  # Cheap lane: runs on every push. Format, lint, and the fast test set.
+  dependencies:
+    name: dependency policy
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the pinned toolchain
+        run: rustup show
+
+      - name: Install cargo-deny
+        run: cargo install cargo-deny --version 0.19.9 --locked
+
+      - name: Check dependency advisories, licenses, bans, and sources
+        run: cargo deny check
+
+      - name: Test dependency policy enforcement
+        run: bash .github/scripts/test-dependency-policy.sh
+
+  # Cheap lane: runs on every push. Node bindings, format, lint, and workspace tests.
   fast:
     name: fast
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Test Node bindings
+        run: node --test bindings/node/test.mjs
 
       - name: Install the pinned toolchain
         run: rustup show
@@ -39,10 +66,55 @@ jobs:
 
       - name: Install the sandbox helper
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y bubblewrap
+        run: |
+          sudo apt-get update && sudo apt-get install -y bubblewrap
+          # Ubuntu's AppArmor user-namespace restriction can block bwrap.
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
 
-      - name: Test
+      - name: Require live Linux network isolation and source editing
+        if: runner.os == 'Linux'
+        env:
+          RUNE_REQUIRE_LINUX_SANDBOX: '1'
+        run: cargo test -p rune-exec --test linux_network live_linux_network_isolation -- --exact --nocapture
+
+      - name: Check PTY replay prerequisites
+        run: python3 -c "import fcntl, pty, termios"
+
+      - name: Test workspace including the real PTY replay gate
         run: cargo test --workspace
+
+  wasm:
+    name: WASM build and smoke test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install the pinned toolchain and WASI target
+        run: rustup target add wasm32-wasip1
+
+      - name: Cache the build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: wasm-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: wasm-${{ runner.os }}-
+
+      - name: Build rune-web for WASI
+        run: cargo build --release --locked -p rune-web --target wasm32-wasip1
+
+      - name: Smoke-test the exported WASM boundary with a fixture prompt
+        run: node .github/scripts/test-wasm.mjs target/wasm32-wasip1/release/rune_web.wasm
 
   # Gate lane: runs on a pull request. Adds budgets and every platform.
   budget:
@@ -69,8 +141,7 @@ jobs:
       - name: Check size, startup, and dependency duplication
         run: cargo xtask budget
 
-  # Checks that packing the same input twice gives one answer, which is what a
-  # published checksum is for.
+  # Compare binaries and archives from two independent clean release builds.
   reproducible:
     name: reproducible
     runs-on: ubuntu-latest
@@ -81,16 +152,11 @@ jobs:
       - name: Install the pinned toolchain
         run: rustup show
 
-      - name: Stage twice and compare
-        run: |
-          cargo xtask release dev
-          first=$(sha256sum target/dist/*/*.tar.gz | cut -d' ' -f1)
-          rm -rf target/dist
-          cargo xtask release dev
-          second=$(sha256sum target/dist/*/*.tar.gz | cut -d' ' -f1)
-          echo "first  $first"
-          echo "second $second"
-          test "$first" = "$second"
+      - name: Build independently and compare extracted binaries and archives
+        run: bash .github/scripts/check-reproducible-release.sh
+
+      - name: Smoke-test the documented archive install and uninstall path
+        run: python3 .github/scripts/test-archive-install.py target/dist/*/*.tar.gz
 
   cross-platform:
     name: test on ${{ matrix.os }}
@@ -102,6 +168,12 @@ jobs:
         os: [macos-latest, ubuntu-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
+
+      - name: Set up Python for Windows archive tests
+        if: runner.os == 'Windows'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
 
       - name: Install the pinned toolchain
         run: rustup show
@@ -118,7 +190,40 @@ jobs:
 
       - name: Install the sandbox helper
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y bubblewrap
+        run: |
+          sudo apt-get update && sudo apt-get install -y bubblewrap
+          # Ubuntu's AppArmor user-namespace restriction can block bwrap.
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
 
-      - name: Test
+      - name: Require live Linux network isolation and source editing
+        if: runner.os == 'Linux'
+        env:
+          RUNE_REQUIRE_LINUX_SANDBOX: '1'
+        run: cargo test -p rune-exec --test linux_network live_linux_network_isolation -- --exact --nocapture
+
+      - name: Check PTY replay prerequisites
+        if: runner.os != 'Windows'
+        run: python3 -c "import fcntl, pty, termios"
+
+      - name: Test workspace including the real PTY replay gate on Unix
         run: cargo test --workspace
+
+      - name: Stage native release with artifact size and startup measurements
+        shell: bash
+        run: |
+          rm -rf target/dist
+          cargo xtask release dev
+
+      - name: Extract Windows ZIP and smoke-test executable replacement
+        if: runner.os == 'Windows'
+        shell: bash
+        run: python .github/scripts/test-windows-release.py target/dist/*/*.zip
+
+      - name: Publish measured release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: rune-${{ runner.os }}-${{ runner.arch }}
+          path: target/dist/rune-*/*
+          if-no-files-found: error

@@ -1,0 +1,79 @@
+name: signed macOS release
+
+on:
+  workflow_dispatch:
+    inputs:
+      channel:
+        description: Release channel
+        default: stable
+        required: true
+      version:
+        description: Release version (empty uses Cargo.toml)
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  signed-release:
+    runs-on: macos-latest
+    timeout-minutes: 25
+    env:
+      # Publish this certificate SHA-1 fingerprint as a repository variable.
+      # The corresponding Developer ID private key remains in encrypted secrets.
+      RUNE_SIGNING_IDENTITY: ${{ vars.MACOS_SIGNING_IDENTITY }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the pinned toolchain
+        run: rustup show
+
+      - name: Import the release signing certificate into a temporary keychain
+        env:
+          CERTIFICATE_P12: ${{ secrets.MACOS_SIGNING_CERTIFICATE_P12 }}
+          CERTIFICATE_PASSWORD: ${{ secrets.MACOS_SIGNING_CERTIFICATE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          umask 077
+          signing_keychain="$RUNNER_TEMP/rune-release.keychain-db"
+          test -n "$RUNE_SIGNING_IDENTITY"
+          test -n "$CERTIFICATE_P12"
+          test -n "$CERTIFICATE_PASSWORD"
+          signing_password=$(openssl rand -hex 32)
+          printf '%s' "$CERTIFICATE_P12" | base64 --decode > "$RUNNER_TEMP/rune-signing.p12"
+          security create-keychain -p "$signing_password" "$signing_keychain"
+          security set-keychain-settings -lut 21600 "$signing_keychain"
+          security unlock-keychain -p "$signing_password" "$signing_keychain"
+          security import "$RUNNER_TEMP/rune-signing.p12" -k "$signing_keychain" -P "$CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$signing_password" "$signing_keychain"
+          security list-keychains -d user -s "$signing_keychain"
+          rm "$RUNNER_TEMP/rune-signing.p12"
+
+      - name: Test native certificate verification and tamper rejection
+        run: cargo test -p xtask --test macos_signing -- --include-ignored
+
+      - name: Sign and check the exact packaged executable
+        env:
+          RELEASE_CHANNEL: ${{ inputs.channel }}
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if [ -n "$RELEASE_VERSION" ]; then
+            cargo xtask release "$RELEASE_CHANNEL" "$RELEASE_VERSION" --sign-identity "$RUNE_SIGNING_IDENTITY"
+          else
+            cargo xtask release "$RELEASE_CHANNEL" --sign-identity "$RUNE_SIGNING_IDENTITY"
+          fi
+          cargo xtask verify-release target/dist/rune-*/manifest.json "$RUNE_SIGNING_IDENTITY"
+
+      - name: Upload the verified signed archive, checksum and published identity
+        uses: actions/upload-artifact@v4
+        with:
+          name: rune-signed-macos
+          path: target/dist/rune-*/*
+          if-no-files-found: error
+
+      - name: Remove signing credentials
+        if: always()
+        run: |
+          security delete-keychain "$RUNNER_TEMP/rune-release.keychain-db" || true
+          rm -f "$RUNNER_TEMP/rune-signing.p12"

@@ -190,6 +190,8 @@ impl Range {
 pub enum LimitName {
     /// Maximum model tool-loop steps per turn. Zero means unlimited.
     MaxAgentSteps,
+    /// Consecutive failures allowed for an identical tool name and argument string.
+    MaxConsecutiveToolFailures,
     /// Maximum bytes retained from one tool result.
     MaxToolResultBytes,
     /// Tool-result bytes retained across one turn.
@@ -212,6 +214,8 @@ pub enum LimitName {
     ProjectInstructionFileBytes,
     /// Combined size of all applicable project instructions.
     ProjectInstructionsTotalBytes,
+    /// Rendered repository symbol map bytes. Zero disables the map.
+    RepositoryMapBytes,
     /// Text produced by an image analysis adapter.
     ImageAdapterOutputBytes,
     /// Bytes retained from one command's output.
@@ -232,6 +236,8 @@ pub enum LimitName {
     ProviderRequestTimeoutMs,
     /// Attempts made against a provider before failing the turn.
     ProviderMaxAttempts,
+    /// Time allowed for a client to answer an ACP permission request.
+    AcpPermissionTimeoutMs,
     /// Time allowed for one MCP operation.
     McpOperationTimeoutMs,
     /// Time allowed for an MCP server to start and complete discovery.
@@ -270,6 +276,7 @@ impl LimitName {
     pub const fn all() -> &'static [Self] {
         &[
             Self::MaxAgentSteps,
+            Self::MaxConsecutiveToolFailures,
             Self::MaxToolResultBytes,
             Self::MaxTurnResultBytes,
             Self::SkillCatalogBytes,
@@ -281,6 +288,7 @@ impl LimitName {
             Self::McpSelectedSchemaBytes,
             Self::ProjectInstructionFileBytes,
             Self::ProjectInstructionsTotalBytes,
+            Self::RepositoryMapBytes,
             Self::ImageAdapterOutputBytes,
             Self::CommandOutputBytes,
             Self::ReadFileLines,
@@ -291,6 +299,7 @@ impl LimitName {
             Self::ProviderHeadTimeoutMs,
             Self::ProviderRequestTimeoutMs,
             Self::ProviderMaxAttempts,
+            Self::AcpPermissionTimeoutMs,
             Self::McpOperationTimeoutMs,
             Self::McpStartupTimeoutMs,
             Self::McpRestartLimit,
@@ -314,6 +323,7 @@ impl LimitName {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::MaxAgentSteps => "max_agent_steps",
+            Self::MaxConsecutiveToolFailures => "max_consecutive_tool_failures",
             Self::MaxToolResultBytes => "max_tool_result_bytes",
             Self::MaxTurnResultBytes => "max_turn_result_bytes",
             Self::SkillCatalogBytes => "skill_catalog_bytes",
@@ -325,6 +335,7 @@ impl LimitName {
             Self::McpSelectedSchemaBytes => "mcp_selected_schema_bytes",
             Self::ProjectInstructionFileBytes => "project_instruction_file_bytes",
             Self::ProjectInstructionsTotalBytes => "project_instructions_total_bytes",
+            Self::RepositoryMapBytes => "repository_map_bytes",
             Self::ImageAdapterOutputBytes => "image_adapter_output_bytes",
             Self::CommandOutputBytes => "command_output_bytes",
             Self::ReadFileLines => "read_file_lines",
@@ -335,6 +346,7 @@ impl LimitName {
             Self::ProviderHeadTimeoutMs => "provider_head_timeout_ms",
             Self::ProviderRequestTimeoutMs => "provider_request_timeout_ms",
             Self::ProviderMaxAttempts => "provider_max_attempts",
+            Self::AcpPermissionTimeoutMs => "acp_permission_timeout_ms",
             Self::McpOperationTimeoutMs => "mcp_operation_timeout_ms",
             Self::McpStartupTimeoutMs => "mcp_startup_timeout_ms",
             Self::McpRestartLimit => "mcp_restart_limit",
@@ -359,6 +371,7 @@ impl LimitName {
         match self {
             // Zero means unlimited steps. Embedded hosts lower this.
             Self::MaxAgentSteps => Budget::Bounded(0),
+            Self::MaxConsecutiveToolFailures => Budget::Bounded(3),
             Self::MaxToolResultBytes => Budget::Bounded(64 * 1024),
             Self::MaxTurnResultBytes => Budget::Bounded(8 * 1024 * 1024),
             Self::SkillCatalogBytes => Budget::Bounded(32768),
@@ -370,6 +383,7 @@ impl LimitName {
             Self::McpSelectedSchemaBytes => Budget::Bounded(64 * 1024),
             Self::ProjectInstructionFileBytes => Budget::Bounded(64 * 1024),
             Self::ProjectInstructionsTotalBytes => Budget::Bounded(128 * 1024),
+            Self::RepositoryMapBytes => Budget::Bounded(8192),
             Self::ImageAdapterOutputBytes => Budget::Bounded(20 * 1024),
             Self::CommandOutputBytes => Budget::Bounded(64 * 1024),
             Self::ReadFileLines => Budget::Bounded(2000),
@@ -380,6 +394,7 @@ impl LimitName {
             Self::ProviderHeadTimeoutMs => Budget::Bounded(120_000),
             Self::ProviderRequestTimeoutMs => Budget::Bounded(600_000),
             Self::ProviderMaxAttempts => Budget::Bounded(10),
+            Self::AcpPermissionTimeoutMs => Budget::Bounded(120_000),
             Self::McpOperationTimeoutMs => Budget::Bounded(60_000),
             Self::McpStartupTimeoutMs => Budget::Bounded(30_000),
             Self::McpRestartLimit => Budget::Bounded(1),
@@ -404,6 +419,10 @@ impl LimitName {
         match self {
             Self::MaxAgentSteps => Range {
                 min: 0,
+                max: Some(10_000),
+            },
+            Self::MaxConsecutiveToolFailures => Range {
+                min: 1,
                 max: Some(10_000),
             },
             Self::CompactionTriggerPercent => Range {
@@ -457,11 +476,13 @@ impl LimitName {
         match self {
             Self::ProviderHeadTimeoutMs
             | Self::ProviderRequestTimeoutMs
+            | Self::AcpPermissionTimeoutMs
             | Self::McpOperationTimeoutMs
             | Self::McpStartupTimeoutMs
             | Self::ReviewTimeoutMs
             | Self::WebFetchTimeoutMs => Unit::Millis,
-            Self::ParallelToolCalls
+            Self::MaxConsecutiveToolFailures
+            | Self::ParallelToolCalls
             | Self::SubagentChildren
             | Self::McpRestartLimit
             | Self::ReviewHoldsPerTurn
@@ -482,6 +503,9 @@ impl LimitName {
     pub const fn description(self) -> &'static str {
         match self {
             Self::MaxAgentSteps => "Maximum model tool-loop steps per turn; zero means unlimited.",
+            Self::MaxConsecutiveToolFailures => {
+                "Consecutive identical tool failures allowed before stopping the next duplicate."
+            }
             Self::MaxToolResultBytes => "Bytes retained from one tool result before spilling.",
             Self::MaxTurnResultBytes => "Tool-result bytes one turn retains across its steps.",
             Self::SkillCatalogBytes => "Combined size of the skill catalog placed in the prompt.",
@@ -495,6 +519,9 @@ impl LimitName {
             Self::ProjectInstructionsTotalBytes => {
                 "Combined size of all applicable project instructions."
             }
+            Self::RepositoryMapBytes => {
+                "Rendered Rust repository symbol map bytes; zero disables it."
+            }
             Self::ImageAdapterOutputBytes => "Text produced by an image analysis adapter.",
             Self::CommandOutputBytes => "Bytes retained from one command's output.",
             Self::ReadFileLines => "Lines returned by one file read.",
@@ -505,6 +532,9 @@ impl LimitName {
             Self::ProviderHeadTimeoutMs => "Time to wait for a model response head.",
             Self::ProviderRequestTimeoutMs => "Total time allowed for one model request attempt.",
             Self::ProviderMaxAttempts => "Provider attempts before the turn fails.",
+            Self::AcpPermissionTimeoutMs => {
+                "Time allowed for a client to answer an ACP permission request."
+            }
             Self::McpOperationTimeoutMs => "Time allowed for one MCP operation.",
             Self::McpStartupTimeoutMs => {
                 "Time allowed for an MCP server to start and be discovered."

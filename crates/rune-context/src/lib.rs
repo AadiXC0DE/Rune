@@ -1,10 +1,11 @@
 //! Project instructions, skills, MCP client, and prompt assembly.
 //!
-//! Two sources of context are assembled here. Project instructions come from
+//! Project instructions come from
 //! `AGENTS.md` files and are selected per tool target, so a call inside a nested
 //! package sees that package's rules on top of the workspace-wide ones. Skills
 //! come from `SKILL.md` directories and enter the prompt as a catalog of names
-//! and descriptions, with bodies loaded on demand.
+//! and descriptions, with bodies loaded on demand. Rust repository symbol maps
+//! add bounded declaration and lexical reference locations from current sources.
 
 #![forbid(unsafe_code)]
 // Tests assert by panicking. The guards that forbid panicking apply to the
@@ -20,6 +21,7 @@ pub mod mcp_trust;
 pub mod prompt;
 pub mod skill_invocation;
 pub mod skills;
+pub mod symbol_map;
 
 pub use catalog::{CatalogOutput, read_body, render_catalog};
 // `discover` exists in both modules with a different signature, so each stays

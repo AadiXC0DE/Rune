@@ -10,11 +10,12 @@
 //!
 //! - A malformed tool call or a tool failure is information for the model, not
 //!   an error that ends the turn. Only a policy denial, a cancellation, or an
-//!   exhausted retry budget stops it.
+//!   exhausted retry/objective budget or consecutive identical failure cap stops it.
 //! - Finalization happens exactly once, so a session cannot record a turn twice.
 
 use std::time::Duration;
 
+use camino::Utf8Path;
 use rune_core::budget::{BudgetSet, LimitName};
 use rune_core::config::{Effort, PermissionMode};
 use rune_core::error::{ErrorCode, Result, RuneError};
@@ -25,10 +26,11 @@ use rune_net::stream::{FinishReason, Usage};
 use rune_net::transport::{self, Endpoint, StreamOutcome};
 use rune_policy::decision::Outcome;
 use rune_policy::rules::RuleSet;
-use rune_tools::Registry;
 use rune_tools::contract::{Activity, ExecutionContext, ToolOutput};
+use rune_tools::{Registry, Tool};
 
 use crate::history::History;
+use crate::retry::{self, RetryPolicy};
 use crate::steering::{Boundary, Cancellation, SteeringQueue};
 
 /// How a turn ended.
@@ -38,6 +40,8 @@ pub enum StopReason {
     Completed,
     /// The model stopped asking for tools at the step limit.
     StepLimit,
+    /// The active objective exhausted its accounted token budget.
+    ObjectiveBudget,
     /// The response hit the output token limit.
     OutputLimit,
     /// The model declined.
@@ -57,6 +61,7 @@ impl StopReason {
         match self {
             Self::Completed => "end_turn",
             Self::StepLimit => "max_model_turns",
+            Self::ObjectiveBudget => "objective_token_budget",
             Self::OutputLimit => "max_output_tokens",
             Self::Refused => "refused",
             Self::Cancelled => "cancelled",
@@ -83,6 +88,15 @@ pub struct PreparedCall {
     pub arguments: String,
 }
 
+/// A pre-tool hook's named refusal. Hooks can only narrow existing authority.
+#[derive(Clone, Debug)]
+pub struct HookVeto {
+    /// User-defined hook name.
+    pub name: String,
+    /// Explanation sent to the model and reported in the denial event.
+    pub reason: String,
+}
+
 /// How a tool call was resolved.
 #[derive(Clone, Debug)]
 pub struct CallResult {
@@ -99,6 +113,22 @@ pub struct CallResult {
 pub enum Event {
     /// A turn began.
     TurnStarted {
+        /// Step index, starting at one.
+        step: u32,
+    },
+    /// A retryable provider failure scheduled another request attempt.
+    ProviderRetry {
+        /// Step index, starting at one.
+        step: u32,
+        /// Next request attempt, counting the initial request as one.
+        next_attempt: usize,
+        /// Maximum requests allowed for this step.
+        max_attempts: usize,
+        /// Wait before the next attempt, including a provider Retry-After.
+        delay: Duration,
+    },
+    /// A retried provider request succeeded, before any tool decisions begin.
+    ProviderRetryFinished {
         /// Step index, starting at one.
         step: u32,
     },
@@ -135,11 +165,16 @@ pub enum Event {
         /// Whether the tool reported a failure.
         is_error: bool,
     },
-    /// A tool call was refused by policy.
+    /// The live plan changed after an allowed tool call.
+    PlanUpdated {
+        /// Complete replacement snapshot with its monotonically increasing version.
+        update: rune_tools::PlanUpdate,
+    },
+    /// A tool call was refused by policy, a pre-tool hook, or a turn guard.
     ToolDenied {
         /// The call.
         call: PreparedCall,
-        /// The rule that decided it.
+        /// The deciding rule, hook, or guard and its explanation.
         reason: String,
     },
     /// Steering was drained at a boundary.
@@ -148,6 +183,13 @@ pub enum Event {
         boundary: Boundary,
         /// How many messages were applied.
         count: usize,
+    },
+    /// Earlier context was summarized before a model request.
+    ContextCompacted {
+        /// Original turns replaced by the summary.
+        removed_turns: usize,
+        /// Turns remaining, including the summary.
+        remaining_turns: usize,
     },
     /// The turn finished.
     Finished {
@@ -187,6 +229,35 @@ pub trait Host {
     /// Returns the tools available for this turn.
     fn tools(&self) -> Vec<ToolSpec>;
 
+    /// Returns the registered tool's activity for event presentation.
+    ///
+    /// Hosts with a registry should return its declared activity. When none
+    /// is supplied, built-in names retain their usual labels and other names
+    /// are presented as executions.
+    fn tool_activity(&self, _name: &str) -> Option<Activity> {
+        None
+    }
+
+    /// Returns the permission target declared by the tool that will execute.
+    ///
+    /// Hosts with a registry should resolve through that registry, including
+    /// returning `None` when the registered tool declares no target. Hosts
+    /// without a registry retain the built-in target resolution by default.
+    fn tool_permission_target(&self, name: &str, arguments: &serde_json::Value) -> Option<String> {
+        infer_target(name, arguments)
+    }
+
+    /// Offers a thread-safe executor for a registered read-only tool.
+    ///
+    /// Returning `Some(self)` opts this call into native concurrent execution.
+    /// Hosts must check the tool's read-only contract, rather than its name.
+    /// Policy and events stay on the turn thread; only execution is delegated.
+    /// Hosts without this capability and WebAssembly hosts execute in order.
+    #[cfg(not(target_family = "wasm"))]
+    fn concurrent_tool_host(&self, _name: &str) -> Option<&(dyn Host + Sync)> {
+        None
+    }
+
     /// Returns the reasoning effort to request.
     fn effort(&self) -> Effort {
         Effort::Auto
@@ -224,8 +295,45 @@ pub trait Host {
         false
     }
 
+    /// Prepares context immediately before sending a model request.
+    ///
+    /// A host may compact history and update the plan's messages. The default
+    /// leaves both unchanged, so context policy remains the host's decision.
+    fn prepare_request(
+        &self,
+        _history: &mut History,
+        _plan: &mut RequestPlan,
+        _client: &dyn Fetch,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// Observes a completed provider response before recording or executing it.
+    /// Hosts may retain finish metadata needed by their output contract.
+    fn observe_response(&self, _outcome: &StreamOutcome) {}
+
+    /// Records delegated provider usage without adding child conversation events.
+    fn record_child_usage(&self, _model: &str, _usage: &Usage) {}
+
     /// Reports an event.
     fn emit(&self, event: Event);
+
+    /// Runs a user-authorized veto hook after all policy checks, before execution.
+    ///
+    /// Called once on the turn thread for each eligible call, including concurrent
+    /// reads and retained-result reads. Returning a veto or an error prevents
+    /// execution and preserves the matching error result. The default allows
+    /// the call to continue. Hosts must bound external hook execution themselves.
+    fn pre_tool(&self, _call: &PreparedCall) -> Result<Option<HookVeto>> {
+        Ok(None)
+    }
+
+    /// Observes each finalized result once on the turn thread, in request order.
+    ///
+    /// Includes refused calls, concurrent reads, and retained-result reads after
+    /// result budgets are applied. Hosts must redact data and bound external
+    /// execution. This notification cannot change the tool result.
+    fn post_tool(&self, _result: &CallResult) {}
 
     /// Executes a tool call, after policy has allowed it.
     fn execute(&self, name: &str, arguments: &serde_json::Value) -> Result<ToolOutput>;
@@ -235,12 +343,45 @@ pub trait Host {
     /// Returns the outcome and, for an explanation, the deciding rule.
     fn decide(&self, name: &str, target: Option<&str>) -> (Outcome, String);
 
+    /// Resolves a separate user decision for private-network access, including
+    /// this fetch's redirects. A model review or full-access mode is insufficient.
+    /// Hosts without a user approval path refuse it by default.
+    fn decide_private_network(&self, _target: Option<&str>) -> (Outcome, String) {
+        (
+            Outcome::Deny,
+            "private-network access requires user authority".to_owned(),
+        )
+    }
+
+    /// Executes with the per-call authority resolved by the loop.
+    /// Hosts running web or plan tools must pass this context to their implementation.
+    fn execute_with_context(
+        &self,
+        name: &str,
+        arguments: &serde_json::Value,
+        _context: &ExecutionContext,
+    ) -> Result<ToolOutput> {
+        self.execute(name, arguments)
+    }
+
     /// Returns the execution context for this turn.
     fn context(&self) -> ExecutionContext;
 
     /// Returns the limits in force.
     fn limits(&self) -> BudgetSet {
         BudgetSet::new()
+    }
+
+    /// Remaining input plus output tokens for an explicitly budgeted objective.
+    /// `None` leaves ordinary conversations and unbudgeted objectives unlimited.
+    fn objective_tokens_remaining(&self) -> Option<u64> {
+        None
+    }
+
+    /// Durably charges one provider attempt, including attempts that failed.
+    /// Called before another request can start. Persistence failure stops the turn.
+    fn account_objective_tokens(&self, _tokens: u64) -> Result<()> {
+        Ok(())
     }
 
     /// Returns the cancellation flag for this turn.
@@ -286,14 +427,8 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
     let cancellation = host.cancellation();
     let steering = host.steering();
     let step_limit = limits.get(LimitName::MaxAgentSteps).value().unwrap_or(0);
-    let result_limit = limits.get_usize(LimitName::MaxTurnResultBytes);
     let max_attempts = limits.get_usize(LimitName::ProviderMaxAttempts).max(1);
-    let head_timeout = Duration::from_millis(
-        limits
-            .get(LimitName::ProviderHeadTimeoutMs)
-            .value()
-            .unwrap_or(120_000),
-    );
+    let timeouts = transport::RequestTimeouts::from_limits(&limits);
 
     let instructions = host.instructions();
     history.set_instructions(instructions);
@@ -316,9 +451,16 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
         cancellation.check()?;
 
         // A step limit of zero means unlimited, which is the documented default.
-        if step_limit > 0 && u64::from(steps) >= step_limit {
+        let stop_reason = if host.objective_tokens_remaining() == Some(0) {
+            Some(StopReason::ObjectiveBudget)
+        } else if step_limit > 0 && u64::from(steps) >= step_limit {
+            Some(StopReason::StepLimit)
+        } else {
+            None
+        };
+        if let Some(stop_reason) = stop_reason {
             let outcome = TurnOutcome {
-                stop_reason: StopReason::StepLimit,
+                stop_reason,
                 text,
                 reasoning,
                 usage,
@@ -327,7 +469,7 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
                 calls,
             };
             host.emit(Event::Finished {
-                reason: StopReason::StepLimit,
+                reason: stop_reason,
                 usage,
                 last_request,
                 steps,
@@ -347,11 +489,12 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
             host,
             history,
             steps,
-            head_timeout,
+            timeouts,
             max_attempts,
             &cancellation,
         )?;
 
+        host.observe_response(&outcome);
         usage = usage.merge_sum(outcome.usage);
         last_request = outcome.usage;
 
@@ -429,19 +572,23 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
             // It is drained here rather than left for the next model boundary,
             // so it is recorded and reported once, at the boundary it actually
             // arrived at.
-            if !steering.is_empty() {
+            if !steering.is_empty() && host.objective_tokens_remaining() != Some(0) {
                 apply_steering(history, steering, Boundary::Finalizing, host);
                 continue;
             }
-            let reason = match finish {
-                FinishReason::Stop => StopReason::Completed,
-                FinishReason::MaxTokens => StopReason::OutputLimit,
-                FinishReason::Refused => StopReason::Refused,
-                FinishReason::ContentFilter => StopReason::ContentFilter,
-                FinishReason::Cancelled => StopReason::Cancelled,
-                FinishReason::ToolCalls => StopReason::Completed,
-                FinishReason::MaxModelTurns => StopReason::StepLimit,
-                FinishReason::ProviderError => StopReason::ProviderFailure,
+            let reason = if host.objective_tokens_remaining() == Some(0) {
+                StopReason::ObjectiveBudget
+            } else {
+                match finish {
+                    FinishReason::Stop => StopReason::Completed,
+                    FinishReason::MaxTokens => StopReason::OutputLimit,
+                    FinishReason::Refused => StopReason::Refused,
+                    FinishReason::ContentFilter => StopReason::ContentFilter,
+                    FinishReason::Cancelled => StopReason::Cancelled,
+                    FinishReason::ToolCalls => StopReason::Completed,
+                    FinishReason::MaxModelTurns => StopReason::StepLimit,
+                    FinishReason::ProviderError => StopReason::ProviderFailure,
+                }
             };
             host.emit(Event::Finished {
                 reason,
@@ -462,22 +609,18 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
 
         // Execute the batch. Policy is resolved per call before anything runs,
         // so a denial never reaches a tool.
-        let mut results = execute_batch(&pending_calls, host);
-
-        // Every result must still be answered, because an unanswered call is an
-        // invalid request. The retained bytes are charged against the turn's
-        // bound, so a turn that runs for many steps cannot accumulate more
-        // result text than the limit allows.
-        for result in &mut results {
-            let remaining = result_limit.saturating_sub(result_bytes);
-            let text = std::mem::take(&mut result.output.text);
-            let bounded = bound_result(text, remaining);
-            result_bytes = result_bytes.saturating_add(bounded.len());
-            result.output.text = bounded;
-        }
+        let (results, failure_limit_reached) = execute_batch(
+            &pending_calls,
+            host,
+            history,
+            &mut result_bytes,
+            &limits,
+            &calls,
+        );
 
         let mut result_parts = Vec::new();
         for result in &results {
+            host.post_tool(result);
             result_parts.push(ContentPart::ToolResult {
                 id: rune_core::id::ToolCallId::new(result.call.id.clone())?,
                 name: result.call.name.clone(),
@@ -487,6 +630,14 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
         }
         history.push_tool_results(result_parts);
         calls.extend(results);
+
+        if failure_limit_reached {
+            return Err(RuneError::new(
+                ErrorCode::LimitExceeded,
+                "stopped before repeating a tool call at max_consecutive_tool_failures",
+            )
+            .with_invariant(LimitName::MaxConsecutiveToolFailures.as_str()));
+        }
 
         // A provider error with tool calls in flight still ends the turn after
         // the results are recorded, so nothing is lost.
@@ -508,35 +659,163 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
             });
         }
 
-        // Drain steering that arrived during the request, then continue so the
-        // next attempt or the next step sees it.
+        // Drain steering that arrived during the successful request, then
+        // continue so the next step sees it.
         if steering_arrived {
             apply_steering(history, steering, Boundary::AfterFailure, host);
         }
     }
 }
 
+/// Refuses another provider request once the objective budget is exhausted.
+pub fn check_objective_budget(host: &dyn Host) -> Result<()> {
+    if host.objective_tokens_remaining() == Some(0) {
+        return Err(RuneError::new(
+            ErrorCode::LimitExceeded,
+            "the active objective exhausted its token budget",
+        )
+        .with_invariant("objective_token_budget"));
+    }
+    Ok(())
+}
+
+/// Accounting for one provider attempt, shared with context summarization.
+/// Missing counts use rounded-up request/output bytes divided by four. Cache
+/// details are added only for dialects that exclude them from input totals;
+/// reasoning details already included in output are not added again.
+#[derive(Debug)]
+pub struct ObjectiveAccounting {
+    input_estimate: Option<u64>,
+    output_bytes: u64,
+    argument_bytes: std::collections::BTreeMap<rune_core::id::ToolCallId, u64>,
+    usage: Usage,
+}
+
+impl ObjectiveAccounting {
+    /// Checks the budget and narrows an existing output ceiling when applicable.
+    pub fn begin(host: &dyn Host, plan: &mut RequestPlan) -> Result<Self> {
+        check_objective_budget(host)?;
+        let input_estimate = if let Some(remaining) = host.objective_tokens_remaining() {
+            host.dialect().validate(plan)?;
+            let body = host.dialect().build_request(plan)?;
+            let ceiling = ["max_tokens", "max_completion_tokens", "max_output_tokens"]
+                .iter()
+                .find_map(|key| body.get(key).and_then(serde_json::Value::as_u64));
+            plan.max_output_tokens = Some(
+                plan.max_output_tokens
+                    .or(ceiling)
+                    .map_or(remaining, |cap| cap.min(remaining)),
+            );
+            let body = host.dialect().build_request(plan)?;
+            let bytes = serde_json::to_vec(&body)
+                .map_err(|err| RuneError::new(ErrorCode::Internal, err.to_string()))?
+                .len() as u64;
+            Some(
+                bytes
+                    .div_ceil(crate::tokens::DEFAULT_BYTES_PER_TOKEN)
+                    .max(1),
+            )
+        } else {
+            None
+        };
+        Ok(Self {
+            input_estimate,
+            output_bytes: 0,
+            argument_bytes: std::collections::BTreeMap::new(),
+            usage: Usage::default(),
+        })
+    }
+
+    /// Tracks partial counts even when the transport later fails or is cancelled.
+    pub fn observe(&mut self, event: &rune_net::stream::ProviderEvent) {
+        use rune_net::stream::ProviderEvent;
+        if self.input_estimate.is_none() {
+            return;
+        }
+        match event {
+            ProviderEvent::Usage(usage) => self.usage = self.usage.merge_max(*usage),
+            ProviderEvent::TextDelta { delta } | ProviderEvent::ReasoningDelta { delta } => {
+                self.output_bytes = self.output_bytes.saturating_add(delta.len() as u64);
+            }
+            ProviderEvent::ToolCallStart { name, .. } => {
+                self.output_bytes = self.output_bytes.saturating_add(name.len() as u64);
+            }
+            ProviderEvent::ToolCallDelta { id, delta } => {
+                let bytes = self.argument_bytes.entry(id.clone()).or_default();
+                *bytes = bytes.saturating_add(delta.len() as u64);
+                self.output_bytes = self.output_bytes.saturating_add(delta.len() as u64);
+            }
+            ProviderEvent::ToolCallEnd { id, arguments } => {
+                let streamed = self.argument_bytes.remove(id).unwrap_or(0);
+                self.output_bytes = self
+                    .output_bytes
+                    .saturating_add((arguments.len() as u64).saturating_sub(streamed));
+            }
+            _ => {}
+        }
+    }
+
+    /// Persists the charge before the next request or tool execution.
+    pub fn finish(self, host: &dyn Host, reported: Option<Usage>) -> Result<()> {
+        // An offline refusal never reached a provider and consumes no tokens.
+        if host.endpoint().offline {
+            return Ok(());
+        }
+        let Some(input_estimate) = self.input_estimate else {
+            return Ok(());
+        };
+        let usage = self.usage.merge_max(reported.unwrap_or_default());
+        let input = usage.input_tokens.map_or(input_estimate, |input| {
+            if host.dialect().name() == rune_net::anthropic::NAME {
+                input
+                    .saturating_add(usage.cache_read_tokens.unwrap_or(0))
+                    .saturating_add(usage.cache_write_tokens.unwrap_or(0))
+            } else {
+                input
+            }
+        });
+        let output = usage.output_tokens.map_or_else(
+            || {
+                self.output_bytes
+                    .div_ceil(crate::tokens::DEFAULT_BYTES_PER_TOKEN)
+            },
+            |output| {
+                // Gemini reports thinking separately from candidate output. Other
+                // dialects already include reasoning in their output totals.
+                if host.dialect().name() == "gemini" {
+                    output.saturating_add(usage.reasoning_tokens.unwrap_or(0))
+                } else {
+                    output
+                }
+            },
+        );
+        host.account_objective_tokens(input.saturating_add(output))
+    }
+}
+
 /// Streams a request, retrying a transient failure within a bounded budget.
 ///
-/// Returns the outcome together with a flag saying whether steering arrived
-/// while the request was failing. The caller applies it, because the history is
-/// borrowed here to build each attempt.
+/// Applies queued steering before rebuilding a retry request. Returns the
+/// outcome together with a flag saying whether steering is queued after the
+/// successful attempt, for the caller to apply at the next boundary.
 fn stream_with_retry(
     client: &dyn Fetch,
     host: &dyn Host,
-    history: &History,
+    history: &mut History,
     step: u32,
-    head_timeout: Duration,
+    timeouts: transport::RequestTimeouts,
     max_attempts: usize,
     cancellation: &Cancellation,
 ) -> Result<(StreamOutcome, bool)> {
     let steering = host.steering();
     let mut attempt = 0_usize;
     let mut last: Option<RuneError> = None;
+    let retry_policy = RetryPolicy::new(max_attempts);
 
     loop {
         cancellation.check()?;
 
+        check_objective_budget(host)?;
         if attempt >= max_attempts {
             return Err(last.unwrap_or_else(|| {
                 RuneError::new(ErrorCode::TransportFailure, "the request did not succeed")
@@ -544,6 +823,9 @@ fn stream_with_retry(
         }
         if attempt > 0 {
             host.emit(Event::StepRestarted { step });
+            // Include corrections from the failed stream or retry delay before
+            // constructing the plan and preparing its context.
+            apply_steering(history, steering, Boundary::AfterFailure, host);
         }
         attempt = attempt.saturating_add(1);
 
@@ -556,250 +838,586 @@ fn stream_with_retry(
         } else {
             ToolChoice::Auto
         };
+        plan.parallel_tool_calls =
+            host.limits().get(LimitName::ParallelToolCalls).value() != Some(1);
         plan.effort = host.effort();
         plan.fast_mode = host.fast_mode();
         plan.provider_order = host.provider_order();
         plan.provider_strict = host.provider_strict();
+        host.prepare_request(history, &mut plan, client)?;
+        cancellation.check()?;
+        let mut accounting = ObjectiveAccounting::begin(host, &mut plan)?;
 
         // Each event is handed to the host as it is decoded, so text appears
         // while it is being produced rather than once the response has ended.
         // A retry re-sends the request, so the host is told the step restarted
         // and the partial text of the failed attempt is dropped.
-        let mut observe = |event: &rune_net::stream::ProviderEvent| match event {
-            rune_net::stream::ProviderEvent::TextDelta { delta } => {
-                host.emit(Event::TextDelta {
-                    delta: delta.clone(),
-                });
+        let mut observe = |event: &rune_net::stream::ProviderEvent| {
+            accounting.observe(event);
+            match event {
+                rune_net::stream::ProviderEvent::TextDelta { delta } => {
+                    host.emit(Event::TextDelta {
+                        delta: delta.clone(),
+                    });
+                }
+                rune_net::stream::ProviderEvent::ReasoningDelta { delta } => {
+                    host.emit(Event::ReasoningDelta {
+                        delta: delta.clone(),
+                    });
+                }
+                _ => {}
             }
-            rune_net::stream::ProviderEvent::ReasoningDelta { delta } => {
-                host.emit(Event::ReasoningDelta {
-                    delta: delta.clone(),
-                });
-            }
-            _ => {}
         };
 
-        match transport::stream_completion_observed(
+        let response = transport::stream_completion_observed(
             client,
             host.endpoint(),
             host.dialect(),
             &plan,
-            head_timeout,
+            timeouts,
             &|| cancellation.is_cancelled(),
             &mut observe,
-        ) {
-            Ok(outcome) => return Ok((outcome, !steering.is_empty())),
+        );
+        accounting.finish(host, response.as_ref().ok().map(|outcome| outcome.usage))?;
+        match response {
+            Ok(outcome) => {
+                if attempt > 1 {
+                    host.emit(Event::ProviderRetryFinished { step });
+                }
+                return Ok((outcome, !steering.is_empty()));
+            }
             Err(err) => {
-                if !err.is_retryable() {
+                let Some(delay) = retry_policy.delay(attempt, err.kind(), err.retry_after_ms())
+                else {
                     return Err(err.to_rune_error());
-                }
-
-                // Steering may have arrived while the request was failing, and
-                // it can change the request enough that retrying is worth it.
-                let delay = err
-                    .retry_after_ms()
-                    .map_or_else(|| backoff(attempt), Duration::from_millis);
+                };
+                check_objective_budget(host)?;
                 last = Some(err.to_rune_error());
-
-                // Sleep in small slices so a cancellation is noticed promptly
-                // rather than after the whole delay.
-                let started = std::time::Instant::now();
-                while started.elapsed() < delay {
-                    cancellation.check()?;
-                    std::thread::sleep(Duration::from_millis(25));
-                }
+                host.emit(Event::ProviderRetry {
+                    step,
+                    next_attempt: attempt.saturating_add(1),
+                    max_attempts,
+                    delay,
+                });
+                retry::wait(delay, cancellation)?;
             }
         }
     }
-}
-
-/// Returns the delay before an attempt.
-///
-/// Doubles from a small base and caps, so a short outage is retried promptly and
-/// a long one does not hammer the endpoint.
-fn backoff(attempt: usize) -> Duration {
-    let exponent = u32::try_from(attempt.saturating_sub(1)).unwrap_or(0).min(5);
-    let factor = 1_u64.checked_shl(exponent).unwrap_or(u64::MAX);
-    let millis = 250_u64.saturating_mul(factor);
-    Duration::from_millis(millis.min(8_000))
 }
 
 /// Resolves and executes a batch of tool calls.
 ///
-/// Read-only calls at the front of the batch run concurrently; everything after
-/// the first mutating call runs in order, so a write can never race a read of
-/// the same file.
+/// Native hosts may run independent read-only calls at the front concurrently,
+/// within the configured cap. Retained-result reads and everything after the
+/// first mutating call run in order, so writes cannot race reads of the same file.
 ///
 /// Every call is answered, including those left unrun by a cancellation, so
 /// the history never holds a call without its result. A conversation in that
 /// state cannot form another request.
-fn execute_batch(calls: &[PreparedCall], host: &dyn Host) -> Vec<CallResult> {
+fn execute_batch(
+    calls: &[PreparedCall],
+    host: &dyn Host,
+    history: &mut History,
+    result_bytes: &mut usize,
+    limits: &BudgetSet,
+    previous: &[CallResult],
+) -> (Vec<CallResult>, bool) {
     let mut results = Vec::with_capacity(calls.len());
     let mut cancelled = false;
-    // The names the model was offered. A call to anything else is answered
-    // before policy is consulted: asking whether a tool that does not exist
-    // may run puts a question to the person that has no useful answer.
+    let mut stopped = false;
+    let failure_limit = limits.get(LimitName::MaxConsecutiveToolFailures).value();
     let offered: Vec<String> = host.tools().into_iter().map(|spec| spec.name).collect();
+    let turn_cap = limits.get_usize(LimitName::MaxTurnResultBytes);
+    let tool_cap = limits.get_usize(LimitName::MaxToolResultBytes);
+    // Only the initial independent reads may overlap. Retained-result reads
+    // depend on earlier spills and on the exact remaining budget, so flush the
+    // prefix before them and keep the rest of the batch sequential.
+    // `off` still respects the documented hard concurrency ceiling.
+    #[cfg(not(target_family = "wasm"))]
+    let width = limits.get_usize(LimitName::ParallelToolCalls).clamp(1, 64);
+    #[cfg(not(target_family = "wasm"))]
+    let parallel_prefix = if width > 1 {
+        calls
+            .iter()
+            .take_while(|call| {
+                call.name != "read_tool_result" && host.concurrent_tool_host(&call.name).is_some()
+            })
+            .count()
+    } else {
+        0
+    };
+    // Adjacent duplicates must see the preceding result before they can run.
+    // Keep those and the remaining calls in order, while other reads overlap.
+    #[cfg(not(target_family = "wasm"))]
+    let parallel_prefix = if failure_limit.is_some() {
+        calls[..parallel_prefix]
+            .windows(2)
+            .position(|pair| identical_call(&pair[0], &pair[1]))
+            .map_or(parallel_prefix, |index| index.saturating_add(1))
+    } else {
+        parallel_prefix
+    };
+    #[cfg(target_family = "wasm")]
+    let parallel_prefix = 0;
 
-    for call in calls {
-        if cancelled {
-            results.push(CallResult {
+    #[cfg(not(target_family = "wasm"))]
+    for group in calls[..parallel_prefix].chunks(width) {
+        let group_results = std::thread::scope(|scope| {
+            let mut pending = Vec::with_capacity(group.len());
+            for (index, call) in group.iter().enumerate() {
+                // Later calls in this group differ from their predecessor,
+                // so they cannot extend an existing failure streak.
+                let blocked = if index == 0 || stopped {
+                    failure_guard(
+                        call,
+                        host,
+                        previous,
+                        &results,
+                        failure_limit,
+                        cancelled,
+                        &mut stopped,
+                    )
+                } else {
+                    None
+                };
+                let prepared = match blocked {
+                    Some(result) => Err(result),
+                    None => prepare_call(call, host, &offered, &mut cancelled),
+                };
+                let execution = match prepared {
+                    Ok((arguments, context)) => {
+                        let executor = host.concurrent_tool_host(&call.name);
+                        scope.spawn(move || {
+                            let executor = executor.ok_or_else(|| {
+                                RuneError::new(ErrorCode::Internal, "read executor disappeared")
+                            })?;
+                            executor.cancellation().check()?;
+                            context.check_cancelled()?;
+                            executor.execute_with_context(&call.name, &arguments, &context)
+                        })
+                    }
+                    Err(result) => {
+                        pending.push((call, Err(result)));
+                        continue;
+                    }
+                };
+                pending.push((call, Ok(execution)));
+            }
+            pending
+                .into_iter()
+                .map(|(call, pending)| match pending {
+                    Err(result) => result,
+                    Ok(worker) => {
+                        let execution = match worker.join() {
+                            Ok(output) => output,
+                            Err(payload) => std::panic::resume_unwind(payload),
+                        };
+                        finish_call(call, host, execution, &mut cancelled)
+                    }
+                })
+                .collect::<Vec<_>>()
+        });
+        for result in group_results {
+            retain_result(
+                result,
+                history,
+                result_bytes,
+                turn_cap,
+                tool_cap,
+                &mut results,
+            );
+        }
+    }
+    for call in &calls[parallel_prefix..] {
+        let cap = turn_cap.saturating_sub(*result_bytes).min(tool_cap);
+        let result = failure_guard(
+            call,
+            host,
+            previous,
+            &results,
+            failure_limit,
+            cancelled,
+            &mut stopped,
+        )
+        .unwrap_or_else(|| execute_call(call, host, &offered, &mut cancelled, history, cap));
+        retain_result(
+            result,
+            history,
+            result_bytes,
+            turn_cap,
+            tool_cap,
+            &mut results,
+        );
+    }
+    (results, stopped)
+}
+
+/// Call IDs identify requests, not the operation being repeated.
+fn identical_call(left: &PreparedCall, right: &PreparedCall) -> bool {
+    left.name == right.name && left.arguments == right.arguments
+}
+
+/// Checks failures in request order, across batches but only within this turn.
+fn failure_guard(
+    call: &PreparedCall,
+    host: &dyn Host,
+    previous: &[CallResult],
+    results: &[CallResult],
+    limit: Option<u64>,
+    cancelled: bool,
+    stopped: &mut bool,
+) -> Option<CallResult> {
+    // Cancellation retains its existing outcome and answers pending calls.
+    if cancelled || host.cancellation().is_cancelled() {
+        return None;
+    }
+    if !*stopped {
+        let limit = limit?;
+        let failures = previous
+            .iter()
+            .chain(results)
+            .rev()
+            .take_while(|result| result.output.is_error && identical_call(&result.call, call))
+            .take(usize::try_from(limit).unwrap_or(usize::MAX))
+            .count();
+        *stopped = u64::try_from(failures).unwrap_or(u64::MAX) >= limit;
+    }
+    if !*stopped {
+        return None;
+    }
+    let reason = "not run: the turn reached max_consecutive_tool_failures";
+    host.emit(Event::ToolDenied {
+        call: call.clone(),
+        reason: reason.to_owned(),
+    });
+    Some(CallResult {
+        call: call.clone(),
+        output: ToolOutput::failure(reason),
+        executed: false,
+    })
+}
+
+/// Retains and charges answers in request order, regardless of execution order.
+fn retain_result(
+    mut result: CallResult,
+    history: &mut History,
+    result_bytes: &mut usize,
+    turn_cap: usize,
+    tool_cap: usize,
+    results: &mut Vec<CallResult>,
+) {
+    let cap = turn_cap.saturating_sub(*result_bytes).min(tool_cap);
+    let text = std::mem::take(&mut result.output.text);
+    let bounded = if text.len() > cap {
+        spill_result(history, &result, text, cap)
+    } else {
+        text
+    };
+    *result_bytes = result_bytes.saturating_add(bounded.len());
+    result.output.text = bounded;
+    results.push(result);
+}
+
+/// Resolves advertisement, arguments and authority on the turn thread.
+fn prepare_call(
+    call: &PreparedCall,
+    host: &dyn Host,
+    offered: &[String],
+    cancelled: &mut bool,
+) -> std::result::Result<(serde_json::Value, ExecutionContext), CallResult> {
+    if *cancelled || host.cancellation().is_cancelled() {
+        *cancelled = true;
+        return Err(CallResult {
+            call: call.clone(),
+            output: ToolOutput::failure("not run: the turn was cancelled"),
+            executed: false,
+        });
+    }
+
+    if !offered.iter().any(|name| name == &call.name) {
+        let reason = format!(
+            "there is no tool named `{}`; the tools are {}",
+            call.name,
+            offered.join(", ")
+        );
+        host.emit(Event::ToolDenied {
+            call: call.clone(),
+            reason: reason.clone(),
+        });
+        return Err(CallResult {
+            call: call.clone(),
+            output: ToolOutput::failure(reason),
+            executed: false,
+        });
+    }
+
+    let activity = host
+        .tool_activity(&call.name)
+        .unwrap_or_else(|| infer_activity(&call.name));
+    let arguments: serde_json::Value = match serde_json::from_str(&call.arguments) {
+        Ok(value) => value,
+        Err(err) => {
+            // A malformed argument string is the model's error to correct.
+            let output = ToolOutput::failure(format!(
+                "the arguments for `{}` are not valid JSON: {err}",
+                call.name
+            ));
+            return Err(CallResult {
                 call: call.clone(),
-                output: ToolOutput::failure("not run: the turn was cancelled"),
+                output,
                 executed: false,
             });
-            continue;
         }
+    };
 
-        if !offered.iter().any(|name| name == &call.name) {
-            let reason = format!(
-                "there is no tool named `{}`; the tools are {}",
-                call.name,
-                offered.join(", ")
-            );
+    let target = host.tool_permission_target(&call.name, &arguments);
+    let (outcome, reason) = host.decide(&call.name, target.as_deref());
+
+    match outcome {
+        Outcome::Deny => {
             host.emit(Event::ToolDenied {
                 call: call.clone(),
                 reason: reason.clone(),
             });
-            results.push(CallResult {
+            return Err(CallResult {
                 call: call.clone(),
-                output: ToolOutput::failure(reason),
+                output: ToolOutput::failure(format!(
+                    "`{}` was refused by policy: {reason}",
+                    call.name
+                )),
                 executed: false,
             });
-            continue;
         }
-
-        let activity = infer_activity(&call.name);
-        let arguments: serde_json::Value = match serde_json::from_str(&call.arguments) {
-            Ok(value) => value,
-            Err(err) => {
-                // A malformed argument string is the model's error to correct.
-                let output = ToolOutput::failure(format!(
-                    "the arguments for `{}` are not valid JSON: {err}",
+        Outcome::Ask => {
+            // The host resolves an ask before reaching this point, so an
+            // ask that arrives here means nothing could approve the call.
+            // It is reported like a refusal, so the person watching sees
+            // it, and the model is told why and not to retry, because the
+            // same call will be held the same way every time.
+            let action = target.as_deref().unwrap_or(&call.name);
+            host.emit(Event::ToolDenied {
+                call: call.clone(),
+                reason: format!("{reason}; nothing in this session could approve it"),
+            });
+            return Err(CallResult {
+                call: call.clone(),
+                output: ToolOutput::failure(format!(
+                    "`{}` was not run: no rule allows `{action}`, and this session has no \
+                     way to ask for approval. Do not retry it or a variation of it. Continue \
+                     without it, or tell the user what to run or which rule to add.",
                     call.name
-                ));
-                results.push(CallResult {
-                    call: call.clone(),
-                    output,
-                    executed: false,
-                });
-                continue;
-            }
-        };
+                )),
+                executed: false,
+            });
+        }
+        Outcome::Allow => {}
+    }
 
-        let target = infer_target(host, &call.name, &arguments);
-        let (outcome, reason) = host.decide(&call.name, target.as_deref());
-
-        match outcome {
-            Outcome::Deny => {
+    // Every image in a vision batch needs its own decision before the backend
+    // sees any of them. A grant for the first path cannot cover the rest.
+    if call.name == "vision"
+        && let Some(paths) = arguments.get("paths").and_then(serde_json::Value::as_array)
+    {
+        for path in paths.iter().skip(1).filter_map(serde_json::Value::as_str) {
+            let path = path.trim();
+            let (outcome, reason) = host.decide(&call.name, Some(path));
+            if outcome != Outcome::Allow {
                 host.emit(Event::ToolDenied {
                     call: call.clone(),
                     reason: reason.clone(),
                 });
-                results.push(CallResult {
+                return Err(CallResult {
                     call: call.clone(),
                     output: ToolOutput::failure(format!(
-                        "`{}` was refused by policy: {reason}",
-                        call.name
+                        "vision image `{path}` was not approved: {reason}"
                     )),
                     executed: false,
                 });
-                continue;
             }
-            Outcome::Ask => {
-                // The host resolves an ask before reaching this point, so an
-                // ask that arrives here means nothing could approve the call.
-                // It is reported like a refusal, so the person watching sees
-                // it, and the model is told why and not to retry, because the
-                // same call will be held the same way every time.
-                let action = target.as_deref().unwrap_or(&call.name);
-                host.emit(Event::ToolDenied {
-                    call: call.clone(),
-                    reason: format!("{reason}; nothing in this session could approve it"),
-                });
-                results.push(CallResult {
-                    call: call.clone(),
-                    output: ToolOutput::failure(format!(
-                        "`{}` was not run: no rule allows `{action}`, and this session has no \
-                         way to ask for approval. Do not retry it or a variation of it. Continue \
-                         without it, or tell the user what to run or which rule to add.",
-                        call.name
-                    )),
-                    executed: false,
-                });
-                continue;
-            }
-            Outcome::Allow => {}
         }
-
-        host.emit(Event::ToolStarted {
-            call: call.clone(),
-            activity,
-        });
-
-        let output = match host.execute(&call.name, &arguments) {
-            Ok(output) => output,
-            Err(err) if matches!(err.code(), ErrorCode::Cancelled) => {
-                results.push(CallResult {
-                    call: call.clone(),
-                    output: ToolOutput::failure("the call was cancelled"),
-                    executed: false,
-                });
-                cancelled = true;
-                continue;
-            }
-            // The hint is part of the answer: it is what tells the model how
-            // to correct the call.
-            Err(err) => ToolOutput::failure(match err.hint() {
-                Some(hint) => format!("{}; {hint}", err.message()),
-                None => err.message().to_owned(),
-            }),
-        };
-
-        host.emit(Event::ToolFinished {
-            call: call.clone(),
-            is_error: output.is_error,
-        });
-
-        results.push(CallResult {
-            call: call.clone(),
-            output,
-            executed: true,
-        });
     }
 
-    results
+    // A rename changes both names. Neither path's grant may authorize the
+    // other, so resolve the destination through the same host policy as the source.
+    if call.name == "rename_file"
+        && let Some(destination) = arguments
+            .get("new_path")
+            .and_then(serde_json::Value::as_str)
+    {
+        let (outcome, reason) = host.decide(&call.name, Some(destination));
+        if outcome != Outcome::Allow {
+            host.emit(Event::ToolDenied {
+                call: call.clone(),
+                reason: reason.clone(),
+            });
+            return Err(CallResult {
+                call: call.clone(),
+                output: ToolOutput::failure(format!(
+                    "rename destination `{destination}` was not approved: {reason}"
+                )),
+                executed: false,
+            });
+        }
+    }
+
+    let private_access = call.name == "web_fetch"
+        && arguments
+            .get("allow_private")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true);
+    if private_access {
+        let (outcome, reason) = host.decide_private_network(target.as_deref());
+        if outcome != Outcome::Allow {
+            host.emit(Event::ToolDenied {
+                call: call.clone(),
+                reason: reason.clone(),
+            });
+            return Err(CallResult {
+                call: call.clone(),
+                output: ToolOutput::failure(format!(
+                    "private-network access was not approved: {reason}"
+                )),
+                executed: false,
+            });
+        }
+    }
+    let veto = match host.pre_tool(call) {
+        Ok(veto) => {
+            veto.map(|veto| format!("pre-tool hook `{}` vetoed: {}", veto.name, veto.reason))
+        }
+        Err(error) if error.code() == ErrorCode::Cancelled => {
+            *cancelled = true;
+            return Err(CallResult {
+                call: call.clone(),
+                output: ToolOutput::failure("not run: the turn was cancelled"),
+                executed: false,
+            });
+        }
+        Err(error) => Some(format!("pre-tool hook failed: {error}")),
+    };
+    if let Some(reason) = veto {
+        host.emit(Event::ToolDenied {
+            call: call.clone(),
+            reason: reason.clone(),
+        });
+        return Err(CallResult {
+            call: call.clone(),
+            output: ToolOutput::failure(reason),
+            executed: false,
+        });
+    }
+    // A hook may have observed cancellation while deciding to allow the call.
+    if host.cancellation().is_cancelled() {
+        *cancelled = true;
+        return Err(CallResult {
+            call: call.clone(),
+            output: ToolOutput::failure("not run: the turn was cancelled"),
+            executed: false,
+        });
+    }
+    let context = host.context().with_private_network_access(private_access);
+
+    host.emit(Event::ToolStarted {
+        call: call.clone(),
+        activity,
+    });
+    Ok((arguments, context))
 }
 
-/// Returns the activity for a tool name.
+/// Executes one offered, policy-approved call and preserves batch cancellation.
+fn execute_call(
+    call: &PreparedCall,
+    host: &dyn Host,
+    offered: &[String],
+    cancelled: &mut bool,
+    history: &History,
+    output_cap: usize,
+) -> CallResult {
+    let (arguments, context) = match prepare_call(call, host, offered, cancelled) {
+        Ok(prepared) => prepared,
+        Err(result) => return result,
+    };
+    // Retained output is owned by the history rather than the host. Supply
+    // that store only after advertisement and policy checks have passed.
+    let execution = if call.name == "read_tool_result" {
+        let cap = context.max_output_bytes.min(output_cap);
+        rune_tools::ReadToolResult::default().call(
+            &arguments,
+            &context
+                .with_output_cap(cap)
+                .with_result_store(history.shared_result_store()),
+        )
+    } else {
+        host.execute_with_context(
+            &call.name,
+            &arguments,
+            &context.with_live_plan(history.shared_live_plan()),
+        )
+    };
+    finish_call(call, host, execution, cancelled)
+}
+
+/// Reports execution and preserves a cancellation for calls still pending.
+fn finish_call(
+    call: &PreparedCall,
+    host: &dyn Host,
+    execution: Result<ToolOutput>,
+    cancelled: &mut bool,
+) -> CallResult {
+    let output = match execution {
+        Ok(output) => output,
+        Err(err) if matches!(err.code(), ErrorCode::Cancelled) => {
+            *cancelled = true;
+            return CallResult {
+                call: call.clone(),
+                output: ToolOutput::failure("the call was cancelled"),
+                executed: false,
+            };
+        }
+        // Preserve the diagnostic even when the host bypasses the registry.
+        Err(err) => ToolOutput::from_error(&err),
+    };
+    if !output.is_error
+        && let Some(update) = &output.plan_update
+    {
+        host.emit(Event::PlanUpdated {
+            update: update.clone(),
+        });
+    }
+    host.emit(Event::ToolFinished {
+        call: call.clone(),
+        is_error: output.is_error,
+    });
+    CallResult {
+        call: call.clone(),
+        output,
+        executed: true,
+    }
+}
+
+/// Returns the fallback activity for a host without registered metadata.
 ///
-/// A name the registry does not know is treated as an execution, which is the
-/// conservative answer for presentation purposes.
+/// An unknown name is treated as an execution, which is the conservative
+/// answer for presentation purposes.
 fn infer_activity(name: &str) -> Activity {
     match name {
-        "read_file" => Activity::Read,
+        "read_file" | "read_tool_result" | "git_diff" | "syntax_diagnostics" => Activity::Read,
         "glob_files" => Activity::List,
         "grep_files" => Activity::Search,
-        "write_file" => Activity::Write,
+        "write_file" | "rename_file" | "create_directory" => Activity::Write,
         "edit_file" => Activity::Edit,
         "shell" => Activity::Execute,
         "web_fetch" | "web_search" => Activity::Network,
         "subagent" => Activity::Delegate,
         "ask_user_question" => Activity::Interact,
+        "update_plan" => Activity::Plan,
         _ => Activity::Execute,
     }
 }
 
-/// Returns the permission target for a call, when the tool names one.
-///
-/// Each tool declares its own target, so the loop asks the registry rather than
-/// keeping a second table that can drift from it. The host does not hand the
-/// loop its registry, so the built-in one answers, and it gives the same
-/// target: a tool's target depends only on its arguments and on state every
-/// instance reads, such as the command a shell session runs.
-fn infer_target(host: &dyn Host, name: &str, arguments: &serde_json::Value) -> Option<String> {
+/// Resolves built-in targets for hosts without a registry.
+fn infer_target(name: &str, arguments: &serde_json::Value) -> Option<String> {
     static BUILTIN: std::sync::OnceLock<Option<Registry>> = std::sync::OnceLock::new();
-    let _ = host;
     match BUILTIN.get_or_init(|| rune_tools::inventory::builtin_default().ok()) {
         Some(registry) => permission_target_for(registry, name, arguments),
         None => infer_target_standalone(name, arguments),
@@ -808,6 +1426,37 @@ fn infer_target(host: &dyn Host, name: &str, arguments: &serde_json::Value) -> O
 
 /// Marker appended to a result cut by the turn's result budget.
 const RESULT_TRUNCATION_MARKER: &str = "\n[tool result truncated at the turn's result limit]";
+
+/// Stores the full body before reducing the model-visible text. Metadata is
+/// charged to both result budgets, so a tiny or exhausted budget can still
+/// answer the call with an empty body without exceeding its limit.
+fn spill_result(history: &mut History, result: &CallResult, text: String, cap: usize) -> String {
+    match history.result_store_mut().spill(
+        &result.call.name,
+        &result.call.id,
+        text,
+        result.output.is_error,
+        cap,
+    ) {
+        Ok(preview) => {
+            let marker = format!(
+                "\n[{} bytes retained; handle {}]",
+                preview.retained_bytes, preview.handle
+            );
+            if marker.len() > cap {
+                return String::new();
+            }
+            let mut end = preview.text.len().min(cap.saturating_sub(marker.len()));
+            while end > 0 && !preview.text.is_char_boundary(end) {
+                end = end.saturating_sub(1);
+            }
+            let mut output = preview.text.get(..end).unwrap_or_default().to_owned();
+            output.push_str(&marker);
+            output
+        }
+        Err(err) => bound_result(format!("[tool result could not be retained: {err}]"), cap),
+    }
+}
 
 /// Cuts a rendered tool result to the bytes the turn can still retain.
 ///
@@ -888,22 +1537,26 @@ pub fn effective_outcome(mode: PermissionMode, decided: Outcome) -> Outcome {
 ///
 /// Present so the loop and the command surface agree on how a target is derived
 /// from arguments; a divergence between them would mean a rule matching one path
-/// in the loop and another outside it.
+/// in the loop and another outside it. Registered declarations, including no
+/// target, are authoritative. Unregistered built-in names use argument fallback.
 #[must_use]
 pub fn permission_target_for(
     registry: &Registry,
     name: &str,
     arguments: &serde_json::Value,
 ) -> Option<String> {
-    registry
-        .permission_target(name, arguments)
-        .or_else(|| infer_target_standalone(name, arguments))
+    if registry.contains(name) {
+        registry.permission_target(name, arguments)
+    } else {
+        infer_target_standalone(name, arguments)
+    }
 }
 
 /// Returns the permission target without a host.
 fn infer_target_standalone(name: &str, arguments: &serde_json::Value) -> Option<String> {
     match name {
-        "read_file" | "write_file" | "edit_file" | "glob_files" | "grep_files" => arguments
+        "read_file" | "write_file" | "edit_file" | "rename_file" | "create_directory"
+        | "glob_files" | "grep_files" | "syntax_diagnostics" => arguments
             .get("path")
             .and_then(serde_json::Value::as_str)
             .map(str::to_owned),
@@ -930,6 +1583,21 @@ pub fn decide_call(
     let fallback = rune_policy::decision::mode_default(mode);
     let target = target.unwrap_or("");
     let decision = rules.evaluate(name, target, fallback);
+    let outcome = effective_outcome(mode, decision.outcome);
+    (outcome, decision.explain())
+}
+
+/// Evaluates a call using the workspace its file tools resolve paths against.
+#[must_use]
+pub fn decide_call_in_workspace(
+    rules: &RuleSet,
+    mode: PermissionMode,
+    name: &str,
+    target: Option<&str>,
+    workspace: &Utf8Path,
+) -> (Outcome, String) {
+    let fallback = rune_policy::decision::mode_default(mode);
+    let decision = rules.evaluate_in_workspace(name, target.unwrap_or(""), fallback, workspace);
     let outcome = effective_outcome(mode, decision.outcome);
     (outcome, decision.explain())
 }
@@ -1012,17 +1680,6 @@ mod tests {
     }
 
     #[test]
-    fn backoff_grows_then_caps() {
-        assert_eq!(backoff(1), Duration::from_millis(250));
-        assert_eq!(backoff(2), Duration::from_millis(500));
-        assert_eq!(backoff(3), Duration::from_millis(1000));
-        assert_eq!(backoff(4), Duration::from_millis(2000));
-        assert_eq!(backoff(5), Duration::from_millis(4000));
-        assert_eq!(backoff(6), Duration::from_millis(8000));
-        assert_eq!(backoff(20), Duration::from_millis(8000));
-    }
-
-    #[test]
     fn full_access_resolves_every_outcome_to_allow() {
         assert_eq!(
             effective_outcome(PermissionMode::FullAccess, Outcome::Deny),
@@ -1084,6 +1741,8 @@ mod tests {
     #[test]
     fn activity_is_inferred_for_each_builtin_name() {
         assert_eq!(infer_activity("read_file"), Activity::Read);
+        assert_eq!(infer_activity("git_diff"), Activity::Read);
+        assert_eq!(infer_activity("syntax_diagnostics"), Activity::Read);
         assert_eq!(infer_activity("glob_files"), Activity::List);
         assert_eq!(infer_activity("grep_files"), Activity::Search);
         assert_eq!(infer_activity("write_file"), Activity::Write);
@@ -1107,6 +1766,10 @@ mod tests {
         );
         assert_eq!(
             infer_target_standalone("edit_file", &arguments).as_deref(),
+            Some("src/main.rs")
+        );
+        assert_eq!(
+            infer_target_standalone("syntax_diagnostics", &arguments).as_deref(),
             Some("src/main.rs")
         );
     }

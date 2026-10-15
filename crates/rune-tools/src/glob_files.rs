@@ -4,7 +4,7 @@ use std::fmt::Write as _;
 
 use rune_core::error::{Result, RuneError};
 
-use crate::contract::{Activity, ExecutionContext, Tool, ToolOutput};
+use crate::contract::{Activity, ExecutionContext, Tool, ToolOutput, validate_closed_arguments};
 use crate::workspace::{
     FileLimits, SUMMARY_RESERVE_BYTES, Walker, compile_glob, default_root, display_in, resolve,
     roots, string_arg, walk_notes,
@@ -83,6 +83,7 @@ impl Tool for GlobFiles {
         arguments: &serde_json::Value,
         context: &ExecutionContext,
     ) -> Result<ToolOutput> {
+        validate_closed_arguments(arguments, &self.input_schema())?;
         let pattern = string_arg(arguments, "pattern")?
             .ok_or_else(|| RuneError::missing_field("pattern"))?
             .to_owned();

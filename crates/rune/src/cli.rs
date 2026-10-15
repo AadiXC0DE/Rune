@@ -17,7 +17,7 @@ use crate::spec;
 /// A subcommand.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Command {
-    /// Run one request without an interactive session.
+    /// Run one bounded turn without an interactive session.
     Ask,
     /// Serve the Agent Client Protocol.
     Acp,
@@ -27,7 +27,7 @@ pub enum Command {
     Connect,
     /// List sessions.
     Sessions,
-    /// Inspect, migrate, or recover one session.
+    /// Inspect, search, export, fork, migrate, or recover one session.
     Session,
     /// Show the session branch structure.
     Tree,
@@ -37,8 +37,14 @@ pub enum Command {
     Auth,
     /// List models.
     Models,
+    /// Check provider capabilities before running a turn.
+    Capabilities,
+    /// List, check, or import project MCP servers without an agent turn.
+    Mcp,
     /// Show permission state.
     Permissions,
+    /// Explain a command's sandbox policy without running it.
+    Sandbox,
     /// Inspect and change workspace trust.
     Projects,
     /// Show resolved configuration.
@@ -59,6 +65,8 @@ pub enum Command {
     Uninstall,
     /// Print the generated command reference.
     Reference,
+    /// Generate shell completion from the command specification.
+    Completion,
     /// Print help.
     Help,
     /// Print the version.
@@ -84,7 +92,10 @@ impl Command {
             Self::Usage => "usage",
             Self::Auth => "auth",
             Self::Models => "models",
+            Self::Capabilities => "capabilities",
+            Self::Mcp => "mcp",
             Self::Permissions => "permissions",
+            Self::Sandbox => "sandbox",
             Self::Projects => "projects",
             Self::Config => "config",
             Self::Limits => "limits",
@@ -95,6 +106,7 @@ impl Command {
             Self::Upgrade => "upgrade",
             Self::Uninstall => "uninstall",
             Self::Reference => "reference",
+            Self::Completion => "completion",
             Self::Help => "help",
             Self::Version => "version",
             Self::Interactive => "interactive",
@@ -137,6 +149,8 @@ pub struct Launch {
     pub permission_mode: Option<String>,
     /// Theme override.
     pub theme: Option<String>,
+    /// Use ASCII terminal decorations for this process.
+    pub ascii: bool,
     /// Provider order override.
     pub provider_order: Option<String>,
     /// Whether requests are restricted to the listed providers.
@@ -145,10 +159,14 @@ pub struct Launch {
     pub offline: bool,
     /// Whether a command may run where the host has no sandbox backend.
     pub allow_unsandboxed: bool,
+    /// Whether sessions use append-only, labelled output and line input.
+    pub accessible: bool,
     /// Whether output is machine readable.
     pub json: bool,
     /// Positional arguments after the command.
     pub args: Vec<String>,
+    /// Index of the first positional argument supplied after `--`, when present.
+    pub separator: Option<usize>,
     /// Flags the command declares, given after it, with their values.
     pub flags: Vec<(String, Option<String>)>,
     /// Session resume target, when the launch resumes.
@@ -225,12 +243,15 @@ pub fn parse(args: Vec<OsString>, benchmark: bool) -> Result<Launch> {
         fast_mode: None,
         permission_mode: None,
         theme: None,
+        ascii: false,
         provider_order: None,
         provider_strict: None,
         offline: false,
         allow_unsandboxed: false,
+        accessible: false,
         json: false,
         args: Vec::new(),
+        separator: None,
         flags: Vec::new(),
         resume: None,
         benchmark,
@@ -268,7 +289,7 @@ pub fn parse(args: Vec<OsString>, benchmark: bool) -> Result<Launch> {
                     .get(index.saturating_add(1))
                     .cloned()
                     .unwrap_or_default();
-                if next.is_empty() || next.starts_with('-') {
+                if next.is_empty() || (next.starts_with('-') && !flag_shaped_session_id(&next)) {
                     launch.resume = Some(ResumeTarget::Latest);
                     index = index.saturating_add(1);
                 } else {
@@ -302,20 +323,23 @@ pub fn parse(args: Vec<OsString>, benchmark: bool) -> Result<Launch> {
     // Subcommand.
     if let Some(token) = tokens.get(index).filter(|token| !token.starts_with('-')) {
         {
-            launch.command = match token.as_str() {
+            launch.command = match spec::find(token).map_or(token.as_str(), |spec| spec.name) {
                 "ask" => Command::Ask,
                 "acp" => Command::Acp,
-                "review" | "pr" | "issue" => Command::Review,
-                "connect" | "login" | "setup" | "provider" => Command::Connect,
+                "review" => Command::Review,
+                "connect" => Command::Connect,
                 "sessions" => Command::Sessions,
                 "session" => Command::Session,
                 "tree" => Command::Tree,
-                "usage" | "cost" => Command::Usage,
-                "auth" | "logout" => Command::Auth,
+                "usage" => Command::Usage,
+                "auth" => Command::Auth,
                 "models" => Command::Models,
+                "capabilities" => Command::Capabilities,
+                "mcp" => Command::Mcp,
                 "permissions" => Command::Permissions,
+                "sandbox" => Command::Sandbox,
                 "projects" => Command::Projects,
-                "config" | "settings" => Command::Config,
+                "config" => Command::Config,
                 "limits" => Command::Limits,
                 "workspace" => Command::Workspace,
                 "prompt" => Command::Prompt,
@@ -324,6 +348,7 @@ pub fn parse(args: Vec<OsString>, benchmark: bool) -> Result<Launch> {
                 "upgrade" => Command::Upgrade,
                 "uninstall" => Command::Uninstall,
                 "reference" => Command::Reference,
+                "completion" => Command::Completion,
                 "help" => Command::Help,
                 "version" => Command::Version,
                 "resume" => {
@@ -343,17 +368,25 @@ pub fn parse(args: Vec<OsString>, benchmark: bool) -> Result<Launch> {
         }
     }
 
-    // `resume` may carry a target as its first positional argument.
+    // `resume_requested` distinguishes an explicit resume from the default
+    // interactive launch, which is used by resume handling in a later phase.
+    let _ = resume_requested;
+    let mut launch = finish(launch, &tokens, index)?;
+    // Classify after flags have been consumed, including identifiers beginning
+    // with a dash and targets following global options.
     if launch.command == Command::Resume
-        && let Some(token) = tokens.get(index).filter(|token| !token.starts_with('-'))
+        && let Some(token) = launch.args.first()
     {
         launch.resume = Some(classify_resume(token));
     }
+    Ok(launch)
+}
 
-    // `resume_requested` distinguishes an explicit resume from the default
-    // interactive launch, which is used by the resume handling in a later phase.
-    let _ = resume_requested;
-    finish(launch, &tokens, index)
+/// Session identifiers use base64url, so their first character may be a dash.
+/// Recognized global flags retain precedence even if they have the same length.
+fn flag_shaped_session_id(raw: &str) -> bool {
+    raw.parse::<rune_core::id::SessionId>().is_ok()
+        && !spec::GLOBAL_FLAGS.iter().any(|flag| flag.name == raw)
 }
 
 /// Applies one flag that changes a setting for the whole process.
@@ -384,6 +417,8 @@ fn take_global(launch: &mut Launch, tokens: &[String], index: &mut usize) -> Res
             | "--offline"
             | "--allow-unsandboxed"
             | "--json"
+            | "--accessible"
+            | "--ascii"
     ) {
         if inline.is_some() {
             return Err(RuneError::invalid_field(
@@ -399,6 +434,8 @@ fn take_global(launch: &mut Launch, tokens: &[String], index: &mut usize) -> Res
             "--no-provider-strict" => launch.provider_strict = Some(false),
             "--offline" => launch.offline = true,
             "--allow-unsandboxed" => launch.allow_unsandboxed = true,
+            "--accessible" => launch.accessible = true,
+            "--ascii" => launch.ascii = true,
             _ => launch.json = true,
         }
         *index = (*index).saturating_add(1);
@@ -428,8 +465,28 @@ fn take_global(launch: &mut Launch, tokens: &[String], index: &mut usize) -> Res
     match canonical {
         "--model" => launch.model = Some(value),
         "--provider" => launch.provider = Some(value),
-        "--effort" => launch.effort = Some(value),
-        "--permission-mode" => launch.permission_mode = Some(value),
+        "--effort" => {
+            if parse_effort(&value).is_none() {
+                return Err(RuneError::invalid_field(
+                    canonical,
+                    format!(
+                        "`{value}` is not a reasoning effort; accepted efforts: auto, none, minimal, low, medium, high, xhigh, max"
+                    ),
+                ));
+            }
+            launch.effort = Some(value);
+        }
+        "--permission-mode" => {
+            if rune_core::config::PermissionMode::from_name(&value).is_none() {
+                return Err(RuneError::invalid_field(
+                    canonical,
+                    format!(
+                        "`{value}` is not a permission mode; accepted modes: ask, auto, full-access (aliases: full_access, fullaccess, yolo)"
+                    ),
+                ));
+            }
+            launch.permission_mode = Some(value);
+        }
         "--add-dir" => launch.add_dirs.push(value),
         "--theme" => launch.theme = Some(value),
         "--provider-order" => launch.provider_order = Some(value),
@@ -472,6 +529,7 @@ fn finish(mut launch: Launch, tokens: &[String], mut index: usize) -> Result<Lau
     while index < tokens.len() {
         let token = tokens.get(index).cloned().unwrap_or_default();
         if token == "--" {
+            launch.separator = Some(launch.args.len());
             // Everything after a bare double dash is a positional argument,
             // even when it looks like a flag.
             launch
@@ -491,6 +549,12 @@ fn finish(mut launch: Launch, tokens: &[String], mut index: usize) -> Result<Lau
             None => (token.clone(), None),
         };
         if let Some(flag) = declared.iter().find(|flag| flag.name == name) {
+            if flag.value.is_none() && inline.is_some() {
+                return Err(RuneError::invalid_field(
+                    &name,
+                    format!("`{name}` takes no value"),
+                ));
+            }
             let mut value = inline;
             if flag.value.is_some() && value.is_none() {
                 // The next token is the value whatever it looks like, because
@@ -508,6 +572,15 @@ fn finish(mut launch: Launch, tokens: &[String], mut index: usize) -> Result<Lau
             continue;
         }
         if take_global(&mut launch, tokens, &mut index)? {
+            continue;
+        }
+        if matches!(
+            launch.command,
+            Command::Session | Command::Tree | Command::Resume
+        ) && flag_shaped_session_id(&token)
+        {
+            launch.args.push(token);
+            index = index.saturating_add(1);
             continue;
         }
         if text_started || lenient {
@@ -535,7 +608,9 @@ fn undeclared_flag(raw: &str, command: Command) -> RuneError {
         ErrorCode::InvalidField,
         format!("`{raw}` is not a flag of `rune {name}`"),
     );
-    if matches!(command, Command::Ask | Command::Review) {
+    if command == Command::Sandbox {
+        err.with_hint("put `--` before the command, as in `rune sandbox -- rm -rf /`; run `rune help sandbox` for flags")
+    } else if matches!(command, Command::Ask | Command::Review) {
         err.with_hint(format!(
             "run `rune help {name}` for its flags, or put `--` before text that starts with a dash"
         ))
@@ -590,13 +665,49 @@ fn to_strings(args: Vec<OsString>) -> Result<Vec<String>> {
 pub fn apply_to_settings(launch: &Launch, settings: &mut rune_core::config::Settings) {
     let layer = Layer::CommandLine;
 
+    if let Some(provider) = &launch.provider {
+        let provider = rune_core::config::parse_provider(provider);
+        if settings.provider != provider {
+            // These values describe the previous provider. Keep the model
+            // declarations so the newly selected provider can resolve its own.
+            settings.model.clear();
+            settings.context_window = None;
+            settings.base_url = None;
+            settings.api_key_env = None;
+            settings.anonymous = false;
+            for key in [
+                "model",
+                "context_window",
+                "base_url",
+                "api_key_env",
+                "anonymous",
+            ] {
+                settings.sources.sources.remove(key);
+            }
+            let key = rune_core::config::provider_key(&provider);
+            if let Some(model) = settings
+                .configured_models
+                .get(&key)
+                .or_else(|| settings.configured_models.get("default"))
+            {
+                model.id().clone_into(&mut settings.model);
+                settings.sources.record("model", Layer::User);
+                settings.context_window = model.context_window();
+                if settings.context_window.is_some() {
+                    settings.sources.record("context_window", Layer::User);
+                }
+            }
+        }
+        settings.provider = provider;
+        settings.sources.record("provider", layer);
+    }
     if let Some(model) = &launch.model {
+        if settings.model != *model {
+            settings.context_window = None;
+            settings.sources.sources.remove("context_window");
+        }
         settings.model.clone_from(model);
         settings.sources.record("model", layer);
-    }
-    if let Some(provider) = &launch.provider {
-        settings.provider = rune_core::config::parse_provider(provider);
-        settings.sources.record("provider", layer);
     }
     if let Some(effort) = launch.effort.as_deref().and_then(parse_effort) {
         settings.effort = effort;
@@ -613,6 +724,10 @@ pub fn apply_to_settings(launch: &Launch, settings: &mut rune_core::config::Sett
     {
         settings.permission_mode = parsed;
         settings.sources.record("permission_mode", layer);
+    }
+    if launch.ascii {
+        settings.ascii = true;
+        settings.sources.record("ascii", layer);
     }
     if let Some(theme) = &launch.theme {
         settings.theme = Some(theme.clone());
@@ -675,6 +790,39 @@ mod tests {
         let launch = parse_list(&[]).expect("parse");
         assert_eq!(launch.command, Command::Interactive);
         assert!(launch.args.is_empty());
+        assert!(!launch.accessible);
+    }
+
+    #[test]
+    fn ascii_flag_selects_decorations_before_or_after_the_command() {
+        let mut settings = rune_core::config::Settings::default();
+        let default = parse_list(&[]).expect("parse");
+        assert!(!default.ascii);
+        settings.ascii = true;
+        apply_to_settings(&default, &mut settings);
+        assert!(settings.ascii, "an absent flag must preserve configuration");
+        for arguments in [&["--ascii"][..], &["resume", "last", "--ascii"][..]] {
+            let launch = parse_list(arguments).expect("parse");
+            assert!(launch.ascii);
+            settings.ascii = false;
+            apply_to_settings(&launch, &mut settings);
+            assert!(settings.ascii);
+            assert_eq!(settings.source_of("ascii"), Layer::CommandLine);
+        }
+        assert!(parse_list(&["--ascii=false"]).is_err());
+        assert!(parse_list(&["--ascii=true"]).is_err());
+        assert!(crate::reference::render().contains("--ascii"));
+    }
+
+    #[test]
+    fn accessible_mode_is_explicit_and_accepts_no_value() {
+        let launch = parse_list(&["--accessible"]).expect("parse");
+        assert!(launch.accessible);
+        assert_eq!(launch.command, Command::Interactive);
+        let launch = parse_list(&["resume", "last", "--accessible"]).expect("parse");
+        assert!(launch.accessible);
+        assert_eq!(launch.resume, Some(ResumeTarget::Latest));
+        assert!(parse_list(&["--accessible=false"]).is_err());
     }
 
     #[test]
@@ -691,6 +839,32 @@ mod tests {
     }
 
     #[test]
+    fn dash_prefixed_session_ids_are_positional_and_known_flags_keep_precedence() {
+        for id in ["-fixedchild0", "--fixedchild"] {
+            for command in ["session", "tree", "resume"] {
+                let launch =
+                    parse_list(&[command, "--accessible", id, "--json"]).expect("identifier");
+                assert_eq!(launch.args, [id]);
+                assert!(launch.accessible);
+                assert!(launch.json || launch.has_flag("--json"));
+                if command == "resume" {
+                    assert_eq!(launch.resume, Some(ResumeTarget::Exact(id.to_owned())));
+                }
+            }
+            let fork = parse_list(&["session", "fork", id, "--at", "10", "--json"]).expect("fork");
+            assert_eq!(fork.args, ["fork", id]);
+            assert_eq!(fork.flag("--at"), Some("10"));
+            assert_eq!(
+                parse_list(&["--resume", id]).expect("resume flag").resume,
+                Some(ResumeTarget::Exact(id.to_owned()))
+            );
+        }
+        let launch = parse_list(&["--resume", "--accessible"]).expect("global flag");
+        assert_eq!(launch.resume, Some(ResumeTarget::Latest));
+        assert!(launch.accessible);
+    }
+
+    #[test]
     fn aliases_map_to_their_canonical_command() {
         assert_eq!(
             parse_list(&["cost"]).expect("parse").command,
@@ -701,6 +875,34 @@ mod tests {
             Command::Config
         );
         assert_eq!(parse_list(&["pr"]).expect("parse").command, Command::Review);
+    }
+
+    #[test]
+    fn declared_aliases_preserve_arguments_and_flags() {
+        for (alias, canonical, args) in [
+            ("login", "connect", &["anthropic", "--json"][..]),
+            ("setup", "connect", &["anthropic", "--json"][..]),
+            ("provider", "connect", &["anthropic", "--json"][..]),
+            ("pr", "review", &["context", "-la"][..]),
+            ("issue", "review", &["context", "-la"][..]),
+            ("cost", "usage", &["--period", "7d", "--json"][..]),
+            ("logout", "auth", &["--json"][..]),
+            ("logout", "auth", &["logout", "--json"][..]),
+            ("settings", "config", &["--explain", "--json"][..]),
+        ] {
+            assert_eq!(spec::find(alias).expect("declared alias").name, canonical);
+            let tokens = |name| {
+                let mut tokens = vec![name];
+                tokens.extend_from_slice(args);
+                tokens
+            };
+            let alias_launch = parse_list(&tokens(alias)).expect("alias parse");
+            let canonical_launch = parse_list(&tokens(canonical)).expect("canonical parse");
+            assert_eq!(alias_launch.command, canonical_launch.command, "{alias}");
+            assert_eq!(alias_launch.args, canonical_launch.args, "{alias}");
+            assert_eq!(alias_launch.flags, canonical_launch.flags, "{alias}");
+            assert_eq!(alias_launch.json, canonical_launch.json, "{alias}");
+        }
     }
 
     #[test]
@@ -745,6 +947,38 @@ mod tests {
     fn command_flag_with_equals_value_is_captured() {
         let launch = parse_list(&["session", "last", "--id=abc123"]).expect("parse");
         assert_eq!(launch.flag("--id"), Some("abc123"));
+    }
+
+    #[test]
+    fn declared_boolean_flags_reject_attached_values() {
+        for command in spec::all_commands() {
+            for flag in command.flags.iter().filter(|flag| flag.value.is_none()) {
+                for value in ["", "no", "yes", "false", "true", "0", "1"] {
+                    let token = format!("{}={value}", flag.name);
+                    let err = parse_list(&[command.name, &token]).expect_err("attached value");
+                    assert_eq!(err.code(), ErrorCode::InvalidField, "{token}");
+                    assert_eq!(err.message(), format!("`{}` takes no value", flag.name));
+                    assert_eq!(err.detail().field.as_deref(), Some(flag.name));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn declared_boolean_flags_preserve_bare_flags_and_positional_text() {
+        for command in spec::all_commands() {
+            for flag in command.flags.iter().filter(|flag| flag.value.is_none()) {
+                let launch = parse_list(&[command.name, flag.name, "no"]).expect("bare flag");
+                assert!(launch.has_flag(flag.name));
+                assert_eq!(launch.flag(flag.name), None);
+                assert_eq!(launch.args, vec!["no"]);
+
+                let token = format!("{}=no", flag.name);
+                let launch = parse_list(&[command.name, "--", &token]).expect("positional text");
+                assert!(!launch.has_flag(flag.name));
+                assert_eq!(launch.args, vec![token]);
+            }
+        }
     }
 
     #[test]
@@ -909,10 +1143,11 @@ mod tests {
             }
             let mut list = vec!["status", flag.name];
             if flag.value.is_some() {
-                list.push(if flag.name == "--limit" {
-                    "list_entries=5"
-                } else {
-                    "value"
+                list.push(match flag.name {
+                    "--limit" => "list_entries=5",
+                    "--effort" => "high",
+                    "--permission-mode" => "ask",
+                    _ => "value",
                 });
             }
             let parsed = parse_list(&list);
@@ -983,13 +1218,114 @@ mod tests {
     }
 
     #[test]
-    fn invalid_effort_on_the_command_line_is_ignored_rather_than_applied() {
-        use rune_core::config::{Effort, Settings};
-        let launch = parse_list(&["--effort", "sideways"]).expect("parse");
-        let mut settings = Settings::default();
+    fn provider_override_does_not_inherit_an_anonymous_connection() {
+        let mut settings = rune_core::config::Settings {
+            provider: rune_core::config::Provider::ChatCompletions,
+            anonymous: true,
+            base_url: Some("http://localhost:8000/v1".to_owned()),
+            ..rune_core::config::Settings::default()
+        };
+        let launch = parse_list(&["--provider", "chat_completions"]).expect("parse");
         apply_to_settings(&launch, &mut settings);
-        assert_eq!(settings.effort, Effort::Auto);
-        assert_eq!(settings.source_of("effort"), Layer::Default);
+        assert!(settings.anonymous);
+        let launch = parse_list(&["--provider", "anthropic"]).expect("parse");
+        apply_to_settings(&launch, &mut settings);
+        assert!(!settings.anonymous);
+        assert!(settings.base_url.is_none());
+    }
+
+    #[test]
+    fn provider_override_resolves_the_default_model_and_the_new_endpoint() {
+        use rune_core::config::{EnvironmentOverrides, load};
+
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let path =
+            camino::Utf8PathBuf::from_path_buf(dir.path().join("config.toml")).expect("UTF-8 path");
+        std::fs::write(
+            &path,
+            r#"
+provider = "responses"
+base_url = "https://old-endpoint.invalid"
+api_key_env = "OLD_KEY"
+[models.responses]
+id = "old-model"
+context_window = 2000000
+[models.default]
+id = "fallback-model"
+context_window = 64000
+"#,
+        )
+        .expect("write config");
+
+        for (provider, endpoint) in [
+            ("anthropic", Some("https://api.anthropic.com")),
+            ("openai", None),
+            ("custom-provider", None),
+        ] {
+            let mut settings = load(None, Some(&path), &EnvironmentOverrides::default());
+            let launch = parse_list(&["--provider", provider]).expect("parse");
+            apply_to_settings(&launch, &mut settings);
+            assert_eq!(settings.model, "fallback-model");
+            assert_eq!(settings.context_window, Some(64000));
+            assert_eq!(settings.source_of("model"), Layer::User);
+            assert_eq!(settings.source_of("context_window"), Layer::User);
+            assert!(settings.base_url.is_none());
+            assert!(settings.api_key_env.is_none());
+            assert_eq!(
+                crate::provider_setup::configured_base_url(&settings).as_deref(),
+                endpoint
+            );
+            assert_eq!(
+                crate::provider_setup::require_base_url(&settings).is_ok(),
+                endpoint.is_some()
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_effort_on_the_command_line_is_rejected() {
+        for args in [
+            vec!["--effort", "banana", "config"],
+            vec!["--effort=banana", "config"],
+            vec!["config", "--effort", "banana"],
+            vec!["config", "--effort=banana"],
+            vec!["--effort", "banana", "--effort", "high", "config"],
+            vec!["--effort", "sideways"],
+            vec!["--effort="],
+            vec!["--effort", "   "],
+        ] {
+            let error = parse_list(&args).expect_err("invalid effort");
+            assert_eq!(error.code(), ErrorCode::InvalidField, "{args:?}");
+            assert!(error.to_string().contains("--effort"), "{error}");
+            assert!(
+                error
+                    .to_string()
+                    .contains("auto, none, minimal, low, medium, high, xhigh, max"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn accepted_efforts_on_the_command_line_are_applied() {
+        use rune_core::config::{Effort, Settings};
+        for (raw, expected) in [
+            ("auto", Effort::Auto),
+            ("none", Effort::None),
+            ("minimal", Effort::Minimal),
+            ("low", Effort::Low),
+            ("medium", Effort::Medium),
+            ("high", Effort::High),
+            ("xhigh", Effort::Xhigh),
+            ("max", Effort::Max),
+            (" HIGH ", Effort::High),
+        ] {
+            let launch = parse_list(&["--effort", raw, "config"]).expect("parse");
+            let mut settings = Settings::default();
+            apply_to_settings(&launch, &mut settings);
+            assert_eq!(settings.effort, expected, "{raw}");
+            assert_eq!(settings.source_of("effort"), Layer::CommandLine, "{raw}");
+        }
     }
 
     #[test]

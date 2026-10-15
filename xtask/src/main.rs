@@ -5,21 +5,24 @@
 
 #![forbid(unsafe_code)]
 
+use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
-/// Budget targets. These are Rune's own numbers, measured on the release
-/// profile, not a restatement of another project's figures.
-/// Runs per measurement. The fastest is kept, so more samples only reduce noise.
+mod macos;
+mod windows;
+
+/// Serial runs per measurement, used for the minimum, median and p95.
 const MEASUREMENT_SAMPLES: usize = 31;
 
+/// Enforced release budget ceilings, distinct from measured build results.
 mod targets {
     /// Largest accepted stripped release binary, in bytes.
     pub const MAX_BINARY_BYTES: u64 = 8 * 1024 * 1024;
 
-    /// Median startup for `rune --version`, in milliseconds.
+    /// Baseline-subtracted minimum-of-31 work for `rune --version`, in milliseconds.
     pub const MAX_VERSION_MS: f64 = 5.0;
 
-    /// Median startup for `rune --help`, in milliseconds.
+    /// Baseline-subtracted minimum-of-31 work for `rune --help`, in milliseconds.
     pub const MAX_HELP_MS: f64 = 8.0;
 }
 
@@ -40,9 +43,19 @@ fn main() -> ExitCode {
             "warnings",
         ]),
         "test" => cargo(&["test", "--workspace"]),
+        "budget"
+            if extra
+                .first()
+                .is_some_and(|arg| arg == "--help" || arg == "-h") =>
+        {
+            print_budget_help();
+            Ok(())
+        }
         "budget" => budget(),
         "gate" => gate(),
         "release" => release(&extra),
+        "verify-release" => macos::verify_release(&extra),
+        "benchmark" => benchmark(&extra),
         "web" => web(),
         "help" | "--help" | "-h" => {
             print_help();
@@ -75,15 +88,54 @@ fn print_help() {
     println!("  lint     run clippy with warnings denied");
     println!("  test     run the workspace test suite");
     println!("  budget   build the release profile and check size and startup");
-    println!("  gate     budget plus the full workspace test suite");
+    println!("  gate     format, lint, budget, and the full workspace test suite");
     println!("  release  stage a release artifact, its checksum, and a manifest");
+    println!("  benchmark  print raw size and startup JSON for an existing executable");
+    println!("  verify-release  check a signed macOS archive against a trusted identity");
     println!("  web      build the harness for the landing page into site/demo/rune.wasm");
     println!();
-    println!("  release takes: cargo xtask release <channel> [version] [target]");
+    println!(
+        "  release takes: cargo xtask release <channel> [version] [target] [--sign-identity <certificate SHA-1>]"
+    );
+    println!(
+        "  verify-release takes: cargo xtask verify-release <manifest-path> <certificate SHA-1>"
+    );
+    println!("  benchmark takes: cargo xtask benchmark <executable-path>");
+    println!();
+    print_budget_help();
+}
+
+/// Explains the measured reference build and the enforced size ceiling.
+fn print_budget_help() {
+    println!("usage: cargo xtask budget [--help]");
+    println!();
+    println!("  Builds the release profile and checks size and startup.");
+    println!("  The audited stripped release build measured 5.43 MiB for");
+    println!("  x86_64-unknown-linux-gnu (GNU/Linux).");
+    println!(
+        "  The enforced binary size budget is an {} MiB ceiling ({} bytes).",
+        targets::MAX_BINARY_BYTES / (1024 * 1024),
+        targets::MAX_BINARY_BYTES
+    );
+    println!("  Startup reports raw process latency: minimum-of-31, median and p95.");
+    println!("  p95 uses nearest rank (the 30th sorted sample of 31).");
+    println!("  Work is minimum-of-31 minus the system true process baseline minimum-of-31,");
+    println!("  clamped to zero, or the raw minimum when no baseline is available.");
+    println!(
+        "  Work budgets: --version {} ms, --help {} ms.",
+        targets::MAX_VERSION_MS,
+        targets::MAX_HELP_MS
+    );
 }
 
 /// The per-commit loop: format, lint, test.
 fn check() -> Result<(), String> {
+    format_and_lint()?;
+    cargo(&["test", "--workspace"])
+}
+
+/// Checks formatting and lint before more expensive work.
+fn format_and_lint() -> Result<(), String> {
     cargo(&["fmt", "--all", "--", "--check"])?;
     cargo(&[
         "clippy",
@@ -92,8 +144,7 @@ fn check() -> Result<(), String> {
         "--",
         "-D",
         "warnings",
-    ])?;
-    cargo(&["test", "--workspace"])
+    ])
 }
 
 /// Runs cargo with the given arguments, inheriting stdio.
@@ -108,12 +159,12 @@ fn cargo(args: &[&str]) -> Result<(), String> {
 fn web() -> Result<(), String> {
     const TARGET: &str = "wasm32-wasip1";
     cargo(&["build", "--release", "-p", "rune-web", "--target", TARGET])?;
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .ok_or("the xtask crate has no parent directory")?
         .to_path_buf();
-    let target = std::env::var_os("CARGO_TARGET_DIR")
-        .map_or_else(|| root.join("target"), std::path::PathBuf::from);
+    let target =
+        std::env::var_os("CARGO_TARGET_DIR").map_or_else(|| root.join("target"), PathBuf::from);
     let built = target.join(TARGET).join("release").join("rune_web.wasm");
     let placed = root.join("site").join("demo").join("rune.wasm");
     std::fs::copy(&built, &placed).map_err(|err| {
@@ -149,7 +200,7 @@ fn budget() -> Result<(), String> {
 
     let binary = release_binary_path();
     let size = std::fs::metadata(&binary)
-        .map_err(|err| format!("could not read {binary}: {err}"))?
+        .map_err(|err| format!("could not read {}: {err}", binary.display()))?
         .len();
 
     let mib = size as f64 / (1024.0 * 1024.0);
@@ -166,29 +217,31 @@ fn budget() -> Result<(), String> {
     Ok(())
 }
 
-/// Budget plus the full suite, for a pull request.
+/// Format, lint, budget, and the full suite, for a pull request.
 fn gate() -> Result<(), String> {
+    format_and_lint()?;
     budget()?;
     cargo(&["test", "--workspace"])
 }
 
 /// Path of the built release binary.
-fn release_binary_path() -> String {
-    let mut path = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-    path.push("target");
-    path.push("release");
-    path.push(format!("rune{}", std::env::consts::EXE_SUFFIX));
-    path.display().to_string()
+fn release_binary_path() -> PathBuf {
+    binary_path(env!("TARGET"))
+}
+
+/// Cargo resolves a relative target directory against the build's working directory.
+fn target_directory() -> PathBuf {
+    let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    root.join(std::env::var_os("CARGO_TARGET_DIR").unwrap_or_else(|| "target".into()))
 }
 
 /// Stages a release artifact for the host that is building it.
 ///
-/// One target is staged at a time: a machine can only build the platform it is
-/// running on without a cross-compilation toolchain, so a matrix is produced by
-/// running this once per machine. The artifact is named after the target, and a
-/// checksum and a manifest are written beside it, because an artifact without a
-/// published checksum cannot be verified by whoever downloads it.
+/// One target is staged at a time. Cross-compilation is supported, but startup
+/// measurements require a runner that can execute the resulting artifact. The
+/// artifact is named after the target, with a checksum and a measured manifest.
 fn release(extra: &[String]) -> Result<(), String> {
+    let (extra, signing_identity) = macos::release_args(extra)?;
     let channel = extra.first().map_or("dev", String::as_str);
     let version = match extra.get(1) {
         Some(value) => value.clone(),
@@ -202,6 +255,9 @@ fn release(extra: &[String]) -> Result<(), String> {
         .cloned()
         .unwrap_or_else(|| env!("TARGET").to_owned());
     let directory = format!("target/dist/rune-{target}");
+    if signing_identity.is_some() && !target.ends_with("-apple-darwin") {
+        return Err("--sign-identity requires a macOS release target".to_owned());
+    }
 
     if target == env!("TARGET") {
         cargo(&["build", "--release", "--locked", "-p", "rune"])?;
@@ -218,9 +274,20 @@ fn release(extra: &[String]) -> Result<(), String> {
     }
 
     let binary = binary_path(&target);
+    let signature = signing_identity
+        .as_deref()
+        .map(|identity| macos::sign(&binary, identity))
+        .transpose()?;
     let name = executable_name(&target);
-    let archive = format!("rune-{version}-{target}.tar.gz");
+    let extension = archive_extension(&target);
+    let archive = format!("rune-{version}-{target}.{extension}");
     let archive_path = format!("{directory}/{archive}");
+
+    // Measure the exact bytes that will be archived. A cross-built executable
+    // must run on this machine; host measurements cannot stand in for it.
+    let binary_bytes = std::fs::read(&binary)
+        .map_err(|err| format!("could not read {}: {err}", binary.display()))?;
+    let measurements = artifact_measurements(&binary, &binary_bytes)?;
 
     std::fs::create_dir_all(&directory)
         .map_err(|err| format!("could not create {directory}: {err}"))?;
@@ -233,9 +300,16 @@ fn release(extra: &[String]) -> Result<(), String> {
     // the other rejects, and an unpinned timestamp makes two runs over identical
     // input produce different archives. Writing it means the bytes depend on the
     // binary alone.
-    let binary_bytes =
-        std::fs::read(&binary).map_err(|err| format!("could not read {binary}: {err}"))?;
-    std::fs::write(&archive_path, archive_bytes(&name, &binary_bytes)?)
+    let packed = if extension == "zip" {
+        windows::archive(&binary_bytes)?
+    } else {
+        archive_bytes(&name, &binary_bytes)?
+    };
+    if let Some(signature) = &signature {
+        // Check an extracted copy of the archive, not just the build output.
+        macos::verify_archive(&packed, signature, &measurements["binary"])?;
+    }
+    std::fs::write(&archive_path, &packed)
         .map_err(|err| format!("could not write {archive_path}: {err}"))?;
 
     let bytes = std::fs::read(&archive_path)
@@ -246,7 +320,7 @@ fn release(extra: &[String]) -> Result<(), String> {
     // publish a digest that does not describe the file.
     let reread = std::fs::read(&archive_path)
         .map_err(|err| format!("could not re-read {archive_path}: {err}"))?;
-    if digest(&reread) != checksum {
+    if digest(&reread) != checksum || (signature.is_some() && reread != packed) {
         return Err(format!("{archive_path} changed while it was being staged"));
     }
 
@@ -254,22 +328,96 @@ fn release(extra: &[String]) -> Result<(), String> {
         &format!("{directory}/{archive}.sha256"),
         &format!("{checksum}  {archive}\n"),
     )?;
-    write(
-        &format!("{directory}/manifest.json"),
-        &format!(
-            "{{\n  \"name\": \"rune\",\n  \"version\": \"{version}\",\n  \
-             \"channel\": \"{channel}\",\n  \"target\": \"{target}\",\n  \
-             \"archive\": \"{archive}\",\n  \"bytes\": {},\n  \
-             \"sha256\": \"{checksum}\"\n}}\n",
-            bytes.len()
-        ),
-    )?;
+    let mut manifest = serde_json::json!({
+        "name": "rune",
+        "version": version,
+        "channel": channel,
+        "target": target,
+        "archive": archive,
+        "bytes": bytes.len(),
+        "sha256": checksum,
+        "binary": measurements["binary"],
+        "startup": measurements["startup"],
+    });
+    if let Some(signature) = signature {
+        manifest["signature"] = signature;
+    }
+    let mut manifest_json = serde_json::to_string_pretty(&manifest)
+        .map_err(|err| format!("could not serialize the release manifest: {err}"))?;
+    manifest_json.push('\n');
+    write(&format!("{directory}/manifest.json"), &manifest_json)?;
 
     println!("staged   {archive_path}");
     println!("bytes    {}", bytes.len());
     println!("sha256   {checksum}");
     println!("manifest {directory}/manifest.json");
     Ok(())
+}
+
+/// Repeats release measurements on an extracted executable without rebuilding it.
+fn benchmark(extra: &[String]) -> Result<(), String> {
+    let [path] = extra else {
+        return Err("usage: cargo xtask benchmark <executable-path>".to_owned());
+    };
+    let binary = Path::new(path);
+    let bytes = std::fs::read(binary)
+        .map_err(|err| format!("could not read {}: {err}", binary.display()))?;
+    let measurements = artifact_measurements(binary, &bytes)?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&measurements)
+            .map_err(|err| format!("could not serialize measurements: {err}"))?
+    );
+    Ok(())
+}
+
+/// Records raw measurements and enough method detail to repeat them.
+fn artifact_measurements(binary: &Path, bytes: &[u8]) -> Result<serde_json::Value, String> {
+    // Resolve relative paths, including a bare filename, rather than searching PATH.
+    let executable = std::fs::canonicalize(binary)
+        .map_err(|err| format!("could not resolve {}: {err}", binary.display()))?;
+    let version = startup_metrics(&executable, "--version")?;
+    let help = startup_metrics(&executable, "--help")?;
+    let reread = std::fs::read(&executable)
+        .map_err(|err| format!("could not re-read {}: {err}", executable.display()))?;
+    if reread != bytes {
+        return Err(format!("{} changed during benchmarking", binary.display()));
+    }
+    Ok(serde_json::json!({
+        "binary": {
+            "name": binary.file_name().ok_or("executable path has no filename")?.to_string_lossy(),
+            "bytes": bytes.len(),
+            "sha256": digest(bytes),
+        },
+        "startup": {
+            "host": {
+                "target": env!("TARGET"),
+                "os": std::env::consts::OS,
+                "arch": std::env::consts::ARCH,
+            },
+            "method": {
+                "reproduce": ["cargo", "xtask", "benchmark", "<extracted executable path>"],
+                "sample_count": MEASUREMENT_SAMPLES,
+                "commands": [["--version"], ["--help"]],
+                "clock": "std::time::Instant",
+                "timing": "wall time from before process spawn through successful exit",
+                "execution": "serial, --version samples followed by --help samples",
+                "warmup_runs": 0,
+                "cache": "uncontrolled; no cache flushing or cold-start guarantee",
+                "stdin": "inherited",
+                "stdout": "discarded",
+                "stderr": "discarded",
+                "environment": "inherited from benchmark process",
+                "working_directory": "inherited from benchmark process",
+                "baseline_subtracted": false,
+                "percentile": "nearest rank: p95 is the 30th sorted sample of 31",
+            },
+            "measurements": {
+                "--version": version.raw_json(),
+                "--help": help.raw_json(),
+            },
+        },
+    }))
 }
 
 /// Builds a tar archive holding one file.
@@ -298,6 +446,14 @@ pub fn tar_single(name: &str, contents: &[u8]) -> Vec<u8> {
 /// machine which sniffs the format.
 fn archive_bytes(name: &str, binary: &[u8]) -> Result<Vec<u8>, String> {
     gzip(&tar_single(name, binary))
+}
+
+fn archive_extension(target: &str) -> &'static str {
+    if target.contains("-windows-") {
+        "zip"
+    } else {
+        "tar.gz"
+    }
 }
 
 /// Compresses an archive, as the `.tar.gz` name promises.
@@ -350,15 +506,14 @@ fn tar_header(name: &str, size: usize) -> [u8; 512] {
 /// Returns the path of the built binary for a target.
 ///
 /// A cross build puts its output under the target name; a host build does not.
-fn binary_path(target: &str) -> String {
-    let mut path = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-    path.push("target");
+fn binary_path(target: &str) -> PathBuf {
+    let mut path = target_directory();
     if target != env!("TARGET") {
         path.push(target);
     }
     path.push("release");
     path.push(executable_name(target));
-    path.display().to_string()
+    path
 }
 
 /// Returns the executable name a platform produces.
@@ -411,14 +566,17 @@ fn write(path: &str, contents: &str) -> Result<(), String> {
 
 /// Measures startup for the help and version paths.
 ///
-/// Uses the fastest observed run rather than the median. On a busy machine the
-/// median mostly measures contention, while the minimum is the closest estimate
-/// of the work the binary must actually do. The process floor is measured the
-/// same way and subtracted, so the number reported is our work rather than the
-/// host's fork and loader cost.
-fn check_startup(binary: &str) -> Result<(), String> {
+/// Reports the raw distribution of spawn-to-exit wall times. The budget uses
+/// the minimum of 31 runs minus the baseline minimum, clamped to zero. This
+/// adjusted work estimate is distinct from the observed raw process latency.
+fn check_startup(binary: &Path) -> Result<(), String> {
     let floor = measure_floor()?;
-    println!("process floor       {floor:.2} ms");
+    match floor {
+        Some(floor) => println!("process baseline minimum-of-31 {floor:.2} ms (true)"),
+        None => {
+            println!("process baseline unavailable; using raw minimum-of-31 for the work budget");
+        }
+    }
 
     let cases = [
         ("--version", targets::MAX_VERSION_MS),
@@ -428,15 +586,14 @@ fn check_startup(binary: &str) -> Result<(), String> {
     let mut failures = Vec::new();
 
     for (flag, budget_ms) in cases {
-        let raw = fastest_startup_ms(binary, flag)?;
-        let work = (raw - floor).max(0.0);
-        println!(
-            "startup {flag:<10} {raw:.2} ms raw, {work:.2} ms work (budget {budget_ms:.0} ms)"
-        );
+        let raw = startup_metrics(binary, flag)?;
+        let work = raw.work_ms(floor);
+        println!("{}", raw.report(flag, floor, budget_ms));
 
         if work > budget_ms {
             failures.push(format!(
-                "{flag} took {work:.2} ms of work, budget is {budget_ms:.0} ms"
+                "{flag} took {work:.2} ms of {}, budget is {budget_ms:.0} ms",
+                work_label(floor)
             ));
         }
     }
@@ -450,20 +607,17 @@ fn check_startup(binary: &str) -> Result<(), String> {
 
 /// Measures the cost of starting a trivial program.
 ///
-/// This is the fork and exec floor plus the dynamic loader for a system binary.
-/// Subtracting it isolates the work this binary does.
-fn measure_floor() -> Result<f64, String> {
+/// Includes spawn, execution and waiting for exit of a system `true` binary.
+/// Subtracting its minimum gives an estimate of additional work, not latency.
+fn measure_floor() -> Result<Option<f64>, String> {
     let candidates = ["/usr/bin/true", "/bin/true"];
-    let Some(program) = candidates
-        .iter()
-        .find(|path| std::path::Path::new(path).exists())
-    else {
+    let Some(program) = candidates.iter().find(|path| Path::new(path).exists()) else {
         // Without a suitable baseline the raw measurement stands on its own.
-        return Ok(0.0);
+        return Ok(None);
     };
 
-    let mut samples = Vec::with_capacity(MEASUREMENT_SAMPLES);
-    for _ in 0..MEASUREMENT_SAMPLES {
+    let mut samples = [0.0; MEASUREMENT_SAMPLES];
+    for sample in &mut samples {
         let start = std::time::Instant::now();
         let status = Command::new(program)
             .stdout(std::process::Stdio::null())
@@ -473,35 +627,87 @@ fn measure_floor() -> Result<f64, String> {
         if !status.success() {
             return Err(format!("`{program}` exited with a failure"));
         }
-        samples.push(start.elapsed().as_secs_f64() * 1000.0);
+        *sample = start.elapsed().as_secs_f64() * 1000.0;
     }
-    Ok(fastest(samples))
+    Ok(Some(StartupMetrics::from_samples(samples).minimum))
 }
 
-/// Returns the smallest sample, the least noisy estimate of true cost.
-fn fastest(mut samples: Vec<f64>) -> f64 {
-    samples.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    samples.first().copied().unwrap_or(0.0)
+/// Raw spawn-to-exit wall times in milliseconds, without baseline subtraction.
+struct StartupMetrics {
+    samples: [f64; MEASUREMENT_SAMPLES],
+    minimum: f64,
+    median: f64,
+    p95: f64,
 }
 
-/// Returns the fastest wall time in milliseconds for one invocation path.
-fn fastest_startup_ms(binary: &str, flag: &str) -> Result<f64, String> {
-    let mut samples = Vec::with_capacity(MEASUREMENT_SAMPLES);
-    for _ in 0..MEASUREMENT_SAMPLES {
+impl StartupMetrics {
+    fn from_samples(samples: [f64; MEASUREMENT_SAMPLES]) -> Self {
+        // Nearest rank: ceil(0.95 * 31) = 30, with a zero-based index of 29.
+        const P95_INDEX: usize = (95 * MEASUREMENT_SAMPLES).div_ceil(100) - 1;
+        let mut sorted = samples;
+        sorted.sort_by(f64::total_cmp);
+        Self {
+            samples,
+            minimum: sorted[0],
+            median: sorted[MEASUREMENT_SAMPLES / 2],
+            p95: sorted[P95_INDEX],
+        }
+    }
+
+    fn raw_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "samples_ms": self.samples.as_slice(),
+            "minimum_ms": self.minimum,
+            "median_ms": self.median,
+            "p95_ms": self.p95,
+        })
+    }
+
+    fn work_ms(&self, floor: Option<f64>) -> f64 {
+        (self.minimum - floor.unwrap_or(0.0)).max(0.0)
+    }
+
+    fn report(&self, flag: &str, floor: Option<f64>, budget_ms: f64) -> String {
+        format!(
+            "startup {flag:<10} raw process latency: minimum-of-{MEASUREMENT_SAMPLES} {:.2} ms, median {:.2} ms, p95 {:.2} ms; {} {:.2} ms (budget {budget_ms:.0} ms)",
+            self.minimum,
+            self.median,
+            self.p95,
+            work_label(floor),
+            self.work_ms(floor)
+        )
+    }
+}
+
+fn work_label(floor: Option<f64>) -> &'static str {
+    if floor.is_some() {
+        "baseline-subtracted work"
+    } else {
+        "work without baseline subtraction"
+    }
+}
+
+/// Measures all 31 raw wall times for one invocation path.
+fn startup_metrics(binary: &Path, flag: &str) -> Result<StartupMetrics, String> {
+    let mut samples = [0.0; MEASUREMENT_SAMPLES];
+    for sample in &mut samples {
         let start = std::time::Instant::now();
         let status = Command::new(binary)
             .arg(flag)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status()
-            .map_err(|err| format!("could not run {binary}: {err}"))?;
+            .map_err(|err| format!("could not run {}: {err}", binary.display()))?;
         if !status.success() {
-            return Err(format!("`{binary} {flag}` exited with a failure"));
+            return Err(format!(
+                "`{} {flag}` exited with a failure",
+                binary.display()
+            ));
         }
-        samples.push(start.elapsed().as_secs_f64() * 1000.0);
+        *sample = start.elapsed().as_secs_f64() * 1000.0;
     }
 
-    Ok(fastest(samples))
+    Ok(StartupMetrics::from_samples(samples))
 }
 
 /// Crates whose duplicate versions are accepted, with the reason.
@@ -594,6 +800,44 @@ mod tests {
     #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 
     use super::*;
+
+    #[test]
+    fn startup_distribution_reports_raw_minimum_median_and_nearest_rank_p95() {
+        let samples = std::array::from_fn(|index| (MEASUREMENT_SAMPLES - index) as f64);
+        let metrics = StartupMetrics::from_samples(samples);
+        assert!((metrics.minimum - 1.0).abs() < f64::EPSILON);
+        assert!((metrics.median - 16.0).abs() < f64::EPSILON);
+        assert!((metrics.p95 - 30.0).abs() < f64::EPSILON);
+        // Tails above the budget must not change the existing minimum-based gate.
+        assert!(metrics.median > targets::MAX_VERSION_MS);
+        assert!(metrics.p95 > targets::MAX_VERSION_MS);
+        assert!(metrics.work_ms(Some(0.5)) <= targets::MAX_VERSION_MS);
+        assert_eq!(
+            metrics.report("--version", Some(0.5), targets::MAX_VERSION_MS),
+            "startup --version  raw process latency: minimum-of-31 1.00 ms, median 16.00 ms, p95 30.00 ms; baseline-subtracted work 0.50 ms (budget 5 ms)"
+        );
+    }
+
+    #[test]
+    fn startup_work_is_clamped_without_subtracting_from_raw_metrics() {
+        let metrics = StartupMetrics::from_samples([1.0; MEASUREMENT_SAMPLES]);
+        assert!(metrics.work_ms(Some(2.0)).abs() < f64::EPSILON);
+        assert_eq!(
+            metrics.report("--help", Some(2.0), targets::MAX_HELP_MS),
+            "startup --help     raw process latency: minimum-of-31 1.00 ms, median 1.00 ms, p95 1.00 ms; baseline-subtracted work 0.00 ms (budget 8 ms)"
+        );
+    }
+
+    #[test]
+    fn startup_without_a_baseline_labels_the_unadjusted_work_budget() {
+        let metrics = StartupMetrics::from_samples([9.0; MEASUREMENT_SAMPLES]);
+        assert!((metrics.work_ms(None) - 9.0).abs() < f64::EPSILON);
+        assert!(metrics.work_ms(None) > targets::MAX_HELP_MS);
+        assert_eq!(
+            metrics.report("--help", None, targets::MAX_HELP_MS),
+            "startup --help     raw process latency: minimum-of-31 9.00 ms, median 9.00 ms, p95 9.00 ms; work without baseline subtraction 9.00 ms (budget 8 ms)"
+        );
+    }
 
     /// Returns the tar header of an archive, for assertions about its fields.
     fn header_of(archive: &[u8]) -> &[u8] {

@@ -1,0 +1,10 @@
+[
+  {"tool": "read_file", "target": "input.txt"},
+  {"tool": "write_file", "target": "written.txt"},
+  {"tool": "create_directory", "target": "created"},
+  {"tool": "shell", "target": "pwd"},
+  {"tool": "shell", "target": "printf executed > executed.txt"},
+  {"tool": "shell", "target": "printf executed > executed.txt"},
+  {"tool": "web_fetch", "target": "https://example.invalid"},
+  {"tool": "update_plan", "target": ""}
+]

@@ -5,7 +5,8 @@
 //! - `events.jsonl` is the authority. Every other file can be deleted and
 //!   rebuilt from it.
 //! - `session.json` is the derived projection, written for tools that want the
-//!   summary without replaying the log.
+//!   summary without replaying the log. Atomic replacement gives readers a
+//!   complete old or new projection, even if the writer is killed.
 //! - `session.lock` is the advisory writer lock.
 //!
 //! One writer and any number of readers. A reader takes no lock and always sees
@@ -121,6 +122,50 @@ pub struct SessionState {
 }
 
 impl SessionState {
+    /// Finds saved conversation records by a case-insensitive literal fragment.
+    ///
+    /// Searches the authoritative frames, including records removed from model
+    /// context by compaction and saved streaming fragments. Matches retain their
+    /// original sequence, timestamp, schema and event content in log order.
+    /// Metadata and record identifiers are not searched.
+    pub fn search_records(&self, query: &str) -> Result<Vec<&EventFrame>> {
+        if query.trim().is_empty() {
+            return Err(RuneError::invalid_field("search", "search text is empty")
+                .with_hint("pass a message, tool argument, or tool result fragment"));
+        }
+        let query = query.to_lowercase();
+        let contains = |text: &str| text.to_lowercase().contains(&query);
+        Ok(self
+            .events
+            .iter()
+            .filter(|frame| match &frame.event {
+                SessionEvent::UserMessage { text }
+                | SessionEvent::AssistantMessage { text, .. }
+                | SessionEvent::AssistantDelta { text, .. } => contains(text),
+                SessionEvent::ToolCall {
+                    name, arguments, ..
+                } => contains(name) || contains(arguments),
+                SessionEvent::ToolResult { output, .. } => contains(output),
+                SessionEvent::Compaction { summary, .. } => contains(summary),
+                _ => false,
+            })
+            .collect())
+    }
+
+    /// Writes the saved frames as stable schema-versioned JSONL in log order.
+    ///
+    /// Only typed event fields are serialized, excluding metadata, credentials,
+    /// and unknown transport fields. Recorded message and tool content is kept
+    /// verbatim. No export-time values or synthesized replay events are added.
+    /// A torn tail, if present, is excluded as it is when reading the session.
+    pub fn export_jsonl(&self, mut writer: impl Write) -> Result<()> {
+        for frame in &self.events {
+            writeln!(writer, "{}", frame.encode()?)?;
+        }
+        writer.flush()?;
+        Ok(())
+    }
+
     /// Returns the last sequence number read.
     #[must_use]
     pub fn last_seq(&self) -> Option<EventSeq> {
@@ -168,16 +213,27 @@ struct Projection {
 
 /// An open session directory with the writer lock held.
 ///
-/// Dropping the store releases the lock and clears the holder record.
+/// Dropping the store clears the holder record before releasing the lock.
 #[derive(Debug)]
 pub struct SessionStore {
     id: SessionId,
     dir: Utf8PathBuf,
     log: File,
-    /// The held writer lock. Closing this handle is what releases the lock, so
-    /// the handle is kept rather than the lock being released explicitly.
+    /// The writer lock, held until drop clears the holder record and unlocks it.
     lock: File,
     projection: std::cell::RefCell<Projection>,
+}
+
+/// A successfully synced event, with a separate disposable projection outcome.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct AppendReport {
+    /// Sequence number of the durable event. Do not retry this event.
+    pub seq: EventSeq,
+    /// Repair warning when refreshing `session.json` failed.
+    ///
+    /// The event and in-memory totals are already committed. Rebuilding metadata
+    /// or reopening the session after fixing the filesystem repairs the summary.
+    pub metadata_warning: Option<RuneError>,
 }
 
 impl SessionStore {
@@ -318,11 +374,15 @@ impl SessionStore {
         }
     }
 
-    /// Appends one event and fsyncs it, returning the sequence number used.
+    /// Appends one event and fsyncs it, returning its durable sequence number
+    /// and any metadata repair warning separately.
     ///
     /// The line is written whole, so a reader sees either all of it or none of
     /// it, and a torn tail can only ever be the last frame of the file.
-    pub fn append(&self, event: SessionEvent) -> Result<EventSeq> {
+    ///
+    /// Once the event sync succeeds, projection failure cannot fail the append.
+    /// Callers should report `metadata_warning` without retrying the event.
+    pub fn append(&self, event: SessionEvent) -> Result<AppendReport> {
         let mut projection = self.projection.borrow_mut();
         let seq = projection.last_seq.next();
         let timestamp_ms = event::now_millis().max(projection.last_ts);
@@ -357,10 +417,22 @@ impl SessionStore {
             _ => {}
         }
 
-        // Refreshed on every append so a tool that reads the projection rather
-        // than the log never sees a summary behind the truth.
-        self.write_metadata(&projection)?;
-        Ok(seq)
+        // Refreshed after every durable append. Until replacement completes,
+        // readers can still see the previous complete projection.
+        let metadata_warning = self.write_metadata(&projection).err().map(|error| {
+            RuneError::new(
+                error.code(),
+                format!(
+                    "session `{}` event {seq} is durable, but metadata refresh failed: {error}; repair session.json after fixing the filesystem, or reopen the session; do not retry this event",
+                    self.id
+                ),
+            )
+            .with_hint("fix the metadata path, then rebuild metadata or reopen the session")
+        });
+        Ok(AppendReport {
+            seq,
+            metadata_warning,
+        })
     }
 
     /// Rewrites `session.json` from the event log on disk.
@@ -372,7 +444,7 @@ impl SessionStore {
         self.write_metadata(&projection)
     }
 
-    /// Serializes and writes the projection.
+    /// Serializes and atomically replaces the projection.
     fn write_metadata(&self, projection: &Projection) -> Result<()> {
         let metadata = Metadata {
             schema: METADATA_VERSION,
@@ -385,7 +457,7 @@ impl SessionStore {
         };
         let mut text = serde_json::to_string_pretty(&metadata)?;
         text.push('\n');
-        paths::write_private(&self.metadata_path(), &text)
+        paths::write_private_atomic(&self.metadata_path(), &text)
     }
 
     /// Reads this session without taking the lock.
@@ -396,11 +468,15 @@ impl SessionStore {
 
 impl Drop for SessionStore {
     fn drop(&mut self) {
-        // A released lock leaves no holder behind, so the next writer cannot be
-        // misled by a stale record. The lock itself is released when the handle
-        // in `lock` closes, which happens with this value.
-        let _ = self.lock.unlock();
+        // Clear diagnostics while we still own the lock. After unlock, another
+        // writer can acquire it and record its identity, which must survive our
+        // drop. Closing the handle also releases the lock if unlock fails.
         let _ = paths::write_private(&self.dir.join(HOLDER_FILE), "");
+        let _ = self.lock.unlock();
+        #[cfg(test)]
+        if let Some(after_unlock) = tests::AFTER_UNLOCK.with_borrow_mut(Option::take) {
+            after_unlock();
+        }
     }
 }
 
@@ -533,9 +609,9 @@ fn acquire_lock(dir: &Utf8Path, id: &SessionId, deadline_ms: u64) -> Result<File
 ///
 /// Best effort, and deliberately so: the record is diagnostic text, while the
 /// lock itself is held by the operating system. Only one writer exists at a
-/// time, so no holder ever races another holder here; the record is empty only
-/// between one writer releasing and the next acquiring, when the lock is
-/// genuinely free.
+/// time. Both recording and clearing happen with the lock held, so an old
+/// writer cannot erase its successor's record. Readers can briefly observe an
+/// empty record during acquisition or release.
 fn record_holder(dir: &Utf8Path) -> Result<()> {
     let holder = LockHolder {
         pid: std::process::id(),
@@ -588,6 +664,12 @@ fn id_from_dir(dir: &Utf8Path) -> Result<SessionId> {
 mod tests {
     use super::*;
     use crate::event::{LogRead, read_log};
+
+    std::thread_local! {
+        /// Forces a handoff immediately after unlock, before drop continues.
+        pub(super) static AFTER_UNLOCK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+            std::cell::RefCell::new(None);
+    }
 
     /// Builds paths rooted entirely inside the temporary directory.
     ///
@@ -683,7 +765,9 @@ mod tests {
             },
         ];
         for (index, event) in events.iter().enumerate() {
-            let seq = store.append(event.clone()).expect("append");
+            let report = store.append(event.clone()).expect("append");
+            assert!(report.metadata_warning.is_none());
+            let seq = report.seq;
             assert_eq!(
                 seq,
                 EventSeq(u64::try_from(index).unwrap_or(0).saturating_add(1))
@@ -788,6 +872,97 @@ mod tests {
     }
 
     #[test]
+    fn metadata_failure_reports_durable_events_and_allows_repair_without_retry() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let (_paths, store) = store_in(&root);
+        std::fs::remove_file(store.metadata_path()).expect("remove metadata");
+        std::fs::create_dir(store.metadata_path()).expect("block replacement");
+
+        let events = [
+            SessionEvent::TurnStarted { turn: 1 },
+            SessionEvent::UsageRecorded {
+                input_tokens: 7,
+                output_tokens: 2,
+            },
+            SessionEvent::TitleSet {
+                title: "durable".to_owned(),
+            },
+        ];
+        for (index, event) in events.iter().enumerate() {
+            let report = store.append(event.clone()).expect("durable append");
+            let seq = EventSeq((index as u64).saturating_add(1));
+            assert_eq!(report.seq, seq);
+            let warning = report.metadata_warning.expect("repair warning");
+            assert!(
+                warning
+                    .message()
+                    .contains(&format!("event {seq} is durable"))
+            );
+            assert!(warning.message().contains("metadata refresh failed"));
+            assert!(warning.message().contains("do not retry this event"));
+            assert!(
+                warning
+                    .detail()
+                    .hint
+                    .as_deref()
+                    .expect("hint")
+                    .contains("rebuild")
+            );
+            let read = load_read_only(store.dir()).expect("replay despite metadata failure");
+            assert_eq!(read.len(), index + 1);
+            assert_eq!(read.events[index].event, *event);
+            assert_eq!(read.last_seq(), Some(seq));
+            assert_eq!(store.next_seq(), seq.next());
+        }
+        assert_eq!(store.turns(), 1);
+        assert_eq!(store.usage().total(), 9);
+        assert_eq!(store.title().as_deref(), Some("durable"));
+        assert_eq!(store.metadata().events, 3);
+        assert!(store.rebuild_metadata().is_err(), "repair remains fallible");
+
+        let log = std::fs::read(store.events_path()).expect("durable log");
+        std::fs::remove_dir(store.metadata_path()).expect("unblock replacement");
+        store.rebuild_metadata().expect("repair metadata");
+        assert_eq!(std::fs::read(store.events_path()).expect("log"), log);
+        assert_eq!(
+            serde_json::from_slice::<Metadata>(
+                &std::fs::read(store.metadata_path()).expect("metadata")
+            )
+            .expect("parse metadata"),
+            store.metadata()
+        );
+        let report = store
+            .append(user("next event"))
+            .expect("append after repair");
+        assert_eq!(report.seq, EventSeq(4));
+        assert!(report.metadata_warning.is_none());
+        let dir = store.dir().to_owned();
+        drop(store);
+        let reopened = SessionStore::open(&dir).expect("reopen");
+        assert_eq!(reopened.read().expect("read").len(), 4);
+        assert_eq!(reopened.next_seq(), EventSeq(5));
+    }
+
+    #[test]
+    fn event_write_failure_still_fails_without_advancing_the_projection() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let (_paths, mut store) = store_in(&root);
+        let before = std::fs::read(store.metadata_path()).expect("metadata");
+        store.log = File::open(store.events_path()).expect("read-only log handle");
+
+        store
+            .append(user("cannot write"))
+            .expect_err("append failed");
+        assert_eq!(store.next_seq(), EventSeq::FIRST);
+        assert_eq!(store.metadata().events, 0);
+        assert!(store.read().expect("read").is_empty());
+        assert_eq!(
+            std::fs::read(store.metadata_path()).expect("metadata"),
+            before
+        );
+    }
+
+    #[test]
     fn metadata_survives_a_reopen() {
         let root = tempfile::tempdir().expect("tempdir");
         let id = SessionId::from_str("sessionaaaaa").expect("id");
@@ -817,8 +992,39 @@ mod tests {
         assert_eq!(reopened.turns(), 1);
         assert_eq!(reopened.usage().input_tokens, 7);
         assert_eq!(reopened.title().as_deref(), Some("kept"));
-        assert_eq!(reopened.append(user("after")).expect("append"), EventSeq(5));
+        assert_eq!(
+            reopened.append(user("after")).expect("append").seq,
+            EventSeq(5)
+        );
         assert_eq!(reopened.read().expect("read").len(), 5);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn metadata_replacement_preserves_an_open_readers_complete_projection() {
+        use std::io::Read;
+
+        let root = tempfile::tempdir().expect("tempdir");
+        let (_paths, store) = store_in(&root);
+        for title in ["a long title 🦀".repeat(1024), "short".to_owned()] {
+            let before = std::fs::read(store.metadata_path()).expect("old metadata");
+            let mut reader = File::open(store.metadata_path()).expect("open reader");
+
+            store
+                .append(SessionEvent::TitleSet { title })
+                .expect("append");
+
+            let mut retained = Vec::new();
+            reader.read_to_end(&mut retained).expect("read old handle");
+            assert_eq!(retained, before, "an existing reader retains the old file");
+            let after = std::fs::read(store.metadata_path()).expect("new metadata");
+            assert_ne!(after, before);
+            assert_eq!(
+                serde_json::from_slice::<Metadata>(&after).expect("complete new metadata"),
+                store.metadata()
+            );
+            assert!(after.ends_with(b"\n"));
+        }
     }
 
     #[test]
@@ -842,7 +1048,10 @@ mod tests {
         assert!(err.detail().hint.is_some());
 
         // The holder still works, and a reader still reads.
-        assert_eq!(store.append(user("mine")).expect("append"), EventSeq::FIRST);
+        assert_eq!(
+            store.append(user("mine")).expect("append").seq,
+            EventSeq::FIRST
+        );
         assert_eq!(load_read_only(store.dir()).expect("read").len(), 1);
     }
 
@@ -867,9 +1076,55 @@ mod tests {
         );
         let next = SessionStore::open_with_deadline(&dir, 0).expect("open");
         assert_eq!(
-            next.append(user("second writer")).expect("append"),
+            next.append(user("second writer")).expect("append").seq,
             EventSeq(2)
         );
+    }
+
+    #[test]
+    fn releasing_an_old_owner_preserves_the_new_owners_holder_record() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let (_paths, store) = store_in(&root);
+        store.append(user("old owner")).expect("append");
+        let dir = store.dir().to_path_buf();
+        let next_owner = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let acquired = std::rc::Rc::clone(&next_owner);
+        let next_dir = dir.clone();
+
+        // Pause the old owner's drop after unlock until another thread takes
+        // the lock and writes its record. Cleanup after unlock would erase it.
+        AFTER_UNLOCK.with_borrow_mut(|hook| {
+            *hook = Some(Box::new(move || {
+                let next = std::thread::spawn(move || {
+                    let next = SessionStore::open_with_deadline(&next_dir, 0)
+                        .expect("new owner acquires the released lock");
+                    let record = std::fs::read(next_dir.join(HOLDER_FILE)).expect("new record");
+                    (next, record)
+                })
+                .join()
+                .expect("new owner thread");
+                *acquired.borrow_mut() = Some(next);
+            }));
+        });
+
+        drop(store);
+
+        let (next, record) = next_owner.borrow_mut().take().expect("new owner");
+        let holder: LockHolder = serde_json::from_slice(&record).expect("valid holder record");
+        assert_eq!(holder.pid, std::process::id());
+        assert_eq!(
+            std::fs::read(dir.join(HOLDER_FILE)).expect("preserved record"),
+            record,
+            "the old owner's drop must preserve the new owner's diagnostics"
+        );
+        let err = SessionStore::open_with_deadline(&dir, 0).expect_err("new owner holds lock");
+        assert_eq!(err.code(), ErrorCode::Locked);
+        assert!(err.message().contains(&holder.pid.to_string()));
+        assert_eq!(
+            next.append(user("new owner")).expect("append").seq,
+            EventSeq(2)
+        );
+        assert_eq!(next.read().expect("read").len(), 2);
     }
 
     #[test]
@@ -1085,7 +1340,7 @@ mod tests {
         assert_eq!(reopened.next_seq(), EventSeq(2));
         assert_eq!(std::fs::read(&path).expect("read"), complete);
         assert_eq!(
-            reopened.append(user("after the tear")).expect("append"),
+            reopened.append(user("after the tear")).expect("append").seq,
             EventSeq(2)
         );
         let read = reopened.read().expect("read");

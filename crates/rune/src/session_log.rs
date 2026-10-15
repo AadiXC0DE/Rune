@@ -71,14 +71,49 @@ pub struct Summary {
 #[derive(Debug)]
 pub struct Recorder {
     store: SessionStore,
+    objective: Option<String>,
+    objective_budget: Option<u64>,
+    objective_tokens: u64,
     turn: u64,
+    active_turn: bool,
+    responses: Vec<rune_agent::history::Turn>,
+    journal_error: Option<RuneError>,
+    metadata_warning: std::cell::RefCell<Option<RuneError>>,
+    /// Initial estimate and its source, populated only when resuming.
+    resumed_context: (u64, Option<&'static str>),
 }
 
 impl Recorder {
     /// Creates a new session and its log.
     pub fn create(paths: &Paths, id: &SessionId) -> Result<Self> {
         let store = SessionStore::create(paths, id)?;
-        Ok(Self { store, turn: 0 })
+        Ok(Self {
+            store,
+            objective: None,
+            objective_budget: None,
+            objective_tokens: 0,
+            turn: 0,
+            active_turn: false,
+            responses: Vec::new(),
+            journal_error: None,
+            metadata_warning: std::cell::RefCell::new(None),
+            resumed_context: (0, None),
+        })
+    }
+
+    /// Records an event while keeping projection warnings out of journal errors.
+    fn append(&self, event: SessionEvent) -> Result<()> {
+        let report = self.store.append(event)?;
+        // Keep one warning while a projection remains unavailable, even if
+        // many streamed deltas were synced. A later successful refresh repairs
+        // the summary and clears the pending warning.
+        *self.metadata_warning.borrow_mut() = report.metadata_warning;
+        Ok(())
+    }
+
+    /// Takes the pending metadata repair warning for display at a turn boundary.
+    pub fn take_metadata_warning(&self) -> Option<RuneError> {
+        self.metadata_warning.borrow_mut().take()
     }
 
     /// Marks this session as a child of another.
@@ -90,7 +125,7 @@ impl Recorder {
     /// with the other session marks.
     #[cfg(test)]
     pub fn set_parent(&self, parent: &SessionId) -> Result<()> {
-        self.store.append(SessionEvent::ChildOf {
+        self.append(SessionEvent::ChildOf {
             parent: parent.to_string(),
         })?;
         Ok(())
@@ -101,7 +136,7 @@ impl Recorder {
     /// Written once at the start, so a later listing can scope itself to a
     /// workspace without reading every session's contents.
     pub fn set_workspace(&self, workspace: &Utf8Path) -> Result<()> {
-        self.store.append(SessionEvent::WorkspaceSet {
+        self.append(SessionEvent::WorkspaceSet {
             workspace: rune_policy::trust::canonical_workspace(workspace).to_string(),
         })?;
         Ok(())
@@ -111,7 +146,47 @@ impl Recorder {
     pub fn open(paths: &Paths, id: &SessionId) -> Result<Self> {
         let store = SessionStore::open(&paths.session_dir(id))?;
         let turn = store.turns();
-        Ok(Self { store, turn })
+        let mut objective = None;
+        let mut objective_budget = None;
+        let mut objective_tokens = 0_u64;
+        for frame in &store.read()?.events {
+            match &frame.event {
+                SessionEvent::ObjectiveSet { objective: text } => {
+                    objective = Some(text.clone());
+                    objective_budget = None;
+                    objective_tokens = 0;
+                }
+                SessionEvent::ObjectiveBudgetSet {
+                    objective: text,
+                    token_budget,
+                } => {
+                    objective = Some(text.clone());
+                    objective_budget = Some(*token_budget);
+                    objective_tokens = 0;
+                }
+                SessionEvent::ObjectiveTokensRecorded { tokens } if objective_budget.is_some() => {
+                    objective_tokens = objective_tokens.saturating_add(*tokens);
+                }
+                _ => {}
+            }
+        }
+        Ok(Self {
+            store,
+            objective,
+            objective_budget,
+            objective_tokens,
+            turn,
+            active_turn: false,
+            responses: Vec::new(),
+            journal_error: None,
+            metadata_warning: std::cell::RefCell::new(None),
+            resumed_context: (0, None),
+        })
+    }
+
+    /// Returns the initial context estimate and its source for a resumed log.
+    pub fn resumed_context(&self) -> (u64, Option<&'static str>) {
+        self.resumed_context
     }
 
     /// Returns the session identifier.
@@ -120,56 +195,283 @@ impl Recorder {
         self.store.id()
     }
 
+    /// Returns the explicitly set objective, absent for ordinary conversations.
+    pub fn objective(&self) -> Option<&str> {
+        self.objective.as_deref()
+    }
+
+    /// Persists an explicit objective before making it active in memory.
+    pub fn set_objective(&mut self, objective: &str) -> Result<()> {
+        if objective.trim().is_empty() {
+            return Err(RuneError::invalid_field("objective", "objective is empty"));
+        }
+        self.append(SessionEvent::ObjectiveSet {
+            objective: objective.to_owned(),
+        })?;
+        self.objective = Some(objective.to_owned());
+        self.objective_budget = None;
+        self.objective_tokens = 0;
+        Ok(())
+    }
+
+    /// Atomically replaces the objective and its accounting with an explicit budget.
+    pub fn set_budgeted_objective(&mut self, objective: &str, token_budget: u64) -> Result<()> {
+        if objective.trim().is_empty() {
+            return Err(RuneError::invalid_field("objective", "objective is empty"));
+        }
+        if token_budget == 0 {
+            return Err(RuneError::invalid_field(
+                "token_budget",
+                "token budget must be positive",
+            ));
+        }
+        self.append(SessionEvent::ObjectiveBudgetSet {
+            objective: objective.to_owned(),
+            token_budget,
+        })?;
+        self.objective = Some(objective.to_owned());
+        self.objective_budget = Some(token_budget);
+        self.objective_tokens = 0;
+        Ok(())
+    }
+
+    /// Budget and accounted usage of the current objective, when explicitly set.
+    pub fn objective_budget(&self) -> Option<(u64, u64)> {
+        self.objective_budget
+            .map(|budget| (budget, self.objective_tokens))
+    }
+
+    /// Persists a provider attempt before allowing another continuation.
+    pub fn account_objective_tokens(&mut self, tokens: u64) -> Result<()> {
+        if self.objective_budget.is_some() {
+            self.append(SessionEvent::ObjectiveTokensRecorded { tokens })?;
+            self.objective_tokens = self.objective_tokens.saturating_add(tokens);
+        }
+        Ok(())
+    }
+
     /// Records the user's message.
     pub fn user_message(&self, text: &str) -> Result<()> {
-        self.store.append(SessionEvent::UserMessage {
+        self.append(SessionEvent::UserMessage {
             text: text.to_owned(),
         })?;
         Ok(())
     }
 
+    /// Persists an explicit user constraint before the live history adopts it.
+    pub fn pin_constraint(&self, text: &str) -> Result<()> {
+        if text.trim().is_empty() {
+            return Err(RuneError::invalid_field(
+                "constraint",
+                "constraint is empty",
+            ));
+        }
+        self.append(SessionEvent::ConstraintPinned {
+            text: text.to_owned(),
+        })?;
+        Ok(())
+    }
+
+    /// Starts an exchange before the provider can produce visible text.
+    pub fn begin_turn(&mut self) -> Result<()> {
+        if !self.active_turn {
+            let turn = self.turn.saturating_add(1);
+            self.append(SessionEvent::TurnStarted { turn })?;
+            self.turn = turn;
+            self.active_turn = true;
+            self.responses.clear();
+        }
+        Ok(())
+    }
+
+    /// Journals visible text in bounded frames before the terminal draws it.
+    pub fn assistant_delta(&self, text: &str) -> Result<()> {
+        // Bound encoded frames even when a provider sends a very large delta.
+        // JSON escaping can expand each byte by at most six times.
+        const CHUNK_BYTES: usize = 8 * 1024;
+        if let Some(error) = &self.journal_error {
+            return Err(error.clone());
+        }
+        let mut remaining = text;
+        while !remaining.is_empty() {
+            let mut end = remaining.len().min(CHUNK_BYTES);
+            while !remaining.is_char_boundary(end) {
+                end = end.saturating_sub(1);
+            }
+            self.append(SessionEvent::AssistantDelta {
+                turn: self.turn,
+                text: remaining[..end].to_owned(),
+            })?;
+            remaining = &remaining[end..];
+        }
+        Ok(())
+    }
+
+    /// Durably clears a failed request attempt's visible text before a retry.
+    pub fn reset_assistant(&self) -> Result<()> {
+        if let Some(error) = &self.journal_error {
+            return Err(error.clone());
+        }
+        self.append(SessionEvent::AssistantReset { turn: self.turn })?;
+        Ok(())
+    }
+
+    /// Remembers an observer write failure, since the observer cannot return it.
+    pub fn journal_failed(&mut self, error: RuneError) {
+        if self.journal_error.is_none() {
+            self.journal_error = Some(error);
+        }
+    }
+
+    /// Returns a journal failure to the input loop after its worker stops.
+    pub fn check_journal(&mut self) -> Result<()> {
+        self.journal_error.take().map_or(Ok(()), Err)
+    }
+
+    /// Retains completed provider responses until their tool results are saved.
+    /// This is independent of model history, which can compact between steps.
+    pub fn response(&mut self, outcome: &rune_net::transport::StreamOutcome) -> Result<()> {
+        self.begin_turn()?;
+        let mut parts = Vec::new();
+        let text = outcome.text();
+        if !text.is_empty() {
+            parts.push(ContentPart::Text { text });
+        }
+        let reasoning = outcome.reasoning();
+        if !reasoning.is_empty() {
+            parts.push(ContentPart::Reasoning { text: reasoning });
+        }
+        for (id, name, arguments) in outcome.tool_calls() {
+            parts.push(ContentPart::ToolCall {
+                id: rune_core::id::ToolCallId::new(id)?,
+                name,
+                arguments,
+            });
+        }
+        let mut message = rune_agent::history::Turn::assistant(0, parts);
+        message.replay.clone_from(&outcome.replay);
+        if !message.parts.is_empty() {
+            self.responses.push(message);
+        }
+        Ok(())
+    }
+
     /// Records a turn and everything it produced.
     ///
-    /// The turn number is assigned here rather than by the caller, so a turn
-    /// that produced no output is still numbered in the order it ran.
+    /// A streamed exchange keeps the number assigned before its request. A
+    /// caller recording a finished outcome directly starts the exchange here,
+    /// so even a turn with no output is numbered in the order it ran.
     pub fn turn(&mut self, outcome: &TurnOutcome) -> Result<()> {
-        self.turn = self.turn.saturating_add(1);
+        self.begin_turn()?;
         let turn = self.turn;
-        self.store.append(SessionEvent::TurnStarted { turn })?;
 
-        // The calls of one step are a batch, and their results follow the whole
-        // batch. Writing them interleaved would leave a log that cannot be
-        // replayed into the conversation the model actually saw.
-        for call in &outcome.calls {
-            self.store.append(SessionEvent::ToolCall {
-                call_id: call.call.id.clone(),
-                name: call.call.name.clone(),
-                arguments: call.call.arguments.clone(),
-            })?;
-        }
-        for call in &outcome.calls {
-            self.store.append(SessionEvent::ToolResult {
-                call_id: call.call.id.clone(),
-                ok: !call.output.is_error,
-                output: call.output.text.clone(),
-            })?;
-        }
+        if self.responses.is_empty() {
+            // The calls of one step are a batch, and their results follow the whole
+            // batch. Writing them interleaved would leave a log that cannot be
+            // replayed into the conversation the model actually saw.
+            for call in &outcome.calls {
+                self.append(SessionEvent::ToolCall {
+                    call_id: call.call.id.clone(),
+                    name: call.call.name.clone(),
+                    arguments: call.call.arguments.clone(),
+                })?;
+            }
+            for call in &outcome.calls {
+                self.append(SessionEvent::ToolResult {
+                    call_id: call.call.id.clone(),
+                    ok: !call.output.is_error,
+                    output: call.output.text.clone(),
+                })?;
+            }
 
-        if !outcome.text.is_empty() {
-            self.store.append(SessionEvent::AssistantMessage {
-                turn,
-                text: outcome.text.clone(),
-            })?;
+            if !outcome.text.is_empty() {
+                self.append(SessionEvent::AssistantMessage {
+                    turn,
+                    text: outcome.text.clone(),
+                })?;
+            }
+        } else {
+            let mut results = outcome.calls.iter();
+            for message in std::mem::take(&mut self.responses) {
+                for event in message_events(&message, turn)? {
+                    self.append(event)?;
+                }
+                for (id, _, _) in message.tool_calls() {
+                    if let Some(result) = results
+                        .next()
+                        .filter(|result| result.call.id == id.as_str())
+                    {
+                        self.append(SessionEvent::ToolResult {
+                            call_id: result.call.id.clone(),
+                            ok: !result.output.is_error,
+                            output: result.output.text.clone(),
+                        })?;
+                    }
+                }
+            }
         }
 
         if let (Some(input), Some(output)) =
             (outcome.usage.input_tokens, outcome.usage.output_tokens)
         {
-            self.store.append(SessionEvent::UsageRecorded {
+            self.append(SessionEvent::UsageRecorded {
                 input_tokens: input,
                 output_tokens: output,
             })?;
         }
+        self.append(SessionEvent::TurnFinished { turn })?;
+        self.active_turn = false;
+        Ok(())
+    }
+
+    /// Adds child usage without child messages or turn boundaries.
+    pub fn child_usage(&self, usage: &rune_net::stream::Usage) -> Result<()> {
+        if let (Some(input), Some(output)) = (usage.input_tokens, usage.output_tokens) {
+            self.append(SessionEvent::UsageRecorded {
+                input_tokens: input,
+                output_tokens: output,
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Records the visible answer and boundary of a cancelled exchange.
+    ///
+    /// A cancellation is numbered even when no text arrived. Unknown usage is
+    /// left absent rather than recorded as a completed request with zero usage.
+    pub fn cancelled_turn(&mut self, partial: &str) -> Result<()> {
+        self.begin_turn()?;
+        let turn = self.turn;
+        if !partial.trim().is_empty() {
+            self.append(SessionEvent::AssistantMessage {
+                turn,
+                text: partial.to_owned(),
+            })?;
+        }
+        self.append(SessionEvent::TurnCancelled { turn })?;
+        self.active_turn = false;
+        Ok(())
+    }
+
+    /// Records the visible answer and cause of a failed exchange.
+    ///
+    /// A failure is numbered even when no text arrived. Unknown usage is left
+    /// absent rather than recorded as a completed request with zero usage.
+    pub fn failed_turn(&mut self, partial: &str, error: &RuneError) -> Result<()> {
+        self.begin_turn()?;
+        let turn = self.turn;
+        if !partial.trim().is_empty() {
+            self.append(SessionEvent::AssistantMessage {
+                turn,
+                text: partial.to_owned(),
+            })?;
+        }
+        self.append(SessionEvent::TurnFailed {
+            turn,
+            code: error.code(),
+            message: error.message().to_owned(),
+        })?;
+        self.active_turn = false;
         Ok(())
     }
 
@@ -184,10 +486,15 @@ impl Recorder {
     /// Called once, with the opening prompt, so a listing distinguishes
     /// sessions by what they were about rather than by identifier alone.
     pub fn set_title(&self, title: &str) -> Result<()> {
-        self.store.append(SessionEvent::TitleSet {
+        self.append(SessionEvent::TitleSet {
             title: title.to_owned(),
         })?;
         Ok(())
+    }
+
+    /// Archives original messages while holding the session's writer lock.
+    pub fn archive_messages(&self, messages: &[rune_agent::history::Turn]) -> Result<()> {
+        crate::compaction_archive::append(self.store.dir(), messages)
     }
 }
 
@@ -220,8 +527,30 @@ pub fn page(
     limit: usize,
     cursor: Option<&str>,
 ) -> Result<Page> {
+    paginate(list_scoped(paths, scope), limit, cursor)
+}
+
+/// Searches titles and recorded user messages by a case-insensitive literal fragment.
+///
+/// Workspace and child-session exclusions are the same as for an ordinary
+/// listing. Matching precedes the listing cap and pagination.
+pub fn search_page(
+    paths: &Paths,
+    scope: Option<&Utf8Path>,
+    query: &str,
+    limit: usize,
+    cursor: Option<&str>,
+) -> Result<Page> {
+    if query.trim().is_empty() {
+        return Err(RuneError::invalid_field("search", "search text is empty")
+            .with_hint("pass a title or user-message fragment"));
+    }
+    let query = query.to_lowercase();
+    paginate(list_matching(paths, scope, Some(&query)), limit, cursor)
+}
+
+fn paginate(all: Vec<Summary>, limit: usize, cursor: Option<&str>) -> Result<Page> {
     let limit = limit.clamp(1, MAX_PAGE);
-    let all = list_scoped(paths, scope);
 
     let start = match cursor {
         None => 0,
@@ -252,6 +581,10 @@ pub fn page(
 /// than assumed to belong to it, because guessing would attribute a session to a
 /// repository it may never have touched.
 pub fn list_scoped(paths: &Paths, scope: Option<&Utf8Path>) -> Vec<Summary> {
+    list_matching(paths, scope, None)
+}
+
+fn list_matching(paths: &Paths, scope: Option<&Utf8Path>, query: Option<&str>) -> Vec<Summary> {
     let wanted = scope.map(rune_policy::trust::canonical_workspace);
     let Ok(entries) = std::fs::read_dir(paths.sessions_dir()) else {
         return Vec::new();
@@ -274,6 +607,18 @@ pub fn list_scoped(paths: &Paths, scope: Option<&Utf8Path>) -> Vec<Summary> {
         // a conversation the user never started, and resuming it directly would
         // run it without the authority its parent had.
         if state.parent.is_some() {
+            continue;
+        }
+        if let Some(query) = query
+            && !state
+                .title
+                .as_deref()
+                .is_some_and(|title| title.to_lowercase().contains(query))
+            && !state.events.iter().any(|frame| {
+                matches!(&frame.event, SessionEvent::UserMessage { text }
+                    if text.to_lowercase().contains(query))
+            })
+        {
             continue;
         }
         out.push(summarize(&state, dir));
@@ -342,26 +687,42 @@ pub fn render_detail(state: &SessionState, dir: &Utf8Path) -> String {
 
 /// Builds the branch tree of a stored session.
 ///
-/// Every stored session is a single chain, so the tree is built by following the
-/// log in order. It exists so the shape is reported from the log rather than
-/// assumed, which is what lets a branch show up here when branching lands.
+/// Each saved branch has its own session log, so this view follows that log in
+/// order. Fork provenance is available in the exported journal.
 #[must_use]
 pub fn tree_of(state: &SessionState) -> Tree {
     use rune_session::tree::Role;
 
     let mut tree = Tree::new();
     let mut parent: Option<u64> = None;
-    for frame in &state.events {
+    for frame in rune_session::replay::replay_events(&state.events) {
+        let failure;
         let (role, preview) = match &frame.event {
             SessionEvent::UserMessage { text } => (Role::User, text.as_str()),
             SessionEvent::AssistantMessage { text, .. } => (Role::Assistant, text.as_str()),
+            SessionEvent::TurnCancelled { .. } => (Role::System, "[cancelled]"),
+            SessionEvent::TurnInterrupted { .. } => (Role::System, "[interrupted]"),
+            SessionEvent::TurnFailed { code, .. } => {
+                failure = format!("[failed: {code}]");
+                (Role::System, failure.as_str())
+            }
             SessionEvent::ToolResult { output, .. } => (Role::Tool, output.as_str()),
             SessionEvent::ToolCall { name, .. } => (Role::Assistant, name.as_str()),
-            SessionEvent::TurnStarted { .. }
+            SessionEvent::AssistantContent { .. }
+            | SessionEvent::AssistantDelta { .. }
+            | SessionEvent::AssistantReset { .. }
+            | SessionEvent::TurnStarted { .. }
+            | SessionEvent::TurnFinished { .. }
             | SessionEvent::Compaction { .. }
             | SessionEvent::UsageRecorded { .. }
             | SessionEvent::TitleSet { .. }
+            | SessionEvent::ObjectiveSet { .. }
+            | SessionEvent::ObjectiveBudgetSet { .. }
+            | SessionEvent::ObjectiveTokensRecorded { .. }
+            | SessionEvent::ConstraintPinned { .. }
+            | SessionEvent::ModelSet { .. }
             | SessionEvent::WorkspaceSet { .. }
+            | SessionEvent::ForkedFrom { .. }
             | SessionEvent::ChildOf { .. } => continue,
         };
         let node = Node::new(
@@ -389,10 +750,26 @@ pub fn render_tree(tree: &Tree, state: &SessionState) -> String {
     let _ = writeln!(out, "session {} ({} turns)", state.id, state.turns);
 
     for branch in tree.branches() {
+        // An interrupted boundary has its own row below. Keep it out of the
+        // branch summary so an exchange ending here reports the boundary once.
+        let failure_boundary = branch
+            .head_seq
+            .and_then(|seq| tree.node(seq))
+            .is_some_and(|node| {
+                node.role == rune_session::tree::Role::System
+                    && node.preview.starts_with("[failed: ")
+            });
+        let summary = if matches!(branch.summary.as_str(), "[cancelled]" | "[interrupted]")
+            || failure_boundary
+        {
+            ""
+        } else {
+            &branch.summary
+        };
         let _ = writeln!(
             out,
             "  branch {}  {} turn(s)  {}",
-            branch.name, branch.turn_count, branch.summary
+            branch.name, branch.turn_count, summary
         );
     }
 
@@ -507,8 +884,78 @@ pub fn load(paths: &Paths, id: &SessionId) -> Result<(Recorder, History)> {
         .with_hint("resume the session that created it"));
     }
     let history = history_from(&state);
-    let recorder = Recorder::open(paths, id)?;
+    let mut recorder = Recorder::open(paths, id)?;
+    // Usage is per turn and can include several requests. It is an estimate,
+    // not an exact current request count. Never sum repeated conversation input.
+    let saved = state
+        .events
+        .iter()
+        .filter_map(|frame| match frame.event {
+            SessionEvent::UsageRecorded {
+                input_tokens,
+                output_tokens,
+            } => Some(input_tokens.saturating_add(output_tokens)),
+            _ => None,
+        })
+        .max()
+        .unwrap_or(0);
+    let bytes = u64::try_from(history.byte_len()).unwrap_or(u64::MAX);
+    let estimated = rune_agent::tokens::estimate_tokens(bytes).max(u64::from(!history.is_empty()));
+    recorder.resumed_context = if saved > 0 && saved >= estimated {
+        (saved, Some("saved usage"))
+    } else if estimated > 0 {
+        (estimated, Some("history bytes"))
+    } else {
+        (0, None)
+    };
     Ok((recorder, history))
+}
+
+/// Encodes one history message without flattening provider response boundaries.
+pub fn message_events(message: &rune_agent::history::Turn, turn: u64) -> Result<Vec<SessionEvent>> {
+    let mut events = Vec::new();
+    if message.role == rune_net::message::Role::Assistant {
+        events.push(SessionEvent::AssistantContent {
+            message: serde_json::to_string(&rune_net::message::Message {
+                role: message.role,
+                parts: message.parts.clone(),
+                replay: message.replay.clone(),
+            })?,
+        });
+        let text = message.text();
+        if !text.is_empty() {
+            events.push(SessionEvent::AssistantMessage { turn, text });
+        }
+    } else if message.role == rune_net::message::Role::User {
+        events.push(SessionEvent::UserMessage {
+            text: message.text(),
+        });
+    }
+    for part in &message.parts {
+        match part {
+            ContentPart::ToolCall {
+                id,
+                name,
+                arguments,
+            } => events.push(SessionEvent::ToolCall {
+                call_id: id.to_string(),
+                name: name.clone(),
+                arguments: arguments.clone(),
+            }),
+            ContentPart::ToolResult {
+                id,
+                content,
+                is_error,
+                ..
+            } => events.push(SessionEvent::ToolResult {
+                call_id: id.to_string(),
+                ok: !is_error,
+                output: content.clone(),
+            }),
+            _ => {}
+        }
+    }
+    Ok(events)
 }
 
 /// The result a replayed call is given when the log holds none for it.
@@ -520,19 +967,40 @@ pub fn history_from(state: &SessionState) -> History {
     let mut history = History::new();
     let mut calls: Vec<ContentPart> = Vec::new();
     let mut results: Vec<ContentPart> = Vec::new();
+    let mut assistant: Option<rune_net::message::Message> = None;
 
-    for frame in &state.events {
+    for frame in rune_session::replay::replay_events(&state.events) {
         match &frame.event {
+            SessionEvent::ConstraintPinned { text } => {
+                // Empty pins are refused at write time. Keep replay compatible
+                // with a hand-edited log without changing its ordinary turns.
+                let _ = history.pin_constraint(text.clone());
+            }
             SessionEvent::UserMessage { text } => {
-                flush(&mut history, &mut calls, &mut results);
+                flush(&mut history, &mut calls, &mut results, &mut assistant);
                 history.push_user(text.clone());
             }
+            SessionEvent::AssistantContent { message } => {
+                flush(&mut history, &mut calls, &mut results, &mut assistant);
+                assistant = serde_json::from_str(message).ok();
+                if let Some(message) = &assistant {
+                    calls.extend(
+                        message
+                            .parts
+                            .iter()
+                            .filter(|part| matches!(part, ContentPart::ToolCall { .. }))
+                            .cloned(),
+                    );
+                }
+            }
+            SessionEvent::AssistantMessage { .. } if assistant.is_some() => {}
             SessionEvent::AssistantMessage { text, .. } => {
-                flush(&mut history, &mut calls, &mut results);
+                flush(&mut history, &mut calls, &mut results, &mut assistant);
                 if !text.is_empty() {
                     history.push_assistant(vec![ContentPart::Text { text: text.clone() }]);
                 }
             }
+            SessionEvent::ToolCall { .. } if assistant.is_some() && results.is_empty() => {}
             SessionEvent::ToolCall {
                 call_id,
                 name,
@@ -541,7 +1009,7 @@ pub fn history_from(state: &SessionState) -> History {
                 // A tool result run always follows the calls it answers, so a
                 // new call closes the previous group.
                 if !results.is_empty() {
-                    flush(&mut history, &mut calls, &mut results);
+                    flush(&mut history, &mut calls, &mut results, &mut assistant);
                 }
                 if let Ok(id) = rune_core::id::ToolCallId::new(call_id.clone()) {
                     calls.push(ContentPart::ToolCall {
@@ -565,16 +1033,27 @@ pub fn history_from(state: &SessionState) -> History {
                     });
                 }
             }
-            SessionEvent::TurnStarted { .. }
+            SessionEvent::AssistantDelta { .. }
+            | SessionEvent::AssistantReset { .. }
+            | SessionEvent::TurnStarted { .. }
+            | SessionEvent::TurnFinished { .. }
             | SessionEvent::Compaction { .. }
             | SessionEvent::UsageRecorded { .. }
             | SessionEvent::TitleSet { .. }
+            | SessionEvent::ObjectiveSet { .. }
+            | SessionEvent::ObjectiveBudgetSet { .. }
+            | SessionEvent::ObjectiveTokensRecorded { .. }
+            | SessionEvent::ModelSet { .. }
             | SessionEvent::WorkspaceSet { .. }
-            | SessionEvent::ChildOf { .. } => {}
+            | SessionEvent::ForkedFrom { .. }
+            | SessionEvent::ChildOf { .. }
+            | SessionEvent::TurnInterrupted { .. }
+            | SessionEvent::TurnCancelled { .. }
+            | SessionEvent::TurnFailed { .. } => {}
         }
     }
 
-    flush(&mut history, &mut calls, &mut results);
+    flush(&mut history, &mut calls, &mut results, &mut assistant);
     history
 }
 
@@ -584,7 +1063,12 @@ pub fn history_from(state: &SessionState) -> History {
 /// are all written before any of its results, so a process that stopped between
 /// the two leaves calls that were never answered, and a conversation holding
 /// one is refused by every request that follows.
-fn flush(history: &mut History, calls: &mut Vec<ContentPart>, results: &mut Vec<ContentPart>) {
+fn flush(
+    history: &mut History,
+    calls: &mut Vec<ContentPart>,
+    results: &mut Vec<ContentPart>,
+    assistant: &mut Option<rune_net::message::Message>,
+) {
     if !calls.is_empty() {
         for call in calls.iter() {
             let ContentPart::ToolCall { id, name, .. } = call else {
@@ -602,7 +1086,23 @@ fn flush(history: &mut History, calls: &mut Vec<ContentPart>, results: &mut Vec<
                 });
             }
         }
-        history.push_assistant(std::mem::take(calls));
+        for result in results.iter_mut() {
+            if let ContentPart::ToolResult { id, name, .. } = result
+                && let Some(ContentPart::ToolCall { name: called, .. }) = calls.iter().find(
+                    |call| matches!(call, ContentPart::ToolCall { id: called, .. } if called == id),
+                )
+            {
+                name.clone_from(called);
+            }
+        }
+        if assistant.is_none() {
+            history.push_assistant(std::mem::take(calls));
+        } else {
+            calls.clear();
+        }
+    }
+    if let Some(message) = assistant.take() {
+        history.push_assistant_with_replay(message.parts, message.replay);
     }
     if !results.is_empty() {
         history.push_tool_results(std::mem::take(results));
@@ -704,6 +1204,229 @@ mod tests {
         raw.parse().expect("id")
     }
 
+    #[test]
+    fn gemini_responses_survive_the_journal_resume_and_fork() {
+        use rune_net::provider::{Provider, RequestPlan};
+        use rune_net::stream::StreamReducer;
+        use serde_json::json;
+        let temp = tempfile::tempdir().expect("temp");
+        let paths = paths(Utf8Path::from_path(temp.path()).expect("utf8"));
+        let id = SessionId::generate();
+        let mut recorder = Recorder::create(&paths, &id).expect("recorder");
+        recorder.user_message("lookup twice").expect("prompt");
+        let mut completed = outcome("done");
+        let mut native_parts = Vec::new();
+        for step in 0..3 {
+            let parts = if step < 2 {
+                json!([
+                    {"text": "thinking", "thought": true, "thoughtSignature": format!("thought-{step}")},
+                    {"functionCall": {"name": "lookup", "args": {"step": step}}, "thoughtSignature": format!("call-{step}")}
+                ])
+            } else {
+                json!([{"text": "done", "thoughtSignature": "final-signature"}])
+            };
+            let mut reducer = rune_net::gemini::Reducer::default();
+            let mut events = Vec::new();
+            reducer.apply(Some(&json!({"candidates": [{"content": {"parts": parts}, "finishReason": "STOP"}]}).to_string()), &mut events).expect("frame");
+            reducer.apply(None, &mut events).expect("finish");
+            let response = rune_net::transport::StreamOutcome {
+                events,
+                replay: reducer.replay(),
+                finish: Some(reducer.finish().expect("reason")),
+                ..Default::default()
+            };
+            recorder.response(&response).expect("response");
+            for (id, name, arguments) in response.tool_calls() {
+                completed.calls.push(rune_agent::turn::CallResult {
+                    call: PreparedCall {
+                        id,
+                        name,
+                        arguments,
+                    },
+                    output: ToolOutput::success(format!("result-{step}")),
+                    executed: true,
+                });
+            }
+            native_parts.push(parts);
+        }
+        recorder.turn(&completed).expect("save");
+        let mut interrupted = recorder.store.read().expect("state");
+        let content = interrupted
+            .events
+            .iter()
+            .position(|frame| matches!(frame.event, SessionEvent::AssistantContent { .. }))
+            .expect("native content");
+        interrupted.events.truncate(content + 1);
+        history_from(&interrupted)
+            .validate()
+            .expect("unfinished calls receive interrupted results");
+        assert!(
+            rune_session::fork::fork(
+                &paths,
+                &id,
+                &SessionId::generate(),
+                interrupted.events[content].seq
+            )
+            .is_err()
+        );
+        let boundary = recorder
+            .store
+            .read()
+            .expect("state")
+            .events
+            .last()
+            .expect("last")
+            .seq;
+        drop(recorder);
+        let branch = SessionId::generate();
+        rune_session::fork::fork(&paths, &id, &branch, boundary).expect("fork");
+        for saved in [id, branch] {
+            let (_, history) = load(&paths, &saved).expect("resume");
+            history.validate().expect("paired history");
+            let mut plan = RequestPlan::new("gemini-fixture");
+            plan.messages = history.to_messages();
+            let request = rune_net::gemini::Gemini
+                .build_request(&plan)
+                .expect("request");
+            assert_eq!(request["contents"].as_array().expect("contents").len(), 6);
+            let state = load_read_only(&paths.session_dir(&saved)).expect("saved events");
+            plan.messages = rune_acp::session::history_from_events(&state.events).to_messages();
+            assert_eq!(
+                rune_net::gemini::Gemini
+                    .build_request(&plan)
+                    .expect("ACP request"),
+                request
+            );
+            for (step, parts) in native_parts.iter().enumerate() {
+                assert_eq!(&request["contents"][step * 2 + 1]["parts"], parts);
+                if step < 2 {
+                    let response =
+                        &request["contents"][step * 2 + 2]["parts"][0]["functionResponse"];
+                    assert_eq!(response["name"], "lookup");
+                    assert_eq!(response["response"]["output"], format!("result-{step}"));
+                    assert!(response.get("id").is_none());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_tool_results_recover_their_function_names() {
+        use rune_net::provider::{Provider, RequestPlan};
+        let temp = tempfile::tempdir().expect("temp");
+        let paths = paths(Utf8Path::from_path(temp.path()).expect("utf8"));
+        let id = SessionId::generate();
+        let mut recorder = Recorder::create(&paths, &id).expect("recorder");
+        recorder.user_message("lookup").expect("prompt");
+        let mut completed = outcome("done");
+        completed.calls.push(rune_agent::turn::CallResult {
+            call: PreparedCall {
+                id: "legacy".into(),
+                name: "lookup".into(),
+                arguments: "{}".into(),
+            },
+            output: ToolOutput::success("found"),
+            executed: true,
+        });
+        recorder.turn(&completed).expect("save legacy format");
+        drop(recorder);
+        let (_, history) = load(&paths, &id).expect("resume");
+        let mut plan = RequestPlan::new("gemini-fixture");
+        plan.messages = history.to_messages();
+        let request = rune_net::gemini::Gemini
+            .build_request(&plan)
+            .expect("request");
+        assert_eq!(
+            request["contents"][2]["parts"][0]["functionResponse"]["name"],
+            "lookup"
+        );
+    }
+
+    #[test]
+    fn forked_tool_pair_replays_as_a_valid_history_and_continues_with_the_next_turn() {
+        let temp = tempfile::tempdir().expect("temp");
+        let paths = paths(Utf8Path::from_path(temp.path()).expect("utf8"));
+        let source = SessionId::generate();
+        let branch = SessionId::generate();
+        let store = SessionStore::create(&paths, &source).expect("store");
+        for event in [
+            SessionEvent::ConstraintPinned {
+                text: "keep exact text".into(),
+            },
+            SessionEvent::TurnStarted { turn: 1 },
+            SessionEvent::UserMessage {
+                text: "read it".into(),
+            },
+            SessionEvent::ToolCall {
+                call_id: "read".into(),
+                name: "read_file".into(),
+                arguments: "{}".into(),
+            },
+            SessionEvent::ToolResult {
+                call_id: "read".into(),
+                ok: true,
+                output: "complete original result".into(),
+            },
+            SessionEvent::AssistantMessage {
+                turn: 1,
+                text: "later source answer".into(),
+            },
+            SessionEvent::TurnFinished { turn: 1 },
+        ] {
+            store.append(event).expect("event");
+        }
+        rune_session::fork::fork(&paths, &source, &branch, rune_core::id::EventSeq(5))
+            .expect("fork");
+        let (mut recorder, history) = load(&paths, &branch).expect("resume fork");
+        history.validate().expect("tool pair is sendable");
+        assert_eq!(history.pinned_constraints(), &["keep exact text"]);
+        assert_eq!(history.len(), 3);
+        assert!(
+            matches!(&history.turns()[2].parts[0], ContentPart::ToolResult { content, is_error: false, .. } if content == "complete original result")
+        );
+        recorder.user_message("branch continuation").expect("user");
+        recorder.turn(&outcome("branch answer")).expect("next turn");
+        drop(recorder);
+        let (recorder, history) = load(&paths, &branch).expect("reopen");
+        history.validate().expect("continued history is sendable");
+        assert_eq!(recorder.turn, 2);
+        let source_state = store.read().expect("source");
+        assert_eq!(source_state.events.len(), 7);
+        assert_eq!(
+            source_state.events[5].event,
+            SessionEvent::AssistantMessage {
+                turn: 1,
+                text: "later source answer".into()
+            }
+        );
+    }
+
+    #[test]
+    fn a_later_successful_refresh_clears_the_pending_metadata_warning() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let root = Utf8Path::from_path(root.path()).expect("utf8");
+        let recorder = Recorder::create(&paths(root), &id("sessionaaaaa")).expect("create");
+        let metadata = recorder.store.metadata_path();
+        std::fs::remove_file(&metadata).expect("remove projection");
+        std::fs::create_dir(&metadata).expect("block projection");
+        recorder
+            .user_message("durable")
+            .expect("record despite projection failure");
+        assert!(recorder.metadata_warning.borrow().is_some());
+
+        std::fs::remove_dir(&metadata).expect("unblock projection");
+        recorder.set_title("repaired").expect("record and refresh");
+        assert!(recorder.take_metadata_warning().is_none());
+        assert_eq!(recorder.store.read().expect("replay").len(), 2);
+        assert_eq!(
+            serde_json::from_slice::<rune_session::Metadata>(
+                &std::fs::read(metadata).expect("projection")
+            )
+            .expect("parse projection"),
+            recorder.store.metadata()
+        );
+    }
+
     fn outcome(text: &str) -> TurnOutcome {
         TurnOutcome {
             stop_reason: StopReason::Completed,
@@ -725,6 +1448,103 @@ mod tests {
     }
 
     #[test]
+    fn journal_frames_are_bounded_and_recover_unicode_before_a_torn_tail() {
+        use std::io::Write as _;
+
+        let dir = tempfile::tempdir().expect("temp");
+        let paths = paths(Utf8Path::from_path(dir.path()).expect("utf8"));
+        let key = id("sessionjrnl1");
+        let text = "aé🦀\n\t".repeat(5000);
+        let mut recorder = Recorder::create(&paths, &key).expect("created");
+        recorder.user_message("slow").expect("prompt saved");
+        recorder.begin_turn().expect("started");
+        recorder.assistant_delta(&text).expect("journalled");
+        let state = recorder.store.read().expect("read while streaming");
+        let deltas: Vec<_> = state
+            .events
+            .iter()
+            .filter_map(|frame| match &frame.event {
+                SessionEvent::AssistantDelta { text, .. } => {
+                    assert!(text.len() <= 8 * 1024);
+                    assert!(frame.encode().expect("encoded").len() < 50 * 1024);
+                    Some(text.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(deltas.len() > 1);
+        assert_eq!(deltas.concat(), text);
+        assert_eq!(state.usage, rune_session::store::UsageTotal::default());
+        drop(recorder);
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(paths.session_dir(&key).join("events.jsonl"))
+            .expect("log")
+            .write_all(b"{\"schema\":1,\"seq\":")
+            .expect("torn frame");
+        let (mut recorder, history) = load(&paths, &key).expect("recovered");
+        assert_eq!(history.to_messages()[1].text(), text);
+        recorder.user_message("continue").expect("continued prompt");
+        recorder.begin_turn().expect("next turn");
+        recorder.assistant_delta("done").expect("journalled");
+        recorder.turn(&outcome("done")).expect("finished");
+        let state = recorder.store.read().expect("read");
+        assert_eq!(state.turns, 2);
+        assert_eq!(
+            state
+                .events
+                .iter()
+                .filter(|frame| matches!(frame.event, SessionEvent::TurnFinished { turn: 2 }))
+                .count(),
+            1
+        );
+        let replay = render_tree(&tree_of(&state), &state);
+        assert_eq!(replay.matches("[interrupted]").count(), 1);
+        assert_eq!(history_from(&state).to_messages()[1].text(), text);
+    }
+
+    #[test]
+    fn resume_estimates_context_without_summing_repeated_inputs() {
+        for usage in [Some((1234, 0)), None, Some((u64::MAX, 1))] {
+            let dir = tempfile::tempdir().expect("temp");
+            let root = Utf8Path::from_path(dir.path()).expect("utf8");
+            let paths = paths(root);
+            let key = id("sessionctx01");
+            let recorder = Recorder::create(&paths, &key).expect("created");
+            assert_eq!(recorder.resumed_context(), (0, None));
+            recorder.user_message("hello").expect("user");
+            if let Some((input_tokens, output_tokens)) = usage {
+                for _ in 0..2 {
+                    recorder
+                        .store
+                        .append(SessionEvent::UsageRecorded {
+                            input_tokens,
+                            output_tokens,
+                        })
+                        .expect("usage");
+                }
+            }
+            drop(recorder);
+            let (recorder, _) = load(&paths, &key).expect("resumed");
+            let expected = match usage {
+                Some((input, output)) => (input.saturating_add(output), Some("saved usage")),
+                None => (1, Some("history bytes")),
+            };
+            assert_eq!(recorder.resumed_context(), expected);
+        }
+    }
+
+    #[test]
+    fn resuming_an_empty_log_keeps_an_empty_context_meter() {
+        let dir = tempfile::tempdir().expect("temp");
+        let paths = paths(Utf8Path::from_path(dir.path()).expect("utf8"));
+        let key = id("sessionctx02");
+        drop(Recorder::create(&paths, &key).expect("created"));
+        let (recorder, _) = load(&paths, &key).expect("resumed");
+        assert_eq!(recorder.resumed_context(), (0, None));
+    }
+
+    #[test]
     fn a_turn_round_trips_through_the_log() {
         let dir = tempfile::tempdir().expect("temp");
         let root = Utf8Path::from_path(dir.path()).expect("utf8");
@@ -740,6 +1560,155 @@ mod tests {
         assert_eq!(history.turns().len(), 2);
         assert_eq!(history.turns()[0].text(), "what changed?");
         assert_eq!(history.turns()[1].text(), "two files");
+    }
+
+    #[test]
+    fn cancelled_exchanges_round_trip_without_duplicate_text_or_invented_usage() {
+        for partial in ["", "STREAM-01\nSTREAM-02\nSTREAM-03\n"] {
+            let dir = tempfile::tempdir().expect("temp");
+            let root = Utf8Path::from_path(dir.path()).expect("utf8");
+            let paths = paths(root);
+            let key = id("sessionccccc");
+            let mut recorder = Recorder::create(&paths, &key).expect("created");
+            recorder.user_message("slow").expect("wrote");
+            recorder.cancelled_turn(partial).expect("cancelled");
+            drop(recorder);
+
+            let (mut recorder, history) = load(&paths, &key).expect("resumed");
+            history.validate().expect("valid replay");
+            assert_eq!(history.len(), if partial.is_empty() { 1 } else { 2 });
+            if !partial.is_empty() {
+                assert_eq!(history.turns()[1].text(), partial);
+            }
+            let state = inspect(&paths, &key).expect("inspected");
+            assert_eq!(state.turns, 1);
+            assert_eq!(state.usage.total(), 0);
+            assert!(
+                !state
+                    .events
+                    .iter()
+                    .any(|frame| matches!(frame.event, SessionEvent::UsageRecorded { .. }))
+            );
+            assert_eq!(
+                state
+                    .events
+                    .iter()
+                    .filter(|frame| matches!(frame.event, SessionEvent::TurnCancelled { turn: 1 }))
+                    .count(),
+                1
+            );
+            let rendered = render_tree(&tree_of(&state), &state);
+            assert_eq!(rendered.matches("[cancelled]").count(), 1);
+            for line in partial.lines() {
+                assert_eq!(rendered.matches(line).count(), 1, "{rendered}");
+            }
+
+            recorder.user_message("continue").expect("wrote");
+            recorder.turn(&outcome("continued")).expect("wrote");
+            drop(recorder);
+            let state = inspect(&paths, &key).expect("inspected");
+            assert_eq!(state.turns, 2);
+            assert!(state.events.iter().any(|frame| matches!(
+                frame.event,
+                SessionEvent::AssistantMessage { turn: 2, .. }
+            )));
+            assert_eq!(
+                render_tree(&tree_of(&state), &state)
+                    .matches("[cancelled]")
+                    .count(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn failed_exchanges_round_trip_with_the_visible_answer_and_cause() {
+        for partial in ["", "STREAM-01\nSTREAM-02\nSTREAM-03\n"] {
+            let dir = tempfile::tempdir().expect("temp");
+            let root = Utf8Path::from_path(dir.path()).expect("utf8");
+            let paths = paths(root);
+            let key = id("sessionfffff");
+            let error = RuneError::new(
+                ErrorCode::IncompleteStream,
+                "the provider closed the stream",
+            );
+            let mut recorder = Recorder::create(&paths, &key).expect("created");
+            recorder.user_message("die").expect("wrote");
+            recorder.failed_turn(partial, &error).expect("failed");
+            drop(recorder);
+
+            let (mut recorder, history) = load(&paths, &key).expect("resumed");
+            history.validate().expect("valid replay");
+            assert_eq!(history.len(), if partial.is_empty() { 1 } else { 2 });
+            if !partial.is_empty() {
+                assert_eq!(history.turns()[1].text(), partial);
+            }
+            let state = inspect(&paths, &key).expect("inspected");
+            assert_eq!(state.turns, 1);
+            assert_eq!(state.usage.total(), 0);
+            assert!(
+                !state
+                    .events
+                    .iter()
+                    .any(|frame| matches!(frame.event, SessionEvent::UsageRecorded { .. }))
+            );
+            let failures: Vec<_> = state
+                .events
+                .iter()
+                .filter(|frame| matches!(frame.event, SessionEvent::TurnFailed { .. }))
+                .map(|frame| &frame.event)
+                .collect();
+            assert_eq!(
+                failures,
+                [&SessionEvent::TurnFailed {
+                    turn: 1,
+                    code: ErrorCode::IncompleteStream,
+                    message: error.message().to_owned(),
+                }]
+            );
+            let rendered = render_tree(&tree_of(&state), &state);
+            assert_eq!(rendered.matches("[failed: incomplete_stream]").count(), 1);
+            for line in partial.lines() {
+                assert_eq!(rendered.matches(line).count(), 1, "{rendered}");
+            }
+
+            recorder.user_message("continue").expect("wrote");
+            recorder.turn(&outcome("continued")).expect("wrote");
+            drop(recorder);
+            let state = inspect(&paths, &key).expect("inspected");
+            assert_eq!(state.turns, 2);
+            assert!(state.events.iter().any(|frame| matches!(
+                frame.event,
+                SessionEvent::AssistantMessage { turn: 2, .. }
+            )));
+            assert_eq!(
+                render_tree(&tree_of(&state), &state)
+                    .matches("[failed: incomplete_stream]")
+                    .count(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_reply_text_does_not_become_a_failure_boundary() {
+        let dir = tempfile::tempdir().expect("temp");
+        let root = Utf8Path::from_path(dir.path()).expect("utf8");
+        let paths = paths(root);
+        let key = id("sessionfffff");
+        let mut recorder = Recorder::create(&paths, &key).expect("created");
+        recorder.user_message("quote this marker").expect("wrote");
+        recorder
+            .turn(&outcome("[failed: incomplete_stream]"))
+            .expect("wrote");
+        let state = inspect(&paths, &key).expect("inspected");
+        let rendered = render_tree(&tree_of(&state), &state);
+        assert!(
+            rendered.lines().any(|line| {
+                line.starts_with("  branch ") && line.ends_with("[failed: incomplete_stream]")
+            }),
+            "{rendered}"
+        );
     }
 
     #[test]
@@ -871,6 +1840,96 @@ mod tests {
             vec![("file text", false), ("no matches", true)],
             "{turns:#?}"
         );
+    }
+
+    #[test]
+    fn registry_failure_code_and_hint_survive_session_recording_and_replay() {
+        use rune_tools::{Activity, ExecutionContext, Registry, Tool};
+
+        struct HintTool;
+
+        impl Tool for HintTool {
+            fn name(&self) -> &'static str {
+                "hint"
+            }
+
+            fn description(&self) -> &'static str {
+                "Return a missing file diagnostic."
+            }
+
+            fn input_schema(&self) -> serde_json::Value {
+                serde_json::json!({"type": "object"})
+            }
+
+            fn activity(&self) -> Activity {
+                Activity::Read
+            }
+
+            fn call(
+                &self,
+                _arguments: &serde_json::Value,
+                _context: &ExecutionContext,
+            ) -> Result<ToolOutput> {
+                Err(RuneError::new(ErrorCode::NotFound, "missing").with_hint("try other.txt"))
+            }
+        }
+
+        let dir = tempfile::tempdir().expect("temp");
+        let root = Utf8Path::from_path(dir.path()).expect("utf8");
+        let paths = paths(root);
+        let key = id("sessionhint1");
+        let mut registry = Registry::new();
+        registry.insert(Box::new(HintTool)).expect("register");
+        let output = registry
+            .call(
+                "hint",
+                &serde_json::json!({}),
+                &ExecutionContext::new(root.to_owned()),
+            )
+            .expect("repairable failure");
+        let expected = output.render();
+        let mut with_call = outcome("I can try the suggested file.");
+        with_call.calls.push(rune_agent::turn::CallResult {
+            call: PreparedCall {
+                id: "call_hint".to_owned(),
+                name: "hint".to_owned(),
+                arguments: "{}".to_owned(),
+            },
+            output,
+            executed: true,
+        });
+        let mut recorder = Recorder::create(&paths, &key).expect("created");
+        recorder.user_message("read missing.txt").expect("wrote");
+        recorder.turn(&with_call).expect("recorded");
+        drop(recorder);
+
+        let state = load_read_only(&paths.session_dir(&key)).expect("read saved events");
+        let saved = state
+            .events
+            .iter()
+            .find_map(|frame| match &frame.event {
+                SessionEvent::ToolResult {
+                    call_id,
+                    ok,
+                    output,
+                } if call_id == "call_hint" => {
+                    assert!(!ok);
+                    Some(output)
+                }
+                _ => None,
+            })
+            .expect("saved tool result");
+        assert_eq!(saved, &expected);
+        let diagnostic: serde_json::Value = serde_json::from_str(saved).expect("diagnostic JSON");
+        assert_eq!(diagnostic["code"], "not_found");
+        assert_eq!(diagnostic["message"], "missing");
+        assert_eq!(diagnostic["detail"]["hint"], "try other.txt");
+
+        let (_, history) = load(&paths, &key).expect("replay");
+        history.validate().expect("replayed failure has an answer");
+        assert!(history.turns().iter().flat_map(|turn| &turn.parts).any(|part| {
+            matches!(part, ContentPart::ToolResult { content, is_error: true, .. } if content == &expected)
+        }));
     }
 
     #[test]
@@ -1247,6 +2306,40 @@ mod tests {
     }
 
     #[test]
+    fn tree_previews_escape_saved_newlines_and_controls_without_injecting_rows() {
+        let dir = tempfile::tempdir().expect("temp");
+        let root = Utf8Path::from_path(dir.path()).expect("utf8");
+        let paths = paths(root);
+        let key = id("sessionline1");
+        let mut recorder = Recorder::create(&paths, &key).expect("created");
+        recorder
+            .user_message("question\n999 injected\r\t\0\u{1b}[2J")
+            .expect("wrote");
+        recorder
+            .turn(&outcome("answer\r\nDONE\u{85}\u{2028}\u{2029} 世界"))
+            .expect("wrote");
+        drop(recorder);
+
+        let state = inspect(&paths, &key).expect("inspected");
+        let tree = tree_of(&state);
+        let previews = [
+            "question\\n999 injected\\r\\t\\u{0}\\u{1b}[2J",
+            "answer\\r\\nDONE\\u{85}\\u{2028}\\u{2029} 世界",
+        ];
+        let rendered = render_tree(&tree, &state);
+        let lines: Vec<_> = rendered.lines().collect();
+        // Session heading, branch summary, blank line, table heading, two nodes.
+        assert_eq!(lines.len(), 6, "{rendered}");
+        assert!(lines[1].ends_with(previews[1]), "{rendered}");
+        for (index, expected) in previews.into_iter().enumerate() {
+            let seq = u64::try_from(index + 1).expect("seq");
+            assert_eq!(tree.node(seq).expect("node").preview, expected);
+            assert!(lines[index + 4].ends_with(expected), "{rendered}");
+        }
+        assert!(!rendered.chars().any(|ch| ch.is_control() && ch != '\n'));
+    }
+
+    #[test]
     fn a_long_preview_is_truncated() {
         let dir = tempfile::tempdir().expect("temp");
         let root = Utf8Path::from_path(dir.path()).expect("utf8");
@@ -1496,5 +2589,124 @@ mod tests {
             timestamp(1_704_164_645_000).as_deref(),
             Some("2024-01-02T03:04:05Z")
         );
+    }
+
+    #[test]
+    fn explicit_pins_survive_restart_and_compaction_events_verbatim() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let paths = paths(Utf8Path::from_path(root.path()).expect("utf8"));
+        let id = id("pinned000001");
+        let recorder = Recorder::create(&paths, &id).expect("create");
+        let constraints = [
+            "Never commit.",
+            "Preserve café and 日本語.\nKeep \"quotes\".",
+            "  No dependencies.  ",
+        ];
+        assert!(recorder.pin_constraint(" \n ").is_err());
+        recorder.user_message("an ordinary prompt").expect("prompt");
+        for text in constraints {
+            recorder.pin_constraint(text).expect("persist pin");
+        }
+        for _ in 0..3 {
+            recorder
+                .append(SessionEvent::Compaction {
+                    through: 1,
+                    summary: "A summary that omits every constraint.".to_owned(),
+                })
+                .expect("compaction event");
+        }
+        std::fs::remove_file(recorder.store.metadata_path()).expect("remove projection");
+        drop(recorder);
+        let (_, history) = load(&paths, &id).expect("restart");
+        assert_eq!(history.pinned_constraints(), constraints);
+        assert_eq!(history.len(), 1, "pins do not become summarizable turns");
+        assert_eq!(history.turns()[0].text(), "an ordinary prompt");
+        history.validate().expect("valid replay");
+        for text in constraints {
+            assert!(
+                history
+                    .to_messages()
+                    .iter()
+                    .any(|message| message.text().contains(text))
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_objectives_survive_reopen_and_compaction_without_entering_history() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let root = Utf8Path::from_path(root.path()).expect("utf8");
+        let paths = paths(root);
+        let id = id("objective001");
+        let mut recorder = Recorder::create(&paths, &id).expect("create");
+        assert_eq!(recorder.objective(), None);
+        recorder
+            .user_message("Set a goal to fix this")
+            .expect("prompt");
+        assert_eq!(recorder.objective(), None);
+        assert!(recorder.set_objective(" \n ").is_err());
+        assert_eq!(recorder.store.read().expect("state").len(), 1);
+        recorder.set_objective("superseded").expect("first goal");
+        let objective = "Fix the café parser\nPreserve \"quoted\" inputs and 日本語";
+        recorder.set_objective(objective).expect("goal");
+        recorder
+            .append(SessionEvent::Compaction {
+                through: 3,
+                summary: "Earlier conversation".to_owned(),
+            })
+            .expect("compaction");
+        std::fs::remove_file(recorder.store.metadata_path()).expect("remove projection");
+        drop(recorder);
+
+        let (recorder, history) = load(&paths, &id).expect("restart");
+        assert_eq!(recorder.objective(), Some(objective));
+        assert_eq!(history.len(), 1);
+        assert_eq!(history.turns()[0].text(), "Set a goal to fix this");
+        assert_eq!(recorder.store.read().expect("state").turns, 0);
+    }
+    #[test]
+    fn objective_budget_usage_survives_compaction_and_resets_only_on_replacement() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let paths = paths(Utf8Path::from_path(root.path()).expect("utf8"));
+        let id = id("budget000001");
+        let mut recorder = Recorder::create(&paths, &id).expect("create");
+        recorder
+            .account_objective_tokens(99)
+            .expect("ordinary prompt");
+        assert_eq!(recorder.objective_budget(), None);
+        assert!(recorder.set_budgeted_objective("work", 0).is_err());
+        assert!(recorder.set_budgeted_objective(" ", 10).is_err());
+        recorder.set_budgeted_objective("work", 30).expect("goal");
+        recorder
+            .account_objective_tokens(15)
+            .expect("first request");
+        recorder
+            .append(SessionEvent::Compaction {
+                through: 2,
+                summary: "Earlier work".to_owned(),
+            })
+            .expect("compaction");
+        drop(recorder);
+        let mut recorder = Recorder::open(&paths, &id).expect("resume");
+        assert_eq!(recorder.objective(), Some("work"));
+        assert_eq!(recorder.objective_budget(), Some((30, 15)));
+        recorder
+            .account_objective_tokens(u64::MAX)
+            .expect("saturating usage");
+        drop(recorder);
+        let mut recorder = Recorder::open(&paths, &id).expect("resume exhausted");
+        assert_eq!(recorder.objective_budget(), Some((30, u64::MAX)));
+        recorder
+            .set_budgeted_objective("new work", 20)
+            .expect("replace");
+        assert_eq!(recorder.objective_budget(), Some((20, 0)));
+        recorder.set_objective("unbudgeted work").expect("replace");
+        recorder
+            .account_objective_tokens(50)
+            .expect("unbudgeted request");
+        drop(recorder);
+        let recorder = Recorder::open(&paths, &id).expect("resume unbudgeted");
+        assert_eq!(recorder.objective(), Some("unbudgeted work"));
+        assert_eq!(recorder.objective_budget(), None);
     }
 }

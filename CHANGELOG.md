@@ -6,6 +6,343 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Added
 
+- Native Rust MCP hosts can complete OAuth through `LoopbackAuthorization`:
+  ephemeral loopback callbacks check generated state and exchange codes with
+  S256 PKCE. Matched callbacks are single-use, including failed exchanges.
+  `OAuthTokenStore` stores bounded tokens atomically in private files bound to
+  resource, issuer, and client, with redacted diagnostics. Hosts supply client
+  registration and browser launch; the CLI does not yet offer OAuth login.
+
+- `/goal --budget <tokens> <objective>` sets an explicit objective token budget.
+  Accounted input/output usage persists across resume and compaction. Conversation
+  requests, retries, delegated children, and summaries stop requesting further
+  model continuation once the budget is exhausted. `/goal` shows usage and
+  remaining tokens; missing provider counts use byte estimates.
+
+- Windows releases use reproducible Deflate ZIP archives containing `rune.exe`.
+  `rune upgrade` verifies and extracts their executable before replacing a
+  stopped target. Windows CI extracts a release, runs its version command,
+  upgrades a disposable old executable, and runs the new version.
+
+- macOS release staging supports certificate-pinned signing with hardened runtime
+  and a secure timestamp. Signed manifests publish the identity, and
+  `cargo xtask verify-release <manifest-path> <certificate SHA-1>` checks the
+  archived signature and rejects tampered code even with recomputed checksums.
+  A manual macOS workflow imports signing credentials into a temporary keychain
+  and uploads verified signed artifacts.
+
+- Release manifests publish the target's uncompressed executable size and hash,
+  raw startup samples and distribution statistics, measurement host and method.
+  `cargo xtask benchmark <executable-path>` repeats the method on an extracted
+  artifact. CI uploads measured native releases for Linux, macOS and Windows.
+
+- Linux shell calls can set `pty: true` for a controlling terminal, send input
+  with `interact`, and resize with paired `rows` and `cols` (initially 24 by 80).
+  PTY output merges stdout and stderr under the existing byte cap. Stop,
+  cancellation, and handle cleanup end the supervised process group; sandbox
+  policy, environment filtering, and resource ceilings still apply.
+
+- ACP accepts inline PNG, JPEG, GIF, and WebP image blocks for the session's
+  selected model, including retries and tool follow-ups. Image advertisement
+  follows dialect support; unsupported dialects return a named `unsupported`
+  error. Prompts accept up to 16 images within the 8 MiB frame cap, validate
+  MIME types and base64, and retain image bytes only during that prompt.
+
+- Node `askStream` exposes ask JSONL events through a pull-based async iterator,
+  including incremental text and a validated final result. Record and combined
+  output byte caps bound buffering; abort, timeout, and early iterator exit stop
+  the subprocess, with SIGKILL after a two-second grace if needed.
+
+- Rust SDK `Agent::diagnostics` exposes effective SDK limits, their configuration
+  layers and host/default origins, dialect capabilities and input provenance.
+  The serializable snapshot makes no network requests and excludes credentials,
+  endpoint URLs, model identifiers, instructions, tools, and conversation data.
+
+- Rust SDK `HostFetch::post_with_context` receives per-attempt cancellation and
+  absolute response-head and total deadlines. Cooperative hosts can stop silent
+  sends and body reads, including when decoding ends before the total deadline.
+  Existing host fetch methods remain compatible.
+
+- Interactive `subagent` calls can select a project role with `agent`, loading
+  instructions and an explicit tool allowlist from `.rune/agents/<name>.json`.
+  Role tools intersect inherited read-only tools and remain subject to parent
+  policy. Unsafe paths, linked definitions, oversized files, and fields that
+  attempt to configure commands or permissions are refused.
+
+- User configuration can define a named `post_tool_hook` observer that receives
+  each finalized tool result once as a bounded, redacted JSON event. Supervised
+  deadlines and cancellation stop hook processes; failures warn without changing
+  tool results. Project files cannot enable the hook.
+
+- User configuration can define a named `pre_tool_hook` command to veto
+  policy-approved tool calls in interactive sessions, ask, review, and delegated
+  children. Vetoes preserve the call/result pair and report the hook's reason.
+  Hook commands use supervised execution with cancellation, a deadline, and
+  bounded output; failures hold the tool call. Project files cannot enable hooks.
+
+- `rune mcp import claude-desktop <file>` prints a validated project config for
+  review from local stdio `mcpServers` entries. It preserves commands, arguments,
+  and environment values without executing commands or writing trust records.
+  Saving the output as `.mcp.json` retains the normal project trust requirement.
+
+- Native Rust MCP hosts can preflight OAuth discovery metadata with
+  `mcp::oauth::ProtectedResourceMetadata`. Resource and issuer identifiers must
+  match exactly; authorization, token, and registration endpoints require HTTPS
+  or loopback HTTP. Validated endpoints are exposed only after all checks pass.
+  Discovery and client registration remain host responsibilities.
+
+- `rune permissions --simulate <file>` dry-runs a recorded JSON sequence of
+  tool names and permission targets. Text and JSON reports preserve call order
+  and name the deciding rule, layer and outcome for every call without executing
+  tools or writing approvals. JSON also shows mode overrides and considered rules.
+
+- `rune review` can use read-only tools in the bounded host loop. The named
+  `read-only review` rule refuses file mutations, shell commands, and skill
+  installation before normal permission evaluation, including in full-access
+  mode. Reads remain subject to the configured policy, and tool results are saved.
+
+- Models can call `syntax_diagnostics` for one Rust file and receive syntax
+  messages with file, line, and column from local `rustfmt`. The checker runs
+  under process supervision with cancellation, a 30-second deadline, resource
+  limits, and bounded output. It leaves files unchanged and skips child modules.
+
+- Models can call `update_plan` to replace a bounded in-memory step plan with
+  pending, in_progress, and completed statuses. Changed snapshots produce
+  versioned status events, including `plan_updated` in `rune ask --jsonl`.
+  Duplicate steps are refused, identical retries keep the version, and workspace
+  files are unchanged. Plans last for the live conversation and reset on reopening.
+
+- `rune ask --image <path>` attaches local PNG, JPEG, GIF, or WebP images to the
+  selected model's user message, including subsequent tool steps. Repeatable
+  attachments are bounded to 16 files and 8 MiB total; oversized input returns
+  `too_large` before upload. Image bytes are retained only for the ask turn.
+
+- `rune usage export` writes retained usage records as stable, versioned JSONL,
+  with an optional `--period` filter. Main, permission review, and vision usage
+  keep their recorded model, timestamp, request counts, and reported values;
+  missing measurements stay absent and cost strings retain their precision.
+
+- `rune session fork <last|id> --at <seq>` creates an independently resumable
+  saved branch through an inclusive event boundary, with recorded provenance.
+  Unanswered tool calls and partial result groups are refused; the original
+  session history and workspace files stay unchanged.
+
+- `/undo preview` shows affected paths and per-file diffs before restoring the
+  session's file changes, without changing file bytes or the mutation journal.
+  Created files and rename paths are included; binary changes show byte counts.
+
+- `/pin <constraint>` and Rust SDK `Agent::pin_constraint` keep explicit user
+  constraints verbatim in subsequent provider requests across repeated
+  compaction and session or checkpoint restoration. `/pin` lists current pins;
+  `/new` starts without them. Pins count toward request capacity.
+
+- Rust workspaces receive a bounded repository symbol map with declaration and
+  lexical reference locations, refreshed before model requests after edits.
+  Ignore rules exclude files; scan and output caps mark incomplete maps.
+  `repository_map_bytes` defaults to 8192 bytes and zero disables the map.
+
+- Rust SDK hosts can call `Agent::compact` with their own synchronous summarizer.
+  It preserves recent tool pairs, provider replay data, usage, and checkpoint
+  restoration. Failed or unusable summaries leave the conversation intact;
+  closed agents and running turns refuse compaction.
+
+- `rune capabilities` checks dialect support for effort, images, tool streaming,
+  fast mode, and routing before a turn, with text or JSON context provenance.
+  Unsupported selections fail preflight and are refused before HTTP requests.
+  Offline checks use configuration and cached capacity without a completion.
+
+- `rune connect ollama` imports a local endpoint without storing a credential.
+  Model discovery uses its native `/api/tags` and `/api/show` endpoints, reports
+  the endpoint and context-field provenance in terminal and JSON listings,
+  and skips remote catalogs. Requests use the existing Chat Completions dialect.
+
+- `rune connect gemini` selects Google's native Generate Content API, using
+  `GEMINI_API_KEY` or `GOOGLE_API_KEY`. Streaming text, function calls and
+  results, thought signatures, reported usage, and cancellation work through
+  the shared transport. The Rust SDK exposes `Dialect::Gemini`.
+
+- User config can explicitly select `anonymous = true` for loopback model
+  endpoints. Connecting, listing models, and completing requests skip credential
+  lookup and storage and omit authentication headers. The Rust SDK provides
+  `Agent::new_anonymous` for the same mode.
+
+- Unix release archives have a documented checksum, install, and uninstall
+  path. CI runs those commands in a disposable prefix, checks the installed
+  version, and verifies that configuration, credentials, and sessions survive
+  unchanged.
+
+- Linux CI requires a live sandbox smoke check that refuses a socket connection
+  while allowing source editing, with working network controls. Missing or
+  unusable isolation fails declared runners and is reported explicitly locally.
+
+- `rune completion bash` generates a script for Bash to complete all declared
+  commands, aliases, global flags, and command flags from the shared command
+  table, including `resume`. Generation needs no configuration or network.
+
+- The shared host turn loop stops before executing a duplicate after three
+  consecutive failures of the same tool name and exact argument string. The
+  `limit_exceeded` error names `max_consecutive_tool_failures`; configure that
+  limit to change the cap or use `off` to disable it.
+
+- `rune ask --jsonl` streams flushed `start`, `text_delta`, and `final` JSON
+  records, with step boundaries and retry resets. Records are bounded to 1 MiB,
+  deltas are split at UTF-8 boundaries, and diagnostics stay on stderr.
+  An oversized final result emits a `too_large` failure and exits 1.
+
+- `rune ask` executes allowed built-in tools through the shared host loop and
+  sends their results in subsequent requests. A positive `max_agent_steps`
+  bounds the turn; otherwise ask uses 16 steps. Cap exhaustion exits 1 with
+  `limit_exceeded`, while JSON reports actual tool statuses and summed usage.
+  Saved exchanges include the tool calls and results.
+
+- CI compares release binaries and archives from two independent clean builds
+  in scratch target directories, failing if either pair of SHA-256 hashes differs.
+
+- CI builds `rune-web` for `wasm32-wasip1` and runs a configured fixture prompt
+  through its exported WASM boundary, checking the provider request, streamed
+  answer, and successful completion without a live provider.
+
+- CI runs `node --test bindings/node/test.mjs` with Node.js 22 on pushes to
+  `main` and pull requests, failing the fast job when the binding contract breaks.
+
+- CI checks the dependency advisory and license policy in `deny.toml` with
+  `cargo deny check` and verifies that scratch policy violations are rejected.
+  The existing `webpki-roots` 1.0.9 trust-store data has a license exception
+  limited to that crate and version.
+
+- The Node binding accepts `provider` and `offline` options for `ask`, passing
+  `--provider <name>` and `--offline` before the command name.
+
+- ACP negotiates protocol version 1 and requires compatible initialization
+  before session methods can run. Unsupported versions receive the supported
+  version but leave sessions blocked until a version 1 retry; malformed versions
+  and repeated initialization after success receive explicit protocol errors.
+
+- ACP bounds unanswered client permission requests with
+  `acp_permission_timeout_ms` (120000 ms by default). Expiry returns a `timeout`
+  prompt error without executing the tool; later prompts still work on the same
+  connection and late approvals are ignored.
+
+- `rune mcp check [server] [--json]` reports negotiated protocol, discovered
+  tool names, warnings, timeouts and timeout outcomes without a model request.
+  It respects project trust and offline settings, closes connections, and exits
+  unsuccessfully when a selected server cannot connect.
+
+- `rune mcp list --json` reports project MCP declarations, transport, trust,
+  enabled/required flags and every eligible server's startup result. Required
+  failures do not hide later servers. Pending and rejected servers stay blocked;
+  offline listing skips remote servers. Reports omit transport secrets and redact
+  configured secret values from startup errors.
+
+- The footer and `/status` label provider-reported context counts distinctly
+  from byte-derived estimates, including before the first response and when a
+  provider omits token usage. Resume estimates retain their saved-history source.
+
+- `/compact preview` reports exact conversation record counts to summarize and
+  retain using the manual compaction plan, without model requests or history
+  changes, including offline sessions.
+
+- `rune session <last|id> --search <text>` searches saved messages, tool records,
+  and summaries, including original records removed from context by compaction.
+  Text and JSON results preserve original event content, sequence positions,
+  schema versions, and timestamps.
+
+- `rune sessions --search <text>` finds case-insensitive literal fragments in
+  current session titles and recorded user messages, with workspace scoping,
+  pagination, and JSON output preserved.
+
+- `rune session export <last|id>` emits stable, ordered JSONL event records with
+  saved schema versions and timestamps, excluding credentials, metadata, and
+  transport headers. Recorded message and tool content is preserved.
+
+- Native turns execute eligible read-only calls at the front of a tool batch
+  concurrently, up to `parallel_tool_calls`. Mutations and subsequent calls run
+  in order after those reads finish. Retained-result readers stay sequential to
+  preserve spill dependencies and the remaining turn budget. Hosts opt in with
+  a thread-safe executor; WebAssembly turns keep executing calls in order.
+
+- `git_diff` inspects staged or unstaged tracked changes under the workspace.
+  Output caps include the view label and truncation marker. Inspection disables
+  external diff commands, text conversion, clean filters, and optional index
+  writes. Partial-clone configurations are refused to prevent implicit fetches;
+  untracked files and submodules are excluded.
+
+- `create_directory` creates nested directories within permitted workspace roots,
+  with policy checks and bounded summaries. Existing directories succeed without
+  changes; files and paths outside permitted roots are refused. Each call creates
+  at most 128 missing directories and accepts paths up to 16 KiB.
+
+- `rename_file` moves a file within permitted workspace roots. Policy checks
+  both paths; existing destinations, symlinks, and directories are refused.
+  A successful rename reports one tool mutation and can be undone with `/undo`.
+
+- `edit_file` accepts an `edits` array of up to 128 literal replacement hunks.
+  Hunks run in order against earlier results and commit in one atomic write.
+  A missing or ambiguous hunk leaves the entire file unchanged and returns a
+  repair hint identifying the failed hunk. Single-replacement calls still work.
+
+- Provider retries show the next attempt, attempt limit, and pending delay in
+  the existing terminal status row. The delay disappears when the retry starts.
+
+- In the transcript viewer, Tab/Shift-Tab selects a tool and Space collapses or
+  expands its preview. Requested expansions show up to 16 KiB and 200 wrapped
+  content rows, preserving surrounding entries and the composer draft.
+
+- `/help` lists active composer, menu, and transcript bindings, cancellation
+  precedence, and bracketed paste behavior. Line-input sessions describe their
+  input mode.
+
+- `--ascii`, `RUNE_ASCII=true`, and profile `ascii = true` select ASCII terminal
+  decorations, including code continuations, history previews and prompt echoes.
+  Status, selection markers, and tool summaries stay ASCII; message text keeps Unicode.
+
+- `--theme high-contrast` selects bright themed foregrounds on explicit black,
+  with a documented 7:1 contrast target for every palette pair in truecolor and
+  256-color output. Footer metadata stays bright; `NO_COLOR` suppresses colors.
+
+- `--accessible` provides line input and append-only screen reader transcripts
+  with explicit speaker labels, completed replies, numbered questions, and
+  permission prompts. Saved sessions replay in the same format without cursor
+  movement or rewritten status rows.
+
+- Ctrl-R searches workspace prompt history by a case-insensitive substring.
+  Enter or Tab restores the selected prompt without submitting; cancelling
+  preserves the draft and caret, and restoration is undoable.
+
+- Tab completes workspace paths in idle prompts, quoting spaces and shell
+  metacharacters as one selection. Multiple matches use Up/Down and Tab or
+  Enter; completion stays inside configured workspace roots and is undoable.
+
+- Ctrl-G edits the draft in `VISUAL`, `EDITOR`, or `vi`, then restores terminal
+  input and reloads the saved text. Failed edits preserve the draft and caret.
+
+- Alt-Enter inserts a newline at the composer caret. Enter submits the whole
+  prompt with its newlines preserved.
+- Multiline drafts display on separate rows with the caret on the edited line,
+  including while a turn runs. Tall drafts scroll to keep the caret visible.
+
+- Interactive assistant text is durably journalled before display. After process
+  death, resume restores the partial answer once with an interrupted boundary
+  and leaves the turn unfinished.
+
+- Interactive resume replays saved user and assistant exchanges before the first
+  input, preserving them in terminal scrollback.
+- Ctrl-O opens a scrollable full transcript snapshot, including recorded tool
+  calls and result bodies. Escape or Ctrl-O returns to the same draft and caret.
+- Fenced code preserves indentation and spaces while streaming and in the
+  finished transcript. Long lines wrap with an indented `↪` continuation marker
+  (`>` with `--ascii`);
+  code tabs use eight-column stops and wrapping adapts to terminal resizing.
+- `rune sandbox explain` previews a shell command without executing it, showing
+  the backend, writable roots, network policy, protected paths and their sources.
+  It reports refusal or unsandboxed fallback when enforcement is unavailable.
+
+- CI replays the actual Rune process in Unix PTYs and compares captured grids
+  for long drafts, 12-column output, short menus, and draft resizing. The gate
+  checks caret positions and that narrow output survives in scrollback.
+- Models can read retained tool output with `read_tool_result`, paging by byte
+  offset until EOF. JSON page metadata and escaping fit within the tool cap and
+  the turn's remaining result budget; handles stay scoped to the live conversation.
 - A running turn can be steered from the keyboard. Enter sends what was typed to
   the turn at its next step, Escape twice cancels it, and Control-C clears a
   typed line before cancelling. A cancelled or failed turn ends that exchange
@@ -18,6 +355,21 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Security
 
+- Sandboxed commands protect `.git/config` and hooks in nested repositories
+  throughout the workspace and additional writable roots on Linux and macOS.
+  Normal source files remain writable, and sandbox explanations include these
+  nested protections. Discovery refuses directories it cannot inspect.
+- On macOS, sandboxed commands cannot create a previously absent `.git/hooks`
+  directory in a repository at a writable root. The hooks destination is denied
+  using its resolved `.git` parent; other Git metadata and source files remain
+  writable. Sandbox explanations include the absent hooks destination.
+- On Linux, sandboxed commands cannot create a previously absent `.git/hooks`
+  directory in a repository at a writable root. Its existing `.git` parent
+  stays read-only while hooks are absent, also blocking index and lock writes;
+  source files remain writable. Sandbox explanations report the parent rule.
+- `Endpoint` debug formatting redacts the provider credential.
+- `rune upgrade` creates a unique staging file exclusively, so a preexisting
+  staging symlink cannot overwrite another file or become the installed binary.
 - Commands receive an allowlisted environment and no longer inherit the
   provider credential. They run with CPU, process, and file size ceilings.
 - A sandboxed command can no longer read or write the credential stores under
@@ -27,11 +379,432 @@ Notable changes, newest first. Each entry describes what a user can observe.
   `edit_file` are held to the same roots as reads.
 - A shell rule is judged against every command a line runs, so `ls; rm -rf .git`
   no longer matches an allow for `ls*`.
-- Web fetch checks every redirect hop before following it.
+- Native web fetch checks every redirect hop and its resolved addresses before
+  connecting, then connects only to those vetted addresses. Private destinations
+  still require `allow_private`. Proxy requests are refused unless `NO_PROXY`
+  permits a direct connection, because proxy DNS can bypass address vetting.
+- Web fetch refuses abbreviated private IPv4 addresses such as `127.1`,
+  `127.0.1`, and `10.1` before calling the backend, unless `allow_private` is true.
 - Model output is stripped of terminal control sequences while it streams.
 
 ### Fixed
 
+- The WASM page bridge checks staged response heads and shell replies against
+  `max_bridge_bytes` (default 1 MiB) before allocating or copying host bytes.
+  Oversized replies report a transport error or a failed shell result instead
+  of attempting an unbounded allocation.
+
+- The WASM page bridge rejects body lengths larger than the supplied buffer
+  capacity with an `InvalidData` I/O error before consumers slice the buffer.
+  The failed response handle is released and the page receives a named
+  `transport_failure` error.
+
+- Review test fixtures fail explicitly when Git initialization, staging, or
+  commit setup fails, reporting the command, exit status, stdout, and stderr.
+  A failed initialization can no longer pass as an empty repository test.
+
+- A zero configured `context_window` produces an `invalid_field` diagnostic
+  naming the model's field and is ignored. The session uses the endpoint's
+  reported capacity or the default window instead of a zero-capacity budget.
+
+- Manual and automatic compaction reject summaries stopped at the token limit,
+  even when they contain usable text. An explicit incomplete-summary error keeps
+  the original history intact and blocks the pending automatic request.
+
+- Interactive sessions connect trusted, enabled project stdio MCP servers,
+  advertise their discovered schemas, and execute model calls through the
+  existing permission checks. Startup and calls obey MCP timeouts, cancellation
+  stops pending calls, and session exit terminates the children. Optional startup
+  failures are notices; required failures stop startup.
+
+- Interactive sessions also connect trusted, enabled project HTTP MCP servers
+  online, advertise their schemas, and dispatch calls through permission checks.
+  Offline mode skips HTTP before credential expansion or requests, including
+  loopback endpoints. SSE remains outside the interactive tool surface.
+
+- `vision` uses the profile's `vision_model` with the active provider endpoint
+  and credential in interactive sessions, ask, and ACP. Permitted workspace
+  images reach the host as bounded inline bytes, and their analysis returns to
+  the calling model. Every batch path is checked before upload. Unconfigured
+  and offline runs explicitly advertise vision as unavailable. Session image
+  IDs remain unavailable in this host.
+
+- Interactive sessions and `rune ask` connect `capability_search` and `skill`
+  to discovered workspace and user skills. Search returns declared names and
+  loadable locations; loading returns exact instructions within `skill_file_bytes`
+  and refuses oversized files.
+
+- Interactive `subagent` calls run one synchronous child with separate history
+  and return its result to the parent. Children use only inherited, advertised
+  read-only tools under the parent's permission policy, with at most 16 model
+  steps (or a smaller parent cap) and the configured child-count limit. Project
+  roles can narrow the tool set; child messages and nested delegation remain
+  unavailable.
+
+- `rune ask` honors `provider_max_attempts` through the shared bounded retry
+  policy, including `Retry-After` and configured request deadlines. Rejected
+  credentials stop immediately, and retries do not consume extra model steps.
+
+- `rune ask` includes the resolved instructions from `rune prompt --show` in
+  every request, including workspace rules, system prompt overrides, and
+  configured instruction limits.
+
+- The model picker accepts unknown tagged IDs such as `qwen3:latest` and sends
+  the chosen ID unchanged. Empty and malformed typed IDs are refused.
+
+- Custom-tool permission targets resolve through the executing host's registry,
+  so explicit target denials prevent execution, including when a custom tool
+  replaces a built-in name.
+
+- Session-tree previews and branch summaries escape newlines, control characters,
+  and Unicode line separators, keeping each preview on one logical table row.
+
+- Resuming a session restores `/cost` request counts and saved input/output
+  token totals before a new request, including usage covered by compaction.
+
+- Slash-command completion includes discovered project and user commands, with
+  descriptions and argument hints. Up/Down selects them; Tab or Enter completes
+  a partial name before the existing command expansion for review.
+
+- Settled slash-command output wraps at the terminal width, keeping full
+  `/help` descriptions and other command results available in scrollback.
+
+- Completion menus preserve the selected row across terminal resizes and
+  ignored keys. Editing the draft still resets the selection for new matches.
+
+- Provider JSON failures preserve redacted provider codes and retry delays in
+  structured error detail. `rune ask --json` reports nonempty `error_detail`
+  alongside its existing message and stable error code.
+
+- `RuneError` retains typed I/O causes through cloning and contextual file-write
+  errors. Generic I/O failures report `io_failure` instead of `transport_failure`;
+  filesystem permission denials keep `permission_denied` and their OS cause.
+
+- Cargo and Node package metadata now link to the maintained `AadiXC0DE/Rune`
+  repository. The Node package version is aligned with the Rust workspace;
+  the documented shared version policy and repository links are checked in CI.
+
+- Offline documentation now maps provider, web, remote MCP, local MCP and shell
+  traffic to tested behavior. CLI help and the site describe the same boundary:
+  local MCP children and an explicitly permitted unsandboxed shell fallback
+  retain network access. Offline mode is not a process-wide network filter.
+
+- Startup budget output labels minimum-of-31 measurements and reports raw
+  process latency median and p95 separately from baseline-subtracted work.
+  The existing 5 ms version and 8 ms help work budgets remain unchanged.
+
+- `cargo xtask release` writes valid JSON manifests for channels containing
+  quotes, backslashes, or control characters, preserving their exact values.
+
+- `cargo xtask budget` and `cargo xtask release` read the freshly built binary
+  from `CARGO_TARGET_DIR` when set, including relative paths, instead of using
+  a stale binary under `target/release`.
+
+- The Node binding finds `rune.exe` on Windows `PATH`, including when `bin`
+  or `RUNE_BIN` names `rune`. Exact names and PATH directory order retain priority.
+
+- The Node binding bounds combined child stdout and stderr to 8 MiB by default,
+  configurable with `maxOutputBytes`. Exceeding the cap discards captured output,
+  kills the child, and raises `RuneOutputLimitError` with code `OUTPUT_LIMIT`.
+
+- The Node binding validates every required ask-result field, nested token counts
+  and tool calls before returning JSON results. A clean exit with an incomplete
+  or mistyped result raises `RuneOutputError` naming missing or invalid fields.
+
+- The Node binding rejects nonfinite `timeoutMs` values and delays above
+  2,147,483,647 ms before binary lookup or spawning, without timer overflow
+  warnings. Positive fractional delays and the maximum timer delay remain valid.
+
+- The Node binding resolves explicit relative `bin` paths against `options.cwd`
+  before checking and running the executable. Absolute paths and bare names
+  searched on `PATH` keep their existing behavior.
+
+- SDK turns bound unread events to 1,024 entries. A stalled consumer that fills
+  the queue cancels cooperative provider and tool work and receives an explicit
+  `limit_exceeded` backpressure error with invariant `sdk_event_queue` from
+  `Turn::result()`. Event delivery never blocks shutdown, and queued events
+  remain readable after the failure.
+
+- SDK prompts with default options honor the agent's configured
+  `max_agent_steps` limit. A nonzero `PromptOptions.max_steps` overrides that
+  limit for the turn; zero or `off` in the agent limits still allows unlimited
+  steps.
+
+- SDK checkpoint creation enforces the same `prompt_history_bytes` cap as
+  restoration, returning `too_large` for `checkpoint` instead of bytes that
+  cannot be restored under the same limits. The cap includes JSON metadata
+  and escaping.
+
+- SDK provider requests retry transient failures using the shared retry policy
+  and `provider_max_attempts`, honoring `Retry-After` from the default fetch or
+  a host's `post_with_retry_after`. Closing the agent or dropping the turn
+  interrupts retry delays. Failed attempts consume no extra agent steps and
+  do not enter conversation history or usage totals.
+
+- ACP rejects an entire prompt when any text block has missing or non-string
+  `text`, returning `invalid_params` with the malformed block's field path
+  instead of silently dropping it.
+
+- ACP cancels active provider and tool work when a protocol frame cannot be
+  written or flushed, releases pending permissions, and discards queued prompts.
+  Further input cannot start turns after output fails.
+
+- ACP saves model and reasoning effort selections in the session log and
+  restores them when loading or resuming, including after reconnecting.
+  Older sessions without saved selections use the connection defaults.
+
+- ACP usage updates report the capacity of the model used for that turn after
+  a model switch, using the endpoint's model listing and a conservative fallback
+  when capacity is unavailable. The default model honors its configured window;
+  changes during a turn apply to subsequent turns without affecting other sessions.
+
+- ACP loading and resuming apply the current `additionalDirectories` list
+  alongside configured roots, with shared roots kept once. Earlier client roots
+  are removed, including when the list is omitted, null, or empty. Invalid lists
+  are rejected before replacing the open session.
+
+- ACP session listings sort all matching sessions by most recent activity
+  before applying the listing cap, so directory order cannot hide newer sessions.
+
+- ACP session listings include only sessions whose stored workspace matches
+  the connection's launch workspace, and report that stored cwd. Sessions with
+  no recorded workspace are omitted from listings; direct loading still uses
+  the launch workspace as their fallback.
+
+- ACP connects requested stdio MCP servers when creating, loading, or resuming
+  a session, advertises their tools to the model, and executes approved calls.
+  Servers stay isolated by session and are stopped when no longer in use;
+  startup failures and timeouts are reported instead of silently ignored.
+
+- ACP uses the client-supplied session `cwd` for relative file operations,
+  workspace instructions and skills, and the cwd reported by session listings.
+  The workspace is saved for loading and resuming; an omitted cwd defaults to
+  the process's launch workspace.
+
+- Session event reads stay bounded when a log grows after its size check.
+  Normal and recovery reads report `too_large` for `event_log` with the
+  `log_size` invariant rather than returning a partial log past the size cap.
+
+- Session lock handoffs preserve the new writer's diagnostic record. The
+  previous writer clears its record before releasing the lock.
+
+- Session metadata is replaced atomically after durable event appends. Killing
+  a writer leaves complete old or new metadata; reopening rebuilds the summary
+  from the authoritative event log.
+- A metadata refresh failure after an event sync reports the event as durable
+  with a repair warning. Recording continues without retrying or duplicating
+  the event, and interactive streaming keeps displaying the saved text.
+
+- Setting `parallel_tool_calls = 1` disables parallel tool calls in provider
+  requests for Chat Completions, Responses, and Anthropic Messages.
+
+- Provider endpoint validation rejects empty authorities or hosts, control
+  characters (including leading or trailing newlines), and embedded whitespace
+  before client creation. HTTPS and loopback HTTP endpoints remain accepted.
+
+- Offline provider requests return a nonretryable policy refusal, so generic
+  turn hosts report the refusal immediately without backoff or outbound fetches.
+  Model listing uses the same refusal, with the `permission_denied` error code.
+
+- Steering submitted during a failed provider attempt or its retry delay is
+  included when the next retry request is rebuilt, within the same step.
+
+- Automatic compaction measures the retained tail with instructions, tool schemas,
+  and the output reserve before refusing an oversized request. A large removable
+  prefix can now be summarized when the retained request fits.
+
+- Tool events and transcript summaries use the registered tool's declared
+  activity, so custom Read tools are labelled Reading instead of Running.
+
+- Retained tool results include the truncation marker within the configured
+  byte cap, preserving UTF-8 boundaries. Caps smaller than the marker keep
+  only the portion of the marker that fits.
+
+- Small tool-result previews returned without retention no longer advertise
+  an unreadable handle or a `read_tool_result` instruction.
+
+- Retaining the same tool-result handle again counts its stored bytes once,
+  keeping the session's retained-byte total accurate on replacement.
+
+- `grep_files` checks cancellation between buffered chunks within each file,
+  including oversized lines. Cancelled searches stop before scanning the rest
+  of the file and return a `cancelled` error without partial results.
+
+- `read_file` checks cancellation before file access and between buffered
+  chunks while skipping, collecting, or counting lines, including oversized
+  lines. Cancelled reads return a `cancelled` error without a partial page.
+
+- Tool validation and execution failures preserve their stable error code,
+  message, and diagnostic details, including repair hints, in the model's
+  result and saved session output.
+
+- Built-in tools reject unknown arguments in closed schemas on both direct and
+  registry calls, naming misspelled fields such as `read_file.start_lien`
+  instead of silently using defaults.
+
+- Policy settings writes and updates replace the complete rules file atomically.
+  An interrupted write leaves the old rules intact until replacement; backups
+  and private file permissions are preserved.
+
+- Settings writers recover automatically after a lock holder is killed. The
+  OS releases the lock on process exit; the persistent `.lock` file no longer
+  blocks later writers, while live holders retain the two-second wait limit.
+
+- Invalid legacy project limits, such as `max_agent_steps = 10001`, report
+  an `invalid_field` diagnostic naming the key and accepted range, matching
+  `[limits]` validation while preserving user-selected limits.
+
+- Help for an unknown command, such as `rune help not-real`, exits 1 while
+  preserving the diagnostic and hint. Valid command and top-level help exit 0.
+
+- `rune ask --json` prints a failed request's error once on stderr, followed by
+  its hint when available, while preserving the JSON failure result on stdout.
+
+- `rune tree --id <id>` shows that exact saved session's branch structure without
+  a positional argument, in text or JSON output. The flag takes precedence over
+  a positional selector.
+
+- `rune session --id <id>` inspects that exact saved session without a positional
+  argument, in text or JSON output. The flag takes precedence over a positional
+  inspection selector.
+
+- Declared boolean command flags reject attached values, including empty values.
+  `rune sessions --all=no` reports that `--all` takes no value and exits 1.
+
+- Help and the generated command reference describe the accepted aliases
+  `login`, `setup`, `provider`, `pr`, `issue`, `cost`, `logout`, and `settings`.
+  `logout` behaves like `auth`: without an action it shows connection status;
+  `rune auth logout` removes the stored credential.
+
+- `rune help resume` and `rune resume --help` show usage for resuming a saved
+  session, and the generated command reference includes `resume`.
+
+- Alt-R reapplies an undone composer edit and restores the draft and caret.
+
+- Ctrl-_ undoes the last composer edit and restores the draft and caret,
+  including Unicode grapheme deletions and pasted text.
+
+- Ctrl-Y restores the last text cut with Ctrl-U or Ctrl-K at the caret, leaving
+  the caret after the restored text.
+
+- Short terminals describe the usable compact mode instead of saying to resize
+  to continue while prompts are still accepted.
+
+- Caught worker panics in unwinding builds display one diagnostic through the
+  session renderer without leaving duplicate prompt or status rows. They are
+  reported and saved as internal failures rather than user cancellations.
+
+- `grep_files` searches complete source lines, including matches beyond the retained
+  one MiB head, with bounded display output. Long-line truncation annotations
+  cannot create a match for text absent from the source.
+- Unknown `--permission-mode` values fail with `invalid_field`, list the
+  accepted modes, and exit 1 instead of silently keeping the configured mode.
+- Unknown `--effort` values fail with `invalid_field`, list the accepted
+  efforts, and exit 1 instead of silently keeping the configured effort.
+- `rune workspace clear --json` reports an empty directory list, matching the
+  saved configuration and subsequent `rune workspace list --json` output.
+- `cargo xtask gate` checks formatting and Clippy with warnings denied before
+  running the size and startup budgets and workspace tests.
+- Workspace edits and provider selections honor `RUNE_CONFIG`, preserving
+  unrelated settings in that file and leaving the default config untouched.
+- `rune ask --json` emits one failure object and exits 1 when the prompt is
+  empty or contains only whitespace, including when read from standard input.
+- `rune permissions --explain shell:pwd --json` reports one structured decision
+  with its outcome, deciding rule and source layer. Positional explanations also
+  honor `--json`.
+- `rune tree last` shows the branch structure of the most recent saved session
+  in the current workspace, including JSON output.
+- `rune session last` inspects the most recent saved session in the current
+  workspace, including JSON output, instead of parsing `last` as an exact ID.
+- `rune auth status` reports the same connection status as `rune auth`, including
+  JSON output, and exits successfully.
+- `rune usage` honors `--period` when selecting the reporting interval, while
+  preserving positional periods and the default 24-hour report.
+- CLI sessions automatically compact earlier conversation before sending a model request
+  when its estimate reaches `compaction_trigger_percent`, including after tool results. A failed
+  summary preserves history and stops the pending request.
+- Changing the provider with `--provider` selects its configured model and
+  capacity and discards the previous provider's endpoint and credential variable.
+  Changing the model with `--model` discards the previous model's capacity;
+  overrides naming the same provider or model preserve their settings.
+- Changing the model with `RUNE_MODEL` discards the previous model's declared
+  context window and reports the default capacity and source. An override naming
+  the same model preserves its declared window.
+- Changing the provider with `RUNE_PROVIDER` selects its configured model and
+  declared capacity, falling back to `models.default`. Without either entry,
+  the previous model and capacity are cleared. `RUNE_MODEL` takes precedence.
+- Resumed sessions initialize the context meter from saved usage or history
+  bytes and label the estimate with its source until the next request.
+- README and budget help distinguish the audited 5.40 MiB stripped release
+  build for `x86_64-unknown-linux-gnu` from the enforced 8 MiB binary size ceiling.
+- Concurrent credential updates and removals hold an OS lock across the full
+  update, preserving other provider profiles when multiple processes connect.
+- Credential updates and removals replace the complete file atomically, so
+  interrupting a writer preserves the previous credentials until replacement.
+- Credential updates and removals reject complete serialized files above the
+  64 KiB reader cap before writing, preserving the previous readable file.
+- Long Unicode tool descriptions truncate at a character boundary, so registering
+  a custom tool preserves valid UTF-8 without panicking.
+- Completed shell sessions keep their final output until `interact` or `stop`
+  reads it, even when another command starts. Completed sessions release their
+  running slot, and reading their final output removes the session.
+- The shared agent turn loop retains oversized tool output in the live
+  conversation and returns a bounded preview with a readable retained handle.
+  Both output limits include preview metadata; retained bytes can be retrieved
+  through the store API across turns and compaction.
+- `rune ask` saves completed exchanges with their prompt, reply, and reported
+  usage. JSON reports a resolvable `session_id`; `--no-save` creates no session
+  and keeps the identifier empty.
+- Failed terminal turns save their visible partial answer and failure cause.
+  Resuming retains the answer, and `/tree` shows the failure boundary and code once.
+- Cancelled terminal turns save their visible partial answer and a cancellation
+  boundary. Resuming retains the answer, and `/tree` shows the boundary once.
+- Responses requests now send explicit reasoning effort as `reasoning.effort`.
+  Auto keeps provider defaults.
+- Chat Completions requests now send explicit reasoning effort as
+  `reasoning_effort` to compatible endpoints. Auto keeps provider defaults.
+- Anthropic requests now serialize reasoning effort for models that support
+  manual extended thinking. Auto keeps provider defaults, None disables thinking,
+  and explicit output ceilings bound the thinking budget without being raised.
+- Web fetch and search are disabled by default, matching the documented opt-in.
+  Set `web_tools = true` or `RUNE_WEB_TOOLS=true` to enable them; offline mode
+  still disables both web backends.
+- Offline mode disables sandboxed shell networking even when external access
+  is granted.
+- The user configuration accepts `offline = true` and enforces offline mode
+  without discarding the other settings in the file. `RUNE_OFFLINE` still takes
+  precedence over the file setting.
+- Cancelling a native provider stream releases its socket and reader thread,
+  including when the response body stays silent.
+- Native provider streams enforce `provider_head_timeout_ms` when response
+  headers arrive but the body stays silent, without waiting for the connection
+  to close.
+- Native provider requests enforce `provider_request_timeout_ms` across the
+  response head and streamed body, returning a timeout even while output keeps
+  arriving.
+- Transcript text wraps to fit narrow terminals, preserving long words and
+  their complete endings when finished answers enter scrollback.
+- Completion and model menus shrink to fit the terminal height while keeping
+  the highlighted choice visible. Closing a menu clears its rows without
+  moving the prompt's caret off its row.
+- `rune upgrade` verifies a release tar.gz before extracting its single Rune
+  executable, so upgrading from a staged release installs a runnable binary.
+- Structured questions in terminal sessions now collect choices with the arrow
+  keys and Enter, then send the selected answers to the model. Escape or
+  Control-C cancels the waiting turn; piped sessions still report input unavailable.
+- `rune ask` fails with `unsupported_tool_call` when the provider reports a
+  tool-call finish without a completed call.
+- File permission rules also match normalized absolute and workspace-relative
+  paths, so denying `.env` also denies `./.env` and its absolute workspace path.
+- Long drafts scroll horizontally to keep the caret and the text being edited
+  visible, both at the prompt and while a turn is running.
+- Interactive permission requests display their complete scope and offer Run
+  once or Deny. Escape or Control-C cancels the waiting turn without executing
+  the request.
+- `grep_files` rejects context windows above 1,000 lines with a tool validation
+  error, keeping the session usable instead of aborting on an oversized allocation.
+- Connecting a provider creates Rune's state directory with mode 0700, so a
+  fresh install can start a session with umask 022 or 002.
 - Anthropic sessions send the key in the header Anthropic reads.
 - Streamed tool calls on the Responses API, reasoning replay, retries of
   errors reported mid-stream, `Retry-After`, unrecognized stop reasons, and
@@ -67,13 +840,12 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Changed
 
-- The web tools are on by default. `web_search` and `web_fetch` were registered
-  with a backend that refused every call and were then denied by a built-in rule
-  that nothing could overrule, so both reported that the session had refused them
-  whatever the configuration said. A coding agent that cannot look something up
-  is the odd one out, so reaching the network is now the default and
-  `web_tools = false` turns it off. `offline = true` still refuses everything,
-  including the model.
+- Web tools received working outbound clients and user-level permission rules,
+  so explicitly enabling them could overrule the built-in denial. This release
+  enabled web tools by default; 0.1.16 restores the documented opt-in via
+  `web_tools = true`. `offline = true` refuses provider requests and disables
+  web backends; local MCP processes and unsandboxed commands can still use
+  the network.
 - The site's canonical and Open Graph URLs name `rune.heyaadi.com`.
 
 ## 0.1.13
@@ -308,7 +1080,7 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Added
 
-- `rune ask` for one request, with a JSON result object.
+- `rune ask` for one bounded turn, with a JSON result object.
 - Session persistence: every turn is written to a log, sessions can be listed,
   inspected, resumed, paged, and shown as a branch tree.
 - Recovery of a damaged session into a new one, and a report of the log schema
@@ -331,7 +1103,7 @@ Notable changes, newest first. Each entry describes what a user can observe.
   edits by character and by word.
 - `rune upgrade` and `rune uninstall`, which verify an artifact against a
   checksum before replacing anything.
-- Offline mode, which refuses every outbound request.
+- Offline mode, which refuses provider requests and disables web backends.
 - A generated command reference at `COMMANDS.md`.
 
 ### Changed
@@ -344,7 +1116,7 @@ Notable changes, newest first. Each entry describes what a user can observe.
 ### Fixed
 
 - Offline mode was parsed and never enforced, so a run that asked to stay
-  offline still made requests.
+  offline still made provider requests.
 - The system prompt override was checked for but never read, so writing one had
   no effect.
 - A prompt whose skill catalog was cut was never told anything was omitted.

@@ -394,7 +394,7 @@ mod tests {
         let store = SessionStore::open(&destination).expect("open");
         assert_eq!(store.next_seq(), EventSeq(4));
         assert_eq!(
-            store.append(user("after recovery")).expect("append"),
+            store.append(user("after recovery")).expect("append").seq,
             EventSeq(4)
         );
         assert_eq!(store.read().expect("read").len(), 4);

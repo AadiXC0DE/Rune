@@ -36,6 +36,8 @@ pub enum Activity {
     Delegate,
     /// Asking the user something.
     Interact,
+    /// Updating the live in-memory plan.
+    Plan,
 }
 
 impl Activity {
@@ -52,6 +54,7 @@ impl Activity {
             Self::Network => "network",
             Self::Delegate => "delegate",
             Self::Interact => "interact",
+            Self::Plan => "plan",
         }
     }
 
@@ -74,6 +77,7 @@ impl Activity {
             Self::Network => "Fetching",
             Self::Delegate => "Delegating",
             Self::Interact => "Asking",
+            Self::Plan => "Updating plan",
         }
     }
 
@@ -90,6 +94,7 @@ impl Activity {
             Self::Network => "Fetched",
             Self::Delegate => "Delegated",
             Self::Interact => "Asked",
+            Self::Plan => "Updated plan",
         }
     }
 }
@@ -104,6 +109,8 @@ pub struct ToolOutput {
     /// Bytes the tool produced before any truncation, for the retained-result
     /// accounting.
     pub produced_bytes: u64,
+    /// Changed plan snapshot for the host to report as a status event.
+    pub plan_update: Option<crate::update_plan::PlanUpdate>,
 }
 
 impl ToolOutput {
@@ -115,6 +122,7 @@ impl ToolOutput {
             produced_bytes: text.len() as u64,
             text,
             is_error: false,
+            plan_update: None,
         }
     }
 
@@ -130,7 +138,25 @@ impl ToolOutput {
             produced_bytes: text.len() as u64,
             text,
             is_error: true,
+            plan_update: None,
         }
+    }
+
+    /// Builds a failed result preserving the stable code, message, and detail.
+    ///
+    /// The diagnostic is JSON in the result text, so model requests and saved
+    /// session results carry the same repair hints and observed values without
+    /// requiring a separate event schema.
+    #[must_use]
+    pub fn from_error(error: &rune_core::error::RuneError) -> Self {
+        Self::failure(
+            serde_json::json!({
+                "code": error.code(),
+                "message": error.message(),
+                "detail": error.detail(),
+            })
+            .to_string(),
+        )
     }
 
     /// Returns the result as a model-visible string.
@@ -152,6 +178,10 @@ pub struct ExecutionContext {
     pub additional_roots: Vec<Utf8PathBuf>,
     /// Whether the tool was permitted to reach outside the roots.
     pub external_access: bool,
+    /// Whether a separate user decision allowed private-network web access.
+    pub private_network_access: bool,
+    /// Whether shell network access is disabled, even with external access.
+    pub offline: bool,
     /// Whether a command may run without a sandbox.
     ///
     /// Separate from reaching outside the workspace: a host with no usable
@@ -160,6 +190,10 @@ pub struct ExecutionContext {
     pub allow_unsandboxed: bool,
     /// Per-call byte budget for produced output.
     pub max_output_bytes: usize,
+    /// Retained output from the live conversation, supplied by its owner.
+    result_store: Option<Arc<crate::result_store::Store>>,
+    /// In-memory plan for this conversation, shared by per-call contexts.
+    live_plan: Arc<std::sync::Mutex<crate::update_plan::PlanUpdate>>,
     /// Composite cancellation flag, checked between steps of long work.
     cancelled: Arc<AtomicBool>,
 }
@@ -172,8 +206,12 @@ impl ExecutionContext {
             workspace,
             additional_roots: Vec::new(),
             external_access: false,
+            private_network_access: false,
+            offline: false,
             allow_unsandboxed: false,
             max_output_bytes: 64 * 1024,
+            result_store: None,
+            live_plan: Arc::default(),
             cancelled: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -192,6 +230,20 @@ impl ExecutionContext {
         self
     }
 
+    /// Carries the resolved private-network decision for this call.
+    #[must_use]
+    pub const fn with_private_network_access(mut self, allowed: bool) -> Self {
+        self.private_network_access = allowed;
+        self
+    }
+
+    /// Sets offline mode for shell network policy.
+    #[must_use]
+    pub const fn with_offline(mut self, offline: bool) -> Self {
+        self.offline = offline;
+        self
+    }
+
     /// Allows a command to run where no sandbox backend is available.
     #[must_use]
     pub const fn with_allow_unsandboxed(mut self, allowed: bool) -> Self {
@@ -206,6 +258,33 @@ impl ExecutionContext {
         self
     }
 
+    /// Supplies the conversation's retained output for `read_tool_result`.
+    #[must_use]
+    pub fn with_result_store(mut self, store: Arc<crate::result_store::Store>) -> Self {
+        self.result_store = Some(store);
+        self
+    }
+
+    /// Supplies the conversation-owned live plan for this call.
+    #[must_use]
+    pub fn with_live_plan(
+        mut self,
+        plan: Arc<std::sync::Mutex<crate::update_plan::PlanUpdate>>,
+    ) -> Self {
+        self.live_plan = plan;
+        self
+    }
+
+    pub(crate) fn live_plan(&self) -> &std::sync::Mutex<crate::update_plan::PlanUpdate> {
+        &self.live_plan
+    }
+
+    /// Returns the retained output this call may read.
+    #[must_use]
+    pub fn result_store(&self) -> Option<&crate::result_store::Store> {
+        self.result_store.as_deref()
+    }
+
     /// Returns a copy sharing this context's cancellation flag.
     ///
     /// Used where a host must hand a fresh context to each call while keeping a
@@ -216,8 +295,12 @@ impl ExecutionContext {
             workspace: self.workspace.clone(),
             additional_roots: self.additional_roots.clone(),
             external_access: self.external_access,
+            private_network_access: self.private_network_access,
+            offline: self.offline,
             allow_unsandboxed: self.allow_unsandboxed,
             max_output_bytes: self.max_output_bytes,
+            result_store: self.result_store.clone(),
+            live_plan: Arc::clone(&self.live_plan),
             cancelled: Arc::clone(&self.cancelled),
         }
     }
@@ -319,9 +402,11 @@ pub trait Tool: Send + Sync {
     /// Validates arguments before execution.
     ///
     /// A failure here is returned to the model as a tool error, so a malformed
-    /// call teaches the model rather than ending the turn.
+    /// call teaches the model rather than ending the turn. Checks required
+    /// names and closed objects; argument types are decoded by the tool.
     fn validate(&self, arguments: &serde_json::Value) -> Result<()> {
         let schema = self.input_schema();
+        validate_closed_arguments(arguments, &schema)?;
         let Some(required) = schema.get("required").and_then(serde_json::Value::as_array) else {
             return Ok(());
         };
@@ -338,6 +423,80 @@ pub trait Tool: Send + Sync {
     }
 }
 
+/// Checks closed objects using the advertised fields, including nested objects
+/// and array items. Built-ins also call this before decoding so direct calls
+/// enforce the same contract as registry calls.
+pub(crate) fn validate_closed_arguments(
+    arguments: &serde_json::Value,
+    schema: &serde_json::Value,
+) -> Result<()> {
+    validate_closed_fields(arguments, schema, "")
+}
+
+fn validate_closed_fields(
+    arguments: &serde_json::Value,
+    schema: &serde_json::Value,
+    path: &str,
+) -> Result<()> {
+    let properties = schema
+        .get("properties")
+        .and_then(serde_json::Value::as_object);
+    if schema
+        .get("additionalProperties")
+        .and_then(serde_json::Value::as_bool)
+        == Some(false)
+    {
+        let object = arguments.as_object().ok_or_else(|| {
+            rune_core::error::RuneError::invalid_field(
+                if path.is_empty() { "arguments" } else { path },
+                "the tool expects an object",
+            )
+        })?;
+        for key in object.keys() {
+            if !properties.is_some_and(|fields| fields.contains_key(key)) {
+                let field = if path.is_empty() {
+                    key.clone()
+                } else {
+                    format!("{path}.{key}")
+                };
+                let accepted = properties
+                    .map(|fields| {
+                        fields
+                            .keys()
+                            .map(String::as_str)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    })
+                    .unwrap_or_default();
+                return Err(rune_core::error::RuneError::invalid_field(
+                    &field,
+                    format!("`{field}` is not an argument this tool accepts"),
+                )
+                .with_hint(format!("accepted arguments: {accepted}")));
+            }
+        }
+    }
+    if let Some(object) = arguments.as_object() {
+        for (key, value) in object {
+            if let Some(property) = properties.and_then(|fields| fields.get(key)) {
+                let field = if path.is_empty() {
+                    key.clone()
+                } else {
+                    format!("{path}.{key}")
+                };
+                validate_closed_fields(value, property, &field)?;
+            }
+        }
+    } else if let Some(array) = arguments.as_array()
+        && let Some(items) = schema.get("items")
+    {
+        for (index, value) in array.iter().enumerate() {
+            validate_closed_fields(value, items, &format!("{path}[{index}]"))?;
+        }
+    }
+    Ok(())
+}
+
 /// Largest description a tool may advertise.
 pub const MAX_DESCRIPTION_BYTES: usize = 1024;
 
@@ -348,7 +507,8 @@ pub fn model_spec(tool: &dyn Tool) -> ToolSpec {
     if description.len() > MAX_DESCRIPTION_BYTES {
         // Truncation is explicit rather than silent, because a description cut
         // mid-sentence without a marker looks like a bug in the tool.
-        description.truncate(MAX_DESCRIPTION_BYTES.saturating_sub(16));
+        let end = description.floor_char_boundary(MAX_DESCRIPTION_BYTES.saturating_sub(16));
+        description.truncate(end);
         description.push_str("... [truncated]");
     }
     ToolSpec {
@@ -437,6 +597,7 @@ mod tests {
             Activity::Network,
             Activity::Delegate,
             Activity::Interact,
+            Activity::Plan,
         ];
         for activity in activities {
             assert!(!activity.running_label().is_empty(), "{activity:?}");
@@ -474,6 +635,70 @@ mod tests {
     fn validation_passes_when_every_required_argument_is_present() {
         Echo.validate(&serde_json::json!({ "text": "x" }))
             .expect("valid");
+    }
+
+    #[test]
+    fn open_schemas_continue_to_accept_extra_arguments() {
+        let arguments = serde_json::json!({"text": "x", "extra": true});
+        Echo.validate(&arguments).expect("open by default");
+        for additional in [
+            serde_json::json!(true),
+            serde_json::json!({"type": "boolean"}),
+        ] {
+            let mut schema = Echo.input_schema();
+            schema["additionalProperties"] = additional;
+            validate_closed_arguments(&arguments, &schema).expect("extra fields permitted");
+        }
+    }
+
+    #[test]
+    fn closed_schemas_without_required_fields_still_reject_unknown_arguments() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {"optional": {"type": "string"}},
+            "additionalProperties": false
+        });
+        validate_closed_arguments(&serde_json::json!({}), &schema).expect("optional omitted");
+        validate_closed_arguments(&serde_json::json!({"optional": "value"}), &schema)
+            .expect("known optional field");
+        let err = validate_closed_arguments(&serde_json::json!({"optoinal": "value"}), &schema)
+            .expect_err("unknown optional field");
+        assert_eq!(err.code(), rune_core::error::ErrorCode::InvalidField);
+        assert_eq!(err.detail().field.as_deref(), Some("optoinal"));
+        assert_eq!(err.hint(), Some("accepted arguments: optional"));
+    }
+
+    #[test]
+    fn closed_schemas_without_properties_accept_only_empty_objects() {
+        let schema = serde_json::json!({"type": "object", "additionalProperties": false});
+        validate_closed_arguments(&serde_json::json!({}), &schema).expect("empty object");
+        let err = validate_closed_arguments(&serde_json::json!({"extra": 1}), &schema)
+            .expect_err("no declared properties");
+        assert_eq!(err.detail().field.as_deref(), Some("extra"));
+        for arguments in [
+            serde_json::json!(null),
+            serde_json::json!([]),
+            serde_json::json!(1),
+        ] {
+            let err = validate_closed_arguments(&arguments, &schema).expect_err("object expected");
+            assert_eq!(err.code(), rune_core::error::ErrorCode::InvalidField);
+            assert_eq!(err.detail().field.as_deref(), Some("arguments"));
+        }
+    }
+
+    #[test]
+    fn nested_closed_objects_report_the_unknown_property_path() {
+        let schema = crate::ask_user::AskUserQuestion::unavailable().input_schema();
+        let arguments = serde_json::json!({"questions": [{
+            "question": "Which?",
+            "options": [{"label": "One", "descriptoin": "First"}, {"label": "Two"}]
+        }]});
+        let err = validate_closed_arguments(&arguments, &schema).expect_err("nested typo refused");
+        assert_eq!(
+            err.detail().field.as_deref(),
+            Some("questions[0].options[0].descriptoin")
+        );
+        assert!(err.message().contains("descriptoin"));
     }
 
     #[test]
@@ -604,6 +829,56 @@ mod tests {
             spec.description.ends_with("[truncated]"),
             "truncation was not marked"
         );
+    }
+
+    #[test]
+    fn unicode_descriptions_register_and_serialize_at_character_boundaries() {
+        struct UnicodeTool {
+            text: &'static str,
+        }
+        impl Tool for UnicodeTool {
+            fn name(&self) -> &'static str {
+                "unicode"
+            }
+            fn description(&self) -> &'static str {
+                self.text
+            }
+            fn input_schema(&self) -> serde_json::Value {
+                serde_json::json!({ "type": "object" })
+            }
+            fn activity(&self) -> Activity {
+                Activity::Read
+            }
+            fn call(
+                &self,
+                _arguments: &serde_json::Value,
+                _context: &ExecutionContext,
+            ) -> Result<ToolOutput> {
+                Ok(ToolOutput::success("ok"))
+            }
+        }
+
+        for (character, retained) in [("é", 503), ("€", 335), ("🦀", 251)] {
+            let text = Box::leak(format!("a{}", character.repeat(600)).into_boxed_str());
+            let mut registry = crate::registry::Registry::new();
+            registry
+                .insert(Box::new(UnicodeTool { text }))
+                .expect("register Unicode description without panicking");
+            let specs = registry.all_schemas();
+            let spec = &specs[0];
+            assert_eq!(
+                spec.description,
+                format!("a{}... [truncated]", character.repeat(retained))
+            );
+            assert!(spec.description.len() <= MAX_DESCRIPTION_BYTES);
+            rune_core::tool::validate_tool_spec(spec).expect("valid tool schema");
+
+            let bytes = serde_json::to_vec(&specs).expect("serialize tool schemas");
+            std::str::from_utf8(&bytes).expect("valid UTF-8 JSON");
+            let decoded: Vec<ToolSpec> =
+                serde_json::from_slice(&bytes).expect("deserialize tool schemas");
+            assert_eq!(decoded, specs);
+        }
     }
 
     #[test]

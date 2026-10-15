@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 
 use rune_core::error::{ErrorCode, Result, RuneError};
 
-use crate::contract::{Activity, ExecutionContext, Tool, ToolOutput};
+use crate::contract::{Activity, ExecutionContext, Tool, ToolOutput, validate_closed_arguments};
 
 /// Fewest options a question may offer.
 pub const MIN_OPTIONS: usize = 2;
@@ -316,6 +316,7 @@ impl Tool for AskUserQuestion {
         context: &ExecutionContext,
     ) -> Result<ToolOutput> {
         context.check_cancelled()?;
+        validate_closed_arguments(arguments, &self.input_schema())?;
         let questions = decode_questions(arguments)?;
 
         match self.answerer.ask(&questions, context) {

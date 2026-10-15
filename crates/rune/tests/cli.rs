@@ -60,6 +60,92 @@ fn version_prints_one_line_and_exits_zero() {
 }
 
 #[test]
+fn ask_selects_native_gemini_from_configuration_and_environment_credentials() {
+    use std::io::{BufRead as _, Read as _, Write as _};
+    use std::time::{Duration, Instant};
+
+    let frame = serde_json::json!({"candidates": [{"content": {"role": "model", "parts": [{"text": "native answer"}]}, "finishReason": "STOP"}], "usageMetadata": {"promptTokenCount": 5, "candidatesTokenCount": 2}});
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    listener.set_nonblocking(true).expect("nonblocking");
+    let address = listener.local_addr().expect("address");
+    let server = std::thread::spawn(move || {
+        let started = Instant::now();
+        let mut stream = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break stream,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(started.elapsed() < Duration::from_secs(10), "no request");
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("accept: {error}"),
+            }
+        };
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("read timeout");
+        stream
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .expect("write timeout");
+        let mut reader = std::io::BufReader::new(&mut stream);
+        let mut line = String::new();
+        reader.read_line(&mut line).expect("request line");
+        assert_eq!(
+            line,
+            "POST /v1beta/models/gemini-fixture:streamGenerateContent?alt=sse HTTP/1.1\r\n"
+        );
+        let mut length = 0;
+        let mut authenticated = false;
+        loop {
+            line.clear();
+            assert!(reader.read_line(&mut line).expect("header") > 0);
+            if line == "\r\n" {
+                break;
+            }
+            if let Some((name, value)) = line.split_once(':') {
+                assert!(!name.eq_ignore_ascii_case("authorization"));
+                if name.eq_ignore_ascii_case("content-length") {
+                    length = value.trim().parse().expect("length");
+                }
+                if name.eq_ignore_ascii_case("x-goog-api-key") {
+                    assert_eq!(value.trim(), "fixture-key");
+                    authenticated = true;
+                }
+            }
+        }
+        assert!(authenticated);
+        let mut body = vec![0; length];
+        reader.read_exact(&mut body).expect("body");
+        drop(reader);
+        let response = format!("data: {frame}\n\n");
+        write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}", response.len()).expect("response");
+        serde_json::from_slice::<serde_json::Value>(&body).expect("request JSON")
+    });
+    let dir = tempfile::tempdir().expect("isolated state");
+    let output = Command::new(binary())
+        .env_clear()
+        .env("HOME", dir.path())
+        .env("RUNE_HOME", dir.path().join("state"))
+        .env("XDG_CONFIG_HOME", dir.path().join("config"))
+        .env("XDG_DATA_HOME", dir.path().join("data"))
+        .env("RUNE_PROVIDER", "google")
+        .env("RUNE_BASE_URL", format!("http://{address}/v1beta"))
+        .env("RUNE_MODEL", "gemini-fixture")
+        .env("GEMINI_API_KEY", "fixture-key")
+        .current_dir(dir.path())
+        .args(["ask", "--json", "hello"])
+        .output()
+        .expect("ask");
+    assert!(output.status.success(), "{output:?}");
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).expect("result");
+    assert_eq!(result["output"], "native answer");
+    assert_eq!(result["usage"]["input_tokens"], 5);
+    assert_eq!(result["usage"]["output_tokens"], 2);
+    let body = server.join().expect("native fixture");
+    assert_eq!(body["contents"][0]["role"], "user");
+    assert!(body.get("messages").is_none());
+}
+
+#[test]
 fn version_short_flag_matches_long_flag() {
     assert_eq!(run(&["-v"]).stdout, run(&["--version"]).stdout);
     assert_eq!(run(&["version"]).stdout, run(&["--version"]).stdout);
@@ -89,10 +175,192 @@ fn help_for_one_command_shows_its_usage() {
 }
 
 #[test]
-fn help_for_an_unknown_command_says_so() {
-    let out = run(&["help", "frobnicate"]);
-    assert!(out.stdout.contains("frobnicate"));
-    assert!(out.stdout.contains("rune help"));
+fn completion_prints_only_a_script_without_loading_paths_or_config() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let config = dir.path().join("broken.toml");
+    std::fs::write(&config, "invalid toml [[").expect("write config");
+    let output = Command::new(binary())
+        .args(["completion", "bash"])
+        .env("RUNE_HOME", "relative-path-is-invalid")
+        .env("RUNE_CONFIG", config)
+        .output()
+        .expect("run completion");
+    assert!(output.status.success(), "{output:?}");
+    assert!(output.stderr.is_empty(), "{output:?}");
+    let script = String::from_utf8(output.stdout).expect("utf8");
+    assert!(script.starts_with("# Generated by rune completion bash."));
+    assert!(script.ends_with("complete -F _rune_complete rune\n"));
+    assert!(script.contains("resume"));
+}
+
+#[test]
+fn completion_rejects_missing_unsupported_and_extra_shell_arguments() {
+    for args in [
+        &["completion"][..],
+        &["completion", "fish"][..],
+        &["completion", "bash", "extra"][..],
+    ] {
+        let output = run(args);
+        assert_eq!(output.status, Some(1), "{args:?}");
+        assert!(output.stdout.is_empty(), "{}", output.stdout);
+        assert!(output.stderr.contains("shell"), "{}", output.stderr);
+        assert!(output.stderr.contains("rune completion bash"));
+    }
+    let help = run(&["completion", "--help"]);
+    assert_eq!(help.status, Some(0));
+    assert!(help.stdout.contains("rune completion bash"));
+}
+
+#[test]
+fn resume_help_and_reference_document_the_same_usage() {
+    let usage = "rune resume [last|id]";
+    let help = run(&["help", "resume"]);
+    assert_eq!(help.status, Some(0), "{}", help.stderr);
+    assert!(help.stderr.is_empty(), "{}", help.stderr);
+    assert!(help.stdout.contains(usage), "{}", help.stdout);
+    assert!(help.stdout.contains("latest in this workspace"));
+
+    for args in [
+        &["resume", "--help"][..],
+        &["resume", "-h"][..],
+        &["--help", "resume"][..],
+    ] {
+        let out = run(args);
+        assert_eq!(out.status, Some(0), "{args:?}: {}", out.stderr);
+        assert!(out.stderr.is_empty(), "{}", out.stderr);
+        assert_eq!(out.stdout, help.stdout, "{args:?}");
+    }
+
+    let reference = run(&["reference"]);
+    assert_eq!(reference.status, Some(0), "{}", reference.stderr);
+    assert!(reference.stderr.is_empty(), "{}", reference.stderr);
+    assert!(reference.stdout.contains(&format!("### `{usage}`")));
+    assert!(run(&["help"]).stdout.contains("  resume "));
+}
+
+#[test]
+fn accepted_aliases_are_documented_in_help_and_reference() {
+    let reference = run(&["reference"]);
+    assert_eq!(reference.status, Some(0), "{}", reference.stderr);
+    assert!(reference.stderr.is_empty(), "{}", reference.stderr);
+
+    for (alias, canonical) in [
+        ("login", "connect"),
+        ("setup", "connect"),
+        ("provider", "connect"),
+        ("pr", "review"),
+        ("issue", "review"),
+        ("cost", "usage"),
+        ("logout", "auth"),
+        ("settings", "config"),
+    ] {
+        let help = run(&["help", alias]);
+        assert_eq!(help.status, Some(0), "{alias}: {}", help.stderr);
+        assert!(help.stderr.is_empty(), "{alias}: {}", help.stderr);
+        assert_eq!(help.stdout, run(&["help", canonical]).stdout, "{alias}");
+        assert!(help.stdout.contains(alias), "{alias}: {}", help.stdout);
+        for args in [
+            &[alias, "--help"][..],
+            &[alias, "-h"][..],
+            &["--help", alias][..],
+        ] {
+            let out = run(args);
+            assert_eq!(out.status, Some(0), "{args:?}: {}", out.stderr);
+            assert!(out.stderr.is_empty(), "{args:?}: {}", out.stderr);
+            assert_eq!(out.stdout, help.stdout, "{args:?}");
+        }
+
+        let section = reference
+            .stdout
+            .split("### ")
+            .find(|section| section.starts_with(&format!("`rune {canonical} ")))
+            .expect("canonical reference entry");
+        assert!(section.contains(&format!("`{alias}`")), "{section}");
+        assert!(
+            section.contains(&format!("Same as `rune {canonical}`")),
+            "{section}"
+        );
+        if alias == "logout" {
+            for text in [&help.stdout, section] {
+                assert!(
+                    text.contains("without an action, shows connection status"),
+                    "{text}"
+                );
+                assert!(text.contains("rune auth logout"), "{text}");
+            }
+        }
+    }
+}
+
+#[test]
+fn logout_alias_shows_status_until_given_a_logout_action() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = camino::Utf8Path::from_path(dir.path()).expect("utf8");
+    let paths = rune_core::paths::Paths {
+        state_root: root.join("state"),
+        config_root: root.join("config/rune"),
+        data_root: root.join("data/rune"),
+    };
+    rune_net::auth::store(&paths, "anthropic", "alias-test-credential").expect("store credential");
+    for args in [
+        &["auth", "--json"][..],
+        &["logout", "--json"][..],
+        &["logout", "status", "--json"][..],
+    ] {
+        let out = config_mutation_command(root)
+            .env("RUNE_PROVIDER", "anthropic")
+            .args(args)
+            .output()
+            .expect("auth status");
+        assert!(out.status.success(), "{args:?}: {out:?}");
+        assert!(out.stderr.is_empty(), "{out:?}");
+        let value: serde_json::Value = serde_json::from_slice(&out.stdout).expect("valid json");
+        assert_eq!(value["provider"], "anthropic");
+        assert!(value.get("removed").is_none(), "{value}");
+        assert_eq!(
+            rune_net::auth::stored_providers(&paths).expect("stored providers"),
+            vec!["anthropic"]
+        );
+    }
+    let out = config_mutation_command(root)
+        .env("RUNE_PROVIDER", "anthropic")
+        .args(["logout", "logout", "--json"])
+        .output()
+        .expect("logout action");
+    assert!(out.status.success(), "{out:?}");
+    assert!(out.stderr.is_empty(), "{out:?}");
+    let value: serde_json::Value = serde_json::from_slice(&out.stdout).expect("valid json");
+    assert_eq!(value["removed"], true);
+    assert!(
+        rune_net::auth::stored_providers(&paths)
+            .expect("stored providers")
+            .is_empty()
+    );
+}
+
+#[test]
+fn help_for_an_unknown_command_fails_with_a_hint() {
+    for args in [
+        &["help", "not-real"][..],
+        &["--help", "not-real"][..],
+        &["-h", "not-real"][..],
+    ] {
+        let out = run(args);
+        assert_eq!(out.status, Some(1), "{args:?}: {}", out.stdout);
+        assert!(out.stdout.contains("`not-real` is not a command"));
+        assert!(out.stdout.contains("run `rune help` to list the commands"));
+        assert!(out.stderr.is_empty(), "{args:?}: {}", out.stderr);
+    }
+}
+
+#[test]
+fn top_level_help_forms_exit_zero() {
+    for args in [&["help"][..], &["--help"][..], &["-h"][..]] {
+        let out = run(args);
+        assert_eq!(out.status, Some(0), "{args:?}: {}", out.stderr);
+        assert!(out.stdout.contains("Usage:"), "{args:?}: {}", out.stdout);
+        assert!(out.stderr.is_empty(), "{args:?}: {}", out.stderr);
+    }
 }
 
 #[test]
@@ -112,10 +380,551 @@ fn unknown_global_flag_fails_before_loading_configuration() {
 }
 
 #[test]
+fn unknown_effort_fails_with_the_accepted_values() {
+    for args in [
+        vec!["--effort", "banana", "config"],
+        vec!["--effort=banana", "config"],
+        vec!["config", "--effort", "banana"],
+        vec!["config", "--effort=banana", "--json"],
+    ] {
+        let out = run(&args);
+        assert_eq!(out.status, Some(1), "{args:?}: {}", out.stderr);
+        assert!(out.stdout.is_empty(), "{}", out.stdout);
+        for expected in [
+            "invalid_field",
+            "--effort",
+            "banana",
+            "auto, none, minimal, low, medium, high, xhigh, max",
+        ] {
+            assert!(out.stderr.contains(expected), "{}", out.stderr);
+        }
+    }
+}
+
+#[test]
 fn missing_flag_value_is_reported_as_a_missing_field() {
     let out = run(&["--model"]);
     assert_eq!(out.status, Some(1));
     assert!(out.stderr.contains("requires a value"), "{}", out.stderr);
+}
+
+#[test]
+fn declared_boolean_flags_with_attached_values_fail() {
+    for (command, token, flag) in [
+        ("sessions", "--all=no", "--all"),
+        ("sessions", "--all=", "--all"),
+        ("sessions", "--all=true", "--all"),
+        ("sessions", "--json=false", "--json"),
+        ("ask", "--no-save=no", "--no-save"),
+        ("config", "--explain=no", "--explain"),
+    ] {
+        let out = run(&[command, token]);
+        assert_eq!(out.status, Some(1), "{command} {token}: {}", out.stderr);
+        assert!(out.stdout.is_empty(), "{}", out.stdout);
+        assert!(out.stderr.contains("invalid_field"), "{}", out.stderr);
+        assert!(
+            out.stderr.contains(&format!("`{flag}` takes no value")),
+            "{}",
+            out.stderr
+        );
+    }
+}
+
+#[test]
+fn session_last_inspects_the_saved_session_in_the_current_workspace() {
+    use camino::Utf8PathBuf;
+    use rune_core::{id::SessionId, paths::Paths};
+    use rune_session::{SessionEvent, SessionStore};
+
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let root = Utf8PathBuf::from_path_buf(dir.path().canonicalize().expect("canonical tempdir"))
+        .expect("utf-8 path");
+    let paths = Paths {
+        state_root: root.join("state"),
+        config_root: root.join("config/rune"),
+        data_root: root.join("data/rune"),
+    };
+    let workspaces = [root.join("one"), root.join("two")];
+    let ids = ["sessionws001", "sessionws002"];
+    for (workspace, raw) in workspaces.iter().zip(ids) {
+        std::fs::create_dir(workspace).expect("workspace");
+        let id: SessionId = raw.parse().expect("session id");
+        let store = SessionStore::create(&paths, &id).expect("create session");
+        store
+            .append(SessionEvent::WorkspaceSet {
+                workspace: workspace.to_string(),
+            })
+            .expect("save workspace");
+        store
+            .append(SessionEvent::UserMessage {
+                text: "saved prompt".into(),
+            })
+            .expect("save message");
+    }
+
+    for (workspace, raw) in workspaces.iter().zip(ids) {
+        let command = || {
+            let mut command = Command::new(binary());
+            command
+                .current_dir(workspace)
+                .env("RUNE_HOME", &paths.state_root)
+                .env("XDG_CONFIG_HOME", root.join("config"))
+                .env("XDG_DATA_HOME", root.join("data"));
+            command
+        };
+        for selector in ["last", ids[0], ids[1]] {
+            let out = command()
+                .args(["session", selector, "--json"])
+                .output()
+                .expect("run binary");
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert!(out.stderr.is_empty());
+            let value: serde_json::Value = serde_json::from_slice(&out.stdout).expect("valid json");
+            assert_eq!(value["id"], if selector == "last" { raw } else { selector });
+            assert_eq!(value["events"], 2);
+        }
+        let out = command()
+            .args(["session", "last"])
+            .output()
+            .expect("run binary");
+        assert!(out.status.success());
+        assert!(out.stderr.is_empty());
+        assert!(String::from_utf8_lossy(&out.stdout).contains(raw));
+    }
+}
+
+#[test]
+fn session_id_flag_inspects_the_exact_saved_session() {
+    use camino::Utf8PathBuf;
+    use rune_core::{id::SessionId, paths::Paths};
+    use rune_session::{SessionEvent, SessionStore};
+
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let root = Utf8PathBuf::from_path_buf(dir.path().canonicalize().expect("canonical tempdir"))
+        .expect("utf-8 path");
+    let paths = Paths {
+        state_root: root.join("state"),
+        config_root: root.join("config/rune"),
+        data_root: root.join("data/rune"),
+    };
+    let workspaces = [root.join("one"), root.join("two")];
+    let ids = ["sessionws001", "sessionws002"];
+    for (workspace, raw) in workspaces.iter().zip(ids) {
+        std::fs::create_dir(workspace).expect("workspace");
+        let id: SessionId = raw.parse().expect("session id");
+        let store = SessionStore::create(&paths, &id).expect("create session");
+        store
+            .append(SessionEvent::WorkspaceSet {
+                workspace: workspace.to_string(),
+            })
+            .expect("save workspace");
+        store
+            .append(SessionEvent::UserMessage {
+                text: format!("saved prompt for {raw}"),
+            })
+            .expect("save message");
+    }
+
+    for args in [
+        vec!["session", "--id", ids[1]],
+        vec!["session", "--id=sessionws002"],
+        vec!["session", "last", "--id", ids[1]],
+        vec!["session", ids[0], "--id", ids[1]],
+    ] {
+        for json in [false, true] {
+            let mut command = Command::new(binary());
+            command.args(&args);
+            if json {
+                command.arg("--json");
+            }
+            let out = command
+                .current_dir(&workspaces[0])
+                .env("RUNE_HOME", &paths.state_root)
+                .env("XDG_CONFIG_HOME", root.join("config"))
+                .env("XDG_DATA_HOME", root.join("data"))
+                .output()
+                .expect("run binary");
+            assert!(
+                out.status.success(),
+                "{args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert!(out.stderr.is_empty());
+            if json {
+                let value: serde_json::Value =
+                    serde_json::from_slice(&out.stdout).expect("valid json");
+                assert_eq!(value["id"], ids[1]);
+                assert_eq!(value["events"], 2);
+            } else {
+                let text = String::from_utf8_lossy(&out.stdout);
+                assert!(text.contains(ids[1]), "{text}");
+                let id: SessionId = ids[1].parse().expect("session id");
+                assert!(text.contains(paths.session_dir(&id).as_str()), "{text}");
+            }
+        }
+    }
+}
+
+#[test]
+fn session_last_without_saved_sessions_reports_not_found() {
+    let out = run(&["session", "last", "--json"]);
+    assert_eq!(out.status, Some(1));
+    assert!(out.stdout.is_empty(), "{}", out.stdout);
+    assert!(out.stderr.contains("not_found"), "{}", out.stderr);
+    assert!(
+        out.stderr.contains("no session has been saved yet"),
+        "{}",
+        out.stderr
+    );
+}
+
+#[test]
+fn session_inspection_still_requires_a_valid_selector() {
+    for (args, error) in [
+        (vec!["session", "--json"], "missing_field"),
+        (vec!["session", "bad", "--json"], "invalid_field"),
+        (vec!["session", "--id"], "missing_field"),
+        (vec!["session", "--id", "bad", "--json"], "invalid_field"),
+        (vec!["session", "--id=last", "--json"], "invalid_field"),
+        (vec!["session", "--id=sessionws001", "--json"], "not_found"),
+        (
+            vec!["session", "last", "--id=bad", "--json"],
+            "invalid_field",
+        ),
+    ] {
+        let out = run(&args);
+        assert_eq!(out.status, Some(1));
+        assert!(out.stdout.is_empty(), "{}", out.stdout);
+        assert!(out.stderr.contains(error), "{}", out.stderr);
+    }
+}
+
+#[test]
+fn tree_last_reports_the_saved_branch_structure_in_the_current_workspace() {
+    use camino::Utf8PathBuf;
+    use rune_core::{id::SessionId, paths::Paths};
+    use rune_session::{SessionEvent, SessionStore};
+
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let root = Utf8PathBuf::from_path_buf(dir.path().canonicalize().expect("canonical tempdir"))
+        .expect("utf-8 path");
+    let paths = Paths {
+        state_root: root.join("state"),
+        config_root: root.join("config/rune"),
+        data_root: root.join("data/rune"),
+    };
+    let workspaces = [root.join("one"), root.join("two")];
+    let ids = ["sessionws001", "sessionws002"];
+    for ((workspace, raw), turns) in workspaces.iter().zip(ids).zip([1_u64, 2]) {
+        std::fs::create_dir(workspace).expect("workspace");
+        let id: SessionId = raw.parse().expect("session id");
+        let store = SessionStore::create(&paths, &id).expect("create session");
+        store
+            .append(SessionEvent::WorkspaceSet {
+                workspace: workspace.to_string(),
+            })
+            .expect("save workspace");
+        for turn in 1..=turns {
+            store
+                .append(SessionEvent::UserMessage {
+                    text: "saved prompt".into(),
+                })
+                .expect("save prompt");
+            store
+                .append(SessionEvent::AssistantMessage {
+                    turn,
+                    text: "saved reply".into(),
+                })
+                .expect("save reply");
+        }
+    }
+
+    for (workspace, raw) in workspaces.iter().zip(ids) {
+        let command = || {
+            let mut command = Command::new(binary());
+            command
+                .current_dir(workspace)
+                .env("RUNE_HOME", &paths.state_root)
+                .env("XDG_CONFIG_HOME", root.join("config"))
+                .env("XDG_DATA_HOME", root.join("data"));
+            command
+        };
+        for selector in [None, Some("last"), Some(ids[0]), Some(ids[1])] {
+            let out = command()
+                .arg("tree")
+                .args(selector)
+                .arg("--json")
+                .output()
+                .expect("run binary");
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert!(out.stderr.is_empty());
+            let value: serde_json::Value = serde_json::from_slice(&out.stdout).expect("valid json");
+            let expected_id = match selector {
+                None | Some("last") => raw,
+                Some(id) => id,
+            };
+            let nodes = if expected_id == ids[0] { 2 } else { 4 };
+            assert_eq!(
+                value,
+                serde_json::json!({
+                    "session": expected_id,
+                    "active_branch": "main",
+                    "branches": [{
+                        "name": "main",
+                        "turns": nodes,
+                        "head": nodes,
+                        "diverges_at": null,
+                    }],
+                    "turns": nodes,
+                })
+            );
+        }
+        let out = command()
+            .args(["tree", "last"])
+            .output()
+            .expect("run binary");
+        assert!(out.status.success());
+        assert!(out.stderr.is_empty());
+        let text = String::from_utf8_lossy(&out.stdout);
+        for expected in [raw, "main", "saved prompt", "saved reply"] {
+            assert!(text.contains(expected), "{text}");
+        }
+    }
+}
+
+#[test]
+fn tree_id_flag_reports_the_exact_saved_sessions_branch_structure() {
+    use camino::Utf8PathBuf;
+    use rune_core::{id::SessionId, paths::Paths};
+    use rune_session::{SessionEvent, SessionStore};
+
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let root = Utf8PathBuf::from_path_buf(dir.path().canonicalize().expect("canonical tempdir"))
+        .expect("utf-8 path");
+    let paths = Paths {
+        state_root: root.join("state"),
+        config_root: root.join("config/rune"),
+        data_root: root.join("data/rune"),
+    };
+    let workspaces = [root.join("one"), root.join("two")];
+    let ids = ["sessionws001", "sessionws002"];
+    for ((workspace, raw), turns) in workspaces.iter().zip(ids).zip([1_u64, 2]) {
+        std::fs::create_dir(workspace).expect("workspace");
+        let id: SessionId = raw.parse().expect("session id");
+        let store = SessionStore::create(&paths, &id).expect("create session");
+        store
+            .append(SessionEvent::WorkspaceSet {
+                workspace: workspace.to_string(),
+            })
+            .expect("save workspace");
+        for turn in 1..=turns {
+            store
+                .append(SessionEvent::UserMessage {
+                    text: format!("saved prompt for {raw}"),
+                })
+                .expect("save prompt");
+            store
+                .append(SessionEvent::AssistantMessage {
+                    turn,
+                    text: format!("saved reply for {raw}"),
+                })
+                .expect("save reply");
+        }
+    }
+
+    for args in [
+        vec!["tree", "--id", ids[1]],
+        vec!["tree", "--id=sessionws002"],
+        vec!["tree", "last", "--id", ids[1]],
+        vec!["tree", ids[0], "--id", ids[1]],
+    ] {
+        for json in [false, true] {
+            let mut command = Command::new(binary());
+            command.args(&args);
+            if json {
+                command.arg("--json");
+            }
+            let out = command
+                .current_dir(&workspaces[0])
+                .env("RUNE_HOME", &paths.state_root)
+                .env("XDG_CONFIG_HOME", root.join("config"))
+                .env("XDG_DATA_HOME", root.join("data"))
+                .output()
+                .expect("run binary");
+            assert!(
+                out.status.success(),
+                "{args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert!(out.stderr.is_empty());
+            if json {
+                let value: serde_json::Value =
+                    serde_json::from_slice(&out.stdout).expect("valid json");
+                assert_eq!(
+                    value,
+                    serde_json::json!({
+                        "session": ids[1],
+                        "active_branch": "main",
+                        "branches": [{
+                            "name": "main",
+                            "turns": 4,
+                            "head": 4,
+                            "diverges_at": null,
+                        }],
+                        "turns": 4,
+                    })
+                );
+            } else {
+                let text = String::from_utf8_lossy(&out.stdout);
+                for expected in [ids[1], "main", "saved prompt", "saved reply"] {
+                    assert!(text.contains(expected), "{text}");
+                }
+                assert!(!text.contains(ids[0]), "{text}");
+            }
+        }
+    }
+}
+
+#[test]
+fn tree_id_flag_requires_a_valid_exact_identifier() {
+    for (args, error) in [
+        (vec!["tree", "--id"], "missing_field"),
+        (vec!["tree", "--id", "bad", "--json"], "invalid_field"),
+        (vec!["tree", "--id=last", "--json"], "invalid_field"),
+        (vec!["tree", "--id=sessionws001", "--json"], "not_found"),
+        (vec!["tree", "last", "--id=bad", "--json"], "invalid_field"),
+    ] {
+        let out = run(&args);
+        assert_eq!(out.status, Some(1), "{args:?}: {}", out.stderr);
+        assert!(out.stdout.is_empty(), "{}", out.stdout);
+        assert!(out.stderr.contains(error), "{args:?}: {}", out.stderr);
+    }
+}
+
+#[test]
+fn tree_last_without_saved_sessions_reports_not_found() {
+    for args in [vec!["tree", "last", "--json"], vec!["tree", "--json"]] {
+        let out = run(&args);
+        assert_eq!(out.status, Some(1));
+        assert!(out.stdout.is_empty(), "{}", out.stdout);
+        assert!(out.stderr.contains("not_found"), "{}", out.stderr);
+        assert!(
+            out.stderr.contains("no session has been saved yet"),
+            "{}",
+            out.stderr
+        );
+    }
+}
+
+#[test]
+fn tree_still_rejects_an_invalid_exact_id() {
+    let out = run(&["tree", "bad", "--json"]);
+    assert_eq!(out.status, Some(1));
+    assert!(out.stdout.is_empty(), "{}", out.stdout);
+    assert!(out.stderr.contains("invalid_field"), "{}", out.stderr);
+}
+
+#[test]
+fn auth_status_json_matches_the_default_inspection() {
+    let default = run(&["auth", "--json"]);
+    let status = run(&["auth", "status", "--json"]);
+    for out in [&default, &status] {
+        assert_eq!(out.status, Some(0), "stderr: {}", out.stderr);
+        assert!(out.stderr.is_empty(), "{}", out.stderr);
+    }
+    let default: serde_json::Value = serde_json::from_str(&default.stdout).expect("valid json");
+    let status: serde_json::Value = serde_json::from_str(&status.stdout).expect("valid json");
+    assert!(status.is_object());
+    assert!(status["provider"].is_string());
+    assert!(status["model"].is_string());
+    assert!(status.get("base_url").is_some());
+    assert_eq!(status, default);
+}
+
+#[test]
+fn auth_status_text_matches_the_default_inspection() {
+    let default = run(&["auth"]);
+    let status = run(&["auth", "status"]);
+    for out in [&default, &status] {
+        assert_eq!(out.status, Some(0), "stderr: {}", out.stderr);
+        assert!(out.stderr.is_empty(), "{}", out.stderr);
+        assert!(!out.stdout.is_empty());
+    }
+    assert_eq!(status.stdout, default.stdout);
+}
+
+#[test]
+fn usage_reports_the_selected_period_and_interval() {
+    let day_ms = 24 * 60 * 60 * 1_000;
+    for (args, period, days) in [
+        (vec!["usage", "--json"], "24h", 1),
+        (vec!["usage", "7d", "--json"], "7d", 7),
+        (vec!["usage", "--period", "24h", "--json"], "24h", 1),
+        (vec!["usage", "--period", "7d", "--json"], "7d", 7),
+        (vec!["usage", "--period", "30d", "--json"], "30d", 30),
+        (vec!["usage", "--period=7d", "--json"], "7d", 7),
+        (vec!["usage", "24h", "--period", "7d", "--json"], "7d", 7),
+    ] {
+        let out = run(&args);
+        assert_eq!(out.status, Some(0), "{args:?}: {}", out.stderr);
+        let value: serde_json::Value = serde_json::from_str(&out.stdout).expect("valid json");
+        assert_eq!(value["period"], period, "{args:?}");
+        let now_ms = value["now_ms"].as_i64().expect("now_ms");
+        let since_ms = value["since_ms"].as_i64().expect("since_ms");
+        assert_eq!(now_ms - since_ms, days * day_ms, "{args:?}");
+    }
+}
+
+#[test]
+fn usage_rejects_an_invalid_period_flag() {
+    let out = run(&["usage", "--period", "99y", "--json"]);
+    assert_eq!(out.status, Some(1), "{}", out.stdout);
+    assert!(out.stdout.is_empty(), "{}", out.stdout);
+    assert!(out.stderr.contains("invalid_field"), "{}", out.stderr);
+    assert!(out.stderr.contains("99y"), "{}", out.stderr);
+    assert!(out.stderr.contains("24h, 7d, or 30d"), "{}", out.stderr);
+}
+
+#[test]
+fn usage_period_flag_filters_the_ledger_to_seven_days() {
+    use rune_session::usage::{HelperKind, Ledger, UsageRecord, now_ms};
+
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let state = dir.path().join("state");
+    let path = camino::Utf8PathBuf::from_path_buf(state.join("usage.jsonl")).expect("utf-8 path");
+    let ledger = Ledger::new(path);
+    let now = now_ms();
+    let day_ms = 24 * 60 * 60 * 1_000;
+    for (days_ago, tokens) in [(0, 11), (3, 22), (8, 44)] {
+        let mut record = UsageRecord::new(now - days_ago * day_ms, "test-model", HelperKind::Main);
+        record.input_tokens = Some(tokens);
+        ledger.append(&record).expect("append usage");
+    }
+
+    let out = Command::new(binary())
+        .args(["usage", "--period", "7d", "--json"])
+        .env("RUNE_HOME", &state)
+        .env("XDG_CONFIG_HOME", dir.path().join("config"))
+        .env("XDG_DATA_HOME", dir.path().join("data"))
+        .output()
+        .expect("run binary");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&out.stdout).expect("valid json");
+    assert_eq!(value["period"], "7d");
+    assert_eq!(value["requests"], 2);
+    assert_eq!(value["tokens"]["input_tokens"], 33);
 }
 
 #[test]
@@ -237,6 +1046,183 @@ fn an_unknown_limit_name_is_rejected() {
 }
 
 #[test]
+fn permissions_explain_flag_reports_one_structured_decision() {
+    for args in [
+        vec!["permissions", "--explain", "shell:pwd", "--json"],
+        vec!["permissions", "--explain=shell:pwd", "--json"],
+    ] {
+        let out = run(&args);
+        assert_eq!(out.status, Some(0), "{}", out.stderr);
+        assert!(out.stderr.is_empty(), "{}", out.stderr);
+        let value: serde_json::Value = serde_json::from_str(&out.stdout).expect("one JSON object");
+        assert_eq!(value["tool"], "shell");
+        assert_eq!(value["target"], "pwd");
+        assert_eq!(value["mode"], "auto");
+        assert_eq!(value["outcome"], "allow");
+        assert_eq!(value["rule"], "shell pwd");
+        assert_eq!(value["layer"], "default");
+        assert!(value.get("rules").is_none(), "{value}");
+    }
+}
+
+#[test]
+fn permissions_explanations_preserve_positional_and_text_output() {
+    let positional = run(&["permissions", "shell", "pwd"]);
+    let flagged = run(&["permissions", "--explain", "shell:pwd"]);
+    assert_eq!(positional.status, Some(0), "{}", positional.stderr);
+    assert_eq!(flagged.status, Some(0), "{}", flagged.stderr);
+    assert_eq!(flagged.stdout, positional.stdout);
+    assert_eq!(
+        flagged.stdout,
+        "shell `pwd`: allowed (allow: matched `shell pwd` at the default layer)\n"
+    );
+
+    let json = run(&["permissions", "shell", "pwd", "--json"]);
+    assert_eq!(json.status, Some(0), "{}", json.stderr);
+    let value: serde_json::Value = serde_json::from_str(&json.stdout).expect("one JSON object");
+    assert_eq!(value["outcome"], "allow");
+    assert_eq!(value["rule"], "shell pwd");
+}
+
+#[test]
+fn permissions_explain_preserves_colons_in_the_target() {
+    let out = run(&[
+        "permissions",
+        "--explain",
+        "read_file:path:segment",
+        "--json",
+    ]);
+    assert_eq!(out.status, Some(0), "{}", out.stderr);
+    let value: serde_json::Value = serde_json::from_str(&out.stdout).expect("one JSON object");
+    assert_eq!(value["tool"], "read_file");
+    assert_eq!(value["target"], "path:segment");
+    assert_eq!(value["outcome"], "allow");
+    assert_eq!(value["rule"], "read_file *");
+}
+
+#[test]
+fn permissions_explain_rejects_malformed_actions() {
+    for action in ["pwd", ":pwd", "shell:", ""] {
+        let out = run(&["permissions", "--explain", action]);
+        assert_eq!(out.status, Some(1), "{action}: {}", out.stderr);
+        assert!(out.stdout.is_empty(), "{}", out.stdout);
+        assert!(out.stderr.contains("invalid_field"), "{}", out.stderr);
+        assert!(out.stderr.contains("tool:target"), "{}", out.stderr);
+        assert!(out.stderr.contains("shell:pwd"), "{}", out.stderr);
+    }
+}
+
+#[test]
+fn permissions_explain_reports_mode_defaults_and_effective_outcomes() {
+    for (mode, action, outcome, rule, from_rule) in [
+        ("ask", "shell:pwd", "ask", "no rule matched `pwd`", false),
+        (
+            "auto",
+            "web_fetch:https://example.com",
+            "deny",
+            "web_fetch *",
+            true,
+        ),
+        (
+            "full-access",
+            "web_fetch:https://example.com",
+            "allow",
+            "web_fetch *",
+            true,
+        ),
+    ] {
+        let out = run(&[
+            "permissions",
+            "--permission-mode",
+            mode,
+            "--explain",
+            action,
+            "--json",
+        ]);
+        assert_eq!(out.status, Some(0), "{}", out.stderr);
+        let value: serde_json::Value = serde_json::from_str(&out.stdout).expect("one JSON object");
+        assert_eq!(value["outcome"], outcome, "{mode}: {value}");
+        assert_eq!(value["rule"], rule, "{mode}: {value}");
+        assert_eq!(value["from_rule"], from_rule, "{mode}: {value}");
+        assert_eq!(value["layer"], "default");
+    }
+}
+
+#[test]
+fn unknown_permission_mode_fails_with_the_accepted_values() {
+    for args in [
+        vec!["--permission-mode", "banana", "permissions"],
+        vec!["--permission-mode=banana", "permissions"],
+        vec!["permissions", "--permission-mode", "banana"],
+        vec!["permissions", "--permission-mode=banana", "--json"],
+        vec!["--permissions", "banana", "permissions"],
+        vec!["permissions", "--permissions=banana"],
+        vec![
+            "--permission-mode",
+            "banana",
+            "--permission-mode",
+            "auto",
+            "permissions",
+        ],
+        vec!["--permission-mode=", "permissions"],
+        vec!["--permission-mode", "   ", "permissions"],
+    ] {
+        let out = run(&args);
+        assert_eq!(out.status, Some(1), "{args:?}: {}", out.stderr);
+        assert!(out.stdout.is_empty(), "{}", out.stdout);
+        for expected in [
+            "invalid_field",
+            "--permission-mode",
+            "accepted modes: ask, auto, full-access",
+        ] {
+            assert!(out.stderr.contains(expected), "{args:?}: {}", out.stderr);
+        }
+    }
+}
+
+#[test]
+fn accepted_permission_modes_and_aliases_still_apply() {
+    for (raw, expected) in [
+        ("ask", "ask"),
+        ("auto", "auto"),
+        ("full-access", "full_access"),
+        ("full_access", "full_access"),
+        ("fullaccess", "full_access"),
+        ("yolo", "full_access"),
+        (" ASK ", "ask"),
+        (" FULL-ACCESS ", "full_access"),
+    ] {
+        for flag in ["--permission-mode", "--permissions"] {
+            let out = run(&["permissions", flag, raw, "--json"]);
+            assert_eq!(out.status, Some(0), "{flag} {raw}: {}", out.stderr);
+            assert!(out.stderr.is_empty(), "{}", out.stderr);
+            let value: serde_json::Value = serde_json::from_str(&out.stdout).expect("valid json");
+            assert_eq!(value["mode"], expected, "{flag} {raw}: {value}");
+        }
+    }
+}
+
+#[test]
+fn permissions_without_an_action_still_lists_rules() {
+    let out = run(&["permissions", "--json"]);
+    assert_eq!(out.status, Some(0), "{}", out.stderr);
+    let value: serde_json::Value = serde_json::from_str(&out.stdout).expect("one JSON object");
+    assert_eq!(value["mode"], "auto");
+    let rules = value["rules"].as_array().expect("rules array");
+    assert!(
+        rules
+            .iter()
+            .any(|rule| rule["tool"] == "shell" && rule["pattern"] == "pwd")
+    );
+    assert!(value.get("outcome").is_none(), "{value}");
+
+    let text = run(&["permissions"]);
+    assert_eq!(text.status, Some(0), "{}", text.stderr);
+    assert!(text.stdout.contains("mode: auto"), "{}", text.stdout);
+    assert!(text.stdout.contains("pattern"), "{}", text.stdout);
+}
+
+#[test]
 fn config_explain_reports_the_source_layer() {
     let out = run(&["config", "--json"]);
     assert_eq!(out.status, Some(0));
@@ -248,6 +1234,200 @@ fn config_explain_reports_the_source_layer() {
         .expect("provider row");
     assert_eq!(provider["source"], "default");
     assert_eq!(value["layers"]["command_line"], "command_line");
+}
+
+#[test]
+fn cli_provider_and_model_overrides_resolve_only_their_own_settings() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let config = dir.path().join("user.toml");
+    std::fs::write(
+        &config,
+        r#"
+provider = "anthropic"
+base_url = "https://previous-provider.invalid"
+api_key_env = "PREVIOUS_PROVIDER_KEY"
+[models.anthropic]
+id = "large-model"
+context_window = 2000000
+[models.chat_completions]
+id = "chat-model"
+context_window = 64000
+[models.responses]
+id = "large-model"
+context_window = 32000
+[models]
+opencode = "named-model"
+"#,
+    )
+    .expect("write config");
+
+    for (args, provider, provider_source, model, model_source, capacity, capacity_source, reset) in [
+        (
+            vec!["--provider", "openai", "config"],
+            "chat_completions",
+            "command_line",
+            "chat-model",
+            "user",
+            "64000",
+            "user",
+            true,
+        ),
+        (
+            vec!["config", "--provider", "responses"],
+            "responses",
+            "command_line",
+            "large-model",
+            "user",
+            "32000",
+            "user",
+            true,
+        ),
+        (
+            vec!["--provider", "opencode", "config"],
+            "opencode",
+            "command_line",
+            "named-model",
+            "user",
+            "128000",
+            "default",
+            true,
+        ),
+        (
+            vec!["--provider", "unknown-provider", "config"],
+            "unknown-provider",
+            "command_line",
+            "",
+            "default",
+            "128000",
+            "default",
+            true,
+        ),
+        (
+            vec!["--provider", "ANTHROPIC", "config"],
+            "anthropic",
+            "command_line",
+            "large-model",
+            "user",
+            "2000000",
+            "user",
+            false,
+        ),
+        (
+            vec![
+                "--provider",
+                "openai",
+                "--model",
+                "explicit-model",
+                "config",
+            ],
+            "chat_completions",
+            "command_line",
+            "explicit-model",
+            "command_line",
+            "128000",
+            "default",
+            true,
+        ),
+        (
+            vec![
+                "--model",
+                "explicit-model",
+                "config",
+                "--provider",
+                "openai",
+            ],
+            "chat_completions",
+            "command_line",
+            "explicit-model",
+            "command_line",
+            "128000",
+            "default",
+            true,
+        ),
+        (
+            vec!["--provider", "openai", "--model", "chat-model", "config"],
+            "chat_completions",
+            "command_line",
+            "chat-model",
+            "command_line",
+            "64000",
+            "user",
+            true,
+        ),
+        (
+            vec!["--model", "small-model", "config"],
+            "anthropic",
+            "user",
+            "small-model",
+            "command_line",
+            "128000",
+            "default",
+            false,
+        ),
+        (
+            vec!["config", "--model", "large-model"],
+            "anthropic",
+            "user",
+            "large-model",
+            "command_line",
+            "2000000",
+            "user",
+            false,
+        ),
+    ] {
+        let mut command = Command::new(binary());
+        // Keep the fixture independent of the developer's provider environment.
+        for (key, _) in std::env::vars_os() {
+            if key.to_string_lossy().starts_with("RUNE_") {
+                command.env_remove(key);
+            }
+        }
+        let out = command
+            .args(&args)
+            .arg("--json")
+            .current_dir(dir.path())
+            .env("RUNE_CONFIG", &config)
+            .env("RUNE_STATE", dir.path().join("state"))
+            .env("XDG_CONFIG_HOME", dir.path().join("config"))
+            .env("XDG_DATA_HOME", dir.path().join("data"))
+            .output()
+            .expect("run config");
+        assert!(out.status.success(), "{args:?}: {out:?}");
+        assert!(out.stderr.is_empty(), "{args:?}: {out:?}");
+        let value: serde_json::Value = serde_json::from_slice(&out.stdout).expect("valid json");
+        assert_eq!(value["diagnostics"], serde_json::json!([]), "{args:?}");
+        let values = value["values"].as_array().expect("values array");
+        for (key, expected, source) in [
+            ("provider", provider, provider_source),
+            ("model", model, model_source),
+            ("context_window", capacity, capacity_source),
+            (
+                "base_url",
+                if reset {
+                    "default"
+                } else {
+                    "https://previous-provider.invalid"
+                },
+                if reset { "default" } else { "user" },
+            ),
+            (
+                "api_key_env",
+                if reset {
+                    "default"
+                } else {
+                    "PREVIOUS_PROVIDER_KEY"
+                },
+                if reset { "default" } else { "user" },
+            ),
+        ] {
+            let row = values
+                .iter()
+                .find(|row| row["key"] == key)
+                .expect("config row");
+            assert_eq!(row["value"], expected, "{args:?}: {key}");
+            assert_eq!(row["source"], source, "{args:?}: {key}");
+        }
+    }
 }
 
 #[test]
@@ -309,6 +1489,244 @@ fn workspace_list_is_empty_on_a_fresh_install() {
     assert_eq!(out.status, Some(0));
     let value: serde_json::Value = serde_json::from_str(&out.stdout).expect("valid json");
     assert_eq!(value["directories"].as_array().expect("array").len(), 0);
+}
+
+/// Isolates configuration mutations from the caller's Rune settings.
+fn config_mutation_command(root: &camino::Utf8Path) -> Command {
+    let mut command = Command::new(binary());
+    for (key, _) in std::env::vars_os() {
+        if key.to_string_lossy().starts_with("RUNE_") {
+            command.env_remove(key);
+        }
+    }
+    command
+        .current_dir(root)
+        .env("RUNE_HOME", root.join("state"))
+        .env("XDG_CONFIG_HOME", root.join("config"))
+        .env("XDG_DATA_HOME", root.join("data"));
+    command
+}
+
+#[test]
+fn workspace_clear_reports_an_empty_list_and_persists_it() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = camino::Utf8Path::from_path(dir.path()).expect("utf8");
+    let added = root.join("added");
+    std::fs::create_dir(&added).expect("additional directory");
+    let added = added.canonicalize_utf8().expect("canonical directory");
+
+    for (args, expected) in [
+        (vec!["add", added.as_str()], serde_json::json!([added])),
+        (vec!["clear"], serde_json::json!([])),
+        (vec!["list"], serde_json::json!([])),
+        (vec!["clear"], serde_json::json!([])),
+    ] {
+        let out = config_mutation_command(root)
+            .arg("workspace")
+            .args(&args)
+            .arg("--json")
+            .output()
+            .expect("workspace command");
+        assert!(out.status.success(), "{args:?}: {out:?}");
+        let value: serde_json::Value = serde_json::from_slice(&out.stdout).expect("valid json");
+        assert_eq!(value["directories"], expected, "{args:?}");
+    }
+}
+
+#[test]
+fn workspace_mutations_read_and_write_the_active_config() {
+    for override_path in [
+        None,
+        Some(""),
+        Some("settings.toml"),
+        Some("custom/settings.toml"),
+    ] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = camino::Utf8Path::from_path(dir.path()).expect("utf8");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700))
+                .expect("private scratch directory");
+        }
+        let default_path = root.join("config/rune/config.toml");
+        let default_text = "effort = 'low'\n";
+        rune_core::paths::create_dir_private(default_path.parent().expect("default parent"))
+            .expect("private default parent");
+        rune_core::paths::write_private(&default_path, default_text).expect("default config");
+        let active_path = override_path
+            .filter(|path| !path.is_empty())
+            .map_or_else(|| default_path.clone(), |path| root.join(path));
+        let existing = root.join("existing");
+        let added = root.join("added");
+        std::fs::create_dir(&existing).expect("existing directory");
+        std::fs::create_dir(&added).expect("added directory");
+        let existing = existing.canonicalize_utf8().expect("canonical existing");
+        let added = added.canonicalize_utf8().expect("canonical added");
+        let mut original: toml::Table =
+            toml::from_str("effort = 'high'\n[models]\nanthropic = 'saved-model'\n")
+                .expect("original config");
+        original.insert(
+            "additional_directories".to_owned(),
+            toml::Value::Array(vec![toml::Value::String(existing.to_string())]),
+        );
+        rune_core::paths::create_dir_private(active_path.parent().expect("active parent"))
+            .expect("private active parent");
+        rune_core::paths::write_private(
+            &active_path,
+            &toml::to_string(&original).expect("render config"),
+        )
+        .expect("active config");
+        let mut both = vec![existing.as_str(), added.as_str()];
+        both.sort_unstable();
+
+        for (args, expected) in [
+            (vec!["add", added.as_str()], both.clone()),
+            (vec!["add", added.as_str()], both),
+            (vec!["remove", added.as_str()], vec![existing.as_str()]),
+            (vec!["clear"], vec![]),
+        ] {
+            let mut command = config_mutation_command(root);
+            if let Some(path) = override_path {
+                command.env("RUNE_CONFIG", path);
+            }
+            let out = command
+                .arg("workspace")
+                .args(&args)
+                .arg("--json")
+                .output()
+                .expect("workspace mutation");
+            assert!(out.status.success(), "{override_path:?} {args:?}: {out:?}");
+            let stored: toml::Table =
+                toml::from_str(&std::fs::read_to_string(&active_path).expect("read active config"))
+                    .expect("parse active config");
+            assert_eq!(stored["effort"], original["effort"]);
+            assert_eq!(stored["models"], original["models"]);
+            let directories = stored
+                .get("additional_directories")
+                .map_or_else(Vec::new, |value| {
+                    value
+                        .as_array()
+                        .expect("directory array")
+                        .iter()
+                        .map(|value| value.as_str().expect("directory string"))
+                        .collect::<Vec<_>>()
+                });
+            assert_eq!(directories, expected, "{override_path:?} {args:?}");
+            if active_path != default_path {
+                assert_eq!(
+                    std::fs::read_to_string(&default_path).expect("default"),
+                    default_text
+                );
+            }
+            // Reload in a fresh process, including after clear.
+            let mut command = config_mutation_command(root);
+            if let Some(path) = override_path {
+                command.env("RUNE_CONFIG", path);
+            }
+            let out = command
+                .args(["workspace", "list", "--json"])
+                .output()
+                .expect("list");
+            assert!(out.status.success(), "{out:?}");
+            let value: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json");
+            assert_eq!(value["directories"], serde_json::json!(expected));
+        }
+    }
+}
+
+#[test]
+fn config_mutations_create_an_override_without_creating_the_default() {
+    for (args, override_path) in [
+        (
+            vec!["workspace", "add", ".", "--json"],
+            "custom/settings.toml",
+        ),
+        (
+            vec!["connect", "anthropic", "--model", "saved-model", "--json"],
+            "custom/settings.toml",
+        ),
+        (vec!["workspace", "add", ".", "--json"], "settings.toml"),
+        (
+            vec!["connect", "anthropic", "--model", "saved-model", "--json"],
+            "settings.toml",
+        ),
+    ] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = camino::Utf8Path::from_path(dir.path()).expect("utf8");
+        let path = root.join(override_path);
+        let out = config_mutation_command(root)
+            .args(&args)
+            .env("RUNE_CONFIG", override_path)
+            .env("ANTHROPIC_API_KEY", "test-key")
+            .output()
+            .expect("config mutation");
+        assert!(out.status.success(), "{args:?}: {out:?}");
+        let text = rune_core::paths::read_private(&path, 4096)
+            .expect("private config")
+            .expect("created config");
+        let stored: toml::Table = toml::from_str(&text).expect("parse config");
+        if args[0] == "workspace" {
+            assert_eq!(
+                stored["additional_directories"]
+                    .as_array()
+                    .expect("array")
+                    .len(),
+                1
+            );
+        } else {
+            assert_eq!(stored["provider"].as_str(), Some("anthropic"));
+            assert_eq!(stored["models"]["anthropic"].as_str(), Some("saved-model"));
+        }
+        assert!(
+            !root.join("config").exists(),
+            "default config directory was created"
+        );
+    }
+}
+
+#[test]
+fn provider_selection_preserves_the_override_and_leaves_the_default_unchanged() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = camino::Utf8Path::from_path(dir.path()).expect("utf8");
+    let default_path = root.join("config/rune/config.toml");
+    let default_text = "effort = 'low'\n";
+    rune_core::paths::create_dir_private(default_path.parent().expect("default parent"))
+        .expect("private default parent");
+    rune_core::paths::write_private(&default_path, default_text).expect("default config");
+    let path = root.join("custom/settings.toml");
+    rune_core::paths::create_dir_private(path.parent().expect("active parent"))
+        .expect("private active parent");
+    rune_core::paths::write_private(
+        &path,
+        "effort = 'high'\n[models]\nresponses = 'other-model'\n",
+    )
+    .expect("active config");
+    let out = config_mutation_command(root)
+        .args(["connect", "anthropic", "--model", "saved-model", "--json"])
+        .env("RUNE_CONFIG", &path)
+        .env("ANTHROPIC_API_KEY", "test-key")
+        .output()
+        .expect("connect");
+    assert!(out.status.success(), "{out:?}");
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).expect("report");
+    assert_eq!(report["model"], "saved-model");
+    assert!(report.get("next_step").is_none());
+    let stored: toml::Table =
+        toml::from_str(&std::fs::read_to_string(&path).expect("active config"))
+            .expect("parse config");
+    assert_eq!(stored["provider"].as_str(), Some("anthropic"));
+    assert_eq!(
+        stored["base_url"].as_str(),
+        Some("https://api.anthropic.com")
+    );
+    assert_eq!(stored["models"]["anthropic"].as_str(), Some("saved-model"));
+    assert_eq!(stored["models"]["responses"].as_str(), Some("other-model"));
+    assert_eq!(stored["effort"].as_str(), Some("high"));
+    assert_eq!(
+        std::fs::read_to_string(&default_path).expect("default config"),
+        default_text
+    );
 }
 
 #[test]
@@ -481,6 +1899,65 @@ fn offline_after_the_command_refuses_the_request() {
 }
 
 #[test]
+fn offline_in_the_user_file_preserves_the_model_and_refuses_requests() {
+    let listener = Listener::start();
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let config_dir = dir.path().join("config").join("rune");
+    std::fs::create_dir_all(&config_dir).expect("mkdir");
+    std::fs::write(
+        config_dir.join("config.toml"),
+        format!(
+            r#"
+offline = true
+web_tools = true
+provider = "chat_completions"
+base_url = "http://127.0.0.1:{}/v1"
+api_key_env = "RUNE_CLI_TEST_KEY"
+[models]
+chat_completions = "configured-model"
+[limits]
+provider_request_timeout_ms = 1000
+"#,
+            listener.port
+        ),
+    )
+    .expect("write config");
+
+    let run_with_config = |args: &[&str]| {
+        Command::new(binary())
+            .env_clear()
+            .env("HOME", dir.path())
+            .env("RUNE_HOME", dir.path().join("state"))
+            .env("XDG_CONFIG_HOME", dir.path().join("config"))
+            .env("XDG_DATA_HOME", dir.path().join("data"))
+            .env("RUNE_CLI_TEST_KEY", "sk-test")
+            .current_dir(dir.path())
+            .args(args)
+            .output()
+            .expect("run binary")
+    };
+
+    let models = run_with_config(&["models"]);
+    assert!(models.status.success(), "{models:?}");
+    assert!(
+        String::from_utf8_lossy(&models.stdout).contains("configured-model"),
+        "{models:?}"
+    );
+    assert!(models.stderr.is_empty(), "{models:?}");
+
+    let ask = run_with_config(&["ask", "hi"]);
+    assert_eq!(ask.status.code(), Some(1), "{ask:?}");
+    let stderr = String::from_utf8_lossy(&ask.stderr);
+    assert!(stderr.contains("outbound requests are disabled"), "{ask:?}");
+    assert!(!stderr.contains("could not parse"), "{ask:?}");
+    assert_eq!(
+        listener.count(),
+        0,
+        "the offline user file allowed a request"
+    );
+}
+
+#[test]
 fn a_model_named_after_the_command_is_used() {
     let listener = Listener::start();
     let out = run_against(
@@ -587,7 +2064,197 @@ fn connecting_with_the_key_exported_succeeds() {
     assert_eq!(out.status, Some(0), "stderr: {}", out.stderr);
     let value: serde_json::Value = serde_json::from_str(&out.stdout).expect("valid json");
     assert_eq!(value["provider"], "anthropic");
+    assert!(value["model"].is_null());
+    assert!(
+        value["next_step"]
+            .as_str()
+            .expect("next step")
+            .contains("rune connect anthropic --model <id>")
+    );
     assert!(!out.stdout.contains("sk-ant-test"), "{}", out.stdout);
+}
+
+#[test]
+fn concurrent_connect_processes_preserve_both_credentials_after_reopening() {
+    use rune_core::paths::{self, Paths};
+    use std::process::Stdio;
+    use std::time::Duration;
+
+    let dir = tempfile::tempdir().expect("scratch home");
+    let home = dir.path().to_str().expect("utf8");
+    let state = dir.path().join("state");
+    let resolved = Paths::resolve(
+        Some(home),
+        None,
+        None,
+        None,
+        Some(state.to_str().expect("utf8")),
+    );
+    paths::create_dir_private(&resolved.state_root).expect("state");
+    let lock = paths::lock_private(&resolved.credentials_lock()).expect("hold lock");
+
+    let mut children = Vec::new();
+    for (provider, variable, value) in [
+        ("anthropic", "ANTHROPIC_API_KEY", "scratch-anthropic"),
+        ("opencode", "OPENCODE_API_KEY", "scratch-opencode"),
+    ] {
+        // Each profile has its own selection config; credentials share the
+        // state root. This isolates credential concurrency from config writes.
+        children.push(
+            Command::new(binary())
+                .args(["connect", provider, "--json"])
+                .env_clear()
+                .env("HOME", dir.path())
+                .env("RUNE_HOME", &state)
+                .env("XDG_CONFIG_HOME", dir.path().join(provider))
+                .env(variable, value)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("connect process"),
+        );
+    }
+    std::thread::sleep(Duration::from_millis(200));
+    let blocked: Vec<_> = children
+        .iter_mut()
+        .map(|child| child.try_wait().expect("status").is_none())
+        .collect();
+    // A writer must read only after acquiring the lock, or this entry is lost.
+    let body = serde_json::json!({
+        "version": 1,
+        "entries": { "holder": { "value": "scratch-holder" } }
+    });
+    paths::write_private_atomic(&resolved.credentials_file(), &body.to_string())
+        .expect("holder update");
+    drop(lock);
+    for child in children {
+        let output = child.wait_with_output().expect("connect result");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    assert!(
+        blocked.into_iter().all(|waiting| waiting),
+        "connect bypassed the held lock"
+    );
+
+    let reopened = Paths::resolve(
+        Some(home),
+        None,
+        None,
+        None,
+        Some(state.to_str().expect("utf8")),
+    );
+    let providers = rune_net::auth::stored_providers(&reopened).expect("reopen");
+    assert_eq!(providers, ["anthropic", "holder", "opencode"]);
+    let stored: serde_json::Value = serde_json::from_str(
+        &paths::read_private(
+            &reopened.credentials_file(),
+            rune_net::auth::MAX_CREDENTIAL_FILE_BYTES,
+        )
+        .expect("read")
+        .expect("file"),
+    )
+    .expect("complete JSON");
+    for (provider, value) in [
+        ("anthropic", "scratch-anthropic"),
+        ("opencode", "scratch-opencode"),
+        ("holder", "scratch-holder"),
+    ] {
+        assert_eq!(stored["entries"][provider]["value"], value);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn connecting_in_a_fresh_home_creates_private_state_and_opens_a_session() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    // Set the umask in a child shell so parallel tests keep their own mask.
+    for mask in ["022", "002"] {
+        for xdg in [false, true] {
+            let dir = tempfile::tempdir().expect("fresh home");
+            let state = dir.path().join(if xdg {
+                "state/rune"
+            } else {
+                ".local/state/rune"
+            });
+            let command = || {
+                let mut command = Command::new("sh");
+                command
+                    .args(["-c", r#"umask "$1"; shift; exec "$@""#, "rune-test", mask])
+                    .arg(binary())
+                    .env_clear()
+                    .env("HOME", dir.path())
+                    .current_dir(dir.path());
+                if xdg {
+                    command.env("XDG_STATE_HOME", dir.path().join("state"));
+                }
+                command
+            };
+            assert!(!state.exists(), "the home already has Rune state");
+
+            let connected = command()
+                .args(["connect", "anthropic", "--json"])
+                .env("ANTHROPIC_API_KEY", "sk-ant-test")
+                .output()
+                .expect("connect");
+            assert!(
+                connected.status.success(),
+                "umask {mask}, xdg {xdg}: {}",
+                String::from_utf8_lossy(&connected.stderr)
+            );
+            for (path, mode) in [
+                (state.clone(), 0o700),
+                (state.join("credentials.json"), 0o600),
+            ] {
+                assert_eq!(
+                    std::fs::metadata(&path)
+                        .expect("metadata")
+                        .permissions()
+                        .mode()
+                        & 0o777,
+                    mode,
+                    "{} with umask {mask}, xdg {xdg}",
+                    path.display()
+                );
+            }
+
+            // No key in the environment: the session must use the stored one.
+            // EOF ends it after startup, without needing a live provider.
+            let session = command()
+                .args(["--offline", "--model", "claude-test"])
+                .stdin(std::process::Stdio::null())
+                .output()
+                .expect("open session");
+            assert!(
+                session.status.success(),
+                "umask {mask}, xdg {xdg}: {}",
+                String::from_utf8_lossy(&session.stderr)
+            );
+            assert!(
+                String::from_utf8_lossy(&session.stdout).contains("session "),
+                "the session was not announced"
+            );
+            let sessions: Vec<_> = std::fs::read_dir(state.join("sessions"))
+                .expect("sessions directory")
+                .collect::<Result<_, _>>()
+                .expect("session entries");
+            assert_eq!(sessions.len(), 1, "one session must have opened");
+            let session_dir = camino::Utf8PathBuf::from_path_buf(sessions[0].path()).expect("utf8");
+            let saved = rune_session::store::load_read_only(&session_dir).expect("session log");
+            assert!(
+                saved.events.iter().any(|frame| matches!(
+                    &frame.event,
+                    rune_session::event::SessionEvent::WorkspaceSet { .. }
+                )),
+                "the session did not record its workspace"
+            );
+        }
+    }
 }
 
 #[test]
@@ -600,4 +2267,96 @@ fn a_flag_the_command_does_not_take_is_refused() {
         out.stderr
     );
     assert!(out.stderr.contains("hint:"), "{}", out.stderr);
+}
+
+#[test]
+fn interactive_connect_offers_endpoint_models_and_saves_the_choice() {
+    use std::io::{Read as _, Write as _};
+    use std::process::Stdio;
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("listener");
+    let address = listener.local_addr().expect("address");
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("request");
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .expect("timeout");
+        let mut request = [0; 4096];
+        let read = stream.read(&mut request).expect("read request");
+        assert!(String::from_utf8_lossy(&request[..read]).starts_with("GET /v1/models "));
+        let body = r#"{"data":[{"id":"first-model"},{"id":"chosen-model"}]}"#;
+        write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).expect("response");
+    });
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = camino::Utf8Path::from_path(dir.path()).expect("utf8");
+    let mut child = config_mutation_command(root)
+        .args(["connect", "chat_completions"])
+        .env("RUNE_BASE_URL", format!("http://{address}/v1"))
+        .env("RUNE_PROVIDER", "chat_completions")
+        .env("OPENAI_API_KEY", "test-key")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("connect");
+    child
+        .stdin
+        .take()
+        .expect("input")
+        .write_all(b"2\n")
+        .expect("choice");
+    let out = child.wait_with_output().expect("output");
+    assert!(out.status.success(), "{out:?}");
+    server.join().expect("server");
+    let text = String::from_utf8(out.stdout).expect("text");
+    assert!(
+        text.contains("first-model") && text.contains("chosen-model"),
+        "{text}"
+    );
+    assert!(!text.contains("No model is selected"), "{text}");
+    let stored: toml::Table = toml::from_str(
+        &std::fs::read_to_string(root.join("config/rune/config.toml")).expect("config"),
+    )
+    .expect("toml");
+    assert_eq!(
+        stored["models"]["chat_completions"].as_str(),
+        Some("chosen-model")
+    );
+}
+
+#[test]
+fn malformed_user_config_names_the_field_for_provider_commands() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = camino::Utf8Path::from_path(dir.path()).expect("utf8");
+    let path = root.join("config/rune/config.toml");
+    rune_core::paths::create_dir_private(path.parent().expect("parent")).expect("directory");
+    rune_core::paths::write_private(&path, "model = 'wrong-key'\n").expect("config");
+    for args in [
+        vec!["auth"],
+        vec!["auth", "--json"],
+        vec!["ask", "hello"],
+        vec!["review"],
+        vec!["--accessible"],
+        vec!["models"],
+    ] {
+        let out = config_mutation_command(root)
+            .args(&args)
+            .output()
+            .expect("command");
+        assert!(!out.status.success(), "{args:?}: {out:?}");
+        let error = String::from_utf8(out.stderr).expect("stderr");
+        assert!(
+            error.contains("user configuration")
+                && error.contains("unknown field `model`")
+                && error.contains("rune doctor"),
+            "{args:?}: {error}"
+        );
+        assert!(!error.contains("no model provider is connected"), "{error}");
+    }
+    let doctor = config_mutation_command(root)
+        .args(["doctor", "--json"])
+        .output()
+        .expect("doctor");
+    let report: serde_json::Value = serde_json::from_slice(&doctor.stdout).expect("doctor report");
+    assert!(report.to_string().contains("unknown field `model`"));
 }

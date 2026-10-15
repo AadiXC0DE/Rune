@@ -53,6 +53,19 @@ const TERMINATE_GRACE: Duration = Duration::from_millis(500);
 /// Time between checks while waiting for a child to exit.
 const POLL_INTERVAL: Duration = Duration::from_millis(5);
 
+/// Time between cancellation checks during a stdio tool call.
+const CANCELLATION_POLL: Duration = Duration::from_millis(25);
+
+fn check_cancelled(cancelled: Option<&dyn Fn() -> bool>) -> Result<()> {
+    if cancelled.is_some_and(|cancelled| cancelled()) {
+        return Err(RuneError::new(
+            ErrorCode::Cancelled,
+            "the mcp call was cancelled",
+        ));
+    }
+    Ok(())
+}
+
 /// Programs that deliver a signal to a process group, tried in order.
 #[cfg(unix)]
 const KILL_PROGRAMS: [&str; 2] = ["/bin/kill", "kill"];
@@ -124,6 +137,10 @@ pub struct CallOutcome {
 }
 
 /// Connects to MCP servers and dispatches their tools.
+///
+/// This client has no offline policy. A host must exclude remote servers before
+/// calling `connect_all` when offline. Stdio children are spawned without the
+/// shell sandbox, so their own network traffic requires host-supplied isolation.
 #[derive(Debug)]
 pub struct Client {
     limits: BudgetSet,
@@ -205,7 +222,7 @@ impl Client {
         }
     }
 
-    /// Connects every enabled server.
+    /// Connects every enabled server supplied by the host, without an offline check.
     pub fn connect_all(&self, servers: &[ServerConfig]) -> Result<ConnectReport> {
         let mut state = self.lock()?;
         state.shutdown = false;
@@ -252,6 +269,29 @@ impl Client {
 
     /// Calls a tool by its projected name.
     pub fn call(&self, name: &str, arguments: &Value) -> Result<CallOutcome> {
+        self.call_inner(name, arguments, None)
+    }
+
+    /// Calls a tool, checking cancellation while waiting on a stdio server.
+    ///
+    /// Cancellation terminates the stdio process group. Remote transports keep
+    /// their configured operation timeout once a request has started.
+    pub fn call_cancellable(
+        &self,
+        name: &str,
+        arguments: &Value,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<CallOutcome> {
+        self.call_inner(name, arguments, Some(cancelled))
+    }
+
+    fn call_inner(
+        &self,
+        name: &str,
+        arguments: &Value,
+        cancelled: Option<&dyn Fn() -> bool>,
+    ) -> Result<CallOutcome> {
+        check_cancelled(cancelled)?;
         let mut state = self.lock()?;
         if state.shutdown {
             return Err(RuneError::new(
@@ -287,7 +327,7 @@ impl Client {
         // The parameters are built once so a retry replays the exact call the
         // server rejected rather than one rebuilt from the same arguments.
         let params = json!({ "name": server_tool, "arguments": arguments });
-        self.call_entry(entry, &params)
+        self.call_entry(entry, &params, cancelled)
     }
 
     /// Reconnects every configured server from scratch.
@@ -373,17 +413,27 @@ impl Client {
     }
 
     /// Runs one tool call, reconnecting once if the credential is rejected.
-    fn call_entry(&self, entry: &mut ServerEntry, params: &Value) -> Result<CallOutcome> {
+    fn call_entry(
+        &self,
+        entry: &mut ServerEntry,
+        params: &Value,
+        cancelled: Option<&dyn Fn() -> bool>,
+    ) -> Result<CallOutcome> {
         // A credential the server already reported as expired is refreshed
         // before the call, so the rejection is not paid for first.
+        if entry.session.is_none() && entry.last_error.is_some() {
+            Self::spend_restart(entry)?;
+        }
         if entry.session.is_none() || !entry.credential().is_usable(now_ms()) {
             entry.establish(&self.limits, &self.variables)?;
         }
-        match entry.call(params, &self.limits) {
+        check_cancelled(cancelled)?;
+        match entry.call(params, &self.limits, cancelled) {
             Err(error) if error.code() == ErrorCode::AuthenticationRequired => {
                 Self::spend_restart(entry)?;
                 entry.establish(&self.limits, &self.variables)?;
-                match entry.call(params, &self.limits) {
+                check_cancelled(cancelled)?;
+                match entry.call(params, &self.limits, cancelled) {
                     // A credential rejected twice is not going to recover, so
                     // the session is closed rather than left half usable.
                     Err(again) if again.code() == ErrorCode::AuthenticationRequired => {
@@ -402,8 +452,9 @@ impl Client {
     /// The budget is what makes a rejected credential recoverable without
     /// letting a permanently broken server be retried in a loop.
     fn spend_restart(entry: &mut ServerEntry) -> Result<()> {
-        entry.close();
+        entry.disconnect();
         if entry.restarts >= entry.config.restart_limit {
+            entry.close();
             return Err(RuneError::new(
                 ErrorCode::AuthenticationRequired,
                 format!(
@@ -473,7 +524,19 @@ impl ServerEntry {
 
     /// Opens a session, initializes it, and lists its tools.
     fn establish(&mut self, limits: &BudgetSet, variables: &Arc<dyn Variables>) -> Result<()> {
-        self.close();
+        self.disconnect();
+        let result = self.establish_session(limits, variables);
+        if let Err(error) = &result {
+            self.last_error = Some(error.message().to_owned());
+        }
+        result
+    }
+
+    fn establish_session(
+        &mut self,
+        limits: &BudgetSet,
+        variables: &Arc<dyn Variables>,
+    ) -> Result<()> {
         let mut session = Session::open(&self.config, variables)?;
         let startup = self.config.startup_timeout();
         let (version, result) = initialize(&mut session, startup)?;
@@ -496,7 +559,12 @@ impl ServerEntry {
     }
 
     /// Runs a tool and reduces the result.
-    fn call(&mut self, params: &Value, limits: &BudgetSet) -> Result<CallOutcome> {
+    fn call(
+        &mut self,
+        params: &Value,
+        limits: &BudgetSet,
+        cancelled: Option<&dyn Fn() -> bool>,
+    ) -> Result<CallOutcome> {
         let name = self.config.name.clone();
         let tool = params
             .get("name")
@@ -510,23 +578,42 @@ impl ServerEntry {
                 format!("server `{name}` is not connected"),
             ));
         };
-        let result = session.request(TOOLS_CALL, Some(params), timeout)?;
+        let result = match session {
+            Session::Stdio(session) => {
+                session.request_cancellable(TOOLS_CALL, Some(params), timeout, cancelled)
+            }
+            #[cfg(not(target_family = "wasm"))]
+            session => session.request(TOOLS_CALL, Some(params), timeout),
+        };
+        if let Err(error) = &result
+            && matches!(
+                error.code(),
+                ErrorCode::Cancelled | ErrorCode::Timeout | ErrorCode::TransportFailure
+            )
+        {
+            // Keep discovery for dispatch of the next call, but discard the dead transport.
+            self.session.take();
+            self.last_error = Some(error.message().to_owned());
+        }
+        let result = result?;
         let limit = limits.get_usize(LimitName::MaxToolResultBytes);
         Ok(reduce_result(&name, &tool, &result, limit))
     }
 
-    /// Ends the session, terminating any child process.
-    ///
-    /// The tools go with the session: a caller that kept a name from a closed
-    /// server would otherwise reach a session that no longer exists.
-    fn close(&mut self) {
+    /// Ends the transport, retaining discovery so a later call can reconnect.
+    fn disconnect(&mut self) {
         if let Some(mut session) = self.session.take() {
             session.shutdown();
         }
-        self.tools.clear();
-        self.warnings.clear();
         self.protocol_version = None;
         self.credential_expires_at_ms = None;
+    }
+
+    /// Permanently closes this entry and removes its dispatch metadata.
+    fn close(&mut self) {
+        self.disconnect();
+        self.tools.clear();
+        self.warnings.clear();
     }
 }
 
@@ -766,12 +853,9 @@ impl Session {
     }
 
     /// Sends a notification, which has no result.
-    // The stdio transport takes no timeout, so the parameter is unread when it
-    // is the only variant.
-    #[cfg_attr(target_family = "wasm", allow(unused_variables))]
     fn notify(&mut self, method: &str, params: Option<&Value>, timeout: Duration) -> Result<()> {
         match self {
-            Self::Stdio(session) => session.notify(method, params),
+            Self::Stdio(session) => session.notify(method, params, timeout),
             #[cfg(not(target_family = "wasm"))]
             Self::Http(session) => session.notify(method, params, timeout),
             #[cfg(not(target_family = "wasm"))]
@@ -807,7 +891,7 @@ struct StdioSession {
     /// Name of the server, for error messages.
     server: String,
     /// Where frames are written.
-    stdin: std::process::ChildStdin,
+    stdin: Option<std::process::ChildStdin>,
     /// Where frames arrive.
     frames: Receiver<Event>,
     /// The child, kept so it can be terminated.
@@ -861,7 +945,7 @@ impl StdioSession {
         std::thread::spawn(move || read_frames(stdout, &sender));
         Ok(Self {
             server: server.to_owned(),
-            stdin,
+            stdin: Some(stdin),
             frames,
             child,
             next_id: 1,
@@ -875,13 +959,41 @@ impl StdioSession {
         params: Option<&Value>,
         timeout: Duration,
     ) -> Result<Value> {
+        self.request_cancellable(method, params, timeout, None)
+    }
+
+    fn request_cancellable(
+        &mut self,
+        method: &str,
+        params: Option<&Value>,
+        timeout: Duration,
+        cancelled: Option<&dyn Fn() -> bool>,
+    ) -> Result<Value> {
+        check_cancelled(cancelled)?;
         let id = self.next_id;
         self.next_id = self.next_id.saturating_add(1);
-        self.write(&protocol::request(id, method, params))?;
         let deadline = Instant::now().checked_add(timeout);
+        self.write(
+            protocol::request(id, method, params),
+            method,
+            timeout,
+            deadline,
+            cancelled,
+        )?;
         loop {
-            let event = match self.frames.recv_timeout(remaining(deadline)) {
+            if let Err(error) = check_cancelled(cancelled) {
+                self.terminate();
+                return Err(error);
+            }
+            let time_left = remaining(deadline);
+            let wait = if cancelled.is_some() {
+                time_left.min(CANCELLATION_POLL)
+            } else {
+                time_left
+            };
+            let event = match self.frames.recv_timeout(wait) {
                 Ok(event) => event,
+                Err(RecvTimeoutError::Timeout) if !remaining(deadline).is_zero() => continue,
                 Err(RecvTimeoutError::Timeout) => {
                     self.terminate();
                     return Err(timeout_error(&self.server, method, timeout));
@@ -920,23 +1032,66 @@ impl StdioSession {
         }
     }
 
-    /// Sends a notification.
-    fn notify(&mut self, method: &str, params: Option<&Value>) -> Result<()> {
-        self.write(&protocol::notification(method, params))
+    /// Sends a notification under the same write deadline as a request.
+    fn notify(&mut self, method: &str, params: Option<&Value>, timeout: Duration) -> Result<()> {
+        self.write(
+            protocol::notification(method, params),
+            method,
+            timeout,
+            Instant::now().checked_add(timeout),
+            None,
+        )
     }
 
-    /// Writes one frame to the child.
-    fn write(&mut self, frame: &str) -> Result<()> {
-        let error = |action: &str, err: std::io::Error| {
-            RuneError::new(
-                ErrorCode::TransportFailure,
-                format!("could not {action} server `{}`: {err}", self.server),
-            )
-        };
-        self.stdin
-            .write_all(frame.as_bytes())
-            .map_err(|err| error("write to", err))?;
-        self.stdin.flush().map_err(|err| error("flush", err))
+    /// A blocked pipe write must not block the thread supervising the child.
+    fn write(
+        &mut self,
+        frame: String,
+        method: &str,
+        timeout: Duration,
+        deadline: Option<Instant>,
+        cancelled: Option<&dyn Fn() -> bool>,
+    ) -> Result<()> {
+        let mut stdin = self.stdin.take().ok_or_else(|| {
+            RuneError::new(ErrorCode::TransportFailure, "the mcp input pipe is closed")
+        })?;
+        let (sender, written) = std::sync::mpsc::sync_channel(1);
+        std::thread::Builder::new()
+            .name("rune-mcp-write".to_owned())
+            .spawn(move || {
+                let result = stdin
+                    .write_all(frame.as_bytes())
+                    .and_then(|()| stdin.flush());
+                let _ = sender.send((stdin, result));
+            })?;
+        loop {
+            if let Err(error) = check_cancelled(cancelled) {
+                self.terminate();
+                return Err(error);
+            }
+            if remaining(deadline).is_zero() {
+                self.terminate();
+                return Err(timeout_error(&self.server, method, timeout));
+            }
+            match written.recv_timeout(remaining(deadline).min(CANCELLATION_POLL)) {
+                Ok((stdin, result)) => {
+                    self.stdin = Some(stdin);
+                    return result.map_err(|err| {
+                        RuneError::new(
+                            ErrorCode::TransportFailure,
+                            format!("could not write to server `{}`: {err}", self.server),
+                        )
+                    });
+                }
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => {
+                    return Err(RuneError::new(
+                        ErrorCode::TransportFailure,
+                        "the mcp input writer stopped",
+                    ));
+                }
+            }
+        }
     }
 
     /// Ends the child process group and closes the pipes.
@@ -1420,13 +1575,17 @@ fn resolve_endpoint(base: &str, endpoint: &str) -> String {
     format!("{}/{}", base.trim_end_matches('/'), endpoint)
 }
 
-/// Builds the HTTP agent shared by the remote transports.
+/// Builds the HTTP agent shared by the remote transports and OAuth exchange.
 #[cfg(not(target_family = "wasm"))]
-fn http_agent() -> ureq::Agent {
-    ureq::Agent::config_builder()
+pub(super) fn http_agent() -> ureq::Agent {
+    let config = ureq::Agent::config_builder()
         .http_status_as_error(false)
-        .build()
-        .into()
+        .build();
+    ureq::Agent::with_parts(
+        config,
+        super::http_transport::Connector::default(),
+        ureq::unversioned::resolver::DefaultResolver::default(),
+    )
 }
 
 /// Copies a string map into request order.
@@ -1593,6 +1752,46 @@ impl Credential {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn blocked_writes_obey_deadlines_and_cancellation() {
+        for mode in ["request", "notification", "cancel"] {
+            let mut session = StdioSession::open(
+                "blocked",
+                &["/bin/sh".to_owned(), "-c".to_owned(), "sleep 3".to_owned()],
+                &BTreeMap::new(),
+            )
+            .expect("server");
+            let params = json!({"padding": "x".repeat(1024 * 1024)});
+            let started = Instant::now();
+            let timeout = Duration::from_millis(100);
+            let result = match mode {
+                "notification" => session.notify(INITIALIZED, Some(&params), timeout),
+                "cancel" => session
+                    .request_cancellable(
+                        TOOLS_CALL,
+                        Some(&params),
+                        Duration::from_secs(10),
+                        Some(&|| started.elapsed() >= timeout),
+                    )
+                    .map(|_| ()),
+                _ => session
+                    .request(TOOLS_CALL, Some(&params), timeout)
+                    .map(|_| ()),
+            };
+            assert_eq!(
+                result.expect_err("blocked pipe").code(),
+                if mode == "cancel" {
+                    ErrorCode::Cancelled
+                } else {
+                    ErrorCode::Timeout
+                }
+            );
+            assert!(started.elapsed() < Duration::from_secs(2), "{mode}");
+            assert!(session.child.try_wait().expect("reaped").is_some());
+        }
+    }
 
     #[test]
     fn a_credential_without_a_reported_expiry_is_usable() {

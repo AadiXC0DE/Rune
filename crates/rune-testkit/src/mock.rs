@@ -95,6 +95,8 @@ struct Handler {
     requests: usize,
     /// The last request body, for assertions about what was sent.
     last_body: Option<serde_json::Value>,
+    /// The last request target, including the selected model for Gemini.
+    last_path: Option<String>,
     /// Number of requests to fail with a retryable status before succeeding.
     fail_first: usize,
 }
@@ -160,6 +162,12 @@ impl MockEndpoint {
         self.handler.lock().ok().and_then(|h| h.last_body.clone())
     }
 
+    /// Returns the most recent HTTP request target.
+    #[must_use]
+    pub fn last_path(&self) -> Option<String> {
+        self.handler.lock().ok().and_then(|h| h.last_path.clone())
+    }
+
     /// Configures the endpoint to fail the first `count` requests with a
     /// retryable status.
     pub fn fail_first(&self, count: usize) {
@@ -187,6 +195,8 @@ fn serve(stream: TcpStream, handler: &Arc<Mutex<Handler>>) -> std::io::Result<()
 
     let mut content_length = 0_usize;
     let mut line = String::new();
+    reader.read_line(&mut line)?;
+    let request_path = line.split_whitespace().nth(1).map(str::to_owned);
     loop {
         line.clear();
         if reader.read_line(&mut line)? == 0 {
@@ -212,6 +222,7 @@ fn serve(stream: TcpStream, handler: &Arc<Mutex<Handler>>) -> std::io::Result<()
         };
         guard.requests = guard.requests.saturating_add(1);
         guard.last_body = serde_json::from_slice(&body).ok();
+        guard.last_path = request_path;
 
         if guard.fail_first > 0 {
             guard.fail_first = guard.fail_first.saturating_sub(1);

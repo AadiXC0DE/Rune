@@ -53,17 +53,31 @@ pub struct CommandSpec {
     /// Canonical name.
     pub name: &'static str,
     /// Alternative names.
-    pub aliases: &'static [&'static str],
+    pub aliases: &'static [AliasSpec],
     /// One-line summary shown in the command list.
     pub summary: &'static str,
     /// Usage line shown by `rune <command> --help`.
     pub usage: &'static str,
-    /// Flags accepted by this command, for help rendering.
+    /// Flags accepted by this command, for parsing, help, and completion.
     pub flags: &'static [FlagSpec],
     /// What the command needs from the runtime.
     pub requirements: Requirements,
     /// Whether the command produces JSON with `--json`.
     pub supports_json: bool,
+}
+
+/// One accepted alternative command name and its behavior.
+#[derive(Clone, Copy, Debug)]
+pub struct AliasSpec {
+    /// Alternative name.
+    pub name: &'static str,
+    /// Behavior shown in help and the generated reference.
+    pub description: &'static str,
+}
+
+/// Alias helper.
+const fn alias(name: &'static str, description: &'static str) -> AliasSpec {
+    AliasSpec { name, description }
 }
 
 /// One flag in a command's help.
@@ -132,12 +146,23 @@ pub const GLOBAL_FLAGS: &[FlagSpec] = &[
         "--no-additional-dirs",
         "Ignore saved additional directories for this process.",
     ),
-    flag("--offline", "Refuse every outbound network request."),
+    flag(
+        "--offline",
+        "Refuse provider requests, disable web tools, skip remote MCP checks and restrict sandboxed shell networking. Local MCP and unsandboxed commands can still use the network.",
+    ),
     flag(
         "--allow-unsandboxed",
         "Run commands where the host has no sandbox backend. Without this, such a host refuses them.",
     ),
     flag("--json", "Emit machine-readable output where supported."),
+    flag(
+        "--accessible",
+        "Use append-only labelled session output and line input for screen readers.",
+    ),
+    flag(
+        "--ascii",
+        "Use ASCII terminal decorations, preserving message text.",
+    ),
     option("--theme", "name", "Override the theme for this process."),
     option(
         "--provider-order",
@@ -155,13 +180,31 @@ pub const GLOBAL_FLAGS: &[FlagSpec] = &[
 /// Commands that start an interactive session rather than performing one action.
 pub const RUN: &[CommandSpec] = &[
     CommandSpec {
+        name: "resume",
+        aliases: &[],
+        summary: "Resume a saved session, defaulting to the latest in this workspace",
+        usage: "rune resume [last|id]",
+        flags: &[],
+        requirements: Requirements::FULL,
+        supports_json: false,
+    },
+    CommandSpec {
         name: "ask",
         aliases: &[],
-        summary: "Run one request without an interactive session",
+        summary: "Run one bounded turn without an interactive session",
         usage: "rune ask [flags] <prompt>",
         flags: &[
             flag("--json", "Print one JSON object instead of Markdown."),
+            flag(
+                "--jsonl",
+                "Stream bounded JSONL events (takes precedence over --json).",
+            ),
             flag("--no-save", "Do not create a session."),
+            option(
+                "--image",
+                "path",
+                "Attach a PNG, JPEG, GIF, or WebP file. Repeatable; 8 MiB total, at most 16 images.",
+            ),
         ],
         requirements: Requirements::FULL,
         supports_json: true,
@@ -181,7 +224,16 @@ pub const RUN: &[CommandSpec] = &[
     },
     CommandSpec {
         name: "review",
-        aliases: &[],
+        aliases: &[
+            alias(
+                "pr",
+                "Same as `rune review`; reviews pending workspace changes with optional context.",
+            ),
+            alias(
+                "issue",
+                "Same as `rune review`; reviews pending workspace changes with optional context.",
+            ),
+        ],
         summary: "Review the pending changes in the workspace",
         usage: "rune review [context]",
         flags: &[],
@@ -190,7 +242,20 @@ pub const RUN: &[CommandSpec] = &[
     },
     CommandSpec {
         name: "connect",
-        aliases: &[],
+        aliases: &[
+            alias(
+                "login",
+                "Same as `rune connect`; connects a provider, choosing from a list when no name is given.",
+            ),
+            alias(
+                "setup",
+                "Same as `rune connect`; connects a provider, choosing from a list when no name is given.",
+            ),
+            alias(
+                "provider",
+                "Same as `rune connect`; connects a provider, choosing from a list when no name is given.",
+            ),
+        ],
         summary: "Connect a model provider, choosing from a list",
         usage: "rune connect [<name>] [--json]",
         flags: &[flag("--json", "Emit JSON.")],
@@ -205,9 +270,14 @@ pub const SESSIONS: &[CommandSpec] = &[
         name: "sessions",
         aliases: &[],
         summary: "List sessions",
-        usage: "rune sessions [--all] [--limit <n>] [--cursor <c>]",
+        usage: "rune sessions [--all] [--search <text>] [--limit <n>] [--cursor <c>]",
         flags: &[
             flag("--all", "Include sessions from every workspace."),
+            option(
+                "--search",
+                "text",
+                "Match a case-insensitive literal fragment in titles or user messages.",
+            ),
             option("--limit", "n", "Page size, 1 to 100."),
             option("--cursor", "c", "Continue from a previous page."),
             flag("--json", "Emit JSON."),
@@ -218,16 +288,34 @@ pub const SESSIONS: &[CommandSpec] = &[
     CommandSpec {
         name: "session",
         aliases: &[],
-        summary: "Inspect, migrate, or recover one session",
-        usage: "rune session <last|id> [--json] | rune session migrate <id> | rune session recover <id>",
+        summary: "Inspect, search, export, fork, migrate, or recover one session",
+        usage: "rune session <last|id> [--search <text> | --record <id|all>] [--json] | rune session --id <id> [--search <text> | --record <id|all>] [--json] | rune session export <last|id> | rune session export --id <id> | rune session fork <last|id> --at <seq> [--json] | rune session fork --id <id> --at <seq> [--json] | rune session migrate <id> | rune session recover <id>",
         flags: &[
             option(
                 "--id",
                 "id",
-                "Read the argument as an exact session identifier.",
+                "Inspect, search, export, or fork this exact session identifier, taking precedence over a positional selector.",
+            ),
+            option(
+                "--at",
+                "seq",
+                "Fork through this inclusive saved event sequence. All tool calls must have results.",
+            ),
+            option(
+                "--search",
+                "text",
+                "Search saved message, tool, and summary records, including compacted context, by a case-insensitive literal fragment. Return original records and sequence positions.",
             ),
             flag("--allow-large", "Permit migrating an oversized session."),
-            flag("--json", "Emit JSON."),
+            option(
+                "--record",
+                "id|all",
+                "Retrieve exact original messages archived by manual compaction. IDs are stable within the session; all lists every archived record.",
+            ),
+            flag(
+                "--json",
+                "Emit JSON. Export always emits ordered JSONL event records.",
+            ),
         ],
         requirements: Requirements::CONFIG,
         supports_json: true,
@@ -236,9 +324,13 @@ pub const SESSIONS: &[CommandSpec] = &[
         name: "tree",
         aliases: &[],
         summary: "Show the branch structure of a session",
-        usage: "rune tree [last|id] [--json]",
+        usage: "rune tree [last|id] [--json] | rune tree --id <id> [--json]",
         flags: &[
-            option("--id", "id", "Read the argument as an exact identifier."),
+            option(
+                "--id",
+                "id",
+                "Show the tree of this exact session identifier, taking precedence over a positional selector.",
+            ),
             flag("--json", "Emit JSON."),
         ],
         requirements: Requirements::CONFIG,
@@ -246,12 +338,22 @@ pub const SESSIONS: &[CommandSpec] = &[
     },
     CommandSpec {
         name: "usage",
-        aliases: &[],
-        summary: "Report token usage recorded on this machine",
-        usage: "rune usage [--period <24h|7d|30d>] [--json]",
+        aliases: &[alias(
+            "cost",
+            "Same as `rune usage`; reports token usage recorded on this machine.",
+        )],
+        summary: "Report or export token usage recorded on this machine",
+        usage: "rune usage [--period <24h|7d|30d>] [--json] | rune usage export [--period <24h|7d|30d>]",
         flags: &[
-            option("--period", "span", "One of 24h, 7d, or 30d."),
-            flag("--json", "Emit JSON."),
+            option(
+                "--period",
+                "span",
+                "One of 24h, 7d, or 30d. Export defaults to all retained records.",
+            ),
+            flag(
+                "--json",
+                "Emit JSON. Export always emits ordered JSONL usage records.",
+            ),
         ],
         requirements: Requirements::CONFIG,
         supports_json: true,
@@ -262,11 +364,33 @@ pub const SESSIONS: &[CommandSpec] = &[
 pub const ACCOUNT: &[CommandSpec] = &[
     CommandSpec {
         name: "auth",
-        aliases: &[],
+        aliases: &[alias(
+            "logout",
+            "Same as `rune auth`; without an action, shows connection status. Use `rune auth logout` to remove the stored credential.",
+        )],
         summary: "Show or manage stored credentials",
         usage: "rune auth [status|logout] [--json]",
         flags: &[flag("--json", "Emit JSON.")],
         requirements: Requirements::CONFIG,
+        supports_json: true,
+    },
+    CommandSpec {
+        name: "capabilities",
+        aliases: &[],
+        summary: "Check provider capabilities and context provenance before a turn",
+        usage: "rune capabilities [--require-images] [--require-tool-streaming] [--json]",
+        flags: &[
+            flag(
+                "--require-images",
+                "Require image content support in the dialect.",
+            ),
+            flag(
+                "--require-tool-streaming",
+                "Require incremental tool argument streaming.",
+            ),
+            flag("--json", "Emit JSON."),
+        ],
+        requirements: Requirements::NETWORK,
         supports_json: true,
     },
     CommandSpec {
@@ -279,15 +403,47 @@ pub const ACCOUNT: &[CommandSpec] = &[
         supports_json: true,
     },
     CommandSpec {
+        name: "mcp",
+        aliases: &[],
+        summary: "Manage MCP servers: mcp list, mcp check, mcp import",
+        usage: "rune mcp list [--json] | rune mcp check [server] [--json] | rune mcp import claude-desktop <file>",
+        flags: &[flag(
+            "--json",
+            "Emit JSON diagnostics without secrets. Import always emits full configuration JSON; save it as `.mcp.json` at the workspace root.",
+        )],
+        requirements: Requirements::NETWORK,
+        supports_json: true,
+    },
+    CommandSpec {
         name: "permissions",
         aliases: &[],
         summary: "Show the permission mode and rules",
-        usage: "rune permissions [--explain <target>] [--json]",
+        usage: "rune permissions [--explain <target> | --simulate <file>] [--json]",
         flags: &[
             option(
                 "--explain",
                 "target",
-                "Explain the decision for one target.",
+                "Explain one tool:target action, such as shell:pwd. JSON includes the outcome, deciding rule and layer.",
+            ),
+            option(
+                "--simulate",
+                "file",
+                "Dry-run a JSON array of {tool, target} calls in order, without execution or approval writes.",
+            ),
+            flag("--json", "Emit JSON."),
+        ],
+        requirements: Requirements::CONFIG,
+        supports_json: true,
+    },
+    CommandSpec {
+        name: "sandbox",
+        aliases: &[],
+        summary: "Explain command policy: sandbox [explain] -- <command>",
+        usage: "rune sandbox [explain] [--external-access] [--json] -- <command>",
+        flags: &[
+            flag(
+                "--external-access",
+                "Preview an explicit external-access grant to the shell context.",
             ),
             flag("--json", "Emit JSON."),
         ],
@@ -305,7 +461,10 @@ pub const ACCOUNT: &[CommandSpec] = &[
     },
     CommandSpec {
         name: "config",
-        aliases: &[],
+        aliases: &[alias(
+            "settings",
+            "Same as `rune config`; shows resolved configuration and value sources.",
+        )],
         summary: "Show the resolved configuration and where each value came from",
         usage: "rune config [--explain] [--json]",
         flags: &[
@@ -401,6 +560,15 @@ pub const MAINTENANCE: &[CommandSpec] = &[
         supports_json: true,
     },
     CommandSpec {
+        name: "completion",
+        aliases: &[],
+        summary: "Generate shell completion from the command table",
+        usage: "rune completion bash",
+        flags: &[],
+        requirements: Requirements::NONE,
+        supports_json: false,
+    },
+    CommandSpec {
         name: "reference",
         aliases: &[],
         summary: "Print the generated command reference",
@@ -411,7 +579,10 @@ pub const MAINTENANCE: &[CommandSpec] = &[
     },
     CommandSpec {
         name: "help",
-        aliases: &["-h", "--help"],
+        aliases: &[
+            alias("-h", "Same as `rune help`."),
+            alias("--help", "Same as `rune help`."),
+        ],
         summary: "Print help",
         usage: "rune help [command]",
         flags: &[],
@@ -420,7 +591,10 @@ pub const MAINTENANCE: &[CommandSpec] = &[
     },
     CommandSpec {
         name: "version",
-        aliases: &["-v", "--version"],
+        aliases: &[
+            alias("-v", "Same as `rune version`."),
+            alias("--version", "Same as `rune version`."),
+        ],
         summary: "Print the version",
         usage: "rune version",
         flags: &[],
@@ -438,17 +612,15 @@ pub const GROUPS: &[(&str, &[CommandSpec])] = &[
 ];
 
 /// Every command, flattened.
-#[must_use]
-pub fn all_commands() -> Vec<&'static CommandSpec> {
-    GROUPS.iter().flat_map(|(_, specs)| specs.iter()).collect()
+pub fn all_commands() -> impl Iterator<Item = &'static CommandSpec> {
+    GROUPS.iter().flat_map(|(_, specs)| specs.iter())
 }
 
 /// Looks up a command by name or alias.
 #[must_use]
 pub fn find(name: &str) -> Option<&'static CommandSpec> {
     all_commands()
-        .into_iter()
-        .find(|spec| spec.name == name || spec.aliases.contains(&name))
+        .find(|spec| spec.name == name || spec.aliases.iter().any(|alias| alias.name == name))
 }
 
 /// Resolves a parsed command to its specification.
@@ -471,13 +643,17 @@ mod tests {
 
     #[test]
     fn aliases_do_not_collide_with_names() {
-        let names: std::collections::HashSet<_> =
-            all_commands().iter().map(|spec| spec.name).collect();
+        let names: std::collections::HashSet<_> = all_commands().map(|spec| spec.name).collect();
         let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
         for spec in all_commands() {
             for alias in spec.aliases {
-                assert!(!names.contains(alias), "alias `{alias}` shadows a command");
-                assert!(seen.insert(alias), "alias `{alias}` is declared twice");
+                let name = alias.name;
+                assert!(!names.contains(name), "alias `{name}` shadows a command");
+                assert!(seen.insert(name), "alias `{name}` is declared twice");
+                assert!(
+                    !alias.description.is_empty(),
+                    "alias `{name}` has no description"
+                );
             }
         }
     }
@@ -520,6 +696,14 @@ mod tests {
         assert_eq!(find("--help").map(|s| s.name), Some("help"));
         assert_eq!(find("-v").map(|s| s.name), Some("version"));
         assert!(find("nonexistent").is_none());
+    }
+
+    #[test]
+    fn resume_declares_its_interactive_runtime_requirements() {
+        let spec = spec_for(Command::Resume).expect("resume specification");
+        assert_eq!(spec.name, "resume");
+        assert_eq!(spec.requirements, Requirements::FULL);
+        assert!(!spec.supports_json);
     }
 
     #[test]

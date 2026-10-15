@@ -39,6 +39,15 @@ impl Provider for Responses {
         NAME
     }
 
+    fn capabilities(&self) -> crate::provider::ProviderCapabilities {
+        crate::provider::ProviderCapabilities {
+            efforts: crate::provider::ALL_EFFORTS,
+            images: true,
+            tool_streaming: crate::provider::ToolStreaming::Incremental,
+            fast_mode: true,
+        }
+    }
+
     fn request_path(&self) -> &'static str {
         PATH
     }
@@ -55,7 +64,7 @@ impl Provider for Responses {
         let mut input: Vec<serde_json::Value> = Vec::new();
 
         for message in &plan.messages {
-            encode_message(message, &mut input)?;
+            encode_message(message, plan, &mut input)?;
         }
 
         let instructions = if plan.instructions.is_empty() {
@@ -74,6 +83,13 @@ impl Provider for Responses {
             "include".to_owned(),
             serde_json::json!(["reasoning.encrypted_content"]),
         );
+
+        if let Some(effort) = effort_wire(plan.effort) {
+            body.insert(
+                "reasoning".to_owned(),
+                serde_json::json!({ "effort": effort }),
+            );
+        }
 
         if plan.has_tools() {
             let tools: Vec<serde_json::Value> = plan
@@ -112,14 +128,18 @@ impl Provider for Responses {
 }
 
 /// Encodes one message into one or more input items.
-fn encode_message(message: &Message, out: &mut Vec<serde_json::Value>) -> Result<()> {
+fn encode_message(
+    message: &Message,
+    plan: &RequestPlan,
+    out: &mut Vec<serde_json::Value>,
+) -> Result<()> {
     match message.role {
         Role::System => Err(RuneError::invalid_field(
             "messages",
             "system content must be supplied as instructions, not as a message",
         )),
         Role::User => {
-            out.push(encode_user(message));
+            out.push(encode_user(message, plan));
             Ok(())
         }
         Role::Assistant => {
@@ -134,7 +154,7 @@ fn encode_message(message: &Message, out: &mut Vec<serde_json::Value>) -> Result
 }
 
 /// Encodes a user message.
-fn encode_user(message: &Message) -> serde_json::Value {
+fn encode_user(message: &Message, plan: &RequestPlan) -> serde_json::Value {
     let content: Vec<serde_json::Value> = message
         .parts
         .iter()
@@ -146,7 +166,10 @@ fn encode_user(message: &Message) -> serde_json::Value {
             ContentPart::Image { image } => Some(serde_json::json!({
                 "type": "input_image",
                 "detail": "auto",
-                "image_url": format!("image-ref:{}", image.id),
+                "image_url": plan.image_data.get(&image.id).map_or_else(
+                    || format!("image-ref:{}", image.id),
+                    |data| format!("data:{};base64,{data}", image.media_type),
+                ),
             })),
             _ => None,
         })
@@ -823,6 +846,26 @@ mod tests {
     }
 
     #[test]
+    fn one_call_mode_is_explicitly_serialized() {
+        let mut plan = plan_with_user("hi");
+        plan.tools = vec![ToolSpec {
+            name: "read_file".to_owned(),
+            description: "Read a file".to_owned(),
+            input_schema: serde_json::json!({ "type": "object" }),
+        }];
+        for parallel in [true, false] {
+            plan.parallel_tool_calls = parallel;
+            let body = Responses.build_request(&plan).expect("build");
+            assert_eq!(body["parallel_tool_calls"], parallel);
+            assert_eq!(body["tool_choice"], "auto");
+        }
+
+        plan.tools.clear();
+        let body = Responses.build_request(&plan).expect("build without tools");
+        assert!(body.get("parallel_tool_calls").is_none());
+    }
+
+    #[test]
     fn an_assistant_tool_call_becomes_a_function_call_item() {
         let mut plan = RequestPlan::new("m");
         plan.messages = vec![
@@ -904,6 +947,37 @@ mod tests {
         ])];
         let body = Responses.build_request(&plan).expect("build");
         assert_eq!(body["input"][0]["content"][1]["type"], "input_image");
+    }
+
+    #[test]
+    fn auto_effort_preserves_provider_defaults() {
+        let body = Responses
+            .build_request(&plan_with_user("hi"))
+            .expect("build");
+        assert!(body.get("reasoning").is_none());
+    }
+
+    #[test]
+    fn explicit_efforts_are_serialized_in_the_request() {
+        use rune_core::config::Effort;
+        for (effort, wire) in [
+            (Effort::None, "low"),
+            (Effort::Minimal, "low"),
+            (Effort::Low, "low"),
+            (Effort::Medium, "medium"),
+            (Effort::High, "high"),
+            (Effort::Xhigh, "xhigh"),
+            (Effort::Max, "xhigh"),
+        ] {
+            let mut plan = plan_with_user("hi");
+            plan.effort = effort;
+            let body = Responses.build_request(&plan).expect("build");
+            assert_eq!(
+                body["reasoning"],
+                serde_json::json!({ "effort": wire }),
+                "{effort}"
+            );
+        }
     }
 
     #[test]

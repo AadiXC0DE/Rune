@@ -21,10 +21,12 @@ use rune_term::theme::Theme;
 
 fn state() -> FooterState {
     FooterState {
+        provider_retry: None,
         model: "claude-sonnet-4".to_owned(),
         permission_mode: PermissionMode::Auto,
         workspace: "/Users/dev/rune".to_owned(),
         context_used: 24_500,
+        context_source: None,
         context_limit: 200_000,
         session_id: "9f2c1a7b4e".to_owned(),
     }

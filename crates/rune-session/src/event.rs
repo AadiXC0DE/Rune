@@ -13,9 +13,11 @@
 //!   readable and the caller can decide whether to truncate or to recover.
 
 use camino::Utf8Path;
+use rune_core::config::Effort;
 use rune_core::error::{ErrorCode, Result, RuneError};
 use rune_core::id::EventSeq;
 use serde::{Deserialize, Serialize};
+use std::io::Read;
 
 /// Schema version written by this build.
 pub const SCHEMA_VERSION: u32 = 1;
@@ -48,6 +50,25 @@ pub enum SessionEvent {
         /// Turn number, starting at one.
         turn: u64,
     },
+    /// A running exchange saved its final outcome.
+    TurnFinished {
+        /// Turn whose outcome was saved.
+        turn: u64,
+    },
+    /// The caller cancelled a turn, after any visible answer was recorded.
+    TurnCancelled {
+        /// Turn number of the cancelled exchange.
+        turn: u64,
+    },
+    /// A turn failed, after any visible answer was recorded.
+    TurnFailed {
+        /// Turn number of the failed exchange.
+        turn: u64,
+        /// Stable failure code.
+        code: ErrorCode,
+        /// Human-readable failure cause.
+        message: String,
+    },
     /// The user contributed a message.
     UserMessage {
         /// Message text.
@@ -59,6 +80,30 @@ pub enum SessionEvent {
         turn: u64,
         /// Message text.
         text: String,
+    },
+    /// Complete assistant content accompanying the following display and tool records.
+    AssistantContent {
+        /// Serialized provider-neutral message, including native replay state.
+        message: String,
+    },
+    /// Visible assistant text durably saved while a turn is still running.
+    /// A final message or outcome supersedes these deltas during replay.
+    AssistantDelta {
+        /// Turn the delta belongs to.
+        turn: u64,
+        /// Additional visible text, without terminal control sequences.
+        text: String,
+    },
+    /// Discards the text of a request attempt before retrying it.
+    AssistantReset {
+        /// Turn whose streamed text was cleared.
+        turn: u64,
+    },
+    /// Replay boundary derived from a journal without a final outcome.
+    /// This is synthesized by replay, rather than written by a dying process.
+    TurnInterrupted {
+        /// Turn that stopped before its outcome was saved.
+        turn: u64,
     },
     /// The model asked for a tool call.
     ToolCall {
@@ -97,6 +142,35 @@ pub enum SessionEvent {
         /// Display title.
         title: String,
     },
+    /// The user explicitly set the active session objective.
+    ObjectiveSet {
+        /// Objective text, retained independently of conversation compaction.
+        objective: String,
+    },
+    /// The user explicitly replaced the objective with a positive token budget.
+    ObjectiveBudgetSet {
+        /// Exact objective text.
+        objective: String,
+        /// Maximum accounted input plus output tokens across provider attempts.
+        token_budget: u64,
+    },
+    /// One provider attempt was charged to the active budgeted objective.
+    ObjectiveTokensRecorded {
+        /// Accounted input plus output tokens, including estimates when absent.
+        tokens: u64,
+    },
+    /// The user explicitly pinned a constraint for subsequent provider requests.
+    ConstraintPinned {
+        /// Exact text, independent of conversation compaction.
+        text: String,
+    },
+    /// The model settings for subsequent turns were saved.
+    ModelSet {
+        /// Selected model identifier.
+        model: String,
+        /// Selected reasoning effort.
+        effort: Effort,
+    },
     /// The session was created as a child of another.
     ///
     /// Recorded so the session can be kept out of ordinary discovery: a child is
@@ -106,6 +180,13 @@ pub enum SessionEvent {
     ChildOf {
         /// Session that created this one.
         parent: String,
+    },
+    /// This independent session copied another session's inclusive prefix.
+    ForkedFrom {
+        /// Source session identifier.
+        session: String,
+        /// Last source event copied, using journal sequence positions.
+        through: u64,
     },
     /// The workspace the session ran in was recorded.
     ///
@@ -123,15 +204,28 @@ impl SessionEvent {
     pub const fn kind(&self) -> &'static str {
         match self {
             Self::TurnStarted { .. } => "turn_started",
+            Self::TurnFinished { .. } => "turn_finished",
+            Self::TurnCancelled { .. } => "turn_cancelled",
+            Self::TurnFailed { .. } => "turn_failed",
             Self::UserMessage { .. } => "user_message",
             Self::AssistantMessage { .. } => "assistant_message",
+            Self::AssistantContent { .. } => "assistant_content",
+            Self::AssistantDelta { .. } => "assistant_delta",
+            Self::AssistantReset { .. } => "assistant_reset",
+            Self::TurnInterrupted { .. } => "turn_interrupted",
             Self::ToolCall { .. } => "tool_call",
             Self::ToolResult { .. } => "tool_result",
             Self::Compaction { .. } => "compaction",
             Self::UsageRecorded { .. } => "usage_recorded",
             Self::TitleSet { .. } => "title_set",
+            Self::ObjectiveSet { .. } => "objective_set",
+            Self::ObjectiveBudgetSet { .. } => "objective_budget_set",
+            Self::ObjectiveTokensRecorded { .. } => "objective_tokens_recorded",
+            Self::ConstraintPinned { .. } => "constraint_pinned",
+            Self::ModelSet { .. } => "model_set",
             Self::WorkspaceSet { .. } => "workspace_set",
             Self::ChildOf { .. } => "child_of",
+            Self::ForkedFrom { .. } => "forked_from",
         }
     }
 }
@@ -341,7 +435,7 @@ pub fn read_log(path: &Utf8Path) -> Result<LogRead> {
     read_log_limited(path, MAX_LOG_BYTES)
 }
 
-/// Reads a log with an explicit file size bound.
+/// Reads a log with an explicit file size bound, even if it grows during reading.
 pub fn read_log_limited(path: &Utf8Path, limit: u64) -> Result<LogRead> {
     let bytes = read_log_bytes(path, limit)?.unwrap_or_default();
     salvage_bytes(&bytes).into_read()
@@ -356,6 +450,7 @@ pub fn salvage_log(path: &Utf8Path) -> Result<LogSalvage> {
 }
 
 /// Reads a log with an explicit file size bound, keeping the valid prefix.
+/// Growth past the bound is a size error rather than a salvaged or torn prefix.
 pub fn salvage_log_limited(path: &Utf8Path, limit: u64) -> Result<LogSalvage> {
     let bytes = read_log_bytes(path, limit)?.unwrap_or_default();
     Ok(salvage_bytes(&bytes))
@@ -389,7 +484,23 @@ fn read_log_bytes(path: &Utf8Path, limit: u64) -> Result<Option<Vec<u8>>> {
     if meta.len() > limit {
         return Err(size_error("event_log", meta.len(), limit).with_invariant("log_size"));
     }
-    Ok(Some(std::fs::read(path)?))
+    let file = std::fs::File::open(path)?;
+    Ok(Some(read_log_bytes_capped(file, limit)?))
+}
+
+/// Reads at most the limit plus one byte, so growth cannot bypass the size bound.
+fn read_log_bytes_capped(reader: impl Read, limit: u64) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    // The extra byte distinguishes an exact fit from an oversized log without
+    // accepting the bounded prefix as a complete log or a torn tail.
+    reader
+        .take(limit.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    let observed = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    if observed > limit {
+        return Err(size_error("event_log", observed, limit).with_invariant("log_size"));
+    }
+    Ok(bytes)
 }
 
 /// Verifies that a path is a regular private file with a single link.
@@ -649,6 +760,11 @@ mod tests {
     fn every_event_kind_round_trips() {
         let events = [
             SessionEvent::TurnStarted { turn: 1 },
+            SessionEvent::TurnFailed {
+                turn: 1,
+                code: ErrorCode::IncompleteStream,
+                message: "the response stream ended without a completion event".to_owned(),
+            },
             SessionEvent::UserMessage {
                 text: "line one\nline two".to_owned(),
             },
@@ -676,6 +792,10 @@ mod tests {
             },
             SessionEvent::TitleSet {
                 title: "tidy the parser".to_owned(),
+            },
+            SessionEvent::ModelSet {
+                model: "fixture/model".to_owned(),
+                effort: Effort::Max,
             },
         ];
 
@@ -956,6 +1076,89 @@ mod tests {
         let err = read_log_limited(&path, limit).expect_err("over the limit");
         assert_eq!(err.code(), ErrorCode::TooLarge);
         assert_eq!(err.detail().invariant.as_deref(), Some("log_size"));
+    }
+
+    #[test]
+    fn log_growth_after_metadata_is_bounded_and_reports_a_size_error() {
+        struct GrowingLog<'a> {
+            file: std::fs::File,
+            path: &'a Utf8Path,
+            grew: bool,
+            bytes_read: usize,
+        }
+
+        impl Read for GrowingLog<'_> {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                if !self.grew {
+                    use std::io::Write;
+
+                    let mut writer = std::fs::OpenOptions::new().append(true).open(self.path)?;
+                    writer.write_all(&[b' '; 4096])?;
+                    self.grew = true;
+                }
+                let count = self.file.read(buffer)?;
+                self.bytes_read += count;
+                Ok(count)
+            }
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = log_path(&dir);
+        write_log(&path, &body(&[message(1)]));
+        let meta = std::fs::symlink_metadata(&path).expect("metadata");
+        check_private(&path, &meta).expect("private log");
+        let limit = meta.len();
+        let mut reader = GrowingLog {
+            file: std::fs::File::open(&path).expect("open log"),
+            path: &path,
+            grew: false,
+            bytes_read: 0,
+        };
+
+        let err = read_log_bytes_capped(&mut reader, limit).expect_err("growth exceeds limit");
+        assert!(reader.grew);
+        assert_eq!(
+            reader.bytes_read,
+            usize::try_from(limit + 1).expect("limit")
+        );
+        assert!(std::fs::metadata(&path).expect("grown metadata").len() > limit + 1);
+        assert_eq!(err.code(), ErrorCode::TooLarge);
+        assert_eq!(err.field(), Some("event_log"));
+        assert_eq!(err.detail().invariant.as_deref(), Some("log_size"));
+        assert_eq!(err.detail().observed, Some((limit + 1).to_string()));
+    }
+
+    #[test]
+    fn capped_log_reads_preserve_empty_and_exact_limit_logs() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = log_path(&dir);
+        write_log(&path, "");
+        assert!(read_log_limited(&path, 0).expect("empty read").is_empty());
+        assert_eq!(
+            salvage_log_limited(&path, 0)
+                .expect("empty salvage")
+                .salvaged(),
+            0
+        );
+
+        let frames = vec![message(1)];
+        let contents = body(&frames);
+        write_log(&path, &contents);
+        let exact_limit = u64::try_from(contents.len()).expect("length");
+        for limit in [exact_limit, u64::MAX] {
+            assert_eq!(read_log_limited(&path, limit).expect("read").events, frames);
+            let salvage = salvage_log_limited(&path, limit).expect("salvage");
+            assert_eq!(salvage.events, frames);
+            assert!(salvage.stop.is_none());
+        }
+        for limit in [0, exact_limit - 1] {
+            let read_error = read_log_limited(&path, limit).expect_err("oversize read");
+            let salvage_error = salvage_log_limited(&path, limit).expect_err("oversize salvage");
+            assert_eq!(read_error, salvage_error);
+            assert_eq!(read_error.code(), ErrorCode::TooLarge);
+            assert_eq!(read_error.field(), Some("event_log"));
+            assert_eq!(read_error.detail().invariant.as_deref(), Some("log_size"));
+        }
     }
 
     #[test]

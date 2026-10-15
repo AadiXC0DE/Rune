@@ -45,8 +45,8 @@ pub const SUMMARY_RESERVE_BYTES: usize = 512;
 
 /// The caps a file tool applies, resolved once from the limit set.
 ///
-/// Every bound a tool enforces comes from here, so `rune limits` reports the
-/// number that actually governs the run rather than a compiled constant.
+/// Configurable bounds come from here, so `rune limits` reports their values.
+/// Tools may also enforce fixed safety ceilings, such as grep's context window.
 #[derive(Clone, Copy, Debug)]
 pub struct FileLimits {
     /// Lines returned by one read.
@@ -360,16 +360,41 @@ pub fn read_line_bounded<R: BufRead>(
     buffer: &mut Vec<u8>,
     keep: usize,
 ) -> std::io::Result<LineRead> {
+    read_line_bounded_checked(reader, buffer, keep, || Ok(()))
+}
+
+/// Reads a bounded line, checking for cancellation before each buffered chunk
+/// and before returning. Work between checks is bounded by the reader's buffer
+/// capacity, including when discarding the rest of an oversized line.
+pub fn read_line_bounded_checked<R: BufRead, E: From<std::io::Error>>(
+    reader: &mut R,
+    buffer: &mut Vec<u8>,
+    keep: usize,
+    check: impl FnMut() -> std::result::Result<(), E>,
+) -> std::result::Result<LineRead, E> {
+    read_line_bounded_observed(reader, buffer, keep, check, |_| {})
+}
+
+/// Reads a bounded line with cancellation checks, passing every source chunk
+/// to `observe`, including bytes beyond the retained head and the terminator.
+pub fn read_line_bounded_observed<R: BufRead, E: From<std::io::Error>>(
+    reader: &mut R,
+    buffer: &mut Vec<u8>,
+    keep: usize,
+    mut check: impl FnMut() -> std::result::Result<(), E>,
+    mut observe: impl FnMut(&[u8]),
+) -> std::result::Result<LineRead, E> {
     buffer.clear();
     let mut read = LineRead::default();
     // Line terminators at the end of what has been seen so far, which are not
     // part of the line's length.
     let mut terminators = 0_usize;
     loop {
+        check()?;
         let available = match reader.fill_buf() {
             Ok(available) => available,
             Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(err) => return Err(err),
+            Err(err) => return Err(err.into()),
         };
         if available.is_empty() {
             break;
@@ -380,6 +405,7 @@ pub fn read_line_bounded<R: BufRead>(
         };
         let room = keep.saturating_sub(buffer.len()).min(chunk.len());
         buffer.extend_from_slice(&chunk[..room]);
+        observe(chunk);
         read.has_nul |= chunk.contains(&0);
         let tail = chunk
             .iter()
@@ -398,6 +424,7 @@ pub fn read_line_bounded<R: BufRead>(
             break;
         }
     }
+    check()?;
     read.length = read.consumed.saturating_sub(terminators);
     Ok(read)
 }

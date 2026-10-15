@@ -128,7 +128,7 @@ impl Registry {
         if let Err(err) = tool.validate(arguments) {
             // A malformed call is returned to the model as a tool error so it
             // can correct itself rather than the turn ending.
-            return Ok(ToolOutput::failure(err.message().to_owned()));
+            return Ok(ToolOutput::from_error(&err));
         }
 
         match tool.call(arguments, context) {
@@ -136,7 +136,7 @@ impl Registry {
             // A tool that fails for an operational reason is also a tool error:
             // a missing file or a failed command is information the model needs.
             Err(err) if !matches!(err.code(), ErrorCode::Cancelled) => {
-                Ok(ToolOutput::failure(err.message().to_owned()))
+                Ok(ToolOutput::from_error(&err))
             }
             Err(err) => Err(err),
         }
@@ -153,5 +153,114 @@ impl Registry {
     pub fn permission_target(&self, name: &str, arguments: &serde_json::Value) -> Option<String> {
         self.get(name)
             .and_then(|tool| tool.permission_target(arguments))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct FailingTool {
+        error: RuneError,
+        fail_validation: bool,
+    }
+
+    impl Tool for FailingTool {
+        fn name(&self) -> &'static str {
+            "fixture"
+        }
+
+        fn description(&self) -> &'static str {
+            "Return a fixture diagnostic."
+        }
+
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+
+        fn activity(&self) -> Activity {
+            Activity::Read
+        }
+
+        fn validate(&self, _arguments: &serde_json::Value) -> Result<()> {
+            if self.fail_validation {
+                Err(self.error.clone())
+            } else {
+                Ok(())
+            }
+        }
+
+        fn call(
+            &self,
+            _arguments: &serde_json::Value,
+            _context: &ExecutionContext,
+        ) -> Result<ToolOutput> {
+            assert!(!self.fail_validation, "invalid calls must not execute");
+            Err(self.error.clone())
+        }
+    }
+
+    #[test]
+    fn validation_and_execution_failures_preserve_the_full_diagnostic() {
+        for fail_validation in [false, true] {
+            let error = if fail_validation {
+                RuneError::invalid_field("path", "invalid path")
+            } else {
+                RuneError::new(ErrorCode::NotFound, "missing")
+            }
+            .with_hint("try other.txt")
+            .with_observed("missing.txt")
+            .with_invariant("fixture_path");
+            let mut registry = Registry::new();
+            registry
+                .insert(Box::new(FailingTool {
+                    error: error.clone(),
+                    fail_validation,
+                }))
+                .expect("register");
+            let output = registry
+                .call(
+                    "fixture",
+                    &serde_json::json!({}),
+                    &ExecutionContext::new("/fixture".into()),
+                )
+                .expect("a repairable failure is a tool result");
+            assert!(output.is_error);
+            assert_eq!(output.produced_bytes, output.text.len() as u64);
+            let diagnostic: serde_json::Value =
+                serde_json::from_str(&output.render()).expect("diagnostic JSON");
+            assert_eq!(diagnostic["code"], error.code().as_str());
+            assert_eq!(diagnostic["message"], error.message());
+            assert_eq!(diagnostic["detail"]["hint"], "try other.txt");
+            assert_eq!(diagnostic["detail"]["observed"], "missing.txt");
+            assert_eq!(diagnostic["detail"]["invariant"], "fixture_path");
+            if fail_validation {
+                assert_eq!(diagnostic["detail"]["field"], "path");
+            } else {
+                assert!(diagnostic["detail"].get("field").is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn execution_cancellation_still_propagates_as_an_error() {
+        let error = RuneError::new(ErrorCode::Cancelled, "cancelled fixture");
+        let mut registry = Registry::new();
+        registry
+            .insert(Box::new(FailingTool {
+                error: error.clone(),
+                fail_validation: false,
+            }))
+            .expect("register");
+        assert_eq!(
+            registry
+                .call(
+                    "fixture",
+                    &serde_json::json!({}),
+                    &ExecutionContext::new("/fixture".into()),
+                )
+                .expect_err("cancellation must stop execution"),
+            error
+        );
     }
 }

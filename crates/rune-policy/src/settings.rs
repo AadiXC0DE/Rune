@@ -60,36 +60,50 @@ impl Fingerprint {
 /// An advisory lock over the settings file.
 ///
 /// The lock is a separate file, so acquiring it never touches the content being
-/// replaced. It is released on drop, including on an error path.
+/// replaced. The OS releases it when the handle is dropped or the process dies.
+/// The file stays on disk so every writer locks the same file. The PID in the
+/// adjacent `.holder` file is only diagnostic metadata; a leftover PID does not
+/// mean the lock is held.
 #[derive(Debug)]
 pub struct Lock {
-    path: camino::Utf8PathBuf,
-    held: bool,
+    _file: std::fs::File,
 }
 
 impl Lock {
     /// Acquires the lock, waiting up to the deadline.
     pub fn acquire(path: &Utf8Path) -> Result<Self> {
         let started = Instant::now();
+        // Existing lock files may come from an interrupted writer. Refuse links
+        // and nonregular files before opening them for the persistent OS lock.
+        match std::fs::symlink_metadata(path) {
+            Ok(meta) => verify_lock_file(path, &meta)?,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err.into()),
+        }
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true).write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let file = options.open(path)?;
+        verify_lock_file(path, &std::fs::symlink_metadata(path)?)?;
+        verify_lock_file(path, &file.metadata()?)?;
         loop {
-            match std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(path)
-            {
-                Ok(mut file) => {
-                    use std::io::Write as _;
+            match file.try_lock() {
+                Ok(()) => {
+                    // Windows locks can prevent other handles from reading the
+                    // locked file. Keep diagnostics in a separate file, written
+                    // only after acquiring the lock.
                     let identity = format!("{}\n", std::process::id());
-                    let _ = file.write_all(identity.as_bytes());
-                    let _ = file.sync_all();
-                    return Ok(Self {
-                        path: path.to_owned(),
-                        held: true,
-                    });
+                    paths::write_private(&holder_path_for(path), &identity)?;
+                    return Ok(Self { _file: file });
                 }
-                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                Err(std::fs::TryLockError::WouldBlock) => {
                     if started.elapsed() >= LOCK_DEADLINE {
-                        let holder = std::fs::read_to_string(path).unwrap_or_default();
+                        let holder =
+                            std::fs::read_to_string(holder_path_for(path)).unwrap_or_default();
                         return Err(RuneError::new(
                             ErrorCode::Locked,
                             format!("`{path}` is held by another process"),
@@ -99,19 +113,35 @@ impl Lock {
                     }
                     std::thread::sleep(LOCK_POLL);
                 }
-                Err(err) => return Err(err.into()),
+                Err(std::fs::TryLockError::Error(err)) => return Err(err.into()),
             }
         }
     }
 }
 
-impl Drop for Lock {
-    fn drop(&mut self) {
-        if self.held {
-            let _ = std::fs::remove_file(&self.path);
-            self.held = false;
+fn holder_path_for(lock_path: &Utf8Path) -> camino::Utf8PathBuf {
+    camino::Utf8PathBuf::from(format!("{lock_path}.holder"))
+}
+
+/// A lock must refer to a regular file that cannot alias another file.
+fn verify_lock_file(path: &Utf8Path, meta: &std::fs::Metadata) -> Result<()> {
+    if !meta.is_file() {
+        return Err(RuneError::new(
+            ErrorCode::UnsafePath,
+            format!("`{path}` is not a regular lock file"),
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if meta.nlink() != 1 {
+            return Err(RuneError::new(
+                ErrorCode::UnsafePath,
+                format!("`{path}` has {} hard links", meta.nlink()),
+            ));
         }
     }
+    Ok(())
 }
 
 /// Outcome of a settings write.
@@ -126,7 +156,7 @@ pub enum WriteOutcome {
     },
 }
 
-/// Replaces the settings file.
+/// Atomically replaces the settings file with a complete, synced private file.
 ///
 /// `expected` is the fingerprint the caller read. A mismatch means another
 /// process or a person changed the file, which is reported rather than
@@ -172,7 +202,7 @@ pub fn write(path: &Utf8Path, body: &str, expected: Option<&Fingerprint>) -> Res
         _ => None,
     };
 
-    paths::write_private(path, body)?;
+    paths::write_private_atomic(path, body)?;
 
     // A widened mode would make the file unreadable by the next command, so the
     // write is verified rather than assumed.
@@ -212,7 +242,7 @@ where
         _ => None,
     };
 
-    paths::write_private(path, &replacement)?;
+    paths::write_private_atomic(path, &replacement)?;
     verify_private(path)?;
 
     Ok(WriteOutcome::Written {
@@ -396,11 +426,72 @@ mod tests {
     }
 
     #[test]
+    fn write_and_update_replace_rules_without_truncating_the_old_file() {
+        use std::io::Read;
+
+        const OLD_RULES: &str = "{\"rules\":[{\"tool\":\"shell\",\"decision\":\"ask\"}]}\n";
+        const NEW_RULES: &str = "{\"rules\":[{\"tool\":\"read_file\",\"decision\":\"allow\"}]}\n";
+
+        for use_update in [false, true] {
+            let dir = TempDir::new().expect("tempdir");
+            let path = settings_path(&dir);
+            paths::write_private(&path, OLD_RULES).expect("initial rules");
+            // A reader that opened the old file must retain a complete snapshot
+            // across replacement. An in-place truncate/write corrupts it.
+            let mut old_reader = std::fs::File::open(&path).expect("open old rules");
+            let outcome = if use_update {
+                update(&path, |current| {
+                    assert_eq!(current, Some(OLD_RULES));
+                    Ok(NEW_RULES.to_owned())
+                })
+            } else {
+                write(&path, NEW_RULES, Some(&Fingerprint::of(OLD_RULES)))
+            }
+            .expect("replace rules");
+
+            let mut old_body = String::new();
+            old_reader
+                .read_to_string(&mut old_body)
+                .expect("old snapshot");
+            assert_eq!(old_body, OLD_RULES);
+            let new_body = paths::read_private(&path, MAX_BYTES)
+                .expect("private new rules")
+                .expect("present");
+            assert_eq!(new_body, NEW_RULES);
+            for body in [&old_body, &new_body] {
+                serde_json::from_str::<serde_json::Value>(body).expect("complete rules JSON");
+            }
+            let WriteOutcome::Written { bytes, backup } = outcome;
+            assert_eq!(bytes, NEW_RULES.len());
+            let backup = backup.expect("backup of old rules");
+            assert_eq!(
+                paths::read_private(Utf8Path::new(&backup), MAX_BYTES)
+                    .expect("private backup")
+                    .as_deref(),
+                Some(OLD_RULES)
+            );
+            assert!(
+                std::fs::read_dir(dir.path())
+                    .expect("directory")
+                    .all(|entry| {
+                        !entry
+                            .expect("entry")
+                            .file_name()
+                            .to_string_lossy()
+                            .starts_with(".rune-private-")
+                    })
+            );
+        }
+    }
+
+    #[test]
     fn a_write_releases_the_lock() {
         let dir = TempDir::new().expect("tempdir");
         let path = settings_path(&dir);
         write(&path, "{}\n", None).expect("write");
-        assert!(!lock_path_for(&path).exists(), "the lock was left behind");
+        let lock_path = lock_path_for(&path);
+        assert!(lock_path.exists(), "writers must keep the same lock file");
+        let _lock = Lock::acquire(&lock_path).expect("the OS lock was released");
     }
 
     #[test]
@@ -414,6 +505,63 @@ mod tests {
         assert_eq!(err.code(), ErrorCode::Locked);
         assert!(err.detail().hint.is_some());
         drop(held);
+    }
+
+    #[test]
+    fn leftover_lock_metadata_does_not_block_a_writer() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = settings_path(&dir);
+        let lock_path = lock_path_for(&path);
+        for metadata in [
+            String::new(),
+            format!("{}\n", std::process::id()),
+            "not a PID\n".to_owned(),
+        ] {
+            // Also covers the older lock files created with default permissions.
+            std::fs::write(&lock_path, metadata).expect("leftover lock file");
+            write(&path, "{}\n", None).expect("unheld lock does not block");
+            assert_eq!(
+                std::fs::read_to_string(holder_path_for(&lock_path)).expect("holder PID"),
+                format!("{}\n", std::process::id())
+            );
+        }
+    }
+
+    #[test]
+    fn a_failed_update_releases_the_lock() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = settings_path(&dir);
+        let err = update(&path, |_| {
+            Err(RuneError::new(ErrorCode::InvalidState, "edit refused"))
+        })
+        .expect_err("edit failure");
+        assert_eq!(err.code(), ErrorCode::InvalidState);
+        write(&path, "{}\n", None).expect("write after edit failure");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn linked_lock_files_are_refused_without_changing_the_target() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = settings_path(&dir);
+        let lock_path = lock_path_for(&path);
+        let target = dir.path().join("target");
+        std::fs::write(&target, "keep me").expect("target");
+        std::os::unix::fs::symlink(&target, &lock_path).expect("symlink");
+        assert_eq!(
+            Lock::acquire(&lock_path).expect_err("symlink").code(),
+            ErrorCode::UnsafePath
+        );
+        std::fs::remove_file(&lock_path).expect("remove symlink");
+        std::fs::hard_link(&target, &lock_path).expect("hard link");
+        assert_eq!(
+            Lock::acquire(&lock_path).expect_err("hard link").code(),
+            ErrorCode::UnsafePath
+        );
+        assert_eq!(
+            std::fs::read_to_string(target).expect("target unchanged"),
+            "keep me"
+        );
     }
 
     #[test]

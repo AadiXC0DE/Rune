@@ -880,10 +880,12 @@ mod tests {
     #[test]
     fn a_frame_drawn_from_the_footer_layout_covers_the_terminal() {
         let state = crate::footer::FooterState {
+            provider_retry: None,
             model: "claude-sonnet-4".to_owned(),
             permission_mode: rune_core::config::PermissionMode::Auto,
             workspace: "/Users/dev/rune".to_owned(),
             context_used: 24_500,
+            context_source: None,
             context_limit: 200_000,
             session_id: "9f2c1a7b4e".to_owned(),
         };
@@ -896,7 +898,7 @@ mod tests {
         let composed = compose(&regions, 80, 24).expect("compose");
         assert_eq!(
             composed.row_text(23),
-            "claude-sonnet-4 | auto | ctx 12% (175.5k left) | /Users/dev/rune 9f2c1a7b"
+            "claude-sonnet-4 | auto | ctx 12% (provider-reported) (175.5k left) | /Users/dev/"
         );
         assert_eq!(composed.row_text(22), crate::footer::HINTS);
         assert_eq!(composed.row_text(21), ">");

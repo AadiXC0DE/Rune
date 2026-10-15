@@ -10,7 +10,7 @@ use rune_core::error::Result;
 use rune_core::tool::ToolSpec;
 use sha2::{Digest as _, Sha256};
 
-use crate::ask_user::AskUserQuestion;
+use crate::ask_user::{Answerer, AskUserQuestion, Unavailable};
 use crate::contract::{Tool, model_spec};
 use crate::registry::Registry;
 use crate::shell::Shell;
@@ -18,7 +18,10 @@ use crate::skill::{CapabilitySearch, InstallSkill, LoadSkill};
 use crate::vision::Vision;
 use crate::web::{WebFetch, WebSearch};
 use crate::workspace::FileLimits;
-use crate::{EditFile, GlobFiles, GrepFiles, ReadFile, WriteFile};
+use crate::{
+    CreateDirectory, EditFile, GitDiff, GlobFiles, GrepFiles, ReadFile, ReadToolResult, RenameFile,
+    SyntaxDiagnostics, UpdatePlan, WriteFile,
+};
 
 /// Names of every tool this build ships, in advertisement order.
 ///
@@ -28,10 +31,16 @@ pub const ADVERTISEMENT_ORDER: &[&str] = &[
     "glob_files",
     "grep_files",
     "read_file",
+    "read_tool_result",
+    "git_diff",
+    "syntax_diagnostics",
     "write_file",
     "edit_file",
+    "rename_file",
+    "create_directory",
     "shell",
     "ask_user_question",
+    "update_plan",
     "web_fetch",
     "web_search",
     "vision",
@@ -100,19 +109,78 @@ pub fn builtin_with_web(
     skills_root: &camino::Utf8Path,
     web: Option<WebBackends>,
 ) -> Result<Registry> {
+    builtin_with_answerer(
+        limits,
+        budget,
+        skills_root,
+        web,
+        std::sync::Arc::new(Unavailable),
+    )
+}
+
+/// Builds the registry with a host-supplied structured question answerer.
+///
+/// Machine callers keep using [`builtin_with_web`], which reports unavailable
+/// input instead of selecting an answer or waiting for terminal input.
+pub fn builtin_with_answerer(
+    limits: &FileLimits,
+    budget: &rune_core::budget::BudgetSet,
+    skills_root: &camino::Utf8Path,
+    web: Option<WebBackends>,
+    answerer: std::sync::Arc<dyn Answerer>,
+) -> Result<Registry> {
+    builtin_with_catalog(
+        limits,
+        budget,
+        skills_root,
+        web,
+        answerer,
+        std::sync::Arc::new(crate::skill::Empty),
+    )
+}
+
+/// Builds the registry with a host-supplied discovered skill catalog.
+///
+/// Search and loading share the catalog, while instruction reads retain the
+/// caller's configured skill file limit.
+pub fn builtin_with_catalog(
+    limits: &FileLimits,
+    budget: &rune_core::budget::BudgetSet,
+    skills_root: &camino::Utf8Path,
+    web: Option<WebBackends>,
+    answerer: std::sync::Arc<dyn Answerer>,
+    catalog: std::sync::Arc<dyn crate::skill::Catalog>,
+) -> Result<Registry> {
+    builtin_with_vision(limits, budget, skills_root, web, answerer, catalog, None)
+}
+
+/// Builds the inventory with an optional host image analysis backend.
+///
+/// An absent backend keeps the tool explicitly labelled unavailable.
+pub fn builtin_with_vision(
+    limits: &FileLimits,
+    budget: &rune_core::budget::BudgetSet,
+    skills_root: &camino::Utf8Path,
+    web: Option<WebBackends>,
+    answerer: std::sync::Arc<dyn Answerer>,
+    catalog: std::sync::Arc<dyn crate::skill::Catalog>,
+    vision: Option<std::sync::Arc<dyn crate::vision::VisionBackend>>,
+) -> Result<Registry> {
     let mut registry = Registry::new();
     registry.insert(Box::new(GlobFiles::with_limits(*limits)))?;
     registry.insert(Box::new(GrepFiles::with_limits(*limits)))?;
     registry.insert(Box::new(ReadFile::with_limits(*limits)))?;
+    registry.insert(Box::new(ReadToolResult::new(budget)))?;
+    registry.insert(Box::new(GitDiff::with_limits(*limits)))?;
+    registry.insert(Box::new(SyntaxDiagnostics::with_limits(*limits)))?;
     registry.insert(Box::new(WriteFile))?;
     registry.insert(Box::new(EditFile))?;
+    registry.insert(Box::new(RenameFile))?;
+    registry.insert(Box::new(CreateDirectory::with_limits(*limits)))?;
     registry.insert(Box::new(Shell::new(budget)))?;
-    registry.insert(Box::new(AskUserQuestion::unavailable()))?;
+    registry.insert(Box::new(AskUserQuestion::new(answerer)))?;
+    registry.insert(Box::new(UpdatePlan))?;
 
-    // The catalog is supplied by the host, so a run with no workspace to scan
-    // reports an empty catalog rather than failing.
-    let catalog: std::sync::Arc<dyn crate::skill::Catalog> =
-        std::sync::Arc::new(crate::skill::Empty);
     let context_limits = rune_context::limits::Limits::resolve(budget)?;
     registry.insert(Box::new(LoadSkill::new(
         std::sync::Arc::clone(&catalog),
@@ -133,7 +201,11 @@ pub fn builtin_with_web(
         registry.insert(Box::new(WebFetch::unconfigured(budget)))?;
         registry.insert(Box::new(WebSearch::unconfigured(budget)))?;
     }
-    registry.insert(Box::new(Vision::unconfigured(budget)))?;
+    let vision = vision.map_or_else(
+        || Vision::unconfigured(budget),
+        |backend| Vision::new(backend, budget),
+    );
+    registry.insert(Box::new(vision))?;
     debug_assert_eq!(registry.len(), ADVERTISEMENT_ORDER.len());
     Ok(registry)
 }
@@ -223,6 +295,40 @@ mod tests {
     }
 
     #[test]
+    fn a_host_answerer_preserves_the_advertisement_and_returns_the_chosen_label() {
+        let registry = builtin_with_answerer(
+            &FileLimits::default(),
+            &rune_core::budget::BudgetSet::new(),
+            camino::Utf8Path::new("/tmp/skills"),
+            None,
+            std::sync::Arc::new(crate::ask_user::Scripted::new([
+                crate::ask_user::Answer::Chosen(vec![1]),
+            ])),
+        )
+        .expect("built");
+        let machine = builtin_default().expect("built");
+        assert_eq!(
+            advertisement_digest(&registry),
+            advertisement_digest(&machine)
+        );
+        let arguments = serde_json::json!({"questions": [{
+            "question": "Which choice?",
+            "options": [{"label": "Alpha"}, {"label": "Beta"}]
+        }]});
+        let context = crate::contract::ExecutionContext::new(camino::Utf8PathBuf::from("/tmp"));
+        let chosen = registry
+            .call("ask_user_question", &arguments, &context)
+            .expect("answer");
+        assert!(!chosen.is_error);
+        assert_eq!(chosen.text, "Which choice?\nAnswer: Beta");
+        let unavailable = machine
+            .call("ask_user_question", &arguments, &context)
+            .expect("unavailable");
+        assert!(unavailable.is_error);
+        assert!(unavailable.text.contains("this run cannot collect one"));
+    }
+
+    #[test]
     fn the_registry_holds_exactly_the_advertised_set() {
         let registry = builtin_default().expect("built");
         assert_eq!(registry.len(), ADVERTISEMENT_ORDER.len());
@@ -245,6 +351,69 @@ mod tests {
     fn every_tool_has_a_valid_schema() {
         let registry = builtin_default().expect("built");
         validate_all(&registry).expect("every tool is well formed");
+    }
+
+    #[test]
+    fn every_closed_builtin_rejects_unknown_arguments_on_direct_and_registry_calls() {
+        let registry = builtin_default().expect("built");
+        let context = crate::contract::ExecutionContext::new(camino::Utf8PathBuf::from("/tmp"));
+        for name in ADVERTISEMENT_ORDER {
+            let tool = registry.get(name).expect("registered");
+            let schema = tool.input_schema();
+            assert_eq!(schema["additionalProperties"], false, "{name}");
+            let mut arguments = serde_json::json!({"misspelled_argument": true});
+            if let Some(required) = schema["required"].as_array() {
+                for field in required {
+                    arguments[field.as_str().expect("field name")] = serde_json::Value::Null;
+                }
+            }
+            // The retained-result reader validates inside call to keep errors
+            // within its response byte cap.
+            if *name != "read_tool_result" {
+                let err = tool
+                    .validate(&arguments)
+                    .expect_err("unknown field refused");
+                assert_eq!(
+                    err.code(),
+                    rune_core::error::ErrorCode::InvalidField,
+                    "{name}"
+                );
+                assert!(
+                    err.message().contains("misspelled_argument"),
+                    "{name}: {err}"
+                );
+            }
+            match tool.call(&arguments, &context) {
+                Err(err) => {
+                    assert_eq!(
+                        err.code(),
+                        rune_core::error::ErrorCode::InvalidField,
+                        "{name}"
+                    );
+                    assert!(
+                        err.message().contains("misspelled_argument"),
+                        "{name}: {err}"
+                    );
+                }
+                Ok(output) => {
+                    assert!(output.is_error, "{name}");
+                    assert!(
+                        output.text.contains("misspelled_argument"),
+                        "{name}: {}",
+                        output.text
+                    );
+                }
+            }
+            let output = registry
+                .call(name, &arguments, &context)
+                .expect("schema error");
+            assert!(output.is_error, "{name}");
+            assert!(
+                output.text.contains("misspelled_argument"),
+                "{name}: {}",
+                output.text
+            );
+        }
     }
 
     #[test]
@@ -329,10 +498,17 @@ mod tests {
     fn the_read_only_set_is_identified() {
         let registry = builtin_default().expect("built");
         let read_only = registry.read_only_names();
-        for name in ["glob_files", "grep_files", "read_file"] {
+        for name in [
+            "glob_files",
+            "grep_files",
+            "read_file",
+            "read_tool_result",
+            "git_diff",
+            "syntax_diagnostics",
+        ] {
             assert!(read_only.contains(&name), "`{name}` should be read only");
         }
-        for name in ["write_file", "edit_file"] {
+        for name in ["write_file", "edit_file", "rename_file", "create_directory"] {
             assert!(!read_only.contains(&name), "`{name}` must not be read only");
         }
     }
@@ -361,6 +537,17 @@ mod tests {
             .insert(Box::new(ReadFile::new()))
             .expect_err("duplicate");
         assert_eq!(err.code(), rune_core::error::ErrorCode::AlreadyExists);
+    }
+
+    #[test]
+    fn unconfigured_vision_is_explicitly_unavailable_in_the_advertisement() {
+        let registry = builtin_default().expect("built");
+        let spec = advertisement(&registry)
+            .into_iter()
+            .find(|spec| spec.name == "vision")
+            .expect("vision schema");
+        assert!(spec.description.starts_with("Unavailable:"));
+        assert!(spec.description.contains("no image analysis backend"));
     }
 
     #[test]

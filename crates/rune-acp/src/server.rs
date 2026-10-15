@@ -10,30 +10,32 @@
 //! - Standard output carries frames and nothing else. Every diagnostic goes to
 //!   the configured log file, because a stray line on stdout is a malformed
 //!   frame as far as the client is concerned.
-//! - A prompt that arrives during a turn is admitted. It is queued, or refused
-//!   with a named reason once the queue is full. It is never dropped.
+//! - While protocol output is writable, a prompt that arrives during a turn is
+//!   admitted. It is queued, or refused with a named reason once the queue is
+//!   full. Output failure cancels the turn and discards its queue.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::fs::OpenOptions;
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use camino::Utf8PathBuf;
+use camino::{Utf8Path, Utf8PathBuf};
 use rune_agent::history::History;
 use rune_agent::steering::{Cancellation, SteeringQueue};
 use rune_agent::turn::{Event, Host, StopReason, run_turn};
+use rune_context::mcp::Client;
 use rune_core::budget::{BudgetSet, LimitName};
 use rune_core::config::{Effort, PermissionMode};
 use rune_core::error::{ErrorCode, Result, RuneError};
 use rune_core::paths::Paths;
 use rune_net::catalog::Catalog;
 use rune_net::message::ToolSpec;
-use rune_net::provider::Provider;
+use rune_net::provider::{Provider, RequestPlan};
 use rune_net::stream::Usage;
 use rune_net::transport::Endpoint;
 use rune_policy::decision::Outcome;
@@ -45,6 +47,7 @@ use rune_tools::workspace::FileLimits;
 use serde_json::{Value, json};
 
 use crate::jsonrpc::{FrameError, Id, Message, Request, Response, RpcError, Writer};
+use crate::prompt::Prompt;
 use crate::session::{
     SessionConfig, Sessions, config_options, kind_for_name, message_chunk, modes, tool_call,
     tool_call_update, tool_title, usage_update,
@@ -62,6 +65,9 @@ const POLL: Duration = Duration::from_millis(25);
 /// Time an in-flight turn is given to stop once input ends.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 
+/// Capacity discovery runs on the turn thread, within a short request budget.
+const CONTEXT_LOOKUP_TIMEOUT: Duration = Duration::from_secs(3);
+
 /// Which dialect an endpoint speaks.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum Dialect {
@@ -72,6 +78,8 @@ pub enum Dialect {
     Responses,
     /// An Anthropic Messages endpoint.
     Anthropic,
+    /// A native Gemini Generate Content endpoint.
+    Gemini,
 }
 
 impl Dialect {
@@ -82,10 +90,12 @@ impl Dialect {
             rune_net::chat_completions::ChatCompletions;
         static RESPONSES: rune_net::responses::Responses = rune_net::responses::Responses;
         static ANTHROPIC: rune_net::anthropic::Anthropic = rune_net::anthropic::Anthropic;
+        static GEMINI: rune_net::gemini::Gemini = rune_net::gemini::Gemini;
         match self {
             Self::ChatCompletions => &CHAT,
             Self::Responses => &RESPONSES,
             Self::Anthropic => &ANTHROPIC,
+            Self::Gemini => &GEMINI,
         }
     }
 
@@ -96,6 +106,7 @@ impl Dialect {
             Self::ChatCompletions => "chat_completions",
             Self::Responses => "responses",
             Self::Anthropic => "anthropic",
+            Self::Gemini => "gemini",
         }
     }
 
@@ -106,16 +117,20 @@ impl Dialect {
             "chat_completions" | "chat-completions" | "openai" => Some(Self::ChatCompletions),
             "responses" => Some(Self::Responses),
             "anthropic" | "messages" => Some(Self::Anthropic),
+            "gemini" | "google" => Some(Self::Gemini),
             _ => None,
         }
     }
 }
 
+/// Builds workspace-specific instructions using the host's existing loader.
+pub type InstructionLoader = fn(&Utf8Path, &Utf8Path, &BudgetSet) -> String;
+
 /// Everything one server process needs.
 pub struct ServerConfig {
     /// State layout, used to create and open sessions.
     pub paths: Paths,
-    /// Primary workspace every session is rooted at.
+    /// Default workspace when the client supplies no session cwd.
     pub workspace: Utf8PathBuf,
     /// Endpoint model requests go to.
     pub endpoint: Endpoint,
@@ -123,8 +138,10 @@ pub struct ServerConfig {
     pub dialect: Dialect,
     /// Model used unless a session overrides it.
     pub model: String,
-    /// System instructions for every turn.
+    /// Host instructions for every turn, independent of the session workspace.
     pub instructions: String,
+    /// Optional loader for project instructions and skills at the session cwd.
+    pub instruction_loader: Option<InstructionLoader>,
     /// Tool registry.
     pub registry: Registry,
     /// Rules in force before any session approval.
@@ -137,7 +154,7 @@ pub struct ServerConfig {
     pub limits: BudgetSet,
     /// Where diagnostics go. Standard output is never used for them.
     pub log_file: Option<Utf8PathBuf>,
-    /// Usable context size of the active model, reported in usage updates.
+    /// Usable context size of the default model, reported in usage updates.
     pub context_window: u64,
     /// Directories every session may reach in addition to the workspace.
     pub additional_roots: Vec<Utf8PathBuf>,
@@ -173,9 +190,8 @@ impl ServerConfig {
         let context_window = Catalog::new("acp")
             .metadata_or_default(&model)
             .usable_context();
-        let instructions = format!(
-            "You are Rune, a coding agent. The workspace is {workspace}. Inspect and change files with the tools."
-        );
+        let instructions =
+            "You are Rune, a coding agent. Inspect and change files with the tools.".to_owned();
         Ok(Self {
             paths,
             workspace,
@@ -183,6 +199,7 @@ impl ServerConfig {
             dialect: Dialect::default(),
             model,
             instructions,
+            instruction_loader: None,
             registry,
             rules: RuleSet::new(),
             mode: PermissionMode::default(),
@@ -236,6 +253,13 @@ impl ServerConfig {
         self
     }
 
+    /// Sets the loader used to discover instructions at each session's cwd.
+    #[must_use]
+    pub const fn with_instruction_loader(mut self, loader: InstructionLoader) -> Self {
+        self.instruction_loader = Some(loader);
+        self
+    }
+
     /// Sets the limits and rebuilds the tool set from them.
     pub fn with_limits(mut self, limits: BudgetSet) -> Result<Self> {
         self.registry = rune_tools::inventory::builtin(
@@ -254,7 +278,7 @@ impl ServerConfig {
         self
     }
 
-    /// Sets the context size reported in usage updates.
+    /// Sets the default model's context size reported in usage updates.
     #[must_use]
     pub const fn with_context_window(mut self, tokens: u64) -> Self {
         self.context_window = tokens;
@@ -266,7 +290,7 @@ impl ServerConfig {
 struct Queued {
     id: Id,
     session: String,
-    text: String,
+    prompt: Prompt,
 }
 
 /// The state of the one turn a connection may be running.
@@ -290,7 +314,13 @@ struct Active {
 pub struct Server<W: Write + Send + 'static> {
     config: ServerConfig,
     writer: Mutex<Writer<W>>,
+    /// A failed frame makes this connection unusable for any further work.
+    output_failed: AtomicBool,
+    /// True only after an initialize request agreed on our protocol version.
+    initialized: AtomicBool,
     sessions: Mutex<Sessions>,
+    /// Endpoint capacities, discovered when a turn first uses another model.
+    model_catalog: OnceLock<Catalog>,
     /// Requests this server issued, by identifier, awaiting a client answer.
     pending: Mutex<BTreeMap<i64, std::sync::mpsc::Sender<Response>>>,
     next_request: AtomicI64,
@@ -336,7 +366,10 @@ impl<W: Write + Send + 'static> Server<W> {
         Ok(Self {
             config,
             writer: Mutex::new(Writer::new(output)),
+            output_failed: AtomicBool::new(false),
+            initialized: AtomicBool::new(false),
             sessions: Mutex::new(sessions),
+            model_catalog: OnceLock::new(),
             pending: Mutex::new(BTreeMap::new()),
             next_request: AtomicI64::new(1),
             log: Mutex::new(log),
@@ -346,13 +379,18 @@ impl<W: Write + Send + 'static> Server<W> {
         })
     }
 
-    /// Serves messages until the input ends.
+    /// Serves messages while the input and protocol output remain usable.
     ///
     /// A frame the reader could not accept is answered with an error and the
     /// connection carries on. Only a failure of the stream itself ends the loop.
+    /// Output failure cancels turn work immediately; a blocked input read still
+    /// waits for input or EOF before this method returns.
     pub fn run<R: BufRead>(self: &Arc<Self>, input: R) -> Result<()> {
         let mut reader = crate::jsonrpc::Reader::new(input);
         loop {
+            if self.output_failed.load(Ordering::SeqCst) {
+                break;
+            }
             match reader.read_message() {
                 Ok(None) => break,
                 Ok(Some(message)) => self.dispatch(message),
@@ -376,10 +414,33 @@ impl<W: Write + Send + 'static> Server<W> {
     /// Writes one frame.
     fn send(&self, message: &Message) {
         let outcome = match self.writer.lock() {
-            Ok(mut writer) => writer.write_message(message),
+            Ok(mut writer) => {
+                if self.output_failed.load(Ordering::SeqCst) {
+                    return;
+                }
+                let outcome = writer.write_message(message);
+                if outcome.is_err() {
+                    self.output_failed.store(true, Ordering::SeqCst);
+                }
+                outcome
+            }
             Err(_) => return,
         };
         if let Err(err) = outcome {
+            // This can run on the turn thread. Signal cancellation without
+            // waiting for that same thread to settle, or holding the writer.
+            if let Ok(mut active) = self.active.lock() {
+                active.queue.clear();
+                if let Some(cancellation) = &active.cancellation {
+                    cancellation.cancel();
+                }
+                if let Some(tools) = &active.tools {
+                    tools.cancel();
+                }
+            }
+            if let Ok(mut pending) = self.pending.lock() {
+                pending.clear();
+            }
             self.note(format_args!("could not write a frame: {err}"));
         }
     }
@@ -436,7 +497,18 @@ impl<W: Write + Send + 'static> Server<W> {
     }
 
     /// Issues a request to the client and waits for its answer.
-    fn ask(&self, method: &str, params: Value, cancellation: &Cancellation) -> Option<Value> {
+    fn ask(
+        &self,
+        method: &str,
+        params: Value,
+        cancellation: &Cancellation,
+    ) -> Result<Option<Value>> {
+        let started = Instant::now();
+        let timeout = Duration::from_millis(
+            self.config
+                .limits
+                .get_bytes(LimitName::AcpPermissionTimeoutMs),
+        );
         let id = self.next_request.fetch_add(1, Ordering::SeqCst);
         let (sender, receiver) = std::sync::mpsc::channel();
         if let Ok(mut guard) = self.pending.lock() {
@@ -447,7 +519,7 @@ impl<W: Write + Send + 'static> Server<W> {
             method,
             params,
         )));
-        let answer = wait_for(&receiver, cancellation);
+        let answer = wait_for(&receiver, cancellation, started, timeout);
         if let Ok(mut guard) = self.pending.lock() {
             guard.remove(&id);
         }
@@ -456,6 +528,9 @@ impl<W: Write + Send + 'static> Server<W> {
 
     /// Routes one incoming message.
     fn dispatch(self: &Arc<Self>, message: Message) {
+        if self.output_failed.load(Ordering::SeqCst) {
+            return;
+        }
         match message {
             Message::Response(response) => self.resolve(response),
             Message::Notification(notification) => {
@@ -491,7 +566,31 @@ impl<W: Write + Send + 'static> Server<W> {
         id: Option<Id>,
     ) -> std::result::Result<Option<Value>, RpcError> {
         match method {
-            "initialize" => Ok(Some(self.initialize(params))),
+            "initialize" => {
+                if id.is_none() {
+                    return Err(RpcError::invalid_request("initialize must be a request"));
+                }
+                self.initialize(params).map(Some)
+            }
+            "session/new"
+            | "session/load"
+            | "session/resume"
+            | "session/close"
+            | "session/list"
+            | "session/set_config_option"
+            | "session/set_mode"
+            | "session/cancel"
+            | "session/prompt"
+                if !self.initialized.load(Ordering::SeqCst) =>
+            {
+                Err(RpcError::invalid_request(
+                    "initialize with a compatible protocolVersion before calling session methods",
+                )
+                .with_data(json!({
+                    "code": "not_initialized",
+                    "protocolVersion": PROTOCOL_VERSION,
+                })))
+            }
             "session/new" => self.new_session(params).map(Some),
             "session/load" => self.load_session(params).map(Some),
             "session/resume" => self.resume_session(params).map(Some),
@@ -505,20 +604,40 @@ impl<W: Write + Send + 'static> Server<W> {
         }
     }
 
-    /// Answers `initialize`, advertising what this server supports.
-    fn initialize(&self, params: &Value) -> Value {
+    /// Answers `initialize`, establishing compatibility only on a version match.
+    ///
+    /// ACP requires returning our latest version even on a mismatch. The client
+    /// can close the connection or retry with that version if it supports it.
+    fn initialize(&self, params: &Value) -> std::result::Result<Value, RpcError> {
+        if self.initialized.load(Ordering::SeqCst) {
+            return Err(
+                RpcError::invalid_request("connection is already initialized")
+                    .with_data(json!({"code": "already_initialized"})),
+            );
+        }
+        let version = params
+            .get("protocolVersion")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| {
+                RpcError::invalid_params("protocolVersion must be a nonnegative integer")
+                    .with_data(json!({"code": "invalid_field", "field": "protocolVersion"}))
+            })?;
+        self.initialized.store(
+            Some(version) == u64::try_from(PROTOCOL_VERSION).ok(),
+            Ordering::SeqCst,
+        );
         let client = params
             .get("clientInfo")
             .and_then(|info| info.get("name"))
             .and_then(Value::as_str)
             .unwrap_or("unknown");
         self.note(format_args!("client `{client}` opened a connection"));
-        json!({
+        Ok(json!({
             "protocolVersion": PROTOCOL_VERSION,
             "agentCapabilities": {
                 "loadSession": true,
                 "promptCapabilities": {
-                    "image": false,
+                    "image": self.config.dialect.provider().capabilities().images,
                     "audio": false,
                     "embeddedContext": true,
                 },
@@ -535,28 +654,22 @@ impl<W: Write + Send + 'static> Server<W> {
                 "title": "Rune",
             },
             "authMethods": [],
-        })
+        }))
     }
 
     /// Answers `session/new`.
     fn new_session(&self, params: &Value) -> std::result::Result<Value, RpcError> {
         let roots = additional_roots(params)?;
-        if let Some(cwd) = optional_string(params, "cwd")? {
-            require_absolute(&Utf8PathBuf::from(cwd), "cwd")?;
-        }
-        if let Some(list) = params.get("mcpServers").and_then(Value::as_array)
-            && !list.is_empty()
-        {
-            // No MCP client is wired in, so the request is reported rather than
-            // implying servers the session will never reach.
-            self.note(format_args!(
-                "ignoring {} requested MCP server(s)",
-                list.len()
-            ));
-        }
+        let workspace = optional_string(params, "cwd")?
+            .map_or_else(|| self.config.workspace.clone(), Utf8PathBuf::from);
+        require_absolute(&workspace, "cwd")?;
+        let mcp = crate::mcp::connect(params, &self.config.limits)?;
         let mut sessions = self.lock_sessions()?;
         let id = sessions
-            .create(roots)
+            .create_in(workspace, roots)
+            .map_err(|err| RpcError::from_rune(&err))?;
+        sessions
+            .set_mcp(&id, mcp)
             .map_err(|err| RpcError::from_rune(&err))?;
         let session = sessions.get(&id).map_err(|err| RpcError::from_rune(&err))?;
         Ok(json!({
@@ -569,11 +682,17 @@ impl<W: Write + Send + 'static> Server<W> {
     /// Answers `session/load`, replaying the stored conversation first.
     fn load_session(&self, params: &Value) -> std::result::Result<Value, RpcError> {
         let id = string_field(params, "sessionId")?;
+        let roots = additional_roots(params)?;
+        let mcp = crate::mcp::connect(params, &self.config.limits)?;
         let updates = {
             let mut sessions = self.lock_sessions()?;
+            let updates = sessions
+                .load_with_roots(&id, roots)
+                .map_err(|err| RpcError::from_rune(&err))?;
             sessions
-                .load(&id)
-                .map_err(|err| RpcError::from_rune(&err))?
+                .set_mcp(&id, mcp)
+                .map_err(|err| RpcError::from_rune(&err))?;
+            updates
         };
         for update in updates {
             self.send(&Message::Notification(update));
@@ -584,9 +703,14 @@ impl<W: Write + Send + 'static> Server<W> {
     /// Answers `session/resume`, which replays nothing.
     fn resume_session(&self, params: &Value) -> std::result::Result<Value, RpcError> {
         let id = string_field(params, "sessionId")?;
+        let roots = additional_roots(params)?;
+        let mcp = crate::mcp::connect(params, &self.config.limits)?;
         let mut sessions = self.lock_sessions()?;
         sessions
-            .resume(&id)
+            .resume_with_roots(&id, roots)
+            .map_err(|err| RpcError::from_rune(&err))?;
+        sessions
+            .set_mcp(&id, mcp)
             .map_err(|err| RpcError::from_rune(&err))?;
         drop(sessions);
         self.session_state(&id)
@@ -704,7 +828,7 @@ impl<W: Write + Send + 'static> Server<W> {
             ));
         };
         let session = string_field(params, "sessionId")?;
-        let text = prompt_text(params)?;
+        let prompt = Prompt::parse(params, self.config.dialect.provider())?;
         {
             let sessions = self.lock_sessions()?;
             sessions
@@ -712,11 +836,18 @@ impl<W: Write + Send + 'static> Server<W> {
                 .map_err(|err| RpcError::from_rune(&err))?;
         }
 
-        let arriving = Queued { id, session, text };
+        let arriving = Queued {
+            id,
+            session,
+            prompt,
+        };
         let running = {
             let Ok(mut active) = self.active.lock() else {
                 return Err(RpcError::internal("the session state is unavailable"));
             };
+            if self.output_failed.load(Ordering::SeqCst) {
+                return Err(RpcError::internal("the protocol output is unavailable"));
+            }
             if active.cancellation.is_some() {
                 {
                     if active.queue.len() >= self.queue_depth {
@@ -782,17 +913,34 @@ impl<W: Write + Send + 'static> Server<W> {
     }
 }
 
-/// Waits for a response, giving up when the turn is cancelled.
-fn wait_for(receiver: &Receiver<Response>, cancellation: &Cancellation) -> Option<Value> {
+/// Waits for a response until cancellation or the permission deadline.
+fn wait_for(
+    receiver: &Receiver<Response>,
+    cancellation: &Cancellation,
+    started: Instant,
+    timeout: Duration,
+) -> Result<Option<Value>> {
     loop {
-        match receiver.recv_timeout(POLL) {
-            Ok(response) => return response.into_outcome().and_then(std::result::Result::ok),
-            Err(RecvTimeoutError::Timeout) => {
-                if cancellation.is_cancelled() {
-                    return None;
-                }
+        if cancellation.is_cancelled() {
+            return Ok(None);
+        }
+        let remaining = timeout.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            return Err(RuneError::new(
+                ErrorCode::Timeout,
+                format!(
+                    "the client did not answer the permission request within {} ms \
+                     (`acp_permission_timeout_ms`)",
+                    timeout.as_millis()
+                ),
+            ));
+        }
+        match receiver.recv_timeout(POLL.min(remaining)) {
+            Ok(response) => {
+                return Ok(response.into_outcome().and_then(std::result::Result::ok));
             }
-            Err(RecvTimeoutError::Disconnected) => return None,
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => return Ok(None),
         }
     }
 }
@@ -809,6 +957,9 @@ fn run_queued<W: Write + Send + 'static>(server: &Arc<Server<W>>, first: Queued)
             let Ok(mut active) = server.active.lock() else {
                 return;
             };
+            if server.output_failed.load(Ordering::SeqCst) {
+                active.queue.clear();
+            }
             if let Some(following) = active.queue.pop_front() {
                 active.cancellation = Some(Cancellation::new());
                 active.tools = None;
@@ -851,6 +1002,13 @@ fn run_one<W: Write + Send + 'static>(server: &Arc<Server<W>>, queued: Queued) {
             .active
             .lock()
             .map(|mut active| {
+                // Output can fail before the turn registers its tool handle.
+                if server.output_failed.load(Ordering::SeqCst) {
+                    tools.cancel();
+                    if let Some(cancellation) = &active.cancellation {
+                        cancellation.cancel();
+                    }
+                }
                 active.tools = Some(tools);
                 active.cancellation.clone().unwrap_or_default()
             })
@@ -860,31 +1018,51 @@ fn run_one<W: Write + Send + 'static>(server: &Arc<Server<W>>, queued: Queued) {
     server.record(
         &session,
         SessionEvent::UserMessage {
-            text: queued.text.clone(),
+            text: queued.prompt.text.clone(),
         },
     );
     server.send(&Message::Notification(message_chunk(
         &session,
         "user_message_chunk",
-        &queued.text,
+        &queued.prompt.text,
     )));
 
+    let mut tools = server.config.registry.all_schemas();
+    if let Some(client) = &snapshot.mcp {
+        tools.extend(client.tools().into_iter().map(|tool| ToolSpec {
+            name: tool.name,
+            description: tool.description,
+            input_schema: tool.input_schema,
+        }));
+    }
+    let mut history = snapshot.history;
+    let prompt_seq = history.push_user(queued.prompt.text.clone());
     let host = TurnHost {
         server: Arc::clone(server),
+        prompt: queued.prompt,
+        prompt_seq,
         session: session.clone(),
+        context_window: server.context_window(&snapshot.config.model),
         config: snapshot.config.clone(),
         rules: Mutex::new(snapshot.rules),
-        context: snapshot.context.clone(),
+        context: snapshot
+            .context
+            .clone()
+            .with_offline(server.config.endpoint.offline),
         cancellation: cancellation.clone(),
         steering: snapshot.steering,
-        tools: server.config.registry.all_schemas(),
+        tools,
+        mcp: snapshot.mcp,
         answer: Mutex::default(),
         thought: Mutex::default(),
+        permission_timeout: OnceLock::new(),
     };
 
-    let mut history = snapshot.history;
-    history.push_user(queued.text.clone());
     let outcome = run_turn(&mut history, &host);
+    // The host cancels work when an approval expires. Preserve the deadline
+    // error so the prompt reports a timeout rather than a user cancellation.
+    let permission_timeout = host.permission_timeout.get();
+    let outcome = permission_timeout.map_or(outcome, |err| Err(err.clone()));
     let rules = host
         .rules
         .lock()
@@ -922,7 +1100,10 @@ fn run_one<W: Write + Send + 'static>(server: &Arc<Server<W>>, queued: Queued) {
                 json!({ "stopReason": stop_reason(outcome.stop_reason) }),
             );
         }
-        Err(err) if cancellation.is_cancelled() || err.code() == ErrorCode::Cancelled => {
+        Err(err)
+            if permission_timeout.is_none()
+                && (cancellation.is_cancelled() || err.code() == ErrorCode::Cancelled) =>
+        {
             server.absorb(&session, history, rules);
             server.retire_tools();
             server.respond(queued.id, json!({ "stopReason": "cancelled" }));
@@ -945,7 +1126,7 @@ pub const fn stop_reason(reason: StopReason) -> &'static str {
     match reason {
         StopReason::Completed => "end_turn",
         StopReason::StepLimit => "max_turn_requests",
-        StopReason::OutputLimit => "max_tokens",
+        StopReason::OutputLimit | StopReason::ObjectiveBudget => "max_tokens",
         StopReason::Refused | StopReason::ContentFilter => "refusal",
         StopReason::Cancelled => "cancelled",
         StopReason::ProviderFailure => "end_turn",
@@ -953,12 +1134,43 @@ pub const fn stop_reason(reason: StopReason) -> &'static str {
 }
 
 impl<W: Write + Send + 'static> Server<W> {
+    /// Resolves capacity for the model captured at the start of a turn.
+    ///
+    /// The default model retains its configured capacity. Changed models use
+    /// the endpoint's listing, or the conservative default when no capacity is
+    /// available. Discovery is deferred so startup and unchanged sessions do
+    /// not need an extra network request, and never holds the session lock.
+    fn context_window(&self, model: &str) -> u64 {
+        if model == self.config.model {
+            return self.config.context_window;
+        }
+        let catalog = self.model_catalog.get_or_init(|| {
+            rune_net::transport::list_models(
+                &rune_net::transport::agent(),
+                &self.config.endpoint,
+                self.config.dialect.provider(),
+                CONTEXT_LOOKUP_TIMEOUT,
+            )
+            .ok()
+            .and_then(|body| {
+                rune_net::catalog::from_endpoint_listing(self.config.dialect.name(), &body)
+            })
+            .unwrap_or_else(|| Catalog::new(self.config.dialect.name()))
+        });
+        catalog.metadata_or_default(model).usable_context()
+    }
+
     /// Appends one event to a session log, reporting a failure without stopping.
     fn record(&self, session: &str, event: SessionEvent) {
-        if let Ok(mut sessions) = self.sessions.lock()
-            && let Err(err) = sessions.record(session, event)
-        {
-            self.note(format_args!("could not record an event: {err}"));
+        if let Ok(mut sessions) = self.sessions.lock() {
+            match sessions.record(session, event) {
+                Ok(report) => {
+                    if let Some(warning) = report.metadata_warning {
+                        self.note(format_args!("warning: {warning}"));
+                    }
+                }
+                Err(err) => self.note(format_args!("could not record an event: {err}")),
+            }
         }
     }
 
@@ -981,18 +1193,25 @@ impl<W: Write + Send + 'static> Server<W> {
 
 /// The host a turn runs against.
 struct TurnHost<W: Write + Send + 'static> {
+    prompt: Prompt,
+    prompt_seq: u64,
     server: Arc<Server<W>>,
     session: String,
     config: SessionConfig,
+    /// Capacity belonging to this turn's model, unaffected by later changes.
+    context_window: u64,
     rules: Mutex<RuleSet>,
     context: ExecutionContext,
     cancellation: Cancellation,
     steering: SteeringQueue,
     tools: Vec<ToolSpec>,
+    mcp: Option<Arc<Client>>,
     /// Answer text of the running step, as the client has been sent it.
     answer: Mutex<StreamedStep>,
     /// Reasoning of the running step, as the client has been sent it.
     thought: Mutex<StreamedStep>,
+    /// Deadline failure retained while cancellation stops the tool batch.
+    permission_timeout: OnceLock<RuneError>,
 }
 
 impl<W: Write + Send + 'static> TurnHost<W> {
@@ -1047,14 +1266,24 @@ impl<W: Write + Send + 'static> TurnHost<W> {
                 {"optionId": "reject_once", "name": "Reject", "kind": "reject_once"},
             ],
         });
-        let Some(answer) =
-            self.server
-                .ask("session/request_permission", params, &self.cancellation)
-        else {
-            return (
-                Outcome::Deny,
-                format!("the approval for {name} was not answered"),
-            );
+        let answer = match self
+            .server
+            .ask("session/request_permission", params, &self.cancellation)
+        {
+            Ok(Some(answer)) => answer,
+            Ok(None) => {
+                return (
+                    Outcome::Deny,
+                    format!("the approval for {name} was not answered"),
+                );
+            }
+            Err(err) => {
+                let reason = err.message().to_owned();
+                let _ = self.permission_timeout.set(err);
+                self.cancellation.cancel();
+                self.context.cancellation().cancel();
+                return (Outcome::Deny, reason);
+            }
         };
         let option = answer
             .get("outcome")
@@ -1078,6 +1307,16 @@ impl<W: Write + Send + 'static> TurnHost<W> {
 }
 
 impl<W: Write + Send + 'static> Host for TurnHost<W> {
+    fn prepare_request(
+        &self,
+        history: &mut History,
+        plan: &mut RequestPlan,
+        _client: &dyn rune_net::fetch::Fetch,
+    ) -> Result<()> {
+        self.prompt.hydrate(self.prompt_seq, history, plan);
+        Ok(())
+    }
+
     fn dialect(&self) -> &dyn Provider {
         self.server.config.dialect.provider()
     }
@@ -1091,11 +1330,42 @@ impl<W: Write + Send + 'static> Host for TurnHost<W> {
     }
 
     fn instructions(&self) -> String {
-        self.server.config.instructions.clone()
+        let config = &self.server.config;
+        let mut instructions = config.instructions.clone();
+        if let Some(loader) = config.instruction_loader {
+            instructions.push_str("\n\n");
+            instructions.push_str(&loader(
+                self.context.workspace(),
+                &config.paths.config_root,
+                &config.limits,
+            ));
+        }
+        instructions.push_str("\n\nThe workspace is ");
+        instructions.push_str(self.context.workspace().as_str());
+        instructions.push('.');
+        instructions
     }
 
     fn tools(&self) -> Vec<ToolSpec> {
         self.tools.clone()
+    }
+
+    fn tool_activity(&self, name: &str) -> Option<rune_tools::Activity> {
+        self.server.config.registry.activity(name)
+    }
+
+    fn tool_permission_target(&self, name: &str, arguments: &Value) -> Option<String> {
+        rune_agent::turn::permission_target_for(&self.server.config.registry, name, arguments)
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    fn concurrent_tool_host(&self, name: &str) -> Option<&(dyn Host + Sync)> {
+        self.server
+            .config
+            .registry
+            .get(name)?
+            .is_read_only()
+            .then_some(self)
     }
 
     fn effort(&self) -> Effort {
@@ -1146,14 +1416,36 @@ impl<W: Write + Send + 'static> Host for TurnHost<W> {
                 self.server.send(&Message::Notification(usage_update(
                     &self.session,
                     reported_tokens(last_request),
-                    self.server.config.context_window,
+                    self.context_window,
                 )));
             }
-            Event::SteeringApplied { .. } => {}
+            Event::PlanUpdated { .. }
+            | Event::SteeringApplied { .. }
+            | Event::ContextCompacted { .. }
+            | Event::ProviderRetry { .. }
+            | Event::ProviderRetryFinished { .. } => {}
         }
     }
 
     fn execute(&self, name: &str, arguments: &Value) -> Result<ToolOutput> {
+        if let Some(client) = &self.mcp
+            && client.tools().iter().any(|tool| tool.name == name)
+        {
+            self.context.check_cancelled()?;
+            let output = match client
+                .call_cancellable(name, arguments, &|| self.context.check_cancelled().is_err())
+            {
+                Ok(outcome) => ToolOutput {
+                    produced_bytes: outcome.text.len() as u64,
+                    text: outcome.text,
+                    is_error: outcome.is_error,
+                    plan_update: None,
+                },
+                Err(err) => ToolOutput::from_error(&err),
+            };
+            self.context.check_cancelled()?;
+            return Ok(output);
+        }
         self.server
             .config
             .registry
@@ -1166,14 +1458,31 @@ impl<W: Write + Send + 'static> Host for TurnHost<W> {
             .lock()
             .map(|guard| guard.clone())
             .unwrap_or_default();
-        let (outcome, reason) =
-            rune_agent::turn::decide_call(&rules, self.config.mode, name, target);
+        let (outcome, reason) = rune_agent::turn::decide_call_in_workspace(
+            &rules,
+            self.config.mode,
+            name,
+            target,
+            self.context.workspace(),
+        );
         match outcome {
             // This server has no reviewer of its own, so the client is the
             // reviewer for a call the rules left open.
             Outcome::Ask => self.request_permission(name, target),
             resolved => (resolved, reason),
         }
+    }
+
+    fn execute_with_context(
+        &self,
+        name: &str,
+        arguments: &Value,
+        context: &ExecutionContext,
+    ) -> Result<ToolOutput> {
+        if name == "update_plan" {
+            return self.server.config.registry.call(name, arguments, context);
+        }
+        self.execute(name, arguments)
     }
 
     fn context(&self) -> ExecutionContext {
@@ -1313,69 +1622,80 @@ fn require_absolute(path: &Utf8PathBuf, field: &str) -> std::result::Result<(), 
     )))
 }
 
-/// Extracts the text of a prompt.
-///
-/// Text blocks and embedded resources carry text; every other block type is
-/// refused by name, because this server advertises support for none of them.
+#[cfg(test)]
 fn prompt_text(params: &Value) -> std::result::Result<String, RpcError> {
-    let Some(blocks) = params.get("prompt") else {
-        return Err(RpcError::from_rune(&RuneError::missing_field("prompt")));
-    };
-    let Some(blocks) = blocks.as_array() else {
-        return Err(RpcError::from_rune(&RuneError::invalid_field(
-            "prompt",
-            "must be an array of content blocks",
-        )));
-    };
-    let mut text = String::new();
-    for block in blocks {
-        match block.get("type").and_then(Value::as_str) {
-            Some("text") => {
-                if let Some(part) = block.get("text").and_then(Value::as_str) {
-                    push_block(&mut text, part);
-                }
-            }
-            Some("resource") => {
-                if let Some(part) = block
-                    .get("resource")
-                    .and_then(|resource| resource.get("text"))
-                    .and_then(Value::as_str)
-                {
-                    push_block(&mut text, part);
-                }
-            }
-            Some(other) => {
-                return Err(RpcError::invalid_params(format!(
-                    "this server does not accept `{other}` content in a prompt"
-                )));
-            }
-            None => {
-                return Err(RpcError::invalid_params(
-                    "a prompt block must declare its type",
-                ));
-            }
-        }
-    }
-    if text.trim().is_empty() {
-        return Err(RpcError::from_rune(&RuneError::invalid_field(
-            "prompt",
-            "must contain some text",
-        )));
-    }
-    Ok(text)
+    Prompt::parse(params, Dialect::ChatCompletions.provider()).map(|prompt| prompt.text)
 }
 
-/// Appends one block's text, separating blocks with a blank line.
-fn push_block(target: &mut String, text: &str) {
-    if !target.is_empty() {
-        target.push_str("\n\n");
-    }
-    target.push_str(text);
-}
+#[cfg(all(test, unix))]
+#[path = "output_failure_tests.rs"]
+mod output_failure_tests;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_expired_permission_is_removed_from_pending_requests() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let path = Utf8PathBuf::from_path_buf(root.path().to_owned()).expect("UTF-8 path");
+        let mut config = ServerConfig::new(
+            Paths {
+                config_root: path.join("config"),
+                state_root: path.join("state"),
+                data_root: path.join("data"),
+            },
+            path,
+            Endpoint::new("http://127.0.0.1:1", "test-key"),
+            "test/model",
+        )
+        .expect("config");
+        config
+            .limits
+            .set(
+                LimitName::AcpPermissionTimeoutMs,
+                rune_core::budget::Budget::Bounded(0),
+                rune_core::config::Layer::User,
+            )
+            .expect("immediate deadline");
+        let server = Server::new(config, Vec::new()).expect("server");
+        let error = server
+            .ask(
+                "session/request_permission",
+                json!({}),
+                &Cancellation::new(),
+            )
+            .expect_err("deadline exceeded");
+        assert_eq!(error.code(), ErrorCode::Timeout);
+        assert!(server.pending.lock().expect("pending").is_empty());
+        server.resolve(Response::ok(Id::Number(1), json!({})));
+        assert!(server.pending.lock().expect("pending").is_empty());
+    }
+
+    #[test]
+    fn permission_wait_preserves_answers_cancellation_and_disconnection() {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let cancellation = Cancellation::new();
+        sender
+            .send(Response::ok(Id::Number(1), json!({"approved": true})))
+            .expect("answer");
+        assert_eq!(
+            wait_for(&receiver, &cancellation, Instant::now(), POLL).expect("answer"),
+            Some(json!({"approved": true}))
+        );
+
+        // Cancellation wins even when the deadline has already elapsed.
+        cancellation.cancel();
+        assert_eq!(
+            wait_for(&receiver, &cancellation, Instant::now(), Duration::ZERO).expect("cancelled"),
+            None
+        );
+        drop(sender);
+        assert_eq!(
+            wait_for(&receiver, &Cancellation::new(), Instant::now(), POLL).expect("disconnected"),
+            None
+        );
+    }
 
     #[test]
     fn stop_reasons_map_to_the_protocol_names() {
@@ -1393,6 +1713,7 @@ mod tests {
             Dialect::ChatCompletions,
             Dialect::Responses,
             Dialect::Anthropic,
+            Dialect::Gemini,
         ] {
             assert_eq!(Dialect::from_name(dialect.name()), Some(dialect));
             assert!(!dialect.provider().name().is_empty());
@@ -1414,6 +1735,31 @@ mod tests {
     }
 
     #[test]
+    fn malformed_text_blocks_are_rejected_even_alongside_valid_text() {
+        for malformed in [
+            json!({"type": "text"}),
+            json!({"type": "text", "text": null}),
+            json!({"type": "text", "text": 42}),
+            json!({"type": "text", "text": true}),
+            json!({"type": "text", "text": []}),
+            json!({"type": "text", "text": {}}),
+        ] {
+            for index in 0..2 {
+                let valid = json!({"type": "text", "text": "valid"});
+                let blocks = if index == 0 {
+                    json!([malformed, valid])
+                } else {
+                    json!([valid, malformed])
+                };
+                let error = prompt_text(&json!({"prompt": blocks})).expect_err("rejected");
+                assert_eq!(error.code, crate::jsonrpc::INVALID_PARAMS);
+                assert!(error.message.contains(&format!("prompt[{index}].text")));
+                assert!(error.message.contains("must be a string"));
+            }
+        }
+    }
+
+    #[test]
     fn prompt_blocks_are_joined_with_a_blank_line() {
         let text = prompt_text(&json!({
             "prompt": [
@@ -1427,7 +1773,7 @@ mod tests {
 
     #[test]
     fn an_unsupported_block_type_is_reported() {
-        let error = prompt_text(&json!({"prompt": [{"type": "image", "data": "x"}]}))
+        let error = prompt_text(&json!({"prompt": [{"type": "audio", "data": "x"}]}))
             .expect_err("rejected");
         assert_eq!(error.code, crate::jsonrpc::INVALID_PARAMS);
     }
@@ -1452,6 +1798,115 @@ mod tests {
     }
 
     #[test]
+    fn reopening_applies_only_configured_and_current_request_roots() {
+        for method in ["session/load", "session/resume"] {
+            for with_configured_root in [false, true] {
+                let root = tempfile::tempdir().expect("tempdir");
+                let path = |name: &str| {
+                    Utf8PathBuf::from_path_buf(root.path().join(name)).expect("UTF-8 path")
+                };
+                let workspace = path("workspace");
+                let configured = path("configured");
+                let original = path("original");
+                let requested = path("requested");
+                let replacement = path("replacement");
+                let mut config = ServerConfig::new(
+                    Paths {
+                        config_root: path("config"),
+                        state_root: path("state"),
+                        data_root: path("data"),
+                    },
+                    workspace.clone(),
+                    Endpoint::new("http://127.0.0.1:1", "test-key"),
+                    "test/model",
+                )
+                .expect("config");
+                if with_configured_root {
+                    config.additional_roots.push(configured.clone());
+                }
+                let defaults = config.additional_roots.clone();
+                let server = Arc::new(Server::new(config, Vec::new()).expect("server"));
+                server
+                    .initialize(&json!({"protocolVersion": PROTOCOL_VERSION}))
+                    .expect("initialize");
+                let created = server
+                    .new_session(&json!({"additionalDirectories": [original]}))
+                    .expect("create");
+                let id = created["sessionId"].as_str().expect("session id");
+                server
+                    .close_session(&json!({"sessionId": id}))
+                    .expect("close");
+
+                let assert_roots = |additional: &[Utf8PathBuf]| {
+                    let sessions = server.lock_sessions().expect("sessions");
+                    let snapshot = sessions.snapshot(id).expect("snapshot");
+                    assert_eq!(snapshot.context.workspace(), workspace);
+                    assert_eq!(snapshot.context.additional_roots, additional);
+                    assert_eq!(
+                        sessions.get(id).expect("session").additional_roots(),
+                        additional
+                    );
+                };
+                let mut expected = defaults.clone();
+                expected.push(requested.clone());
+                let mut request_roots = expected.clone();
+                request_roots.push(requested.clone());
+                server
+                    .handle(
+                        method,
+                        &json!({"sessionId": id, "additionalDirectories": request_roots}),
+                        None,
+                    )
+                    .expect("reopen closed session");
+                assert_roots(&expected);
+
+                for invalid in [json!(["relative"]), json!([42]), json!("invalid")] {
+                    let error = server
+                        .handle(
+                            method,
+                            &json!({"sessionId": id, "additionalDirectories": invalid}),
+                            None,
+                        )
+                        .expect_err("invalid roots");
+                    assert_eq!(error.code, crate::jsonrpc::INVALID_PARAMS);
+                    assert_roots(&expected);
+                }
+
+                server
+                    .handle(
+                        method,
+                        &json!({"sessionId": id, "additionalDirectories": [replacement]}),
+                        None,
+                    )
+                    .expect("reopen held session");
+                expected = defaults.clone();
+                expected.push(replacement);
+                assert_roots(&expected);
+
+                for mut params in [
+                    json!({}),
+                    json!({"additionalDirectories": null}),
+                    json!({"additionalDirectories": []}),
+                ] {
+                    // Restore a request root before each removal check.
+                    server
+                        .handle(
+                            method,
+                            &json!({"sessionId": id, "additionalDirectories": [requested]}),
+                            None,
+                        )
+                        .expect("restore request root");
+                    params["sessionId"] = json!(id);
+                    server
+                        .handle(method, &params, None)
+                        .expect("clear request roots");
+                    assert_roots(&defaults);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn a_missing_string_member_is_a_missing_field() {
         let error = string_field(&json!({}), "sessionId").expect_err("rejected");
         assert_eq!(error.data.expect("data")["code"], "missing_field");
@@ -1466,6 +1921,34 @@ mod tests {
         };
         assert_eq!(reported_tokens(usage), 15);
         assert_eq!(reported_tokens(Usage::default()), 0);
+    }
+
+    #[test]
+    fn a_configured_capacity_belongs_only_to_the_default_model_even_offline() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let path = Utf8PathBuf::from_path_buf(root.path().to_owned()).expect("UTF-8 path");
+        let mut endpoint = Endpoint::new("http://127.0.0.1:1", "test-key");
+        endpoint.offline = true;
+        let config = ServerConfig::new(
+            Paths {
+                config_root: path.join("config"),
+                state_root: path.join("state"),
+                data_root: path.join("data"),
+            },
+            path,
+            endpoint,
+            "test/model",
+        )
+        .expect("config")
+        .with_context_window(8192);
+        let server = Server::new(config, Vec::new()).expect("server");
+        assert_eq!(server.context_window("test/model"), 8192);
+        assert!(server.model_catalog.get().is_none());
+        assert_eq!(
+            server.context_window("other/model"),
+            rune_net::catalog::DEFAULT_CONTEXT_WINDOW
+        );
+        assert_eq!(server.context_window("test/model"), 8192);
     }
 
     #[test]

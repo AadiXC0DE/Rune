@@ -324,6 +324,24 @@ pub struct LedgerRead {
     pub tail_incomplete: bool,
 }
 
+impl LedgerRead {
+    /// Writes records in ledger order as versioned JSONL, one record per line.
+    ///
+    /// Uses the ledger's stable timestamp, model, and helper dimensions. Missing
+    /// measurements stay absent, reported zeroes stay present, and cost strings
+    /// retain their original precision. No records are added for missing data.
+    /// An incomplete tail is excluded by the reader; callers can warn using
+    /// [`Self::tail_incomplete`]. Output write and flush failures are returned.
+    pub fn export_jsonl(&self, mut writer: impl Write) -> Result<()> {
+        for record in &self.records {
+            writer.write_all(record.encode()?.as_bytes())?;
+            writer.write_all(b"\n")?;
+        }
+        writer.flush()?;
+        Ok(())
+    }
+}
+
 /// The append-only usage ledger.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Ledger {
@@ -798,6 +816,48 @@ mod tests {
 
     fn timestamps(read: &LedgerRead) -> Vec<i64> {
         read.records.iter().map(|r| r.created_at_ms).collect()
+    }
+
+    #[test]
+    fn export_returns_write_and_flush_failures() {
+        use std::error::Error as _;
+
+        struct FlushFailure;
+        impl Write for FlushFailure {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Err(std::io::Error::other("flush failed"))
+            }
+        }
+
+        let read = LedgerRead {
+            records: vec![at(0)],
+            tail_incomplete: false,
+        };
+        let mut short = [0_u8; 1];
+        let err = read
+            .export_jsonl(short.as_mut_slice())
+            .expect_err("short output");
+        assert_eq!(err.code(), ErrorCode::IoFailure);
+        assert_eq!(
+            err.source()
+                .expect("write cause")
+                .downcast_ref::<std::io::Error>()
+                .expect("IO cause")
+                .kind(),
+            std::io::ErrorKind::WriteZero
+        );
+
+        let err = read.export_jsonl(FlushFailure).expect_err("flush failure");
+        assert_eq!(err.code(), ErrorCode::IoFailure);
+        assert!(
+            err.source()
+                .expect("flush cause")
+                .to_string()
+                .contains("flush failed")
+        );
     }
 
     #[test]

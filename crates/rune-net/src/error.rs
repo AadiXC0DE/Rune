@@ -44,6 +44,8 @@ pub enum FailureKind {
     ProviderError,
     /// The provider blocked the request on policy grounds.
     ContentFiltered,
+    /// Local policy forbids the request, such as when offline mode is enabled.
+    PolicyDenied,
     /// The request was cancelled.
     Cancelled,
 }
@@ -67,14 +69,16 @@ impl FailureKind {
             Self::ProtocolViolation => "protocol_violation",
             Self::ProviderError => "provider_error",
             Self::ContentFiltered => "content_filtered",
+            Self::PolicyDenied => "policy_denied",
             Self::Cancelled => "cancelled",
         }
     }
 
     /// Returns true when repeating the identical request could succeed.
     ///
-    /// A cancellation and a malformed request are not retryable. A rate limit is
-    /// retryable only after the endpoint's own delay, which the caller applies.
+    /// A cancellation, policy refusal, and malformed request are not retryable.
+    /// A rate limit is retryable only after the endpoint's own delay, which the
+    /// caller applies.
     #[must_use]
     pub const fn is_retryable(self) -> bool {
         matches!(
@@ -118,6 +122,7 @@ impl FailureKind {
             Self::ProtocolViolation => ErrorCode::ProtocolViolation,
             Self::ProviderError => ErrorCode::RequestRejected,
             Self::ContentFiltered => ErrorCode::RequestRejected,
+            Self::PolicyDenied => ErrorCode::PermissionDenied,
             Self::Cancelled => ErrorCode::Cancelled,
         }
     }
@@ -218,7 +223,8 @@ impl NetError {
         self.kind.is_retryable()
     }
 
-    /// Converts to the workspace error type, preserving the code and hint.
+    /// Converts to the workspace error type, preserving the code, hint and
+    /// provider metadata. Provider codes are redacted before being exposed.
     #[must_use]
     pub fn to_rune_error(&self) -> RuneError {
         let mut error = RuneError::new(self.kind.code(), self.message.clone());
@@ -227,6 +233,12 @@ impl NetError {
         }
         if let Some(status) = self.status {
             error = error.with_observed(format!("http {status}"));
+        }
+        if let Some(code) = &self.provider_code {
+            error = error.with_provider_code(crate::redact::redact(code));
+        }
+        if let Some(millis) = self.retry_after_ms {
+            error = error.with_retry_after(millis);
         }
         error
     }
@@ -395,6 +407,7 @@ impl From<RuneError> for NetError {
             ErrorCode::ProtocolViolation => FailureKind::ProtocolViolation,
             ErrorCode::Timeout => FailureKind::Timeout,
             ErrorCode::Cancelled => FailureKind::Cancelled,
+            ErrorCode::PermissionDenied => FailureKind::PolicyDenied,
             ErrorCode::TooLarge | ErrorCode::InvalidField => FailureKind::InvalidRequest,
             ErrorCode::RequestRejected => FailureKind::ProviderError,
             _ => FailureKind::Decode,
@@ -441,6 +454,7 @@ mod tests {
             FailureKind::ProtocolViolation,
             FailureKind::ProviderError,
             FailureKind::ContentFiltered,
+            FailureKind::PolicyDenied,
             FailureKind::Cancelled,
         ];
         let mut seen = std::collections::HashSet::new();
@@ -467,6 +481,7 @@ mod tests {
             FailureKind::Cancelled,
             FailureKind::ModelNotFound,
             FailureKind::ContentFiltered,
+            FailureKind::PolicyDenied,
         ] {
             assert!(!kind.is_retryable(), "{kind:?} must not be retried");
         }
@@ -476,6 +491,25 @@ mod tests {
     fn a_cancellation_is_never_retried() {
         // Retrying a cancellation would resurrect work the user stopped.
         assert!(!FailureKind::Cancelled.is_retryable());
+    }
+
+    #[test]
+    fn a_policy_refusal_preserves_its_nonretryable_kind_and_hint() {
+        let error = NetError::new(FailureKind::PolicyDenied, "outbound requests are disabled")
+            .with_hint("remove the offline setting to reach a provider");
+        assert!(!error.is_retryable());
+        assert!(!error.kind().is_request_fault());
+        assert_eq!(error.kind().as_str(), "policy_denied");
+        let converted = error.to_rune_error();
+        assert_eq!(converted.code(), ErrorCode::PermissionDenied);
+        assert_eq!(converted.message(), error.message());
+        assert_eq!(
+            converted.detail().hint.as_deref(),
+            Some("remove the offline setting to reach a provider")
+        );
+        let restored = NetError::from(converted);
+        assert_eq!(restored.kind(), FailureKind::PolicyDenied);
+        assert!(!restored.is_retryable());
     }
 
     #[test]
@@ -550,6 +584,41 @@ mod tests {
     }
 
     #[test]
+    fn converting_preserves_optional_provider_metadata_without_a_status() {
+        let error = NetError::new(FailureKind::ProviderError, "failed")
+            .with_provider_code("rate_limit_exceeded")
+            .with_retry_after(0);
+        let converted = RuneError::from(error);
+        let detail = serde_json::to_value(converted.detail()).expect("detail");
+        assert_eq!(
+            detail,
+            serde_json::json!({
+                "provider_code": "rate_limit_exceeded",
+                "retry_after_ms": 0
+            })
+        );
+        assert!(!converted.detail().is_empty());
+
+        let plain = NetError::new(FailureKind::Network, "failed").to_rune_error();
+        assert!(plain.detail().is_empty());
+        assert_eq!(
+            serde_json::to_value(plain.detail()).expect("detail"),
+            serde_json::json!({})
+        );
+    }
+
+    #[test]
+    fn converting_redacts_provider_codes_attached_by_a_caller() {
+        let error = NetError::new(FailureKind::ProviderError, "failed")
+            .with_provider_code("sk-fixture-secret-code");
+        let converted = error.to_rune_error();
+        assert_eq!(
+            converted.detail().provider_code.as_deref(),
+            Some("[redacted]")
+        );
+    }
+
+    #[test]
     fn builder_methods_accumulate() {
         let error = NetError::new(FailureKind::RateLimited, "slow")
             .with_status(429)
@@ -591,6 +660,7 @@ mod tests {
             FailureKind::ProviderError,
             FailureKind::Timeout,
             FailureKind::Cancelled,
+            FailureKind::PolicyDenied,
         ] {
             let converted = NetError::from(RuneError::new(kind.code(), "failed"));
             assert_eq!(converted.kind(), kind);

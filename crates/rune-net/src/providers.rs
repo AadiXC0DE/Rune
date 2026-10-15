@@ -16,6 +16,8 @@ use rune_core::config::Provider;
 pub enum CredentialKind {
     /// A key the provider issues, pasted by the user.
     ApiKey,
+    /// An explicitly selected local provider, without a credential.
+    AnonymousLoopback,
 }
 
 /// One provider a user can connect.
@@ -56,16 +58,16 @@ impl KnownProvider {
     pub fn credential_label(self) -> &'static str {
         match self.credential {
             CredentialKind::ApiKey => "API key",
+            CredentialKind::AnonymousLoopback => "no credential (loopback only)",
         }
     }
 }
 
 /// Providers a fresh install offers, in the order they are shown.
 ///
-/// Ordered with the two that need nothing but a key first, then the generic
+/// Ordered with native APIs that need nothing but a key first, then the generic
 /// OpenAI-compatible dialect, which needs an endpoint, and finally the
-/// providers that are recognized by name so a configuration written by hand
-/// reads back correctly.
+/// local Ollama endpoint, which uses anonymous loopback mode.
 pub const KNOWN_PROVIDERS: &[KnownProvider] = &[
     KnownProvider {
         name: "anthropic",
@@ -81,6 +83,15 @@ pub const KNOWN_PROVIDERS: &[KnownProvider] = &[
         summary: "OpenAI Responses API",
         base_url: Some("https://api.openai.com/v1"),
         key_variable: Some("OPENAI_API_KEY"),
+        credential: CredentialKind::ApiKey,
+        implemented: true,
+        required_headers: &[],
+    },
+    KnownProvider {
+        name: "gemini",
+        summary: "Google Gemini Generate Content API",
+        base_url: Some("https://generativelanguage.googleapis.com/v1beta"),
+        key_variable: Some("GEMINI_API_KEY"),
         credential: CredentialKind::ApiKey,
         implemented: true,
         required_headers: &[],
@@ -115,6 +126,15 @@ pub const KNOWN_PROVIDERS: &[KnownProvider] = &[
         implemented: true,
         required_headers: &[],
     },
+    KnownProvider {
+        name: "ollama",
+        summary: "Local Ollama models, native discovery and Chat Completions requests",
+        base_url: Some("http://127.0.0.1:11434/v1"),
+        key_variable: None,
+        credential: CredentialKind::AnonymousLoopback,
+        implemented: true,
+        required_headers: &[],
+    },
 ];
 
 /// Agent name sent when a provider asks its clients to identify themselves.
@@ -145,6 +165,7 @@ pub fn lookup(name: &str) -> Option<&'static KnownProvider> {
 pub fn aliases(name: &str) -> &'static [&'static str] {
     match name {
         "openai" => &["responses"],
+        "gemini" => &["google"],
         "chat_completions" => &["chat-completions"],
         "opencode" => &["zen", "opencode-zen"],
         "opencode-go" => &["go", "zen-go"],

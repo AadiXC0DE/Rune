@@ -4,8 +4,9 @@
 //! handles approval prompts. The renderer and the agent are both supplied, so
 //! this module owns only the loop that connects them.
 //!
-//! The loop never takes the alternate screen. Output is written inline and
-//! finished content is promoted into the terminal's own scrollback, which is what
+//! The loop writes output inline. The session can open an on-demand transcript
+//! on the alternate screen while preserving this shell underneath. Finished
+//! content is promoted into the terminal's own scrollback, which is what
 //! keeps a long session readable with the terminal's own search and copy.
 
 use std::io::BufRead;
@@ -49,10 +50,22 @@ impl Input {
         if trimmed.is_empty() {
             return Self::Empty;
         }
-        if let Some(rest) = trimmed.strip_prefix('/') {
+        // A pinned constraint is literal text. Remove only the input line's
+        // terminator and the command separator, preserving its whitespace.
+        let command_line = line
+            .strip_suffix("\r\n")
+            .or_else(|| line.strip_suffix('\n'))
+            .unwrap_or(line)
+            .trim_start();
+        if let Some(rest) = command_line.strip_prefix('/') {
             let mut parts = rest.splitn(2, char::is_whitespace);
             let name = parts.next().unwrap_or_default();
-            let arguments = parts.next().unwrap_or_default().trim().to_owned();
+            let arguments = parts.next().unwrap_or_default();
+            let arguments = if name == "pin" {
+                arguments.to_owned()
+            } else {
+                arguments.trim().to_owned()
+            };
             if !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
                 return Self::Command {
                     name: name.to_owned(),
@@ -364,6 +377,27 @@ mod tests {
             Input::Command {
                 name: "help".to_owned(),
                 arguments: String::new()
+            }
+        );
+    }
+
+    #[test]
+    fn pin_arguments_preserve_whitespace_unicode_and_line_breaks() {
+        let constraint = "  Preserve café and 日本語.\nNever commit.  ";
+        for terminator in ["", "\n", "\r\n"] {
+            assert_eq!(
+                Input::parse(&format!("/pin {constraint}{terminator}")),
+                Input::Command {
+                    name: "pin".to_owned(),
+                    arguments: constraint.to_owned(),
+                }
+            );
+        }
+        assert_eq!(
+            Input::parse(" /model  vendor/name  \n"),
+            Input::Command {
+                name: "model".to_owned(),
+                arguments: "vendor/name".to_owned(),
             }
         );
     }

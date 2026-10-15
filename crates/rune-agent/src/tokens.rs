@@ -221,8 +221,15 @@ const APPROACHING_BAND_PERCENT: u8 = 10;
 /// The trigger is a percentage of usable input, taken from the limits so it can
 /// be tuned without a rebuild. The approaching band sits ten points below it,
 /// which gives the caller one request of warning before compaction is required.
+/// `estimate` measures the full request; `retained_estimate` measures the request
+/// after removing the planned prefix, including any fixed request overhead. If
+/// no prefix can be removed, pass the full estimate as the retained estimate.
 #[must_use]
-pub fn decide_capacity(estimate: &Estimate, limits: &BudgetSet) -> CapacityDecision {
+pub fn decide_capacity(
+    estimate: &Estimate,
+    retained_estimate: &Estimate,
+    limits: &BudgetSet,
+) -> CapacityDecision {
     let trigger = u8::try_from(
         limits
             .get_usize(LimitName::CompactionTriggerPercent)
@@ -231,11 +238,10 @@ pub fn decide_capacity(estimate: &Estimate, limits: &BudgetSet) -> CapacityDecis
     .unwrap_or(80);
     let used = estimate.used_percent();
 
-    if estimate.total_tokens() > estimate.capacity {
-        // Over capacity even before the trigger, which means the retained tail
-        // alone does not fit and a summary will not rescue it.
+    if retained_estimate.total_tokens() > estimate.capacity {
+        // Only the retained request proves that removing the prefix cannot help.
         CapacityDecision::OverCapacity
-    } else if used >= trigger {
+    } else if estimate.total_tokens() > estimate.capacity || used >= trigger {
         CapacityDecision::Compact
     } else if used.saturating_add(APPROACHING_BAND_PERCENT) >= trigger {
         CapacityDecision::Approaching
@@ -422,7 +428,10 @@ mod tests {
     fn capacity_below_the_trigger_fits() {
         let limits = BudgetSet::new();
         let estimate = Estimate::new(0, 10, 1000);
-        assert_eq!(decide_capacity(&estimate, &limits), CapacityDecision::Fits);
+        assert_eq!(
+            decide_capacity(&estimate, &estimate, &limits),
+            CapacityDecision::Fits
+        );
     }
 
     #[test]
@@ -432,7 +441,7 @@ mod tests {
         // approaching band and still sendable.
         let estimate = Estimate::new(0, 750, 1000);
         assert_eq!(
-            decide_capacity(&estimate, &limits),
+            decide_capacity(&estimate, &estimate, &limits),
             CapacityDecision::Approaching
         );
     }
@@ -442,7 +451,7 @@ mod tests {
         let limits = BudgetSet::new();
         let estimate = Estimate::new(0, 800, 1000);
         assert_eq!(
-            decide_capacity(&estimate, &limits),
+            decide_capacity(&estimate, &estimate, &limits),
             CapacityDecision::Compact
         );
     }
@@ -452,7 +461,34 @@ mod tests {
         let limits = BudgetSet::new();
         let estimate = Estimate::new(0, 1200, 1000);
         assert_eq!(
-            decide_capacity(&estimate, &limits),
+            decide_capacity(&estimate, &estimate, &limits),
+            CapacityDecision::OverCapacity
+        );
+    }
+
+    #[test]
+    fn full_history_over_capacity_is_compactable_when_the_retained_request_fits() {
+        let limits = BudgetSet::new();
+        let full = Estimate::new(8000, 2000, 1000);
+        let retained = Estimate::new(400, 100, 1000);
+        assert_eq!(
+            decide_capacity(&full, &retained, &limits),
+            CapacityDecision::Compact
+        );
+    }
+
+    #[test]
+    fn retained_capacity_includes_the_output_reserve_and_allows_an_exact_fit() {
+        let limits = BudgetSet::new();
+        let full = Estimate::new(8000, 2000, 1000).with_output_reserve(100);
+        let retained = Estimate::new(3600, 900, 1000).with_output_reserve(100);
+        assert_eq!(
+            decide_capacity(&full, &retained, &limits),
+            CapacityDecision::Compact
+        );
+        let too_large = retained.with_output_reserve(101);
+        assert_eq!(
+            decide_capacity(&full, &too_large, &limits),
             CapacityDecision::OverCapacity
         );
     }
@@ -469,7 +505,7 @@ mod tests {
             .expect("set");
         let estimate = Estimate::new(0, 600, 1000);
         assert_eq!(
-            decide_capacity(&estimate, &limits),
+            decide_capacity(&estimate, &estimate, &limits),
             CapacityDecision::Compact
         );
     }

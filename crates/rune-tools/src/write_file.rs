@@ -3,7 +3,7 @@
 use rune_core::error::Result;
 use serde_json::json;
 
-use crate::contract::{Activity, ExecutionContext, Tool, ToolOutput};
+use crate::contract::{Activity, ExecutionContext, Tool, ToolOutput, validate_closed_arguments};
 use crate::mutation;
 use crate::workspace::resolve;
 
@@ -65,6 +65,7 @@ impl Tool for WriteFile {
         context: &ExecutionContext,
     ) -> Result<ToolOutput> {
         context.check_cancelled()?;
+        validate_closed_arguments(arguments, &self.input_schema())?;
         let raw = mutation::required_string(self.name(), arguments, "path")?;
         let content = mutation::required_string(self.name(), arguments, "content")?;
         // Resolved the way a read is, so a write cannot reach where a read of
@@ -149,6 +150,60 @@ mod tests {
             std::fs::read(path_of(&dir, "one.txt")).expect("read"),
             b"a much longer body\n"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_permission_denied_write_retains_its_filesystem_cause() {
+        use std::error::Error as _;
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let (dir, context) = workspace();
+        let protected = path_of(&dir, "protected");
+        std::fs::create_dir(&protected).expect("fixture directory");
+        let target = protected.join("original.txt");
+        std::fs::write(&target, "original\n").expect("seed");
+        let permissions = std::fs::metadata(&protected)
+            .expect("metadata")
+            .permissions();
+        std::fs::set_permissions(&protected, std::fs::Permissions::from_mode(0o500))
+            .expect("deny directory writes");
+
+        let direct_write = std::fs::write(protected.join("new.txt"), "fixture");
+        let tool_write = WriteFile.call(
+            &json!({ "path": "protected/original.txt", "content": "replacement\n" }),
+            &context,
+        );
+        // Restore permissions before asserting so fixture cleanup can succeed.
+        std::fs::set_permissions(&protected, permissions).expect("restore permissions");
+
+        let io_error = direct_write.expect_err("filesystem must deny the fixture write");
+        assert_eq!(io_error.kind(), std::io::ErrorKind::PermissionDenied);
+        let os_code = io_error.raw_os_error();
+        assert!(os_code.is_some());
+        let converted = rune_core::error::RuneError::from(io_error);
+        let err = tool_write.expect_err("file tool must report the filesystem failure");
+        for error in [&converted, &err, &err.clone()] {
+            assert_eq!(error.code(), ErrorCode::PermissionDenied);
+            assert_eq!(
+                serde_json::to_value(error.code()).expect("JSON code"),
+                "permission_denied"
+            );
+            let source = error
+                .source()
+                .expect("filesystem cause")
+                .downcast_ref::<std::io::Error>()
+                .expect("typed filesystem cause");
+            assert_eq!(source.kind(), std::io::ErrorKind::PermissionDenied);
+            assert_eq!(source.raw_os_error(), os_code);
+        }
+        assert!(err.message().contains("protected"));
+        assert!(err.detail().observed.is_some());
+        assert_eq!(
+            std::fs::read(&target).expect("read preimage"),
+            b"original\n"
+        );
+        assert_eq!(std::fs::read_dir(&protected).expect("entries").count(), 1);
     }
 
     #[test]

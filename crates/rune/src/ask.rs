@@ -1,23 +1,34 @@
 //! The one-shot runner.
 //!
-//! Runs a single request, prints the assistant output to standard output and
+//! Runs a bounded turn, prints the assistant output to standard output and
 //! every diagnostic to standard error, and exits. With `--json` it prints one
-//! object instead, which is the contract scripts depend on.
+//! object instead; `--jsonl` streams bounded event records. This path supports
+//! host tools under the configured permission policy without interactive approval.
+//! Completed exchanges are saved unless `--no-save` is selected.
 //!
 //! The key set and its order are fixed. `output` is the text produced during the
 //! request; `final_output` is the completed final response. A usage count the
 //! provider did not report is `null`, and a reported zero stays `0`, because the
 //! difference matters to a caller summing them.
 
+use std::cell::{Cell, RefCell};
 use std::io::Write;
 
-use rune_core::config::Settings;
-use rune_core::error::{ErrorCode, Result, RuneError};
+use rune_agent::history::History;
+use rune_agent::steering::{Cancellation, SteeringQueue};
+use rune_agent::turn::{self, Event, Host, StopReason};
+use rune_core::budget::{Budget, BudgetSet, LimitName};
+use rune_core::config::{Layer, Settings};
+use rune_core::error::{ErrorCode, ErrorDetail, Result, RuneError};
+use rune_core::id::SessionId;
 use rune_core::paths::Paths;
-use rune_net::message::Message;
-use rune_net::provider::{Provider, RequestPlan};
-use rune_net::stream::FinishReason;
-use rune_net::transport;
+use rune_net::message::{ContentPart, ToolSpec};
+use rune_net::provider::Provider;
+use rune_net::stream::{FinishReason, Usage};
+use rune_net::transport::{Endpoint, StreamOutcome};
+use rune_policy::{Outcome, RuleSet};
+use rune_session::{SessionEvent, SessionStore};
+use rune_tools::{ExecutionContext, Registry, ToolOutput, inventory};
 use serde::Serialize;
 
 /// Exit code for a successful run.
@@ -29,15 +40,139 @@ pub const EXIT_FAILURE: u8 = 1;
 /// Largest prompt accepted from standard input.
 pub const MAX_STDIN_PROMPT_BYTES: usize = 8 * 1024 * 1024;
 
+/// Default finite bound when the configured step limit is zero or unbounded.
+pub const DEFAULT_MAX_STEPS: u64 = 16;
+
 /// Options for one run.
 #[derive(Clone, Debug, Default)]
 pub struct Options {
     /// The prompt text.
     pub prompt: String,
+    /// Explicit local image paths to attach to the user prompt.
+    pub images: Vec<std::path::PathBuf>,
     /// Emit one JSON object instead of Markdown.
     pub json: bool,
+    /// Stream bounded JSONL records instead of Markdown or one JSON result.
+    pub jsonl: bool,
     /// Do not create or update a session.
     pub no_save: bool,
+    /// Execute host tools in a bounded loop.
+    pub tool_loop: bool,
+    /// Refuse tools that do not declare themselves read-only, before policy grants.
+    pub read_only: bool,
+}
+
+/// Hard cap for one JSONL record, including its terminating newline.
+pub const MAX_JSONL_EVENT_BYTES: usize = 1024 * 1024;
+
+/// Raw delta chunk cap, allowing even six-byte JSON escapes within the record cap.
+const MAX_JSONL_DELTA_BYTES: usize = 8 * 1024;
+
+#[derive(Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum JsonlEvent<'a> {
+    Start {},
+    StepStart { step: u32 },
+    StepRestart { step: u32 },
+    TextDelta { step: u32, delta: &'a str },
+    PlanUpdated { update: &'a rune_tools::PlanUpdate },
+    Final { result: &'a JsonResult },
+}
+
+/// Stages one complete record without ever growing beyond the wire cap.
+#[derive(Default)]
+struct JsonlBuffer {
+    bytes: Vec<u8>,
+    overflow: bool,
+}
+
+impl Write for JsonlBuffer {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if bytes.len() > (MAX_JSONL_EVENT_BYTES - 1).saturating_sub(self.bytes.len()) {
+            self.overflow = true;
+            return Err(std::io::Error::other("JSONL event exceeds its byte cap"));
+        }
+        let required = self.bytes.len().saturating_add(bytes.len());
+        if self.bytes.capacity() < required {
+            let capacity = self
+                .bytes
+                .capacity()
+                .saturating_mul(2)
+                .max(required)
+                .min(MAX_JSONL_EVENT_BYTES);
+            self.bytes
+                .reserve_exact(capacity.saturating_sub(self.bytes.len()));
+        }
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn write_jsonl(writer: &mut impl Write, event: &JsonlEvent<'_>) -> Result<()> {
+    let mut buffer = JsonlBuffer::default();
+    if let Err(error) = serde_json::to_writer(&mut buffer, event) {
+        return Err(if buffer.overflow {
+            RuneError::too_large(
+                "jsonl_event",
+                MAX_JSONL_EVENT_BYTES + 1,
+                MAX_JSONL_EVENT_BYTES,
+            )
+        } else {
+            RuneError::new(ErrorCode::Internal, error.to_string())
+        });
+    }
+    buffer.bytes.reserve_exact(1);
+    buffer.bytes.push(b'\n');
+    writer
+        .write_all(&buffer.bytes)
+        .and_then(|()| writer.flush())
+        .map_err(|error| RuneError::new(ErrorCode::IoFailure, error.to_string()))?;
+    Ok(())
+}
+
+fn write_text_deltas(writer: &mut impl Write, step: u32, mut delta: &str) -> Result<()> {
+    while !delta.is_empty() {
+        let mut end = delta.len().min(MAX_JSONL_DELTA_BYTES);
+        while !delta.is_char_boundary(end) {
+            end = end.saturating_sub(1);
+        }
+        write_jsonl(
+            writer,
+            &JsonlEvent::TextDelta {
+                step,
+                delta: &delta[..end],
+            },
+        )?;
+        delta = &delta[end..];
+    }
+    Ok(())
+}
+
+/// Starts the JSONL stream before prompt validation or provider setup.
+pub fn start_jsonl() -> Result<()> {
+    write_jsonl(&mut std::io::stdout().lock(), &JsonlEvent::Start {})
+}
+
+/// Emits a final record, replacing an oversized result with a bounded failure.
+/// Returns the effective exit code and prints any size diagnostic on stderr.
+pub fn final_jsonl(result: &JsonResult) -> Result<u8> {
+    match write_jsonl(&mut std::io::stdout().lock(), &JsonlEvent::Final { result }) {
+        Ok(()) => Ok(u8::try_from(result.exit_code).unwrap_or(EXIT_FAILURE)),
+        Err(error) if error.code() == ErrorCode::TooLarge => {
+            let failure = JsonResult::failure("", &error, i32::from(EXIT_FAILURE));
+            write_jsonl(
+                &mut std::io::stdout().lock(),
+                &JsonlEvent::Final { result: &failure },
+            )?;
+            let _ = writeln!(std::io::stderr().lock(), "rune: {error}");
+            Ok(EXIT_FAILURE)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 /// One tool call as reported in the JSON result.
@@ -71,7 +206,7 @@ pub struct JsonResult {
     pub steps: u32,
     /// Token counts. A count the provider did not report is absent.
     pub usage: UsageReport,
-    /// Tool calls made, in order.
+    /// Tool calls requested by the provider, in order.
     pub tool_calls: Vec<ToolCallReport>,
     /// Failure detail, present only when the run failed.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -79,6 +214,9 @@ pub struct JsonResult {
     /// Stable failure code, present only when the run failed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_code: Option<ErrorCode>,
+    /// Structured failure context, present only when nonempty.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_detail: Option<ErrorDetail>,
 }
 
 /// Token counts as reported.
@@ -108,6 +246,7 @@ impl JsonResult {
             tool_calls: Vec::new(),
             error: Some(error.message().to_owned()),
             error_code: Some(error.code()),
+            error_detail: (!error.detail().is_empty()).then(|| error.detail().clone()),
         }
     }
 
@@ -141,10 +280,183 @@ pub fn read_stdin_prompt() -> Result<String> {
     Ok(String::from_utf8_lossy(&buffer).trim_end().to_owned())
 }
 
-/// Runs one request and returns the result to report.
+/// Noninteractive composition of the shared agent loop and built-in tools.
+struct AskHost<'a> {
+    settings: &'a Settings,
+    instructions: String,
+    dialect: Box<dyn Provider>,
+    endpoint: Endpoint,
+    registry: Registry,
+    read_only: bool,
+    rules: RuleSet,
+    context: ExecutionContext,
+    limits: BudgetSet,
+    steering: SteeringQueue,
+    cancellation: Cancellation,
+    incomplete_tool_call: Cell<bool>,
+    jsonl: bool,
+    step: Cell<u32>,
+    emit_error: RefCell<Option<RuneError>>,
+}
+
+impl Host for AskHost<'_> {
+    fn dialect(&self) -> &dyn Provider {
+        self.dialect.as_ref()
+    }
+
+    fn endpoint(&self) -> &Endpoint {
+        &self.endpoint
+    }
+
+    fn model(&self) -> String {
+        self.settings.model.clone()
+    }
+
+    fn instructions(&self) -> String {
+        rune_context::prompt::with_repository_map(
+            &self.instructions,
+            self.context.workspace(),
+            &self.limits,
+        )
+    }
+
+    fn tools(&self) -> Vec<ToolSpec> {
+        inventory::advertisement(&self.registry)
+    }
+
+    fn tool_activity(&self, name: &str) -> Option<rune_tools::Activity> {
+        self.registry.activity(name)
+    }
+
+    fn tool_permission_target(&self, name: &str, arguments: &serde_json::Value) -> Option<String> {
+        turn::permission_target_for(&self.registry, name, arguments)
+    }
+
+    fn effort(&self) -> rune_core::config::Effort {
+        self.settings.effort
+    }
+
+    fn fast_mode(&self) -> bool {
+        self.settings.fast_mode
+    }
+
+    fn provider_order(&self) -> Vec<String> {
+        self.settings.provider_order.clone()
+    }
+
+    fn provider_strict(&self) -> bool {
+        self.settings.provider_strict
+    }
+
+    fn observe_response(&self, outcome: &StreamOutcome) {
+        self.incomplete_tool_call.set(
+            outcome.finish == Some(FinishReason::ToolCalls) && outcome.tool_calls().is_empty(),
+        );
+    }
+
+    fn emit(&self, event: Event) {
+        if !self.jsonl || self.emit_error.borrow().is_some() {
+            return;
+        }
+        let mut stdout = std::io::stdout().lock();
+        let result = match event {
+            Event::TurnStarted { step } => {
+                self.step.set(step);
+                write_jsonl(&mut stdout, &JsonlEvent::StepStart { step })
+            }
+            Event::StepRestarted { step } => {
+                write_jsonl(&mut stdout, &JsonlEvent::StepRestart { step })
+            }
+            Event::PlanUpdated { update } => {
+                write_jsonl(&mut stdout, &JsonlEvent::PlanUpdated { update: &update })
+            }
+            Event::TextDelta { delta } => write_text_deltas(&mut stdout, self.step.get(), &delta),
+            _ => Ok(()),
+        };
+        if let Err(error) = result {
+            *self.emit_error.borrow_mut() = Some(error);
+            self.cancellation.cancel();
+        }
+    }
+
+    fn pre_tool(&self, call: &turn::PreparedCall) -> Result<Option<turn::HookVeto>> {
+        crate::pre_tool_hook::run(
+            self.settings.pre_tool_hook.as_ref(),
+            call,
+            &self.context,
+            &self.cancellation,
+        )
+    }
+
+    fn post_tool(&self, result: &turn::CallResult) {
+        if let Some(message) = crate::post_tool_hook::notify(
+            self.settings.post_tool_hook.as_ref(),
+            result,
+            &self.context,
+            &self.cancellation,
+            &self.endpoint.credential,
+        ) {
+            let _ = writeln!(std::io::stderr(), "warning: {message}");
+        }
+    }
+
+    fn execute(&self, name: &str, arguments: &serde_json::Value) -> Result<ToolOutput> {
+        self.registry.call(name, arguments, &self.context)
+    }
+
+    fn execute_with_context(
+        &self,
+        name: &str,
+        arguments: &serde_json::Value,
+        context: &ExecutionContext,
+    ) -> Result<ToolOutput> {
+        self.registry.call(name, arguments, context)
+    }
+
+    fn decide(&self, name: &str, target: Option<&str>) -> (Outcome, String) {
+        if self.read_only
+            && !self
+                .registry
+                .get(name)
+                .is_some_and(rune_tools::Tool::is_read_only)
+        {
+            let decision = rune_policy::decision::Decision::matched(
+                Outcome::Deny,
+                rune_policy::decision::Layer::Session,
+                "read-only review",
+            );
+            return (decision.outcome, decision.explain());
+        }
+        turn::decide_call_in_workspace(
+            &self.rules,
+            self.settings.permission_mode,
+            name,
+            target,
+            self.context.workspace(),
+        )
+    }
+
+    fn context(&self) -> ExecutionContext {
+        self.context.fork()
+    }
+
+    fn limits(&self) -> BudgetSet {
+        self.limits.clone()
+    }
+
+    fn cancellation(&self) -> Cancellation {
+        self.cancellation.clone()
+    }
+
+    fn steering(&self) -> &SteeringQueue {
+        &self.steering
+    }
+}
+
+/// Runs one bounded turn and returns the result to report.
 ///
-/// Performs no printing, so the caller decides the output shape and the tests
-/// can assert on the result directly.
+/// With JSONL enabled, emits deltas synchronously with bounded staging and
+/// stdout backpressure. The caller emits the start and final records.
 pub fn run(
     settings: &Settings,
     paths: &Paths,
@@ -152,106 +464,214 @@ pub fn run(
 ) -> std::result::Result<JsonResult, RuneError> {
     // Validate before touching the network so a missing credential or an
     // unselected model is reported immediately and names the remedy.
-    settings.require_model()?;
+    crate::provider_setup::validate_selection(settings)?;
 
     // Configuration is validated before a credential is looked up, so a user
     // who has not set an endpoint is told that rather than being told about a
     // credential for an endpoint that does not exist.
-    let provider_name = settings.provider.to_string();
-    let base_url = crate::provider_setup::require_base_url(settings)?;
-    transport::validate_url(&base_url)?;
+    let endpoint = crate::provider_setup::configured_endpoint(settings, paths)?;
 
-    let credential =
-        rune_net::auth::resolve(paths, &provider_name, settings.api_key_env.as_deref())?
-            .ok_or_else(|| {
-                rune_net::auth::missing_credential_error(
-                    &provider_name,
-                    settings.api_key_env.as_deref(),
-                )
-            })?;
+    let attachments = crate::attachments::Attachments::read(&options.images)?;
+    let dialect = attachments.provider(crate::provider_setup::dialect_for(&settings.provider));
 
-    let dialect: Box<dyn Provider> = match settings.provider {
-        rune_core::config::Provider::Anthropic => Box::new(rune_net::anthropic::Anthropic),
-        rune_core::config::Provider::Responses => Box::new(rune_net::responses::Responses),
-        _ => Box::new(rune_net::chat_completions::ChatCompletions),
+    let mut limits = settings.limits.clone();
+    let step_cap = limits
+        .get(LimitName::MaxAgentSteps)
+        .value()
+        .filter(|cap| *cap > 0)
+        .unwrap_or(DEFAULT_MAX_STEPS);
+    let step_cap = if options.tool_loop { step_cap } else { 1 };
+    limits.set(
+        LimitName::MaxAgentSteps,
+        Budget::Bounded(step_cap),
+        Layer::CommandLine,
+    )?;
+    let registry = if options.tool_loop {
+        let catalog = rune_context::skills::discover(
+            &crate::current_workspace()?,
+            rune_core::paths::home_directory().as_deref(),
+            &paths.config_root,
+        )?;
+        inventory::builtin_with_vision(
+            &rune_tools::FileLimits::from_budget(&limits),
+            &limits,
+            &paths.managed_skills_dir(),
+            crate::web_client::backends(settings),
+            std::sync::Arc::new(rune_tools::ask_user::Unavailable),
+            std::sync::Arc::new(rune_tools::skill::Fixed::new(catalog)),
+            crate::vision_client::backend(settings, paths)?,
+        )?
+    } else {
+        Registry::new()
     };
-
-    let model = settings.model.clone();
-
-    // An image attachment is not wired into this path yet, so a run that
-    // reaches here has no images to send.
-    let mut plan = RequestPlan::new(model.clone());
-    plan.messages = vec![Message::user(options.prompt.clone())];
-    plan.effort = settings.effort;
-    plan.fast_mode = settings.fast_mode;
-    plan.provider_order.clone_from(&settings.provider_order);
-    plan.provider_strict = settings.provider_strict;
-
-    let endpoint = crate::provider_setup::endpoint(
-        &settings.provider,
-        &base_url,
-        credential.expose(),
-        settings.offline,
-    );
-
-    let agent = transport::agent();
-    let head_timeout = std::time::Duration::from_millis(
-        settings
-            .limits
-            .get(rune_core::LimitName::ProviderHeadTimeoutMs)
-            .value()
-            .unwrap_or(120_000),
-    );
-
-    let outcome = transport::stream_completion(
-        &agent,
-        &endpoint,
-        dialect.as_ref(),
-        &plan,
-        head_timeout,
-        &|| false,
-    )
-    .map_err(|err| err.to_rune_error())?;
-
-    let text = outcome.text();
-    let tool_calls: Vec<ToolCallReport> = outcome
-        .tool_calls()
-        .into_iter()
-        .map(|(_, name, _)| ToolCallReport {
-            name,
-            status: "success",
-        })
-        .collect();
-
-    let finish = outcome.finish.unwrap_or(FinishReason::Stop);
-    let exit_code = if matches!(finish, FinishReason::Stop | FinishReason::ToolCalls) {
+    let mut history = History::new();
+    let mut parts = vec![ContentPart::Text {
+        text: options.prompt.clone(),
+    }];
+    parts.extend(attachments.parts());
+    history.prepend(rune_net::message::Role::User, parts);
+    let mut context = ExecutionContext::new(crate::current_workspace()?)
+        .with_offline(settings.offline)
+        .with_allow_unsandboxed(settings.allow_unsandboxed);
+    context
+        .additional_roots
+        .clone_from(&settings.additional_directories);
+    let host = AskHost {
+        settings,
+        instructions: rune_context::prompt::base_instructions_for(
+            context.workspace(),
+            &paths.config_root,
+            &settings.limits,
+        ),
+        dialect,
+        endpoint,
+        registry,
+        read_only: options.read_only,
+        rules: crate::permissions::validated(settings)?,
+        context,
+        steering: SteeringQueue::from_limits(&limits),
+        cancellation: Cancellation::new(),
+        incomplete_tool_call: Cell::new(false),
+        jsonl: options.jsonl,
+        step: Cell::new(0),
+        emit_error: RefCell::new(None),
+        limits,
+    };
+    let outcome = turn::run_turn(&mut history, &host);
+    if let Some(error) = host.emit_error.borrow_mut().take() {
+        return Err(error);
+    }
+    let outcome = outcome?;
+    let error = if host.incomplete_tool_call.get() {
+        Some(RuneError::new(
+            ErrorCode::UnsupportedToolCall,
+            "the provider requested tools without a completed tool call",
+        ))
+    } else if !options.tool_loop && !outcome.calls.is_empty() {
+        let names = outcome
+            .calls
+            .iter()
+            .map(|call| call.call.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        Some(RuneError::new(
+            ErrorCode::UnsupportedToolCall,
+            format!("tool calls are unsupported when the tool loop is disabled: {names}"),
+        ))
+    } else if outcome.stop_reason == StopReason::StepLimit {
+        Some(RuneError::new(
+            ErrorCode::LimitExceeded,
+            turn::step_limit_notice(step_cap),
+        ))
+    } else {
+        None
+    };
+    let exit_code = if error.is_none() && outcome.stop_reason == StopReason::Completed {
         i32::from(EXIT_OK)
     } else {
         i32::from(EXIT_FAILURE)
     };
+    let tool_calls = outcome
+        .calls
+        .iter()
+        .map(|call| ToolCallReport {
+            name: call.call.name.clone(),
+            status: if call.output.is_error {
+                "error"
+            } else {
+                "success"
+            },
+        })
+        .collect();
+    let session_id = if options.no_save {
+        String::new()
+    } else {
+        save_exchange(
+            paths,
+            &options.prompt,
+            &history,
+            &outcome.usage,
+            error.as_ref(),
+        )?
+        .to_string()
+    };
 
     Ok(JsonResult {
-        final_output: text.clone(),
-        output: text,
-        exit_code,
-        model,
-        resolved_provider: None,
-        session_id: if options.no_save {
-            String::new()
+        final_output: if error.is_none() {
+            outcome.text.clone()
         } else {
-            // Sessions land next; a run without one reports an empty id rather
-            // than an identifier that cannot be resolved.
             String::new()
         },
-        steps: 1,
+        output: outcome.text,
+        exit_code,
+        model: settings.model.clone(),
+        resolved_provider: None,
+        session_id,
+        steps: outcome.steps,
         usage: UsageReport {
             input_tokens: outcome.usage.input_tokens,
             output_tokens: outcome.usage.output_tokens,
         },
         tool_calls,
-        error: None,
-        error_code: None,
+        error: error.as_ref().map(|error| error.message().to_owned()),
+        error_code: error.as_ref().map(RuneError::code),
+        error_detail: error
+            .as_ref()
+            .filter(|error| !error.detail().is_empty())
+            .map(|error| error.detail().clone()),
     })
+}
+
+/// Saves a completed request before its identifier is reported to the caller.
+fn save_exchange(
+    paths: &Paths,
+    prompt: &str,
+    history: &History,
+    usage: &Usage,
+    error: Option<&RuneError>,
+) -> Result<SessionId> {
+    let workspace = crate::current_workspace()?;
+    let id = SessionId::generate();
+    let store = SessionStore::create(paths, &id)?;
+    let mut metadata_warning = None;
+    let mut append = |event| -> Result<()> {
+        let report = store.append(event)?;
+        metadata_warning = report.metadata_warning;
+        Ok(())
+    };
+    append(SessionEvent::WorkspaceSet {
+        workspace: rune_policy::trust::canonical_workspace(&workspace).to_string(),
+    })?;
+    append(SessionEvent::TitleSet {
+        title: crate::session_log::derive_title(prompt),
+    })?;
+    append(SessionEvent::UserMessage {
+        text: prompt.to_owned(),
+    })?;
+    append(SessionEvent::TurnStarted { turn: 1 })?;
+    for turn in history.turns().iter().skip(1) {
+        for event in crate::session_log::message_events(turn, 1)? {
+            append(event)?;
+        }
+    }
+
+    if let (Some(input_tokens), Some(output_tokens)) = (usage.input_tokens, usage.output_tokens) {
+        append(SessionEvent::UsageRecorded {
+            input_tokens,
+            output_tokens,
+        })?;
+    }
+    if let Some(error) = error {
+        append(SessionEvent::TurnFailed {
+            turn: 1,
+            code: error.code(),
+            message: error.message().to_owned(),
+        })?;
+    }
+    if let Some(warning) = metadata_warning {
+        let _ = writeln!(std::io::stderr(), "warning: {warning}");
+    }
+    Ok(id)
 }
 
 /// Writes a result to the two output streams.
@@ -259,11 +679,16 @@ pub fn run(
 /// Markdown goes to standard output and diagnostics to standard error, so a
 /// pipeline can consume the answer while a human still sees progress.
 pub fn report(result: &JsonResult, options: &Options) -> Result<u8> {
-    if options.json {
+    let code = if options.jsonl {
+        final_jsonl(result)?
+    } else {
+        u8::try_from(result.exit_code).unwrap_or(EXIT_FAILURE)
+    };
+    if !options.jsonl && options.json {
         let mut stdout = std::io::stdout().lock();
         writeln!(stdout, "{}", result.render()?)
             .map_err(|err| RuneError::new(ErrorCode::Internal, err.to_string()))?;
-    } else if result.error.is_none() {
+    } else if !options.jsonl && result.error.is_none() {
         let mut stdout = std::io::stdout().lock();
         write!(stdout, "{}", result.final_output)
             .map_err(|err| RuneError::new(ErrorCode::Internal, err.to_string()))?;
@@ -277,7 +702,7 @@ pub fn report(result: &JsonResult, options: &Options) -> Result<u8> {
         let _ = writeln!(stderr, "rune: {error}");
     }
 
-    Ok(u8::try_from(result.exit_code).unwrap_or(EXIT_FAILURE))
+    Ok(code)
 }
 
 #[cfg(test)]
@@ -292,6 +717,129 @@ mod tests {
             base_url: Some("https://api.example.com".to_owned()),
             ..Settings::default()
         }
+    }
+
+    #[test]
+    fn saved_ask_preserves_native_assistant_replay() {
+        use rune_net::provider::{Provider as _, RequestPlan};
+        let temp = tempfile::tempdir().expect("temp");
+        let root = camino::Utf8Path::from_path(temp.path()).expect("utf8");
+        let paths = Paths {
+            config_root: root.join("config"),
+            state_root: root.join("state"),
+            data_root: root.join("data"),
+        };
+        let mut history = History::new();
+        history.push_user("lookup");
+        let id = rune_core::id::ToolCallId::new("local").expect("id");
+        let parts = serde_json::json!([{ "functionCall": { "id": "native", "name": "lookup", "args": {} }, "thoughtSignature": "signature" }]);
+        history.push_assistant_with_replay(
+            vec![ContentPart::ToolCall {
+                id: id.clone(),
+                name: "lookup".into(),
+                arguments: "{}".into(),
+            }],
+            Some(serde_json::json!({"gemini_parts": parts}).to_string()),
+        );
+        history.push_tool_results(vec![ContentPart::ToolResult {
+            id,
+            name: "lookup".into(),
+            content: "found".into(),
+            is_error: false,
+        }]);
+        let saved =
+            save_exchange(&paths, "lookup", &history, &Usage::default(), None).expect("save");
+        let (_, restored) = crate::session_log::load(&paths, &saved).expect("resume");
+        restored.validate().expect("history");
+        let mut plan = RequestPlan::new("gemini-fixture");
+        plan.messages = restored.to_messages();
+        let body = rune_net::gemini::Gemini
+            .build_request(&plan)
+            .expect("request");
+        assert_eq!(body["contents"][1]["parts"], parts);
+        assert_eq!(
+            body["contents"][2]["parts"][0]["functionResponse"]["name"],
+            "lookup"
+        );
+        assert_eq!(
+            body["contents"][2]["parts"][0]["functionResponse"]["id"],
+            "native"
+        );
+    }
+
+    #[test]
+    fn jsonl_splits_escaped_unicode_deltas_and_flushes_each_record() {
+        #[derive(Default)]
+        struct Output {
+            bytes: Vec<u8>,
+            flushes: usize,
+        }
+        impl Write for Output {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.bytes.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                self.flushes += 1;
+                Ok(())
+            }
+        }
+        let delta = format!(
+            "{}{}",
+            "a".repeat(MAX_JSONL_DELTA_BYTES - 1),
+            "🌱\n\0\"".repeat(5000)
+        );
+        let mut output = Output::default();
+        write_text_deltas(&mut output, 2, &delta).expect("write deltas");
+        let lines = std::str::from_utf8(&output.bytes).expect("UTF-8");
+        let mut joined = String::new();
+        for line in lines.lines() {
+            assert!(line.len() < MAX_JSONL_EVENT_BYTES);
+            let event: serde_json::Value = serde_json::from_str(line).expect("JSON event");
+            assert_eq!(event["type"], "text_delta");
+            assert_eq!(event["step"], 2);
+            let chunk = event["delta"].as_str().expect("delta");
+            assert!(chunk.len() <= MAX_JSONL_DELTA_BYTES);
+            joined.push_str(chunk);
+        }
+        assert_eq!(joined, delta);
+        assert_eq!(output.flushes, lines.lines().count());
+        assert!(output.flushes > 1);
+    }
+
+    #[test]
+    fn jsonl_rejects_oversized_serialized_records_before_writing_stdout() {
+        let mut result = JsonResult::failure("m", &RuneError::new(ErrorCode::Internal, "x"), 1);
+        result.output = "\0".repeat(MAX_JSONL_EVENT_BYTES / 6);
+        let mut stdout = Vec::new();
+        let error = write_jsonl(&mut stdout, &JsonlEvent::Final { result: &result })
+            .expect_err("escaped record exceeds cap");
+        assert_eq!(error.code(), ErrorCode::TooLarge);
+        assert!(stdout.is_empty());
+        let mut buffer = JsonlBuffer::default();
+        buffer
+            .write_all(&vec![b'a'; MAX_JSONL_EVENT_BYTES - 1])
+            .expect("at cap");
+        assert!(buffer.write_all(b"b").is_err());
+        assert_eq!(buffer.bytes.len(), MAX_JSONL_EVENT_BYTES - 1);
+        buffer.bytes.reserve_exact(1);
+        buffer.bytes.push(b'\n');
+        assert!(buffer.bytes.capacity() <= MAX_JSONL_EVENT_BYTES);
+    }
+
+    #[test]
+    fn jsonl_propagates_output_failure() {
+        struct Closed;
+        impl Write for Closed {
+            fn write(&mut self, _bytes: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::ErrorKind::BrokenPipe.into())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let error = write_text_deltas(&mut Closed, 1, "hello").expect_err("closed pipe");
+        assert_eq!(error.code(), ErrorCode::IoFailure);
     }
 
     #[test]
@@ -364,6 +912,7 @@ mod tests {
         assert_eq!(value["exit_code"], 1);
         assert_eq!(value["output"], "");
         assert_eq!(value["final_output"], "");
+        assert!(value.get("error_detail").is_none());
     }
 
     #[test]
@@ -430,11 +979,13 @@ mod tests {
             tool_calls: Vec::new(),
             error: None,
             error_code: None,
+            error_detail: None,
         };
         let json = result.render().expect("render");
         let value: serde_json::Value = serde_json::from_str(&json).expect("valid json");
         assert!(value.get("error").is_none());
         assert!(value.get("error_code").is_none());
+        assert!(value.get("error_detail").is_none());
     }
 
     #[test]

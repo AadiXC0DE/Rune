@@ -188,6 +188,8 @@ pub enum Provider {
     Responses,
     /// An Anthropic Messages endpoint.
     Anthropic,
+    /// A native Gemini Generate Content endpoint.
+    Gemini,
     /// A named endpoint declared in the user configuration.
     Named(String),
 }
@@ -228,6 +230,7 @@ impl Provider {
             Self::ChatCompletions => "chat_completions",
             Self::Responses => "responses",
             Self::Anthropic => "anthropic",
+            Self::Gemini => "gemini",
             Self::Named(name) => name.as_str(),
         }
     }
@@ -321,6 +324,7 @@ pub struct ModelSettings {
     /// Declared rather than assumed: a wrong window either truncates a
     /// conversation that would have fit or lets one grow past what the model
     /// accepts, and both are worse than being told.
+    /// Zero is rejected during loading with a field diagnostic and ignored.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_window: Option<u64>,
     /// Largest answer the model will produce.
@@ -328,22 +332,62 @@ pub struct ModelSettings {
     pub max_output_tokens: Option<u64>,
 }
 
+/// A user-authorized command that may veto an otherwise allowed tool call.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PreToolHook {
+    /// Name reported with a veto or hook failure.
+    pub name: String,
+    /// Explicit program and arguments, without implicit shell interpretation.
+    pub argv: Vec<String>,
+    /// Deadline in milliseconds, from 1 to 60,000.
+    #[serde(default = "default_hook_timeout")]
+    pub timeout_ms: u64,
+}
+
+/// A user-authorized command observing a redacted, completed tool result.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PostToolHook {
+    /// Name reported with a hook failure.
+    pub name: String,
+    /// Explicit program and arguments, without implicit shell interpretation.
+    pub argv: Vec<String>,
+    /// Deadline in milliseconds, from 1 to 60,000.
+    #[serde(default = "default_hook_timeout")]
+    pub timeout_ms: u64,
+}
+
+const fn default_hook_timeout() -> u64 {
+    5_000
+}
+
 /// A user configuration file as parsed.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct UserConfig {
+    /// Pre-tool veto command. Only the user configuration may set this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pre_tool_hook: Option<PreToolHook>,
+    /// Post-tool result command. Only the user configuration may set this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub post_tool_hook: Option<PostToolHook>,
+
     /// Active provider.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<Provider>,
 
+    /// Whether provider requests are refused, web backends disabled, remote MCP
+    /// checks skipped and sandboxed shell networking denied. Local MCP children
+    /// and unsandboxed shell fallback require separate network isolation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offline: Option<bool>,
+
     /// Whether the web tools may reach the network.
     ///
-    /// On by default, because a coding agent that cannot look something up is
-    /// the odd one out: every comparable harness reaches the network unless told
-    /// not to. `offline = true` is the switch that refuses everything, including
-    /// the model, and it overrules this. Setting this to false allows the model
-    /// while refusing the web tools, which is what a run that must not send a
-    /// query to a third party wants.
+    /// Off by default. Set `web_tools = true` or `RUNE_WEB_TOOLS=true` to enable
+    /// web fetch and search. `offline = true` disables both web backends and
+    /// overrules this setting.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub web_tools: Option<bool>,
 
@@ -358,6 +402,10 @@ pub struct UserConfig {
     /// Environment variable holding the credential, if not the platform default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key_env: Option<String>,
+
+    /// Connect to a loopback model endpoint without resolving a credential.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anonymous: Option<bool>,
 
     /// Effective permission mode.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -374,6 +422,10 @@ pub struct UserConfig {
     /// Theme name or a light or dark pin.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub theme: Option<String>,
+
+    /// Whether terminal decorations use only ASCII.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ascii: Option<bool>,
 
     /// Whether automatic update checks run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -402,6 +454,10 @@ pub struct UserConfig {
     /// Permission rules.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub permission: Option<toml::Value>,
+
+    /// Image analysis model on the active provider and endpoint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vision_model: Option<String>,
 
     /// Model used for automatic permission review.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -487,10 +543,16 @@ impl MergeReport {
 /// Fully resolved configuration.
 #[derive(Clone, Debug)]
 pub struct Settings {
+    /// User-authorized pre-tool veto command, absent by default.
+    pub pre_tool_hook: Option<PreToolHook>,
+    /// User-authorized post-tool result command, absent by default.
+    pub post_tool_hook: Option<PostToolHook>,
     /// Active provider.
     pub provider: Provider,
     /// Effective model identifier for the active provider.
     pub model: String,
+    /// User-configured models retained for environment and command-line provider selection.
+    pub configured_models: BTreeMap<String, ModelEntry>,
     /// Whether the web tools may reach the network.
     pub web_tools: bool,
     /// Input capacity the configured model accepts, when one is declared.
@@ -503,6 +565,8 @@ pub struct Settings {
     pub base_url: Option<String>,
     /// Environment variable holding the credential.
     pub api_key_env: Option<String>,
+    /// Whether the loopback model endpoint is explicitly anonymous.
+    pub anonymous: bool,
     /// Effective permission mode.
     pub permission_mode: PermissionMode,
     /// Whether a command may run without a sandbox.
@@ -517,9 +581,13 @@ pub struct Settings {
     pub fast_mode: bool,
     /// Theme selection.
     pub theme: Option<String>,
+    /// Whether terminal decorations use only ASCII.
+    pub ascii: bool,
     /// Whether automatic update checks run.
     pub auto_upgrade: bool,
-    /// Whether every outbound request is refused.
+    /// Whether provider requests are refused, web backends disabled, remote MCP
+    /// checks skipped and sandboxed shell networking denied. This is not a
+    /// process-wide network filter; hosts must enforce each path's policy.
     pub offline: bool,
     /// Whether tool call groups are collapsed.
     pub collapse_tool_calls: bool,
@@ -535,6 +603,8 @@ pub struct Settings {
     pub provider_order: Vec<String>,
     /// Whether to restrict requests to the listed providers.
     pub provider_strict: bool,
+    /// Image analysis model on the active provider and endpoint.
+    pub vision_model: Option<String>,
     /// Model used for automatic permission review.
     pub review_model: Option<String>,
     /// Where each value came from.
@@ -548,15 +618,20 @@ impl Default for Settings {
         Self {
             provider: Provider::default(),
             model: String::new(),
-            web_tools: true,
+            configured_models: BTreeMap::new(),
+            pre_tool_hook: None,
+            post_tool_hook: None,
+            web_tools: false,
             context_window: None,
             base_url: None,
             api_key_env: None,
+            anonymous: false,
             permission_mode: PermissionMode::default(),
             allow_unsandboxed: false,
             effort: Effort::default(),
             fast_mode: false,
             theme: None,
+            ascii: false,
             auto_upgrade: true,
             offline: false,
             collapse_tool_calls: false,
@@ -566,6 +641,7 @@ impl Default for Settings {
             limits: BudgetSet::new(),
             provider_order: Vec::new(),
             provider_strict: false,
+            vision_model: None,
             review_model: None,
             sources: MergeReport::default(),
             diagnostics: Vec::new(),
@@ -597,7 +673,7 @@ impl Settings {
                 ErrorCode::InvalidConfiguration,
                 format!("no model is selected for provider `{}`", self.provider),
             )
-            .with_hint("set `model` in the user config, or pass `--model <id>`"));
+            .with_hint("set the provider entry in the `models` table, or pass `--model <id>`"));
         }
         Ok(())
     }
@@ -608,8 +684,29 @@ impl Settings {
     /// can ask for a model before its first turn, while a caller that cannot be
     /// asked still has to refuse rather than send an empty identifier.
     pub fn require_provider(&self) -> Result<()> {
+        self.require_valid_user_config()?;
         if !self.provider.is_configured() {
             return Err(unconfigured_provider_error());
+        }
+        Ok(())
+    }
+
+    /// Surfaces a rejected user layer before a command relies on its provider.
+    pub fn require_valid_user_config(&self) -> Result<()> {
+        if let Some(diagnostic) = self.diagnostics.iter().find(|diagnostic| {
+            diagnostic.layer == Layer::User && diagnostic.code == ErrorCode::InvalidConfiguration
+        }) {
+            let location = diagnostic.path.as_ref().map_or_else(
+                || "user configuration".to_owned(),
+                |path| format!("user configuration `{path}`"),
+            );
+            return Err(RuneError::new(
+                ErrorCode::InvalidConfiguration,
+                format!("{location} failed to load: {}", diagnostic.message),
+            )
+            .with_hint(
+                "run `rune doctor` for the configuration diagnostic, then repair the user config",
+            ));
         }
         Ok(())
     }
@@ -645,13 +742,33 @@ impl Settings {
                     .unwrap_or_else(|| "default".to_owned()),
             ),
             ("permission_mode", self.permission_mode.to_string()),
+            ("anonymous", self.anonymous.to_string()),
             ("effort", self.effort.to_string()),
             ("fast_mode", self.fast_mode.to_string()),
             (
                 "theme",
                 self.theme.clone().unwrap_or_else(|| "auto".to_owned()),
             ),
+            ("ascii", self.ascii.to_string()),
             ("web_tools", self.web_tools.to_string()),
+            (
+                "post_tool_hook",
+                self.post_tool_hook
+                    .as_ref()
+                    .map_or_else(|| "disabled".to_owned(), |hook| hook.name.clone()),
+            ),
+            (
+                "pre_tool_hook",
+                self.pre_tool_hook
+                    .as_ref()
+                    .map_or_else(|| "disabled".to_owned(), |hook| hook.name.clone()),
+            ),
+            (
+                "vision_model",
+                self.vision_model
+                    .clone()
+                    .unwrap_or_else(|| "unavailable".to_owned()),
+            ),
             ("auto_upgrade", self.auto_upgrade.to_string()),
             ("collapse_tool_calls", self.collapse_tool_calls.to_string()),
             ("session_titles", self.session_titles.to_string()),
@@ -710,6 +827,8 @@ pub struct EnvironmentOverrides {
     pub fast_mode: Option<bool>,
     /// Theme.
     pub theme: Option<String>,
+    /// ASCII terminal decorations.
+    pub ascii: Option<bool>,
     /// Automatic updates.
     pub auto_upgrade: Option<bool>,
     /// Additional directories.
@@ -772,6 +891,7 @@ impl EnvironmentOverrides {
             effort: lookup("RUNE_EFFORT"),
             fast_mode: boolean(&mut lookup, "RUNE_FAST_MODE"),
             theme: lookup("RUNE_THEME"),
+            ascii: boolean(&mut lookup, "RUNE_ASCII"),
             auto_upgrade: boolean(&mut lookup, "RUNE_AUTO_UPGRADE"),
             additional_directories: Vec::new(),
             limits: Vec::new(),
@@ -834,21 +954,27 @@ const PROJECT_SAFE_KEYS: &[&str] = &[
 
 /// Profile-owned keys. Present in a project file, they are ignored and reported.
 const PROFILE_ONLY_KEYS: &[&str] = &[
+    "post_tool_hook",
+    "pre_tool_hook",
     "provider",
     "models",
     "model",
     "base_url",
     "api_key_env",
+    "anonymous",
     "permission_mode",
     "permission",
     "effort",
     "fast_mode",
     "theme",
+    "ascii",
     "auto_upgrade",
+    "offline",
     "collapse_tool_calls",
     "session_titles",
     "additional_directories",
     "review_model",
+    "vision_model",
 ];
 
 /// Loads and merges every configuration layer.
@@ -1029,6 +1155,18 @@ fn read_bounded(path: &Utf8Path, layer: Layer) -> std::result::Result<Option<Str
 
 /// Applies a user configuration to the settings.
 fn apply_user(settings: &mut Settings, user: &UserConfig, layer: Layer) {
+    if let Some(hook) = &user.post_tool_hook {
+        settings.post_tool_hook = Some(hook.clone());
+        settings.sources.record("post_tool_hook", layer);
+    }
+    if let Some(hook) = &user.pre_tool_hook {
+        settings.pre_tool_hook = Some(hook.clone());
+        settings.sources.record("pre_tool_hook", layer);
+    }
+    if let Some(offline) = user.offline {
+        settings.offline = offline;
+        settings.sources.record("offline", layer);
+    }
     if let Some(web_tools) = user.web_tools {
         // A project file cannot set this: it decides whether a repository can
         // send the user's queries to a search engine, which is the profile
@@ -1048,9 +1186,35 @@ fn apply_user(settings: &mut Settings, user: &UserConfig, layer: Layer) {
         settings.api_key_env = Some(api_key_env.clone());
         settings.sources.record("api_key_env", layer);
     }
+    if let Some(anonymous) = user.anonymous {
+        settings.anonymous = anonymous;
+        settings.sources.record("anonymous", layer);
+    }
     if let Some(models) = &user.models {
+        settings.configured_models.clone_from(models);
+        for (provider, entry) in &mut settings.configured_models {
+            if let ModelEntry::Detailed(model) = entry
+                && model.context_window == Some(0)
+            {
+                model.context_window = None;
+                let key = format!("models.{provider}.context_window");
+                settings.diagnostics.push(
+                    Diagnostic::new(
+                        layer,
+                        ErrorCode::InvalidField,
+                        format!("`{key}` must be greater than zero; ignoring the declared window"),
+                    )
+                    .with_key(key)
+                    .with_hint("set a positive token count or omit context_window"),
+                );
+            }
+        }
         let key = provider_key(&settings.provider);
-        if let Some(model) = models.get(&key).or_else(|| models.get("default")) {
+        if let Some(model) = settings
+            .configured_models
+            .get(&key)
+            .or_else(|| settings.configured_models.get("default"))
+        {
             model.id().clone_into(&mut settings.model);
             settings.sources.record("model", layer);
             // The declared capacity travels with the model it describes, so a
@@ -1076,6 +1240,10 @@ fn apply_user(settings: &mut Settings, user: &UserConfig, layer: Layer) {
     if let Some(theme) = &user.theme {
         settings.theme = Some(theme.clone());
         settings.sources.record("theme", layer);
+    }
+    if let Some(ascii) = user.ascii {
+        settings.ascii = ascii;
+        settings.sources.record("ascii", layer);
     }
     if let Some(auto) = user.auto_upgrade {
         settings.auto_upgrade = auto;
@@ -1105,6 +1273,10 @@ fn apply_user(settings: &mut Settings, user: &UserConfig, layer: Layer) {
         settings.provider_strict = strict;
         settings.sources.record("provider_strict", layer);
     }
+    if let Some(model) = &user.vision_model {
+        settings.vision_model = Some(model.clone());
+        settings.sources.record("vision_model", layer);
+    }
     if let Some(review) = &user.review_model {
         settings.review_model = Some(review.clone());
         settings.sources.record("review_model", layer);
@@ -1133,21 +1305,18 @@ fn apply_project(settings: &mut Settings, project: &ProjectConfig, layer: Layer)
         }
     }
 
-    if let Some(steps) = project
-        .max_agent_steps
-        .filter(|_| !user_set(&settings.limits, LimitName::MaxAgentSteps))
-    {
-        let _ = settings
-            .limits
-            .set(LimitName::MaxAgentSteps, Budget::Bounded(steps), layer);
-    }
-    if let Some(bytes) = project
-        .max_tool_result_bytes
-        .filter(|_| !user_set(&settings.limits, LimitName::MaxToolResultBytes))
-    {
-        let _ = settings
-            .limits
-            .set(LimitName::MaxToolResultBytes, Budget::Bounded(bytes), layer);
+    for (name, value) in [
+        (LimitName::MaxAgentSteps, project.max_agent_steps),
+        (LimitName::MaxToolResultBytes, project.max_tool_result_bytes),
+    ] {
+        if let Some(value) = value.filter(|_| !user_set(&settings.limits, name))
+            && let Err(err) = settings.limits.set(name, Budget::Bounded(value), layer)
+        {
+            settings.diagnostics.push(
+                Diagnostic::new(layer, err.code(), err.message().to_owned())
+                    .with_key(name.as_str()),
+            );
+        }
     }
     if let Some(context) = project
         .context
@@ -1227,10 +1396,38 @@ fn apply_environment(settings: &mut Settings, env: &EnvironmentOverrides) {
     let layer = Layer::Environment;
 
     if let Some(provider) = &env.provider {
-        settings.provider = parse_provider(provider);
+        let provider = parse_provider(provider);
+        if settings.provider != provider {
+            // Resolve the model and its capacity for the new provider before
+            // applying an explicit environment model override.
+            settings.model.clear();
+            settings.context_window = None;
+            for key in ["model", "context_window"] {
+                settings.sources.sources.remove(key);
+            }
+            let key = provider_key(&provider);
+            if let Some(model) = settings
+                .configured_models
+                .get(&key)
+                .or_else(|| settings.configured_models.get("default"))
+            {
+                model.id().clone_into(&mut settings.model);
+                settings.sources.record("model", Layer::User);
+                settings.context_window = model.context_window();
+                if settings.context_window.is_some() {
+                    settings.sources.record("context_window", Layer::User);
+                }
+            }
+        }
+        settings.provider = provider;
         settings.sources.record("provider", layer);
     }
     if let Some(model) = &env.model {
+        if settings.model != *model {
+            // A declared window belongs to the model it describes.
+            settings.context_window = None;
+            settings.sources.sources.remove("context_window");
+        }
         settings.model.clone_from(model);
         settings.sources.record("model", layer);
     }
@@ -1296,6 +1493,10 @@ fn apply_environment(settings: &mut Settings, env: &EnvironmentOverrides) {
     if let Some(theme) = &env.theme {
         settings.theme = Some(theme.clone());
         settings.sources.record("theme", layer);
+    }
+    if let Some(ascii) = env.ascii {
+        settings.ascii = ascii;
+        settings.sources.record("ascii", layer);
     }
     if let Some(auto) = env.auto_upgrade {
         settings.auto_upgrade = auto;
@@ -1414,6 +1615,7 @@ pub fn provider_key(provider: &Provider) -> String {
         Provider::ChatCompletions => "chat_completions".to_owned(),
         Provider::Responses => "responses".to_owned(),
         Provider::Anthropic => "anthropic".to_owned(),
+        Provider::Gemini => "gemini".to_owned(),
         Provider::Named(name) => name.clone(),
     }
 }
@@ -1429,6 +1631,7 @@ pub fn parse_provider(raw: &str) -> Provider {
         "chat_completions" | "chat-completions" | "openai" => Provider::ChatCompletions,
         "responses" => Provider::Responses,
         "anthropic" => Provider::Anthropic,
+        "gemini" | "google" => Provider::Gemini,
         other => Provider::Named(other.to_owned()),
     }
 }
@@ -1456,7 +1659,7 @@ pub fn unconfigured_model_error() -> RuneError {
         ErrorCode::InvalidConfiguration,
         "no model is selected",
     )
-    .with_hint("run `rune models` to list the ones the endpoint serves, and `rune connect <provider> <model>` to set one")
+    .with_hint("run `rune models` to list the ones the endpoint serves, and `rune connect <provider> --model <id>` to set one")
 }
 
 /// Renders the project configuration keys, for documentation consistency tests.
@@ -1483,6 +1686,7 @@ pub fn to_status_json(settings: &Settings, workspace: &Utf8Path) -> serde_json::
         "effort": settings.effort,
         "fast_mode": settings.fast_mode,
         "theme": settings.theme,
+        "ascii": settings.ascii,
         "auto_upgrade": settings.auto_upgrade,
         "context": settings.context,
         "collapse_tool_calls": settings.collapse_tool_calls,
@@ -1491,6 +1695,9 @@ pub fn to_status_json(settings: &Settings, workspace: &Utf8Path) -> serde_json::
         "provider_order": settings.provider_order,
         "provider_strict": settings.provider_strict,
         "review_model": settings.review_model,
+        "vision_model": settings.vision_model,
+        "pre_tool_hook": settings.pre_tool_hook,
+        "post_tool_hook": settings.post_tool_hook,
         "workspace": workspace.as_str(),
         "diagnostics": settings.diagnostics,
     })
@@ -1530,6 +1737,202 @@ mod tests {
         assert_eq!(settings.permission_mode, PermissionMode::Auto);
         assert_eq!(settings.source_of("permission_mode"), Layer::Default);
         assert!(settings.context);
+        assert!(!settings.web_tools);
+        assert_eq!(settings.source_of("web_tools"), Layer::Default);
+    }
+
+    #[test]
+    fn ascii_setting_respects_profile_and_environment_precedence() {
+        assert!(!load(None, None, &empty_env()).ascii);
+        let dir = TempDir::new().expect("tempdir");
+        let project = write(&dir, "project.toml", "ascii = true\n");
+        let scoped = load(Some(&project), None, &empty_env());
+        assert!(!scoped.ascii);
+        assert!(scoped.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == ErrorCode::KeyNotAllowedInScope
+                && diagnostic.key.as_deref() == Some("ascii")
+        }));
+        for enabled in [true, false] {
+            let user = write(&dir, "config.toml", &format!("ascii = {enabled}\n"));
+            let settings = load(None, Some(&user), &empty_env());
+            assert!(settings.diagnostics.is_empty());
+            assert_eq!(settings.ascii, enabled);
+            assert_eq!(settings.source_of("ascii"), Layer::User);
+            let env = EnvironmentOverrides::from_lookup(|key| {
+                (key == "RUNE_ASCII").then(|| (!enabled).to_string())
+            });
+            let settings = load(None, Some(&user), &env);
+            assert!(settings.diagnostics.is_empty());
+            assert_eq!(settings.ascii, !enabled);
+            assert_eq!(settings.source_of("ascii"), Layer::Environment);
+            assert_eq!(
+                to_status_json(&settings, Utf8Path::new("/w"))["ascii"],
+                !enabled
+            );
+            assert!(settings.explain().iter().any(|entry| {
+                entry.key == "ascii"
+                    && entry.value == (!enabled).to_string()
+                    && entry.source == Layer::Environment
+            }));
+        }
+        let invalid = EnvironmentOverrides::from_lookup(|key| {
+            (key == "RUNE_ASCII").then(|| "invalid".to_owned())
+        });
+        assert_eq!(
+            invalid.invalid_booleans,
+            [("RUNE_ASCII", "invalid".to_owned())]
+        );
+    }
+
+    #[test]
+    fn vision_model_is_profile_owned_and_reported_with_its_source() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let user = write(&dir, "config.toml", "vision_model = 'image-fixture'\n");
+        let project = write(&dir, ".rune.toml", "vision_model = 'untrusted-model'\n");
+        let settings = load(
+            Some(&project),
+            Some(&user),
+            &EnvironmentOverrides::default(),
+        );
+        assert_eq!(settings.vision_model.as_deref(), Some("image-fixture"));
+        assert_eq!(settings.source_of("vision_model"), Layer::User);
+        assert!(
+            settings
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.key.as_deref() == Some("vision_model"))
+        );
+        assert!(
+            settings
+                .explain()
+                .iter()
+                .any(|entry| entry.key == "vision_model"
+                    && entry.value == "image-fixture"
+                    && entry.source == Layer::User)
+        );
+        assert_eq!(
+            to_status_json(&settings, Utf8Path::new("/fixture"))["vision_model"],
+            "image-fixture"
+        );
+    }
+
+    #[test]
+    fn pre_tool_hooks_are_user_owned_and_keep_their_provenance() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let definition = "[pre_tool_hook]\nname = 'fixture guard'\nargv = ['/bin/false']\n";
+        let project = write(&dir, ".rune.toml", definition);
+        let settings = load(Some(&project), None, &empty_env());
+        assert!(settings.pre_tool_hook.is_none());
+        assert!(
+            settings
+                .diagnostics
+                .iter()
+                .any(|diagnostic| { diagnostic.code == ErrorCode::KeyNotAllowedInScope })
+        );
+        let user = write(&dir, "config.toml", definition);
+        let settings = load(Some(&project), Some(&user), &empty_env());
+        let hook = settings.pre_tool_hook.as_ref().expect("user hook");
+        assert_eq!(hook.name, "fixture guard");
+        assert_eq!(hook.argv, ["/bin/false"]);
+        assert_eq!(hook.timeout_ms, 5_000);
+        assert_eq!(settings.source_of("pre_tool_hook"), Layer::User);
+        assert!(
+            settings
+                .explain()
+                .iter()
+                .any(|row| row.key == "pre_tool_hook"
+                    && row.value == "fixture guard"
+                    && row.source == Layer::User)
+        );
+        let encoded =
+            toml::to_string(&read_user(&user).expect("read").expect("config")).expect("serialize");
+        assert!(encoded.contains("pre_tool_hook"));
+    }
+
+    #[test]
+    fn post_tool_hooks_are_user_owned_and_keep_their_provenance() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let definition = "[post_tool_hook]\nname = 'fixture guard'\nargv = ['/bin/false']\n";
+        let project = write(&dir, ".rune.toml", definition);
+        let settings = load(Some(&project), None, &empty_env());
+        assert!(settings.post_tool_hook.is_none());
+        assert!(
+            settings
+                .diagnostics
+                .iter()
+                .any(|diagnostic| { diagnostic.code == ErrorCode::KeyNotAllowedInScope })
+        );
+        let user = write(&dir, "config.toml", definition);
+        let settings = load(Some(&project), Some(&user), &empty_env());
+        let hook = settings.post_tool_hook.as_ref().expect("user hook");
+        assert_eq!(hook.name, "fixture guard");
+        assert_eq!(hook.argv, ["/bin/false"]);
+        assert_eq!(hook.timeout_ms, 5_000);
+        assert_eq!(settings.source_of("post_tool_hook"), Layer::User);
+        assert!(
+            settings
+                .explain()
+                .iter()
+                .any(|row| row.key == "post_tool_hook"
+                    && row.value == "fixture guard"
+                    && row.source == Layer::User)
+        );
+        let encoded =
+            toml::to_string(&read_user(&user).expect("read").expect("config")).expect("serialize");
+        assert!(encoded.contains("post_tool_hook"));
+        assert_eq!(
+            to_status_json(&settings, Utf8Path::new("/fixture"))["post_tool_hook"]["name"],
+            "fixture guard"
+        );
+    }
+
+    #[test]
+    fn web_tools_respect_explicit_user_and_environment_settings() {
+        let dir = TempDir::new().expect("tempdir");
+        for enabled in [true, false] {
+            let user = write(&dir, "config.toml", &format!("web_tools = {enabled}\n"));
+            let settings = load(None, Some(&user), &empty_env());
+            assert!(settings.diagnostics.is_empty());
+            assert_eq!(settings.web_tools, enabled);
+            assert_eq!(settings.source_of("web_tools"), Layer::User);
+
+            let env = EnvironmentOverrides::from_lookup(|key| {
+                (key == "RUNE_WEB_TOOLS").then(|| (!enabled).to_string())
+            });
+            let settings = load(None, Some(&user), &env);
+            assert!(settings.diagnostics.is_empty());
+            assert_eq!(settings.web_tools, !enabled);
+            assert_eq!(settings.source_of("web_tools"), Layer::Environment);
+        }
+    }
+
+    #[test]
+    fn anonymous_endpoints_require_a_profile_choice() {
+        let dir = TempDir::new().expect("tempdir");
+        let user = write(&dir, "config.toml", "anonymous = true\n");
+        let project = write(&dir, ".rune.toml", "anonymous = true\n");
+        let settings = load(None, Some(&user), &empty_env());
+        assert!(settings.anonymous);
+        assert_eq!(settings.source_of("anonymous"), Layer::User);
+        assert!(settings.diagnostics.is_empty());
+        assert!(
+            settings
+                .explain()
+                .iter()
+                .any(|entry| entry.key == "anonymous"
+                    && entry.value == "true"
+                    && entry.source == Layer::User)
+        );
+
+        let settings = load(Some(&project), None, &empty_env());
+        assert!(!settings.anonymous);
+        assert!(
+            settings
+                .diagnostics
+                .iter()
+                .any(|entry| entry.key.as_deref() == Some("anonymous")
+                    && entry.code == ErrorCode::KeyNotAllowedInScope)
+        );
     }
 
     #[test]
@@ -1568,6 +1971,87 @@ theme_unused = "x"
         let settings = load(None, Some(&user), &env);
         assert_eq!(settings.permission_mode, PermissionMode::FullAccess);
         assert_eq!(settings.source_of("permission_mode"), Layer::Environment);
+    }
+
+    #[test]
+    fn user_offline_setting_preserves_the_remaining_config() {
+        let dir = TempDir::new().expect("tempdir");
+        for offline in [true, false] {
+            let user = write(
+                &dir,
+                "config.toml",
+                &format!(
+                    r#"
+offline = {offline}
+provider = "chat_completions"
+web_tools = true
+theme = "light"
+[models]
+chat_completions = "configured-model"
+[limits]
+max_agent_steps = 50
+"#
+                ),
+            );
+            let settings = load(None, Some(&user), &empty_env());
+            assert!(
+                settings.diagnostics.is_empty(),
+                "{:?}",
+                settings.diagnostics
+            );
+            assert_eq!(settings.offline, offline);
+            assert_eq!(settings.source_of("offline"), Layer::User);
+            assert_eq!(settings.provider, Provider::ChatCompletions);
+            assert_eq!(settings.model, "configured-model");
+            assert_eq!(settings.theme.as_deref(), Some("light"));
+            assert!(settings.web_tools);
+            assert_eq!(settings.source_of("model"), Layer::User);
+            assert_eq!(
+                settings.limits.get(LimitName::MaxAgentSteps),
+                Budget::Bounded(50)
+            );
+        }
+    }
+
+    #[test]
+    fn environment_overrides_the_user_offline_setting() {
+        let dir = TempDir::new().expect("tempdir");
+        for offline in [true, false] {
+            let user = write(&dir, "config.toml", &format!("offline = {offline}\n"));
+            let env = EnvironmentOverrides::from_lookup(|key| {
+                (key == "RUNE_OFFLINE").then(|| (!offline).to_string())
+            });
+            let settings = load(None, Some(&user), &env);
+            assert!(
+                settings.diagnostics.is_empty(),
+                "{:?}",
+                settings.diagnostics
+            );
+            assert_eq!(settings.offline, !offline);
+            assert_eq!(settings.source_of("offline"), Layer::Environment);
+        }
+    }
+
+    #[test]
+    fn project_cannot_change_the_user_offline_setting() {
+        let dir = TempDir::new().expect("tempdir");
+        for offline in [true, false] {
+            let user = write(&dir, "config.toml", &format!("offline = {offline}\n"));
+            let project = write(
+                &dir,
+                ".rune.toml",
+                &format!("offline = {}\ncontext = false\n", !offline),
+            );
+            let settings = load(Some(&project), Some(&user), &empty_env());
+            assert_eq!(settings.offline, offline);
+            assert_eq!(settings.source_of("offline"), Layer::User);
+            assert!(!settings.context);
+            assert_eq!(settings.diagnostics.len(), 1, "{:?}", settings.diagnostics);
+            let diagnostic = &settings.diagnostics[0];
+            assert_eq!(diagnostic.layer, Layer::Project);
+            assert_eq!(diagnostic.code, ErrorCode::KeyNotAllowedInScope);
+            assert_eq!(diagnostic.key.as_deref(), Some("offline"));
+        }
     }
 
     #[test]
@@ -1682,6 +2166,89 @@ theme_unused = "x"
             settings.limits.source(LimitName::MaxAgentSteps),
             Some(Layer::Project)
         );
+    }
+
+    #[test]
+    fn invalid_legacy_project_limit_is_reported_like_a_limit_table_value() {
+        let dir = TempDir::new().expect("tempdir");
+        for prefix in ["", "[limits]\n"] {
+            let project = write(
+                &dir,
+                ".rune.toml",
+                &format!(
+                    "context = false\n{prefix}max_agent_steps = 10001\nmax_tool_result_bytes = 1000\n"
+                ),
+            );
+            let settings = load(Some(&project), None, &empty_env());
+            assert_eq!(settings.diagnostics.len(), 1, "{prefix}");
+            let diagnostic = &settings.diagnostics[0];
+            assert_eq!(diagnostic.layer, Layer::Project);
+            assert_eq!(diagnostic.code, ErrorCode::InvalidField);
+            assert_eq!(diagnostic.key.as_deref(), Some("max_agent_steps"));
+            assert!(diagnostic.message.contains("10001"));
+            assert!(diagnostic.message.contains("0..10000"));
+            assert_eq!(
+                settings.limits.get(LimitName::MaxAgentSteps),
+                LimitName::MaxAgentSteps.default_value()
+            );
+            assert_eq!(settings.limits.source(LimitName::MaxAgentSteps), None);
+            assert_eq!(
+                settings.limits.get(LimitName::MaxToolResultBytes),
+                Budget::Bounded(1000)
+            );
+            assert_eq!(
+                settings.limits.source(LimitName::MaxToolResultBytes),
+                Some(Layer::Project)
+            );
+            assert!(!settings.context);
+            assert_eq!(settings.source_of("context"), Layer::Project);
+        }
+    }
+
+    #[test]
+    fn legacy_project_limits_accept_valid_boundaries() {
+        let dir = TempDir::new().expect("tempdir");
+        for steps in [0, 10_000] {
+            for bytes in [0, 65_536] {
+                let project = write(
+                    &dir,
+                    ".rune.toml",
+                    &format!("max_agent_steps = {steps}\nmax_tool_result_bytes = {bytes}\n"),
+                );
+                let settings = load(Some(&project), None, &empty_env());
+                assert!(settings.diagnostics.is_empty());
+                for (name, value) in [
+                    (LimitName::MaxAgentSteps, steps),
+                    (LimitName::MaxToolResultBytes, bytes),
+                ] {
+                    assert_eq!(settings.limits.get(name), Budget::Bounded(value));
+                    assert_eq!(settings.limits.source(name), Some(Layer::Project));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_project_limit_does_not_replace_or_diagnose_a_user_limit() {
+        let dir = TempDir::new().expect("tempdir");
+        let user = write(&dir, "config.toml", "[limits]\nmax_agent_steps = 50\n");
+        for prefix in ["", "[limits]\n"] {
+            let project = write(
+                &dir,
+                ".rune.toml",
+                &format!("{prefix}max_agent_steps = 10001\n"),
+            );
+            let settings = load(Some(&project), Some(&user), &empty_env());
+            assert!(settings.diagnostics.is_empty());
+            assert_eq!(
+                settings.limits.get(LimitName::MaxAgentSteps),
+                Budget::Bounded(50)
+            );
+            assert_eq!(
+                settings.limits.source(LimitName::MaxAgentSteps),
+                Some(Layer::User)
+            );
+        }
     }
 
     #[test]
@@ -1827,6 +2394,29 @@ theme_unused = "x"
     }
 
     #[test]
+    fn acp_permission_deadline_resolves_from_user_config_and_environment() {
+        let dir = TempDir::new().expect("tempdir");
+        let user = write(
+            &dir,
+            "config.toml",
+            "[limits]\nacp_permission_timeout_ms = 250\n",
+        );
+        let name = LimitName::AcpPermissionTimeoutMs;
+        let settings = load(None, Some(&user), &empty_env());
+        assert!(settings.diagnostics.is_empty());
+        assert_eq!(settings.limits.get(name), Budget::Bounded(250));
+        assert_eq!(settings.limits.source(name), Some(Layer::User));
+
+        let env = EnvironmentOverrides::from_lookup(|key| {
+            (key == "RUNE_LIMITS").then(|| "acp_permission_timeout_ms=500".to_owned())
+        });
+        let settings = load(None, Some(&user), &env);
+        assert!(settings.diagnostics.is_empty());
+        assert_eq!(settings.limits.get(name), Budget::Bounded(500));
+        assert_eq!(settings.limits.source(name), Some(Layer::Environment));
+    }
+
+    #[test]
     fn environment_overrides_read_from_a_lookup() {
         let directories = std::env::join_paths(["/a", "/b"])
             .expect("join")
@@ -1962,6 +2552,227 @@ theme_unused = "x"
         assert_eq!(settings.model, "m");
         assert_eq!(settings.context_window, Some(200_000));
         assert_eq!(settings.source_of("context_window"), Layer::User);
+    }
+
+    #[test]
+    fn zero_context_windows_are_diagnosed_and_ignored_before_model_selection() {
+        let dir = TempDir::new().expect("tempdir");
+        for (provider, entry, override_provider) in [
+            ("anthropic", "anthropic", None),
+            ("local", "default", None),
+            ("anthropic", "chat_completions", Some("openai")),
+        ] {
+            let user = write(
+                &dir,
+                "config.toml",
+                &format!(
+                    "provider = '{provider}'\n[models.{entry}]\nid = 'small'\n\
+                     context_window = 0\nmax_output_tokens = 1234\n"
+                ),
+            );
+            let env = EnvironmentOverrides::from_lookup(|key| {
+                (key == "RUNE_PROVIDER")
+                    .then(|| override_provider.map(str::to_owned))
+                    .flatten()
+            });
+            let settings = load(None, Some(&user), &env);
+            assert_eq!(settings.model, "small");
+            assert_eq!(settings.context_window, None);
+            assert_eq!(settings.source_of("context_window"), Layer::Default);
+            let row = settings
+                .explain()
+                .into_iter()
+                .find(|row| row.key == "context_window")
+                .expect("context_window is reported");
+            assert_eq!(row.value, DEFAULT_CONTEXT_WINDOW.to_string());
+            assert_eq!(row.source, Layer::Default);
+
+            assert_eq!(settings.diagnostics.len(), 1);
+            let diagnostic = &settings.diagnostics[0];
+            let key = format!("models.{entry}.context_window");
+            assert_eq!(diagnostic.code, ErrorCode::InvalidField);
+            assert_eq!(diagnostic.layer, Layer::User);
+            assert_eq!(diagnostic.key.as_deref(), Some(key.as_str()));
+            assert!(diagnostic.message.contains(&key));
+
+            let ModelEntry::Detailed(model) = &settings.configured_models[entry] else {
+                panic!("model details must be preserved");
+            };
+            assert_eq!(model.context_window, None);
+            assert_eq!(model.max_output_tokens, Some(1234));
+        }
+    }
+
+    #[test]
+    fn environment_provider_change_selects_its_configured_model_and_window() {
+        let dir = TempDir::new().expect("tempdir");
+        let user = write(
+            &dir,
+            "config.toml",
+            "provider = 'anthropic'\n\
+             [models.anthropic]\nid = 'wide'\ncontext_window = 2000000\n\
+             [models.chat_completions]\nid = 'chat'\ncontext_window = 64000\n",
+        );
+        for model in [None, Some("chat"), Some("custom"), Some("wide")] {
+            let env = EnvironmentOverrides::from_lookup(|key| match key {
+                "RUNE_PROVIDER" => Some("openai".to_owned()),
+                "RUNE_MODEL" => model.map(str::to_owned),
+                _ => None,
+            });
+
+            let settings = load(None, Some(&user), &env);
+            assert!(settings.diagnostics.is_empty());
+            assert_eq!(settings.provider, Provider::ChatCompletions);
+            assert_eq!(settings.source_of("provider"), Layer::Environment);
+            assert_eq!(settings.model, model.unwrap_or("chat"));
+            assert_eq!(
+                settings.source_of("model"),
+                if model.is_some() {
+                    Layer::Environment
+                } else {
+                    Layer::User
+                }
+            );
+            let (window, source) = if matches!(model, Some("custom" | "wide")) {
+                (None, Layer::Default)
+            } else {
+                (Some(64_000), Layer::User)
+            };
+            assert_eq!(settings.context_window, window);
+            assert_eq!(settings.source_of("context_window"), source);
+        }
+    }
+
+    #[test]
+    fn environment_provider_change_uses_fallback_or_clears_the_previous_model() {
+        let dir = TempDir::new().expect("tempdir");
+        for (declaration, model, window) in [
+            ("", "", None),
+            ("[models]\nchat_completions = 'chat'\n", "chat", None),
+            (
+                "[models.default]\nid = 'fallback'\ncontext_window = 32000\n",
+                "fallback",
+                Some(32_000),
+            ),
+        ] {
+            let user = write(
+                &dir,
+                "config.toml",
+                &format!(
+                    "provider = 'anthropic'\n{declaration}\
+                     [models.anthropic]\nid = 'wide'\ncontext_window = 2000000\n"
+                ),
+            );
+            let env = EnvironmentOverrides::from_lookup(|key| {
+                (key == "RUNE_PROVIDER").then(|| "openai".to_owned())
+            });
+
+            let settings = load(None, Some(&user), &env);
+            assert!(settings.diagnostics.is_empty());
+            assert_eq!(settings.provider, Provider::ChatCompletions);
+            assert_eq!(settings.model, model);
+            assert_eq!(settings.context_window, window);
+            assert_eq!(
+                settings.source_of("model"),
+                if model.is_empty() {
+                    Layer::Default
+                } else {
+                    Layer::User
+                }
+            );
+            assert_eq!(
+                settings.source_of("context_window"),
+                if window.is_some() {
+                    Layer::User
+                } else {
+                    Layer::Default
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn unchanged_environment_provider_preserves_the_configured_model_and_window() {
+        let dir = TempDir::new().expect("tempdir");
+        let user = write(
+            &dir,
+            "config.toml",
+            "provider = 'openai'\n\
+             [models.chat_completions]\nid = 'chat'\ncontext_window = 64000\n",
+        );
+        let env = EnvironmentOverrides::from_lookup(|key| {
+            (key == "RUNE_PROVIDER").then(|| "chat-completions".to_owned())
+        });
+
+        let settings = load(None, Some(&user), &env);
+        assert!(settings.diagnostics.is_empty());
+        assert_eq!(settings.provider, Provider::ChatCompletions);
+        assert_eq!(settings.source_of("provider"), Layer::Environment);
+        assert_eq!(settings.model, "chat");
+        assert_eq!(settings.source_of("model"), Layer::User);
+        assert_eq!(settings.context_window, Some(64_000));
+        assert_eq!(settings.source_of("context_window"), Layer::User);
+    }
+
+    #[test]
+    fn environment_model_change_discards_the_declared_window() {
+        let dir = TempDir::new().expect("tempdir");
+        let user = write(
+            &dir,
+            "config.toml",
+            "provider = 'anthropic'\n[models.anthropic]\nid = 'wide'\ncontext_window = 2000000\n",
+        );
+        let env = EnvironmentOverrides::from_lookup(|key| {
+            (key == "RUNE_MODEL").then(|| "small".to_owned())
+        });
+
+        let settings = load(None, Some(&user), &env);
+        assert!(settings.diagnostics.is_empty());
+        assert_eq!(settings.provider, Provider::Anthropic);
+        assert_eq!(settings.model, "small");
+        assert_eq!(settings.source_of("model"), Layer::Environment);
+        assert_eq!(settings.context_window, None);
+        assert_eq!(settings.source_of("context_window"), Layer::Default);
+        let row = settings
+            .explain()
+            .into_iter()
+            .find(|row| row.key == "context_window")
+            .expect("context_window is reported");
+        assert_eq!(row.value, DEFAULT_CONTEXT_WINDOW.to_string());
+        assert_eq!(row.source, Layer::Default);
+    }
+
+    #[test]
+    fn unchanged_environment_model_preserves_the_declared_window() {
+        let dir = TempDir::new().expect("tempdir");
+        let user = write(
+            &dir,
+            "config.toml",
+            "provider = 'anthropic'\n[models.anthropic]\nid = 'wide'\ncontext_window = 2000000\n",
+        );
+        for model in [None, Some(""), Some("  "), Some("wide")] {
+            let env = EnvironmentOverrides::from_lookup(|key| {
+                if key == "RUNE_MODEL" {
+                    model.map(str::to_owned)
+                } else {
+                    None
+                }
+            });
+
+            let settings = load(None, Some(&user), &env);
+            assert!(settings.diagnostics.is_empty());
+            assert_eq!(settings.model, "wide");
+            assert_eq!(
+                settings.source_of("model"),
+                if model == Some("wide") {
+                    Layer::Environment
+                } else {
+                    Layer::User
+                }
+            );
+            assert_eq!(settings.context_window, Some(2_000_000));
+            assert_eq!(settings.source_of("context_window"), Layer::User);
+        }
     }
 
     #[test]
@@ -2125,6 +2936,14 @@ theme_unused = "x"
         );
         assert_eq!(parse_provider("openai"), Provider::ChatCompletions);
         assert_eq!(parse_provider("ANTHROPIC"), Provider::Anthropic);
+        assert_eq!(parse_provider("GOOGLE"), Provider::Gemini);
+        assert_eq!(parse_provider("gemini"), Provider::Gemini);
+        assert_eq!(provider_key(&Provider::Gemini), "gemini");
+        let encoded = serde_json::to_string(&Provider::Gemini).expect("encode");
+        assert_eq!(
+            serde_json::from_str::<Provider>(&encoded).expect("decode"),
+            Provider::Gemini
+        );
         assert_eq!(
             parse_provider("chat-completions"),
             Provider::ChatCompletions

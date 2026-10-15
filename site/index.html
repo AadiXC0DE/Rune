@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 
 <title>Rune, a tiny coding agent in Rust</title>
-<meta name="description" content="A coding agent in one 4.5 MiB native binary. Sandboxed commands, permission rules that name their source, any model, no account and no telemetry. Try it in the page: the harness runs as WebAssembly.">
+<meta name="description" content="A coding agent in one 5.43 MiB native binary. Sandboxed commands, permission rules that name their source, any model, no account and no telemetry. Try it in the page: the harness runs as WebAssembly.">
 <link rel="canonical" href="https://rune.heyaadi.com/">
 <meta name="color-scheme" content="dark light">
 <meta name="theme-color" content="#0b0b0a" media="(prefers-color-scheme: dark)">
@@ -13,17 +13,17 @@
 
 <meta property="og:type" content="website">
 <meta property="og:title" content="Rune, a tiny coding agent in Rust">
-<meta property="og:description" content="One 4.5 MiB binary, sandboxed, model agnostic. The page runs the real harness as WebAssembly.">
+<meta property="og:description" content="One 5.43 MiB binary, sandboxed, model agnostic. The page runs the real harness as WebAssembly.">
 <meta property="og:url" content="https://rune.heyaadi.com/">
 <meta property="og:site_name" content="Rune">
 <meta property="og:image" content="https://rune.heyaadi.com/og.png">
 <meta property="og:image:width" content="1200">
 <meta property="og:image:height" content="630">
-<meta property="og:image:alt" content="A coding agent in one 4.5 MiB binary, beside the Rune mark drawn in dots.">
+<meta property="og:image:alt" content="A coding agent in one 5.43 MiB binary, beside the Rune mark drawn in dots.">
 <meta name="twitter:card" content="summary_large_image">
 <meta name="twitter:image" content="https://rune.heyaadi.com/og.png">
 <meta name="twitter:title" content="Rune, a tiny coding agent in Rust">
-<meta name="twitter:description" content="One 4.5 MiB binary, sandboxed, model agnostic. The page runs the real harness as WebAssembly.">
+<meta name="twitter:description" content="One 5.43 MiB binary, sandboxed, model agnostic. The page runs the real harness as WebAssembly.">
 
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' fill='%230b0b0a'/><path d='M8 8h10a6 6 0 0 1 0 12h-4l6 8' fill='none' stroke='%23ffb454' stroke-width='3'/></svg>">
 <link rel="preload" href="fonts/plex-mono-400.woff2" as="font" type="font/woff2" crossorigin>
@@ -299,7 +299,7 @@
     padding: 0 .5rem;
     cursor: pointer;
   }
-  .choices button:first-child { border-color: var(--accent); color: var(--accent); }
+  .choices button.selected { border-color: var(--accent); color: var(--accent); }
 
   .term-foot { border-top: 1px solid var(--term-line); padding: .45rem 1rem .6rem; }
   .input-row { display: flex; align-items: center; gap: .6rem; }
@@ -467,8 +467,8 @@
   <section class="hero" style="padding:0">
     <div class="wrap">
       <div>
-        <h1 class="rise">A coding agent in one <em>3&nbsp;MiB</em> binary.</h1>
-        <p class="lede rise">Native Rust, sandboxed, and model agnostic. It starts in about 2 ms, and every rule it applies names the file that set it.</p>
+        <h1 class="rise">A coding agent in one <em>5.43&nbsp;MiB</em> binary.</h1>
+        <p class="lede rise">Native Rust, sandboxed, and model agnostic. Startup work budgets are enforced in CI, and every rule it applies names the file that set it.</p>
         <div class="install rise">
           <div role="tablist" aria-label="Install with">
             <button role="tab" aria-selected="true" data-target="brew">brew</button>
@@ -488,7 +488,7 @@
             <button class="copy" data-copy="cmd-source">copy</button>
           </div>
         </div>
-        <p class="meta rise"><b>4.5 MiB</b> binary &nbsp;/&nbsp; <b>~2 ms</b> to start &nbsp;/&nbsp; Apache-2.0</p>
+        <p class="meta rise"><b>5.43 MiB</b> binary &nbsp;/&nbsp; <b>5 ms</b> version work ceiling &nbsp;/&nbsp; Apache-2.0</p>
       </div>
       <div class="glyph" aria-hidden="true"><canvas id="glyph"></canvas></div>
     </div>
@@ -497,7 +497,7 @@
   <section id="demo">
     <div class="wrap">
       <h2>This is Rune, running in the page.</h2>
-      <p class="sub">The same Rust as the binary, compiled to WebAssembly: the turn loop, the tools, and the permission rules, in <span data-harness-size>about 540 KB</span>. The files live in the tab. Watch it fix a bug, then type your own request.</p>
+      <p class="sub">The same Rust as the binary, compiled to WebAssembly: the turn loop, the tools, and the permission rules, in <span data-harness-size>one module</span>. The files live in the tab. Watch it fix a bug, then type your own request.</p>
 
       <div class="term" id="term">
         <div class="term-bar">
@@ -558,11 +558,11 @@
       <h2 class="rise">Small on purpose, and held there.</h2>
       <p class="sub rise">Each of these is enforced by a test or a build step, not a promise.</p>
       <dl class="points">
-        <div class="rise"><dt>A budget, not an aspiration</dt><dd>Binary size and startup are measured on every pull request against a ceiling of 8 MiB and 5 ms. The build fails when either is crossed.</dd></div>
+        <div class="rise"><dt>A budget, not an aspiration</dt><dd>Every pull request checks an 8 MiB binary size ceiling and startup work ceilings of 5 ms for <code>--version</code> and 8 ms for <code>--help</code>. Work uses the baseline-subtracted minimum-of-31, or the raw minimum when no baseline is available. Budget output also reports raw process latency minimum, median and p95. The build fails when a ceiling is crossed.</dd></div>
         <div class="rise"><dt>Commands run in a sandbox</dt><dd>Seatbelt on macOS, bubblewrap on Linux. Writes stay in the workspace, credential files cannot be read, and <code>rune doctor</code> says what your machine enforces.</dd></div>
         <div class="rise"><dt>Every decision names its source</dt><dd>A limit, a rule, a setting: <code>rune permissions</code> and <code>rune config --explain</code> answer which file decided, rather than restating the value.</dd></div>
         <div class="rise"><dt>Steer a turn while it runs</dt><dd>Type while the model works and the correction reaches it at the next step. Escape twice cancels, and the session carries on.</dd></div>
-        <div class="rise"><dt>Any model, no account</dt><dd>Anthropic, OpenAI, OpenCode, or any OpenAI-compatible endpoint, hosted or on your machine. No telemetry, and <code>--offline</code> refuses every request.</dd></div>
+        <div class="rise"><dt>Any model, no account</dt><dd>Anthropic, OpenAI, OpenCode, or any OpenAI-compatible endpoint, hosted or on your machine. No telemetry. <code>--offline</code> blocks provider and web requests, skips remote MCP checks and restricts sandboxed shell networking. Local MCP and unsandboxed commands can still use the network.</dd></div>
         <div class="rise"><dt>One harness, several hosts</dt><dd>The terminal, <code>rune ask</code> in a script, an editor over the Agent Client Protocol, a Rust library, and the tab above.</dd></div>
       </dl>
     </div>
@@ -780,7 +780,7 @@
     demo = await mount(section);
     const size = performance.getEntriesByType('resource').find((entry) => entry.name.endsWith('rune.wasm'));
     if (size && size.encodedBodySize) {
-      document.querySelector('[data-harness-size]').textContent = Math.round(size.encodedBodySize / 1024) + ' KB';
+      document.querySelector('[data-harness-size]').textContent = Math.round(size.encodedBodySize / 1024) + ' KiB';
     }
     play.observe(section);
   }, { rootMargin: '400px 0px' });
@@ -799,7 +799,7 @@
       const bytes = entries.reduce((sum, entry) => sum + (entry.encodedBodySize || 0), 0);
       if (bytes > 0) {
         const note = document.createElement('span');
-        note.textContent = `this page: ${Math.round(bytes / 1024)} KB, no framework  /  `;
+        note.textContent = `this page: ${Math.round(bytes / 1024)} KiB, no framework  /  `;
         document.querySelector('[data-weight]').prepend(note);
       }
     }, 0);

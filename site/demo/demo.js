@@ -85,7 +85,7 @@ export async function mount(root) {
     status.textContent = `${state.model.label} | ${PERMISSION_MODE} | ctx ${pct}% | ~/tally`;
     chip.textContent = state.model.label;
     hint.textContent = state.asking
-      ? 'y allow  n deny'
+      ? 'y allow  n deny  arrows choose  enter confirm'
       : state.running
         ? 'enter steer  esc esc cancel'
         : '/help commands  /model switch model';
@@ -156,22 +156,37 @@ export async function mount(root) {
       const line = row('ask', '  allow ', [question.tool, 'tool-name'], ' ', [question.target === question.tool ? '' : question.target, 'strong'], '?  ');
       const buttons = document.createElement('span');
       buttons.className = 'choices';
+      const choices = [];
+      let selected = 0;
+      const select = (index) => {
+        selected = index;
+        choices.forEach((button, position) => button.classList.toggle('selected', position === selected));
+      };
       const settle = (allowed) => {
+        if (state.asking?.settle !== settle) return;
         buttons.remove();
         line.append(span(allowed ? 'allowed' : 'declined', allowed ? 'ok' : 'warn'));
         state.asking = null;
+        input.focus({ preventScroll: true });
         drawStatus();
         resolve(allowed);
       };
-      for (const [label, allowed] of [['y allow', true], ['n deny', false]]) {
+      for (const [index, [label, allowed]] of [['y allow', true], ['n deny', false]].entries()) {
         const button = document.createElement('button');
         button.type = 'button';
         button.textContent = label;
         button.addEventListener('click', () => settle(allowed));
+        button.addEventListener('focus', () => select(index));
+        choices.push(button);
         buttons.append(button);
       }
       line.append(buttons);
-      state.asking = settle;
+      state.asking = {
+        settle,
+        move: (delta) => select((selected + delta + choices.length) % choices.length),
+        confirm: () => settle(selected === 0),
+      };
+      select(0);
       drawStatus();
       scrollDown();
     });
@@ -319,12 +334,24 @@ export async function mount(root) {
 
   // ---------- keys ----------
 
+  // Capture permission keys before the composer, including when autoplay left
+  // focus on the page or a permission button has focus.
+  document.addEventListener('keydown', (event) => {
+    const menu = state.asking;
+    if (!menu || event.ctrlKey || event.altKey || event.metaKey || event.isComposing) return;
+    const key = event.key.toLowerCase();
+    const answer = key === 'y' || key === 'n';
+    const move = key === 'arrowup' || key === 'arrowdown';
+    const confirm = key === 'enter' && !input.value.trim();
+    if (!answer && !move && !confirm) return;
+    event.preventDefault();
+    event.stopPropagation();
+    if (answer) menu.settle(key === 'y');
+    else if (move) menu.move(key === 'arrowup' ? -1 : 1);
+    else menu.confirm();
+  }, true);
+
   input.addEventListener('keydown', (event) => {
-    if (state.asking && (event.key === 'y' || event.key === 'n')) {
-      event.preventDefault();
-      state.asking(event.key === 'y');
-      return;
-    }
     if (event.key === 'Enter') {
       event.preventDefault();
       const text = input.value;

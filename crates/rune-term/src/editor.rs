@@ -112,9 +112,9 @@ impl Composer {
 
     /// Returns the columns before the cursor.
     ///
-    /// This is where a renderer places the cursor, which is not the same as the
-    /// character count: a wide character advances two columns, and a pasted line
-    /// break or tab is drawn as one column.
+    /// This differs from the character count: a wide character advances two
+    /// columns, and a line break or tab counts as one. Multiline renderers
+    /// resolve this prefix width into a row and a column within that row.
     #[must_use]
     pub fn cursor_column(&self) -> usize {
         str_width(&displayed(self.head()))
@@ -129,6 +129,27 @@ impl Composer {
         let at = self.byte_of(self.cursor);
         self.text.insert_str(at, text);
         self.cursor = self.cursor.saturating_add(text.chars().count());
+        self.settle();
+    }
+
+    /// Replaces a byte range as one edit and puts the caret after the replacement.
+    /// Invalid ranges leave the draft unchanged.
+    pub fn replace_range(&mut self, range: std::ops::Range<usize>, replacement: &str) {
+        if range.start > range.end
+            || !self.text.is_char_boundary(range.start)
+            || !self.text.is_char_boundary(range.end)
+        {
+            return;
+        }
+        let caret = self.text[..range.start]
+            .chars()
+            .count()
+            .saturating_add(replacement.chars().count());
+        self.record();
+        self.text.replace_range(range, replacement);
+        self.cursor = caret;
+        self.recall = None;
+        self.draft.clear();
         self.settle();
     }
 
@@ -344,6 +365,19 @@ impl Composer {
         self.draft.clear();
     }
 
+    /// Replaces an externally edited draft as one undoable edit.
+    /// An unchanged draft retains its caret and editing history.
+    pub fn replace_draft(&mut self, text: &str) {
+        if text == self.text {
+            return;
+        }
+        self.record();
+        text.clone_into(&mut self.text);
+        self.cursor = self.text.chars().count();
+        self.recall = None;
+        self.draft.clear();
+    }
+
     /// Recalls the previous entry of a history.
     ///
     /// The entry nearest the cursor is the most recent one. At the oldest entry
@@ -540,10 +574,10 @@ impl Composer {
     }
 }
 
-/// Drawn in place of a line break inside the line being edited.
+/// Drawn in place of a line break in a single-row prompt echo.
 pub const LINE_BREAK: char = '\u{23ce}';
 
-/// Returns the line as it is drawn on its single row.
+/// Returns the text for a single-row echo or prefix width measurement.
 ///
 /// A pasted line break or tab is part of the text, but written to the terminal
 /// as it is it would move the cursor to another row or column. Each is drawn as
@@ -551,13 +585,26 @@ pub const LINE_BREAK: char = '\u{23ce}';
 /// measured from it is the column the terminal uses.
 #[must_use]
 pub fn displayed(text: &str) -> std::borrow::Cow<'_, str> {
+    displayed_with_ascii(text, false)
+}
+
+/// Returns a single-row echo, using `/` for newlines in ASCII mode.
+/// Source Unicode is preserved, including characters matching a decoration.
+#[must_use]
+pub fn displayed_with_ascii(text: &str, ascii: bool) -> std::borrow::Cow<'_, str> {
     if !text.contains(['\n', '\t']) {
         return std::borrow::Cow::Borrowed(text);
     }
     std::borrow::Cow::Owned(
         text.chars()
             .map(|c| match c {
-                '\n' => LINE_BREAK,
+                '\n' => {
+                    if ascii {
+                        '/'
+                    } else {
+                        LINE_BREAK
+                    }
+                }
                 '\t' => ' ',
                 c => c,
             })

@@ -61,6 +61,9 @@ pub struct ModelMetadata {
     /// Input capacity, when the catalog reports one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_window: Option<u64>,
+    /// Field or fallback that supplied an imported Ollama context window.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_source: Option<String>,
     /// Output ceiling, when the catalog reports one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_output_tokens: Option<u64>,
@@ -80,6 +83,7 @@ impl ModelMetadata {
             id: id.into(),
             display_name: None,
             context_window: None,
+            context_source: None,
             max_output_tokens: None,
             reasoning_efforts: Vec::new(),
             capabilities: Capabilities::unknown(),
@@ -158,6 +162,9 @@ pub use rune_core::config::DEFAULT_CONTEXT_WINDOW;
 pub struct Catalog {
     /// Provider the catalog describes.
     pub provider: String,
+    /// Explicit endpoint used to import a local Ollama catalog.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
     /// Entries, in the order the endpoint reported them.
     pub models: Vec<ModelMetadata>,
     /// Whether the entries came from the endpoint or a compiled fallback.
@@ -183,6 +190,7 @@ impl Catalog {
     pub fn new(provider: impl Into<String>) -> Self {
         Self {
             provider: provider.into(),
+            endpoint: None,
             models: Vec::new(),
             source: CatalogSource::Endpoint,
         }
@@ -232,11 +240,15 @@ impl Catalog {
     /// Returns the catalog as the value printed by `models --json`.
     #[must_use]
     pub fn to_json(&self) -> serde_json::Value {
-        serde_json::json!({
+        let mut value = serde_json::json!({
             "provider": self.provider,
             "source": self.source,
             "models": self.models,
-        })
+        });
+        if let Some(endpoint) = &self.endpoint {
+            value["endpoint"] = serde_json::Value::String(endpoint.clone());
+        }
+        value
     }
 }
 
@@ -289,24 +301,28 @@ impl Catalog {
 /// Returns true when a string is plausibly an endpoint model identifier.
 ///
 /// Accepts the letters, digits, and separators that appear in real identifiers,
-/// and rejects anything with whitespace or a shell metacharacter.
+/// including an optional nonempty `:tag` suffix, and rejects anything with
+/// whitespace or a shell metacharacter.
 fn looks_like_model_id(value: &str) -> bool {
     let value = value.trim();
     if value.is_empty() || value.len() > 256 {
         return false;
     }
-    if !value.contains('/') {
-        // A bare name is accepted only when it has no spaces.
-        return value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'));
-    }
-    value.split('/').all(|segment| {
+    let clean_segment = |segment: &str| {
         !segment.is_empty()
             && segment
                 .bytes()
                 .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
-    })
+    };
+    let name = if let Some((name, tag)) = value.split_once(':') {
+        if !clean_segment(tag) {
+            return false;
+        }
+        name
+    } else {
+        value
+    };
+    name.split('/').all(clean_segment)
 }
 
 /// Builds the catalog for a named connection from its declared model list.
@@ -371,6 +387,15 @@ pub fn from_endpoint_listing(provider: &str, body: &str) -> Option<Catalog> {
     let mut catalog = Catalog::new(provider);
     catalog.source = CatalogSource::Endpoint;
     for entry in entries {
+        let native_gemini = matches!(provider, "gemini" | "google");
+        if native_gemini
+            && entry
+                .get("supportedGenerationMethods")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|methods| !methods.iter().any(|method| method == "generateContent"))
+        {
+            continue;
+        }
         let id = entry
             .get("id")
             .or_else(|| entry.get("name"))
@@ -380,6 +405,11 @@ pub fn from_endpoint_listing(provider: &str, body: &str) -> Option<Catalog> {
         if id.is_empty() {
             continue;
         }
+        let id = if native_gemini {
+            id.strip_prefix("models/").unwrap_or(id)
+        } else {
+            id
+        };
         let mut model = ModelMetadata::new(id);
         // An endpoint that states a capacity is believed. Discarding it left
         // every session budgeting against a compiled default, which understates
@@ -394,6 +424,16 @@ pub fn from_endpoint_listing(provider: &str, body: &str) -> Option<Catalog> {
             .and_then(serde_json::Value::as_str)
             .filter(|name| *name != id)
             .map(str::to_owned);
+        if native_gemini {
+            model.context_window = number(entry, &["inputTokenLimit"]).or(model.context_window);
+            model.max_output_tokens =
+                number(entry, &["outputTokenLimit"]).or(model.max_output_tokens);
+            model.display_name = entry
+                .get("displayName")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+                .or(model.display_name);
+        }
         catalog.models.push(model);
     }
     Some(catalog)
@@ -415,9 +455,24 @@ fn number(entry: &serde_json::Value, keys: &[&str]) -> Option<u64> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn native_gemini_listing_keeps_reported_windows_and_generation_models() {
+        let body = serde_json::json!({"models": [
+            {"name": "models/gemini-fixture", "displayName": "Gemini Fixture", "inputTokenLimit": 1_000_000, "outputTokenLimit": 8192, "supportedGenerationMethods": ["generateContent", "countTokens"]},
+            {"name": "models/embedding-fixture", "supportedGenerationMethods": ["embedContent"]}
+        ]}).to_string();
+        let catalog = from_endpoint_listing("gemini", &body).expect("catalog");
+        assert_eq!(catalog.models.len(), 1);
+        let model = catalog.get("gemini-fixture").expect("generation model");
+        assert_eq!(model.display_name.as_deref(), Some("Gemini Fixture"));
+        assert_eq!(model.context_window, Some(1_000_000));
+        assert_eq!(model.max_output_tokens, Some(8192));
+    }
+
     fn catalog_with(entries: Vec<ModelMetadata>) -> Catalog {
         Catalog {
             provider: "test".to_owned(),
+            endpoint: None,
             models: entries,
             source: CatalogSource::Endpoint,
         }
@@ -428,6 +483,7 @@ mod tests {
             id: "vendor/full".to_owned(),
             display_name: Some("Full".to_owned()),
             context_window: Some(200_000),
+            context_source: None,
             max_output_tokens: Some(8192),
             reasoning_efforts: vec!["low".to_owned(), "medium".to_owned(), "high".to_owned()],
             capabilities: Capabilities {
@@ -655,6 +711,33 @@ mod tests {
             catalog.choose("local-llama"),
             ModelChoice::One("local-llama".to_owned())
         );
+    }
+
+    #[test]
+    fn unknown_tagged_identifiers_are_accepted_verbatim() {
+        let catalog = catalog_with(vec![ModelMetadata::new("qwen3:8b")]);
+        for id in ["qwen3:latest", "vendor/Qwen3:Q4_K-M", "org/team/model:1.2"] {
+            assert!(catalog.get(id).is_none());
+            assert_eq!(catalog.choose(id), ModelChoice::One(id.to_owned()));
+        }
+    }
+
+    #[test]
+    fn malformed_unknown_tagged_identifiers_are_refused() {
+        let catalog = Catalog::new("test");
+        for id in [
+            "",
+            " ",
+            ":latest",
+            "qwen3:",
+            "qwen3::latest",
+            "qwen3:bad tag",
+            "qwen3:tag/extra",
+            "vendor//qwen3:latest",
+            "qwen3:$(id)",
+        ] {
+            assert_eq!(catalog.choose(id), ModelChoice::None, "{id:?}");
+        }
     }
 
     #[test]

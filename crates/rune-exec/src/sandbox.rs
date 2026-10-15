@@ -49,6 +49,9 @@ pub const NAMESPACE_HELPER: &str = "bwrap";
 /// carries anything.
 const NULL_DEVICE: &str = "/dev/null";
 
+/// Device paths the Seatbelt profile permits a command to write.
+const WRITABLE_DEVICES: [&str; 4] = ["/dev/null", "/dev/stdout", "/dev/stderr", "/dev/tty"];
+
 /// Locations under the home directory that hold credentials.
 ///
 /// A sandboxed command has no business reading any of these, so each backend
@@ -76,7 +79,7 @@ pub const CREDENTIAL_PATHS: [&str; 12] = [
     ".local/state/rune",
 ];
 
-/// Paths inside a writable root that stay read-only.
+/// Paths inside every repository under a writable root that stay read-only.
 ///
 /// Git runs a repository's hooks and configured helpers outside any sandbox: a
 /// hook on the next commit, a diff driver or file system monitor on the next
@@ -155,6 +158,23 @@ impl SandboxPolicy {
         std::iter::once(&self.workspace).chain(self.writable_roots.iter())
     }
 
+    /// Resolves the same roots and exceptions used to build backend rules.
+    pub fn resolved_paths(&self) -> Result<PolicyPaths> {
+        self.paths_with(&existing_credential_paths())
+    }
+
+    fn paths_with(&self, credentials: &[Utf8PathBuf]) -> Result<PolicyPaths> {
+        let writable_roots = self
+            .writable()
+            .map(|path| resolve(path, "a writable path"))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(PolicyPaths {
+            protected_paths: protected_paths(&writable_roots)?,
+            credential_paths: masked_paths(credentials, &writable_roots),
+            writable_roots,
+        })
+    }
+
     /// Returns the credential locations a command under this policy has
     /// hidden, for a caller to assert against without repeating the list.
     pub fn credential_paths(&self) -> Result<Vec<Utf8PathBuf>> {
@@ -164,6 +184,17 @@ impl SandboxPolicy {
             .collect::<Result<Vec<_>>>()?;
         Ok(masked_paths(&existing_credential_paths(), &writable))
     }
+}
+
+/// Resolved paths used by both sandbox backends and policy diagnostics.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct PolicyPaths {
+    /// Workspace followed by any additional writable roots.
+    pub writable_roots: Vec<Utf8PathBuf>,
+    /// Repository paths whose writes are denied, including absent macOS hooks.
+    pub protected_paths: Vec<Utf8PathBuf>,
+    /// Existing credential locations masked by the backend.
+    pub credential_paths: Vec<Utf8PathBuf>,
 }
 
 /// A way to restrict what a command can reach.
@@ -177,6 +208,31 @@ pub trait Sandbox {
 
     /// Reports what this host can enforce.
     fn support(&self) -> Support;
+
+    /// Returns writable scratch directories added by this backend.
+    /// These are separate from host workspace grants.
+    fn temporary_writable_roots(&self) -> Vec<Utf8PathBuf> {
+        Vec::new()
+    }
+
+    /// Returns writable device paths added by this backend.
+    fn writable_device_paths(&self) -> Vec<Utf8PathBuf> {
+        Vec::new()
+    }
+
+    /// Wraps a Linux PTY command whose launcher creates a dedicated session.
+    /// The host terminal is never inherited; backends must preserve that PTY.
+    fn wrap_pty(
+        &self,
+        _prepared: &PreparedCommand,
+        _policy: &SandboxPolicy,
+        _allow_unsandboxed: bool,
+    ) -> Result<PreparedCommand> {
+        Err(RuneError::new(
+            ErrorCode::Unsupported,
+            "PTY shell mode is only supported on Linux",
+        ))
+    }
 
     /// Returns the command that runs under the restriction.
     ///
@@ -319,21 +375,81 @@ fn masked_paths(credentials: &[Utf8PathBuf], writable: &[Utf8PathBuf]) -> Vec<Ut
 
 /// Returns the repository paths under the writable roots that stay read-only.
 ///
-/// Only paths that exist are named, resolved the same way the roots are, since
-/// a rule about a missing path matches nothing and a `bwrap` bind of one fails.
-fn protected_paths(writable: &[Utf8PathBuf]) -> Vec<Utf8PathBuf> {
+/// Existing paths are resolved the same way the roots are. On macOS, an absent
+/// hooks destination is joined to its resolved `.git` parent and denied as a
+/// subtree, without preventing writes to other Git metadata.
+/// A `bwrap` bind of a missing path fails.
+/// On Linux, an absent hooks directory is protected by binding its existing
+/// `.git` parent read-only. This also denies other metadata writes until hooks
+/// exist, but leaves source files writable and creates no host directories.
+/// Discovery includes nested repositories and fails closed if a source
+/// directory cannot be inspected. Symlinks and Git metadata are not traversed.
+fn protected_paths(writable: &[Utf8PathBuf]) -> Result<Vec<Utf8PathBuf>> {
     let mut paths = Vec::new();
-    for root in writable {
+    let mut pending = writable.to_vec();
+    let mut visited = std::collections::BTreeSet::new();
+    while let Some(root) = pending.pop() {
+        if !visited.insert(root.clone()) {
+            continue;
+        }
         for relative in PROTECTED_REPOSITORY_PATHS {
             let path = root.join(relative);
-            if let Ok(resolved) = path.canonicalize_utf8()
+            let resolved = path.canonicalize_utf8().or_else(|error| {
+                if cfg!(target_os = "linux") && relative == ".git/hooks" {
+                    let git = root.join(".git");
+                    if git.is_dir() {
+                        return git.canonicalize_utf8();
+                    }
+                }
+                if cfg!(target_os = "macos") && relative == ".git/hooks" {
+                    let git = root.join(".git");
+                    if git.is_dir() {
+                        return git.canonicalize_utf8().map(|git| git.join("hooks"));
+                    }
+                }
+                Err(error)
+            });
+            if let Ok(resolved) = resolved
                 && !paths.contains(&resolved)
             {
                 paths.push(resolved);
             }
         }
+        // Inspect all source directories, including ignored and hidden ones.
+        // Git metadata itself needs no walk. Directory symlinks do not expand
+        // a writable grant: their targets are scanned through the real path
+        // when it is under a writable root. Skipping them also avoids cycles.
+        let inspection_error = |error: std::io::Error| {
+            RuneError::new(
+                ErrorCode::UnsafePath,
+                format!("cannot inspect `{root}` for nested repositories: {error}"),
+            )
+        };
+        let entries = std::fs::read_dir(&root).map_err(inspection_error)?;
+        let mut directories = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(inspection_error)?;
+            if entry.file_name() == ".git" {
+                continue;
+            }
+            if entry.file_type().map_err(inspection_error)?.is_dir() {
+                let directory = Utf8PathBuf::from_path_buf(entry.path()).map_err(|path| {
+                    RuneError::new(
+                        ErrorCode::UnsafePath,
+                        format!(
+                            "cannot inspect non-UTF-8 directory `{}` for nested repositories",
+                            path.display()
+                        ),
+                    )
+                })?;
+                directories.push(directory);
+            }
+        }
+        // Stable order keeps policy diagnostics and generated rules repeatable.
+        directories.sort();
+        pending.extend(directories.into_iter().rev());
     }
-    paths
+    Ok(paths)
 }
 
 /// Returns the temporary directories a command on macOS may write.
@@ -369,9 +485,10 @@ fn temporary_roots() -> Vec<Utf8PathBuf> {
 /// Returns the Seatbelt rule that covers a resolved path.
 ///
 /// A file is named literally, where a subpath rule would also cover a directory
-/// that happened to share its name.
+/// that happened to share its name. An absent protected directory needs a
+/// subpath rule so both its creation and future contents are covered.
 fn rule_for(resolved: &Utf8Path) -> &'static str {
-    if resolved.is_dir() {
+    if resolved.is_dir() || !resolved.exists() {
         "subpath"
     } else {
         "literal"
@@ -495,10 +612,8 @@ impl MacSandbox {
     /// can build a profile over a fixture home without moving this process's own
     /// home directory.
     fn profile_with(policy: &SandboxPolicy, credentials: &[Utf8PathBuf]) -> Result<String> {
-        let writable = policy
-            .writable()
-            .map(|path| resolve(path, "a writable path"))
-            .collect::<Result<Vec<_>>>()?;
+        let paths = policy.paths_with(credentials)?;
+        let writable = &paths.writable_roots;
         let mut profile = String::new();
         let _ = writeln!(profile, "(version 1)");
         let _ = writeln!(profile, "(allow default)");
@@ -508,12 +623,12 @@ impl MacSandbox {
         }
         // Redirection to these is not a way to change the machine, and denying
         // them breaks almost every command that prints.
-        for device in ["/dev/null", "/dev/stdout", "/dev/stderr", "/dev/tty"] {
+        for device in WRITABLE_DEVICES {
             let _ = writeln!(profile, "(allow file-write* (literal \"{device}\"))");
         }
         // After the grants, so the deny is the rule that decides for these.
-        for protected in protected_paths(&writable) {
-            let _ = writeln!(profile, "(deny file-write* {})", operand(&protected)?);
+        for protected in &paths.protected_paths {
+            let _ = writeln!(profile, "(deny file-write* {})", operand(protected)?);
         }
         // Reading stays open everywhere else, so a command still reads its own
         // libraries and the files it was pointed at. The roots it works in are
@@ -523,16 +638,16 @@ impl MacSandbox {
         //
         // The readable roots and the writable ones are the same paths, so the
         // loop is shared.
-        for resolved in &writable {
+        for resolved in writable {
             let _ = writeln!(profile, "(allow file-read* {})", operand(resolved)?);
         }
         // Writes are denied as well as reads. When the home directory is the
         // workspace, a credential location sits under a writable grant, and a
         // command could otherwise add a key to `authorized_keys` or a
         // `ProxyCommand` to the SSH configuration without reading either.
-        for credential in masked_paths(credentials, &writable) {
-            let _ = writeln!(profile, "(deny file-read* {})", operand(&credential)?);
-            let _ = writeln!(profile, "(deny file-write* {})", operand(&credential)?);
+        for credential in &paths.credential_paths {
+            let _ = writeln!(profile, "(deny file-read* {})", operand(credential)?);
+            let _ = writeln!(profile, "(deny file-write* {})", operand(credential)?);
         }
         if !policy.network {
             let _ = writeln!(profile, "(deny network*)");
@@ -542,6 +657,17 @@ impl MacSandbox {
 }
 
 impl Sandbox for MacSandbox {
+    fn writable_device_paths(&self) -> Vec<Utf8PathBuf> {
+        WRITABLE_DEVICES
+            .into_iter()
+            .map(Utf8PathBuf::from)
+            .collect()
+    }
+
+    fn temporary_writable_roots(&self) -> Vec<Utf8PathBuf> {
+        temporary_roots()
+    }
+
     fn name(&self) -> &'static str {
         "seatbelt"
     }
@@ -676,18 +802,16 @@ impl LinuxSandbox {
             String::from("--tmpfs"),
             String::from("/tmp"),
         ]);
-        let writable = policy
-            .writable()
-            .map(|path| resolve(path, "a writable path"))
-            .collect::<Result<Vec<_>>>()?;
-        for resolved in &writable {
+        let paths = policy.resolved_paths()?;
+        let writable = &paths.writable_roots;
+        for resolved in writable {
             argv.push(String::from("--bind"));
             argv.push(resolved.as_str().to_owned());
             argv.push(resolved.as_str().to_owned());
         }
         // Bound again read-only after the writable binds, so the later mount is
         // the one a command sees at these paths.
-        for protected in protected_paths(&writable) {
+        for protected in &paths.protected_paths {
             argv.push(String::from("--ro-bind"));
             argv.push(protected.as_str().to_owned());
             argv.push(protected.as_str().to_owned());
@@ -695,7 +819,7 @@ impl LinuxSandbox {
         // The credential locations are covered last, so the mask is the rule
         // that applies to a path a writable bind would otherwise expose, which
         // is the case when the home directory is itself the workspace.
-        for credential in masked_paths(&existing_credential_paths(), &writable) {
+        for credential in &paths.credential_paths {
             if credential.is_dir() {
                 // A directory is covered by an empty filesystem, which hides
                 // everything under it in one operation.
@@ -719,12 +843,43 @@ impl LinuxSandbox {
 }
 
 impl Sandbox for LinuxSandbox {
+    fn writable_device_paths(&self) -> Vec<Utf8PathBuf> {
+        vec![Utf8PathBuf::from("/dev")]
+    }
+
+    fn temporary_writable_roots(&self) -> Vec<Utf8PathBuf> {
+        vec![Utf8PathBuf::from("/tmp")]
+    }
+
     fn name(&self) -> &'static str {
         "namespaces"
     }
 
     fn support(&self) -> Support {
         self.support.clone()
+    }
+
+    fn wrap_pty(
+        &self,
+        prepared: &PreparedCommand,
+        policy: &SandboxPolicy,
+        allow_unsandboxed: bool,
+    ) -> Result<PreparedCommand> {
+        let mut wrapped = self.wrap(prepared, policy, allow_unsandboxed)?;
+        if self.support.is_full() {
+            // The launcher already detached from Rune's terminal and assigned
+            // a dedicated PTY. A second setsid would discard its controlling
+            // terminal. Remove only our helper flag, before the argv separator.
+            if let Some(index) = wrapped
+                .argv
+                .iter()
+                .take_while(|arg| *arg != "--")
+                .position(|arg| arg == "--new-session")
+            {
+                wrapped.argv.remove(index);
+            }
+        }
+        Ok(wrapped)
     }
 
     fn wrap(
@@ -808,15 +963,15 @@ mod tests {
 
     use tempfile::TempDir;
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     use std::time::Duration;
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     use crate::command::run;
     use crate::command::{prepare, verify_unchanged};
 
     /// Returns a condition that never cancels.
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn never() -> bool {
         false
     }
@@ -853,6 +1008,97 @@ mod tests {
     /// Returns a policy over one workspace.
     fn policy(workspace: &Utf8Path) -> SandboxPolicy {
         SandboxPolicy::new(workspace.to_owned(), Vec::new(), false)
+    }
+
+    #[test]
+    fn pty_wrapping_preserves_namespaces_without_detaching_the_terminal() {
+        let dir = tempfile::tempdir().expect("workspace");
+        let cwd = Utf8PathBuf::from_path_buf(dir.path().to_owned()).expect("UTF-8");
+        let prepared = crate::prepare_shell("echo --new-session", &cwd, None, BTreeMap::new())
+            .expect("prepare");
+        let policy = SandboxPolicy::new(cwd, Vec::new(), false);
+        let sandbox = LinuxSandbox::with_helper(Utf8PathBuf::from("/fixture/bwrap"));
+        let normal = sandbox.wrap(&prepared, &policy, false).expect("wrap");
+        let pty = sandbox
+            .wrap_pty(&prepared, &policy, false)
+            .expect("PTY wrap");
+        let mut expected = normal.argv;
+        let index = expected
+            .iter()
+            .position(|arg| arg == "--new-session")
+            .expect("session flag");
+        expected.remove(index);
+        assert_eq!(pty.argv, expected);
+        assert!(pty.argv.iter().any(|arg| arg == "--unshare-pid"));
+        assert!(pty.argv.iter().any(|arg| arg == "--unshare-net"));
+        assert_eq!(pty.reviewed, prepared.reviewed);
+    }
+
+    #[test]
+    fn reported_paths_match_the_rules_of_both_backends() {
+        let (_guard, root) = tempdir();
+        let workspace = root.join("workspace");
+        let extra = root.join("extra");
+        let credentials = root.join("credentials");
+        for directory in [&workspace, &extra, &credentials] {
+            std::fs::create_dir_all(directory.join(".git/hooks")).expect("fixture directories");
+            std::fs::write(directory.join(".git/config"), "[core]\n").expect("git config");
+        }
+        let policy = SandboxPolicy::new(workspace, vec![extra], false);
+        let credentials = vec![credentials.canonicalize_utf8().expect("resolved")];
+        let paths = policy.paths_with(&credentials).expect("paths");
+        assert_eq!(paths.writable_roots.len(), 2);
+        assert_eq!(paths.protected_paths.len(), 4);
+        assert_eq!(paths.credential_paths, credentials);
+        let profile = MacSandbox::profile_with(&policy, &credentials).expect("profile");
+        for path in &paths.writable_roots {
+            assert!(profile.contains(&format!(
+                "(allow file-write* {})",
+                operand(path).expect("operand")
+            )));
+        }
+        for path in &paths.protected_paths {
+            assert!(profile.contains(&format!(
+                "(deny file-write* {})",
+                operand(path).expect("operand")
+            )));
+        }
+        for path in &paths.credential_paths {
+            assert!(profile.contains(&format!(
+                "(deny file-read* {})",
+                operand(path).expect("operand")
+            )));
+            assert!(profile.contains(&format!(
+                "(deny file-write* {})",
+                operand(path).expect("operand")
+            )));
+        }
+        let prepared =
+            prepare("echo fixture", &policy.workspace, None, environment()).expect("prepare");
+        let argv =
+            LinuxSandbox::argv(Utf8Path::new("/fixture/bwrap"), &prepared, &policy).expect("argv");
+        let host_paths = policy.resolved_paths().expect("host paths");
+        for path in &host_paths.writable_roots {
+            assert!(
+                argv.windows(3)
+                    .any(|args| args == ["--bind", path.as_str(), path.as_str()])
+            );
+        }
+        for path in &host_paths.protected_paths {
+            assert!(
+                argv.windows(3)
+                    .any(|args| args == ["--ro-bind", path.as_str(), path.as_str()])
+            );
+        }
+        for path in &host_paths.credential_paths {
+            assert!(
+                argv.windows(2)
+                    .any(|args| args == ["--tmpfs", path.as_str()])
+                    || argv
+                        .windows(3)
+                        .any(|args| args == ["--ro-bind", NULL_DEVICE, path.as_str()])
+            );
+        }
     }
 
     #[test]
@@ -1445,7 +1691,7 @@ mod tests {
         std::fs::create_dir_all(workspace.join(".git/hooks")).expect("hooks");
         std::fs::write(workspace.join(".git/config"), "[core]\n").expect("config");
         let resolved = workspace.canonicalize_utf8().expect("workspace");
-        let protected = protected_paths(std::slice::from_ref(&resolved));
+        let protected = protected_paths(std::slice::from_ref(&resolved)).expect("protected paths");
         assert_eq!(
             protected,
             vec![resolved.join(".git/config"), resolved.join(".git/hooks")]
@@ -1453,7 +1699,250 @@ mod tests {
         // A workspace that is not a repository has nothing to protect.
         let (_other, plain) = tempdir();
         let plain = plain.canonicalize_utf8().expect("plain");
-        assert!(protected_paths(&[plain]).is_empty());
+        assert!(
+            protected_paths(&[plain])
+                .expect("protected paths")
+                .is_empty()
+        );
+    }
+
+    /// Includes a hidden, deeply nested repository, an overlapping grant, and
+    /// repositories with present and absent hooks in an additional root.
+    fn nested_repositories() -> (TempDir, SandboxPolicy, Vec<Utf8PathBuf>) {
+        let (guard, root) = tempdir();
+        let workspace = root.join("workspace");
+        let extra = root.join("extra");
+        let repositories = vec![
+            workspace.join("vendor/.hidden/deep"),
+            extra.join("child"),
+            extra.join("without-hooks"),
+        ];
+        for repository in &repositories {
+            std::fs::create_dir_all(repository.join(".git")).expect("git directory");
+            std::fs::write(repository.join(".git/config"), "[core]\n").expect("config");
+        }
+        for repository in &repositories[..2] {
+            std::fs::create_dir(repository.join(".git/hooks")).expect("hooks");
+            std::fs::write(repository.join(".git/hooks/pre-commit"), "original").expect("hook");
+        }
+        let overlap = workspace.join("vendor");
+        let policy = SandboxPolicy::new(workspace, vec![extra, overlap], false);
+        let repositories = repositories
+            .into_iter()
+            .map(|repository| repository.canonicalize_utf8().expect("repository"))
+            .collect();
+        (guard, policy, repositories)
+    }
+
+    #[test]
+    fn both_backends_protect_nested_repositories_after_every_write_grant() {
+        let (_guard, policy, repositories) = nested_repositories();
+        let paths = policy.resolved_paths().expect("paths");
+        let mut expected = Vec::new();
+        for repository in &repositories {
+            expected.push(repository.join(".git/config"));
+            let hooks = repository.join(".git/hooks");
+            if hooks.exists() || cfg!(target_os = "macos") {
+                expected.push(hooks);
+            } else if cfg!(target_os = "linux") {
+                expected.push(repository.join(".git"));
+            }
+        }
+        let mut actual = paths.protected_paths.clone();
+        actual.sort();
+        expected.sort();
+        assert_eq!(actual, expected, "missing or duplicate protections");
+
+        let profile = MacSandbox::profile_with(&policy, &[]).expect("profile");
+        let last_write_grant = profile.rfind("(allow file-write*").expect("write grant");
+        let prepared =
+            prepare("echo fixture", &policy.workspace, None, environment()).expect("prepare");
+        let argv =
+            LinuxSandbox::argv(Utf8Path::new("/fixture/bwrap"), &prepared, &policy).expect("argv");
+        let last_writable_bind = argv.iter().rposition(|arg| arg == "--bind").expect("bind");
+        for protected in &expected {
+            let deny = format!(
+                "(deny file-write* {})",
+                operand(protected).expect("operand")
+            );
+            assert!(profile.find(&deny).expect("deny") > last_write_grant);
+            let read_only = argv
+                .windows(3)
+                .position(|args| args == ["--ro-bind", protected.as_str(), protected.as_str()])
+                .expect("nested repository read-only bind");
+            assert!(read_only > last_writable_bind, "{argv:?}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn repository_discovery_skips_symlink_cycles_and_git_metadata() {
+        let (_guard, workspace) = tempdir();
+        let nested = workspace
+            .canonicalize_utf8()
+            .expect("workspace")
+            .join("nested");
+        std::fs::create_dir_all(nested.join(".git/hooks")).expect("hooks");
+        std::fs::write(nested.join(".git/config"), "[core]\n").expect("config");
+        std::fs::create_dir_all(nested.join(".git/objects/ignored/.git/hooks")).expect("metadata");
+        std::os::unix::fs::symlink(&workspace, nested.join("cycle")).expect("cycle");
+        let paths = policy(&workspace).resolved_paths().expect("paths");
+        assert_eq!(
+            paths.protected_paths,
+            vec![nested.join(".git/config"), nested.join(".git/hooks")]
+        );
+    }
+
+    #[test]
+    fn repository_discovery_refuses_an_uninspectable_directory() {
+        let (_guard, workspace) = tempdir();
+        let file = workspace.join("file");
+        std::fs::write(&file, "fixture").expect("file");
+        let error = policy(&file)
+            .resolved_paths()
+            .expect_err("cannot inspect a file");
+        assert_eq!(error.code(), ErrorCode::UnsafePath);
+        assert!(error.message().contains("cannot inspect"));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn sandboxed_commands_refuse_nested_config_and_hooks_but_allow_source_writes() {
+        let sandbox = detect();
+        let support = sandbox.support();
+        if !support.is_full() {
+            eprintln!("live nested repository regression skipped: {support:?}");
+            return;
+        }
+        let (_guard, policy, repositories) = nested_repositories();
+        for repository in &repositories {
+            for (command, permitted) in [
+                ("printf source > kept.txt", true),
+                ("printf changed > .git/config", false),
+                (
+                    "mkdir -p .git/hooks && printf changed > .git/hooks/pre-commit",
+                    false,
+                ),
+            ] {
+                let prepared = prepare(command, repository, None, environment()).expect("prepare");
+                let wrapped = sandbox.wrap(&prepared, &policy, false).expect("wrap");
+                let outcome = run(&wrapped, Duration::from_secs(20), &never).expect("run");
+                assert_eq!(
+                    outcome.exit.is_success(),
+                    permitted,
+                    "`{command}` in {repository}: {outcome:?}"
+                );
+            }
+            assert_eq!(
+                std::fs::read_to_string(repository.join("kept.txt")).expect("source"),
+                "source"
+            );
+            assert_eq!(
+                std::fs::read_to_string(repository.join(".git/config")).expect("config"),
+                "[core]\n"
+            );
+        }
+        for repository in &repositories[..2] {
+            assert_eq!(
+                std::fs::read_to_string(repository.join(".git/hooks/pre-commit")).expect("hook"),
+                "original"
+            );
+        }
+        assert!(!repositories[2].join(".git/hooks").exists());
+    }
+
+    #[test]
+    fn an_absent_seatbelt_destination_is_protected_as_a_subtree() {
+        let (_guard, workspace) = tempdir();
+        let hooks = workspace
+            .canonicalize_utf8()
+            .expect("workspace")
+            .join("hooks");
+        assert!(!hooks.exists());
+        assert_eq!(
+            operand(&hooks).expect("operand"),
+            format!("(subpath {})", quote(&hooks).expect("quote"))
+        );
+        assert!(!hooks.exists(), "building the rule created hooks");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_seatbelt_profile_protects_absent_hooks_in_every_writable_root() {
+        let (_guard, root) = tempdir();
+        let workspace = root.join("workspace");
+        let extra = root.join("extra");
+        for directory in [&workspace, &extra] {
+            std::fs::create_dir_all(directory.join(".git")).expect("git directory");
+            std::fs::write(directory.join(".git/config"), "[core]\n").expect("config");
+        }
+        let policy = SandboxPolicy::new(workspace, vec![extra], false);
+        let profile = MacSandbox::profile_with(&policy, &[]).expect("profile");
+        let paths = policy.resolved_paths().expect("paths");
+        let last_write_grant = profile.rfind("(allow file-write*").expect("write grant");
+        for directory in &paths.writable_roots {
+            let git = directory.join(".git");
+            let hooks = git.join("hooks");
+            assert!(paths.protected_paths.contains(&hooks), "{paths:?}");
+            let deny = format!(
+                "(deny file-write* (subpath {}))",
+                quote(&hooks).expect("quote")
+            );
+            assert!(profile.find(&deny).expect("hooks deny") > last_write_grant);
+            assert!(!paths.protected_paths.contains(&git), "{paths:?}");
+            assert!(!hooks.exists(), "building the profile created hooks");
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_macos_sandboxed_command_cannot_create_an_absent_executable_hook() {
+        let sandbox = MacSandbox::detect();
+        if !sandbox.support().is_full() {
+            eprintln!(
+                "live macOS hooks regression skipped: {:?}",
+                sandbox.support()
+            );
+            return;
+        }
+        let (_guard, root) = tempdir();
+        let workspace = root.join("workspace");
+        let extra = root.join("extra");
+        for directory in [&workspace, &extra] {
+            std::fs::create_dir_all(directory.join(".git")).expect("git directory");
+            std::fs::write(directory.join(".git/config"), "[core]\n").expect("config");
+        }
+        let policy = SandboxPolicy::new(workspace.clone(), vec![extra.clone()], false);
+        for directory in [&workspace, &extra] {
+            let hooks = directory.join(".git/hooks");
+            assert!(!hooks.exists());
+            for (command, permitted) in [
+                ("printf source > kept.txt", true),
+                ("printf metadata > .git/index", true),
+                (
+                    "mkdir -p .git/hooks && printf '#!/bin/sh\\nexit 0\\n' > .git/hooks/pre-commit && chmod +x .git/hooks/pre-commit",
+                    false,
+                ),
+            ] {
+                let prepared = prepare(command, directory, None, environment()).expect("prepare");
+                let wrapped = sandbox.wrap(&prepared, &policy, false).expect("wrap");
+                let outcome = run(&wrapped, Duration::from_secs(20), &never).expect("run");
+                assert_eq!(
+                    outcome.exit.is_success(),
+                    permitted,
+                    "`{command}`: {outcome:?}"
+                );
+            }
+            assert_eq!(
+                std::fs::read_to_string(directory.join("kept.txt")).expect("source"),
+                "source"
+            );
+            assert_eq!(
+                std::fs::read_to_string(directory.join(".git/index")).expect("index"),
+                "metadata"
+            );
+            assert!(!hooks.exists(), "the sandboxed command created hooks");
+        }
     }
 
     #[cfg(target_os = "macos")]
@@ -1571,5 +2060,84 @@ mod tests {
                 "{path} is bound before the workspace, so it is writable"
             );
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_linux_argv_protects_absent_hooks_in_every_writable_root() {
+        let (_guard, root) = tempdir();
+        let workspace = root.join("workspace");
+        let extra = root.join("extra");
+        for directory in [&workspace, &extra] {
+            std::fs::create_dir_all(directory.join(".git")).expect("git directory");
+            std::fs::write(directory.join(".git/config"), "[core]\n").expect("config");
+        }
+        let policy = SandboxPolicy::new(workspace.clone(), vec![extra], false);
+        let prepared = prepare("echo fixture", &workspace, None, environment()).expect("prepare");
+        let sandbox = LinuxSandbox::with_helper(Utf8PathBuf::from("/usr/bin/bwrap"));
+        let wrapped = sandbox.wrap(&prepared, &policy, false).expect("wrap");
+        let paths = policy.resolved_paths().expect("paths");
+        let last_writable_bind = wrapped
+            .argv
+            .iter()
+            .rposition(|argument| argument == "--bind")
+            .expect("writable bind");
+        for directory in &paths.writable_roots {
+            let git = directory.join(".git");
+            assert!(paths.protected_paths.contains(&git), "{paths:?}");
+            let read_only = wrapped
+                .argv
+                .windows(3)
+                .position(|args| args == ["--ro-bind", git.as_str(), git.as_str()])
+                .expect("read-only git parent bind");
+            assert!(read_only > last_writable_bind, "{:?}", wrapped.argv);
+            assert!(!git.join("hooks").exists(), "wrapping created hooks");
+            assert!(
+                !wrapped
+                    .argv
+                    .iter()
+                    .any(|argument| argument == git.join("hooks").as_str())
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_linux_sandboxed_command_cannot_create_an_absent_executable_hook() {
+        let sandbox = LinuxSandbox::detect();
+        if !sandbox.support().is_full() {
+            eprintln!(
+                "live Linux hooks regression skipped: {:?}",
+                sandbox.support()
+            );
+            return;
+        }
+        let (_guard, workspace) = tempdir();
+        std::fs::create_dir(workspace.join(".git")).expect("git directory");
+        std::fs::write(workspace.join(".git/config"), "[core]\n").expect("config");
+        let hooks = workspace.join(".git/hooks");
+        assert!(!hooks.exists());
+        let policy = policy(&workspace);
+        for (command, permitted) in [
+            ("printf source > kept.txt", true),
+            (
+                "mkdir -p .git/hooks && printf '#!/bin/sh\\nexit 0\\n' > .git/hooks/pre-commit && chmod +x .git/hooks/pre-commit",
+                false,
+            ),
+        ] {
+            let prepared = prepare(command, &workspace, None, environment()).expect("prepare");
+            let wrapped = sandbox.wrap(&prepared, &policy, false).expect("wrap");
+            let outcome = run(&wrapped, Duration::from_secs(20), &never).expect("run");
+            assert_eq!(
+                outcome.exit.is_success(),
+                permitted,
+                "`{command}`: {outcome:?}"
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("kept.txt")).expect("source"),
+            "source"
+        );
+        assert!(!hooks.exists(), "the sandboxed command created hooks");
     }
 }

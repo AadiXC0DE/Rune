@@ -15,7 +15,7 @@ use rune_net::error::FailureKind;
 use rune_net::error::NetError;
 use rune_net::message::Message;
 use rune_net::provider::{Provider, RequestPlan};
-use rune_net::transport::{Endpoint, agent, stream_completion};
+use rune_net::transport::{Endpoint, RequestTimeouts, agent, stream_completion};
 use rune_policy::review::{ReviewOutcome, ReviewRequest, Reviewer};
 
 /// Most characters of one evidence excerpt kept in the prompt.
@@ -44,36 +44,34 @@ pub fn build(settings: &Settings, paths: &Paths) -> Result<Option<Box<dyn Review
         return Ok(None);
     }
 
-    let provider_name = settings.provider.to_string();
-    let Some(base_url) = crate::provider_setup::configured_base_url(settings) else {
+    if crate::provider_setup::configured_base_url(settings).is_none() {
         return Ok(None);
-    };
-    let Some(credential) =
-        rune_net::auth::resolve(paths, &provider_name, settings.api_key_env.as_deref())?
-    else {
-        return Ok(None);
+    }
+    let endpoint = match crate::provider_setup::configured_endpoint(settings, paths) {
+        Ok(endpoint) => endpoint,
+        Err(error) if error.code() == rune_core::error::ErrorCode::AuthenticationRequired => {
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
     };
 
     let dialect: Box<dyn Provider> = match settings.provider {
         rune_core::config::Provider::Anthropic => Box::new(rune_net::anthropic::Anthropic),
         rune_core::config::Provider::Responses => Box::new(rune_net::responses::Responses),
+        rune_core::config::Provider::Gemini => Box::new(rune_net::gemini::Gemini),
         _ => Box::new(rune_net::chat_completions::ChatCompletions),
     };
 
     Ok(Some(Box::new(ModelReviewer {
         model,
         dialect,
-        endpoint: crate::provider_setup::endpoint(
-            &settings.provider,
-            &base_url,
-            credential.expose(),
-            settings.offline,
-        ),
+        endpoint,
         timeout: Duration::from_millis(
             settings
                 .limits
                 .get_bytes(rune_core::budget::LimitName::ReviewTimeoutMs),
         ),
+        request_timeout: RequestTimeouts::from_limits(&settings.limits).total,
         attempts: RETRIES,
     })))
 }
@@ -84,6 +82,7 @@ struct ModelReviewer {
     dialect: Box<dyn Provider>,
     endpoint: Endpoint,
     timeout: Duration,
+    request_timeout: Option<Duration>,
     /// Extra attempts after the first. Capped at one: a malformed answer is
     /// worth one more try, and a second failure means the model is not reliable
     /// for this task rather than unlucky.
@@ -164,7 +163,10 @@ impl ModelReviewer {
             &self.endpoint,
             self.dialect.as_ref(),
             &plan,
-            self.timeout,
+            RequestTimeouts {
+                head: self.timeout,
+                total: self.request_timeout,
+            },
             &|| false,
         )?;
         Ok(outcome.text())
@@ -354,6 +356,7 @@ mod tests {
             dialect: Box::new(rune_net::chat_completions::ChatCompletions),
             endpoint: Endpoint::new("http://127.0.0.1:1/v1", "k").offline(true),
             timeout: Duration::from_millis(10),
+            request_timeout: None,
             attempts: 0,
         };
         let outcome = reviewer.review(&request());
@@ -371,6 +374,7 @@ mod tests {
             dialect: Box::new(rune_net::chat_completions::ChatCompletions),
             endpoint: Endpoint::new("http://127.0.0.1:1/v1", "k"),
             timeout: Duration::from_millis(30),
+            request_timeout: None,
             attempts: 1,
         };
         let outcome = reviewer.review(&request());
@@ -392,6 +396,7 @@ mod tests {
             dialect: Box::new(rune_net::chat_completions::ChatCompletions),
             endpoint: Endpoint::new("http://127.0.0.1:1/v1", "k"),
             timeout: Duration::from_millis(20),
+            request_timeout: None,
             attempts: RETRIES,
         };
         let outcome = reviewer.review(&request());

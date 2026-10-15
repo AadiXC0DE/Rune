@@ -24,6 +24,8 @@ use sha2::{Digest, Sha256};
 pub const MAX_WRITE_BYTES: usize = 4 * 1024 * 1024;
 /// Largest combined preimage and postimage accepted by one mutation.
 pub const MAX_TOTAL_BYTES: usize = 8 * 1024 * 1024;
+/// Largest number of literal hunks accepted by one mutation.
+pub const MAX_EDIT_HUNKS: usize = 128;
 
 /// Lines rendered in one change preview.
 const PREVIEW_LINES: usize = 6;
@@ -84,6 +86,17 @@ pub enum Occurrence {
     All,
     /// Only the given one-based index is replaced.
     Index(usize),
+}
+
+/// One literal replacement in an ordered, atomic edit.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct LiteralEdit<'a> {
+    /// Exact text to find in the current in-memory content.
+    pub old: &'a str,
+    /// Replacement text, written verbatim.
+    pub new: &'a str,
+    /// Which matches this hunk replaces.
+    pub occurrence: Occurrence,
 }
 
 /// One-based inclusive line range a change produced in the resulting file.
@@ -311,15 +324,30 @@ pub fn prepare_edit(
     new: &str,
     occurrence: Occurrence,
 ) -> Result<Prepared> {
-    if old.is_empty() {
-        return Err(RuneError::invalid_field("old_string", "must not be empty"));
+    prepare_edits(
+        path,
+        &[LiteralEdit {
+            old,
+            new,
+            occurrence,
+        }],
+    )
+}
+
+/// Prepares ordered literal hunks against one snapshot without writing the file.
+///
+/// Each hunk matches the preceding hunk's in-memory result. All hunks must
+/// succeed before the single postimage can be applied. Intermediate content
+/// obeys the same size limits as the final postimage.
+pub fn prepare_edits(path: &Utf8Path, edits: &[LiteralEdit<'_>]) -> Result<Prepared> {
+    if edits.is_empty() {
+        return Err(RuneError::invalid_field("edits", "must not be empty"));
     }
-    if old == new {
-        return Err(RuneError::invalid_field(
-            "new_string",
-            "is identical to `old_string`, so the edit would change nothing",
-        )
-        .with_hint("pass different text, or leave the file alone"));
+    if edits.len() > MAX_EDIT_HUNKS {
+        return Err(RuneError::too_large("edits", edits.len(), MAX_EDIT_HUNKS));
+    }
+    for (index, edit) in edits.iter().enumerate() {
+        validate_edit(edit.old, edit.new).map_err(|err| hunk_error(err, index, edits.len()))?;
     }
     let Some(snapshot) = read_preimage(path)? else {
         return Err(
@@ -328,41 +356,13 @@ pub fn prepare_edit(
         );
     };
     let before = std::str::from_utf8(&snapshot.bytes).map_err(|_| not_text(path))?;
-    let count = count_occurrences(before, old);
-    if count == 0 {
-        return Err(no_match(path));
-    }
-    let (postimage, replacements) = match occurrence {
-        Occurrence::Unique => {
-            if count != 1 {
-                return Err(ambiguous(path, count));
-            }
-            let Some(replaced) = replace_one(before, old, new, 1) else {
-                return Err(no_match(path));
-            };
-            (replaced, 1)
-        }
-        Occurrence::All => (before.replace(old, new), count),
-        Occurrence::Index(index) => {
-            if index == 0 {
-                return Err(index_out_of_range(path, index, count));
-            }
-            let Some(replaced) = replace_one(before, old, new, index) else {
-                return Err(index_out_of_range(path, index, count));
-            };
-            (replaced, 1)
-        }
-    };
-    if postimage.len() > MAX_WRITE_BYTES {
-        return Err(RuneError::too_large(
-            "content",
-            postimage.len(),
-            MAX_WRITE_BYTES,
-        ));
-    }
-    let total = before.len().saturating_add(postimage.len());
-    if total > MAX_TOTAL_BYTES {
-        return Err(RuneError::too_large("content", total, MAX_TOTAL_BYTES));
+    let mut postimage = before.to_owned();
+    let mut replacements = 0usize;
+    for (index, edit) in edits.iter().enumerate() {
+        let (next, count) = replace_literal(path, &postimage, edit, before.len())
+            .map_err(|err| hunk_error(err, index, edits.len()))?;
+        postimage = next;
+        replacements = replacements.saturating_add(count);
     }
     let region = changed_region(before, &postimage);
     let preview = preview_of(before, &postimage, region.as_ref());
@@ -377,6 +377,93 @@ pub fn prepare_edit(
         span: region.as_ref().map(|region| region.span),
         replacements,
     })
+}
+
+/// Rejects empty searches and identical replacements before reading the file.
+fn validate_edit(old: &str, new: &str) -> Result<()> {
+    if old.is_empty() {
+        return Err(RuneError::invalid_field("old_string", "must not be empty"));
+    }
+    if old == new {
+        return Err(RuneError::invalid_field(
+            "new_string",
+            "is identical to `old_string`, so the edit would change nothing",
+        )
+        .with_hint("pass different text, or leave the file alone"));
+    }
+    Ok(())
+}
+
+/// Adds the failing hunk to the repair hint without changing its error code.
+fn hunk_error(err: RuneError, index: usize, hunks: usize) -> RuneError {
+    if hunks == 1 {
+        return err;
+    }
+    let repair = err
+        .detail()
+        .hint
+        .as_deref()
+        .unwrap_or("check this hunk's text and selector");
+    let hint = format!(
+        "repair edits[{index}] (hunk {}): {repair}; hunks run in order against earlier results; no edits were written",
+        index.saturating_add(1)
+    );
+    err.with_hint(hint)
+}
+
+/// Builds one replacement after validating its matches and allocation size.
+fn replace_literal(
+    path: &Utf8Path,
+    before: &str,
+    edit: &LiteralEdit<'_>,
+    preimage_len: usize,
+) -> Result<(String, usize)> {
+    let LiteralEdit {
+        old,
+        new,
+        occurrence,
+    } = *edit;
+    let count = count_occurrences(before, old);
+    if count == 0 {
+        return Err(no_match(path));
+    }
+    let replacements = match occurrence {
+        Occurrence::Unique => {
+            if count != 1 {
+                return Err(ambiguous(path, count));
+            }
+            1
+        }
+        Occurrence::All => count,
+        Occurrence::Index(index) => {
+            if index == 0 || index > count {
+                return Err(index_out_of_range(path, index, count));
+            }
+            1
+        }
+    };
+    let postimage_len = before
+        .len()
+        .saturating_sub(old.len().saturating_mul(replacements))
+        .saturating_add(new.len().saturating_mul(replacements));
+    if postimage_len > MAX_WRITE_BYTES {
+        return Err(RuneError::too_large(
+            "content",
+            postimage_len,
+            MAX_WRITE_BYTES,
+        ));
+    }
+    let total = preimage_len.saturating_add(postimage_len);
+    if total > MAX_TOTAL_BYTES {
+        return Err(RuneError::too_large("content", total, MAX_TOTAL_BYTES));
+    }
+    let postimage = match occurrence {
+        Occurrence::All => before.replace(old, new),
+        Occurrence::Unique => replace_one(before, old, new, 1).ok_or_else(|| no_match(path))?,
+        Occurrence::Index(index) => replace_one(before, old, new, index)
+            .ok_or_else(|| index_out_of_range(path, index, count))?,
+    };
+    Ok((postimage, replacements))
 }
 
 /// Applies a prepared mutation.
@@ -408,7 +495,7 @@ pub fn apply(prepared: Prepared) -> Result<Applied> {
     let directory = directory.to_owned();
     if !directory.exists() {
         std::fs::create_dir_all(directory.as_std_path())
-            .map_err(|err| io_error(&directory, &err))?;
+            .map_err(|err| io_error(&directory, err))?;
     }
     let (staged, mut file) = create_stage(&directory)?;
     let mut guard = StageGuard::new(staged.clone());
@@ -417,18 +504,18 @@ pub fn apply(prepared: Prepared) -> Result<Applied> {
         // carry over, and refusing the write for that would refuse every one.
         match file.set_permissions(permissions) {
             Err(err) if err.kind() != ErrorKind::Unsupported => {
-                return Err(io_error(&staged, &err));
+                return Err(io_error(&staged, err));
             }
             _ => {}
         }
     }
     file.write_all(&postimage)
-        .map_err(|err| io_error(&staged, &err))?;
-    file.sync_all().map_err(|err| io_error(&staged, &err))?;
+        .map_err(|err| io_error(&staged, err))?;
+    file.sync_all().map_err(|err| io_error(&staged, err))?;
     drop(file);
     revalidate(&resolved, identity.as_ref(), &hash)?;
     std::fs::rename(staged.as_std_path(), resolved.as_std_path())
-        .map_err(|err| io_error(&resolved, &err))?;
+        .map_err(|err| io_error(&resolved, err))?;
     guard.disarm();
     sync_directory(&directory);
     Ok(Applied {
@@ -443,9 +530,9 @@ pub fn apply(prepared: Prepared) -> Result<Applied> {
 
 /// Maps an I/O failure to a typed error that names the path involved.
 ///
-/// The generic conversion cannot know which path failed, and its fallback code
-/// describes a network stream rather than a file.
-fn io_error(path: &Utf8Path, err: &std::io::Error) -> RuneError {
+/// The generic conversion cannot know which path failed. Keep the filesystem
+/// context and retain the original cause rather than just its display text.
+fn io_error(path: &Utf8Path, err: std::io::Error) -> RuneError {
     let code = match err.kind() {
         ErrorKind::NotFound => ErrorCode::NotFound,
         ErrorKind::PermissionDenied => ErrorCode::PermissionDenied,
@@ -453,9 +540,11 @@ fn io_error(path: &Utf8Path, err: &std::io::Error) -> RuneError {
         ErrorKind::IsADirectory | ErrorKind::NotADirectory | ErrorKind::InvalidInput => {
             ErrorCode::InvalidField
         }
-        _ => ErrorCode::Internal,
+        _ => ErrorCode::IoFailure,
     };
-    RuneError::new(code, format!("`{path}`: {err}")).with_observed(err.to_string())
+    RuneError::new(code, format!("`{path}`: {err}"))
+        .with_observed(err.to_string())
+        .with_io_source(err)
 }
 
 /// Reads the current bytes of a file, or `None` when it does not exist.
@@ -471,7 +560,7 @@ fn read_preimage(path: &Utf8Path) -> Result<Option<Snapshot>> {
         Err(err) if matches!(err.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) => {
             return Ok(None);
         }
-        Err(err) => return Err(io_error(path, &err)),
+        Err(err) => return Err(io_error(path, err)),
     };
     if metadata.file_type().is_symlink() {
         return Err(
@@ -500,15 +589,15 @@ fn read_preimage(path: &Utf8Path) -> Result<Option<Snapshot>> {
             MAX_TOTAL_BYTES,
         ));
     }
-    let file = File::open(path.as_std_path()).map_err(|err| io_error(path, &err))?;
-    let metadata = file.metadata().map_err(|err| io_error(path, &err))?;
+    let file = File::open(path.as_std_path()).map_err(|err| io_error(path, err))?;
+    let metadata = file.metadata().map_err(|err| io_error(path, err))?;
     let identity = FileIdentity::of(&file);
     let permissions = metadata.permissions();
     let limit = u64::try_from(MAX_TOTAL_BYTES.saturating_add(1)).unwrap_or(u64::MAX);
     let mut bytes = Vec::with_capacity(observed.min(MAX_TOTAL_BYTES));
     file.take(limit)
         .read_to_end(&mut bytes)
-        .map_err(|err| io_error(path, &err))?;
+        .map_err(|err| io_error(path, err))?;
     if bytes.len() > MAX_TOTAL_BYTES {
         return Err(RuneError::too_large(
             path.as_str(),
@@ -532,13 +621,13 @@ fn identity_and_hash(path: &Utf8Path) -> Result<Option<(FileIdentity, [u8; 32])>
     let mut file = match File::open(path.as_std_path()) {
         Ok(file) => file,
         Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
-        Err(err) => return Err(io_error(path, &err)),
+        Err(err) => return Err(io_error(path, err)),
     };
     let identity = FileIdentity::of(&file);
     let mut hasher = Sha256::new();
     let mut buffer = vec![0u8; HASH_BUFFER_BYTES].into_boxed_slice();
     loop {
-        let read = file.read(&mut buffer).map_err(|err| io_error(path, &err))?;
+        let read = file.read(&mut buffer).map_err(|err| io_error(path, err))?;
         if read == 0 {
             break;
         }
@@ -583,7 +672,7 @@ fn create_stage(directory: &Utf8Path) -> Result<(Utf8PathBuf, File)> {
         match opened {
             Ok(file) => return Ok((candidate, file)),
             Err(err) if err.kind() == ErrorKind::AlreadyExists => {}
-            Err(err) => return Err(io_error(&candidate, &err)),
+            Err(err) => return Err(io_error(&candidate, err)),
         }
     }
     Err(RuneError::new(
@@ -978,6 +1067,28 @@ mod tests {
     }
 
     #[test]
+    fn a_filesystem_io_failure_retains_its_cause_and_path() {
+        use std::error::Error as _;
+
+        let path = Utf8Path::new("fixture.txt");
+        let err = io_error(path, std::io::Error::other("fixture disk failure"));
+        assert_eq!(err.code(), ErrorCode::IoFailure);
+        assert_eq!(err.code().as_str(), "io_failure");
+        assert!(err.message().contains(path.as_str()));
+        assert_eq!(
+            err.detail().observed.as_deref(),
+            Some("fixture disk failure")
+        );
+        let source = err
+            .source()
+            .expect("filesystem cause")
+            .downcast_ref::<std::io::Error>()
+            .expect("typed filesystem cause");
+        assert_eq!(source.kind(), ErrorKind::Other);
+        assert_eq!(source.to_string(), "fixture disk failure");
+    }
+
+    #[test]
     fn a_write_creates_a_missing_file() {
         let dir = dir();
         let path = file_in(&dir, "new.txt");
@@ -1115,6 +1226,136 @@ mod tests {
             std::fs::read(&path).expect("read"),
             b"alpha\r\nBETA\r\ngamma\r\n"
         );
+    }
+
+    fn literal<'a>(old: &'a str, new: &'a str) -> LiteralEdit<'a> {
+        LiteralEdit {
+            old,
+            new,
+            occurrence: Occurrence::Unique,
+        }
+    }
+
+    #[test]
+    fn multiple_hunks_prepare_one_postimage_without_writing_any_intermediate_content() {
+        let dir = dir();
+        let path = file_in(&dir, "two.txt");
+        let original = "alpha\r\nbeta\rgamma\n";
+        std::fs::write(&path, original).expect("seed");
+        let prepared = prepare_edits(
+            &path,
+            &[literal("alpha", "ALPHA!"), literal("gamma", "GAMMA!")],
+        )
+        .expect("prepare");
+        assert_eq!(prepared.preimage_hash(), &hash_of(original.as_bytes()));
+        assert_eq!(prepared.replacements(), 2);
+        assert_eq!(
+            prepared.span(),
+            Some(ChangeSpan {
+                first_line: 1,
+                last_line: 3
+            })
+        );
+        assert!(prepared.preview().text.contains("ALPHA!"));
+        assert!(prepared.preview().text.contains("GAMMA!"));
+        assert_eq!(std::fs::read(&path).expect("read"), original.as_bytes());
+        assert!(staging_files(&dir).is_empty());
+        let applied = apply(prepared).expect("apply");
+        assert_eq!(applied.replacements(), 2);
+        assert_eq!(applied.byte_delta(), 2);
+        assert_eq!(
+            std::fs::read(&path).expect("read"),
+            b"ALPHA!\r\nbeta\rGAMMA!\n"
+        );
+        assert!(staging_files(&dir).is_empty());
+    }
+
+    #[test]
+    fn a_stale_batch_is_refused_without_overwriting_the_changed_file() {
+        let dir = dir();
+        let path = file_in(&dir, "two.txt");
+        std::fs::write(&path, "alpha beta\n").expect("seed");
+        let prepared = prepare_edits(&path, &[literal("alpha", "ALPHA"), literal("beta", "BETA")])
+            .expect("prepare");
+        std::fs::write(&path, "external change\n").expect("concurrent change");
+        let err = apply(prepared).expect_err("stale snapshot");
+        assert_eq!(err.code(), ErrorCode::StalePreimage);
+        assert!(
+            err.detail()
+                .hint
+                .as_deref()
+                .expect("hint")
+                .contains("read the file again")
+        );
+        assert_eq!(std::fs::read(&path).expect("read"), b"external change\n");
+        assert!(staging_files(&dir).is_empty());
+    }
+
+    #[test]
+    fn a_later_hunk_over_the_size_cap_leaves_the_preimage_untouched() {
+        let dir = dir();
+        let path = file_in(&dir, "two.txt");
+        std::fs::write(&path, "alpha beta\n").expect("seed");
+        let growth = "x".repeat(MAX_WRITE_BYTES);
+        let err = prepare_edits(
+            &path,
+            &[literal("alpha", "ALPHA"), literal("beta", &growth)],
+        )
+        .expect_err("oversized batch");
+        assert_eq!(err.code(), ErrorCode::TooLarge);
+        assert!(
+            err.detail()
+                .hint
+                .as_deref()
+                .expect("hint")
+                .contains("edits[1]")
+        );
+        assert_eq!(std::fs::read(&path).expect("read"), b"alpha beta\n");
+        assert!(staging_files(&dir).is_empty());
+    }
+
+    #[test]
+    fn batches_keep_the_combined_preimage_and_postimage_cap() {
+        let dir = dir();
+        let path = file_in(&dir, "large.txt");
+        let original = format!("alpha beta {}", "x".repeat(MAX_WRITE_BYTES));
+        std::fs::write(&path, &original).expect("seed");
+        let err = prepare_edits(
+            &path,
+            &[
+                literal(&original, "beta"),
+                literal("beta", &"x".repeat(MAX_WRITE_BYTES)),
+            ],
+        )
+        .expect_err("combined size");
+        assert_eq!(err.code(), ErrorCode::TooLarge);
+        assert!(
+            err.detail()
+                .hint
+                .as_deref()
+                .expect("hint")
+                .contains("edits[1]")
+        );
+        assert_eq!(std::fs::read(&path).expect("read"), original.as_bytes());
+        assert!(staging_files(&dir).is_empty());
+    }
+
+    #[test]
+    fn batches_refuse_empty_and_excessive_hunk_lists() {
+        let dir = dir();
+        let path = file_in(&dir, "two.txt");
+        std::fs::write(&path, "alpha beta\n").expect("seed");
+        assert_eq!(
+            prepare_edits(&path, &[]).expect_err("empty").code(),
+            ErrorCode::InvalidField
+        );
+        let edits = vec![literal("alpha", "ALPHA"); MAX_EDIT_HUNKS + 1];
+        assert_eq!(
+            prepare_edits(&path, &edits).expect_err("too many").code(),
+            ErrorCode::TooLarge
+        );
+        assert_eq!(std::fs::read(&path).expect("read"), b"alpha beta\n");
+        assert!(staging_files(&dir).is_empty());
     }
 
     #[test]

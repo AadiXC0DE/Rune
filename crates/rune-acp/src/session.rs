@@ -5,15 +5,17 @@
 //! again reaches the same conversation, and a client that reconnects can be sent
 //! the whole transcript again as updates.
 //!
-//! Every session is rooted at the workspace the server was started in. One server
-//! process serves one primary workspace, so a session cannot silently operate
-//! somewhere else.
+//! Each session is rooted at the workspace requested by the client. The launch
+//! workspace is the default when no working directory was supplied, including
+//! for older stored sessions that have no recorded workspace.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use camino::Utf8PathBuf;
 use rune_agent::history::History;
 use rune_agent::steering::SteeringQueue;
+use rune_context::mcp::Client;
 use rune_core::budget::{BudgetSet, LimitName};
 use rune_core::config::{Effort, PermissionMode};
 use rune_core::error::{ErrorCode, Result, RuneError};
@@ -53,6 +55,14 @@ impl SessionConfig {
             mode,
         }
     }
+
+    /// Records model settings together so changing one preserves the other.
+    fn model_event(&self) -> SessionEvent {
+        SessionEvent::ModelSet {
+            model: self.model.clone(),
+            effort: self.effort,
+        }
+    }
 }
 
 /// What `session/list` reports about one stored session.
@@ -73,11 +83,14 @@ pub struct SessionSummary {
 pub struct Session {
     id: String,
     config: SessionConfig,
+    workspace: Utf8PathBuf,
     history: History,
     /// Rules granted by an approval for this session only.
     grants: RuleSet,
     /// Additional roots this session's tools may reach.
     additional_roots: Vec<Utf8PathBuf>,
+    /// Connections owned by this session, retained by an in-flight turn.
+    mcp: Option<Arc<Client>>,
     store: SessionStore,
 }
 
@@ -113,6 +126,8 @@ pub struct Snapshot {
     pub context: ExecutionContext,
     /// Steering queue for the turn.
     pub steering: SteeringQueue,
+    /// Session-local MCP connections, kept alive for this turn.
+    pub mcp: Option<Arc<Client>>,
 }
 
 /// The sessions held by one connection.
@@ -122,7 +137,7 @@ pub struct Sessions {
     paths: Paths,
     workspace: Utf8PathBuf,
     defaults: SessionConfig,
-    /// Directories every new session may reach.
+    /// Directories every created or reopened session may reach.
     default_roots: Vec<Utf8PathBuf>,
     limits: BudgetSet,
     cap: usize,
@@ -162,17 +177,16 @@ impl Sessions {
     /// limit, because a client that opens sessions in a loop would otherwise hold
     /// one writer lock per iteration.
     pub fn create(&mut self, additional_roots: Vec<Utf8PathBuf>) -> Result<String> {
-        // Configured directories come first, so a session reaches what the user
-        // saved even when the client asks for none of its own. A root the client
-        // names as well is kept once, since the context would otherwise hold the
-        // same directory twice.
-        let mut roots = self.default_roots.clone();
-        for root in additional_roots {
-            if !roots.contains(&root) {
-                roots.push(root);
-            }
-        }
-        let additional_roots = roots;
+        self.create_in(self.workspace.clone(), additional_roots)
+    }
+
+    /// Creates a session rooted at the client-requested workspace.
+    pub fn create_in(
+        &mut self,
+        workspace: Utf8PathBuf,
+        additional_roots: Vec<Utf8PathBuf>,
+    ) -> Result<String> {
+        let additional_roots = self.effective_roots(additional_roots);
         if self.entries.len() >= self.cap {
             return Err(RuneError::new(
                 ErrorCode::LimitExceeded,
@@ -196,15 +210,21 @@ impl Sessions {
             }
             match SessionStore::create(&self.paths, &id) {
                 Ok(store) => {
+                    store.append(SessionEvent::WorkspaceSet {
+                        workspace: workspace.to_string(),
+                    })?;
+                    store.append(self.defaults.model_event())?;
                     let name = id.to_string();
                     self.entries.insert(
                         name.clone(),
                         Session {
                             id: name.clone(),
                             config: self.defaults.clone(),
+                            workspace,
                             history: History::new(),
                             grants: RuleSet::new(),
                             additional_roots,
+                            mcp: None,
                             store,
                         },
                     );
@@ -232,26 +252,70 @@ impl Sessions {
     /// loads a conversation shows the transcript it missed, and a client that
     /// resumes already has one on screen.
     pub fn load(&mut self, id: &str) -> Result<Vec<Notification>> {
-        self.open(id)?;
+        self.load_with_roots(id, Vec::new())
+    }
+
+    /// Loads a saved session with the current request's additional roots.
+    ///
+    /// Configured roots remain available; roots from earlier requests are
+    /// replaced, including when the current request supplies none.
+    pub fn load_with_roots(
+        &mut self,
+        id: &str,
+        additional_roots: Vec<Utf8PathBuf>,
+    ) -> Result<Vec<Notification>> {
+        self.open(id, additional_roots)?;
         let session = self.get(id)?;
         Ok(replay_updates(&session.id, &session.history))
     }
 
     /// Reconnects to a saved session without replaying its history.
     pub fn resume(&mut self, id: &str) -> Result<()> {
-        self.open(id)?;
-        Ok(())
+        self.resume_with_roots(id, Vec::new())
+    }
+
+    /// Resumes with configured roots and only the current request's roots.
+    pub fn resume_with_roots(
+        &mut self,
+        id: &str,
+        additional_roots: Vec<Utf8PathBuf>,
+    ) -> Result<()> {
+        self.open(id, additional_roots)
+    }
+
+    /// Merges configured and requested roots in the same order for every
+    /// lifecycle request, retaining shared roots only once.
+    fn effective_roots(&self, additional_roots: Vec<Utf8PathBuf>) -> Vec<Utf8PathBuf> {
+        let mut roots = self.default_roots.clone();
+        for root in additional_roots {
+            if !roots.contains(&root) {
+                roots.push(root);
+            }
+        }
+        roots
     }
 
     /// Opens a stored session, replacing any entry already held for it.
     ///
     /// The previous entry holds the writer lock for the same directory, so it is
     /// dropped before the store is opened again.
-    fn open(&mut self, id: &str) -> Result<()> {
+    fn open(&mut self, id: &str, additional_roots: Vec<Utf8PathBuf>) -> Result<()> {
         let key: SessionId = id.parse()?;
+        let additional_roots = self.effective_roots(additional_roots);
         self.entries.remove(key.as_str());
         let store = SessionStore::open(&self.paths.session_dir(&key))?;
         let state = store.read()?;
+        let mut config = self.defaults.clone();
+        if let Some((model, effort)) = state.events.iter().rev().find_map(|frame| {
+            if let SessionEvent::ModelSet { model, effort } = &frame.event {
+                Some((model, effort))
+            } else {
+                None
+            }
+        }) {
+            config.model.clone_from(model);
+            config.effort = *effort;
+        }
         let history = history_from_events(&state.events);
         history.validate().map_err(|err| {
             RuneError::invariant(
@@ -265,10 +329,14 @@ impl Sessions {
             name.clone(),
             Session {
                 id: name,
-                config: self.defaults.clone(),
+                config,
+                workspace: state
+                    .workspace
+                    .map_or_else(|| self.workspace.clone(), Utf8PathBuf::from),
                 history,
                 grants: RuleSet::new(),
-                additional_roots: Vec::new(),
+                additional_roots,
+                mcp: None,
                 store,
             },
         );
@@ -277,8 +345,11 @@ impl Sessions {
 
     /// Lists stored sessions for this workspace, most recently active first.
     ///
-    /// Bounded by the configured listing bound, so a large session directory
-    /// costs a bounded read.
+    /// Sessions without a recorded workspace are omitted because their scope
+    /// cannot be determined from storage.
+    ///
+    /// Reads all stored sessions to determine recency, then limits the returned
+    /// summaries to the configured listing bound.
     #[must_use]
     pub fn list(&self) -> Vec<SessionSummary> {
         let Ok(entries) = std::fs::read_dir(self.paths.sessions_dir()) else {
@@ -286,18 +357,21 @@ impl Sessions {
         };
         let mut out: Vec<SessionSummary> = Vec::new();
         for entry in entries.flatten() {
-            if out.len() >= self.cap {
-                break;
-            }
             let Ok(path) = Utf8PathBuf::from_path_buf(entry.path()) else {
                 continue;
             };
             let Ok(state) = load_read_only(&path) else {
                 continue;
             };
+            let Some(workspace) = state.workspace else {
+                continue;
+            };
+            if workspace != self.workspace.as_str() {
+                continue;
+            }
             out.push(SessionSummary {
                 id: state.id.to_string(),
-                cwd: self.workspace.to_string(),
+                cwd: workspace,
                 title: state.title,
                 updated_at: state
                     .events
@@ -333,12 +407,13 @@ impl Sessions {
         Ok(parsed.to_string())
     }
 
-    /// Changes a configuration option.
+    /// Saves a configuration option before applying it to subsequent turns.
     pub fn set_config_option(&mut self, id: &str, option: &str, value: &str) -> Result<()> {
         let session = self
             .entries
             .get_mut(id)
             .ok_or_else(|| unknown_session(id))?;
+        let mut config = session.config.clone();
         match option {
             "model" => {
                 let model = value.trim();
@@ -349,8 +424,7 @@ impl Sessions {
                 if model.len() > MAX_MODEL_BYTES {
                     return Err(RuneError::too_large("model", model.len(), MAX_MODEL_BYTES));
                 }
-                model.clone_into(&mut session.config.model);
-                Ok(())
+                model.clone_into(&mut config.model);
             }
             "effort" => {
                 let effort = parse_effort(value).ok_or_else(|| {
@@ -360,15 +434,19 @@ impl Sessions {
                     )
                     .with_hint("use auto, none, minimal, low, medium, high, xhigh, or max")
                 })?;
-                session.config.effort = effort;
-                Ok(())
+                config.effort = effort;
             }
-            other => Err(RuneError::new(
-                ErrorCode::NotFound,
-                format!("no configuration option named `{other}`"),
-            )
-            .with_hint("this server offers `model` and `effort`")),
+            other => {
+                return Err(RuneError::new(
+                    ErrorCode::NotFound,
+                    format!("no configuration option named `{other}`"),
+                )
+                .with_hint("this server offers `model` and `effort`"));
+            }
         }
+        session.store.append(config.model_event())?;
+        session.config = config;
+        Ok(())
     }
 
     /// Changes the permission mode.
@@ -391,7 +469,7 @@ impl Sessions {
         let Some(session) = self.entries.get(&key) else {
             return Err(unknown_session(id));
         };
-        let mut context = ExecutionContext::new(self.workspace.clone())
+        let mut context = ExecutionContext::new(session.workspace.clone())
             .with_output_cap(self.limits.get_usize(LimitName::MaxToolResultBytes));
         for root in &session.additional_roots {
             context = context.with_root(root.clone());
@@ -402,7 +480,18 @@ impl Sessions {
             rules: session.grants.clone(),
             context,
             steering: SteeringQueue::from_limits(&self.limits),
+            mcp: session.mcp.clone(),
         })
+    }
+
+    /// Attaches the connections supplied by the current lifecycle request.
+    pub(crate) fn set_mcp(&mut self, id: &str, client: Option<Arc<Client>>) -> Result<()> {
+        let session = self
+            .entries
+            .get_mut(id)
+            .ok_or_else(|| unknown_session(id))?;
+        session.mcp = client;
+        Ok(())
     }
 
     /// Replaces a session's conversation and approvals with what a turn produced.
@@ -418,13 +507,12 @@ impl Sessions {
     }
 
     /// Appends one event to a session's log.
-    pub fn record(&mut self, id: &str, event: SessionEvent) -> Result<()> {
+    pub fn record(&mut self, id: &str, event: SessionEvent) -> Result<rune_session::AppendReport> {
         let session = self
             .entries
             .get_mut(id)
             .ok_or_else(|| unknown_session(id))?;
-        session.store.append(event)?;
-        Ok(())
+        session.store.append(event)
     }
 }
 
@@ -622,9 +710,26 @@ pub fn history_from_events(frames: &[EventFrame]) -> History {
     let mut history = History::new();
     let mut calls: Vec<ContentPart> = Vec::new();
     let mut results: Vec<ContentPart> = Vec::new();
+    let mut native_assistant = false;
 
-    for frame in frames {
+    for frame in rune_session::replay::replay_events(frames) {
         match &frame.event {
+            // Model settings are metadata, not conversation boundaries. A
+            // client may change them while a tool batch is still being saved.
+            SessionEvent::ModelSet { .. } => {}
+            SessionEvent::AssistantContent { message } => {
+                flush_calls(&mut history, &mut calls);
+                flush_results(&mut history, &mut results);
+                if let Ok(message) = serde_json::from_str::<rune_net::message::Message>(message) {
+                    history.push_assistant_with_replay(message.parts, message.replay);
+                    native_assistant = true;
+                }
+            }
+            SessionEvent::ToolCall { .. } | SessionEvent::AssistantMessage { .. }
+                if native_assistant => {}
+            SessionEvent::ConstraintPinned { text } => {
+                let _ = history.pin_constraint(text.clone());
+            }
             SessionEvent::ToolCall {
                 call_id,
                 name,
@@ -650,13 +755,20 @@ pub fn history_from_events(frames: &[EventFrame]) -> History {
                 if let Ok(id) = ToolCallId::new(call_id.clone()) {
                     results.push(ContentPart::ToolResult {
                         id,
-                        name: String::new(),
+                        name: history
+                            .turns()
+                            .iter()
+                            .rev()
+                            .flat_map(rune_agent::history::Turn::tool_calls)
+                            .find(|(called, _, _)| called.as_str() == call_id)
+                            .map_or_else(String::new, |(_, name, _)| name.to_owned()),
                         content: output.clone(),
                         is_error: !ok,
                     });
                 }
             }
             SessionEvent::UserMessage { text } => {
+                native_assistant = false;
                 flush_calls(&mut history, &mut calls);
                 flush_results(&mut history, &mut results);
                 history.push_user(text.clone());
@@ -668,11 +780,21 @@ pub fn history_from_events(frames: &[EventFrame]) -> History {
                     history.push_assistant(vec![ContentPart::Text { text: text.clone() }]);
                 }
             }
-            SessionEvent::TurnStarted { .. }
+            SessionEvent::AssistantDelta { .. }
+            | SessionEvent::AssistantReset { .. }
+            | SessionEvent::TurnInterrupted { .. }
+            | SessionEvent::TurnStarted { .. }
+            | SessionEvent::TurnFinished { .. }
+            | SessionEvent::TurnCancelled { .. }
+            | SessionEvent::TurnFailed { .. }
             | SessionEvent::Compaction { .. }
             | SessionEvent::UsageRecorded { .. }
             | SessionEvent::TitleSet { .. }
+            | SessionEvent::ObjectiveSet { .. }
+            | SessionEvent::ObjectiveBudgetSet { .. }
+            | SessionEvent::ObjectiveTokensRecorded { .. }
             | SessionEvent::WorkspaceSet { .. }
+            | SessionEvent::ForkedFrom { .. }
             | SessionEvent::ChildOf { .. } => {
                 flush_calls(&mut history, &mut calls);
                 flush_results(&mut history, &mut results);
@@ -890,6 +1012,76 @@ mod tests {
     }
 
     #[test]
+    fn session_workspaces_are_independent_and_survive_reopening() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let mut sessions = sessions(&root);
+        let requested = utf8_path(&root, "workspace-b");
+        let first = sessions.create(Vec::new()).expect("default session");
+        let second = sessions
+            .create_in(requested.clone(), Vec::new())
+            .expect("client session");
+        assert_eq!(
+            sessions
+                .snapshot(&first)
+                .expect("snapshot")
+                .context
+                .workspace(),
+            "/tmp/work"
+        );
+        assert_eq!(
+            sessions
+                .snapshot(&second)
+                .expect("snapshot")
+                .context
+                .workspace(),
+            requested
+        );
+
+        sessions.close(&second).expect("close");
+        let listed = sessions.list();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, first);
+        assert_eq!(listed[0].cwd, "/tmp/work");
+        sessions.load(&second).expect("load");
+        assert_eq!(
+            sessions
+                .snapshot(&second)
+                .expect("snapshot")
+                .context
+                .workspace(),
+            requested
+        );
+        sessions.close(&second).expect("close");
+        sessions.resume(&second).expect("resume");
+        assert_eq!(
+            sessions
+                .snapshot(&second)
+                .expect("snapshot")
+                .context
+                .workspace(),
+            requested
+        );
+    }
+
+    #[test]
+    fn older_sessions_without_a_recorded_workspace_use_the_launch_workspace() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let mut sessions = sessions(&root);
+        let key = SessionId::generate();
+        drop(SessionStore::create(&paths_for(&root), &key).expect("legacy session"));
+        sessions.load(key.as_str()).expect("load");
+        assert_eq!(
+            sessions
+                .snapshot(key.as_str())
+                .expect("snapshot")
+                .context
+                .workspace(),
+            "/tmp/work"
+        );
+        assert!(sessions.list().is_empty());
+    }
+
+    #[test]
     fn an_unknown_session_is_a_not_found_error() {
         let root = tempfile::tempdir().expect("tempdir");
         let sessions = sessions(&root);
@@ -932,6 +1124,73 @@ mod tests {
         sessions.load(&id).expect("load");
         let session = sessions.get(&id).expect("held");
         assert_eq!(session.history.turns().len(), 1);
+    }
+
+    #[test]
+    fn recording_reports_projection_failure_as_a_durable_event_with_a_warning() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let mut sessions = sessions(&root);
+        let id = sessions.create(Vec::new()).expect("create");
+        let store = &sessions.get(&id).expect("held").store;
+        let seq = store.next_seq();
+        let metadata = store.metadata_path();
+        let dir = store.dir().to_owned();
+        std::fs::remove_file(&metadata).expect("remove projection");
+        std::fs::create_dir(&metadata).expect("block projection writes");
+
+        let report = sessions
+            .record(
+                &id,
+                SessionEvent::UserMessage {
+                    text: "durable".to_owned(),
+                },
+            )
+            .expect("recorded");
+        assert_eq!(report.seq, seq);
+        assert!(
+            report
+                .metadata_warning
+                .expect("warning")
+                .message()
+                .contains("is durable")
+        );
+        let state = load_read_only(&dir).expect("read authority");
+        assert_eq!(state.last_seq(), Some(seq));
+        assert!(matches!(
+            &state.events.last().expect("event").event,
+            SessionEvent::UserMessage { text } if text == "durable"
+        ));
+    }
+
+    #[test]
+    fn loading_a_cli_stream_journal_replays_its_partial_answer_once() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let mut sessions = sessions(&root);
+        let id = sessions.create(Vec::new()).expect("create");
+        for event in [
+            SessionEvent::UserMessage {
+                text: "slow".to_owned(),
+            },
+            SessionEvent::TurnStarted { turn: 1 },
+            SessionEvent::AssistantDelta {
+                turn: 1,
+                text: "STREAM-01\n".to_owned(),
+            },
+            SessionEvent::AssistantDelta {
+                turn: 1,
+                text: "STREAM-02\nSTREAM-03\n".to_owned(),
+            },
+        ] {
+            sessions.record(&id, event).expect("record");
+        }
+        sessions.close(&id).expect("close");
+        let updates = sessions.load(&id).expect("load");
+        assert_eq!(updates.len(), 2);
+        assert_eq!(
+            updates[1].params["update"]["content"]["text"],
+            "STREAM-01\nSTREAM-02\nSTREAM-03\n"
+        );
+        assert_eq!(sessions.get(&id).expect("held").history.len(), 2);
     }
 
     #[test]
@@ -1032,6 +1291,96 @@ mod tests {
     }
 
     #[test]
+    fn saved_model_settings_survive_a_new_connection_with_different_defaults() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let mut original = sessions(&root);
+        let untouched = original.create(Vec::new()).expect("untouched session");
+        let model_only = original.create(Vec::new()).expect("model session");
+        original
+            .set_config_option(&model_only, "model", "chosen/model")
+            .expect("model");
+        let effort_only = original.create(Vec::new()).expect("effort session");
+        original
+            .set_config_option(&effort_only, "effort", "max")
+            .expect("effort");
+        drop(original);
+
+        let mut reconnected = Sessions::new(
+            paths_for(&root),
+            Utf8PathBuf::from("/tmp/work"),
+            SessionConfig::new("new/default", Effort::Low, PermissionMode::Ask),
+            &BudgetSet::new(),
+            Vec::new(),
+        );
+        for (id, model, effort) in [
+            (untouched, "test/model", Effort::Auto),
+            (model_only, "chosen/model", Effort::Auto),
+            (effort_only, "test/model", Effort::Max),
+        ] {
+            assert!(reconnected.load(&id).expect("load").is_empty());
+            let snapshot = reconnected.snapshot(&id).expect("snapshot");
+            assert_eq!(snapshot.config.model, model);
+            assert_eq!(snapshot.config.effort, effort);
+            assert_eq!(snapshot.config.mode, PermissionMode::Ask);
+        }
+    }
+
+    #[test]
+    fn sessions_without_saved_model_settings_use_connection_defaults() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let id = SessionId::generate();
+        drop(SessionStore::create(&paths_for(&root), &id).expect("legacy session"));
+        let mut sessions = sessions(&root);
+        assert!(sessions.load(id.as_str()).expect("load").is_empty());
+        assert_eq!(
+            sessions.get(id.as_str()).expect("session").config,
+            sessions.defaults
+        );
+    }
+
+    #[test]
+    fn invalid_config_changes_leave_saved_model_settings_intact() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let mut sessions = sessions(&root);
+        let id = sessions.create(Vec::new()).expect("create");
+        sessions
+            .set_config_option(&id, "model", "chosen/model")
+            .expect("model");
+        sessions
+            .set_config_option(&id, "effort", "high")
+            .expect("effort");
+        let saved = sessions
+            .get(&id)
+            .expect("session")
+            .store
+            .read()
+            .expect("saved log");
+        for (option, value) in [
+            ("model", " "),
+            ("model", &"a".repeat(MAX_MODEL_BYTES + 1)),
+            ("effort", "bogus"),
+            ("temperature", "1"),
+        ] {
+            assert!(sessions.set_config_option(&id, option, value).is_err());
+        }
+        assert_eq!(
+            sessions
+                .get(&id)
+                .expect("session")
+                .store
+                .read()
+                .expect("unchanged log")
+                .events,
+            saved.events
+        );
+        sessions.close(&id).expect("close");
+        sessions.load(&id).expect("load");
+        let config = sessions.get(&id).expect("session").config();
+        assert_eq!(config.model, "chosen/model");
+        assert_eq!(config.effort, Effort::High);
+    }
+
+    #[test]
     fn an_unknown_config_option_is_reported() {
         let root = tempfile::tempdir().expect("tempdir");
         let mut sessions = sessions(&root);
@@ -1097,6 +1446,45 @@ mod tests {
     }
 
     #[test]
+    fn model_changes_during_a_tool_batch_do_not_split_the_conversation() {
+        let frames: Vec<_> = [
+            SessionEvent::ToolCall {
+                call_id: "c1".to_owned(),
+                name: "read_file".to_owned(),
+                arguments: "{}".to_owned(),
+            },
+            SessionEvent::ModelSet {
+                model: "other/model".to_owned(),
+                effort: Effort::High,
+            },
+            SessionEvent::ToolCall {
+                call_id: "c2".to_owned(),
+                name: "read_file".to_owned(),
+                arguments: "{}".to_owned(),
+            },
+            SessionEvent::ToolResult {
+                call_id: "c1".to_owned(),
+                ok: true,
+                output: "first".to_owned(),
+            },
+            SessionEvent::ToolResult {
+                call_id: "c2".to_owned(),
+                ok: true,
+                output: "second".to_owned(),
+            },
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, event)| EventFrame::new(EventSeq(index as u64 + 1), 0, event))
+        .collect();
+        let history = history_from_events(&frames);
+        history.validate().expect("valid tool batch");
+        assert_eq!(history.turns().len(), 2);
+        assert_eq!(history.turns()[0].parts.len(), 2);
+        assert_eq!(history.turns()[1].parts.len(), 2);
+    }
+
+    #[test]
     fn history_rebuilt_from_events_pairs_calls_with_results() {
         let frames = vec![
             EventFrame::new(
@@ -1139,6 +1527,32 @@ mod tests {
     }
 
     #[test]
+    fn history_rebuild_preserves_explicit_pins_outside_turns() {
+        let text = "  Preserve café and 日本語.\nNever commit.  ";
+        let frames = vec![
+            EventFrame::new(
+                EventSeq(1),
+                0,
+                SessionEvent::ConstraintPinned {
+                    text: text.to_owned(),
+                },
+            ),
+            EventFrame::new(
+                EventSeq(2),
+                0,
+                SessionEvent::UserMessage {
+                    text: "continue".to_owned(),
+                },
+            ),
+        ];
+        let history = history_from_events(&frames);
+        assert_eq!(history.pinned_constraints(), [text]);
+        assert_eq!(history.len(), 1);
+        assert!(history.to_messages()[0].text().contains(text));
+        history.validate().expect("valid pinned history");
+    }
+
+    #[test]
     fn an_empty_log_rebuilds_to_an_empty_conversation() {
         assert!(history_from_events(&[]).is_empty());
     }
@@ -1159,6 +1573,109 @@ mod tests {
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].id, id);
         assert_eq!(listed[0].cwd, "/tmp/work");
+    }
+
+    #[test]
+    fn the_listing_cap_keeps_the_newest_sessions_in_shuffled_directory_order() {
+        use rune_session::store::write_log_atomic;
+
+        let root = tempfile::tempdir().expect("tempdir");
+        let paths = paths_for(&root);
+        let mut limits = BudgetSet::new();
+        limits
+            .set(
+                LimitName::ListEntries,
+                rune_core::budget::Budget::Bounded(3),
+                ConfigLayer::User,
+            )
+            .expect("set cap");
+        let workspace = utf8_path(&root, "workspace");
+        let sessions = Sessions::new(
+            paths.clone(),
+            workspace.clone(),
+            SessionConfig::new("test/model", Effort::Auto, PermissionMode::Auto),
+            &limits,
+            Vec::new(),
+        );
+        for _ in 0..6 {
+            let id = SessionId::generate();
+            drop(SessionStore::create(&paths, &id).expect("fixture session"));
+        }
+        let dirs: Vec<Utf8PathBuf> = std::fs::read_dir(paths.sessions_dir())
+            .expect("session directories")
+            .map(|entry| Utf8PathBuf::from_path_buf(entry.expect("entry").path()).expect("UTF-8"))
+            .collect();
+
+        // Assign timestamps in the observed directory order so the newest
+        // sessions lie beyond the cap regardless of the filesystem's ordering.
+        // A second shuffle checks that updating activity changes the selection.
+        for (timestamps, newest) in [
+            ([3_000, 1_000, 5_000, 2_000, 6_000, 4_000], [4, 2, 5]),
+            ([6_000, 2_000, 1_000, 5_000, 3_000, 4_000], [0, 3, 5]),
+        ] {
+            for (dir, timestamp) in dirs.iter().zip(timestamps) {
+                let frames = [
+                    EventFrame::new(
+                        EventSeq(1),
+                        0,
+                        SessionEvent::WorkspaceSet {
+                            workspace: workspace.to_string(),
+                        },
+                    ),
+                    EventFrame::new(
+                        EventSeq(2),
+                        timestamp,
+                        SessionEvent::TitleSet {
+                            title: format!("activity {timestamp}"),
+                        },
+                    ),
+                ];
+                write_log_atomic(dir, &frames).expect("fixture timestamps");
+            }
+            let expected = newest.map(|index| {
+                dirs[index]
+                    .file_name()
+                    .expect("session identifier")
+                    .to_owned()
+            });
+            for _ in 0..3 {
+                let listed = sessions.list();
+                let ids: Vec<&str> = listed.iter().map(|session| session.id.as_str()).collect();
+                assert_eq!(ids, expected);
+                assert!(listed.iter().all(|session| session.cwd == workspace));
+            }
+        }
+    }
+
+    #[test]
+    fn foreign_sessions_do_not_consume_the_listing_cap() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let mut limits = BudgetSet::new();
+        limits
+            .set(
+                LimitName::ListEntries,
+                rune_core::budget::Budget::Bounded(1),
+                ConfigLayer::User,
+            )
+            .expect("set cap");
+        let workspace = utf8_path(&root, "workspace-a");
+        let mut sessions = Sessions::new(
+            paths_for(&root),
+            workspace.clone(),
+            SessionConfig::new("test/model", Effort::Auto, PermissionMode::Auto),
+            &limits,
+            Vec::new(),
+        );
+        let foreign = sessions
+            .create_in(utf8_path(&root, "workspace-b"), Vec::new())
+            .expect("foreign session");
+        sessions.close(&foreign).expect("close foreign session");
+        let id = sessions.create(Vec::new()).expect("matching session");
+        sessions.close(&id).expect("close matching session");
+        let listed = sessions.list();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, id);
+        assert_eq!(listed[0].cwd, workspace);
     }
 
     #[test]

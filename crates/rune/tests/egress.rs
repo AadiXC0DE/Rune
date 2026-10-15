@@ -1,8 +1,8 @@
 //! Egress auditing.
 //!
-//! Two properties are asserted here. Offline mode produces no request at all,
-//! and every outbound call in the workspace goes through one module, so reading
-//! that module answers what the product can send.
+//! Provider offline mode produces no connection. Native network clients are
+//! confined to the provider/web transport and the separate MCP client. Child
+//! processes have a different boundary, documented and checked below.
 
 #![allow(
     clippy::expect_used,
@@ -67,6 +67,7 @@ fn send(endpoint: &Endpoint, dialect: &dyn Dialect) -> Result<(), rune_core::err
         model: "test/model".to_owned(),
         instructions: String::new(),
         messages: rune_net::transport::one_shot_messages("hello"),
+        image_data: std::collections::BTreeMap::new(),
         tools: Vec::<ToolSpec>::new(),
         tool_choice: rune_net::provider::ToolChoice::Auto,
         parallel_tool_calls: false,
@@ -154,13 +155,13 @@ fn a_settings_value_carries_offline_into_the_endpoint() {
 
 #[test]
 fn no_crate_constructs_a_network_client_outside_the_transport() {
-    // One module owns egress, which is what makes an audit a single read rather
-    // than a search. A client built anywhere else would be invisible to it.
+    // Native network clients must remain in the two audited modules. This
+    // source check cannot account for traffic from spawned child processes.
     let root = workspace_root();
     let transport = root.join("crates/rune-net/src/transport.rs");
     // The remote MCP transports hold their own client because they keep a
-    // session open across requests. No binary connects an MCP server yet, and
-    // naming the file here keeps the exception visible rather than unscanned.
+    // session open across requests. CLI list/check connects them only online;
+    // the library client itself has no offline setting.
     let allowed = [root.join("crates/rune-context/src/mcp/client.rs")];
     let mut offenders = Vec::new();
 
@@ -243,4 +244,77 @@ fn a_settings_default_is_online() {
     // Offline is opt in; a product that refused every request by default would
     // be unusable and the flag would say nothing.
     assert!(!Settings::default().offline);
+}
+
+#[test]
+fn offline_shell_fallback_requires_opt_in_and_applies_no_isolation() {
+    use rune_exec::Sandbox;
+
+    let directory = tempfile::tempdir().expect("workspace");
+    let root = camino::Utf8Path::from_path(directory.path()).expect("utf8");
+    let context = rune_tools::ExecutionContext::new(root.to_owned())
+        .with_external_access(true)
+        .with_offline(true);
+    let policy = rune_tools::shell::sandbox_policy(&context);
+    assert!(
+        !policy.network,
+        "offline overrides the external-access grant"
+    );
+    let prepared =
+        rune_exec::prepare_shell("printf probe", root, None, rune_exec::minimal_environment())
+            .expect("prepare");
+    let backend = rune_exec::NullSandbox;
+    let error = backend
+        .wrap(&prepared, &policy, false)
+        .expect_err("no implicit fallback");
+    assert_eq!(error.code(), rune_core::error::ErrorCode::Unsupported);
+    let fallback = backend
+        .wrap(&prepared, &policy, true)
+        .expect("explicit unsandboxed fallback");
+    assert_eq!(fallback, prepared, "fallback adds no network isolation");
+}
+
+#[test]
+fn offline_documentation_maps_all_five_paths_without_promising_total_isolation() {
+    let root = workspace_root();
+    let readme = std::fs::read_to_string(root.join("README.md")).expect("README");
+    let boundary = readme
+        .split("## Offline enforcement boundary\n")
+        .nth(1)
+        .expect("offline boundary")
+        .split("\n## ")
+        .next()
+        .expect("boundary content");
+    for traffic in [
+        "Model/provider requests and model discovery",
+        "Web fetch and search",
+        "Remote MCP over HTTP or SSE",
+        "Local MCP over stdio",
+        "Shell commands",
+    ] {
+        let row = boundary
+            .lines()
+            .find(|line| line.starts_with(&format!("| {traffic} |")))
+            .unwrap_or_else(|| panic!("missing offline mapping for {traffic}"));
+        assert!(row.contains(".rs)"), "missing test evidence: {row}");
+    }
+    for file in [
+        "README.md",
+        "COMMANDS.md",
+        "CHANGELOG.md",
+        "site/index.html",
+    ] {
+        let text = std::fs::read_to_string(root.join(file)).expect("documentation");
+        for overclaim in [
+            "refuse every outbound",
+            "refuses every outbound",
+            "refuses every request",
+            "refuses everything",
+        ] {
+            assert!(
+                !text.contains(overclaim),
+                "{file} promises total isolation with `{overclaim}`"
+            );
+        }
+    }
 }

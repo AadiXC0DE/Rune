@@ -14,11 +14,17 @@ workspace = true
 rune-core = { workspace = true }
 camino = { workspace = true }
 
-# Only the resource ceilings need it, and only on a platform that has them. It
-# is used rather than `libc` because rustix exposes `setrlimit` as a safe
-# function, which keeps the unsafe surface to the one `pre_exec` call.
+# Resource ceilings and Linux PTYs use safe rustix syscall wrappers, keeping
+# the unsafe surface to the one child setup `pre_exec` call.
 [target.'cfg(unix)'.dependencies]
 rustix = { workspace = true, features = ["process"] }
+
+# Linux PTYs reuse rustix rather than adding a terminal runtime dependency.
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix = { workspace = true, features = ["pty", "termios", "stdio"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
 
 [dev-dependencies]
 tempfile.workspace = true

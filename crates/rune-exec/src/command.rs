@@ -11,7 +11,7 @@
 //! everything it started rather than only the process Rune spawned. Signals are
 //! delivered by running `kill` against the negated group id: the standard
 //! library exposes no signal API, and this crate keeps unsafe code to the one
-//! call that sets a child's resource limits.
+//! child setup call that sets resource limits and the Linux PTY session.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -727,6 +727,12 @@ pub fn own_group(spec: &mut Command) {
     }
 }
 
+/// Applies resource limits without changing the child's terminal.
+#[cfg(unix)]
+pub(crate) fn apply_limits(spec: &mut Command, limits: ResourceLimits) {
+    apply_child_setup(spec, limits, false);
+}
+
 /// Applies a hard resource ceiling to a child before it executes.
 ///
 /// The wall-clock deadline in the supervisor stops a command that runs too
@@ -742,21 +748,33 @@ pub fn own_group(spec: &mut Command) {
 #[allow(
     unsafe_code,
     reason = "pre_exec is the only point at which a child's limits can be set, \
-              and it is unsafe by its own contract; the closure calls setrlimit \
-              and nothing else"
+              and it is unsafe by its own contract; the closure makes only \
+              resource-limit and terminal setup syscalls"
 )]
-pub(crate) fn apply_limits(spec: &mut Command, limits: ResourceLimits) {
+pub(crate) fn apply_child_setup(spec: &mut Command, limits: ResourceLimits, terminal: bool) {
     use std::os::unix::process::CommandExt as _;
 
     // `pre_exec` runs in the child between fork and exec, which is the only
     // point where a limit can be set on a process that is already its own.
-    // Everything here is async-signal-safe: rustix's `setrlimit` makes one
-    // syscall and allocates nothing.
+    // Everything here is async-signal-safe: rustix wrappers make syscalls
+    // without allocation or locks.
     //
-    // SAFETY: the closure calls `setrlimit` only. A failure is returned so the
+    // SAFETY: the closure only sets limits and, for a Linux PTY, creates a
+    // session and assigns the already-installed stdin as its controlling tty.
+    // No allocation or locks occur. A failure is returned so the
     // child refuses to exec rather than running unlimited, which is the point.
     unsafe {
-        spec.pre_exec(move || limits.apply());
+        spec.pre_exec(move || {
+            limits.apply()?;
+            #[cfg(target_os = "linux")]
+            if terminal {
+                rustix::process::setsid()?;
+                rustix::process::ioctl_tiocsctty(rustix::stdio::stdin())?;
+            }
+            #[cfg(not(target_os = "linux"))]
+            let _ = terminal;
+            Ok(())
+        });
     }
 }
 

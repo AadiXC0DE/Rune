@@ -1,11 +1,11 @@
 {
   "name": "@rune-sh/node",
-  "version": "0.1.0",
+  "version": "0.1.16",
   "description": "Drive the rune coding agent harness from Node.",
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
-    "url": "https://github.com/rune-sh/rune.git",
+    "url": "https://github.com/AadiXC0DE/Rune.git",
     "directory": "bindings/node"
   },
   "type": "module",

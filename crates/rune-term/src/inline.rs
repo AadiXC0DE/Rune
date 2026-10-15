@@ -188,6 +188,22 @@ impl Inline {
             prompt
         };
 
+        // A pasted draft may be taller than the terminal. Window its logical
+        // rows around the caret before reserving room for menus and streaming
+        // text, so every rendered row can still be repainted and erased.
+        let prompt_room = usize::from(self.max_rows)
+            .saturating_sub(usize::from(activity.is_some()))
+            .saturating_sub(footer.len())
+            .max(1);
+        let within = usize::from(caret.0).min(prompt.len().saturating_sub(1));
+        let prompt_offset = within.saturating_sub(prompt_room.saturating_sub(1));
+        let prompt_end = prompt_offset.saturating_add(prompt_room).min(prompt.len());
+        let prompt = &prompt[prompt_offset..prompt_end];
+        let caret = (
+            u16::try_from(within.saturating_sub(prompt_offset)).unwrap_or(u16::MAX),
+            caret.1,
+        );
+
         let capacity = usize::from(activity.is_some())
             .saturating_add(footer.len())
             .saturating_add(prompt.len())
@@ -205,15 +221,15 @@ impl Inline {
         // it put the answer after the prompt rather than after the question it
         // was answering.
         //
-        // The menu is part of what is reserved rather than part of what is
-        // trimmed, because it belongs to the input: a list opened under the line
-        // being typed is what the reader is looking at, so it is never the part
-        // that gets dropped.
+        // Menus share the height budget with the input and status. Callers
+        // window their choices to keep the highlight visible; this final cap
+        // prevents an oversized menu from scrolling its own anchor away.
         let reserved = usize::from(activity.is_some())
             .saturating_add(footer.len())
-            .saturating_add(prompt.len())
-            .saturating_add(menu.len());
-        let room = usize::from(self.max_rows).saturating_sub(reserved).max(1);
+            .saturating_add(prompt.len());
+        let menu_room = usize::from(self.max_rows).saturating_sub(reserved);
+        let menu = &menu[..menu.len().min(menu_room)];
+        let room = menu_room.saturating_sub(menu.len());
         let visible: &[String] = if arriving.len() > room {
             arriving
                 .get(arriving.len().saturating_sub(room)..)
@@ -254,18 +270,21 @@ impl Inline {
         let unchanged = self.drawn
             && self.shown == rows
             && self.shown_settled == settled.len()
-            && self.cursor_row == caret_row
             && settled.is_empty();
         if unchanged {
             let mut out = String::new();
             out.push_str(HIDE_CURSOR);
-            // The caret is already on its row, so only the column moves. Any
-            // vertical move here is a round trip, and on the screen's last row
-            // the downward half is clamped, which would leave the caret on the
-            // status row for the next frame to write over.
+            // Move directly between input rows. Walking past the region and
+            // back can be clamped at the screen's bottom and lose a row.
+            if caret_row < self.cursor_row {
+                up(&mut out, self.cursor_row.saturating_sub(caret_row));
+            } else {
+                down(&mut out, caret_row.saturating_sub(self.cursor_row));
+            }
             out.push('\r');
             column(&mut out, caret.1);
             out.push_str(SHOW_CURSOR);
+            self.cursor_row = caret_row;
             return out.into_bytes();
         }
 
@@ -343,13 +362,10 @@ impl Inline {
             out.push_str(ERASE_BELOW);
         }
 
-        // The caret is placed after the region is written. The walk back is
-        // measured from the last row written, which may be above the region's
-        // bottom when only an early row changed.
-        let last_written = rows
-            .len()
-            .saturating_sub(1)
-            .max(first_changed.min(rows.len().saturating_sub(1)));
+        // The walk back includes the first erased row when a menu disappeared
+        // and every remaining row stayed unchanged: in that case no row was
+        // written, and the cursor is just below the shortened region.
+        let last_written = rows.len().saturating_sub(1).max(first_changed);
         let from_bottom = last_written.saturating_sub(usize::from(caret_row));
         up(&mut out, u16::try_from(from_bottom).unwrap_or(u16::MAX));
         column(&mut out, caret.1);
@@ -416,6 +432,67 @@ fn column(out: &mut String, col: u16) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tall_drafts_window_around_the_caret_and_clear_after_shrinking() {
+        let mut inline = Inline::new(20);
+        inline.set_max_rows(5);
+        let mut grid = crate::Grid::new(20, 6).expect("grid");
+        let prompt: Vec<String> = (0..20).map(|i| format!("  line-{i:02}")).collect();
+        let footer = vec!["status".to_owned()];
+        grid.feed(&inline.frame(&Frame {
+            settled: &[],
+            arriving: &["streaming answer".to_owned()],
+            activity: Some("working"),
+            footer: &footer,
+            prompt: &prompt,
+            menu: &["choice".to_owned()],
+            caret: (19, 9),
+        }))
+        .expect("feed");
+        assert_eq!(inline.shown.len(), 5);
+        assert_eq!(grid.row_text(grid.cursor().row), "  line-19");
+        for row in [19, 0, 10, 19] {
+            let bytes = frame_with_menu(&mut inline, &footer, &prompt, &[], (row, 9));
+            grid.feed(&bytes).expect("feed");
+            assert_eq!(grid.row_text(grid.cursor().row), format!("  line-{row:02}"));
+            assert_eq!(grid.cursor().col, 9);
+            assert_eq!(grid.text().matches("status").count(), 1, "{}", grid.text());
+            assert!(inline.shown.len() <= 5);
+        }
+        grid.feed(&frame_with_menu(
+            &mut inline,
+            &footer,
+            &["> ".to_owned()],
+            &[],
+            (0, 2),
+        ))
+        .expect("feed");
+        assert!(!grid.text().contains("line-"), "{}", grid.text());
+        assert_eq!(grid.row_text(grid.cursor().row), ">");
+    }
+
+    #[test]
+    fn moving_between_unchanged_draft_rows_at_screen_bottom_keeps_the_caret_exact() {
+        let mut inline = Inline::new(20);
+        inline.set_max_rows(5);
+        let mut grid = crate::Grid::new(20, 6).expect("grid");
+        grid.feed(b"\r\n\r\n\r\n\r\n\r\n").expect("bottom");
+        let prompt = vec![
+            "> first".to_owned(),
+            "  second".to_owned(),
+            "  third".to_owned(),
+        ];
+        let footer = vec!["status".to_owned()];
+        grid.feed(&frame_with_menu(&mut inline, &footer, &prompt, &[], (2, 7)))
+            .expect("feed");
+        for row in [0, 2, 1, 2, 0] {
+            let bytes = frame_with_menu(&mut inline, &footer, &prompt, &[], (row, 2));
+            grid.feed(&bytes).expect("feed");
+            assert_eq!(grid.row_text(grid.cursor().row), prompt[usize::from(row)]);
+            assert_eq!(grid.cursor().col, 2);
+        }
+    }
 
     /// Every control sequence in a byte string, in order.
     ///
@@ -1435,6 +1512,43 @@ mod tests {
         let text = String::from_utf8_lossy(&bytes).into_owned();
         let drawn = text.matches("\r\n").count().saturating_add(1);
         assert!(drawn <= 4, "the region drew {drawn} rows:\n{text}");
+    }
+
+    #[test]
+    fn menus_share_the_height_limit_with_the_prompt_and_arriving_text() {
+        for menu_rows in [4, 20] {
+            let mut inline = Inline::new(32);
+            inline.set_max_rows(7);
+            let mut grid = crate::engine::Grid::new(32, 8).expect("grid");
+            let footer = rows(&["hints", "status"]);
+            let prompt = rows(&["> "]);
+            let menu: Vec<String> = (0..menu_rows).map(|i| format!("choice {i}")).collect();
+            let bytes = inline.frame(&Frame {
+                arriving: &rows(&["arriving one", "arriving two"]),
+                footer: &footer,
+                prompt: &prompt,
+                menu: &menu,
+                caret: (0, 2),
+                ..Frame::default()
+            });
+            let drawn = String::from_utf8_lossy(&bytes)
+                .matches("\r\n")
+                .count()
+                .saturating_add(1);
+            assert!(drawn <= 7, "the region drew {drawn} rows");
+            grid.feed(&bytes).expect("feed");
+            assert!(grid.text().contains("status"), "{}", grid.text());
+            assert_eq!(grid.cursor().row, 2, "{}", grid.text());
+
+            grid.feed(&frame_with_menu(&mut inline, &footer, &prompt, &[], (0, 2)))
+                .expect("close menu");
+            assert_eq!(grid.cursor().row, 2, "{}", grid.text());
+            grid.feed(&frame_with_menu(&mut inline, &footer, &prompt, &[], (0, 2)))
+                .expect("idle redraw");
+            let screen = grid.text();
+            assert!(!screen.contains("choice"), "{screen}");
+            assert_eq!(screen.matches("status").count(), 1, "{screen}");
+        }
     }
 
     #[test]

@@ -5,9 +5,12 @@
 //! shape; this is the owner of the sequence, and it is what compaction, forking,
 //! and session persistence operate on.
 
+use std::sync::Arc;
+
 use rune_core::error::{ErrorCode, Result, RuneError};
 use rune_core::id::ToolCallId;
 use rune_net::message::{ContentPart, Message, Role, validate};
+use rune_tools::result_store::Store;
 use serde::{Deserialize, Serialize};
 
 /// One turn in the conversation.
@@ -111,14 +114,41 @@ impl Turn {
 }
 
 /// The conversation history.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct History {
     /// System instructions, separate from the turn list.
     instructions: String,
+    /// Explicit user constraints, retained independently of summarized turns.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pinned_constraints: Vec<String>,
     /// Turns in order.
     turns: Vec<Turn>,
     /// Next sequence number.
     next_seq: u64,
+    /// Retained output lives as long as this in-memory conversation. It is not
+    /// part of a provider request or a serialized transcript.
+    #[serde(skip, default = "new_result_store")]
+    result_store: Arc<Store>,
+    /// Plan state shares the lifetime of this live conversation, not its registry.
+    #[serde(skip)]
+    live_plan: Arc<std::sync::Mutex<rune_tools::PlanUpdate>>,
+}
+
+fn new_result_store() -> Arc<Store> {
+    Arc::new(Store::new(rune_core::id::SessionId::generate().to_string()))
+}
+
+impl Default for History {
+    fn default() -> Self {
+        Self {
+            instructions: String::default(),
+            pinned_constraints: Vec::new(),
+            turns: Vec::default(),
+            next_seq: u64::default(),
+            result_store: new_result_store(),
+            live_plan: Arc::default(),
+        }
+    }
 }
 
 impl History {
@@ -127,9 +157,33 @@ impl History {
     pub fn new() -> Self {
         Self {
             instructions: String::new(),
+            pinned_constraints: Vec::new(),
             turns: Vec::new(),
             next_seq: 1,
+            result_store: new_result_store(),
+            live_plan: Arc::default(),
         }
+    }
+
+    /// Returns the full tool results spilled from this live conversation.
+    ///
+    /// Handles remain readable across turns and compaction, but are not saved
+    /// in serialized history or shared with a new conversation.
+    #[must_use]
+    pub fn result_store(&self) -> &Store {
+        &self.result_store
+    }
+
+    pub(crate) fn result_store_mut(&mut self) -> &mut Store {
+        Arc::make_mut(&mut self.result_store)
+    }
+
+    pub(crate) fn shared_result_store(&self) -> Arc<Store> {
+        Arc::clone(&self.result_store)
+    }
+
+    pub(crate) fn shared_live_plan(&self) -> Arc<std::sync::Mutex<rune_tools::PlanUpdate>> {
+        Arc::clone(&self.live_plan)
     }
 
     /// Sets the system instructions.
@@ -141,6 +195,32 @@ impl History {
     #[must_use]
     pub fn instructions(&self) -> &str {
         &self.instructions
+    }
+
+    /// Pins an explicit user constraint verbatim until this conversation ends.
+    ///
+    /// Empty constraints are rejected. Exact duplicates are a no-op; returns
+    /// true when a new constraint was added. No constraints are inferred from
+    /// ordinary user messages, assistant responses, or tool results.
+    pub fn pin_constraint(&mut self, text: impl Into<String>) -> Result<bool> {
+        let text = text.into();
+        if text.trim().is_empty() {
+            return Err(RuneError::invalid_field(
+                "constraint",
+                "constraint is empty",
+            ));
+        }
+        if self.pinned_constraints.contains(&text) {
+            return Ok(false);
+        }
+        self.pinned_constraints.push(text);
+        Ok(true)
+    }
+
+    /// Returns the exact user constraints in insertion order.
+    #[must_use]
+    pub fn pinned_constraints(&self) -> &[String] {
+        &self.pinned_constraints
     }
 
     /// Returns every turn.
@@ -232,16 +312,43 @@ impl History {
     /// Projects the history into the message list a provider expects.
     ///
     /// The system lane is returned separately rather than as a message, because
-    /// every dialect places instructions in its own field.
+    /// every dialect places instructions in its own field. Pinned constraints
+    /// precede the turns as user content and are never replaced by a summary.
     pub fn to_messages(&self) -> Vec<Message> {
-        self.turns
+        let pinned = (!self.pinned_constraints.is_empty()).then(|| Message {
+            role: Role::User,
+            parts: std::iter::once(ContentPart::Text {
+                text: "Explicit user constraints (preserve verbatim across context compaction):\n"
+                    .to_owned(),
+            })
+            .chain(self.pinned_constraints.iter().cloned().flat_map(|text| {
+                [
+                    ContentPart::Text { text },
+                    ContentPart::Text {
+                        text: "\n".to_owned(),
+                    },
+                ]
+            }))
+            .collect(),
+            replay: None,
+        });
+        let mut messages: Vec<Message> = self
+            .turns
             .iter()
             .map(|turn| Message {
                 role: turn.role,
                 parts: turn.parts.clone(),
                 replay: turn.replay.clone(),
             })
-            .collect()
+            .collect();
+        if let Some(pinned) = pinned {
+            let index = messages
+                .iter()
+                .take_while(|message| message.role == Role::System)
+                .count();
+            messages.insert(index, pinned);
+        }
+        messages
     }
 
     /// Validates the ordering rules a request depends on.
@@ -252,9 +359,13 @@ impl History {
     /// Estimates the total byte size of the conversation.
     #[must_use]
     pub fn byte_len(&self) -> usize {
-        self.turns
+        let pinned_bytes = self
+            .pinned_constraints
             .iter()
-            .fold(0_usize, |total, turn| total.saturating_add(turn.byte_len()))
+            .fold(0_usize, |total, text| total.saturating_add(text.len()));
+        self.turns.iter().fold(pinned_bytes, |total, turn| {
+            total.saturating_add(turn.byte_len())
+        })
     }
 
     /// Truncates to the first `count` turns.
@@ -366,8 +477,11 @@ impl History {
         let next_seq = u64::try_from(turns.len()).unwrap_or(0).saturating_add(1);
         Self {
             instructions: self.instructions.clone(),
+            pinned_constraints: self.pinned_constraints.clone(),
             turns,
             next_seq,
+            result_store: self.result_store.clone(),
+            live_plan: Arc::default(),
         }
     }
 
@@ -423,6 +537,31 @@ pub fn invalid_history(err: &RuneError) -> RuneError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retained_store_snapshots_and_branches_remain_independent_on_a_spill() {
+        let mut history = History::new();
+        history.push_user("retain");
+        let first = history
+            .result_store_mut()
+            .spill("shell", "first", "first body".to_owned(), false, 0)
+            .expect("spill");
+        let snapshot = history.shared_result_store();
+        let branch = history.branch_at(1);
+        let second = history
+            .result_store_mut()
+            .spill("shell", "second", "second body".to_owned(), false, 0)
+            .expect("spill");
+        assert_eq!(history.result_store().len(), 2);
+        for store in [snapshot.as_ref(), branch.result_store()] {
+            assert_eq!(store.len(), 1);
+            assert_eq!(
+                store.read(&first.handle, 0, 64).expect("first").text,
+                "first body"
+            );
+            assert!(store.read(&second.handle, 0, 64).is_err());
+        }
+    }
 
     fn call(id: &str, name: &str) -> ContentPart {
         ContentPart::ToolCall {

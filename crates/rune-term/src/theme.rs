@@ -170,7 +170,7 @@ impl Slot {
     }
 }
 
-/// The polarity a theme is built for.
+/// The built-in palette a theme is based on.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum Base {
     /// Built for a dark terminal.
@@ -178,6 +178,8 @@ pub enum Base {
     Dark,
     /// Built for a light terminal.
     Light,
+    /// Bright foregrounds on black, with at least 7:1 contrast for every slot.
+    HighContrast,
     /// No color at all, every slot left to the terminal.
     Mono,
 }
@@ -211,6 +213,15 @@ impl Theme {
         Self::builtin(Base::Light)
     }
 
+    /// Returns the built-in high-contrast theme.
+    ///
+    /// Every foreground has at least a 7:1 WCAG contrast ratio against the
+    /// explicit black background, including after 256-color quantization.
+    #[must_use]
+    pub const fn high_contrast() -> Self {
+        Self::builtin(Base::HighContrast)
+    }
+
     /// Returns a theme that emits no color, for a terminal without it.
     ///
     /// A colorless theme reports the terminal default for every slot, including
@@ -221,7 +232,7 @@ impl Theme {
         Self::builtin(Base::Mono)
     }
 
-    /// Returns the polarity this theme was built for.
+    /// Returns the built-in palette this theme is based on.
     #[must_use]
     pub const fn base(&self) -> Base {
         self.base
@@ -254,8 +265,17 @@ impl Theme {
     ///
     /// The color is used as the foreground, except for [`Slot::Bg`] where it is
     /// the background, which is the only slot that describes a surface.
+    /// High contrast always sets both colors so terminal defaults cannot lower
+    /// the contrast of a themed run.
     #[must_use]
     pub fn style(&self, slot: Slot, truecolor: bool) -> Style {
+        if self.base == Base::HighContrast {
+            return Style {
+                fg: self.indexed(if slot == Slot::Bg { Slot::Fg } else { slot }, truecolor),
+                bg: self.indexed(Slot::Bg, truecolor),
+                ..Style::new()
+            };
+        }
         let color = self.indexed(slot, truecolor);
         match slot {
             Slot::Bg => Style {
@@ -341,7 +361,8 @@ impl Theme {
 
     /// Resolves a configured theme name.
     ///
-    /// `dark`, `light`, `none`, and `mono` are pins that ignore the terminal.
+    /// `dark`, `light`, `high-contrast`, `none`, and `mono` are pins that ignore
+    /// the terminal polarity.
     /// Any other name is a theme file in `themes_dir`, optionally suffixed
     /// `.json`. A name that does not exist falls back to the built-in theme,
     /// but a name that exists and cannot be used is an error.
@@ -353,6 +374,7 @@ impl Theme {
         match trimmed.to_ascii_lowercase().as_str() {
             "dark" => return Ok(Self::fx_dark()),
             "light" => return Ok(Self::fx_light()),
+            "high-contrast" => return Ok(Self::high_contrast()),
             "none" | "no-color" | "mono" => return Ok(Self::no_color()),
             _ => {}
         }
@@ -610,6 +632,21 @@ const fn base_color(base: Base, slot: Slot) -> Color {
         Base::Mono => Color::Default,
         Base::Dark => dark_color(slot),
         Base::Light => light_color(slot),
+        Base::HighContrast => high_contrast_color(slot),
+    }
+}
+
+/// Bright colors from the fixed 256-color cube, unchanged by quantization.
+const fn high_contrast_color(slot: Slot) -> Color {
+    match slot {
+        Slot::Bg => Color::Rgb(0, 0, 0),
+        Slot::Fg | Slot::Variable => Color::Rgb(255, 255, 255),
+        Slot::Dim | Slot::Divider | Slot::Comment => Color::Rgb(215, 215, 215),
+        Slot::Accent | Slot::Link | Slot::Function | Slot::Operator => Color::Rgb(95, 215, 255),
+        Slot::Error => Color::Rgb(255, 135, 135),
+        Slot::Success | Slot::String => Color::Rgb(135, 255, 135),
+        Slot::UserRail | Slot::Keyword => Color::Rgb(215, 175, 255),
+        Slot::Number => Color::Rgb(255, 215, 95),
     }
 }
 
@@ -747,6 +784,75 @@ mod tests {
         assert_eq!(dark.base(), Base::Dark);
         let light = Theme::resolve(Some("light"), true, dir);
         assert_eq!(light.base(), Base::Light);
+    }
+
+    #[test]
+    fn high_contrast_is_a_named_pin_for_either_terminal_polarity() {
+        let dir = Utf8Path::new("/nonexistent-themes");
+        for dark_mode in [false, true] {
+            for name in ["high-contrast", " HIGH-CONTRAST "] {
+                let theme = Theme::try_resolve(Some(name), dark_mode, dir).expect("theme");
+                assert_eq!(theme, Theme::high_contrast());
+            }
+        }
+    }
+
+    #[test]
+    fn every_high_contrast_pair_meets_seven_to_one_at_both_color_depths() {
+        let theme = Theme::high_contrast();
+        for truecolor in [false, true] {
+            for slot in SLOTS {
+                let style = theme.style(slot, truecolor);
+                let foreground = luminance(palette_rgb(style.fg));
+                let background = luminance(palette_rgb(style.bg));
+                let ratio = contrast_ratio(foreground, background);
+                assert!(
+                    ratio >= 7.0,
+                    "{}: {ratio}:1 with truecolor={truecolor}",
+                    slot.name()
+                );
+                assert_eq!(palette_rgb(style.bg), [0, 0, 0]);
+                let mut grid = crate::engine::Grid::new(2, 1).expect("grid");
+                grid.feed(format!("{}x", theme.sgr(slot, truecolor)).as_bytes())
+                    .expect("SGR");
+                assert_eq!(grid.cell(0, 0).expect("cell").style, style);
+            }
+        }
+    }
+
+    /// Decode the fixed xterm color cube independently of quantization.
+    fn palette_rgb(color: Color) -> [u8; 3] {
+        match color {
+            Color::Rgb(r, g, b) => [r, g, b],
+            Color::Indexed(index @ 16..=231) => {
+                let cube = index.saturating_sub(16);
+                let levels = [0, 95, 135, 175, 215, 255];
+                [
+                    levels[usize::from(cube / 36)],
+                    levels[usize::from((cube / 6) % 6)],
+                    levels[usize::from(cube % 6)],
+                ]
+            }
+            _ => panic!("high contrast must use explicit RGB or fixed cube colors: {color:?}"),
+        }
+    }
+
+    #[allow(clippy::arithmetic_side_effects)]
+    fn luminance(rgb: [u8; 3]) -> f64 {
+        let linear = rgb.map(|channel| {
+            let value = f64::from(channel) / 255.0;
+            if value <= 0.04045 {
+                value / 12.92
+            } else {
+                ((value + 0.055) / 1.055).powf(2.4)
+            }
+        });
+        0.2126 * linear[0] + 0.7152 * linear[1] + 0.0722 * linear[2]
+    }
+
+    #[allow(clippy::arithmetic_side_effects)]
+    fn contrast_ratio(first: f64, second: f64) -> f64 {
+        (first.max(second) + 0.05) / (first.min(second) + 0.05)
     }
 
     #[test]

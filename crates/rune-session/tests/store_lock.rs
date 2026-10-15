@@ -198,7 +198,8 @@ fn a_writer_killed_while_holding_the_lock_releases_it() {
             .append(SessionEvent::TitleSet {
                 title: "after the crash".to_owned(),
             })
-            .expect("append"),
+            .expect("append")
+            .seq,
         EventSeq(2)
     );
     assert_eq!(reopened.read().expect("read").len(), 2);

@@ -23,7 +23,7 @@ use rune_policy::rules::{Rule, RuleSet};
 use rune_tools::contract::{ExecutionContext, ToolOutput};
 use rune_tools::registry::Registry;
 use rune_tools::workspace::FileLimits;
-use rune_tools::{EditFile, GlobFiles, GrepFiles, ReadFile, WriteFile};
+use rune_tools::{EditFile, GlobFiles, GrepFiles, ReadFile, ReadToolResult, WriteFile};
 use serde::Deserialize;
 use serde_json::json;
 
@@ -36,6 +36,9 @@ use crate::shell::PageShell;
 /// repeat one call indefinitely, and a bound is what turns that into a turn
 /// that ends and says why.
 pub const DEFAULT_STEPS: u64 = 16;
+
+/// Maximum bytes copied from one staged WASM response head or shell reply.
+pub const DEFAULT_BRIDGE_BYTES: usize = 1024 * 1024;
 
 /// Commands the page's shell offers that only read.
 ///
@@ -77,6 +80,14 @@ pub struct Config {
     /// Steps a turn may take.
     #[serde(default)]
     pub max_steps: Option<u64>,
+    /// Byte cap for one staged reply from the WASM page's imports.
+    /// Native hosts supply their own bridge and enforce their own limits.
+    #[serde(default = "default_bridge_bytes")]
+    pub max_bridge_bytes: usize,
+}
+
+fn default_bridge_bytes() -> usize {
+    DEFAULT_BRIDGE_BYTES
 }
 
 fn default_workspace() -> String {
@@ -134,6 +145,10 @@ impl Session {
                 AuthStyle::ApiKeyHeader,
             ),
             "responses" => (Box::new(rune_net::responses::Responses), AuthStyle::Bearer),
+            "gemini" | "google" => (
+                Box::new(rune_net::gemini::Gemini),
+                AuthStyle::GoogleApiKeyHeader,
+            ),
             "chat_completions" => (
                 Box::new(rune_net::chat_completions::ChatCompletions),
                 AuthStyle::Bearer,
@@ -168,15 +183,17 @@ impl Session {
 
         let file_limits = FileLimits::from_budget(&limits);
         let mut registry = Registry::new();
+        registry.insert(Box::new(rune_tools::UpdatePlan))?;
         registry.insert(Box::new(GlobFiles::with_limits(file_limits)))?;
         registry.insert(Box::new(GrepFiles::with_limits(file_limits)))?;
         registry.insert(Box::new(ReadFile::with_limits(file_limits)))?;
+        registry.insert(Box::new(ReadToolResult::new(&limits)))?;
         registry.insert(Box::new(WriteFile))?;
         registry.insert(Box::new(EditFile))?;
         registry.insert(Box::new(PageShell::new(Arc::clone(&bridge))))?;
         let tools = rune_tools::inventory::advertisement(&registry);
 
-        let instructions = rune_context::prompt::instructions_for(
+        let instructions = rune_context::prompt::base_instructions_for(
             &workspace,
             camino::Utf8Path::new("/config"),
             &limits,
@@ -219,8 +236,8 @@ impl Session {
 
     /// Returns the instructions the model receives, for `/prompt`.
     #[must_use]
-    pub fn instructions_text(&self) -> &str {
-        &self.instructions
+    pub fn instructions_text(&self) -> String {
+        self.instructions()
     }
 }
 
@@ -233,7 +250,9 @@ impl Session {
 fn rules() -> RuleSet {
     let mut rules = RuleSet::new();
     for tool in [
+        "update_plan",
         "read_file",
+        "read_tool_result",
         "glob_files",
         "grep_files",
         "write_file",
@@ -261,11 +280,28 @@ impl Host for Session {
     }
 
     fn instructions(&self) -> String {
-        self.instructions.clone()
+        rune_context::prompt::with_repository_map(
+            &self.instructions,
+            self.context.workspace(),
+            &self.limits,
+        )
     }
 
     fn tools(&self) -> Vec<ToolSpec> {
         self.tools.clone()
+    }
+
+    fn tool_activity(&self, name: &str) -> Option<rune_tools::Activity> {
+        self.registry.activity(name)
+    }
+
+    fn tool_permission_target(&self, name: &str, arguments: &serde_json::Value) -> Option<String> {
+        turn::permission_target_for(&self.registry, name, arguments)
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    fn concurrent_tool_host(&self, name: &str) -> Option<&(dyn Host + Sync)> {
+        self.registry.get(name)?.is_read_only().then_some(self)
     }
 
     fn fetch(&self) -> Box<dyn Fetch> {
@@ -318,7 +354,13 @@ impl Host for Session {
     }
 
     fn decide(&self, name: &str, target: Option<&str>) -> (Outcome, String) {
-        let (outcome, reason) = turn::decide_call(&self.rules, PermissionMode::Ask, name, target);
+        let (outcome, reason) = turn::decide_call_in_workspace(
+            &self.rules,
+            PermissionMode::Ask,
+            name,
+            target,
+            self.context.workspace(),
+        );
         if outcome != Outcome::Ask {
             return (outcome, reason);
         }
@@ -332,6 +374,18 @@ impl Host for Session {
         } else {
             (Outcome::Deny, format!("{reason}; declined in this tab"))
         }
+    }
+
+    fn execute_with_context(
+        &self,
+        name: &str,
+        arguments: &serde_json::Value,
+        context: &ExecutionContext,
+    ) -> Result<ToolOutput> {
+        if name == "update_plan" {
+            return self.registry.call(name, arguments, context);
+        }
+        self.execute(name, arguments)
     }
 
     fn context(&self) -> ExecutionContext {
@@ -355,6 +409,22 @@ impl Host for Session {
 fn encode(event: &Event) -> serde_json::Value {
     match event {
         Event::TurnStarted { step } => json!({ "kind": "step", "step": step }),
+        Event::ProviderRetry {
+            step,
+            next_attempt,
+            max_attempts,
+            delay,
+        } => json!({
+            "kind": "provider_retry",
+            "step": step,
+            "next_attempt": next_attempt,
+            "max_attempts": max_attempts,
+            "delay_ms": u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
+        }),
+        Event::ProviderRetryFinished { step } => {
+            json!({ "kind": "provider_retry_finished", "step": step })
+        }
+        Event::PlanUpdated { update } => json!({ "kind": "plan_updated", "update": update }),
         Event::TextDelta { delta } => json!({ "kind": "text", "delta": delta }),
         Event::ReasoningDelta { delta } => json!({ "kind": "reasoning", "delta": delta }),
         Event::ToolStarted { call, activity } => json!({
@@ -376,6 +446,14 @@ fn encode(event: &Event) -> serde_json::Value {
             "name": call.name,
             "arguments": call.arguments,
             "reason": reason,
+        }),
+        Event::ContextCompacted {
+            removed_turns,
+            remaining_turns,
+        } => json!({
+            "kind": "compacted",
+            "removed_turns": removed_turns,
+            "remaining_turns": remaining_turns,
         }),
         Event::SteeringApplied { count, .. } => json!({ "kind": "steering", "count": count }),
         Event::Finished {
@@ -550,6 +628,7 @@ mod tests {
             headers: Vec::new(),
             workspace: workspace.to_string(),
             max_steps: None,
+            max_bridge_bytes: DEFAULT_BRIDGE_BYTES,
         };
         let page = Arc::clone(page);
         let bridge: Arc<dyn Bridge> = page;
@@ -561,6 +640,26 @@ mod tests {
         let path = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).expect("utf8");
         std::fs::write(path.join("notes.txt"), "the answer is forty-two\n").expect("fixture");
         (dir, path)
+    }
+
+    #[test]
+    fn the_page_advertises_and_allows_the_retained_result_reader() {
+        let (_guard, root) = workspace();
+        let page = ScriptedPage::new(vec![answer("ready")], false);
+        let session = session(&page, &root);
+        assert!(
+            session
+                .tools
+                .iter()
+                .any(|tool| tool.name == "read_tool_result")
+        );
+        assert_eq!(
+            session
+                .rules
+                .evaluate("read_tool_result", "read_tool_result", Outcome::Ask)
+                .outcome,
+            Outcome::Allow
+        );
     }
 
     #[test]
@@ -675,6 +774,7 @@ mod tests {
             headers: Vec::new(),
             workspace: root.to_string(),
             max_steps: None,
+            max_bridge_bytes: DEFAULT_BRIDGE_BYTES,
         };
         let bridge: Arc<dyn Bridge> = page;
         let err = Session::new(&config, bridge, Arc::new(Control::default())).expect_err("refused");
