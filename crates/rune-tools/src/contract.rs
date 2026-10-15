@@ -186,8 +186,18 @@ pub struct ExecutionContext {
     ///
     /// Separate from reaching outside the workspace: a host with no usable
     /// sandbox backend can still run a command that stays inside the workspace,
-    /// and conflating the two means such a host can run nothing at all.
+    /// and conflating the two means such a host can run nothing at all. This is
+    /// the fallback a host needs when it has no backend; it does not disable a
+    /// backend the host does have.
     pub allow_unsandboxed: bool,
+    /// Whether commands run under the host sandbox.
+    ///
+    /// Internal to this crate. Production contexts leave it on. The shell tests
+    /// turn it off because the sandbox runs a command through a wrapper that
+    /// builds a PID namespace and a new session, which changes the process-group
+    /// and signal observations those tests are about. Nothing on the
+    /// model-facing path can reach it.
+    pub(crate) sandboxed: bool,
     /// Per-call byte budget for produced output.
     pub max_output_bytes: usize,
     /// Retained output from the live conversation, supplied by its owner.
@@ -209,6 +219,7 @@ impl ExecutionContext {
             private_network_access: false,
             offline: false,
             allow_unsandboxed: false,
+            sandboxed: true,
             max_output_bytes: 64 * 1024,
             result_store: None,
             live_plan: Arc::default(),
@@ -248,6 +259,18 @@ impl ExecutionContext {
     #[must_use]
     pub const fn with_allow_unsandboxed(mut self, allowed: bool) -> Self {
         self.allow_unsandboxed = allowed;
+        self
+    }
+
+    /// Runs commands without the host sandbox.
+    ///
+    /// Crate-internal and test-only. The shell tests use it to observe process
+    /// groups and signals on the host rather than through a namespace wrapper;
+    /// no model-facing path can turn the sandbox off.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) const fn unconfined(mut self) -> Self {
+        self.sandboxed = false;
         self
     }
 
@@ -298,6 +321,7 @@ impl ExecutionContext {
             private_network_access: self.private_network_access,
             offline: self.offline,
             allow_unsandboxed: self.allow_unsandboxed,
+            sandboxed: self.sandboxed,
             max_output_bytes: self.max_output_bytes,
             result_store: self.result_store.clone(),
             live_plan: Arc::clone(&self.live_plan),
