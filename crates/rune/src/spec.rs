@@ -409,7 +409,7 @@ pub const ACCOUNT: &[CommandSpec] = &[
         usage: "rune mcp list [--json] | rune mcp check [server] [--json] | rune mcp import claude-desktop <file>",
         flags: &[flag(
             "--json",
-            "Emit JSON diagnostics without secrets. Import always emits full configuration JSON.",
+            "Emit JSON diagnostics without secrets. Import always emits full configuration JSON; save it as `.mcp.json` at the workspace root.",
         )],
         requirements: Requirements::NETWORK,
         supports_json: true,

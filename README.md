@@ -179,6 +179,7 @@ explicit loopback mode. `Agent::new` continues to require a credential.
 
 `rune mcp import claude-desktop <file>` converts Claude Desktop's local stdio
 `mcpServers` JSON into a validated Rune project configuration printed to stdout.
+Save the reviewed JSON as `.mcp.json` at the workspace root to configure those servers.
 The supported entries contain a string `command`, optional string-array `args`,
 and optional string-valued `env` map. Other Desktop settings are omitted;
 unsupported server fields and remote entries are refused without partial output.

@@ -155,7 +155,7 @@ Manage MCP servers: mcp list, mcp check, mcp import
 
 | Flag | Description |
 |---|---|
-| `--json` | Emit JSON diagnostics without secrets. Import always emits full configuration JSON. |
+| `--json` | Emit JSON diagnostics without secrets. Import always emits full configuration JSON; save it as `.mcp.json` at the workspace root. |
 ### `rune permissions [--explain <target> | --simulate <file>] [--json]`
 
 Show the permission mode and rules
