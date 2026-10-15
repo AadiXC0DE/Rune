@@ -57,7 +57,8 @@ Verify the checksum before extracting, then install the executable:
 )
 ```
 
-Add `$prefix/bin` to your `PATH` to run `rune` by name. To uninstall this
+Add `$prefix/bin` to your `PATH` to run `rune` by name. `rune version` prints the version.
+`rune uninstall` removes the installed binary and, on request, local state. To uninstall this
 binary while preserving configuration, credentials, and sessions:
 
 <!-- archive-uninstall -->
@@ -90,7 +91,7 @@ Remove-Item -Recurse -Force $extracted
 ```
 
 Windows locks running executables, so use the separate extracted copy to replace
-the stopped target. `upgrade` verifies the archive checksum, decodes its one
+the stopped target. `rune upgrade` verifies the archive checksum, decodes its one
 regular executable member, and stages it beside the target before replacement.
 Rune's ZIP decoder accepts the single-member Deflate format emitted by release
 staging, without ZIP64, extra fields, comments, encryption, or data descriptors.
@@ -509,6 +510,8 @@ to the current workspace unless `--all` is passed. `--limit`, `--cursor`, and
 `--json` work as for ordinary listings; repeat the same search and scope when
 continuing with a cursor.
 
+`rune tree [last|id]` shows the branch structure of a session.
+
 `rune session <last|id> --search "symbol"` searches the saved conversation,
 including original records removed from model context by compaction. It matches
 case-insensitive literal fragments in user and assistant messages, saved streaming
@@ -627,6 +630,7 @@ files that cannot be read show a per-file error. Shell changes are not tracked.
 
 Run `rune help` for everything, or see [COMMANDS.md](COMMANDS.md) for the full
 reference.
+`rune reference` prints the generated command reference.
 
 Models can call `update_plan` with the complete ordered `plan` array of
 `{"step": "description", "status": "pending"}` objects and an optional
@@ -804,7 +808,10 @@ changed by anyone who can open a pull request.
 rune config --explain       # where each setting came from
 rune limits --json          # every limit and its source
 rune prompt --show          # the exact instructions the model receives
+rune status                 # show the resolved configuration and runtime state
 ```
+
+`rune workspace <list|add <path>|remove <path>|clear>` manages additional workspace directories.
 
 Interactive `subagent` calls can select a project role using
 `{"action":"run","agent":"reviewer","task":"Review the parser"}`. Save its
@@ -888,6 +895,8 @@ group. Cancellation also skips hooks for pending results. Ask, review, interacti
 sessions, and delegated child calls support it.
 
 ## Embedding
+
+`rune acp` serves the Agent Client Protocol over standard input and output.
 
 `rune-acp` serves the Agent Client Protocol over stdin and stdout, so an editor
 can drive a session. `rune-sdk` is the library an embedder links against: the
