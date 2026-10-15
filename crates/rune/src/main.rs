@@ -397,6 +397,7 @@ fn run_review(
     workspace: &Utf8Path,
     output: &OutputFlags,
 ) -> Result<ExitCode> {
+    settings.require_valid_user_config()?;
     let changes = pending_changes(workspace)?;
     if changes.trim().is_empty() {
         // Reviewing nothing would produce an invented report, so the condition
@@ -538,6 +539,7 @@ fn run_interactive(
     // is a terminal to answer, the connection flow runs first, so `rune` alone
     // reaches a working session. A piped or machine invocation is not asked
     // anything: the error it already gets names what to do.
+    settings.require_valid_user_config()?;
     let mut settings = settings.clone();
     if settings.provider == Provider::Unconfigured && interactive_stdin() && !launch.accessible {
         let entry = connect_flow::choose_provider()?;
@@ -581,6 +583,7 @@ fn run_auth(
     launch: &Launch,
     output: &OutputFlags,
 ) -> Result<ExitCode> {
+    settings.require_valid_user_config()?;
     let action = launch.args.first().map(String::as_str);
     match action {
         Some("remove" | "logout") => {
@@ -636,6 +639,7 @@ fn run_connect(
     launch: &Launch,
     output: &OutputFlags,
 ) -> Result<ExitCode> {
+    settings.require_valid_user_config()?;
     let named = launch.args.first().map(|value| value.trim().to_owned());
     if named.is_none() && !output.json {
         let entry = connect_flow::choose_provider()?;

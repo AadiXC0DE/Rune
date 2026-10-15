@@ -2323,3 +2323,40 @@ fn interactive_connect_offers_endpoint_models_and_saves_the_choice() {
         Some("chosen-model")
     );
 }
+
+#[test]
+fn malformed_user_config_names_the_field_for_provider_commands() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = camino::Utf8Path::from_path(dir.path()).expect("utf8");
+    let path = root.join("config/rune/config.toml");
+    rune_core::paths::create_dir_private(path.parent().expect("parent")).expect("directory");
+    rune_core::paths::write_private(&path, "model = 'wrong-key'\n").expect("config");
+    for args in [
+        vec!["auth"],
+        vec!["auth", "--json"],
+        vec!["ask", "hello"],
+        vec!["review"],
+        vec!["--accessible"],
+        vec!["models"],
+    ] {
+        let out = config_mutation_command(root)
+            .args(&args)
+            .output()
+            .expect("command");
+        assert!(!out.status.success(), "{args:?}: {out:?}");
+        let error = String::from_utf8(out.stderr).expect("stderr");
+        assert!(
+            error.contains("user configuration")
+                && error.contains("unknown field `model`")
+                && error.contains("rune doctor"),
+            "{args:?}: {error}"
+        );
+        assert!(!error.contains("no model provider is connected"), "{error}");
+    }
+    let doctor = config_mutation_command(root)
+        .args(["doctor", "--json"])
+        .output()
+        .expect("doctor");
+    let report: serde_json::Value = serde_json::from_slice(&doctor.stdout).expect("doctor report");
+    assert!(report.to_string().contains("unknown field `model`"));
+}

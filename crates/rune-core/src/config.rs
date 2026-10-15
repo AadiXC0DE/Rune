@@ -684,8 +684,29 @@ impl Settings {
     /// can ask for a model before its first turn, while a caller that cannot be
     /// asked still has to refuse rather than send an empty identifier.
     pub fn require_provider(&self) -> Result<()> {
+        self.require_valid_user_config()?;
         if !self.provider.is_configured() {
             return Err(unconfigured_provider_error());
+        }
+        Ok(())
+    }
+
+    /// Surfaces a rejected user layer before a command relies on its provider.
+    pub fn require_valid_user_config(&self) -> Result<()> {
+        if let Some(diagnostic) = self.diagnostics.iter().find(|diagnostic| {
+            diagnostic.layer == Layer::User && diagnostic.code == ErrorCode::InvalidConfiguration
+        }) {
+            let location = diagnostic.path.as_ref().map_or_else(
+                || "user configuration".to_owned(),
+                |path| format!("user configuration `{path}`"),
+            );
+            return Err(RuneError::new(
+                ErrorCode::InvalidConfiguration,
+                format!("{location} failed to load: {}", diagnostic.message),
+            )
+            .with_hint(
+                "run `rune doctor` for the configuration diagnostic, then repair the user config",
+            ));
         }
         Ok(())
     }

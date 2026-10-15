@@ -45,6 +45,7 @@ pub fn configured_base_url(settings: &Settings) -> Option<String> {
 /// Returns the endpoint a configured provider is reached at, or why there is
 /// none.
 pub fn require_base_url(settings: &Settings) -> Result<String> {
+    settings.require_valid_user_config()?;
     configured_base_url(settings).ok_or_else(|| {
         RuneError::new(
             ErrorCode::InvalidConfiguration,
