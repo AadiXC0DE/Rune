@@ -151,7 +151,7 @@ List the models of the connected provider
 | `--json` | Emit JSON. |
 ### `rune mcp list [--json] | rune mcp check [server] [--json] | rune mcp import claude-desktop <file>`
 
-List, check, or import MCP servers without an agent turn
+Manage MCP servers: mcp list, mcp check, mcp import
 
 | Flag | Description |
 |---|---|
@@ -165,9 +165,9 @@ Show the permission mode and rules
 | `--explain <target>` | Explain one tool:target action, such as shell:pwd. JSON includes the outcome, deciding rule and layer. |
 | `--simulate <file>` | Dry-run a JSON array of {tool, target} calls in order, without execution or approval writes. |
 | `--json` | Emit JSON. |
-### `rune sandbox explain [--external-access] [--json] -- <command>`
+### `rune sandbox [explain] [--external-access] [--json] -- <command>`
 
-Explain a command's sandbox policy without running it
+Explain command policy: sandbox [explain] -- <command>
 
 | Flag | Description |
 |---|---|

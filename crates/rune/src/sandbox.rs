@@ -48,16 +48,20 @@ pub fn explain(
     launch: &Launch,
     workspace: &Utf8Path,
 ) -> Result<Report> {
-    if launch.args.first().map(String::as_str) != Some("explain") {
+    let skip = if launch.separator == Some(0) {
+        0
+    } else if launch.args.first().map(String::as_str) == Some("explain") {
+        1
+    } else {
         return Err(RuneError::invalid_field(
             "action",
-            "expected `sandbox explain`",
+            "expected `sandbox explain -- <command>` or `sandbox -- <command>`",
         ));
-    }
+    };
     let command = launch
         .args
         .iter()
-        .skip(1)
+        .skip(skip)
         .cloned()
         .collect::<Vec<_>>()
         .join(" ");

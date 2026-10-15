@@ -389,3 +389,61 @@ fn a_root_alias_is_reported_where_the_backend_resolves_it() {
             .any(|rule| rule["path"] == resolved(&saved.join(".git/hooks")))
     );
 }
+
+#[test]
+fn shorthand_matches_explicit_explain_in_text_and_json() {
+    let fixture = Fixture::new();
+    for flags in [
+        vec![],
+        vec!["--json"],
+        vec!["--external-access"],
+        vec!["--external-access", "--json"],
+    ] {
+        let mut explicit = vec!["sandbox", "explain"];
+        explicit.extend_from_slice(&flags);
+        explicit.extend(["--", "rm", "-rf", "/"]);
+        let mut shorthand = vec!["sandbox"];
+        shorthand.extend_from_slice(&flags);
+        shorthand.extend(["--", "rm", "-rf", "/"]);
+        let expected = fixture.run(&explicit);
+        let actual = fixture.run(&shorthand);
+        assert!(expected.status.success(), "{expected:?}");
+        assert_eq!(actual.status.code(), expected.status.code());
+        assert_eq!(actual.stdout, expected.stdout);
+        assert_eq!(actual.stderr, expected.stderr);
+    }
+    let invalid = fixture.run(&["sandbox", "rm", "-rf", "/"]);
+    assert!(!invalid.status.success());
+    assert!(
+        String::from_utf8(invalid.stderr)
+            .expect("error")
+            .contains("put `--` before the command")
+    );
+}
+
+#[test]
+fn top_level_help_names_sandbox_and_mcp_actions() {
+    let fixture = Fixture::new();
+    let output = fixture.run(&["help"]);
+    assert!(output.status.success());
+    let text = String::from_utf8(output.stdout).expect("help");
+    let sandbox = text
+        .lines()
+        .find(|line| line.trim_start().starts_with("sandbox "))
+        .expect("sandbox summary");
+    assert!(
+        sandbox.contains("sandbox [explain] -- <command>"),
+        "{sandbox}"
+    );
+    let mcp = text
+        .lines()
+        .find(|line| line.trim_start().starts_with("mcp "))
+        .expect("mcp summary");
+    for action in ["mcp list", "mcp check", "mcp import"] {
+        assert!(mcp.contains(action), "{mcp}");
+    }
+    let reference = fixture.run(&["reference"]);
+    assert!(reference.status.success());
+    let reference = String::from_utf8(reference.stdout).expect("reference");
+    assert!(reference.contains("rune sandbox [explain] [--external-access] [--json] -- <command>"));
+}

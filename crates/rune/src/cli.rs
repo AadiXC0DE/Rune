@@ -165,6 +165,8 @@ pub struct Launch {
     pub json: bool,
     /// Positional arguments after the command.
     pub args: Vec<String>,
+    /// Index of the first positional argument supplied after `--`, when present.
+    pub separator: Option<usize>,
     /// Flags the command declares, given after it, with their values.
     pub flags: Vec<(String, Option<String>)>,
     /// Session resume target, when the launch resumes.
@@ -249,6 +251,7 @@ pub fn parse(args: Vec<OsString>, benchmark: bool) -> Result<Launch> {
         accessible: false,
         json: false,
         args: Vec::new(),
+        separator: None,
         flags: Vec::new(),
         resume: None,
         benchmark,
@@ -526,6 +529,7 @@ fn finish(mut launch: Launch, tokens: &[String], mut index: usize) -> Result<Lau
     while index < tokens.len() {
         let token = tokens.get(index).cloned().unwrap_or_default();
         if token == "--" {
+            launch.separator = Some(launch.args.len());
             // Everything after a bare double dash is a positional argument,
             // even when it looks like a flag.
             launch
@@ -604,7 +608,9 @@ fn undeclared_flag(raw: &str, command: Command) -> RuneError {
         ErrorCode::InvalidField,
         format!("`{raw}` is not a flag of `rune {name}`"),
     );
-    if matches!(command, Command::Ask | Command::Review) {
+    if command == Command::Sandbox {
+        err.with_hint("put `--` before the command, as in `rune sandbox -- rm -rf /`; run `rune help sandbox` for flags")
+    } else if matches!(command, Command::Ask | Command::Review) {
         err.with_hint(format!(
             "run `rune help {name}` for its flags, or put `--` before text that starts with a dash"
         ))

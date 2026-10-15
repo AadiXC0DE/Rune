@@ -405,7 +405,7 @@ pub const ACCOUNT: &[CommandSpec] = &[
     CommandSpec {
         name: "mcp",
         aliases: &[],
-        summary: "List, check, or import MCP servers without an agent turn",
+        summary: "Manage MCP servers: mcp list, mcp check, mcp import",
         usage: "rune mcp list [--json] | rune mcp check [server] [--json] | rune mcp import claude-desktop <file>",
         flags: &[flag(
             "--json",
@@ -438,8 +438,8 @@ pub const ACCOUNT: &[CommandSpec] = &[
     CommandSpec {
         name: "sandbox",
         aliases: &[],
-        summary: "Explain a command's sandbox policy without running it",
-        usage: "rune sandbox explain [--external-access] [--json] -- <command>",
+        summary: "Explain command policy: sandbox [explain] -- <command>",
+        usage: "rune sandbox [explain] [--external-access] [--json] -- <command>",
         flags: &[
             flag(
                 "--external-access",
