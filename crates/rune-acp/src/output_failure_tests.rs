@@ -10,6 +10,9 @@ use rune_tools::contract::{Activity, Tool};
 
 use super::*;
 
+// Watchdog for stalled fixtures/workers, not a production shutdown deadline.
+const TEST_TIMEOUT: Duration = Duration::from_secs(5);
+
 fn config(root: &tempfile::TempDir, endpoint: Endpoint) -> ServerConfig {
     let path = |name: &str| {
         Utf8PathBuf::from_path_buf(root.path().join(name)).expect("UTF-8 fixture path")
@@ -45,23 +48,45 @@ fn prompt<W: Write + Send + 'static>(server: &Arc<Server<W>>, session: &str, id:
         .expect("prompt");
 }
 
-fn assert_settled<W: Write + Send + 'static>(server: &Server<W>, started: Instant) {
-    let remaining = SHUTDOWN_GRACE.saturating_sub(started.elapsed());
+fn assert_output_failed<W: Write + Send + 'static>(server: &Server<W>) {
+    assert!(
+        server.output_failed.load(Ordering::SeqCst),
+        "the protocol write did not observe output loss"
+    );
+    let active = server.active.lock().expect("active");
+    if let Some(cancellation) = &active.cancellation {
+        assert!(cancellation.is_cancelled(), "turn was not cancelled");
+    }
+    if let Some(tools) = &active.tools {
+        assert!(tools.is_cancelled(), "tools were not cancelled");
+    }
+    assert!(
+        active.queue.is_empty(),
+        "disconnected prompts were retained"
+    );
+    assert!(server.pending.lock().expect("pending").is_empty());
+}
+
+fn assert_settled<W: Write + Send + 'static>(server: &Server<W>) {
+    assert_output_failed(server);
+    // Wait for the state transition. A descheduled test thread must not fail
+    // after observing settlement merely because its stopwatch also expired.
     let (active, _) = server
         .settled
-        .wait_timeout_while(server.active.lock().expect("active"), remaining, |active| {
-            active.cancellation.is_some()
-        })
+        .wait_timeout_while(
+            server.active.lock().expect("active"),
+            TEST_TIMEOUT,
+            |active| active.cancellation.is_some(),
+        )
         .expect("settled wait");
     assert!(
         active.cancellation.is_none(),
-        "turn exceeded shutdown grace"
+        "cancelled turn did not settle before the test watchdog"
     );
     assert!(
         active.queue.is_empty(),
         "disconnected prompts were retained"
     );
-    assert!(started.elapsed() < SHUTDOWN_GRACE);
 }
 
 #[test]
@@ -83,7 +108,7 @@ fn output_loss_on_the_turn_thread_closes_a_silent_provider_and_drops_queued_work
         match listener.accept() {
             Ok((stream, _)) => break stream,
             Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                assert!(accepted.elapsed() < SHUTDOWN_GRACE, "no provider request");
+                assert!(accepted.elapsed() < TEST_TIMEOUT, "no provider request");
                 std::thread::sleep(POLL);
             }
             Err(err) => panic!("accept provider: {err}"),
@@ -96,7 +121,7 @@ fn output_loss_on_the_turn_thread_closes_a_silent_provider_and_drops_queued_work
         .set_nonblocking(false)
         .expect("blocking provider socket");
     provider
-        .set_read_timeout(Some(SHUTDOWN_GRACE))
+        .set_read_timeout(Some(TEST_TIMEOUT))
         .expect("timeout");
     let mut request = BufReader::new(provider.try_clone().expect("clone"));
     let mut length = 0;
@@ -123,14 +148,12 @@ fn output_loss_on_the_turn_thread_closes_a_silent_provider_and_drops_queued_work
 
     // Only output is closed. Input EOF must not be responsible for cancellation.
     drop(client);
-    let started = Instant::now();
     provider
         .write_all(b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"trigger\"}}]}\n\n")
         .expect("streamed delta");
     // Leave the provider body open and silent. Cancellation must close it.
     assert_eq!(provider.read(&mut [0]).expect("provider disconnected"), 0);
-    assert_settled(&server, started);
-    assert!(server.output_failed.load(Ordering::SeqCst));
+    assert_settled(&server);
     assert!(
         server
             .prompt(
@@ -165,7 +188,7 @@ impl Tool for WaitingTool {
         let started = Instant::now();
         while context.check_cancelled().is_ok() {
             assert!(
-                started.elapsed() < SHUTDOWN_GRACE.saturating_mul(2),
+                started.elapsed() < TEST_TIMEOUT.saturating_mul(2),
                 "tool was not cancelled"
             );
             std::thread::sleep(POLL);
@@ -199,21 +222,19 @@ fn output_loss_on_the_reader_thread_cancels_running_tools() {
     );
     let session = open(&server);
     prompt(&server, &session, 1);
-    started_rx
-        .recv_timeout(SHUTDOWN_GRACE)
-        .expect("tool running");
+    started_rx.recv_timeout(TEST_TIMEOUT).expect("tool running");
     prompt(&server, &session, 2);
     drop(client);
-    let started = Instant::now();
     server.dispatch(Message::Request(Request::new(
         Id::Number(3),
         "initialize",
         json!({}),
     )));
+    assert_output_failed(&server);
     stopped_rx
-        .recv_timeout(SHUTDOWN_GRACE)
+        .recv_timeout(TEST_TIMEOUT)
         .expect("tool cancelled");
-    assert_settled(&server, started);
+    assert_settled(&server);
     assert_eq!(mock.request_count(), 1);
     // Further messages on the still-open input must not start work.
     server.dispatch(Message::Request(Request::new(
@@ -234,7 +255,7 @@ fn output_loss_releases_an_unanswered_permission_request() {
     )]);
     let (output, client) = UnixStream::pair().expect("protocol output");
     client
-        .set_read_timeout(Some(SHUTDOWN_GRACE))
+        .set_read_timeout(Some(TEST_TIMEOUT))
         .expect("timeout");
     let server = Arc::new(
         Server::new(
@@ -245,22 +266,27 @@ fn output_loss_releases_an_unanswered_permission_request() {
     );
     let session = open(&server);
     prompt(&server, &session, 1);
-    let mut reader =
-        crate::jsonrpc::Reader::new(BufReader::new(client.try_clone().expect("clone")));
-    loop {
-        if let Some(Message::Request(request)) = reader.read_message().expect("frame")
-            && request.method == "session/request_permission"
-        {
-            break;
+    {
+        let mut reader = crate::jsonrpc::Reader::new(BufReader::new(&client));
+        loop {
+            let message = reader
+                .read_message()
+                .expect("frame")
+                .expect("permission request");
+            if let Message::Request(request) = message
+                && request.method == "session/request_permission"
+            {
+                break;
+            }
         }
     }
     assert_eq!(server.pending.lock().expect("pending").len(), 1);
-    client
-        .shutdown(std::net::Shutdown::Read)
-        .expect("close output");
-    let started = Instant::now();
+    // Close the only reader. SHUT_RD on a Unix socket does not make the
+    // peer's next write fail on Darwin as it does on Linux. No cloned reader
+    // may retain this output; server input is independent and remains open.
+    drop(client);
     server.respond(Id::Number(2), json!({}));
-    assert_settled(&server, started);
+    assert_settled(&server);
     assert!(server.pending.lock().expect("pending").is_empty());
     assert_eq!(mock.request_count(), 1);
 }
@@ -315,7 +341,7 @@ fn output_loss_during_flush_cancels_work_and_never_retries_output() {
 fn output_loss_before_tool_registration_prevents_provider_and_tool_work() {
     let root = tempfile::tempdir().expect("tempdir");
     let mock = MockEndpoint::start(vec![Script::text("must not run")]);
-    let (output, client) = UnixStream::pair().expect("protocol output");
+    let (client, output) = std::io::pipe().expect("protocol output pipe");
     let server = Arc::new(
         Server::new(config(&root, Endpoint::new(mock.base_url(), "key")), output).expect("server"),
     );
@@ -325,11 +351,10 @@ fn output_loss_before_tool_registration_prevents_provider_and_tool_work() {
         active.cancellation = Some(Cancellation::new());
         active.session = Some(session.clone());
     }
-    client
-        .shutdown(std::net::Shutdown::Read)
-        .expect("close output");
-    let started = Instant::now();
+    drop(client);
     server.respond(Id::Number(1), json!({}));
+    assert_output_failed(&server);
+    assert!(server.active.lock().expect("active").tools.is_none());
     run_queued(
         &server,
         Queued {
@@ -342,7 +367,7 @@ fn output_loss_before_tool_registration_prevents_provider_and_tool_work() {
             .expect("prompt"),
         },
     );
-    assert_settled(&server, started);
+    assert_settled(&server);
     assert_eq!(mock.request_count(), 0);
 }
 
@@ -355,7 +380,7 @@ fn output_loss_cancels_a_silent_stdio_mcp_tool_and_terminates_its_child() {
         "mcp_fixture_greet",
         r#"{"who":"wait"}"#,
     )]);
-    let (output, client) = UnixStream::pair().expect("protocol output");
+    let (client, output) = std::io::pipe().expect("protocol output pipe");
     let server = Arc::new(
         Server::new(config(&root, Endpoint::new(mock.base_url(), "key")), output).expect("server"),
     );
@@ -372,16 +397,13 @@ fn output_loss_cancels_a_silent_stdio_mcp_tool_and_terminates_its_child() {
         .unwrap_or_default()
         .contains("\"method\":\"tools/call\"")
     {
-        assert!(waiting.elapsed() < SHUTDOWN_GRACE, "MCP tool did not start");
+        assert!(waiting.elapsed() < TEST_TIMEOUT, "MCP tool did not start");
         std::thread::sleep(POLL);
     }
     prompt(&server, session, 2);
-    client
-        .shutdown(std::net::Shutdown::Read)
-        .expect("close output");
-    let started = Instant::now();
+    drop(client);
     server.respond(Id::Number(3), json!({}));
-    assert_settled(&server, started);
+    assert_settled(&server);
     let pid = std::fs::read_to_string(log.with_extension("pid")).expect("child pid");
     assert!(
         !std::process::Command::new("/bin/kill")
