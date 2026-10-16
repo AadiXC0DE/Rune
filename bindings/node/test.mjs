@@ -813,7 +813,7 @@ test("a bin option that is not executable is reported, not skipped", () => {
   const error = capture(() => resolveBinary({ bin: missing }));
 
   assert.ok(error instanceof RuneBinaryNotFoundError);
-  assert.match(error.message, new RegExp(`${missing} is not an executable file`));
+  assert.ok(error.message.includes(`${missing} is not an executable file`));
 });
 
 test("invalid timeoutMs values fail before spawning and emit no overflow warnings", async (t) => {

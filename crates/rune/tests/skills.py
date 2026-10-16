@@ -1,5 +1,6 @@
 """R-161: discovered names, searchable locations, exact instructions and bounds."""
 
+import html
 import http.server
 import json
 import pathlib
@@ -7,6 +8,12 @@ import subprocess
 import sys
 import tempfile
 import threading
+
+
+def assert_skill_location(location, expected):
+    assert location.startswith("skill:"), location
+    # Filesystem identity also handles Windows short names and drive-letter case.
+    assert pathlib.Path(location.removeprefix("skill:")).samefile(expected), location
 
 
 def run_fixture(ask):
@@ -42,13 +49,24 @@ def run_fixture(ask):
                     name, arguments = "capability_search", {"query": "ships service"}
                 elif step == 2:
                     assert last["role"] == "tool", last
-                    assert last["content"] == f"release-guide\n  skill:{skill_file}\n  Ships the service", last
-                    location = last["content"].splitlines()[1].strip()
+                    lines = last["content"].split("\n")
+                    assert len(lines) == 3, last
+                    assert lines[0] == "release-guide", last
+                    assert lines[1].startswith("  skill:"), last
+                    assert lines[2] == "  Ships the service", last
+                    location = lines[1].removeprefix("  ")
+                    assert_skill_location(location, skill_file)
                     name, arguments = "skill", {"location": location}
                 elif step == 3:
                     assert last["role"] == "tool", last
                     assert last["content"] == f'<skill_content name="release-guide">\n{instructions}\n</skill_content>\n', last
-                    name, arguments = "skill", {"location": f"skill:{oversized_file}"}
+                    # The tool asks for the advertised location, not a path
+                    # reconstructed in the parent process's spelling.
+                    catalog = request["messages"][0]["content"].splitlines()
+                    entry, = [line for line in catalog if line.startswith("- oversized: ")]
+                    location = html.unescape(entry.rsplit(" (location: ", 1)[1].removesuffix(")"))
+                    assert_skill_location(location, oversized_file)
+                    name, arguments = "skill", {"location": location}
                 else:
                     assert step == 4, requests
                     assert last["role"] == "tool", last
@@ -79,7 +97,9 @@ def run_fixture(ask):
         root = base / "workspace"
         skill_file = root / ".agents" / "skills" / "opaque-directory" / "SKILL.md"
         skill_file.parent.mkdir(parents=True)
-        skill_file.write_text(instructions, encoding="utf-8")
+        # Exact loading must compare against the bytes actually written, without
+        # Python's platform newline translation changing the fixture's input.
+        skill_file.write_bytes(instructions.encode("utf-8"))
         oversized_file = root / "skills" / "oversized" / "SKILL.md"
         oversized_file.parent.mkdir(parents=True)
         oversized_file.write_text("---\nname: oversized\n---\n" + "OVERSIZED_BODY" * 40)

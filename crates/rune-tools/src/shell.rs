@@ -1081,14 +1081,13 @@ mod tests {
 
     /// Returns true when `observed` contains `expected` as a path.
     ///
-    /// A path is compared after both sides are put in the same spelling. One
-    /// platform resolves a path to a form carrying a prefix that the shell it
-    /// runs does not print, so a comparison of the raw strings fails on the
-    /// directory the test itself created.
+    /// Resolve both paths so separators, Windows short names, drive-letter
+    /// case and verbatim prefixes do not affect directory identity.
     fn shows_path(observed: &str, expected: &Utf8Path) -> bool {
-        let rendered = expected.as_str();
-        let stripped = rendered.strip_prefix(r"\\?\").unwrap_or(rendered);
-        observed.contains(stripped) || observed.contains(rendered)
+        let expected = std::fs::canonicalize(expected).expect("expected directory");
+        observed
+            .lines()
+            .any(|line| std::fs::canonicalize(line.trim()).is_ok_and(|path| path == expected))
     }
 
     /// Returns a command that prints a marker for each line it reads.
