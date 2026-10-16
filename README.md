@@ -4,9 +4,10 @@
 
 **A tiny, native coding agent harness.**
 
-The audited stripped release build measured 5.43 MiB for
-`x86_64-unknown-linux-gnu` (GNU/Linux). The build enforces an 8 MiB ceiling
-and startup work budgets based on baseline-subtracted minimum-of-31 measurements.
+The audited stripped release build measured 5.46 MiB for
+`x86_64-unknown-linux-gnu` (GNU/Linux). The build enforces an 8 MiB ceiling,
+startup work budgets based on baseline-subtracted minimum-of-31 measurements,
+and a 6 KiB ceiling on the assembled per-turn prompt.
 Written in Rust. One binary for the terminal, for scripts, and for embedding
 in other systems. Every limit, rule, and setting names the source that set it.
 
@@ -454,8 +455,12 @@ declaration locations and lexical identifier references. The map refreshes befor
 each model request, including after tool edits. It respects `.gitignore`,
 `.git/info/exclude`, ancestor ignore rules and `.ignore`, and skips symlinks.
 References do not resolve Rust scopes, types, or macro expansion; comments and
-literals are excluded. The default output cap is 8192 bytes, including its
-incomplete-map notice. Configure `repository_map_bytes` in `[limits]` or with
+literals are excluded. Test-only paths (`tests/` and `benches/` trees,
+`*_tests.rs` files, and `#[cfg(test)]` items) are excluded, and only declarations
+at module scope are listed, so a mock, a method, or a nested helper does not
+crowd out a production type, function, trait, or module. The default output cap
+is 4096 bytes, including its incomplete-map notice. Configure
+`repository_map_bytes` in `[limits]` or with
 `--limit repository_map_bytes=N`; zero disables the map. Scans stop at 4096
 entries, 128 source files, 128 KiB per file, 1 MiB of total source, 1024
 declarations, depth 32, and eight reference locations per symbol. These work caps
