@@ -10,7 +10,11 @@ fn an_unknown_tagged_model_can_be_picked_and_sent_while_invalid_ids_are_refused(
     let output = std::process::Command::new("python3")
         .args([
             "-c",
-            &support::python_script(include_str!("terminal_menu.py")),
+            &support::python_script(concat!(
+                include_str!("fixture_support.py"),
+                "\n",
+                include_str!("terminal_menu.py")
+            )),
             env!("CARGO_BIN_EXE_rune"),
             "tagged-model",
         ])
@@ -52,7 +56,11 @@ fn completion_and_model_menus_fit_a_short_terminal_and_close_cleanly() {
     let output = std::process::Command::new("python3")
         .args([
             "-c",
-            &support::python_script(include_str!("terminal_menu.py")),
+            &support::python_script(concat!(
+                include_str!("fixture_support.py"),
+                "\n",
+                include_str!("terminal_menu.py")
+            )),
             env!("CARGO_BIN_EXE_rune"),
         ])
         .output()
@@ -101,7 +109,11 @@ fn discovered_custom_slash_command_can_be_completed_and_expanded_in_a_terminal()
     let output = std::process::Command::new("python3")
         .args([
             "-c",
-            &support::python_script(include_str!("terminal_menu.py")),
+            &support::python_script(concat!(
+                include_str!("fixture_support.py"),
+                "\n",
+                include_str!("terminal_menu.py")
+            )),
             env!("CARGO_BIN_EXE_rune"),
             "custom-completion",
         ])

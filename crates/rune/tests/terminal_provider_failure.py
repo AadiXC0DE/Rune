@@ -5,7 +5,6 @@ import http.server
 import json
 import os
 import pathlib
-import pty
 import select
 import socket
 import struct
@@ -89,12 +88,7 @@ with tempfile.TemporaryDirectory(prefix="rune-r025-") as directory:
     server.daemon_threads = True
     server_thread = threading.Thread(target=server.serve_forever, daemon=True)
     server_thread.start()
-    environment = child_environment({
-        key: value for key, value in os.environ.items()
-        if not key.startswith("RUNE_") and key.lower() not in {
-            "http_proxy", "https_proxy", "all_proxy",
-        }
-    })
+    environment = fixture_environment()
     environment.update({
         "HOME": directory,
         "XDG_CONFIG_HOME": str(root / "config"),
@@ -115,7 +109,7 @@ with tempfile.TemporaryDirectory(prefix="rune-r025-") as directory:
 
     def launch(*args):
         global child, master, transcript
-        master, slave = pty.openpty()
+        master, slave = open_terminal()
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 100, 0, 0))
         try:
             child = subprocess.Popen(
@@ -140,9 +134,22 @@ with tempfile.TemporaryDirectory(prefix="rune-r025-") as directory:
 
     def stop():
         global child, master
-        os.write(master, b"/quit\r")
-        assert child.wait(timeout=10) == 0
-        os.close(master)
+        write_terminal(master, b"/quit\r", transcript)
+        try:
+            status = wait_for_exit(child, master, transcript, 10)
+        except AssertionError:
+            # The helper drained the master while it waited and still saw no
+            # exit, so this is a genuine hang rather than a full PTY. Report
+            # whether the process is still alive before re-raising the tail.
+            print(
+                "[fixture] /quit sent but the session did not exit within 10s; "
+                f"alive={child.poll() is None}",
+                file=sys.stderr,
+                flush=True,
+            )
+            raise
+        assert status == 0, transcript.decode(errors="replace")
+        close_terminal(master)
         master = None
         child = None
 
@@ -164,10 +171,10 @@ with tempfile.TemporaryDirectory(prefix="rune-r025-") as directory:
         launch()
         wait_for("ctrl-c cancel")
         start = len(transcript)
-        os.write(master, b"die\r")
+        write_terminal(master, b"die\r", transcript)
         wait_for("STREAM-03", start)
         cut_stream.set()
-        wait_for("[the turn failed: the response stream ended without a completion event]", start)
+        wait_for("[the turn failed: the response stream ended without a completion event]\r\n", start)
         log, events = saved_events()
         assert [entry for entry in events if entry["kind"] == "assistant_message"] == [
             {"kind": "assistant_message", "turn": 1, "text": partial},
@@ -180,13 +187,13 @@ with tempfile.TemporaryDirectory(prefix="rune-r025-") as directory:
         assert not any(entry["kind"] == "turn_cancelled" for entry in events), events
 
         start = len(transcript)
-        os.write(master, b"/tree\r")
+        write_terminal(master, b"/tree\r", transcript)
         wait_for("[failed: incomplete_stream]", start)
         assert transcript[start:].decode(errors="replace").count("[failed: incomplete_stream]") == 1
 
         start = len(transcript)
-        os.write(master, b"after-failure\r")
-        wait_for("AFTER_FAILURE_OK", start)
+        write_terminal(master, b"after-failure\r", transcript)
+        wait_for("AFTER_FAILURE_OK\r\n", start)
         check_answer(requests[-1])
         session_id = log.parent.name
         stop()
@@ -194,15 +201,15 @@ with tempfile.TemporaryDirectory(prefix="rune-r025-") as directory:
         launch("resume", session_id)
         wait_for("ctrl-c cancel")
         start = len(transcript)
-        os.write(master, b"/tree\r")
+        write_terminal(master, b"/tree\r", transcript)
         wait_for("[failed: incomplete_stream]", start)
         replay = transcript[start:].decode(errors="replace")
         assert replay.count("[failed: incomplete_stream]") == 1, replay
         for line in partial.splitlines():
             assert replay.count(line) == 1, replay
         start = len(transcript)
-        os.write(master, b"after-resume\r")
-        wait_for("AFTER_RESUME_OK", start)
+        write_terminal(master, b"after-resume\r", transcript)
+        wait_for("AFTER_RESUME_OK\r\n", start)
         check_answer(requests[-1])
         stop()
         _, events = saved_events()
@@ -234,9 +241,12 @@ with tempfile.TemporaryDirectory(prefix="rune-r025-") as directory:
         if child is not None:
             if child.poll() is None:
                 child.kill()
-            child.wait(timeout=10)
+            if master is not None:
+                wait_for_exit(child, master, transcript, 10)
+            else:
+                child.wait(timeout=10)
         if master is not None:
-            os.close(master)
+            close_terminal(master)
         server.shutdown()
         server.server_close()
         server_thread.join(timeout=10)

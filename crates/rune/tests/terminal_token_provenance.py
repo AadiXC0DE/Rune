@@ -5,7 +5,6 @@ import http.server
 import json
 import os
 import pathlib
-import pty
 import select
 import struct
 import subprocess
@@ -64,10 +63,7 @@ with tempfile.TemporaryDirectory(prefix="rune-r115-") as directory:
         '[models.chat_completions]\nid = "provenance-fixture"\n'
         'context_window = 128000\n'
     )
-    environment = child_environment({key: value for key, value in os.environ.items()
-                   if not key.startswith("RUNE_") and key.lower() not in {
-                       "http_proxy", "https_proxy", "all_proxy",
-                   }})
+    environment = fixture_environment()
     environment.update({
         "HOME": directory,
         "XDG_CONFIG_HOME": str(root / "config"),
@@ -79,7 +75,7 @@ with tempfile.TemporaryDirectory(prefix="rune-r115-") as directory:
         "NO_COLOR": "1",
         "TERM": "xterm-256color",
     })
-    master, slave = pty.openpty()
+    master, slave = open_terminal()
     fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 120, 0, 0))
     try:
         child = subprocess.Popen(
@@ -95,7 +91,7 @@ with tempfile.TemporaryDirectory(prefix="rune-r115-") as directory:
     def capture(stage, expected, keys=b""):
         global offset
         if keys:
-            os.write(master, keys)
+            write_terminal(master, keys, transcript)
         deadline = time.monotonic() + 10
         while expected.encode() not in transcript[offset:]:
             assert time.monotonic() < deadline, (
@@ -105,9 +101,7 @@ with tempfile.TemporaryDirectory(prefix="rune-r115-") as directory:
             assert child.poll() is None, "Rune exited before the expected frame"
             if select.select([master], [], [], 0.05)[0]:
                 transcript.extend(os.read(master, 65536))
-        while select.select([master], [], [], 0.15)[0]:
-            assert time.monotonic() < deadline, "terminal never finished drawing"
-            transcript.extend(os.read(master, 65536))
+        drain_terminal(master, transcript, deadline=deadline)
         captures.append((stage, list(transcript[offset:])))
         offset = len(transcript)
 
@@ -122,14 +116,14 @@ with tempfile.TemporaryDirectory(prefix="rune-r115-") as directory:
         capture("new-footer", "started session", b"/new\r")
         capture("new-status", "context source request bytes (estimate)", b"/status\r")
         assert len(requests) == 2, requests
-        os.write(master, b"/quit\r")
-        assert child.wait(timeout=10) == 0
+        write_terminal(master, b"/quit\r", transcript)
+        assert wait_for_exit(child, master, transcript, 10) == 0
         print(json.dumps(captures))
     finally:
         if child.poll() is None:
             child.kill()
-        child.wait(timeout=10)
-        os.close(master)
+        wait_for_exit(child, master, transcript, 10)
+        close_terminal(master)
         server.shutdown()
         server.server_close()
         server_thread.join(timeout=10)

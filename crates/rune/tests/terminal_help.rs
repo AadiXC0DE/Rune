@@ -11,7 +11,11 @@ fn run(args: &[&str]) -> Vec<(String, Vec<u8>, String, u16)> {
     let output = std::process::Command::new("python3")
         .args([
             "-c",
-            &support::python_script(include_str!("terminal_help.py")),
+            &support::python_script(concat!(
+                include_str!("fixture_support.py"),
+                "\n",
+                include_str!("terminal_help.py")
+            )),
             env!("CARGO_BIN_EXE_rune"),
         ])
         .args(args)

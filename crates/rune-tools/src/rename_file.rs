@@ -94,23 +94,38 @@ impl Tool for RenameFile {
             }
         }
         context.check_cancelled()?;
-        rename_no_replace(&path, &new_path).map_err(|err| {
-            RuneError::new(
-                if err.kind() == std::io::ErrorKind::AlreadyExists {
-                    ErrorCode::AlreadyExists
-                } else {
-                    ErrorCode::UnsafePath
-                },
-                format!("cannot rename `{path}` to `{new_path}`: {err}"),
-            )
-            .with_hint(
-                "ensure the destination parent exists and both paths are on the same filesystem",
-            )
-        })?;
+        rename_no_replace(&path, &new_path).map_err(|err| rename_error(&path, &new_path, err))?;
         Ok(ToolOutput::success(format!(
             "Renamed `{path}` to `{new_path}`"
         )))
     }
+}
+
+fn rename_error(
+    source: &camino::Utf8Path,
+    destination: &camino::Utf8Path,
+    err: std::io::Error,
+) -> RuneError {
+    let (code, hint) = match err.kind() {
+        std::io::ErrorKind::Unsupported => (
+            ErrorCode::Unsupported,
+            "use a platform and filesystem that support atomic no-replace rename (Linux, Android, Apple platforms, or Windows)",
+        ),
+        std::io::ErrorKind::AlreadyExists => (
+            ErrorCode::AlreadyExists,
+            "choose an unused destination path",
+        ),
+        _ => (
+            ErrorCode::UnsafePath,
+            "ensure the destination parent exists and both paths are on the same filesystem",
+        ),
+    };
+    RuneError::new(
+        code,
+        format!("cannot rename `{source}` to `{destination}`: {err}"),
+    )
+    .with_hint(hint)
+    .with_io_source(err)
 }
 
 // Both names change in one filesystem operation. Never emulate this with
@@ -153,6 +168,21 @@ fn rename_no_replace(
 mod tests {
     use super::*;
     use camino::Utf8Path;
+
+    #[test]
+    fn an_unavailable_atomic_rename_is_explicitly_unsupported() {
+        let err = rename_error(
+            Utf8Path::new("source"),
+            Utf8Path::new("destination"),
+            std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "atomic no-replace rename is unavailable on this platform",
+            ),
+        );
+        assert_eq!(err.code(), ErrorCode::Unsupported);
+        assert!(err.message().contains("unavailable on this platform"));
+        assert!(err.hint().expect("alternative").contains("filesystem"));
+    }
 
     #[cfg(target_os = "linux")]
     #[test]

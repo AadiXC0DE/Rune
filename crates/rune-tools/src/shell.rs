@@ -267,7 +267,9 @@ impl Shell {
                     ErrorCode::Unsupported,
                     "PTY shell mode is only supported on Linux",
                 )
-                .with_hint("use `interactive` for piped input without a terminal"));
+                .with_hint(
+                    "omit `pty` (or set it to false); use `interactive: true` for piped input, or run on Linux for a controlling terminal",
+                ));
             }
             let (rows, cols) = dimensions.unwrap_or((24, 80));
             Input::Pty { rows, cols }
@@ -1454,8 +1456,12 @@ mod tests {
     fn pty_shell_mode_is_explicitly_unsupported_off_linux() {
         let tool = Shell::default();
         let (dir, mut context) = workspace();
-        for sandboxed in [false, true] {
+        // Refuse before backend detection even when sandbox fallback is allowed.
+        for (sandboxed, allow_unsandboxed) in
+            [(false, false), (false, true), (true, false), (true, true)]
+        {
             context.sandboxed = sandboxed;
+            context.allow_unsandboxed = allow_unsandboxed;
             let err = tool
                 .call(
                     &serde_json::json!({
@@ -1473,6 +1479,12 @@ mod tests {
             );
             assert!(!dir.path().join("spawned").exists());
             assert_eq!(tool.live_sessions(), 0);
+            assert!(err.message().contains("only supported on Linux"), "{err}");
+            let hint = err.hint().expect("an actionable alternative");
+            assert!(hint.contains("omit `pty`"), "{hint}");
+            assert!(hint.contains("interactive: true"), "{hint}");
+            assert!(hint.contains("controlling terminal"), "{hint}");
+            assert_eq!(lock(&tool.state).starting, 0);
         }
     }
 

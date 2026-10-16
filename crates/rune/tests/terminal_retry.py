@@ -5,7 +5,6 @@ import http.server
 import json
 import os
 import pathlib
-import pty
 import select
 import struct
 import subprocess
@@ -80,12 +79,7 @@ with tempfile.TemporaryDirectory(prefix="rune-r075-") as directory:
     server.daemon_threads = True
     server_thread = threading.Thread(target=server.serve_forever, daemon=True)
     server_thread.start()
-    environment = child_environment({
-        key: value for key, value in os.environ.items()
-        if not key.startswith("RUNE_") and key.lower() not in {
-            "http_proxy", "https_proxy", "all_proxy",
-        }
-    })
+    environment = fixture_environment()
     environment.update({
         "HOME": directory,
         "XDG_CONFIG_HOME": str(root / "config"),
@@ -100,7 +94,7 @@ with tempfile.TemporaryDirectory(prefix="rune-r075-") as directory:
         "NO_COLOR": "1",
         "TERM": "xterm-256color",
     })
-    master, slave = pty.openpty()
+    master, slave = open_terminal()
     fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 80, 0, 0))
     try:
         child = subprocess.Popen(
@@ -135,7 +129,7 @@ with tempfile.TemporaryDirectory(prefix="rune-r075-") as directory:
 
     try:
         wait_for("ctrl-c cancel")
-        os.write(master, b"retry please\r")
+        write_terminal(master, b"retry please\r", transcript)
         capture("provider retry 2/3 in 1000ms")
         assert len(requests) == 1, requests
         capture("provider retry 2/3 |")
@@ -144,25 +138,22 @@ with tempfile.TemporaryDirectory(prefix="rune-r075-") as directory:
         assert len(requests) == 2, requests
         capture("provider retry 3/3 |")
         release_third.set()
-        wait_for("RETRY-RECOVERED", offset)
+        wait_for("RETRY-RECOVERED\r\n", offset)
         # Drain through the worker poll and completed exchange's final frame.
-        deadline = time.monotonic() + 10
-        while select.select([master], [], [], 0.15)[0]:
-            assert time.monotonic() < deadline, "the completed renderer did not settle"
-            transcript.extend(os.read(master, 65536))
+        drain_terminal(master, transcript, quiet=0.15)
         captures.append(("completed", list(transcript[offset:])))
         assert len(requests) == 3, requests
         assert all(request["messages"][-1]["content"] == "retry please" for request in requests)
-        os.write(master, b"/quit\r")
-        assert child.wait(timeout=10) == 0
+        write_terminal(master, b"/quit\r", transcript)
+        assert wait_for_exit(child, master, transcript, 10) == 0
         print(json.dumps(captures))
     finally:
         release_second.set()
         release_third.set()
         if child.poll() is None:
             child.kill()
-        child.wait(timeout=10)
-        os.close(master)
+        wait_for_exit(child, master, transcript, 10)
+        close_terminal(master)
         server.shutdown()
         server.server_close()
         server_thread.join(timeout=10)
