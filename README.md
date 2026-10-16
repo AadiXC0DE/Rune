@@ -759,6 +759,14 @@ offline switch: hosts must filter remote configurations before `connect_all`
 and arrange any isolation required for stdio children. Host-supplied backends
 and child processes do not acquire offline enforcement merely by using Rune.
 
+The `shell` tool's `pty: true` mode is Linux-only. It provides a controlling
+terminal, merges stdout and stderr, and supports resizing through `interact`.
+On macOS, Windows, and other platforms, Rune refuses this mode before starting
+the command with `unsupported`. Omit `pty` (or set it to false); set
+`interactive: true` to send input through a pipe. Programs that require a
+controlling terminal need Linux PTY mode. The Unix terminal replay tests below
+exercise Rune's terminal UI and do not imply shell-tool PTY support on macOS.
+
 ## Unsafe code boundaries
 
 The [workspace lint](Cargo.toml) denies unsafe code by default and permits
