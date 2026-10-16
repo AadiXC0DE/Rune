@@ -196,17 +196,12 @@ sys.exit(9 if mode == "editor-failed" else 0)
                 time.sleep(0.01)
             editor_open.set()
             assert stream_sent.wait(10), "provider did not stream while editing"
-            while select.select([master], [], [], 0.2)[0]:
-                assert time.monotonic() < deadline, "terminal never became idle"
-                transcript.extend(os.read(master, 65536))
+            drain_terminal(master, transcript, quiet=0.2, deadline=deadline)
             assert b"EDITOR_STREAM_HIDDEN" not in transcript[start:], transcript[start:]
             (root / "editor-exit").touch()
         wait_for(expected, start)
         # Drain complete frames before handing the byte stream to Rune's grid.
-        deadline = time.monotonic() + 10
-        while select.select([master], [], [], 0.1)[0]:
-            assert time.monotonic() < deadline, "terminal never finished drawing"
-            transcript.extend(os.read(master, 65536))
+        drain_terminal(master, transcript, quiet=0.1)
         captures.append((stage, list(transcript)))
 
     try:

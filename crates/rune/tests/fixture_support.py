@@ -2,6 +2,9 @@
 
 Each fixture `.rs` wrapper prepends this file to the fixture it runs.
 
+`drain_terminal` settles screen captures and handles both PTY EOF conventions.
+It is an output-silence heuristic, not a command-completion signal.
+
 `wait_for_exit` is the one shutdown path for a PTY child: it drains the master
 while it waits, so the child can write its last frame and exit instead of
 wedging on a full PTY buffer (macOS). The fixtures call it in place of a bare
@@ -22,6 +25,7 @@ disturbed. This only observes the fixtures: it changes no wait, no bound, and no
 assertion.
 """
 
+import errno as _errno
 import os as _os
 import select as _select
 import subprocess as _subprocess
@@ -32,17 +36,42 @@ _run = _subprocess.run
 
 
 def _pump(master, transcript, timeout):
-    """Reads whatever a PTY child has written, waiting at most `timeout`."""
+    """Read once: bytes for output, b"" for EOF, None for no ready output.
+
+    EOF remains selectable. macOS can return an empty read where Linux PTYs
+    raise EIO; neither means there is another chunk to drain. Other errors
+    (including a bad descriptor) must still fail the fixture.
+    """
     ready, _, _ = _select.select([master], [], [], timeout)
     if not ready:
-        return
+        return None
     try:
         chunk = _os.read(master, 65536)
-    except OSError:
-        # The slave side is gone, so there is nothing left to read.
-        return
+    except OSError as error:
+        if error.errno != _errno.EIO:
+            raise
+        return b""
     if transcript is not None:
         transcript.extend(chunk)
+    return chunk
+
+
+def drain_terminal(master, transcript, quiet=0.15, timeout=10, deadline=None):
+    """Collect a frame until output is quiet or the PTY reaches EOF.
+
+    Silence only settles screen captures; it does not prove that a command or
+    turn completed. Fixtures must first wait for their expected product output,
+    and use wait_for_exit for shutdown. A slave kept open without output is
+    quiet, so this never waits for all inherited descriptors to close.
+    """
+    if deadline is None:
+        deadline = _time.monotonic() + timeout
+    while True:
+        remaining = deadline - _time.monotonic()
+        if remaining <= 0:
+            raise AssertionError("terminal never became idle:\n" + _tail(transcript))
+        if not _pump(master, transcript, min(quiet, remaining)):
+            return
 
 
 def wait_for_exit(child, master, transcript=None, timeout=10):

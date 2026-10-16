@@ -224,10 +224,7 @@ with tempfile.TemporaryDirectory(prefix="rune-r034-") as directory:
         if keys:
             os.write(master, keys)
         wait_for(expected, start)
-        deadline = time.monotonic() + 10
-        while select.select([master], [], [], 0.15)[0]:
-            assert time.monotonic() < deadline, "terminal never finished drawing"
-            transcript.extend(os.read(master, 65536))
+        drain_terminal(master, transcript, quiet=0.15)
         captures.append({"stage": stage, "cols": cols, "rows": rows,
                          "bytes": list(transcript[offset:])})
         offset = len(transcript)

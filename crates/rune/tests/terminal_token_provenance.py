@@ -105,9 +105,7 @@ with tempfile.TemporaryDirectory(prefix="rune-r115-") as directory:
             assert child.poll() is None, "Rune exited before the expected frame"
             if select.select([master], [], [], 0.05)[0]:
                 transcript.extend(os.read(master, 65536))
-        while select.select([master], [], [], 0.15)[0]:
-            assert time.monotonic() < deadline, "terminal never finished drawing"
-            transcript.extend(os.read(master, 65536))
+        drain_terminal(master, transcript, deadline=deadline)
         captures.append((stage, list(transcript[offset:])))
         offset = len(transcript)
 

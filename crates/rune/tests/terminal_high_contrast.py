@@ -46,10 +46,7 @@ def capture(binary, root, environment):
         start = len(transcript)
         os.write(master, b"/")
         wait_for(b"/model", start)
-        deadline = time.monotonic() + 10
-        while select.select([master], [], [], 0.1)[0]:
-            assert time.monotonic() < deadline, "terminal never finished drawing"
-            transcript.extend(os.read(master, 65536))
+        drain_terminal(master, transcript, quiet=0.1)
         result = list(transcript)
         os.write(master, b"\x03/quit\r")
         assert wait_for_exit(child, master, transcript, 10) == 0, transcript.decode(errors="replace")

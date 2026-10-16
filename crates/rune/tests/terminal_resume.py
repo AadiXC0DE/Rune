@@ -130,13 +130,7 @@ with tempfile.TemporaryDirectory(prefix="rune-r038-") as directory:
                 transcript.extend(os.read(master, 65536))
 
     def drain():
-        deadline = time.monotonic() + 2
-        while time.monotonic() < deadline:
-            readable, _, _ = select.select([master], [], [], 0.15)
-            if not readable:
-                return
-            transcript.extend(os.read(master, 65536))
-        raise AssertionError("terminal never settled")
+        drain_terminal(master, transcript, timeout=2)
 
     def capture(stage, cols):
         captures.append({"stage": stage, "cols": cols, "bytes": list(transcript)})

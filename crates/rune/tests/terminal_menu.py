@@ -115,10 +115,7 @@ with tempfile.TemporaryDirectory(prefix="rune-terminal-menu-") as directory:
         start = len(transcript)
         os.write(master, keys)
         wait_for(expected, start)
-        deadline = time.monotonic() + 10
-        while select.select([master], [], [], 0.1)[0]:
-            assert time.monotonic() < deadline, "terminal never finished drawing"
-            transcript.extend(os.read(master, 65536))
+        drain_terminal(master, transcript, quiet=0.1)
         captures.append((stage, list(transcript)))
 
     try:

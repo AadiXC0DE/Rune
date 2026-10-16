@@ -102,10 +102,7 @@ def capture(binary, root, environment, arguments):
                 transcript.extend(os.read(master, 65536))
 
     def drain():
-        deadline = time.monotonic() + 10
-        while select.select([master], [], [], 0.1)[0]:
-            assert time.monotonic() < deadline, "terminal never finished drawing"
-            transcript.extend(os.read(master, 65536))
+        drain_terminal(master, transcript, quiet=0.1)
 
     try:
         wait_for(b"ctrl-c cancel")

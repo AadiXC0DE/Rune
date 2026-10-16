@@ -146,10 +146,7 @@ with tempfile.TemporaryDirectory(prefix="rune-r075-") as directory:
         release_third.set()
         wait_for("RETRY-RECOVERED", offset)
         # Drain through the worker poll and completed exchange's final frame.
-        deadline = time.monotonic() + 10
-        while select.select([master], [], [], 0.15)[0]:
-            assert time.monotonic() < deadline, "the completed renderer did not settle"
-            transcript.extend(os.read(master, 65536))
+        drain_terminal(master, transcript, quiet=0.15)
         captures.append(("completed", list(transcript[offset:])))
         assert len(requests) == 3, requests
         assert all(request["messages"][-1]["content"] == "retry please" for request in requests)

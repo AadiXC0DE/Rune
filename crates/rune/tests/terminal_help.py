@@ -1,6 +1,5 @@
 """R-073: discover bindings through /help, then exercise them in a real PTY."""
 
-import errno
 import fcntl
 import http.server
 import json
@@ -122,15 +121,7 @@ with tempfile.TemporaryDirectory(prefix="rune-r073-") as directory:
     captures = []
 
     def drain():
-        deadline = time.monotonic() + 10
-        while select.select([master], [], [], 0.15)[0]:
-            assert time.monotonic() < deadline, "terminal never became idle"
-            try:
-                transcript.extend(os.read(master, 65536))
-            except OSError as error:
-                if error.errno == errno.EIO:
-                    return  # The child closed its PTY on a requested exit.
-                raise
+        drain_terminal(master, transcript)
 
     def wait_for(text, start=0):
         deadline = time.monotonic() + 10
@@ -169,7 +160,7 @@ with tempfile.TemporaryDirectory(prefix="rune-r073-") as directory:
             wait_for("Input: terminal line mode")
             assert b"Keyboard bindings (interactive key input)" not in transcript
             assert b"Enter submits one line; end of input leaves the session." in transcript
-            keys(b"/quit\n")
+            os.write(master, b"/quit\n")
             assert wait_for_exit(child, master, transcript, 10) == 0
             print(json.dumps(captures))
             sys.exit(0)
