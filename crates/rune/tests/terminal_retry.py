@@ -154,14 +154,14 @@ with tempfile.TemporaryDirectory(prefix="rune-r075-") as directory:
         assert len(requests) == 3, requests
         assert all(request["messages"][-1]["content"] == "retry please" for request in requests)
         os.write(master, b"/quit\r")
-        assert child.wait(timeout=10) == 0
+        assert wait_for_exit(child, master, transcript, 10) == 0
         print(json.dumps(captures))
     finally:
         release_second.set()
         release_third.set()
         if child.poll() is None:
             child.kill()
-        child.wait(timeout=10)
+        wait_for_exit(child, master, transcript, 10)
         os.close(master)
         server.shutdown()
         server.server_close()

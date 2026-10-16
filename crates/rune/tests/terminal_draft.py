@@ -324,13 +324,13 @@ sys.exit(9 if mode == "editor-failed" else 0)
         wait_for("DRAFT_RECEIVED\r\n", len(transcript) if editor_mode == "editor-steering" else 0)
         assert prompts == (["start", submitted] if editor_mode == "editor-steering" else [submitted]), prompts
         os.write(master, b"/quit\r")
-        assert child.wait(timeout=10) == 0
+        assert wait_for_exit(child, master, transcript, 10) == 0
         assert not errors, errors
         print(json.dumps(captures))
     finally:
         if child.poll() is None:
             child.kill()
-        child.wait(timeout=10)
+        wait_for_exit(child, master, transcript, 10)
         os.close(master)
         server.shutdown()
         server.server_close()

@@ -145,15 +145,14 @@ with tempfile.TemporaryDirectory(prefix="rune-r038-") as directory:
         global child, master
         os.write(master, b"/quit\r")
         try:
-            status = child.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            # Pure observation: the wait bound and the transcript are
-            # unchanged. The tail separates "still painting, so blocked on a
-            # full PTY" from "idle at the prompt, so /quit was never handled".
+            status = wait_for_exit(child, master, transcript, 10)
+        except AssertionError:
+            # The helper drained the master while it waited and still saw no
+            # exit, so this is a genuine hang rather than a full PTY. Report
+            # whether the process is still alive before re-raising the tail.
             print(
                 "[fixture] /quit sent but the session did not exit within 10s; "
-                f"alive={child.poll() is None}; transcript tail:\n"
-                + transcript.decode(errors="replace")[-4000:],
+                f"alive={child.poll() is None}",
                 file=sys.stderr,
                 flush=True,
             )
@@ -225,7 +224,10 @@ with tempfile.TemporaryDirectory(prefix="rune-r038-") as directory:
         if child is not None:
             if child.poll() is None:
                 child.kill()
-            child.wait(timeout=10)
+            if master is not None:
+                wait_for_exit(child, master, transcript, 10)
+            else:
+                child.wait(timeout=10)
         if master is not None:
             os.close(master)
         server.shutdown()

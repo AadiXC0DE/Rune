@@ -336,13 +336,13 @@ with tempfile.TemporaryDirectory(prefix="rune-r034-") as directory:
             capture("finished-answer", b"long-word\r", "END-LONG-W\r\nORD\r\n")
             assert prompts == ["long-word"], prompts
         os.write(master, b"/quit\r")
-        assert child.wait(timeout=10) == 0
+        assert wait_for_exit(child, master, transcript, 10) == 0
         assert not errors, errors
         print(json.dumps(captures))
     finally:
         if child.poll() is None:
             child.kill()
-        child.wait(timeout=10)
+        wait_for_exit(child, master, transcript, 10)
         os.close(master)
         server.shutdown()
         server.server_close()

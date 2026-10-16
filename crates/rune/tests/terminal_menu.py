@@ -148,12 +148,12 @@ with tempfile.TemporaryDirectory(prefix="rune-terminal-menu-") as directory:
             capture("model-last", b"/model\r" + b"\x1b[B" * 14, "> menu-model-15")
             capture("model-closed", b"\x1b", "\x1b[?25h")
         os.write(master, b"/quit\r")
-        assert child.wait(timeout=10) == 0
+        assert wait_for_exit(child, master, transcript, 10) == 0
         print(json.dumps({"captures": captures, "requests": requests} if tagged_model else captures))
     finally:
         if child.poll() is None:
             child.kill()
-        child.wait(timeout=10)
+        wait_for_exit(child, master, transcript, 10)
         os.close(master)
         server.shutdown()
         server.server_close()

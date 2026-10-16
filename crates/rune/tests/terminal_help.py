@@ -170,7 +170,7 @@ with tempfile.TemporaryDirectory(prefix="rune-r073-") as directory:
             assert b"Keyboard bindings (interactive key input)" not in transcript
             assert b"Enter submits one line; end of input leaves the session." in transcript
             keys(b"/quit\n")
-            assert child.wait(timeout=10) == 0
+            assert wait_for_exit(child, master, transcript, 10) == 0
             print(json.dumps(captures))
             sys.exit(0)
 
@@ -311,7 +311,7 @@ with tempfile.TemporaryDirectory(prefix="rune-r073-") as directory:
         # Idle Escape stays, idle Ctrl-D leaves. A second process proves Ctrl-C.
         draft("idle-escape-empty", b"\x1b", "", 2)
         os.write(master, b"\x04")
-        assert child.wait(timeout=10) == 0
+        assert wait_for_exit(child, master, transcript, 10) == 0
         os.close(master)
         master, slave = pty.openpty()
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 100, 0, 0))
@@ -323,7 +323,7 @@ with tempfile.TemporaryDirectory(prefix="rune-r073-") as directory:
         transcript = bytearray()
         wait_for("ctrl-c cancel")
         os.write(master, b"\x03")
-        assert child.wait(timeout=10) == 0
+        assert wait_for_exit(child, master, transcript, 10) == 0
         assert not errors, errors
         print(json.dumps(captures))
     finally:
@@ -331,7 +331,7 @@ with tempfile.TemporaryDirectory(prefix="rune-r073-") as directory:
             release.set()
         if child.poll() is None:
             child.kill()
-        child.wait(timeout=10)
+        wait_for_exit(child, master, transcript, 10)
         os.close(master)
         server.shutdown()
         server.server_close()

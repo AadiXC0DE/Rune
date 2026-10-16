@@ -237,7 +237,7 @@ with tempfile.TemporaryDirectory(prefix="rune-r008-") as directory:
         assert all("SHOULD_NOT_STEER" not in prompt for prompt in prompts), prompts
 
         send(b"/quit\r")
-        assert child.wait(timeout=10) == 0
+        assert wait_for_exit(child, master, transcript, 10) == 0
 
         # Machine callers still fail promptly instead of collecting input.
         piped = subprocess.run(
@@ -257,7 +257,7 @@ with tempfile.TemporaryDirectory(prefix="rune-r008-") as directory:
         release_draft.set()
         if child.poll() is None:
             child.kill()
-        child.wait(timeout=10)
+        wait_for_exit(child, master, transcript, 10)
         os.close(master)
         server.shutdown()
         server.server_close()

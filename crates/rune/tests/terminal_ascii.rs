@@ -10,7 +10,11 @@ fn ascii_setting_uses_ascii_decorations_in_terminal_sessions() {
     let output = std::process::Command::new("python3")
         .args([
             "-c",
-            &support::python_script(include_str!("terminal_ascii.py")),
+            &support::python_script(concat!(
+                include_str!("fixture_support.py"),
+                "\n",
+                include_str!("terminal_ascii.py")
+            )),
             env!("CARGO_BIN_EXE_rune"),
         ])
         .output()

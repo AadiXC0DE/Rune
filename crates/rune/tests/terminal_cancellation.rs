@@ -10,7 +10,11 @@ fn cancellation_saves_the_visible_answer_and_one_boundary_across_resume() {
     let output = std::process::Command::new("python3")
         .args([
             "-c",
-            &support::python_script(include_str!("terminal_cancellation.py")),
+            &support::python_script(concat!(
+                include_str!("fixture_support.py"),
+                "\n",
+                include_str!("terminal_cancellation.py")
+            )),
             env!("CARGO_BIN_EXE_rune"),
         ])
         .output()

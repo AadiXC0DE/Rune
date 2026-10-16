@@ -1,7 +1,14 @@
-"""Self-describing subprocess deadlines, shared by the fixtures that spawn rune.
+"""Shared plumbing for the fixtures that spawn rune over a PTY.
 
-Each fixture `.rs` wrapper prepends this file to the fixture it runs, so every
-`subprocess.run` in those fixtures reports what happened at its deadline:
+Each fixture `.rs` wrapper prepends this file to the fixture it runs.
+
+`wait_for_exit` is the one shutdown path for a PTY child: it drains the master
+while it waits, so the child can write its last frame and exit instead of
+wedging on a full PTY buffer (macOS). The fixtures call it in place of a bare
+`child.wait(timeout=...)`, which is what used to hang.
+
+Every `subprocess.run` in those fixtures also reports what happened at its
+deadline:
 
 - which command was run (the rune arguments, without the machine-specific path),
 - how long the wait actually was,
@@ -15,6 +22,8 @@ disturbed. This only observes the fixtures: it changes no wait, no bound, and no
 assertion.
 """
 
+import os as _os
+import select as _select
 import subprocess as _subprocess
 import sys as _sys
 import time as _time
@@ -22,12 +31,54 @@ import time as _time
 _run = _subprocess.run
 
 
+def _pump(master, transcript, timeout):
+    """Reads whatever a PTY child has written, waiting at most `timeout`."""
+    ready, _, _ = _select.select([master], [], [], timeout)
+    if not ready:
+        return
+    try:
+        chunk = _os.read(master, 65536)
+    except OSError:
+        # The slave side is gone, so there is nothing left to read.
+        return
+    if transcript is not None:
+        transcript.extend(chunk)
+
+
+def wait_for_exit(child, master, transcript=None, timeout=10):
+    """Waits for a PTY child to exit, draining the master while it shuts down.
+
+    A terminal session writes its last frame as it exits. On a platform whose
+    PTY buffer is small (macOS) a driver that merely waits lets that buffer
+    fill, which wedges the child in a write and leaves it unreaped; a later
+    kill can then hang too, because the child never leaves the write. Reading
+    the master while waiting is what keeps the child moving -- the same
+    remedy the MCP fixtures already use. Bytes read are appended to
+    `transcript` when one is supplied, so a fixture keeps every byte it reads
+    for its own assertions. Returns the exit status, and raises an
+    AssertionError carrying the transcript tail if the child outlives
+    `timeout`.
+    """
+    deadline = _time.monotonic() + timeout
+    while child.poll() is None:
+        remaining = deadline - _time.monotonic()
+        if remaining <= 0:
+            raise AssertionError(
+                f"session did not exit within {timeout}s of the quit request:\n"
+                + _tail(transcript)
+            )
+        _pump(master, transcript, min(remaining, 0.1))
+    # Collect the bytes the child wrote just before it exited.
+    _pump(master, transcript, 0)
+    return child.returncode
+
+
 def _tail(data, limit=4000):
     """The trailing bytes of a child's output, decoded for a readable log."""
     if not data:
         return ""
-    if isinstance(data, bytes):
-        data = data.decode("utf-8", "replace")
+    if isinstance(data, (bytes, bytearray, memoryview)):
+        data = bytes(data).decode("utf-8", "replace")
     return data[-limit:]
 
 
