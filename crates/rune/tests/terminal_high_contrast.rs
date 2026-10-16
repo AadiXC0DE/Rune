@@ -3,12 +3,14 @@
 #![cfg(unix)]
 #![allow(clippy::expect_used)]
 
+mod support;
+
 #[test]
 fn high_contrast_draws_explicit_pairs_and_no_color_suppresses_them() {
     let output = std::process::Command::new("python3")
         .args([
             "-c",
-            include_str!("terminal_high_contrast.py"),
+            &support::python_script(include_str!("terminal_high_contrast.py")),
             env!("CARGO_BIN_EXE_rune"),
         ])
         .output()

@@ -109,14 +109,14 @@ def run_fixture(ask, mode):
         server.daemon_threads = True
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
-        environment = {
+        environment = child_environment({
             "HOME": directory, "PATH": "/usr/bin:/bin", "NO_COLOR": "1",
             "XDG_CONFIG_HOME": str(base / "config"), "XDG_DATA_HOME": str(base / "data"),
             "XDG_STATE_HOME": str(base / "state"), "RUNE_HOME": str(base / "rune-state"),
             "RUNE_PROVIDER": "chat_completions", "RUNE_MODEL": "fixture-model",
             "RUNE_BASE_URL": f"http://127.0.0.1:{server.server_port}/v1",
             "RUNE_API_KEY_ENV": "RUNE_VISION_TEST_KEY", "RUNE_VISION_TEST_KEY": "fixture-key",
-        }
+        })
         try:
             args = [sys.argv[1], "--permission-mode", "full-access"]
             args += ["ask", "--json", "describe the image"] if ask else ["--accessible"]

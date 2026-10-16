@@ -1,6 +1,9 @@
 //! R-187: fork the saved journal through the actual CLI, then resume both sides.
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 
+mod support;
+use support::CommandExt as _;
+
 use std::io::Write as _;
 use std::process::{Command, Output, Stdio};
 
@@ -96,7 +99,7 @@ impl Fixture {
 
     fn run(&self, args: &[&str], input: &str) -> Output {
         let mut child = Command::new(env!("CARGO_BIN_EXE_rune"))
-            .env_clear()
+            .isolated_env()
             .env("HOME", &self.root)
             .env("RUNE_HOME", &self.paths.state_root)
             .env("XDG_CONFIG_HOME", self.root.join("config"))
@@ -164,19 +167,21 @@ fn completed_tool_group_forks_and_both_sessions_resume_independently() {
         "[]",
     )
     .expect("source archive");
+    // Whole-directory snapshots also read session.lock, which Windows refuses
+    // while it is locked. Take both snapshots outside the writer's lifetime.
+    let before = fixture.files(&fixture.id);
     // A reader can fork a durable prefix while a source writer holds its lock.
     let writer = SessionStore::open(&fixture.paths.session_dir(&fixture.id)).expect("writer");
-    let before = fixture.files(&fixture.id);
     let source = load_read_only(&fixture.paths.session_dir(&fixture.id)).expect("source");
     let output = fixture.fork(fixture.id.as_str(), "10");
     let branch = fork_id(&output);
     assert_ne!(branch, fixture.id);
+    drop(writer);
     assert_eq!(
         fixture.files(&fixture.id),
         before,
         "fork touched source files"
     );
-    drop(writer);
     let copied = load_read_only(&fixture.paths.session_dir(&branch)).expect("branch");
     assert_eq!(&copied.events[..10], &source.events[..10]);
     assert_eq!(copied.events.len(), 11);

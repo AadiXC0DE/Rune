@@ -2,12 +2,14 @@
 
 #![allow(clippy::expect_used)]
 
+mod support;
+
 #[test]
 fn synchronous_children_return_reads_and_cannot_escape_their_allowlist() {
     let output = std::process::Command::new("python3")
         .args([
             "-c",
-            include_str!("subagent.py"),
+            &support::python_script(include_str!("subagent.py")),
             env!("CARGO_BIN_EXE_rune"),
         ])
         .output()

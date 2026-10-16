@@ -121,8 +121,7 @@ mod tests {
             )
             .expect("call");
         assert!(!output.is_error);
-        // The path is reported as resolved, so Windows spells it with its own
-        // separator.
+        // The resolved path uses native separators; only its stable suffix matters.
         assert!(
             output.text.replace('\\', "/").contains("notes/one.txt"),
             "{}",

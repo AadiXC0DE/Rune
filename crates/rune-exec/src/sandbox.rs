@@ -23,6 +23,11 @@
 //! - Linux builds a mount and network namespace through the `bwrap` helper. The
 //!   helper restricts the process tree as a whole, which is the every-thread
 //!   guarantee an in-process restriction would have to ask for explicitly.
+//! - Windows has no backend. A Seatbelt profile cannot name a Windows path, and
+//!   `bwrap` is a Linux helper, so [`detect`] returns [`NullSandbox`], which
+//!   refuses a command unless `allow_unsandboxed` is passed. The refusal names
+//!   the operating system rather than inventing a restriction, because there is
+//!   no Windows sandbox to fall back to.
 
 use std::fmt::Write as _;
 use std::process::{Command, Output, Stdio};
@@ -1010,6 +1015,7 @@ mod tests {
         SandboxPolicy::new(workspace.to_owned(), Vec::new(), false)
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn pty_wrapping_preserves_namespaces_without_detaching_the_terminal() {
         let dir = tempfile::tempdir().expect("workspace");
@@ -1034,9 +1040,9 @@ mod tests {
         assert_eq!(pty.reviewed, prepared.reviewed);
     }
 
-    #[test]
-    fn reported_paths_match_the_rules_of_both_backends() {
-        let (_guard, root) = tempdir();
+    /// Shared discovery uses native paths; each rule builder is checked on its OS.
+    fn reported_paths_fixture() -> (TempDir, SandboxPolicy, Vec<Utf8PathBuf>, PolicyPaths) {
+        let (guard, root) = tempdir();
         let workspace = root.join("workspace");
         let extra = root.join("extra");
         let credentials = root.join("credentials");
@@ -1047,9 +1053,21 @@ mod tests {
         let policy = SandboxPolicy::new(workspace, vec![extra], false);
         let credentials = vec![credentials.canonicalize_utf8().expect("resolved")];
         let paths = policy.paths_with(&credentials).expect("paths");
+        (guard, policy, credentials, paths)
+    }
+
+    #[test]
+    fn reported_paths_include_every_root_repository_and_credential() {
+        let (_guard, _policy, credentials, paths) = reported_paths_fixture();
         assert_eq!(paths.writable_roots.len(), 2);
         assert_eq!(paths.protected_paths.len(), 4);
         assert_eq!(paths.credential_paths, credentials);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn reported_paths_match_the_seatbelt_profile() {
+        let (_guard, policy, credentials, paths) = reported_paths_fixture();
         let profile = MacSandbox::profile_with(&policy, &credentials).expect("profile");
         for path in &paths.writable_roots {
             assert!(profile.contains(&format!(
@@ -1073,6 +1091,12 @@ mod tests {
                 operand(path).expect("operand")
             )));
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn reported_paths_match_the_linux_argv() {
+        let (_guard, policy, _credentials, _paths) = reported_paths_fixture();
         let prepared =
             prepare("echo fixture", &policy.workspace, None, environment()).expect("prepare");
         let argv =
@@ -1309,6 +1333,7 @@ mod tests {
         assert!(!wrapped.argv.contains(&String::from("--unshare-net")));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn a_full_backend_without_a_helper_refuses() {
         let (_dir, dir) = tempdir();
@@ -1735,7 +1760,7 @@ mod tests {
     }
 
     #[test]
-    fn both_backends_protect_nested_repositories_after_every_write_grant() {
+    fn repository_discovery_finds_nested_repositories_without_duplicate_protections() {
         let (_guard, policy, repositories) = nested_repositories();
         let paths = policy.resolved_paths().expect("paths");
         let mut expected = Vec::new();
@@ -1752,20 +1777,37 @@ mod tests {
         actual.sort();
         expected.sort();
         assert_eq!(actual, expected, "missing or duplicate protections");
+    }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn seatbelt_protects_nested_repositories_after_every_write_grant() {
+        let (_guard, policy, repositories) = nested_repositories();
+        let paths = policy.resolved_paths().expect("paths");
+        assert_eq!(paths.protected_paths.len(), repositories.len() * 2);
         let profile = MacSandbox::profile_with(&policy, &[]).expect("profile");
         let last_write_grant = profile.rfind("(allow file-write*").expect("write grant");
-        let prepared =
-            prepare("echo fixture", &policy.workspace, None, environment()).expect("prepare");
-        let argv =
-            LinuxSandbox::argv(Utf8Path::new("/fixture/bwrap"), &prepared, &policy).expect("argv");
-        let last_writable_bind = argv.iter().rposition(|arg| arg == "--bind").expect("bind");
-        for protected in &expected {
+        for protected in &paths.protected_paths {
             let deny = format!(
                 "(deny file-write* {})",
                 operand(protected).expect("operand")
             );
             assert!(profile.find(&deny).expect("deny") > last_write_grant);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_protects_nested_repositories_after_every_write_grant() {
+        let (_guard, policy, repositories) = nested_repositories();
+        let paths = policy.resolved_paths().expect("paths");
+        assert_eq!(paths.protected_paths.len(), repositories.len() * 2);
+        let prepared =
+            prepare("echo fixture", &policy.workspace, None, environment()).expect("prepare");
+        let argv =
+            LinuxSandbox::argv(Utf8Path::new("/fixture/bwrap"), &prepared, &policy).expect("argv");
+        let last_writable_bind = argv.iter().rposition(|arg| arg == "--bind").expect("bind");
+        for protected in &paths.protected_paths {
             let read_only = argv
                 .windows(3)
                 .position(|args| args == ["--ro-bind", protected.as_str(), protected.as_str()])
@@ -1851,6 +1893,29 @@ mod tests {
         assert!(!repositories[2].join(".git/hooks").exists());
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_seatbelt_profile_refuses_paths_with_uncarryable_characters() {
+        let (_guard, root) = tempdir();
+        for name in ["quote\"here", "backslash\\here", "newline\nhere"] {
+            // These are valid macOS directory names, but unsafe profile operands.
+            let workspace = root.join(name);
+            std::fs::create_dir(&workspace).expect("workspace");
+            let resolved = workspace.canonicalize_utf8().expect("resolved workspace");
+            let error = MacSandbox::profile_with(&policy(&workspace), &[])
+                .expect_err("an uncarryable workspace");
+            assert_eq!(error.code(), ErrorCode::InvalidField);
+            assert_eq!(error.field(), Some("path"));
+            assert!(error.message().contains(resolved.as_str()), "{error}");
+            assert!(error.message().contains("sandbox profile cannot carry"));
+            assert_eq!(
+                error.hint(),
+                Some("use a workspace path without a quote, a backslash, or a newline")
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
     #[test]
     fn an_absent_seatbelt_destination_is_protected_as_a_subtree() {
         let (_guard, workspace) = tempdir();

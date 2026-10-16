@@ -1,6 +1,9 @@
 //! R-181: importing Ollama uses native local metadata and records provenance.
 #![allow(clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 
+mod support;
+use support::CommandExt as _;
+
 use std::io::{BufRead, Read, Write};
 use std::net::TcpListener;
 use std::process::{Command, Output};
@@ -19,7 +22,7 @@ fn profile() -> tempfile::TempDir {
 
 fn run(dir: &std::path::Path, args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_rune"))
-        .env_clear()
+        .isolated_env()
         .env("HOME", dir)
         .env("RUNE_HOME", dir.join("state"))
         .env("RUNE_CONFIG", dir.join("config.toml"))
@@ -81,6 +84,12 @@ fn imports_two_local_models_without_a_remote_catalog_and_keeps_inference_working
                     Err(error) => panic!("accept: {error}"),
                 }
             };
+            // `accept` inherits `O_NONBLOCK` from a nonblocking listener on
+            // macOS, unlike Linux; the read timeout below is the real bound, so
+            // the accepted socket must be blocking before it is read.
+            stream
+                .set_nonblocking(false)
+                .expect("blocking request socket");
             stream
                 .set_read_timeout(Some(Duration::from_secs(5)))
                 .expect("read timeout");

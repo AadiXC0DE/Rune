@@ -2125,6 +2125,12 @@ mod tests {
                     Err(error) => panic!("fixture accept: {error}"),
                 }
             };
+            // `accept` inherits `O_NONBLOCK` from a nonblocking listener on
+            // macOS, unlike Linux; the read timeout below is the real bound, so
+            // the accepted socket must be blocking before it is read.
+            stream
+                .set_nonblocking(false)
+                .expect("blocking request socket");
             stream
                 .set_read_timeout(Some(Duration::from_secs(2)))
                 .expect("read timeout");

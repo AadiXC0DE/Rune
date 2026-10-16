@@ -179,6 +179,12 @@ fn token_server_response(
             assert!(Instant::now() < deadline, "token endpoint not contacted");
             std::thread::sleep(Duration::from_millis(5));
         };
+        // `accept` inherits `O_NONBLOCK` from a nonblocking listener on macOS,
+        // unlike Linux; the read timeout below is the real bound, so the
+        // accepted socket must be blocking before it is read.
+        stream
+            .set_nonblocking(false)
+            .expect("blocking token socket");
         stream.set_read_timeout(Some(TIMEOUT)).expect("timeout");
         let mut reader = BufReader::new(&mut stream);
         let mut head = String::new();

@@ -174,10 +174,10 @@ try:
             config_file.chmod(0o600)
             (root / "fixture.txt").write_text("ASCII_TOOL_CONTENT\n" * 20)
             (root / "fixture-other.txt").write_text("another path\n")
-            environment = {
+            environment = child_environment({
                 key: value for key, value in os.environ.items()
                 if not key.startswith("RUNE_") and key not in {"NO_COLOR", "COLORTERM"}
-            }
+            })
             environment.update({
                 "HOME": directory,
                 "XDG_CONFIG_HOME": str(root / "config"),

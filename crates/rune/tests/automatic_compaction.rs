@@ -2,6 +2,9 @@
 
 #![allow(clippy::expect_used, clippy::panic)]
 
+mod support;
+use support::CommandExt as _;
+
 use std::io::{BufRead as _, Read as _, Write as _};
 use std::net::TcpListener;
 use std::process::{Command, Stdio};
@@ -31,6 +34,12 @@ fn fixture_turns_compact_before_the_next_cli_model_request() {
                 }
                 Err(error) => panic!("accept: {error}"),
             };
+            // `accept` inherits `O_NONBLOCK` from a nonblocking listener on
+            // macOS, unlike Linux; the read timeout below is the real bound, so
+            // the accepted socket must be blocking before it is read.
+            stream
+                .set_nonblocking(false)
+                .expect("blocking request socket");
             stream
                 .set_read_timeout(Some(Duration::from_secs(10)))
                 .expect("read timeout");
@@ -120,7 +129,7 @@ provider_request_timeout_ms = 5000
     )
     .expect("tool fixture");
     let mut child = Command::new(env!("CARGO_BIN_EXE_rune"))
-        .env_clear()
+        .isolated_env()
         .env("HOME", dir.path())
         .env("RUNE_HOME", dir.path().join("state"))
         .env("XDG_CONFIG_HOME", dir.path().join("config"))
@@ -223,7 +232,7 @@ provider_request_timeout_ms = 5000
         "the symbol must have been removed from the live model context"
     );
     let search = Command::new(env!("CARGO_BIN_EXE_rune"))
-        .env_clear()
+        .isolated_env()
         .env("HOME", dir.path())
         .env("RUNE_HOME", dir.path().join("state"))
         .env("XDG_CONFIG_HOME", dir.path().join("config"))

@@ -68,10 +68,10 @@ with tempfile.TemporaryDirectory(prefix="rune-r071-") as directory:
     config_file = config / "config.toml"
     config_file.write_text("auto_upgrade = false\n")
     config_file.chmod(0o600)
-    environment = {
+    environment = child_environment({
         key: value for key, value in os.environ.items()
         if not key.startswith("RUNE_") and key not in {"NO_COLOR", "COLORTERM"}
-    }
+    })
     environment.update({
         "HOME": directory,
         "XDG_CONFIG_HOME": str(root / "config"),

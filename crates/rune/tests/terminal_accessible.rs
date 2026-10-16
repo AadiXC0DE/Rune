@@ -3,12 +3,14 @@
 #![cfg(unix)]
 #![allow(clippy::expect_used, clippy::panic)]
 
+mod support;
+
 #[test]
 fn accessible_sessions_append_labelled_output_without_terminal_controls() {
     let output = std::process::Command::new("python3")
         .args([
             "-c",
-            include_str!("terminal_accessible.py"),
+            &support::python_script(include_str!("terminal_accessible.py")),
             env!("CARGO_BIN_EXE_rune"),
         ])
         .output()

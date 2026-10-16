@@ -1304,6 +1304,7 @@ mod tests {
         assert!(load_read_only(store.dir()).expect("read").is_empty());
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_symlinked_lock_file_is_refused() {
         let root = tempfile::tempdir().expect("tempdir");
@@ -1312,12 +1313,9 @@ mod tests {
         let lock_path = dir.join(LOCK_FILE);
         std::fs::remove_file(&lock_path).expect("remove");
         std::fs::write(dir.join("elsewhere"), "").expect("write");
-        #[cfg(unix)]
-        {
-            std::os::unix::fs::symlink(dir.join("elsewhere"), &lock_path).expect("symlink");
-            let err = SessionStore::open_with_deadline(&dir, 0).expect_err("refused");
-            assert_eq!(err.code(), ErrorCode::UnsafePath);
-        }
+        std::os::unix::fs::symlink(dir.join("elsewhere"), &lock_path).expect("symlink");
+        let err = SessionStore::open_with_deadline(&dir, 0).expect_err("refused");
+        assert_eq!(err.code(), ErrorCode::UnsafePath);
     }
 
     #[test]

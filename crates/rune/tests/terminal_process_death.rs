@@ -3,12 +3,14 @@
 #![cfg(unix)]
 #![allow(clippy::expect_used, clippy::panic)]
 
+mod support;
+
 #[test]
 fn sigkill_preserves_a_replayable_partial_answer_without_completing_the_turn() {
     let output = std::process::Command::new("python3")
         .args([
             "-c",
-            include_str!("terminal_process_death.py"),
+            &support::python_script(include_str!("terminal_process_death.py")),
             env!("CARGO_BIN_EXE_rune"),
         ])
         .output()

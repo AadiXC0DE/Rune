@@ -3,6 +3,8 @@
 #![cfg(unix)]
 #![allow(clippy::expect_used, clippy::panic)]
 
+mod support;
+
 use rune_term::Grid;
 use serde::Deserialize;
 
@@ -18,7 +20,7 @@ fn interactive_resume_replays_saved_exchanges_once_before_input() {
     let output = std::process::Command::new("python3")
         .args([
             "-c",
-            include_str!("terminal_resume.py"),
+            &support::python_script(include_str!("terminal_resume.py")),
             env!("CARGO_BIN_EXE_rune"),
         ])
         .output()

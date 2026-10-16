@@ -3,12 +3,14 @@
 #![cfg(unix)]
 #![allow(clippy::expect_used, clippy::panic)]
 
+mod support;
+
 #[test]
 fn history_search_restores_an_older_prompt_by_its_middle_word_without_submitting() {
     let output = std::process::Command::new("python3")
         .args([
             "-c",
-            include_str!("terminal_draft.py"),
+            &support::python_script(include_str!("terminal_draft.py")),
             env!("CARGO_BIN_EXE_rune"),
             "history-search",
         ])
@@ -70,7 +72,7 @@ fn workspace_path_completion_submits_one_quoted_path_containing_spaces() {
     let output = std::process::Command::new("python3")
         .args([
             "-c",
-            include_str!("terminal_draft.py"),
+            &support::python_script(include_str!("terminal_draft.py")),
             env!("CARGO_BIN_EXE_rune"),
             "path-completion",
         ])
@@ -125,7 +127,7 @@ fn external_editor_reloads_the_draft_and_restores_the_terminal_on_success_and_fa
         let output = std::process::Command::new("python3")
             .args([
                 "-c",
-                include_str!("terminal_draft.py"),
+                &support::python_script(include_str!("terminal_draft.py")),
                 env!("CARGO_BIN_EXE_rune"),
                 scenario,
             ])
@@ -191,7 +193,7 @@ fn alt_enter_sends_one_two_line_prompt_with_an_exact_newline_to_the_provider() {
     let output = std::process::Command::new("python3")
         .args([
             "-c",
-            include_str!("terminal_draft.py"),
+            &support::python_script(include_str!("terminal_draft.py")),
             env!("CARGO_BIN_EXE_rune"),
             "newline",
         ])
@@ -234,7 +236,7 @@ fn pasted_multiline_drafts_show_each_edited_line_and_its_terminal_caret() {
     let output = std::process::Command::new("python3")
         .args([
             "-c",
-            include_str!("terminal_draft.py"),
+            &support::python_script(include_str!("terminal_draft.py")),
             env!("CARGO_BIN_EXE_rune"),
             "multiline",
         ])
@@ -314,7 +316,7 @@ fn redo_restores_unicode_drafts_and_carets_in_a_real_terminal() {
     let output = std::process::Command::new("python3")
         .args([
             "-c",
-            include_str!("terminal_draft.py"),
+            &support::python_script(include_str!("terminal_draft.py")),
             env!("CARGO_BIN_EXE_rune"),
             "redo",
         ])
@@ -354,7 +356,7 @@ fn undo_restores_unicode_drafts_and_carets_in_a_real_terminal() {
     let output = std::process::Command::new("python3")
         .args([
             "-c",
-            include_str!("terminal_draft.py"),
+            &support::python_script(include_str!("terminal_draft.py")),
             env!("CARGO_BIN_EXE_rune"),
             "undo",
         ])
@@ -394,7 +396,7 @@ fn long_drafts_scroll_with_the_caret_in_a_real_terminal() {
     let output = std::process::Command::new("python3")
         .args([
             "-c",
-            include_str!("terminal_draft.py"),
+            &support::python_script(include_str!("terminal_draft.py")),
             env!("CARGO_BIN_EXE_rune"),
         ])
         .output()

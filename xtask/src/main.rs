@@ -133,8 +133,11 @@ fn print_budget_help() {
     );
     println!("  Startup reports raw process latency: minimum-of-31, median and p95.");
     println!("  p95 uses nearest rank (the 30th sorted sample of 31).");
-    println!("  Work is minimum-of-31 minus the system true process baseline minimum-of-31,");
-    println!("  clamped to zero, or the raw minimum when no baseline is available.");
+    println!("  Work is minimum-of-31 minus the process baseline minimum-of-31, clamped to zero.");
+    println!("  The baseline is system true on Unix, an empty Rust executable on Windows.");
+    println!(
+        "  If no baseline is available, the budget fails: startup work ceilings cannot be enforced."
+    );
     println!(
         "  Work budgets: --version {} ms, --help {} ms.",
         targets::MAX_VERSION_MS,
@@ -814,13 +817,9 @@ fn write(path: &str, contents: &str) -> Result<(), String> {
 /// the minimum of 31 runs minus the baseline minimum, clamped to zero. This
 /// adjusted work estimate is distinct from the observed raw process latency.
 fn check_startup(binary: &Path) -> Result<(), String> {
-    let floor = measure_floor()?;
-    match floor {
-        Some(floor) => println!("process baseline minimum-of-31 {floor:.2} ms (true)"),
-        None => {
-            println!("process baseline unavailable; using raw minimum-of-31 for the work budget");
-        }
-    }
+    let (program, label) = baseline_program()?;
+    let floor = measure_floor(program)?;
+    println!("process baseline minimum-of-31 {floor:.2} ms ({label})");
 
     let cases = [
         ("--version", targets::MAX_VERSION_MS),
@@ -831,14 +830,10 @@ fn check_startup(binary: &Path) -> Result<(), String> {
 
     for (flag, budget_ms) in cases {
         let raw = startup_metrics(binary, flag)?;
-        let work = raw.work_ms(floor);
         println!("{}", raw.report(flag, floor, budget_ms));
 
-        if work > budget_ms {
-            failures.push(format!(
-                "{flag} took {work:.2} ms of {}, budget is {budget_ms:.0} ms",
-                work_label(floor)
-            ));
+        if let Some(failure) = raw.budget_failure(flag, floor, budget_ms) {
+            failures.push(failure);
         }
     }
 
@@ -849,17 +844,29 @@ fn check_startup(binary: &Path) -> Result<(), String> {
     }
 }
 
-/// Measures the cost of starting a trivial program.
-///
-/// Includes spawn, execution and waiting for exit of a system `true` binary.
-/// Subtracting its minimum gives an estimate of additional work, not latency.
-fn measure_floor() -> Result<Option<f64>, String> {
-    let candidates = ["/usr/bin/true", "/bin/true"];
-    let Some(program) = candidates.iter().find(|path| Path::new(path).exists()) else {
-        // Without a suitable baseline the raw measurement stands on its own.
-        return Ok(None);
-    };
+/// Chooses a real minimal process, never a shell or the application under test.
+#[cfg(windows)]
+fn baseline_program() -> Result<(&'static Path, &'static str), String> {
+    Ok((
+        Path::new(concat!(env!("OUT_DIR"), "/rune-process-baseline.exe")),
+        "empty Rust executable",
+    ))
+}
 
+#[cfg(not(windows))]
+fn baseline_program() -> Result<(&'static Path, &'static str), String> {
+    let candidates = ["/usr/bin/true", "/bin/true"];
+    let Some(program) = candidates.into_iter().find(|path| Path::new(path).exists()) else {
+        return Err(
+            "no baseline is available; startup work ceilings cannot be enforced".to_owned(),
+        );
+    };
+    Ok((Path::new(program), "true"))
+}
+
+/// Includes spawn, execution and waiting for exit of the baseline process.
+/// Subtracting its minimum gives an estimate of additional work, not latency.
+fn measure_floor(program: &Path) -> Result<f64, String> {
     let mut samples = [0.0; MEASUREMENT_SAMPLES];
     for sample in &mut samples {
         let start = std::time::Instant::now();
@@ -867,13 +874,21 @@ fn measure_floor() -> Result<Option<f64>, String> {
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status()
-            .map_err(|err| format!("could not run {program}: {err}"))?;
+            .map_err(|err| {
+                format!(
+                    "could not run process baseline {}: {err}; startup work ceilings cannot be enforced",
+                    program.display()
+                )
+            })?;
         if !status.success() {
-            return Err(format!("`{program}` exited with a failure"));
+            return Err(format!(
+                "process baseline {} exited with a failure; startup work ceilings cannot be enforced",
+                program.display()
+            ));
         }
         *sample = start.elapsed().as_secs_f64() * 1000.0;
     }
-    Ok(Some(StartupMetrics::from_samples(samples).minimum))
+    Ok(StartupMetrics::from_samples(samples).minimum)
 }
 
 /// Raw spawn-to-exit wall times in milliseconds, without baseline subtraction.
@@ -907,27 +922,27 @@ impl StartupMetrics {
         })
     }
 
-    fn work_ms(&self, floor: Option<f64>) -> f64 {
-        (self.minimum - floor.unwrap_or(0.0)).max(0.0)
+    fn work_ms(&self, floor: f64) -> f64 {
+        (self.minimum - floor).max(0.0)
     }
 
-    fn report(&self, flag: &str, floor: Option<f64>, budget_ms: f64) -> String {
+    fn budget_failure(&self, flag: &str, floor: f64, budget_ms: f64) -> Option<String> {
+        let work = self.work_ms(floor);
+        (work > budget_ms).then(|| {
+            format!(
+                "{flag} took {work:.2} ms of baseline-subtracted work, budget is {budget_ms:.0} ms"
+            )
+        })
+    }
+
+    fn report(&self, flag: &str, floor: f64, budget_ms: f64) -> String {
         format!(
-            "startup {flag:<10} raw process latency: minimum-of-{MEASUREMENT_SAMPLES} {:.2} ms, median {:.2} ms, p95 {:.2} ms; {} {:.2} ms (budget {budget_ms:.0} ms)",
+            "startup {flag:<10} raw process latency: minimum-of-{MEASUREMENT_SAMPLES} {:.2} ms, median {:.2} ms, p95 {:.2} ms; baseline-subtracted work {:.2} ms (budget {budget_ms:.0} ms)",
             self.minimum,
             self.median,
             self.p95,
-            work_label(floor),
             self.work_ms(floor)
         )
-    }
-}
-
-fn work_label(floor: Option<f64>) -> &'static str {
-    if floor.is_some() {
-        "baseline-subtracted work"
-    } else {
-        "work without baseline subtraction"
     }
 }
 
@@ -1055,9 +1070,9 @@ mod tests {
         // Tails above the budget must not change the existing minimum-based gate.
         assert!(metrics.median > targets::MAX_VERSION_MS);
         assert!(metrics.p95 > targets::MAX_VERSION_MS);
-        assert!(metrics.work_ms(Some(0.5)) <= targets::MAX_VERSION_MS);
+        assert!(metrics.work_ms(0.5) <= targets::MAX_VERSION_MS);
         assert_eq!(
-            metrics.report("--version", Some(0.5), targets::MAX_VERSION_MS),
+            metrics.report("--version", 0.5, targets::MAX_VERSION_MS),
             "startup --version  raw process latency: minimum-of-31 1.00 ms, median 16.00 ms, p95 30.00 ms; baseline-subtracted work 0.50 ms (budget 5 ms)"
         );
     }
@@ -1065,21 +1080,67 @@ mod tests {
     #[test]
     fn startup_work_is_clamped_without_subtracting_from_raw_metrics() {
         let metrics = StartupMetrics::from_samples([1.0; MEASUREMENT_SAMPLES]);
-        assert!(metrics.work_ms(Some(2.0)).abs() < f64::EPSILON);
+        assert!(metrics.work_ms(2.0).abs() < f64::EPSILON);
         assert_eq!(
-            metrics.report("--help", Some(2.0), targets::MAX_HELP_MS),
+            metrics.report("--help", 2.0, targets::MAX_HELP_MS),
             "startup --help     raw process latency: minimum-of-31 1.00 ms, median 1.00 ms, p95 1.00 ms; baseline-subtracted work 0.00 ms (budget 8 ms)"
         );
     }
 
     #[test]
-    fn startup_without_a_baseline_labels_the_unadjusted_work_budget() {
-        let metrics = StartupMetrics::from_samples([9.0; MEASUREMENT_SAMPLES]);
-        assert!((metrics.work_ms(None) - 9.0).abs() < f64::EPSILON);
-        assert!(metrics.work_ms(None) > targets::MAX_HELP_MS);
+    fn startup_budgets_exclude_process_cost_but_reject_excess_application_work() {
+        let floor = 6.0;
+        for (flag, budget_ms) in [
+            ("--version", targets::MAX_VERSION_MS),
+            ("--help", targets::MAX_HELP_MS),
+        ] {
+            let at_ceiling = StartupMetrics::from_samples([floor + budget_ms; MEASUREMENT_SAMPLES]);
+            assert!(at_ceiling.minimum > budget_ms);
+            assert!(at_ceiling.budget_failure(flag, floor, budget_ms).is_none());
+
+            let over_ceiling =
+                StartupMetrics::from_samples([floor + budget_ms + 1.0; MEASUREMENT_SAMPLES]);
+            let failure = over_ceiling
+                .budget_failure(flag, floor, budget_ms)
+                .expect("work above the ceiling must fail even with a baseline");
+            assert!(failure.contains("baseline-subtracted work"), "{failure}");
+        }
+    }
+
+    #[test]
+    fn missing_baseline_refuses_to_enforce_work_ceilings() {
+        let missing = Path::new(env!("CARGO_MANIFEST_DIR")).join("missing-process-baseline");
+        let error = measure_floor(&missing).expect_err("missing baseline must fail the budget");
+        assert!(error.contains("could not run process baseline"), "{error}");
+        assert!(
+            error.contains("startup work ceilings cannot be enforced"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn baseline_process_is_available_and_measurable() {
+        let (program, label) = baseline_program().expect("platform baseline");
+        assert!(program.is_file(), "{}", program.display());
+        #[cfg(windows)]
+        assert_eq!(label, "empty Rust executable");
+        #[cfg(not(windows))]
+        assert_eq!(label, "true");
+        let floor = measure_floor(program).expect("measure real baseline process");
+        assert!(floor.is_finite() && floor > 0.0, "{floor}");
+    }
+
+    #[test]
+    fn windows_raw_latency_is_reported_separately_from_work() {
+        let metrics = StartupMetrics::from_samples([7.31; MEASUREMENT_SAMPLES]);
+        assert!(
+            metrics
+                .budget_failure("--version", 6.0, targets::MAX_VERSION_MS)
+                .is_none()
+        );
         assert_eq!(
-            metrics.report("--help", None, targets::MAX_HELP_MS),
-            "startup --help     raw process latency: minimum-of-31 9.00 ms, median 9.00 ms, p95 9.00 ms; work without baseline subtraction 9.00 ms (budget 8 ms)"
+            metrics.report("--version", 6.0, targets::MAX_VERSION_MS),
+            "startup --version  raw process latency: minimum-of-31 7.31 ms, median 7.31 ms, p95 7.31 ms; baseline-subtracted work 1.31 ms (budget 5 ms)"
         );
     }
 

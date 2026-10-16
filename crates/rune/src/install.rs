@@ -557,23 +557,22 @@ mod tests {
         assert_no_staging_files(&root);
     }
 
+    #[cfg(unix)]
     #[test]
     fn an_installed_binary_is_executable() {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            let (_dir, root) = artifact_dir();
-            let target = root.join("rune");
-            let artifact = Artifact::new(b"binary".to_vec());
-            install(&target, &artifact, &artifact.digest).expect("installed");
+        use std::os::unix::fs::PermissionsExt as _;
 
-            let mode = std::fs::metadata(&target)
-                .expect("metadata")
-                .permissions()
-                .mode()
-                & 0o777;
-            assert_eq!(mode, 0o755, "the installed binary is not executable");
-        }
+        let (_dir, root) = artifact_dir();
+        let target = root.join("rune");
+        let artifact = Artifact::new(b"binary".to_vec());
+        install(&target, &artifact, &artifact.digest).expect("installed");
+
+        let mode = std::fs::metadata(&target)
+            .expect("metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o755, "the installed binary is not executable");
     }
 
     #[test]

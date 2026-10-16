@@ -1,6 +1,9 @@
 //! Manual compaction previews through the real CLI leave saved records intact.
 #![allow(clippy::expect_used)]
 
+mod support;
+use support::CommandExt as _;
+
 use std::io::Write as _;
 use std::process::{Command, Stdio};
 
@@ -83,7 +86,7 @@ fn preview_fixture(exchanges: u64, previous_summary: bool, result_limit: usize, 
         "provider = \"chat_completions\"\nbase_url = \"http://127.0.0.1:1/v1\"\n[models.chat_completions]\nid = \"fixture-model\"\n[limits]\nmax_tool_result_bytes = {result_limit}\n"
     )).expect("config");
     let mut child = Command::new(env!("CARGO_BIN_EXE_rune"))
-        .env_clear()
+        .isolated_env()
         .env("HOME", &root)
         .env("RUNE_HOME", &paths.state_root)
         .env("XDG_CONFIG_HOME", root.join("config"))

@@ -793,6 +793,7 @@ mod tests {
         let target = Utf8PathBuf::from_path_buf(dir.path().join("state")).expect("utf8");
         create_dir_private(&target).expect("create");
         create_dir_private(&target).expect("create again");
+        assert!(target.is_dir());
 
         #[cfg(unix)]
         {

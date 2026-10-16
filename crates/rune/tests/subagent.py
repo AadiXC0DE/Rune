@@ -143,7 +143,7 @@ def run_fixture(case):
         server.daemon_threads = True
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
-        environment = {
+        environment = child_environment({
             "HOME": directory,
             "PATH": "/usr/bin:/bin",
             "XDG_CONFIG_HOME": str(base / "config"),
@@ -156,7 +156,7 @@ def run_fixture(case):
             "RUNE_API_KEY_ENV": "RUNE_SUBAGENT_TEST_KEY",
             "RUNE_SUBAGENT_TEST_KEY": "fixture-key",
             "NO_COLOR": "1",
-        }
+        })
         try:
             output = subprocess.run(
                 [sys.argv[1], "--permission-mode", "full-access"],

@@ -3,12 +3,14 @@
 #![cfg(unix)]
 #![allow(clippy::expect_used, clippy::panic)]
 
+mod support;
+
 #[test]
 fn provider_failure_saves_the_visible_answer_and_boundary_across_resume() {
     let output = std::process::Command::new("python3")
         .args([
             "-c",
-            include_str!("terminal_provider_failure.py"),
+            &support::python_script(include_str!("terminal_provider_failure.py")),
             env!("CARGO_BIN_EXE_rune"),
         ])
         .output()

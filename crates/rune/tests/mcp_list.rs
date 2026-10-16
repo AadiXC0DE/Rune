@@ -6,6 +6,9 @@
     clippy::panic
 )]
 
+mod support;
+use support::CommandExt as _;
+
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
 use std::process::{Command, Output};
@@ -65,8 +68,8 @@ impl Workspace {
         Command::new(env!("CARGO_BIN_EXE_rune"))
             .args(args)
             .current_dir(self.dir.path())
-            .env_clear()
-            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .isolated_env()
+            .with_external_programs()
             .env("RUNE_HOME", &self.paths.state_root)
             .env("XDG_CONFIG_HOME", self.dir.path().join("config"))
             .env("XDG_DATA_HOME", self.dir.path().join("data"))
@@ -131,6 +134,12 @@ fn http_scenario(scenario: Scenario) -> (String, JoinHandle<Vec<String>>) {
                     Err(error) => panic!("accept: {error}"),
                 }
             };
+            // `accept` inherits `O_NONBLOCK` from a nonblocking listener on
+            // macOS, unlike Linux; the read deadline below is the real bound, so
+            // the accepted socket must be blocking before it is read.
+            socket
+                .set_nonblocking(false)
+                .expect("blocking request socket");
             socket
                 .set_read_timeout(Some(Duration::from_secs(5)))
                 .expect("read deadline");

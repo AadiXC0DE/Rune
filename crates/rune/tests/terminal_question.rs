@@ -3,6 +3,8 @@
 #![cfg(unix)]
 #![allow(clippy::expect_used, clippy::panic)]
 
+mod support;
+
 #[test]
 fn structured_questions_collect_terminal_answers_for_the_next_provider_request() {
     // Python's standard library supplies the PTY without a dependency or unsafe
@@ -10,7 +12,7 @@ fn structured_questions_collect_terminal_answers_for_the_next_provider_request()
     let output = std::process::Command::new("python3")
         .args([
             "-c",
-            include_str!("terminal_question.py"),
+            &support::python_script(include_str!("terminal_question.py")),
             env!("CARGO_BIN_EXE_rune"),
         ])
         .output()

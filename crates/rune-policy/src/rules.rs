@@ -94,6 +94,23 @@ impl Rule {
         glob_match(&self.pattern, target)
     }
 
+    /// Returns true when the pattern matches a normalized file path.
+    ///
+    /// A file rule is written the way a person writes a path, with `/`, while
+    /// the platform's own normalization spells a Windows path with `\`. Folding
+    /// both sides to `/` on Windows keeps a rule's meaning, so `secrets/*`
+    /// still covers `secrets\key` and an absolute rule still covers the target
+    /// it names. On Unix a backslash is an ordinary character, so the pattern
+    /// is matched as written.
+    #[must_use]
+    fn matches_path(&self, target: &str) -> bool {
+        if cfg!(windows) {
+            glob_match(&self.pattern.replace('\\', "/"), &target.replace('\\', "/"))
+        } else {
+            glob_match(&self.pattern, target)
+        }
+    }
+
     /// Returns true when the pattern holds a wildcard.
     fn is_pattern(&self) -> bool {
         self.pattern.contains('*') || self.pattern.contains('?')
@@ -280,11 +297,11 @@ impl FileTargets {
     }
 
     fn matches(&self, rule: &Rule) -> bool {
-        rule.matches(self.absolute.as_str())
+        rule.matches_path(self.absolute.as_str())
             || self
                 .relative
                 .as_ref()
-                .is_some_and(|path| rule.matches(path.as_str()))
+                .is_some_and(|path| rule.matches_path(path.as_str()))
     }
 }
 
@@ -298,7 +315,7 @@ fn normalize_file_path(path: &Utf8Path) -> Utf8PathBuf {
     for component in path.components() {
         match component {
             Utf8Component::Prefix(prefix) => out.push(prefix.as_str()),
-            Utf8Component::RootDir => out.push("/"),
+            Utf8Component::RootDir => out.push(std::path::MAIN_SEPARATOR_STR),
             Utf8Component::CurDir => {}
             Utf8Component::ParentDir => {
                 let _ = out.pop();

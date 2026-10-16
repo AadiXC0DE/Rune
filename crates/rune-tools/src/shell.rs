@@ -262,6 +262,13 @@ impl Shell {
         };
         let dimensions = terminal_dimensions(arguments)?;
         let input = if bool_arg(arguments, "pty")?.unwrap_or(false) {
+            if !cfg!(target_os = "linux") {
+                return Err(RuneError::new(
+                    ErrorCode::Unsupported,
+                    "PTY shell mode is only supported on Linux",
+                )
+                .with_hint("use `interactive` for piped input without a terminal"));
+            }
             let (rows, cols) = dimensions.unwrap_or((24, 80));
             Input::Pty { rows, cols }
         } else if dimensions.is_some() {
@@ -1081,14 +1088,13 @@ mod tests {
 
     /// Returns true when `observed` contains `expected` as a path.
     ///
-    /// A path is compared after both sides are put in the same spelling. One
-    /// platform resolves a path to a form carrying a prefix that the shell it
-    /// runs does not print, so a comparison of the raw strings fails on the
-    /// directory the test itself created.
+    /// Resolve both paths so separators, Windows short names, drive-letter
+    /// case and verbatim prefixes do not affect directory identity.
     fn shows_path(observed: &str, expected: &Utf8Path) -> bool {
-        let rendered = expected.as_str();
-        let stripped = rendered.strip_prefix(r"\\?\").unwrap_or(rendered);
-        observed.contains(stripped) || observed.contains(rendered)
+        let expected = std::fs::canonicalize(expected).expect("expected directory");
+        observed
+            .lines()
+            .any(|line| std::fs::canonicalize(line.trim()).is_ok_and(|path| path == expected))
     }
 
     /// Returns a command that prints a marker for each line it reads.
@@ -1447,17 +1453,27 @@ mod tests {
     #[test]
     fn pty_shell_mode_is_explicitly_unsupported_off_linux() {
         let tool = Shell::default();
-        let (_dir, context) = workspace();
-        let err = tool
-            .call(
-                &serde_json::json!({
-                    "action": "run", "command": "echo hello", "pty": true,
-                }),
-                &context,
-            )
-            .expect_err("Linux only");
-        assert_eq!(err.code(), ErrorCode::Unsupported);
-        assert_eq!(tool.live_sessions(), 0);
+        let (dir, mut context) = workspace();
+        for sandboxed in [false, true] {
+            context.sandboxed = sandboxed;
+            let err = tool
+                .call(
+                    &serde_json::json!({
+                        "action": "run", "command": "echo hello > spawned", "pty": true,
+                    }),
+                    &context,
+                )
+                .expect_err("Linux only");
+            assert_eq!(err.code(), ErrorCode::Unsupported);
+            assert_eq!(err.message(), "PTY shell mode is only supported on Linux");
+            assert!(
+                err.hint()
+                    .expect("piped input alternative")
+                    .contains("interactive")
+            );
+            assert!(!dir.path().join("spawned").exists());
+            assert_eq!(tool.live_sessions(), 0);
+        }
     }
 
     #[test]

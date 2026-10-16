@@ -143,7 +143,7 @@ def run_fixture(scenario, terminal=False):
         probe.close()
         http_requests.clear()
 
-        environment = {
+        environment = child_environment({
             "HOME": directory, "PATH": "/usr/bin:/bin", "NO_COLOR": "1", "TERM": "xterm-256color",
             "XDG_CONFIG_HOME": str(base / "config"), "XDG_DATA_HOME": str(base / "data"),
             "XDG_STATE_HOME": str(base / "xdg-state"), "RUNE_HOME": str(base / "state"),
@@ -151,7 +151,7 @@ def run_fixture(scenario, terminal=False):
             "RUNE_BASE_URL": f"http://127.0.0.1:{server.server_port}/v1",
             "RUNE_API_KEY_ENV": "RUNE_HTTP_MODEL_KEY", "RUNE_HTTP_MODEL_KEY": "provider-only-secret",
             "RUNE_HTTP_MCP_SECRET": "http-only-secret",
-        }
+        })
         entries = {"remote": {
             "type": "http", "url": f"http://127.0.0.1:{server.server_port}/mcp",
             "headers": {"x-fixture-secret": "${RUNE_HTTP_MCP_SECRET}"},

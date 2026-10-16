@@ -1,9 +1,12 @@
 //! R-034: CI replays actual process output, including PTY resize boundaries.
 //! Fixtures compare every screen row and the caret. The narrow fixture also
 //! compares the answer recovered from scrollback, where clipping loses bytes.
+//! Normalize CRLF in checked-in grids; all screen content stays exact.
 
 #![cfg(unix)]
 #![allow(clippy::expect_used, clippy::panic)]
+
+mod support;
 
 use std::fmt::Write as _;
 
@@ -20,7 +23,11 @@ struct Capture {
 
 fn record(script: &str, scenario: Option<&str>) -> Vec<u8> {
     let mut command = std::process::Command::new("python3");
-    command.args(["-c", script, env!("CARGO_BIN_EXE_rune")]);
+    command.args([
+        "-c",
+        &support::python_script(script),
+        env!("CARGO_BIN_EXE_rune"),
+    ]);
     if let Some(scenario) = scenario {
         command.arg(scenario);
     }
@@ -157,7 +164,7 @@ fn long_draft_grids() {
     let actual = fixed_size_replay(include_str!("terminal_draft.py"), 80, 24);
     assert_eq!(
         actual,
-        include_str!("fixtures/terminal_replay/long_draft.grid")
+        include_str!("fixtures/terminal_replay/long_draft.grid").replace("\r\n", "\n")
     );
 }
 
@@ -166,12 +173,12 @@ fn short_menu_grids() {
     let actual = fixed_size_replay(include_str!("terminal_menu.py"), 32, 8);
     assert_eq!(
         actual,
-        include_str!("fixtures/terminal_replay/short_menu.grid")
+        include_str!("fixtures/terminal_replay/short_menu.grid").replace("\r\n", "\n")
     );
     let resized = event_replay("menu-resize");
     assert_eq!(
         resized,
-        include_str!("fixtures/terminal_replay/menu_resize.grid")
+        include_str!("fixtures/terminal_replay/menu_resize.grid").replace("\r\n", "\n")
     );
 }
 
@@ -274,14 +281,17 @@ fn draft_resize_grids() {
     let actual = event_replay("resize");
     assert_eq!(
         actual,
-        include_str!("fixtures/terminal_replay/draft_resize.grid")
+        include_str!("fixtures/terminal_replay/draft_resize.grid").replace("\r\n", "\n")
     );
 }
 
 #[test]
 fn twelve_column_text_grids_and_scrollback() {
     let actual = event_replay("narrow");
-    assert_eq!(actual, include_str!("fixtures/terminal_replay/narrow.grid"));
+    assert_eq!(
+        actual,
+        include_str!("fixtures/terminal_replay/narrow.grid").replace("\r\n", "\n")
+    );
 }
 
 #[test]

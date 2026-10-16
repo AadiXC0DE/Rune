@@ -2,6 +2,9 @@
 
 #![allow(clippy::expect_used, clippy::panic)]
 
+mod support;
+use support::CommandExt as _;
+
 use std::io::{BufRead as _, Read as _, Write as _};
 use std::net::TcpListener;
 use std::process::Command;
@@ -37,6 +40,12 @@ fn slow_endpoint(status: u16) -> (String, std::thread::JoinHandle<()>) {
                 Err(error) => panic!("accept fixture request: {error}"),
             }
         };
+        // `accept` inherits `O_NONBLOCK` from a nonblocking listener on macOS,
+        // unlike Linux; the read timeout below is the real bound, so the
+        // accepted socket must be blocking before it is read.
+        stream
+            .set_nonblocking(false)
+            .expect("blocking request socket");
         stream
             .set_read_timeout(Some(Duration::from_secs(10)))
             .expect("read timeout");
@@ -92,7 +101,7 @@ fn ask_enforces_the_configured_total_deadline_for_success_and_error_bodies() {
         // Isolate the per-attempt deadline from the retry policy, which also
         // retries timeouts when more attempts are configured.
         let output = Command::new(env!("CARGO_BIN_EXE_rune"))
-            .env_clear()
+            .isolated_env()
             .env("HOME", dir.path())
             .env("RUNE_HOME", dir.path().join("state"))
             .env("XDG_CONFIG_HOME", dir.path().join("config"))

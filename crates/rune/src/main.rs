@@ -2037,10 +2037,16 @@ exit 1
     fn resolving_returns_a_canonical_path() {
         // Canonical is what makes two spellings of one directory compare equal,
         // which is what keeps a list from holding it twice.
-        let resolved = resolve_directory(".").expect("resolved");
+        let dir = tempfile::tempdir().expect("temp");
+        let child = dir.path().join("child");
+        std::fs::create_dir(&child).expect("child directory");
+        let raw = child.join("..");
+        let resolved = resolve_directory(raw.to_str().expect("utf8")).expect("resolved");
         assert!(Utf8PathBuf::from(&resolved).is_absolute(), "{resolved}");
-        assert!(!resolved.contains("/./"), "{resolved}");
-        assert!(!resolved.contains(".."), "{resolved}");
+        assert_eq!(
+            std::path::Path::new(&resolved),
+            dir.path().canonicalize().expect("canonical directory")
+        );
     }
 
     #[test]

@@ -3,12 +3,14 @@
 #![cfg(unix)]
 #![allow(clippy::expect_used)]
 
+mod support;
+
 #[test]
 fn interactive_http_mcp_obeys_trust_policy_and_offline_mode() {
     let output = std::process::Command::new("python3")
         .args([
             "-c",
-            include_str!("mcp_http.py"),
+            &support::python_script(include_str!("mcp_http.py")),
             env!("CARGO_BIN_EXE_rune"),
         ])
         .output()

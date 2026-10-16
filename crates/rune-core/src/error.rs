@@ -425,6 +425,7 @@ impl From<std::io::Error> for RuneError {
             std::io::ErrorKind::TimedOut => ErrorCode::Timeout,
             std::io::ErrorKind::Interrupted => ErrorCode::Cancelled,
             std::io::ErrorKind::PermissionDenied => ErrorCode::PermissionDenied,
+            std::io::ErrorKind::Unsupported => ErrorCode::Unsupported,
             std::io::ErrorKind::ConnectionRefused
             | std::io::ErrorKind::ConnectionReset
             | std::io::ErrorKind::ConnectionAborted
@@ -562,6 +563,9 @@ mod tests {
 
         let denied = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "no");
         assert_eq!(RuneError::from(denied).code(), ErrorCode::PermissionDenied);
+
+        let unsupported = std::io::Error::new(std::io::ErrorKind::Unsupported, "unavailable");
+        assert_eq!(RuneError::from(unsupported).code(), ErrorCode::Unsupported);
 
         let other = std::io::Error::other("?");
         assert_eq!(RuneError::from(other).code(), ErrorCode::IoFailure);

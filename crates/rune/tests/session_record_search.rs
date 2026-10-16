@@ -1,6 +1,9 @@
 //! Search original session records, including archived compaction input.
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 
+mod support;
+use support::CommandExt as _;
+
 use std::process::{Command, Output};
 
 use camino::Utf8PathBuf;
@@ -93,7 +96,7 @@ impl Fixture {
 
     fn run(&self, args: &[&str]) -> Output {
         Command::new(env!("CARGO_BIN_EXE_rune"))
-            .env_clear()
+            .isolated_env()
             .env("HOME", &self.root)
             .env("RUNE_HOME", &self.paths.state_root)
             .env("XDG_CONFIG_HOME", self.root.join("config"))
