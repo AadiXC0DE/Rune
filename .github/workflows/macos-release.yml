@@ -70,10 +70,10 @@ jobs:
           RELEASE_VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
-          # An empty version input means the workspace manifest decides, and the
-          # target is always passed explicitly so one leg cannot silently build
-          # the other architecture.
-          version="${RELEASE_VERSION:-$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)}"
+          # An empty version input means the single source of truth decides, and
+          # the target is always passed explicitly so one leg cannot silently
+          # build the other architecture.
+          version="${RELEASE_VERSION:-$(sed -n 's/^pub const VERSION: &str = "\(.*\)";/\1/p' crates/rune/src/version.rs)}"
           test -n "$version"
           cargo xtask release "$RELEASE_CHANNEL" "$version" "${{ matrix.target }}" --sign-identity "$RUNE_SIGNING_IDENTITY"
           cargo xtask verify-release "target/dist/rune-${{ matrix.target }}/manifest.json" "$RUNE_SIGNING_IDENTITY"
