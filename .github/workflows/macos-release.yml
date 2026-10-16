@@ -8,7 +8,7 @@ on:
         default: stable
         required: true
       version:
-        description: Release version (empty uses Cargo.toml)
+        description: Release version (empty uses the version in source)
         required: false
 
 permissions:
@@ -21,8 +21,13 @@ jobs:
     # Both architectures are built here rather than one per manual dispatch: the
     # Homebrew formula carries a checksum for each, so a release missing one
     # leaves half of the people installing from the landing page on an old
-    # build. Signing a cross-built executable still happens on macOS, which is
-    # where codesign runs.
+    # build.
+    #
+    # Signing happens when the credentials are present and is skipped loudly
+    # when they are not. A Developer ID certificate requires a paid Apple
+    # Developer Program membership, so an unsigned release has to remain
+    # possible; what must not happen is an unsigned artifact being passed off as
+    # signed, so the log says which path ran and the release body repeats it.
     strategy:
       fail-fast: false
       matrix:
@@ -31,6 +36,8 @@ jobs:
       # Publish this certificate SHA-1 fingerprint as a repository variable.
       # The corresponding Developer ID private key remains in encrypted secrets.
       RUNE_SIGNING_IDENTITY: ${{ vars.MACOS_SIGNING_IDENTITY }}
+      CERTIFICATE_P12: ${{ secrets.MACOS_SIGNING_CERTIFICATE_P12 }}
+      CERTIFICATE_PASSWORD: ${{ secrets.MACOS_SIGNING_CERTIFICATE_PASSWORD }}
     steps:
       - uses: actions/checkout@v4
 
@@ -40,10 +47,18 @@ jobs:
       - name: Add the release target
         run: rustup target add ${{ matrix.target }}
 
+      - name: Report whether this build will be signed
+        run: |
+          set -eu
+          if [ -n "$CERTIFICATE_P12" ] && [ -n "$CERTIFICATE_PASSWORD" ] && [ -n "$RUNE_SIGNING_IDENTITY" ]; then
+            echo "signing: yes, with $RUNE_SIGNING_IDENTITY"
+          else
+            echo "::warning::Signing credentials are absent, so this release is UNSIGNED."
+            echo "signing: no, no Developer ID certificate is configured for this repository"
+          fi
+
       - name: Import the release signing certificate into a temporary keychain
-        env:
-          CERTIFICATE_P12: ${{ secrets.MACOS_SIGNING_CERTIFICATE_P12 }}
-          CERTIFICATE_PASSWORD: ${{ secrets.MACOS_SIGNING_CERTIFICATE_PASSWORD }}
+        if: env.CERTIFICATE_P12 != ''
         run: |
           set -euo pipefail
           umask 077
@@ -62,9 +77,10 @@ jobs:
           rm "$RUNNER_TEMP/rune-signing.p12"
 
       - name: Test native certificate verification and tamper rejection
+        if: env.CERTIFICATE_P12 != ''
         run: cargo test -p xtask --test macos_signing -- --include-ignored
 
-      - name: Sign and check the exact packaged executable
+      - name: Package the release, signed when a certificate is configured
         env:
           RELEASE_CHANNEL: ${{ inputs.channel }}
           RELEASE_VERSION: ${{ inputs.version }}
@@ -75,13 +91,29 @@ jobs:
           # build the other architecture.
           version="${RELEASE_VERSION:-$(sed -n 's/^pub const VERSION: &str = "\(.*\)";/\1/p' crates/rune/src/version.rs)}"
           test -n "$version"
-          cargo xtask release "$RELEASE_CHANNEL" "$version" "${{ matrix.target }}" --sign-identity "$RUNE_SIGNING_IDENTITY"
-          cargo xtask verify-release "target/dist/rune-${{ matrix.target }}/manifest.json" "$RUNE_SIGNING_IDENTITY"
+          if [ -n "$CERTIFICATE_P12" ] && [ -n "$RUNE_SIGNING_IDENTITY" ]; then
+            cargo xtask release "$RELEASE_CHANNEL" "$version" "${{ matrix.target }}" --sign-identity "$RUNE_SIGNING_IDENTITY"
+            cargo xtask verify-release "target/dist/rune-${{ matrix.target }}/manifest.json" "$RUNE_SIGNING_IDENTITY"
+          else
+            # Without an identity the archive is packaged unsigned; the checksum
+            # still covers the exact bytes that are published.
+            cargo xtask release "$RELEASE_CHANNEL" "$version" "${{ matrix.target }}"
+          fi
 
-      - name: Upload the verified signed archive, checksum and published identity
+      - name: Say what was produced
+        run: |
+          set -eu
+          ls -l "target/dist/rune-${{ matrix.target }}/"
+          if [ -n "$CERTIFICATE_P12" ]; then
+            echo "produced: signed ${{ matrix.target }} archive"
+          else
+            echo "produced: UNSIGNED ${{ matrix.target }} archive"
+          fi
+
+      - name: Upload the archive, checksum and manifest
         uses: actions/upload-artifact@v4
         with:
-          name: rune-signed-macos-${{ matrix.target }}
+          name: rune-macos-${{ matrix.target }}
           path: target/dist/rune-${{ matrix.target }}/*
           if-no-files-found: error
 
@@ -100,24 +132,47 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Collect the signed artifacts
+      - name: Collect the artifacts, one directory per architecture
         uses: actions/download-artifact@v4
         with:
           path: dist
-          merge-multiple: true
 
-      - name: Publish the release from the signed artifacts
+      - name: Publish the release from what this run produced
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CERTIFICATE_P12: ${{ secrets.MACOS_SIGNING_CERTIFICATE_P12 }}
         run: |
           set -euo pipefail
-          ls -l dist
-          # The tag comes from the archives themselves, so the release can only
-          # be named after something that was actually signed in this run.
-          version=$(basename "$(ls dist/rune-*-aarch64-apple-darwin.tar.gz | head -1)" | sed 's/^rune-\(.*\)-aarch64-apple-darwin\.tar\.gz$/\1/')
+          mkdir -p release
+          # Each leg ships the same file names, so the manifest is the only file
+          # that needs the architecture in its name; archives keep the names the
+          # formula and the readme already point at.
+          for directory in dist/*/; do
+            leg=$(basename "$directory")
+            for file in "$directory"*; do
+              base=$(basename "$file")
+              if [ "$base" = "manifest.json" ]; then
+                cp "$file" "release/${leg}-manifest.json"
+              else
+                cp "$file" "release/$base"
+              fi
+            done
+          done
+          ls -l release
+
+          # The tag comes from the archives themselves, so the release can only be
+          # named after something this run produced.
+          version=$(basename "$(ls release/rune-*-aarch64-apple-darwin.tar.gz | head -1)" | sed 's/^rune-\(.*\)-aarch64-apple-darwin\.tar\.gz$/\1/')
           test -n "$version"
-          if gh release view "v$version" > /dev/null 2>&1; then
-            gh release upload "v$version" dist/* --clobber
+
+          if [ -n "$CERTIFICATE_P12" ]; then
+            note="These archives are signed with this repository's Developer ID certificate."
           else
-            gh release create "v$version" dist/* --title "Rune v$version" --generate-notes
+            note="These archives are **not signed**: no Developer ID certificate is configured for this repository, which requires a paid Apple Developer Program membership. Installing through Homebrew is unaffected, because the download does not carry the quarantine flag. A tarball downloaded by hand does, and Gatekeeper will refuse an unsigned binary."
+          fi
+
+          if gh release view "v$version" > /dev/null 2>&1; then
+            gh release upload "v$version" release/* --clobber
+          else
+            gh release create "v$version" release/* --title "Rune v$version" --generate-notes --notes "$note"
           fi
