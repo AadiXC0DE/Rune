@@ -16,5 +16,6 @@ workspace = true
 
 [dependencies]
 flate2.workspace = true
+rune-core.workspace = true
 sha2.workspace = true
 serde_json.workspace = true

@@ -24,6 +24,18 @@ mod targets {
 
     /// Baseline-subtracted minimum-of-31 work for `rune --help`, in milliseconds.
     pub const MAX_HELP_MS: f64 = 8.0;
+
+    /// Largest accepted assembled system prompt, in bytes.
+    ///
+    /// Shared with the crate that compiles the prompt, so the gate and the
+    /// compiled-in floor cannot drift apart.
+    pub const MAX_PROMPT_BYTES: usize = rune_core::budget::PROMPT_CEILING_BYTES;
+
+    /// Divisor used to turn prompt bytes into an estimated token count.
+    ///
+    /// Four is the estimator's working bytes-per-token figure, not a tokenizer:
+    /// the number printed beside the byte count is an estimate at this divisor.
+    pub const PROMPT_BYTES_PER_TOKEN: usize = 4;
 }
 
 fn main() -> ExitCode {
@@ -112,7 +124,7 @@ fn print_budget_help() {
     println!("usage: cargo xtask budget [--help]");
     println!();
     println!("  Builds the release profile and checks size and startup.");
-    println!("  The audited stripped release build measured 5.43 MiB for");
+    println!("  The audited stripped release build measured 5.46 MiB for");
     println!("  x86_64-unknown-linux-gnu (GNU/Linux).");
     println!(
         "  The enforced binary size budget is an {} MiB ceiling ({} bytes).",
@@ -127,6 +139,15 @@ fn print_budget_help() {
         "  Work budgets: --version {} ms, --help {} ms.",
         targets::MAX_VERSION_MS,
         targets::MAX_HELP_MS
+    );
+    println!("  The assembled system prompt is measured from this working tree and its");
+    println!(
+        "  fixed per-request cost is checked against a {} byte ceiling.",
+        targets::MAX_PROMPT_BYTES
+    );
+    println!(
+        "  Tokens are estimated at {} bytes per token, not a tokenizer count.",
+        targets::PROMPT_BYTES_PER_TOKEN
     );
 }
 
@@ -386,8 +407,58 @@ fn budget() -> Result<(), String> {
     }
 
     check_startup(&binary)?;
+    check_prompt(&binary)?;
     check_duplicate_dependencies()?;
     Ok(())
+}
+
+/// Measures the assembled system prompt and enforces its ceiling.
+///
+/// The prompt is assembled from the working tree, so its size depends on the
+/// repository contents and the effective limits. The release binary is run the
+/// way a turn would run it. User configuration and user skills are excluded, so
+/// the measurement reflects the checkout rather than the machine.
+fn check_prompt(binary: &Path) -> Result<(), String> {
+    let isolated = std::env::temp_dir().join(format!("rune-budget-{}", std::process::id()));
+    std::fs::create_dir_all(&isolated)
+        .map_err(|err| format!("could not create {}: {err}", isolated.display()))?;
+    let output = Command::new(binary)
+        .args(["prompt", "--show"])
+        .env("HOME", &isolated)
+        .env("RUNE_HOME", &isolated)
+        .env("XDG_CONFIG_HOME", &isolated)
+        .env("XDG_STATE_HOME", &isolated)
+        .env("XDG_DATA_HOME", &isolated)
+        .output()
+        .map_err(|err| format!("could not run {}: {err}", binary.display()))?;
+    // `prompt --show` prints the prompt and then a newline when the text does
+    // not end with one, so the trailing byte the CLI adds is not part of it.
+    let bytes = output
+        .stdout
+        .strip_suffix(b"\n")
+        .map_or(output.stdout.len(), <[u8]>::len);
+    if !output.status.success() {
+        return Err("`rune prompt --show` failed while measuring the prompt".to_owned());
+    }
+    let tokens = bytes / targets::PROMPT_BYTES_PER_TOKEN;
+    println!(
+        "prompt bytes  {bytes} bytes ({tokens} estimated tokens at {} bytes/token)",
+        targets::PROMPT_BYTES_PER_TOKEN
+    );
+    match prompt_ceiling_failure(bytes) {
+        Some(message) => Err(message),
+        None => Ok(()),
+    }
+}
+
+/// Returns the failure message for an assembled prompt over its ceiling.
+fn prompt_ceiling_failure(bytes: usize) -> Option<String> {
+    (bytes > targets::MAX_PROMPT_BYTES).then(|| {
+        format!(
+            "assembled prompt exceeds the {} byte ceiling",
+            targets::MAX_PROMPT_BYTES
+        )
+    })
 }
 
 /// Format, lint, budget, and the full suite, for a pull request.
@@ -1012,6 +1083,16 @@ mod tests {
         );
     }
 
+    #[test]
+    fn the_prompt_ceiling_fails_only_above_it() {
+        // The gate must pass at the ceiling and fail one byte past it, so a
+        // prompt that grows past the floor is caught rather than reported.
+        assert!(prompt_ceiling_failure(targets::MAX_PROMPT_BYTES).is_none());
+        let message = prompt_ceiling_failure(targets::MAX_PROMPT_BYTES + 1)
+            .expect("one byte over the ceiling was accepted");
+        assert!(message.contains("assembled prompt exceeds"), "{message}");
+    }
+
     /// Returns the tar header of an archive, for assertions about its fields.
     fn header_of(archive: &[u8]) -> &[u8] {
         &archive[..512]
@@ -1182,9 +1263,14 @@ mod tests {
             web_rustflags(
                 Path::new("/work/rune"),
                 Some(Path::new("/home/user/.cargo")),
-                None,
+                Some((
+                    Path::new("/home/user/.rustup/toolchains/1.98/lib/rustlib/src/rust"),
+                    "/rustc/0123456789abcdef",
+                )),
             ),
-            "--remap-path-prefix=/work/rune=/rune --remap-path-prefix=/home/user/.cargo=/cargo"
+            "--remap-path-prefix=/work/rune=/rune \
+             --remap-path-prefix=/home/user/.cargo=/cargo \
+             --remap-path-prefix=/home/user/.rustup/toolchains/1.98/lib/rustlib/src/rust=/rustc/0123456789abcdef"
         );
     }
 
@@ -1197,24 +1283,26 @@ mod tests {
     }
 
     #[test]
-    fn the_web_rebuild_remaps_the_toolchain_sources_onto_the_precompiled_prefix() {
-        // A host with `rust-src` records the standard library under the
-        // toolchain, a host without it records `/rustc/<commit>`. Mapping the
-        // local tree onto that virtual prefix is what makes the two match.
+    fn the_web_rebuild_remaps_the_standard_library_when_rust_src_is_absent() {
+        // A machine without rust-src has nothing recorded under the toolchain
+        // tree, so the remap is simply not added.
         assert_eq!(
-            web_rustflags(
-                Path::new("/work/rune"),
-                Some(Path::new("/home/user/.cargo")),
-                Some((
-                    Path::new(
-                        "/home/user/.rustup/toolchains/1.98-x86_64-unknown-linux-gnu/lib/rustlib/src/rust"
-                    ),
-                    "/rustc/0123456789abcdef",
-                )),
-            ),
-            "--remap-path-prefix=/work/rune=/rune \
-             --remap-path-prefix=/home/user/.cargo=/cargo \
-             --remap-path-prefix=/home/user/.rustup/toolchains/1.98-x86_64-unknown-linux-gnu/lib/rustlib/src/rust=/rustc/0123456789abcdef"
+            web_rustflags(Path::new("/work/rune"), Some(Path::new("/cargo")), None),
+            "--remap-path-prefix=/work/rune=/rune --remap-path-prefix=/cargo=/cargo"
         );
+    }
+
+    #[test]
+    fn the_rust_src_remap_targets_the_precompiled_virtual_prefix() {
+        // The precompiled standard library records its sources as
+        // `/rustc/<commit>/library`, so the local rust-src tree must be mapped
+        // onto exactly that prefix or a host with rust-src builds differently.
+        let (from, to) = rust_src_remap().expect("rustc should report its sysroot and commit");
+        assert!(
+            from.ends_with("lib/rustlib/src/rust"),
+            "unexpected rust-src root: {}",
+            from.display()
+        );
+        assert!(to.starts_with("/rustc/"), "unexpected virtual prefix: {to}");
     }
 }

@@ -465,6 +465,25 @@ mod tests {
     }
 
     #[test]
+    fn the_default_prompt_floor_fits_the_ceiling() {
+        // The assembled prompt depends on the workspace, so the gate measures it
+        // where it can. This is the part that does not move with repository
+        // contents: the compiled system prompt, the separator before the map, and
+        // the default map cap. Raising any of the three past the ceiling fails
+        // here rather than only at release time.
+        let limits = BudgetSet::new();
+        let floor = SYSTEM_PROMPT
+            .len()
+            .saturating_add(2)
+            .saturating_add(limits.get_usize(LimitName::RepositoryMapBytes));
+        assert!(
+            floor <= rune_core::budget::PROMPT_CEILING_BYTES,
+            "the default prompt floor is {floor} bytes, over the {} byte ceiling",
+            rune_core::budget::PROMPT_CEILING_BYTES
+        );
+    }
+
+    #[test]
     fn sections_follow_the_fixed_order() {
         let skills = vec![skill("one")];
         let project = vec![instruction("/w", "workspace rules")];
