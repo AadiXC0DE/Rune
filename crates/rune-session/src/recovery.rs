@@ -400,29 +400,28 @@ mod tests {
         assert_eq!(store.read().expect("read").len(), 4);
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_destination_directory_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+
         let root = tempfile::tempdir().expect("tempdir");
         let (paths, source) = seeded(&root);
         let destination = paths.session_dir(&id("sessionbbbbb"));
         recover(source.as_std_path(), destination.as_std_path()).expect("recover");
 
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(&destination)
-                .expect("metadata")
-                .permissions()
-                .mode()
-                & 0o777;
-            assert_eq!(mode, 0o700);
-            let mode = std::fs::metadata(destination.join(EVENTS_FILE))
-                .expect("metadata")
-                .permissions()
-                .mode()
-                & 0o777;
-            assert_eq!(mode, 0o600);
-        }
+        let mode = std::fs::metadata(&destination)
+            .expect("metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o700);
+        let mode = std::fs::metadata(destination.join(EVENTS_FILE))
+            .expect("metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
     }
 
     #[test]

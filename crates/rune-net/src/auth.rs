@@ -501,22 +501,21 @@ mod tests {
         assert_eq!(credential.source(), CredentialSource::ProfileFile);
     }
 
+    #[cfg(unix)]
     #[test]
     fn the_file_is_created_with_private_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
         let dir = TempDir::new().expect("tempdir");
         let paths = paths_for(&dir);
         store(&paths, "anthropic", "secret").expect("store");
 
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(paths.credentials_file())
-                .expect("meta")
-                .permissions()
-                .mode()
-                & 0o777;
-            assert_eq!(mode, 0o600, "credential file mode was {mode:o}");
-        }
+        let mode = std::fs::metadata(paths.credentials_file())
+            .expect("meta")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "credential file mode was {mode:o}");
     }
 
     #[cfg(unix)]

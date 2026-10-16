@@ -1140,23 +1140,22 @@ mod tests {
         assert!(err.message().contains("line 2"), "{err}");
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_widened_ledger_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+
         let dir = tempfile::tempdir().expect("tempdir");
         let ledger = ledger(&dir);
         ledger.append(&at(1)).expect("append");
 
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(ledger.path(), std::fs::Permissions::from_mode(0o644))
-                .expect("widen");
+        std::fs::set_permissions(ledger.path(), std::fs::Permissions::from_mode(0o644))
+            .expect("widen");
 
-            let err = ledger.read().expect_err("read refused");
-            assert_eq!(err.code(), ErrorCode::UnsafePath);
-            let err = ledger.append(&at(2)).expect_err("append refused");
-            assert_eq!(err.code(), ErrorCode::UnsafePath);
-        }
+        let err = ledger.read().expect_err("read refused");
+        assert_eq!(err.code(), ErrorCode::UnsafePath);
+        let err = ledger.append(&at(2)).expect_err("append refused");
+        assert_eq!(err.code(), ErrorCode::UnsafePath);
     }
 
     #[cfg(unix)]
@@ -1178,24 +1177,22 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn appending_creates_a_private_ledger_and_lock() {
+        use std::os::unix::fs::PermissionsExt;
+
         let dir = tempfile::tempdir().expect("tempdir");
         let ledger = ledger(&dir);
         ledger.append(&at(1)).expect("append");
 
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-
-            for path in [ledger.path(), ledger.lock_path().as_path()] {
-                let mode = std::fs::metadata(path)
-                    .expect("metadata")
-                    .permissions()
-                    .mode()
-                    & 0o777;
-                assert_eq!(mode, paths::FILE_MODE, "{path}");
-            }
+        for path in [ledger.path(), ledger.lock_path().as_path()] {
+            let mode = std::fs::metadata(path)
+                .expect("metadata")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, paths::FILE_MODE, "{path}");
         }
     }
 

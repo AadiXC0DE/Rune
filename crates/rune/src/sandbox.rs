@@ -288,21 +288,15 @@ mod tests {
             false,
         )
         .expect("parse");
-        // A Seatbelt profile quotes its operands and refuses a backslash, so it
-        // can only be built where a path is spelled without one. On Windows
-        // there is no such path, and no Seatbelt backend either: the host
-        // detection returns the null backend, which refuses.
-        #[cfg(not(windows))]
-        let full_backends: Vec<Box<dyn Sandbox>> = vec![
-            Box::new(LinuxSandbox::with_helper("/fixture/bwrap".into())),
-            Box::new(MacSandbox::with_support(Support::Full)),
-        ];
-        #[cfg(windows)]
-        let full_backends: Vec<Box<dyn Sandbox>> =
-            vec![Box::new(LinuxSandbox::with_helper("/fixture/bwrap".into()))];
-        for backend in full_backends {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            // Full support must use the host's backend and native path rules.
+            #[cfg(target_os = "linux")]
+            let backend = LinuxSandbox::with_helper("/fixture/bwrap".into());
+            #[cfg(target_os = "macos")]
+            let backend = MacSandbox::with_support(Support::Full);
             let report = report(
-                &*backend,
+                &backend,
                 &prepared,
                 &policy,
                 &Settings::default(),

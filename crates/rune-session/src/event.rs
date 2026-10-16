@@ -1223,18 +1223,17 @@ mod tests {
         assert_eq!(read.events, vec![message(1)]);
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_widened_log_file_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+
         let dir = tempfile::tempdir().expect("tempdir");
         let path = log_path(&dir);
         write_log(&path, &body(&[message(1)]));
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("widen");
-            let err = read_log(&path).expect_err("refused");
-            assert_eq!(err.code(), ErrorCode::UnsafePath);
-        }
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("widen");
+        let err = read_log(&path).expect_err("refused");
+        assert_eq!(err.code(), ErrorCode::UnsafePath);
     }
 
     #[test]
