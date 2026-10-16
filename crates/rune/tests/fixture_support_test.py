@@ -2,12 +2,15 @@
 
 import errno
 import fcntl
+import hashlib
 import os
+import pathlib
 import pty
 import select
 import subprocess
 import sys
 import termios
+import tempfile
 import threading
 import time
 import unittest
@@ -15,6 +18,104 @@ from unittest.mock import patch
 
 
 class TerminalDrainTests(unittest.TestCase):
+    def test_provider_condition_drains_output_before_the_signal(self):
+        # Rune can repaint more than a queue-full BEFORE the provider sees
+        # the submitted line. Reproduce that dependency even on Linux's larger
+        # queue; a plain Event.wait/file sleep here cannot let the child finish.
+        with tempfile.TemporaryDirectory(prefix="rune-pty-condition-") as directory:
+            signal = pathlib.Path(directory) / "request-received"
+            master, slave = open_terminal()
+            child = subprocess.Popen(
+                [sys.executable, "-c",
+                 "import pathlib, sys; "
+                 "sys.stdout.buffer.write(b'x' * (4 * 1024 * 1024)); "
+                 "sys.stdout.buffer.flush(); "
+                 "pathlib.Path(sys.argv[1]).touch(); sys.stdin.buffer.read(1)",
+                 str(signal)],
+                stdin=slave, stdout=slave, stderr=slave,
+            )
+            os.close(slave)
+            transcript = bytearray()
+            try:
+                wait_for_condition(child, master, transcript, signal.exists,
+                                   "provider signal", timeout=10)
+                write_terminal(master, b"\n", transcript)
+                self.assertEqual(wait_for_exit(child, master, transcript, 10), 0)
+                self.assertEqual(transcript, b'x' * (4 * 1024 * 1024) + b'\r\n')
+            finally:
+                if child.poll() is None:
+                    child.kill()
+                wait_for_exit(child, master, transcript, 10)
+                close_terminal(master)
+
+    def test_condition_deadline_reports_what_was_drained(self):
+        master, slave = open_terminal()
+        try:
+            os.write(slave, b"blocked before request")
+            transcript = bytearray()
+            child = unittest.mock.Mock()
+            child.poll.return_value = None
+            with self.assertRaisesRegex(AssertionError, "provider signal") as raised:
+                wait_for_condition(child, master, transcript, lambda: False,
+                                   "provider signal", timeout=0.05)
+            self.assertIn("blocked before request", str(raised.exception))
+        finally:
+            os.close(slave)
+            close_terminal(master)
+
+    def test_key_delivery_pumps_output_and_preserves_every_byte(self):
+        master, slave = open_terminal()
+        # The child reads a small input chunk, writes a much larger repaint,
+        # then reads again. A blocking write-all without reads deadlocks once
+        # both queues fill. Raw mode is established before the driver sends.
+        import tty
+        tty.setraw(slave)
+        payload = bytes(range(256)) * 512
+        child = subprocess.Popen(
+            [sys.executable, "-c",
+             "import hashlib, os, sys\n"
+             "digest = hashlib.sha256()\n"
+             "remaining = int(sys.argv[1])\n"
+             "while remaining:\n"
+             "    chunk = os.read(0, min(128, remaining))\n"
+             "    if not chunk: sys.exit(2)\n"
+             "    remaining -= len(chunk)\n"
+             "    digest.update(chunk)\n"
+             "    sys.stdout.buffer.write(chunk * 32)\n"
+             "    sys.stdout.buffer.flush()\n"
+             "sys.exit(0 if digest.hexdigest() == sys.argv[2] else 3)\n",
+             str(len(payload)), hashlib.sha256(payload).hexdigest()],
+            stdin=slave, stdout=slave, stderr=slave,
+        )
+        os.close(slave)
+        transcript = bytearray()
+        original_write = os.write
+        try:
+            # Force short writes as well as real kernel backpressure. Repeating
+            # an unsent suffix is byte delivery, never a retry of a test action.
+            with patch.object(os, "write", lambda fd, data: original_write(fd, data[:256])):
+                write_terminal(master, payload, transcript, timeout=10)
+            self.assertTrue(os.get_blocking(master))
+            self.assertEqual(wait_for_exit(child, master, transcript, 10), 0)
+            # Each read may be shorter than 128 bytes, so compare counts for
+            # every byte; each input byte must be returned exactly 32 times.
+            self.assertEqual(len(transcript), len(payload) * 32)
+            self.assertEqual([transcript.count(value) for value in range(256)], [512 * 32] * 256)
+        finally:
+            if child.poll() is None:
+                child.kill()
+            wait_for_exit(child, master, transcript, 10)
+            close_terminal(master)
+
+    def test_fixture_environment_ignores_host_scenario_knobs(self):
+        with patch.dict(os.environ, {
+            "RUNE_ACCESSIBLE": "true", "HTTPS_PROXY": "http://host.invalid",
+            "NO_COLOR": "", "COLORTERM": "truecolor", "VISUAL": "host-editor",
+            "EDITOR": "host-editor", "COLUMNS": "12", "LINES": "4",
+            "PATH": "/fixture/bin",
+        }, clear=True):
+            self.assertEqual(fixture_environment(), {"PATH": "/fixture/bin"})
+
     def test_empty_read_eof_preserves_the_final_chunk(self):
         # A closed pipe gives Linux the same readable EOF as a macOS PTY.
         master, writer = os.pipe()

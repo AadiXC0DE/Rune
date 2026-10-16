@@ -219,14 +219,14 @@ def run_fixture(scenario, terminal=False):
                         pump(min(remaining, 0.1))
 
                 wait_for(b"ctrl-c cancel")
-                os.write(master, b"echo through HTTP MCP\r")
+                write_terminal(master, b"echo through HTTP MCP\r", transcript)
                 # Wait for the committed reply, not the streamed delta. While a
                 # turn is running the keyboard feeds the steering queue, so an
                 # Enter sent on the first sight of the text is swallowed by the
                 # turn and never reaches command handling; the \r\n appears only
                 # once report_turn has committed the finished reply.
                 wait_for(b"HTTP_MCP_PASSED\r\n")
-                os.write(master, b"/quit\r")
+                write_terminal(master, b"/quit\r", transcript)
                 assert wait_for_exit(child, master, transcript, 30) == 0, (
                     f"session exited with status {child.returncode}:\n"
                     + transcript.decode(errors="replace")

@@ -79,12 +79,7 @@ with tempfile.TemporaryDirectory(prefix="rune-r075-") as directory:
     server.daemon_threads = True
     server_thread = threading.Thread(target=server.serve_forever, daemon=True)
     server_thread.start()
-    environment = child_environment({
-        key: value for key, value in os.environ.items()
-        if not key.startswith("RUNE_") and key.lower() not in {
-            "http_proxy", "https_proxy", "all_proxy",
-        }
-    })
+    environment = fixture_environment()
     environment.update({
         "HOME": directory,
         "XDG_CONFIG_HOME": str(root / "config"),
@@ -134,7 +129,7 @@ with tempfile.TemporaryDirectory(prefix="rune-r075-") as directory:
 
     try:
         wait_for("ctrl-c cancel")
-        os.write(master, b"retry please\r")
+        write_terminal(master, b"retry please\r", transcript)
         capture("provider retry 2/3 in 1000ms")
         assert len(requests) == 1, requests
         capture("provider retry 2/3 |")
@@ -143,13 +138,13 @@ with tempfile.TemporaryDirectory(prefix="rune-r075-") as directory:
         assert len(requests) == 2, requests
         capture("provider retry 3/3 |")
         release_third.set()
-        wait_for("RETRY-RECOVERED", offset)
+        wait_for("RETRY-RECOVERED\r\n", offset)
         # Drain through the worker poll and completed exchange's final frame.
         drain_terminal(master, transcript, quiet=0.15)
         captures.append(("completed", list(transcript[offset:])))
         assert len(requests) == 3, requests
         assert all(request["messages"][-1]["content"] == "retry please" for request in requests)
-        os.write(master, b"/quit\r")
+        write_terminal(master, b"/quit\r", transcript)
         assert wait_for_exit(child, master, transcript, 10) == 0
         print(json.dumps(captures))
     finally:

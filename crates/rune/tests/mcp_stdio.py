@@ -228,7 +228,7 @@ def run_fixture(scenario, terminal=False):
                         pump(min(remaining, 0.1))
 
                 wait_for(b"ctrl-c cancel")
-                os.write(master, b"echo through MCP\r")
+                write_terminal(master, b"echo through MCP\r", transcript)
                 if scenario == "cancel":
                     # Keep draining the terminal while the call is in flight.
                     # The process writes its repaints to the PTY whether or not
@@ -242,15 +242,15 @@ def run_fixture(scenario, terminal=False):
                         assert time.monotonic() < deadline, transcript
                         pump(0.02)
                     cancelled = time.monotonic()
-                    os.write(master, b"\x03")
-                    wait_for(b"[cancelled]")
+                    write_terminal(master, b"\x03", transcript)
+                    wait_for(b"[cancelled]\r\n")
                     assert time.monotonic() - cancelled < 2, transcript
                 else:
                     # Wait for the committed reply, not the streamed delta: an
                     # Enter sent mid-turn is queued as steering, so /quit would
                     # never reach command handling.
                     wait_for(b"MCP_FIXTURE_PASSED\r\n")
-                os.write(master, b"/quit\r")
+                write_terminal(master, b"/quit\r", transcript)
                 assert wait_for_exit(child, master, transcript, 10) == 0, (
                     f"session exited with status {child.returncode}:\n"
                     + transcript.decode(errors="replace")

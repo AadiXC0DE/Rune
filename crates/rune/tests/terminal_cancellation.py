@@ -84,12 +84,7 @@ with tempfile.TemporaryDirectory(prefix="rune-r024-") as directory:
     server.daemon_threads = True
     server_thread = threading.Thread(target=server.serve_forever, daemon=True)
     server_thread.start()
-    environment = child_environment({
-        key: value for key, value in os.environ.items()
-        if not key.startswith("RUNE_") and key.lower() not in {
-            "http_proxy", "https_proxy", "all_proxy",
-        }
-    })
+    environment = fixture_environment()
     environment.update({
         "HOME": directory,
         "XDG_CONFIG_HOME": str(root / "config"),
@@ -135,7 +130,7 @@ with tempfile.TemporaryDirectory(prefix="rune-r024-") as directory:
 
     def stop():
         global child, master
-        os.write(master, b"/quit\r")
+        write_terminal(master, b"/quit\r", transcript)
         try:
             status = wait_for_exit(child, master, transcript, 10)
         except AssertionError:
@@ -172,10 +167,10 @@ with tempfile.TemporaryDirectory(prefix="rune-r024-") as directory:
         launch()
         wait_for("ctrl-c cancel")
         start = len(transcript)
-        os.write(master, b"slow\r")
+        write_terminal(master, b"slow\r", transcript)
         wait_for("STREAM-03", start)
-        os.write(master, b"\x03")
-        wait_for("[cancelled]", start)
+        write_terminal(master, b"\x03", transcript)
+        wait_for("[cancelled]\r\n", start)
         release_stream.set()
         log, events = saved_events()
         assert [entry for entry in events if entry["kind"] == "assistant_message"] == [
@@ -187,8 +182,8 @@ with tempfile.TemporaryDirectory(prefix="rune-r024-") as directory:
         assert not any(entry["kind"] == "usage_recorded" for entry in events), events
 
         start = len(transcript)
-        os.write(master, b"after-cancel\r")
-        wait_for("AFTER_CANCEL_OK", start)
+        write_terminal(master, b"after-cancel\r", transcript)
+        wait_for("AFTER_CANCEL_OK\r\n", start)
         check_answer(requests[-1])
         session_id = log.parent.name
         stop()
@@ -196,15 +191,15 @@ with tempfile.TemporaryDirectory(prefix="rune-r024-") as directory:
         launch("resume", session_id)
         wait_for("ctrl-c cancel")
         start = len(transcript)
-        os.write(master, b"/tree\r")
-        wait_for("[cancelled]", start)
+        write_terminal(master, b"/tree\r", transcript)
+        wait_for("[cancelled]\r\n", start)
         replay = transcript[start:].decode(errors="replace")
         assert replay.count("[cancelled]") == 1, replay
         for line in partial.splitlines():
             assert replay.count(line) == 1, replay
         start = len(transcript)
-        os.write(master, b"after-resume\r")
-        wait_for("AFTER_RESUME_OK", start)
+        write_terminal(master, b"after-resume\r", transcript)
+        wait_for("AFTER_RESUME_OK\r\n", start)
         check_answer(requests[-1])
         stop()
         _, events = saved_events()

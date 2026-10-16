@@ -116,12 +116,7 @@ with tempfile.TemporaryDirectory(prefix="rune-r008-") as directory:
     server.daemon_threads = True
     server_thread = threading.Thread(target=server.serve_forever, daemon=True)
     server_thread.start()
-    environment = child_environment({
-        key: value for key, value in os.environ.items()
-        if not key.startswith("RUNE_") and key.lower() not in {
-            "http_proxy", "https_proxy", "all_proxy",
-        }
-    })
+    environment = fixture_environment()
     environment.update({
         "HOME": directory,
         "XDG_CONFIG_HOME": str(root / "config"),
@@ -170,7 +165,7 @@ with tempfile.TemporaryDirectory(prefix="rune-r008-") as directory:
         wait_for(text + "\r\n", start)
 
     def send(data):
-        os.write(master, data)
+        write_terminal(master, data, transcript)
 
     def question(prompt="question"):
         start = len(transcript)
@@ -212,7 +207,7 @@ with tempfile.TemporaryDirectory(prefix="rune-r008-") as directory:
         for cancel in [b"\x1b", b"\x03", b"\x04"]:
             start = question()
             send(cancel)
-            wait_for("cancelled", start)
+            wait_for_committed("[cancelled]", start)
             start = len(transcript)
             send(b"after-cancel\r")
             wait_for_committed("SESSION_STILL_USABLE", start)
@@ -221,9 +216,13 @@ with tempfile.TemporaryDirectory(prefix="rune-r008-") as directory:
         # Choice keys and pasted text preserve the correction and its caret.
         start = len(transcript)
         send(b"question-draft\r")
-        assert draft_request.wait(10), "provider did not receive the draft turn"
+        wait_for_condition(child, master, transcript, draft_request.is_set,
+                           "provider to receive the draft turn")
         send(b"correction\x1b[D\x1b[D\x1b[D")
         wait_for("correction", start)
+        # A pending Left must not be consumed by the question picker.
+        draft_end = transcript.index(b"correction", start) + len(b"correction")
+        wait_for("\x1b[10G\x1b[?25h", draft_end)
         release_draft.set()
         wait_for("answer required (1/1)", start)
         send(b"\x1b[200~SHOULD_NOT_STEER\x1b[201~\x15\x1b[B\r")

@@ -43,11 +43,11 @@ def capture(binary, root, environment):
     try:
         wait_for(b"ctrl-c cancel")
         start = len(transcript)
-        os.write(master, b"/")
+        write_terminal(master, b"/", transcript)
         wait_for(b"/model", start)
         drain_terminal(master, transcript, quiet=0.1)
         result = list(transcript)
-        os.write(master, b"\x03/quit\r")
+        write_terminal(master, b"\x03/quit\r", transcript)
         assert wait_for_exit(child, master, transcript, 10) == 0, transcript.decode(errors="replace")
         return result
     finally:
@@ -64,10 +64,7 @@ with tempfile.TemporaryDirectory(prefix="rune-r071-") as directory:
     config_file = config / "config.toml"
     config_file.write_text("auto_upgrade = false\n")
     config_file.chmod(0o600)
-    environment = child_environment({
-        key: value for key, value in os.environ.items()
-        if not key.startswith("RUNE_") and key not in {"NO_COLOR", "COLORTERM"}
-    })
+    environment = fixture_environment()
     environment.update({
         "HOME": directory,
         "XDG_CONFIG_HOME": str(root / "config"),

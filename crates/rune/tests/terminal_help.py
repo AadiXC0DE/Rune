@@ -83,12 +83,7 @@ with tempfile.TemporaryDirectory(prefix="rune-r073-") as directory:
     server.daemon_threads = True
     server_thread = threading.Thread(target=server.serve_forever, daemon=True)
     server_thread.start()
-    environment = child_environment({
-        key: value for key, value in os.environ.items()
-        if not key.startswith("RUNE_") and key.lower() not in {
-            "http_proxy", "https_proxy", "all_proxy",
-        }
-    })
+    environment = fixture_environment()
     environment.update({
         "HOME": directory,
         "XDG_CONFIG_HOME": str(root / "config"),
@@ -135,11 +130,19 @@ with tempfile.TemporaryDirectory(prefix="rune-r073-") as directory:
         assert not errors, errors
 
     def keys(data):
-        os.write(master, data)
+        start = len(transcript)
+        write_terminal(master, data, transcript)
+        if data in (b"\x1b", b"\x03", b"\x15"):
+            # A standalone Escape must be consumed before the next write can
+            # turn it into an Alt-key sequence. These keys return to the main
+            # composer (including when closing the transcript).
+            wait_for("\x1b[?25h", start)
         drain()
+        return start
 
     def draft(label, data, text, column):
-        keys(data)
+        start = keys(data)
+        wait_for(f"\x1b[{column + 1}G\x1b[?25h", start)
         captures.append([label, list(transcript), "> " + text, column])
 
     def submit(text):
@@ -149,7 +152,8 @@ with tempfile.TemporaryDirectory(prefix="rune-r073-") as directory:
         assert prompts[-1] == text, prompts
 
     def viewer(label, data):
-        keys(data)
+        start = keys(data)
+        wait_for("\x1b[24;1H", start)
         captures.append(["viewer-" + label, list(transcript), "", 0])
 
     try:
@@ -159,7 +163,7 @@ with tempfile.TemporaryDirectory(prefix="rune-r073-") as directory:
             wait_for("Input: terminal line mode")
             assert b"Keyboard bindings (interactive key input)" not in transcript
             assert b"Enter submits one line; end of input leaves the session." in transcript
-            os.write(master, b"/quit\n")
+            write_terminal(master, b"/quit\n", transcript)
             assert wait_for_exit(child, master, transcript, 10) == 0
             print(json.dumps(captures))
             sys.exit(0)
@@ -300,7 +304,7 @@ with tempfile.TemporaryDirectory(prefix="rune-r073-") as directory:
 
         # Idle Escape stays, idle Ctrl-D leaves. A second process proves Ctrl-C.
         draft("idle-escape-empty", b"\x1b", "", 2)
-        os.write(master, b"\x04")
+        write_terminal(master, b"\x04", transcript)
         assert wait_for_exit(child, master, transcript, 10) == 0
         close_terminal(master)
         master, slave = open_terminal()
@@ -312,7 +316,7 @@ with tempfile.TemporaryDirectory(prefix="rune-r073-") as directory:
         os.close(slave)
         transcript = bytearray()
         wait_for("ctrl-c cancel")
-        os.write(master, b"\x03")
+        write_terminal(master, b"\x03", transcript)
         assert wait_for_exit(child, master, transcript, 10) == 0
         assert not errors, errors
         print(json.dumps(captures))

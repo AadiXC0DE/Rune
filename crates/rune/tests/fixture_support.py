@@ -14,6 +14,13 @@ read, so never wait for that child before draining. Fixtures must use this
 shared shutdown path, including cleanup after kill, rather than subprocess.wait
 on a writing PTY child.
 
+The same rule applies BEFORE shutdown: use wait_for_condition for provider
+events and editor/file handshakes. Event.wait or sleep in the driver stops
+reading while Rune is repainting in response to keys, so it can block before
+it even submits the prompt. A retained slave preserves bytes, not queue space.
+Use write_terminal for keys so partial writes and input backpressure also keep
+the output moving. Neither operation treats output silence as readiness.
+
 Every `subprocess.run` in those fixtures also reports what happened at its
 deadline:
 
@@ -38,6 +45,17 @@ import time as _time
 
 _run = _subprocess.run
 _terminal_slaves = {}
+
+
+def fixture_environment():
+    """Inherit host tools, but isolate provider, proxy, editor and display knobs."""
+    return child_environment({
+        key: value for key, value in _os.environ.items()
+        if not key.startswith("RUNE_") and key.lower() not in {
+            "http_proxy", "https_proxy", "all_proxy", "no_proxy",
+            "no_color", "colorterm", "visual", "editor", "columns", "lines",
+        }
+    })
 
 
 def open_terminal():
@@ -113,6 +131,64 @@ def drain_terminal(master, transcript, quiet=0.15, timeout=10, deadline=None):
             raise AssertionError("terminal never became idle:\n" + _tail(transcript))
         if not _pump(master, transcript, min(quiet, remaining)):
             return
+
+
+def wait_for_condition(child, master, transcript, predicate, description, timeout=10,
+                       deadline=None):
+    """Wait for a product/provider condition while servicing terminal output.
+
+    A predicate can inspect captured bytes, an Event.is_set or a fixture file.
+    Keep one absolute deadline, including when sharing a bound across phases.
+    Provider-side Event.wait is fine: the driver remains free to drain the PTY.
+    """
+    if deadline is None:
+        deadline = _time.monotonic() + timeout
+    while not predicate():
+        remaining = deadline - _time.monotonic()
+        if remaining <= 0:
+            raise AssertionError(f"timed out waiting for {description}:\n" + _tail(transcript))
+        if child.poll() is not None:
+            # Include queued diagnostics, and let a last output satisfy the
+            # condition even when poll observes exit before the final read.
+            while _pump(master, transcript, 0):
+                if _time.monotonic() >= deadline:
+                    break
+            if predicate():
+                return
+            raise AssertionError(
+                f"child exited ({child.returncode}) before {description}:\n" + _tail(transcript)
+            )
+        _pump(master, transcript, min(remaining, 0.05))
+
+
+def write_terminal(master, data, transcript, timeout=10):
+    """Deliver all keys, draining output if the terminal cannot take them yet.
+
+    Writes do not acknowledge that keys were processed. Callers still wait for
+    the resulting frame or provider condition before making assertions.
+    """
+    deadline = _time.monotonic() + timeout
+    blocking = _os.get_blocking(master)
+    _os.set_blocking(master, False)
+    try:
+        pending = memoryview(data)
+        while pending:
+            remaining = deadline - _time.monotonic()
+            if remaining <= 0:
+                raise AssertionError("timed out delivering terminal keys:\n" + _tail(transcript))
+            readable, writable, _ = _select.select([master], [master], [], min(remaining, 0.05))
+            if readable:
+                _pump(master, transcript, 0)
+            if writable:
+                try:
+                    sent = _os.write(master, pending)
+                except BlockingIOError:
+                    continue
+                if sent == 0:
+                    raise AssertionError("terminal accepted no keys:\n" + _tail(transcript))
+                pending = pending[sent:]
+    finally:
+        _os.set_blocking(master, blocking)
 
 
 def wait_for_exit(child, master, transcript=None, timeout=10):

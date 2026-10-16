@@ -131,12 +131,8 @@ class Terminal:
     def drain(self, duration=0.15):
         deadline = time.monotonic() + duration
         while time.monotonic() < deadline:
-            ready, _, _ = select.select([self.master], [], [], 0.02)
-            if ready:
-                try:
-                    self.output.extend(os.read(self.master, 65536))
-                except OSError:
-                    break
+            if _pump(self.master, self.output, min(0.02, deadline - time.monotonic())) == b"":
+                break
 
     def wait_for(self, text, start=0):
         deadline = time.monotonic() + 12
@@ -149,7 +145,7 @@ class Terminal:
         assert not errors, errors
 
     def send(self, line):
-        os.write(self.master, line.encode() + b"\n")
+        write_terminal(self.master, line.encode() + b"\n", self.output)
 
     def finish(self):
         self.send("/exit")
@@ -179,12 +175,7 @@ with tempfile.TemporaryDirectory(prefix="rune-r070-") as directory:
     server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Provider)
     server.daemon_threads = True
     threading.Thread(target=server.serve_forever, daemon=True).start()
-    environment = child_environment({
-        key: value for key, value in os.environ.items()
-        if not key.startswith("RUNE_") and key.lower() not in {
-            "http_proxy", "https_proxy", "all_proxy", "no_color",
-        }
-    })
+    environment = fixture_environment()
     environment.update({
         "HOME": directory,
         "XDG_CONFIG_HOME": str(root / "config"),
@@ -208,7 +199,8 @@ with tempfile.TemporaryDirectory(prefix="rune-r070-") as directory:
         terminal.drain(0.3)
         assert bytes(terminal.output) == opening, "idle status was rewritten"
         terminal.send(LONG_PROMPT)
-        assert first_delta.wait(10), "provider did not stream"
+        wait_for_condition(terminal.child, terminal.master, terminal.output,
+                           first_delta.is_set, "provider to stream")
         terminal.drain()
         assert b"Assistant: FIRST-" not in terminal.output, "partial reply printed"
         release_reply.set()

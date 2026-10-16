@@ -68,12 +68,7 @@ with tempfile.TemporaryDirectory(prefix="rune-terminal-menu-") as directory:
     server.daemon_threads = True
     server_thread = threading.Thread(target=server.serve_forever, daemon=True)
     server_thread.start()
-    environment = child_environment({
-        key: value for key, value in os.environ.items()
-        if not key.startswith("RUNE_") and key.lower() not in {
-            "http_proxy", "https_proxy", "all_proxy",
-        }
-    })
+    environment = fixture_environment()
     environment.update({
         "HOME": directory,
         "XDG_CONFIG_HOME": str(root / "config"),
@@ -112,7 +107,7 @@ with tempfile.TemporaryDirectory(prefix="rune-terminal-menu-") as directory:
 
     def capture(stage, keys, expected):
         start = len(transcript)
-        os.write(master, keys)
+        write_terminal(master, keys, transcript)
         wait_for(expected, start)
         drain_terminal(master, transcript, quiet=0.1)
         captures.append((stage, list(transcript)))
@@ -126,7 +121,7 @@ with tempfile.TemporaryDirectory(prefix="rune-terminal-menu-") as directory:
             capture("invalid-tag", b"\rqwen3:", "no match for `qwen3:`")
             capture("typed-tag", b"\rlatest", "> use qwen3:latest (not listed)")
             capture("chosen-tag", b"\r", "model set to qwen3:latest")
-            capture("reply", b"respond using the selected model\r", "TAGGED-MODEL-REPLY")
+            capture("reply", b"respond using the selected model\r", "TAGGED-MODEL-REPLY\r\n")
             assert requests, "no provider request was sent"
             assert all(request["model"] == "qwen3:latest" for request in requests), requests
             assert 'qwen3:latest' in config_file.read_text(), "choice was not saved"
@@ -136,14 +131,14 @@ with tempfile.TemporaryDirectory(prefix="rune-terminal-menu-") as directory:
             capture("custom-menu-enter", b"\x15/audit", "> /audit-command")
             capture("custom-enter", b"\r", "> /audit-command")
             capture("custom-expanded", b"\r", "/audit-command expanded; edit before sending")
-            os.write(master, b"\x15")
+            write_terminal(master, b"\x15", transcript)
         else:
             # Fifteen builtins, including /pin and commands beyond the first window.
             capture("completion-last", b"/" + b"\x1b[B" * 14, "> /quit")
             capture("completion-closed", b"\x1b", "\x1b[?25h")
             capture("model-last", b"/model\r" + b"\x1b[B" * 14, "> menu-model-15")
             capture("model-closed", b"\x1b", "\x1b[?25h")
-        os.write(master, b"/quit\r")
+        write_terminal(master, b"/quit\r", transcript)
         assert wait_for_exit(child, master, transcript, 10) == 0
         print(json.dumps({"captures": captures, "requests": requests} if tagged_model else captures))
     finally:

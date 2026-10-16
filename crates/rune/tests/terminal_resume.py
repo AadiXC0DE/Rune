@@ -69,12 +69,7 @@ with tempfile.TemporaryDirectory(prefix="rune-r038-") as directory:
     server.daemon_threads = True
     server_thread = threading.Thread(target=server.serve_forever, daemon=True)
     server_thread.start()
-    environment = child_environment({
-        key: value for key, value in os.environ.items()
-        if not key.startswith("RUNE_") and key.lower() not in {
-            "http_proxy", "https_proxy", "all_proxy",
-        }
-    })
+    environment = fixture_environment()
     environment.update({
         "HOME": directory,
         "XDG_CONFIG_HOME": str(root / "config"),
@@ -136,7 +131,7 @@ with tempfile.TemporaryDirectory(prefix="rune-r038-") as directory:
 
     def stop():
         global child, master
-        os.write(master, b"/quit\r")
+        write_terminal(master, b"/quit\r", transcript)
         try:
             status = wait_for_exit(child, master, transcript, 10)
         except AssertionError:
@@ -174,16 +169,16 @@ with tempfile.TemporaryDirectory(prefix="rune-r038-") as directory:
         capture("resume-last-before-input", 80)
         assert len(requests) == 1, "replay must not request another reply"
         assert log.read_bytes() == original_log, "replay must not append messages"
-        os.write(master, b"draft")
+        write_terminal(master, b"draft", transcript)
         wait_for("> draft")
         drain()
         capture("resume-last-draft", 80)
         assert len(requests) == 1
-        os.write(master, b"\x03")
+        write_terminal(master, b"\x03", transcript)
         drain()
         start = len(transcript)
-        os.write(master, b"continue saved prompt\r")
-        wait_for("CONTINUED-REPLY", start)
+        write_terminal(master, b"continue saved prompt\r", transcript)
+        wait_for("CONTINUED-REPLY\r\n", start)
         drain()
         assert [message for message in requests[-1]["messages"]
                 if message["role"] != "system"] == [

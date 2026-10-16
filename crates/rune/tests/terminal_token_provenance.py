@@ -63,10 +63,7 @@ with tempfile.TemporaryDirectory(prefix="rune-r115-") as directory:
         '[models.chat_completions]\nid = "provenance-fixture"\n'
         'context_window = 128000\n'
     )
-    environment = child_environment({key: value for key, value in os.environ.items()
-                   if not key.startswith("RUNE_") and key.lower() not in {
-                       "http_proxy", "https_proxy", "all_proxy",
-                   }})
+    environment = fixture_environment()
     environment.update({
         "HOME": directory,
         "XDG_CONFIG_HOME": str(root / "config"),
@@ -94,7 +91,7 @@ with tempfile.TemporaryDirectory(prefix="rune-r115-") as directory:
     def capture(stage, expected, keys=b""):
         global offset
         if keys:
-            os.write(master, keys)
+            write_terminal(master, keys, transcript)
         deadline = time.monotonic() + 10
         while expected.encode() not in transcript[offset:]:
             assert time.monotonic() < deadline, (
@@ -119,7 +116,7 @@ with tempfile.TemporaryDirectory(prefix="rune-r115-") as directory:
         capture("new-footer", "started session", b"/new\r")
         capture("new-status", "context source request bytes (estimate)", b"/status\r")
         assert len(requests) == 2, requests
-        os.write(master, b"/quit\r")
+        write_terminal(master, b"/quit\r", transcript)
         assert wait_for_exit(child, master, transcript, 10) == 0
         print(json.dumps(captures))
     finally:

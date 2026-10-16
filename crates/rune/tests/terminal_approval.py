@@ -104,12 +104,7 @@ with tempfile.TemporaryDirectory(prefix="rune-r003-") as directory:
     server.daemon_threads = True
     server_thread = threading.Thread(target=server.serve_forever, daemon=True)
     server_thread.start()
-    environment = child_environment({
-        key: value for key, value in os.environ.items()
-        if not key.startswith("RUNE_") and key.lower() not in {
-            "http_proxy", "https_proxy", "all_proxy",
-        }
-    })
+    environment = fixture_environment()
     environment.update({
         "HOME": directory,
         "XDG_CONFIG_HOME": str(root / "config"),
@@ -149,7 +144,7 @@ with tempfile.TemporaryDirectory(prefix="rune-r003-") as directory:
         assert not errors, errors
 
     def send(data):
-        os.write(master, data)
+        write_terminal(master, data, transcript)
 
     def settled_reply(text, start):
         # Streaming rows end in an erase/style sequence. The plain line ending
@@ -198,7 +193,8 @@ with tempfile.TemporaryDirectory(prefix="rune-r003-") as directory:
         # An approval consumes neither a correction draft nor its caret position.
         start = len(transcript)
         send(b"permission-draft\r")
-        assert draft_request.wait(10), "provider did not receive the draft turn"
+        wait_for_condition(child, master, transcript, draft_request.is_set,
+                           "provider to receive the draft turn")
         send(b"correction\x1b[D\x1b[D\x1b[D")
         wait_for("correction", start)
         # Release the provider only after all three caret moves were rendered,

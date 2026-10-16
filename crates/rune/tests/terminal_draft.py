@@ -98,12 +98,7 @@ with tempfile.TemporaryDirectory(prefix="rune-r004-") as directory:
     server.daemon_threads = True
     server_thread = threading.Thread(target=server.serve_forever, daemon=True)
     server_thread.start()
-    environment = child_environment({
-        key: value for key, value in os.environ.items()
-        if not key.startswith("RUNE_") and key.lower() not in {
-            "http_proxy", "https_proxy", "all_proxy",
-        }
-    })
+    environment = fixture_environment()
     environment.update({
         "HOME": directory,
         "XDG_CONFIG_HOME": str(root / "config"),
@@ -185,20 +180,23 @@ sys.exit(9 if mode == "editor-failed" else 0)
                 transcript.extend(os.read(master, 65536))
         assert not errors, errors
 
-    def capture(stage, keys, expected):
+    def capture(stage, keys, expected, caret=None):
         start = len(transcript)
-        os.write(master, keys)
+        write_terminal(master, keys, transcript)
         if editor_mode == "editor-steering" and stage == "returned":
             deadline = time.monotonic() + 10
-            while not (root / "editor-path").exists():
-                assert time.monotonic() < deadline, "editor did not start"
-                time.sleep(0.01)
+            wait_for_condition(child, master, transcript,
+                               (root / "editor-path").exists, "editor to start",
+                               deadline=deadline)
             editor_open.set()
-            assert stream_sent.wait(10), "provider did not stream while editing"
+            wait_for_condition(child, master, transcript, stream_sent.is_set,
+                               "provider to stream while editing")
             drain_terminal(master, transcript, quiet=0.2, deadline=deadline)
             assert b"EDITOR_STREAM_HIDDEN" not in transcript[start:], transcript[start:]
             (root / "editor-exit").touch()
         wait_for(expected, start)
+        marker = transcript.index(expected.encode(), start) + len(expected.encode())
+        wait_for("\x1b[?25h" if caret is None else f"\x1b[{caret + 1}G\x1b[?25h", marker)
         # Drain complete frames before handing the byte stream to Rune's grid.
         drain_terminal(master, transcript, quiet=0.1)
         captures.append((stage, list(transcript)))
@@ -207,9 +205,9 @@ sys.exit(9 if mode == "editor-failed" else 0)
         wait_for("ctrl-c cancel")
         if editor_mode:
             if editor_mode == "editor-steering":
-                os.write(master, b"start\r")
+                write_terminal(master, b"start\r", transcript)
                 wait_for("EDITOR_TURN_STARTED")
-            capture("original", "draft 界".encode() + b"\x1b[D", "draft 界")
+            capture("original", "draft 界".encode() + b"\x1b[D", "draft 界", caret=8)
             changed = editor_mode in {"editor", "editor-fallback", "editor-steering"}
             capture("returned", b"\x07", "second 界" if changed else "\x1b[?1049l")
             flags = termios.tcgetattr(master)[3]
@@ -235,11 +233,11 @@ sys.exit(9 if mode == "editor-failed" else 0)
                 capture("typed", b"!", "draft !界")
                 submitted = "draft !界"
         elif sys.argv[2:] == ["history-search"]:
-            capture("original", "draft 界".encode() + b"\x1b[D", "draft 界")
+            capture("original", "draft 界".encode() + b"\x1b[D", "draft 界", caret=8)
             for label, cancel in [("escape", b"\x1b"), ("control-c", b"\x03")]:
                 capture("search-" + label, b"\x12absent", "no match for `absent`")
                 # Enter with no match must keep searching, never submit the query.
-                os.write(master, b"\r")
+                write_terminal(master, b"\r", transcript)
                 capture("cancel-" + label, cancel, "draft 界")
                 assert not prompts, prompts
             capture("search-control-d", b"\x12", "prompt history")
@@ -283,7 +281,7 @@ sys.exit(9 if mode == "editor-failed" else 0)
             capture("end-again", b"\x05", "\x1b[12G")
             submitted = "first 界Y\nsecond e\u0301X\nthird 👩‍💻Z"
         elif sys.argv[2:] == ["redo"]:
-            capture("original", "界ab".encode() + b"\x1b[D", "界ab")
+            capture("original", "界ab".encode() + b"\x1b[D", "界ab", caret=5)
             capture(
                 "inserted", b"\x1b[200~" + "e\u0301".encode() + b"\x1b[201~",
                 "界ae\u0301b",
@@ -293,7 +291,7 @@ sys.exit(9 if mode == "editor-failed" else 0)
             capture("redone", b"\x1br", "界ae\u0301b")
             submitted = "界ae\u0301b"
         elif sys.argv[2:] == ["undo"]:
-            capture("original", "界ab".encode() + b"\x1b[D", "界ab")
+            capture("original", "界ab".encode() + b"\x1b[D", "界ab", caret=5)
             capture(
                 "inserted", b"\x1b[200~" + "e\u0301".encode() + b"\x1b[201~",
                 "界ae\u0301b",
@@ -312,12 +310,13 @@ sys.exit(9 if mode == "editor-failed" else 0)
             capture("home", b"\x01", "> " + "a" * 78)
             capture("end-again", b"\x05", "TAIL-ENZ")
             submitted = "a" * 160 + "TAIL-ENZ"
-        os.write(master, b"\r")
+        submitted_at = len(transcript)
+        write_terminal(master, b"\r", transcript)
         # Wait for close_turn's committed line, not its earlier streamed row,
         # so /quit is handled as a command rather than steering the old turn.
-        wait_for("DRAFT_RECEIVED\r\n", len(transcript) if editor_mode == "editor-steering" else 0)
+        wait_for("DRAFT_RECEIVED\r\n", submitted_at)
         assert prompts == (["start", submitted] if editor_mode == "editor-steering" else [submitted]), prompts
-        os.write(master, b"/quit\r")
+        write_terminal(master, b"/quit\r", transcript)
         assert wait_for_exit(child, master, transcript, 10) == 0
         assert not errors, errors
         print(json.dumps(captures))

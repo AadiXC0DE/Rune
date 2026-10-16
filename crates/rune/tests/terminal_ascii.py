@@ -107,45 +107,46 @@ def capture(binary, root, environment, arguments):
         wait_for(b"ctrl-c cancel")
         wait_for(b"ascii-fixture")
         start = len(transcript)
-        os.write(master, b"/mod")
+        write_terminal(master, b"/mod", transcript)
         wait_for(b"> /model", start)
         drain()
         start = len(transcript)
-        os.write(master, b"\x03fixture")
-        os.write(master, b"\t")
+        write_terminal(master, b"\x03fixture", transcript)
+        write_terminal(master, b"\t", transcript)
         wait_for(b"> fixture", start)
         drain()
         # Cancel completion, then submit a multiline prompt for the history menu.
-        os.write(master, b"\x1b")
+        write_terminal(master, b"\x1b", transcript)
         drain()
-        os.write(master, b"\x03\x1b[200~fixture\nsecond\x1b[201~\r")
+        write_terminal(master, b"\x03\x1b[200~fixture\nsecond\x1b[201~\r", transcript)
         wait_for(b"ASCII_REPLY_END")
         finish_reply.set()
         # Tool summaries are settled after stream completion and journal writes.
         # A quiet PTY after a streamed delta is not a completion signal.
         wait_for(b"read_file")
         wait_for(b"    > ")
+        wait_for(b"ASCII_REPLY_END\r\n")
         drain()
         assert b"read_file" in transcript, "tool summary was not displayed"
         assert b"    > " in transcript, "code continuation was not displayed"
         start = len(transcript)
-        os.write(master, b"\x12")
+        write_terminal(master, b"\x12", transcript)
         wait_for(b"> fixture / second", start)
         drain()
-        os.write(master, b"\x1b")
+        write_terminal(master, b"\x1b", transcript)
         drain()
         start = len(transcript)
-        os.write(master, b"\x0f")
+        write_terminal(master, b"\x0f", transcript)
         wait_for(b"Transcript", start)
         drain()
         start = len(transcript)
-        os.write(master, b"\x1b[F")
+        write_terminal(master, b"\x1b[F", transcript)
         wait_for(b"ASCII_REPLY_END", start)
         drain()
         assert transcript.isascii(), transcript.decode(errors="replace")
-        os.write(master, b"\x1b")
+        write_terminal(master, b"\x1b", transcript)
         drain()
-        os.write(master, b"/quit\r")
+        write_terminal(master, b"/quit\r", transcript)
         assert wait_for_exit(child, master, transcript, 10) == 0, transcript.decode(errors="replace")
     finally:
         if child.poll() is None:
@@ -170,10 +171,7 @@ try:
             config_file.chmod(0o600)
             (root / "fixture.txt").write_text("ASCII_TOOL_CONTENT\n" * 20)
             (root / "fixture-other.txt").write_text("another path\n")
-            environment = child_environment({
-                key: value for key, value in os.environ.items()
-                if not key.startswith("RUNE_") and key not in {"NO_COLOR", "COLORTERM"}
-            })
+            environment = fixture_environment()
             environment.update({
                 "HOME": directory,
                 "XDG_CONFIG_HOME": str(root / "config"),

@@ -86,12 +86,7 @@ with tempfile.TemporaryDirectory(prefix="rune-r058-") as directory:
     server.daemon_threads = True
     server_thread = threading.Thread(target=server.serve_forever, daemon=True)
     server_thread.start()
-    environment = child_environment({
-        key: value for key, value in os.environ.items()
-        if not key.startswith("RUNE_") and key.lower() not in {
-            "http_proxy", "https_proxy", "all_proxy",
-        }
-    })
+    environment = fixture_environment()
     environment.update({
         "HOME": directory,
         "XDG_CONFIG_HOME": str(root / "config"),
@@ -137,7 +132,7 @@ with tempfile.TemporaryDirectory(prefix="rune-r058-") as directory:
 
     def stop():
         global child, master
-        os.write(master, b"/quit\r")
+        write_terminal(master, b"/quit\r", transcript)
         try:
             status = wait_for_exit(child, master, transcript, 10)
         except AssertionError:
@@ -174,7 +169,7 @@ with tempfile.TemporaryDirectory(prefix="rune-r058-") as directory:
         launch()
         wait_for("ctrl-c cancel")
         start = len(transcript)
-        os.write(master, b"slow\r")
+        write_terminal(master, b"slow\r", transcript)
         wait_for("STREAM-03", start)
         os.kill(child.pid, signal.SIGKILL)
         assert wait_for_exit(child, master, transcript, 10) == -signal.SIGKILL
@@ -200,15 +195,15 @@ with tempfile.TemporaryDirectory(prefix="rune-r058-") as directory:
         assert replay.count("[interrupted]") == 1, replay
         assert "STREAM-04" not in replay, replay
         start = len(transcript)
-        os.write(master, b"/tree\r")
+        write_terminal(master, b"/tree\r", transcript)
         wait_for("[interrupted]", start)
         replay = transcript[start:].decode(errors="replace")
         assert replay.count("[interrupted]") == 1, replay
         for line in partial.splitlines():
             assert replay.count(line) == 1, replay
         start = len(transcript)
-        os.write(master, b"after-resume\r")
-        wait_for("AFTER_RESUME_OK", start)
+        write_terminal(master, b"after-resume\r", transcript)
+        wait_for("AFTER_RESUME_OK\r\n", start)
         check_answer(requests[-1])
         stop()
         _, events = saved_events()
@@ -223,8 +218,8 @@ with tempfile.TemporaryDirectory(prefix="rune-r058-") as directory:
         for text in [*partial.splitlines(), "AFTER_RESUME_OK", "[interrupted]"]:
             assert replay.count(text) == 1, replay
         start = len(transcript)
-        os.write(master, b"after-resume\r")
-        wait_for("AFTER_RESUME_OK", start)
+        write_terminal(master, b"after-resume\r", transcript)
+        wait_for("AFTER_RESUME_OK\r\n", start)
         check_answer(requests[-1])
         assert [message["content"] for message in requests[-1]["messages"]
                 if message["role"] == "assistant"].count("AFTER_RESUME_OK") == 1
