@@ -278,6 +278,9 @@ fn offline_shell_fallback_requires_opt_in_and_applies_no_isolation() {
 fn offline_documentation_maps_all_five_paths_without_promising_total_isolation() {
     let root = workspace_root();
     let readme = std::fs::read_to_string(root.join("README.md")).expect("README");
+    // Git may check documentation out with CRLF. Keep the section boundaries
+    // and required evidence exact, independent of checkout line endings.
+    let readme = readme.replace("\r\n", "\n");
     let boundary = readme
         .split("## Offline enforcement boundary\n")
         .nth(1)
