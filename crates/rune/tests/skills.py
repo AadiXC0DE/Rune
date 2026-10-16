@@ -56,6 +56,10 @@ def run_fixture(ask):
                     assert lines[1].startswith("  skill:"), last
                     assert lines[2] == "  Ships the service", last
                     location = lines[1].removeprefix("  ")
+                    # Compare the file the product names, not the spelling of
+                    # the path: the product reports the discovered file at its
+                    # canonical location, which on macOS resolves `$TMPDIR`'s
+                    # `/var` to `/private/var`.
                     assert_skill_location(location, skill_file)
                     name, arguments = "skill", {"location": location}
                 elif step == 3:
@@ -94,7 +98,12 @@ def run_fixture(ask):
                 self.send_error(500)
 
     with tempfile.TemporaryDirectory(prefix="rune-r161-") as directory:
-        base = pathlib.Path(directory)
+        # The product reports the discovered files at their canonical path
+        # (`getcwd`-based), and on macOS `$TMPDIR` is `/var/...`, a symlink to
+        # `/private/var/...`. Resolving the fixture root once keeps every path
+        # it builds — the search hit, the loaded location and the oversized
+        # lookup — in the same spelling the catalog uses.
+        base = pathlib.Path(directory).resolve()
         root = base / "workspace"
         skill_file = root / ".agents" / "skills" / "opaque-directory" / "SKILL.md"
         skill_file.parent.mkdir(parents=True)

@@ -85,7 +85,11 @@ def controlling_terminal():
 
 
 with tempfile.TemporaryDirectory(prefix="rune-r004-") as directory:
-    root = pathlib.Path(directory)
+    # `TemporaryDirectory` returns the `$TMPDIR` spelling, which on macOS is
+    # `/var/folders/...` while the process's real workspace (`getcwd`) is
+    # `/private/var/folders/...`. Recall is scoped by comparing the recorded
+    # workspace to that real path, so the fixture must record the resolved one.
+    root = pathlib.Path(directory).resolve()
     config = root / "config" / "rune"
     config.mkdir(parents=True, mode=0o700)
     config_file = config / "config.toml"
