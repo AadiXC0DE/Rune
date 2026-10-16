@@ -2,7 +2,14 @@
 //!
 //! A prompt is shown for one scope, and the choice that remembers the answer
 //! records exactly the scope shown. Both come from [`Scope`], so the string a
-//! user reads and the string a grant stores cannot drift apart.
+//! user reads and the string a grant stores cannot drift apart. The remembered
+//! grant also matches that scope literally: approving a file named `foo*` allows
+//! `foo*` and not `foobar`, because widening what the user saw would approve a
+//! different file.
+//!
+//! A grant built directly from a pattern, as a configured rule may be, still
+//! matches as a glob. Only the grant a prompt remembers is pinned to one exact
+//! scope.
 //!
 //! Grants live in memory for one session. They are never written to
 //! configuration and never restored, which is why they live in this crate
@@ -123,9 +130,12 @@ impl Scope {
     }
 
     /// Returns the grant this scope records.
+    ///
+    /// The grant matches the scope literally. A prompt shows one exact target,
+    /// so remembering it must not widen it into a pattern.
     #[must_use]
     pub fn grant(&self) -> SessionGrant {
-        SessionGrant::new(self.tool.clone(), self.target.clone())
+        SessionGrant::literal(self.tool.clone(), self.target.clone())
     }
 }
 
@@ -142,29 +152,50 @@ pub struct SessionGrant {
     pub tool: String,
     /// The scope the grant covers.
     pub target: String,
+    /// True when `target` is matched literally rather than as a glob pattern.
+    ///
+    /// Defaulted so a grant serialized before this field existed is read back as
+    /// a pattern, which is the behaviour it was written under.
+    #[serde(default)]
+    literal: bool,
 }
 
 impl SessionGrant {
-    /// Builds a grant.
+    /// Builds a grant whose target is a pattern, as a configured rule may be.
+    ///
+    /// Use [`Self::literal`] for a grant remembered from a prompt, where the
+    /// user saw one exact scope.
     #[must_use]
     pub fn new(tool: impl Into<String>, target: impl Into<String>) -> Self {
         Self {
             tool: tool.into(),
             target: target.into(),
+            literal: false,
+        }
+    }
+
+    /// Builds a grant that matches only the exact target the user was shown.
+    #[must_use]
+    pub fn literal(tool: impl Into<String>, target: impl Into<String>) -> Self {
+        Self {
+            tool: tool.into(),
+            target: target.into(),
+            literal: true,
         }
     }
 
     /// Returns true when the grant covers a call.
     ///
-    /// A command grant matches its exact target. A grant for any other tool may
-    /// use a pattern, because a path or a query is a category the user can see
-    /// the shape of.
+    /// A grant remembered from a prompt matches the exact target the user saw.
+    /// A command grant always matches its exact target, since a pattern would
+    /// let the model run a command the user never saw. A grant built directly
+    /// from a pattern may use a glob, as a configured rule does.
     #[must_use]
     pub fn matches(&self, tool: &str, target: &str) -> bool {
         if self.tool != tool {
             return false;
         }
-        if is_command_tool(tool) {
+        if self.literal || is_command_tool(tool) {
             return self.target == target;
         }
         glob_match(&self.target, target)
@@ -494,6 +525,9 @@ mod tests {
 
     #[test]
     fn a_non_command_grant_may_use_a_pattern() {
+        // A directly-built grant carries a pattern, as a configured rule does.
+        // A grant a prompt remembers is pinned to one literal target instead;
+        // the tests below cover that.
         let grant = SessionGrant::new("read_file", "src/**");
         assert!(grant.matches("read_file", "src/lib.rs"));
         assert!(grant.matches("read_file", "src/deep/mod.rs"));
@@ -502,6 +536,38 @@ mod tests {
 
         let any = SessionGrant::new("web_search", "*");
         assert!(any.matches("web_search", "rust edition 2024 release notes"));
+    }
+
+    #[test]
+    fn a_remembered_grant_matches_its_literal_filename() {
+        // `Scope::grant` is what a remembered prompt records, so this is the
+        // path a user's answer takes.
+        let mut grants = Grants::new();
+        let outcome = ApprovalOutcome::RememberForSession
+            .apply(&mut grants, &Scope::new("read_file", "foo*"));
+        assert_eq!(outcome, Outcome::Allow);
+
+        // `foo*` would be a wildcard in a configured rule, but the user approved
+        // one literal filename. `foobar` is a different file and stays
+        // unapproved.
+        assert!(grants.allows("read_file", "foo*"));
+        assert!(!grants.allows("read_file", "foobar"));
+
+        // Grants are session-scoped by design: a fresh session starts empty, so
+        // the approval cannot outlive the session that recorded it.
+        assert!(!Grants::new().allows("read_file", "foo*"));
+    }
+
+    #[test]
+    fn a_remembered_bracketed_filename_matches_literally() {
+        let mut grants = Grants::new();
+        ApprovalOutcome::RememberForSession
+            .apply(&mut grants, &Scope::new("read_file", "report[1].md"));
+
+        // A glob that read `[1]` as a character class would allow `report1.md`.
+        // The remembered grant allows only the name the user was shown.
+        assert!(grants.allows("read_file", "report[1].md"));
+        assert!(!grants.allows("read_file", "report1.md"));
     }
 
     #[test]

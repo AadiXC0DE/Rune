@@ -389,6 +389,11 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Fixed
 
+- A grant remembered from an approval prompt matches the exact scope that was
+  shown. Approving a file named `foo*` no longer approves `foobar`, and a
+  bracketed name is matched literally. Grants remain session-scoped, and a
+  pattern built directly, as a configured rule is, still matches as a glob.
+
 - The WASM page bridge checks staged response heads and shell replies against
   `max_bridge_bytes` (default 1 MiB) before allocating or copying host bytes.
   Oversized replies report a transport error or a failed shell result instead
