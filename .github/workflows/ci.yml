@@ -208,6 +208,13 @@ jobs:
         run: python3 -c "import fcntl, pty, termios"
 
       - name: Test workspace including the real PTY replay gate on Unix
+        env:
+          # The ACP child/fixture test stamps every frame, phase, and deadline
+          # on one clock and flushes each line to stderr. Turning off libtest
+          # capture puts those lines in the job log as they happen, so a run
+          # that stalls at a deadline (rather than unwinding) still explains
+          # which side stalled and how far the other side had got.
+          RUST_TEST_NOCAPTURE: '1'
         run: cargo test --workspace
 
       - name: Stage native release with artifact size and startup measurements
