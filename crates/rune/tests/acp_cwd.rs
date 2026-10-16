@@ -239,8 +239,19 @@ fn client_cwd_roots_reads_listing_and_project_instructions() {
     let address = listener.local_addr().expect("provider address");
     note!("provider listener bound to {address}");
     let provider = std::thread::spawn(move || provider(&listener));
-    let mut child = Command::new(env!("CARGO_BIN_EXE_rune"))
-        .env_clear()
+    let mut command = Command::new(env!("CARGO_BIN_EXE_rune"));
+    command.env_clear();
+    // Windows loads Winsock providers using SystemRoot. Clearing it creates
+    // an invalid environment for the first network request, even though the
+    // ACP handshake over stdio can succeed. Keep this OS dependency while
+    // still isolating Rune settings, credentials, and proxy variables.
+    #[cfg(windows)]
+    {
+        let system_root = std::env::var_os("SystemRoot").expect("Windows SystemRoot");
+        note!("child SystemRoot: {}", system_root.to_string_lossy());
+        command.env("SystemRoot", system_root);
+    }
+    let mut child = command
         .env("HOME", root.path())
         .env("RUNE_HOME", root.path().join("state"))
         .env("XDG_CONFIG_HOME", root.path().join("config"))
@@ -252,6 +263,10 @@ fn client_cwd_roots_reads_listing_and_project_instructions() {
         .env("RUNE_ACP_TEST_KEY", "fixture-key")
         .current_dir(&workspace_a)
         .arg("acp")
+        // This fixture expects exactly three successful requests. Surface a
+        // connection failure directly instead of spending the test deadline
+        // in the product's default ten-attempt backoff.
+        .args(["--limit", "provider_max_attempts=1"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
