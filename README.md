@@ -4,7 +4,7 @@
 
 **A tiny, native coding agent harness.**
 
-The audited stripped release build measured 5.44 MiB for
+The audited stripped release build measured 5.46 MiB for
 `x86_64-unknown-linux-gnu` (GNU/Linux). The build enforces an 8 MiB ceiling,
 startup work budgets based on baseline-subtracted minimum-of-31 measurements,
 and a 6 KiB ceiling on the assembled per-turn prompt.
