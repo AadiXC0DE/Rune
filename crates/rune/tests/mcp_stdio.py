@@ -5,8 +5,6 @@ import http.server
 import json
 import os
 import pathlib
-import pty
-import select
 import signal
 import struct
 import subprocess
@@ -187,6 +185,7 @@ def run_fixture(scenario, terminal=False):
                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=15, **options)
 
         child, master = None, None
+        transcript = bytearray()
         try:
             if scenario != "pending":
                 action = "reject" if scenario == "rejected" else "approve"
@@ -203,32 +202,16 @@ def run_fixture(scenario, terminal=False):
                 args.append("--offline")
             started = time.monotonic()
             if terminal:
-                master, slave = pty.openpty()
+                master, slave = open_terminal()
                 fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 100, 0, 0))
-                child = subprocess.Popen([sys.argv[1], *args], stdin=slave, stdout=slave, stderr=slave,
-                                         cwd=root, env=environment, preexec_fn=controlling_terminal)
-                os.close(slave)
-                transcript = bytearray()
-                closed = False
+                try:
+                    child = subprocess.Popen([sys.argv[1], *args], stdin=slave, stdout=slave, stderr=slave,
+                                             cwd=root, env=environment, preexec_fn=controlling_terminal)
+                finally:
+                    os.close(slave)
 
                 def pump(timeout):
-                    # Read whatever the child has written, waiting at most
-                    # `timeout` seconds for the first byte. The master is drained
-                    # while the child shuts down too, so a small platform PTY
-                    # buffer cannot leave the child blocked in write.
-                    nonlocal closed
-                    if closed:
-                        time.sleep(min(timeout, 0.01))
-                        return
-                    readable, _, _ = select.select([master], [], [], timeout)
-                    if not readable:
-                        return
-                    try:
-                        transcript.extend(os.read(master, 65536))
-                    except OSError:
-                        # The slave side is gone, so there is nothing left to
-                        # read; the exit check will report the status.
-                        closed = True
+                    return _pump(master, transcript, timeout)
 
                 def wait_for(marker, timeout=10):
                     deadline = time.monotonic() + timeout
@@ -243,20 +226,6 @@ def run_fixture(scenario, terminal=False):
                             + transcript.decode(errors="replace")
                         )
                         pump(min(remaining, 0.1))
-
-                def wait_for_exit(timeout=10):
-                    deadline = time.monotonic() + timeout
-                    while child.poll() is None:
-                        remaining = deadline - time.monotonic()
-                        assert remaining > 0, (
-                            f"session did not exit within {timeout}s of /quit:\n"
-                            + transcript.decode(errors="replace")
-                        )
-                        pump(min(remaining, 0.1))
-                    assert child.returncode == 0, (
-                        f"session exited with status {child.returncode}:\n"
-                        + transcript.decode(errors="replace")
-                    )
 
                 wait_for(b"ctrl-c cancel")
                 os.write(master, b"echo through MCP\r")
@@ -282,7 +251,10 @@ def run_fixture(scenario, terminal=False):
                     # never reach command handling.
                     wait_for(b"MCP_FIXTURE_PASSED\r\n")
                 os.write(master, b"/quit\r")
-                wait_for_exit()
+                assert wait_for_exit(child, master, transcript, 10) == 0, (
+                    f"session exited with status {child.returncode}:\n"
+                    + transcript.decode(errors="replace")
+                )
                 stdout, stderr = bytes(transcript), b""
             else:
                 prompt = b"echo through MCP\n" + (b"no\n" if scenario == "policy" else b"")
@@ -330,11 +302,12 @@ def run_fixture(scenario, terminal=False):
                 else:
                     raise AssertionError(f"MCP child {pid} survived CLI exit ({scenario})")
         finally:
-            if child is not None and child.poll() is None:
-                child.kill()
-                child.wait(timeout=5)
+            if child is not None:
+                if child.poll() is None:
+                    child.kill()
+                wait_for_exit(child, master, transcript, 5)
             if master is not None:
-                os.close(master)
+                close_terminal(master)
             for pid_file in root.glob("*.pid"):
                 try:
                     os.kill(int(pid_file.read_text()), signal.SIGKILL)

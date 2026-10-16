@@ -8,9 +8,11 @@ Use open_terminal/close_terminal to retain a slave throughout capture: Darwin
 can discard unread output when the last slave closes.
 
 `wait_for_exit` is the one shutdown path for a PTY child: it drains the master
-while it waits, so the child can write its last frame and exit instead of
-wedging on a full PTY buffer (macOS). The fixtures call it in place of a bare
-`child.wait(timeout=...)`, which is what used to hang.
+while it waits. The terminal queue is about 1024 bytes on Darwin and larger on
+Linux. A child writing more than a queue-full can block until the master is
+read, so never wait for that child before draining. Fixtures must use this
+shared shutdown path, including cleanup after kill, rather than subprocess.wait
+on a writing PTY child.
 
 Every `subprocess.run` in those fixtures also reports what happened at its
 deadline:
@@ -116,8 +118,9 @@ def drain_terminal(master, transcript, quiet=0.15, timeout=10, deadline=None):
 def wait_for_exit(child, master, transcript=None, timeout=10):
     """Waits for a PTY child to exit, draining the master while it shuts down.
 
-    A terminal session writes its last frame as it exits. On a platform whose
-    PTY buffer is small (macOS) a driver that merely waits lets that buffer
+    A terminal session writes its last frame as it exits. Darwin's terminal
+    queue holds about 1024 bytes; Linux's is larger. Never wait for a child
+    writing more than a queue-full before draining: that lets the buffer
     fill, which wedges the child in a write and leaves it unreaped; a later
     kill can then hang too, because the child never leaves the write. Reading
     the master while waiting is what keeps the child moving -- the same

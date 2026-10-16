@@ -194,13 +194,31 @@ class TerminalDrainTests(unittest.TestCase):
         )
         os.close(slave)
         original_read = os.read
+        original_pump = _pump
+        transcript = bytearray()
+        queued_chunks = []
+
+        def keep_tail_queued(master, transcript, timeout):
+            # Drain the first 1050 bytes while waiting, letting the writer
+            # finish even on Darwin's 1024-byte queue. The last 50 bytes fit.
+            # Leave that tail queued until poll observes exit, making the
+            # post-exit case deterministic even if the reader wins every race.
+            if timeout > 0 and len(transcript) >= 1050:
+                time.sleep(min(timeout, 0.001))
+                return None
+            chunk = original_pump(master, transcript, timeout)
+            if timeout == 0 and chunk:
+                queued_chunks.append(chunk)
+            return chunk
+
         try:
-            # A small write fits the PTY. Deliberately reap before draining:
-            # the retained slave must protect even a child that exits this fast.
-            self.assertEqual(child.wait(timeout=1), 0)
-            transcript = bytearray()
-            with patch.object(os, "read", lambda fd, size: original_read(fd, min(size, 7))):
+            with patch.object(os, "read", lambda fd, size: original_read(fd, min(size, 7))), \
+                    patch.dict(wait_for_exit.__globals__, _pump=keep_tail_queued):
                 self.assertEqual(wait_for_exit(child, master, transcript, 1), 0)
+            self.assertGreater(len(queued_chunks), 1)
+            self.assertGreaterEqual(sum(map(len, queued_chunks)), 50)
+            # Exact equality requires every byte, including all queued chunks;
+            # no extra drain after wait_for_exit can repair a missing tail.
             self.assertEqual(transcript, b"final frame" * 100)
         finally:
             if child.poll() is None:
