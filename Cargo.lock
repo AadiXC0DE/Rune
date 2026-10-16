@@ -971,7 +971,7 @@ dependencies = [
 
 [[package]]
 name = "rune"
-version = "0.1.16"
+version = "0.1.17"
 dependencies = [
  "camino",
  "flate2",
@@ -996,7 +996,7 @@ dependencies = [
 
 [[package]]
 name = "rune-acp"
-version = "0.1.16"
+version = "0.1.17"
 dependencies = [
  "camino",
  "jiff",
@@ -1015,7 +1015,7 @@ dependencies = [
 
 [[package]]
 name = "rune-agent"
-version = "0.1.16"
+version = "0.1.17"
 dependencies = [
  "camino",
  "jiff",
@@ -1033,7 +1033,7 @@ dependencies = [
 
 [[package]]
 name = "rune-context"
-version = "0.1.16"
+version = "0.1.17"
 dependencies = [
  "camino",
  "getrandom 0.2.17",
@@ -1050,7 +1050,7 @@ dependencies = [
 
 [[package]]
 name = "rune-core"
-version = "0.1.16"
+version = "0.1.17"
 dependencies = [
  "camino",
  "getrandom 0.2.17",
@@ -1066,7 +1066,7 @@ dependencies = [
 
 [[package]]
 name = "rune-exec"
-version = "0.1.16"
+version = "0.1.17"
 dependencies = [
  "camino",
  "rune-core",
@@ -1077,7 +1077,7 @@ dependencies = [
 
 [[package]]
 name = "rune-net"
-version = "0.1.16"
+version = "0.1.17"
 dependencies = [
  "camino",
  "jiff",
@@ -1092,7 +1092,7 @@ dependencies = [
 
 [[package]]
 name = "rune-policy"
-version = "0.1.16"
+version = "0.1.17"
 dependencies = [
  "camino",
  "globset",
@@ -1106,7 +1106,7 @@ dependencies = [
 
 [[package]]
 name = "rune-sdk"
-version = "0.1.16"
+version = "0.1.17"
 dependencies = [
  "rune-agent",
  "rune-core",
@@ -1122,7 +1122,7 @@ dependencies = [
 
 [[package]]
 name = "rune-session"
-version = "0.1.16"
+version = "0.1.17"
 dependencies = [
  "camino",
  "jiff",
@@ -1137,7 +1137,7 @@ dependencies = [
 
 [[package]]
 name = "rune-term"
-version = "0.1.16"
+version = "0.1.17"
 dependencies = [
  "camino",
  "crossterm",
@@ -1153,7 +1153,7 @@ dependencies = [
 
 [[package]]
 name = "rune-testkit"
-version = "0.1.16"
+version = "0.1.17"
 dependencies = [
  "rune-core",
  "serde",
@@ -1164,7 +1164,7 @@ dependencies = [
 
 [[package]]
 name = "rune-tools"
-version = "0.1.16"
+version = "0.1.17"
 dependencies = [
  "camino",
  "globset",
@@ -1186,7 +1186,7 @@ dependencies = [
 
 [[package]]
 name = "rune-web"
-version = "0.1.16"
+version = "0.1.17"
 dependencies = [
  "camino",
  "rune-agent",
@@ -1905,7 +1905,7 @@ checksum = "3ad82d2a33cdc9674dc7465672f271e096168fcdbe0f799d9e6db8c5892679dc"
 
 [[package]]
 name = "xtask"
-version = "0.1.16"
+version = "0.1.17"
 dependencies = [
  "flate2",
  "rune-core",

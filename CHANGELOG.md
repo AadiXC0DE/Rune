@@ -2,6 +2,43 @@
 
 Notable changes, newest first. Each entry describes what a user can observe.
 
+## 0.1.17
+
+### Changed
+
+- `pty: true` on the shell tool is Linux-only and is now refused before the
+  command starts, with a hint naming the alternatives (`interactive: true` for
+  piped input, or a Linux host for a controlling terminal). The README says the
+  same, and the terminal replay tests are described as what they are: Rune's own
+  interface, not shell-tool PTY support elsewhere.
+
+- Remembered permission grants are matched literally. A grant remembered for one
+  command no longer covers a different command that merely begins the same way.
+
+- The fixed per-turn prompt cost is measured and reduced, and the same number the
+  gate enforces is the one the budget prints.
+
+### Fixed
+
+- An operation the platform cannot perform is refused with the path and the cause
+  rather than surfaced as a generic I/O failure.
+
+- Startup work is measured against a real baseline process on Windows, where
+  there was none, so the cost of the operating system starting a process is no
+  longer charged to Rune's ceiling. When no baseline can be measured the gate
+  fails instead of reporting raw latency as work.
+
+- Windows fixtures keep the system directories Winsock loads its providers from,
+  and keep `PATH` for the fixtures whose child runs an external program such as
+  `git`. The Windows job passes end to end.
+
+- Tests no longer depend on the speed of the machine, on how the runner spells a
+  line ending, or on the spelling of a path: fixtures that drive a terminal
+  service it while they wait, and comparisons of a path ask the filesystem
+  instead of comparing text.
+
+- The dependency advisory gate is clean after rustls 0.23.45 to 0.23.46.
+
 ## 0.1.16
 
 ### Added
