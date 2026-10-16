@@ -17,6 +17,7 @@ def call(name, arguments, index=0):
 
 
 def run_fixture(case):
+    print(f"[fixture] subagent case={case}: begin", file=sys.stderr, flush=True)
     requests = []
     errors = []
 
@@ -190,6 +191,7 @@ def run_fixture(case):
             server.shutdown()
             server.server_close()
             thread.join(timeout=5)
+        print(f"[fixture] subagent case={case}: passed", file=sys.stderr, flush=True)
 
 
 for case in ["success", "cap", "named", "role"]:

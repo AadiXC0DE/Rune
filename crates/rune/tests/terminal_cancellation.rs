@@ -15,6 +15,9 @@ fn cancellation_saves_the_visible_answer_and_one_boundary_across_resume() {
         ])
         .output()
         .expect("python3 is required for the Unix terminal cancellation regression");
+    // surface the fixture's phase and /quit diagnostics under --nocapture
+    print!("{}", String::from_utf8_lossy(&output.stdout));
+    eprint!("{}", String::from_utf8_lossy(&output.stderr));
     assert!(
         output.status.success(),
         "terminal cancellation regression failed:\n{}\n{}",

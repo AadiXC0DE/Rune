@@ -15,6 +15,9 @@ fn sigkill_preserves_a_replayable_partial_answer_without_completing_the_turn() {
         ])
         .output()
         .expect("python3 is required for the Unix process death regression");
+    // surface the fixture's phase and /quit diagnostics under --nocapture
+    print!("{}", String::from_utf8_lossy(&output.stdout));
+    eprint!("{}", String::from_utf8_lossy(&output.stderr));
     assert!(
         output.status.success(),
         "terminal process death regression failed:\n{}\n{}",

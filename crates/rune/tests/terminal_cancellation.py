@@ -137,7 +137,21 @@ with tempfile.TemporaryDirectory(prefix="rune-r024-") as directory:
     def stop():
         global child, master
         os.write(master, b"/quit\r")
-        assert child.wait(timeout=10) == 0
+        try:
+            status = child.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            # Pure observation: the wait bound and the transcript are
+            # unchanged. The tail separates "still painting, so blocked on a
+            # full PTY" from "idle at the prompt, so /quit was never handled".
+            print(
+                "[fixture] /quit sent but the session did not exit within 10s; "
+                f"alive={child.poll() is None}; transcript tail:\n"
+                + transcript.decode(errors="replace")[-4000:],
+                file=sys.stderr,
+                flush=True,
+            )
+            raise
+        assert status == 0, transcript.decode(errors="replace")
         os.close(master)
         master = None
         child = None

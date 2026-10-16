@@ -13,6 +13,7 @@ PNG = base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR4
 
 
 def run_fixture(ask, mode):
+    print(f"[fixture] vision ask={ask} mode={mode}: begin", file=sys.stderr, flush=True)
     requests, images, errors = [], [], []
     expected_error = {
         "absent": "no image analysis is configured",
@@ -137,6 +138,7 @@ def run_fixture(ask, mode):
             server.shutdown()
             server.server_close()
             thread.join(timeout=5)
+        print(f"[fixture] vision ask={ask} mode={mode}: passed", file=sys.stderr, flush=True)
 
 
 for ask in [False, True]:

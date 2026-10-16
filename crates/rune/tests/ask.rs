@@ -266,11 +266,25 @@ fn run_responses_fixture_command(
 
             // Consume the whole request before closing the connection, so unread
             // request bytes cannot cause a reset to discard the fixture response.
+            // Each step reports how long the wait had run when it failed, so a
+            // macOS `WouldBlock` or a stall names the phase instead of only the
+            // file and line.
+            let read_started = Instant::now();
             let mut reader = std::io::BufReader::new(&mut stream);
             let mut content_length = None;
             loop {
                 let mut line = String::new();
-                assert!(reader.read_line(&mut line).expect("request header") > 0);
+                let read = reader.read_line(&mut line).unwrap_or_else(|error| {
+                    panic!(
+                        "request header after {:.1}s: {error}",
+                        read_started.elapsed().as_secs_f64()
+                    )
+                });
+                assert!(
+                    read > 0,
+                    "provider closed the request after {:.1}s",
+                    read_started.elapsed().as_secs_f64()
+                );
                 if line == "\r\n" {
                     break;
                 }
@@ -279,7 +293,12 @@ fn run_responses_fixture_command(
                 }
             }
             let mut request = vec![0; content_length.expect("request content length")];
-            reader.read_exact(&mut request).expect("request body");
+            reader.read_exact(&mut request).unwrap_or_else(|error| {
+                panic!(
+                    "request body after {:.1}s: {error}",
+                    read_started.elapsed().as_secs_f64()
+                )
+            });
             drop(reader);
             // Keep serving until the child exits so an unexpected retry is
             // counted, rather than hidden by a closed fixture endpoint.
@@ -331,8 +350,14 @@ fn run_responses_fixture_command(
         .arg("run the fixture command")
         .output()
         .expect("ask");
-    finished.send(()).expect("stop fixture server");
-    let requests = server.join().expect("fixture server");
+    // The send fails when the server thread already stopped (for example it
+    // panicked while reading the request). That panic is reported on its own;
+    // re-raise it here rather than masking it with a second "stop fixture
+    // server" panic.
+    let _ = finished.send(());
+    let requests = server
+        .join()
+        .unwrap_or_else(|payload| std::panic::resume_unwind(payload));
     (output, dir, requests)
 }
 

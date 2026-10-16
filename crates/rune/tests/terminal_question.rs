@@ -12,11 +12,17 @@ fn structured_questions_collect_terminal_answers_for_the_next_provider_request()
     let output = std::process::Command::new("python3")
         .args([
             "-c",
-            &support::python_script(include_str!("terminal_question.py")),
+            &support::python_script(concat!(
+                include_str!("fixture_support.py"),
+                "\n",
+                include_str!("terminal_question.py")
+            )),
             env!("CARGO_BIN_EXE_rune"),
         ])
         .output()
         .expect("python3 is required for the Unix terminal question regression");
+    print!("{}", String::from_utf8_lossy(&output.stdout));
+    eprint!("{}", String::from_utf8_lossy(&output.stderr));
     assert!(
         output.status.success(),
         "terminal question regression failed:\n{}\n{}",

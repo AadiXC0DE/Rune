@@ -17,6 +17,7 @@ def assert_skill_location(location, expected):
 
 
 def run_fixture(ask):
+    print(f"[fixture] skills ask={ask}: begin", file=sys.stderr, flush=True)
     requests = []
     errors = []
     instructions = "---\nname: release-guide\ndescription: Ships the service\n---\n  Preserve indentation.\nUse café.\n\n"
@@ -140,6 +141,7 @@ def run_fixture(ask):
             server.shutdown()
             server.server_close()
             thread.join(timeout=5)
+        print(f"[fixture] skills ask={ask}: passed", file=sys.stderr, flush=True)
 
 
 for ask in [False, True]:
