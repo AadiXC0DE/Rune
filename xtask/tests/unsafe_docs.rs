@@ -30,7 +30,16 @@ fn unsafe_lint_comment_scopes_the_single_site_to_the_native_binary() {
 
 #[test]
 fn readme_links_both_boundaries_and_describes_their_safety_contracts() {
-    let safety_docs = README
+    let lf = README.replace("\r\n", "\n");
+    for readme in [&lf, &lf.replace('\n', "\r\n")] {
+        assert_readme_boundary_docs(readme);
+    }
+}
+
+fn assert_readme_boundary_docs(readme: &str) {
+    // Keep section delimiters exact across LF and Windows CRLF checkouts.
+    let readme = readme.replace("\r\n", "\n");
+    let safety_docs = readme
         .split_once("## Unsafe code boundaries\n")
         .expect("document the native and WASM unsafe boundaries")
         .1
