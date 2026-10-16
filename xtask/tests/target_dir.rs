@@ -114,15 +114,18 @@ fn budget_measures_and_runs_the_binary_in_cargos_target_directory() {
             );
             assert!(line.contains(" ms, median "), "{line}");
             assert!(line.contains(" ms, p95 "), "{line}");
-            if stdout.contains("process baseline unavailable") {
-                assert!(line.contains("work without baseline subtraction"), "{line}");
+            assert!(line.contains("baseline-subtracted work"), "{line}");
+            assert!(
+                stdout.contains("process baseline minimum-of-31"),
+                "{stdout}"
+            );
+            let baseline = if cfg!(windows) {
+                "empty Rust executable"
             } else {
-                assert!(line.contains("baseline-subtracted work"), "{line}");
-                assert!(
-                    stdout.contains("process baseline minimum-of-31"),
-                    "{stdout}"
-                );
-            }
+                "true"
+            };
+            assert!(stdout.contains(&format!("ms ({baseline})")), "{stdout}");
+            assert!(!stdout.contains("without baseline subtraction"), "{stdout}");
         }
         assert!(workspace.0.join("ran-fixture").exists(), "{output:?}");
     }

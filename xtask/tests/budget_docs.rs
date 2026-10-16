@@ -23,6 +23,18 @@ fn assert_startup_claims(text: &str) {
     assert!(text.contains("baseline minimum-of-31"), "{text}");
     assert!(text.contains("clamped to zero"), "{text}");
     assert!(text.contains("no baseline is available"), "{text}");
+    assert!(text.contains("system true on Unix"), "{text}");
+    assert!(
+        text.contains("an empty Rust executable on Windows"),
+        "{text}"
+    );
+    assert!(text.contains("the budget fails"), "{text}");
+    assert!(
+        text.contains("startup work ceilings cannot be enforced"),
+        "{text}"
+    );
+    assert!(!text.contains("raw minimum when no baseline"), "{text}");
+    assert!(!text.contains("raw minimum is used"), "{text}");
     assert!(!text.contains("about 2 ms to start"), "{text}");
 }
 
@@ -71,6 +83,10 @@ fn landing_page_size_claims_and_work_ceilings_match_the_audit() {
     assert!(page.contains("5 ms for <code>--version</code>"));
     assert!(page.contains("8 ms for <code>--help</code>"));
     assert!(page.contains("baseline-subtracted minimum-of-31"));
+    assert!(page.contains("system <code>true</code> on Unix"));
+    assert!(page.contains("an empty Rust executable on Windows"));
+    assert!(page.contains("startup work ceilings cannot be enforced"));
+    assert!(!page.contains("or the raw minimum"));
     assert!(page.contains("raw process latency minimum, median and p95"));
     assert!(page.contains("checks it against a 6 KiB per-turn ceiling"));
 }

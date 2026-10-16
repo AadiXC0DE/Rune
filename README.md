@@ -1048,8 +1048,12 @@ then the workspace tests. A failed step stops the gate immediately.
 minimum-of-31, median and p95 (nearest rank, the 30th sorted sample). Each run
 measures wall time from process spawn through exit with stdout and stderr discarded.
 The enforced work budgets are 5 ms for `--version` and 8 ms for `--help`: the
-minimum-of-31 minus the system `true` process baseline minimum-of-31, clamped to
-zero. If no baseline is available, the raw minimum is used and labeled accordingly.
+minimum-of-31 minus the process baseline minimum-of-31, clamped to zero.
+The baseline is system `true` on Unix, an empty Rust executable on Windows.
+The Windows baseline is compiled with release settings and no dependencies; its
+`main` does no work. Both baselines include process startup and exit; the Windows
+helper also includes Rust runtime startup and exit.
+If no baseline is available, the budget fails: startup work ceilings cannot be enforced.
 Baseline-subtracted work is an estimate of additional work, not process latency.
 
 CI also builds `rune-web` for `wasm32-wasip1` and runs a fixture prompt through
