@@ -909,10 +909,15 @@ impl ResourceLimits {
 /// bounded while leaving ordinary work its full allowance.
 #[must_use]
 pub fn resource_limits() -> ResourceLimits {
+    resource_limits_for_tasks(tasks_on_host())
+}
+
+/// Adds process headroom to one snapshot of the host's task count.
+fn resource_limits_for_tasks(running: u64) -> ResourceLimits {
     let mut limits = ResourceLimits::default();
     limits.processes = limits
         .processes
-        .map(|headroom| headroom.saturating_add(tasks_on_host()));
+        .map(|headroom| headroom.saturating_add(running));
     limits
 }
 
@@ -926,16 +931,20 @@ fn tasks_on_host() -> u64 {
     {
         std::fs::read_to_string("/proc/loadavg")
             .ok()
-            .and_then(|text| {
-                let field = text.split_whitespace().nth(3)?;
-                field.split('/').nth(1)?.parse::<u64>().ok()
-            })
+            .and_then(|text| tasks_in_loadavg(&text))
             .unwrap_or(0)
     }
     #[cfg(not(target_os = "linux"))]
     {
         0
     }
+}
+
+/// Reads the total task count, including threads, rather than the runnable count.
+#[cfg(target_os = "linux")]
+fn tasks_in_loadavg(text: &str) -> Option<u64> {
+    let field = text.split_whitespace().nth(3)?;
+    field.split('/').nth(1)?.parse::<u64>().ok()
 }
 
 /// Delivers no signal, on a platform with no process group to signal.
@@ -1643,16 +1652,42 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_os = "linux")]
     fn the_process_ceiling_is_headroom_over_what_is_running() {
         // The kernel counts every task the user owns against this limit, so a
-        // fixed number would refuse the first fork on a busy desktop.
-        let running = tasks_on_host();
-        assert!(running > 0, "the host reported no tasks");
-        assert!(
-            resource_limits().processes.unwrap_or(0) >= running + DEFAULT_PROCESSES,
-            "a command would start with less than its full allowance"
-        );
+        // fixed number would refuse the first fork on a busy desktop. Supply
+        // the count: two reads of the host can differ as unrelated tasks exit.
+        for running in [0, 1, 4096, 10_000, 9_999, 100_000] {
+            let ceiling = resource_limits_for_tasks(running)
+                .processes
+                .expect("a process ceiling");
+            assert_eq!(ceiling, running + DEFAULT_PROCESSES);
+            assert_eq!(ceiling - running, DEFAULT_PROCESSES);
+        }
+    }
+
+    #[test]
+    fn the_process_ceiling_saturates_instead_of_wrapping() {
+        for running in [
+            u64::MAX - DEFAULT_PROCESSES,
+            u64::MAX - DEFAULT_PROCESSES + 1,
+            u64::MAX,
+        ] {
+            assert_eq!(resource_limits_for_tasks(running).processes, Some(u64::MAX));
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn the_host_task_count_includes_sleeping_tasks_and_threads() {
+        for text in [
+            "0.00 0.01 0.02 1/12345 67890\n",
+            "99.00 98.00 97.00 345/12345 67891\n",
+        ] {
+            assert_eq!(tasks_in_loadavg(text), Some(12_345));
+        }
+        for text in ["", "0.00 0.01 0.02", "0.00 0.01 0.02 1", "0 0 0 1/unknown"] {
+            assert_eq!(tasks_in_loadavg(text), None);
+        }
     }
 
     #[test]
