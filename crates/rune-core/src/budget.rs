@@ -383,7 +383,7 @@ impl LimitName {
             Self::McpSelectedSchemaBytes => Budget::Bounded(64 * 1024),
             Self::ProjectInstructionFileBytes => Budget::Bounded(64 * 1024),
             Self::ProjectInstructionsTotalBytes => Budget::Bounded(128 * 1024),
-            Self::RepositoryMapBytes => Budget::Bounded(8192),
+            Self::RepositoryMapBytes => Budget::Bounded(4096),
             Self::ImageAdapterOutputBytes => Budget::Bounded(20 * 1024),
             Self::CommandOutputBytes => Budget::Bounded(64 * 1024),
             Self::ReadFileLines => Budget::Bounded(2000),
@@ -585,6 +585,17 @@ impl FromStr for LimitName {
 /// Exists so that `off` cannot be used to disable a bound entirely, which would
 /// make a hostile or broken input able to exhaust memory.
 pub const EMERGENCY_CEILING_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Ceiling for the fixed part of every request, in bytes.
+///
+/// The base system prompt plus the default repository map is the floor the
+/// request pays on every turn, before any conversation or tool result. It is a
+/// repository gate rather than a user-tunable limit: `cargo xtask budget`
+/// enforces it against the assembled prompt, and a test here fails if the
+/// compiled-in floor outgrows it. It is a step above
+/// `SYSTEM_PROMPT` + the default `repository_map_bytes` so a small project
+/// instruction file still fits, but well under the old 9 KiB prompt.
+pub const PROMPT_CEILING_BYTES: usize = 6 * 1024;
 
 /// Share of a model's context window the skill catalog may occupy, as a percent.
 const SKILL_CATALOG_WINDOW_PERCENT: u64 = 2;
