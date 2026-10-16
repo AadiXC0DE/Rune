@@ -18,6 +18,15 @@ jobs:
   signed-release:
     runs-on: macos-latest
     timeout-minutes: 25
+    # Both architectures are built here rather than one per manual dispatch: the
+    # Homebrew formula carries a checksum for each, so a release missing one
+    # leaves half of the people installing from the landing page on an old
+    # build. Signing a cross-built executable still happens on macOS, which is
+    # where codesign runs.
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [aarch64-apple-darwin, x86_64-apple-darwin]
     env:
       # Publish this certificate SHA-1 fingerprint as a repository variable.
       # The corresponding Developer ID private key remains in encrypted secrets.
@@ -27,6 +36,9 @@ jobs:
 
       - name: Install the pinned toolchain
         run: rustup show
+
+      - name: Add the release target
+        run: rustup target add ${{ matrix.target }}
 
       - name: Import the release signing certificate into a temporary keychain
         env:
@@ -58,18 +70,19 @@ jobs:
           RELEASE_VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
-          if [ -n "$RELEASE_VERSION" ]; then
-            cargo xtask release "$RELEASE_CHANNEL" "$RELEASE_VERSION" --sign-identity "$RUNE_SIGNING_IDENTITY"
-          else
-            cargo xtask release "$RELEASE_CHANNEL" --sign-identity "$RUNE_SIGNING_IDENTITY"
-          fi
-          cargo xtask verify-release target/dist/rune-*/manifest.json "$RUNE_SIGNING_IDENTITY"
+          # An empty version input means the single source of truth decides, and
+          # the target is always passed explicitly so one leg cannot silently
+          # build the other architecture.
+          version="${RELEASE_VERSION:-$(sed -n 's/^pub const VERSION: &str = "\(.*\)";/\1/p' crates/rune/src/version.rs)}"
+          test -n "$version"
+          cargo xtask release "$RELEASE_CHANNEL" "$version" "${{ matrix.target }}" --sign-identity "$RUNE_SIGNING_IDENTITY"
+          cargo xtask verify-release "target/dist/rune-${{ matrix.target }}/manifest.json" "$RUNE_SIGNING_IDENTITY"
 
       - name: Upload the verified signed archive, checksum and published identity
         uses: actions/upload-artifact@v4
         with:
-          name: rune-signed-macos
-          path: target/dist/rune-*/*
+          name: rune-signed-macos-${{ matrix.target }}
+          path: target/dist/rune-${{ matrix.target }}/*
           if-no-files-found: error
 
       - name: Remove signing credentials
@@ -77,3 +90,34 @@ jobs:
         run: |
           security delete-keychain "$RUNNER_TEMP/rune-release.keychain-db" || true
           rm -f "$RUNNER_TEMP/rune-signing.p12"
+
+  publish-release:
+    needs: signed-release
+    if: inputs.channel == 'stable'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Collect the signed artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish the release from the signed artifacts
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          ls -l dist
+          # The tag comes from the archives themselves, so the release can only
+          # be named after something that was actually signed in this run.
+          version=$(basename "$(ls dist/rune-*-aarch64-apple-darwin.tar.gz | head -1)" | sed 's/^rune-\(.*\)-aarch64-apple-darwin\.tar\.gz$/\1/')
+          test -n "$version"
+          if gh release view "v$version" > /dev/null 2>&1; then
+            gh release upload "v$version" dist/* --clobber
+          else
+            gh release create "v$version" dist/* --title "Rune v$version" --generate-notes
+          fi

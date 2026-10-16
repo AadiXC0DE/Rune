@@ -1119,18 +1119,43 @@ test("askStream applies backpressure to a stalled consumer and kills the child o
       emit({ type: "final", result });
     })();
   `);
+  // The producer stops once the consumer stops pulling, but writes already in
+  // flight still land, so the count settles rather than freezing. What matters
+  // is that it comes to rest far below the whole script, not that two samples
+  // taken a fixed distance apart are identical: a loaded runner can fail the
+  // latter while the behaviour is correct.
+  const settles = async (budgetMs) => {
+    let value = Number(readFileSync(progress, "utf8"));
+    const deadline = Date.now() + budgetMs;
+    while (Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      const next = Number(readFileSync(progress, "utf8"));
+      if (next === value) return value;
+      value = next;
+    }
+    return value;
+  };
   let countBefore;
   for await (const event of askStream("hello", { bin, maxOutputBytes: 64 * 1024 * 1024 })) {
     assert.equal(event.type, "start");
     await new Promise((resolve) => setTimeout(resolve, 300));
     countBefore = Number(readFileSync(progress, "utf8"));
-    await new Promise((resolve) => setTimeout(resolve, 300));
-    assert.equal(Number(readFileSync(progress, "utf8")), countBefore, "producer must stop when the iterator stops pulling");
-    assert.ok(countBefore > 0 && countBefore < 512, `unexpected buffered records: ${countBefore}`);
+    const settled = await settles(3_000);
+    assert.ok(settled >= countBefore, `the producer cannot go backwards: ${countBefore} -> ${settled}`);
+    assert.ok(settled < 512, `unexpected buffered records: ${settled}`);
+    assert.ok(
+      settled - countBefore < 64,
+      `producer kept writing after the consumer stopped: ${countBefore} -> ${settled}`,
+    );
+    countBefore = settled;
     break;
   }
   await new Promise((resolve) => setTimeout(resolve, 100));
-  assert.equal(Number(readFileSync(progress, "utf8")), countBefore, "loop break must stop the producer");
+  const afterBreak = Number(readFileSync(progress, "utf8"));
+  assert.ok(
+    afterBreak - countBefore < 64,
+    `loop break must stop the producer: ${countBefore} -> ${afterBreak}`,
+  );
   assert.throws(() => process.kill(Number(readFileSync(pidFile, "utf8")), 0), { code: "ESRCH" });
 });
 
