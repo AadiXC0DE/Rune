@@ -16,6 +16,7 @@ fn pty_drain_handles_eof_quiet_output_and_shutdown() {
         ])
         .output()
         .expect("python3 is required for the Unix PTY driver tests");
+    eprint!("{}", String::from_utf8_lossy(&output.stderr));
     assert!(
         output.status.success(),
         "PTY driver tests failed:\n{}\n{}",

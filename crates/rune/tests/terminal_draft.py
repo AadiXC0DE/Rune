@@ -5,7 +5,6 @@ import http.server
 import json
 import os
 import pathlib
-import pty
 import select
 import shlex
 import struct
@@ -163,7 +162,7 @@ sys.exit(9 if mode == "editor-failed" else 0)
             ("other needle workspace", root / "other"),
         ]))
         history_file.chmod(0o600)
-    master, slave = pty.openpty()
+    master, slave = open_terminal()
     fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 80, 0, 0))
     child = subprocess.Popen(
         [sys.argv[1]], stdin=slave, stdout=slave, stderr=slave,
@@ -326,7 +325,7 @@ sys.exit(9 if mode == "editor-failed" else 0)
         if child.poll() is None:
             child.kill()
         wait_for_exit(child, master, transcript, 10)
-        os.close(master)
+        close_terminal(master)
         server.shutdown()
         server.server_close()
         server_thread.join(timeout=10)

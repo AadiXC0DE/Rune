@@ -5,7 +5,6 @@ import http.server
 import json
 import os
 import pathlib
-import pty
 import select
 import shlex
 import struct
@@ -110,7 +109,7 @@ with tempfile.TemporaryDirectory(prefix="rune-r073-") as directory:
     environment["VISUAL"] = f"{shlex.quote(sys.executable)} {shlex.quote(str(stub))}"
     for name in ["fixture a.txt", "fixture b.txt"]:
         (root / name).write_text("fixture")
-    master, slave = pty.openpty()
+    master, slave = open_terminal()
     fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 100, 0, 0))
     child = subprocess.Popen(
         [sys.argv[1], *sys.argv[2:]], stdin=slave, stdout=slave, stderr=slave,
@@ -303,8 +302,8 @@ with tempfile.TemporaryDirectory(prefix="rune-r073-") as directory:
         draft("idle-escape-empty", b"\x1b", "", 2)
         os.write(master, b"\x04")
         assert wait_for_exit(child, master, transcript, 10) == 0
-        os.close(master)
-        master, slave = pty.openpty()
+        close_terminal(master)
+        master, slave = open_terminal()
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 100, 0, 0))
         child = subprocess.Popen(
             [sys.argv[1]], stdin=slave, stdout=slave, stderr=slave,
@@ -323,7 +322,7 @@ with tempfile.TemporaryDirectory(prefix="rune-r073-") as directory:
         if child.poll() is None:
             child.kill()
         wait_for_exit(child, master, transcript, 10)
-        os.close(master)
+        close_terminal(master)
         server.shutdown()
         server.server_close()
         server_thread.join(timeout=10)

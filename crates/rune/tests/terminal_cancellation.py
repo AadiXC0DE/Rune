@@ -5,7 +5,6 @@ import http.server
 import json
 import os
 import pathlib
-import pty
 import select
 import struct
 import subprocess
@@ -111,7 +110,7 @@ with tempfile.TemporaryDirectory(prefix="rune-r024-") as directory:
 
     def launch(*args):
         global child, master, transcript
-        master, slave = pty.openpty()
+        master, slave = open_terminal()
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 100, 0, 0))
         try:
             child = subprocess.Popen(
@@ -151,7 +150,7 @@ with tempfile.TemporaryDirectory(prefix="rune-r024-") as directory:
             )
             raise
         assert status == 0, transcript.decode(errors="replace")
-        os.close(master)
+        close_terminal(master)
         master = None
         child = None
 
@@ -224,7 +223,7 @@ with tempfile.TemporaryDirectory(prefix="rune-r024-") as directory:
             else:
                 child.wait(timeout=10)
         if master is not None:
-            os.close(master)
+            close_terminal(master)
         server.shutdown()
         server.server_close()
         server_thread.join(timeout=10)

@@ -5,7 +5,6 @@ import http.server
 import json
 import os
 import pathlib
-import pty
 import select
 import struct
 import subprocess
@@ -82,7 +81,7 @@ def controlling_terminal():
 
 
 def capture(binary, root, environment, arguments):
-    master, slave = pty.openpty()
+    master, slave = open_terminal()
     fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 100, 0, 0))
     child = subprocess.Popen(
         [binary, *arguments], stdin=slave, stdout=slave, stderr=slave,
@@ -152,7 +151,7 @@ def capture(binary, root, environment, arguments):
         if child.poll() is None:
             child.kill()
         wait_for_exit(child, master, transcript, 10)
-        os.close(master)
+        close_terminal(master)
 
 
 server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Provider)

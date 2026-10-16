@@ -4,6 +4,8 @@ Each fixture `.rs` wrapper prepends this file to the fixture it runs.
 
 `drain_terminal` settles screen captures and handles both PTY EOF conventions.
 It is an output-silence heuristic, not a command-completion signal.
+Use open_terminal/close_terminal to retain a slave throughout capture: Darwin
+can discard unread output when the last slave closes.
 
 `wait_for_exit` is the one shutdown path for a PTY child: it drains the master
 while it waits, so the child can write its last frame and exit instead of
@@ -33,14 +35,49 @@ import sys as _sys
 import time as _time
 
 _run = _subprocess.run
+_terminal_slaves = {}
+
+
+def open_terminal():
+    """Open a PTY, retaining a slave until close_terminal after the final drain.
+
+    Darwin's ptsclose/ttyclose flush unread output on the last slave close;
+    reading again after EOF cannot recover it. Keep a non-inheritable duplicate
+    in the driver so an ordinary child close cannot discard its final bytes.
+    Callers still close their original slave after Popen, and must pair this
+    with close_terminal. Session-leader exit can also revoke a controlling TTY;
+    wait_for_exit must keep reading during shutdown (Darwin ttywait precedes
+    that revoke), rather than waiting for exit before starting to drain.
+    """
+    # This file also supports pipe-only fixtures on Windows.
+    import pty
+
+    master, slave = pty.openpty()
+    try:
+        _terminal_slaves[master] = _os.dup(slave)
+    except BaseException:
+        _os.close(slave)
+        _os.close(master)
+        raise
+    return master, slave
+
+
+def close_terminal(master):
+    """Release a captured terminal, after wait_for_exit has drained its output."""
+    slave = _terminal_slaves.pop(master)
+    try:
+        _os.close(slave)
+    finally:
+        _os.close(master)
 
 
 def _pump(master, transcript, timeout):
     """Read once: bytes for output, b"" for EOF, None for no ready output.
 
-    EOF remains selectable. macOS can return an empty read where Linux PTYs
-    raise EIO; neither means there is another chunk to drain. Other errors
-    (including a bad descriptor) must still fail the fixture.
+    Readiness can mean data or disconnection. macOS returns an empty read where
+    Linux PTYs raise EIO. EOF cannot recover output already flushed by slave
+    close; open_terminal prevents that close until capture finishes. Other
+    errors (including a bad descriptor) must still fail the fixture.
     """
     ready, _, _ = _select.select([master], [], [], timeout)
     if not ready:
@@ -57,12 +94,14 @@ def _pump(master, transcript, timeout):
 
 
 def drain_terminal(master, transcript, quiet=0.15, timeout=10, deadline=None):
-    """Collect a frame until output is quiet or the PTY reaches EOF.
+    """Collect available bytes until output is quiet or the PTY reaches EOF.
 
     Silence only settles screen captures; it does not prove that a command or
     turn completed. Fixtures must first wait for their expected product output,
     and use wait_for_exit for shutdown. A slave kept open without output is
     quiet, so this never waits for all inherited descriptors to close.
+    To preserve bytes across child close, use open_terminal/close_terminal:
+    this function cannot retrieve data the kernel discarded before a read.
     """
     if deadline is None:
         deadline = _time.monotonic() + timeout
@@ -97,8 +136,12 @@ def wait_for_exit(child, master, transcript=None, timeout=10):
                 + _tail(transcript)
             )
         _pump(master, transcript, min(remaining, 0.1))
-    # Collect the bytes the child wrote just before it exited.
-    _pump(master, transcript, 0)
+    # poll() can observe exit with multiple chunks still queued. The retained
+    # slave prevents last-close flushing; drain all ready bytes, without waiting
+    # for EOF or for inherited writers to close, within the same shutdown bound.
+    while _pump(master, transcript, 0):
+        if _time.monotonic() >= deadline:
+            raise AssertionError("terminal kept writing after exit:\n" + _tail(transcript))
     return child.returncode
 
 

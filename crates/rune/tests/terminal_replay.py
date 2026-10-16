@@ -9,7 +9,6 @@ import http.server
 import json
 import os
 import pathlib
-import pty
 import select
 import struct
 import subprocess
@@ -186,7 +185,7 @@ with tempfile.TemporaryDirectory(prefix="rune-r034-") as directory:
                   "menu-resize": (80, 24), "completion-resize": (80, 24), "code": (32, 24),
                   "transcript": (80, 24), "compact": (80, 4),
                   "help-40": (40, 24), "help-80": (80, 24)}[scenario]
-    master, slave = pty.openpty()
+    master, slave = open_terminal()
     fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
     try:
         child = subprocess.Popen(
@@ -340,7 +339,7 @@ with tempfile.TemporaryDirectory(prefix="rune-r034-") as directory:
         if child.poll() is None:
             child.kill()
         wait_for_exit(child, master, transcript, 10)
-        os.close(master)
+        close_terminal(master)
         server.shutdown()
         server.server_close()
         server_thread.join(timeout=10)

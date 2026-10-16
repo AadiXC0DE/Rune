@@ -4,7 +4,6 @@ import fcntl
 import json
 import os
 import pathlib
-import pty
 import re
 import select
 import struct
@@ -21,7 +20,7 @@ def controlling_terminal():
 
 
 def capture(binary, root, environment):
-    master, slave = pty.openpty()
+    master, slave = open_terminal()
     fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 100, 0, 0))
     child = subprocess.Popen(
         [binary, "--offline", "--theme", "high-contrast"],
@@ -55,7 +54,7 @@ def capture(binary, root, environment):
         if child.poll() is None:
             child.kill()
         wait_for_exit(child, master, transcript, 10)
-        os.close(master)
+        close_terminal(master)
 
 
 with tempfile.TemporaryDirectory(prefix="rune-r071-") as directory:

@@ -5,7 +5,6 @@ import http.server
 import json
 import os
 import pathlib
-import pty
 import select
 import struct
 import subprocess
@@ -118,7 +117,7 @@ def controlling_terminal():
 
 class Terminal:
     def __init__(self, binary, root, environment, extra=()):
-        self.master, slave = pty.openpty()
+        self.master, slave = open_terminal()
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 8, 12, 0, 0))
         self.child = subprocess.Popen(
             [binary, "--accessible", "--permission-mode", "ask",
@@ -167,7 +166,7 @@ class Terminal:
         if self.child.poll() is None:
             self.child.kill()
         wait_for_exit(self.child, self.master, self.output, 5)
-        os.close(self.master)
+        close_terminal(self.master)
 
 
 with tempfile.TemporaryDirectory(prefix="rune-r070-") as directory:

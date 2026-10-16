@@ -5,7 +5,6 @@ import http.server
 import json
 import os
 import pathlib
-import pty
 import select
 import struct
 import subprocess
@@ -137,7 +136,7 @@ with tempfile.TemporaryDirectory(prefix="rune-r008-") as directory:
         "NO_COLOR": "1",
         "TERM": "xterm-256color",
     })
-    master, slave = pty.openpty()
+    master, slave = open_terminal()
     fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 100, 0, 0))
     child = subprocess.Popen(
         [sys.argv[1], "--permission-mode", "full-access"],
@@ -258,7 +257,7 @@ with tempfile.TemporaryDirectory(prefix="rune-r008-") as directory:
         if child.poll() is None:
             child.kill()
         wait_for_exit(child, master, transcript, 10)
-        os.close(master)
+        close_terminal(master)
         server.shutdown()
         server.server_close()
         server_thread.join(timeout=10)
