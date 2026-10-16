@@ -131,6 +131,12 @@ fn http_scenario(scenario: Scenario) -> (String, JoinHandle<Vec<String>>) {
                     Err(error) => panic!("accept: {error}"),
                 }
             };
+            // `accept` inherits `O_NONBLOCK` from a nonblocking listener on
+            // macOS, unlike Linux; the read deadline below is the real bound, so
+            // the accepted socket must be blocking before it is read.
+            socket
+                .set_nonblocking(false)
+                .expect("blocking request socket");
             socket
                 .set_read_timeout(Some(Duration::from_secs(5)))
                 .expect("read deadline");

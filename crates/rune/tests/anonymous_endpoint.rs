@@ -74,6 +74,12 @@ fn connect_list_and_ask_an_anonymous_loopback_without_storing_a_credential() {
                     Err(error) => panic!("accept: {error}"),
                 }
             };
+            // `accept` inherits `O_NONBLOCK` from a nonblocking listener on
+            // macOS, unlike Linux; the read timeout below is the real bound, so
+            // the accepted socket must be blocking before it is read.
+            stream
+                .set_nonblocking(false)
+                .expect("blocking request socket");
             stream
                 .set_read_timeout(Some(Duration::from_secs(5)))
                 .expect("read timeout");

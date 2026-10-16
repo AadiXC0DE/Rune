@@ -158,6 +158,13 @@ impl LoopbackAuthorization {
                 Err(_) => return Err(callback_io()),
             }
         };
+        // A listener set nonblocking hands back a nonblocking socket on macOS,
+        // where `accept` inherits `O_NONBLOCK` from it; Linux does not. The
+        // callback read below is bounded by the socket timeout, not by a poll,
+        // so the socket must be blocking or a browser callback that has not
+        // arrived yet would be refused with a spurious `WouldBlock` instead of
+        // being waited for.
+        stream.set_nonblocking(false).map_err(|_| callback_io())?;
         let parameters = self.read_callback(&mut stream);
         let parameters = match parameters {
             Ok(parameters) => parameters,

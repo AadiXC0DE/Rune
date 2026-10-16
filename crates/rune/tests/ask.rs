@@ -246,6 +246,14 @@ fn run_responses_fixture_command(
                     Err(error) => panic!("accept fixture request: {error}"),
                 }
             };
+            // `accept` inherits `O_NONBLOCK` from a nonblocking listener on
+            // macOS, unlike Linux, so the socket must be put back to blocking
+            // before it is read: otherwise the read below can return
+            // `WouldBlock` (Darwin errno 35) instead of waiting for the request.
+            // The read timeout set next is the real bound.
+            stream
+                .set_nonblocking(false)
+                .expect("blocking fixture request");
             stream
                 .set_read_timeout(Some(Duration::from_secs(10)))
                 .expect("request timeout");

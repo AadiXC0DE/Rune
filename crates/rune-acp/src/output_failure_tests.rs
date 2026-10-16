@@ -89,6 +89,12 @@ fn output_loss_on_the_turn_thread_closes_a_silent_provider_and_drops_queued_work
             Err(err) => panic!("accept provider: {err}"),
         }
     };
+    // `accept` inherits `O_NONBLOCK` from a nonblocking listener on macOS,
+    // unlike Linux; the read timeout below is the real bound, so the accepted
+    // socket must be blocking before it is read.
+    provider
+        .set_nonblocking(false)
+        .expect("blocking provider socket");
     provider
         .set_read_timeout(Some(SHUTDOWN_GRACE))
         .expect("timeout");

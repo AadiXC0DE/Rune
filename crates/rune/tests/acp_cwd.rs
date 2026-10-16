@@ -70,6 +70,12 @@ fn provider(listener: &TcpListener) -> Vec<Value> {
                 Err(error) => panic!("accept request: {error}"),
             }
         };
+        // `accept` inherits `O_NONBLOCK` from a nonblocking listener on macOS,
+        // unlike Linux; the read timeout below is the real bound, so the
+        // accepted socket must be blocking before it is read.
+        stream
+            .set_nonblocking(false)
+            .expect("blocking request socket");
         stream
             .set_read_timeout(Some(TIMEOUT))
             .expect("read timeout");
