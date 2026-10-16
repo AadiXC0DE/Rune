@@ -214,7 +214,7 @@ fn run_responses_fixture_with_images(
         no_save,
         max_steps,
         (&["ask"], images),
-        setup,
+        |dir, _| setup(dir),
     )
 }
 
@@ -224,7 +224,7 @@ fn run_responses_fixture_command(
     no_save: bool,
     max_steps: Option<u64>,
     (arguments, images): (&[&str], &[&str]),
-    setup: impl FnOnce(&tempfile::TempDir),
+    setup: impl FnOnce(&tempfile::TempDir, &mut Command),
 ) -> (Output, tempfile::TempDir, Vec<Value>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind fixture");
     listener.set_nonblocking(true).expect("nonblocking");
@@ -309,8 +309,8 @@ fn run_responses_fixture_command(
         )
         .expect("step cap");
     }
-    setup(&dir);
     let mut command = isolated_command(&dir);
+    setup(&dir, &mut command);
     command
         .env("RUNE_PROVIDER", "chat_completions")
         .env("RUNE_BASE_URL", format!("http://{address}/v1"))
@@ -782,7 +782,8 @@ fn review_refuses_mutations_by_a_named_rule_and_still_reads_in_every_permission_
             false,
             Some(3),
             (&["--permission-mode", mode, "review"], &[]),
-            |dir| {
+            |dir, command| {
+                command.with_external_programs();
                 let git = Command::new("git")
                     .args(["init", "-q"])
                     .current_dir(dir.path())
@@ -1706,7 +1707,8 @@ fn user_pre_tool_hook_veto_preserves_the_pair_and_reports_its_named_reason() {
         false,
         Some(2),
         (&["--permission-mode", "full-access", "ask"], &[]),
-        |dir| {
+        |dir, command| {
+            command.with_external_programs();
             std::fs::write(
                 dir.path().join("guard.sh"),
                 r#"printf '%s' "$RUNE_PRE_TOOL_CALL" >> hook-input.json
@@ -1790,7 +1792,7 @@ fn pre_tool_allow_runs_the_tool_and_hook_failures_hold_it() {
         ("sleep 10", 20, "exceeded its deadline"),
         ("head -c 5000 /dev/zero", 5000, "output exceeds 4096 bytes"),
     ] {
-        let (output, dir, requests) = run_responses_fixture_with_setup(
+        let (output, dir, requests) = run_responses_fixture_command(
             vec![
                 completion_response(
                     &call_delta("read_file", r#"{"path":"fixture.txt"}"#),
@@ -1798,10 +1800,12 @@ fn pre_tool_allow_runs_the_tool_and_hook_failures_hold_it() {
                 ),
                 completion_response(&json!({"content":"done"}), "stop"),
             ],
-            true,
+            Some("--json"),
             true,
             Some(2),
-            |dir| {
+            (&["ask"], &[]),
+            |dir, command| {
+                command.with_external_programs();
                 std::fs::write(dir.path().join("guard.sh"), script).expect("hook script");
                 let config = dir.path().join("config/rune/config.toml");
                 let mut file = std::fs::OpenOptions::new()
@@ -1846,7 +1850,8 @@ fn user_post_tool_hook_receives_one_redacted_result_without_changing_the_tool_pa
         false,
         Some(2),
         (&["ask"], &[]),
-        |dir| {
+        |dir, command| {
+            command.with_external_programs();
             std::fs::write(dir.path().join("fixture.txt"), original).expect("fixture");
             std::fs::write(
                 dir.path().join("observer.sh"),
@@ -1939,7 +1944,7 @@ fn post_tool_timeout_and_nonzero_exit_preserve_completed_results_and_continue() 
         ),
     ] {
         let started = Instant::now();
-        let (output, dir, requests) = run_responses_fixture_with_setup(
+        let (output, dir, requests) = run_responses_fixture_command(
             vec![
                 completion_response(
                     &call_delta("read_file", r#"{"path":"fixture.txt"}"#),
@@ -1947,10 +1952,12 @@ fn post_tool_timeout_and_nonzero_exit_preserve_completed_results_and_continue() 
                 ),
                 completion_response(&json!({"content":"done"}), "stop"),
             ],
-            true,
+            Some("--json"),
             true,
             Some(2),
-            |dir| {
+            (&["ask"], &[]),
+            |dir, command| {
+                command.with_external_programs();
                 std::fs::write(dir.path().join("observer.sh"), script).expect("script");
                 let mut file = std::fs::OpenOptions::new()
                     .append(true)

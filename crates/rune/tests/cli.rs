@@ -2197,6 +2197,7 @@ fn connecting_in_a_fresh_home_creates_private_state_and_opens_a_session() {
                     .args(["-c", r#"umask "$1"; shift; exec "$@""#, "rune-test", mask])
                     .arg(binary())
                     .isolated_env()
+                    .with_external_programs()
                     .env("HOME", dir.path())
                     .current_dir(dir.path());
                 if xdg {

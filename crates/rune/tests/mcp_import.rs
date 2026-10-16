@@ -24,7 +24,7 @@ impl Workspace {
             .args(args)
             .current_dir(self.0.path())
             .isolated_env()
-            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .with_external_programs()
             .env("RUNE_HOME", self.0.path().join("state"))
             .env("XDG_CONFIG_HOME", self.0.path().join("config"))
             .env("XDG_DATA_HOME", self.0.path().join("data"))

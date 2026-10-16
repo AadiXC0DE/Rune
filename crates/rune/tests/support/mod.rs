@@ -13,8 +13,8 @@ use std::process::Command;
 /// https://learn.microsoft.com/en-us/windows/win32/api/ws2spi/nf-ws2spi-wscgetproviderpath
 /// The combined 32/64-bit provider API also documents `%windir%` paths:
 /// https://learn.microsoft.com/en-us/windows/win32/api/ws2spi/nf-ws2spi-wscinstallproviderandchains64_32
-/// These absolute paths need no PATH lookup. Fixtures that need executable
-/// lookup keep their existing explicit PATH; do not inherit Rune settings,
+/// These absolute paths need no PATH lookup. Fixtures that run external programs
+/// opt in with `with_external_programs`; do not inherit Rune settings,
 /// credentials, proxies, or user configuration directories here.
 fn os_environment() -> BTreeMap<&'static str, OsString> {
     #[cfg(windows)]
@@ -31,11 +31,20 @@ pub trait CommandExt {
     /// Deliberately strip the environment to test Rune in isolation, restoring
     /// only Windows' OS requirements. On Unix this remains an empty environment.
     fn isolated_env(&mut self) -> &mut Self;
+
+    /// Add executable lookup to an isolated child by copying only the real PATH.
+    /// Call after `isolated_env`; explicit fixture settings remain intact, and
+    /// no parent Rune settings, credentials, proxies, or config directories leak.
+    fn with_external_programs(&mut self) -> &mut Self;
 }
 
 impl CommandExt for Command {
     fn isolated_env(&mut self) -> &mut Self {
         self.env_clear().envs(os_environment())
+    }
+
+    fn with_external_programs(&mut self) -> &mut Self {
+        self.env("PATH", std::env::var_os("PATH").unwrap_or_default())
     }
 }
 
