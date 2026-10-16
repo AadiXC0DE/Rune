@@ -1,6 +1,9 @@
 //! R-170: only an explicit /goal creates a persistent session objective.
 #![allow(clippy::expect_used)]
 
+mod support;
+use support::CommandExt as _;
+
 use std::io::Write as _;
 use std::process::{Command, Stdio};
 
@@ -46,7 +49,7 @@ impl Fixture {
 
     fn run(&self, input: &str) -> String {
         let mut child = Command::new(env!("CARGO_BIN_EXE_rune"))
-            .env_clear()
+            .isolated_env()
             .env("HOME", &self.root)
             .env("RUNE_HOME", &self.paths.state_root)
             .env("XDG_CONFIG_HOME", self.root.join("config"))

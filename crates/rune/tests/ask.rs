@@ -2,6 +2,9 @@
 
 #![allow(clippy::expect_used, clippy::panic)]
 
+mod support;
+use support::CommandExt as _;
+
 use std::io::{BufRead as _, Read as _, Write as _};
 use std::net::TcpListener;
 use std::process::{Command, Output, Stdio};
@@ -17,7 +20,7 @@ fn run_fixture(delta: &Value, finish: &str, json_output: bool) -> Output {
 fn isolated_command(dir: &tempfile::TempDir) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_rune"));
     command
-        .env_clear()
+        .isolated_env()
         .env("HOME", dir.path())
         .env("RUNE_HOME", dir.path().join("state"))
         .env("XDG_CONFIG_HOME", dir.path().join("config"))

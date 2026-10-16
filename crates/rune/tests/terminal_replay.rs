@@ -5,6 +5,8 @@
 #![cfg(unix)]
 #![allow(clippy::expect_used, clippy::panic)]
 
+mod support;
+
 use std::fmt::Write as _;
 
 use rune_term::Grid;
@@ -20,7 +22,11 @@ struct Capture {
 
 fn record(script: &str, scenario: Option<&str>) -> Vec<u8> {
     let mut command = std::process::Command::new("python3");
-    command.args(["-c", script, env!("CARGO_BIN_EXE_rune")]);
+    command.args([
+        "-c",
+        &support::python_script(script),
+        env!("CARGO_BIN_EXE_rune"),
+    ]);
     if let Some(scenario) = scenario {
         command.arg(scenario);
     }

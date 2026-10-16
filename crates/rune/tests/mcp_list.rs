@@ -6,6 +6,9 @@
     clippy::panic
 )]
 
+mod support;
+use support::CommandExt as _;
+
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
 use std::process::{Command, Output};
@@ -65,7 +68,7 @@ impl Workspace {
         Command::new(env!("CARGO_BIN_EXE_rune"))
             .args(args)
             .current_dir(self.dir.path())
-            .env_clear()
+            .isolated_env()
             .env("PATH", std::env::var_os("PATH").unwrap_or_default())
             .env("RUNE_HOME", &self.paths.state_root)
             .env("XDG_CONFIG_HOME", self.dir.path().join("config"))

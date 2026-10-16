@@ -3,6 +3,8 @@
 #![cfg(unix)]
 #![allow(clippy::expect_used, clippy::panic)]
 
+mod support;
+
 #[test]
 fn terminal_permission_requests_are_displayed_and_resolved() {
     // Python's standard library supplies the PTY without adding a crate or
@@ -10,7 +12,7 @@ fn terminal_permission_requests_are_displayed_and_resolved() {
     let output = std::process::Command::new("python3")
         .args([
             "-c",
-            include_str!("terminal_approval.py"),
+            &support::python_script(include_str!("terminal_approval.py")),
             env!("CARGO_BIN_EXE_rune"),
         ])
         .output()

@@ -5,11 +5,13 @@
 #![cfg(unix)]
 #![allow(clippy::expect_used, clippy::panic)]
 
+mod support;
+
 fn run(args: &[&str]) -> Vec<(String, Vec<u8>, String, u16)> {
     let output = std::process::Command::new("python3")
         .args([
             "-c",
-            include_str!("terminal_help.py"),
+            &support::python_script(include_str!("terminal_help.py")),
             env!("CARGO_BIN_EXE_rune"),
         ])
         .args(args)

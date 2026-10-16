@@ -1,6 +1,9 @@
 //! R-194: replay recorded policy targets through the real CLI without writes.
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 
+mod support;
+use support::CommandExt as _;
+
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -25,7 +28,7 @@ impl Fixture {
     fn run(&self, args: &[&str]) -> Output {
         Command::new(env!("CARGO_BIN_EXE_rune"))
             .args(args)
-            .env_clear()
+            .isolated_env()
             .env("HOME", self.temp.path())
             .env("RUNE_HOME", self.temp.path().join("state"))
             .env("RUNE_CONFIG", self.temp.path().join("config.toml"))

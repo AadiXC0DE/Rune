@@ -1,6 +1,9 @@
 //! R-182: inspect provider support and reject selections before the first turn.
 #![allow(clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 
+mod support;
+use support::CommandExt as _;
+
 use std::process::{Command, Output};
 
 fn profile(config: &str) -> tempfile::TempDir {
@@ -13,7 +16,7 @@ fn profile(config: &str) -> tempfile::TempDir {
 
 fn run(dir: &std::path::Path, args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_rune"))
-        .env_clear()
+        .isolated_env()
         .env("HOME", dir)
         .env("RUNE_HOME", dir.join("state"))
         .env("RUNE_CONFIG", dir.join("config.toml"))

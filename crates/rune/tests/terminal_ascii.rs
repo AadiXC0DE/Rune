@@ -3,12 +3,14 @@
 #![cfg(unix)]
 #![allow(clippy::expect_used)]
 
+mod support;
+
 #[test]
 fn ascii_setting_uses_ascii_decorations_in_terminal_sessions() {
     let output = std::process::Command::new("python3")
         .args([
             "-c",
-            include_str!("terminal_ascii.py"),
+            &support::python_script(include_str!("terminal_ascii.py")),
             env!("CARGO_BIN_EXE_rune"),
         ])
         .output()

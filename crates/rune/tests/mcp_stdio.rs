@@ -3,12 +3,14 @@
 #![cfg(unix)]
 #![allow(clippy::expect_used)]
 
+mod support;
+
 #[test]
 fn interactive_stdio_mcp_obeys_trust_policy_and_lifecycle_bounds() {
     let output = std::process::Command::new("python3")
         .args([
             "-c",
-            include_str!("mcp_stdio.py"),
+            &support::python_script(include_str!("mcp_stdio.py")),
             env!("CARGO_BIN_EXE_rune"),
         ])
         .output()

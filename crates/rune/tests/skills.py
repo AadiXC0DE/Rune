@@ -94,7 +94,7 @@ def run_fixture(ask):
         server.daemon_threads = True
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
-        environment = {
+        environment = child_environment({
             "HOME": directory, "PATH": "/usr/bin:/bin", "NO_COLOR": "1",
             "XDG_CONFIG_HOME": str(base / "config"),
             "XDG_DATA_HOME": str(base / "data"),
@@ -103,7 +103,7 @@ def run_fixture(ask):
             "RUNE_PROVIDER": "chat_completions", "RUNE_MODEL": "fixture-model",
             "RUNE_BASE_URL": f"http://127.0.0.1:{server.server_port}/v1",
             "RUNE_API_KEY_ENV": "RUNE_SKILL_TEST_KEY", "RUNE_SKILL_TEST_KEY": "fixture-key",
-        }
+        })
         try:
             args = [sys.argv[1], "--permission-mode", "full-access"]
             args += ["ask", "--json", "load the fixture skill"] if ask else ["--accessible"]

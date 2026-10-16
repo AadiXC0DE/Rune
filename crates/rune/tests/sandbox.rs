@@ -1,6 +1,9 @@
 //! Sandbox explanation through the real command-line surface.
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 
+mod support;
+use support::CommandExt as _;
+
 use std::path::Path;
 use std::process::{Command, Output};
 
@@ -39,7 +42,7 @@ impl Fixture {
     fn run(&self, args: &[&str]) -> Output {
         Command::new(env!("CARGO_BIN_EXE_rune"))
             .current_dir(self.dir.path().join("workspace"))
-            .env_clear()
+            .isolated_env()
             .env("HOME", self.dir.path().join("home"))
             .env("RUNE_HOME", self.dir.path().join("state"))
             .env("RUNE_CONFIG", self.dir.path().join("config.toml"))

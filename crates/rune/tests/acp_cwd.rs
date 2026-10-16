@@ -2,6 +2,9 @@
 
 #![allow(clippy::expect_used, clippy::panic)]
 
+mod support;
+use support::CommandExt as _;
+
 use std::fmt;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
@@ -240,16 +243,16 @@ fn client_cwd_roots_reads_listing_and_project_instructions() {
     note!("provider listener bound to {address}");
     let provider = std::thread::spawn(move || provider(&listener));
     let mut command = Command::new(env!("CARGO_BIN_EXE_rune"));
-    command.env_clear();
-    // Windows loads Winsock providers using SystemRoot. Clearing it creates
-    // an invalid environment for the first network request, even though the
-    // ACP handshake over stdio can succeed. Keep this OS dependency while
-    // still isolating Rune settings, credentials, and proxy variables.
+    command.isolated_env();
     #[cfg(windows)]
-    {
-        let system_root = std::env::var_os("SystemRoot").expect("Windows SystemRoot");
-        note!("child SystemRoot: {}", system_root.to_string_lossy());
-        command.env("SystemRoot", system_root);
+    for (key, value) in command.get_envs() {
+        if let Some(value) = value {
+            note!(
+                "child {}: {}",
+                key.to_string_lossy(),
+                value.to_string_lossy()
+            );
+        }
     }
     let mut child = command
         .env("HOME", root.path())

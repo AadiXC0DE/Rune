@@ -1,6 +1,9 @@
 //! R-181: importing Ollama uses native local metadata and records provenance.
 #![allow(clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 
+mod support;
+use support::CommandExt as _;
+
 use std::io::{BufRead, Read, Write};
 use std::net::TcpListener;
 use std::process::{Command, Output};
@@ -19,7 +22,7 @@ fn profile() -> tempfile::TempDir {
 
 fn run(dir: &std::path::Path, args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_rune"))
-        .env_clear()
+        .isolated_env()
         .env("HOME", dir)
         .env("RUNE_HOME", dir.join("state"))
         .env("RUNE_CONFIG", dir.join("config.toml"))

@@ -1,6 +1,9 @@
 //! R-187: fork the saved journal through the actual CLI, then resume both sides.
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 
+mod support;
+use support::CommandExt as _;
+
 use std::io::Write as _;
 use std::process::{Command, Output, Stdio};
 
@@ -96,7 +99,7 @@ impl Fixture {
 
     fn run(&self, args: &[&str], input: &str) -> Output {
         let mut child = Command::new(env!("CARGO_BIN_EXE_rune"))
-            .env_clear()
+            .isolated_env()
             .env("HOME", &self.root)
             .env("RUNE_HOME", &self.paths.state_root)
             .env("XDG_CONFIG_HOME", self.root.join("config"))

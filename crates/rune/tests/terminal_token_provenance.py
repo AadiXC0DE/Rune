@@ -64,10 +64,10 @@ with tempfile.TemporaryDirectory(prefix="rune-r115-") as directory:
         '[models.chat_completions]\nid = "provenance-fixture"\n'
         'context_window = 128000\n'
     )
-    environment = {key: value for key, value in os.environ.items()
+    environment = child_environment({key: value for key, value in os.environ.items()
                    if not key.startswith("RUNE_") and key.lower() not in {
                        "http_proxy", "https_proxy", "all_proxy",
-                   }}
+                   }})
     environment.update({
         "HOME": directory,
         "XDG_CONFIG_HOME": str(root / "config"),

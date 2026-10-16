@@ -180,12 +180,12 @@ with tempfile.TemporaryDirectory(prefix="rune-r070-") as directory:
     server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Provider)
     server.daemon_threads = True
     threading.Thread(target=server.serve_forever, daemon=True).start()
-    environment = {
+    environment = child_environment({
         key: value for key, value in os.environ.items()
         if not key.startswith("RUNE_") and key.lower() not in {
             "http_proxy", "https_proxy", "all_proxy", "no_color",
         }
-    }
+    })
     environment.update({
         "HOME": directory,
         "XDG_CONFIG_HOME": str(root / "config"),

@@ -2,10 +2,16 @@
 
 #![allow(clippy::expect_used)]
 
+mod support;
+
 #[test]
 fn configured_vision_uploads_permitted_images_and_unavailable_runs_are_labelled() {
     let output = std::process::Command::new("python3")
-        .args(["-c", include_str!("vision.py"), env!("CARGO_BIN_EXE_rune")])
+        .args([
+            "-c",
+            &support::python_script(include_str!("vision.py")),
+            env!("CARGO_BIN_EXE_rune"),
+        ])
         .output()
         .expect("python3 is required for the local vision fixture");
     assert!(

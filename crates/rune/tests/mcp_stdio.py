@@ -145,7 +145,7 @@ def run_fixture(scenario, terminal=False):
         server.daemon_threads = True
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
-        environment = {
+        environment = child_environment({
             "HOME": directory, "PATH": "/usr/bin:/bin", "NO_COLOR": "1", "TERM": "xterm-256color",
             "XDG_CONFIG_HOME": str(base / "config"), "XDG_DATA_HOME": str(base / "data"),
             "XDG_STATE_HOME": str(base / "xdg-state"), "RUNE_HOME": str(base / "state"),
@@ -153,7 +153,7 @@ def run_fixture(scenario, terminal=False):
             "RUNE_BASE_URL": f"http://127.0.0.1:{server.server_port}/v1",
             "RUNE_API_KEY_ENV": "RUNE_MCP_TEST_KEY", "RUNE_MCP_TEST_KEY": "provider-only-secret",
             "RUNE_TEST_SERVER_SECRET": "server-only-secret",
-        }
+        })
         mode = {
             "optional-timeout": "startup-timeout", "required-timeout": "list-timeout",
         }.get(scenario, scenario)

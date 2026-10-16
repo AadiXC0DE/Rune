@@ -13,6 +13,9 @@
     clippy::indexing_slicing
 )]
 
+mod support;
+use support::CommandExt as _;
+
 use std::process::Command;
 
 /// Path of the binary under test.
@@ -128,7 +131,7 @@ fn ask_selects_native_gemini_from_configuration_and_environment_credentials() {
     });
     let dir = tempfile::tempdir().expect("isolated state");
     let output = Command::new(binary())
-        .env_clear()
+        .isolated_env()
         .env("HOME", dir.path())
         .env("RUNE_HOME", dir.path().join("state"))
         .env("XDG_CONFIG_HOME", dir.path().join("config"))
@@ -1931,7 +1934,7 @@ provider_request_timeout_ms = 1000
 
     let run_with_config = |args: &[&str]| {
         Command::new(binary())
-            .env_clear()
+            .isolated_env()
             .env("HOME", dir.path())
             .env("RUNE_HOME", dir.path().join("state"))
             .env("XDG_CONFIG_HOME", dir.path().join("config"))
@@ -2109,7 +2112,7 @@ fn concurrent_connect_processes_preserve_both_credentials_after_reopening() {
         children.push(
             Command::new(binary())
                 .args(["connect", provider, "--json"])
-                .env_clear()
+                .isolated_env()
                 .env("HOME", dir.path())
                 .env("RUNE_HOME", &state)
                 .env("XDG_CONFIG_HOME", dir.path().join(provider))
@@ -2193,7 +2196,7 @@ fn connecting_in_a_fresh_home_creates_private_state_and_opens_a_session() {
                 command
                     .args(["-c", r#"umask "$1"; shift; exec "$@""#, "rune-test", mask])
                     .arg(binary())
-                    .env_clear()
+                    .isolated_env()
                     .env("HOME", dir.path())
                     .current_dir(dir.path());
                 if xdg {

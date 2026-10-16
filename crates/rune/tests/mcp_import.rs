@@ -1,6 +1,9 @@
 //! Import external config through the CLI, then exercise the project trust gate.
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::indexing_slicing)]
 
+mod support;
+use support::CommandExt as _;
+
 use std::process::{Command, Output};
 
 use serde_json::{Value, json};
@@ -20,7 +23,7 @@ impl Workspace {
         Command::new(env!("CARGO_BIN_EXE_rune"))
             .args(args)
             .current_dir(self.0.path())
-            .env_clear()
+            .isolated_env()
             .env("PATH", std::env::var_os("PATH").unwrap_or_default())
             .env("RUNE_HOME", self.0.path().join("state"))
             .env("XDG_CONFIG_HOME", self.0.path().join("config"))

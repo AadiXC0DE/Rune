@@ -1,6 +1,9 @@
 //! Manual compaction preserves exact originals for retrieval after restart.
 #![allow(clippy::expect_used, clippy::panic)]
 
+mod support;
+use support::CommandExt as _;
+
 use std::io::{BufRead as _, Read as _, Write as _};
 use std::net::TcpListener;
 use std::process::{Command, Output, Stdio};
@@ -174,7 +177,7 @@ fn compact_restart_and_retrieve_every_removed_message_and_complete_tool_batch() 
     let command = || {
         let mut command = Command::new(env!("CARGO_BIN_EXE_rune"));
         command
-            .env_clear()
+            .isolated_env()
             .env("HOME", &root)
             .env("RUNE_HOME", &paths.state_root)
             .env("XDG_CONFIG_HOME", root.join("config"))

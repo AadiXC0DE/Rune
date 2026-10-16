@@ -1,6 +1,9 @@
 //! R-153: /cost restores saved usage before making another provider request.
 #![allow(clippy::expect_used)]
 
+mod support;
+use support::CommandExt as _;
+
 use std::io::Write as _;
 use std::process::{Command, Stdio};
 
@@ -37,7 +40,7 @@ fn saved_cost(events: Vec<SessionEvent>, selector: &str, expected: &str) {
         "provider = \"chat_completions\"\nbase_url = \"http://127.0.0.1:1/v1\"\n[models.chat_completions]\nid = \"fixture-model\"\n")
         .expect("config");
     let mut child = Command::new(env!("CARGO_BIN_EXE_rune"))
-        .env_clear()
+        .isolated_env()
         .env("HOME", &root)
         .env("RUNE_HOME", &paths.state_root)
         .env("XDG_CONFIG_HOME", root.join("config"))
