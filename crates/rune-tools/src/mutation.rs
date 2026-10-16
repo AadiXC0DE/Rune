@@ -537,6 +537,7 @@ fn io_error(path: &Utf8Path, err: std::io::Error) -> RuneError {
         ErrorKind::NotFound => ErrorCode::NotFound,
         ErrorKind::PermissionDenied => ErrorCode::PermissionDenied,
         ErrorKind::AlreadyExists => ErrorCode::AlreadyExists,
+        ErrorKind::Unsupported => ErrorCode::Unsupported,
         ErrorKind::IsADirectory | ErrorKind::NotADirectory | ErrorKind::InvalidInput => {
             ErrorCode::InvalidField
         }
@@ -1064,6 +1065,26 @@ mod tests {
             })
             .filter(|name| name.starts_with(STAGE_PREFIX))
             .collect()
+    }
+
+    #[test]
+    fn an_unsupported_filesystem_operation_is_a_refusal_with_its_cause_and_path() {
+        use std::error::Error as _;
+
+        let path = Utf8Path::new("fixture.txt");
+        let err = io_error(
+            path,
+            std::io::Error::new(ErrorKind::Unsupported, "unavailable"),
+        );
+        assert_eq!(err.code(), ErrorCode::Unsupported);
+        assert!(err.message().contains(path.as_str()));
+        assert_eq!(err.detail().observed.as_deref(), Some("unavailable"));
+        let source = err
+            .source()
+            .expect("filesystem cause")
+            .downcast_ref::<std::io::Error>()
+            .expect("typed filesystem cause");
+        assert_eq!(source.kind(), ErrorKind::Unsupported);
     }
 
     #[test]
