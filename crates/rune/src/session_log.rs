@@ -84,6 +84,23 @@ pub struct Recorder {
 }
 
 impl Recorder {
+    /// Copies this session's journal, through its latest event, into a new
+    /// session and returns the new id. This session is left as it is.
+    pub fn fork(&self, paths: &Paths) -> Result<SessionId> {
+        let last = self
+            .store
+            .read()?
+            .events
+            .last()
+            .map(|frame| frame.seq)
+            .ok_or_else(|| {
+                RuneError::new(ErrorCode::NotFound, "the session has nothing to fork yet")
+            })?;
+        let destination = SessionId::generate();
+        rune_session::fork::fork(paths, &self.store.id(), &destination, last)?;
+        Ok(destination)
+    }
+
     /// Creates a new session and its log.
     pub fn create(paths: &Paths, id: &SessionId) -> Result<Self> {
         let store = SessionStore::create(paths, id)?;
@@ -1340,6 +1357,21 @@ mod tests {
             request["contents"][2]["parts"][0]["functionResponse"]["name"],
             "lookup"
         );
+    }
+
+    #[test]
+    fn a_recorder_forks_into_a_new_session_with_the_same_history() {
+        let temp = tempfile::tempdir().expect("home");
+        let paths = paths(Utf8Path::from_path(temp.path()).expect("utf8"));
+        let id = SessionId::generate();
+        let recorder = Recorder::create(&paths, &id).expect("create");
+        assert!(recorder.fork(&paths).is_err());
+        recorder.user_message("hello").expect("message");
+        let branch = recorder.fork(&paths).expect("fork");
+        assert_ne!(branch, id);
+        let (_, history) = load(&paths, &branch).expect("resume the branch");
+        assert_eq!(history.turns().len(), 1);
+        Recorder::open(&paths, &branch).expect("the branch is writable");
     }
 
     #[test]

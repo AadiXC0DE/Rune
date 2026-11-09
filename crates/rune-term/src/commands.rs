@@ -43,9 +43,14 @@ pub const BUILTINS: &[Builtin] = &[
         summary: "plan read-only before acting, or leave plan mode",
     },
     Builtin {
+        name: "fork",
+        arguments: "",
+        summary: "branch this conversation and continue in the branch",
+    },
+    Builtin {
         name: "permissions",
         arguments: "[mode]",
-        summary: "show the permission mode, or switch to ask, auto or full-access",
+        summary: "show the permission mode, or switch it",
     },
     Builtin {
         name: "effort",

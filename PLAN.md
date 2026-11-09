@@ -87,7 +87,7 @@ These are compared against `main` before a push rather than counted as regressio
 
 ## Resume here (2026-11-09)
 
-State: `main` is 10 commits ahead of `origin/main` (last push `56828d7`, CI run 42647916013).
+State: `main` is 12 commits ahead of `origin/main` (last push `56828d7`, CI run 42647916013).
 
 Before the next push: `cargo xtask web` (the demo module record is stale once
 `rune-term`, `rune-tools`, `rune-agent`, `rune-net`, `rune-core` or `rune-context`
@@ -95,14 +95,15 @@ change), `cargo fmt --all -- --check`,
 `cargo clippy --workspace --all-targets -D warnings`, `cargo xtask budget`, and
 `cargo test --workspace --no-fail-fast`, compared against the known local failures.
 
-Next task: 8.4b, `/fork` in the interactive session on top of `rune session
-fork`: save the current branch as a new session and continue in it, printing the
-new id. Then 4.4 across turns, and 10.1 (move `rune-sdk` onto the shared loop).
+Next task: 10.1, move `rune-sdk` onto the `rune-agent` turn loop. 4.4 across
+turns stays open on purpose: between turns the person may edit files, so a
+pointer to an earlier read needs a content check (size, mtime or hash of the
+range) before it can be trusted.
 
 Waiting on the owner: a DeepSeek key and approval to spend about $0.02 for the
 head-to-head runs (9.5) and the `reasoning_content` check (3.5).
 
-Remaining open items: 3.5, 4.4 (across turns), 8.4b, 9.5, 10.1 to 10.4.
+Remaining open items: 3.5, 4.4 (across turns), 9.5, 10.1 to 10.4.
 
 ## Phases
 
@@ -213,7 +214,7 @@ Done when the binary stays inside its ceiling and a snapshot test pins each elem
 - [x] 8.3 `/plan` read-only mode enforced at the session layer.
 - [x] 8.3b `/permissions` to switch mode during a session.
 - [x] 8.4 `/effort` slash command.
-- [ ] 8.4b `/fork` slash command (the CLI has `rune session fork`).
+- [x] 8.4b `/fork` slash command (the CLI has `rune session fork`).
 
 Done when a headless run on a JS task can run its tests without full access.
 
@@ -290,3 +291,4 @@ Done when a reproducible table exists with Rune in it.
 | 2026-11-09 | eb039ce | CI | Run 42647916013: `terminal_help` failed on Linux because the 6.2b spinner redrew every 100 ms and a held turn never left the harness's 150 ms quiet window. Redraw at most every 250 ms (checked with the harness: fails at 100, passes the held-turn stage at 250). macOS `mcp_http` timed out waiting for exit after `/quit`, the same as the known local failure; watch it on the next run. |
 | 2026-11-09 | 011e834 | 5.1 | `TurnOutcome.narration` (`Narration::Text` / `Call(id)`), a new entry per step; `ask --json` adds `narration` (`{text}` or `{tool, status}` with `not_run`). Saved sessions already kept the order in the assistant parts. |
 | 2026-11-09 | 22c21aa | 8.3b | `/permissions [ask|auto|full-access]`; `SessionHost.mode` and `rules` behind locks, rebuilt with `permissions::validated` from a kept copy of the settings; narrowing clears grants. README updated. |
+| 2026-11-09 | pending | 8.4b | `/fork`: `Recorder::fork` copies the journal through its last event (`rune_session::fork::fork`), the session switches its recorder to the copy and keeps its history; the earlier session is unchanged. README updated. |

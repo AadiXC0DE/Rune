@@ -629,7 +629,8 @@ reasoning effort in force and the levels the provider accepts, and
 the permission mode, and `/permissions ask|auto|full-access` switches it for the
 calls that follow, rebuilding the rules as if the session had started in that
 mode; a switch to a mode that allows less forgets the session's remembered
-approvals.
+approvals. `/fork` copies the conversation into a new
+session and continues there, leaving the earlier session as it was.
 
 When the model's prices are known, each turn's summary line, `/cost`, the status
 row and the usage ledger carry its estimated cost. `/budget <dollars>` sets a

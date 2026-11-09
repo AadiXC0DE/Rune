@@ -2403,6 +2403,34 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                         host.estimate_context(&history)?;
                         note(format!("started session {id}"));
                     }
+                    Handled::Fork => {
+                        // The copy has the same history, so only the recorder
+                        // changes: the turns that follow are saved to the copy,
+                        // and the earlier session stays as it was.
+                        let mut current = recorder
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        let source = current.id();
+                        let forked = current.fork(&config.paths).and_then(|id| {
+                            let opened = Recorder::open(&config.paths, &id)?;
+                            opened.set_workspace(&config.workspace)?;
+                            Ok((id, opened))
+                        });
+                        match forked {
+                            Ok((id, opened)) => {
+                                *current = opened;
+                                drop(current);
+                                host.set_session_id(id.as_str());
+                                note(format!(
+                                    "forked into session {id}; session {source} is unchanged"
+                                ));
+                            }
+                            Err(err) => {
+                                drop(current);
+                                note(format!("could not fork: {err}"));
+                            }
+                        }
+                    }
                     Handled::Undo => return Ok(Step::Undo),
                     Handled::UndoPreview => {
                         flush_lines(&host, sink, &host.preview_undo())?;
@@ -5393,6 +5421,8 @@ enum Handled {
     Effort(Option<String>),
     /// Show the permission mode, or switch it for the calls that follow.
     Permissions(Option<String>),
+    /// Copy this conversation into a new session and continue in the copy.
+    Fork,
     /// Enter plan mode, optionally with a task for the composer, or leave it.
     Plan(Option<String>),
     /// Show the spend limit, or set it in dollars, or turn it off.
@@ -5684,6 +5714,7 @@ fn handle_command<W: std::io::Write>(
         "plan" => Ok(Handled::Plan(
             (!arguments.trim().is_empty()).then(|| arguments.trim().to_owned()),
         )),
+        "fork" => Ok(Handled::Fork),
         "permissions" => Ok(Handled::Permissions(
             (!arguments.trim().is_empty()).then(|| arguments.trim().to_owned()),
         )),
@@ -10003,7 +10034,11 @@ mod tests {
 
     #[test]
     fn the_copy_and_new_commands_are_recognized() {
-        for (name, expected) in [("copy", Handled::Copy), ("new", Handled::NewSession)] {
+        for (name, expected) in [
+            ("copy", Handled::Copy),
+            ("new", Handled::NewSession),
+            ("fork", Handled::Fork),
+        ] {
             let mut output = Vec::new();
             let action = handle_command(
                 name,
