@@ -237,7 +237,7 @@ Done when a reproducible table exists with Rune in it.
 ### Phase 10: Consolidation and release
 
 - [ ] 10.1 Move `rune-sdk` onto the `rune-agent` turn loop so every surface shares one loop.
-- [ ] 10.2 Re-measure size and startup; trim anything that grew without paying for itself.
+- [x] 10.2 Re-measure size and startup; trim anything that grew without paying for itself.
 - [ ] 10.3 README, COMMANDS, CHANGELOG and site updated to measured numbers only.
       CHANGELOG `Unreleased` written; README, COMMANDS and site still to check.
 - [ ] 10.4 Release 0.2.0.
@@ -298,3 +298,4 @@ Done when a reproducible table exists with Rune in it.
 | 2026-11-09 | a424153 | 10.3 (part) | CHANGELOG `Unreleased` lists the plan's user-visible changes; numbers are the measured ones from this log. |
 | 2026-11-09 | dc8e9f4 | 1.3 fix | First deploy of a new branch failed: `VERCEL_GIT_PREVIOUS_SHA` is empty and `git diff` exits 128. The ignore command now builds (exit 1) when the previous commit is unknown or absent from the clone. |
 | 2026-11-09 | 3ca3ac7 | CI | Per-push CI cut from 8 jobs to 2 (`fast` on Linux, Windows) plus `dependencies.yml` when the dependency set changes. The Ubuntu matrix entry duplicated `fast` and is gone; WASM, budget, reproducible, macOS and release staging run on `workflow_dispatch`. `scripts/preflight.sh` runs them locally. |
+| 2026-11-09 | (this) | 10.2 | Re-measured on aarch64 macOS: binary 3,851,632 to 3,968,336 bytes (+116,704, +3.0%) for Markdown, highlighting, diffs, bench, prices and the live rows; startup work 1.50 to 1.49 ms (`--version`) and 1.52 to 1.55 ms (`--help`); tool schemas 17,379 to 9,154 bytes. Nothing trimmed: each addition is a user-visible feature, and the ceiling is 8 MiB. |
