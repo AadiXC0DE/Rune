@@ -79,6 +79,10 @@ Gaps that cost tokens, pass rate or user trust:
 - `rune-acp` `output_failure_tests`: 3 tests exceed the shutdown grace.
 - `rune` `terminal_question` and `terminal_accessible`: the PTY child does not exit in 10 s.
 
+- `rune` `mcp_http`, `mcp_stdio`, and every PTY suite (`terminal_*`, 17 binaries): the
+  harness times out waiting for exit after `/quit`. A minimal PTY session with a turn exits
+  in 0.2 s, so the cause is in the harness on this host; CI is the arbiter for these.
+
 These are compared against `main` before a push rather than counted as regressions.
 
 ## Phases
@@ -155,13 +159,14 @@ Done when the turn result carries ordered steps and a verification verdict.
 
 ### Phase 6: Live turn rendering
 
-- [ ] 6.1 Tool results carry structured metadata: target, exit code, duration, line and
+- [x] 6.1 Tool results carry structured metadata: target, exit code, duration, line and
       match counts, `+N -M`.
-- [ ] 6.2 Draw tool rows live while a turn runs: status glyph, tool, target, right-aligned
+- [x] 6.2 Draw tool rows live while a turn runs: status glyph, tool, target, right-aligned
       result; a spinner with elapsed time in the live region.
-- [ ] 6.3 Scrollback keeps narration and tool rows interleaved in the order they happened,
+- [x] 6.3 Scrollback keeps narration and tool rows interleaved in the order they happened,
       one row per call.
-- [ ] 6.4 End-of-turn summary line: files changed, tests, tokens with cache share, cost, time.
+- [x] 6.4 End-of-turn summary line: files changed, tests, tokens with cache share, cost, time.
+- [ ] 6.2b Animate the running row (spinner and elapsed time) from a ticker.
 - [ ] 6.5 Footer shows session cost and the running turn's elapsed time.
 
 Done when a PTY test pins the live rows and the summary.
@@ -227,4 +232,7 @@ Done when a reproducible table exists with Rune in it.
 | 2026-11-09 | 620afb1 | 3.3 | `Usage.input_tokens` now means the whole prompt in every dialect; Anthropic adds its cache counts back. Manual `/compact` resets and re-estimates the meter. |
 | 2026-11-09 | a8a3d7a | 3.4 | Anthropic only (`requires_output_ceiling`); min(catalog or config, 32,768); unknown stays 8,192. Objective accounting no longer re-adds cache counts. |
 | 2026-11-09 | 388cd3f | 4.1 | Render: a third head, the rest tail, cut at line breaks. Capture: a quarter-cap ring of the newest bytes past the head, shown once the command ends. |
-| 2026-11-09 | (this) | 4.1b | Preview names the exact omitted byte range for `read_tool_result`. |
+| 2026-11-09 | 8da55ca | 4.1b | Preview names the exact omitted byte range for `read_tool_result`. |
+| 2026-11-09 | 811b10f | push | First batch of 17 commits pushed; CI run 42609046209. |
+| 2026-11-09 | 432ea66 | 6.1 | `ToolFinished` carries output and elapsed time. |
+| 2026-11-09 | (this) | 6.2-6.4 | Narration and `✓/✗ tool target · result · time` rows committed live; running rows in the live region (static, no animated spinner yet); one dim summary line per turn. Words instead of glyphs for screen readers. |

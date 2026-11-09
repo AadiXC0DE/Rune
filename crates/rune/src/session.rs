@@ -331,6 +331,11 @@ struct SessionHost {
     /// Shared and mutable because a delta arrives on the turn's own thread
     /// while the renderer needs to read what has accumulated.
     streaming: Arc<Mutex<StreamingText>>,
+    /// Calls still running in the current step, by call id, with the row that
+    /// stands for each in the live region.
+    running: Mutex<Vec<(String, String)>>,
+    /// When the turn now running sent its first request.
+    turn_started: Mutex<Option<std::time::Instant>>,
     /// Where the live region is written, so a delta can be shown as it lands.
     ///
     /// Absent until a session attaches one, which keeps every other caller of
@@ -577,6 +582,11 @@ impl Host for SessionHost {
             Event::ProviderRetryFinished { .. }
             | Event::TurnStarted { .. }
             | Event::Finished { .. } => {
+                if matches!(event, Event::TurnStarted { .. })
+                    && let Ok(mut started) = self.turn_started.lock()
+                {
+                    started.get_or_insert_with(std::time::Instant::now);
+                }
                 if self.clear_provider_retry() {
                     self.draw_stream();
                 }
@@ -612,6 +622,42 @@ impl Host for SessionHost {
                 }
                 self.draw_stream();
             }
+            Event::ToolStarted { call, activity } => {
+                // What the model said before calling a tool is finished, so it
+                // moves into scrollback ahead of the call it led to.
+                let mut entries = self.take_narration();
+                if let Ok(mut running) = self.running.lock() {
+                    running.push((call.id.clone(), self.running_row(call, *activity)));
+                }
+                entries.retain(|entry| !entry.text.trim().is_empty());
+                self.commit(&entries);
+            }
+            Event::ToolFinished {
+                call,
+                output,
+                elapsed,
+            } => {
+                if let Ok(mut running) = self.running.lock() {
+                    running.retain(|(id, _)| id != &call.id);
+                }
+                // A plan change is reported by its own event.
+                if call.name == "update_plan" && !output.is_error {
+                    self.draw_stream();
+                } else {
+                    let row = self.finished_row(call, output, *elapsed);
+                    if self.accessible {
+                        self.commit(&[Entry::tool(row)]);
+                    } else {
+                        self.commit_lines(&[self.styled_tool_line(&row, output.is_error)]);
+                    }
+                }
+            }
+            Event::ToolDenied { call, reason } => {
+                let mut entries = self.take_narration();
+                entries.retain(|entry| !entry.text.trim().is_empty());
+                entries.push(Entry::notice(format!("refused {}: {reason}", call.name)));
+                self.commit(&entries);
+            }
             Event::PlanUpdated { update } => {
                 self.draw_notice(&plan_summary(update));
             }
@@ -621,7 +667,8 @@ impl Host for SessionHost {
             } => self.draw_notice(&format!(
                 "compacted {removed_turns} earlier turn(s); {remaining_turns} turn(s) remain"
             )),
-            _ => {}
+            // A queued message is reported once the turn ends, from the events.
+            Event::SteeringApplied { .. } => {}
         }
         if let Ok(mut events) = self.events.lock() {
             events.push(event);
@@ -1401,7 +1448,10 @@ impl SessionHost {
             line.clone_into(&mut typed.0);
             typed.1 = column;
         }
-        let rows = self.streaming_rows();
+        let mut rows = self.streaming_rows();
+        if let Ok(running) = self.running.lock() {
+            rows.extend(running.iter().map(|(_, row)| row.clone()));
+        }
         // One lock across painting and writing, so a frame from one thread
         // cannot land inside a frame from the other.
         let Ok(_frame) = self.frame.lock() else {
@@ -1542,6 +1592,127 @@ impl SessionHost {
         }
     }
 
+    /// Takes the current step's reasoning and narration as transcript entries,
+    /// leaving the live text empty.
+    fn take_narration(&self) -> Vec<Entry> {
+        let Ok(mut streaming) = self.streaming.lock() else {
+            return Vec::new();
+        };
+        let reasoning = std::mem::take(&mut streaming.reasoning);
+        let answer = std::mem::take(&mut streaming.answer);
+        streaming.answer_rows = transcript::AssistantRows::default();
+        streaming.reasoning_rows = LazyRows::default();
+        vec![Entry::reasoning(reasoning), Entry::assistant(answer)]
+    }
+
+    /// Prints finished entries into scrollback above the live region.
+    ///
+    /// A turn's tool calls are written as they finish rather than when the
+    /// turn ends, so the scrollback reads in the order things happened and a
+    /// long turn shows its progress while it runs.
+    fn commit(&self, entries: &[Entry]) {
+        if entries.is_empty() {
+            self.draw_stream();
+            return;
+        }
+        self.commit_lines(&render_entries(entries, self));
+    }
+
+    /// Prints finished lines into scrollback above the live region.
+    fn commit_lines(&self, lines: &[String]) {
+        if self.accessible {
+            let _frame = self
+                .frame
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            self.show(&transcript::append_lines(lines));
+            return;
+        }
+        let (line, column) = self.typed_line();
+        let mut rows = self.streaming_rows();
+        if let Ok(running) = self.running.lock() {
+            rows.extend(running.iter().map(|(_, row)| row.clone()));
+        }
+        let Ok(_frame) = self.frame.lock() else {
+            return;
+        };
+        if self
+            .transcript_open
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return;
+        }
+        let marker = rune_term::shell::prompt();
+        let width = usize::from(self.width());
+        let (prompt_rows, caret) = transcript::render_draft_at(marker, &line, column, width);
+        if let Ok(painted) = self.paint(lines, None, &prompt_rows, &rows, caret) {
+            self.show(&painted);
+        }
+    }
+
+    /// Styles a finished call's row: the status glyph in the success or error
+    /// colour, the tool and target as text, and the details after them dimmed.
+    fn styled_tool_line(&self, row: &str, failed: bool) -> String {
+        let text = transcript::sanitize(row);
+        let reset = rune_term::engine::Style::RESET;
+        let status = self.theme.sgr(
+            if failed { Slot::Error } else { Slot::Success },
+            self.truecolor,
+        );
+        let dim = self.theme.sgr(Slot::Dim, self.truecolor);
+        let (glyph, rest) = text.split_once(' ').unwrap_or((text.as_str(), ""));
+        let separator = if self.ascii { " - " } else { " \u{b7} " };
+        match rest.split_once(separator) {
+            Some((call, details)) => {
+                format!("  {status}{glyph}{reset} {call}{dim}{separator}{details}{reset}")
+            }
+            None => format!("  {status}{glyph}{reset} {rest}"),
+        }
+    }
+
+    /// Returns the live row for a call that is running.
+    fn running_row(&self, call: &turn::PreparedCall, activity: rune_tools::Activity) -> String {
+        let dim = self.theme.sgr(Slot::Dim, self.truecolor);
+        let reset = rune_term::engine::Style::RESET;
+        let target = self.call_target(call);
+        let subject = if target.is_empty() {
+            &call.name
+        } else {
+            &target
+        };
+        let glyph = if self.ascii { "..." } else { "\u{25cb}" };
+        format!(
+            "{dim}  {glyph} {} {subject}{reset}",
+            activity.running_label()
+        )
+    }
+
+    /// Returns the scrollback row for a call that has finished.
+    fn finished_row(
+        &self,
+        call: &turn::PreparedCall,
+        output: &ToolOutput,
+        elapsed: std::time::Duration,
+    ) -> String {
+        let glyphs = if self.accessible {
+            RowGlyphs::Words
+        } else if self.ascii {
+            RowGlyphs::Ascii
+        } else {
+            RowGlyphs::Unicode
+        };
+        tool_row(&call.name, &self.call_target(call), output, elapsed, glyphs)
+    }
+
+    /// Returns what a call acts on, such as a path or a command, cut to fit.
+    fn call_target(&self, call: &turn::PreparedCall) -> String {
+        let arguments = serde_json::from_str(&call.arguments).unwrap_or_default();
+        let target =
+            turn::permission_target_for(&self.registry, &call.name, &arguments).unwrap_or_default();
+        let width = usize::from(self.width()).saturating_sub(40).clamp(16, 72);
+        shorten(target.lines().next().unwrap_or_default(), width, self.ascii)
+    }
+
     /// Clears retry state when a request advances or the turn is finalized.
     fn clear_provider_retry(&self) -> bool {
         self.provider_retry
@@ -1563,6 +1734,12 @@ impl SessionHost {
     fn clear_events(&self) {
         if let Ok(mut events) = self.events.lock() {
             events.clear();
+        }
+        if let Ok(mut running) = self.running.lock() {
+            running.clear();
+        }
+        if let Ok(mut started) = self.turn_started.lock() {
+            *started = None;
         }
     }
 }
@@ -1712,6 +1889,8 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
         provider_order: config.settings.provider_order.clone(),
         provider_strict: config.settings.provider_strict,
         streaming: Arc::new(Mutex::new(StreamingText::default())),
+        running: Mutex::new(Vec::new()),
+        turn_started: Mutex::new(None),
         live_out: Arc::new(Mutex::new(None)),
         reasoning: Mutex::new(reasoning_escape),
         reviewer: crate::auto_review::build(&config.settings, &config.paths)?,
@@ -2165,15 +2344,34 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                 record_usage(&config.paths, &host.model(), &outcome);
                 host.record_usage(&outcome.usage);
                 host.record_context_usage(&history, &outcome.last_request)?;
+                let elapsed = host
+                    .turn_started
+                    .lock()
+                    .ok()
+                    .and_then(|started| *started)
+                    .map(|started| started.elapsed());
                 host.clear_events();
                 // The streamed text has been superseded by the finished turn,
-                // so it is dropped before the render that replaces it.
-                host.clear_streaming();
+                // so it is taken before the render that replaces it; only the
+                // last step's reasoning is still unprinted.
+                let reasoning = host
+                    .take_narration()
+                    .into_iter()
+                    .find(|entry| entry.speaker == transcript::Speaker::Reasoning)
+                    .map(|entry| entry.text)
+                    .unwrap_or_default();
                 // A finished turn is printed once and becomes part of the
                 // terminal's own scrollback, so it stays readable with the
                 // terminal's search and copy. Nothing else writes to the
                 // terminal: the region below is redrawn in place.
-                let lines = report_turn(&outcome, &host)?;
+                let mut lines = report_turn(&outcome, &host, &reasoning)?;
+                if !host.accessible
+                    && let Some(summary) = turn_summary(&outcome, elapsed, host.ascii)
+                {
+                    let dim = host.theme.sgr(Slot::Dim, host.truecolor);
+                    let reset = rune_term::engine::Style::RESET;
+                    lines.push(format!("{dim}  {summary}{reset}"));
+                }
                 let activity = if host.accessible {
                     None
                 } else {
@@ -5084,34 +5282,222 @@ fn plan_summary(update: &rune_tools::PlanUpdate) -> String {
     )
 }
 
-/// Returns the one line that stands for a finished tool call.
+/// Builds the scrollback row for a finished call: status, tool, target, and
+/// what it produced.
 ///
-/// A tool result already opens with a headline naming what it found, because
-/// that is what the model reads first. That line is the whole of what a reader
-/// needs while skimming, and the body stays available to the model and in the
-/// session log.
-fn tool_summary(name: &str, output: &ToolOutput) -> String {
-    if name == "update_plan"
-        && !output.is_error
-        && let Ok(update) = serde_json::from_str::<rune_tools::PlanUpdate>(&output.text)
-    {
-        return plan_summary(&update);
+/// The body is what the model asked for and already has, so only its outcome
+/// reaches the conversation; printing it again would bury the answer under the
+/// material it was drawn from.
+fn tool_row(
+    name: &str,
+    target: &str,
+    output: &ToolOutput,
+    elapsed: std::time::Duration,
+    glyphs: RowGlyphs,
+) -> String {
+    let ascii = glyphs != RowGlyphs::Unicode;
+    let glyph = match (output.is_error, glyphs) {
+        (false, RowGlyphs::Unicode) => "\u{2713}",
+        (true, RowGlyphs::Unicode) => "\u{2717}",
+        (false, RowGlyphs::Ascii) => "+",
+        (true, RowGlyphs::Ascii) => "x",
+        (false, RowGlyphs::Words) => "done",
+        (true, RowGlyphs::Words) => "failed",
+    };
+    let mut row = format!("{glyph} {name}");
+    if !target.is_empty() {
+        row.push(' ');
+        row.push_str(target);
     }
-    let headline = output
-        .text
-        .lines()
-        .find(|line| !line.trim().is_empty())
-        .unwrap_or("")
-        .trim();
-    // A failure is stated in full, because the reason is the result and a
-    // reader needs it to act.
+    let mut details = Vec::new();
+    let result = result_summary(name, output, ascii);
+    if !result.is_empty() {
+        details.push(result);
+    }
+    if elapsed >= std::time::Duration::from_millis(100) {
+        details.push(format_elapsed(elapsed));
+    }
+    if !details.is_empty() {
+        row.push_str(if ascii { " - " } else { " \u{b7} " });
+        row.push_str(&details.join(if ascii { ", " } else { " \u{b7} " }));
+    }
+    row
+}
+
+/// How a finished call's status is marked.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum RowGlyphs {
+    /// A check or a cross.
+    Unicode,
+    /// Plain characters, for a terminal limited to ASCII.
+    Ascii,
+    /// Words, for a screen reader, which reads a symbol by its name.
+    Words,
+}
+
+/// Summarizes what a call produced in a few words.
+fn result_summary(name: &str, output: &ToolOutput, ascii: bool) -> String {
+    let lines = || {
+        output
+            .text
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+    };
+    let headline = lines().next().unwrap_or_default();
     if output.is_error {
-        return format!("{name}: {headline}");
+        return shorten(headline, 96, ascii);
     }
-    if headline.is_empty() {
-        return format!("{name}: done");
+    match name {
+        "shell" => output
+            .text
+            .lines()
+            .rev()
+            .map(str::trim)
+            .find(|line| line.starts_with('[') && line.ends_with(']'))
+            .map(|state| {
+                let state = &state[1..state.len().saturating_sub(1)];
+                state
+                    .strip_prefix("exited with status ")
+                    .map_or_else(|| shorten(state, 48, ascii), |code| format!("exit {code}"))
+            })
+            .unwrap_or_default(),
+        "read_file" => {
+            let count = output
+                .text
+                .lines()
+                .filter(|line| {
+                    line.split_once('\t').is_some_and(|(number, _)| {
+                        !number.trim().is_empty()
+                            && number.trim().bytes().all(|b| b.is_ascii_digit())
+                    })
+                })
+                .count();
+            plural(count, "line")
+        }
+        "grep_files" | "glob_files" => {
+            let count = lines().filter(|line| !line.starts_with('[')).count();
+            if count == 0 {
+                shorten(headline, 48, ascii)
+            } else {
+                plural(count, if name == "grep_files" { "line" } else { "path" })
+            }
+        }
+        "edit_file" | "write_file" => headline
+            .rsplit_once('(')
+            .and_then(|(_, rest)| rest.strip_suffix(')'))
+            .map_or_else(|| shorten(headline, 64, ascii), str::to_owned),
+        _ => shorten(headline, 64, ascii),
     }
-    format!("{name}: {headline}")
+}
+
+/// Summarizes a finished turn in one line: what it did, what it cost in
+/// tokens, and how long it took.
+///
+/// Omitted for a turn that used no tool and reported no usage, where the
+/// answer is the whole story.
+fn turn_summary(
+    outcome: &turn::TurnOutcome,
+    elapsed: Option<std::time::Duration>,
+    ascii: bool,
+) -> Option<String> {
+    let executed: Vec<&turn::CallResult> =
+        outcome.calls.iter().filter(|call| call.executed).collect();
+    let mut parts = Vec::new();
+    if !executed.is_empty() {
+        parts.push(plural(executed.len(), "call"));
+    }
+    let mut changed: Vec<String> = executed
+        .iter()
+        .filter(|call| {
+            !call.output.is_error
+                && matches!(
+                    call.call.name.as_str(),
+                    "write_file" | "edit_file" | "rename_file"
+                )
+        })
+        .filter_map(|call| {
+            serde_json::from_str::<serde_json::Value>(&call.call.arguments)
+                .ok()?
+                .get("path")?
+                .as_str()
+                .map(str::to_owned)
+        })
+        .collect();
+    changed.sort();
+    changed.dedup();
+    if !changed.is_empty() {
+        parts.push(format!("{} changed", plural(changed.len(), "file")));
+    }
+    if let Some(input) = outcome.usage.input_tokens {
+        let cached = outcome
+            .usage
+            .cache_read_tokens
+            .filter(|cached| *cached > 0 && input > 0)
+            .map(|cached| {
+                format!(
+                    " ({}% cached)",
+                    cached
+                        .saturating_mul(100)
+                        .checked_div(input)
+                        .unwrap_or_default()
+                )
+            })
+            .unwrap_or_default();
+        parts.push(format!("{} in{cached}", footer::format_tokens(input)));
+    }
+    if let Some(output) = outcome.usage.output_tokens {
+        parts.push(format!("{} out", footer::format_tokens(output)));
+    }
+    if executed.is_empty() && parts.is_empty() {
+        return None;
+    }
+    if let Some(elapsed) = elapsed {
+        parts.push(format_elapsed(elapsed));
+    }
+    Some(parts.join(if ascii { ", " } else { " \u{b7} " }))
+}
+
+/// Counts something, in the singular when there is one.
+fn plural(count: usize, noun: &str) -> String {
+    if count == 1 {
+        format!("1 {noun}")
+    } else {
+        format!("{count} {noun}s")
+    }
+}
+
+/// Renders a duration the way a person reads it.
+fn format_elapsed(elapsed: std::time::Duration) -> String {
+    let millis = elapsed.as_millis();
+    if millis < 1000 {
+        format!("{millis}ms")
+    } else if millis < 60_000 {
+        format!("{:.1}s", elapsed.as_secs_f64())
+    } else {
+        format!("{}m{:02}s", millis / 60_000, (millis / 1000) % 60)
+    }
+}
+
+/// Cuts text to `width` columns, marking the cut.
+fn shorten(text: &str, width: usize, ascii: bool) -> String {
+    let marker = if ascii { "..." } else { "\u{2026}" };
+    if rune_term::width::str_width(text) <= width {
+        return text.to_owned();
+    }
+    let mut out = String::new();
+    let mut used: usize = 0;
+    let room = width.saturating_sub(rune_term::width::str_width(marker));
+    for ch in text.chars() {
+        let cell = rune_term::width::str_width(ch.encode_utf8(&mut [0; 4]));
+        if used.saturating_add(cell) > room {
+            break;
+        }
+        used = used.saturating_add(cell);
+        out.push(ch);
+    }
+    out.push_str(marker);
+    out
 }
 
 /// Renders what a turn produced, as the lines to print.
@@ -5120,22 +5506,17 @@ fn tool_summary(name: &str, output: &ToolOutput) -> String {
 /// component that writes to the terminal. A line printed beside it would move
 /// the rows the live region is drawn at, and in raw mode a bare newline moves
 /// down without returning to the first column.
-fn report_turn(outcome: &turn::TurnOutcome, host: &SessionHost) -> Result<Vec<String>> {
+fn report_turn(
+    outcome: &turn::TurnOutcome,
+    host: &SessionHost,
+    reasoning: &str,
+) -> Result<Vec<String>> {
+    // Earlier steps and their calls were written to scrollback as they
+    // finished, so what remains is the last step: its reasoning, shown in its
+    // own lane above the answer, and the answer itself.
     let mut entries = event_entries(host);
-
-    for call in &outcome.calls {
-        if call.executed {
-            // Only the result's headline reaches the conversation. The body is
-            // what the model asked for and what it already has; printing it
-            // again buries the answer under the material it was drawn from.
-            entries.push(Entry::tool(tool_summary(&call.call.name, &call.output)));
-        }
-    }
-
-    // Reasoning is shown above the answer and in its own lane, so a reader can
-    // tell what the model thought from what it concluded.
-    if !outcome.reasoning.trim().is_empty() {
-        entries.push(Entry::reasoning(outcome.reasoning.clone()));
+    if !reasoning.trim().is_empty() {
+        entries.push(Entry::reasoning(reasoning.to_owned()));
     }
 
     if !outcome.text.is_empty() {
@@ -5214,22 +5595,11 @@ fn event_entries(host: &SessionHost) -> Vec<Entry> {
     // through the transcript, which strips the control sequences a terminal
     // would act on.
     let mut entries = Vec::new();
+    // Calls and refusals reach scrollback as they happen; what is left for
+    // the end of the turn is a summary of what was applied between steps.
     for event in &events {
-        match event {
-            Event::ToolStarted { call, activity } => {
-                entries.push(Entry::tool(format!(
-                    "{} {}",
-                    activity.running_label(),
-                    call.name
-                )));
-            }
-            Event::ToolDenied { call, reason } => {
-                entries.push(Entry::notice(format!("refused {}: {reason}", call.name)));
-            }
-            Event::SteeringApplied { count, .. } => {
-                entries.push(Entry::notice(format!("applied {count} queued message(s)")));
-            }
-            _ => {}
+        if let Event::SteeringApplied { count, .. } = event {
+            entries.push(Entry::notice(format!("applied {count} queued message(s)")));
         }
     }
     entries
@@ -5524,7 +5894,7 @@ mod tests {
         assert_eq!(stopped.stop_reason, StopReason::ObjectiveBudget);
         assert_eq!(stopped.steps, 0);
         assert!(
-            report_turn(&stopped, &host)
+            report_turn(&stopped, &host, "")
                 .expect("notice")
                 .join("\n")
                 .contains("exhausted the objective token budget")
@@ -9639,7 +10009,7 @@ mod tests {
             steps: 1,
             calls: Vec::new(),
         };
-        let lines = report_turn(&outcome, &host).expect("reported");
+        let lines = report_turn(&outcome, &host, "").expect("reported");
         assert!(
             lines.iter().any(|line| line.contains("the answer")),
             "{lines:?}"
@@ -9658,7 +10028,7 @@ mod tests {
             steps: 40,
             calls: Vec::new(),
         };
-        let lines = report_turn(&outcome, &host).expect("reported");
+        let lines = report_turn(&outcome, &host, "").expect("reported");
         assert!(
             lines.iter().any(|line| line.contains("step limit")),
             "{lines:?}"
@@ -9667,7 +10037,10 @@ mod tests {
 
     #[test]
     fn reporting_a_denied_call_names_the_tool() {
+        let bytes = Arc::new(Mutex::new(Vec::new()));
         let host = test_host();
+        *host.live_out.lock().expect("lock") =
+            Some(Arc::new(Mutex::new(SharedSink(Arc::clone(&bytes)))));
         host.emit(Event::ToolDenied {
             call: turn::PreparedCall {
                 id: "c1".to_owned(),
@@ -9685,9 +10058,83 @@ mod tests {
             steps: 1,
             calls: Vec::new(),
         };
-        let lines = report_turn(&outcome, &host).expect("reported");
-        let text = lines.join("\n");
-        assert!(text.contains("refused shell"), "{text}");
+        // The refusal reaches scrollback when it happens, and the end of the
+        // turn does not print it a second time.
+        let shown = String::from_utf8_lossy(&bytes.lock().expect("lock")).into_owned();
+        assert!(shown.contains("refused shell"), "{shown}");
+        let lines = report_turn(&outcome, &host, "").expect("reported");
+        assert!(!lines.join("\n").contains("refused shell"), "{lines:?}");
+    }
+
+    #[test]
+    fn narration_and_finished_calls_reach_scrollback_in_order() {
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let host = test_host();
+        *host.live_out.lock().expect("lock") =
+            Some(Arc::new(Mutex::new(SharedSink(Arc::clone(&bytes)))));
+        let call = turn::PreparedCall {
+            id: "c1".to_owned(),
+            name: "read_file".to_owned(),
+            arguments: r#"{"path":"src/session.js"}"#.to_owned(),
+        };
+        host.emit(Event::TextDelta {
+            delta: "Inspecting the module.".to_owned(),
+        });
+        host.emit(Event::ToolStarted {
+            call: call.clone(),
+            activity: rune_tools::Activity::Read,
+        });
+        assert_eq!(host.running.lock().expect("running").len(), 1);
+        host.emit(Event::ToolFinished {
+            call,
+            output: ToolOutput::success("     1\ta\n     2\tb\n"),
+            elapsed: std::time::Duration::from_millis(5),
+        });
+        assert!(host.running.lock().expect("running").is_empty());
+        assert!(host.partial_answer().is_empty(), "narration was moved out");
+
+        let shown = String::from_utf8_lossy(&bytes.lock().expect("lock")).into_owned();
+        let narration = shown.find("Inspecting the module.").expect("narration");
+        let row = shown.find("read_file src/session.js").expect("tool row");
+        assert!(narration < row, "{shown}");
+        assert!(shown.contains("2 lines"), "{shown}");
+    }
+
+    #[test]
+    fn a_turn_summary_names_calls_changes_tokens_and_time() {
+        let edit = turn::CallResult {
+            call: turn::PreparedCall {
+                id: "e".to_owned(),
+                name: "edit_file".to_owned(),
+                arguments: r#"{"path":"a.rs"}"#.to_owned(),
+            },
+            output: ToolOutput::success("Edited `a.rs` (1 replacement)"),
+            executed: true,
+        };
+        let outcome = turn::TurnOutcome {
+            stop_reason: StopReason::Completed,
+            text: String::new(),
+            reasoning: String::new(),
+            usage: rune_net::stream::Usage {
+                input_tokens: Some(12_000),
+                output_tokens: Some(640),
+                cache_read_tokens: Some(9_000),
+                ..rune_net::stream::Usage::default()
+            },
+            last_request: rune_net::stream::Usage::default(),
+            steps: 2,
+            calls: vec![edit.clone(), edit],
+        };
+        let summary = turn_summary(
+            &outcome,
+            Some(std::time::Duration::from_millis(9_400)),
+            true,
+        )
+        .expect("summary");
+        assert_eq!(
+            summary,
+            "2 calls, 1 file changed, 12.0k in (75% cached), 640 out, 9.4s"
+        );
     }
 
     #[test]
@@ -9933,15 +10380,11 @@ mod tests {
             activity,
         });
 
-        let entries = event_entries(&host);
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].text, "Reading custom_read");
-        for accessible in [false, true] {
-            host.accessible = accessible;
-            let summary = render_entries(&entries, &host).join("\n");
-            assert!(summary.contains("Reading custom_read"), "{summary}");
-            assert!(!summary.contains("Running custom_read"), "{summary}");
-        }
+        // A running call is drawn with its own activity, not the generic one.
+        let running = host.running.lock().expect("running").clone();
+        assert_eq!(running.len(), 1);
+        assert!(running[0].1.contains("Reading custom_read"), "{running:?}");
+        assert!(!running[0].1.contains("Running custom_read"), "{running:?}");
     }
 
     fn test_host() -> SessionHost {
@@ -9998,6 +10441,8 @@ mod tests {
             provider_order: Vec::new(),
             provider_strict: false,
             streaming: Arc::new(Mutex::new(StreamingText::default())),
+            running: Mutex::new(Vec::new()),
+            turn_started: Mutex::new(None),
             live_out: Arc::new(Mutex::new(None)),
             reasoning: Mutex::new("\u{1b}[2m".to_owned()),
             reviewer: None,

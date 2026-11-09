@@ -240,7 +240,7 @@ with tempfile.TemporaryDirectory(prefix="rune-r070-") as directory:
             terminal.wait_for("Assistant: TOOL_REPLY", start)
             assert (root / "approved.txt").exists() == allowed
         assert (root / "approved.txt").read_text() == "ACCESSIBLE_SHELL_OK"
-        assert b"Tool: shell:" in terminal.output
+        assert b"Tool: done shell" in terminal.output
 
         start = len(terminal.output)
         terminal.send("question")
