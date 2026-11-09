@@ -97,15 +97,17 @@ State: work continues on `plan/phase-5-to-8` (PR #21); its first push was `ffe32
 Before the next push: `cargo xtask web` if a crate the demo uses changed, then
 `scripts/preflight.sh`, compared against the known local failures.
 
-Next task: 10.1, move `rune-sdk` onto the `rune-agent` turn loop. 4.4 across
-turns stays open on purpose: between turns the person may edit files, so a
-pointer to an earlier read needs a content check (size, mtime or hash of the
-range) before it can be trusted.
+Next task: 10.1, move `rune-sdk` onto the `rune-agent` turn loop. What the SDK
+loop has that `run_turn` lacks: image attachments on tool results
+(`HostImage` registered as `ContentPart::Image`), the `HostFetch` deadline and
+cancellation contract with `Retry-After`, cancellation that settles the turn
+(`StopReason::Cancelled`, keeping the calls so far) instead of failing it, and a
+history the caller can read while a turn runs (`Mutex<History>`).
 
 Waiting on the owner: a DeepSeek key and approval to spend about $0.02 for the
 head-to-head runs (9.5) and the `reasoning_content` check (3.5).
 
-Remaining open items: 3.5, 4.4 (across turns), 9.5, 10.1 to 10.4.
+Remaining open items: 3.5, 9.5, 10.1 to 10.4.
 
 ## Phases
 
@@ -160,9 +162,9 @@ Done when a recorded Anthropic exchange shows cache reads on the second request.
 - [x] 4.3 A repeated test command returns a delta against its previous run: new and changed
       failures in full, unchanged failures by name, newly passing tests, and a handle to the
       full log.
-- [ ] 4.4 A re-read of an unchanged range returns a pointer to the earlier call; an edit
-      invalidates the file's earlier reads. Within a turn this is done by 5.3; across
-      turns it is still open.
+- [x] 4.4 A re-read of an unchanged range returns a pointer to the earlier call; an edit
+      invalidates the file's earlier reads. `read_file` checks a SHA-256 of the file,
+      so this holds across turns and against edits made outside the agent.
 - [x] 4.5 Edit results report `+N -M` lines and the changed hunk, compactly.
 
 Done when a scripted debugging session sends measurably fewer result bytes with every fact
@@ -299,3 +301,4 @@ Done when a reproducible table exists with Rune in it.
 | 2026-11-09 | dc8e9f4 | 1.3 fix | First deploy of a new branch failed: `VERCEL_GIT_PREVIOUS_SHA` is empty and `git diff` exits 128. The ignore command now builds (exit 1) when the previous commit is unknown or absent from the clone. |
 | 2026-11-09 | 3ca3ac7 | CI | Per-push CI cut from 8 jobs to 2 (`fast` on Linux, Windows) plus `dependencies.yml` when the dependency set changes. The Ubuntu matrix entry duplicated `fast` and is gone; WASM, budget, reproducible, macOS and release staging run on `workflow_dispatch`. `scripts/preflight.sh` runs them locally. |
 | 2026-11-09 | (this) | 10.2 | Re-measured on aarch64 macOS: binary 3,851,632 to 3,968,336 bytes (+116,704, +3.0%) for Markdown, highlighting, diffs, bench, prices and the live rows; startup work 1.50 to 1.49 ms (`--version`) and 1.52 to 1.55 ms (`--help`); tool schemas 17,379 to 9,154 bytes. Nothing trimmed: each addition is a user-visible feature, and the ceiling is 8 MiB. |
+| 2026-11-09 | pending | 4.4 | `History` keeps a SHA-256 per successful `read_file` call, taken when its result is retained (before a later call in the batch can change the file). An identical read of a byte-identical file, in this turn or an earlier one, with the result still in history, gets a pointer; a second repeat in a turn runs. Other reads keep the in-turn rule. |

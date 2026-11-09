@@ -1213,6 +1213,7 @@ fn execute_batch(
         for result in group_results {
             retain_result(
                 result,
+                host,
                 history,
                 result_bytes,
                 turn_cap,
@@ -1236,6 +1237,7 @@ fn execute_batch(
         .unwrap_or_else(|| execute_call(call, host, &offered, &mut cancelled, history, cap));
         retain_result(
             result,
+            host,
             history,
             result_bytes,
             turn_cap,
@@ -1282,6 +1284,37 @@ fn repeat_guard(
     if !reads(activity_now) || call.name == "read_tool_result" {
         return None;
     }
+    // A file read can be checked directly: an identical read of a file whose
+    // content is the same as when the earlier result was kept, in this turn or
+    // an earlier one, is answered from that result.
+    if call.name == "read_file" {
+        let repeated_here = previous
+            .iter()
+            .chain(results)
+            .rev()
+            .take_while(|result| !(result.executed && identical_call(&result.call, call)))
+            .any(|result| identical_call(&result.call, call));
+        if repeated_here {
+            return None;
+        }
+        let digest = file_digest(host, &call.arguments)?;
+        let (id, succeeded) = results
+            .iter()
+            .rev()
+            .find(|result| result.executed && identical_call(&result.call, call))
+            .map(|result| (result.call.id.clone(), !result.output.is_error))
+            .or_else(|| latest_identical_result(history, call))?;
+        if !succeeded || history.read_digest(&id) != Some(digest) {
+            return None;
+        }
+        return Some(repeat_pointer(
+            call,
+            host,
+            &id,
+            activity_now,
+            "the file is unchanged",
+        ));
+    }
     let earlier = previous.iter().chain(results).rev().find_map(|result| {
         if identical_call(&result.call, call) {
             if !result.executed && result.output.text.starts_with(REPEAT_MARKER) {
@@ -1300,36 +1333,96 @@ fn repeat_guard(
     let in_batch = results
         .iter()
         .any(|result| result.call.id == earlier.call.id);
-    let retained = in_batch
-        || history.turns().iter().any(|turn| {
-            turn.parts.iter().any(|part| {
-                matches!(part, ContentPart::ToolResult { id, .. }
-                    if id.to_string() == earlier.call.id)
-            })
-        });
-    if !retained {
+    if !in_batch && !result_retained(history, &earlier.call.id) {
         return None;
     }
+    Some(repeat_pointer(
+        call,
+        host,
+        &earlier.call.id,
+        activity_now,
+        "nothing that changes files has run since",
+    ))
+}
+
+/// Answers a repeated call with a pointer to the earlier result and reports it.
+fn repeat_pointer(
+    call: &PreparedCall,
+    host: &dyn Host,
+    earlier: &str,
+    activity: Activity,
+    why: &str,
+) -> CallResult {
     let output = ToolOutput::success(format!(
-        "{REPEAT_MARKER}{}] Same `{}` call as `{}` earlier in this turn, and nothing that \
-         changes files has run since, so its result above still holds. Call it once more \
-         only if something outside this turn changed it.",
-        earlier.call.id, call.name, earlier.call.id
+        "{REPEAT_MARKER}{earlier}] Same `{}` call as `{earlier}` above, and {why}, so its \
+         result still holds. Call it once more only if you have reason to think it changed.",
+        call.name
     ));
     host.emit(Event::ToolStarted {
         call: call.clone(),
-        activity: activity_now,
+        activity,
     });
     host.emit(Event::ToolFinished {
         call: call.clone(),
         output: output.clone(),
         elapsed: Duration::ZERO,
     });
-    Some(CallResult {
+    CallResult {
         call: call.clone(),
         output,
         executed: false,
+    }
+}
+
+/// Returns whether the history still holds a call's result.
+fn result_retained(history: &History, id: &str) -> bool {
+    history.turns().iter().any(|turn| {
+        turn.parts.iter().any(|part| {
+            matches!(part, ContentPart::ToolResult { id: held, .. } if held.to_string() == id)
+        })
     })
+}
+
+/// Finds the newest identical read with a recorded digest in the history,
+/// and whether its result, still held there, succeeded.
+fn latest_identical_result(history: &History, call: &PreparedCall) -> Option<(String, bool)> {
+    let id = history.turns().iter().rev().find_map(|turn| {
+        turn.parts.iter().rev().find_map(|part| match part {
+            ContentPart::ToolCall {
+                id,
+                name,
+                arguments,
+            } if name == &call.name
+                && arguments == &call.arguments
+                && history.read_digest(&id.to_string()).is_some() =>
+            {
+                Some(id.to_string())
+            }
+            _ => None,
+        })
+    })?;
+    history.turns().iter().find_map(|turn| {
+        turn.parts.iter().find_map(|part| match part {
+            ContentPart::ToolResult {
+                id: held, is_error, ..
+            } if held.to_string() == id => Some((id.clone(), !is_error)),
+            _ => None,
+        })
+    })
+}
+
+/// Digests the file a `read_file` call names, as it is now.
+fn file_digest(host: &dyn Host, arguments: &str) -> Option<[u8; 32]> {
+    use sha2::{Digest as _, Sha256};
+    let value: serde_json::Value = serde_json::from_str(arguments).ok()?;
+    let path = Utf8Path::new(value.get("path")?.as_str()?);
+    let path = if path.is_absolute() {
+        path.to_owned()
+    } else {
+        host.context().workspace().join(path)
+    };
+    let bytes = std::fs::read(path).ok()?;
+    Some(Sha256::digest(&bytes).into())
 }
 
 /// Checks failures in request order, across batches but only within this turn.
@@ -1375,12 +1468,21 @@ fn failure_guard(
 /// Retains and charges answers in request order, regardless of execution order.
 fn retain_result(
     mut result: CallResult,
+    host: &dyn Host,
     history: &mut History,
     result_bytes: &mut usize,
     turn_cap: usize,
     tool_cap: usize,
     results: &mut Vec<CallResult>,
 ) {
+    // Taken now, before any later call in the batch can change the file.
+    if result.executed
+        && !result.output.is_error
+        && result.call.name == "read_file"
+        && let Some(digest) = file_digest(host, &result.call.arguments)
+    {
+        history.record_read(&result.call.id, digest);
+    }
     let cap = turn_cap.saturating_sub(*result_bytes).min(tool_cap);
     let mut text = std::mem::take(&mut result.output.text);
     // A shortened view keeps the complete text one read away.

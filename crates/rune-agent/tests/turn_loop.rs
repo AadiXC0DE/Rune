@@ -3077,10 +3077,8 @@ fn success_resets_the_failure_streak_for_the_same_call() {
     history.push_user("retry a recovering tool");
     let outcome = run_turn(&mut history, &host).expect("success resets the streak");
     assert_eq!(outcome.stop_reason, StopReason::Completed);
-    // `c` repeats the successful `b` and is answered from it; `d` looks again.
-    assert_eq!(host.executed_calls().len(), 3);
+    assert_eq!(host.executed_calls().len(), 4);
     assert!(!outcome.calls[1].output.is_error);
-    assert!(!outcome.calls[2].executed);
     history.validate().expect("paired history");
 }
 
@@ -3771,7 +3769,10 @@ fn repeat_pointers(host: &TestHost) -> usize {
 
 #[test]
 fn a_repeated_read_is_answered_from_the_earlier_result_once() {
-    let arguments = r#"{"path":"src/lib.rs"}"#;
+    let directory = tempfile::tempdir().expect("workspace");
+    let file = directory.path().join("lib.rs");
+    std::fs::write(&file, "fn main() {}").expect("file");
+    let arguments = &serde_json::json!({"path": file}).to_string();
     let endpoint = MockEndpoint::start(vec![
         Script::tool_call("first", "read_file", arguments),
         Script::tool_call("second", "read_file", arguments),
@@ -3792,18 +3793,20 @@ fn a_repeated_read_is_answered_from_the_earlier_result_once() {
 }
 
 #[test]
-fn a_change_between_identical_reads_lets_the_second_run() {
-    let arguments = r#"{"path":"src/lib.rs"}"#;
+fn a_change_between_identical_searches_lets_the_second_run() {
+    let arguments = r#"{"pattern":"fn main"}"#;
+    let mut grep = read_tool();
+    grep.name = "grep_files".to_owned();
     let mut edit = read_tool();
     edit.name = "edit_file".to_owned();
     let endpoint = MockEndpoint::start(vec![
-        Script::tool_call("first", "read_file", arguments),
-        Script::tool_call("change", "edit_file", arguments),
-        Script::tool_call("second", "read_file", arguments),
+        Script::tool_call("first", "grep_files", arguments),
+        Script::tool_call("change", "edit_file", r#"{"path":"src/lib.rs"}"#),
+        Script::tool_call("second", "grep_files", arguments),
         Script::text("done"),
     ]);
     let host = TestHost::new(endpoint)
-        .with_tools(vec![read_tool(), edit])
+        .with_tools(vec![grep, edit])
         .with_tool_response(ToolOutput::success("ok"));
     let mut history = rune_agent::History::new();
     history.push_user("read, edit, read");
@@ -3814,7 +3817,10 @@ fn a_change_between_identical_reads_lets_the_second_run() {
 
 #[test]
 fn identical_reads_in_one_batch_run_once() {
-    let arguments = r#"{"path":"src/lib.rs"}"#;
+    let directory = tempfile::tempdir().expect("workspace");
+    let file = directory.path().join("lib.rs");
+    std::fs::write(&file, "text").expect("file");
+    let arguments = &serde_json::json!({"path": file}).to_string();
     let endpoint = MockEndpoint::start(vec![
         failure_batch(&[
             ("first", "read_file", arguments),
@@ -3911,4 +3917,36 @@ fn the_outcome_keeps_text_and_calls_in_the_order_they_happened() {
             rune_agent::turn::Narration::Text("It is fine.".to_owned()),
         ]
     );
+}
+
+#[test]
+fn a_read_in_a_later_turn_points_back_while_the_file_is_unchanged() {
+    let directory = tempfile::tempdir().expect("workspace");
+    let file = directory.path().join("notes.txt");
+    std::fs::write(&file, "one").expect("file");
+    let arguments = &serde_json::json!({"path": file}).to_string();
+    let endpoint = MockEndpoint::start(vec![
+        Script::tool_call("first", "read_file", arguments),
+        Script::text("read"),
+        Script::tool_call("again", "read_file", arguments),
+        Script::text("same"),
+        Script::tool_call("after_change", "read_file", arguments),
+        Script::text("changed"),
+    ]);
+    let host = TestHost::new(endpoint)
+        .with_tools(vec![read_tool()])
+        .with_tool_response(ToolOutput::success("1\tone"));
+    let mut history = rune_agent::History::new();
+    for prompt in ["read", "read again"] {
+        history.push_user(prompt);
+        run_turn(&mut history, &host).expect("turn");
+    }
+    assert_eq!(host.executed_calls().len(), 1);
+    assert_eq!(repeat_pointers(&host), 1);
+    // Someone edits the file between turns, so the next read runs.
+    std::fs::write(&file, "two").expect("edit");
+    history.push_user("read after the edit");
+    run_turn(&mut history, &host).expect("turn");
+    assert_eq!(host.executed_calls().len(), 2);
+    assert_eq!(repeat_pointers(&host), 1);
 }

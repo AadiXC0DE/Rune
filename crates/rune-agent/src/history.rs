@@ -132,7 +132,15 @@ pub struct History {
     /// Plan state shares the lifetime of this live conversation, not its registry.
     #[serde(skip)]
     live_plan: Arc<std::sync::Mutex<rune_tools::PlanUpdate>>,
+    /// A digest of each file a successful `read_file` call read, by call id,
+    /// taken when the result was kept. A later identical read of a file whose
+    /// digest is unchanged can point at that result instead of running.
+    #[serde(skip)]
+    read_digests: std::collections::BTreeMap<String, [u8; 32]>,
 }
+
+/// Reads whose file digest is kept; past this, one is dropped to make room.
+const MAX_READ_DIGESTS: usize = 256;
 
 fn new_result_store() -> Arc<Store> {
     Arc::new(Store::new(rune_core::id::SessionId::generate().to_string()))
@@ -147,6 +155,7 @@ impl Default for History {
             next_seq: u64::default(),
             result_store: new_result_store(),
             live_plan: Arc::default(),
+            read_digests: std::collections::BTreeMap::new(),
         }
     }
 }
@@ -162,7 +171,21 @@ impl History {
             next_seq: 1,
             result_store: new_result_store(),
             live_plan: Arc::default(),
+            read_digests: std::collections::BTreeMap::new(),
         }
+    }
+
+    /// Records the digest of the file a successful `read_file` call read.
+    pub(crate) fn record_read(&mut self, call_id: &str, digest: [u8; 32]) {
+        if self.read_digests.len() >= MAX_READ_DIGESTS && !self.read_digests.contains_key(call_id) {
+            self.read_digests.pop_first();
+        }
+        self.read_digests.insert(call_id.to_owned(), digest);
+    }
+
+    /// Returns the digest recorded for a `read_file` call, if any.
+    pub(crate) fn read_digest(&self, call_id: &str) -> Option<[u8; 32]> {
+        self.read_digests.get(call_id).copied()
     }
 
     /// Returns the full tool results spilled from this live conversation.
@@ -482,6 +505,7 @@ impl History {
             next_seq,
             result_store: self.result_store.clone(),
             live_plan: Arc::default(),
+            read_digests: self.read_digests.clone(),
         }
     }
 
