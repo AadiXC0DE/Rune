@@ -37,7 +37,9 @@ Notable changes, newest first. Each entry describes what a user can observe.
   parsed counts, and a repeat of the same test command shows only what changed
   since the last run, with the full log one `read_tool_result` away.
 - A read, list or search repeated in a turn with nothing changed since is
-  answered from the earlier result instead of running again.
+  answered from the earlier result instead of running again, and so is a test,
+  build or lint command. A file read again in a later turn is answered the same
+  way while the file is byte for byte unchanged. Asking a second time runs it.
 - Anthropic output is no longer capped at 8,192 tokens when the catalog knows
   the model's limit, and a reply cut off before it said anything is asked for
   once more.

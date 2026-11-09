@@ -25,7 +25,6 @@ use rune_agent::steering::{Cancellation, SteeringQueue};
 use rune_agent::turn::{CallResult, Event, StopReason, TurnOutcome};
 use rune_core::budget::{Budget, BudgetSet, LimitDescription, LimitName};
 use rune_core::config::Layer;
-use rune_policy::Outcome;
 use rune_core::error::{ErrorCode, Result, RuneError};
 use rune_core::tool::ToolSpec;
 use rune_net::error::NetError;
@@ -33,6 +32,7 @@ use rune_net::message::{ContentPart, ImageRef, validate_tool_specs};
 use rune_net::provider::{Provider, ProviderCapabilities, Routing};
 use rune_net::stream::Usage;
 use rune_net::transport::{AuthStyle, Endpoint, StreamOutcome};
+use rune_policy::Outcome;
 use rune_tools::contract::{Activity, ExecutionContext, ToolOutput};
 
 /// Version of the checkpoint format written by [`Agent::checkpoint`].
@@ -1479,7 +1479,9 @@ impl rune_agent::turn::Host for SdkHost<'_> {
             .tools
             .iter()
             .find(|tool| tool.name == name)
-            .ok_or_else(|| RuneError::new(ErrorCode::NotFound, format!("no tool named `{name}`")))?;
+            .ok_or_else(|| {
+                RuneError::new(ErrorCode::NotFound, format!("no tool named `{name}`"))
+            })?;
         let host_context = HostToolContext {
             signal: self.context.cancel.clone().into(),
         };

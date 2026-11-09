@@ -3950,3 +3950,30 @@ fn a_read_in_a_later_turn_points_back_while_the_file_is_unchanged() {
     assert_eq!(host.executed_calls().len(), 2);
     assert_eq!(repeat_pointers(&host), 1);
 }
+
+#[test]
+fn a_repeated_test_command_with_nothing_changed_is_answered_from_the_last_run() {
+    let test = r#"{"action":"run","command":"cargo test -p core 2>&1 | tail -20"}"#;
+    let sed = r#"{"action":"run","command":"sed -i 's/a/aa/' notes.txt"}"#;
+    let mut shell = read_tool();
+    shell.name = "shell".to_owned();
+    let endpoint = MockEndpoint::start(vec![
+        Script::tool_call("first", "shell", test),
+        Script::tool_call("same", "shell", test),
+        Script::tool_call("edit", "shell", sed),
+        Script::tool_call("edit_again", "shell", sed),
+        Script::tool_call("after_edit", "shell", test),
+        Script::text("done"),
+    ]);
+    let host = TestHost::new(endpoint)
+        .with_tools(vec![shell])
+        .with_tool_response(ToolOutput::failure("[tests: 3 passed, 1 failed]"));
+    let mut history = rune_agent::History::new();
+    history.push_user("test");
+    let outcome = run_turn(&mut history, &host).expect("turn");
+    // Only `same` is skipped: the failing run is the answer. Writes always run,
+    // and a test after a write runs again.
+    assert_eq!(host.executed_calls().len(), 4);
+    assert_eq!(repeat_pointers(&host), 1);
+    assert!(!outcome.calls[1].executed);
+}
