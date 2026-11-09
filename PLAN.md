@@ -115,8 +115,8 @@ stability across steps.
 
 - [x] 3.1 Anthropic: send `cache_control` on the tool list, the system text and the latest
       user turn.
-- [ ] 3.2 Responses and Chat Completions: send a per-session `prompt_cache_key` where the
-      dialect accepts it.
+- [x] 3.2 Responses: send a `prompt_cache_key` derived from the instructions and tools.
+      Chat Completions is left alone: generic servers differ on unknown fields.
 - [ ] 3.3 Count cached input in the context meter, and let `/compact` lower the meter.
 - [ ] 3.4 Take the output ceiling from the model catalog instead of a fixed 8192.
 - [ ] 3.5 Return `reasoning_content` on Chat Completions assistant turns where the endpoint
@@ -221,4 +221,5 @@ Done when a reproducible table exists with Rune in it.
 | 2026-11-09 | 84d6fa4 | 2.3 | Map built at the first request and kept until compaction; session, `ask` and the web host share `MappedInstructions`. |
 | 2026-11-09 | e618740 | 2.4 | One environment line, 145 bytes; this repository's prompt 4,943 to 5,087 bytes. |
 | 2026-11-09 | abea25b | 2.5 | `skill_description_bytes` default 1024 to 256. This home: catalog 8,290 to 5,892 bytes; JS-repo prompt 9,354 to 7,196. Phase 2 closes with tools at 52.7% of baseline (target was 50%); the remainder is `edit_file` and `shell`. |
-| 2026-11-09 | (this) | 3.1 | Three markers: last tool, system block, newest message. Cache reads against the live API not yet observed (needs a key). |
+| 2026-11-09 | 355f228 | 3.1 | Three markers: last tool, system block, newest message. Cache reads against the live API not yet observed (needs a key). |
+| 2026-11-09 | (this) | 3.2 | Key is `rune-` plus 32 hex of SHA-256 over the prefix; same prefix, same key, no session identifier sent. |

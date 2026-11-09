@@ -78,6 +78,10 @@ impl Provider for Responses {
         body.insert("store".to_owned(), serde_json::json!(false));
         body.insert("stream".to_owned(), serde_json::json!(true));
         body.insert("instructions".to_owned(), serde_json::json!(instructions));
+        body.insert(
+            "prompt_cache_key".to_owned(),
+            serde_json::json!(prefix_cache_key(&instructions, &plan.tools)),
+        );
         body.insert("input".to_owned(), serde_json::Value::Array(input));
         body.insert(
             "include".to_owned(),
@@ -779,6 +783,35 @@ fn parse_usage(value: &serde_json::Value) -> Usage {
     }
 }
 
+/// Names the cacheable prefix of a request: the instructions and the tools.
+///
+/// The endpoint routes requests with the same key to the same cache, which is
+/// what makes a long shared prefix actually hit. Deriving the key from the
+/// prefix itself means two requests share a key exactly when they share that
+/// prefix, across turns and across sessions in one workspace, with no
+/// identifier leaving the machine that is not already implied by the request.
+fn prefix_cache_key(instructions: &str, tools: &[crate::message::ToolSpec]) -> String {
+    use sha2::{Digest as _, Sha256};
+    use std::fmt::Write as _;
+
+    let mut hasher = Sha256::new();
+    hasher.update(instructions.as_bytes());
+    for tool in tools {
+        hasher.update(b"\x1e");
+        hasher.update(tool.name.as_bytes());
+        hasher.update(b"\x1f");
+        hasher.update(tool.description.as_bytes());
+        hasher.update(b"\x1f");
+        hasher.update(tool.input_schema.to_string().as_bytes());
+    }
+    let digest = hasher.finalize();
+    let mut key = String::from("rune-");
+    for byte in digest.iter().take(16) {
+        let _ = write!(key, "{byte:02x}");
+    }
+    key
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -805,6 +838,24 @@ mod tests {
         assert_eq!(body["input"][0]["role"], "user");
         assert_eq!(body["input"][0]["content"][0]["type"], "input_text");
         assert_eq!(body["include"][0], "reasoning.encrypted_content");
+    }
+
+    #[test]
+    fn the_cache_key_follows_the_prefix_and_ignores_the_conversation() {
+        let first = Responses
+            .build_request(&plan_with_user("hi"))
+            .expect("build");
+        let later = Responses
+            .build_request(&plan_with_user("a different question"))
+            .expect("build");
+        let key = first["prompt_cache_key"].as_str().expect("key");
+        assert!(key.starts_with("rune-") && key.len() == 37, "{key}");
+        assert_eq!(first["prompt_cache_key"], later["prompt_cache_key"]);
+
+        let mut changed = plan_with_user("hi");
+        changed.instructions = "be brief".to_owned();
+        let changed = Responses.build_request(&changed).expect("build");
+        assert_ne!(first["prompt_cache_key"], changed["prompt_cache_key"]);
     }
 
     #[test]
