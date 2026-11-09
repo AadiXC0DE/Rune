@@ -714,8 +714,17 @@ fn observe(
 ) -> String {
     let stdout = process.stdout().since(seen.0);
     let stderr = process.stderr().since(seen.1);
+    // An ended command is observed for the last time, so the newest bytes of a
+    // stream that outgrew its head follow that head, once.
+    let ended = process.exit().is_some();
     let mut body = String::from_utf8_lossy(&stdout.bytes).into_owned();
+    if ended {
+        push_tail(&mut body, process.stdout());
+    }
     body.push_str(&String::from_utf8_lossy(&stderr.bytes));
+    if ended {
+        push_tail(&mut body, process.stderr());
+    }
     seen.0 = stdout.next;
     seen.1 = stderr.next;
 
@@ -743,11 +752,26 @@ fn observe(
     render(command, body, &note, state, cap)
 }
 
+/// Appends a stream's newest bytes past its retained head, with the gap.
+fn push_tail(body: &mut String, stream: &rune_exec::Buffer) {
+    let (tail, skipped) = stream.tail();
+    if tail.is_empty() {
+        return;
+    }
+    if !body.is_empty() && !body.ends_with('\n') {
+        body.push('\n');
+    }
+    let _ = writeln!(body, "[{skipped} bytes not retained]");
+    body.push_str(&String::from_utf8_lossy(&tail));
+}
+
 /// Renders the command, the bytes it produced, and the state it ended in.
 ///
 /// The bytes are cut to the cap, and the cut is stated with the number of bytes
 /// retained, because a result that is merely short looks like a command that
-/// printed nothing.
+/// printed nothing. A cut keeps the start and the end and drops the middle:
+/// a build names its first error at the top, and a test run puts its failures
+/// and its summary at the bottom.
 fn render(command: &str, mut body: String, note: &str, state: &str, cap: usize) -> String {
     if cap == 0 {
         return String::new();
@@ -786,17 +810,21 @@ fn render(command: &str, mut body: String, note: &str, state: &str, cap: usize) 
         // The marker states how many bytes were kept, so its own length depends
         // on the answer. Two passes settle it; the loop is a bound, not a guess.
         for _ in 0..8 {
-            let settled =
-                truncate_to_bytes(&body, room.saturating_sub(marker(kept, total, cap).len())).len();
+            let (start, end) =
+                head_and_tail(&body, room.saturating_sub(marker(kept, total, cap).len()));
+            let settled = start.len().saturating_add(end.len());
             if settled == kept {
                 break;
             }
             kept = settled;
         }
-        out.push_str(truncate_to_bytes(&body, kept));
+        let (start, end) =
+            head_and_tail(&body, room.saturating_sub(marker(kept, total, cap).len()));
+        out.push_str(start);
         if room > kept {
             out.push_str(&marker(kept, total, cap));
         }
+        out.push_str(end);
     }
     out.push_str(&note);
     out.push_str(&state);
@@ -808,7 +836,34 @@ const MIN_NOTE_BODY_BYTES: usize = 256;
 
 /// Returns the marker that states how much of an output survived the cut.
 fn marker(kept: usize, total: usize, cap: usize) -> String {
-    format!("\n[output truncated: {kept} of {total} bytes retained, the cap is {cap} bytes]")
+    format!("\n[output truncated: {kept} of {total} bytes retained, the cap is {cap} bytes]\n")
+}
+
+/// Splits at most `budget` bytes of `text` into a start and an end.
+///
+/// A third goes to the start and the rest to the end. Each cut moves to a line
+/// break when one is near, so neither side shows a broken line.
+fn head_and_tail(text: &str, budget: usize) -> (&str, &str) {
+    if text.len() <= budget {
+        return (text, "");
+    }
+    let head_budget = budget / 3;
+    let mut start = truncate_to_bytes(text, head_budget);
+    if let Some(line) = start.rfind('\n').filter(|end| *end >= start.len() / 2) {
+        start = &text[..=line];
+    }
+    let tail_budget = budget.saturating_sub(start.len());
+    let mut from = text.len().saturating_sub(tail_budget);
+    while from < text.len() && !text.is_char_boundary(from) {
+        from = from.saturating_add(1);
+    }
+    if let Some(offset) = text[from..]
+        .find('\n')
+        .filter(|offset| *offset < tail_budget / 2)
+    {
+        from = from.saturating_add(offset).saturating_add(1);
+    }
+    (start, &text[from.max(start.len())..])
 }
 
 /// Returns the error for a session id the tool does not hold.
@@ -1825,15 +1880,29 @@ mod tests {
             "{observed}"
         );
 
-        // The count in the marker is the number of bytes actually kept.
-        let marker = observed.find("[output truncated").expect("a marker");
+        // The count in the marker is the number of bytes actually kept, which
+        // are the start before the marker and the end after it.
+        let marker = observed.find("\n[output truncated").expect("a marker");
         let reported: usize = observed[marker..]
             .split_once(": ")
             .and_then(|(_, rest)| rest.split_once(" of "))
             .and_then(|(kept, _)| kept.parse().ok())
             .expect("a retained count");
         let head = observed.find('\n').expect("the command line") + 1;
-        assert_eq!(reported, marker - head - 1);
+        let after = marker + observed[marker..].find("]\n").expect("marker end") + 2;
+        // The end runs to the capture note or, without one, the state line.
+        let state = ["\n[standard output", "\n[exited"]
+            .iter()
+            .filter_map(|line| observed[after..].find(line))
+            .min()
+            .map(|offset| after + offset + 1)
+            .expect("the state line");
+        assert_eq!(reported, (marker - head) + (state - after));
+
+        // The end of the output survives the cut, which is where a test run
+        // reports what failed.
+        assert!(observed[after..state].contains("2000"), "{observed}");
+        assert!(observed[head..marker].contains('1'), "{observed}");
     }
 
     #[test]

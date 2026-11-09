@@ -60,11 +60,17 @@ pub struct Buffer {
     cap: usize,
 }
 
+/// Fraction of a stream's cap kept for its newest bytes, as a divisor.
+const TAIL_SHARE: usize = 4;
+
 /// The retained state of one captured stream.
 #[derive(Debug, Default)]
 struct Captured {
     /// Retained bytes, never more than the cap.
     bytes: Vec<u8>,
+    /// The newest bytes past the retained head, never more than a quarter of
+    /// the cap.
+    tail: std::collections::VecDeque<u8>,
     /// Bytes the stream produced in total.
     produced: u64,
 }
@@ -85,9 +91,38 @@ impl Buffer {
             .produced
             .saturating_add(u64::try_from(chunk.len()).unwrap_or(u64::MAX));
         let room = self.cap.saturating_sub(state.bytes.len()).min(chunk.len());
-        // The head of the stream is kept rather than the tail: the first bytes
-        // usually say what the command is and what it complained about.
+        // The head of the stream is kept in full, because the first bytes
+        // usually say what the command is and what it complained about. Past
+        // the head only the newest bytes are kept, because a test run or a
+        // build reports its outcome last.
         state.bytes.extend_from_slice(&chunk[..room]);
+        let rest = &chunk[room..];
+        let tail_cap = self.cap / TAIL_SHARE;
+        if rest.len() >= tail_cap {
+            state.tail.clear();
+            state
+                .tail
+                .extend(&rest[rest.len().saturating_sub(tail_cap)..]);
+        } else {
+            state.tail.extend(rest);
+            let excess = state.tail.len().saturating_sub(tail_cap);
+            state.tail.drain(..excess);
+        }
+    }
+
+    /// Returns the newest bytes kept past the retained head, and how many bytes
+    /// between the head and them were not kept.
+    ///
+    /// Empty while the stream still fits its head.
+    #[must_use]
+    pub fn tail(&self) -> (Vec<u8>, u64) {
+        let state = lock(&self.state);
+        let kept =
+            u64::try_from(state.bytes.len().saturating_add(state.tail.len())).unwrap_or(u64::MAX);
+        (
+            state.tail.iter().copied().collect(),
+            state.produced.saturating_sub(kept),
+        )
     }
 
     /// Returns the retained byte count and the number of bytes produced.
@@ -1090,6 +1125,26 @@ mod tests {
         assert_eq!(reading.produced, 16);
         assert_eq!(buffer.since(6).bytes, b"67");
         assert!(buffer.since(8).bytes.is_empty());
+    }
+
+    #[test]
+    fn a_buffer_keeps_the_newest_bytes_past_its_head() {
+        let buffer = Buffer::new(8);
+        buffer.append(b"0123456");
+        assert_eq!(buffer.tail(), (Vec::new(), 0), "the head still fits");
+
+        // The cap is 8, so the tail holds the newest 2 bytes.
+        buffer.append(b"789");
+        assert_eq!(buffer.tail(), (b"89".to_vec(), 0));
+        buffer.append(b"abcdef");
+        let (tail, skipped) = buffer.tail();
+        assert_eq!(tail, b"ef");
+        assert_eq!(skipped, 16 - 8 - 2, "the gap is what neither part kept");
+        assert_eq!(buffer.since(0).bytes, b"01234567", "the head is unchanged");
+
+        // One chunk longer than the tail replaces it outright.
+        buffer.append(b"uvwxyz");
+        assert_eq!(buffer.tail().0, b"yz");
     }
 
     #[cfg(unix)]

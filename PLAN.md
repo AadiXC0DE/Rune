@@ -120,14 +120,15 @@ stability across steps.
 - [x] 3.3 Count cached input in the context meter, and let `/compact` lower the meter.
 - [x] 3.4 Take the output ceiling from the model catalog instead of a fixed 8192.
 - [ ] 3.5 Return `reasoning_content` on Chat Completions assistant turns where the endpoint
-      requires it during tool use.
+      requires it during tool use. Deferred to 9.5: older DeepSeek reasoners reject the
+      field and newer thinking-with-tools modes require it, so it needs a live check.
 
 Done when a recorded Anthropic exchange shows cache reads on the second request.
 
 ### Phase 4: Tool output economy
 
-- [ ] 4.1 Shell truncation keeps head and tail with an omitted-bytes marker; spill previews
-      do the same.
+- [x] 4.1 Shell truncation keeps head and tail with an omitted-bytes marker.
+- [ ] 4.1b Spill previews keep head and tail too.
 - [ ] 4.2 Recognize test runners (cargo, node --test, npm, vitest, jest, pytest, go test) and
       lead the result with parsed pass, fail and skip counts.
 - [ ] 4.3 A repeated test command returns a delta against its previous run: new and changed
@@ -224,4 +225,5 @@ Done when a reproducible table exists with Rune in it.
 | 2026-11-09 | 355f228 | 3.1 | Three markers: last tool, system block, newest message. Cache reads against the live API not yet observed (needs a key). |
 | 2026-11-09 | 3a26d7e | 3.2 | Key is `rune-` plus 32 hex of SHA-256 over the prefix; same prefix, same key, no session identifier sent. |
 | 2026-11-09 | 620afb1 | 3.3 | `Usage.input_tokens` now means the whole prompt in every dialect; Anthropic adds its cache counts back. Manual `/compact` resets and re-estimates the meter. |
-| 2026-11-09 | (this) | 3.4 | Anthropic only (`requires_output_ceiling`); min(catalog or config, 32,768); unknown stays 8,192. Objective accounting no longer re-adds cache counts. |
+| 2026-11-09 | a8a3d7a | 3.4 | Anthropic only (`requires_output_ceiling`); min(catalog or config, 32,768); unknown stays 8,192. Objective accounting no longer re-adds cache counts. |
+| 2026-11-09 | (this) | 4.1 | Render: a third head, the rest tail, cut at line breaks. Capture: a quarter-cap ring of the newest bytes past the head, shown once the command ends. |
