@@ -151,7 +151,9 @@ sys.exit(9 if mode == "editor-failed" else 0)
         state.mkdir(mode=0o700)
         history_file = state / "history.jsonl"
         history_file.write_text("".join(json.dumps({
-            "text": text, "workspace": str(workspace), "session": "fixture-history",
+            # Rune records the resolved workspace; on macOS the temporary
+            # directory sits behind the /var -> /private/var link.
+            "text": text, "workspace": os.path.realpath(workspace), "session": "fixture-history",
         }) + "\n" for text, workspace in [
             ("older needle prompt\n界", root),
             ("newer needle prompt", root),

@@ -126,11 +126,14 @@ with tempfile.TemporaryDirectory(prefix="rune-r073-") as directory:
         while select.select([master], [], [], 0.15)[0]:
             assert time.monotonic() < deadline, "terminal never became idle"
             try:
-                transcript.extend(os.read(master, 65536))
+                data = os.read(master, 65536)
             except OSError as error:
                 if error.errno == errno.EIO:
                     return  # The child closed its PTY on a requested exit.
                 raise
+            if not data:
+                return  # macOS reports the closed PTY as end of file instead.
+            transcript.extend(data)
 
     def wait_for(text, start=0):
         deadline = time.monotonic() + 10

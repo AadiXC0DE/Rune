@@ -48,7 +48,8 @@ impl CommandExt for Command {
     }
 }
 
-/// Waits for a PTY child to exit while reading what it still writes.
+/// Waits for a PTY child to exit, or for a fixture event, while reading what
+/// the child still writes.
 ///
 /// A child that prints more at exit than the PTY buffer holds blocks on that
 /// write until someone reads; macOS buffers far less than Linux, so a harness
@@ -68,6 +69,19 @@ def drain_wait(child, master, timeout, sink):
             time.sleep(0.01)
         sink.extend(data)
     return child.returncode
+
+def event_wait(event, master, timeout, sink):
+    import os, select, time
+    deadline = time.monotonic() + timeout
+    while not event.is_set():
+        if time.monotonic() >= deadline:
+            return False
+        if select.select([master], [], [], 0.05)[0]:
+            try:
+                sink.extend(os.read(master, 65536))
+            except OSError:
+                time.sleep(0.01)
+    return True
 ";
 
 /// Give embedded Python fixtures the same OS allowlist without a second copy.

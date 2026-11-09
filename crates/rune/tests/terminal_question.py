@@ -222,7 +222,7 @@ with tempfile.TemporaryDirectory(prefix="rune-r008-") as directory:
         # Choice keys and pasted text preserve the correction and its caret.
         start = len(transcript)
         send(b"question-draft\r")
-        assert draft_request.wait(10), "provider did not receive the draft turn"
+        assert event_wait(draft_request, master, 10, transcript), "provider did not receive the draft turn"
         send(b"correction\x1b[D\x1b[D\x1b[D")
         wait_for("correction", start)
         release_draft.set()

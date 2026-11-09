@@ -199,7 +199,7 @@ with tempfile.TemporaryDirectory(prefix="rune-r003-") as directory:
         # An approval consumes neither a correction draft nor its caret position.
         start = len(transcript)
         send(b"permission-draft\r")
-        assert draft_request.wait(10), "provider did not receive the draft turn"
+        assert event_wait(draft_request, master, 10, transcript), "provider did not receive the draft turn"
         send(b"correction\x1b[D\x1b[D\x1b[D")
         wait_for("correction", start)
         # Release the provider only after all three caret moves were rendered,

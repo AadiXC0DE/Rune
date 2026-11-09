@@ -224,7 +224,9 @@ def run_fixture(scenario, terminal=False):
                     deadline = time.monotonic() + 10
                     while "tools/call" not in (root / "local.jsonl").read_text():
                         assert time.monotonic() < deadline, transcript
-                        time.sleep(0.02)
+                        # Keep reading, or a full PTY stalls Rune before the call.
+                        if select.select([master], [], [], 0.02)[0]:
+                            transcript.extend(os.read(master, 65536))
                     cancelled = time.monotonic()
                     os.write(master, b"\x03")
                     wait_for(b"[cancelled]")
