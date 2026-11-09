@@ -1757,6 +1757,27 @@ fn prompt_reports_the_built_in_source() {
 }
 
 #[test]
+fn prompt_tools_prints_each_advertised_schema_and_its_measured_size() {
+    let tools = run(&["prompt", "--tools"]);
+    assert_eq!(tools.status, Some(0), "stderr: {}", tools.stderr);
+    let lines: Vec<&str> = tools.stdout.lines().collect();
+    assert!(!lines.is_empty(), "no tools printed");
+    for line in &lines {
+        let value: serde_json::Value = serde_json::from_str(line).expect("one JSON object a line");
+        assert!(value["name"].is_string(), "{line}");
+        assert!(value["input_schema"].is_object(), "{line}");
+    }
+
+    // The reported size is the bytes of exactly those lines, so the gate and a
+    // reader measure the same thing.
+    let summary = run(&["prompt", "--json"]);
+    let value: serde_json::Value = serde_json::from_str(&summary.stdout).expect("json");
+    let bytes: usize = lines.iter().map(|line| line.len()).sum();
+    assert_eq!(value["tools"], lines.len());
+    assert_eq!(value["tool_bytes"], bytes);
+}
+
+#[test]
 fn an_unavailable_surface_says_so_explicitly() {
     // Fetching a release over the network is genuinely unsupported: the
     // installer only takes an artifact the caller supplies.

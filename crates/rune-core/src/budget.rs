@@ -597,6 +597,13 @@ pub const EMERGENCY_CEILING_BYTES: u64 = 64 * 1024 * 1024;
 /// instruction file still fits, but well under the old 9 KiB prompt.
 pub const PROMPT_CEILING_BYTES: usize = 6 * 1024;
 
+/// Largest accepted size of the advertised tool schemas, in bytes.
+///
+/// Counted as compact JSON of each tool's name, description, and schema, which
+/// is the part every dialect sends with every request. With the instructions it
+/// forms the fixed cost of each model call, so it is a budget like the prompt.
+pub const TOOL_SCHEMA_CEILING_BYTES: usize = 18 * 1024;
+
 /// Share of a model's context window the skill catalog may occupy, as a percent.
 const SKILL_CATALOG_WINDOW_PERCENT: u64 = 2;
 

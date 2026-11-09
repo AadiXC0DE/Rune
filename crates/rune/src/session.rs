@@ -5253,35 +5253,8 @@ pub fn prepare(
     let dialect = crate::provider_setup::dialect_for(&settings.provider);
 
     let questions = Arc::new(TerminalQuestions::default());
-    let catalog = rune_context::skills::discover(
-        workspace,
-        rune_core::paths::home_directory().as_deref(),
-        &paths.config_root,
-    )?;
-    let mut registry = inventory::builtin_with_vision(
-        &rune_tools::workspace::FileLimits::from_budget(&settings.limits),
-        &settings.limits,
-        &paths.managed_skills_dir(),
-        crate::web_client::backends(settings),
-        questions.clone(),
-        Arc::new(rune_tools::skill::Fixed::new(catalog)),
-        crate::vision_client::backend(settings, paths)?,
-    )?;
     let rules = crate::permissions::validated(settings)?;
-    let mut tools: Vec<String> = registry.names().into_iter().map(str::to_owned).collect();
-    tools.push("subagent".to_owned());
-    let subagent = crate::subagent::Bridge::new(rune_agent::Authority {
-        mode: settings.permission_mode,
-        rules: rules.clone(),
-        workspace: workspace.to_owned(),
-        roots: std::iter::once(workspace.to_owned())
-            .chain(settings.additional_directories.iter().cloned())
-            .collect(),
-        tools,
-        mcp_view: None,
-        generation: 0,
-    });
-    registry.insert(subagent.registered())?;
+    let (registry, subagent) = session_registry(settings, paths, workspace, &rules, &questions)?;
 
     Ok(SessionConfig {
         accessible: false,
@@ -5300,6 +5273,60 @@ pub fn prepare(
         rules,
         questions,
     })
+}
+
+/// Returns the tool schemas an interactive session in `workspace` advertises.
+///
+/// Built by the same function a session uses, so `rune prompt --tools` measures
+/// what is sent rather than a reconstruction of it.
+pub fn advertised_tools(
+    settings: &Settings,
+    paths: &Paths,
+    workspace: &Utf8Path,
+) -> Result<Vec<ToolSpec>> {
+    let rules = crate::permissions::validated(settings)?;
+    let questions = Arc::new(TerminalQuestions::default());
+    let (registry, _) = session_registry(settings, paths, workspace, &rules, &questions)?;
+    Ok(inventory::advertisement(&registry))
+}
+
+/// Builds the tool registry an interactive session advertises.
+fn session_registry(
+    settings: &Settings,
+    paths: &Paths,
+    workspace: &Utf8Path,
+    rules: &RuleSet,
+    questions: &Arc<TerminalQuestions>,
+) -> Result<(Registry, Arc<crate::subagent::Bridge>)> {
+    let catalog = rune_context::skills::discover(
+        workspace,
+        rune_core::paths::home_directory().as_deref(),
+        &paths.config_root,
+    )?;
+    let mut registry = inventory::builtin_with_vision(
+        &rune_tools::workspace::FileLimits::from_budget(&settings.limits),
+        &settings.limits,
+        &paths.managed_skills_dir(),
+        crate::web_client::backends(settings),
+        questions.clone(),
+        Arc::new(rune_tools::skill::Fixed::new(catalog)),
+        crate::vision_client::backend(settings, paths)?,
+    )?;
+    let mut tools: Vec<String> = registry.names().into_iter().map(str::to_owned).collect();
+    tools.push("subagent".to_owned());
+    let subagent = crate::subagent::Bridge::new(rune_agent::Authority {
+        mode: settings.permission_mode,
+        rules: rules.clone(),
+        workspace: workspace.to_owned(),
+        roots: std::iter::once(workspace.to_owned())
+            .chain(settings.additional_directories.iter().cloned())
+            .collect(),
+        tools,
+        mcp_view: None,
+        generation: 0,
+    });
+    registry.insert(subagent.registered())?;
+    Ok((registry, subagent))
 }
 
 #[cfg(test)]

@@ -1577,8 +1577,23 @@ fn run_prompt(settings: &Settings, launch: &Launch, output: &OutputFlags) -> Res
         return Ok(ExitCode::from(EXIT_OK));
     }
 
+    let workspace = current_workspace()?;
+    let tools = session::advertised_tools(settings, &paths, &workspace)?;
+    let tool_bytes = advertised_tool_bytes(&tools);
+
+    // `--tools` prints each advertised tool as one JSON line, so the schemas
+    // sent with every request can be read and measured like the instructions.
+    if launch.has_flag("--tools") {
+        for tool in &tools {
+            println!("{}", tool_line(tool));
+        }
+        return Ok(ExitCode::from(EXIT_OK));
+    }
+
     if output.json {
         let value = serde_json::json!({
+            "tools": tools.len(),
+            "tool_bytes": tool_bytes,
             "source": if override_text.is_some() { "override" } else { "builtin" },
             "path": override_path,
             "bytes": override_text
@@ -1601,6 +1616,10 @@ fn run_prompt(settings: &Settings, launch: &Launch, output: &OutputFlags) -> Res
         ),
     }
     println!(
+        "tools          {} advertised, {tool_bytes} bytes of schema",
+        tools.len()
+    );
+    println!(
         "context        {}",
         if settings.context {
             "enabled"
@@ -1609,6 +1628,24 @@ fn run_prompt(settings: &Settings, launch: &Launch, output: &OutputFlags) -> Res
         }
     );
     Ok(ExitCode::from(EXIT_OK))
+}
+
+/// One advertised tool as a compact JSON object.
+fn tool_line(tool: &rune_core::tool::ToolSpec) -> String {
+    serde_json::json!({
+        "name": tool.name,
+        "description": tool.description,
+        "input_schema": tool.input_schema,
+    })
+    .to_string()
+}
+
+/// Bytes the advertised tools add to a request, counted as compact JSON.
+///
+/// Each dialect wraps a tool slightly differently, so this counts the part they
+/// share: the name, the description, and the schema.
+fn advertised_tool_bytes(tools: &[rune_core::tool::ToolSpec]) -> usize {
+    tools.iter().map(|tool| tool_line(tool).len()).sum()
 }
 
 /// Runs `workspace`.

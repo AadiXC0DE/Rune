@@ -496,8 +496,14 @@ pub const ACCOUNT: &[CommandSpec] = &[
         name: "prompt",
         aliases: &[],
         summary: "Show the assembled system prompt",
-        usage: "rune prompt [--show]",
-        flags: &[flag("--show", "Print the assembled prompt.")],
+        usage: "rune prompt [--show | --tools]",
+        flags: &[
+            flag("--show", "Print the assembled prompt."),
+            flag(
+                "--tools",
+                "Print each advertised tool schema as one JSON line.",
+            ),
+        ],
         requirements: Requirements::CONFIG,
         supports_json: false,
     },

@@ -206,13 +206,14 @@ Manage additional workspace directories
 | Flag | Description |
 |---|---|
 | `--json` | Emit JSON. |
-### `rune prompt [--show]`
+### `rune prompt [--show | --tools]`
 
 Show the assembled system prompt
 
 | Flag | Description |
 |---|---|
 | `--show` | Print the assembled prompt. |
+| `--tools` | Print each advertised tool schema as one JSON line. |
 
 ## Diagnostics and maintenance
 

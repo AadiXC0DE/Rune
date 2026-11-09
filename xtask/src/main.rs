@@ -31,6 +31,9 @@ mod targets {
     /// compiled-in floor cannot drift apart.
     pub const MAX_PROMPT_BYTES: usize = rune_core::budget::PROMPT_CEILING_BYTES;
 
+    /// Largest accepted advertised tool schema set, in bytes.
+    pub const MAX_TOOL_BYTES: usize = rune_core::budget::TOOL_SCHEMA_CEILING_BYTES;
+
     /// Divisor used to turn prompt bytes into an estimated token count.
     ///
     /// Four is the estimator's working bytes-per-token figure, not a tokenizer:
@@ -411,6 +414,7 @@ fn budget() -> Result<(), String> {
 
     check_startup(&binary)?;
     check_prompt(&binary)?;
+    check_tools(&binary)?;
     check_duplicate_dependencies()?;
     Ok(())
 }
@@ -422,18 +426,7 @@ fn budget() -> Result<(), String> {
 /// way a turn would run it. User configuration and user skills are excluded, so
 /// the measurement reflects the checkout rather than the machine.
 fn check_prompt(binary: &Path) -> Result<(), String> {
-    let isolated = std::env::temp_dir().join(format!("rune-budget-{}", std::process::id()));
-    std::fs::create_dir_all(&isolated)
-        .map_err(|err| format!("could not create {}: {err}", isolated.display()))?;
-    let output = Command::new(binary)
-        .args(["prompt", "--show"])
-        .env("HOME", &isolated)
-        .env("RUNE_HOME", &isolated)
-        .env("XDG_CONFIG_HOME", &isolated)
-        .env("XDG_STATE_HOME", &isolated)
-        .env("XDG_DATA_HOME", &isolated)
-        .output()
-        .map_err(|err| format!("could not run {}: {err}", binary.display()))?;
+    let output = run_isolated(binary, &["prompt", "--show"])?;
     // `prompt --show` prints the prompt and then a newline when the text does
     // not end with one, so the trailing byte the CLI adds is not part of it.
     let bytes = output
@@ -452,6 +445,49 @@ fn check_prompt(binary: &Path) -> Result<(), String> {
         Some(message) => Err(message),
         None => Ok(()),
     }
+}
+
+/// Measures the advertised tool schemas and enforces their ceiling.
+///
+/// Measured in the same isolated home as the prompt, so the count is what a
+/// fresh install in this checkout advertises.
+fn check_tools(binary: &Path) -> Result<(), String> {
+    let output = run_isolated(binary, &["prompt", "--tools"])?;
+    if !output.status.success() {
+        return Err("`rune prompt --tools` failed while measuring the tool schemas".to_owned());
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let count = text.lines().count();
+    let bytes: usize = text.lines().map(str::len).sum();
+    let tokens = bytes / targets::PROMPT_BYTES_PER_TOKEN;
+    println!(
+        "tool bytes    {bytes} bytes over {count} tools ({tokens} estimated tokens, budget {})",
+        targets::MAX_TOOL_BYTES
+    );
+    if bytes > targets::MAX_TOOL_BYTES {
+        return Err(format!(
+            "advertised tool schemas exceed the {} byte ceiling",
+            targets::MAX_TOOL_BYTES
+        ));
+    }
+    Ok(())
+}
+
+/// Runs the binary with a throwaway home, so user configuration and user skills
+/// do not reach the measurement.
+fn run_isolated(binary: &Path, args: &[&str]) -> Result<std::process::Output, String> {
+    let isolated = std::env::temp_dir().join(format!("rune-budget-{}", std::process::id()));
+    std::fs::create_dir_all(&isolated)
+        .map_err(|err| format!("could not create {}: {err}", isolated.display()))?;
+    Command::new(binary)
+        .args(args)
+        .env("HOME", &isolated)
+        .env("RUNE_HOME", &isolated)
+        .env("XDG_CONFIG_HOME", &isolated)
+        .env("XDG_STATE_HOME", &isolated)
+        .env("XDG_DATA_HOME", &isolated)
+        .output()
+        .map_err(|err| format!("could not run {}: {err}", binary.display()))
 }
 
 /// Returns the failure message for an assembled prompt over its ceiling.
