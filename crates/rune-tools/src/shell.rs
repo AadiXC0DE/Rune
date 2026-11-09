@@ -726,6 +726,11 @@ fn observe(
     body.push_str(&String::from_utf8_lossy(&stderr.bytes));
     if ended {
         push_tail(&mut body, process.stderr());
+        // A finished test run leads with its verdict, which the cut below
+        // always keeps, because the start of the output survives it.
+        if let Some(counts) = crate::test_report::parse(&body) {
+            body = format!("[tests: {counts}]\n{body}");
+        }
     }
     seen.0 = stdout.next;
     seen.1 = stderr.next;
@@ -1897,6 +1902,25 @@ mod tests {
         assert!(started.contains("standard output"), "{started}");
         let (id, _group) = running(&started);
         let _ = stop(&tool, &context, &id);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_finished_test_run_leads_with_its_counts() {
+        let tool = shell(4, TEST_CAP);
+        let (_dir, context) = workspace();
+        // A failing run exits nonzero, which the result reports as an error.
+        let observed = call(
+            &tool,
+            &context,
+            &serde_json::json!({
+                "action": "run",
+                "command": "printf 'running 3 tests\\ntest result: FAILED. 2 passed; 1 failed; 0 ignored\\n'; exit 101",
+            }),
+        )
+        .text;
+        let second = observed.lines().nth(1).unwrap_or_default();
+        assert_eq!(second, "[tests: 2 passed, 1 failed]", "{observed}");
     }
 
     #[test]

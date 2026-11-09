@@ -133,7 +133,7 @@ Done when a recorded Anthropic exchange shows cache reads on the second request.
 
 - [x] 4.1 Shell truncation keeps head and tail with an omitted-bytes marker.
 - [x] 4.1b Spill previews keep head and tail too.
-- [ ] 4.2 Recognize test runners (cargo, node --test, npm, vitest, jest, pytest, go test) and
+- [x] 4.2 Recognize test runners (cargo, node --test, npm, vitest, jest, pytest, go test) and
       lead the result with parsed pass, fail and skip counts.
 - [ ] 4.3 A repeated test command returns a delta against its previous run: new and changed
       failures in full, unchanged failures by name, newly passing tests, and a handle to the
@@ -242,4 +242,5 @@ Done when a reproducible table exists with Rune in it.
 | 2026-11-09 | e8c018e | 7.1 | `rune-term::markdown`; styled before wrapping, so widths stay exact. Off unless a host opts in. |
 | 2026-11-09 | 999bc61 | 7.2 | `rune-term::highlight`: per-row lexer, seven language families, theme syntax slots. |
 | 2026-11-09 | 63729c7 | 4.5 | Edit and write results report `+N -M` lines instead of a byte delta; the tool row shows the counts. |
-| 2026-11-09 | (this) | 8.2 | 34 verification patterns plus `grep`, `rg`, `git show` in auto mode; chained, substituted and redirected parts are still judged alone. |
+| 2026-11-09 | 7daf52e | 8.2 | 34 verification patterns plus `grep`, `rg`, `git show` in auto mode; chained, substituted and redirected parts are still judged alone. |
+| 2026-11-09 | (this) | 4.2 | `rune-tools::test_report`: cargo, TAP (`node --test`), jest, vitest, pytest, mocha, go. Shell result leads with `[tests: …]`; the row shows `exit 1 · 3 passed, 1 failed`. |

@@ -5377,19 +5377,32 @@ fn result_summary(name: &str, output: &ToolOutput, ascii: bool) -> String {
         return shorten(headline, 96, ascii);
     }
     match name {
-        "shell" => output
-            .text
-            .lines()
-            .rev()
-            .map(str::trim)
-            .find(|line| line.starts_with('[') && line.ends_with(']'))
-            .map(|state| {
-                let state = &state[1..state.len().saturating_sub(1)];
-                state
-                    .strip_prefix("exited with status ")
-                    .map_or_else(|| shorten(state, 48, ascii), |code| format!("exit {code}"))
-            })
-            .unwrap_or_default(),
+        "shell" => {
+            let state = output
+                .text
+                .lines()
+                .rev()
+                .map(str::trim)
+                .find(|line| line.starts_with('[') && line.ends_with(']'))
+                .map(|state| {
+                    let state = &state[1..state.len().saturating_sub(1)];
+                    state
+                        .strip_prefix("exited with status ")
+                        .map_or_else(|| shorten(state, 48, ascii), |code| format!("exit {code}"))
+                })
+                .unwrap_or_default();
+            let tests = output
+                .text
+                .lines()
+                .find_map(|line| line.strip_prefix("[tests: ")?.strip_suffix(']'));
+            match tests {
+                Some(tests) if !state.is_empty() => {
+                    format!("{state}{}{tests}", if ascii { ", " } else { " \u{b7} " })
+                }
+                Some(tests) => tests.to_owned(),
+                None => state,
+            }
+        }
         "read_file" => {
             let count = output
                 .text
@@ -10152,6 +10165,17 @@ mod tests {
         let row = shown.find("read_file src/session.js").expect("tool row");
         assert!(narration < row, "{shown}");
         assert!(shown.contains("2 lines"), "{shown}");
+    }
+
+    #[test]
+    fn a_test_run_row_shows_its_exit_status_and_counts() {
+        let output = ToolOutput::success(
+            "$ npm test\n[tests: 3 passed, 1 failed]\n...\n[exited with status 1]\n",
+        );
+        assert_eq!(
+            result_summary("shell", &output, false),
+            "exit 1 \u{b7} 3 passed, 1 failed"
+        );
     }
 
     #[test]
