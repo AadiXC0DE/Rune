@@ -186,7 +186,7 @@ Done when the binary stays inside its ceiling and a snapshot test pins each elem
 
 - [ ] 8.1 The approval prompt shows the diff for an edit and the full command for a shell
       call, with `y` once, `a` for the session (never offered for destructive actions), `n`.
-- [ ] 8.2 Routine test and build commands for common ecosystems are allowed in auto mode
+- [x] 8.2 Routine test and build commands for common ecosystems are allowed in auto mode
       inside the sandbox, so headless runs can verify.
 - [ ] 8.3 `/plan` read-only mode enforced by policy, and `/permissions` to switch mode.
 - [ ] 8.4 `/effort` and `/fork` slash commands.
@@ -241,4 +241,5 @@ Done when a reproducible table exists with Rune in it.
 | 2026-11-09 | 34b31cf | CI | Demo module verified by a source digest record: aarch64 macOS, x86_64 macOS and Linux build three different module digests from one source. |
 | 2026-11-09 | e8c018e | 7.1 | `rune-term::markdown`; styled before wrapping, so widths stay exact. Off unless a host opts in. |
 | 2026-11-09 | 999bc61 | 7.2 | `rune-term::highlight`: per-row lexer, seven language families, theme syntax slots. |
-| 2026-11-09 | (this) | 4.5 | Edit and write results report `+N -M` lines instead of a byte delta; the tool row shows the counts. |
+| 2026-11-09 | 63729c7 | 4.5 | Edit and write results report `+N -M` lines instead of a byte delta; the tool row shows the counts. |
+| 2026-11-09 | (this) | 8.2 | 34 verification patterns plus `grep`, `rg`, `git show` in auto mode; chained, substituted and redirected parts are still judged alone. |
