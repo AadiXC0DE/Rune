@@ -2,6 +2,48 @@
 
 Notable changes, newest first. Each entry describes what a user can observe.
 
+## Unreleased
+
+### Added
+
+- Prompt caching: Anthropic requests mark the tool list, the system text and the
+  newest message with `cache_control`; Responses requests send a
+  `prompt_cache_key` derived from the instructions and tools. The context meter
+  counts cached input.
+- Costs from the published prices of a cached models.dev catalog: the turn
+  summary, `/cost`, the status row, the usage ledger and `ask --json`
+  (`cost_usd`). `/budget <dollars>` and `session_spend_cents` stop a session at
+  a spend limit.
+- `rune bench` runs tasks in the Sutra task format and reports pass, time,
+  tokens, cache share and cost; `bench/tasks` holds six harder tasks in four
+  languages, each proven solvable by `bench/check.sh`.
+- Live turn rendering: narration and one row per tool call in the order they
+  happened, a spinner with elapsed time, a summary line per turn, Markdown with
+  aligned tables, highlighted code fences, and the lines an edit changed under
+  its row.
+- `/plan` (read-only, enforced by the session), `/effort`, `/permissions`,
+  `/fork`, and an approval choice that remembers an exact, non-destructive
+  action for the session. An edit awaiting approval shows the lines it would
+  change.
+- A turn that changed files and ran nothing to check them is asked once to
+  verify; `ask --json` reports `verification` and an ordered `narration`.
+
+### Changed
+
+- The tool schemas sent with each request fell from 17,379 to 9,154 bytes in
+  the interactive default, and tools this host cannot run are no longer offered.
+  The instructions are byte-stable for a session, so the cached prefix holds.
+- Shell output keeps its head and tail. A finished test run leads with its
+  parsed counts, and a repeat of the same test command shows only what changed
+  since the last run, with the full log one `read_tool_result` away.
+- A read, list or search repeated in a turn with nothing changed since is
+  answered from the earlier result instead of running again.
+- Anthropic output is no longer capped at 8,192 tokens when the catalog knows
+  the model's limit, and a reply cut off before it said anything is asked for
+  once more.
+- In auto mode, routine test and build commands for common ecosystems run
+  inside the sandbox without a prompt, so a headless run can verify its work.
+
 ## 0.1.17
 
 ### Changed

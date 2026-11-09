@@ -237,6 +237,7 @@ Done when a reproducible table exists with Rune in it.
 - [ ] 10.1 Move `rune-sdk` onto the `rune-agent` turn loop so every surface shares one loop.
 - [ ] 10.2 Re-measure size and startup; trim anything that grew without paying for itself.
 - [ ] 10.3 README, COMMANDS, CHANGELOG and site updated to measured numbers only.
+      CHANGELOG `Unreleased` written; README, COMMANDS and site still to check.
 - [ ] 10.4 Release 0.2.0.
 
 ## Log
@@ -292,3 +293,4 @@ Done when a reproducible table exists with Rune in it.
 | 2026-11-09 | 011e834 | 5.1 | `TurnOutcome.narration` (`Narration::Text` / `Call(id)`), a new entry per step; `ask --json` adds `narration` (`{text}` or `{tool, status}` with `not_run`). Saved sessions already kept the order in the assistant parts. |
 | 2026-11-09 | 22c21aa | 8.3b | `/permissions [ask|auto|full-access]`; `SessionHost.mode` and `rules` behind locks, rebuilt with `permissions::validated` from a kept copy of the settings; narrowing clears grants. README updated. |
 | 2026-11-09 | 6432dd8 | 8.4b | `/fork`: `Recorder::fork` copies the journal through its last event (`rune_session::fork::fork`), the session switches its recorder to the copy and keeps its history; the earlier session is unchanged. README updated. |
+| 2026-11-09 | pending | 10.3 (part) | CHANGELOG `Unreleased` lists the plan's user-visible changes; numbers are the measured ones from this log. |
