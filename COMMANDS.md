@@ -292,7 +292,7 @@ Every limit takes a count, or `off` to remove it. A hard ceiling still applies t
 | `max_tool_result_bytes` | 65536 | bytes | 0 to unbounded | Bytes retained from one tool result before spilling. |
 | `max_turn_result_bytes` | 8388608 | bytes | 0 to unbounded | Tool-result bytes one turn retains across its steps. |
 | `skill_catalog_bytes` | 32768 | bytes | 0 to unbounded | Combined size of the skill catalog placed in the prompt. |
-| `skill_description_bytes` | 1024 | bytes | 0 to unbounded | Size of one skill description in the catalog. |
+| `skill_description_bytes` | 256 | bytes | 0 to unbounded | Size of one skill description in the catalog. |
 | `skill_file_bytes` | 1048576 | bytes | 0 to unbounded | Largest skill file that may be loaded. |
 | `mcp_description_bytes` | 1024 | bytes | 0 to unbounded | Size of one MCP tool description. |
 | `mcp_search_result_bytes` | 16384 | bytes | 0 to unbounded | Size of MCP tool search results. |

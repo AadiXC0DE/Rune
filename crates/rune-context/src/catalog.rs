@@ -303,11 +303,12 @@ mod tests {
     #[test]
     fn the_catalog_stays_within_its_byte_limit_and_reports_omissions() {
         let per_skill = cap(LimitName::SkillDescriptionBytes).saturating_mul(2);
-        let skills: Vec<Skill> = (0..64)
+        // Enough skills that the byte budget, not the count limit, cuts the list.
+        let skills: Vec<Skill> = (0..256)
             .map(|index| skill(&format!("skill-{index:03}"), Some(per_skill)))
             .collect();
 
-        let output = render_catalog(&skills, 64);
+        let output = render_catalog(&skills, 256);
         let budget = cap(LimitName::SkillCatalogBytes);
 
         assert!(output.text.len() <= budget);
@@ -356,11 +357,12 @@ mod tests {
     #[test]
     fn a_catalog_with_escaped_names_stays_within_its_byte_limit() {
         let per_skill = cap(LimitName::SkillDescriptionBytes).saturating_mul(2);
-        let skills: Vec<Skill> = (0..64)
+        // Enough skills that the byte budget, not the count limit, cuts the list.
+        let skills: Vec<Skill> = (0..256)
             .map(|index| skill(&format!("<skill-{index:03}>&\"quoted\""), Some(per_skill)))
             .collect();
 
-        let output = render_catalog(&skills, 64);
+        let output = render_catalog(&skills, 256);
         assert!(output.text.len() <= cap(LimitName::SkillCatalogBytes));
         assert!(!output.omitted.is_empty());
         assert!(output.text.contains("&lt;skill-000&gt;"));

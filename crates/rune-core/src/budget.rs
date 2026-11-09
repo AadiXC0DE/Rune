@@ -375,7 +375,7 @@ impl LimitName {
             Self::MaxToolResultBytes => Budget::Bounded(64 * 1024),
             Self::MaxTurnResultBytes => Budget::Bounded(8 * 1024 * 1024),
             Self::SkillCatalogBytes => Budget::Bounded(32768),
-            Self::SkillDescriptionBytes => Budget::Bounded(1024),
+            Self::SkillDescriptionBytes => Budget::Bounded(256),
             Self::SkillFileBytes => Budget::Bounded(1024 * 1024),
             Self::McpDescriptionBytes => Budget::Bounded(1024),
             Self::McpSearchResultBytes => Budget::Bounded(16 * 1024),
