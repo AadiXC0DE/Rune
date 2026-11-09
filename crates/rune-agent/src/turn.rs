@@ -1075,15 +1075,15 @@ fn execute_batch(
     };
     // Adjacent duplicates must see the preceding result before they can run.
     // Keep those and the remaining calls in order, while other reads overlap.
+    // A repeat must see the earlier result before it can be answered from it.
     #[cfg(not(target_family = "wasm"))]
-    let parallel_prefix = if failure_limit.is_some() {
-        calls[..parallel_prefix]
-            .windows(2)
-            .position(|pair| identical_call(&pair[0], &pair[1]))
-            .map_or(parallel_prefix, |index| index.saturating_add(1))
-    } else {
-        parallel_prefix
-    };
+    let parallel_prefix = (1..parallel_prefix)
+        .find(|&index| {
+            calls[..index]
+                .iter()
+                .any(|earlier| identical_call(earlier, &calls[index]))
+        })
+        .unwrap_or(parallel_prefix);
     #[cfg(target_family = "wasm")]
     let parallel_prefix = 0;
 
@@ -1107,6 +1107,8 @@ fn execute_batch(
                 } else {
                     None
                 };
+                let blocked = blocked
+                    .or_else(|| repeat_guard(call, host, history, previous, &results, cancelled));
                 let prepared = match blocked {
                     Some(result) => Err(result),
                     None => prepare_call(call, host, &offered, &mut cancelled),
@@ -1170,6 +1172,7 @@ fn execute_batch(
             cancelled,
             &mut stopped,
         )
+        .or_else(|| repeat_guard(call, host, history, previous, &results, cancelled))
         .unwrap_or_else(|| execute_call(call, host, &offered, &mut cancelled, history, cap));
         retain_result(
             result,
@@ -1186,6 +1189,87 @@ fn execute_batch(
 /// Call IDs identify requests, not the operation being repeated.
 fn identical_call(left: &PreparedCall, right: &PreparedCall) -> bool {
     left.name == right.name && left.arguments == right.arguments
+}
+
+/// Opens the answer given in place of a repeated read.
+pub const REPEAT_MARKER: &str = "[unchanged since call ";
+
+/// Answers a read-only call that repeats an earlier successful one.
+///
+/// It applies within this turn, only when no call that could change anything
+/// ran since, and only while the earlier result is still in the history. A
+/// second repeat runs, so a model that knows of an outside change can still
+/// look again.
+fn repeat_guard(
+    call: &PreparedCall,
+    host: &dyn Host,
+    history: &History,
+    previous: &[CallResult],
+    results: &[CallResult],
+    cancelled: bool,
+) -> Option<CallResult> {
+    if cancelled || host.cancellation().is_cancelled() {
+        return None;
+    }
+    let activity = |name: &str| {
+        host.tool_activity(name)
+            .unwrap_or_else(|| infer_activity(name))
+    };
+    let reads =
+        |activity: Activity| matches!(activity, Activity::Read | Activity::List | Activity::Search);
+    let activity_now = activity(&call.name);
+    // A retained-result page depends on the remaining budget, not only its arguments.
+    if !reads(activity_now) || call.name == "read_tool_result" {
+        return None;
+    }
+    let earlier = previous.iter().chain(results).rev().find_map(|result| {
+        if identical_call(&result.call, call) {
+            if !result.executed && result.output.text.starts_with(REPEAT_MARKER) {
+                return Some(None);
+            }
+            if result.executed && !result.output.is_error {
+                return Some(Some(result));
+            }
+        }
+        let changes = result.executed
+            && !reads(activity(&result.call.name))
+            && activity(&result.call.name) != Activity::Plan;
+        changes.then_some(None)
+    })??;
+    // A compaction inside the turn may have removed the earlier result.
+    let in_batch = results
+        .iter()
+        .any(|result| result.call.id == earlier.call.id);
+    let retained = in_batch
+        || history.turns().iter().any(|turn| {
+            turn.parts.iter().any(|part| {
+                matches!(part, ContentPart::ToolResult { id, .. }
+                    if id.to_string() == earlier.call.id)
+            })
+        });
+    if !retained {
+        return None;
+    }
+    let output = ToolOutput::success(format!(
+        "{REPEAT_MARKER}{}] Same `{}` call as `{}` earlier in this turn, and nothing that \
+         changes files has run since, so its result above still holds. Call it once more \
+         only if something outside this turn changed it.",
+        earlier.call.id, call.name, earlier.call.id
+    ));
+    host.emit(Event::ToolStarted {
+        call: call.clone(),
+        activity: activity_now,
+    });
+    host.emit(Event::ToolFinished {
+        call: call.clone(),
+        output: output.clone(),
+        elapsed: Duration::ZERO,
+    });
+    Some(CallResult {
+        call: call.clone(),
+        output,
+        executed: false,
+    })
 }
 
 /// Checks failures in request order, across batches but only within this turn.

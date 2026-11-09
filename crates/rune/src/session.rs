@@ -5760,6 +5760,9 @@ fn result_summary(name: &str, output: &ToolOutput, ascii: bool) -> String {
     if output.is_error {
         return shorten(headline, 96, ascii);
     }
+    if output.text.starts_with(turn::REPEAT_MARKER) {
+        return "unchanged, not re-run".to_owned();
+    }
     match name {
         "shell" => {
             let state = output

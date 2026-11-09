@@ -3077,8 +3077,10 @@ fn success_resets_the_failure_streak_for_the_same_call() {
     history.push_user("retry a recovering tool");
     let outcome = run_turn(&mut history, &host).expect("success resets the streak");
     assert_eq!(outcome.stop_reason, StopReason::Completed);
-    assert_eq!(host.executed_calls().len(), 4);
+    // `c` repeats the successful `b` and is answered from it; `d` looks again.
+    assert_eq!(host.executed_calls().len(), 3);
     assert!(!outcome.calls[1].output.is_error);
+    assert!(!outcome.calls[2].executed);
     history.validate().expect("paired history");
 }
 
@@ -3755,4 +3757,78 @@ fn a_command_after_the_last_change_counts_as_a_check() {
         Verification::Unverified
     );
     assert_eq!(Verification::of(&[test, edit]), Verification::Unverified);
+}
+
+fn repeat_pointers(host: &TestHost) -> usize {
+    host.events()
+        .iter()
+        .filter(|event| {
+            matches!(event, Event::ToolFinished { output, .. }
+                if output.text.starts_with(rune_agent::turn::REPEAT_MARKER))
+        })
+        .count()
+}
+
+#[test]
+fn a_repeated_read_is_answered_from_the_earlier_result_once() {
+    let arguments = r#"{"path":"src/lib.rs"}"#;
+    let endpoint = MockEndpoint::start(vec![
+        Script::tool_call("first", "read_file", arguments),
+        Script::tool_call("second", "read_file", arguments),
+        Script::tool_call("third", "read_file", arguments),
+        Script::text("done"),
+    ]);
+    let host = TestHost::new(endpoint)
+        .with_tools(vec![read_tool()])
+        .with_tool_response(ToolOutput::success("1\tfn main() {}"));
+    let mut history = rune_agent::History::new();
+    history.push_user("read it");
+    let outcome = run_turn(&mut history, &host).expect("turn");
+    // The second call is answered by a pointer; a third look runs again.
+    assert_eq!(host.executed_calls().len(), 2);
+    assert_eq!(repeat_pointers(&host), 1);
+    assert!(!outcome.calls[1].executed);
+    assert!(outcome.calls[1].output.text.contains("`first`"));
+}
+
+#[test]
+fn a_change_between_identical_reads_lets_the_second_run() {
+    let arguments = r#"{"path":"src/lib.rs"}"#;
+    let mut edit = read_tool();
+    edit.name = "edit_file".to_owned();
+    let endpoint = MockEndpoint::start(vec![
+        Script::tool_call("first", "read_file", arguments),
+        Script::tool_call("change", "edit_file", arguments),
+        Script::tool_call("second", "read_file", arguments),
+        Script::text("done"),
+    ]);
+    let host = TestHost::new(endpoint)
+        .with_tools(vec![read_tool(), edit])
+        .with_tool_response(ToolOutput::success("ok"));
+    let mut history = rune_agent::History::new();
+    history.push_user("read, edit, read");
+    run_turn(&mut history, &host).expect("turn");
+    assert_eq!(host.executed_calls().len(), 3);
+    assert_eq!(repeat_pointers(&host), 0);
+}
+
+#[test]
+fn identical_reads_in_one_batch_run_once() {
+    let arguments = r#"{"path":"src/lib.rs"}"#;
+    let endpoint = MockEndpoint::start(vec![
+        failure_batch(&[
+            ("first", "read_file", arguments),
+            ("other", "read_file", r#"{"path":"README.md"}"#),
+            ("second", "read_file", arguments),
+        ]),
+        Script::text("done"),
+    ]);
+    let host = TestHost::new(endpoint)
+        .with_tools(vec![read_tool()])
+        .with_tool_response(ToolOutput::success("text"));
+    let mut history = rune_agent::History::new();
+    history.push_user("read twice");
+    run_turn(&mut history, &host).expect("turn");
+    assert_eq!(host.executed_calls().len(), 2);
+    assert_eq!(repeat_pointers(&host), 1);
 }
