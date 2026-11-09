@@ -6,6 +6,7 @@ import json
 import os
 import pathlib
 import pty
+import re
 import select
 import struct
 import subprocess
@@ -142,8 +143,17 @@ with tempfile.TemporaryDirectory(prefix="rune-terminal-menu-") as directory:
             capture("custom-expanded", b"\r", "/audit-command expanded; edit before sending")
             os.write(master, b"\x15")
         else:
-            # Fifteen builtins, including /pin and commands beyond the first window.
-            capture("completion-last", b"/" + b"\x1b[B" * 14, "> /quit")
+            # Walk to the last builtin, /quit, past the first window. The count
+            # is read from the menu's own "1-3 of N", so a new command does not
+            # break the walk.
+            start = len(transcript)
+            os.write(master, b"/")
+            wait_for(" of ", start)
+            shown = re.search(rb"1-\d+ of (\d+)", bytes(transcript[start:]))
+            assert shown, transcript[start:].decode(errors="replace")
+            os.write(master, b"\x15")
+            wait_for("\x1b[?25h", len(transcript))
+            capture("completion-last", b"/" + b"\x1b[B" * (int(shown.group(1)) - 1), "> /quit")
             capture("completion-closed", b"\x1b", "\x1b[?25h")
             capture("model-last", b"/model\r" + b"\x1b[B" * 14, "> menu-model-15")
             capture("model-closed", b"\x1b", "\x1b[?25h")
