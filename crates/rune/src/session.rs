@@ -340,7 +340,9 @@ struct SessionHost {
     streaming: Arc<Mutex<StreamingText>>,
     /// Calls still running in the current step, by call id, with the row that
     /// stands for each in the live region.
-    running: Mutex<Vec<(String, String)>>,
+    running: Mutex<Vec<Running>>,
+    /// When the live region was last redrawn by the turn's idle tick.
+    last_tick: Mutex<Option<std::time::Instant>>,
     /// When the turn now running sent its first request.
     turn_started: Mutex<Option<std::time::Instant>>,
     /// Where the live region is written, so a delta can be shown as it lands.
@@ -639,7 +641,11 @@ impl Host for SessionHost {
                 // moves into scrollback ahead of the call it led to.
                 let mut entries = self.take_narration();
                 if let Ok(mut running) = self.running.lock() {
-                    running.push((call.id.clone(), self.running_row(call, *activity)));
+                    running.push(Running {
+                        id: call.id.clone(),
+                        label: self.running_label(call, *activity),
+                        started: std::time::Instant::now(),
+                    });
                 }
                 entries.retain(|entry| !entry.text.trim().is_empty());
                 self.commit(&entries);
@@ -650,7 +656,7 @@ impl Host for SessionHost {
                 elapsed,
             } => {
                 if let Ok(mut running) = self.running.lock() {
-                    running.retain(|(id, _)| id != &call.id);
+                    running.retain(|running| running.id != call.id);
                 }
                 // A plan change is reported by its own event.
                 if call.name == "update_plan" && !output.is_error {
@@ -1499,9 +1505,7 @@ impl SessionHost {
             typed.1 = column;
         }
         let mut rows = self.streaming_rows();
-        if let Ok(running) = self.running.lock() {
-            rows.extend(running.iter().map(|(_, row)| row.clone()));
-        }
+        rows.extend(self.live_rows());
         // One lock across painting and writing, so a frame from one thread
         // cannot land inside a frame from the other.
         let Ok(_frame) = self.frame.lock() else {
@@ -1681,9 +1685,7 @@ impl SessionHost {
         }
         let (line, column) = self.typed_line();
         let mut rows = self.streaming_rows();
-        if let Ok(running) = self.running.lock() {
-            rows.extend(running.iter().map(|(_, row)| row.clone()));
-        }
+        rows.extend(self.live_rows());
         let Ok(_frame) = self.frame.lock() else {
             return;
         };
@@ -1748,23 +1750,85 @@ impl SessionHost {
         }
     }
 
-    /// Returns the live row for a call that is running.
-    fn running_row(&self, call: &turn::PreparedCall, activity: rune_tools::Activity) -> String {
-        let dim = self.theme.sgr(Slot::Dim, self.truecolor);
-        let reset = rune_term::engine::Style::RESET;
+    /// Returns what a running call is doing, such as `Reading src/app.js`.
+    fn running_label(&self, call: &turn::PreparedCall, activity: rune_tools::Activity) -> String {
         let target = self.call_target(call);
         let subject = if target.is_empty() {
             &call.name
         } else {
             &target
         };
-        let glyph = if self.ascii { "..." } else { "\u{25cb}" };
-        format!(
-            "{dim}  {glyph} {} {subject}{reset}",
-            activity.running_label()
-        )
+        format!("{} {subject}", activity.running_label())
     }
 
+    /// Returns the rows that show work in progress: each running call, or,
+    /// while the model has said nothing yet, that it is working.
+    ///
+    /// Each row carries a turning glyph and the time spent so far, so a long
+    /// call or a slow first token is visibly alive rather than a frozen screen.
+    fn live_rows(&self) -> Vec<String> {
+        let dim = self.theme.sgr(Slot::Dim, self.truecolor);
+        let reset = rune_term::engine::Style::RESET;
+        let row = |label: &str, started: std::time::Instant| {
+            let elapsed = started.elapsed();
+            let frames: &[&str] = if self.ascii {
+                &["-", "\\", "|", "/"]
+            } else {
+                &["\u{25d0}", "\u{25d3}", "\u{25d1}", "\u{25d2}"]
+            };
+            let step = (elapsed.as_millis() / 150) as usize;
+            let frame = frames
+                .get(step.checked_rem(frames.len()).unwrap_or_default())
+                .copied()
+                .unwrap_or_default();
+            format!("{dim}  {frame} {label} {}{reset}", format_elapsed(elapsed))
+        };
+        let running = self
+            .running
+            .lock()
+            .map(|running| {
+                running
+                    .iter()
+                    .map(|call| row(&call.label, call.started))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if !running.is_empty() {
+            return running;
+        }
+        let quiet = self.streaming.lock().is_ok_and(|streaming| {
+            streaming.answer.trim().is_empty() && streaming.reasoning.trim().is_empty()
+        });
+        let started = self.turn_started.lock().ok().and_then(|started| *started);
+        match started {
+            Some(started) if quiet => vec![row("thinking", started)],
+            _ => Vec::new(),
+        }
+    }
+
+    /// Redraws the live region while a turn is quiet, at most ten times a
+    /// second, so the spinner and the elapsed time move.
+    fn tick(&self) {
+        if self.accessible {
+            return;
+        }
+        let live = self
+            .turn_started
+            .lock()
+            .is_ok_and(|started| started.is_some());
+        if !live {
+            return;
+        }
+        let Ok(mut last) = self.last_tick.lock() else {
+            return;
+        };
+        if last.is_some_and(|last| last.elapsed() < std::time::Duration::from_millis(100)) {
+            return;
+        }
+        *last = Some(std::time::Instant::now());
+        drop(last);
+        self.draw_stream();
+    }
     /// Returns the scrollback row for a call that has finished.
     fn finished_row(
         &self,
@@ -1969,6 +2033,7 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
         provider_strict: config.settings.provider_strict,
         streaming: Arc::new(Mutex::new(StreamingText::default())),
         running: Mutex::new(Vec::new()),
+        last_tick: Mutex::new(None),
         turn_started: Mutex::new(None),
         live_out: Arc::new(Mutex::new(None)),
         reasoning: Mutex::new(reasoning_escape),
@@ -2782,6 +2847,7 @@ fn run_turn_steerable(
                 return;
             }
             let Some(key) = reader.poll_key(rune_term::shell::POLL_INTERVAL) else {
+                host.tick();
                 return;
             };
             match key {
@@ -5023,6 +5089,14 @@ fn record_usage(paths: &Paths, model: &str, outcome: &turn::TurnOutcome, cost: O
         // still sees a clean conversation.
         let _ = writeln!(std::io::stderr(), "usage was not recorded: {err}");
     }
+}
+
+/// A call that is running, as the live region shows it.
+#[derive(Clone, Debug)]
+struct Running {
+    id: String,
+    label: String,
+    started: std::time::Instant,
 }
 
 /// What handling a slash command decided.
@@ -10707,8 +10781,27 @@ mod tests {
         // A running call is drawn with its own activity, not the generic one.
         let running = host.running.lock().expect("running").clone();
         assert_eq!(running.len(), 1);
-        assert!(running[0].1.contains("Reading custom_read"), "{running:?}");
-        assert!(!running[0].1.contains("Running custom_read"), "{running:?}");
+        assert_eq!(running[0].label, "Reading custom_read");
+        let rows = host.live_rows();
+        assert!(rows[0].contains("Reading custom_read"), "{rows:?}");
+        assert!(
+            rows[0].contains("ms"),
+            "the row shows the time so far: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn a_quiet_turn_shows_that_the_model_is_working() {
+        let host = test_host();
+        assert!(host.live_rows().is_empty(), "no turn is running");
+        host.emit(Event::TurnStarted { step: 1 });
+        let rows = host.live_rows();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].contains("thinking"), "{rows:?}");
+        host.emit(Event::TextDelta {
+            delta: "Answering.".to_owned(),
+        });
+        assert!(host.live_rows().is_empty(), "streamed text replaces it");
     }
 
     fn test_host() -> SessionHost {
@@ -10767,6 +10860,7 @@ mod tests {
             provider_strict: false,
             streaming: Arc::new(Mutex::new(StreamingText::default())),
             running: Mutex::new(Vec::new()),
+            last_tick: Mutex::new(None),
             turn_started: Mutex::new(None),
             live_out: Arc::new(Mutex::new(None)),
             reasoning: Mutex::new("\u{1b}[2m".to_owned()),

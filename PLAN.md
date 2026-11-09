@@ -166,7 +166,7 @@ Done when the turn result carries ordered steps and a verification verdict.
 - [x] 6.3 Scrollback keeps narration and tool rows interleaved in the order they happened,
       one row per call.
 - [x] 6.4 End-of-turn summary line: files changed, tests, tokens with cache share, cost, time.
-- [ ] 6.2b Animate the running row (spinner and elapsed time) from a ticker.
+- [x] 6.2b Animate the running row (spinner and elapsed time) from a ticker.
 - [ ] 6.5 Footer shows session cost and the running turn's elapsed time.
 
 Done when a PTY test pins the live rows and the summary.
@@ -253,4 +253,5 @@ Done when a reproducible table exists with Rune in it.
 | 2026-11-09 | d88e784 | push | Second batch of 15 commits; CI run 42631487661. |
 | 2026-11-09 | 124306f | 8.1 | `ApprovalOutcome::RememberForSession` wired into the session; literal grants, cleared by `/new`; `always` in accessible mode. |
 | 2026-11-09 | ca9afb7 | CI | Narrow replay grids cut the estimate to `ctx ~4.`; fixtures now expect `ctx ~2.`. |
-| 2026-11-09 | (this) | 8.4 | `/effort [level]`, limited to the dialect's accepted levels. |
+| 2026-11-09 | 5623980 | 8.4 | `/effort [level]`, limited to the dialect's accepted levels. |
+| 2026-11-09 | (this) | 6.2b | Spinner and elapsed time on running calls, and a `thinking` row before the first token; ticks on idle input polls, at most ten redraws a second. |
