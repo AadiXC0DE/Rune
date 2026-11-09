@@ -154,7 +154,7 @@ with tempfile.TemporaryDirectory(prefix="rune-r075-") as directory:
         assert len(requests) == 3, requests
         assert all(request["messages"][-1]["content"] == "retry please" for request in requests)
         os.write(master, b"/quit\r")
-        assert child.wait(timeout=10) == 0
+        assert drain_wait(child, master, 10, transcript) == 0
         print(json.dumps(captures))
     finally:
         release_second.set()

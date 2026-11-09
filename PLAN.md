@@ -79,16 +79,14 @@ Gaps that cost tokens, pass rate or user trust:
 - Commit subjects follow `type(scope): summary`; no em dashes in committed text.
 - Numbers in README, site or CHANGELOG come from a measurement taken in this repository.
 
-## Known local failures (macOS host, present on `844ee56` before any change)
+## Known local failures (macOS host)
 
 - `rune-acp` `output_failure_tests`: 3 tests exceed the shutdown grace.
-- `rune` `terminal_question` and `terminal_accessible`: the PTY child does not exit in 10 s.
 
-- `rune` `mcp_http`, `mcp_stdio`, and every PTY suite (`terminal_*`, 17 binaries): the
-  harness times out waiting for exit after `/quit`. A minimal PTY session with a turn exits
-  in 0.2 s, so the cause is in the harness on this host; CI is the arbiter for these.
-
-These are compared against `main` before a push rather than counted as regressions.
+The PTY and MCP suites (`terminal_*`, `mcp_http`, `mcp_stdio`) failed here until
+`2026-11-09` because their harnesses waited for exit without reading the PTY: Rune
+blocked writing its exit output into the small macOS PTY buffer. `drain_wait` in
+`crates/rune/tests/support/mod.rs` fixed it; they pass locally now.
 
 ## Resume here (2026-11-09)
 
@@ -308,3 +306,4 @@ Done when a reproducible table exists with Rune in it.
 | 2026-11-09 | 5f6d383 | 10.1 | `rune-sdk` drives `rune_agent::turn::run_turn` through `SdkHost` (-152 lines net). New `Host` hooks, all defaulting to the old behaviour: `settles_cancellation` (end with `Cancelled` and the work so far), `tool_attachments` (host tool images after each result), `retains_results` (cut in place when `read_tool_result` is not offered), `attempt_finished` (release a host reader when the loop stops reading). `NetError::from_rune_error` keeps a host fetch's own error. SDK text is the text of every step, from `narration`. All 86 SDK tests pass unchanged. |
 | 2026-11-09 | 062288d | CI | `budget` back on every push: the site says every pull request checks the size and startup ceilings. |
 | 2026-11-09 | ce9e02b | 5.3b | The repeat guard covers shell test, build and lint runs (`is_repeatable_check`: cargo, npm/pnpm/yarn/bun, npx tools, node --test, pytest, go, make test/check/lint; pipes allowed, no redirects, chaining or substitution). A failing run counts too, since nothing changed; a second repeat runs, for flaky tests. Also formats the SDK file, which the 10.1 commit left unformatted. |
+| 2026-11-09 | pending | tests | PTY harnesses read the PTY while waiting for exit (`drain_wait` in the shared Python prelude, 20 call sites). Confirmed first on `terminal_help`: fails with a bare wait, passes with the drain. All 46 PTY and MCP test groups pass on macOS; the CI macOS `mcp_http` timeout was the same bug. |

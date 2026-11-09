@@ -320,7 +320,7 @@ sys.exit(9 if mode == "editor-failed" else 0)
         wait_for("DRAFT_RECEIVED\r\n", len(transcript) if editor_mode == "editor-steering" else 0)
         assert prompts == (["start", submitted] if editor_mode == "editor-steering" else [submitted]), prompts
         os.write(master, b"/quit\r")
-        assert child.wait(timeout=10) == 0
+        assert drain_wait(child, master, 10, transcript) == 0
         assert not errors, errors
         print(json.dumps(captures))
     finally:

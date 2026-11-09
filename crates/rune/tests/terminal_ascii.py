@@ -150,7 +150,7 @@ def capture(binary, root, environment, arguments):
         os.write(master, b"\x1b")
         drain()
         os.write(master, b"/quit\r")
-        assert child.wait(timeout=10) == 0, transcript.decode(errors="replace")
+        assert drain_wait(child, master, 10, transcript) == 0, transcript.decode(errors="replace")
     finally:
         if child.poll() is None:
             child.kill()

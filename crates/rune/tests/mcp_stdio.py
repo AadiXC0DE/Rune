@@ -232,7 +232,7 @@ def run_fixture(scenario, terminal=False):
                 else:
                     wait_for(b"MCP_FIXTURE_PASSED")
                 os.write(master, b"/quit\r")
-                assert child.wait(timeout=5) == 0, transcript
+                assert drain_wait(child, master, 5, transcript) == 0, transcript
                 stdout, stderr = bytes(transcript), b""
             else:
                 prompt = b"echo through MCP\n" + (b"no\n" if scenario == "policy" else b"")

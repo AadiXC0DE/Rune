@@ -137,7 +137,7 @@ with tempfile.TemporaryDirectory(prefix="rune-r024-") as directory:
     def stop():
         global child, master
         os.write(master, b"/quit\r")
-        assert child.wait(timeout=10) == 0
+        assert drain_wait(child, master, 10, transcript) == 0
         os.close(master)
         master = None
         child = None

@@ -219,7 +219,7 @@ with tempfile.TemporaryDirectory(prefix="rune-r003-") as directory:
         assert all("SHOULD_NOT_STEER" not in prompt for prompt in prompts), prompts
 
         send(b"/quit\r")
-        assert child.wait(timeout=10) == 0
+        assert drain_wait(child, master, 10, transcript) == 0
 
         # Piped sessions have nobody to ask and must keep their refusal behavior.
         piped = subprocess.run(

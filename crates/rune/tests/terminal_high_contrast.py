@@ -52,7 +52,7 @@ def capture(binary, root, environment):
             transcript.extend(os.read(master, 65536))
         result = list(transcript)
         os.write(master, b"\x03/quit\r")
-        assert child.wait(timeout=10) == 0, transcript.decode(errors="replace")
+        assert drain_wait(child, master, 10, transcript) == 0, transcript.decode(errors="replace")
         return result
     finally:
         if child.poll() is None:

@@ -209,7 +209,7 @@ def run_fixture(scenario, terminal=False):
                 os.write(master, b"echo through HTTP MCP\r")
                 wait_for(b"HTTP_MCP_PASSED")
                 os.write(master, b"/quit\r")
-                assert child.wait(timeout=30) == 0, transcript
+                assert drain_wait(child, master, 30, transcript) == 0, transcript
                 stdout, stderr = bytes(transcript), b""
             else:
                 prompt = b"echo through HTTP MCP\n" + (b"no\n" if scenario == "policy" else b"")

@@ -48,6 +48,28 @@ impl CommandExt for Command {
     }
 }
 
+/// Waits for a PTY child to exit while reading what it still writes.
+///
+/// A child that prints more at exit than the PTY buffer holds blocks on that
+/// write until someone reads; macOS buffers far less than Linux, so a harness
+/// that only waited never saw the exit there. What is read joins the sink.
+const DRAIN_WAIT: &str = "\
+def drain_wait(child, master, timeout, sink):
+    import os, select, time
+    deadline = time.monotonic() + timeout
+    while child.poll() is None:
+        if time.monotonic() >= deadline:
+            return child.wait(timeout=0.01)
+        try:
+            ready = select.select([master], [], [], 0.05)[0]
+            data = os.read(master, 65536) if ready else b''
+        except OSError:
+            data = b''
+            time.sleep(0.01)
+        sink.extend(data)
+    return child.returncode
+";
+
 /// Give embedded Python fixtures the same OS allowlist without a second copy.
 /// The Python helper leaves each fixture's Linux environment exactly intact.
 pub fn python_script(script: &str) -> String {
@@ -62,6 +84,6 @@ pub fn python_script(script: &str) -> String {
         .collect();
     let environment = serde_json::to_string(&environment).expect("OS environment JSON");
     format!(
-        "def child_environment(environment):\n    environment.update({environment})\n    return environment\n\n{script}"
+        "def child_environment(environment):\n    environment.update({environment})\n    return environment\n\n{DRAIN_WAIT}\n{script}"
     )
 }

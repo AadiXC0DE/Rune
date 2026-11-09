@@ -237,7 +237,7 @@ with tempfile.TemporaryDirectory(prefix="rune-r008-") as directory:
         assert all("SHOULD_NOT_STEER" not in prompt for prompt in prompts), prompts
 
         send(b"/quit\r")
-        assert child.wait(timeout=10) == 0
+        assert drain_wait(child, master, 10, transcript) == 0
 
         # Machine callers still fail promptly instead of collecting input.
         piped = subprocess.run(

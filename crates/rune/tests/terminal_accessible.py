@@ -154,7 +154,7 @@ class Terminal:
 
     def finish(self):
         self.send("/exit")
-        assert self.child.wait(timeout=5) == 0
+        assert drain_wait(self.child, self.master, 5, self.output) == 0
         self.drain()
         # CRLF is terminal newline translation, not an application cursor move.
         output = bytes(self.output).replace(b"\r\n", b"\n")

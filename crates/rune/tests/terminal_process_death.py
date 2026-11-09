@@ -139,7 +139,7 @@ with tempfile.TemporaryDirectory(prefix="rune-r058-") as directory:
     def stop():
         global child, master
         os.write(master, b"/quit\r")
-        assert child.wait(timeout=10) == 0
+        assert drain_wait(child, master, 10, transcript) == 0
         os.close(master)
         master = None
         child = None
@@ -165,7 +165,7 @@ with tempfile.TemporaryDirectory(prefix="rune-r058-") as directory:
         os.write(master, b"slow\r")
         wait_for("STREAM-03", start)
         os.kill(child.pid, signal.SIGKILL)
-        assert child.wait(timeout=10) == -signal.SIGKILL
+        assert drain_wait(child, master, 10, transcript) == -signal.SIGKILL
         child = None
         os.close(master)
         master = None
