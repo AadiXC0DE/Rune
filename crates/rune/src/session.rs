@@ -24,6 +24,7 @@ use rune_core::paths::Paths;
 use rune_net::message::ToolSpec;
 use rune_net::provider::Provider;
 use rune_net::transport::Endpoint;
+use rune_policy::approval::{ApprovalOutcome, Grants, SessionGrant};
 use rune_policy::decision::Outcome;
 use rune_policy::review::{ReviewOutcome, ReviewRequest, ReviewSession, Reviewer};
 use rune_policy::rules::RuleSet;
@@ -171,12 +172,15 @@ fn rows_for(lazy: &mut LazyRows, text: &str, width: usize) -> Vec<String> {
 /// producing it.
 type LiveSink = Arc<Mutex<dyn std::io::Write + Send>>;
 
-/// One call waiting for the input thread's answer. No answer creates a grant.
+/// One call waiting for the input thread's answer.
 struct ApprovalRequest {
     tool: String,
     target: String,
     reason: String,
-    answer: mpsc::SyncSender<Outcome>,
+    /// Whether the answer may be remembered for the session. Never true for an
+    /// action that destroys data or publishes.
+    rememberable: bool,
+    answer: mpsc::SyncSender<ApprovalOutcome>,
 }
 
 /// A tool worker hands questions to the thread that owns terminal input.
@@ -360,6 +364,8 @@ struct SessionHost {
     review_session: Arc<Mutex<ReviewSession>>,
     /// Attached only while a terminal input loop can collect an answer.
     approval_requests: Mutex<Option<mpsc::Sender<ApprovalRequest>>>,
+    /// Exact actions approved for the rest of this session.
+    grants: Mutex<Grants>,
     questions: Arc<TerminalQuestions>,
 }
 
@@ -874,6 +880,16 @@ impl Host for SessionHost {
 impl SessionHost {
     /// Waits for a terminal answer while allowing cancellation to wake us.
     fn request_approval(&self, tool: &str, target: &str, reason: String) -> (Outcome, String) {
+        if self
+            .grants
+            .lock()
+            .is_ok_and(|grants| grants.allows(tool, target))
+        {
+            return (
+                Outcome::Allow,
+                format!("{reason}; approved earlier in this session"),
+            );
+        }
         let Some(requests) = self
             .approval_requests
             .lock()
@@ -887,6 +903,7 @@ impl SessionHost {
             tool: tool.to_owned(),
             target: target.to_owned(),
             reason: reason.clone(),
+            rememberable: rememberable(tool, target),
             answer,
         };
         if requests.send(request).is_err() {
@@ -900,8 +917,17 @@ impl SessionHost {
                 return (Outcome::Deny, format!("{reason}; approval was cancelled"));
             }
             match response.recv_timeout(rune_term::shell::POLL_INTERVAL) {
-                Ok(Outcome::Allow) if !self.cancellation.is_cancelled() => {
+                Ok(ApprovalOutcome::RunOnce) if !self.cancellation.is_cancelled() => {
                     return (Outcome::Allow, format!("{reason}; approved for this call"));
+                }
+                Ok(ApprovalOutcome::RememberForSession) if !self.cancellation.is_cancelled() => {
+                    if let Ok(mut grants) = self.grants.lock() {
+                        grants.insert(SessionGrant::literal(tool, target));
+                    }
+                    return (
+                        Outcome::Allow,
+                        format!("{reason}; approved for the rest of this session"),
+                    );
                 }
                 Ok(_) => return (Outcome::Deny, format!("{reason}; approval was denied")),
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -1947,6 +1973,7 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
         undo: Mutex::new(BTreeMap::new()),
         review_session: Arc::new(Mutex::new(ReviewSession::new(&limits))),
         approval_requests: Mutex::new(None),
+        grants: Mutex::new(Grants::new()),
         questions: config.questions,
     };
     if context_source.is_none() {
@@ -2149,6 +2176,10 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                             .unwrap_or_else(std::sync::PoisonError::into_inner)
                             .clear();
                         host.set_session_id(id.as_str());
+                        // Approvals were given for the conversation that ended.
+                        if let Ok(mut grants) = host.grants.lock() {
+                            grants.clear();
+                        }
                         // The context reading belongs to the conversation that
                         // just ended, so it is cleared rather than carried into
                         // a session that has sent nothing.
@@ -2589,13 +2620,25 @@ fn run_turn_accessible(
         || {
             if let Ok(request) = pending.try_recv() {
                 let mut lines = approval_lines(&request, usize::MAX);
-                lines.push("type yes to run once; any other answer denies".to_owned());
+                lines.push(if request.rememberable {
+                    "type yes to run once, or always to allow it for this session; any other answer denies"
+                        .to_owned()
+                } else {
+                    "type yes to run once; any other answer denies".to_owned()
+                });
                 host.show(&transcript::append_lines(&transcript::accessible_lines(&[
                     Entry::notice(lines.join("\n")),
                 ])));
                 let answer = match input.next_line() {
-                    Ok(Some(line)) if line.trim().eq_ignore_ascii_case("yes") => Outcome::Allow,
-                    _ => Outcome::Deny,
+                    Ok(Some(line)) if line.trim().eq_ignore_ascii_case("yes") => {
+                        ApprovalOutcome::RunOnce
+                    }
+                    Ok(Some(line))
+                        if request.rememberable && line.trim().eq_ignore_ascii_case("always") =>
+                    {
+                        ApprovalOutcome::RememberForSession
+                    }
+                    _ => ApprovalOutcome::Deny,
                 };
                 let _ = request.answer.send(answer);
             } else if let Ok(request) = pending_questions.try_recv() {
@@ -2834,27 +2877,42 @@ fn run_turn_steerable(
     }
 }
 
-/// Shows the complete scope in scrollback, then waits on a two-choice picker.
-/// Deny is selected initially. Escape, Control-C, and Control-D cancel the turn.
+/// Shows the complete scope in scrollback, then waits on a picker.
+///
+/// Deny is selected initially, with running once directly above it, so one
+/// step up runs the action and remembering it takes a second, deliberate one.
+/// Escape, Control-C, and Control-D cancel the turn.
 fn collect_approval(
     request: &ApprovalRequest,
     host: &SessionHost,
     reader: &mut rune_term::input::KeyReader,
-) -> Outcome {
+) -> ApprovalOutcome {
+    let choices: Vec<ApprovalOutcome> = if request.rememberable {
+        vec![
+            ApprovalOutcome::RememberForSession,
+            ApprovalOutcome::RunOnce,
+            ApprovalOutcome::Deny,
+        ]
+    } else {
+        vec![ApprovalOutcome::RunOnce, ApprovalOutcome::Deny]
+    };
     let mut picker = rune_term::picker::Picker::new(
         "permission required",
-        vec![String::from("Run once"), String::from("Deny")],
-        2,
+        choices
+            .iter()
+            .map(|choice| choice.label().to_owned())
+            .collect(),
+        choices.len(),
     );
-    picker.to(1);
+    picker.to(choices.len().saturating_sub(1));
     host.refresh_size();
     let lines = approval_lines(request, usize::from(host.width()));
     if draw_choice(host, &picker, &lines).is_err() {
-        return Outcome::Deny;
+        return ApprovalOutcome::Deny;
     }
     loop {
         if host.cancellation.is_cancelled() {
-            return Outcome::Deny;
+            return ApprovalOutcome::Deny;
         }
         if let Some(key) = reader.poll_choice(rune_term::shell::POLL_INTERVAL)
             && let Some(answer) = approval_key(key, &mut picker, &host.cancellation)
@@ -2863,9 +2921,28 @@ fn collect_approval(
         }
         // Also refreshes dimensions when no input arrives.
         if draw_choice(host, &picker, &[]).is_err() {
-            return Outcome::Deny;
+            return ApprovalOutcome::Deny;
         }
     }
+}
+
+/// Returns true when an approval may be remembered for the session.
+///
+/// A command that destroys data or publishes is approved one run at a time,
+/// and so is reaching a private network address.
+fn rememberable(tool: &str, target: &str) -> bool {
+    if tool == "web_fetch_private" {
+        return false;
+    }
+    if tool == "shell" {
+        // The program's own argv is read when the line needs no shell, which
+        // is what lets subcommands such as `git push` be recognized.
+        let argv = rune_policy::command::direct_argv(target)
+            .unwrap_or_else(|| rune_policy::command::shell_argv(target));
+        return rune_policy::command::classify(&argv).kind
+            != rune_policy::command::CommandKind::Consequential;
+    }
+    true
 }
 
 /// Collects every answer without editing or submitting the current draft.
@@ -2965,13 +3042,14 @@ fn approval_key(
     key: KeyAction,
     picker: &mut rune_term::picker::Picker,
     cancellation: &Cancellation,
-) -> Option<Outcome> {
+) -> Option<ApprovalOutcome> {
     match key {
-        KeyAction::Submit => Some(if picker.selected() == Some("Run once") {
-            Outcome::Allow
-        } else {
-            Outcome::Deny
-        }),
+        KeyAction::Submit => Some(
+            ApprovalOutcome::ALL
+                .into_iter()
+                .find(|choice| picker.selected() == Some(choice.label()))
+                .unwrap_or(ApprovalOutcome::Deny),
+        ),
         KeyAction::Up => {
             picker.up();
             None
@@ -2982,7 +3060,7 @@ fn approval_key(
         }
         KeyAction::Escape | KeyAction::Cancel | KeyAction::Interrupt => {
             cancellation.cancel();
-            Some(Outcome::Deny)
+            Some(ApprovalOutcome::Deny)
         }
         KeyAction::Complete
         | KeyAction::Ignored
@@ -7254,11 +7332,14 @@ mod tests {
                 assert_eq!(request.target, "domain:localhost");
                 assert!(request.reason.contains("private-network access"));
                 assert!(request.reason.contains("redirects"));
-                request.answer.send(Outcome::Allow).expect("approve once");
+                request
+                    .answer
+                    .send(ApprovalOutcome::RunOnce)
+                    .expect("approve once");
                 let request = pending
                     .recv_timeout(std::time::Duration::from_secs(2))
                     .expect("approval cannot leak to the next call");
-                request.answer.send(Outcome::Deny).expect("deny");
+                request.answer.send(ApprovalOutcome::Deny).expect("deny");
                 let (first, second) = worker.join().expect("worker");
                 assert_eq!(first.0, Outcome::Allow);
                 assert_eq!(second.0, Outcome::Deny);
@@ -7333,11 +7414,11 @@ mod tests {
                     .join("\n")
                     .contains(&first.target)
             );
-            first.answer.send(Outcome::Allow).expect("approve once");
+            first.answer.send(ApprovalOutcome::RunOnce).expect("approve once");
             let second = pending
                 .recv_timeout(std::time::Duration::from_secs(2))
                 .expect("the same command needs another approval");
-            second.answer.send(Outcome::Deny).expect("deny");
+            second.answer.send(ApprovalOutcome::Deny).expect("deny");
             let (first, second) = worker.join().expect("worker");
             assert_eq!(first.0, Outcome::Allow, "{}", first.1);
             assert_eq!(second.0, Outcome::Deny, "{}", second.1);
@@ -7418,6 +7499,7 @@ mod tests {
             tool: "shell".to_owned(),
             target: "printf 'a\\b'\n\t\u{1b}[2J\u{202e}TAIL-END".to_owned(),
             reason: "no rule allows it".to_owned(),
+            rememberable: true,
             answer,
         };
         let lines = approval_lines(&request, 80).join("\n");
@@ -7444,12 +7526,13 @@ mod tests {
             tool: "shell".to_owned(),
             target: "printf AUDIT_SHELL_OK".to_owned(),
             reason: "no rule allows it".to_owned(),
+            rememberable: true,
             answer,
         };
         let mut reader = rune_term::input::KeyReader::new();
         assert_eq!(
             collect_approval(&request, &host, &mut reader),
-            Outcome::Deny
+            ApprovalOutcome::Deny
         );
     }
 
@@ -10226,6 +10309,44 @@ mod tests {
     }
 
     #[test]
+    fn only_actions_that_can_be_undone_may_be_remembered() {
+        assert!(rememberable("shell", "npm run e2e"));
+        assert!(rememberable("write_file", "../outside/notes.txt"));
+        assert!(!rememberable("shell", "rm -rf build"));
+        assert!(!rememberable("shell", "git push --force"));
+        assert!(!rememberable("web_fetch_private", "http://10.0.0.1"));
+    }
+
+    #[test]
+    fn a_remembered_approval_covers_the_same_action_and_nothing_else() {
+        let host = test_host();
+        let (sender, requests) = mpsc::channel::<ApprovalRequest>();
+        *host.approval_requests.lock().expect("slot") = Some(sender);
+        let answerer = std::thread::spawn(move || {
+            let request = requests.recv().expect("one request");
+            assert!(request.rememberable);
+            request
+                .answer
+                .send(ApprovalOutcome::RememberForSession)
+                .expect("answer");
+        });
+        let (outcome, _) = host.request_approval("shell", "npm run e2e", "asked".to_owned());
+        assert_eq!(outcome, Outcome::Allow);
+        answerer.join().expect("answered");
+
+        // With no way left to ask, only the grant can allow anything.
+        *host.approval_requests.lock().expect("slot") = None;
+        let (again, reason) = host.request_approval("shell", "npm run e2e", "asked".to_owned());
+        assert_eq!(again, Outcome::Allow);
+        assert!(
+            reason.contains("approved earlier in this session"),
+            "{reason}"
+        );
+        let (other, _) = host.request_approval("shell", "npm run e2e -- --all", "asked".to_owned());
+        assert_eq!(other, Outcome::Ask);
+    }
+
+    #[test]
     fn a_test_run_row_shows_its_exit_status_and_counts() {
         let output = ToolOutput::success(
             "$ npm test\n[tests: 3 passed, 1 failed]\n...\n[exited with status 1]\n",
@@ -10600,6 +10721,7 @@ mod tests {
             undo: Mutex::new(BTreeMap::new()),
             review_session: Arc::new(Mutex::new(ReviewSession::new(&BudgetSet::new()))),
             approval_requests: Mutex::new(None),
+            grants: Mutex::new(Grants::new()),
             questions,
         }
     }

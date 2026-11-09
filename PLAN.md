@@ -184,8 +184,10 @@ Done when the binary stays inside its ceiling and a snapshot test pins each elem
 
 ### Phase 8: Approvals and control
 
-- [ ] 8.1 The approval prompt shows the diff for an edit and the full command for a shell
-      call, with `y` once, `a` for the session (never offered for destructive actions), `n`.
+- [x] 8.1 The approval prompt offers remembering an exact action for the session, never for a
+      destructive one; Deny stays selected and running once is one step up.
+- [ ] 8.1b The approval prompt shows the diff for an edit (the decision path has no arguments
+      today).
 - [x] 8.2 Routine test and build commands for common ecosystems are allowed in auto mode
       inside the sandbox, so headless runs can verify.
 - [ ] 8.3 `/plan` read-only mode enforced by policy, and `/permissions` to switch mode.
@@ -244,6 +246,8 @@ Done when a reproducible table exists with Rune in it.
 | 2026-11-09 | 63729c7 | 4.5 | Edit and write results report `+N -M` lines instead of a byte delta; the tool row shows the counts. |
 | 2026-11-09 | 7daf52e | 8.2 | 34 verification patterns plus `grep`, `rg`, `git show` in auto mode; chained, substituted and redirected parts are still judged alone. |
 | 2026-11-09 | fe98d9d | 4.2 | `rune-tools::test_report`: cargo, TAP (`node --test`), jest, vitest, pytest, mocha, go. Shell result leads with `[tests: …]`; the row shows `exit 1 · 3 passed, 1 failed`. |
-| 2026-11-09 | 0dfa860 | 5.2 | `Verification::of`, `verification_reminders` (default 1), `VerificationRequested` event; `ask --json` adds `verification` and cache token counts. |
-| 2026-11-09 | 9362681 | 9.1 | `Prices` in micro-dollars per Mtok from models.dev `cost`; turn summary, `/cost`, ledger `total_cost`, and `ask --json` `cost_usd` (cache only, no network). |
-| 2026-11-09 | (this) | 9.3 | `rune bench` runs Sutra-format tasks; smoke-tested on Sutra's suite without a provider (clean failure rows). A real run needs a key. |
+| 2026-11-09 | a5fe362 | 5.2 | `Verification::of`, `verification_reminders` (default 1), `VerificationRequested` event; `ask --json` adds `verification` and cache token counts. |
+| 2026-11-09 | 50c9118 | 9.1 | `Prices` in micro-dollars per Mtok from models.dev `cost`; turn summary, `/cost`, ledger `total_cost`, and `ask --json` `cost_usd` (cache only, no network). |
+| 2026-11-09 | cdae308 | 9.3 | `rune bench` runs Sutra-format tasks; smoke-tested on Sutra's suite without a provider (clean failure rows). A real run needs a key. |
+| 2026-11-09 | d88e784 | push | Second batch of 15 commits; CI run 42631487661. |
+| 2026-11-09 | (this) | 8.1 | `ApprovalOutcome::RememberForSession` wired into the session; literal grants, cleared by `/new`; `always` in accessible mode. |
