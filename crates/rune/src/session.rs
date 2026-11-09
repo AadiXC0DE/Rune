@@ -669,6 +669,15 @@ impl Host for SessionHost {
             )),
             // A queued message is reported once the turn ends, from the events.
             Event::SteeringApplied { .. } => {}
+            // Said in scrollback, so the reader knows why the turn went on.
+            Event::VerificationRequested => {
+                let mut entries = self.take_narration();
+                entries.retain(|entry| !entry.text.trim().is_empty());
+                entries.push(Entry::notice(
+                    "files changed with no check since; asked for one before finishing",
+                ));
+                self.commit(&entries);
+            }
         }
         if let Ok(mut events) = self.events.lock() {
             events.push(event);
@@ -10074,6 +10083,7 @@ mod tests {
             usage: rune_net::stream::Usage::default(),
             last_request: rune_net::stream::Usage::default(),
             steps: 1,
+            verification: turn::Verification::NotApplicable,
             calls: Vec::new(),
         };
         let lines = report_turn(&outcome, &host, "").expect("reported");
@@ -10093,6 +10103,7 @@ mod tests {
             usage: rune_net::stream::Usage::default(),
             last_request: rune_net::stream::Usage::default(),
             steps: 40,
+            verification: turn::Verification::NotApplicable,
             calls: Vec::new(),
         };
         let lines = report_turn(&outcome, &host, "").expect("reported");
@@ -10123,6 +10134,7 @@ mod tests {
             usage: rune_net::stream::Usage::default(),
             last_request: rune_net::stream::Usage::default(),
             steps: 1,
+            verification: turn::Verification::NotApplicable,
             calls: Vec::new(),
         };
         // The refusal reaches scrollback when it happens, and the end of the
@@ -10212,6 +10224,7 @@ mod tests {
             },
             last_request: rune_net::stream::Usage::default(),
             steps: 2,
+            verification: turn::Verification::NotApplicable,
             calls: vec![edit.clone(), edit],
         };
         let summary = turn_summary(

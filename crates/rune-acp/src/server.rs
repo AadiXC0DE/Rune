@@ -1425,6 +1425,7 @@ impl<W: Write + Send + 'static> Host for TurnHost<W> {
             }
             Event::PlanUpdated { .. }
             | Event::SteeringApplied { .. }
+            | Event::VerificationRequested
             | Event::ContextCompacted { .. }
             | Event::ProviderRetry { .. }
             | Event::ProviderRetryFinished { .. } => {}

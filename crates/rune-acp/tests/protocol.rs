@@ -1402,6 +1402,14 @@ fn unanswered_permissions_time_out_without_blocking_later_prompts_or_granting_ac
             Layer::User,
         )
         .expect("permission deadline");
+    // The script has no reply for a request to verify the approved write.
+    limits
+        .set(
+            LimitName::VerificationReminders,
+            Budget::Bounded(0),
+            Layer::User,
+        )
+        .expect("no verification reminder");
     let mut harness = Harness::start_with(
         vec![
             Script::tool_call(

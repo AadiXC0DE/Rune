@@ -960,7 +960,7 @@ fn ask_keeps_a_capped_repository_map_fixed_across_an_edit() {
                 .expect("references");
             std::fs::write(
                 dir.path().join("config/rune/config.toml"),
-                "[limits]\nmax_agent_steps = 2\nrepository_map_bytes = 512\n",
+                "[limits]\nmax_agent_steps = 2\nrepository_map_bytes = 512\nverification_reminders = 0\n",
             )
             .expect("map cap");
         },

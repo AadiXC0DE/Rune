@@ -486,7 +486,17 @@ honoring `Retry-After` or using bounded backoff. Each attempt uses the configure
 Rejected credentials never retry. Retries consume no extra model steps or usage.
 Reaching the cap before a final answer exits 1 with `limit_exceeded` and an
 empty `final_output`. JSON reports the steps, summed usage, and each tool's
-`success` or `error` status.
+`success` or `error` status. Usage includes `cache_read_tokens` and
+`cache_write_tokens` when the provider reports them; both are parts of
+`input_tokens`.
+
+A turn that wrote, edited or renamed a file and then stops with no command run
+since the last change is asked once to check it, by running a test, build or
+other command, or to say why it cannot. A plain read such as `cat` or
+`git diff` is not a check. The reminder costs one model step and no other
+request; set `verification_reminders = 0` in `[limits]` to turn it off. JSON
+reports `verification` as `verified`, `unverified`, or `not_applicable` when
+nothing changed.
 Completed exchanges are saved as sessions for the current workspace, and
 `--json` reports their `session_id`. Pass `--no-save` to create no session and
 return an empty ID.

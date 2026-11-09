@@ -3682,3 +3682,77 @@ fn a_known_output_ceiling_is_requested_only_where_the_dialect_needs_one() {
         );
     }
 }
+
+#[test]
+fn an_unchecked_change_is_sent_back_once_for_verification() {
+    for (reminders, expected_requests) in [(1, 3), (0, 2)] {
+        let endpoint = MockEndpoint::start(vec![
+            Script::tool_call("w", "write_file", "{\"path\":\"a.txt\",\"content\":\"x\"}"),
+            Script::text("Done."),
+            Script::text("Nothing here can run a check."),
+        ]);
+        let mut host = TestHost::new(endpoint)
+            .with_tools(vec![ToolSpec {
+                name: "write_file".to_owned(),
+                description: "Write a file.".to_owned(),
+                input_schema: serde_json::json!({"type": "object"}),
+            }])
+            .with_tool_response(ToolOutput::success("Wrote `a.txt` (new file, 1 line)"));
+        host.limits
+            .set(
+                rune_core::LimitName::VerificationReminders,
+                rune_core::budget::Budget::Bounded(reminders),
+                rune_core::config::Layer::User,
+            )
+            .expect("reminder limit");
+        let mut history = rune_agent::History::new();
+        history.push_user("write a file");
+        let outcome = run_turn(&mut history, &host).expect("turn");
+
+        let server = host.server.as_ref().expect("server");
+        assert_eq!(server.request_count(), expected_requests, "{reminders}");
+        let asked = host
+            .events
+            .lock()
+            .expect("events")
+            .iter()
+            .filter(|event| matches!(event, Event::VerificationRequested))
+            .count();
+        assert_eq!(asked, usize::try_from(reminders).expect("count"));
+        // Nothing checked the change, and the reminder is not repeated.
+        assert_eq!(
+            outcome.verification,
+            rune_agent::turn::Verification::Unverified
+        );
+    }
+}
+
+#[test]
+fn a_command_after_the_last_change_counts_as_a_check() {
+    use rune_agent::turn::{CallResult, PreparedCall, Verification};
+    let call = |name: &str, arguments: &str| CallResult {
+        call: PreparedCall {
+            id: name.to_owned(),
+            name: name.to_owned(),
+            arguments: arguments.to_owned(),
+        },
+        output: ToolOutput::success("ok"),
+        executed: true,
+    };
+    let edit = call("edit_file", "{}");
+    let test = call("shell", r#"{"action":"run","command":"npm test"}"#);
+    let read = call("shell", r#"{"action":"run","command":"cat a.js"}"#);
+    assert_eq!(
+        Verification::of(std::slice::from_ref(&test)),
+        Verification::NotApplicable
+    );
+    assert_eq!(
+        Verification::of(&[edit.clone(), test.clone()]),
+        Verification::Verified
+    );
+    assert_eq!(
+        Verification::of(&[edit.clone(), read]),
+        Verification::Unverified
+    );
+    assert_eq!(Verification::of(&[test, edit]), Verification::Unverified);
+}

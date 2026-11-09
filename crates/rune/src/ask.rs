@@ -208,6 +208,11 @@ pub struct JsonResult {
     pub usage: UsageReport,
     /// Tool calls requested by the provider, in order.
     pub tool_calls: Vec<ToolCallReport>,
+    /// Whether a check ran after the last change to a file: `verified`,
+    /// `unverified`, or `not_applicable` when nothing changed. Absent when the
+    /// run failed before finishing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verification: Option<&'static str>,
     /// Failure detail, present only when the run failed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
@@ -220,6 +225,8 @@ pub struct JsonResult {
 }
 
 /// Token counts as reported.
+// The field names are the keys of the JSON contract, so they keep the suffix.
+#[allow(clippy::struct_field_names)]
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct UsageReport {
     /// Input tokens, or absent when unreported.
@@ -228,6 +235,12 @@ pub struct UsageReport {
     /// Output tokens, or absent when unreported.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output_tokens: Option<u64>,
+    /// Input tokens read from a prompt cache, part of the input count.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_read_tokens: Option<u64>,
+    /// Input tokens written to a prompt cache, part of the input count.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_write_tokens: Option<u64>,
 }
 
 impl JsonResult {
@@ -244,6 +257,7 @@ impl JsonResult {
             steps: 0,
             usage: UsageReport::default(),
             tool_calls: Vec::new(),
+            verification: None,
             error: Some(error.message().to_owned()),
             error_code: Some(error.code()),
             error_detail: (!error.detail().is_empty()).then(|| error.detail().clone()),
@@ -615,8 +629,11 @@ pub fn run(
         usage: UsageReport {
             input_tokens: outcome.usage.input_tokens,
             output_tokens: outcome.usage.output_tokens,
+            cache_read_tokens: outcome.usage.cache_read_tokens,
+            cache_write_tokens: outcome.usage.cache_write_tokens,
         },
         tool_calls,
+        verification: error.is_none().then(|| outcome.verification.as_str()),
         error: error.as_ref().map(|error| error.message().to_owned()),
         error_code: error.as_ref().map(RuneError::code),
         error_detail: error
@@ -962,7 +979,7 @@ mod tests {
     fn a_reported_zero_usage_count_is_present() {
         let usage = UsageReport {
             input_tokens: Some(0),
-            output_tokens: None,
+            ..UsageReport::default()
         };
         let json = serde_json::to_value(&usage).expect("serialize");
         assert_eq!(json["input_tokens"], 0);
@@ -981,6 +998,7 @@ mod tests {
             steps: 1,
             usage: UsageReport::default(),
             tool_calls: Vec::new(),
+            verification: Some("not_applicable"),
             error: None,
             error_code: None,
             error_detail: None,

@@ -193,6 +193,8 @@ pub enum Event {
         /// Turns remaining, including the summary.
         remaining_turns: usize,
     },
+    /// A turn that changed files without checking them was asked to verify.
+    VerificationRequested,
     /// The turn finished.
     Finished {
         /// How it ended.
@@ -431,7 +433,98 @@ pub struct TurnOutcome {
     pub steps: u32,
     /// Tool calls made, in order.
     pub calls: Vec<CallResult>,
+    /// Whether a check ran after the turn's last change to a file.
+    pub verification: Verification,
 }
+
+/// Whether a turn checked its own change.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Verification {
+    /// The turn changed no file.
+    NotApplicable,
+    /// A command or check ran after the last change.
+    Verified,
+    /// A file changed and nothing checked it afterwards.
+    Unverified,
+}
+
+impl Verification {
+    /// Returns the stable label used in machine output.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NotApplicable => "not_applicable",
+            Self::Verified => "verified",
+            Self::Unverified => "unverified",
+        }
+    }
+
+    /// Classifies a turn's calls.
+    ///
+    /// A change is a successful write, edit or rename. A check is any command
+    /// that is not a plain read, whatever its exit status, or a syntax check:
+    /// a failing test is still evidence, and the model has seen it.
+    #[must_use]
+    pub fn of(calls: &[CallResult]) -> Self {
+        let changed = |call: &&CallResult| {
+            call.executed
+                && !call.output.is_error
+                && matches!(
+                    call.call.name.as_str(),
+                    "write_file" | "edit_file" | "rename_file"
+                )
+        };
+        let Some(last_change) = calls.iter().rposition(|call| changed(&call)) else {
+            return Self::NotApplicable;
+        };
+        let checked = calls[last_change..].iter().any(|call| {
+            call.executed
+                && match call.call.name.as_str() {
+                    "syntax_diagnostics" => true,
+                    "shell" => is_check_command(&call.call.arguments),
+                    _ => false,
+                }
+        });
+        if checked {
+            Self::Verified
+        } else {
+            Self::Unverified
+        }
+    }
+}
+
+/// Returns true when a shell call ran something other than a plain read.
+fn is_check_command(arguments: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(arguments) else {
+        return false;
+    };
+    if value.get("action").and_then(serde_json::Value::as_str) != Some("run") {
+        return false;
+    }
+    let command = value
+        .get("command")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .trim();
+    let program = command.split_whitespace().next().unwrap_or_default();
+    let reads = [
+        "ls", "cat", "head", "tail", "wc", "pwd", "echo", "grep", "rg", "find", "tree", "file",
+        "stat", "which",
+    ];
+    let git_read = command.starts_with("git ")
+        && ["status", "diff", "log", "show", "branch"]
+            .iter()
+            .any(|sub| command.split_whitespace().nth(1) == Some(sub));
+    !command.is_empty() && !reads.contains(&program) && !git_read
+}
+
+/// Asks the model to check a change before the turn ends.
+///
+/// Sent as a turn from the harness, and only once per configured reminder,
+/// so a model that has a reason not to run anything can say so and finish.
+const VERIFICATION_REMINDER: &str = "<harness_check>Files were changed and nothing has \
+run since the last change to check it. Run the focused test, build, or command that \
+exercises the change and report what it shows, or say why it cannot be run.</harness_check>";
 
 /// Runs one turn to completion.
 ///
@@ -442,6 +535,10 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
     let cancellation = host.cancellation();
     let steering = host.steering();
     let step_limit = limits.get(LimitName::MaxAgentSteps).value().unwrap_or(0);
+    let mut reminders = limits
+        .get(LimitName::VerificationReminders)
+        .value()
+        .unwrap_or(0);
     let max_attempts = limits.get_usize(LimitName::ProviderMaxAttempts).max(1);
     let timeouts = transport::RequestTimeouts::from_limits(&limits);
 
@@ -481,6 +578,7 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
                 usage,
                 last_request,
                 steps,
+                verification: Verification::of(&calls),
                 calls,
             };
             host.emit(Event::Finished {
@@ -591,6 +689,19 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
                 apply_steering(history, steering, Boundary::Finalizing, host);
                 continue;
             }
+            // A turn that changed files and stopped of its own accord is asked
+            // once to check its work. No extra request is spent on a turn that
+            // already checked, changed nothing, or ended for another reason.
+            if finish == FinishReason::Stop
+                && reminders > 0
+                && host.objective_tokens_remaining() != Some(0)
+                && Verification::of(&calls) == Verification::Unverified
+            {
+                reminders = reminders.saturating_sub(1);
+                history.push_user(VERIFICATION_REMINDER);
+                host.emit(Event::VerificationRequested);
+                continue;
+            }
             let reason = if host.objective_tokens_remaining() == Some(0) {
                 StopReason::ObjectiveBudget
             } else {
@@ -618,6 +729,7 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
                 usage,
                 last_request,
                 steps,
+                verification: Verification::of(&calls),
                 calls,
             });
         }
@@ -670,6 +782,7 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
                 usage,
                 last_request,
                 steps,
+                verification: Verification::of(&calls),
                 calls,
             });
         }

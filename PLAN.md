@@ -149,7 +149,7 @@ still one call away.
 
 - [ ] 5.1 Record each step's narration in order with the tool calls, for scrollback, `ask`
       and sessions.
-- [ ] 5.2 Verification check with no extra model call: when a turn edited files and no test
+- [x] 5.2 Verification check with no extra model call: when a turn edited files and no test
       or build ran after the last edit, ask the model once to verify; report `verified` or
       `unverified` in the turn result and in `ask --json`.
 - [ ] 5.3 Stop repeated identical successful calls, not only repeated failures.
@@ -243,4 +243,5 @@ Done when a reproducible table exists with Rune in it.
 | 2026-11-09 | 999bc61 | 7.2 | `rune-term::highlight`: per-row lexer, seven language families, theme syntax slots. |
 | 2026-11-09 | 63729c7 | 4.5 | Edit and write results report `+N -M` lines instead of a byte delta; the tool row shows the counts. |
 | 2026-11-09 | 7daf52e | 8.2 | 34 verification patterns plus `grep`, `rg`, `git show` in auto mode; chained, substituted and redirected parts are still judged alone. |
-| 2026-11-09 | (this) | 4.2 | `rune-tools::test_report`: cargo, TAP (`node --test`), jest, vitest, pytest, mocha, go. Shell result leads with `[tests: …]`; the row shows `exit 1 · 3 passed, 1 failed`. |
+| 2026-11-09 | fe98d9d | 4.2 | `rune-tools::test_report`: cargo, TAP (`node --test`), jest, vitest, pytest, mocha, go. Shell result leads with `[tests: …]`; the row shows `exit 1 · 3 passed, 1 failed`. |
+| 2026-11-09 | (this) | 5.2 | `Verification::of`, `verification_reminders` (default 1), `VerificationRequested` event; `ask --json` adds `verification` and cache token counts. |

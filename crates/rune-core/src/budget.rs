@@ -192,6 +192,8 @@ pub enum LimitName {
     MaxAgentSteps,
     /// Consecutive failures allowed for an identical tool name and argument string.
     MaxConsecutiveToolFailures,
+    /// Times a turn that changed files is asked to verify before it may end.
+    VerificationReminders,
     /// Maximum bytes retained from one tool result.
     MaxToolResultBytes,
     /// Tool-result bytes retained across one turn.
@@ -277,6 +279,7 @@ impl LimitName {
         &[
             Self::MaxAgentSteps,
             Self::MaxConsecutiveToolFailures,
+            Self::VerificationReminders,
             Self::MaxToolResultBytes,
             Self::MaxTurnResultBytes,
             Self::SkillCatalogBytes,
@@ -324,6 +327,7 @@ impl LimitName {
         match self {
             Self::MaxAgentSteps => "max_agent_steps",
             Self::MaxConsecutiveToolFailures => "max_consecutive_tool_failures",
+            Self::VerificationReminders => "verification_reminders",
             Self::MaxToolResultBytes => "max_tool_result_bytes",
             Self::MaxTurnResultBytes => "max_turn_result_bytes",
             Self::SkillCatalogBytes => "skill_catalog_bytes",
@@ -372,6 +376,7 @@ impl LimitName {
             // Zero means unlimited steps. Embedded hosts lower this.
             Self::MaxAgentSteps => Budget::Bounded(0),
             Self::MaxConsecutiveToolFailures => Budget::Bounded(3),
+            Self::VerificationReminders => Budget::Bounded(1),
             Self::MaxToolResultBytes => Budget::Bounded(64 * 1024),
             Self::MaxTurnResultBytes => Budget::Bounded(8 * 1024 * 1024),
             Self::SkillCatalogBytes => Budget::Bounded(32768),
@@ -424,6 +429,10 @@ impl LimitName {
             Self::MaxConsecutiveToolFailures => Range {
                 min: 1,
                 max: Some(10_000),
+            },
+            Self::VerificationReminders => Range {
+                min: 0,
+                max: Some(8),
             },
             Self::CompactionTriggerPercent => Range {
                 min: 10,
@@ -482,6 +491,7 @@ impl LimitName {
             | Self::ReviewTimeoutMs
             | Self::WebFetchTimeoutMs => Unit::Millis,
             Self::MaxConsecutiveToolFailures
+            | Self::VerificationReminders
             | Self::ParallelToolCalls
             | Self::SubagentChildren
             | Self::McpRestartLimit
@@ -505,6 +515,9 @@ impl LimitName {
             Self::MaxAgentSteps => "Maximum model tool-loop steps per turn; zero means unlimited.",
             Self::MaxConsecutiveToolFailures => {
                 "Consecutive identical tool failures allowed before stopping the next duplicate."
+            }
+            Self::VerificationReminders => {
+                "Times a turn that changed files without a check afterwards is asked to verify."
             }
             Self::MaxToolResultBytes => "Bytes retained from one tool result before spilling.",
             Self::MaxTurnResultBytes => "Tool-result bytes one turn retains across its steps.",

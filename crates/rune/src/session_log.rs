@@ -1443,6 +1443,7 @@ mod tests {
                 ..Usage::default()
             },
             steps: 1,
+            verification: rune_agent::turn::Verification::NotApplicable,
             calls: Vec::new(),
         }
     }

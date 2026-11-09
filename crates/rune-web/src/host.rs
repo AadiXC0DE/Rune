@@ -456,6 +456,7 @@ fn encode(event: &Event) -> serde_json::Value {
             "remaining_turns": remaining_turns,
         }),
         Event::SteeringApplied { count, .. } => json!({ "kind": "steering", "count": count }),
+        Event::VerificationRequested => json!({ "kind": "verification_requested" }),
         Event::Finished {
             reason,
             usage,

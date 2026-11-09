@@ -1889,6 +1889,7 @@ fn settle(context: &TurnContext, stop_reason: StopReason, acc: Accumulated) -> T
             usage,
             last_request,
             steps,
+            verification: rune_agent::turn::Verification::of(&calls),
             calls,
         },
         images,
