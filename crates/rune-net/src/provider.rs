@@ -132,6 +132,9 @@ pub struct ProviderCapabilities {
     pub tool_streaming: ToolStreaming,
     /// The dialect can express fast mode.
     pub fast_mode: bool,
+    /// The request must state an output ceiling, so one the model is known to
+    /// accept is better than the dialect's conservative fallback.
+    pub requires_output_ceiling: bool,
 }
 
 impl Default for ProviderCapabilities {
@@ -141,6 +144,7 @@ impl Default for ProviderCapabilities {
             images: false,
             tool_streaming: ToolStreaming::Unsupported,
             fast_mode: false,
+            requires_output_ceiling: false,
         }
     }
 }

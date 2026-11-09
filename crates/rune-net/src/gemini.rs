@@ -30,6 +30,7 @@ impl Provider for Gemini {
             images: true,
             tool_streaming: crate::provider::ToolStreaming::CompleteCalls,
             fast_mode: false,
+            requires_output_ceiling: false,
         }
     }
 

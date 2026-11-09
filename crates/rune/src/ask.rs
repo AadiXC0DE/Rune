@@ -335,6 +335,10 @@ impl Host for AskHost<'_> {
         self.settings.effort
     }
 
+    fn max_output_tokens(&self) -> Option<u64> {
+        self.settings.model_output_limit()
+    }
+
     fn fast_mode(&self) -> bool {
         self.settings.fast_mode
     }

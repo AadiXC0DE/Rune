@@ -204,6 +204,14 @@ pub enum Event {
     },
 }
 
+/// Largest output ceiling a request asks for when the model's own is known.
+///
+/// A dialect that requires a ceiling falls back to a small one, which cuts a
+/// long file write short. The model's published maximum is often far larger,
+/// and the context estimate reserves whatever a request asks for, so the
+/// ceiling is capped where it still leaves most of a window for input.
+pub const MAX_REQUESTED_OUTPUT_TOKENS: u64 = 32 * 1024;
+
 /// Everything the loop needs from its host.
 ///
 /// The loop owns no product state: sessions, credentials, and presentation all
@@ -261,6 +269,11 @@ pub trait Host {
     /// Returns the reasoning effort to request.
     fn effort(&self) -> Effort {
         Effort::Auto
+    }
+
+    /// Returns the largest answer the model is known to produce, if known.
+    fn max_output_tokens(&self) -> Option<u64> {
+        None
     }
 
     /// Returns the client this turn sends through.
@@ -765,15 +778,9 @@ impl ObjectiveAccounting {
             return Ok(());
         };
         let usage = self.usage.merge_max(reported.unwrap_or_default());
-        let input = usage.input_tokens.map_or(input_estimate, |input| {
-            if host.dialect().name() == rune_net::anthropic::NAME {
-                input
-                    .saturating_add(usage.cache_read_tokens.unwrap_or(0))
-                    .saturating_add(usage.cache_write_tokens.unwrap_or(0))
-            } else {
-                input
-            }
-        });
+        // Every dialect reports the whole prompt as input, cached parts
+        // included, so the cache counts are not added again.
+        let input = usage.input_tokens.unwrap_or(input_estimate);
         let output = usage.output_tokens.map_or_else(
             || {
                 self.output_bytes
@@ -841,6 +848,11 @@ fn stream_with_retry(
         plan.parallel_tool_calls =
             host.limits().get(LimitName::ParallelToolCalls).value() != Some(1);
         plan.effort = host.effort();
+        if host.dialect().capabilities().requires_output_ceiling {
+            plan.max_output_tokens = host
+                .max_output_tokens()
+                .map(|known| known.min(MAX_REQUESTED_OUTPUT_TOKENS));
+        }
         plan.fast_mode = host.fast_mode();
         plan.provider_order = host.provider_order();
         plan.provider_strict = host.provider_strict();

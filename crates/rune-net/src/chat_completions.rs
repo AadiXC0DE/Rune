@@ -54,6 +54,7 @@ impl Provider for ChatCompletions {
             images: true,
             tool_streaming: crate::provider::ToolStreaming::Incremental,
             fast_mode: false,
+            requires_output_ceiling: false,
         }
     }
 

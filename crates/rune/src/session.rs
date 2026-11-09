@@ -262,6 +262,8 @@ struct SessionHost {
     provider_retry: Mutex<Option<ProviderRetry>>,
     /// Largest observed conversation size, estimated when usage is unavailable.
     context_used: std::sync::atomic::AtomicU64,
+    /// Largest answer the current model produces, or zero when unknown.
+    output_limit: std::sync::atomic::AtomicU64,
     /// Present while the meter uses an estimate rather than provider usage.
     context_source: Mutex<Option<&'static str>>,
     /// Size of the context window, zero when the provider stated none.
@@ -443,6 +445,11 @@ impl Host for SessionHost {
 
     fn effort(&self) -> Effort {
         self.effort
+    }
+
+    fn max_output_tokens(&self) -> Option<u64> {
+        Some(self.output_limit.load(std::sync::atomic::Ordering::Relaxed))
+            .filter(|limit| *limit > 0)
     }
 
     fn fast_mode(&self) -> bool {
@@ -859,7 +866,7 @@ impl SessionHost {
     /// left over from a larger model would understate how full the smaller one
     /// is, and a window invented for a model nothing describes would be a guess
     /// presented as a fact.
-    fn set_model(&self, model: &str, context_window: Option<u64>) {
+    fn set_model(&self, model: &str, context_window: Option<u64>, output: Option<u64>) {
         {
             let mut current = lock_model(&self.model);
             model.clone_into(&mut current);
@@ -868,6 +875,12 @@ impl SessionHost {
             self.context_limit
                 .store(window, std::sync::atomic::Ordering::Relaxed);
         }
+        // Unlike the window, an unknown ceiling is reset: a ceiling left over
+        // from a larger model would be refused by a smaller one.
+        self.output_limit.store(
+            output.unwrap_or_default(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
     }
 
     /// Returns the theme the interface is drawn with.
@@ -1670,6 +1683,9 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
         events: Arc::new(Mutex::new(Vec::new())),
         provider_retry: Mutex::new(None),
         context_used: std::sync::atomic::AtomicU64::new(initial_context),
+        output_limit: std::sync::atomic::AtomicU64::new(
+            config.settings.model_output_limit().unwrap_or_default(),
+        ),
         context_source: Mutex::new(context_source),
         context_limit: std::sync::atomic::AtomicU64::new(context_limit(&config.settings, &limits)),
         theme,
@@ -1982,7 +1998,7 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                     Handled::SetModel(model) => {
                         // Named inline, so no catalog entry describes it and the
                         // window already in force is kept rather than guessed.
-                        host.set_model(&model, None);
+                        host.set_model(&model, None, None);
                         note(format!("model set to {}", host.model_name()));
                     }
                     Handled::ClearHistory => {
@@ -4306,12 +4322,12 @@ fn choose_model(
     // The catalog is where a model's capacity is declared, so the window that
     // travels with the choice is the one the endpoint reported for it rather
     // than a number invented for it.
-    let window = catalog
-        .models
-        .iter()
-        .find(|model| model.id == chosen)
-        .and_then(|model| model.context_window);
-    host.set_model(&chosen, window);
+    let entry = catalog.models.iter().find(|model| model.id == chosen);
+    host.set_model(
+        &chosen,
+        entry.and_then(|model| model.context_window),
+        entry.and_then(|model| model.max_output_tokens),
+    );
     // Written after the change takes effect, so a failed write cannot leave the
     // session on a model the file does not name.
     let selection = crate::provider_setup::Selection {
@@ -4486,12 +4502,15 @@ fn resolve_context_window(host: &SessionHost, settings: &Settings, paths: &Paths
         return;
     };
     let current = host.model_name();
-    let reported = catalog
-        .models
-        .iter()
-        .find(|model| model.id == current)
-        .and_then(|model| model.context_window);
+    let model = catalog.models.iter().find(|model| model.id == current);
+    let reported = model.and_then(|model| model.context_window);
     host.adopt_context_window(reported, settings.context_window.is_some());
+    if settings.model_output_limit().is_none()
+        && let Some(output) = model.and_then(|model| model.max_output_tokens)
+    {
+        host.output_limit
+            .store(output, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 /// How long the session waits for the endpoint's model list at startup.
@@ -7511,7 +7530,7 @@ mod tests {
     fn switching_the_model_changes_what_the_session_sends() {
         let host = test_host();
         assert_eq!(host.model(), "test");
-        host.set_model("other/model", None);
+        host.set_model("other/model", None, None);
         assert_eq!(host.model(), "other/model");
     }
 
@@ -7575,20 +7594,20 @@ mod tests {
         let before = host
             .context_limit
             .load(std::sync::atomic::Ordering::Relaxed);
-        host.set_model("small", None);
+        host.set_model("small", None, None);
         assert_eq!(
             host.context_limit
                 .load(std::sync::atomic::Ordering::Relaxed),
             before
         );
-        host.set_model("large", Some(1_000_000));
+        host.set_model("large", Some(1_000_000), None);
         assert_eq!(
             host.context_limit
                 .load(std::sync::atomic::Ordering::Relaxed),
             1_000_000
         );
         // A zero means nothing is known, not a window of nothing.
-        host.set_model("zero", Some(0));
+        host.set_model("zero", Some(0), None);
         assert_eq!(
             host.context_limit
                 .load(std::sync::atomic::Ordering::Relaxed),
@@ -7599,7 +7618,7 @@ mod tests {
     #[test]
     fn the_status_command_names_the_model_in_effect() {
         let host = test_host();
-        host.set_model("picked/model", None);
+        host.set_model("picked/model", None, None);
         let info = host.info("chat_completions", "https://example.invalid/v1");
         let rendered = render_status(&info);
         assert!(rendered.contains("picked/model"), "{rendered}");
@@ -9958,6 +9977,7 @@ mod tests {
             events: Arc::new(Mutex::new(Vec::new())),
             provider_retry: Mutex::new(None),
             context_used: std::sync::atomic::AtomicU64::new(0),
+            output_limit: std::sync::atomic::AtomicU64::new(0),
             context_source: Mutex::new(None),
             context_limit: std::sync::atomic::AtomicU64::new(
                 rune_net::catalog::DEFAULT_CONTEXT_WINDOW,

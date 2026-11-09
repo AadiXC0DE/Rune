@@ -311,6 +311,15 @@ impl ModelEntry {
             Self::Detailed(settings) => settings.context_window,
         }
     }
+
+    /// Returns the declared largest answer, when one is stated.
+    #[must_use]
+    pub fn max_output_tokens(&self) -> Option<u64> {
+        match self {
+            Self::Id(_) => None,
+            Self::Detailed(settings) => settings.max_output_tokens,
+        }
+    }
 }
 
 /// What a model accepts, as declared in a configuration file.
@@ -650,6 +659,15 @@ impl Default for Settings {
 }
 
 impl Settings {
+    /// Returns the largest answer declared for the active model, if any.
+    #[must_use]
+    pub fn model_output_limit(&self) -> Option<u64> {
+        self.configured_models
+            .values()
+            .filter(|entry| entry.id() == self.model)
+            .find_map(ModelEntry::max_output_tokens)
+    }
+
     /// Returns true when any layer produced a diagnostic.
     #[must_use]
     pub fn has_diagnostics(&self) -> bool {

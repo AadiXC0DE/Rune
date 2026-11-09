@@ -75,6 +75,10 @@ struct TestHost {
     /// Cancels the turn from inside the next tool call, as a user pressing
     /// Escape while a tool runs would.
     cancel_on_execute: Mutex<bool>,
+    /// Largest answer the model is described as producing.
+    max_output: Option<u64>,
+    /// Output ceilings of the plans that reached request preparation.
+    planned_output: Mutex<Vec<Option<u64>>>,
 }
 
 impl TestHost {
@@ -108,6 +112,8 @@ impl TestHost {
             private_decisions: Mutex::new(Vec::new()),
             submit_on_first_delta: Mutex::new(None),
             cancel_on_execute: Mutex::new(false),
+            max_output: None,
+            planned_output: Mutex::new(Vec::new()),
         }
     }
 
@@ -228,6 +234,23 @@ impl Host for TestHost {
 
     fn effort(&self) -> Effort {
         Effort::Auto
+    }
+
+    fn max_output_tokens(&self) -> Option<u64> {
+        self.max_output
+    }
+
+    fn prepare_request(
+        &self,
+        _history: &mut rune_agent::history::History,
+        plan: &mut rune_net::provider::RequestPlan,
+        _client: &dyn rune_net::fetch::Fetch,
+    ) -> Result<()> {
+        self.planned_output
+            .lock()
+            .expect("planned output")
+            .push(plan.max_output_tokens);
+        Ok(())
     }
 
     fn fetch(&self) -> Box<dyn rune_net::fetch::Fetch> {
@@ -3585,9 +3608,11 @@ fn objective_estimates_count_complete_calls_and_anthropic_cache_tokens() {
             }),
         )
         .expect("charge caches");
+    // The input count already includes the cached parts, as the dialect
+    // reports it, so only input and output are charged: 26 + 10 + 5.
     assert_eq!(
         *host.objective_budget.lock().expect("budget"),
-        Some((10_000, 51))
+        Some((10_000, 41))
     );
     assert_eq!(host.server.as_ref().expect("server").request_count(), 0);
 }
@@ -3618,4 +3643,36 @@ fn gemini_thinking_tokens_exhaust_the_objective_before_another_request() {
     let outcome = run_turn(&mut history, &host).expect("budget stop");
     assert_eq!(outcome.stop_reason, StopReason::ObjectiveBudget);
     assert_eq!(host.server.as_ref().expect("server").request_count(), 0);
+}
+
+#[test]
+fn a_known_output_ceiling_is_requested_only_where_the_dialect_needs_one() {
+    let cases = [
+        (
+            true,
+            Some(200_000),
+            Some(rune_agent::turn::MAX_REQUESTED_OUTPUT_TOKENS),
+        ),
+        (true, Some(16_000), Some(16_000)),
+        (true, None, None),
+        (false, Some(200_000), None),
+    ];
+    for (anthropic, known, expected) in cases {
+        let mut host = TestHost::new(MockEndpoint::start(vec![Script::text("done")]));
+        host.max_output = known;
+        if anthropic {
+            host.dialect = Box::new(rune_net::anthropic::Anthropic);
+        }
+        let mut history = rune_agent::history::History::new();
+        history.push_user("hello");
+        // The mock speaks one dialect, so the Anthropic attempt may fail after
+        // preparation; only the planned ceiling is under test.
+        let _ = run_turn(&mut history, &host);
+        let planned = host.planned_output.lock().expect("planned").clone();
+        assert_eq!(
+            planned.first().copied(),
+            Some(expected),
+            "{anthropic} {known:?}"
+        );
+    }
 }

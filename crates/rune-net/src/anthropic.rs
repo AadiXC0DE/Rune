@@ -45,6 +45,7 @@ impl Provider for Anthropic {
             images: true,
             tool_streaming: crate::provider::ToolStreaming::Incremental,
             fast_mode: false,
+            requires_output_ceiling: true,
         }
     }
 

@@ -45,6 +45,7 @@ impl Provider for Responses {
             images: true,
             tool_streaming: crate::provider::ToolStreaming::Incremental,
             fast_mode: true,
+            requires_output_ceiling: false,
         }
     }
 
