@@ -151,6 +151,11 @@ pub enum Answer {
 pub trait Answerer: Send + Sync {
     /// Collects one answer per question.
     fn ask(&self, questions: &[Question], context: &ExecutionContext) -> Result<Answer>;
+
+    /// Returns false for an answerer that can never collect an answer.
+    fn is_available(&self) -> bool {
+        true
+    }
 }
 
 /// An answerer that always reports that input is unavailable.
@@ -167,6 +172,10 @@ impl Answerer for Unavailable {
             "a question needs an answer, and this run cannot collect one",
         )
         .with_hint("run interactively, or answer in the prompt"))
+    }
+
+    fn is_available(&self) -> bool {
+        false
     }
 }
 
@@ -247,6 +256,10 @@ impl AskUserQuestion {
 impl Tool for AskUserQuestion {
     fn name(&self) -> &'static str {
         "ask_user_question"
+    }
+
+    fn is_advertised(&self) -> bool {
+        self.answerer.is_available()
     }
 
     fn description(&self) -> &'static str {

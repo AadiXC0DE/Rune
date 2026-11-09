@@ -103,6 +103,11 @@ pub trait FetchBackend: Send + Sync {
     /// Returns the response, or a failure the tool reports to the model.
     fn get(&self, url: &str, timeout: Duration) -> Result<Fetched>;
 
+    /// Returns false for a backend that refuses every request.
+    fn is_configured(&self) -> bool {
+        true
+    }
+
     /// Performs one request with the caller's resolved private-network authority.
     ///
     /// A network backend must check the resolved addresses and connect only to
@@ -163,6 +168,11 @@ pub trait SearchBackend: Send + Sync {
     /// Returns at most `max` sources for a query.
     fn search(&self, query: &str, filters: &SearchFilters, max: usize)
     -> Result<Vec<SearchResult>>;
+
+    /// Returns false for a backend that refuses every request.
+    fn is_configured(&self) -> bool {
+        true
+    }
 }
 
 /// The backend used when a run has no outbound transport.
@@ -172,6 +182,10 @@ pub struct Unconfigured;
 impl FetchBackend for Unconfigured {
     fn get(&self, _url: &str, _timeout: Duration) -> Result<Fetched> {
         Err(no_transport("web_fetch"))
+    }
+
+    fn is_configured(&self) -> bool {
+        false
     }
 }
 
@@ -187,6 +201,10 @@ impl SearchBackend for UnconfiguredSearch {
         _max: usize,
     ) -> Result<Vec<SearchResult>> {
         Err(no_transport("web_search"))
+    }
+
+    fn is_configured(&self) -> bool {
+        false
     }
 }
 
@@ -1064,6 +1082,10 @@ impl Tool for WebFetch {
         "web_fetch"
     }
 
+    fn is_advertised(&self) -> bool {
+        self.backend.is_configured()
+    }
+
     fn description(&self) -> &'static str {
         "Fetch one http or https URL and return its text. An HTML page is converted to Markdown \
          with its links kept; JSON and plain text are returned unchanged. Loopback, private, and \
@@ -1253,6 +1275,10 @@ impl WebSearch {
 impl Tool for WebSearch {
     fn name(&self) -> &'static str {
         "web_search"
+    }
+
+    fn is_advertised(&self) -> bool {
+        self.backend.is_configured()
     }
 
     fn description(&self) -> &'static str {

@@ -74,6 +74,13 @@ Gaps that cost tokens, pass rate or user trust:
 - Commit subjects follow `type(scope): summary`; no em dashes in committed text.
 - Numbers in README, site or CHANGELOG come from a measurement taken in this repository.
 
+## Known local failures (macOS host, present on `844ee56` before any change)
+
+- `rune-acp` `output_failure_tests`: 3 tests exceed the shutdown grace.
+- `rune` `terminal_question` and `terminal_accessible`: the PTY child does not exit in 10 s.
+
+These are compared against `main` before a push rather than counted as regressions.
+
 ## Phases
 
 ### Phase 1: Baseline and guardrails
@@ -88,7 +95,7 @@ Done when the request floor is a printed, gated number.
 
 ### Phase 2: Request floor diet
 
-- [ ] 2.1 Advertise a tool only when this host can run it: no web tools while web tools are
+- [x] 2.1 Advertise a tool only when this host can run it: no web tools while web tools are
       off, no vision without a vision model, no question tool without a question channel, no
       skill tools with an empty catalog.
 - [ ] 2.1a List each skill once when the same name is discovered in more than one root.
@@ -205,4 +212,5 @@ Done when a reproducible table exists with Rune in it.
 | 2026-11-09 | 3a45e19 | 1.1 | Plan written, baseline measured. |
 | 2026-11-09 | c7edc18 | 1.2 | `rune prompt --tools`; budget gates schemas at 18 KiB (measured 17,379). |
 | 2026-11-09 | e15f68e | 1.3 | Pushes that change crates used by the demo still deploy, because `site/demo/rune.wasm` must be regenerated; regenerate it once per push, in the last commit. |
-| 2026-11-09 | (this) | 1.4 | Budget job no longer limited to pull requests. |
+| 2026-11-09 | a7a89fc | 1.4 | Budget job no longer limited to pull requests. |
+| 2026-11-09 | (this) | 2.1 | Interactive default: 20 tools, 17,379 bytes to 15 tools, 14,382 bytes. A call to a hidden tool is answered as never offered. |

@@ -15,7 +15,7 @@ PNG = base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR4
 def run_fixture(ask, mode):
     requests, images, errors = [], [], []
     expected_error = {
-        "absent": "no image analysis is configured",
+        "absent": "there is no tool named `vision`",
         "outside": "path_outside_workspace",
         "oversized": "limit is 8388608",
         "attached": "session image IDs are unavailable",
@@ -54,8 +54,8 @@ def run_fixture(ask, mode):
                 else:
                     requests.append(request)
                     if len(requests) == 1:
-                        vision = next(tool["function"] for tool in request["tools"] if tool["function"]["name"] == "vision")
-                        assert ("Unavailable:" in vision["description"]) == (mode == "absent"), vision
+                        names = [tool["function"]["name"] for tool in request["tools"]]
+                        assert ("vision" in names) == (mode != "absent"), names
                         arguments = {"paths": ["pixel.png"]}
                         if mode == "outside":
                             arguments = {"paths": ["../outside.png"]}

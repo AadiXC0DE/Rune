@@ -414,6 +414,15 @@ pub trait Tool: Send + Sync {
         None
     }
 
+    /// Returns false when this run cannot execute the tool.
+    ///
+    /// Such a tool stays registered but is left out of the advertisement, so its
+    /// schema costs nothing per request. A call to it is answered like a call to
+    /// any tool that was never offered.
+    fn is_advertised(&self) -> bool {
+        true
+    }
+
     /// Returns true when the tool cannot change anything.
     fn is_read_only(&self) -> bool {
         self.activity().is_read_only()

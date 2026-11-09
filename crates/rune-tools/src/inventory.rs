@@ -307,10 +307,15 @@ mod tests {
         )
         .expect("built");
         let machine = builtin_default().expect("built");
-        assert_eq!(
-            advertisement_digest(&registry),
-            advertisement_digest(&machine)
-        );
+        let advertises = |registry: &Registry| {
+            advertisement(registry)
+                .iter()
+                .any(|spec| spec.name == "ask_user_question")
+        };
+        // A run that can collect an answer offers the tool; one that cannot
+        // leaves it out, and still explains itself if the model calls it.
+        assert!(advertises(&registry));
+        assert!(!advertises(&machine));
         let arguments = serde_json::json!({"questions": [{
             "question": "Which choice?",
             "options": [{"label": "Alpha"}, {"label": "Beta"}]
@@ -344,7 +349,39 @@ mod tests {
         let registry = builtin_default().expect("built");
         let specs = advertisement(&registry);
         let names: Vec<&str> = specs.iter().map(|spec| spec.name.as_str()).collect();
-        assert_eq!(names, ADVERTISEMENT_ORDER);
+        let expected: Vec<&str> = ADVERTISEMENT_ORDER
+            .iter()
+            .copied()
+            .filter(|name| registry.get(name).is_some_and(Tool::is_advertised))
+            .collect();
+        assert_eq!(names, expected);
+    }
+
+    #[test]
+    fn a_run_without_a_backend_leaves_exactly_those_tools_unadvertised() {
+        // These are the tools a default run cannot execute: no question
+        // channel, no web transport, no image analysis, and no skills.
+        let registry = builtin_default().expect("built");
+        let advertised: Vec<String> = advertisement(&registry)
+            .into_iter()
+            .map(|spec| spec.name)
+            .collect();
+        let hidden: Vec<&str> = ADVERTISEMENT_ORDER
+            .iter()
+            .copied()
+            .filter(|name| !advertised.iter().any(|spec| spec == name))
+            .collect();
+        assert_eq!(
+            hidden,
+            [
+                "ask_user_question",
+                "web_fetch",
+                "web_search",
+                "vision",
+                "skill",
+                "capability_search"
+            ]
+        );
     }
 
     #[test]
@@ -540,14 +577,18 @@ mod tests {
     }
 
     #[test]
-    fn unconfigured_vision_is_explicitly_unavailable_in_the_advertisement() {
+    fn unconfigured_vision_is_unadvertised_and_explains_a_call() {
         let registry = builtin_default().expect("built");
-        let spec = advertisement(&registry)
-            .into_iter()
-            .find(|spec| spec.name == "vision")
-            .expect("vision schema");
-        assert!(spec.description.starts_with("Unavailable:"));
-        assert!(spec.description.contains("no image analysis backend"));
+        assert!(
+            advertisement(&registry)
+                .iter()
+                .all(|spec| spec.name != "vision")
+        );
+        let context = crate::contract::ExecutionContext::new(camino::Utf8PathBuf::from("/tmp"));
+        let output = registry
+            .call("vision", &serde_json::json!({"paths": ["a.png"]}), &context)
+            .expect("answered");
+        assert!(output.is_error, "{}", output.text);
     }
 
     #[test]

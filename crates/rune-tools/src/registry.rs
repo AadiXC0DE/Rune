@@ -84,6 +84,7 @@ impl Registry {
         names
             .iter()
             .filter_map(|name| self.get(name))
+            .filter(|tool| tool.is_advertised())
             .map(model_spec)
             .collect()
     }
@@ -93,6 +94,7 @@ impl Registry {
     pub fn all_schemas(&self) -> Vec<ToolSpec> {
         self.tools
             .values()
+            .filter(|tool| tool.is_advertised())
             .map(|tool| model_spec(tool.as_ref()))
             .collect()
     }

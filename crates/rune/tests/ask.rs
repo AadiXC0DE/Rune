@@ -784,6 +784,9 @@ fn review_refuses_mutations_by_a_named_rule_and_still_reads_in_every_permission_
             (&["--permission-mode", mode, "review"], &[]),
             |dir, command| {
                 command.with_external_programs();
+                // Web tools are offered only when enabled, and the review must
+                // refuse a network tool it was offered.
+                command.env("RUNE_WEB_TOOLS", "true");
                 let git = Command::new("git")
                     .args(["init", "-q"])
                     .current_dir(dir.path())

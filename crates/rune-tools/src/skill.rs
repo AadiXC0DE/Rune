@@ -21,6 +21,11 @@ use crate::contract::{Activity, ExecutionContext, Tool, ToolOutput, validate_clo
 pub trait Catalog: Send + Sync {
     /// Returns every skill the catalog holds.
     fn skills(&self) -> Vec<Skill>;
+
+    /// Returns true when the catalog holds no skill.
+    fn is_empty(&self) -> bool {
+        self.skills().is_empty()
+    }
 }
 
 /// A catalog that always reports nothing.
@@ -33,6 +38,10 @@ pub struct Empty;
 impl Catalog for Empty {
     fn skills(&self) -> Vec<Skill> {
         Vec::new()
+    }
+
+    fn is_empty(&self) -> bool {
+        true
     }
 }
 
@@ -53,6 +62,10 @@ impl Fixed {
 impl Catalog for Fixed {
     fn skills(&self) -> Vec<Skill> {
         self.skills.clone()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.skills.is_empty()
     }
 }
 
@@ -88,6 +101,10 @@ impl LoadSkill {
 impl Tool for LoadSkill {
     fn name(&self) -> &'static str {
         "skill"
+    }
+
+    fn is_advertised(&self) -> bool {
+        !self.catalog.is_empty()
     }
 
     fn description(&self) -> &'static str {
@@ -170,6 +187,10 @@ impl CapabilitySearch {
 impl Tool for CapabilitySearch {
     fn name(&self) -> &'static str {
         "capability_search"
+    }
+
+    fn is_advertised(&self) -> bool {
+        !self.catalog.is_empty()
     }
 
     fn description(&self) -> &'static str {
