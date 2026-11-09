@@ -251,8 +251,11 @@ struct SessionHost {
     /// The instructions with the repository map, fixed until compaction.
     mapped: prompt::MappedInstructions,
     tools: Vec<ToolSpec>,
-    rules: RuleSet,
-    mode: PermissionMode,
+    rules: Mutex<RuleSet>,
+    mode: Mutex<PermissionMode>,
+    /// The settings the rules were built from, so `/permissions` can rebuild
+    /// them for another mode.
+    permission_settings: Settings,
     /// Behind a lock because `/effort` changes it between turns.
     effort: Mutex<Effort>,
     fast_mode: bool,
@@ -817,7 +820,7 @@ impl Host for SessionHost {
         // Only a rule explicitly naming this authority at a user-controlled
         // layer can grant it. Broad web grants and project rules cannot.
         let mut rules = RuleSet::new();
-        for rule in self.rules.rules() {
+        for rule in lock_rules(&self.rules).rules() {
             if rule.tool == "web_fetch_private"
                 && (rule.outcome != Outcome::Allow
                     || rule.layer >= rune_policy::decision::Layer::User)
@@ -854,9 +857,10 @@ impl Host for SessionHost {
             );
             return (decision.outcome, decision.explain());
         }
+        let mode = self.mode();
         let (outcome, reason) = turn::decide_call_in_workspace(
-            &self.rules,
-            self.mode,
+            &lock_rules(&self.rules),
+            mode,
             name,
             target,
             self.context.workspace(),
@@ -869,7 +873,7 @@ impl Host for SessionHost {
         // than a person's attention. The review never opens a prompt and never
         // ends the turn: a caution or an unreachable reviewer holds the action
         // and hands the agent guidance.
-        if self.mode == PermissionMode::Auto
+        if mode == PermissionMode::Auto
             && let Some(reviewer) = &self.reviewer
         {
             let action = target.unwrap_or(name).to_owned();
@@ -1066,6 +1070,14 @@ impl SessionHost {
     }
 
     /// Returns the model the session is sending to.
+    /// Returns the permission mode in force.
+    fn mode(&self) -> PermissionMode {
+        *self
+            .mode
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     fn model_name(&self) -> String {
         lock_model(&self.model).clone()
     }
@@ -1102,7 +1114,7 @@ impl SessionHost {
             model: self.model_name(),
             provider,
             endpoint,
-            mode: self.mode,
+            mode: self.mode(),
             effort: Host::effort(self),
             session_id: self.session_id_name(),
             workspace: &self.workspace,
@@ -1365,7 +1377,7 @@ impl SessionHost {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
             model: lock_model(&self.model).clone(),
-            permission_mode: self.mode,
+            permission_mode: self.mode(),
             planning: self.planning.load(std::sync::atomic::Ordering::Relaxed),
             workspace: self.workspace.clone(),
             context_used: self.context_used.load(std::sync::atomic::Ordering::Relaxed),
@@ -2112,8 +2124,9 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
         instructions: prompt.instructions,
         mapped: prompt::MappedInstructions::default(),
         tools,
-        rules: config.rules,
-        mode: config.settings.permission_mode,
+        rules: Mutex::new(config.rules),
+        mode: Mutex::new(config.settings.permission_mode),
+        permission_settings: config.settings.clone(),
         effort: Mutex::new(config.settings.effort),
         fast_mode: config.settings.fast_mode,
         limits: limits.clone(),
@@ -2464,6 +2477,9 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                         note(format!("model set to {}", host.model_name()));
                     }
                     Handled::Effort(requested) => note(set_effort(&host, requested.as_deref())),
+                    Handled::Permissions(requested) => {
+                        note(set_permissions(&host, requested.as_deref()));
+                    }
                     Handled::Budget(requested) => note(set_budget(&host, requested.as_deref())),
                     Handled::Plan(argument) => {
                         let leave = argument.as_deref() == Some("off");
@@ -5090,6 +5106,56 @@ fn set_budget(host: &SessionHost, requested: Option<&str>) -> String {
 ///
 /// Only a level the provider's dialect can express is accepted, so the
 /// setting never claims an effort the request cannot carry.
+/// Locks the session's rules, which a poisoned lock does not invalidate.
+fn lock_rules(rules: &Mutex<RuleSet>) -> std::sync::MutexGuard<'_, RuleSet> {
+    rules
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Shows the permission mode, or switches it for the calls that follow.
+///
+/// The rules are rebuilt from the session's settings for the new mode, so
+/// the switch is the same as having started in it. Moving to a mode that
+/// allows less also forgets what was approved for the session.
+fn set_permissions(host: &SessionHost, requested: Option<&str>) -> String {
+    let current = host.mode();
+    let Some(requested) = requested else {
+        return format!(
+            "permissions are {}; choose ask, auto, or full-access",
+            current.label()
+        );
+    };
+    let Some(mode) = PermissionMode::from_name(requested) else {
+        return format!("`{requested}` is not a permission mode; choose ask, auto, or full-access");
+    };
+    let mut settings = host.permission_settings.clone();
+    settings.permission_mode = mode;
+    let rules = match crate::permissions::validated(&settings) {
+        Ok(rules) => rules,
+        Err(err) => return format!("permissions unchanged: {err}"),
+    };
+    let rank = |mode: PermissionMode| match mode {
+        PermissionMode::Ask => 0,
+        PermissionMode::Auto => 1,
+        PermissionMode::FullAccess => 2,
+    };
+    *lock_rules(&host.rules) = rules;
+    *host
+        .mode
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = mode;
+    if rank(mode) < rank(current)
+        && let Ok(mut grants) = host.grants.lock()
+    {
+        grants.clear();
+    }
+    format!(
+        "permissions set to {} for the calls that follow",
+        mode.label()
+    )
+}
+
 fn set_effort(host: &SessionHost, requested: Option<&str>) -> String {
     let supported = host.dialect.capabilities().efforts;
     let names = supported
@@ -5325,6 +5391,8 @@ enum Handled {
     SetModel(String),
     /// Show the reasoning effort, or set it for the requests that follow.
     Effort(Option<String>),
+    /// Show the permission mode, or switch it for the calls that follow.
+    Permissions(Option<String>),
     /// Enter plan mode, optionally with a task for the composer, or leave it.
     Plan(Option<String>),
     /// Show the spend limit, or set it in dollars, or turn it off.
@@ -5614,6 +5682,9 @@ fn handle_command<W: std::io::Write>(
             (!arguments.trim().is_empty()).then(|| arguments.trim().to_owned()),
         )),
         "plan" => Ok(Handled::Plan(
+            (!arguments.trim().is_empty()).then(|| arguments.trim().to_owned()),
+        )),
+        "permissions" => Ok(Handled::Permissions(
             (!arguments.trim().is_empty()).then(|| arguments.trim().to_owned()),
         )),
         "effort" => Ok(Handled::Effort(
@@ -7579,7 +7650,7 @@ mod tests {
     /// Builds a host in automatic mode with the given reviewer.
     fn host_with_reviewer(outcome: ReviewOutcome) -> SessionHost {
         let mut host = test_host();
-        host.mode = PermissionMode::Auto;
+        *host.mode.get_mut().expect("mode") = PermissionMode::Auto;
         host.reviewer = Some(Box::new(Scripted(outcome)));
         host
     }
@@ -7635,7 +7706,7 @@ mod tests {
         let mut host = host_with_reviewer(ReviewOutcome::Caution {
             reason: "should not be consulted".to_owned(),
         });
-        host.mode = PermissionMode::FullAccess;
+        *host.mode.get_mut().expect("mode") = PermissionMode::FullAccess;
         let (outcome, _) = host.decide("shell", Some("rm -rf /tmp/x"));
         assert_eq!(outcome, Outcome::Allow);
     }
@@ -7645,7 +7716,7 @@ mod tests {
         // Nothing judged it: no rule allowed it and no reviewer saw it. Whether
         // a person is watching is not a decision, so it stays unresolved.
         let mut host = test_host();
-        host.mode = PermissionMode::Auto;
+        *host.mode.get_mut().expect("mode") = PermissionMode::Auto;
         let (outcome, reason) = host.decide("shell", Some("rm -rf /tmp/x"));
         assert_eq!(outcome, Outcome::Ask, "{reason}");
     }
@@ -7660,17 +7731,23 @@ mod tests {
             let mut host = host_with_reviewer(ReviewOutcome::Clear {
                 reviewed_action: "domain:localhost".to_owned(),
             });
-            host.mode = mode;
-            host.rules.push(rune_policy::rules::Rule::allow(
-                "web_fetch",
-                "*",
-                rune_policy::decision::Layer::User,
-            ));
-            host.rules.push(rune_policy::rules::Rule::allow(
-                "*",
-                "*",
-                rune_policy::decision::Layer::User,
-            ));
+            *host.mode.get_mut().expect("mode") = mode;
+            host.rules
+                .get_mut()
+                .expect("rules")
+                .push(rune_policy::rules::Rule::allow(
+                    "web_fetch",
+                    "*",
+                    rune_policy::decision::Layer::User,
+                ));
+            host.rules
+                .get_mut()
+                .expect("rules")
+                .push(rune_policy::rules::Rule::allow(
+                    "*",
+                    "*",
+                    rune_policy::decision::Layer::User,
+                ));
             assert_eq!(
                 host.decide("web_fetch", Some("domain:localhost")).0,
                 Outcome::Allow
@@ -7721,9 +7798,12 @@ mod tests {
             Layer::Grant,
         ] {
             let mut host = test_host();
-            host.mode = PermissionMode::FullAccess;
-            host.rules
-                .push(Rule::allow("web_fetch_private", "domain:localhost", layer));
+            *host.mode.get_mut().expect("mode") = PermissionMode::FullAccess;
+            host.rules.get_mut().expect("rules").push(Rule::allow(
+                "web_fetch_private",
+                "domain:localhost",
+                layer,
+            ));
             let outcome = host.decide_private_network(Some("domain:localhost")).0;
             assert_eq!(
                 outcome,
@@ -7739,9 +7819,12 @@ mod tests {
             );
         }
         let mut host = test_host();
-        host.mode = PermissionMode::FullAccess;
-        host.rules
-            .push(Rule::deny("web_fetch_private", "*", Layer::User));
+        *host.mode.get_mut().expect("mode") = PermissionMode::FullAccess;
+        host.rules.get_mut().expect("rules").push(Rule::deny(
+            "web_fetch_private",
+            "*",
+            Layer::User,
+        ));
         let (requests, pending) = mpsc::channel();
         *host.approval_requests.lock().expect("lock") = Some(requests);
         assert_eq!(
@@ -7757,11 +7840,14 @@ mod tests {
     #[test]
     fn a_terminal_answer_resolves_only_the_displayed_call() {
         let mut host = test_host();
-        host.rules.push(rune_policy::rules::Rule::ask(
-            "edit_file",
-            "*",
-            rune_policy::decision::Layer::Session,
-        ));
+        host.rules
+            .get_mut()
+            .expect("rules")
+            .push(rune_policy::rules::Rule::ask(
+                "edit_file",
+                "*",
+                rune_policy::decision::Layer::Session,
+            ));
         let (requests, pending) = mpsc::channel();
         *host.approval_requests.lock().expect("lock") = Some(requests);
         std::thread::scope(|scope| {
@@ -7797,11 +7883,14 @@ mod tests {
     #[test]
     fn cancellation_wakes_a_worker_waiting_for_approval() {
         let mut host = test_host();
-        host.rules.push(rune_policy::rules::Rule::ask(
-            "edit_file",
-            "*",
-            rune_policy::decision::Layer::Session,
-        ));
+        host.rules
+            .get_mut()
+            .expect("rules")
+            .push(rune_policy::rules::Rule::ask(
+                "edit_file",
+                "*",
+                rune_policy::decision::Layer::Session,
+            ));
         let (requests, pending) = mpsc::channel();
         *host.approval_requests.lock().expect("lock") = Some(requests);
         std::thread::scope(|scope| {
@@ -7819,11 +7908,14 @@ mod tests {
     #[test]
     fn closed_approval_input_never_allows_a_call() {
         let mut host = test_host();
-        host.rules.push(rune_policy::rules::Rule::ask(
-            "edit_file",
-            "*",
-            rune_policy::decision::Layer::Session,
-        ));
+        host.rules
+            .get_mut()
+            .expect("rules")
+            .push(rune_policy::rules::Rule::ask(
+                "edit_file",
+                "*",
+                rune_policy::decision::Layer::Session,
+            ));
         let (requests, pending) = mpsc::channel();
         *host.approval_requests.lock().expect("lock") = Some(requests);
         std::thread::scope(|scope| {
@@ -7846,16 +7938,22 @@ mod tests {
     #[test]
     fn terminal_approval_does_not_override_a_rule_or_approve_without_input() {
         let mut host = test_host();
-        host.rules.push(rune_policy::rules::Rule::ask(
-            "edit_file",
-            "*",
-            rune_policy::decision::Layer::Session,
-        ));
-        host.rules.push(rune_policy::rules::Rule::deny(
-            "read_file",
-            ".env",
-            rune_policy::decision::Layer::User,
-        ));
+        host.rules
+            .get_mut()
+            .expect("rules")
+            .push(rune_policy::rules::Rule::ask(
+                "edit_file",
+                "*",
+                rune_policy::decision::Layer::Session,
+            ));
+        host.rules
+            .get_mut()
+            .expect("rules")
+            .push(rune_policy::rules::Rule::deny(
+                "read_file",
+                ".env",
+                rune_policy::decision::Layer::User,
+            ));
         assert_eq!(
             host.decide("shell", Some("printf AUDIT_SHELL_OK")).0,
             Outcome::Ask
@@ -10744,7 +10842,7 @@ mod tests {
     #[test]
     fn plan_mode_refuses_changes_whatever_the_permission_mode() {
         let mut host = test_host();
-        host.mode = PermissionMode::FullAccess;
+        *host.mode.get_mut().expect("mode") = PermissionMode::FullAccess;
         host.registry
             .insert(Box::new(rune_tools::WriteFile))
             .expect("write tool");
@@ -10768,6 +10866,43 @@ mod tests {
             Host::decide(&host, "write_file", Some("a.txt")).0,
             Outcome::Allow
         );
+    }
+
+    #[test]
+    fn permissions_switch_the_mode_and_rules_and_forget_grants_when_narrowed() {
+        let host = test_host();
+        assert!(set_permissions(&host, None).starts_with("permissions are auto"));
+        // Auto allows a routine test command; ask leaves it to the mode default.
+        let (before, _) = host.decide("shell", Some("cargo test"));
+        assert_eq!(before, Outcome::Allow);
+        ApprovalOutcome::RememberForSession.apply(
+            &mut host.grants.lock().expect("grants"),
+            &rune_policy::approval::Scope::new("shell", "npm run e2e"),
+        );
+        assert_eq!(
+            set_permissions(&host, Some("ask")),
+            "permissions set to ask for the calls that follow"
+        );
+        assert_eq!(host.mode(), PermissionMode::Ask);
+        let (after, _) = turn::decide_call_in_workspace(
+            &lock_rules(&host.rules),
+            host.mode(),
+            "shell",
+            Some("cargo test"),
+            host.context.workspace(),
+        );
+        assert_ne!(after, Outcome::Allow);
+        assert!(
+            !host
+                .grants
+                .lock()
+                .expect("grants")
+                .allows("shell", "npm run e2e")
+        );
+        assert!(set_permissions(&host, Some("sideways")).contains("not a permission mode"));
+        assert_eq!(host.mode(), PermissionMode::Ask);
+        set_permissions(&host, Some("yolo"));
+        assert_eq!(host.mode(), PermissionMode::FullAccess);
     }
 
     #[test]
@@ -10796,11 +10931,14 @@ mod tests {
     #[test]
     fn an_edit_awaiting_approval_shows_the_lines_it_would_change() {
         let mut host = test_host();
-        host.rules.push(rune_policy::rules::Rule::ask(
-            "edit_file",
-            "*",
-            rune_policy::decision::Layer::Session,
-        ));
+        host.rules
+            .get_mut()
+            .expect("rules")
+            .push(rune_policy::rules::Rule::ask(
+                "edit_file",
+                "*",
+                rune_policy::decision::Layer::Session,
+            ));
         let (sender, requests) = mpsc::channel::<ApprovalRequest>();
         *host.approval_requests.lock().expect("slot") = Some(sender);
         let answerer = std::thread::spawn(move || {
@@ -11203,8 +11341,9 @@ mod tests {
             instructions: String::new(),
             mapped: prompt::MappedInstructions::default(),
             tools: Vec::new(),
-            rules: crate::permissions::validated(&Settings::default()).expect("rules"),
-            mode: PermissionMode::Auto,
+            rules: Mutex::new(crate::permissions::validated(&Settings::default()).expect("rules")),
+            mode: Mutex::new(PermissionMode::Auto),
+            permission_settings: Settings::default(),
             effort: Mutex::new(Effort::Auto),
             fast_mode: false,
             limits: BudgetSet::new(),

@@ -87,7 +87,7 @@ These are compared against `main` before a push rather than counted as regressio
 
 ## Resume here (2026-11-09)
 
-State: `main` is 8 commits ahead of `origin/main` (last push `56828d7`, CI run 42647916013).
+State: `main` is 10 commits ahead of `origin/main` (last push `56828d7`, CI run 42647916013).
 
 Before the next push: `cargo xtask web` (the demo module record is stale once
 `rune-term`, `rune-tools`, `rune-agent`, `rune-net`, `rune-core` or `rune-context`
@@ -95,15 +95,14 @@ change), `cargo fmt --all -- --check`,
 `cargo clippy --workspace --all-targets -D warnings`, `cargo xtask budget`, and
 `cargo test --workspace --no-fail-fast`, compared against the known local failures.
 
-Next task: 8.3b, `/permissions [ask|auto|full-access]` to show or switch the
-session's permission mode (the field is `SessionHost::mode`; make it settable
-like `/effort` does, and clear remembered grants when the mode narrows). Then
-8.4b `/fork` on top of `rune session fork`.
+Next task: 8.4b, `/fork` in the interactive session on top of `rune session
+fork`: save the current branch as a new session and continue in it, printing the
+new id. Then 4.4 across turns, and 10.1 (move `rune-sdk` onto the shared loop).
 
 Waiting on the owner: a DeepSeek key and approval to spend about $0.02 for the
 head-to-head runs (9.5) and the `reasoning_content` check (3.5).
 
-Remaining open items: 3.5, 4.4 (across turns), 8.3b, 8.4b, 9.5, 10.1 to 10.4.
+Remaining open items: 3.5, 4.4 (across turns), 8.4b, 9.5, 10.1 to 10.4.
 
 ## Phases
 
@@ -212,7 +211,7 @@ Done when the binary stays inside its ceiling and a snapshot test pins each elem
 - [x] 8.2 Routine test and build commands for common ecosystems are allowed in auto mode
       inside the sandbox, so headless runs can verify.
 - [x] 8.3 `/plan` read-only mode enforced at the session layer.
-- [ ] 8.3b `/permissions` to switch mode during a session.
+- [x] 8.3b `/permissions` to switch mode during a session.
 - [x] 8.4 `/effort` slash command.
 - [ ] 8.4b `/fork` slash command (the CLI has `rune session fork`).
 
@@ -290,3 +289,4 @@ Done when a reproducible table exists with Rune in it.
 | 2026-11-09 | 6ae4bc4 | 8.1b | `Host::decide_with_arguments` (defaults to `decide`; subagents forward it). The session stores a plain `rune_term::diff` view of an `edit_file` call, at most 12 lines, and the prompt draws it under the scope. Plain text, because the picker measures its lines without escapes. |
 | 2026-11-09 | eb039ce | CI | Run 42647916013: `terminal_help` failed on Linux because the 6.2b spinner redrew every 100 ms and a held turn never left the harness's 150 ms quiet window. Redraw at most every 250 ms (checked with the harness: fails at 100, passes the held-turn stage at 250). macOS `mcp_http` timed out waiting for exit after `/quit`, the same as the known local failure; watch it on the next run. |
 | 2026-11-09 | 011e834 | 5.1 | `TurnOutcome.narration` (`Narration::Text` / `Call(id)`), a new entry per step; `ask --json` adds `narration` (`{text}` or `{tool, status}` with `not_run`). Saved sessions already kept the order in the assistant parts. |
+| 2026-11-09 | pending | 8.3b | `/permissions [ask|auto|full-access]`; `SessionHost.mode` and `rules` behind locks, rebuilt with `permissions::validated` from a kept copy of the settings; narrowing clears grants. README updated. |

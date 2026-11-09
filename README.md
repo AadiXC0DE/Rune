@@ -625,7 +625,11 @@ approval says. Each prompt sent in plan mode tells the model it is planning.
 `/plan <task>` enters plan mode and places the task in the composer to send;
 `/plan off` leaves it so the plan can be carried out. `/effort` shows the
 reasoning effort in force and the levels the provider accepts, and
-`/effort <level>` sets it for the requests that follow.
+`/effort <level>` sets it for the requests that follow. `/permissions` shows
+the permission mode, and `/permissions ask|auto|full-access` switches it for the
+calls that follow, rebuilding the rules as if the session had started in that
+mode; a switch to a mode that allows less forgets the session's remembered
+approvals.
 
 When the model's prices are known, each turn's summary line, `/cost`, the status
 row and the usage ledger carry its estimated cost. `/budget <dollars>` sets a
