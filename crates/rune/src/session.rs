@@ -369,6 +369,8 @@ struct SessionHost {
     approval_requests: Mutex<Option<mpsc::Sender<ApprovalRequest>>>,
     /// Exact actions approved for the rest of this session.
     grants: Mutex<Grants>,
+    /// Whether the session is planning: only reads and plan updates may run.
+    planning: std::sync::atomic::AtomicBool,
     questions: Arc<TerminalQuestions>,
 }
 
@@ -823,6 +825,22 @@ impl Host for SessionHost {
     }
 
     fn decide(&self, name: &str, target: Option<&str>) -> (Outcome, String) {
+        // Plan mode is enforced here, before any rule or mode, so no rule, mode
+        // or approval can let a change through while the session is planning.
+        if self.planning.load(std::sync::atomic::Ordering::Relaxed)
+            && name != "update_plan"
+            && !self
+                .registry
+                .get(name)
+                .is_some_and(rune_tools::Tool::is_read_only)
+        {
+            let decision = rune_policy::decision::Decision::matched(
+                Outcome::Deny,
+                rune_policy::decision::Layer::Session,
+                "plan mode",
+            );
+            return (decision.outcome, decision.explain());
+        }
         let (outcome, reason) = turn::decide_call_in_workspace(
             &self.rules,
             self.mode,
@@ -1297,6 +1315,7 @@ impl SessionHost {
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
             model: lock_model(&self.model).clone(),
             permission_mode: self.mode,
+            planning: self.planning.load(std::sync::atomic::Ordering::Relaxed),
             workspace: self.workspace.clone(),
             context_used: self.context_used.load(std::sync::atomic::Ordering::Relaxed),
             context_source: *self
@@ -2049,6 +2068,7 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
         review_session: Arc::new(Mutex::new(ReviewSession::new(&limits))),
         approval_requests: Mutex::new(None),
         grants: Mutex::new(Grants::new()),
+        planning: std::sync::atomic::AtomicBool::new(false),
         questions: config.questions,
     };
     if context_source.is_none() {
@@ -2336,6 +2356,22 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                         note(format!("model set to {}", host.model_name()));
                     }
                     Handled::Effort(requested) => note(set_effort(&host, requested.as_deref())),
+                    Handled::Plan(argument) => {
+                        let leave = argument.as_deref() == Some("off");
+                        host.planning
+                            .store(!leave, std::sync::atomic::Ordering::Relaxed);
+                        if leave {
+                            note("plan mode is off; changes and commands may run again".to_owned());
+                        } else {
+                            note(
+                                "plan mode is on: only reads and plan updates run; /plan off to act on the plan"
+                                    .to_owned(),
+                            );
+                            if let Some(task) = argument {
+                                reader.replace(&task);
+                            }
+                        }
+                    }
                     Handled::ClearHistory => {
                         // Forgetting is reported, because a silent success would
                         // leave the user unsure whether anything was removed.
@@ -2407,7 +2443,11 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .user_message(&text)?;
-                history.push_user(text.clone());
+                if host.planning.load(std::sync::atomic::Ordering::Relaxed) {
+                    history.push_user(format!("{PLAN_MODE_NOTE}\n\n{text}"));
+                } else {
+                    history.push_user(text.clone());
+                }
                 host.transcript
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -5097,6 +5137,14 @@ fn record_usage(paths: &Paths, model: &str, outcome: &turn::TurnOutcome, cost: O
     }
 }
 
+/// Sent with a prompt while the session is planning.
+///
+/// Carried in the user turn rather than the instructions, so entering and
+/// leaving plan mode never changes the cached prefix of the request.
+const PLAN_MODE_NOTE: &str = "<plan_mode>The session is in plan mode: changes and \
+commands are refused. Investigate with reads, then record a step-by-step plan with \
+update_plan and explain it. The user will leave plan mode to carry it out.</plan_mode>";
+
 /// A call that is running, as the live region shows it.
 #[derive(Clone, Debug)]
 struct Running {
@@ -5120,6 +5168,8 @@ enum Handled {
     SetModel(String),
     /// Show the reasoning effort, or set it for the requests that follow.
     Effort(Option<String>),
+    /// Enter plan mode, optionally with a task for the composer, or leave it.
+    Plan(Option<String>),
     /// Ask the user to choose a model from a list.
     PickModel,
     /// Put back the files the session changed.
@@ -5401,6 +5451,9 @@ fn handle_command<W: std::io::Write>(
             }
             Ok(Handled::SetModel(requested.to_owned()))
         }
+        "plan" => Ok(Handled::Plan(
+            (!arguments.trim().is_empty()).then(|| arguments.trim().to_owned()),
+        )),
         "effort" => Ok(Handled::Effort(
             (!arguments.trim().is_empty()).then(|| arguments.trim().to_ascii_lowercase()),
         )),
@@ -10429,6 +10482,35 @@ mod tests {
     }
 
     #[test]
+    fn plan_mode_refuses_changes_whatever_the_permission_mode() {
+        let mut host = test_host();
+        host.mode = PermissionMode::FullAccess;
+        host.registry
+            .insert(Box::new(rune_tools::WriteFile))
+            .expect("write tool");
+        host.registry
+            .insert(Box::new(rune_tools::UpdatePlan))
+            .expect("plan tool");
+        host.planning
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let (write, reason) = Host::decide(&host, "write_file", Some("a.txt"));
+        assert_eq!(write, Outcome::Deny);
+        assert!(reason.contains("plan mode"), "{reason}");
+        assert_eq!(Host::decide(&host, "shell", Some("ls")).0, Outcome::Deny);
+        assert_eq!(
+            Host::decide(&host, "read_file", Some("a.txt")).0,
+            Outcome::Allow
+        );
+        assert_eq!(Host::decide(&host, "update_plan", None).0, Outcome::Allow);
+        host.planning
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            Host::decide(&host, "write_file", Some("a.txt")).0,
+            Outcome::Allow
+        );
+    }
+
+    #[test]
     fn effort_is_shown_and_set_only_to_a_level_the_dialect_accepts() {
         let host = test_host();
         assert!(set_effort(&host, None).starts_with("effort is auto"));
@@ -10876,6 +10958,7 @@ mod tests {
             review_session: Arc::new(Mutex::new(ReviewSession::new(&BudgetSet::new()))),
             approval_requests: Mutex::new(None),
             grants: Mutex::new(Grants::new()),
+            planning: std::sync::atomic::AtomicBool::new(false),
             questions,
         }
     }

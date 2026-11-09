@@ -616,6 +616,15 @@ you explicitly replace the objective. A request already in flight can exceed the
 remaining budget; this is a continuation limit rather than a provider billing
 cap. Ordinary prompts and `/goal <objective>` have no token budget.
 
+`/plan` puts an interactive session in plan mode, shown as `plan` in the status
+row: only reads and plan updates run, and every write, edit, rename or command
+is refused at the session layer whatever the permission mode or a remembered
+approval says. Each prompt sent in plan mode tells the model it is planning.
+`/plan <task>` enters plan mode and places the task in the composer to send;
+`/plan off` leaves it so the plan can be carried out. `/effort` shows the
+reasoning effort in force and the levels the provider accepts, and
+`/effort <level>` sets it for the requests that follow.
+
 Interactive assistant text is journalled in bounded, durable frames before it is
 displayed.
 After process death, resume replays the partial answer once with an

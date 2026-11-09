@@ -190,7 +190,8 @@ Done when the binary stays inside its ceiling and a snapshot test pins each elem
       today).
 - [x] 8.2 Routine test and build commands for common ecosystems are allowed in auto mode
       inside the sandbox, so headless runs can verify.
-- [ ] 8.3 `/plan` read-only mode enforced by policy, and `/permissions` to switch mode.
+- [x] 8.3 `/plan` read-only mode enforced at the session layer.
+- [ ] 8.3b `/permissions` to switch mode during a session.
 - [x] 8.4 `/effort` slash command.
 - [ ] 8.4b `/fork` slash command (the CLI has `rune session fork`).
 
@@ -256,4 +257,5 @@ Done when a reproducible table exists with Rune in it.
 | 2026-11-09 | 5623980 | 8.4 | `/effort [level]`, limited to the dialect's accepted levels. |
 | 2026-11-09 | c417bb4 | 6.2b | Spinner and elapsed time on running calls, and a `thinking` row before the first token; ticks on idle input polls, at most ten redraws a second. |
 | 2026-11-09 | 39fcd68 | 6.5 | `FooterState.cost`, shown after the context field when prices are known. |
-| 2026-11-09 | (this) | 7.1b | Pipe tables in a finished answer are aligned by visible width; the stream shows them as written. |
+| 2026-11-09 | 1cfc279 | 7.1b | Pipe tables in a finished answer are aligned by visible width; the stream shows them as written. |
+| 2026-11-09 | (this) | 8.3 | `/plan [task|off]`; denial before rules and grants; note sent in the user turn so the cached prefix is unchanged; status row shows `plan`. |

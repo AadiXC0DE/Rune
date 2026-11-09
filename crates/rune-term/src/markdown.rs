@@ -272,7 +272,10 @@ pub fn align_tables(text: &str, ascii: bool) -> String {
         if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
             fence = !fence;
         }
-        let delimiter = lines.get(index.saturating_add(1)).copied().unwrap_or_default();
+        let delimiter = lines
+            .get(index.saturating_add(1))
+            .copied()
+            .unwrap_or_default();
         if !fence && is_row(line) && is_delimiter(delimiter) {
             let mut rows = vec![cells(line)];
             let mut next = index.saturating_add(2);
@@ -308,11 +311,7 @@ fn is_row(line: &str) -> bool {
 
 fn is_delimiter(line: &str) -> bool {
     let line = line.trim();
-    is_row(line)
-        && line.contains('-')
-        && line
-            .chars()
-            .all(|ch| matches!(ch, '|' | '-' | ':' | ' '))
+    is_row(line) && line.contains('-') && line.chars().all(|ch| matches!(ch, '|' | '-' | ':' | ' '))
 }
 
 /// Splits a row into trimmed cells, honouring escaped pipes.
@@ -460,12 +459,17 @@ mod tests {
 
     #[test]
     fn a_pipe_table_is_aligned_and_its_delimiter_becomes_a_rule() {
-        let text = "Results:\n| Task | Pass |\n|---|:-:|\n| pagination | yes |\n| csv | **no** |\nafter";
+        let text =
+            "Results:\n| Task | Pass |\n|---|:-:|\n| pagination | yes |\n| csv | **no** |\nafter";
         let aligned = align_tables(text, true);
         let lines: Vec<&str> = aligned.lines().collect();
         assert_eq!(lines[0], "Results:");
         assert_eq!(lines[1], "Task       | Pass");
-        assert!(lines[2].chars().all(|ch| ch == '-' || ch == '+'), "{}", lines[2]);
+        assert!(
+            lines[2].chars().all(|ch| ch == '-' || ch == '+'),
+            "{}",
+            lines[2]
+        );
         assert_eq!(lines[3], "pagination | yes");
         // Measured without its markers, so the styled cell lines up.
         assert_eq!(lines[4], "csv        | **no**");

@@ -33,6 +33,11 @@ pub const BUILTINS: &[Builtin] = &[
         summary: "same as /model",
     },
     Builtin {
+        name: "plan",
+        arguments: "[task|off]",
+        summary: "plan read-only before acting, or leave plan mode",
+    },
+    Builtin {
         name: "effort",
         arguments: "[level]",
         summary: "show the reasoning effort, or set it for the next requests",

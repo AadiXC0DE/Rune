@@ -45,6 +45,8 @@ pub struct FooterState {
     pub model: String,
     /// Effective permission mode.
     pub permission_mode: PermissionMode,
+    /// Whether the session is in plan mode, which overrides the mode shown.
+    pub planning: bool,
     /// Working directory, shown as given.
     pub workspace: String,
     /// Observed or estimated conversation tokens.
@@ -240,7 +242,11 @@ fn status_row(state: &FooterState, theme: &Theme, truecolor: bool) -> String {
         row.push_str(&divider(theme, truecolor));
     }
     row.push_str(&paint(theme, Slot::Dim, truecolor, 0));
-    row.push_str(state.permission_mode.label());
+    row.push_str(if state.planning {
+        "plan"
+    } else {
+        state.permission_mode.label()
+    });
     row.push_str(&reset(theme));
     row.push_str(&divider(theme, truecolor));
     row.push_str(&context_field(state, theme, truecolor));
@@ -395,6 +401,7 @@ mod tests {
             provider_retry: None,
             model: "claude-sonnet-4".to_owned(),
             permission_mode: PermissionMode::Auto,
+            planning: false,
             workspace: "/Users/dev/rune/".to_owned(),
             context_used: 24_500,
             context_source: None,
