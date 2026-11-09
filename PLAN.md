@@ -98,13 +98,15 @@ Done when the request floor is a printed, gated number.
 - [x] 2.1 Advertise a tool only when this host can run it: no web tools while web tools are
       off, no vision without a vision model, no question tool without a question channel, no
       skill tools with an empty catalog.
-- [ ] 2.1a List each skill once when the same name is discovered in more than one root.
+- [x] 2.1a List each skill once when the same name is discovered in more than one root.
 - [ ] 2.2 Rewrite tool descriptions and schemas for brevity without losing a constraint the
       model needs; record before and after bytes.
 - [ ] 2.3 Keep the instructions byte-stable for a whole session: build the repository map
       once at session start instead of on every request.
 - [ ] 2.4 State the environment once in the stable prefix: platform, shell, workspace root,
       and whether it is a git repository.
+- [ ] 2.5 Bound each skill catalog entry (first sentence, a fixed byte cap) so a home with
+      many installed skills does not pay kilobytes per request; the body still loads in full.
 
 Done when the request floor is at most half of the 1.2 baseline and a test pins prefix
 stability across steps.
@@ -213,4 +215,5 @@ Done when a reproducible table exists with Rune in it.
 | 2026-11-09 | c7edc18 | 1.2 | `rune prompt --tools`; budget gates schemas at 18 KiB (measured 17,379). |
 | 2026-11-09 | e15f68e | 1.3 | Pushes that change crates used by the demo still deploy, because `site/demo/rune.wasm` must be regenerated; regenerate it once per push, in the last commit. |
 | 2026-11-09 | a7a89fc | 1.4 | Budget job no longer limited to pull requests. |
-| 2026-11-09 | (this) | 2.1 | Interactive default: 20 tools, 17,379 bytes to 15 tools, 14,382 bytes. A call to a hidden tool is answered as never offered. |
+| 2026-11-09 | e775938 | 2.1 | Interactive default: 20 tools, 17,379 bytes to 15 tools, 14,382 bytes. A call to a hidden tool is answered as never offered. |
+| 2026-11-09 | (this) | 2.1a | A byte-identical skill in two user roots is listed once. This home: 10,323 to 9,354 bytes. |

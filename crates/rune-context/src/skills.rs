@@ -10,7 +10,9 @@
 //! directory, then from fixed user roots. A candidate that cannot be parsed is
 //! skipped with a warning rather than failing the scan, so one broken skill
 //! never hides its siblings. Names are not deduplicated: two roots may hold
-//! different skills that share a name, and both are offered.
+//! different skills that share a name, and both are offered. A copy of a skill
+//! already found in an earlier root, with the same name, description, and file
+//! bytes, is the same skill installed for two tools and is offered once.
 //!
 //! A skill file that is a symlink is followed only when its resolved target
 //! stays inside the root that declared it. A root is a directory the user
@@ -193,10 +195,27 @@ fn scan_root(root: &Utf8Path, out: &mut Discovery) {
             continue;
         }
         match load(&directory, root) {
+            Ok(skill) if out.skills.iter().any(|known| is_copy(known, &skill)) => {}
             Ok(skill) => out.skills.push(skill),
             Err(warning) => out.warnings.push(warning),
         }
     }
+}
+
+/// Returns true when `candidate` is a byte-identical copy of `known`.
+///
+/// Files are compared only on a name and description match, which is rare, so
+/// an ordinary scan reads nothing extra.
+fn is_copy(known: &Skill, candidate: &Skill) -> bool {
+    known.name == candidate.name
+        && known.description == candidate.description
+        && match (
+            std::fs::read(&known.location),
+            std::fs::read(&candidate.location),
+        ) {
+            (Ok(first), Ok(second)) => first == second,
+            _ => false,
+        }
 }
 
 /// Loads one skill directory, refusing an unsafe or unparsable candidate.
@@ -736,15 +755,39 @@ mod tests {
     }
 
     #[test]
+    fn an_identical_copy_in_a_later_root_is_offered_once() {
+        let (_dir, root) = tree();
+        let workspace = root.join("proj");
+        let home = root.join("home");
+        let text = "---\nname: shared\ndescription: same\n---\nbody\n";
+        skill(&home.join(".config/opencode/skills"), "shared", text);
+        skill(&home.join(".claude/skills"), "shared", text);
+
+        let discovery = scan_of(&workspace, &home, &root.join("config"));
+        assert_eq!(names(&discovery), vec!["shared"]);
+        assert!(
+            discovery.skills[0]
+                .location
+                .as_str()
+                .contains(".config/opencode/skills"),
+            "the copy in the earlier root is kept"
+        );
+    }
+
+    #[test]
     fn duplicate_names_are_preserved() {
         let (_dir, root) = tree();
         let workspace = root.join("proj");
         let home = root.join("home");
-        skill(&workspace.join("skills"), "one", "---\nname: shared\n---\n");
+        skill(
+            &workspace.join("skills"),
+            "one",
+            "---\nname: shared\n---\nfirst\n",
+        );
         skill(
             &workspace.join(".claude/skills"),
             "two",
-            "---\nname: shared\n---\n",
+            "---\nname: shared\n---\nsecond\n",
         );
 
         let discovery = scan_of(&workspace, &home, &root.join("config"));
@@ -762,13 +805,27 @@ mod tests {
         let workspace = root.join("proj");
         let home = root.join("home");
         let skills = workspace.join("skills");
-        write(&skills.join("shared/SKILL.md"), "---\nname: shared\n---\n");
+        // The target sits in a directory with no skill file of its own, so the
+        // link is the only way this skill is found.
+        write(
+            &skills.join("sources/shared.md"),
+            "---\nname: shared\n---\n",
+        );
         std::fs::create_dir_all(skills.join("link")).expect("create dir");
-        std::os::unix::fs::symlink(skills.join("shared/SKILL.md"), skills.join("link/SKILL.md"))
-            .expect("symlink");
+        std::os::unix::fs::symlink(
+            skills.join("sources/shared.md"),
+            skills.join("link/SKILL.md"),
+        )
+        .expect("symlink");
 
         let discovery = scan_of(&workspace, &home, &root.join("config"));
-        assert_eq!(names(&discovery), vec!["shared", "shared"]);
+        assert_eq!(names(&discovery), vec!["shared"]);
+        assert!(
+            discovery.skills[0]
+                .location
+                .as_str()
+                .ends_with("link/SKILL.md")
+        );
         assert!(discovery.warnings.is_empty());
     }
 
