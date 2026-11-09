@@ -108,7 +108,14 @@ impl Provider for Anthropic {
         }
 
         if !plan.instructions.is_empty() {
-            body.insert("system".to_owned(), serde_json::json!(plan.instructions));
+            body.insert(
+                "system".to_owned(),
+                serde_json::json!([{
+                    "type": "text",
+                    "text": plan.instructions,
+                    "cache_control": cache_control(),
+                }]),
+            );
         }
 
         if plan.has_tools() {
@@ -139,6 +146,7 @@ impl Provider for Anthropic {
             }
         }
 
+        mark_cache_breakpoints(&mut body);
         Ok(serde_json::Value::Object(body))
     }
 }
@@ -268,6 +276,55 @@ fn encode_tool_blocks(message: &Message) -> Vec<serde_json::Value> {
 ///
 /// The endpoint rejects two consecutive messages with the same role, which a
 /// tool turn produces naturally because tool results are user content.
+/// The marker that lets the endpoint cache the request up to the block holding it.
+fn cache_control() -> serde_json::Value {
+    serde_json::json!({ "type": "ephemeral" })
+}
+
+/// Marks the tool list and the newest message as cacheable prefixes.
+///
+/// This endpoint caches only up to an explicit marker, so without one every
+/// request paid full price for the tools, the instructions, and the whole
+/// conversation. The prefix is cached in the order tools, system, messages:
+/// the last tool covers the tools, the system block covers the instructions,
+/// and the newest message's last block covers the conversation so far, which
+/// the next request reads back before adding its own. That is three of the
+/// four markers a request may carry. A thinking block or an empty text block
+/// cannot hold one, so the newest block that can is used.
+fn mark_cache_breakpoints(body: &mut serde_json::Map<String, serde_json::Value>) {
+    if let Some(last) = body
+        .get_mut("tools")
+        .and_then(serde_json::Value::as_array_mut)
+        .and_then(|tools| tools.last_mut())
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        last.insert("cache_control".to_owned(), cache_control());
+    }
+    let block = body
+        .get_mut("messages")
+        .and_then(serde_json::Value::as_array_mut)
+        .and_then(|messages| messages.last_mut())
+        .and_then(|message| message.get_mut("content"))
+        .and_then(serde_json::Value::as_array_mut)
+        .and_then(|blocks| blocks.iter_mut().rev().find(|block| can_hold_marker(block)))
+        .and_then(serde_json::Value::as_object_mut);
+    if let Some(block) = block {
+        block.insert("cache_control".to_owned(), cache_control());
+    }
+}
+
+/// Returns true for a content block the endpoint accepts a cache marker on.
+fn can_hold_marker(block: &serde_json::Value) -> bool {
+    match block.get("type").and_then(serde_json::Value::as_str) {
+        Some("text") => block
+            .get("text")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|text| !text.is_empty()),
+        Some("image" | "tool_use" | "tool_result" | "document") => true,
+        _ => false,
+    }
+}
+
 fn merge_adjacent(messages: &mut Vec<serde_json::Value>, encoded: serde_json::Value) {
     let role = encoded.get("role").and_then(serde_json::Value::as_str);
     let blocks = encoded.get("content").cloned();
@@ -714,10 +771,71 @@ mod tests {
             .expect("build");
         assert_eq!(body["model"], "claude-test");
         assert_eq!(body["stream"], true);
-        assert_eq!(body["system"], "be helpful");
+        assert_eq!(body["system"][0]["text"], "be helpful");
         assert_eq!(body["messages"][0]["role"], "user");
         assert_eq!(body["messages"][0]["content"][0]["type"], "text");
         assert_eq!(body["max_tokens"], DEFAULT_MAX_TOKENS);
+    }
+
+    #[test]
+    fn the_tools_the_instructions_and_the_newest_turn_are_marked_cacheable() {
+        let mut plan = plan_with_user("first");
+        plan.messages
+            .push(Message::assistant(vec![ContentPart::Text {
+                text: "answer".to_owned(),
+            }]));
+        plan.messages.push(Message::user("second"));
+        plan.tools = vec![
+            ToolSpec {
+                name: "a".to_owned(),
+                description: "first tool".to_owned(),
+                input_schema: serde_json::json!({"type": "object"}),
+            },
+            ToolSpec {
+                name: "b".to_owned(),
+                description: "second tool".to_owned(),
+                input_schema: serde_json::json!({"type": "object"}),
+            },
+        ];
+        let body = Anthropic.build_request(&plan).expect("build");
+        let ephemeral = serde_json::json!({"type": "ephemeral"});
+
+        assert_eq!(body["tools"][1]["cache_control"], ephemeral);
+        assert!(body["tools"][0].get("cache_control").is_none());
+        assert_eq!(body["system"][0]["cache_control"], ephemeral);
+        // Only the newest message carries a marker; the endpoint reads the
+        // earlier prefix back from the previous request's marker.
+        assert_eq!(
+            body["messages"][2]["content"][0]["cache_control"],
+            ephemeral
+        );
+        for earlier in 0..2 {
+            assert!(
+                body["messages"][earlier]["content"][0]
+                    .get("cache_control")
+                    .is_none()
+            );
+        }
+        let markers = body.to_string().matches("cache_control").count();
+        assert!(markers <= 4, "the endpoint accepts at most four markers");
+    }
+
+    #[test]
+    fn a_marker_skips_blocks_that_cannot_hold_one() {
+        let mut body = serde_json::Map::new();
+        body.insert(
+            "messages".to_owned(),
+            serde_json::json!([{"role": "assistant", "content": [
+                {"type": "text", "text": "kept"},
+                {"type": "thinking", "thinking": "private", "signature": "s"},
+                {"type": "text", "text": ""},
+            ]}]),
+        );
+        mark_cache_breakpoints(&mut body);
+        let blocks = &body["messages"][0]["content"];
+        assert!(blocks[0].get("cache_control").is_some());
+        assert!(blocks[1].get("cache_control").is_none());
+        assert!(blocks[2].get("cache_control").is_none());
     }
 
     #[test]

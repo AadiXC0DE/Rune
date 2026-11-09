@@ -113,7 +113,7 @@ stability across steps.
 
 ### Phase 3: Prompt caching and accounting
 
-- [ ] 3.1 Anthropic: send `cache_control` on the tool list, the system text and the latest
+- [x] 3.1 Anthropic: send `cache_control` on the tool list, the system text and the latest
       user turn.
 - [ ] 3.2 Responses and Chat Completions: send a per-session `prompt_cache_key` where the
       dialect accepts it.
@@ -220,4 +220,5 @@ Done when a reproducible table exists with Rune in it.
 | 2026-11-09 | 428cd0b | 2.2 | 14,382 to 9,154 bytes (17,379 to 9,154 with 2.1, -47%). Ceiling lowered to 10 KiB. Demo wasm is stale until regenerated before the push. |
 | 2026-11-09 | 84d6fa4 | 2.3 | Map built at the first request and kept until compaction; session, `ask` and the web host share `MappedInstructions`. |
 | 2026-11-09 | e618740 | 2.4 | One environment line, 145 bytes; this repository's prompt 4,943 to 5,087 bytes. |
-| 2026-11-09 | (this) | 2.5 | `skill_description_bytes` default 1024 to 256. This home: catalog 8,290 to 5,892 bytes; JS-repo prompt 9,354 to 7,196. Phase 2 closes with tools at 52.7% of baseline (target was 50%); the remainder is `edit_file` and `shell`. |
+| 2026-11-09 | abea25b | 2.5 | `skill_description_bytes` default 1024 to 256. This home: catalog 8,290 to 5,892 bytes; JS-repo prompt 9,354 to 7,196. Phase 2 closes with tools at 52.7% of baseline (target was 50%); the remainder is `edit_file` and `shell`. |
+| 2026-11-09 | (this) | 3.1 | Three markers: last tool, system block, newest message. Cache reads against the live API not yet observed (needs a key). |

@@ -147,7 +147,7 @@ fn three_pinned_constraints_reach_every_request_after_repeated_compaction_and_re
                 .expect("result");
             let requests = fetch.requests.lock().expect("requests");
             let body = requests.last().expect("provider request");
-            assert_eq!(body["system"], "fixture host instructions");
+            assert_eq!(body["system"][0]["text"], "fixture host instructions");
             let user_blocks: Vec<&Value> = body["messages"]
                 .as_array()
                 .expect("messages")
@@ -267,7 +267,7 @@ fn compact_preserves_tool_pairs_signed_replay_and_checkpoint_continuation() {
         let requests = fetch.requests.lock().expect("requests");
         assert_eq!(requests.len(), 1);
         let body = &requests[0];
-        assert_eq!(body["system"], "fixture host instructions");
+        assert_eq!(body["system"][0]["text"], "fixture host instructions");
         let blocks: Vec<&Value> = body["messages"]
             .as_array()
             .expect("messages")
