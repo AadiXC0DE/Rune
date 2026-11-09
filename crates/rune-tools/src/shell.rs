@@ -17,7 +17,9 @@ use rune_core::budget::BudgetSet;
 use rune_core::error::{ErrorCode, Result, RuneError};
 
 use crate::contract::{Activity, ExecutionContext, Tool, ToolOutput, validate_closed_arguments};
-use crate::workspace::{FileLimits, bool_arg, resolve, string_arg, truncate_to_bytes, usize_arg};
+use crate::workspace::{
+    FileLimits, bool_arg, head_and_tail, resolve, string_arg, truncate_to_bytes, usize_arg,
+};
 use rune_exec::command::Exit;
 use rune_exec::session::{Input, POLL_INTERVAL, Process};
 
@@ -837,33 +839,6 @@ const MIN_NOTE_BODY_BYTES: usize = 256;
 /// Returns the marker that states how much of an output survived the cut.
 fn marker(kept: usize, total: usize, cap: usize) -> String {
     format!("\n[output truncated: {kept} of {total} bytes retained, the cap is {cap} bytes]\n")
-}
-
-/// Splits at most `budget` bytes of `text` into a start and an end.
-///
-/// A third goes to the start and the rest to the end. Each cut moves to a line
-/// break when one is near, so neither side shows a broken line.
-fn head_and_tail(text: &str, budget: usize) -> (&str, &str) {
-    if text.len() <= budget {
-        return (text, "");
-    }
-    let head_budget = budget / 3;
-    let mut start = truncate_to_bytes(text, head_budget);
-    if let Some(line) = start.rfind('\n').filter(|end| *end >= start.len() / 2) {
-        start = &text[..=line];
-    }
-    let tail_budget = budget.saturating_sub(start.len());
-    let mut from = text.len().saturating_sub(tail_budget);
-    while from < text.len() && !text.is_char_boundary(from) {
-        from = from.saturating_add(1);
-    }
-    if let Some(offset) = text[from..]
-        .find('\n')
-        .filter(|offset| *offset < tail_budget / 2)
-    {
-        from = from.saturating_add(offset).saturating_add(1);
-    }
-    (start, &text[from.max(start.len())..])
 }
 
 /// Returns the error for a session id the tool does not hold.

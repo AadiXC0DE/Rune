@@ -128,7 +128,7 @@ Done when a recorded Anthropic exchange shows cache reads on the second request.
 ### Phase 4: Tool output economy
 
 - [x] 4.1 Shell truncation keeps head and tail with an omitted-bytes marker.
-- [ ] 4.1b Spill previews keep head and tail too.
+- [x] 4.1b Spill previews keep head and tail too.
 - [ ] 4.2 Recognize test runners (cargo, node --test, npm, vitest, jest, pytest, go test) and
       lead the result with parsed pass, fail and skip counts.
 - [ ] 4.3 A repeated test command returns a delta against its previous run: new and changed
@@ -226,4 +226,5 @@ Done when a reproducible table exists with Rune in it.
 | 2026-11-09 | 3a26d7e | 3.2 | Key is `rune-` plus 32 hex of SHA-256 over the prefix; same prefix, same key, no session identifier sent. |
 | 2026-11-09 | 620afb1 | 3.3 | `Usage.input_tokens` now means the whole prompt in every dialect; Anthropic adds its cache counts back. Manual `/compact` resets and re-estimates the meter. |
 | 2026-11-09 | a8a3d7a | 3.4 | Anthropic only (`requires_output_ceiling`); min(catalog or config, 32,768); unknown stays 8,192. Objective accounting no longer re-adds cache counts. |
-| 2026-11-09 | (this) | 4.1 | Render: a third head, the rest tail, cut at line breaks. Capture: a quarter-cap ring of the newest bytes past the head, shown once the command ends. |
+| 2026-11-09 | 388cd3f | 4.1 | Render: a third head, the rest tail, cut at line breaks. Capture: a quarter-cap ring of the newest bytes past the head, shown once the command ends. |
+| 2026-11-09 | (this) | 4.1b | Preview names the exact omitted byte range for `read_tool_result`. |

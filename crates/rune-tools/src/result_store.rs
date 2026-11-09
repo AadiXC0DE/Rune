@@ -324,12 +324,8 @@ impl Store {
         is_error: bool,
         preview_bytes: usize,
     ) -> Preview {
-        let mut cut = preview_bytes.min(content.len());
-        while cut > 0 && !content.is_char_boundary(cut) {
-            cut = cut.saturating_sub(1);
-        }
         Preview {
-            text: content.get(..cut).unwrap_or_default().to_owned(),
+            text: preview_text(content, preview_bytes),
             retained_bytes: u64::try_from(content.len()).unwrap_or(u64::MAX),
             is_retained: true,
             handle: handle.clone(),
@@ -477,9 +473,64 @@ fn unknown_handle(handle: &Handle) -> RuneError {
     .with_hint("handles work only within the session that produced them")
 }
 
+/// Bytes a preview keeps for the marker naming the range it leaves out.
+const OMISSION_MARKER_ROOM: usize = 96;
+
+/// Returns at most `budget` bytes of `content` for a preview.
+///
+/// A long result keeps its start and its end and names the byte range between
+/// them, because the end is often the part that matters, such as a test run's
+/// failures, and the range is exactly what `read_tool_result` takes to fetch
+/// the rest.
+fn preview_text(content: &str, budget: usize) -> String {
+    if content.len() <= budget {
+        return content.to_owned();
+    }
+    if budget < OMISSION_MARKER_ROOM.saturating_mul(4) {
+        return truncate_to_bytes(content, budget).to_owned();
+    }
+    let (start, end) =
+        crate::workspace::head_and_tail(content, budget.saturating_sub(OMISSION_MARKER_ROOM));
+    let resume = content.len().saturating_sub(end.len());
+    format!(
+        "{start}\n[bytes {} to {resume} omitted; read_tool_result reads them]\n{end}",
+        start.len()
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_long_preview_keeps_both_ends_and_names_the_omitted_range() {
+        let content: String = (0..2000).fold(String::new(), |mut text, index| {
+            use std::fmt::Write as _;
+            writeln!(text, "line {index}").expect("format");
+            text
+        });
+        let preview = preview_text(&content, 4096);
+        assert!(preview.len() <= 4096, "{} bytes", preview.len());
+        assert!(preview.starts_with("line 0\n"));
+        assert!(preview.ends_with("line 1999\n"));
+        let (from, to) = preview
+            .split_once("[bytes ")
+            .and_then(|(_, rest)| rest.split_once(" omitted"))
+            .and_then(|(range, _)| range.split_once(" to "))
+            .map(|(from, to)| {
+                (
+                    from.parse::<usize>().expect("from"),
+                    to.parse::<usize>().expect("to"),
+                )
+            })
+            .expect("an omitted range");
+        // The range is exact: what precedes it and what follows it are the
+        // content's own bytes, so reading it restores the whole result.
+        assert_eq!(&content[..from], &preview[..from]);
+        assert!(preview.ends_with(&content[to..]));
+
+        assert_eq!(preview_text("short", 4096), "short");
+    }
 
     fn store() -> Store {
         Store::new("session-abc")

@@ -735,7 +735,13 @@ fn oversized_tool_results_have_a_bounded_preview_and_a_readable_full_body() {
             Script::text("inspected"),
             Script::text("later turn"),
         ]);
-        let content = format!("PREVIEW {} FULL-TAIL", "é".repeat(40_000));
+        // The middle is what a preview leaves out, so it stands for content
+        // that only the store holds.
+        let content = format!(
+            "PREVIEW {} MIDDLE-ONLY {} FULL-TAIL",
+            "é".repeat(20_000),
+            "é".repeat(20_000)
+        );
         let output = if is_error {
             ToolOutput::failure(content.clone())
         } else {
@@ -750,7 +756,10 @@ fn oversized_tool_results_have_a_bounded_preview_and_a_readable_full_body() {
         let outcome = run_turn(&mut history, &host).expect("turn");
         let shown = &outcome.calls[0].output;
         assert!(shown.text.starts_with("PREVIEW "));
-        assert!(!shown.text.contains("FULL-TAIL"));
+        // The preview keeps both ends and names the range left out between.
+        assert!(shown.text.contains("FULL-TAIL"), "{}", shown.text);
+        assert!(shown.text.contains("omitted; read_tool_result reads them"));
+        assert!(!shown.text.contains("MIDDLE-ONLY"));
         assert!(shown.text.len() <= 65_536);
         assert_eq!(shown.produced_bytes, content.len() as u64);
         assert_eq!(shown.is_error, is_error);
@@ -779,7 +788,7 @@ fn oversized_tool_results_have_a_bounded_preview_and_a_readable_full_body() {
             .last_body()
             .expect("request");
         assert!(body.to_string().contains(handle.as_str()));
-        assert!(!body.to_string().contains("FULL-TAIL"));
+        assert!(!body.to_string().contains("MIDDLE-ONLY"));
         assert!(
             rune_agent::History::new()
                 .result_store()
@@ -793,7 +802,7 @@ fn oversized_tool_results_have_a_bounded_preview_and_a_readable_full_body() {
                 .is_err()
         );
         let saved = serde_json::to_string(&history).expect("serialized history");
-        assert!(!saved.contains("FULL-TAIL"));
+        assert!(!saved.contains("MIDDLE-ONLY"));
         let restored: rune_agent::History = serde_json::from_str(&saved).expect("restored history");
         assert!(restored.result_store().is_empty());
 

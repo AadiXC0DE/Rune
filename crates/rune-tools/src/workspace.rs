@@ -325,6 +325,33 @@ pub fn truncate_to_bytes(text: &str, limit: usize) -> &str {
     &text[..end]
 }
 
+/// Splits at most `budget` bytes of `text` into a start and an end.
+///
+/// A third goes to the start and the rest to the end. Each cut moves to a line
+/// break when one is near, so neither side shows a broken line.
+pub(crate) fn head_and_tail(text: &str, budget: usize) -> (&str, &str) {
+    if text.len() <= budget {
+        return (text, "");
+    }
+    let head_budget = budget / 3;
+    let mut start = truncate_to_bytes(text, head_budget);
+    if let Some(line) = start.rfind('\n').filter(|end| *end >= start.len() / 2) {
+        start = &text[..=line];
+    }
+    let tail_budget = budget.saturating_sub(start.len());
+    let mut from = text.len().saturating_sub(tail_budget);
+    while from < text.len() && !text.is_char_boundary(from) {
+        from = from.saturating_add(1);
+    }
+    if let Some(offset) = text[from..]
+        .find('\n')
+        .filter(|offset| *offset < tail_budget / 2)
+    {
+        from = from.saturating_add(offset).saturating_add(1);
+    }
+    (start, &text[from.max(start.len())..])
+}
+
 /// Returns one line of file content, cut to `limit` bytes with a marker.
 ///
 /// `length` is the line's true length, which is more than `line` holds when
