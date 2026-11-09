@@ -446,12 +446,9 @@ impl Tool for Shell {
     }
 
     fn description(&self) -> &'static str {
-        "Run a command under a shell. `run` starts it and returns either the finished output and \
-         its exit status, or a session for a command that is still working. `interact` then reads \
-         what a session produced since the last read, and sends input when chars is given to a \
-         session started with `interactive` or `pty`. Linux `pty` mode supplies a controlling \
-         terminal with merged stdout/stderr; `interact` can resize it using rows and cols. \
-         `stop` ends a session and everything it started."
+        "Run a shell command. `run` returns the output and exit status, or a session_id \
+         when the command is still running after yield_time_ms. `interact` reads new output \
+         and sends chars; `stop` ends a session and its processes."
     }
 
     fn input_schema(&self) -> serde_json::Value {
@@ -461,53 +458,52 @@ impl Tool for Shell {
                 "action": {
                     "type": "string",
                     "enum": ["run", "interact", "stop"],
-                    "description": "Start a command, read from a session, or end one.",
                 },
                 "command": {
                     "type": "string",
-                    "description": "Command line for the shell, passed through unmodified. Required by `run`.",
+                    "description": "Required by `run`.",
                 },
                 "cwd": {
                     "type": "string",
-                    "description": "Directory the command starts in. Defaults to the workspace root.",
+                    "description": "Defaults to the workspace root.",
                 },
                 "interactive": {
                     "type": "boolean",
-                    "description": "Pipe standard input so `interact` can send chars. Input defaults to closed unless `pty` is true.",
+                    "description": "Keep standard input open for `interact`.",
                 },
                 "pty": {
                     "type": "boolean",
-                    "description": "Linux only: allocate a controlling terminal and accept input. Output streams are merged. Default false; does not require interactive.",
+                    "description": "Linux only: run under a terminal, with merged output.",
                 },
                 "rows": {
                     "type": "integer",
                     "minimum": 1,
                     "maximum": 65535,
-                    "description": "PTY rows, paired with cols. Run defaults to 24; interact resizes a PTY session.",
+                    "description": "Terminal rows; `interact` resizes.",
                 },
                 "cols": {
                     "type": "integer",
                     "minimum": 1,
                     "maximum": 65535,
-                    "description": "PTY columns, paired with rows. Run defaults to 80; interact resizes a PTY session.",
+                    "description": "Terminal columns; `interact` resizes.",
                 },
                 "session_id": {
                     "type": "string",
-                    "description": "Session returned by `run`. Required by `interact` and `stop`.",
+                    "description": "From `run`. Required by `interact` and `stop`.",
                 },
                 "chars": {
                     "type": "string",
-                    "description": "Exact input written to the command, newline included when you write one.",
+                    "description": "Input to send, newline included.",
                 },
                 "yield_time_ms": {
                     "type": "integer",
                     "minimum": 0,
                     "maximum": MAX_YIELD_MS,
-                    "description": "Milliseconds to wait before returning. Zero returns at once.",
+                    "description": "Wait before returning.",
                 },
                 "force": {
                     "type": "boolean",
-                    "description": "Skip the graceful stop and kill the group at once.",
+                    "description": "Kill at once instead of stopping gracefully.",
                 },
             },
             "required": ["action"],

@@ -65,18 +65,18 @@ impl Tool for Registered {
         "subagent"
     }
     fn description(&self) -> &'static str {
-        "Run one synchronous read-only child task and return its result. Select an optional project role with agent. Role instructions and tools come from .rune/agents/<agent>.json and can only narrow inherited permissions. Messages and nested delegation are unavailable."
+        "Run a read-only child task and return its result. agent selects a role from \
+         .rune/agents/<agent>.json."
     }
     fn input_schema(&self) -> serde_json::Value {
         let mut schema = self.0.tool.input_schema();
         schema["properties"]["action"]["enum"] = serde_json::json!(["run"]);
-        schema["properties"]["action"]["description"] =
-            serde_json::json!("Run a synchronous child task.");
+        if let Some(action) = schema["properties"]["action"].as_object_mut() {
+            action.remove("description");
+        }
         if let Some(properties) = schema["properties"].as_object_mut() {
             properties.remove("message");
-            properties["agent"]["description"] = serde_json::json!(
-                "Optional project role name loaded from .rune/agents/<agent>.json."
-            );
+            properties["agent"]["description"] = serde_json::json!("Role name.");
         }
         schema
     }

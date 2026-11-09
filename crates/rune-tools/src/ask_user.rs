@@ -263,10 +263,8 @@ impl Tool for AskUserQuestion {
     }
 
     fn description(&self) -> &'static str {
-        "Ask the user one to four multiple-choice questions when a concrete decision \
-         blocks progress and no tool can answer it. Use it for a choice between precise \
-         alternatives, not for facts you can look up. Do not use it for safety decisions \
-         or for open-ended discussion."
+        "Ask the user one to four multiple-choice questions when a decision blocks progress \
+         and no tool can answer it. Not for facts you can look up or for safety decisions."
     }
 
     fn input_schema(&self) -> serde_json::Value {

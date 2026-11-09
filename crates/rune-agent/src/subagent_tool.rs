@@ -236,15 +236,15 @@ impl Tool for Subagent {
                 },
                 "instructions": {
                     "type": "string",
-                    "description": "Instructions for a new child, replacing the default brief."
+                    "description": "Instructions for the child, replacing the default."
                 },
                 "model": {
                     "type": "string",
-                    "description": "Model for a new child. Applied only at creation."
+                    "description": "Model for the child."
                 },
                 "effort": {
                     "type": "string",
-                    "description": "Reasoning effort for a new child. Applied only at creation."
+                    "description": "Reasoning effort for the child."
                 }
             },
             "required": ["action"],

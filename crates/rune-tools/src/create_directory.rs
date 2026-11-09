@@ -32,10 +32,7 @@ impl Tool for CreateDirectory {
     }
 
     fn description(&self) -> &'static str {
-        "Creates a directory and any missing parents within permitted roots. Existing \
-         directories succeed without changes; existing files are refused. Paths through \
-         links must remain within permitted roots. Creates at most 128 missing directories \
-         per call, with paths limited to 16384 bytes. Returns a bounded summary."
+        "Create a directory and any missing parents."
     }
 
     fn input_schema(&self) -> serde_json::Value {
@@ -44,7 +41,7 @@ impl Tool for CreateDirectory {
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "Directory to create. Relative paths resolve against the workspace root."
+                    "description": "Relative to the workspace root, or absolute."
                 }
             },
             "required": ["path"],

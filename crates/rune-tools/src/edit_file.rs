@@ -25,13 +25,10 @@ impl Tool for EditFile {
     }
 
     fn description(&self) -> &'static str {
-        "Replaces exact text inside an existing file and leaves every other byte untouched. The \
-         text must occur exactly once unless `occurrence` names which match to replace or \
-         `replace_all` replaces every match. Matching is case and whitespace sensitive, and line \
-         endings are never normalized. Refuses identical old and new text, and refuses a change \
-         if the file is modified between the read and the write. For multiple hunks, pass `edits` \
-         instead of the top-level replacement fields. Hunks run in order against earlier \
-         in-memory results; all must succeed before one atomic write."
+        "Replace exact text in a file. old_string must match once, whitespace included, \
+         unless occurrence or replace_all is set. Pass edits for several replacements in \
+         one atomic write; each sees the previous result. Refused if the file changed since \
+         it was read."
     }
 
     fn input_schema(&self) -> serde_json::Value {
@@ -40,30 +37,28 @@ impl Tool for EditFile {
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "File to edit. A relative path resolves against the workspace root."
+                    "description": "Relative to the workspace root, or absolute."
                 },
                 "old_string": {
                     "type": "string",
-                    "description": "Exact text to replace, including indentation and line endings."
+                    "description": "Exact text, including indentation."
                 },
                 "new_string": {
                     "type": "string",
-                    "description": "Replacement text, written verbatim."
                 },
                 "occurrence": {
                     "type": "integer",
                     "minimum": 1,
-                    "description": "Which match to replace, counted from 1. Only needed when the text occurs more than once."
+                    "description": "Which match, counted from 1."
                 },
                 "replace_all": {
                     "type": "boolean",
-                    "description": "Replace every match. Cannot be combined with `occurrence`."
                 },
                 "edits": {
                     "type": "array",
                     "minItems": 1,
                     "maxItems": mutation::MAX_EDIT_HUNKS,
-                    "description": "Ordered literal hunks, matched against earlier hunks' results. Every hunk must succeed before the file is written. Cannot be combined with top-level replacement fields.",
+                    "description": "Replacements applied in order; all must match.",
                     "items": {
                         "type": "object",
                         "properties": {

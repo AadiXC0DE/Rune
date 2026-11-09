@@ -35,27 +35,22 @@ impl Tool for SyntaxDiagnostics {
     }
 
     fn description(&self) -> &'static str {
-        "Check the syntax of one .rs file with local rustfmt, returning compiler-style \
-         diagnostics with file, line, column, and message. Requires rustfmt on PATH. \
-         Defaults to Rust edition 2024; edition can be 2015, 2018, 2021, or 2024. \
-         Checks syntax only, not types or dependencies. Does not compile, expand procedural \
-         macros, follow child modules, or modify source files. Ignores rustfmt configuration. \
-         The supervised checker has a 30-second deadline, cancellation, resource limits, \
-         and bounded output. Syntax errors return a tool error; max_bytes lowers the output cap."
+        "Check one Rust file's syntax with rustfmt, without type checking. Returns line and \
+         column diagnostics."
     }
 
     fn input_schema(&self) -> serde_json::Value {
         serde_json::json!({
             "type": "object",
             "properties": {
-                "path": {"type": "string", "description": "Rust fixture file to check."},
+                "path": {"type": "string", "description": "Rust file to check."},
                 "edition": {
                     "type": "string", "enum": ["2015", "2018", "2021", "2024"],
-                    "description": "Rust parsing edition. Defaults to 2024."
+                    "description": "Defaults to 2024."
                 },
                 "max_bytes": {
                     "type": "integer", "minimum": 1,
-                    "description": "Total output bytes, capped by host limits. Must fit the label and truncation marker."
+                    "description": "Output cap."
                 }
             },
             "required": ["path"],

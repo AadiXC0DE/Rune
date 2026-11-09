@@ -39,9 +39,7 @@ impl Tool for GlobFiles {
     }
 
     fn description(&self) -> &'static str {
-        "Find files by path pattern. `*` and `?` do not cross a directory separator and `**` \
-         matches any depth, so `**/*.rs` finds Rust files anywhere below the root. `count` \
-         reports the exact total when the listing itself is truncated."
+        "Find files by glob pattern. `*` stays within one directory; `**` matches any depth."
     }
 
     fn input_schema(&self) -> serde_json::Value {
@@ -50,16 +48,16 @@ impl Tool for GlobFiles {
             "properties": {
                 "pattern": {
                     "type": "string",
-                    "description": "Glob pattern, for example `**/*.rs` or `src/*.toml`.",
+                    "description": "For example `**/*.rs`.",
                 },
                 "path": {
                     "type": "string",
-                    "description": "Directory or file to search under. Defaults to the workspace root.",
+                    "description": "Directory to search. Defaults to the workspace root.",
                 },
                 "mode": {
                     "type": "string",
                     "enum": ["matches", "count"],
-                    "description": "Return matching paths, or only the exact total.",
+                    "description": "`count` returns only the total.",
                 },
             },
             "required": ["pattern"],

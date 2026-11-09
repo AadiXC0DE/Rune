@@ -34,12 +34,8 @@ impl Tool for GitDiff {
     }
 
     fn description(&self) -> &'static str {
-        "Inspect tracked changes under the workspace. Defaults to unstaged changes; set \
-         staged to true for the index versus HEAD (also works before the first commit). \
-         Untracked files and submodules are excluded. max_bytes lowers the output cap, \
-         including the view label and truncation marker. Runs read-only Git inspection \
-         with external diff, text conversion, and clean filters disabled. Partial-clone \
-         configurations are refused to prevent implicit fetches."
+        "Show uncommitted changes to tracked files: unstaged by default, or staged. \
+         Untracked files are not shown."
     }
 
     fn input_schema(&self) -> serde_json::Value {
@@ -48,12 +44,11 @@ impl Tool for GitDiff {
             "properties": {
                 "staged": {
                     "type": "boolean",
-                    "description": "Inspect staged changes instead of unstaged changes. Defaults to false."
                 },
                 "max_bytes": {
                     "type": "integer",
                     "minimum": 1,
-                    "description": "Total output bytes, capped by host limits. Must fit the label and truncation marker."
+                    "description": "Output cap."
                 }
             },
             "required": [],

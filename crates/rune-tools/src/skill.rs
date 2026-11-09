@@ -326,8 +326,7 @@ impl Tool for InstallSkill {
     }
 
     fn description(&self) -> &'static str {
-        "Install a skill by writing its file into the managed skill directory. \
-         Reports the final path. The name must be a single path segment."
+        "Install a skill file into the managed skill directory."
     }
 
     fn input_schema(&self) -> serde_json::Value {
@@ -336,11 +335,11 @@ impl Tool for InstallSkill {
             "properties": {
                 "name": {
                     "type": "string",
-                    "description": "Directory name for the skill. One path segment."
+                    "description": "One path segment."
                 },
                 "content": {
                     "type": "string",
-                    "description": "Full contents of the skill file, frontmatter included."
+                    "description": "Complete skill file, frontmatter included."
                 }
             },
             "required": ["name", "content"],

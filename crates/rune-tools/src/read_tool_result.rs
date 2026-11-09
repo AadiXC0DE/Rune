@@ -109,19 +109,16 @@ impl Tool for ReadToolResult {
     }
 
     fn description(&self) -> &'static str {
-        "Read a byte page of retained tool output using its handle. Pass offset (default 0) and \
-         length (default 65536, capped). Returns JSON with text, offset, next_offset, total_bytes \
-         and eof. Continue at next_offset until eof to reconstruct the full text. Both response \
-         budgets include JSON escaping and metadata. Handles belong to the live conversation."
+        "Read a page of a truncated tool result by its handle. Continue at next_offset until eof."
     }
 
     fn input_schema(&self) -> serde_json::Value {
         serde_json::json!({
             "type": "object",
             "properties": {
-                "handle": {"type": "string", "description": "Handle from a retained result preview."},
-                "offset": {"type": "integer", "minimum": 0, "description": "Byte offset, at a UTF-8 character boundary. Defaults to 0."},
-                "length": {"type": "integer", "minimum": 1, "description": "Requested bytes, clamped to the response budget and 65536 bytes."},
+                "handle": {"type": "string", "description": "From the truncated result."},
+                "offset": {"type": "integer", "minimum": 0, "description": "Byte offset. Defaults to 0."},
+                "length": {"type": "integer", "minimum": 1},
             },
             "required": ["handle"],
             "additionalProperties": false,

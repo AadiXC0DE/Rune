@@ -99,7 +99,7 @@ Done when the request floor is a printed, gated number.
       off, no vision without a vision model, no question tool without a question channel, no
       skill tools with an empty catalog.
 - [x] 2.1a List each skill once when the same name is discovered in more than one root.
-- [ ] 2.2 Rewrite tool descriptions and schemas for brevity without losing a constraint the
+- [x] 2.2 Rewrite tool descriptions and schemas for brevity without losing a constraint the
       model needs; record before and after bytes.
 - [ ] 2.3 Keep the instructions byte-stable for a whole session: build the repository map
       once at session start instead of on every request.
@@ -216,4 +216,5 @@ Done when a reproducible table exists with Rune in it.
 | 2026-11-09 | e15f68e | 1.3 | Pushes that change crates used by the demo still deploy, because `site/demo/rune.wasm` must be regenerated; regenerate it once per push, in the last commit. |
 | 2026-11-09 | a7a89fc | 1.4 | Budget job no longer limited to pull requests. |
 | 2026-11-09 | e775938 | 2.1 | Interactive default: 20 tools, 17,379 bytes to 15 tools, 14,382 bytes. A call to a hidden tool is answered as never offered. |
-| 2026-11-09 | (this) | 2.1a | A byte-identical skill in two user roots is listed once. This home: 10,323 to 9,354 bytes. |
+| 2026-11-09 | 8ec7540 | 2.1a | A byte-identical skill in two user roots is listed once. This home: 10,323 to 9,354 bytes. |
+| 2026-11-09 | (this) | 2.2 | 14,382 to 9,154 bytes (17,379 to 9,154 with 2.1, -47%). Ceiling lowered to 10 KiB. Demo wasm is stale until regenerated before the push. |

@@ -59,10 +59,7 @@ impl Tool for GrepFiles {
     }
 
     fn description(&self) -> &'static str {
-        "Search file contents for literal text. The pattern is not a regular expression: \
-         metacharacters match themselves. Supports an include glob, case-insensitive matching, \
-         context lines, and pagination with head_limit and offset. Binary files are skipped and \
-         reported."
+        "Search file contents for literal text, not a regular expression. Binary files are skipped."
     }
 
     fn input_schema(&self) -> serde_json::Value {
@@ -71,7 +68,6 @@ impl Tool for GrepFiles {
             "properties": {
                 "pattern": {
                     "type": "string",
-                    "description": "Literal text to find. Regex metacharacters match literally.",
                 },
                 "path": {
                     "type": "string",
@@ -79,32 +75,31 @@ impl Tool for GrepFiles {
                 },
                 "include": {
                     "type": "string",
-                    "description": "Glob filter for file paths, for example `**/*.rs`.",
+                    "description": "Glob filter, for example `**/*.rs`.",
                 },
                 "case_insensitive": {
                     "type": "boolean",
-                    "description": "Match without regard to case. Defaults to false.",
                 },
                 "mode": {
                     "type": "string",
                     "enum": ["matches", "files_with_matches", "count"],
-                    "description": "List matching lines, matching files, or exact counts.",
+                    "description": "Lines, file names, or counts.",
                 },
                 "head_limit": {
                     "type": "integer",
                     "minimum": 1,
-                    "description": "Entries this page returns. Defaults to the list_entries limit.",
+                    "description": "Entries to return.",
                 },
                 "offset": {
                     "type": "integer",
                     "minimum": 0,
-                    "description": "Entries to skip before this page, for paging.",
+                    "description": "Entries to skip.",
                 },
                 "context_lines": {
                     "type": "integer",
                     "minimum": 0,
                     "maximum": MAX_CONTEXT_LINES,
-                    "description": "Lines shown before and after each match, in matches mode.",
+                    "description": "Lines around each match.",
                 },
             },
             "required": ["pattern"],

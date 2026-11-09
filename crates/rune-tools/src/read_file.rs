@@ -44,9 +44,7 @@ impl Tool for ReadFile {
     }
 
     fn description(&self) -> &'static str {
-        "Read a text file as numbered lines. Returns a bounded window: pass start_line and \
-         line_count to page through a long file. An image is described rather than decoded, and \
-         binary content is refused instead of returned."
+        "Read a text file as numbered lines. Page a long file with start_line and line_count."
     }
 
     fn input_schema(&self) -> serde_json::Value {
@@ -55,17 +53,16 @@ impl Tool for ReadFile {
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "File to read, relative to the workspace root or absolute.",
+                    "description": "Relative to the workspace root, or absolute.",
                 },
                 "start_line": {
                     "type": "integer",
                     "minimum": 1,
-                    "description": "First line to return, 1-based. Defaults to the first line.",
+                    "description": "1-based.",
                 },
                 "line_count": {
                     "type": "integer",
                     "minimum": 1,
-                    "description": "Lines to return, capped by the read_file_lines limit.",
                 },
             },
             "required": ["path"],

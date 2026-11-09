@@ -57,7 +57,8 @@ impl Tool for UpdatePlan {
     }
 
     fn description(&self) -> &'static str {
-        "Replace the live plan with the complete ordered list of steps and their statuses: pending, in_progress, or completed. Steps must be distinct and at most one may be in_progress. Optionally explain the update. Returns the current version; identical retries keep that version. The plan lives in memory for this session and does not edit files."
+        "Replace the session plan with the complete ordered list of steps. At most one step \
+         may be in_progress."
     }
 
     fn input_schema(&self) -> serde_json::Value {
