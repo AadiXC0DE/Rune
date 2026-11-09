@@ -116,12 +116,12 @@ jobs:
       - name: Smoke-test the exported WASM boundary with a fixture prompt
         run: node .github/scripts/test-wasm.mjs target/wasm32-wasip1/release/rune_web.wasm
 
-  # Gate lane: runs on a pull request. Adds budgets and every platform.
+  # Size, startup, prompt, and tool schema budgets. Runs on every push to main
+  # as well as on a pull request, so a direct push cannot regress them unmeasured.
   budget:
     name: budget
     runs-on: ubuntu-latest
     timeout-minutes: 25
-    if: github.event_name == 'pull_request'
     steps:
       - uses: actions/checkout@v4
 
