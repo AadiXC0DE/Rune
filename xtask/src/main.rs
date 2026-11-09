@@ -198,11 +198,173 @@ fn web() -> Result<(), String> {
             placed.display()
         )
     })?;
-    let bytes = std::fs::metadata(&placed)
-        .map_err(|err| err.to_string())?
-        .len();
-    println!("site/demo/rune.wasm: {bytes} bytes");
+    let module = std::fs::read(&placed)
+        .map_err(|err| format!("could not read {}: {err}", placed.display()))?;
+    let record = WebRecord {
+        source: web_source_digest()?,
+        module: digest(&module),
+    };
+    std::fs::write(web_record_path()?, record.render())
+        .map_err(|err| format!("could not write the module record: {err}"))?;
+    println!(
+        "site/demo/rune.wasm: {} bytes, source {}",
+        module.len(),
+        record.source
+    );
     Ok(())
+}
+
+/// What a committed module was built from, and what it is.
+///
+/// The compiler does not produce the same module bytes on every host, so the
+/// module cannot be checked by rebuilding it and comparing bytes on another
+/// machine. The record ties it to the source it was built from instead: the
+/// source digest is the same on every host, and the module digest shows the
+/// committed module is the one that was recorded.
+#[derive(Debug, PartialEq, Eq)]
+struct WebRecord {
+    source: String,
+    module: String,
+}
+
+impl WebRecord {
+    fn render(&self) -> String {
+        format!("source {}\nmodule {}\n", self.source, self.module)
+    }
+
+    fn parse(text: &str) -> Option<Self> {
+        let mut source = None;
+        let mut module = None;
+        for line in text.lines() {
+            match line.split_once(' ') {
+                Some(("source", value)) => source = Some(value.trim().to_owned()),
+                Some(("module", value)) => module = Some(value.trim().to_owned()),
+                _ => {}
+            }
+        }
+        Some(Self {
+            source: source?,
+            module: module?,
+        })
+    }
+}
+
+/// Path of the record that sits beside the committed module.
+fn web_record_path() -> Result<PathBuf, String> {
+    Ok(web_module_path()?.with_extension("wasm.source"))
+}
+
+/// Digests every input the browser module is built from.
+///
+/// The inputs are the tracked files of each path package the module depends
+/// on, the lockfile, the workspace manifest and the toolchain pin, each named
+/// by its path relative to the root, so the digest is the same on every host.
+fn web_source_digest() -> Result<String, String> {
+    use sha2::{Digest, Sha256};
+    let root = workspace_root()?;
+    let mut paths = vec![
+        "Cargo.lock".to_owned(),
+        "Cargo.toml".to_owned(),
+        "rust-toolchain.toml".to_owned(),
+    ];
+    let packages = web_package_dirs(&root)?;
+    let listed = Command::new("git")
+        .arg("-C")
+        .arg(&root)
+        .args(["ls-files", "-z", "--"])
+        .args(&packages)
+        .output()
+        .map_err(|err| format!("could not run git: {err}"))?;
+    if !listed.status.success() {
+        return Err("`git ls-files` failed while digesting the module source".to_owned());
+    }
+    paths.extend(
+        String::from_utf8_lossy(&listed.stdout)
+            .split('\0')
+            .filter(|path| !path.is_empty())
+            .map(str::to_owned),
+    );
+    paths.sort();
+    paths.dedup();
+    let mut hasher = Sha256::new();
+    for path in &paths {
+        let bytes = std::fs::read(root.join(path))
+            .map_err(|err| format!("could not read {path}: {err}"))?;
+        hasher.update(path.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(bytes.len().to_le_bytes());
+        hasher.update(&bytes);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// Returns the directories of the path packages the browser module builds,
+/// relative to the workspace root.
+fn web_package_dirs(root: &Path) -> Result<Vec<String>, String> {
+    let output = Command::new("cargo")
+        .args([
+            "metadata",
+            "--format-version",
+            "1",
+            "--locked",
+            "--filter-platform",
+            WEB_TARGET,
+        ])
+        .current_dir(root)
+        .output()
+        .map_err(|err| format!("could not run `cargo metadata`: {err}"))?;
+    if !output.status.success() {
+        return Err("`cargo metadata` failed while digesting the module source".to_owned());
+    }
+    let metadata: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .map_err(|err| format!("`cargo metadata` printed invalid JSON: {err}"))?;
+    let packages = metadata["packages"].as_array().cloned().unwrap_or_default();
+    let nodes = metadata["resolve"]["nodes"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let web = packages
+        .iter()
+        .find(|package| package["name"] == "rune-web")
+        .and_then(|package| package["id"].as_str())
+        .ok_or("`cargo metadata` does not list rune-web")?
+        .to_owned();
+    let mut reached = std::collections::BTreeSet::new();
+    let mut pending = vec![web];
+    while let Some(id) = pending.pop() {
+        if !reached.insert(id.clone()) {
+            continue;
+        }
+        let Some(node) = nodes.iter().find(|node| node["id"] == id.as_str()) else {
+            continue;
+        };
+        for dependency in node["deps"].as_array().into_iter().flatten() {
+            // Development dependencies do not reach the module.
+            let normal_or_build = dependency["dep_kinds"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|kind| kind["kind"] != "dev");
+            if normal_or_build && let Some(next) = dependency["pkg"].as_str() {
+                pending.push(next.to_owned());
+            }
+        }
+    }
+    let mut dirs: Vec<String> = packages
+        .iter()
+        .filter(|package| package["source"].is_null())
+        .filter(|package| {
+            package["id"]
+                .as_str()
+                .is_some_and(|id| reached.contains(id))
+        })
+        .filter_map(|package| package["manifest_path"].as_str())
+        .filter_map(|manifest| Path::new(manifest).parent())
+        .filter_map(|dir| dir.strip_prefix(root).ok())
+        .map(|dir| dir.to_string_lossy().replace('\\', "/"))
+        .collect();
+    dirs.sort();
+    Ok(dirs)
 }
 
 /// Fails unless the committed landing-page module is what the source builds.
@@ -215,26 +377,44 @@ fn verify_web(extra: &[String]) -> Result<(), String> {
         [path] => PathBuf::from(path),
         _ => return Err("usage: cargo xtask verify-web [committed-module-path]".to_owned()),
     };
+    // The module is still built, so the source compiles for the browser and a
+    // caller can exercise the fresh build.
     let built = build_web()?;
-    let expected = std::fs::read(&placed)
+    let committed = std::fs::read(&placed)
         .map_err(|err| format!("could not read {}: {err}", placed.display()))?;
-    let actual = std::fs::read(&built)
-        .map_err(|err| format!("could not read {}: {err}", built.display()))?;
-    if expected != actual {
+    let record_path = placed.with_extension("wasm.source");
+    let record = std::fs::read_to_string(&record_path)
+        .ok()
+        .as_deref()
+        .and_then(WebRecord::parse)
+        .ok_or_else(|| {
+            format!(
+                "{} is missing or unreadable; run `cargo xtask web` and commit the result",
+                record_path.display()
+            )
+        })?;
+    let source = web_source_digest()?;
+    let regenerate = "run `cargo xtask web` and commit the result";
+    if record.source != source {
         return Err(format!(
-            "{} is stale: the source builds {} bytes ({}), the committed module is {} bytes ({}); run `cargo xtask web` and commit the result",
+            "{} is stale: it was built from source {}, the current source is {source}; {regenerate}",
             placed.display(),
-            actual.len(),
-            digest(&actual),
-            expected.len(),
-            digest(&expected),
+            record.source
+        ));
+    }
+    if record.module != digest(&committed) {
+        return Err(format!(
+            "{} is not the module its record names ({}, found {}); {regenerate}",
+            placed.display(),
+            record.module,
+            digest(&committed)
         ));
     }
     println!(
-        "{} matches the current source ({} bytes, {})",
+        "{} was built from the current source ({source}); this host built {} bytes at {}",
         placed.display(),
-        actual.len(),
-        digest(&actual)
+        std::fs::metadata(&built).map_or(0, |meta| meta.len()),
+        built.display()
     );
     Ok(())
 }
@@ -1095,6 +1275,16 @@ mod tests {
     #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 
     use super::*;
+
+    #[test]
+    fn a_module_record_round_trips_and_rejects_a_partial_file() {
+        let record = WebRecord {
+            source: "abc".to_owned(),
+            module: "def".to_owned(),
+        };
+        assert_eq!(WebRecord::parse(&record.render()), Some(record));
+        assert_eq!(WebRecord::parse("source abc\n"), None);
+    }
 
     #[test]
     fn startup_distribution_reports_raw_minimum_median_and_nearest_rank_p95() {
