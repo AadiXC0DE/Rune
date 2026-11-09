@@ -65,7 +65,8 @@ impl FinishReason {
 /// absent; a reported zero stays zero.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
 pub struct Usage {
-    /// Input tokens.
+    /// Input tokens for the whole prompt, including any read from or written
+    /// to a prompt cache. The two cache counts are parts of this one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub input_tokens: Option<u64>,
     /// Output tokens.

@@ -660,23 +660,19 @@ impl Reducer {
         Ok(())
     }
 
-    /// Records usage, replacing rather than accumulating.
+    /// Records usage, keeping the largest report of each count.
     ///
-    /// The endpoint reports a running total, so the later value is the accurate
-    /// one and adding them would double count.
+    /// The endpoint reports running totals, so the largest value is the latest
+    /// and adding them would double count. A later frame may omit the cache
+    /// counts its input total was built from, and the maximum keeps the total
+    /// that included them.
     fn record_usage(
         &mut self,
         usage: &serde_json::Value,
         out: &mut Vec<crate::stream::ProviderEvent>,
     ) {
         let parsed = parse_usage(usage);
-        self.usage = Usage {
-            input_tokens: parsed.input_tokens.or(self.usage.input_tokens),
-            output_tokens: parsed.output_tokens.or(self.usage.output_tokens),
-            cache_read_tokens: parsed.cache_read_tokens.or(self.usage.cache_read_tokens),
-            cache_write_tokens: parsed.cache_write_tokens.or(self.usage.cache_write_tokens),
-            reasoning_tokens: parsed.reasoning_tokens.or(self.usage.reasoning_tokens),
-        };
+        self.usage = self.usage.merge_max(parsed);
         out.push(crate::stream::ProviderEvent::Usage(parsed));
     }
 }
@@ -724,13 +720,24 @@ impl StreamReducer for Reducer {
 }
 
 /// Reads a usage object.
+///
+/// This endpoint's `input_tokens` excludes tokens read from or written to the
+/// cache, while every other dialect counts them in. They are added back here,
+/// so the input count means the whole prompt everywhere and the cache counts
+/// are parts of it, which is what the context meter and the ledger assume.
 fn parse_usage(value: &serde_json::Value) -> Usage {
     let field = |name: &str| value.get(name).and_then(serde_json::Value::as_u64);
+    let cache_read_tokens = field("cache_read_input_tokens");
+    let cache_write_tokens = field("cache_creation_input_tokens");
     Usage {
-        input_tokens: field("input_tokens"),
+        input_tokens: field("input_tokens").map(|uncached| {
+            uncached
+                .saturating_add(cache_read_tokens.unwrap_or_default())
+                .saturating_add(cache_write_tokens.unwrap_or_default())
+        }),
         output_tokens: field("output_tokens"),
-        cache_read_tokens: field("cache_read_input_tokens"),
-        cache_write_tokens: field("cache_creation_input_tokens"),
+        cache_read_tokens,
+        cache_write_tokens,
         reasoning_tokens: None,
     }
 }
@@ -1313,6 +1320,21 @@ mod tests {
         let usage = reducer.usage();
         assert_eq!(usage.cache_read_tokens, Some(5));
         assert_eq!(usage.cache_write_tokens, Some(3));
+        // The endpoint's 10 excludes the cache; the normalized count is the
+        // whole prompt, as every other dialect reports it.
+        assert_eq!(usage.input_tokens, Some(18));
+    }
+
+    #[test]
+    fn a_later_frame_without_cache_counts_keeps_the_full_input() {
+        let (_, reducer) = reduce(&[
+            r#"{"type":"message_start","message":{"usage":{"input_tokens":4,"cache_read_input_tokens":90,"cache_creation_input_tokens":0,"output_tokens":1}}}"#,
+            r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":4,"output_tokens":7}}"#,
+            r#"{"type":"message_stop"}"#,
+        ]);
+        let usage = reducer.usage();
+        assert_eq!(usage.input_tokens, Some(94));
+        assert_eq!(usage.output_tokens, Some(7));
     }
 
     #[test]

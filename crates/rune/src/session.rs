@@ -3674,6 +3674,12 @@ fn compact_history(
     ) {
         Ok(removed) => {
             host.mapped.refresh();
+            // The meter keeps the largest reading, so without a reset it would
+            // go on showing the size of the conversation before compaction.
+            host.forget_context();
+            if let Err(err) = host.estimate_context(history) {
+                host.draw_notice(&format!("context size was not estimated: {err}"));
+            }
             report(
                 host,
                 sink,
