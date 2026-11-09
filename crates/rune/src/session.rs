@@ -745,6 +745,7 @@ impl Host for SessionHost {
                     text: outcome.text,
                     is_error: outcome.is_error,
                     plan_update: None,
+                    full_text: None,
                 }),
                 Err(error) if error.code() == ErrorCode::Cancelled => Err(error),
                 Err(error) => Ok(ToolOutput::from_error(&error)),

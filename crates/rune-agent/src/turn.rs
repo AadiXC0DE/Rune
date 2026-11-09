@@ -13,6 +13,7 @@
 //!   exhausted retry/objective budget or consecutive identical failure cap stops it.
 //! - Finalization happens exactly once, so a session cannot record a turn twice.
 
+use std::fmt::Write as _;
 use std::time::{Duration, Instant};
 
 use camino::Utf8Path;
@@ -1322,7 +1323,26 @@ fn retain_result(
     results: &mut Vec<CallResult>,
 ) {
     let cap = turn_cap.saturating_sub(*result_bytes).min(tool_cap);
-    let text = std::mem::take(&mut result.output.text);
+    let mut text = std::mem::take(&mut result.output.text);
+    // A shortened view keeps the complete text one read away.
+    if let Some(full) = result.output.full_text.take()
+        && let Ok(preview) = history.result_store_mut().spill(
+            &result.call.name,
+            &result.call.id,
+            full,
+            result.output.is_error,
+            0,
+        )
+    {
+        if !text.ends_with('\n') {
+            text.push('\n');
+        }
+        let _ = write!(
+            text,
+            "[full log: read_tool_result handle {}]",
+            preview.handle
+        );
+    }
     let bounded = if text.len() > cap {
         spill_result(history, &result, text, cap)
     } else {

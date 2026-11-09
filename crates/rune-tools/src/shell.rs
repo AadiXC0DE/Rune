@@ -72,7 +72,13 @@ pub struct Shell {
     limits: FileLimits,
     max_sessions: usize,
     state: Mutex<State>,
+    /// The last log of each test command that finished in its call, so a
+    /// repeat can be shown as what changed.
+    runs: Mutex<BTreeMap<String, String>>,
 }
+
+/// Test commands whose last log is kept for a delta.
+const MAX_REMEMBERED_RUNS: usize = 8;
 
 /// Returns what a stop on this session will end.
 ///
@@ -240,6 +246,7 @@ impl Shell {
             limits: FileLimits::from_budget(budget),
             max_sessions: budget.get_usize(LimitName::ParallelToolCalls).max(1),
             state: Mutex::new(State::default()),
+            runs: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -294,13 +301,22 @@ impl Shell {
         let process = start(&command, cwd.as_deref(), cap, context, input)?;
         if let Some(exit) = wait_for_exit(&process, window, context)? {
             process.drain_output(DRAIN_WINDOW);
-            let text = observe(&process, &command, &exit.describe(), &mut (0, 0), cap);
-            return Ok(finish(text, exit));
+            let (text, full_text) = observe(
+                &process,
+                &command,
+                &exit.describe(),
+                &mut (0, 0),
+                cap,
+                Some(&self.runs),
+            );
+            let mut output = finish(text, exit);
+            output.full_text = full_text;
+            return Ok(output);
         }
 
         let state = format!("session {id} running, {}", ended_by(process.id()));
         let mut seen = (0, 0);
-        let text = observe(&process, &command, &state, &mut seen, cap);
+        let (text, _) = observe(&process, &command, &state, &mut seen, cap, None);
         let session = Arc::new(Session::new(id.clone(), command, process, seen, input));
         slot.hand_over(id, session);
         Ok(ToolOutput::success(text))
@@ -386,7 +402,14 @@ impl Shell {
             None => format!("session {id} running, {}", ended_by(session.process.id())),
         };
         let mut seen = lock(&session.seen);
-        let text = observe(&session.process, &session.command, &state, &mut seen, cap);
+        let (text, _) = observe(
+            &session.process,
+            &session.command,
+            &state,
+            &mut seen,
+            cap,
+            None,
+        );
         if let Some(exit) = ended {
             // A session that has ended is observed once more and then dropped,
             // so a later call cannot report output that was already returned.
@@ -424,7 +447,14 @@ impl Shell {
             None => format!("session {id} survived the grace period"),
         };
         let mut seen = lock(&session.seen);
-        let text = observe(&session.process, &session.command, &state, &mut seen, cap);
+        let (text, _) = observe(
+            &session.process,
+            &session.command,
+            &state,
+            &mut seen,
+            cap,
+            None,
+        );
         // A stop that ended the group succeeded even though the command was
         // killed: the signal is how it was asked to stop, not a failure of the
         // stop itself, and the status is stated in the result.
@@ -707,19 +737,24 @@ fn produced(process: &Process) -> u64 {
 /// The command is echoed byte for byte, so what the caller reads is the exact
 /// string the shell received rather than a rendering of it. Bytes the caller
 /// has already seen are not repeated.
+///
+/// With `runs`, a finished test run that repeats an earlier one is shown as
+/// what changed, and the complete rendering is returned beside it.
 fn observe(
     process: &Process,
     command: &str,
     state: &str,
     seen: &mut (usize, usize),
     cap: usize,
-) -> String {
+    runs: Option<&Mutex<BTreeMap<String, String>>>,
+) -> (String, Option<String>) {
     let stdout = process.stdout().since(seen.0);
     let stderr = process.stderr().since(seen.1);
     // An ended command is observed for the last time, so the newest bytes of a
     // stream that outgrew its head follow that head, once.
     let ended = process.exit().is_some();
     let mut body = String::from_utf8_lossy(&stdout.bytes).into_owned();
+    let mut full = None;
     if ended {
         push_tail(&mut body, process.stdout());
     }
@@ -729,7 +764,24 @@ fn observe(
         // A finished test run leads with its verdict, which the cut below
         // always keeps, because the start of the output survives it.
         if let Some(counts) = crate::test_report::parse(&body) {
-            body = format!("[tests: {counts}]\n{body}");
+            let shown = runs.and_then(|runs| {
+                let mut runs = lock(runs);
+                let shown = runs
+                    .get(command)
+                    .and_then(|previous| crate::test_report::delta(previous, &body));
+                if runs.len() >= MAX_REMEMBERED_RUNS && !runs.contains_key(command) {
+                    runs.pop_first();
+                }
+                runs.insert(command.to_owned(), body.clone());
+                shown
+            });
+            let header = format!("[tests: {counts}]\n");
+            if let Some(shown) = shown {
+                full = Some(format!("{header}{body}"));
+                body = format!("{header}{shown}");
+            } else {
+                body = format!("{header}{body}");
+            }
         }
     }
     seen.0 = stdout.next;
@@ -756,7 +808,8 @@ fn observe(
             );
         }
     }
-    render(command, body, &note, state, cap)
+    let full = full.map(|full| render(command, full, &note, state, usize::MAX));
+    (render(command, body, &note, state, cap), full)
 }
 
 /// Appends a stream's newest bytes past its retained head, with the gap.
@@ -1921,6 +1974,34 @@ mod tests {
         .text;
         let second = observed.lines().nth(1).unwrap_or_default();
         assert_eq!(second, "[tests: 2 passed, 1 failed]", "{observed}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_repeated_test_run_shows_what_changed_and_keeps_the_full_log() {
+        let tool = shell(4, TEST_CAP);
+        let (_dir, context) = workspace();
+        // The first run fails `a`; the second, finding the marker, passes it.
+        let arguments = serde_json::json!({
+            "action": "run",
+            "command": "for n in 1 2 3 4 5 6 7 8 9 10; do echo \"  at frame $n\"; done; \
+                if [ -f seen ]; then echo 'test a ... ok'; \
+                else touch seen; echo 'test a ... FAILED'; fi; \
+                echo 'test b ... FAILED'; \
+                echo 'test result: FAILED. 0 passed; 1 failed; 0 ignored'; exit 101",
+        });
+        let first = call(&tool, &context, &arguments);
+        assert!(first.full_text.is_none());
+        let second = call(&tool, &context, &arguments);
+        assert!(
+            second
+                .text
+                .contains("[since the last run: now passing: a; still failing: b;"),
+            "{}",
+            second.text
+        );
+        assert!(!second.text.contains("frame 4"), "{}", second.text);
+        assert!(second.full_text.expect("full log").contains("frame 4"));
     }
 
     #[test]

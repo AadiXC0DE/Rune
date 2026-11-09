@@ -3832,3 +3832,25 @@ fn identical_reads_in_one_batch_run_once() {
     assert_eq!(host.executed_calls().len(), 2);
     assert_eq!(repeat_pointers(&host), 1);
 }
+
+#[test]
+fn a_shortened_result_names_a_handle_to_its_full_text() {
+    let endpoint = MockEndpoint::start(vec![
+        Script::tool_call("run", "read_file", r#"{"path":"log"}"#),
+        Script::text("done"),
+    ]);
+    let mut output = ToolOutput::success("short view");
+    output.full_text = Some("the complete log".to_owned());
+    let host = TestHost::new(endpoint)
+        .with_tools(vec![read_tool()])
+        .with_tool_response(output);
+    let mut history = rune_agent::History::new();
+    history.push_user("run");
+    let outcome = run_turn(&mut history, &host).expect("turn");
+    let text = &outcome.calls[0].output.text;
+    assert!(
+        text.starts_with("short view\n[full log: read_tool_result handle "),
+        "{text}"
+    );
+    assert_eq!(history.result_store().len(), 1);
+}

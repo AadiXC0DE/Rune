@@ -87,7 +87,7 @@ These are compared against `main` before a push rather than counted as regressio
 
 ## Resume here (2026-11-09)
 
-State: `main` is 12 commits ahead of `origin/main` (last push `d88e784`). The
+State: `main` is 14 commits ahead of `origin/main` (last push `d88e784`). The
 unpushed commits include the fixes for the three CI failures on the last push:
 the `webpki-roots` licence pin (`deny.toml`), the narrow replay grids, and the
 ACP test that needed `verification_reminders = 0`. Push them in the next batch.
@@ -98,16 +98,15 @@ change; `rune-term` and `rune-agent` changed since `d88e784`), `cargo fmt --all 
 `cargo clippy --workspace --all-targets -D warnings`, `cargo xtask budget`, and
 `cargo test --workspace --no-fail-fast`, compared against the known local failures.
 
-Next task: 4.3, test-output deltas. Key a shell call by its command in
-`rune-tools::test_report`; when the same test command ran earlier in the turn
-(or session), lead the result with new and changed failures in full, unchanged
-failures by name, and newly passing tests, keeping the full log behind a
-`read_tool_result` handle.
+Next task: 5.4, recover an empty reply cut by an output limit: in `run_turn`,
+when a step ends with `FinishReason::MaxTokens`, no text and no tool calls, retry
+that step once (with a note asking for a shorter answer), then report
+`StopReason::OutputLimit`. After it: 5.1, 7.3, 8.1b, 8.3b, 8.4b.
 
 Waiting on the owner: a DeepSeek key and approval to spend about $0.02 for the
 head-to-head runs (9.5) and the `reasoning_content` check (3.5).
 
-Remaining open items: 3.5, 4.3, 4.4 (across turns), 5.1, 5.4, 7.3, 8.1b, 8.3b, 8.4b, 9.5, 10.1 to 10.4.
+Remaining open items: 3.5, 4.4 (across turns), 5.1, 5.4, 7.3, 8.1b, 8.3b, 8.4b, 9.5, 10.1 to 10.4.
 
 ## Phases
 
@@ -159,7 +158,7 @@ Done when a recorded Anthropic exchange shows cache reads on the second request.
 - [x] 4.1b Spill previews keep head and tail too.
 - [x] 4.2 Recognize test runners (cargo, node --test, npm, vitest, jest, pytest, go test) and
       lead the result with parsed pass, fail and skip counts.
-- [ ] 4.3 A repeated test command returns a delta against its previous run: new and changed
+- [x] 4.3 A repeated test command returns a delta against its previous run: new and changed
       failures in full, unchanged failures by name, newly passing tests, and a handle to the
       full log.
 - [ ] 4.4 A re-read of an unchanged range returns a pointer to the earlier call; an edit
@@ -287,3 +286,4 @@ Done when a reproducible table exists with Rune in it.
 | 2026-11-09 | e127a60 | 9.2 | `session_spend_cents` limit (new `cents` unit) and `/budget [dollars|off]`; checked in `prepare_request`. |
 | 2026-11-09 | 099b334 | 9.4 | Six tasks under `bench/tasks` (JS x2, Python x2, Go, Rust), all proven by `bench/check.sh`. Sutra's own tasks verify with `node --test test/`, which fails on Node 22.21 even when solved; a head-to-head must use Node 24 or rewrite their verify. |
 | 2026-11-09 | c67347f | 5.3 | `repeat_guard` beside `failure_guard`: an identical successful read, list or search with no changing call since, still in history, gets a pointer (`REPEAT_MARKER`) instead of running; a second repeat runs. `read_tool_result` excluded (its page depends on the budget). Row reads `unchanged, not re-run`. |
+| 2026-11-09 | pending | 4.3 | `test_report::delta` and `failures`; `Shell` keeps the last log of 8 test commands. A repeat drops lines the previous log had (at least 8, or it is shown whole) and leads with `[since the last run: now passing; still failing; new failures; N lines left out]`. New `ToolOutput.full_text` is retained by the turn loop as `[full log: read_tool_result handle …]`. Runs that finish inside the call only. |

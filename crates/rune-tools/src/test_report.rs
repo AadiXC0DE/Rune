@@ -212,6 +212,114 @@ fn go(output: &str) -> Option<Counts> {
     }
 }
 
+/// Names of the failing tests a runner lists, in order, without repeats.
+///
+/// Covers cargo, TAP, pytest, go and the jest and vitest marks. A runner whose
+/// failures are not named this way yields an empty list.
+#[must_use]
+pub fn failures(output: &str) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    for line in output.lines() {
+        let trimmed = line.trim();
+        let name = trimmed
+            .strip_prefix("test ")
+            .and_then(|rest| rest.strip_suffix(" ... FAILED"))
+            .or_else(|| {
+                let rest = trimmed.strip_prefix("not ok ")?;
+                Some(rest.split_once(" - ")?.1)
+            })
+            .or_else(|| {
+                let rest = trimmed.strip_prefix("FAILED ")?;
+                Some(rest.split_once(" - ").map_or(rest, |(name, _)| name))
+            })
+            .or_else(|| {
+                let rest = trimmed.strip_prefix("--- FAIL: ")?;
+                Some(rest.rsplit_once(" (").map_or(rest, |(name, _)| name))
+            })
+            .or_else(|| {
+                trimmed
+                    .strip_prefix("\u{2715} ")
+                    .or_else(|| trimmed.strip_prefix("\u{d7} "))
+                    .or_else(|| trimmed.strip_prefix("\u{25cf} "))
+            });
+        if let Some(name) = name.map(str::trim).filter(|name| !name.is_empty())
+            && !names.iter().any(|known| known == name)
+        {
+            names.push(name.to_owned());
+        }
+    }
+    names
+}
+
+/// Fewest unchanged lines worth leaving out of a repeated run.
+const MIN_OMITTED_LINES: usize = 8;
+
+/// Shortens a test run against the previous run of the same command.
+///
+/// Lines the previous log already had are left out, which drops unchanged
+/// failure detail; lines that are new, such as a new failure or a changed
+/// message, stay in place. A leading line names tests that now pass, still
+/// fail, and newly fail. Returns `None` when either log has no test summary
+/// or too little would be left out to matter.
+#[must_use]
+pub fn delta(previous: &str, current: &str) -> Option<String> {
+    parse(previous)?;
+    parse(current)?;
+    let seen: std::collections::HashSet<&str> = previous.lines().map(str::trim_end).collect();
+    let mut kept = String::new();
+    let mut omitted = 0_usize;
+    for line in current.lines() {
+        if seen.contains(line.trim_end()) {
+            omitted = omitted.saturating_add(usize::from(!line.trim().is_empty()));
+        } else {
+            kept.push_str(line);
+            kept.push('\n');
+        }
+    }
+    if omitted < MIN_OMITTED_LINES {
+        return None;
+    }
+    let before = failures(previous);
+    let after = failures(current);
+    let list = |names: Vec<&String>, label: &str| {
+        if names.is_empty() {
+            return None;
+        }
+        let shown: Vec<&str> = names.iter().take(8).map(|name| name.as_str()).collect();
+        let more = names.len().saturating_sub(shown.len());
+        let tail = if more > 0 {
+            format!(", {more} more")
+        } else {
+            String::new()
+        };
+        Some(format!("{label}: {}{tail}", shown.join(", ")))
+    };
+    let mut parts: Vec<String> = [
+        list(
+            before.iter().filter(|name| !after.contains(name)).collect(),
+            "now passing",
+        ),
+        list(
+            after.iter().filter(|name| before.contains(name)).collect(),
+            "still failing",
+        ),
+        list(
+            after.iter().filter(|name| !before.contains(name)).collect(),
+            "new failures",
+        ),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    parts.push(format!(
+        "{omitted} lines identical to the previous run of this command left out"
+    ));
+    Some(format!(
+        "[since the last run: {}]\n{kept}",
+        parts.join("; ")
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -286,6 +394,44 @@ mod tests {
         assert_eq!(
             counts(3, 0, 2).expect("counts").to_string(),
             "3 passed, 0 failed, 2 skipped"
+        );
+    }
+
+    #[test]
+    fn a_repeated_run_keeps_only_what_changed() {
+        let detail = "    at frame\n".repeat(10);
+        let previous = format!(
+            "test a ... FAILED\ntest b ... FAILED\ntest c ... ok\n{detail}\
+             test result: FAILED. 1 passed; 2 failed; 0 ignored; finished in 0.10s\n"
+        );
+        let current = format!(
+            "test a ... ok\ntest b ... FAILED\ntest c ... ok\n{detail}\
+             assertion failed: new message\n\
+             test result: FAILED. 2 passed; 1 failed; 0 ignored; finished in 0.12s\n"
+        );
+        let delta = delta(&previous, &current).expect("delta");
+        assert!(delta.starts_with("[since the last run: now passing: a; still failing: b;"));
+        assert!(delta.contains("new message"));
+        assert!(delta.contains("2 passed; 1 failed"));
+        assert!(!delta.contains("frame"));
+        assert!(!delta.contains("test b ... FAILED"));
+    }
+
+    #[test]
+    fn a_run_with_little_in_common_is_shown_whole() {
+        let previous = "test a ... FAILED\ntest result: FAILED. 0 passed; 1 failed;\n";
+        let current = "test a ... ok\ntest result: ok. 1 passed; 0 failed;\n";
+        assert_eq!(delta(previous, current), None);
+        assert_eq!(delta("no summary", current), None);
+    }
+
+    #[test]
+    fn failing_tests_are_named_for_each_runner() {
+        let log = "test m::x ... FAILED\nnot ok 2 - adds\nFAILED t.py::y - assert\n\
+                   --- FAIL: TestZ (0.00s)\n  \u{2715} renders\ntest m::x ... FAILED\n";
+        assert_eq!(
+            failures(log),
+            ["m::x", "adds", "t.py::y", "TestZ", "renders"]
         );
     }
 }

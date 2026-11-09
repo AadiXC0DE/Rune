@@ -458,6 +458,7 @@ impl PluginHost {
             is_error,
             produced_bytes,
             plan_update: None,
+            full_text: None,
         })
     }
 

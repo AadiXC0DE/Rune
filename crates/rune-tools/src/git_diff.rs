@@ -289,6 +289,7 @@ fn render(label: &str, reading: &Reading, cap: usize, failed: bool) -> ToolOutpu
         text,
         is_error: failed,
         plan_update: None,
+        full_text: None,
     }
 }
 

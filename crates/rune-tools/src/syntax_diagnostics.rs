@@ -293,6 +293,7 @@ fn render(exit: Exit, stderr: &Reading, path: &str, cap: usize) -> ToolOutput {
         text,
         is_error: !exit.is_success(),
         plan_update: None,
+        full_text: None,
     }
 }
 

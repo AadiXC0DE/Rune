@@ -111,6 +111,9 @@ pub struct ToolOutput {
     pub produced_bytes: u64,
     /// Changed plan snapshot for the host to report as a status event.
     pub plan_update: Option<crate::update_plan::PlanUpdate>,
+    /// The complete text when `text` is a shortened view of it. The turn loop
+    /// retains it and names its handle, so nothing left out is out of reach.
+    pub full_text: Option<String>,
 }
 
 impl ToolOutput {
@@ -123,6 +126,7 @@ impl ToolOutput {
             text,
             is_error: false,
             plan_update: None,
+            full_text: None,
         }
     }
 
@@ -139,6 +143,7 @@ impl ToolOutput {
             text,
             is_error: true,
             plan_update: None,
+            full_text: None,
         }
     }
 
