@@ -286,6 +286,19 @@ pub fn line_changes(before: &str, after: &str) -> LineChanges {
     }
 }
 
+/// Returns a preview as the lines shown under a call's row, or nothing when
+/// the change has no textual difference. A cut preview ends with `...`.
+pub(crate) fn shown_diff(preview: &Preview) -> Option<String> {
+    if preview.text.is_empty() {
+        return None;
+    }
+    let mut shown = preview.text.clone();
+    if preview.truncated {
+        shown.push_str("\n...");
+    }
+    Some(shown)
+}
+
 /// Describes an applied mutation in one bounded phrase.
 pub(crate) fn detail(applied: &Applied) -> String {
     let lines = applied.lines();

@@ -1446,6 +1446,7 @@ impl<W: Write + Send + 'static> Host for TurnHost<W> {
                     is_error: outcome.is_error,
                     plan_update: None,
                     full_text: None,
+                    diff: None,
                 },
                 Err(err) => ToolOutput::from_error(&err),
             };

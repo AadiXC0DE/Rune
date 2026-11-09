@@ -114,6 +114,10 @@ pub struct ToolOutput {
     /// The complete text when `text` is a shortened view of it. The turn loop
     /// retains it and names its handle, so nothing left out is out of reach.
     pub full_text: Option<String>,
+    /// The change as `- ` and `+ ` lines, for a person to see under the
+    /// call's row. It is never sent to the model, which already knows what it
+    /// asked to change.
+    pub diff: Option<String>,
 }
 
 impl ToolOutput {
@@ -127,6 +131,7 @@ impl ToolOutput {
             is_error: false,
             plan_update: None,
             full_text: None,
+            diff: None,
         }
     }
 
@@ -144,6 +149,7 @@ impl ToolOutput {
             is_error: true,
             plan_update: None,
             full_text: None,
+            diff: None,
         }
     }
 

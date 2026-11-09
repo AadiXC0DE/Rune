@@ -1779,6 +1779,7 @@ fn execute(context: &TurnContext, calls: &[PreparedCall]) -> (Vec<Executed>, boo
                     produced_bytes: produced,
                     plan_update: None,
                     full_text: None,
+                    diff: None,
                 };
                 context.emit(Event::ToolFinished {
                     call: call.clone(),

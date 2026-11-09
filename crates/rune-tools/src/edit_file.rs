@@ -125,13 +125,16 @@ impl Tool for EditFile {
         let path = resolve(context, raw)?.path;
         let prepared = mutation::prepare_edits(&path, &edits)?;
         context.check_cancelled()?;
+        let diff = mutation::shown_diff(prepared.preview());
         let applied = mutation::apply(prepared)?;
-        Ok(ToolOutput::success(format!(
+        let mut output = ToolOutput::success(format!(
             "Edited `{}` ({}, {})",
             applied.path(),
             count_phrase(applied.replacements()),
             mutation::detail(&applied)
-        )))
+        ));
+        output.diff = diff;
+        Ok(output)
     }
 }
 

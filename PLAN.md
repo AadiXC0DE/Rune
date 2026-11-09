@@ -87,7 +87,7 @@ These are compared against `main` before a push rather than counted as regressio
 
 ## Resume here (2026-11-09)
 
-State: `main` matches `origin/main` after the third batch push (see the Log).
+State: `main` is 1 commit ahead of `origin/main` (last push `56828d7`, CI run 42647916013).
 
 Before the next push: `cargo xtask web` (the demo module record is stale once
 `rune-term`, `rune-tools`, `rune-agent`, `rune-net`, `rune-core` or `rune-context`
@@ -95,14 +95,15 @@ change), `cargo fmt --all -- --check`,
 `cargo clippy --workspace --all-targets -D warnings`, `cargo xtask budget`, and
 `cargo test --workspace --no-fail-fast`, compared against the known local failures.
 
-Next task: 7.3, coloured diffs for edit results and `git_diff` in `rune-term`
-(added lines, removed lines, hunk headers through theme slots, off for
-accessible and no-colour output). After it: 5.1, 8.1b, 8.3b, 8.4b.
+Next task: 8.1b, the approval prompt shows the diff for an edit. The decision
+path has no arguments today; carry the call's arguments to the approval request
+and draw `rune_term::diff::changed_lines` + `render` (from 7.3) above the choices.
+After it: 5.1, 8.3b, 8.4b.
 
 Waiting on the owner: a DeepSeek key and approval to spend about $0.02 for the
 head-to-head runs (9.5) and the `reasoning_content` check (3.5).
 
-Remaining open items: 3.5, 4.4 (across turns), 5.1, 7.3, 8.1b, 8.3b, 8.4b, 9.5, 10.1 to 10.4.
+Remaining open items: 3.5, 4.4 (across turns), 5.1, 8.1b, 8.3b, 8.4b, 9.5, 10.1 to 10.4.
 
 ## Phases
 
@@ -198,7 +199,7 @@ Done when a PTY test pins the live rows and the summary.
 - [x] 7.1b Markdown tables: align columns across the rows of one table.
 - [x] 7.2 Code-fence highlighting from a small lexer (keywords, strings, comments, numbers)
       for the common languages, within the size budget.
-- [ ] 7.3 Coloured diffs for edit results and `git_diff`.
+- [x] 7.3 Coloured diffs for edit results and `git_diff`.
 
 Done when the binary stays inside its ceiling and a snapshot test pins each element.
 
@@ -284,3 +285,5 @@ Done when a reproducible table exists with Rune in it.
 | 2026-11-09 | c67347f | 5.3 | `repeat_guard` beside `failure_guard`: an identical successful read, list or search with no changing call since, still in history, gets a pointer (`REPEAT_MARKER`) instead of running; a second repeat runs. `read_tool_result` excluded (its page depends on the budget). Row reads `unchanged, not re-run`. |
 | 2026-11-09 | d3ab973 | 4.3 | `test_report::delta` and `failures`; `Shell` keeps the last log of 8 test commands. A repeat drops lines the previous log had (at least 8, or it is shown whole) and leads with `[since the last run: now passing; still failing; new failures; N lines left out]`. New `ToolOutput.full_text` is retained by the turn loop as `[full log: read_tool_result handle …]`. Runs that finish inside the call only. |
 | 2026-11-09 | fad1f09 | 5.4 | A step that stops at `MaxTokens` with no text and no calls is asked once more (`OUTPUT_LIMIT_RETRY` user note; a placeholder assistant turn first when nothing was recorded); a second one reports `OutputLimit`. |
+| 2026-11-09 | 56828d7 | push | Third batch of 18 commits (5.3, 4.3, 5.4 and the CI fixes); CI run 42647916013. |
+| 2026-11-09 | pending | 7.3 | `rune-term::diff` (`changed_lines` trims shared lines, `render` cuts to 8 lines and the width); edit rows draw it from the call's `old_string`/`new_string` or `edits`, in Success/Error slots. Accessible mode keeps the row alone. `git_diff` output goes to the model, not scrollback, so it has no view to colour. |

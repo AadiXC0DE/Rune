@@ -72,12 +72,15 @@ impl Tool for WriteFile {
         let path = resolve(context, raw)?.path;
         let prepared = mutation::prepare(&path, content)?;
         context.check_cancelled()?;
+        let diff = mutation::shown_diff(prepared.preview());
         let applied = mutation::apply(prepared)?;
-        Ok(ToolOutput::success(format!(
+        let mut output = ToolOutput::success(format!(
             "Wrote `{}` ({})",
             applied.path(),
             mutation::detail(&applied)
-        )))
+        ));
+        output.diff = diff;
+        Ok(output)
     }
 }
 

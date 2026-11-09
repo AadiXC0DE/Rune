@@ -671,7 +671,11 @@ impl Host for SessionHost {
                     if self.accessible {
                         self.commit(&[Entry::tool(row)]);
                     } else {
-                        self.commit_lines(&[self.styled_tool_line(&row, output.is_error)]);
+                        let mut lines = vec![self.styled_tool_line(&row, output.is_error)];
+                        if !output.is_error && call.name == "edit_file" {
+                            lines.extend(self.edit_preview(call));
+                        }
+                        self.commit_lines(&lines);
                     }
                 }
             }
@@ -746,6 +750,7 @@ impl Host for SessionHost {
                     is_error: outcome.is_error,
                     plan_update: None,
                     full_text: None,
+                    diff: None,
                 }),
                 Err(error) if error.code() == ErrorCode::Cancelled => Err(error),
                 Err(error) => Ok(ToolOutput::from_error(&error)),
@@ -1750,6 +1755,48 @@ impl SessionHost {
             }
             None => format!("  {status}{glyph}{reset} {rest}"),
         }
+    }
+
+    /// Draws the lines an edit removed and added, cut to a few, under its row.
+    fn edit_preview(&self, call: &turn::PreparedCall) -> Vec<String> {
+        let arguments: serde_json::Value =
+            serde_json::from_str(&call.arguments).unwrap_or_default();
+        let text = |value: &serde_json::Value, key: &str| {
+            value
+                .get(key)
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_owned()
+        };
+        let pairs: Vec<(String, String)> =
+            match arguments.get("edits").and_then(serde_json::Value::as_array) {
+                Some(edits) => edits
+                    .iter()
+                    .map(|edit| (text(edit, "old_string"), text(edit, "new_string")))
+                    .collect(),
+                None => vec![(
+                    text(&arguments, "old_string"),
+                    text(&arguments, "new_string"),
+                )],
+            };
+        let lines: Vec<(char, &str)> = pairs
+            .iter()
+            .flat_map(|(old, new)| rune_term::diff::changed_lines(old, new))
+            .collect();
+        let sgr = |slot| self.theme.sgr(slot, self.truecolor);
+        let style = rune_term::diff::DiffStyle {
+            added: sgr(Slot::Success),
+            removed: sgr(Slot::Error),
+            dim: sgr(Slot::Dim),
+            reset: rune_term::engine::Style::RESET.to_owned(),
+        };
+        rune_term::diff::render(
+            &lines,
+            &style,
+            EDIT_PREVIEW_LINES,
+            usize::from(self.width()),
+            self.ascii,
+        )
     }
 
     /// Returns how Markdown in an answer is drawn with this session's theme.
@@ -5749,6 +5796,9 @@ enum RowGlyphs {
 }
 
 /// Summarizes what a call produced in a few words.
+/// Changed lines drawn under an edit's tool row before the rest is counted.
+const EDIT_PREVIEW_LINES: usize = 8;
+
 fn result_summary(name: &str, output: &ToolOutput, ascii: bool) -> String {
     let lines = || {
         output
@@ -10502,6 +10552,32 @@ mod tests {
             lines.iter().any(|line| line.contains("step limit")),
             "{lines:?}"
         );
+    }
+
+    #[test]
+    fn a_finished_edit_shows_the_lines_it_changed_under_its_row() {
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let host = test_host();
+        *host.live_out.lock().expect("lock") =
+            Some(Arc::new(Mutex::new(SharedSink(Arc::clone(&bytes)))));
+        host.emit(Event::ToolFinished {
+            call: turn::PreparedCall {
+                id: "c1".to_owned(),
+                name: "edit_file".to_owned(),
+                arguments: serde_json::json!({
+                    "path": "src/lib.rs",
+                    "old_string": "keep\nold line\nkeep too",
+                    "new_string": "keep\nnew line\nkeep too",
+                })
+                .to_string(),
+            },
+            output: ToolOutput::success("edited src/lib.rs (1 replacement, +1 -1, line 2)"),
+            elapsed: std::time::Duration::from_millis(3),
+        });
+        let shown = String::from_utf8_lossy(&bytes.lock().expect("lock")).into_owned();
+        assert!(shown.contains("- old line"), "{shown}");
+        assert!(shown.contains("+ new line"), "{shown}");
+        assert!(!shown.contains("keep too"), "{shown}");
     }
 
     #[test]

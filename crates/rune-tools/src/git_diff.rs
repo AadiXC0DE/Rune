@@ -290,6 +290,7 @@ fn render(label: &str, reading: &Reading, cap: usize, failed: bool) -> ToolOutpu
         is_error: failed,
         plan_update: None,
         full_text: None,
+        diff: None,
     }
 }
 

@@ -6,6 +6,7 @@
 #![cfg_attr(test, allow(clippy::expect_used, clippy::unwrap_used, clippy::panic))]
 
 pub mod commands;
+pub mod diff;
 pub mod editor;
 pub mod engine;
 mod external_editor;
