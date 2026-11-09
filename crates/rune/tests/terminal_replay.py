@@ -263,7 +263,19 @@ with tempfile.TemporaryDirectory(prefix="rune-r034-") as directory:
             capture("closed-grown", size=(80, 24))
             assert not prompts, prompts
         elif scenario == "completion-resize":
-            capture("completion-selected", b"/" + b"\x1b[B" * 9, "> /new")
+            # Walk down to /new a step at a time, each step waiting for its
+            # frame, because its place in the list moves as commands are added.
+            os.write(master, b"/")
+            wait_for(" of ", offset)
+            for _ in range(64):
+                if b"> /new" in transcript[offset:]:
+                    break
+                mark = len(transcript)
+                os.write(master, b"\x1b[B")
+                wait_for("\x1b[?25h", mark)
+            assert b"> /new" in transcript[offset:], "never reached /new"
+            # Already drawn above, so the capture only records it.
+            capture("completion-selected", expected="")
             # No key is sent on either resize. Rust checks the selected row.
             capture("completion-shrunk", size=(32, 10))
             capture("completion-grown", size=(80, 24))

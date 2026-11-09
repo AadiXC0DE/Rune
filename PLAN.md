@@ -81,19 +81,25 @@ Gaps that cost tokens, pass rate or user trust:
 
 ## Known local failures (macOS host)
 
-None as of 2026-11-09. Two test-harness bugs made 41 tests fail on macOS only:
-the PTY harnesses waited for exit without reading the PTY (Rune blocked writing
-into the small macOS PTY buffer; fixed by `drain_wait` in
-`crates/rune/tests/support/mod.rs`), and three ACP output-failure tests closed the
-client with `shutdown(Read)`, after which macOS still accepts writes (fixed by
-closing the socket). A failure in `cargo test --workspace` is now a regression.
+Measured 2026-11-10 with `cargo test --workspace --no-fail-fast` (3,424 tests):
+
+- `rune` `mcp_stdio`: `interactive_stdio_mcp_obeys_trust_policy_and_lifecycle_bounds`.
+- `rune` `terminal_approval`: the provider never receives the draft turn.
+- `rune` `terminal_draft`: history search (`\x12NEEDLE`) times out.
+- `rune` `terminal_help`: `line_input_help_reports_the_active_mode`, terminal never idle.
+
+These pass on Linux CI. Before 2026-11-09 there were 41 local failures: the PTY
+harnesses waited for exit without reading the PTY (Rune blocked writing into the
+small macOS PTY buffer; fixed by `drain_wait` in `crates/rune/tests/support/mod.rs`),
+and three ACP output-failure tests closed the client with `shutdown(Read)`, which
+macOS ignores for writes. Compare a local run against this list before a push.
 
 ## Resume here (2026-11-09)
 
 State: work continues on `plan/phase-5-to-8` (PR #21); its first push was `ffe3241`.
 
 Before the next push: `cargo xtask web` if a crate the demo uses changed, then
-`scripts/preflight.sh`, which must pass outright.
+`scripts/preflight.sh`, compared against the known local failures above.
 
 Next: 10.4 (release 0.2.0, with the size figures of 10.3) needs the owner's
 go-ahead; 9.5 and 3.5 need a DeepSeek key. Without those, look for a gap on
@@ -309,3 +315,4 @@ Done when a reproducible table exists with Rune in it.
 | 2026-11-09 | f4dfa67 | tests | PTY harnesses read the PTY while waiting for exit (`drain_wait` in the shared Python prelude, 20 call sites). Confirmed first on `terminal_help`: fails with a bare wait, passes with the drain. All 46 PTY and MCP test groups pass on macOS; the CI macOS `mcp_http` timeout was the same bug. |
 | 2026-11-09 | 8f7e2bb | tests (acp) | The three ACP output-failure tests close the client socket instead of `shutdown(Read)`; all 80 `rune-acp` tests pass on macOS. No known local failures remain. |
 | 2026-11-09 | 5d4ac08 | tests (menu) | `terminal_menu` walked 14 steps to `/quit`, assuming 15 builtins; there are 20. It now reads N from the menu's `1-3 of N`. Correction: the earlier note that all PTY groups passed came from a run cut off by its timeout; this run (exit 0, 46 groups) is the real one. The `dependencies` run 42672905663 failed with a GitHub internal server error, not a workflow problem. |
+| 2026-11-10 | pending | tests (replay) | CI run 42674458235: `terminal_replay` expected 15 builtins. `short_menu.grid` now reads `18-20 of 20`, and the completion walk steps Down until `/new` is selected. Correction: the earlier "46 groups pass" run passed zsh an unsplit `$args`, which cargo took as a name filter, so it ran no tests. The real run is the list above. |

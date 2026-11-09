@@ -4,7 +4,8 @@
 #   scripts/preflight.sh          format, lint, budget, demo module, tests
 #   scripts/preflight.sh --quick  everything but the workspace test suite
 #
-# Every step must pass; the workspace suite has no known failures on macOS.
+# On macOS a few PTY tests fail that pass on Linux CI; compare the workspace
+# suite's failures with the list in PLAN.md.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 export CARGO_INCREMENTAL=0
