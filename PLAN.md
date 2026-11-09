@@ -81,19 +81,19 @@ Gaps that cost tokens, pass rate or user trust:
 
 ## Known local failures (macOS host)
 
-- `rune-acp` `output_failure_tests`: 3 tests exceed the shutdown grace.
-
-The PTY and MCP suites (`terminal_*`, `mcp_http`, `mcp_stdio`) failed here until
-`2026-11-09` because their harnesses waited for exit without reading the PTY: Rune
-blocked writing its exit output into the small macOS PTY buffer. `drain_wait` in
-`crates/rune/tests/support/mod.rs` fixed it; they pass locally now.
+None as of 2026-11-09. Two test-harness bugs made 41 tests fail on macOS only:
+the PTY harnesses waited for exit without reading the PTY (Rune blocked writing
+into the small macOS PTY buffer; fixed by `drain_wait` in
+`crates/rune/tests/support/mod.rs`), and three ACP output-failure tests closed the
+client with `shutdown(Read)`, after which macOS still accepts writes (fixed by
+closing the socket). A failure in `cargo test --workspace` is now a regression.
 
 ## Resume here (2026-11-09)
 
 State: work continues on `plan/phase-5-to-8` (PR #21); its first push was `ffe3241`.
 
 Before the next push: `cargo xtask web` if a crate the demo uses changed, then
-`scripts/preflight.sh`, compared against the known local failures.
+`scripts/preflight.sh`, which must pass outright.
 
 Next: 10.4 (release 0.2.0, with the size figures of 10.3) needs the owner's
 go-ahead; 9.5 and 3.5 need a DeepSeek key. Without those, look for a gap on
@@ -307,3 +307,4 @@ Done when a reproducible table exists with Rune in it.
 | 2026-11-09 | 062288d | CI | `budget` back on every push: the site says every pull request checks the size and startup ceilings. |
 | 2026-11-09 | ce9e02b | 5.3b | The repeat guard covers shell test, build and lint runs (`is_repeatable_check`: cargo, npm/pnpm/yarn/bun, npx tools, node --test, pytest, go, make test/check/lint; pipes allowed, no redirects, chaining or substitution). A failing run counts too, since nothing changed; a second repeat runs, for flaky tests. Also formats the SDK file, which the 10.1 commit left unformatted. |
 | 2026-11-09 | f4dfa67 | tests | PTY harnesses read the PTY while waiting for exit (`drain_wait` in the shared Python prelude, 20 call sites). Confirmed first on `terminal_help`: fails with a bare wait, passes with the drain. All 46 PTY and MCP test groups pass on macOS; the CI macOS `mcp_http` timeout was the same bug. |
+| 2026-11-09 | pending | tests (acp) | The three ACP output-failure tests close the client socket instead of `shutdown(Read)`; all 80 `rune-acp` tests pass on macOS. No known local failures remain. |

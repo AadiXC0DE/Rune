@@ -4,9 +4,7 @@
 #   scripts/preflight.sh          format, lint, budget, demo module, tests
 #   scripts/preflight.sh --quick  everything but the workspace test suite
 #
-# The workspace suite on macOS has known PTY and MCP harness failures (see
-# PLAN.md); compare its failures against that list. CI's Linux and Windows
-# jobs remain the judge for those suites.
+# Every step must pass; the workspace suite has no known failures on macOS.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 export CARGO_INCREMENTAL=0
