@@ -85,6 +85,30 @@ Gaps that cost tokens, pass rate or user trust:
 
 These are compared against `main` before a push rather than counted as regressions.
 
+## Resume here (2026-11-09)
+
+State: `main` is 11 commits ahead of `origin/main` (last push `d88e784`). The
+unpushed commits include the fixes for the three CI failures on the last push:
+the `webpki-roots` licence pin (`deny.toml`), the narrow replay grids, and the
+ACP test that needed `verification_reminders = 0`. Push them in the next batch.
+
+Before the next push: `cargo xtask web` (the demo module record is stale once
+`rune-term`, `rune-tools`, `rune-agent`, `rune-net`, `rune-core` or `rune-context`
+change; `rune-term` changed since `d88e784`), `cargo fmt --all -- --check`,
+`cargo clippy --workspace --all-targets -D warnings`, `cargo xtask budget`, and
+`cargo test --workspace --no-fail-fast`, compared against the known local failures.
+
+Next task: a repeat guard in `crates/rune-agent/src/turn.rs` beside
+`failure_guard`, applied at both call sites in `execute_batch`. A read-only
+call identical to an earlier successful call in the same turn, with no
+changing call executed since, is answered with a pointer to the earlier result
+instead of running again (covers 4.4 within a turn and 5.3).
+
+Waiting on the owner: a DeepSeek key and approval to spend about $0.02 for the
+head-to-head runs (9.5) and the `reasoning_content` check (3.5).
+
+Remaining open items: 3.5, 4.3, 4.4, 5.1, 5.3, 5.4, 7.3, 8.1b, 8.3b, 8.4b, 9.5, 10.1 to 10.4.
+
 ## Phases
 
 ### Phase 1: Baseline and guardrails
@@ -260,4 +284,4 @@ Done when a reproducible table exists with Rune in it.
 | 2026-11-09 | 1cfc279 | 7.1b | Pipe tables in a finished answer are aligned by visible width; the stream shows them as written. |
 | 2026-11-09 | 5c225ee | 8.3 | `/plan [task|off]`; denial before rules and grants; note sent in the user turn so the cached prefix is unchanged; status row shows `plan`. |
 | 2026-11-09 | e127a60 | 9.2 | `session_spend_cents` limit (new `cents` unit) and `/budget [dollars|off]`; checked in `prepare_request`. |
-| 2026-11-09 | (this) | 9.4 | Six tasks under `bench/tasks` (JS x2, Python x2, Go, Rust), all proven by `bench/check.sh`. Sutra's own tasks verify with `node --test test/`, which fails on Node 22.21 even when solved; a head-to-head must use Node 24 or rewrite their verify. |
+| 2026-11-09 | 099b334 | 9.4 | Six tasks under `bench/tasks` (JS x2, Python x2, Go, Rust), all proven by `bench/check.sh`. Sutra's own tasks verify with `node --test test/`, which fails on Node 22.21 even when solved; a head-to-head must use Node 24 or rewrite their verify. |
