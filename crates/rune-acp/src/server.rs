@@ -1393,8 +1393,12 @@ impl<W: Write + Send + 'static> Host for TurnHost<W> {
                 }
             }
             Event::ToolStarted { call, .. } => self.announce(&call),
-            Event::ToolFinished { call, is_error } => {
-                let status = if is_error { "failed" } else { "completed" };
+            Event::ToolFinished { call, output, .. } => {
+                let status = if output.is_error {
+                    "failed"
+                } else {
+                    "completed"
+                };
                 self.server.send(&Message::Notification(tool_call_update(
                     &self.session,
                     &call.id,

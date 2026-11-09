@@ -13,7 +13,7 @@
 //!   exhausted retry/objective budget or consecutive identical failure cap stops it.
 //! - Finalization happens exactly once, so a session cannot record a turn twice.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use camino::Utf8Path;
 use rune_core::budget::{BudgetSet, LimitName};
@@ -162,8 +162,10 @@ pub enum Event {
     ToolFinished {
         /// The call.
         call: PreparedCall,
-        /// Whether the tool reported a failure.
-        is_error: bool,
+        /// What the tool returned, before the turn bounds it for the model.
+        output: ToolOutput,
+        /// Time the tool spent executing.
+        elapsed: Duration,
     },
     /// The live plan changed after an allowed tool call.
     PlanUpdated {
@@ -1000,12 +1002,16 @@ fn execute_batch(
                     Ok((arguments, context)) => {
                         let executor = host.concurrent_tool_host(&call.name);
                         scope.spawn(move || {
-                            let executor = executor.ok_or_else(|| {
-                                RuneError::new(ErrorCode::Internal, "read executor disappeared")
-                            })?;
-                            executor.cancellation().check()?;
-                            context.check_cancelled()?;
-                            executor.execute_with_context(&call.name, &arguments, &context)
+                            let started = Instant::now();
+                            let execution = (|| {
+                                let executor = executor.ok_or_else(|| {
+                                    RuneError::new(ErrorCode::Internal, "read executor disappeared")
+                                })?;
+                                executor.cancellation().check()?;
+                                context.check_cancelled()?;
+                                executor.execute_with_context(&call.name, &arguments, &context)
+                            })();
+                            (execution, started.elapsed())
                         })
                     }
                     Err(result) => {
@@ -1020,11 +1026,11 @@ fn execute_batch(
                 .map(|(call, pending)| match pending {
                     Err(result) => result,
                     Ok(worker) => {
-                        let execution = match worker.join() {
-                            Ok(output) => output,
+                        let (execution, elapsed) = match worker.join() {
+                            Ok(finished) => finished,
                             Err(payload) => std::panic::resume_unwind(payload),
                         };
-                        finish_call(call, host, execution, &mut cancelled)
+                        finish_call(call, host, execution, elapsed, &mut cancelled)
                     }
                 })
                 .collect::<Vec<_>>()
@@ -1351,6 +1357,7 @@ fn execute_call(
     };
     // Retained output is owned by the history rather than the host. Supply
     // that store only after advertisement and policy checks have passed.
+    let started = Instant::now();
     let execution = if call.name == "read_tool_result" {
         let cap = context.max_output_bytes.min(output_cap);
         rune_tools::ReadToolResult::default().call(
@@ -1366,7 +1373,7 @@ fn execute_call(
             &context.with_live_plan(history.shared_live_plan()),
         )
     };
-    finish_call(call, host, execution, cancelled)
+    finish_call(call, host, execution, started.elapsed(), cancelled)
 }
 
 /// Reports execution and preserves a cancellation for calls still pending.
@@ -1374,6 +1381,7 @@ fn finish_call(
     call: &PreparedCall,
     host: &dyn Host,
     execution: Result<ToolOutput>,
+    elapsed: Duration,
     cancelled: &mut bool,
 ) -> CallResult {
     let output = match execution {
@@ -1398,7 +1406,8 @@ fn finish_call(
     }
     host.emit(Event::ToolFinished {
         call: call.clone(),
-        is_error: output.is_error,
+        output: output.clone(),
+        elapsed,
     });
     CallResult {
         call: call.clone(),

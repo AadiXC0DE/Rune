@@ -1768,23 +1768,26 @@ fn execute(context: &TurnContext, calls: &[PreparedCall]) -> (Vec<Executed>, boo
             signal: context.cancel.clone().into(),
         };
 
+        let started = Instant::now();
         match (tool.execute)(&arguments, &host_context) {
             Ok(result) => {
-                context.emit(Event::ToolFinished {
-                    call: call.clone(),
-                    is_error: result.is_error,
-                });
                 let cap = context.limits.get_usize(LimitName::MaxToolResultBytes);
                 let produced = u64::try_from(result.text.len()).unwrap_or(u64::MAX);
+                let output = ToolOutput {
+                    text: bound_text(&result.text, cap),
+                    is_error: result.is_error,
+                    produced_bytes: produced,
+                    plan_update: None,
+                };
+                context.emit(Event::ToolFinished {
+                    call: call.clone(),
+                    output: output.clone(),
+                    elapsed: started.elapsed(),
+                });
                 results.push(Executed {
                     result: CallResult {
                         call: call.clone(),
-                        output: ToolOutput {
-                            text: bound_text(&result.text, cap),
-                            is_error: result.is_error,
-                            produced_bytes: produced,
-                            plan_update: None,
-                        },
+                        output,
                         executed: true,
                     },
                     images: result.images,
@@ -1793,7 +1796,8 @@ fn execute(context: &TurnContext, calls: &[PreparedCall]) -> (Vec<Executed>, boo
             Err(err) => {
                 context.emit(Event::ToolFinished {
                     call: call.clone(),
-                    is_error: true,
+                    output: ToolOutput::from_error(&err),
+                    elapsed: started.elapsed(),
                 });
                 if err.code() == ErrorCode::Cancelled {
                     cancelled = true;

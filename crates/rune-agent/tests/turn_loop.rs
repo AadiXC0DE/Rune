@@ -2583,10 +2583,7 @@ fn a_file_rename_reports_one_mutation_and_refuses_an_outside_destination() {
             .iter()
             .filter(|event| matches!(
                 event,
-                Event::ToolFinished {
-                    is_error: false,
-                    ..
-                }
+                Event::ToolFinished { output, .. } if !output.is_error
             ))
             .count(),
         1

@@ -434,11 +434,11 @@ fn encode(event: &Event) -> serde_json::Value {
             "arguments": call.arguments,
             "label": activity.running_label(),
         }),
-        Event::ToolFinished { call, is_error } => json!({
+        Event::ToolFinished { call, output, .. } => json!({
             "kind": "tool_finished",
             "id": call.id,
             "name": call.name,
-            "is_error": is_error,
+            "is_error": output.is_error,
         }),
         Event::ToolDenied { call, reason } => json!({
             "kind": "tool_denied",
