@@ -679,8 +679,8 @@ impl Host for SessionHost {
                         self.commit(&[Entry::tool(row)]);
                     } else {
                         let mut lines = vec![self.styled_tool_line(&row, output.is_error)];
-                        if !output.is_error && call.name == "edit_file" {
-                            lines.extend(self.edit_preview(call));
+                        if !output.is_error {
+                            lines.extend(self.change_preview(call, output));
                         }
                         self.commit_lines(&lines);
                     }
@@ -1811,15 +1811,37 @@ impl SessionHost {
         }
     }
 
-    /// Draws the lines an edit removed and added, cut to a few, under its row.
-    fn edit_preview(&self, call: &turn::PreparedCall) -> Vec<String> {
-        let arguments: serde_json::Value =
-            serde_json::from_str(&call.arguments).unwrap_or_default();
-        let pairs = edit_pairs(&arguments);
-        let lines: Vec<(char, &str)> = pairs
-            .iter()
-            .flat_map(|(old, new)| rune_term::diff::changed_lines(old, new))
-            .collect();
+    /// Draws the lines a write or an edit removed and added, cut to a few,
+    /// under its row. The tool's own preview of the applied change is used
+    /// when it sent one; otherwise an edit's arguments are.
+    fn change_preview(&self, call: &turn::PreparedCall, output: &ToolOutput) -> Vec<String> {
+        let pairs;
+        let mut cut = false;
+        let lines: Vec<(char, &str)> = if let Some(diff) = &output.diff {
+            diff.lines()
+                .filter_map(|line| {
+                    if line == "..." {
+                        cut = true;
+                    }
+                    let (mark, text) = line.split_at_checked(2)?;
+                    match mark {
+                        "- " => Some(('-', text)),
+                        "+ " => Some(('+', text)),
+                        _ => None,
+                    }
+                })
+                .collect()
+        } else if call.name == "edit_file" {
+            let arguments: serde_json::Value =
+                serde_json::from_str(&call.arguments).unwrap_or_default();
+            pairs = edit_pairs(&arguments);
+            pairs
+                .iter()
+                .flat_map(|(old, new)| rune_term::diff::changed_lines(old, new))
+                .collect()
+        } else {
+            return Vec::new();
+        };
         let sgr = |slot| self.theme.sgr(slot, self.truecolor);
         let style = rune_term::diff::DiffStyle {
             added: sgr(Slot::Success),
@@ -1827,13 +1849,19 @@ impl SessionHost {
             dim: sgr(Slot::Dim),
             reset: rune_term::engine::Style::RESET.to_owned(),
         };
-        rune_term::diff::render(
+        let mut shown = rune_term::diff::render(
             &lines,
             &style,
             EDIT_PREVIEW_LINES,
             usize::from(self.width()),
             self.ascii,
-        )
+        );
+        // The tool cut its preview; say so unless the view already does.
+        if cut && lines.len() <= EDIT_PREVIEW_LINES {
+            let ellipsis = if self.ascii { "..." } else { "\u{2026}" };
+            shown.push(format!("    {}{ellipsis}{}", style.dim, style.reset));
+        }
+        shown
     }
 
     /// Returns how Markdown in an answer is drawn with this session's theme.
@@ -10758,6 +10786,29 @@ mod tests {
             lines.iter().any(|line| line.contains("step limit")),
             "{lines:?}"
         );
+    }
+
+    #[test]
+    fn a_finished_write_shows_the_preview_the_tool_sent() {
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let host = test_host();
+        *host.live_out.lock().expect("lock") =
+            Some(Arc::new(Mutex::new(SharedSink(Arc::clone(&bytes)))));
+        let mut output = ToolOutput::success("wrote notes.txt (+2 -1, lines 1-2)");
+        output.diff = Some("- before\n+ after\n+ more\n...".to_owned());
+        host.emit(Event::ToolFinished {
+            call: turn::PreparedCall {
+                id: "c1".to_owned(),
+                name: "write_file".to_owned(),
+                arguments: r#"{"path":"notes.txt","content":"after\nmore"}"#.to_owned(),
+            },
+            output,
+            elapsed: std::time::Duration::from_millis(2),
+        });
+        let shown = String::from_utf8_lossy(&bytes.lock().expect("lock")).into_owned();
+        assert!(shown.contains("- before"), "{shown}");
+        assert!(shown.contains("+ more"), "{shown}");
+        assert!(shown.contains('\u{2026}'), "{shown}");
     }
 
     #[test]
