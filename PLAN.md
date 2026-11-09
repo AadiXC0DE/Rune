@@ -69,8 +69,13 @@ Gaps that cost tokens, pass rate or user trust:
   `cargo clean` when it passes about 6 GiB. The machine has little free disk.
 - Run the focused test for the touched crate per task; run the full workspace suite before
   each push.
-- Push to `origin/main` after 15 to 20 local commits, then check CI with `gh run list`.
-  A push deploys the site, so pushes are batched.
+- Never push to `main`. Work on a branch with one open pull request (now
+  `plan/phase-5-to-8`, #21) and push batches of 15 to 20 commits to it; check CI
+  with `gh pr checks`. A push deploys the site, so pushes are batched.
+- Run `scripts/preflight.sh` before each push. CI runs only Linux (`fast`) and
+  Windows on every push, and the dependency policy when dependencies change;
+  WASM, budget, reproducible, macOS and release staging run from the Actions tab
+  (`workflow_dispatch`).
 - Commit subjects follow `type(scope): summary`; no em dashes in committed text.
 - Numbers in README, site or CHANGELOG come from a measurement taken in this repository.
 
@@ -87,13 +92,10 @@ These are compared against `main` before a push rather than counted as regressio
 
 ## Resume here (2026-11-09)
 
-State: `main` is 12 commits ahead of `origin/main` (last push `56828d7`, CI run 42647916013).
+State: work continues on `plan/phase-5-to-8` (PR #21); its first push was `ffe3241`.
 
-Before the next push: `cargo xtask web` (the demo module record is stale once
-`rune-term`, `rune-tools`, `rune-agent`, `rune-net`, `rune-core` or `rune-context`
-change), `cargo fmt --all -- --check`,
-`cargo clippy --workspace --all-targets -D warnings`, `cargo xtask budget`, and
-`cargo test --workspace --no-fail-fast`, compared against the known local failures.
+Before the next push: `cargo xtask web` if a crate the demo uses changed, then
+`scripts/preflight.sh`, compared against the known local failures.
 
 Next task: 10.1, move `rune-sdk` onto the `rune-agent` turn loop. 4.4 across
 turns stays open on purpose: between turns the person may edit files, so a
@@ -295,3 +297,4 @@ Done when a reproducible table exists with Rune in it.
 | 2026-11-09 | 6432dd8 | 8.4b | `/fork`: `Recorder::fork` copies the journal through its last event (`rune_session::fork::fork`), the session switches its recorder to the copy and keeps its history; the earlier session is unchanged. README updated. |
 | 2026-11-09 | a424153 | 10.3 (part) | CHANGELOG `Unreleased` lists the plan's user-visible changes; numbers are the measured ones from this log. |
 | 2026-11-09 | dc8e9f4 | 1.3 fix | First deploy of a new branch failed: `VERCEL_GIT_PREVIOUS_SHA` is empty and `git diff` exits 128. The ignore command now builds (exit 1) when the previous commit is unknown or absent from the clone. |
+| 2026-11-09 | pending | CI | Per-push CI cut from 8 jobs to 2 (`fast` on Linux, Windows) plus `dependencies.yml` when the dependency set changes. The Ubuntu matrix entry duplicated `fast` and is gone; WASM, budget, reproducible, macOS and release staging run on `workflow_dispatch`. `scripts/preflight.sh` runs them locally. |
