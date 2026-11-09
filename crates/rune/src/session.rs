@@ -1928,8 +1928,10 @@ impl SessionHost {
         }
     }
 
-    /// Redraws the live region while a turn is quiet, at most ten times a
-    /// second, so the spinner and the elapsed time move.
+    /// Redraws the live region while a turn is quiet, at most four times a
+    /// second, so the spinner and the elapsed time move. The pause between
+    /// redraws is long enough that a reader waiting for a quiet terminal,
+    /// such as a PTY harness, still sees one while a turn is held.
     fn tick(&self) {
         if self.accessible {
             return;
@@ -1944,7 +1946,7 @@ impl SessionHost {
         let Ok(mut last) = self.last_tick.lock() else {
             return;
         };
-        if last.is_some_and(|last| last.elapsed() < std::time::Duration::from_millis(100)) {
+        if last.is_some_and(|last| last.elapsed() < TICK_INTERVAL) {
             return;
         }
         *last = Some(std::time::Instant::now());
@@ -5823,6 +5825,9 @@ enum RowGlyphs {
 }
 
 /// Summarizes what a call produced in a few words.
+/// Shortest pause between redraws of a running turn's live region.
+const TICK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
+
 /// Changed lines drawn under an edit's tool row before the rest is counted.
 const EDIT_PREVIEW_LINES: usize = 8;
 
