@@ -67,6 +67,9 @@ pub struct ModelMetadata {
     /// Output ceiling, when the catalog reports one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_output_tokens: Option<u64>,
+    /// Published prices, when a catalog lists them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prices: Option<crate::models_dev::Prices>,
     /// Reasoning efforts the model accepts.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reasoning_efforts: Vec<String>,
@@ -85,6 +88,7 @@ impl ModelMetadata {
             context_window: None,
             context_source: None,
             max_output_tokens: None,
+            prices: None,
             reasoning_efforts: Vec::new(),
             capabilities: Capabilities::unknown(),
         }
@@ -485,6 +489,7 @@ mod tests {
             context_window: Some(200_000),
             context_source: None,
             max_output_tokens: Some(8192),
+            prices: None,
             reasoning_efforts: vec!["low".to_owned(), "medium".to_owned(), "high".to_owned()],
             capabilities: Capabilities {
                 tools: true,

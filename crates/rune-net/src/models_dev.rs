@@ -9,9 +9,9 @@
 //! models.dev is the catalog the compatible clients read for exactly this
 //! reason. It is a single JSON document keyed by provider, and within each
 //! provider keyed by model identifier, which is the same identifier the
-//! endpoint lists. Only the capacity is taken from it: this is a description of
-//! a model, not a source of endpoints or credentials, and nothing here is
-//! trusted for anything but numbers.
+//! endpoint lists. Only the capacity and the published prices are taken from
+//! it: this is a description of a model, not a source of endpoints or
+//! credentials, and nothing here is trusted for anything but numbers.
 
 use std::collections::BTreeMap;
 
@@ -29,14 +29,82 @@ pub struct Limits {
     pub context: Option<u64>,
     /// Output ceiling in tokens.
     pub output: Option<u64>,
+    /// Published prices, when the catalog lists them.
+    pub prices: Option<Prices>,
 }
 
 impl Limits {
     /// Returns whether nothing usable was described.
     #[must_use]
     pub const fn is_empty(&self) -> bool {
-        self.context.is_none() && self.output.is_none()
+        self.context.is_none() && self.output.is_none() && self.prices.is_none()
     }
+}
+
+/// Published prices of one model, in millionths of a US dollar per million
+/// tokens.
+///
+/// Whole numbers keep the arithmetic exact and the type comparable; a price of
+/// $0.28 per million tokens is 280,000. A cache price that is not published is
+/// charged at the input price.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
+pub struct Prices {
+    /// Uncached input.
+    pub input: u64,
+    /// Output, reasoning included.
+    pub output: u64,
+    /// Input read from a prompt cache.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_read: Option<u64>,
+    /// Input written to a prompt cache.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write: Option<u64>,
+}
+
+impl Prices {
+    /// Returns the cost of one request's usage in millionths of a dollar.
+    ///
+    /// Absent when the usage reports no token counts. The input count is the
+    /// whole prompt, so its cached parts are taken out and priced on their own.
+    #[must_use]
+    pub fn cost(&self, usage: &crate::stream::Usage) -> Option<u64> {
+        if usage.input_tokens.is_none() && usage.output_tokens.is_none() {
+            return None;
+        }
+        let read = usage.cache_read_tokens.unwrap_or_default();
+        let written = usage.cache_write_tokens.unwrap_or_default();
+        let uncached = usage
+            .input_tokens
+            .unwrap_or_default()
+            .saturating_sub(read)
+            .saturating_sub(written);
+        let charge = |tokens: u64, price: u64| u128::from(tokens).saturating_mul(u128::from(price));
+        let total = charge(uncached, self.input)
+            .saturating_add(charge(read, self.cache_read.unwrap_or(self.input)))
+            .saturating_add(charge(written, self.cache_write.unwrap_or(self.input)))
+            .saturating_add(charge(usage.output_tokens.unwrap_or_default(), self.output));
+        // Rounded to the nearest millionth of a dollar.
+        let micro = total.saturating_add(500_000) / 1_000_000;
+        Some(u64::try_from(micro).unwrap_or(u64::MAX))
+    }
+}
+
+/// Renders millionths of a dollar as a decimal amount, such as `0.001523`.
+#[must_use]
+pub fn dollars(micro: u64) -> String {
+    format!("{}.{:06}", micro / 1_000_000, micro % 1_000_000)
+}
+
+/// Reads a price in dollars per million tokens as millionths of a dollar.
+fn micro_price(value: Option<&serde_json::Value>) -> Option<u64> {
+    let dollars = value?.as_f64()?;
+    if !dollars.is_finite() || dollars < 0.0 {
+        return None;
+    }
+    // A catalog price has at most a few decimal places, so rounding to whole
+    // millionths loses nothing a bill would show.
+    let micro = (dollars * 1_000_000.0).round();
+    (micro <= 1e15).then_some(micro as u64)
 }
 
 /// Capacity for every model of one provider.
@@ -112,10 +180,28 @@ pub fn parse(body: &str, key: &str) -> Option<ProviderLimits> {
             .and_then(|l| l.get("output"))
             .and_then(serde_json::Value::as_u64)
             .filter(|value| *value > 0);
-        if context.is_none() && output.is_none() {
+        let cost = entry.get("cost");
+        let prices = match (
+            micro_price(cost.and_then(|c| c.get("input"))),
+            micro_price(cost.and_then(|c| c.get("output"))),
+        ) {
+            (Some(input), Some(output)) => Some(Prices {
+                input,
+                output,
+                cache_read: micro_price(cost.and_then(|c| c.get("cache_read"))),
+                cache_write: micro_price(cost.and_then(|c| c.get("cache_write"))),
+            }),
+            _ => None,
+        };
+        let entry = Limits {
+            context,
+            output,
+            prices,
+        };
+        if entry.is_empty() {
             continue;
         }
-        limits.models.insert(id.clone(), Limits { context, output });
+        limits.models.insert(id.clone(), entry);
     }
     Some(limits)
 }
@@ -133,7 +219,8 @@ mod tests {
             "env": ["OPENCODE_API_KEY"],
             "models": {
                 "grok-4.7": { "id": "grok-4.7", "name": "Grok 4.7",
-                              "limit": { "context": 500000, "output": 500000 } },
+                              "limit": { "context": 500000, "output": 500000 },
+                              "cost": { "input": 0.28, "output": 1.1, "cache_read": 0.028 } },
                 "glm-5.3-flash": { "id": "glm-5.3-flash", "name": "GLM-5.3-Flash",
                                    "limit": { "context": 1000000, "output": 131072 } }
             }
@@ -152,6 +239,46 @@ mod tests {
             limits.get("glm-5.3-flash").and_then(|l| l.context),
             Some(1_000_000)
         );
+    }
+
+    #[test]
+    fn published_prices_are_read_in_millionths_of_a_dollar() {
+        let limits = parse(DOC, "opencode-go").expect("parsed");
+        let prices = limits
+            .get("grok-4.7")
+            .and_then(|l| l.prices)
+            .expect("prices");
+        assert_eq!(
+            prices,
+            Prices {
+                input: 280_000,
+                output: 1_100_000,
+                cache_read: Some(28_000),
+                cache_write: None,
+            }
+        );
+        assert_eq!(limits.get("glm-5.3-flash").and_then(|l| l.prices), None);
+    }
+
+    #[test]
+    fn a_request_is_priced_with_its_cached_input_apart() {
+        let prices = Prices {
+            input: 280_000,
+            output: 1_100_000,
+            cache_read: Some(28_000),
+            cache_write: None,
+        };
+        let usage = crate::stream::Usage {
+            input_tokens: Some(10_000),
+            cache_read_tokens: Some(8_000),
+            output_tokens: Some(500),
+            ..crate::stream::Usage::default()
+        };
+        // 2,000 uncached at 0.28, 8,000 cached at 0.028, 500 out at 1.10, per
+        // million: 560 + 224 + 550 millionths.
+        assert_eq!(prices.cost(&usage), Some(1_334));
+        assert_eq!(dollars(1_334), "0.001334");
+        assert_eq!(prices.cost(&crate::stream::Usage::default()), None);
     }
 
     #[test]

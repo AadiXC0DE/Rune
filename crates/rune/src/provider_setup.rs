@@ -420,6 +420,9 @@ pub fn enrich_with_capacity(settings: &Settings, paths: &Paths, catalog: &mut Ca
         if model.max_output_tokens.is_none() {
             model.max_output_tokens = limit.output;
         }
+        if model.prices.is_none() {
+            model.prices = limit.prices;
+        }
     }
 }
 
@@ -462,6 +465,18 @@ fn fetch_provider_limits(
     // the next run tries again rather than reading a failure forever.
     let _ = write_cached_catalog(paths, &body);
     Some(limits)
+}
+
+/// Returns the published prices of the configured model from the cache alone.
+///
+/// Never reaches the network, so a caller on the request path can price a run
+/// without delaying it. Absent when nothing has been cached yet or the catalog
+/// does not describe the provider or model.
+pub fn cached_prices(settings: &Settings, paths: &Paths) -> Option<rune_net::models_dev::Prices> {
+    let key = rune_net::models_dev::catalog_key(&settings.provider.to_string())?;
+    read_cached_limits(&paths.models_cache_file(), key)?
+        .get(&settings.model)?
+        .prices
 }
 
 /// Reads a provider's capacity out of the cache.

@@ -208,6 +208,10 @@ pub struct JsonResult {
     pub usage: UsageReport,
     /// Tool calls requested by the provider, in order.
     pub tool_calls: Vec<ToolCallReport>,
+    /// Estimated cost in US dollars as a decimal string, from the published
+    /// prices of a cached model catalog. Absent when no price is known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cost_usd: Option<String>,
     /// Whether a check ran after the last change to a file: `verified`,
     /// `unverified`, or `not_applicable` when nothing changed. Absent when the
     /// run failed before finishing.
@@ -257,6 +261,7 @@ impl JsonResult {
             steps: 0,
             usage: UsageReport::default(),
             tool_calls: Vec::new(),
+            cost_usd: None,
             verification: None,
             error: Some(error.message().to_owned()),
             error_code: Some(error.code()),
@@ -633,6 +638,9 @@ pub fn run(
             cache_write_tokens: outcome.usage.cache_write_tokens,
         },
         tool_calls,
+        cost_usd: crate::provider_setup::cached_prices(settings, paths)
+            .and_then(|prices| prices.cost(&outcome.usage))
+            .map(rune_net::models_dev::dollars),
         verification: error.is_none().then(|| outcome.verification.as_str()),
         error: error.as_ref().map(|error| error.message().to_owned()),
         error_code: error.as_ref().map(RuneError::code),
@@ -998,6 +1006,7 @@ mod tests {
             steps: 1,
             usage: UsageReport::default(),
             tool_calls: Vec::new(),
+            cost_usd: None,
             verification: Some("not_applicable"),
             error: None,
             error_code: None,

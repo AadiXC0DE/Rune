@@ -264,6 +264,8 @@ struct SessionHost {
     context_used: std::sync::atomic::AtomicU64,
     /// Largest answer the current model produces, or zero when unknown.
     output_limit: std::sync::atomic::AtomicU64,
+    /// Published prices of the current model, when a catalog lists them.
+    prices: Mutex<Option<rune_net::models_dev::Prices>>,
     /// Present while the meter uses an estimate rather than provider usage.
     context_source: Mutex<Option<&'static str>>,
     /// Size of the context window, zero when the provider stated none.
@@ -922,7 +924,16 @@ impl SessionHost {
     /// left over from a larger model would understate how full the smaller one
     /// is, and a window invented for a model nothing describes would be a guess
     /// presented as a fact.
-    fn set_model(&self, model: &str, context_window: Option<u64>, output: Option<u64>) {
+    fn set_model(
+        &self,
+        model: &str,
+        context_window: Option<u64>,
+        output: Option<u64>,
+        prices: Option<rune_net::models_dev::Prices>,
+    ) {
+        if let Ok(mut current) = self.prices.lock() {
+            *current = prices;
+        }
         {
             let mut current = lock_model(&self.model);
             model.clone_into(&mut current);
@@ -1897,6 +1908,7 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
         events: Arc::new(Mutex::new(Vec::new())),
         provider_retry: Mutex::new(None),
         context_used: std::sync::atomic::AtomicU64::new(initial_context),
+        prices: Mutex::new(None),
         output_limit: std::sync::atomic::AtomicU64::new(
             config.settings.model_output_limit().unwrap_or_default(),
         ),
@@ -2214,7 +2226,7 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                     Handled::SetModel(model) => {
                         // Named inline, so no catalog entry describes it and the
                         // window already in force is kept rather than guessed.
-                        host.set_model(&model, None, None);
+                        host.set_model(&model, None, None, None);
                         note(format!("model set to {}", host.model_name()));
                     }
                     Handled::ClearHistory => {
@@ -2378,7 +2390,18 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                 host.capture_history(&history);
                 // The model is read back rather than captured at start, so a
                 // turn that ran after `/model` is billed to the model that ran.
-                record_usage(&config.paths, &host.model(), &outcome);
+                let cost = host
+                    .prices
+                    .lock()
+                    .ok()
+                    .and_then(|prices| *prices)
+                    .and_then(|prices| prices.cost(&outcome.usage));
+                record_usage(&config.paths, &host.model(), &outcome, cost);
+                if let Some(cost) = cost
+                    && let Ok(mut totals) = host.totals.lock()
+                {
+                    totals.cost = Some(totals.cost.unwrap_or_default().saturating_add(cost));
+                }
                 host.record_usage(&outcome.usage);
                 host.record_context_usage(&history, &outcome.last_request)?;
                 let elapsed = host
@@ -2403,7 +2426,7 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                 // terminal: the region below is redrawn in place.
                 let mut lines = report_turn(&outcome, &host, &reasoning)?;
                 if !host.accessible
-                    && let Some(summary) = turn_summary(&outcome, elapsed, host.ascii)
+                    && let Some(summary) = turn_summary(&outcome, elapsed, cost, host.ascii)
                 {
                     let dim = host.theme.sgr(Slot::Dim, host.truecolor);
                     let reset = rune_term::engine::Style::RESET;
@@ -4562,6 +4585,7 @@ fn choose_model(
         &chosen,
         entry.and_then(|model| model.context_window),
         entry.and_then(|model| model.max_output_tokens),
+        entry.and_then(|model| model.prices),
     );
     // Written after the change takes effect, so a failed write cannot leave the
     // session on a model the file does not name.
@@ -4700,6 +4724,13 @@ fn render_cost(info: &SessionInfo<'_>) -> String {
             footer::format_tokens(totals.reasoning_tokens)
         );
     }
+    if let Some(cost) = totals.cost {
+        let _ = writeln!(
+            out,
+            "Cost:     ${} estimated from published prices",
+            rune_net::models_dev::dollars(cost)
+        );
+    }
     out.trim_end().to_owned()
 }
 
@@ -4740,6 +4771,13 @@ fn resolve_context_window(host: &SessionHost, settings: &Settings, paths: &Paths
     let model = catalog.models.iter().find(|model| model.id == current);
     let reported = model.and_then(|model| model.context_window);
     host.adopt_context_window(reported, settings.context_window.is_some());
+    if let Some(prices) = model
+        .and_then(|model| model.prices)
+        .or_else(|| crate::provider_setup::cached_prices(settings, paths))
+        && let Ok(mut current) = host.prices.lock()
+    {
+        *current = Some(prices);
+    }
     if settings.model_output_limit().is_none()
         && let Some(output) = model.and_then(|model| model.max_output_tokens)
     {
@@ -4861,8 +4899,9 @@ fn truecolor_supported() -> bool {
 /// A ledger write must never end a session, so a failure is reported and the
 /// session continues: losing an accounting record is better than losing the
 /// conversation, which is already on disk.
-fn record_usage(paths: &Paths, model: &str, outcome: &turn::TurnOutcome) {
+fn record_usage(paths: &Paths, model: &str, outcome: &turn::TurnOutcome, cost: Option<u64>) {
     let mut record = UsageRecord::new(now_ms(), model, HelperKind::Main);
+    record.total_cost = cost.map(rune_net::models_dev::dollars);
     record.input_tokens = outcome.usage.input_tokens;
     record.output_tokens = outcome.usage.output_tokens;
     record.cache_read_tokens = outcome.usage.cache_read_tokens;
@@ -4929,6 +4968,9 @@ struct Totals {
     cache_write_tokens: u64,
     /// Reasoning tokens reported across those requests.
     reasoning_tokens: u64,
+    /// Estimated cost of the turns run since the session started, in
+    /// millionths of a dollar, each priced when it ran. Absent until one is.
+    cost: Option<u64>,
 }
 
 impl Totals {
@@ -5474,6 +5516,7 @@ fn result_summary(name: &str, output: &ToolOutput, ascii: bool) -> String {
 fn turn_summary(
     outcome: &turn::TurnOutcome,
     elapsed: Option<std::time::Duration>,
+    cost: Option<u64>,
     ascii: bool,
 ) -> Option<String> {
     let executed: Vec<&turn::CallResult> =
@@ -5526,6 +5569,9 @@ fn turn_summary(
     }
     if executed.is_empty() && parts.is_empty() {
         return None;
+    }
+    if let Some(cost) = cost {
+        parts.push(format!("${}", rune_net::models_dev::dollars(cost)));
     }
     if let Some(elapsed) = elapsed {
         parts.push(format_elapsed(elapsed));
@@ -7976,7 +8022,7 @@ mod tests {
     fn switching_the_model_changes_what_the_session_sends() {
         let host = test_host();
         assert_eq!(host.model(), "test");
-        host.set_model("other/model", None, None);
+        host.set_model("other/model", None, None, None);
         assert_eq!(host.model(), "other/model");
     }
 
@@ -8040,20 +8086,20 @@ mod tests {
         let before = host
             .context_limit
             .load(std::sync::atomic::Ordering::Relaxed);
-        host.set_model("small", None, None);
+        host.set_model("small", None, None, None);
         assert_eq!(
             host.context_limit
                 .load(std::sync::atomic::Ordering::Relaxed),
             before
         );
-        host.set_model("large", Some(1_000_000), None);
+        host.set_model("large", Some(1_000_000), None, None);
         assert_eq!(
             host.context_limit
                 .load(std::sync::atomic::Ordering::Relaxed),
             1_000_000
         );
         // A zero means nothing is known, not a window of nothing.
-        host.set_model("zero", Some(0), None);
+        host.set_model("zero", Some(0), None, None);
         assert_eq!(
             host.context_limit
                 .load(std::sync::atomic::Ordering::Relaxed),
@@ -8064,7 +8110,7 @@ mod tests {
     #[test]
     fn the_status_command_names_the_model_in_effect() {
         let host = test_host();
-        host.set_model("picked/model", None, None);
+        host.set_model("picked/model", None, None, None);
         let info = host.info("chat_completions", "https://example.invalid/v1");
         let rendered = render_status(&info);
         assert!(rendered.contains("picked/model"), "{rendered}");
@@ -10230,12 +10276,13 @@ mod tests {
         let summary = turn_summary(
             &outcome,
             Some(std::time::Duration::from_millis(9_400)),
+            Some(1_523),
             true,
         )
         .expect("summary");
         assert_eq!(
             summary,
-            "2 calls, 1 file changed, 12.0k in (75% cached), 640 out, 9.4s"
+            "2 calls, 1 file changed, 12.0k in (75% cached), 640 out, $0.001523, 9.4s"
         );
     }
 
@@ -10522,6 +10569,7 @@ mod tests {
             events: Arc::new(Mutex::new(Vec::new())),
             provider_retry: Mutex::new(None),
             context_used: std::sync::atomic::AtomicU64::new(0),
+            prices: Mutex::new(None),
             output_limit: std::sync::atomic::AtomicU64::new(0),
             context_source: Mutex::new(None),
             context_limit: std::sync::atomic::AtomicU64::new(
