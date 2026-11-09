@@ -87,7 +87,7 @@ These are compared against `main` before a push rather than counted as regressio
 
 ## Resume here (2026-11-09)
 
-State: `main` is 1 commit ahead of `origin/main` (last push `56828d7`, CI run 42647916013).
+State: `main` is 2 commits ahead of `origin/main` (last push `56828d7`, CI run 42647916013).
 
 Before the next push: `cargo xtask web` (the demo module record is stale once
 `rune-term`, `rune-tools`, `rune-agent`, `rune-net`, `rune-core` or `rune-context`
@@ -286,4 +286,4 @@ Done when a reproducible table exists with Rune in it.
 | 2026-11-09 | d3ab973 | 4.3 | `test_report::delta` and `failures`; `Shell` keeps the last log of 8 test commands. A repeat drops lines the previous log had (at least 8, or it is shown whole) and leads with `[since the last run: now passing; still failing; new failures; N lines left out]`. New `ToolOutput.full_text` is retained by the turn loop as `[full log: read_tool_result handle …]`. Runs that finish inside the call only. |
 | 2026-11-09 | fad1f09 | 5.4 | A step that stops at `MaxTokens` with no text and no calls is asked once more (`OUTPUT_LIMIT_RETRY` user note; a placeholder assistant turn first when nothing was recorded); a second one reports `OutputLimit`. |
 | 2026-11-09 | 56828d7 | push | Third batch of 18 commits (5.3, 4.3, 5.4 and the CI fixes); CI run 42647916013. |
-| 2026-11-09 | pending | 7.3 | `rune-term::diff` (`changed_lines` trims shared lines, `render` cuts to 8 lines and the width); edit rows draw it from the call's `old_string`/`new_string` or `edits`, in Success/Error slots. Accessible mode keeps the row alone. `git_diff` output goes to the model, not scrollback, so it has no view to colour. |
+| 2026-11-09 | 7835c12 | 7.3 | `rune-term::diff` (`changed_lines` trims shared lines, `render` cuts to 8 lines and the width); edit rows draw it from the call's `old_string`/`new_string` or `edits`, in Success/Error slots. Accessible mode keeps the row alone. `git_diff` output goes to the model, not scrollback, so it has no view to colour. |
