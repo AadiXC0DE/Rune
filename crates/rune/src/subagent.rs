@@ -265,6 +265,17 @@ impl Host for ChildHost<'_> {
         }
         self.parent.decide(name, target)
     }
+    fn decide_with_arguments(
+        &self,
+        name: &str,
+        target: Option<&str>,
+        arguments: &serde_json::Value,
+    ) -> (Outcome, String) {
+        if !self.allowed(name) {
+            return self.decide(name, target);
+        }
+        self.parent.decide_with_arguments(name, target, arguments)
+    }
     fn pre_tool(&self, call: &turn::PreparedCall) -> Result<Option<turn::HookVeto>> {
         self.parent.pre_tool(call)
     }

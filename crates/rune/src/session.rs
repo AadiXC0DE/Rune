@@ -180,6 +180,8 @@ struct ApprovalRequest {
     /// Whether the answer may be remembered for the session. Never true for an
     /// action that destroys data or publishes.
     rememberable: bool,
+    /// What the call would change, drawn under the scope, for an edit.
+    preview: Vec<String>,
     answer: mpsc::SyncSender<ApprovalOutcome>,
 }
 
@@ -369,6 +371,8 @@ struct SessionHost {
     review_session: Arc<Mutex<ReviewSession>>,
     /// Attached only while a terminal input loop can collect an answer.
     approval_requests: Mutex<Option<mpsc::Sender<ApprovalRequest>>>,
+    /// The change an edit awaiting a decision would make, for its prompt.
+    approval_preview: Mutex<Vec<String>>,
     /// Exact actions approved for the rest of this session.
     grants: Mutex<Grants>,
     /// Whether the session is planning: only reads and plan updates may run.
@@ -887,6 +891,39 @@ impl Host for SessionHost {
         self.request_approval(name, target.unwrap_or(name), reason)
     }
 
+    fn decide_with_arguments(
+        &self,
+        name: &str,
+        target: Option<&str>,
+        arguments: &serde_json::Value,
+    ) -> (Outcome, String) {
+        let preview = if name == "edit_file" {
+            let pairs = edit_pairs(arguments);
+            let lines: Vec<(char, &str)> = pairs
+                .iter()
+                .flat_map(|(old, new)| rune_term::diff::changed_lines(old, new))
+                .collect();
+            // Plain text: the prompt measures its lines without escapes.
+            rune_term::diff::render(
+                &lines,
+                &rune_term::diff::DiffStyle::default(),
+                APPROVAL_PREVIEW_LINES,
+                usize::from(self.width()),
+                self.ascii,
+            )
+        } else {
+            Vec::new()
+        };
+        if let Ok(mut slot) = self.approval_preview.lock() {
+            *slot = preview;
+        }
+        let decision = self.decide(name, target);
+        if let Ok(mut slot) = self.approval_preview.lock() {
+            slot.clear();
+        }
+        decision
+    }
+
     fn context(&self) -> ExecutionContext {
         // Sharing the cancellation flag is what lets a cancel reach every tool
         // in the turn rather than only the one running when it arrived.
@@ -941,6 +978,11 @@ impl SessionHost {
             target: target.to_owned(),
             reason: reason.clone(),
             rememberable: rememberable(tool, target),
+            preview: self
+                .approval_preview
+                .lock()
+                .map(|mut preview| std::mem::take(&mut *preview))
+                .unwrap_or_default(),
             answer,
         };
         if requests.send(request).is_err() {
@@ -1761,24 +1803,7 @@ impl SessionHost {
     fn edit_preview(&self, call: &turn::PreparedCall) -> Vec<String> {
         let arguments: serde_json::Value =
             serde_json::from_str(&call.arguments).unwrap_or_default();
-        let text = |value: &serde_json::Value, key: &str| {
-            value
-                .get(key)
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or_default()
-                .to_owned()
-        };
-        let pairs: Vec<(String, String)> =
-            match arguments.get("edits").and_then(serde_json::Value::as_array) {
-                Some(edits) => edits
-                    .iter()
-                    .map(|edit| (text(edit, "old_string"), text(edit, "new_string")))
-                    .collect(),
-                None => vec![(
-                    text(&arguments, "old_string"),
-                    text(&arguments, "new_string"),
-                )],
-            };
+        let pairs = edit_pairs(&arguments);
         let lines: Vec<(char, &str)> = pairs
             .iter()
             .flat_map(|(old, new)| rune_term::diff::changed_lines(old, new))
@@ -2147,6 +2172,7 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
         undo: Mutex::new(BTreeMap::new()),
         review_session: Arc::new(Mutex::new(ReviewSession::new(&limits))),
         approval_requests: Mutex::new(None),
+        approval_preview: Mutex::new(Vec::new()),
         grants: Mutex::new(Grants::new()),
         planning: std::sync::atomic::AtomicBool::new(false),
         questions: config.questions,
@@ -3233,6 +3259,7 @@ fn approval_lines(request: &ApprovalRequest, width: usize) -> Vec<String> {
     ]
     .into_iter()
     .flat_map(|line| rune_term::width::wrap(&line, width.max(1)))
+    .chain(request.preview.iter().cloned())
     .collect()
 }
 
@@ -5799,6 +5826,27 @@ enum RowGlyphs {
 /// Changed lines drawn under an edit's tool row before the rest is counted.
 const EDIT_PREVIEW_LINES: usize = 8;
 
+/// Changed lines an approval prompt shows for an edit.
+const APPROVAL_PREVIEW_LINES: usize = 12;
+
+/// Returns the old and new text of each replacement an `edit_file` call asks for.
+fn edit_pairs(arguments: &serde_json::Value) -> Vec<(String, String)> {
+    let text = |value: &serde_json::Value, key: &str| {
+        value
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_owned()
+    };
+    match arguments.get("edits").and_then(serde_json::Value::as_array) {
+        Some(edits) => edits
+            .iter()
+            .map(|edit| (text(edit, "old_string"), text(edit, "new_string")))
+            .collect(),
+        None => vec![(text(arguments, "old_string"), text(arguments, "new_string"))],
+    }
+}
+
 fn result_summary(name: &str, output: &ToolOutput, ascii: bool) -> String {
     let lines = || {
         output
@@ -7704,7 +7752,11 @@ mod tests {
     #[test]
     fn a_terminal_answer_resolves_only_the_displayed_call() {
         let mut host = test_host();
-        host.mode = PermissionMode::Ask;
+        host.rules.push(rune_policy::rules::Rule::ask(
+            "edit_file",
+            "*",
+            rune_policy::decision::Layer::Session,
+        ));
         let (requests, pending) = mpsc::channel();
         *host.approval_requests.lock().expect("lock") = Some(requests);
         std::thread::scope(|scope| {
@@ -7740,7 +7792,11 @@ mod tests {
     #[test]
     fn cancellation_wakes_a_worker_waiting_for_approval() {
         let mut host = test_host();
-        host.mode = PermissionMode::Ask;
+        host.rules.push(rune_policy::rules::Rule::ask(
+            "edit_file",
+            "*",
+            rune_policy::decision::Layer::Session,
+        ));
         let (requests, pending) = mpsc::channel();
         *host.approval_requests.lock().expect("lock") = Some(requests);
         std::thread::scope(|scope| {
@@ -7758,7 +7814,11 @@ mod tests {
     #[test]
     fn closed_approval_input_never_allows_a_call() {
         let mut host = test_host();
-        host.mode = PermissionMode::Ask;
+        host.rules.push(rune_policy::rules::Rule::ask(
+            "edit_file",
+            "*",
+            rune_policy::decision::Layer::Session,
+        ));
         let (requests, pending) = mpsc::channel();
         *host.approval_requests.lock().expect("lock") = Some(requests);
         std::thread::scope(|scope| {
@@ -7781,7 +7841,11 @@ mod tests {
     #[test]
     fn terminal_approval_does_not_override_a_rule_or_approve_without_input() {
         let mut host = test_host();
-        host.mode = PermissionMode::Ask;
+        host.rules.push(rune_policy::rules::Rule::ask(
+            "edit_file",
+            "*",
+            rune_policy::decision::Layer::Session,
+        ));
         host.rules.push(rune_policy::rules::Rule::deny(
             "read_file",
             ".env",
@@ -7812,6 +7876,7 @@ mod tests {
             target: "printf 'a\\b'\n\t\u{1b}[2J\u{202e}TAIL-END".to_owned(),
             reason: "no rule allows it".to_owned(),
             rememberable: true,
+            preview: Vec::new(),
             answer,
         };
         let lines = approval_lines(&request, 80).join("\n");
@@ -7839,6 +7904,7 @@ mod tests {
             target: "printf AUDIT_SHELL_OK".to_owned(),
             reason: "no rule allows it".to_owned(),
             rememberable: true,
+            preview: Vec::new(),
             answer,
         };
         let mut reader = rune_term::input::KeyReader::new();
@@ -10720,6 +10786,37 @@ mod tests {
     }
 
     #[test]
+    fn an_edit_awaiting_approval_shows_the_lines_it_would_change() {
+        let mut host = test_host();
+        host.rules.push(rune_policy::rules::Rule::ask(
+            "edit_file",
+            "*",
+            rune_policy::decision::Layer::Session,
+        ));
+        let (sender, requests) = mpsc::channel::<ApprovalRequest>();
+        *host.approval_requests.lock().expect("slot") = Some(sender);
+        let answerer = std::thread::spawn(move || {
+            let request = requests
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("the edit asks");
+            let lines = approval_lines(&request, 80).join("\n");
+            request.answer.send(ApprovalOutcome::Deny).expect("answer");
+            lines
+        });
+        let arguments = serde_json::json!({
+            "path": "src/lib.rs",
+            "edits": [{"old_string": "a\nold\nb", "new_string": "a\nnew\nb"}],
+        });
+        let (outcome, _) =
+            Host::decide_with_arguments(&host, "edit_file", Some("src/lib.rs"), &arguments);
+        assert_eq!(outcome, Outcome::Deny);
+        let lines = answerer.join().expect("answered");
+        assert!(lines.contains("    - old"), "{lines}");
+        assert!(lines.contains("    + new"), "{lines}");
+        assert!(host.approval_preview.lock().expect("slot").is_empty());
+    }
+
+    #[test]
     fn a_remembered_approval_covers_the_same_action_and_nothing_else() {
         let host = test_host();
         let (sender, requests) = mpsc::channel::<ApprovalRequest>();
@@ -11144,6 +11241,7 @@ mod tests {
             undo: Mutex::new(BTreeMap::new()),
             review_session: Arc::new(Mutex::new(ReviewSession::new(&BudgetSet::new()))),
             approval_requests: Mutex::new(None),
+            approval_preview: Mutex::new(Vec::new()),
             grants: Mutex::new(Grants::new()),
             planning: std::sync::atomic::AtomicBool::new(false),
             questions,

@@ -361,6 +361,18 @@ pub trait Host {
     /// Returns the outcome and, for an explanation, the deciding rule.
     fn decide(&self, name: &str, target: Option<&str>) -> (Outcome, String);
 
+    /// Resolves a call like [`Host::decide`], with its arguments in view, so
+    /// an approval can show what the call would do. The arguments never
+    /// change the scope that is approved.
+    fn decide_with_arguments(
+        &self,
+        name: &str,
+        target: Option<&str>,
+        _arguments: &serde_json::Value,
+    ) -> (Outcome, String) {
+        self.decide(name, target)
+    }
+
     /// Resolves a separate user decision for private-network access, including
     /// this fetch's redirects. A model review or full-access mode is insufficient.
     /// Hosts without a user approval path refuse it by default.
@@ -1430,7 +1442,7 @@ fn prepare_call(
     };
 
     let target = host.tool_permission_target(&call.name, &arguments);
-    let (outcome, reason) = host.decide(&call.name, target.as_deref());
+    let (outcome, reason) = host.decide_with_arguments(&call.name, target.as_deref(), &arguments);
 
     match outcome {
         Outcome::Deny => {

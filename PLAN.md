@@ -95,15 +95,14 @@ change), `cargo fmt --all -- --check`,
 `cargo clippy --workspace --all-targets -D warnings`, `cargo xtask budget`, and
 `cargo test --workspace --no-fail-fast`, compared against the known local failures.
 
-Next task: 8.1b, the approval prompt shows the diff for an edit. The decision
-path has no arguments today; carry the call's arguments to the approval request
-and draw `rune_term::diff::changed_lines` + `render` (from 7.3) above the choices.
-After it: 5.1, 8.3b, 8.4b.
+Next task: 5.1, record each step's narration in order with the tool calls in
+`TurnOutcome` (an ordered `steps` list of text and call ids), so `ask --json` and
+saved sessions keep the order scrollback already shows. After it: 8.3b, 8.4b.
 
 Waiting on the owner: a DeepSeek key and approval to spend about $0.02 for the
 head-to-head runs (9.5) and the `reasoning_content` check (3.5).
 
-Remaining open items: 3.5, 4.4 (across turns), 5.1, 8.1b, 8.3b, 8.4b, 9.5, 10.1 to 10.4.
+Remaining open items: 3.5, 4.4 (across turns), 5.1, 8.3b, 8.4b, 9.5, 10.1 to 10.4.
 
 ## Phases
 
@@ -207,7 +206,7 @@ Done when the binary stays inside its ceiling and a snapshot test pins each elem
 
 - [x] 8.1 The approval prompt offers remembering an exact action for the session, never for a
       destructive one; Deny stays selected and running once is one step up.
-- [ ] 8.1b The approval prompt shows the diff for an edit (the decision path has no arguments
+- [x] 8.1b The approval prompt shows the diff for an edit (the decision path has no arguments
       today).
 - [x] 8.2 Routine test and build commands for common ecosystems are allowed in auto mode
       inside the sandbox, so headless runs can verify.
@@ -287,3 +286,4 @@ Done when a reproducible table exists with Rune in it.
 | 2026-11-09 | fad1f09 | 5.4 | A step that stops at `MaxTokens` with no text and no calls is asked once more (`OUTPUT_LIMIT_RETRY` user note; a placeholder assistant turn first when nothing was recorded); a second one reports `OutputLimit`. |
 | 2026-11-09 | 56828d7 | push | Third batch of 18 commits (5.3, 4.3, 5.4 and the CI fixes); CI run 42647916013. |
 | 2026-11-09 | 7835c12 | 7.3 | `rune-term::diff` (`changed_lines` trims shared lines, `render` cuts to 8 lines and the width); edit rows draw it from the call's `old_string`/`new_string` or `edits`, in Success/Error slots. Accessible mode keeps the row alone. `git_diff` output goes to the model, not scrollback, so it has no view to colour. |
+| 2026-11-09 | pending | 8.1b | `Host::decide_with_arguments` (defaults to `decide`; subagents forward it). The session stores a plain `rune_term::diff` view of an `edit_file` call, at most 12 lines, and the prompt draws it under the scope. Plain text, because the picker measures its lines without escapes. |
