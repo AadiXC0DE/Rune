@@ -72,9 +72,9 @@ Gaps that cost tokens, pass rate or user trust:
 - Never push to `main`. Work on a branch with one open pull request (now
   `plan/phase-5-to-8`, #21) and push batches of 15 to 20 commits to it; check CI
   with `gh pr checks`. A push deploys the site, so pushes are batched.
-- Run `scripts/preflight.sh` before each push. CI runs only Linux (`fast`) and
-  Windows on every push, and the dependency policy when dependencies change;
-  WASM, budget, reproducible, macOS and release staging run from the Actions tab
+- Run `scripts/preflight.sh` before each push. CI runs Linux (`fast`), Windows
+  and `budget` on every push, and the dependency policy when dependencies
+  change; WASM, reproducible, macOS and release staging run from the Actions tab
   (`workflow_dispatch`).
 - Commit subjects follow `type(scope): summary`; no em dashes in committed text.
 - Numbers in README, site or CHANGELOG come from a measurement taken in this repository.
@@ -97,9 +97,10 @@ State: work continues on `plan/phase-5-to-8` (PR #21); its first push was `ffe32
 Before the next push: `cargo xtask web` if a crate the demo uses changed, then
 `scripts/preflight.sh`, compared against the known local failures.
 
-Next task: 10.3, check README, COMMANDS and the site against measured numbers
-(the CHANGELOG is done). Then 10.4 needs the owner's go-ahead for 0.2.0, and
-9.5 and 3.5 need a DeepSeek key.
+Next: 10.4 (release 0.2.0, with the size figures of 10.3) needs the owner's
+go-ahead; 9.5 and 3.5 need a DeepSeek key. Without those, look for a gap on
+the benchmark axes (tokens, pass rate, time) in `bench/tasks` runs once a key
+exists.
 
 Waiting on the owner: a DeepSeek key and approval to spend about $0.02 for the
 head-to-head runs (9.5) and the `reasoning_content` check (3.5).
@@ -238,7 +239,11 @@ Done when a reproducible table exists with Rune in it.
 - [x] 10.1 Move `rune-sdk` onto the `rune-agent` turn loop so every surface shares one loop.
 - [x] 10.2 Re-measure size and startup; trim anything that grew without paying for itself.
 - [ ] 10.3 README, COMMANDS, CHANGELOG and site updated to measured numbers only.
-      CHANGELOG `Unreleased` written; README, COMMANDS and site still to check.
+      CHANGELOG `Unreleased` written; COMMANDS checked (slash commands live in the
+      README, which lists the new ones). The size figure (README line 7, site
+      meta, hero, `og.png`) says 5.45 MiB; CI measured 5.59 MiB on x86_64 Linux at
+      `ffe3241`. Update all of them, and redraw `og.png`, at 10.4 with the
+      release build's number.
 - [ ] 10.4 Release 0.2.0.
 
 ## Log
@@ -301,3 +306,4 @@ Done when a reproducible table exists with Rune in it.
 | 2026-11-09 | 7171d62 | 4.4 | `History` keeps a SHA-256 per successful `read_file` call, taken when its result is retained (before a later call in the batch can change the file). An identical read of a byte-identical file, in this turn or an earlier one, with the result still in history, gets a pointer; a second repeat in a turn runs. Other reads keep the in-turn rule. |
 | 2026-11-09 | 4dcb29c | 7.3 follow-up | Commit 7835c12 also took in a `ToolOutput.diff` that `edit_file` and `write_file` fill from their mutation preview, which nothing read. Rows now draw that preview (so `write_file` and `replace_all` show their real change), falling back to an edit's arguments; the approval prompt still uses the arguments, since nothing has run yet. |
 | 2026-11-09 | 5f6d383 | 10.1 | `rune-sdk` drives `rune_agent::turn::run_turn` through `SdkHost` (-152 lines net). New `Host` hooks, all defaulting to the old behaviour: `settles_cancellation` (end with `Cancelled` and the work so far), `tool_attachments` (host tool images after each result), `retains_results` (cut in place when `read_tool_result` is not offered), `attempt_finished` (release a host reader when the loop stops reading). `NetError::from_rune_error` keeps a host fetch's own error. SDK text is the text of every step, from `narration`. All 86 SDK tests pass unchanged. |
+| 2026-11-09 | pending | CI | `budget` back on every push: the site says every pull request checks the size and startup ceilings. |

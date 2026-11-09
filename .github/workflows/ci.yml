@@ -1,8 +1,9 @@
 name: ci
 
-# Every push and pull request runs only what this repository cannot check on a
+# Every push and pull request runs what this repository cannot check on a
 # developer's Mac: Linux (format, lint, the full suite with the PTY gate and the
-# bubblewrap sandbox) and Windows. The rest runs locally through
+# bubblewrap sandbox) and Windows, plus the size and startup budget the site
+# promises for every pull request. The rest runs locally through
 # `scripts/preflight.sh` before a push, and here on demand from the Actions tab
 # (`workflow_dispatch`), which is how a release is checked in full.
 on:
@@ -106,9 +107,10 @@ jobs:
 
   # Size, startup, prompt, and tool schema budgets. Runs on every push to main
   # as well as on a pull request, so a direct push cannot regress them unmeasured.
+  # The size and startup ceilings are what the site promises every pull
+  # request checks, so this one runs on every push. It takes about a minute.
   budget:
     name: budget
-    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
