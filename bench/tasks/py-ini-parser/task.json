@@ -1,0 +1,10 @@
+{
+  "title": "Fix value parsing in an INI reader",
+  "kind": "bugfix",
+  "prompt": "The INI reader in config/ mishandles some values: values that contain '=' are cut, inline comments are kept, and a key outside any section crashes. The tests in tests/ describe the intended behaviour. Fix config/ so they pass. Do not modify the tests.",
+  "verify": "python3 -m unittest discover -q -s tests -t .",
+  "protected": [
+    "tests"
+  ],
+  "timeoutMs": 600000
+}

@@ -205,7 +205,7 @@ Done when a headless run on a JS task can run its tests without full access.
 - [x] 9.3 `rune bench`: run tasks in the Sutra task format (`task.json`, `repo/`), each in a
       fresh copy, judged by `verify` after restoring protected paths; report pass, time,
       tokens, cache share and cost.
-- [ ] 9.4 A harder task set of our own: multi-file, long debugging, several languages.
+- [x] 9.4 A harder task set of our own: multi-file, long debugging, several languages.
 - [ ] 9.5 Head-to-head run against Sutra and fx on one model and key through one metering
       proxy; publish only measured rows.
 
@@ -259,4 +259,5 @@ Done when a reproducible table exists with Rune in it.
 | 2026-11-09 | 39fcd68 | 6.5 | `FooterState.cost`, shown after the context field when prices are known. |
 | 2026-11-09 | 1cfc279 | 7.1b | Pipe tables in a finished answer are aligned by visible width; the stream shows them as written. |
 | 2026-11-09 | 5c225ee | 8.3 | `/plan [task|off]`; denial before rules and grants; note sent in the user turn so the cached prefix is unchanged; status row shows `plan`. |
-| 2026-11-09 | (this) | 9.2 | `session_spend_cents` limit (new `cents` unit) and `/budget [dollars|off]`; checked in `prepare_request`. |
+| 2026-11-09 | e127a60 | 9.2 | `session_spend_cents` limit (new `cents` unit) and `/budget [dollars|off]`; checked in `prepare_request`. |
+| 2026-11-09 | (this) | 9.4 | Six tasks under `bench/tasks` (JS x2, Python x2, Go, Rust), all proven by `bench/check.sh`. Sutra's own tasks verify with `node --test test/`, which fails on Node 22.21 even when solved; a head-to-head must use Node 24 or rewrite their verify. |

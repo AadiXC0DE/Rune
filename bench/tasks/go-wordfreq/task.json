@@ -1,0 +1,10 @@
+{
+  "title": "Fix word frequency counting for Unicode text and ties",
+  "kind": "bugfix",
+  "prompt": "TopWords in wordfreq.go miscounts words and orders ties unpredictably. The tests in wordfreq_test.go describe the intended behaviour. Fix wordfreq.go so they pass. Do not modify the tests.",
+  "verify": "go test ./...",
+  "protected": [
+    "wordfreq_test.go"
+  ],
+  "timeoutMs": 600000
+}

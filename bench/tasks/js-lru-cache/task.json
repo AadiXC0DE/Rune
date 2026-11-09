@@ -1,0 +1,10 @@
+{
+  "title": "Implement an LRU cache from its tests",
+  "kind": "feature",
+  "prompt": "Implement the LRUCache class in src/lru.js so that the tests in test/ pass. Do not modify the tests.",
+  "verify": "node --test",
+  "protected": [
+    "test"
+  ],
+  "timeoutMs": 600000
+}

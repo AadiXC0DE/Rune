@@ -1,0 +1,10 @@
+{
+  "title": "Order semantic versions with pre-releases correctly",
+  "kind": "bugfix",
+  "prompt": "Version comparison in src/lib.rs orders pre-release versions wrongly. The tests in tests/ follow the precedence rules of Semantic Versioning 2.0.0. Fix src/lib.rs so they pass. Do not modify the tests.",
+  "verify": "cargo test --quiet --offline",
+  "protected": [
+    "tests"
+  ],
+  "timeoutMs": 600000
+}

@@ -368,7 +368,9 @@ tokens per run, cache share, and cost where the model's prices are known.
 `--only a,b` picks tasks, `--trials N` repeats each, and `--json` prints every
 run and the summary as one object. Runs use your configuration, so a model or
 provider given to `rune bench` applies to each of them. The exit status is 0
-only when every run passed.
+only when every run passed. `bench/tasks/` holds six tasks in JavaScript, Python, Go
+and Rust, each with a `solution/` that `bench/check.sh` uses to prove the task
+fails as shipped and passes once solved; see `bench/README.md`.
 
 Enable Bash completion for command names, aliases, and flags in the current
 shell with `source <(rune completion bash)`. To keep it across shells, save

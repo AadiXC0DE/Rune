@@ -1,0 +1,10 @@
+{
+  "title": "Fix interval merging edge cases",
+  "kind": "bugfix",
+  "prompt": "merge() in intervals.py gives wrong results for some inputs. The tests in test_intervals.py describe the intended behaviour. Fix intervals.py so they pass. Do not modify the tests.",
+  "verify": "python3 -m unittest -q test_intervals",
+  "protected": [
+    "test_intervals.py"
+  ],
+  "timeoutMs": 600000
+}
