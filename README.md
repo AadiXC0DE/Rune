@@ -625,6 +625,13 @@ approval says. Each prompt sent in plan mode tells the model it is planning.
 reasoning effort in force and the levels the provider accepts, and
 `/effort <level>` sets it for the requests that follow.
 
+When the model's prices are known, each turn's summary line, `/cost`, the status
+row and the usage ledger carry its estimated cost. `/budget <dollars>` sets a
+spend limit for the session, and `session_spend_cents` in `[limits]` sets one
+for every session: once the turns run so far reach it, the next request is
+refused with `limit_exceeded` until the limit is raised, removed with
+`/budget off`, or a new session starts. The turn that crosses the limit finishes.
+
 Interactive assistant text is journalled in bounded, durable frames before it is
 displayed.
 After process death, resume replays the partial answer once with an

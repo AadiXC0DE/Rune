@@ -33,6 +33,11 @@ pub const BUILTINS: &[Builtin] = &[
         summary: "same as /model",
     },
     Builtin {
+        name: "budget",
+        arguments: "[dollars|off]",
+        summary: "show or set the session's spend limit",
+    },
+    Builtin {
         name: "plan",
         arguments: "[task|off]",
         summary: "plan read-only before acting, or leave plan mode",

@@ -143,6 +143,8 @@ pub enum Unit {
     Millis,
     /// A count of items.
     Count,
+    /// Hundredths of a US dollar.
+    Cents,
 }
 
 impl Unit {
@@ -153,6 +155,7 @@ impl Unit {
             Self::Bytes => "bytes",
             Self::Millis => "ms",
             Self::Count => "items",
+            Self::Cents => "cents",
         }
     }
 }
@@ -194,6 +197,8 @@ pub enum LimitName {
     MaxConsecutiveToolFailures,
     /// Times a turn that changed files is asked to verify before it may end.
     VerificationReminders,
+    /// Estimated spend at which a session stops sending requests.
+    SessionSpendCents,
     /// Maximum bytes retained from one tool result.
     MaxToolResultBytes,
     /// Tool-result bytes retained across one turn.
@@ -280,6 +285,7 @@ impl LimitName {
             Self::MaxAgentSteps,
             Self::MaxConsecutiveToolFailures,
             Self::VerificationReminders,
+            Self::SessionSpendCents,
             Self::MaxToolResultBytes,
             Self::MaxTurnResultBytes,
             Self::SkillCatalogBytes,
@@ -328,6 +334,7 @@ impl LimitName {
             Self::MaxAgentSteps => "max_agent_steps",
             Self::MaxConsecutiveToolFailures => "max_consecutive_tool_failures",
             Self::VerificationReminders => "verification_reminders",
+            Self::SessionSpendCents => "session_spend_cents",
             Self::MaxToolResultBytes => "max_tool_result_bytes",
             Self::MaxTurnResultBytes => "max_turn_result_bytes",
             Self::SkillCatalogBytes => "skill_catalog_bytes",
@@ -377,6 +384,7 @@ impl LimitName {
             Self::MaxAgentSteps => Budget::Bounded(0),
             Self::MaxConsecutiveToolFailures => Budget::Bounded(3),
             Self::VerificationReminders => Budget::Bounded(1),
+            Self::SessionSpendCents => Budget::Unbounded,
             Self::MaxToolResultBytes => Budget::Bounded(64 * 1024),
             Self::MaxTurnResultBytes => Budget::Bounded(8 * 1024 * 1024),
             Self::SkillCatalogBytes => Budget::Bounded(32768),
@@ -434,6 +442,7 @@ impl LimitName {
                 min: 0,
                 max: Some(8),
             },
+            Self::SessionSpendCents => Range { min: 1, max: None },
             Self::CompactionTriggerPercent => Range {
                 min: 10,
                 max: Some(99),
@@ -504,6 +513,7 @@ impl LimitName {
             | Self::SteeringQueueDepth
             | Self::MaxAgentSteps => Unit::Count,
             Self::ReadFileLines => Unit::Count,
+            Self::SessionSpendCents => Unit::Cents,
             _ => Unit::Bytes,
         }
     }
@@ -518,6 +528,9 @@ impl LimitName {
             }
             Self::VerificationReminders => {
                 "Times a turn that changed files without a check afterwards is asked to verify."
+            }
+            Self::SessionSpendCents => {
+                "Estimated spend at which an interactive session stops sending requests."
             }
             Self::MaxToolResultBytes => "Bytes retained from one tool result before spilling.",
             Self::MaxTurnResultBytes => "Tool-result bytes one turn retains across its steps.",

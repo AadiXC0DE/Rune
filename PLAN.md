@@ -201,7 +201,7 @@ Done when a headless run on a JS task can run its tests without full access.
 
 - [x] 9.1 Prices from the models.dev catalog already fetched for limits; fill `total_cost`;
       show cost in `/cost`, the summary line and `ask --json`.
-- [ ] 9.2 A session spend limit that pauses before the next request.
+- [x] 9.2 A session spend limit that pauses before the next request.
 - [x] 9.3 `rune bench`: run tasks in the Sutra task format (`task.json`, `repo/`), each in a
       fresh copy, judged by `verify` after restoring protected paths; report pass, time,
       tokens, cache share and cost.
@@ -258,4 +258,5 @@ Done when a reproducible table exists with Rune in it.
 | 2026-11-09 | c417bb4 | 6.2b | Spinner and elapsed time on running calls, and a `thinking` row before the first token; ticks on idle input polls, at most ten redraws a second. |
 | 2026-11-09 | 39fcd68 | 6.5 | `FooterState.cost`, shown after the context field when prices are known. |
 | 2026-11-09 | 1cfc279 | 7.1b | Pipe tables in a finished answer are aligned by visible width; the stream shows them as written. |
-| 2026-11-09 | (this) | 8.3 | `/plan [task|off]`; denial before rules and grants; note sent in the user turn so the cached prefix is unchanged; status row shows `plan`. |
+| 2026-11-09 | 5c225ee | 8.3 | `/plan [task|off]`; denial before rules and grants; note sent in the user turn so the cached prefix is unchanged; status row shows `plan`. |
+| 2026-11-09 | (this) | 9.2 | `session_spend_cents` limit (new `cents` unit) and `/budget [dollars|off]`; checked in `prepare_request`. |

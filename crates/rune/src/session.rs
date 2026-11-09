@@ -271,6 +271,8 @@ struct SessionHost {
     output_limit: std::sync::atomic::AtomicU64,
     /// Published prices of the current model, when a catalog lists them.
     prices: Mutex<Option<rune_net::models_dev::Prices>>,
+    /// Estimated spend, in millionths of a dollar, at which requests stop.
+    spend_limit: Mutex<Option<u64>>,
     /// Present while the meter uses an estimate rather than provider usage.
     context_source: Mutex<Option<&'static str>>,
     /// Size of the context window, zero when the provider stated none.
@@ -484,6 +486,7 @@ impl Host for SessionHost {
         client: &dyn rune_net::fetch::Fetch,
     ) -> Result<()> {
         use rune_agent::compaction::{self, Trigger};
+        self.check_spend()?;
         let estimate = request_estimate(self, plan)?;
         if self.context_used.load(std::sync::atomic::Ordering::Relaxed) == 0
             || self
@@ -1775,6 +1778,27 @@ impl SessionHost {
         }
     }
 
+    /// Refuses another request once the session has spent its limit.
+    ///
+    /// Spend is what earlier turns were priced at, so the request that crosses
+    /// the limit completes and the one after it is refused.
+    fn check_spend(&self) -> Result<()> {
+        let limit = self.spend_limit.lock().ok().and_then(|limit| *limit);
+        let spent = self.totals.lock().ok().and_then(|totals| totals.cost);
+        match (limit, spent) {
+            (Some(limit), Some(spent)) if spent >= limit => Err(RuneError::new(
+                ErrorCode::LimitExceeded,
+                format!(
+                    "this session has spent about ${}, which reaches its ${} limit",
+                    rune_net::models_dev::dollars(spent),
+                    rune_net::models_dev::dollars(limit)
+                ),
+            )
+            .with_hint("raise it with /budget <dollars> or session_spend_cents, or start /new")),
+            _ => Ok(()),
+        }
+    }
+
     /// Returns what a running call is doing, such as `Reading src/app.js`.
     fn running_label(&self, call: &turn::PreparedCall, activity: rune_tools::Activity) -> String {
         let target = self.call_target(call);
@@ -2028,6 +2052,14 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
         provider_retry: Mutex::new(None),
         context_used: std::sync::atomic::AtomicU64::new(initial_context),
         prices: Mutex::new(None),
+        spend_limit: Mutex::new(
+            config
+                .settings
+                .limits
+                .get(rune_core::budget::LimitName::SessionSpendCents)
+                .value()
+                .map(|cents| cents.saturating_mul(10_000)),
+        ),
         output_limit: std::sync::atomic::AtomicU64::new(
             config.settings.model_output_limit().unwrap_or_default(),
         ),
@@ -2356,6 +2388,7 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                         note(format!("model set to {}", host.model_name()));
                     }
                     Handled::Effort(requested) => note(set_effort(&host, requested.as_deref())),
+                    Handled::Budget(requested) => note(set_budget(&host, requested.as_deref())),
                     Handled::Plan(argument) => {
                         let leave = argument.as_deref() == Some("off");
                         host.planning
@@ -4929,6 +4962,53 @@ fn render_cost(info: &SessionInfo<'_>) -> String {
     out.trim_end().to_owned()
 }
 
+/// Shows the spend limit, or sets it from an amount in dollars, or turns it off.
+fn set_budget(host: &SessionHost, requested: Option<&str>) -> String {
+    let spent = host
+        .totals
+        .lock()
+        .ok()
+        .and_then(|totals| totals.cost)
+        .map_or_else(
+            || "nothing priced yet".to_owned(),
+            |spent| format!("${} spent", rune_net::models_dev::dollars(spent)),
+        );
+    let Some(requested) = requested else {
+        let limit = host.spend_limit.lock().ok().and_then(|limit| *limit);
+        return match limit {
+            Some(limit) => format!(
+                "spend limit ${}; {spent}",
+                rune_net::models_dev::dollars(limit)
+            ),
+            None => format!("no spend limit; {spent}"),
+        };
+    };
+    let limit = if requested == "off" {
+        None
+    } else {
+        let Some(micro) = requested
+            .trim_start_matches('$')
+            .parse::<f64>()
+            .ok()
+            .filter(|dollars| dollars.is_finite() && *dollars > 0.0 && *dollars < 1e9)
+            .map(|dollars| (dollars * 1_000_000.0).round() as u64)
+        else {
+            return format!("`{requested}` is not an amount; use /budget 0.50 or /budget off");
+        };
+        Some(micro)
+    };
+    if let Ok(mut current) = host.spend_limit.lock() {
+        *current = limit;
+    }
+    match limit {
+        Some(limit) => format!(
+            "spend limit set to ${}; {spent}",
+            rune_net::models_dev::dollars(limit)
+        ),
+        None => format!("spend limit removed; {spent}"),
+    }
+}
+
 /// Shows the reasoning effort, or sets it when a level is named.
 ///
 /// Only a level the provider's dialect can express is accepted, so the
@@ -5170,6 +5250,8 @@ enum Handled {
     Effort(Option<String>),
     /// Enter plan mode, optionally with a task for the composer, or leave it.
     Plan(Option<String>),
+    /// Show the spend limit, or set it in dollars, or turn it off.
+    Budget(Option<String>),
     /// Ask the user to choose a model from a list.
     PickModel,
     /// Put back the files the session changed.
@@ -5451,6 +5533,9 @@ fn handle_command<W: std::io::Write>(
             }
             Ok(Handled::SetModel(requested.to_owned()))
         }
+        "budget" => Ok(Handled::Budget(
+            (!arguments.trim().is_empty()).then(|| arguments.trim().to_owned()),
+        )),
         "plan" => Ok(Handled::Plan(
             (!arguments.trim().is_empty()).then(|| arguments.trim().to_owned()),
         )),
@@ -10482,6 +10567,27 @@ mod tests {
     }
 
     #[test]
+    fn a_spent_limit_refuses_the_next_request_until_it_is_raised() {
+        let host = test_host();
+        assert_eq!(
+            set_budget(&host, Some("0.05")),
+            "spend limit set to $0.050000; nothing priced yet"
+        );
+        assert!(host.check_spend().is_ok());
+        host.totals.lock().expect("totals").cost = Some(60_000);
+        let err = host.check_spend().expect_err("over the limit");
+        assert_eq!(err.code(), ErrorCode::LimitExceeded);
+        assert!(err.message().contains("$0.060000"), "{}", err.message());
+        assert!(set_budget(&host, Some("1")).starts_with("spend limit set to $1.000000"));
+        assert!(host.check_spend().is_ok());
+        assert!(set_budget(&host, Some("lots")).contains("is not an amount"));
+        assert_eq!(
+            set_budget(&host, Some("off")),
+            "spend limit removed; $0.060000 spent"
+        );
+    }
+
+    #[test]
     fn plan_mode_refuses_changes_whatever_the_permission_mode() {
         let mut host = test_host();
         host.mode = PermissionMode::FullAccess;
@@ -10926,6 +11032,7 @@ mod tests {
             provider_retry: Mutex::new(None),
             context_used: std::sync::atomic::AtomicU64::new(0),
             prices: Mutex::new(None),
+            spend_limit: Mutex::new(None),
             output_limit: std::sync::atomic::AtomicU64::new(0),
             context_source: Mutex::new(None),
             context_limit: std::sync::atomic::AtomicU64::new(
