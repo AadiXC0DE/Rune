@@ -87,7 +87,7 @@ These are compared against `main` before a push rather than counted as regressio
 
 ## Resume here (2026-11-09)
 
-State: `main` is 2 commits ahead of `origin/main` (last push `56828d7`, CI run 42647916013).
+State: `main` is 6 commits ahead of `origin/main` (last push `56828d7`, CI run 42647916013).
 
 Before the next push: `cargo xtask web` (the demo module record is stale once
 `rune-term`, `rune-tools`, `rune-agent`, `rune-net`, `rune-core` or `rune-context`
@@ -287,4 +287,4 @@ Done when a reproducible table exists with Rune in it.
 | 2026-11-09 | 56828d7 | push | Third batch of 18 commits (5.3, 4.3, 5.4 and the CI fixes); CI run 42647916013. |
 | 2026-11-09 | 7835c12 | 7.3 | `rune-term::diff` (`changed_lines` trims shared lines, `render` cuts to 8 lines and the width); edit rows draw it from the call's `old_string`/`new_string` or `edits`, in Success/Error slots. Accessible mode keeps the row alone. `git_diff` output goes to the model, not scrollback, so it has no view to colour. |
 | 2026-11-09 | 6ae4bc4 | 8.1b | `Host::decide_with_arguments` (defaults to `decide`; subagents forward it). The session stores a plain `rune_term::diff` view of an `edit_file` call, at most 12 lines, and the prompt draws it under the scope. Plain text, because the picker measures its lines without escapes. |
-| 2026-11-09 | pending | CI | Run 42647916013: `terminal_help` failed on Linux because the 6.2b spinner redrew every 100 ms and a held turn never left the harness's 150 ms quiet window. Redraw at most every 250 ms (checked with the harness: fails at 100, passes the held-turn stage at 250). macOS `mcp_http` timed out waiting for exit after `/quit`, the same as the known local failure; watch it on the next run. |
+| 2026-11-09 | eb039ce | CI | Run 42647916013: `terminal_help` failed on Linux because the 6.2b spinner redrew every 100 ms and a held turn never left the harness's 150 ms quiet window. Redraw at most every 250 ms (checked with the harness: fails at 100, passes the held-turn stage at 250). macOS `mcp_http` timed out waiting for exit after `/quit`, the same as the known local failure; watch it on the next run. |
