@@ -245,5 +245,5 @@ Done when a reproducible table exists with Rune in it.
 | 2026-11-09 | 7daf52e | 8.2 | 34 verification patterns plus `grep`, `rg`, `git show` in auto mode; chained, substituted and redirected parts are still judged alone. |
 | 2026-11-09 | fe98d9d | 4.2 | `rune-tools::test_report`: cargo, TAP (`node --test`), jest, vitest, pytest, mocha, go. Shell result leads with `[tests: …]`; the row shows `exit 1 · 3 passed, 1 failed`. |
 | 2026-11-09 | 0dfa860 | 5.2 | `Verification::of`, `verification_reminders` (default 1), `VerificationRequested` event; `ask --json` adds `verification` and cache token counts. |
-| 2026-11-09 | 1ab9a3a | 9.1 | `Prices` in micro-dollars per Mtok from models.dev `cost`; turn summary, `/cost`, ledger `total_cost`, and `ask --json` `cost_usd` (cache only, no network). |
+| 2026-11-09 | 9362681 | 9.1 | `Prices` in micro-dollars per Mtok from models.dev `cost`; turn summary, `/cost`, ledger `total_cost`, and `ask --json` `cost_usd` (cache only, no network). |
 | 2026-11-09 | (this) | 9.3 | `rune bench` runs Sutra-format tasks; smoke-tested on Sutra's suite without a provider (clean failure rows). A real run needs a key. |
