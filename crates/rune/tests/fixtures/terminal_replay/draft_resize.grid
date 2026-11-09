@@ -1,7 +1,7 @@
 narrow-draft: 32x24, caret 31,3
 00|session ************|
 01|ctrl-c cancel  /help commands  e|
-02|replay-fixture | auto | ctx ~4.7|
+02|replay-fixture | auto | ctx ~2.7|
 03|> 234567890123456789VISIBLE-END|
 04||
 05||
