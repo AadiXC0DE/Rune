@@ -184,6 +184,24 @@ pub struct ToolCallReport {
     pub status: &'static str,
 }
 
+/// One entry of the run's narration: `{"text": ...}` or `{"tool": name, "status": ...}`.
+#[derive(Clone, Debug, Serialize)]
+#[serde(untagged)]
+pub enum NarrationReport {
+    /// Text the model wrote.
+    Text {
+        /// The text.
+        text: String,
+    },
+    /// A tool call.
+    Tool {
+        /// Tool name.
+        tool: String,
+        /// `success`, `error`, or `not_run`.
+        status: &'static str,
+    },
+}
+
 /// The JSON result object.
 ///
 /// Field order here is the field order on the wire, because the struct is
@@ -208,6 +226,10 @@ pub struct JsonResult {
     pub usage: UsageReport,
     /// Tool calls requested by the provider, in order.
     pub tool_calls: Vec<ToolCallReport>,
+    /// What the run said and which tools it called, in the order they
+    /// happened, so text written between calls keeps its place.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub narration: Vec<NarrationReport>,
     /// Estimated cost in US dollars as a decimal string, from the published
     /// prices of a cached model catalog. Absent when no price is known.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -261,6 +283,7 @@ impl JsonResult {
             steps: 0,
             usage: UsageReport::default(),
             tool_calls: Vec::new(),
+            narration: Vec::new(),
             cost_usd: None,
             verification: None,
             error: Some(error.message().to_owned()),
@@ -606,6 +629,27 @@ pub fn run(
             },
         })
         .collect();
+    let narration = outcome
+        .narration
+        .iter()
+        .filter_map(|entry| match entry {
+            turn::Narration::Text(text) if text.trim().is_empty() => None,
+            turn::Narration::Text(text) => Some(NarrationReport::Text { text: text.clone() }),
+            turn::Narration::Call(id) => {
+                let call = outcome.calls.iter().find(|call| &call.call.id == id)?;
+                Some(NarrationReport::Tool {
+                    tool: call.call.name.clone(),
+                    status: if !call.executed {
+                        "not_run"
+                    } else if call.output.is_error {
+                        "error"
+                    } else {
+                        "success"
+                    },
+                })
+            }
+        })
+        .collect();
     let session_id = if options.no_save {
         String::new()
     } else {
@@ -638,6 +682,7 @@ pub fn run(
             cache_write_tokens: outcome.usage.cache_write_tokens,
         },
         tool_calls,
+        narration,
         cost_usd: crate::provider_setup::cached_prices(settings, paths)
             .and_then(|prices| prices.cost(&outcome.usage))
             .map(rune_net::models_dev::dollars),
@@ -1006,6 +1051,7 @@ mod tests {
             steps: 1,
             usage: UsageReport::default(),
             tool_calls: Vec::new(),
+            narration: Vec::new(),
             cost_usd: None,
             verification: Some("not_applicable"),
             error: None,

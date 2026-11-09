@@ -421,6 +421,15 @@ pub trait Host {
     fn steering(&self) -> &SteeringQueue;
 }
 
+/// One entry of what a turn said and did, in the order it happened.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum Narration {
+    /// Text the model wrote between tool calls, or as its answer.
+    Text(String),
+    /// A tool call, by the identifier the model gave it.
+    Call(String),
+}
+
 /// Outcome of a completed turn.
 #[derive(Clone, Debug)]
 pub struct TurnOutcome {
@@ -428,6 +437,8 @@ pub struct TurnOutcome {
     pub stop_reason: StopReason,
     /// Assistant text produced across every step.
     pub text: String,
+    /// Text and tool calls across every step, in order.
+    pub narration: Vec<Narration>,
     /// Reasoning the model produced, kept apart from its answer.
     ///
     /// Held separately so a reader can tell thinking from the reply, and so the
@@ -578,6 +589,7 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
     // The latest step's answer, kept so a turn stopped at the step limit still
     // returns what the model said in its last step.
     let mut text = String::new();
+    let mut narration: Vec<Narration> = Vec::new();
 
     loop {
         cancellation.check()?;
@@ -594,6 +606,7 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
             let outcome = TurnOutcome {
                 stop_reason,
                 text,
+                narration,
                 reasoning,
                 usage,
                 last_request,
@@ -648,11 +661,18 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
         // requires on the next request.
         let mut parts: Vec<ContentPart> = Vec::new();
         let mut pending_calls = Vec::new();
+        // Text from a new step starts a new entry, even with no call between.
+        let mut new_step = true;
         for event in &outcome.events {
             match event {
                 // The host already received this delta as it arrived; here it is
                 // only assembled into the turn's record.
                 rune_net::stream::ProviderEvent::TextDelta { delta } => {
+                    match narration.last_mut() {
+                        Some(Narration::Text(said)) if !new_step => said.push_str(delta),
+                        _ => narration.push(Narration::Text(delta.clone())),
+                    }
+                    new_step = false;
                     parts.push(ContentPart::Text {
                         text: delta.clone(),
                     });
@@ -676,6 +696,7 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
                         name: name.clone(),
                         arguments: arguments.clone(),
                     });
+                    narration.push(Narration::Call(id.to_string()));
                     pending_calls.push(PreparedCall {
                         id: id.to_string(),
                         name,
@@ -762,6 +783,7 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
             return Ok(TurnOutcome {
                 stop_reason: reason,
                 text,
+                narration,
                 reasoning,
                 usage,
                 last_request,
@@ -815,6 +837,7 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
             return Ok(TurnOutcome {
                 stop_reason: StopReason::ProviderFailure,
                 text,
+                narration,
                 reasoning,
                 usage,
                 last_request,

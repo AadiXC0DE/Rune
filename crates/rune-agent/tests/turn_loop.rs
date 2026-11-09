@@ -3885,3 +3885,30 @@ fn a_second_empty_cut_off_reports_the_output_limit() {
     assert_eq!(outcome.stop_reason, StopReason::OutputLimit);
     assert_eq!(host.server.as_ref().expect("endpoint").request_count(), 2);
 }
+
+#[test]
+fn the_outcome_keeps_text_and_calls_in_the_order_they_happened() {
+    let endpoint = MockEndpoint::start(vec![
+        Script::Frames(vec![
+            r#"{"choices":[{"index":0,"delta":{"content":"Let me look."}}]}"#.to_owned(),
+            r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"read_file","arguments":"{\"path\":\"a\"}"}}]}}]}"#.to_owned(),
+            r#"{"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#.to_owned(),
+            "[DONE]".to_owned(),
+        ]),
+        Script::text("It is fine."),
+    ]);
+    let host = TestHost::new(endpoint)
+        .with_tools(vec![read_tool()])
+        .with_tool_response(ToolOutput::success("1\tok"));
+    let mut history = rune_agent::History::new();
+    history.push_user("look");
+    let outcome = run_turn(&mut history, &host).expect("turn");
+    assert_eq!(
+        outcome.narration,
+        [
+            rune_agent::turn::Narration::Text("Let me look.".to_owned()),
+            rune_agent::turn::Narration::Call("c1".to_owned()),
+            rune_agent::turn::Narration::Text("It is fine.".to_owned()),
+        ]
+    );
+}

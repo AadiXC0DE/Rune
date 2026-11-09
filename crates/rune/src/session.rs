@@ -10591,6 +10591,7 @@ mod tests {
         let outcome = turn::TurnOutcome {
             stop_reason: StopReason::Completed,
             text: "the answer".to_owned(),
+            narration: Vec::new(),
             reasoning: String::new(),
             usage: rune_net::stream::Usage::default(),
             last_request: rune_net::stream::Usage::default(),
@@ -10611,6 +10612,7 @@ mod tests {
         let outcome = turn::TurnOutcome {
             stop_reason: StopReason::StepLimit,
             text: String::new(),
+            narration: Vec::new(),
             reasoning: String::new(),
             usage: rune_net::stream::Usage::default(),
             last_request: rune_net::stream::Usage::default(),
@@ -10668,6 +10670,7 @@ mod tests {
         let outcome = turn::TurnOutcome {
             stop_reason: StopReason::Completed,
             text: String::new(),
+            narration: Vec::new(),
             reasoning: String::new(),
             usage: rune_net::stream::Usage::default(),
             last_request: rune_net::stream::Usage::default(),
@@ -10886,6 +10889,7 @@ mod tests {
         let outcome = turn::TurnOutcome {
             stop_reason: StopReason::Completed,
             text: String::new(),
+            narration: Vec::new(),
             reasoning: String::new(),
             usage: rune_net::stream::Usage {
                 input_tokens: Some(12_000),

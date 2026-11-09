@@ -1887,6 +1887,7 @@ fn settle(context: &TurnContext, stop_reason: StopReason, acc: Accumulated) -> T
         outcome: TurnOutcome {
             stop_reason,
             text,
+            narration: Vec::new(),
             reasoning,
             usage,
             last_request,

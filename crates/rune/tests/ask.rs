@@ -421,6 +421,9 @@ fn ask_json_reports_tool_errors_and_stops_at_the_configured_cap() {
         assert_eq!(result["output"], "I will run the command.");
         assert_eq!(result["final_output"], "");
         assert_eq!(result["steps"], 1);
+        assert_eq!(result["narration"][0]["text"], "I will run the command.");
+        assert_eq!(result["narration"][1]["tool"], "shell");
+        assert_eq!(result["narration"][2]["tool"], "read_file");
         assert_eq!(
             result["usage"],
             json!({"input_tokens": 11, "output_tokens": 0})

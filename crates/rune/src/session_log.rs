@@ -1431,6 +1431,7 @@ mod tests {
         TurnOutcome {
             stop_reason: StopReason::Completed,
             text: text.to_owned(),
+            narration: Vec::new(),
             reasoning: String::new(),
             usage: Usage {
                 input_tokens: Some(10),

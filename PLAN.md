@@ -87,7 +87,7 @@ These are compared against `main` before a push rather than counted as regressio
 
 ## Resume here (2026-11-09)
 
-State: `main` is 6 commits ahead of `origin/main` (last push `56828d7`, CI run 42647916013).
+State: `main` is 8 commits ahead of `origin/main` (last push `56828d7`, CI run 42647916013).
 
 Before the next push: `cargo xtask web` (the demo module record is stale once
 `rune-term`, `rune-tools`, `rune-agent`, `rune-net`, `rune-core` or `rune-context`
@@ -95,14 +95,15 @@ change), `cargo fmt --all -- --check`,
 `cargo clippy --workspace --all-targets -D warnings`, `cargo xtask budget`, and
 `cargo test --workspace --no-fail-fast`, compared against the known local failures.
 
-Next task: 5.1, record each step's narration in order with the tool calls in
-`TurnOutcome` (an ordered `steps` list of text and call ids), so `ask --json` and
-saved sessions keep the order scrollback already shows. After it: 8.3b, 8.4b.
+Next task: 8.3b, `/permissions [ask|auto|full-access]` to show or switch the
+session's permission mode (the field is `SessionHost::mode`; make it settable
+like `/effort` does, and clear remembered grants when the mode narrows). Then
+8.4b `/fork` on top of `rune session fork`.
 
 Waiting on the owner: a DeepSeek key and approval to spend about $0.02 for the
 head-to-head runs (9.5) and the `reasoning_content` check (3.5).
 
-Remaining open items: 3.5, 4.4 (across turns), 5.1, 8.3b, 8.4b, 9.5, 10.1 to 10.4.
+Remaining open items: 3.5, 4.4 (across turns), 8.3b, 8.4b, 9.5, 10.1 to 10.4.
 
 ## Phases
 
@@ -167,7 +168,7 @@ still one call away.
 
 ### Phase 5: Turn loop quality
 
-- [ ] 5.1 Record each step's narration in order with the tool calls, for scrollback, `ask`
+- [x] 5.1 Record each step's narration in order with the tool calls, for scrollback, `ask`
       and sessions.
 - [x] 5.2 Verification check with no extra model call: when a turn edited files and no test
       or build ran after the last edit, ask the model once to verify; report `verified` or
@@ -288,3 +289,4 @@ Done when a reproducible table exists with Rune in it.
 | 2026-11-09 | 7835c12 | 7.3 | `rune-term::diff` (`changed_lines` trims shared lines, `render` cuts to 8 lines and the width); edit rows draw it from the call's `old_string`/`new_string` or `edits`, in Success/Error slots. Accessible mode keeps the row alone. `git_diff` output goes to the model, not scrollback, so it has no view to colour. |
 | 2026-11-09 | 6ae4bc4 | 8.1b | `Host::decide_with_arguments` (defaults to `decide`; subagents forward it). The session stores a plain `rune_term::diff` view of an `edit_file` call, at most 12 lines, and the prompt draws it under the scope. Plain text, because the picker measures its lines without escapes. |
 | 2026-11-09 | eb039ce | CI | Run 42647916013: `terminal_help` failed on Linux because the 6.2b spinner redrew every 100 ms and a held turn never left the harness's 150 ms quiet window. Redraw at most every 250 ms (checked with the harness: fails at 100, passes the held-turn stage at 250). macOS `mcp_http` timed out waiting for exit after `/quit`, the same as the known local failure; watch it on the next run. |
+| 2026-11-09 | pending | 5.1 | `TurnOutcome.narration` (`Narration::Text` / `Call(id)`), a new entry per step; `ask --json` adds `narration` (`{text}` or `{tool, status}` with `not_run`). Saved sessions already kept the order in the assistant parts. |
