@@ -191,7 +191,8 @@ Done when the binary stays inside its ceiling and a snapshot test pins each elem
 - [x] 8.2 Routine test and build commands for common ecosystems are allowed in auto mode
       inside the sandbox, so headless runs can verify.
 - [ ] 8.3 `/plan` read-only mode enforced by policy, and `/permissions` to switch mode.
-- [ ] 8.4 `/effort` and `/fork` slash commands.
+- [x] 8.4 `/effort` slash command.
+- [ ] 8.4b `/fork` slash command (the CLI has `rune session fork`).
 
 Done when a headless run on a JS task can run its tests without full access.
 
@@ -250,4 +251,6 @@ Done when a reproducible table exists with Rune in it.
 | 2026-11-09 | 50c9118 | 9.1 | `Prices` in micro-dollars per Mtok from models.dev `cost`; turn summary, `/cost`, ledger `total_cost`, and `ask --json` `cost_usd` (cache only, no network). |
 | 2026-11-09 | cdae308 | 9.3 | `rune bench` runs Sutra-format tasks; smoke-tested on Sutra's suite without a provider (clean failure rows). A real run needs a key. |
 | 2026-11-09 | d88e784 | push | Second batch of 15 commits; CI run 42631487661. |
-| 2026-11-09 | (this) | 8.1 | `ApprovalOutcome::RememberForSession` wired into the session; literal grants, cleared by `/new`; `always` in accessible mode. |
+| 2026-11-09 | 124306f | 8.1 | `ApprovalOutcome::RememberForSession` wired into the session; literal grants, cleared by `/new`; `always` in accessible mode. |
+| 2026-11-09 | ca9afb7 | CI | Narrow replay grids cut the estimate to `ctx ~4.`; fixtures now expect `ctx ~2.`. |
+| 2026-11-09 | (this) | 8.4 | `/effort [level]`, limited to the dialect's accepted levels. |

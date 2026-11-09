@@ -251,7 +251,8 @@ struct SessionHost {
     tools: Vec<ToolSpec>,
     rules: RuleSet,
     mode: PermissionMode,
-    effort: Effort,
+    /// Behind a lock because `/effort` changes it between turns.
+    effort: Mutex<Effort>,
     fast_mode: bool,
     limits: BudgetSet,
     context: ExecutionContext,
@@ -457,7 +458,10 @@ impl Host for SessionHost {
     }
 
     fn effort(&self) -> Effort {
-        self.effort
+        *self
+            .effort
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     fn max_output_tokens(&self) -> Option<u64> {
@@ -1024,7 +1028,7 @@ impl SessionHost {
             provider,
             endpoint,
             mode: self.mode,
-            effort: self.effort,
+            effort: Host::effort(self),
             session_id: self.session_id_name(),
             workspace: &self.workspace,
             context_used: self.context_used.load(std::sync::atomic::Ordering::Relaxed),
@@ -1210,7 +1214,7 @@ impl SessionHost {
             .get(rune_core::budget::LimitName::ParallelToolCalls)
             .value()
             != Some(1);
-        plan.effort = self.effort;
+        plan.effort = Host::effort(self);
         plan.fast_mode = self.fast_mode;
         plan.provider_order.clone_from(&self.provider_order);
         plan.provider_strict = self.provider_strict;
@@ -1922,7 +1926,7 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
         tools,
         rules: config.rules,
         mode: config.settings.permission_mode,
-        effort: config.settings.effort,
+        effort: Mutex::new(config.settings.effort),
         fast_mode: config.settings.fast_mode,
         limits: limits.clone(),
         context,
@@ -2260,6 +2264,7 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                         host.set_model(&model, None, None, None);
                         note(format!("model set to {}", host.model_name()));
                     }
+                    Handled::Effort(requested) => note(set_effort(&host, requested.as_deref())),
                     Handled::ClearHistory => {
                         // Forgetting is reported, because a silent success would
                         // leave the user unsure whether anything was removed.
@@ -4812,6 +4817,33 @@ fn render_cost(info: &SessionInfo<'_>) -> String {
     out.trim_end().to_owned()
 }
 
+/// Shows the reasoning effort, or sets it when a level is named.
+///
+/// Only a level the provider's dialect can express is accepted, so the
+/// setting never claims an effort the request cannot carry.
+fn set_effort(host: &SessionHost, requested: Option<&str>) -> String {
+    let supported = host.dialect.capabilities().efforts;
+    let names = supported
+        .iter()
+        .map(|effort| effort.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let current = Host::effort(host);
+    let Some(requested) = requested else {
+        return format!("effort is {current}; this provider accepts {names}");
+    };
+    match supported.iter().find(|effort| effort.as_str() == requested) {
+        Some(effort) => {
+            *host
+                .effort
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = *effort;
+            format!("effort set to {effort} for the requests that follow")
+        }
+        None => format!("`{requested}` is not an effort this provider accepts; choose {names}"),
+    }
+}
+
 /// Renders the settings that govern the running session.
 #[must_use]
 fn render_settings(info: &SessionInfo<'_>) -> String {
@@ -5006,6 +5038,8 @@ enum Handled {
     ClearHistory,
     /// Send later turns to this model.
     SetModel(String),
+    /// Show the reasoning effort, or set it for the requests that follow.
+    Effort(Option<String>),
     /// Ask the user to choose a model from a list.
     PickModel,
     /// Put back the files the session changed.
@@ -5287,6 +5321,9 @@ fn handle_command<W: std::io::Write>(
             }
             Ok(Handled::SetModel(requested.to_owned()))
         }
+        "effort" => Ok(Handled::Effort(
+            (!arguments.trim().is_empty()).then(|| arguments.trim().to_ascii_lowercase()),
+        )),
         "compact" if arguments.trim() == "preview" => Ok(Handled::CompactPreview),
         "compact" => Ok(Handled::Compact),
         "pin" => Ok(Handled::Pin(
@@ -7414,7 +7451,10 @@ mod tests {
                     .join("\n")
                     .contains(&first.target)
             );
-            first.answer.send(ApprovalOutcome::RunOnce).expect("approve once");
+            first
+                .answer
+                .send(ApprovalOutcome::RunOnce)
+                .expect("approve once");
             let second = pending
                 .recv_timeout(std::time::Duration::from_secs(2))
                 .expect("the same command needs another approval");
@@ -10309,6 +10349,20 @@ mod tests {
     }
 
     #[test]
+    fn effort_is_shown_and_set_only_to_a_level_the_dialect_accepts() {
+        let host = test_host();
+        assert!(set_effort(&host, None).starts_with("effort is auto"));
+        // The test host speaks Chat Completions, which accepts the named levels.
+        assert_eq!(
+            set_effort(&host, Some("high")),
+            "effort set to high for the requests that follow"
+        );
+        assert_eq!(Host::effort(&host), Effort::High);
+        assert!(set_effort(&host, Some("extreme")).contains("is not an effort"));
+        assert_eq!(Host::effort(&host), Effort::High);
+    }
+
+    #[test]
     fn only_actions_that_can_be_undone_may_be_remembered() {
         assert!(rememberable("shell", "npm run e2e"));
         assert!(rememberable("write_file", "../outside/notes.txt"));
@@ -10678,7 +10732,7 @@ mod tests {
             tools: Vec::new(),
             rules: crate::permissions::validated(&Settings::default()).expect("rules"),
             mode: PermissionMode::Auto,
-            effort: Effort::Auto,
+            effort: Mutex::new(Effort::Auto),
             fast_mode: false,
             limits: BudgetSet::new(),
             context: ExecutionContext::new(Utf8PathBuf::from("/tmp")),

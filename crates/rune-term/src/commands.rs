@@ -33,6 +33,11 @@ pub const BUILTINS: &[Builtin] = &[
         summary: "same as /model",
     },
     Builtin {
+        name: "effort",
+        arguments: "[level]",
+        summary: "show the reasoning effort, or set it for the next requests",
+    },
+    Builtin {
         name: "status",
         arguments: "",
         summary: "show the model, provider, context, and session",
