@@ -29,6 +29,7 @@ fn state() -> FooterState {
         context_source: None,
         context_limit: 200_000,
         session_id: "9f2c1a7b4e".to_owned(),
+        cost: None,
     }
 }
 

@@ -888,6 +888,7 @@ mod tests {
             context_source: None,
             context_limit: 200_000,
             session_id: "9f2c1a7b4e".to_owned(),
+            cost: None,
         };
         let layout = crate::footer::solve((80, 24), 1, false, crate::footer::DEFAULT_MINIMUM_ROWS);
         assert!(!layout.too_small);

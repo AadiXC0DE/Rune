@@ -1311,6 +1311,12 @@ impl SessionHost {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clone(),
+            cost: self
+                .totals
+                .lock()
+                .ok()
+                .and_then(|totals| totals.cost)
+                .map(|micro| format!("${}.{:04}", micro / 1_000_000, (micro % 1_000_000) / 100)),
         };
         let layout = footer::solve(
             (

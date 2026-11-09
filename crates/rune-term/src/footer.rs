@@ -55,6 +55,8 @@ pub struct FooterState {
     pub context_limit: u64,
     /// Identifier of the session, shown shortened.
     pub session_id: String,
+    /// Estimated spend so far, already formatted, when prices are known.
+    pub cost: Option<String>,
 }
 
 /// The provider attempt shown in the renderer-owned status row.
@@ -242,6 +244,12 @@ fn status_row(state: &FooterState, theme: &Theme, truecolor: bool) -> String {
     row.push_str(&reset(theme));
     row.push_str(&divider(theme, truecolor));
     row.push_str(&context_field(state, theme, truecolor));
+    if let Some(cost) = &state.cost {
+        row.push_str(&divider(theme, truecolor));
+        row.push_str(&paint(theme, Slot::Dim, truecolor, 0));
+        row.push_str(cost);
+        row.push_str(&reset(theme));
+    }
     if !state.workspace.is_empty() {
         row.push_str(&divider(theme, truecolor));
         row.push_str(&paint(theme, Slot::Dim, truecolor, 0));
@@ -392,6 +400,7 @@ mod tests {
             context_source: None,
             context_limit: 200_000,
             session_id: "9f2c1a7b4e".to_owned(),
+            cost: None,
         }
     }
 
@@ -419,6 +428,16 @@ mod tests {
         let layout = solve((100, 40), 1, false, DEFAULT_MINIMUM_ROWS);
         let rows = strip(&render(state, &layout, &Theme::fx_dark(), width, true));
         rows.last().expect("status row").clone()
+    }
+
+    #[test]
+    fn a_known_spend_is_shown_after_the_context_and_an_unknown_one_is_not() {
+        let mut priced = state();
+        priced.cost = Some("$0.0123".to_owned());
+        let shown = status_of(&priced, 200);
+        assert!(shown.contains("$0.0123"), "{shown}");
+        assert!(shown.find("ctx") < shown.find("$0.0123"), "{shown}");
+        assert!(!status_of(&state(), 200).contains('$'));
     }
 
     #[test]

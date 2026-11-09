@@ -167,7 +167,7 @@ Done when the turn result carries ordered steps and a verification verdict.
       one row per call.
 - [x] 6.4 End-of-turn summary line: files changed, tests, tokens with cache share, cost, time.
 - [x] 6.2b Animate the running row (spinner and elapsed time) from a ticker.
-- [ ] 6.5 Footer shows session cost and the running turn's elapsed time.
+- [x] 6.5 Footer shows session cost; the running turn's elapsed time is on its live row (6.2b).
 
 Done when a PTY test pins the live rows and the summary.
 
@@ -254,4 +254,5 @@ Done when a reproducible table exists with Rune in it.
 | 2026-11-09 | 124306f | 8.1 | `ApprovalOutcome::RememberForSession` wired into the session; literal grants, cleared by `/new`; `always` in accessible mode. |
 | 2026-11-09 | ca9afb7 | CI | Narrow replay grids cut the estimate to `ctx ~4.`; fixtures now expect `ctx ~2.`. |
 | 2026-11-09 | 5623980 | 8.4 | `/effort [level]`, limited to the dialect's accepted levels. |
-| 2026-11-09 | (this) | 6.2b | Spinner and elapsed time on running calls, and a `thinking` row before the first token; ticks on idle input polls, at most ten redraws a second. |
+| 2026-11-09 | c417bb4 | 6.2b | Spinner and elapsed time on running calls, and a `thinking` row before the first token; ticks on idle input polls, at most ten redraws a second. |
+| 2026-11-09 | (this) | 6.5 | `FooterState.cost`, shown after the context field when prices are known. |
