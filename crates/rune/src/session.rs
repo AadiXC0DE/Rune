@@ -1687,6 +1687,14 @@ impl SessionHost {
             link: format!("{}\u{1b}[4m", sgr(Slot::Link)),
             dim: sgr(Slot::Dim),
             reset: rune_term::engine::Style::RESET.to_owned(),
+            code_block: rune_term::highlight::CodeStyle {
+                keyword: sgr(Slot::Keyword),
+                string: sgr(Slot::String),
+                number: sgr(Slot::Number),
+                comment: sgr(Slot::Comment),
+                function: sgr(Slot::Function),
+                reset: rune_term::engine::Style::RESET.to_owned(),
+            },
         }
     }
 

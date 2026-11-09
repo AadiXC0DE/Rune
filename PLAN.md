@@ -176,7 +176,7 @@ Done when a PTY test pins the live rows and the summary.
 - [x] 7.1 Streaming-safe Markdown: headings, emphasis, inline code, lists, quotes, links,
       rules.
 - [ ] 7.1b Markdown tables: align columns across the rows of one table.
-- [ ] 7.2 Code-fence highlighting from a small lexer (keywords, strings, comments, numbers)
+- [x] 7.2 Code-fence highlighting from a small lexer (keywords, strings, comments, numbers)
       for the common languages, within the size budget.
 - [ ] 7.3 Coloured diffs for edit results and `git_diff`.
 
@@ -239,4 +239,5 @@ Done when a reproducible table exists with Rune in it.
 | 2026-11-09 | f0b2bb7 | 6.2-6.4 | Narration and `✓/✗ tool target · result · time` rows committed live; running rows in the live region (static, no animated spinner yet); one dim summary line per turn. Words instead of glyphs for screen readers. |
 | 2026-11-09 | 8c0c011, a43026d | CI | Replay grids expect the smaller request estimate; rustls-webpki 0.103.16 and webpki-roots 1.0.11 for RUSTSEC-2026-0381/0382. |
 | 2026-11-09 | 34b31cf | CI | Demo module verified by a source digest record: aarch64 macOS, x86_64 macOS and Linux build three different module digests from one source. |
-| 2026-11-09 | (this) | 7.1 | `rune-term::markdown`; styled before wrapping, so widths stay exact. Off unless a host opts in. |
+| 2026-11-09 | e8c018e | 7.1 | `rune-term::markdown`; styled before wrapping, so widths stay exact. Off unless a host opts in. |
+| 2026-11-09 | (this) | 7.2 | `rune-term::highlight`: per-row lexer, seven language families, theme syntax slots. |

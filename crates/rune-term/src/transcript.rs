@@ -661,6 +661,7 @@ impl AssistantRows {
 struct Fence {
     marker: u8,
     length: usize,
+    language: crate::highlight::Language,
 }
 
 /// Recognizes a Markdown fence with at most three leading spaces.
@@ -674,7 +675,17 @@ fn fence_start(line: &str) -> Option<(Fence, &str)> {
         return None;
     }
     let length = rest.bytes().take_while(|byte| *byte == marker).count();
-    (length >= 3).then(|| (Fence { marker, length }, &rest[length..]))
+    let info = &rest[length..];
+    (length >= 3).then(|| {
+        (
+            Fence {
+                marker,
+                length,
+                language: crate::highlight::Language::from_info(info),
+            },
+            info,
+        )
+    })
 }
 
 fn assistant_line(
@@ -700,7 +711,10 @@ fn assistant_line(
             *fence = None;
             return delimiter(line);
         }
-        return wrap_code(line, width, ascii);
+        return wrap_code(line, width, ascii)
+            .into_iter()
+            .map(|row| crate::highlight::highlight(&row, open.language, &markdown.code_block))
+            .collect();
     }
     if let Some((open, rest)) = candidate
         && (open.marker != b'`' || !rest.contains('`'))

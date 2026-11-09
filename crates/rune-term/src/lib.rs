@@ -11,6 +11,7 @@ pub mod engine;
 mod external_editor;
 pub mod footer;
 pub mod frame;
+pub mod highlight;
 pub mod inline;
 pub mod input;
 pub mod markdown;

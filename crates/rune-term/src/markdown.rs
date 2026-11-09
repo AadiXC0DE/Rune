@@ -33,6 +33,8 @@ pub struct MarkdownStyle {
     pub dim: String,
     /// Closes any of the above.
     pub reset: String,
+    /// How fenced code is coloured.
+    pub code_block: crate::highlight::CodeStyle,
 }
 
 impl MarkdownStyle {
@@ -48,6 +50,7 @@ impl MarkdownStyle {
             link: "\u{1b}[4m".to_owned(),
             dim: "\u{1b}[2m".to_owned(),
             reset: "\u{1b}[0m".to_owned(),
+            code_block: crate::highlight::CodeStyle::default(),
         }
     }
 }
@@ -266,6 +269,7 @@ mod tests {
             link: "<a>".to_owned(),
             dim: "<d>".to_owned(),
             reset: "</>".to_owned(),
+            code_block: crate::highlight::CodeStyle::default(),
         }
     }
 
