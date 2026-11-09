@@ -527,6 +527,11 @@ const VERIFICATION_REMINDER: &str = "<harness_check>Files were changed and nothi
 run since the last change to check it. Run the focused test, build, or command that \
 exercises the change and report what it shows, or say why it cannot be run.</harness_check>";
 
+/// Asks again after a reply the output limit cut off before it said anything.
+const OUTPUT_LIMIT_RETRY: &str = "<harness_check>Your last reply reached the output \
+token limit before giving any answer. Answer again more briefly: think less, and split \
+large writes into smaller steps.</harness_check>";
+
 /// Runs one turn to completion.
 ///
 /// Returns the outcome; a failure to reach a terminal state is an error, not a
@@ -536,6 +541,8 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
     let cancellation = host.cancellation();
     let steering = host.steering();
     let step_limit = limits.get(LimitName::MaxAgentSteps).value().unwrap_or(0);
+    // One retry for a reply the output limit cut off before it said anything.
+    let mut limit_retry = true;
     let mut reminders = limits
         .get(LimitName::VerificationReminders)
         .value()
@@ -669,7 +676,8 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
 
         // Merge adjacent text parts so the transcript has one entry per run.
         let parts = coalesce_text(parts);
-        if !parts.is_empty() || !pending_calls.is_empty() {
+        let recorded = !parts.is_empty() || !pending_calls.is_empty();
+        if recorded {
             // The replay value travels with the turn that produced it, because
             // a later request must send it back unchanged and must not inherit
             // it from an earlier turn.
@@ -688,6 +696,22 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
             // arrived at.
             if !steering.is_empty() && host.objective_tokens_remaining() != Some(0) {
                 apply_steering(history, steering, Boundary::Finalizing, host);
+                continue;
+            }
+            // A reply cut off before any answer is asked for once more, shorter.
+            // An assistant turn is recorded first, so the roles still alternate.
+            if finish == FinishReason::MaxTokens
+                && limit_retry
+                && text.trim().is_empty()
+                && host.objective_tokens_remaining() != Some(0)
+            {
+                limit_retry = false;
+                if !recorded {
+                    history.push_assistant(vec![ContentPart::Text {
+                        text: "[no reply: the output limit was reached]".to_owned(),
+                    }]);
+                }
+                history.push_user(OUTPUT_LIMIT_RETRY);
                 continue;
             }
             // A turn that changed files and stopped of its own accord is asked

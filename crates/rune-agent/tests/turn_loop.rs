@@ -3854,3 +3854,34 @@ fn a_shortened_result_names_a_handle_to_its_full_text() {
     );
     assert_eq!(history.result_store().len(), 1);
 }
+
+fn cut_off_empty() -> Script {
+    Script::Frames(vec![
+        r#"{"choices":[{"index":0,"delta":{},"finish_reason":"length"}]}"#.to_owned(),
+        "[DONE]".to_owned(),
+    ])
+}
+
+#[test]
+fn an_empty_reply_cut_by_the_output_limit_is_asked_for_once_more() {
+    let endpoint = MockEndpoint::start(vec![cut_off_empty(), Script::text("short answer")]);
+    let host = TestHost::new(endpoint);
+    let mut history = rune_agent::History::new();
+    history.push_user("answer");
+    let outcome = run_turn(&mut history, &host).expect("turn");
+    assert_eq!(outcome.stop_reason, StopReason::Completed);
+    assert_eq!(outcome.text, "short answer");
+    assert_eq!(host.server.as_ref().expect("endpoint").request_count(), 2);
+    history.validate().expect("roles alternate");
+}
+
+#[test]
+fn a_second_empty_cut_off_reports_the_output_limit() {
+    let endpoint = MockEndpoint::start(vec![cut_off_empty(), cut_off_empty()]);
+    let host = TestHost::new(endpoint);
+    let mut history = rune_agent::History::new();
+    history.push_user("answer");
+    let outcome = run_turn(&mut history, &host).expect("turn");
+    assert_eq!(outcome.stop_reason, StopReason::OutputLimit);
+    assert_eq!(host.server.as_ref().expect("endpoint").request_count(), 2);
+}

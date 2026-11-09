@@ -87,26 +87,22 @@ These are compared against `main` before a push rather than counted as regressio
 
 ## Resume here (2026-11-09)
 
-State: `main` is 14 commits ahead of `origin/main` (last push `d88e784`). The
-unpushed commits include the fixes for the three CI failures on the last push:
-the `webpki-roots` licence pin (`deny.toml`), the narrow replay grids, and the
-ACP test that needed `verification_reminders = 0`. Push them in the next batch.
+State: `main` matches `origin/main` after the third batch push (see the Log).
 
 Before the next push: `cargo xtask web` (the demo module record is stale once
 `rune-term`, `rune-tools`, `rune-agent`, `rune-net`, `rune-core` or `rune-context`
-change; `rune-term` and `rune-agent` changed since `d88e784`), `cargo fmt --all -- --check`,
+change), `cargo fmt --all -- --check`,
 `cargo clippy --workspace --all-targets -D warnings`, `cargo xtask budget`, and
 `cargo test --workspace --no-fail-fast`, compared against the known local failures.
 
-Next task: 5.4, recover an empty reply cut by an output limit: in `run_turn`,
-when a step ends with `FinishReason::MaxTokens`, no text and no tool calls, retry
-that step once (with a note asking for a shorter answer), then report
-`StopReason::OutputLimit`. After it: 5.1, 7.3, 8.1b, 8.3b, 8.4b.
+Next task: 7.3, coloured diffs for edit results and `git_diff` in `rune-term`
+(added lines, removed lines, hunk headers through theme slots, off for
+accessible and no-colour output). After it: 5.1, 8.1b, 8.3b, 8.4b.
 
 Waiting on the owner: a DeepSeek key and approval to spend about $0.02 for the
 head-to-head runs (9.5) and the `reasoning_content` check (3.5).
 
-Remaining open items: 3.5, 4.4 (across turns), 5.1, 5.4, 7.3, 8.1b, 8.3b, 8.4b, 9.5, 10.1 to 10.4.
+Remaining open items: 3.5, 4.4 (across turns), 5.1, 7.3, 8.1b, 8.3b, 8.4b, 9.5, 10.1 to 10.4.
 
 ## Phases
 
@@ -177,7 +173,7 @@ still one call away.
       or build ran after the last edit, ask the model once to verify; report `verified` or
       `unverified` in the turn result and in `ask --json`.
 - [x] 5.3 Stop repeated identical successful calls, not only repeated failures.
-- [ ] 5.4 Recover an empty reply cut by an output limit with one retry, then report the limit.
+- [x] 5.4 Recover an empty reply cut by an output limit with one retry, then report the limit.
 
 Done when the turn result carries ordered steps and a verification verdict.
 
@@ -287,3 +283,4 @@ Done when a reproducible table exists with Rune in it.
 | 2026-11-09 | 099b334 | 9.4 | Six tasks under `bench/tasks` (JS x2, Python x2, Go, Rust), all proven by `bench/check.sh`. Sutra's own tasks verify with `node --test test/`, which fails on Node 22.21 even when solved; a head-to-head must use Node 24 or rewrite their verify. |
 | 2026-11-09 | c67347f | 5.3 | `repeat_guard` beside `failure_guard`: an identical successful read, list or search with no changing call since, still in history, gets a pointer (`REPEAT_MARKER`) instead of running; a second repeat runs. `read_tool_result` excluded (its page depends on the budget). Row reads `unchanged, not re-run`. |
 | 2026-11-09 | d3ab973 | 4.3 | `test_report::delta` and `failures`; `Shell` keeps the last log of 8 test commands. A repeat drops lines the previous log had (at least 8, or it is shown whole) and leads with `[since the last run: now passing; still failing; new failures; N lines left out]`. New `ToolOutput.full_text` is retained by the turn loop as `[full log: read_tool_result handle …]`. Runs that finish inside the call only. |
+| 2026-11-09 | pending | 5.4 | A step that stops at `MaxTokens` with no text and no calls is asked once more (`OUTPUT_LIMIT_RETRY` user note; a placeholder assistant turn first when nothing was recorded); a second one reports `OutputLimit`. |
