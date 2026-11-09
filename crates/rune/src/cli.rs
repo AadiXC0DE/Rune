@@ -23,6 +23,8 @@ pub enum Command {
     Acp,
     /// Review the pending changes in the workspace.
     Review,
+    /// Measure the configured model and harness on coding tasks.
+    Bench,
     /// Connect a model provider.
     Connect,
     /// List sessions.
@@ -85,6 +87,7 @@ impl Command {
             Self::Ask => "ask",
             Self::Acp => "acp",
             Self::Review => "review",
+            Self::Bench => "bench",
             Self::Connect => "connect",
             Self::Sessions => "sessions",
             Self::Session => "session",
@@ -327,6 +330,7 @@ pub fn parse(args: Vec<OsString>, benchmark: bool) -> Result<Launch> {
                 "ask" => Command::Ask,
                 "acp" => Command::Acp,
                 "review" => Command::Review,
+                "bench" => Command::Bench,
                 "connect" => Command::Connect,
                 "sessions" => Command::Sessions,
                 "session" => Command::Session,

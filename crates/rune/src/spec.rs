@@ -241,6 +241,26 @@ pub const RUN: &[CommandSpec] = &[
         supports_json: false,
     },
     CommandSpec {
+        name: "bench",
+        aliases: &[],
+        summary: "Measure the configured model and harness on coding tasks",
+        usage: "rune bench <tasks-dir> [--only <ids>] [--trials <n>] [--json]",
+        flags: &[
+            option(
+                "--only",
+                "ids",
+                "Run only these comma-separated task identifiers.",
+            ),
+            option("--trials", "n", "Run each task this many times, 1 to 20."),
+            flag(
+                "--json",
+                "Print one JSON object with every run and the summary.",
+            ),
+        ],
+        requirements: Requirements::CONFIG,
+        supports_json: true,
+    },
+    CommandSpec {
         name: "connect",
         aliases: &[
             alias(

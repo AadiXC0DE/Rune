@@ -13,6 +13,7 @@
 mod ask;
 mod attachments;
 mod auto_review;
+mod bench;
 mod capabilities;
 mod cli;
 mod compaction_archive;
@@ -243,6 +244,7 @@ fn run(launch: &Launch) -> Result<ExitCode> {
             run_interactive(&settings, &paths, &workspace, launch)
         }
         Command::Review => run_review(&settings, &paths, launch, &workspace, &output_flags),
+        Command::Bench => run_bench(launch, &output_flags),
         Command::Upgrade => run_upgrade(launch, &output_flags),
         Command::Uninstall => run_uninstall(&paths, launch, &output_flags),
         Command::Reference => run_reference(launch),
@@ -1549,6 +1551,83 @@ fn run_config(settings: &Settings, output: &OutputFlags) -> Result<ExitCode> {
         print!("{}", diagnostics::config_text(settings));
     }
     Ok(ExitCode::from(EXIT_OK))
+}
+
+/// Runs `bench`: every task under the given directory, each in a fresh copy.
+fn run_bench(launch: &Launch, output: &OutputFlags) -> Result<ExitCode> {
+    let root = launch.args.first().ok_or_else(|| {
+        RuneError::missing_field("tasks directory")
+            .with_hint("give a directory of tasks, each holding task.json and repo/")
+    })?;
+    let trials = match launch.flag("--trials") {
+        None => 1,
+        Some(raw) => raw
+            .parse::<u32>()
+            .ok()
+            .filter(|count| (1..=bench::MAX_TRIALS).contains(count))
+            .ok_or_else(|| {
+                RuneError::invalid_field("--trials", format!("expected 1 to {}", bench::MAX_TRIALS))
+            })?,
+    };
+    let only: Vec<&str> = launch
+        .flag("--only")
+        .map(|ids| {
+            ids.split(',')
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut tasks = bench::discover(Utf8Path::new(root))?;
+    if !only.is_empty() {
+        tasks.retain(|task| only.contains(&task.id.as_str()));
+    }
+    if tasks.is_empty() {
+        return Err(RuneError::new(
+            ErrorCode::NotFound,
+            format!("no task under `{root}` matched"),
+        )
+        .with_hint("a task is a directory holding task.json and repo/"));
+    }
+    let binary = std::env::current_exe()
+        .ok()
+        .and_then(|path| Utf8PathBuf::from_path_buf(path).ok())
+        .ok_or_else(|| RuneError::new(ErrorCode::Internal, "cannot locate this binary"))?;
+    // The model and provider chosen for this process apply to every run.
+    let mut overrides = Vec::new();
+    for (flag, value) in [
+        ("--model", &launch.model),
+        ("--provider", &launch.provider),
+        ("--effort", &launch.effort),
+    ] {
+        if let Some(value) = value {
+            overrides.push(flag.to_owned());
+            overrides.push(value.clone());
+        }
+    }
+
+    let mut runs = Vec::new();
+    for trial in 1..=trials {
+        for task in &tasks {
+            let run = bench::run_task(&binary, &overrides, task, trial)?;
+            if !output.json {
+                println!("{}", bench::row(&run));
+            }
+            runs.push(run);
+        }
+    }
+    let summary = bench::summarize(&runs);
+    if output.json {
+        let value = serde_json::json!({ "runs": runs, "summary": summary });
+        println!("{}", serde_json::to_string_pretty(&value)?);
+    } else {
+        println!("{}", bench::render_summary(&summary));
+    }
+    Ok(ExitCode::from(if summary.passed == summary.runs {
+        EXIT_OK
+    } else {
+        1
+    }))
 }
 
 /// Runs `prompt`, which reports the prompt source without contacting a model.

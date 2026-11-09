@@ -347,6 +347,7 @@ rune                        # interactive session
 rune ask "..."              # one bounded turn, prints the answer
 rune review                 # review the pending changes in this repository
 rune resume last            # continue the most recent session here
+rune bench tasks/           # measure the configured model on coding tasks
 ```
 
 `rune review` can read files and search the workspace through a bounded tool
@@ -354,6 +355,20 @@ loop. Its named `read-only review` rule refuses tools that do not declare
 themselves read-only, including file mutations, shell commands, and skill
 installation. This restriction applies even in full-access mode; ordinary
 permission rules still apply to reads. The review exchange is saved in session state.
+
+`rune bench <dir>` runs every task under a directory and reports how the
+configured model and harness did. A task is a directory holding `task.json`,
+with a `prompt`, a `verify` command, the `protected` paths, and an optional
+`timeoutMs`, and a `repo/` to work in. Each run copies `repo/` to a fresh
+directory with one git commit, runs `rune ask --json` there with full access,
+restores the protected paths so tests cannot be edited into passing (a run that
+changed them is marked `tampered`), and passes only when `verify` exits zero.
+It prints a row per run and a summary of the pass rate, median time, input
+tokens per run, cache share, and cost where the model's prices are known.
+`--only a,b` picks tasks, `--trials N` repeats each, and `--json` prints every
+run and the summary as one object. Runs use your configuration, so a model or
+provider given to `rune bench` applies to each of them. The exit status is 0
+only when every run passed.
 
 Enable Bash completion for command names, aliases, and flags in the current
 shell with `source <(rune completion bash)`. To keep it across shells, save
