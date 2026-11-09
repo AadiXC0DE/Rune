@@ -126,7 +126,7 @@ mod tests {
             "{}",
             output.text
         );
-        assert!(output.text.contains("6 bytes"), "{}", output.text);
+        assert!(output.text.contains("new file, 1 line"), "{}", output.text);
         assert_eq!(
             std::fs::read(path_of(&dir, "notes/one.txt")).expect("read"),
             b"hello\n"
@@ -143,7 +143,8 @@ mod tests {
                 &context,
             )
             .expect("call");
-        assert!(output.text.contains("+13"), "{}", output.text);
+        // One line replaced by one line.
+        assert!(output.text.contains("+1 -1"), "{}", output.text);
         assert_eq!(
             std::fs::read(path_of(&dir, "one.txt")).expect("read"),
             b"a much longer body\n"

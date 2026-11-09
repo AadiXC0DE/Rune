@@ -5411,10 +5411,35 @@ fn result_summary(name: &str, output: &ToolOutput, ascii: bool) -> String {
                 plural(count, if name == "grep_files" { "line" } else { "path" })
             }
         }
+        // The detail reads like `1 replacement, +3 -1, lines 4-6`; the line
+        // counts are the part a reader scans for.
         "edit_file" | "write_file" => headline
             .rsplit_once('(')
             .and_then(|(_, rest)| rest.strip_suffix(')'))
-            .map_or_else(|| shorten(headline, 64, ascii), str::to_owned),
+            .map_or_else(
+                || shorten(headline, 64, ascii),
+                |detail| {
+                    let parts: Vec<&str> = detail.split(", ").collect();
+                    parts
+                        .iter()
+                        .position(|part| part.starts_with("new file"))
+                        .map(|at| {
+                            parts[at..]
+                                .iter()
+                                .take(2)
+                                .copied()
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        })
+                        .or_else(|| {
+                            parts
+                                .iter()
+                                .find(|part| part.starts_with('+'))
+                                .map(|part| (*part).to_owned())
+                        })
+                        .unwrap_or_else(|| detail.to_owned())
+                },
+            ),
         _ => shorten(headline, 64, ascii),
     }
 }
@@ -10127,6 +10152,17 @@ mod tests {
         let row = shown.find("read_file src/session.js").expect("tool row");
         assert!(narration < row, "{shown}");
         assert!(shown.contains("2 lines"), "{shown}");
+    }
+
+    #[test]
+    fn an_edit_row_shows_the_line_counts() {
+        let edited = ToolOutput::success("Edited `/w/a.rs` (1 replacement, +3 -1, lines 4-6)");
+        assert_eq!(result_summary("edit_file", &edited, false), "+3 -1");
+        let created = ToolOutput::success("Wrote `/w/b.rs` (new file, 12 lines, lines 1-12)");
+        assert_eq!(
+            result_summary("write_file", &created, false),
+            "new file, 12 lines"
+        );
     }
 
     #[test]

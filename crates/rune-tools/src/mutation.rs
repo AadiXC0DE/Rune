@@ -128,6 +128,7 @@ pub struct Prepared {
     permissions: Option<Permissions>,
     preview: Preview,
     span: Option<ChangeSpan>,
+    lines: LineChanges,
     replacements: usize,
 }
 
@@ -188,6 +189,7 @@ pub struct Applied {
     bytes_before: usize,
     bytes_after: usize,
     span: Option<ChangeSpan>,
+    lines: LineChanges,
     replacements: usize,
     created: bool,
 }
@@ -231,6 +233,12 @@ impl Applied {
         self.replacements
     }
 
+    /// Returns the lines removed and added.
+    #[must_use]
+    pub const fn lines(&self) -> LineChanges {
+        self.lines
+    }
+
     /// Returns true when the mutation created the file.
     #[must_use]
     pub const fn created(&self) -> bool {
@@ -238,15 +246,54 @@ impl Applied {
     }
 }
 
+/// Lines a mutation removed and added.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct LineChanges {
+    /// Lines of the old text that are gone.
+    pub removed: usize,
+    /// Lines of the new text that were not there.
+    pub added: usize,
+}
+
+/// Counts the lines between the first and the last that differ.
+///
+/// Lines both texts share at the start and at the end are not counted, which
+/// is exact for one contiguous change. Separate changes far apart also count
+/// the unchanged lines between them, which keeps this linear in the file.
+pub fn line_changes(before: &str, after: &str) -> LineChanges {
+    let old: Vec<&str> = before.split_inclusive('\n').collect();
+    let new: Vec<&str> = after.split_inclusive('\n').collect();
+    let shared_start = old
+        .iter()
+        .zip(&new)
+        .take_while(|(left, right)| left == right)
+        .count();
+    let shared_end = old[shared_start..]
+        .iter()
+        .rev()
+        .zip(new[shared_start..].iter().rev())
+        .take_while(|(left, right)| left == right)
+        .count();
+    LineChanges {
+        removed: old
+            .len()
+            .saturating_sub(shared_start)
+            .saturating_sub(shared_end),
+        added: new
+            .len()
+            .saturating_sub(shared_start)
+            .saturating_sub(shared_end),
+    }
+}
+
 /// Describes an applied mutation in one bounded phrase.
 pub(crate) fn detail(applied: &Applied) -> String {
+    let lines = applied.lines();
     let size = if applied.created() {
-        format!("new file, {} bytes", applied.bytes_after())
+        let noun = if lines.added == 1 { "line" } else { "lines" };
+        format!("new file, {} {noun}", lines.added)
     } else {
-        match applied.byte_delta() {
-            0 => "0 bytes".to_owned(),
-            delta => format!("{delta:+} bytes"),
-        }
+        format!("+{} -{}", lines.added, lines.removed)
     };
     match applied.span() {
         None => format!("{size}, no textual change"),
@@ -310,6 +357,7 @@ pub fn prepare(path: &Utf8Path, desired: &str) -> Result<Prepared> {
         permissions,
         preview: preview_of(before, desired, region.as_ref()),
         span: region.as_ref().map(|region| region.span),
+        lines: line_changes(before, desired),
         replacements: 1,
     })
 }
@@ -366,6 +414,7 @@ pub fn prepare_edits(path: &Utf8Path, edits: &[LiteralEdit<'_>]) -> Result<Prepa
     }
     let region = changed_region(before, &postimage);
     let preview = preview_of(before, &postimage, region.as_ref());
+    let lines = line_changes(before, &postimage);
     Ok(Prepared {
         resolved: path.to_owned(),
         identity: Some(snapshot.identity),
@@ -375,6 +424,7 @@ pub fn prepare_edits(path: &Utf8Path, edits: &[LiteralEdit<'_>]) -> Result<Prepa
         permissions: Some(snapshot.permissions.clone()),
         preview,
         span: region.as_ref().map(|region| region.span),
+        lines,
         replacements,
     })
 }
@@ -480,6 +530,7 @@ pub fn apply(prepared: Prepared) -> Result<Applied> {
         postimage,
         permissions,
         span,
+        lines,
         replacements,
         ..
     } = prepared;
@@ -523,6 +574,7 @@ pub fn apply(prepared: Prepared) -> Result<Applied> {
         bytes_before: preimage_len,
         bytes_after: postimage.len(),
         span,
+        lines,
         replacements,
         created: identity.is_none(),
     })
@@ -1044,6 +1096,40 @@ impl Drop for StageGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn line_changes_count_only_the_lines_that_differ() {
+        let before = "a\nb\nc\nd\n";
+        assert_eq!(
+            line_changes(before, "a\nB\nc\nd\n"),
+            LineChanges {
+                removed: 1,
+                added: 1
+            }
+        );
+        assert_eq!(
+            line_changes(before, "a\nb\nx\ny\nc\nd\n"),
+            LineChanges {
+                removed: 0,
+                added: 2
+            }
+        );
+        assert_eq!(
+            line_changes(before, "a\nd\n"),
+            LineChanges {
+                removed: 2,
+                added: 0
+            }
+        );
+        assert_eq!(
+            line_changes("", "one\ntwo"),
+            LineChanges {
+                removed: 0,
+                added: 2
+            }
+        );
+        assert_eq!(line_changes(before, before), LineChanges::default());
+    }
 
     fn dir() -> tempfile::TempDir {
         tempfile::TempDir::new().expect("temp dir")

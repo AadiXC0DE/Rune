@@ -140,7 +140,7 @@ Done when a recorded Anthropic exchange shows cache reads on the second request.
       full log.
 - [ ] 4.4 A re-read of an unchanged range returns a pointer to the earlier call; an edit
       invalidates the file's earlier reads.
-- [ ] 4.5 Edit results report `+N -M` lines and the changed hunk, compactly.
+- [x] 4.5 Edit results report `+N -M` lines and the changed hunk, compactly.
 
 Done when a scripted debugging session sends measurably fewer result bytes with every fact
 still one call away.
@@ -240,4 +240,5 @@ Done when a reproducible table exists with Rune in it.
 | 2026-11-09 | 8c0c011, a43026d | CI | Replay grids expect the smaller request estimate; rustls-webpki 0.103.16 and webpki-roots 1.0.11 for RUSTSEC-2026-0381/0382. |
 | 2026-11-09 | 34b31cf | CI | Demo module verified by a source digest record: aarch64 macOS, x86_64 macOS and Linux build three different module digests from one source. |
 | 2026-11-09 | e8c018e | 7.1 | `rune-term::markdown`; styled before wrapping, so widths stay exact. Off unless a host opts in. |
-| 2026-11-09 | (this) | 7.2 | `rune-term::highlight`: per-row lexer, seven language families, theme syntax slots. |
+| 2026-11-09 | 999bc61 | 7.2 | `rune-term::highlight`: per-row lexer, seven language families, theme syntax slots. |
+| 2026-11-09 | (this) | 4.5 | Edit and write results report `+N -M` lines instead of a byte delta; the tool row shows the counts. |
