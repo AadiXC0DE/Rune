@@ -377,15 +377,49 @@ fn instructions_under(
         .unwrap_or_default();
     let override_text = read_override(config_root);
     let system = override_text.as_deref().unwrap_or(SYSTEM_PROMPT);
+    let environment = environment(workspace);
 
     let inputs = Inputs {
         system,
         tool_guidance: None,
         skills: &skills,
-        host_instructions: None,
+        host_instructions: environment.as_deref(),
         project: &project,
     };
     assemble(&inputs, limits).map_or_else(|_| system.to_owned(), |prompt| prompt.instructions)
+}
+
+/// Describes the machine a command will run on, in one line.
+///
+/// Stated once in the stable part of the prompt so the model writes commands
+/// for the right platform and shell without spending a step to find out. A
+/// browser host has no such machine and supplies its own description.
+#[cfg(not(target_family = "wasm"))]
+fn environment(workspace: &Utf8Path) -> Option<String> {
+    let platform = match std::env::consts::OS {
+        "macos" => "macOS",
+        "linux" => "Linux",
+        "windows" => "Windows",
+        other => other,
+    };
+    let repository = if workspace.ancestors().any(|dir| dir.join(".git").exists()) {
+        " and is a git repository"
+    } else {
+        ""
+    };
+    Some(format!(
+        "Environment: {platform} on {arch}. Commands run through `{shell} {flag}`. The workspace \
+         is {workspace}{repository}.",
+        arch = std::env::consts::ARCH,
+        shell = rune_exec::command::default_shell(),
+        flag = rune_exec::command::SHELL_COMMAND_FLAG,
+    ))
+}
+
+/// Describes the machine a command will run on, in one line.
+#[cfg(target_family = "wasm")]
+fn environment(_workspace: &Utf8Path) -> Option<String> {
+    None
 }
 
 /// Reads the system prompt override, when one is present.
@@ -760,6 +794,26 @@ mod tests {
         // directory nor anything above it contributes.
         assert!(!text.contains("home rules"), "{text}");
         assert!(!text.contains("rules above home"), "{text}");
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn the_environment_names_the_platform_shell_and_repository() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).expect("utf8 tempdir");
+        let plain = environment(&root).expect("native environment");
+        assert!(plain.contains(std::env::consts::ARCH), "{plain}");
+        assert!(
+            plain.contains(&rune_exec::command::default_shell()),
+            "{plain}"
+        );
+        assert!(plain.contains(root.as_str()), "{plain}");
+        assert!(!plain.contains("git repository"), "{plain}");
+
+        std::fs::create_dir(root.join(".git")).expect("git dir");
+        std::fs::create_dir(root.join("nested")).expect("nested");
+        let nested = environment(&root.join("nested")).expect("native environment");
+        assert!(nested.ends_with("and is a git repository."), "{nested}");
     }
 
     #[test]
