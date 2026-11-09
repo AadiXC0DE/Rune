@@ -294,4 +294,4 @@ Done when a reproducible table exists with Rune in it.
 | 2026-11-09 | 22c21aa | 8.3b | `/permissions [ask|auto|full-access]`; `SessionHost.mode` and `rules` behind locks, rebuilt with `permissions::validated` from a kept copy of the settings; narrowing clears grants. README updated. |
 | 2026-11-09 | 6432dd8 | 8.4b | `/fork`: `Recorder::fork` copies the journal through its last event (`rune_session::fork::fork`), the session switches its recorder to the copy and keeps its history; the earlier session is unchanged. README updated. |
 | 2026-11-09 | a424153 | 10.3 (part) | CHANGELOG `Unreleased` lists the plan's user-visible changes; numbers are the measured ones from this log. |
-| 2026-11-09 | pending | 1.3 fix | First deploy of a new branch failed: `VERCEL_GIT_PREVIOUS_SHA` is empty and `git diff` exits 128. The ignore command now builds (exit 1) when the previous commit is unknown or absent from the clone. |
+| 2026-11-09 | dc8e9f4 | 1.3 fix | First deploy of a new branch failed: `VERCEL_GIT_PREVIOUS_SHA` is empty and `git diff` exits 128. The ignore command now builds (exit 1) when the previous commit is unknown or absent from the clone. |
