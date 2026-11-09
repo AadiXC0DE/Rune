@@ -298,7 +298,7 @@ pub fn instructions_for(
 }
 
 /// Builds instructions without the repository map. Long-lived hosts retain this
-/// base and call [`with_repository_map`] before each request so edits are visible.
+/// base and add the map through [`MappedInstructions`].
 pub fn base_instructions_for(
     workspace: &Utf8Path,
     config_root: &Utf8Path,
@@ -325,6 +325,40 @@ pub fn with_repository_map(base: &str, workspace: &Utf8Path, limits: &BudgetSet)
         instructions.push_str(map.text.trim_end());
     }
     instructions
+}
+
+/// Base instructions with the repository map, built once and then reused.
+///
+/// The map lists declarations with their line numbers, so most edits change it.
+/// Rebuilding it before each request moved the front of the prompt on nearly
+/// every step, which discards a provider's cached prefix for the whole
+/// conversation. A turn reads current files with its tools, so the map is kept
+/// from the first request until [`refresh`](Self::refresh), which a host calls
+/// when compaction rewrites the history and the prefix changes anyway.
+#[derive(Debug, Default)]
+pub struct MappedInstructions {
+    built: std::sync::Mutex<Option<String>>,
+}
+
+impl MappedInstructions {
+    /// Returns the instructions, building the map on first use.
+    pub fn get(&self, base: &str, workspace: &Utf8Path, limits: &BudgetSet) -> String {
+        let mut built = self
+            .built
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        built
+            .get_or_insert_with(|| with_repository_map(base, workspace, limits))
+            .clone()
+    }
+
+    /// Discards the built map, so the next request maps the workspace again.
+    pub fn refresh(&self) {
+        *self
+            .built
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    }
 }
 
 /// Builds the system instructions with an explicit home directory.
@@ -726,6 +760,37 @@ mod tests {
         // directory nor anything above it contributes.
         assert!(!text.contains("home rules"), "{text}");
         assert!(!text.contains("rules above home"), "{text}");
+    }
+
+    #[test]
+    fn mapped_instructions_stay_fixed_across_edits_until_refreshed() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let workspace = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).expect("utf8 tempdir");
+        std::fs::write(
+            workspace.join("Cargo.toml"),
+            "[package]\nname = \"fixture\"\n",
+        )
+        .expect("write manifest");
+        std::fs::create_dir_all(workspace.join("src")).expect("create src");
+        std::fs::write(workspace.join("src/lib.rs"), "pub fn first() {}\n").expect("write");
+        let limits = BudgetSet::new();
+        let mapped = MappedInstructions::default();
+
+        let before = mapped.get("base", &workspace, &limits);
+        assert!(before.contains("first"), "{before}");
+
+        // An edit that moves and adds declarations does not reach the prompt,
+        // so a provider's cached prefix survives it.
+        std::fs::write(
+            workspace.join("src/lib.rs"),
+            "pub fn added() {}\n\npub fn first() {}\n",
+        )
+        .expect("rewrite");
+        assert_eq!(mapped.get("base", &workspace, &limits), before);
+
+        mapped.refresh();
+        let after = mapped.get("base", &workspace, &limits);
+        assert!(after.contains("added"), "{after}");
     }
 
     #[test]

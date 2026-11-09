@@ -284,6 +284,8 @@ pub fn read_stdin_prompt() -> Result<String> {
 struct AskHost<'a> {
     settings: &'a Settings,
     instructions: String,
+    /// The instructions with the repository map, fixed for the run.
+    mapped: rune_context::prompt::MappedInstructions,
     dialect: Box<dyn Provider>,
     endpoint: Endpoint,
     registry: Registry,
@@ -313,11 +315,8 @@ impl Host for AskHost<'_> {
     }
 
     fn instructions(&self) -> String {
-        rune_context::prompt::with_repository_map(
-            &self.instructions,
-            self.context.workspace(),
-            &self.limits,
-        )
+        self.mapped
+            .get(&self.instructions, self.context.workspace(), &self.limits)
     }
 
     fn tools(&self) -> Vec<ToolSpec> {
@@ -523,6 +522,7 @@ pub fn run(
             &paths.config_root,
             &settings.limits,
         ),
+        mapped: rune_context::prompt::MappedInstructions::default(),
         dialect,
         endpoint,
         registry,

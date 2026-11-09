@@ -451,9 +451,12 @@ retain the prompt and response text; image bytes are not retained for replay.
 workspace instruction files and the configured system prompt, on every request.
 
 Workspaces containing `Cargo.toml` also receive a Rust repository symbol map with
-declaration locations and lexical identifier references. The map refreshes before
-each model request, including after tool edits. It respects `.gitignore`,
-`.git/info/exclude`, ancestor ignore rules and `.ignore`, and skips symlinks.
+declaration locations and lexical identifier references. The map is built at the
+first request of a session and kept until the conversation is compacted, so an
+edit does not change the front of the prompt and a provider's cached prefix
+survives it; the model reads current files with its tools. It respects
+`.gitignore`, `.git/info/exclude`, ancestor ignore rules and `.ignore`, and skips
+symlinks.
 References do not resolve Rust scopes, types, or macro expansion; comments and
 literals are excluded. Test-only paths (`tests/` and `benches/` trees,
 `*_tests.rs` files, and `#[cfg(test)]` items) are excluded, and only declarations

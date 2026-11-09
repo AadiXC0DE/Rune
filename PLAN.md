@@ -101,7 +101,7 @@ Done when the request floor is a printed, gated number.
 - [x] 2.1a List each skill once when the same name is discovered in more than one root.
 - [x] 2.2 Rewrite tool descriptions and schemas for brevity without losing a constraint the
       model needs; record before and after bytes.
-- [ ] 2.3 Keep the instructions byte-stable for a whole session: build the repository map
+- [x] 2.3 Keep the instructions byte-stable for a whole session: build the repository map
       once at session start instead of on every request.
 - [ ] 2.4 State the environment once in the stable prefix: platform, shell, workspace root,
       and whether it is a git repository.
@@ -217,4 +217,5 @@ Done when a reproducible table exists with Rune in it.
 | 2026-11-09 | a7a89fc | 1.4 | Budget job no longer limited to pull requests. |
 | 2026-11-09 | e775938 | 2.1 | Interactive default: 20 tools, 17,379 bytes to 15 tools, 14,382 bytes. A call to a hidden tool is answered as never offered. |
 | 2026-11-09 | 8ec7540 | 2.1a | A byte-identical skill in two user roots is listed once. This home: 10,323 to 9,354 bytes. |
-| 2026-11-09 | (this) | 2.2 | 14,382 to 9,154 bytes (17,379 to 9,154 with 2.1, -47%). Ceiling lowered to 10 KiB. Demo wasm is stale until regenerated before the push. |
+| 2026-11-09 | 428cd0b | 2.2 | 14,382 to 9,154 bytes (17,379 to 9,154 with 2.1, -47%). Ceiling lowered to 10 KiB. Demo wasm is stale until regenerated before the push. |
+| 2026-11-09 | (this) | 2.3 | Map built at the first request and kept until compaction; session, `ask` and the web host share `MappedInstructions`. |

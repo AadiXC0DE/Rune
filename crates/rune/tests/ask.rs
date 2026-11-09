@@ -922,7 +922,7 @@ fn ask_sends_the_resolved_instructions_shown_by_prompt_show() {
 }
 
 #[test]
-fn ask_refreshes_a_capped_repository_map_after_an_edit() {
+fn ask_keeps_a_capped_repository_map_fixed_across_an_edit() {
     let edit = json!({"path": "src/main.rs", "old_string": "alpha();", "new_string": "beta(); "})
         .to_string();
     let (output, dir, requests) = run_responses_fixture_with_setup(
@@ -972,37 +972,37 @@ fn ask_refreshes_a_capped_repository_map_after_an_edit() {
         .expect("initial instructions");
     let after = requests[1]["messages"][0]["content"]
         .as_str()
-        .expect("refreshed instructions");
+        .expect("instructions after the edit");
     assert!(
         before.contains("src/lib.rs:1 fn alpha <- src/main.rs:1"),
         "{before}"
     );
-    assert!(after.contains("src/lib.rs:1 fn alpha\n"), "{after}");
-    assert!(
-        after.contains("src/lib.rs:2 fn beta <- src/main.rs:1"),
-        "{after}"
-    );
-    for instructions in [before, after] {
-        let map = instructions
-            .split("Repository symbol map")
-            .nth(1)
-            .expect("map section");
-        assert!(map.len() + "Repository symbol map".len() <= 512);
-        assert!(map.contains("map incomplete"));
-        assert!(!instructions.contains("ignored_secret"));
-        assert!(!instructions.contains("ignored.rs"));
-    }
+    // The edit moved the reference from alpha to beta, but the instructions
+    // are byte-identical, so the cached prefix of the second request holds.
+    assert_eq!(before, after);
+
+    // A new run maps the workspace as it is now.
     let shown = isolated_command(&dir)
         .args(["prompt", "--show"])
         .output()
         .expect("prompt preview");
     assert!(shown.status.success(), "{shown:?}");
-    assert_eq!(
-        String::from_utf8(shown.stdout)
-            .expect("UTF-8 preview")
-            .trim_end(),
-        after
+    let current = String::from_utf8(shown.stdout).expect("UTF-8 preview");
+    assert!(current.contains("src/lib.rs:1 fn alpha\n"), "{current}");
+    assert!(
+        current.contains("src/lib.rs:2 fn beta <- src/main.rs:1"),
+        "{current}"
     );
+    for instructions in [before, current.as_str()] {
+        let map = instructions
+            .split("Repository symbol map")
+            .nth(1)
+            .expect("map section");
+        assert!(map.trim_end().len() + "Repository symbol map".len() <= 512);
+        assert!(map.contains("map incomplete"));
+        assert!(!instructions.contains("ignored_secret"));
+        assert!(!instructions.contains("ignored.rs"));
+    }
     let disabled = isolated_command(&dir)
         .args(["--limit", "repository_map_bytes=0", "prompt", "--show"])
         .output()

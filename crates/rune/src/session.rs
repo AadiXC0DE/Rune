@@ -242,6 +242,8 @@ struct SessionHost {
     /// request attempt, so the lock is not on the streaming path.
     model: Mutex<String>,
     instructions: String,
+    /// The instructions with the repository map, fixed until compaction.
+    mapped: prompt::MappedInstructions,
     tools: Vec<ToolSpec>,
     rules: RuleSet,
     mode: PermissionMode,
@@ -387,7 +389,8 @@ impl Host for SessionHost {
 
     fn instructions(&self) -> String {
         let mut instructions =
-            prompt::with_repository_map(&self.instructions, self.context.workspace(), &self.limits);
+            self.mapped
+                .get(&self.instructions, self.context.workspace(), &self.limits);
         if let Some(recorder) = &self.recorder {
             let recorder = recorder
                 .lock()
@@ -485,6 +488,10 @@ impl Host for SessionHost {
         let removed = summarize_history(self, history, &compaction_plan, client, false, &|| {
             self.cancellation.is_cancelled()
         })?;
+        // The history prefix changed, so the cache is already lost; this is
+        // where a fresh map costs nothing extra.
+        self.mapped.refresh();
+        plan.instructions = self.instructions();
         plan.messages = history.to_messages();
         self.emit(Event::ContextCompacted {
             removed_turns: removed,
@@ -1647,6 +1654,7 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
         dialect: config.dialect,
         model: Mutex::new(config.settings.model.clone()),
         instructions: prompt.instructions,
+        mapped: prompt::MappedInstructions::default(),
         tools,
         rules: config.rules,
         mode: config.settings.permission_mode,
@@ -3664,15 +3672,18 @@ fn compact_history(
         true,
         &|| false,
     ) {
-        Ok(removed) => report(
-            host,
-            sink,
-            &format!(
-                "compacted {removed} earlier turn(s); {} turn(s) remain; originals: rune session {} --record all",
-                history.len(),
-                host.session_id_name()
-            ),
-        ),
+        Ok(removed) => {
+            host.mapped.refresh();
+            report(
+                host,
+                sink,
+                &format!(
+                    "compacted {removed} earlier turn(s); {} turn(s) remain; originals: rune session {} --record all",
+                    history.len(),
+                    host.session_id_name()
+                ),
+            )
+        }
         Err(err) => report(host, sink, err.message()),
     }
 }
@@ -9925,6 +9936,7 @@ mod tests {
             dialect: Box::new(rune_net::chat_completions::ChatCompletions),
             model: Mutex::new("test".to_owned()),
             instructions: String::new(),
+            mapped: prompt::MappedInstructions::default(),
             tools: Vec::new(),
             rules: crate::permissions::validated(&Settings::default()).expect("rules"),
             mode: PermissionMode::Auto,

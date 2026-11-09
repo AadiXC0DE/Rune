@@ -120,6 +120,8 @@ pub struct Session {
     endpoint: Endpoint,
     model: String,
     instructions: String,
+    /// The instructions with the repository map, fixed for the session.
+    mapped: rune_context::prompt::MappedInstructions,
     registry: Registry,
     tools: Vec<ToolSpec>,
     rules: RuleSet,
@@ -206,6 +208,7 @@ impl Session {
             endpoint,
             model: config.model.clone(),
             instructions,
+            mapped: rune_context::prompt::MappedInstructions::default(),
             registry,
             tools,
             rules: rules(),
@@ -280,11 +283,8 @@ impl Host for Session {
     }
 
     fn instructions(&self) -> String {
-        rune_context::prompt::with_repository_map(
-            &self.instructions,
-            self.context.workspace(),
-            &self.limits,
-        )
+        self.mapped
+            .get(&self.instructions, self.context.workspace(), &self.limits)
     }
 
     fn tools(&self) -> Vec<ToolSpec> {
