@@ -419,6 +419,32 @@ pub trait Host {
 
     /// Returns the steering queue for this turn.
     fn steering(&self) -> &SteeringQueue;
+
+    /// Returns true when a cancelled turn should end with
+    /// [`StopReason::Cancelled`] and the work done so far, rather than with a
+    /// `Cancelled` error.
+    fn settles_cancellation(&self) -> bool {
+        false
+    }
+
+    /// Called when one request attempt has ended, successfully or not, so a
+    /// host can release what it tied to that attempt, such as a body reader
+    /// still waiting on a connection the loop has stopped reading.
+    fn attempt_finished(&self) {}
+
+    /// Returns true when an oversized result is kept whole behind a handle
+    /// that `read_tool_result` reads. A host that offers no such tool returns
+    /// false, and its results are cut in place.
+    fn retains_results(&self) -> bool {
+        true
+    }
+
+    /// Returns parts recorded right after a call's result, such as images a
+    /// host tool produced. Called once per result, in request order. The
+    /// default has none.
+    fn tool_attachments(&self, _result: &CallResult) -> Vec<ContentPart> {
+        Vec::new()
+    }
 }
 
 /// One entry of what a turn said and did, in the order it happened.
@@ -591,7 +617,34 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
     let mut text = String::new();
     let mut narration: Vec<Narration> = Vec::new();
 
+    // Ends the turn with what it has so far.
+    macro_rules! settle {
+        ($reason:expr) => {{
+            let stop_reason = $reason;
+            host.emit(Event::Finished {
+                reason: stop_reason,
+                usage,
+                last_request,
+                steps,
+            });
+            return Ok(TurnOutcome {
+                stop_reason,
+                text,
+                narration,
+                reasoning,
+                usage,
+                last_request,
+                steps,
+                verification: Verification::of(&calls),
+                calls,
+            });
+        }};
+    }
+
     loop {
+        if host.settles_cancellation() && cancellation.is_cancelled() {
+            settle!(StopReason::Cancelled);
+        }
         cancellation.check()?;
 
         // A step limit of zero means unlimited, which is the documented default.
@@ -630,7 +683,7 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
         steps = steps.saturating_add(1);
         host.emit(Event::TurnStarted { step: steps });
 
-        let (outcome, steering_arrived) = stream_with_retry(
+        let (outcome, steering_arrived) = match stream_with_retry(
             client.as_ref(),
             host,
             history,
@@ -638,7 +691,18 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
             timeouts,
             max_attempts,
             &cancellation,
-        )?;
+        ) {
+            Ok(streamed) => streamed,
+            // Once the turn is cancelled, whatever the stream failed with is
+            // the cancellation's doing.
+            Err(err)
+                if host.settles_cancellation()
+                    && (err.code() == ErrorCode::Cancelled || cancellation.is_cancelled()) =>
+            {
+                settle!(StopReason::Cancelled);
+            }
+            Err(err) => return Err(err),
+        };
 
         host.observe_response(&outcome);
         usage = usage.merge_sum(outcome.usage);
@@ -813,6 +877,7 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
                 content: result.output.render(),
                 is_error: result.output.is_error,
             });
+            result_parts.extend(host.tool_attachments(result));
         }
         history.push_tool_results(result_parts);
         calls.extend(results);
@@ -1065,6 +1130,7 @@ fn stream_with_retry(
             &|| cancellation.is_cancelled(),
             &mut observe,
         );
+        host.attempt_finished();
         accounting.finish(host, response.as_ref().ok().map(|outcome| outcome.usage))?;
         match response {
             Ok(outcome) => {
@@ -1115,6 +1181,7 @@ fn execute_batch(
     let failure_limit = limits.get(LimitName::MaxConsecutiveToolFailures).value();
     let offered: Vec<String> = host.tools().into_iter().map(|spec| spec.name).collect();
     let turn_cap = limits.get_usize(LimitName::MaxTurnResultBytes);
+    let retains = host.retains_results();
     let tool_cap = limits.get_usize(LimitName::MaxToolResultBytes);
     // Only the initial independent reads may overlap. Retained-result reads
     // depend on earlier spills and on the exact remaining budget, so flush the
@@ -1215,6 +1282,7 @@ fn execute_batch(
                 result,
                 host,
                 history,
+                retains,
                 result_bytes,
                 turn_cap,
                 tool_cap,
@@ -1239,6 +1307,7 @@ fn execute_batch(
             result,
             host,
             history,
+            retains,
             result_bytes,
             turn_cap,
             tool_cap,
@@ -1466,10 +1535,12 @@ fn failure_guard(
 }
 
 /// Retains and charges answers in request order, regardless of execution order.
+#[allow(clippy::too_many_arguments)]
 fn retain_result(
     mut result: CallResult,
     host: &dyn Host,
     history: &mut History,
+    retains: bool,
     result_bytes: &mut usize,
     turn_cap: usize,
     tool_cap: usize,
@@ -1486,7 +1557,7 @@ fn retain_result(
     let cap = turn_cap.saturating_sub(*result_bytes).min(tool_cap);
     let mut text = std::mem::take(&mut result.output.text);
     // A shortened view keeps the complete text one read away.
-    if let Some(full) = result.output.full_text.take()
+    if let Some(full) = result.output.full_text.take().filter(|_| retains)
         && let Ok(preview) = history.result_store_mut().spill(
             &result.call.name,
             &result.call.id,
@@ -1504,8 +1575,10 @@ fn retain_result(
             preview.handle
         );
     }
-    let bounded = if text.len() > cap {
+    let bounded = if text.len() > cap && retains {
         spill_result(history, &result, text, cap)
+    } else if text.len() > cap {
+        bound_result(text, cap)
     } else {
         text
     };

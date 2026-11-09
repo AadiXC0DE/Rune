@@ -97,17 +97,14 @@ State: work continues on `plan/phase-5-to-8` (PR #21); its first push was `ffe32
 Before the next push: `cargo xtask web` if a crate the demo uses changed, then
 `scripts/preflight.sh`, compared against the known local failures.
 
-Next task: 10.1, move `rune-sdk` onto the `rune-agent` turn loop. What the SDK
-loop has that `run_turn` lacks: image attachments on tool results
-(`HostImage` registered as `ContentPart::Image`), the `HostFetch` deadline and
-cancellation contract with `Retry-After`, cancellation that settles the turn
-(`StopReason::Cancelled`, keeping the calls so far) instead of failing it, and a
-history the caller can read while a turn runs (`Mutex<History>`).
+Next task: 10.3, check README, COMMANDS and the site against measured numbers
+(the CHANGELOG is done). Then 10.4 needs the owner's go-ahead for 0.2.0, and
+9.5 and 3.5 need a DeepSeek key.
 
 Waiting on the owner: a DeepSeek key and approval to spend about $0.02 for the
 head-to-head runs (9.5) and the `reasoning_content` check (3.5).
 
-Remaining open items: 3.5, 9.5, 10.1 to 10.4.
+Remaining open items: 3.5, 9.5, 10.3, 10.4.
 
 ## Phases
 
@@ -238,7 +235,7 @@ Done when a reproducible table exists with Rune in it.
 
 ### Phase 10: Consolidation and release
 
-- [ ] 10.1 Move `rune-sdk` onto the `rune-agent` turn loop so every surface shares one loop.
+- [x] 10.1 Move `rune-sdk` onto the `rune-agent` turn loop so every surface shares one loop.
 - [x] 10.2 Re-measure size and startup; trim anything that grew without paying for itself.
 - [ ] 10.3 README, COMMANDS, CHANGELOG and site updated to measured numbers only.
       CHANGELOG `Unreleased` written; README, COMMANDS and site still to check.
@@ -303,3 +300,4 @@ Done when a reproducible table exists with Rune in it.
 | 2026-11-09 | (this) | 10.2 | Re-measured on aarch64 macOS: binary 3,851,632 to 3,968,336 bytes (+116,704, +3.0%) for Markdown, highlighting, diffs, bench, prices and the live rows; startup work 1.50 to 1.49 ms (`--version`) and 1.52 to 1.55 ms (`--help`); tool schemas 17,379 to 9,154 bytes. Nothing trimmed: each addition is a user-visible feature, and the ceiling is 8 MiB. |
 | 2026-11-09 | 7171d62 | 4.4 | `History` keeps a SHA-256 per successful `read_file` call, taken when its result is retained (before a later call in the batch can change the file). An identical read of a byte-identical file, in this turn or an earlier one, with the result still in history, gets a pointer; a second repeat in a turn runs. Other reads keep the in-turn rule. |
 | 2026-11-09 | 4dcb29c | 7.3 follow-up | Commit 7835c12 also took in a `ToolOutput.diff` that `edit_file` and `write_file` fill from their mutation preview, which nothing read. Rows now draw that preview (so `write_file` and `replace_all` show their real change), falling back to an edit's arguments; the approval prompt still uses the arguments, since nothing has run yet. |
+| 2026-11-09 | pending | 10.1 | `rune-sdk` drives `rune_agent::turn::run_turn` through `SdkHost` (-152 lines net). New `Host` hooks, all defaulting to the old behaviour: `settles_cancellation` (end with `Cancelled` and the work so far), `tool_attachments` (host tool images after each result), `retains_results` (cut in place when `read_tool_result` is not offered), `attempt_finished` (release a host reader when the loop stops reading). `NetError::from_rune_error` keeps a host fetch's own error. SDK text is the text of every step, from `narration`. All 86 SDK tests pass unchanged. |

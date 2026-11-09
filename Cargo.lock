@@ -1108,10 +1108,12 @@ dependencies = [
 name = "rune-sdk"
 version = "0.1.17"
 dependencies = [
+ "camino",
  "rune-agent",
  "rune-core",
  "rune-exec",
  "rune-net",
+ "rune-policy",
  "rune-testkit",
  "rune-tools",
  "serde",

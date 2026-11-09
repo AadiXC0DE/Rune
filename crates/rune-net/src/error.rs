@@ -143,9 +143,39 @@ pub struct NetError {
     provider_code: Option<String>,
     /// Repair hint.
     hint: Option<String>,
+    /// The error a caller-supplied client reported, returned unchanged by
+    /// [`NetError::to_rune_error`] so its code and detail survive the trip.
+    source: Option<Box<RuneError>>,
 }
 
 impl NetError {
+    /// Wraps an error from a caller-supplied client, keeping it whole.
+    ///
+    /// The kind is read from its code, so retries treat it like the same
+    /// failure from the built-in client; any other code is not retried.
+    #[must_use]
+    pub fn from_rune_error(error: RuneError) -> Self {
+        let kind = match error.code() {
+            ErrorCode::RateLimited => FailureKind::RateLimited,
+            ErrorCode::TransportFailure => FailureKind::Network,
+            ErrorCode::Timeout => FailureKind::Timeout,
+            ErrorCode::IncompleteStream => FailureKind::IncompleteStream,
+            ErrorCode::RequestRejected => FailureKind::ProviderError,
+            ErrorCode::Cancelled => FailureKind::Cancelled,
+            _ => FailureKind::InvalidRequest,
+        };
+        Self {
+            retry_after_ms: error.detail().retry_after_ms,
+            ..Self::new(kind, error.message().to_owned())
+        }
+        .with_source(error)
+    }
+
+    /// Keeps the original error.
+    fn with_source(mut self, error: RuneError) -> Self {
+        self.source = Some(Box::new(error));
+        self
+    }
     /// Builds an error.
     #[must_use]
     pub fn new(kind: FailureKind, message: impl Into<String>) -> Self {
@@ -156,6 +186,7 @@ impl NetError {
             retry_after_ms: None,
             provider_code: None,
             hint: None,
+            source: None,
         }
     }
 
@@ -227,6 +258,9 @@ impl NetError {
     /// provider metadata. Provider codes are redacted before being exposed.
     #[must_use]
     pub fn to_rune_error(&self) -> RuneError {
+        if let Some(source) = &self.source {
+            return (**source).clone();
+        }
         let mut error = RuneError::new(self.kind.code(), self.message.clone());
         if let Some(hint) = &self.hint {
             error = error.with_hint(hint.clone());

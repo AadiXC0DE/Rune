@@ -43,6 +43,11 @@ Notable changes, newest first. Each entry describes what a user can observe.
   once more.
 - In auto mode, routine test and build commands for common ecosystems run
   inside the sandbox without a prompt, so a headless run can verify its work.
+- The embedding SDK runs the same turn loop as the terminal and `rune ask`,
+  through the embedder's `HostFetch` and tools. A turn whose host tools named
+  `write_file`, `edit_file` or `rename_file` changed something and ran no check
+  is now asked once to verify, as elsewhere; `verification_reminders = 0` turns
+  that off. Unknown tool names are reported as refused calls.
 
 ## 0.1.17
 
