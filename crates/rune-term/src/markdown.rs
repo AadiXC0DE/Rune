@@ -254,6 +254,139 @@ fn link(text: &str, style: &MarkdownStyle) -> Option<(usize, String)> {
     ))
 }
 
+/// Lays out every pipe table in a finished text with aligned columns.
+///
+/// A table can only be measured once all of its rows exist, so this runs on a
+/// finished answer rather than while it streams. Cells keep their Markdown, so
+/// emphasis and code inside them are still styled afterwards. Text outside a
+/// table, and inside a code fence, is left exactly as written.
+#[must_use]
+pub fn align_tables(text: &str, ascii: bool) -> String {
+    let lines: Vec<&str> = text.split('\n').collect();
+    let mut out: Vec<String> = Vec::with_capacity(lines.len());
+    let mut fence = false;
+    let mut index = 0;
+    while index < lines.len() {
+        let line = lines[index];
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            fence = !fence;
+        }
+        let delimiter = lines.get(index.saturating_add(1)).copied().unwrap_or_default();
+        if !fence && is_row(line) && is_delimiter(delimiter) {
+            let mut rows = vec![cells(line)];
+            let mut next = index.saturating_add(2);
+            while let Some(row) = lines.get(next).filter(|row| is_row(row)) {
+                rows.push(cells(row));
+                next = next.saturating_add(1);
+            }
+            out.extend(render_table(&rows, ascii));
+            index = next;
+            continue;
+        }
+        out.push(line.to_owned());
+        index = index.saturating_add(1);
+    }
+    out.join("\n")
+}
+
+/// Columns a cell occupies once its Markdown markers are drawn away.
+fn visible_width(cell: &str) -> usize {
+    let plain = MarkdownStyle {
+        enabled: true,
+        ..MarkdownStyle::default()
+    };
+    crate::width::wrap_styled(&inline(cell, &plain), usize::MAX)
+        .first()
+        .map_or(0, |line| line.width)
+}
+
+fn is_row(line: &str) -> bool {
+    let line = line.trim();
+    line.starts_with('|') && line.len() > 1
+}
+
+fn is_delimiter(line: &str) -> bool {
+    let line = line.trim();
+    is_row(line)
+        && line.contains('-')
+        && line
+            .chars()
+            .all(|ch| matches!(ch, '|' | '-' | ':' | ' '))
+}
+
+/// Splits a row into trimmed cells, honouring escaped pipes.
+fn cells(line: &str) -> Vec<String> {
+    let inner = line.trim().trim_start_matches('|');
+    let inner = inner.strip_suffix('|').unwrap_or(inner);
+    let mut cells = Vec::new();
+    let mut cell = String::new();
+    let mut escaped = false;
+    for ch in inner.chars() {
+        if escaped {
+            cell.push(ch);
+            escaped = false;
+        } else if ch == '\\' {
+            escaped = true;
+            cell.push(ch);
+        } else if ch == '|' {
+            cells.push(cell.trim().to_owned());
+            cell.clear();
+        } else {
+            cell.push(ch);
+        }
+    }
+    cells.push(cell.trim().to_owned());
+    cells
+}
+
+/// Renders rows, the first being the header, with every column padded to
+/// its widest cell.
+fn render_table(rows: &[Vec<String>], ascii: bool) -> Vec<String> {
+    let columns = rows.iter().map(Vec::len).max().unwrap_or_default();
+    let mut widths = vec![0_usize; columns];
+    for row in rows {
+        for (column, cell) in row.iter().enumerate() {
+            widths[column] = widths[column].max(visible_width(cell));
+        }
+    }
+    let (bar, rule, cross) = if ascii {
+        ("|", "-", "+")
+    } else {
+        ("\u{2502}", "\u{2500}", "\u{253c}")
+    };
+    let line = |row: &Vec<String>| {
+        let mut text = String::new();
+        for (column, width) in widths.iter().enumerate() {
+            if column > 0 {
+                text.push(' ');
+                text.push_str(bar);
+                text.push(' ');
+            }
+            let cell = row.get(column).map_or("", String::as_str);
+            text.push_str(cell);
+            let pad = width.saturating_sub(visible_width(cell));
+            text.extend(std::iter::repeat_n(' ', pad));
+        }
+        text.trim_end().to_owned()
+    };
+    let mut out = Vec::with_capacity(rows.len().saturating_add(1));
+    if let Some(header) = rows.first() {
+        out.push(line(header));
+        // Each column's rule is its width, and the joint matches the ` | `
+        // between cells, so the rule lines up under the header.
+        out.push(
+            widths
+                .iter()
+                .map(|width| rule.repeat((*width).max(1)))
+                .collect::<Vec<_>>()
+                .join(&format!("{rule}{cross}{rule}")),
+        );
+    }
+    out.extend(rows.iter().skip(1).map(line));
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -323,6 +456,26 @@ mod tests {
         assert!(line.starts_with("see \u{1b}]8;;https://example.com/a\u{1b}\\<a>the docs</>"));
         assert!(line.ends_with("\u{1b}]8;;\u{1b}\\ now"), "{line}");
         assert_eq!(styled("[not a link] (x)"), "[not a link] (x)");
+    }
+
+    #[test]
+    fn a_pipe_table_is_aligned_and_its_delimiter_becomes_a_rule() {
+        let text = "Results:\n| Task | Pass |\n|---|:-:|\n| pagination | yes |\n| csv | **no** |\nafter";
+        let aligned = align_tables(text, true);
+        let lines: Vec<&str> = aligned.lines().collect();
+        assert_eq!(lines[0], "Results:");
+        assert_eq!(lines[1], "Task       | Pass");
+        assert!(lines[2].chars().all(|ch| ch == '-' || ch == '+'), "{}", lines[2]);
+        assert_eq!(lines[3], "pagination | yes");
+        // Measured without its markers, so the styled cell lines up.
+        assert_eq!(lines[4], "csv        | **no**");
+        assert_eq!(lines[5], "after");
+    }
+
+    #[test]
+    fn pipes_outside_a_table_and_inside_code_are_left_alone() {
+        let text = "a | b\n```\n| x | y |\n|---|---|\n```";
+        assert_eq!(align_tables(text, false), text);
     }
 
     #[test]

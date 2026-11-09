@@ -175,7 +175,7 @@ Done when a PTY test pins the live rows and the summary.
 
 - [x] 7.1 Streaming-safe Markdown: headings, emphasis, inline code, lists, quotes, links,
       rules.
-- [ ] 7.1b Markdown tables: align columns across the rows of one table.
+- [x] 7.1b Markdown tables: align columns across the rows of one table.
 - [x] 7.2 Code-fence highlighting from a small lexer (keywords, strings, comments, numbers)
       for the common languages, within the size budget.
 - [ ] 7.3 Coloured diffs for edit results and `git_diff`.
@@ -255,4 +255,5 @@ Done when a reproducible table exists with Rune in it.
 | 2026-11-09 | ca9afb7 | CI | Narrow replay grids cut the estimate to `ctx ~4.`; fixtures now expect `ctx ~2.`. |
 | 2026-11-09 | 5623980 | 8.4 | `/effort [level]`, limited to the dialect's accepted levels. |
 | 2026-11-09 | c417bb4 | 6.2b | Spinner and elapsed time on running calls, and a `thinking` row before the first token; ticks on idle input polls, at most ten redraws a second. |
-| 2026-11-09 | (this) | 6.5 | `FooterState.cost`, shown after the context field when prices are known. |
+| 2026-11-09 | 39fcd68 | 6.5 | `FooterState.cost`, shown after the context field when prices are known. |
+| 2026-11-09 | (this) | 7.1b | Pipe tables in a finished answer are aligned by visible width; the stream shows them as written. |

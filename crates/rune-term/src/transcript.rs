@@ -527,6 +527,12 @@ fn render_entry(entry: &Entry, display: Display, lanes: &Lanes, out: &mut String
     let width = display.width.saturating_sub(2).max(MIN_WIDTH);
     let text = sanitize(&entry.text);
     let body = if entry.speaker == Speaker::Assistant {
+        // A finished answer is whole, so its tables can be measured and aligned.
+        let text = if lanes.markdown.enabled {
+            crate::markdown::align_tables(&text, display.ascii)
+        } else {
+            text
+        };
         AssistantRows::with_markdown(lanes.markdown.clone()).rows_with_ascii(
             &text,
             width,
