@@ -490,6 +490,8 @@ pub struct Lanes {
     pub reasoning: String,
     /// Closes a reasoning line.
     pub reset: String,
+    /// How Markdown in the answer is drawn. Off by default.
+    pub markdown: crate::markdown::MarkdownStyle,
 }
 
 impl Default for Lanes {
@@ -497,6 +499,7 @@ impl Default for Lanes {
         Self {
             reasoning: "\u{1b}[2m".to_owned(),
             reset: "\u{1b}[0m".to_owned(),
+            markdown: crate::markdown::MarkdownStyle::default(),
         }
     }
 }
@@ -524,7 +527,11 @@ fn render_entry(entry: &Entry, display: Display, lanes: &Lanes, out: &mut String
     let width = display.width.saturating_sub(2).max(MIN_WIDTH);
     let text = sanitize(&entry.text);
     let body = if entry.speaker == Speaker::Assistant {
-        AssistantRows::default().rows_with_ascii(&text, width, display.ascii)
+        AssistantRows::with_markdown(lanes.markdown.clone()).rows_with_ascii(
+            &text,
+            width,
+            display.ascii,
+        )
     } else {
         wrap(&text, width)
     };
@@ -584,9 +591,26 @@ pub struct AssistantRows {
     width: Option<usize>,
     ascii: bool,
     fence: Option<Fence>,
+    markdown: crate::markdown::MarkdownStyle,
 }
 
 impl AssistantRows {
+    /// Draws Markdown prose with `style` from now on, rewrapping if it changed.
+    pub fn set_markdown(&mut self, markdown: &crate::markdown::MarkdownStyle) {
+        if &self.markdown != markdown {
+            *self = Self::with_markdown(markdown.clone());
+        }
+    }
+
+    /// Returns rows that draw Markdown prose with `style`.
+    #[must_use]
+    pub fn with_markdown(markdown: crate::markdown::MarkdownStyle) -> Self {
+        Self {
+            markdown,
+            ..Self::default()
+        }
+    }
+
     /// Returns all rows for text that grows by appending deltas.
     ///
     /// Prose uses ordinary word wrapping. Inside backtick or tilde fences,
@@ -603,7 +627,7 @@ impl AssistantRows {
     pub fn rows_with_ascii(&mut self, text: &str, width: usize, ascii: bool) -> Vec<String> {
         let width = width.max(MIN_WIDTH);
         if text.len() < self.covered || self.width != Some(width) || self.ascii != ascii {
-            *self = Self::default();
+            *self = Self::with_markdown(std::mem::take(&mut self.markdown));
         }
         self.width = Some(width);
         self.ascii = ascii;
@@ -614,6 +638,7 @@ impl AssistantRows {
                 width,
                 &mut self.fence,
                 ascii,
+                &self.markdown,
             ));
         }
         self.covered = sealed;
@@ -621,7 +646,13 @@ impl AssistantRows {
         // A partial closing fence must not change the cached state until its
         // newline arrives: the next delta may still make it ordinary code.
         let mut fence = self.fence;
-        rows.extend(assistant_line(&text[sealed..], width, &mut fence, ascii));
+        rows.extend(assistant_line(
+            &text[sealed..],
+            width,
+            &mut fence,
+            ascii,
+            &self.markdown,
+        ));
         rows
     }
 }
@@ -646,14 +677,28 @@ fn fence_start(line: &str) -> Option<(Fence, &str)> {
     (length >= 3).then(|| (Fence { marker, length }, &rest[length..]))
 }
 
-fn assistant_line(line: &str, width: usize, fence: &mut Option<Fence>, ascii: bool) -> Vec<String> {
+fn assistant_line(
+    line: &str,
+    width: usize,
+    fence: &mut Option<Fence>,
+    ascii: bool,
+    markdown: &crate::markdown::MarkdownStyle,
+) -> Vec<String> {
+    // A fence line is syntax rather than content, so styled output dims it.
+    let delimiter = |line: &str| {
+        if markdown.enabled {
+            wrap(&format!("{}{line}{}", markdown.dim, markdown.reset), width)
+        } else {
+            wrap(line, width)
+        }
+    };
     let candidate = fence_start(line);
     if let Some(open) = *fence {
         if candidate.is_some_and(|(close, rest)| {
             close.marker == open.marker && close.length >= open.length && rest.trim().is_empty()
         }) {
             *fence = None;
-            return wrap(line, width);
+            return delimiter(line);
         }
         return wrap_code(line, width, ascii);
     }
@@ -661,8 +706,12 @@ fn assistant_line(line: &str, width: usize, fence: &mut Option<Fence>, ascii: bo
         && (open.marker != b'`' || !rest.contains('`'))
     {
         *fence = Some(open);
+        return delimiter(line);
     }
-    wrap(line, width)
+    wrap(
+        &crate::markdown::style_line(line, markdown, ascii, width),
+        width,
+    )
 }
 
 /// Hard wraps code by grapheme, retaining every space instead of word breaks.
@@ -1313,6 +1362,7 @@ mod tests {
             &Lanes {
                 reasoning: "<dim>".to_owned(),
                 reset: "<reset>".to_owned(),
+                ..Lanes::default()
             },
         );
         let thinking = rendered.find("weighing the options").expect("reasoning");

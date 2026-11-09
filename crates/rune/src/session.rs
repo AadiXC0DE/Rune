@@ -1547,6 +1547,7 @@ impl SessionHost {
             }
         }
         if !answer.trim().is_empty() {
+            answer_rows.set_markdown(&self.markdown_style());
             rows.extend(answer_rows.rows_with_ascii(
                 answer,
                 width.saturating_sub(2).max(1),
@@ -1667,6 +1668,25 @@ impl SessionHost {
                 format!("  {status}{glyph}{reset} {call}{dim}{separator}{details}{reset}")
             }
             None => format!("  {status}{glyph}{reset} {rest}"),
+        }
+    }
+
+    /// Returns how Markdown in an answer is drawn with this session's theme.
+    ///
+    /// Emphasis uses terminal attributes, which a colourless theme still
+    /// draws; colours come from the theme, so a theme without them simply
+    /// leaves them out.
+    fn markdown_style(&self) -> rune_term::markdown::MarkdownStyle {
+        let sgr = |slot| self.theme.sgr(slot, self.truecolor);
+        rune_term::markdown::MarkdownStyle {
+            enabled: true,
+            heading: format!("\u{1b}[1m{}", sgr(Slot::Accent)),
+            bold: "\u{1b}[1m".to_owned(),
+            italic: "\u{1b}[3m".to_owned(),
+            code: sgr(Slot::String),
+            link: format!("{}\u{1b}[4m", sgr(Slot::Link)),
+            dim: sgr(Slot::Dim),
+            reset: rune_term::engine::Style::RESET.to_owned(),
         }
     }
 
@@ -5621,6 +5641,7 @@ fn render_entries(entries: &[Entry], host: &SessionHost) -> Vec<String> {
     let lanes = transcript::Lanes {
         reasoning: host.reasoning_style(),
         reset: rune_term::engine::Style::RESET.to_owned(),
+        markdown: host.markdown_style(),
     };
     let rendered = transcript::render_lanes(entries, display, &lanes);
     rendered.lines().map(str::to_owned).collect()

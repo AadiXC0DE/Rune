@@ -13,6 +13,7 @@ pub mod footer;
 pub mod frame;
 pub mod inline;
 pub mod input;
+pub mod markdown;
 pub mod picker;
 pub mod screen;
 pub mod shell;
