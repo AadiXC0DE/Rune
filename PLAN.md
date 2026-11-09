@@ -81,7 +81,7 @@ Gaps that cost tokens, pass rate or user trust:
 - [x] 1.1 Measure and record the baseline table above (size, startup, instruction bytes).
 - [x] 1.2 Report tool schema bytes in `rune prompt` and gate instructions plus schemas (the
       request floor) in `cargo xtask budget`.
-- [ ] 1.3 Skip site deployments for pushes that do not touch `site/` (Vercel `ignoreCommand`).
+- [x] 1.3 Skip site deployments for pushes that do not touch `site/` (Vercel `ignoreCommand`).
 - [ ] 1.4 Run the budget job on pushes to `main`, not only on pull requests.
 
 Done when the request floor is a printed, gated number.
@@ -203,4 +203,5 @@ Done when a reproducible table exists with Rune in it.
 | Date | Commit | Task | Note |
 | --- | --- | --- | --- |
 | 2026-11-09 | 3a45e19 | 1.1 | Plan written, baseline measured. |
-| 2026-11-09 | (this) | 1.2 | `rune prompt --tools`; budget gates schemas at 18 KiB (measured 17,379). |
+| 2026-11-09 | c7edc18 | 1.2 | `rune prompt --tools`; budget gates schemas at 18 KiB (measured 17,379). |
+| 2026-11-09 | (this) | 1.3 | Pushes that change crates used by the demo still deploy, because `site/demo/rune.wasm` must be regenerated; regenerate it once per push, in the last commit. |
