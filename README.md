@@ -554,6 +554,20 @@ honoring `Retry-After` or using bounded backoff. Each attempt uses the configure
 `provider_head_timeout_ms` and `provider_request_timeout_ms` deadlines; a
 provider's own `head_timeout_ms` under `[providers.<name>]` in the user
 configuration replaces the first, for example for a slow local model.
+The same table takes headers added to every request to that provider; a value
+set there replaces a header the provider requires under the same name:
+
+```toml
+[providers.openrouter.headers]
+"HTTP-Referer" = "https://example.com"
+"X-Title" = "my-tool"
+```
+
+Model requests go through the proxy in `HTTPS_PROXY`, `ALL_PROXY` or
+`HTTP_PROXY` (first set wins), except for hosts in `NO_PROXY` and loopback
+addresses. `SSL_CERT_FILE` names extra certificate authorities, trusted for
+model and MCP requests together with the system bundle; `rune doctor` shows
+which roots are in use.
 Rejected credentials never retry. Retries consume no extra model steps or usage.
 Reaching the cap exits 3 with `limit_exceeded`; the last step's answer is the
 `final_output`. JSON reports the steps, summed usage, and each tool's

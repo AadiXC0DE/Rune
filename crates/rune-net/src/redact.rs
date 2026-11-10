@@ -227,6 +227,32 @@ mod tests {
     use super::*;
 
     #[test]
+    fn secret_headers_are_recognised() {
+        for name in [
+            "Authorization",
+            "proxy-authorization",
+            "Cookie",
+            "x-api-key",
+            "api-key",
+            "x-goog-api-key",
+            "X-Session-Token",
+            "x-client-secret",
+            "X-Auth-User",
+            "cf-aig-authorization",
+        ] {
+            assert!(is_secret_header(name), "{name}");
+        }
+        for name in [
+            "HTTP-Referer",
+            "X-Title",
+            "user-agent",
+            "x-opencode-session",
+        ] {
+            assert!(!is_secret_header(name), "{name}");
+        }
+    }
+
+    #[test]
     fn a_native_gemini_key_header_is_redacted_even_for_short_keys() {
         assert!(!redact("x-goog-api-key: shortkey").contains("shortkey"));
     }

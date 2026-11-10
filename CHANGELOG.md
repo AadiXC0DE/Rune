@@ -27,6 +27,10 @@ Notable changes, newest first. Each entry describes what a user can observe.
   change.
 - A turn that changed files and ran nothing to check them is asked once to
   verify; `ask --json` reports `verification` and an ordered `narration`.
+- `[providers.<name>.headers]` adds headers to every request to a provider.
+  Model and MCP requests use the proxy from `HTTPS_PROXY`, `ALL_PROXY` or
+  `HTTP_PROXY` (never for loopback), and trust the certificate authorities in
+  `SSL_CERT_FILE`.
 
 ### Changed
 

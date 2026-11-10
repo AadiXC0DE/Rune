@@ -18,6 +18,8 @@ pub mod provider;
 pub mod providers;
 pub mod redact;
 pub mod responses;
+#[cfg(not(target_family = "wasm"))]
+pub mod roots;
 pub mod schema;
 pub mod sse;
 pub mod stream;

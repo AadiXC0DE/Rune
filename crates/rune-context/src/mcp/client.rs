@@ -1580,12 +1580,84 @@ fn resolve_endpoint(base: &str, endpoint: &str) -> String {
 pub(super) fn http_agent() -> ureq::Agent {
     let config = ureq::Agent::config_builder()
         .http_status_as_error(false)
+        .proxy(env_proxy(&|name| std::env::var(name).ok()))
+        .tls_config(extra_roots())
         .build();
     ureq::Agent::with_parts(
         config,
         super::http_transport::Connector::default(),
         ureq::unversioned::resolver::DefaultResolver::default(),
     )
+}
+
+/// The proxy named in the environment, with loopback hosts and `NO_PROXY` exempt.
+///
+/// The same rules as the model transport, which this crate does not depend
+/// on; the tests hold both to the same vectors.
+#[cfg(not(target_family = "wasm"))]
+fn env_proxy(lookup: &dyn Fn(&str) -> Option<String>) -> Option<ureq::Proxy> {
+    let value = [
+        "HTTPS_PROXY",
+        "https_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+        "HTTP_PROXY",
+        "http_proxy",
+    ]
+    .iter()
+    .find_map(|name| lookup(name).filter(|value| !value.trim().is_empty()))?;
+    let parsed = ureq::Proxy::new(value.trim()).ok()?;
+    let mut builder = ureq::Proxy::builder(parsed.protocol())
+        .host(parsed.host())
+        .port(parsed.port());
+    if let Some(username) = parsed.username() {
+        builder = builder.username(username);
+    }
+    if let Some(password) = parsed.password() {
+        builder = builder.password(password);
+    }
+    let listed = ["NO_PROXY", "no_proxy"]
+        .iter()
+        .find_map(|name| lookup(name).filter(|value| !value.trim().is_empty()))
+        .unwrap_or_default();
+    for host in listed
+        .split(',')
+        .map(str::trim)
+        .filter(|host| !host.is_empty())
+        .chain(["localhost", "127.0.0.1", "::1", "[::1]"])
+    {
+        builder = builder.no_proxy(host);
+    }
+    builder.build().ok()
+}
+
+/// The roots MCP requests trust: `SSL_CERT_FILE` plus the system bundle, when
+/// the file holds any certificate, and the built-in roots otherwise.
+#[cfg(not(target_family = "wasm"))]
+fn extra_roots() -> ureq::tls::TlsConfig {
+    let certificates = |pem: &[u8]| -> Vec<ureq::tls::Certificate<'static>> {
+        ureq::tls::parse_pem(pem)
+            .filter_map(|item| match item {
+                Ok(ureq::tls::PemItem::Certificate(certificate)) => Some(certificate),
+                _ => None,
+            })
+            .collect()
+    };
+    let mut roots = match rune_core::tls::extra_ca_bundle() {
+        Some(Ok(bytes)) => certificates(&bytes),
+        _ => Vec::new(),
+    };
+    let root_certs = if roots.is_empty() {
+        ureq::tls::RootCerts::WebPki
+    } else {
+        if let Some((_, system)) = rune_core::tls::system_bundle() {
+            roots.extend(certificates(&system));
+        }
+        ureq::tls::RootCerts::Specific(Arc::new(roots))
+    };
+    ureq::tls::TlsConfig::builder()
+        .root_certs(root_certs)
+        .build()
 }
 
 /// Copies a string map into request order.
@@ -1752,6 +1824,58 @@ impl Credential {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Environment, target URL, and whether the request is proxied.
+    #[cfg(not(target_family = "wasm"))]
+    type ProxyVector = (&'static [(&'static str, &'static str)], &'static str, bool);
+
+    /// The vectors the model transport's proxy rules are checked against.
+    #[cfg(not(target_family = "wasm"))]
+    const PROXY_VECTORS: &[ProxyVector] = &[
+        (
+            &[("HTTPS_PROXY", "http://127.0.0.1:3128")],
+            "https://api.example.test/v1",
+            true,
+        ),
+        (
+            &[("HTTPS_PROXY", "http://127.0.0.1:3128")],
+            "http://127.0.0.1:11434/v1",
+            false,
+        ),
+        (
+            &[
+                ("HTTPS_PROXY", "http://127.0.0.1:3128"),
+                ("NO_PROXY", "other.test, api.example.test"),
+            ],
+            "https://api.example.test/v1",
+            false,
+        ),
+        (
+            &[("HTTP_PROXY", "http://127.0.0.1:3128")],
+            "https://api.example.test/v1",
+            true,
+        ),
+        (
+            &[("ALL_PROXY", "socks5://127.0.0.1:1080")],
+            "https://api.example.test/v1",
+            true,
+        ),
+    ];
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn mcp_proxy_choice_matches_the_model_transport() {
+        for (env, url, expected) in PROXY_VECTORS {
+            let lookup = |name: &str| {
+                env.iter()
+                    .find(|(key, _)| *key == name)
+                    .map(|(_, value)| (*value).to_owned())
+            };
+            let uri: ureq::http::Uri = url.parse().expect("uri");
+            let proxied = env_proxy(&lookup).is_some_and(|proxy| !proxy.is_no_proxy(&uri));
+            assert_eq!(proxied, *expected, "{env:?} {url}");
+        }
+    }
 
     #[cfg(unix)]
     #[test]

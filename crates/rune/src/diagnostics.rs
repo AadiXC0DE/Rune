@@ -149,6 +149,7 @@ pub fn run(settings: &Settings, paths: &Paths, workspace: &Utf8Path) -> Report {
         check_limits(settings),
         check_legacy_layout(),
         check_network(settings),
+        check_certificates(&rune_net::roots::Roots::from_environment()),
         check_sandbox(),
     ];
 
@@ -158,6 +159,15 @@ pub fn run(settings: &Settings, paths: &Paths, workspace: &Utf8Path) -> Report {
         config_root: paths.config_root.to_string(),
         state_root: paths.state_root.to_string(),
         checks,
+    }
+}
+
+/// Reports which certificate roots provider and MCP requests trust.
+fn check_certificates(roots: &rune_net::roots::Roots) -> Check {
+    if roots.warning().is_some() {
+        Check::warn("certificates", roots.describe())
+    } else {
+        Check::ok("certificates", roots.describe())
     }
 }
 
@@ -482,6 +492,21 @@ mod tests {
             assert!(hint.contains("--allow-unsandboxed"), "{hint}");
             assert!(!hint.contains("commands run unrestricted"), "{hint}");
         }
+    }
+
+    #[test]
+    fn the_certificate_line_names_the_roots_in_use() {
+        use rune_net::roots::Roots;
+
+        let built_in = check_certificates(&Roots::from_bundles(None, None));
+        assert_eq!(built_in.outcome, Outcome::Ok);
+        assert_eq!(built_in.detail, "built-in roots");
+        let unusable = check_certificates(&Roots::from_bundles(Some(Ok(b"x".to_vec())), None));
+        assert_eq!(unusable.outcome, Outcome::Warn);
+        assert_eq!(
+            unusable.detail,
+            "SSL_CERT_FILE holds no certificates; using the built-in certificate roots"
+        );
     }
 
     #[test]

@@ -589,6 +589,9 @@ pub struct ProviderEntry {
     /// `provider_head_timeout_ms` limit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub head_timeout_ms: Option<u64>,
+    /// Headers added to every request to this provider, after the ones it requires.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub headers: Option<BTreeMap<String, String>>,
 }
 
 /// The resolved settings of one provider.
@@ -598,6 +601,8 @@ pub struct ProviderSettings {
     pub compat: BTreeMap<String, String>,
     /// Time to wait for the first byte of a reply, in milliseconds.
     pub head_timeout_ms: Option<u64>,
+    /// Headers added to every request, in name order.
+    pub headers: Vec<(String, String)>,
 }
 
 /// A diagnostic produced while loading configuration.
@@ -1551,6 +1556,9 @@ fn apply_providers(
                 .or_default()
                 .head_timeout_ms = Some(head);
         }
+        if let Some(headers) = &entry.headers {
+            apply_provider_headers(settings, name, headers, layer);
+        }
         let Some(compat) = &entry.compat else {
             continue;
         };
@@ -1575,6 +1583,49 @@ fn apply_providers(
         }
     }
     settings.sources.record("providers", layer);
+}
+
+/// Headers the transport writes itself, which a configured value would corrupt.
+const RESERVED_HEADERS: &[&str] = &["content-type", "accept", "host", "content-length"];
+
+/// Returns true when a header name is a valid token that a user may set.
+fn settable_header(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte))
+        && !RESERVED_HEADERS.contains(&name.to_ascii_lowercase().as_str())
+}
+
+/// Merges one provider's `headers` table, reporting names that cannot be sent.
+///
+/// A later layer replaces the value of a name an earlier layer set.
+fn apply_provider_headers(
+    settings: &mut Settings,
+    name: &str,
+    headers: &BTreeMap<String, String>,
+    layer: Layer,
+) {
+    for (header, value) in headers {
+        if !settable_header(header) {
+            settings.diagnostics.push(
+                Diagnostic::new(
+                    layer,
+                    ErrorCode::InvalidField,
+                    format!("`{header}` cannot be set here"),
+                )
+                .with_key(format!("providers.{name}.headers.{header}")),
+            );
+            continue;
+        }
+        let target = &mut settings
+            .providers
+            .entry(name.to_owned())
+            .or_default()
+            .headers;
+        target.retain(|(existing, _)| !existing.eq_ignore_ascii_case(header));
+        target.push((header.clone(), value.clone()));
+    }
 }
 
 /// Applies a project configuration, ignoring anything not repository safe.

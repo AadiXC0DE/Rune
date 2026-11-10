@@ -156,7 +156,21 @@ impl fmt::Debug for Endpoint {
             .field("base_url", &self.base_url)
             .field("credential", &"[REDACTED]")
             .field("auth", &self.auth)
-            .field("headers", &self.headers)
+            .field(
+                "headers",
+                &self
+                    .headers
+                    .iter()
+                    .map(|(name, value)| {
+                        let shown = if redact::is_secret_header(name) {
+                            "[REDACTED]"
+                        } else {
+                            value.as_str()
+                        };
+                        (name.as_str(), shown)
+                    })
+                    .collect::<Vec<_>>(),
+            )
             .field("offline", &self.offline)
             .field("trace", &if self.trace.is_some() { "on" } else { "off" })
             .finish()
@@ -441,6 +455,8 @@ pub fn agent() -> ureq::Agent {
         // Callers supply each request's total budget through FetchRequest.
         .timeout_global(None)
         .http_status_as_error(false)
+        .proxy(env_proxy(&|name| std::env::var(name).ok()))
+        .tls_config(crate::roots::Roots::from_environment().tls_config())
         .build();
     // Match ureq's SOCKS, CONNECT, TCP and rustls chain, adding cancellable
     // socket reads below TLS so a silent response can release its reader.
@@ -451,6 +467,72 @@ pub fn agent() -> ureq::Agent {
             .chain(interrupt::StreamConnector)
             .chain(RustlsConnector::default());
     ureq::Agent::with_parts(config, connector, DefaultResolver::default())
+}
+
+/// Variables naming a proxy, in the order they are read.
+///
+/// Every model endpoint is HTTPS except a loopback one, which never uses a
+/// proxy, so the HTTPS names come first whatever the target scheme.
+pub const PROXY_VARIABLES: &[&str] = &[
+    "HTTPS_PROXY",
+    "https_proxy",
+    "ALL_PROXY",
+    "all_proxy",
+    "HTTP_PROXY",
+    "http_proxy",
+];
+
+/// The first non-empty proxy variable and its value.
+#[cfg(not(target_family = "wasm"))]
+fn proxy_variable(lookup: &dyn Fn(&str) -> Option<String>) -> Option<(&'static str, String)> {
+    PROXY_VARIABLES.iter().find_map(|name| {
+        lookup(name)
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty())
+            .map(|value| (*name, value))
+    })
+}
+
+/// The proxy named in the environment, with loopback hosts and `NO_PROXY` exempt.
+///
+/// A value that is not a proxy URL is ignored; [`proxy_warning`] says so.
+#[cfg(not(target_family = "wasm"))]
+#[must_use]
+pub fn env_proxy(lookup: &dyn Fn(&str) -> Option<String>) -> Option<ureq::Proxy> {
+    let (_, value) = proxy_variable(lookup)?;
+    let parsed = ureq::Proxy::new(&value).ok()?;
+    let mut builder = ureq::Proxy::builder(parsed.protocol())
+        .host(parsed.host())
+        .port(parsed.port());
+    if let Some(username) = parsed.username() {
+        builder = builder.username(username);
+    }
+    if let Some(password) = parsed.password() {
+        builder = builder.password(password);
+    }
+    let listed = ["NO_PROXY", "no_proxy"]
+        .iter()
+        .find_map(|name| lookup(name).filter(|value| !value.trim().is_empty()))
+        .unwrap_or_default();
+    for host in listed
+        .split(',')
+        .map(str::trim)
+        .filter(|host| !host.is_empty())
+        .chain(["localhost", "127.0.0.1", "::1", "[::1]"])
+    {
+        builder = builder.no_proxy(host);
+    }
+    builder.build().ok()
+}
+
+/// The startup warning for a proxy variable that is not a proxy URL.
+#[cfg(not(target_family = "wasm"))]
+#[must_use]
+pub fn proxy_warning(lookup: &dyn Fn(&str) -> Option<String>) -> Option<String> {
+    let (name, value) = proxy_variable(lookup)?;
+    ureq::Proxy::new(&value)
+        .is_err()
+        .then(|| format!("ignoring {name}: not a proxy URL"))
 }
 
 /// Adds headers to a request of either typestate.
@@ -1467,6 +1549,109 @@ pub fn diagnostic_for(plan: &RequestPlan, error: &NetError) -> serde_json::Value
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Whether a request to `url` goes through the proxy `env` names.
+    fn proxied(env: &[(&str, &str)], url: &str) -> bool {
+        let lookup = |name: &str| {
+            env.iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| (*value).to_owned())
+        };
+        let uri: ureq::http::Uri = url.parse().expect("uri");
+        env_proxy(&lookup).is_some_and(|proxy| !proxy.is_no_proxy(&uri))
+    }
+
+    /// Environment, target URL, and whether the request is proxied.
+    type ProxyVector = (&'static [(&'static str, &'static str)], &'static str, bool);
+
+    /// The vectors the MCP client's copy of the proxy rules is checked against too.
+    const PROXY_VECTORS: &[ProxyVector] = &[
+        (
+            &[("HTTPS_PROXY", "http://127.0.0.1:3128")],
+            "https://api.example.test/v1",
+            true,
+        ),
+        (
+            &[("HTTPS_PROXY", "http://127.0.0.1:3128")],
+            "http://127.0.0.1:11434/v1",
+            false,
+        ),
+        (
+            &[
+                ("HTTPS_PROXY", "http://127.0.0.1:3128"),
+                ("NO_PROXY", "other.test, api.example.test"),
+            ],
+            "https://api.example.test/v1",
+            false,
+        ),
+        (
+            &[("HTTP_PROXY", "http://127.0.0.1:3128")],
+            "https://api.example.test/v1",
+            true,
+        ),
+        (
+            &[("ALL_PROXY", "socks5://127.0.0.1:1080")],
+            "https://api.example.test/v1",
+            true,
+        ),
+    ];
+
+    #[test]
+    fn env_proxy_prefers_https_and_exempts_loopback() {
+        for (env, url, expected) in PROXY_VECTORS {
+            assert_eq!(proxied(env, url), *expected, "{env:?} {url}");
+        }
+
+        let env = [
+            ("HTTP_PROXY", "http://127.0.0.1:1"),
+            ("HTTPS_PROXY", "http://user:pass@127.0.0.1:3128"),
+            ("ALL_PROXY", "socks5://127.0.0.1:1080"),
+            ("NO_PROXY", "api.example.test"),
+        ];
+        let lookup = |name: &str| {
+            env.iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| (*value).to_owned())
+        };
+        let proxy = env_proxy(&lookup).expect("proxy");
+        assert_eq!(proxy.protocol(), ureq::ProxyProtocol::Http);
+        assert_eq!(proxy.port(), 3128);
+        assert_eq!(proxy.username(), Some("user"));
+        assert_eq!(proxy.password(), Some("pass"));
+        for url in [
+            "http://127.0.0.1:8080/v1",
+            "http://localhost:8080/v1",
+            "http://[::1]:8080/v1",
+            "https://api.example.test/v1",
+        ] {
+            let uri: ureq::http::Uri = url.parse().expect("uri");
+            assert!(proxy.is_no_proxy(&uri), "{url} was proxied");
+        }
+        let socks = env_proxy(&|name: &str| {
+            (name == "ALL_PROXY").then(|| "socks5://127.0.0.1:1080".to_owned())
+        })
+        .expect("socks");
+        assert_eq!(socks.protocol(), ureq::ProxyProtocol::Socks5);
+
+        let bad = |name: &str| (name == "https_proxy").then(|| "http://".to_owned());
+        assert!(env_proxy(&bad).is_none());
+        assert_eq!(
+            proxy_warning(&bad).as_deref(),
+            Some("ignoring https_proxy: not a proxy URL")
+        );
+        assert!(proxy_warning(&lookup).is_none());
+        assert!(env_proxy(&|_| None).is_none());
+    }
+
+    #[test]
+    fn a_credential_header_is_redacted_in_debug_output() {
+        let endpoint = Endpoint::new("https://api.example.test", "sk-hidden")
+            .with_header("Authorization", "Bearer user-secret")
+            .with_header("X-Title", "my-tool");
+        let shown = format!("{endpoint:?}");
+        assert!(!shown.contains("user-secret"), "{shown}");
+        assert!(shown.contains("my-tool"), "{shown}");
+    }
 
     #[test]
     fn a_provider_head_timeout_wins_over_the_limit() {

@@ -15,6 +15,7 @@ pub mod error;
 pub mod experiment;
 pub mod id;
 pub mod paths;
+pub mod tls;
 pub mod tool;
 
 pub use budget::{Budget, BudgetSet, LimitName};

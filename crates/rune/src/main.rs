@@ -164,6 +164,9 @@ fn run(launch: &Launch) -> Result<ExitCode> {
     } else {
         Settings::default()
     };
+    if requirements.config {
+        warn_about_network_environment();
+    }
 
     let saved_directory_source = settings.source_of("additional_directories");
 
@@ -294,6 +297,18 @@ fn current_workspace() -> Result<Utf8PathBuf> {
             ),
         )
     })
+}
+
+/// Says once why a proxy variable or `SSL_CERT_FILE` is being ignored.
+///
+/// The agents fall back silently, so this is the only place the user hears of it.
+fn warn_about_network_environment() {
+    if let Some(warning) = rune_net::transport::proxy_warning(&|name| std::env::var(name).ok()) {
+        eprintln!("rune: {warning}");
+    }
+    if let Some(warning) = rune_net::roots::Roots::from_environment().warning() {
+        eprintln!("rune: {warning}");
+    }
 }
 
 /// Runs `doctor`.

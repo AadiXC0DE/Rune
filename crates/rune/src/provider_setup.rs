@@ -66,9 +66,17 @@ pub fn configured_endpoint(
 ) -> Result<rune_net::transport::Endpoint> {
     let base_url = require_base_url(settings)?;
     rune_net::transport::validate_url(&base_url)?;
+    let configured = configured_headers(settings);
     if settings.anonymous {
         let mut anonymous = rune_net::transport::Endpoint::anonymous(&base_url)?;
-        anonymous.headers = endpoint(&settings.provider, &base_url, "", settings.offline).headers;
+        anonymous.headers = endpoint(
+            &settings.provider,
+            &base_url,
+            "",
+            settings.offline,
+            configured,
+        )
+        .headers;
         return traced(settings, anonymous.offline(settings.offline));
     }
     let provider = settings.provider.as_str();
@@ -81,8 +89,17 @@ pub fn configured_endpoint(
             &base_url,
             credential.expose(),
             settings.offline,
+            configured,
         ),
     )
+}
+
+/// The headers the active provider's `[providers.<name>.headers]` table adds.
+fn configured_headers(settings: &Settings) -> &[(String, String)] {
+    let canonical = rune_net::compat::canonical_preset(settings.provider.as_str());
+    settings
+        .provider_settings(&canonical)
+        .map_or(&[], |(_, provider)| provider.headers.as_slice())
 }
 
 /// The trace every endpoint of this process writes to, so numbering is shared.
@@ -866,13 +883,15 @@ pub const fn auth_style(provider: &Provider) -> rune_net::transport::AuthStyle {
 /// themselves states that in the provider table, so the headers are applied here
 /// rather than at each call site. A caller that builds its own endpoint would
 /// otherwise reach the provider without them and be refused. The credential is
-/// presented the way [`auth_style`] says, for the same reason.
+/// presented the way [`auth_style`] says, for the same reason. The user's
+/// `configured` headers follow, so a value for a required name replaces it.
 #[must_use]
 pub fn endpoint(
     provider: &Provider,
     base_url: &str,
     credential: &str,
     offline: bool,
+    configured: &[(String, String)],
 ) -> rune_net::transport::Endpoint {
     let name = provider.as_str();
     let mut endpoint =
@@ -883,7 +902,15 @@ pub fn endpoint(
         .map(|entry| entry.required_headers)
         .unwrap_or_default()
     {
-        endpoint = endpoint.with_header(*header, *value);
+        if !configured
+            .iter()
+            .any(|(own, _)| own.eq_ignore_ascii_case(header))
+        {
+            endpoint = endpoint.with_header(*header, *value);
+        }
+    }
+    for (header, value) in configured {
+        endpoint = endpoint.with_header(header.clone(), value.clone());
     }
     endpoint
 }
@@ -1000,6 +1027,7 @@ mod tests {
             "https://example.invalid/v1beta",
             "k",
             false,
+            &[],
         );
         assert_eq!(gemini.auth.header(), "x-goog-api-key");
         assert_eq!(
@@ -1013,7 +1041,13 @@ mod tests {
         ] {
             assert_eq!(auth_style(&provider), AuthStyle::Bearer, "{provider}");
         }
-        let built = endpoint(&Provider::Anthropic, "https://example.invalid", "k", false);
+        let built = endpoint(
+            &Provider::Anthropic,
+            "https://example.invalid",
+            "k",
+            false,
+            &[],
+        );
         assert_eq!(built.auth, AuthStyle::ApiKeyHeader);
     }
 
@@ -1027,6 +1061,7 @@ mod tests {
             &format!("http://127.0.0.1:{port}"),
             "sk-ant-captured",
             false,
+            &[],
         );
         let mut plan = rune_net::provider::RequestPlan::new("claude-test");
         plan.messages = rune_net::transport::one_shot_messages("hello");
@@ -1049,6 +1084,70 @@ mod tests {
             !head.contains("\r\nauthorization:"),
             "a bearer token was sent to anthropic:\n{head}"
         );
+    }
+
+    #[test]
+    fn configured_headers_reach_every_request() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = dir.path().join("config.toml");
+        let (port, captured) = capture_one_request();
+        std::fs::write(
+            &config,
+            format!(
+                "provider = \"opencode-go\"\nbase_url = \"http://127.0.0.1:{port}/v1\"\n\
+                 [providers.opencode-go.headers]\n\"User-Agent\" = \"my-tool/1\"\n\
+                 \"X-Title\" = \"my-tool\"\nAuthorization = \"Bearer gateway-secret\"\n\
+                 \"Content-Type\" = \"text/plain\"\n"
+            ),
+        )
+        .expect("config");
+        let path = camino::Utf8PathBuf::from_path_buf(config).expect("utf8");
+        let mut settings = rune_core::config::load(
+            None,
+            Some(path.as_path()),
+            &rune_core::config::EnvironmentOverrides::default(),
+        );
+        assert!(
+            settings.diagnostics.iter().any(|diagnostic| {
+                diagnostic.key.as_deref() == Some("providers.opencode-go.headers.Content-Type")
+                    && diagnostic.message == "`Content-Type` cannot be set here"
+            }),
+            "{:?}",
+            settings.diagnostics
+        );
+        settings.anonymous = true;
+        let root = camino::Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).expect("utf8");
+        let built = configured_endpoint(&settings, &temp_paths(&root)).expect("endpoint");
+        assert!(
+            !format!("{built:?}").contains("gateway-secret"),
+            "a credential header was shown: {built:?}"
+        );
+
+        let mut plan = rune_net::provider::RequestPlan::new("m");
+        plan.messages = rune_net::transport::one_shot_messages("hello");
+        let sent = rune_net::transport::stream_completion(
+            &rune_net::transport::agent(),
+            &built,
+            &rune_net::chat_completions::ChatCompletions,
+            &plan,
+            std::time::Duration::from_secs(5),
+            &|| false,
+        );
+
+        let head = captured.join().expect("captured");
+        let detail = format!("({:?}):\n{head}", sent.err());
+        assert!(head.contains("\r\nx-title: my-tool\r\n"), "{detail}");
+        assert!(
+            head.contains("\r\nauthorization: bearer gateway-secret\r\n"),
+            "{detail}"
+        );
+        assert!(
+            head.contains("\r\nx-opencode-session: rune\r\n"),
+            "{detail}"
+        );
+        assert!(head.contains("\r\nuser-agent: my-tool/1\r\n"), "{detail}");
+        assert_eq!(head.matches("\r\nuser-agent:").count(), 1, "{detail}");
+        assert!(!head.contains("text/plain"), "{detail}");
     }
 
     #[test]
