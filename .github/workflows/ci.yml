@@ -150,6 +150,45 @@ jobs:
       - name: Smoke-test the documented archive install and uninstall path
         run: python3 .github/scripts/test-archive-install.py target/dist/*/*.tar.gz
 
+  # Static musl archives for both Linux architectures, each built on a runner of
+  # its own architecture and run inside Alpine and Debian. Dispatch only, like
+  # the reproducible build.
+  linux-static:
+    name: linux static ${{ matrix.target }}
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-latest
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the pinned toolchain
+        run: rustup show
+
+      - name: Build the static archive
+        run: |
+          set -euo pipefail
+          version="$(sed -n 's/^pub const VERSION: &str = "\(.*\)";/\1/p' crates/rune/src/version.rs)"
+          test -n "$version"
+          bash .github/scripts/build-static-linux.sh "${{ matrix.target }}" dev "$version"
+
+      - name: Run it in Alpine and Debian
+        run: bash .github/scripts/test-static-linux.sh target/dist/rune-${{ matrix.target }}/*.tar.gz
+
+      - name: Upload the archive, checksum and manifest
+        uses: actions/upload-artifact@v4
+        with:
+          name: rune-linux-${{ matrix.target }}
+          path: target/dist/rune-${{ matrix.target }}/*
+          if-no-files-found: error
+
   cross-platform:
     name: test on ${{ matrix.os }}
     runs-on: ${{ matrix.os }}

@@ -39,6 +39,8 @@ Notable changes, newest first. Each entry describes what a user can observe.
 - `rune ask` compacts a long run before it reaches the context window, as the
   interactive session does, and counts the summary requests in its usage and
   cost.
+- Releases include static Linux binaries for x86_64 and aarch64 (musl), which
+  run on any distribution, including Alpine, and need no CA package.
 - Sandboxed commands can write the build tools' caches under the home
   directory (`~/.cache`, `~/.cargo/registry`, `~/go/pkg/mod`, `~/.npm` and
   others), replaceable with `sandbox_cache_roots`; protected and credential

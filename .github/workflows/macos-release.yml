@@ -1,4 +1,4 @@
-name: signed macOS release
+name: release
 
 on:
   workflow_dispatch:
@@ -123,8 +123,47 @@ jobs:
           security delete-keychain "$RUNNER_TEMP/rune-release.keychain-db" || true
           rm -f "$RUNNER_TEMP/rune-signing.p12"
 
+  # Static musl archives for Linux, each built on a runner of its own
+  # architecture and checked in Alpine and Debian before it is published.
+  linux-static:
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-latest
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the pinned toolchain
+        run: rustup show
+
+      - name: Build the static archive
+        env:
+          RELEASE_CHANNEL: ${{ inputs.channel }}
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          version="${RELEASE_VERSION:-$(sed -n 's/^pub const VERSION: &str = "\(.*\)";/\1/p' crates/rune/src/version.rs)}"
+          test -n "$version"
+          bash .github/scripts/build-static-linux.sh "${{ matrix.target }}" "$RELEASE_CHANNEL" "$version"
+
+      - name: Run it in Alpine and Debian
+        run: bash .github/scripts/test-static-linux.sh target/dist/rune-${{ matrix.target }}/*.tar.gz
+
+      - name: Upload the archive, checksum and manifest
+        uses: actions/upload-artifact@v4
+        with:
+          name: rune-linux-${{ matrix.target }}
+          path: target/dist/rune-${{ matrix.target }}/*
+          if-no-files-found: error
+
   publish-release:
-    needs: signed-release
+    needs: [signed-release, linux-static]
     if: inputs.channel == 'stable'
     runs-on: ubuntu-latest
     permissions:
@@ -166,10 +205,12 @@ jobs:
           test -n "$version"
 
           if [ -n "$CERTIFICATE_P12" ]; then
-            note="These archives are signed with this repository's Developer ID certificate."
+            note="These macOS archives are signed with this repository's Developer ID certificate."
           else
             note="These archives are **not signed**: no Developer ID certificate is configured for this repository, which requires a paid Apple Developer Program membership. Installing through Homebrew is unaffected, because the download does not carry the quarantine flag. A tarball downloaded by hand does, and Gatekeeper will refuse an unsigned binary."
           fi
+
+          note="$note Linux archives are static musl builds for x86_64 and aarch64 and are not signed."
 
           if gh release view "v$version" > /dev/null 2>&1; then
             gh release upload "v$version" release/* --clobber

@@ -38,6 +38,12 @@ archive="$PWD/rune-<version>-<target>.tar.gz"
 prefix="$HOME/.local"
 ```
 
+The Linux archives are `rune-<version>-x86_64-unknown-linux-musl.tar.gz` and
+`rune-<version>-aarch64-unknown-linux-musl.tar.gz`. The Linux binaries are
+static and run on any distribution, including Alpine. They carry their own
+certificate roots, so a minimal image needs no CA package; a private certificate
+authority is not used for Rune's own provider requests.
+
 Verify the checksum before extracting, then install the executable:
 
 <!-- archive-install -->
@@ -1309,7 +1315,10 @@ never executes the extracted code. SHA-1 identifies the certificate in Apple's
 requirement language; artifact checksums remain SHA-256. Certificate rotation
 requires publishing and trusting the new fingerprint.
 
-The manual `signed macOS release` workflow requires the repository variable
+The manual `release` workflow builds the macOS archives, signed when the
+credentials below are present, and static Linux archives for x86_64 and aarch64,
+each checked in Alpine and Debian before publishing. Signing requires the
+repository variable
 `MACOS_SIGNING_IDENTITY`, the base64 PKCS#12 secret
 `MACOS_SIGNING_CERTIFICATE_P12`, and secret `MACOS_SIGNING_CERTIFICATE_PASSWORD`.
 Use a Developer ID Application certificate for distribution. The workflow
