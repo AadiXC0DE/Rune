@@ -353,6 +353,56 @@ fn run_responses_fixture_command(
     (output, dir, requests)
 }
 
+fn offered_tools(request: &Value) -> Vec<String> {
+    request["tools"]
+        .as_array()
+        .expect("tools")
+        .iter()
+        .filter_map(|tool| tool["function"]["name"].as_str().map(str::to_owned))
+        .collect()
+}
+
+#[test]
+fn ask_offers_the_subagent_tool() {
+    let (output, _, requests) = run_responses_fixture_command(
+        vec![completion_response(&json!({"content": "ok"}), "stop")],
+        Some("--json"),
+        true,
+        None,
+        (&["ask"], &[]),
+        |_, _| {},
+    );
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert!(offered_tools(&requests[0]).contains(&"subagent".to_owned()));
+}
+
+#[test]
+fn ask_review_does_not_offer_subagents() {
+    let (output, _, requests) = run_responses_fixture_command(
+        vec![completion_response(
+            &json!({"content": "Review complete."}),
+            "stop",
+        )],
+        Some("--json"),
+        false,
+        None,
+        (&["review"], &[]),
+        |dir, command| {
+            command.with_external_programs();
+            let git = Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(dir.path())
+                .output()
+                .expect("initialize review repository");
+            assert!(git.status.success(), "review fixture setup failed: {git:?}");
+        },
+    );
+    assert!(output.status.success(), "{output:?}");
+    let tools = offered_tools(&requests[0]);
+    assert!(tools.contains(&"read_file".to_owned()), "{tools:?}");
+    assert!(!tools.contains(&"subagent".to_owned()), "{tools:?}");
+}
+
 #[test]
 fn ask_json_reports_the_clamped_effort() {
     // Claude Sonnet 4.6 accepts every named level but xhigh.

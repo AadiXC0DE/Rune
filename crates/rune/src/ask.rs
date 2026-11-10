@@ -635,6 +635,8 @@ struct AskHost<'a> {
     /// How requests to the endpoint are shaped, per model.
     compat: crate::provider_setup::CompatSource,
     registry: Registry,
+    /// Runs `subagent` calls; none for a review or a run without tools.
+    subagent: Option<std::sync::Arc<crate::subagent::Bridge>>,
     read_only: bool,
     rules: RuleSet,
     context: ExecutionContext,
@@ -651,6 +653,10 @@ struct AskHost<'a> {
     max_output: Option<u64>,
     /// Usage of summary requests, which the turn's own usage does not count.
     compaction_usage: std::sync::Mutex<Usage>,
+    /// Tokens the run's children used, reported with the run's own.
+    child_usage: std::sync::Mutex<Usage>,
+    /// The run's step limit, when it is bounded.
+    step_cap: Option<u64>,
     /// The request `prepare_request` serialized, for the loop to send.
     encoded_request: std::sync::Mutex<Option<String>>,
     /// Prices of the model, when known, to estimate what the run spends.
@@ -824,8 +830,22 @@ impl Host for AskHost<'_> {
 
     #[cfg(not(target_family = "wasm"))]
     fn concurrent_tool_host(&self, name: &str) -> Option<&(dyn Host + Sync)> {
-        // Independent reads in one reply run together, as in the session.
-        self.registry.get(name)?.is_read_only().then_some(self)
+        // Independent reads in one reply run together, as in the session, and
+        // so do read-only children.
+        ((name == "subagent" && self.subagent.is_some()) || self.registry.get(name)?.is_read_only())
+            .then_some(self)
+    }
+
+    fn remaining_steps(&self) -> Option<u64> {
+        let taken = u64::from(self.step.load(std::sync::atomic::Ordering::Relaxed));
+        self.step_cap.map(|cap| cap.saturating_sub(taken))
+    }
+
+    fn record_child_usage(&self, _model: &str, usage: &Usage) {
+        let mut total = lock(&self.child_usage);
+        *total = total.merge_sum(*usage);
+        drop(total);
+        self.add_spend(usage);
     }
 
     fn tool_attachments(&self, result: &turn::CallResult) -> Vec<ContentPart> {
@@ -1041,7 +1061,7 @@ impl Host for AskHost<'_> {
     }
 
     fn execute(&self, name: &str, arguments: &serde_json::Value) -> Result<ToolOutput> {
-        self.registry.call(name, arguments, &self.context)
+        self.execute_with_context(name, arguments, &self.context)
     }
 
     fn execute_with_context(
@@ -1050,6 +1070,11 @@ impl Host for AskHost<'_> {
         arguments: &serde_json::Value,
         context: &ExecutionContext,
     ) -> Result<ToolOutput> {
+        if name == "subagent"
+            && let Some(subagent) = &self.subagent
+        {
+            return subagent.call(self, &self.registry, arguments, context);
+        }
         self.registry.call(name, arguments, context)
     }
 
@@ -1178,7 +1203,8 @@ pub fn run(
         .get(LimitName::MaxAgentSteps)
         .value()
         .filter(|cap| *cap > 0);
-    let registry = if options.tool_loop {
+    let rules = crate::permissions::validated(settings)?;
+    let (registry, subagent) = if options.tool_loop {
         let catalog = rune_context::skills::discover(
             &crate::current_workspace()?,
             rune_core::paths::home_directory().as_deref(),
@@ -1193,20 +1219,33 @@ pub fn run(
             std::sync::Arc::new(rune_tools::skill::Fixed::new(catalog)),
             crate::vision_client::backend(settings, paths)?,
         )?;
+        let workspace = crate::current_workspace()?;
         inventory::tailor(
             &mut registry,
             &inventory::Tailoring {
-                workspace: &crate::current_workspace()?,
+                workspace: &workspace,
                 interactive: false,
                 edit_tool: rune_net::compat::edit_tool(settings.edit_tool, &settings.model),
             },
         );
+        // A review stays read-only and asks no children.
+        let subagent = if options.read_only {
+            None
+        } else {
+            Some(crate::subagent::register(
+                &mut registry,
+                settings,
+                paths,
+                &workspace,
+                &rules,
+            )?)
+        };
         if let Some(text) = rune_tools::tool_text::from_env()? {
             registry.set_tool_text(text)?;
         }
-        registry
+        (registry, subagent)
     } else {
-        Registry::new()
+        (Registry::new(), None)
     };
     let mut history = History::new();
     let mut parts = vec![ContentPart::Text {
@@ -1241,8 +1280,9 @@ pub fn run(
         endpoint,
         compat,
         registry,
+        subagent,
         read_only: options.read_only,
-        rules: crate::permissions::validated(settings)?,
+        rules,
         context,
         steering: SteeringQueue::from_limits(&limits),
         cancellation: Cancellation::new(),
@@ -1253,6 +1293,8 @@ pub fn run(
         window: rune_agent::compaction::Window(model_limits.context_window.unwrap_or_default()),
         max_output: model_limits.max_output,
         compaction_usage: std::sync::Mutex::new(Usage::default()),
+        child_usage: std::sync::Mutex::new(Usage::default()),
+        step_cap,
         encoded_request: std::sync::Mutex::new(None),
         prices,
         vision: crate::provider_setup::cached_vision(settings, paths).unwrap_or(false),
@@ -1367,7 +1409,10 @@ pub fn run(
     }
     let outcome = outcome?;
     // Summary requests are billed too, so they are part of what the run used.
-    let usage = outcome.usage.merge_sum(*lock(&host.compaction_usage));
+    let usage = outcome
+        .usage
+        .merge_sum(*lock(&host.compaction_usage))
+        .merge_sum(*lock(&host.child_usage));
     // A turn that failed after a completed request still reports its usage,
     // steps and calls, with the failure as the error.
     let error = if let Some(error) = outcome.error.clone() {

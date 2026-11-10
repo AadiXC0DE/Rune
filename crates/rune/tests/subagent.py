@@ -16,6 +16,10 @@ def call(name, arguments, index=0):
     }
 
 
+# Children are capped at the parent's two steps, so each ends at its limit.
+PARTIAL = "child stopped at its step limit; findings so far:"
+
+
 def run_fixture(case):
     requests = []
     errors = []
@@ -103,12 +107,13 @@ def run_fixture(case):
                                    if msg["role"] == "tool"]
                         assert len(results) == 2, results
                         for index, result in enumerate(results, 1):
-                            assert f"child child-{index}: CHILD_READ_RESULT: ALLOWED_CHILD_READ" in result, result
+                            assert (f"child child-{index}: {PARTIAL}\n"
+                                    "CHILD_READ_RESULT: ALLOWED_CHILD_READ") in result, result
                     elif case == "success":
-                        assert "child child-1: CHILD_READ_RESULT: ALLOWED_CHILD_READ" in result, result
-                        assert "(the child reached its step limit)" in result, result
+                        assert (f"child child-1: {PARTIAL}\n"
+                                "CHILD_READ_RESULT: ALLOWED_CHILD_READ") in result, result
                     elif case == "cap":
-                        assert "child stopped: max_model_turns" in result, result
+                        assert f"child child-1: {PARTIAL} none" in result, result
                     else:
                         assert "subagent role `unsupported-role` was not found" in result, result
                     delta = {"content": f"PARENT_RECEIVED_{case}"}

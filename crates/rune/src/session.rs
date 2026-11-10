@@ -498,7 +498,8 @@ impl Host for SessionHost {
 
     #[cfg(not(target_family = "wasm"))]
     fn concurrent_tool_host(&self, name: &str) -> Option<&(dyn Host + Sync)> {
-        self.registry.get(name)?.is_read_only().then_some(self)
+        // Children are read-only, so leading `subagent` calls run together too.
+        (name == "subagent" || self.registry.get(name)?.is_read_only()).then_some(self)
     }
 
     fn tool_attachments(&self, result: &turn::CallResult) -> Vec<rune_net::message::ContentPart> {
@@ -6600,23 +6601,7 @@ fn session_registry(
             edit_tool: rune_net::compat::edit_tool(settings.edit_tool, &settings.model),
         },
     );
-    let mut tools: Vec<String> = registry.names().into_iter().map(str::to_owned).collect();
-    tools.push("subagent".to_owned());
-    let subagent = crate::subagent::Bridge::new(
-        rune_agent::Authority {
-            mode: settings.permission_mode,
-            rules: rules.clone(),
-            workspace: workspace.to_owned(),
-            roots: std::iter::once(workspace.to_owned())
-                .chain(settings.additional_directories.iter().cloned())
-                .collect(),
-            tools,
-            mcp_view: None,
-            generation: 0,
-        },
-        Some((settings.clone(), paths.clone())),
-    );
-    registry.insert(subagent.registered())?;
+    let subagent = crate::subagent::register(&mut registry, settings, paths, workspace, rules)?;
     if let Some(text) = rune_tools::tool_text::from_env()? {
         registry.set_tool_text(text)?;
     }

@@ -566,6 +566,12 @@ pub trait Host {
     fn cache_key(&self) -> Option<String> {
         None
     }
+
+    /// Steps this run may still take, when its step limit is bounded. None by
+    /// default.
+    fn remaining_steps(&self) -> Option<u64> {
+        None
+    }
 }
 
 /// One entry of what a turn said and did, in the order it happened.
@@ -1583,6 +1589,35 @@ fn stream_with_retry(
     }
 }
 
+/// Most `subagent` calls run together in one group.
+pub const MAX_PARALLEL_CHILDREN: usize = 4;
+
+/// Splits the concurrent prefix into the groups that run together, in order:
+/// each holds at most `width` calls and at most `MAX_PARALLEL_CHILDREN` calls
+/// named `subagent`.
+#[cfg(not(target_family = "wasm"))]
+fn parallel_groups(calls: &[PreparedCall], width: usize) -> Vec<&[PreparedCall]> {
+    let mut groups = Vec::new();
+    let mut start = 0_usize;
+    let mut children = 0_usize;
+    for (index, call) in calls.iter().enumerate() {
+        let child = call.name == "subagent";
+        let full = index.saturating_sub(start) >= width;
+        if index > start && (full || (child && children >= MAX_PARALLEL_CHILDREN)) {
+            groups.push(&calls[start..index]);
+            start = index;
+            children = 0;
+        }
+        if child {
+            children = children.saturating_add(1);
+        }
+    }
+    if start < calls.len() {
+        groups.push(&calls[start..]);
+    }
+    groups
+}
+
 /// Shown once when the provider will not return reasoning summaries.
 pub const SUMMARY_REFUSED_NOTICE: &str =
     "reasoning summaries are not available for this organization; continuing without them";
@@ -1662,7 +1697,7 @@ fn execute_batch(
     let parallel_prefix = 0;
 
     #[cfg(not(target_family = "wasm"))]
-    for group in calls[..parallel_prefix].chunks(width) {
+    for group in parallel_groups(&calls[..parallel_prefix], width) {
         let group_results = std::thread::scope(|scope| {
             let mut pending = Vec::with_capacity(group.len());
             for (index, call) in group.iter().enumerate() {

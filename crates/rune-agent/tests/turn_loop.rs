@@ -1461,6 +1461,87 @@ fn barrier_host(calls: &[(&str, &str)], cap: u64) -> (TestHost, Arc<BatchBarrier
 }
 
 #[test]
+fn leading_subagent_calls_run_four_at_a_time() {
+    use rune_tools::{Activity, Tool};
+
+    #[derive(Default)]
+    struct Flight {
+        now: AtomicUsize,
+        peak: AtomicUsize,
+    }
+
+    struct ChildTool(Arc<Flight>);
+
+    impl Tool for ChildTool {
+        fn name(&self) -> &'static str {
+            "subagent"
+        }
+
+        fn description(&self) -> &'static str {
+            "Run a child."
+        }
+
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+
+        fn activity(&self) -> Activity {
+            Activity::Delegate
+        }
+
+        fn is_read_only(&self) -> bool {
+            true
+        }
+
+        fn call(
+            &self,
+            _arguments: &serde_json::Value,
+            _context: &ExecutionContext,
+        ) -> Result<ToolOutput> {
+            let now = self.0.now.fetch_add(1, Ordering::SeqCst) + 1;
+            self.0.peak.fetch_max(now, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(100));
+            self.0.now.fetch_sub(1, Ordering::SeqCst);
+            Ok(ToolOutput::success("child done"))
+        }
+    }
+
+    let mut frames: Vec<String> = (0..6)
+        .map(|index| {
+            serde_json::json!({"choices": [{"index": 0, "delta": {"tool_calls": [{
+                "index": index, "id": format!("child_{index}"), "function": {"name": "subagent",
+                "arguments": serde_json::json!({"task": format!("look {index}")}).to_string()}
+            }]}}]})
+            .to_string()
+        })
+        .collect();
+    frames.push(r#"{"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#.to_owned());
+    frames.push("[DONE]".to_owned());
+    let endpoint = MockEndpoint::start(vec![Script::Frames(frames), Script::text("done")]);
+    let flight = Arc::new(Flight::default());
+    let mut registry = Registry::new();
+    registry
+        .insert(Box::new(ChildTool(Arc::clone(&flight))))
+        .expect("fixture registration");
+    let mut host = TestHost::new(endpoint).with_tools(registry.all_schemas());
+    host.registry = Some(registry);
+    host.limits
+        .set(
+            rune_core::LimitName::ParallelToolCalls,
+            rune_core::budget::Budget::Bounded(8),
+            rune_core::config::Layer::User,
+        )
+        .expect("concurrency cap");
+    let mut history = rune_agent::History::new();
+    history.push_user("ask six children");
+
+    let outcome = run_turn(&mut history, &host).expect("turn");
+    assert_eq!(outcome.calls.len(), 6);
+    assert!(outcome.calls.iter().all(|result| result.executed));
+    assert_eq!(flight.peak.load(Ordering::SeqCst), 4);
+}
+
+#[test]
 fn reads_overlap_at_cap_two_and_drain_before_a_pending_mutation() {
     let calls = [
         ("fixture_read", "a"),

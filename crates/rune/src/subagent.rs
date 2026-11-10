@@ -22,6 +22,38 @@ use rune_tools::{Activity, ExecutionContext, Registry, Tool, ToolOutput};
 /// Settings and paths a child resolves its limits from when it runs another model.
 pub type LimitInputs = (rune_core::config::Settings, rune_core::paths::Paths);
 
+/// Steps a child may take when its parent is not capped lower.
+pub const CHILD_STEPS: u64 = 64;
+
+/// Registers the `subagent` tool over the tools already in `registry`, and
+/// returns the bridge that runs its children.
+pub fn register(
+    registry: &mut Registry,
+    settings: &rune_core::config::Settings,
+    paths: &rune_core::paths::Paths,
+    workspace: &camino::Utf8Path,
+    rules: &rune_policy::RuleSet,
+) -> Result<Arc<Bridge>> {
+    let mut tools: Vec<String> = registry.names().into_iter().map(str::to_owned).collect();
+    tools.push("subagent".to_owned());
+    let bridge = Bridge::new(
+        Authority {
+            mode: settings.permission_mode,
+            rules: rules.clone(),
+            workspace: workspace.to_owned(),
+            roots: std::iter::once(workspace.to_owned())
+                .chain(settings.additional_directories.iter().cloned())
+                .collect(),
+            tools,
+            mcp_view: None,
+            generation: 0,
+        },
+        Some((settings.clone(), paths.clone())),
+    );
+    registry.insert(bridge.registered())?;
+    Ok(bridge)
+}
+
 /// Shared tool state. Execution borrows the live host rather than caching policy.
 pub struct Bridge {
     tool: Subagent,
@@ -163,12 +195,15 @@ impl Delegate for Runner<'_> {
             })
             .map_err(|_| RuneError::new(ErrorCode::LimitExceeded, "subagent child limit reached"))?
             .saturating_add(1);
-        let steps = limits
+        let parent_cap = limits
             .get(LimitName::MaxAgentSteps)
             .value()
-            .filter(|cap| *cap > 0)
-            .unwrap_or(16)
-            .min(16);
+            .filter(|cap| *cap > 0);
+        let steps = match (self.parent.remaining_steps(), parent_cap) {
+            (Some(remaining), _) => remaining.clamp(1, CHILD_STEPS),
+            (None, Some(cap)) => cap.min(CHILD_STEPS),
+            (None, None) => CHILD_STEPS,
+        };
         limits.set(
             LimitName::MaxAgentSteps,
             Budget::Bounded(steps),
@@ -208,11 +243,10 @@ impl Delegate for Runner<'_> {
         );
         let outcome =
             turn::run_turn(&mut history, &child).and_then(turn::TurnOutcome::into_strict)?;
-        // A child told its last step had come still reports what it found;
-        // only a stop with nothing said is a failure.
-        let capped_with_report =
-            outcome.stop_reason == StopReason::StepLimit && !outcome.text.trim().is_empty();
-        if outcome.stop_reason != StopReason::Completed && !capped_with_report {
+        // A child at its step limit returns what it found so far; any other
+        // stop short of completion is a failure.
+        let capped = outcome.stop_reason == StopReason::StepLimit;
+        if outcome.stop_reason != StopReason::Completed && !capped {
             return Err(RuneError::new(
                 ErrorCode::LimitExceeded,
                 format!("child stopped: {}", outcome.stop_reason.as_str()),
@@ -227,12 +261,21 @@ impl Delegate for Runner<'_> {
             label: format!("child-{seq}"),
             // A role is reusable; it is not the name of a persistent child.
             name: None,
-            summary: if capped_with_report {
-                format!("{}\n(the child reached its step limit)", outcome.text)
+            summary: if capped {
+                partial_findings(&outcome.text)
             } else {
                 outcome.text
             },
         })
+    }
+}
+
+/// The result of a child stopped at its step limit.
+fn partial_findings(text: &str) -> String {
+    if text.trim().is_empty() {
+        "child stopped at its step limit; findings so far: none".to_owned()
+    } else {
+        format!("child stopped at its step limit; findings so far:\n{text}")
     }
 }
 
@@ -478,6 +521,102 @@ mod tests {
             limits: BudgetSet::new(),
             objective_remaining: Mutex::new(None),
         }
+    }
+
+    fn read_authority(parent: &Parent) -> Authority {
+        Authority {
+            mode: PermissionMode::Auto,
+            rules: RuleSet::new(),
+            workspace: parent.context.workspace.clone(),
+            roots: vec![parent.context.workspace.clone()],
+            tools: vec!["read_file".to_owned()],
+            mcp_view: None,
+            generation: 0,
+        }
+    }
+
+    #[test]
+    fn a_child_at_its_step_limit_returns_its_findings() {
+        // Every step but the last calls a tool; the last one, told it is the
+        // last, answers.
+        let mut turns: Vec<rune_testkit::scripted::Turn> = (1..CHILD_STEPS)
+            .map(|index| {
+                rune_testkit::scripted::Turn::call(
+                    &format!("call_{index}"),
+                    "read_file",
+                    &format!(r#"{{"path":"f{index}.rs"}}"#),
+                )
+            })
+            .collect();
+        turns.push(rune_testkit::scripted::Turn::text(
+            "the parser is in lex.rs",
+        ));
+        let provider = rune_testkit::scripted::ScriptedProvider::start(turns);
+        let mut parent = parent();
+        parent.endpoint = Endpoint::new(provider.base_url(), "fixture");
+        let mut registry = Registry::new();
+        registry
+            .insert(Box::new(rune_tools::ReadFile::new()))
+            .expect("read");
+        let children = AtomicU64::new(0);
+        let runner = Runner {
+            parent: &parent,
+            registry: &registry,
+            children: &children,
+            limit_inputs: None,
+        };
+        let request = SubagentRequest::decode(&serde_json::json!({
+            "action": "run",
+            "task": "find the parser",
+        }))
+        .expect("request");
+        let outcome = runner
+            .delegate(&request, &Admission::capture(&read_authority(&parent)))
+            .expect("partial findings");
+        assert!(
+            outcome
+                .summary
+                .starts_with("child stopped at its step limit; findings so far:\n"),
+            "{}",
+            outcome.summary
+        );
+        assert!(outcome.summary.contains("lex.rs"), "{}", outcome.summary);
+        assert_eq!(
+            u64::try_from(provider.request_count()).expect("count"),
+            CHILD_STEPS
+        );
+        assert_eq!(
+            partial_findings("  "),
+            "child stopped at its step limit; findings so far: none"
+        );
+    }
+
+    #[test]
+    fn a_child_offers_only_read_only_tools() {
+        let parent = parent();
+        let mut registry = Registry::new();
+        registry
+            .insert(Box::new(rune_tools::ReadFile::new()))
+            .expect("read");
+        registry
+            .insert(Box::new(rune_tools::WriteFile::new()))
+            .expect("write");
+        *parent.tools.lock().expect("tools") = registry.all_schemas();
+        let mut authority = read_authority(&parent);
+        authority.tools.push("write_file".to_owned());
+        let children = AtomicU64::new(0);
+        let runner = Runner {
+            parent: &parent,
+            registry: &registry,
+            children: &children,
+            limit_inputs: None,
+        };
+        let names: Vec<String> = runner
+            .tools(&Admission::capture(&authority), None)
+            .into_iter()
+            .map(|spec| spec.name)
+            .collect();
+        assert_eq!(names, ["read_file"]);
     }
 
     #[test]
