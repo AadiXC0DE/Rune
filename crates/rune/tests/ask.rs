@@ -422,9 +422,9 @@ fn tool_call_delta() -> Value {
 fn ask_json_reports_tool_errors_and_stops_at_the_configured_cap() {
     for finish in ["tool_calls", "stop", "length"] {
         let output = run_capped_fixture(&tool_call_delta(), finish, true);
-        assert_eq!(output.status.code(), Some(1), "finish: {finish}");
+        assert_eq!(output.status.code(), Some(3), "finish: {finish}");
         let result: Value = serde_json::from_slice(&output.stdout).expect("one JSON result");
-        assert_eq!(result["exit_code"], 1);
+        assert_eq!(result["exit_code"], 3);
         assert_eq!(result["error_code"], "limit_exceeded");
         let error = result["error"].as_str().expect("failure detail");
         assert!(error.contains("limit of 1 model steps"), "{error}");
@@ -456,7 +456,7 @@ fn ask_json_reports_tool_errors_and_stops_at_the_configured_cap() {
 #[test]
 fn ask_plain_text_step_limit_prints_the_final_text() {
     let output = run_capped_fixture(&tool_call_delta(), "tool_calls", false);
-    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(output.status.code(), Some(3));
     assert_eq!(output.stdout, b"I will run the command.\n");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("limit of 1 model steps"), "{stderr}");
@@ -612,7 +612,7 @@ fn ask_no_save_creates_no_session() {
 fn ask_saves_a_tool_exchange_stopped_at_the_step_cap() {
     let (output, dir) =
         run_fixture_with_cap(&tool_call_delta(), "tool_calls", true, false, Some(1));
-    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(output.status.code(), Some(3));
     let result: Value = serde_json::from_slice(&output.stdout).expect("ask JSON");
     let session_id = result["session_id"].as_str().expect("saved session id");
     assert!(!session_id.is_empty());
@@ -1159,7 +1159,7 @@ fn ask_stops_repeated_tool_requests_at_the_configured_step_cap() {
         })
         .collect();
     let (output, _, requests) = run_responses_fixture(responses, true, true, Some(2));
-    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(output.status.code(), Some(3));
     let result: Value = serde_json::from_slice(&output.stdout).expect("one JSON result");
     assert_eq!(result["steps"], 2);
     assert_eq!(requests.len(), 2);
@@ -2069,6 +2069,18 @@ fn post_tool_timeout_and_nonzero_exit_preserve_completed_results_and_continue() 
                 .contains("ALLOWED_READ_RESULT")
         );
     }
+}
+
+#[test]
+fn ask_help_lists_the_exit_codes() {
+    let output = Command::new(env!("CARGO_BIN_EXE_rune"))
+        .args(["help", "ask"])
+        .output()
+        .expect("help");
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(text.contains("Exit status:"), "{text}");
+    assert!(text.contains("3    a limit ended the run"), "{text}");
+    assert!(text.contains("143  stopped by SIGTERM or SIGHUP"), "{text}");
 }
 
 #[test]

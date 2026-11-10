@@ -39,6 +39,10 @@ Notable changes, newest first. Each entry describes what a user can observe.
 - `rune ask` compacts a long run before it reaches the context window, as the
   interactive session does, and counts the summary requests in its usage and
   cost.
+- `rune ask --json` reports `stop_reason`, and a run ended by a limit (steps,
+  output tokens, time, spend, objective budget) now exits 3 with its answer,
+  not 1, so a script can tell a limit from a failure. `rune help ask` lists
+  the exit codes.
 - A signal stops `rune ask` cleanly: SIGINT, SIGTERM or SIGHUP cancels the
   run, ends every shell session it started, records the session and prints the
   result, exiting 130 or 143, instead of leaving commands running.

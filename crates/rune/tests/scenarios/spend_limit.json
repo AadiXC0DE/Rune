@@ -47,8 +47,9 @@
     }
   ],
   "expect": {
-    "exit_code": 1,
+    "exit_code": 3,
     "error_code": "limit_exceeded",
-    "max_requests": 1
+    "max_requests": 1,
+    "stop_reason": "spend_limit"
   }
 }

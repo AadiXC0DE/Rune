@@ -668,6 +668,23 @@ pub fn all_commands() -> impl Iterator<Item = &'static CommandSpec> {
     GROUPS.iter().flat_map(|(_, specs)| specs.iter())
 }
 
+/// Extra notes printed after a command's flags in its help and reference,
+/// or `""` for a command with none.
+#[must_use]
+pub fn notes(name: &str) -> &'static str {
+    match name {
+        "ask" => "\
+Exit status:
+  0    the model finished (stop_reason end_turn)
+  1    the run failed: provider_error, refused, content_filter, stalled, or an error before the first request
+  3    a limit ended the run and its output is usable: max_model_turns, max_output_tokens, time_limit, spend_limit, objective_token_budget
+  130  interrupted by SIGINT
+  143  stopped by SIGTERM or SIGHUP
+",
+        _ => "",
+    }
+}
+
 /// Looks up a command by name or alias.
 #[must_use]
 pub fn find(name: &str) -> Option<&'static CommandSpec> {

@@ -36,6 +36,44 @@ pub const EXIT_OK: u8 = 0;
 /// Exit code for a failed run.
 pub const EXIT_FAILURE: u8 = 1;
 
+/// Exit status when a limit ended the run and its output is usable.
+pub const EXIT_LIMIT: u8 = 3;
+
+/// Exit status when SIGINT stopped the run.
+pub const EXIT_SIGINT: u8 = 130;
+
+/// Exit status when SIGTERM or SIGHUP stopped the run.
+pub const EXIT_SIGTERM: u8 = 143;
+
+/// The exit code for a finished run.
+///
+/// A script reads the outcome from it alone: 0 finished, 1 failed, 3 a limit
+/// ended the run with a usable result, 130 and 143 a signal stopped it.
+#[must_use]
+pub fn exit_code(stop: StopReason, error: Option<&RuneError>, signal: Option<i32>) -> u8 {
+    if let Some(signal) = signal {
+        return if signal == crate::shutdown::SIGINT {
+            EXIT_SIGINT
+        } else {
+            EXIT_SIGTERM
+        };
+    }
+    match stop {
+        StopReason::Completed if error.is_none() => EXIT_OK,
+        StopReason::StepLimit
+        | StopReason::OutputLimit
+        | StopReason::TimeLimit
+        | StopReason::SpendLimit
+        | StopReason::ObjectiveBudget => EXIT_LIMIT,
+        StopReason::Completed
+        | StopReason::ProviderFailure
+        | StopReason::Refused
+        | StopReason::ContentFilter
+        | StopReason::Stalled
+        | StopReason::Cancelled => EXIT_FAILURE,
+    }
+}
+
 /// Largest prompt accepted from standard input.
 pub const MAX_STDIN_PROMPT_BYTES: usize = 8 * 1024 * 1024;
 
@@ -406,6 +444,8 @@ pub struct JsonResult {
     pub final_output: String,
     /// Process exit code this run will use.
     pub exit_code: i32,
+    /// Why the run stopped, by its wire name; null when no model step started.
+    pub stop_reason: Option<&'static str>,
     /// Model identifier that served the request.
     pub model: String,
     /// Upstream provider that served it, when the endpoint reported one.
@@ -469,6 +509,7 @@ impl JsonResult {
             output: String::new(),
             final_output: String::new(),
             exit_code,
+            stop_reason: None,
             model: model.to_owned(),
             resolved_provider: None,
             session_id: String::new(),
@@ -1160,13 +1201,7 @@ pub fn run(
     } else {
         None
     };
-    let exit_code = if let Some(signal) = signalled {
-        crate::shutdown::exit_code(signal)
-    } else if error.is_none() && outcome.stop_reason == StopReason::Completed {
-        i32::from(EXIT_OK)
-    } else {
-        i32::from(EXIT_FAILURE)
-    };
+    let exit_code = exit_code(outcome.stop_reason, error.as_ref(), signalled);
     let tool_calls = outcome
         .calls
         .iter()
@@ -1210,18 +1245,16 @@ pub fn run(
 
     Ok(JsonResult {
         // A run stopped by one of its bounds has a usable partial answer.
-        final_output: if error.is_none()
-            || signalled.is_some()
-            || matches!(
-                outcome.stop_reason,
-                StopReason::StepLimit | StopReason::TimeLimit | StopReason::SpendLimit
-            ) {
+        // The answer is usable when the run finished, a limit ended it, or a
+        // signal stopped it; after a failure it is only the raw `output`.
+        final_output: if matches!(exit_code, EXIT_OK | EXIT_LIMIT | EXIT_SIGINT | EXIT_SIGTERM) {
             outcome.text.clone()
         } else {
             String::new()
         },
         output: outcome.text,
-        exit_code,
+        exit_code: i32::from(exit_code),
+        stop_reason: Some(outcome.stop_reason.as_str()),
         model: settings.model.clone(),
         resolved_provider: None,
         session_id,
@@ -1506,6 +1539,40 @@ pub fn report(result: &JsonResult, options: &Options) -> Result<u8> {
 mod tests {
     use super::*;
     use rune_core::config::{EnvironmentOverrides, Provider};
+
+    #[test]
+    fn exit_codes_follow_the_stop_reason() {
+        let error = RuneError::new(ErrorCode::UnsupportedToolCall, "incomplete call");
+        let table = [
+            (StopReason::Completed, 0, 1),
+            (StopReason::StepLimit, 3, 3),
+            (StopReason::OutputLimit, 3, 3),
+            (StopReason::TimeLimit, 3, 3),
+            (StopReason::SpendLimit, 3, 3),
+            (StopReason::ObjectiveBudget, 3, 3),
+            (StopReason::ProviderFailure, 1, 1),
+            (StopReason::Refused, 1, 1),
+            (StopReason::ContentFilter, 1, 1),
+            (StopReason::Stalled, 1, 1),
+            (StopReason::Cancelled, 1, 1),
+        ];
+        for (stop, clean, with_error) in table {
+            assert_eq!(exit_code(stop, None, None), clean, "{stop:?}");
+            assert_eq!(exit_code(stop, Some(&error), None), with_error, "{stop:?}");
+            assert_eq!(
+                exit_code(stop, None, Some(crate::shutdown::SIGINT)),
+                EXIT_SIGINT
+            );
+            assert_eq!(
+                exit_code(stop, Some(&error), Some(crate::shutdown::SIGTERM)),
+                EXIT_SIGTERM
+            );
+            assert_eq!(
+                exit_code(stop, None, Some(crate::shutdown::SIGHUP)),
+                EXIT_SIGTERM
+            );
+        }
+    }
 
     #[test]
     fn review_uses_the_read_only_note() {
@@ -1823,6 +1890,7 @@ mod tests {
             output: "hi".to_owned(),
             final_output: "hi".to_owned(),
             exit_code: 0,
+            stop_reason: Some("end_turn"),
             model: "m".to_owned(),
             resolved_provider: None,
             session_id: String::new(),

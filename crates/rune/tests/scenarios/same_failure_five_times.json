@@ -70,6 +70,7 @@
   "expect": {
     "exit_code": 1,
     "error_code": "limit_exceeded",
-    "max_requests": 5
+    "max_requests": 5,
+    "stop_reason": "stalled"
   }
 }

@@ -47,6 +47,7 @@
     "exit_code": 1,
     "error_code": "invalid_field",
     "final_output": "",
-    "requests": 4
+    "requests": 4,
+    "stop_reason": "provider_error"
   }
 }

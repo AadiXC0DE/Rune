@@ -83,6 +83,7 @@
     "any_request_contains": [
       "<context_handoff>"
     ],
-    "requests": 8
+    "requests": 8,
+    "stop_reason": "end_turn"
   }
 }

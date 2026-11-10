@@ -88,6 +88,8 @@
         "request": 5,
         "text": "This is the last step allowed in this run."
       }
-    ]
+    ],
+    "exit_code": 3,
+    "stop_reason": "max_model_turns"
   }
 }

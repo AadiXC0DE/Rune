@@ -523,7 +523,7 @@ Transient provider failures retry within each step up to `provider_max_attempts`
 honoring `Retry-After` or using bounded backoff. Each attempt uses the configured
 `provider_head_timeout_ms` and `provider_request_timeout_ms` deadlines.
 Rejected credentials never retry. Retries consume no extra model steps or usage.
-Reaching the cap exits 1 with `limit_exceeded`; the last step's answer is the
+Reaching the cap exits 3 with `limit_exceeded`; the last step's answer is the
 `final_output`. JSON reports the steps, summed usage, and each tool's
 `success` or `error` status. Usage includes `cache_read_tokens` and
 `cache_write_tokens` when the provider reports them; both are parts of
@@ -547,6 +547,13 @@ non-interactive: nobody can answer questions or approve actions, so the model
 should choose, say why, and continue. The note is in the first user message, not
 the system prompt, which stays the same as an interactive session's; the saved
 session keeps the prompt without it.
+
+Every `--json` result has a `stop_reason`, and the exit code says how the run
+ended: 0 the model finished (`end_turn`); 1 it failed (`provider_error`,
+`refused`, `content_filter`, `stalled`, or an error before the first request); 3
+a limit ended it and the output is usable (`max_model_turns`,
+`max_output_tokens`, `time_limit`, `spend_limit`, `objective_token_budget`); 130
+SIGINT; 143 SIGTERM or SIGHUP. `rune help ask` lists the same table.
 
 SIGINT, SIGTERM or SIGHUP stops a run the way its limits do: the turn is
 cancelled, every command it started is asked to exit and killed after two

@@ -47,6 +47,15 @@ Run one bounded turn without an interactive session
 | `--max-steps <n>` | Stop after this many model steps; the last one answers without tools. 0 means no limit. |
 | `--timeout <seconds>` | Stop the run after this many seconds and report what it did. |
 | `--max-cost <usd>` | Stop the run once its estimated cost reaches this many dollars. |
+
+```text
+Exit status:
+  0    the model finished (stop_reason end_turn)
+  1    the run failed: provider_error, refused, content_filter, stalled, or an error before the first request
+  3    a limit ended the run and its output is usable: max_model_turns, max_output_tokens, time_limit, spend_limit, objective_token_budget
+  130  interrupted by SIGINT
+  143  stopped by SIGTERM or SIGHUP
+```
 ### `rune acp [--log-file <path>]`
 
 Serve the Agent Client Protocol over standard input and output

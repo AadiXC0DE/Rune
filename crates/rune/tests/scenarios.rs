@@ -469,6 +469,8 @@ fn sigterm_stops_background_commands() {
     let result: serde_json::Value = serde_json::from_str(stdout.trim()).expect("one JSON object");
     assert_eq!(result["error_code"], "cancelled", "{result}");
     assert_eq!(result["steps"], 1, "{result}");
+    assert_eq!(result["stop_reason"], "cancelled", "{result}");
+    assert_eq!(result["exit_code"], 143, "{result}");
     assert!(
         result["error"]
             .as_str()
@@ -485,6 +487,8 @@ fn sigint_exits_130() {
     assert_eq!(code, Some(130), "{stdout}");
     let result: serde_json::Value = serde_json::from_str(stdout.trim()).expect("one JSON object");
     assert_eq!(result["error_code"], "cancelled", "{result}");
+    assert_eq!(result["stop_reason"], "cancelled", "{result}");
+    assert_eq!(result["exit_code"], 130, "{result}");
     assert_no_survivor(&marker);
 }
 
@@ -523,6 +527,7 @@ fn long_150_steps_completes() {
         turns,
         expect: Expect {
             exit_code: Some(0),
+            stop_reason: Some("end_turn".to_owned()),
             min_steps: Some(151),
             requests: Some(151),
             ..Expect::default()

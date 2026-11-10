@@ -63,6 +63,7 @@
         "request": 1,
         "text": "This is the last step allowed in this run."
       }
-    ]
+    ],
+    "stop_reason": "end_turn"
   }
 }

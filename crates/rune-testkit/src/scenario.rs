@@ -61,6 +61,9 @@ pub struct Expect {
     /// The result's `final_output`.
     #[serde(default)]
     pub final_output: Option<String>,
+    /// The result's `stop_reason`, such as `end_turn`.
+    #[serde(default)]
+    pub stop_reason: Option<String>,
     /// Lower bound on the result's `steps`.
     #[serde(default)]
     pub min_steps: Option<u64>,
@@ -396,6 +399,16 @@ pub fn check(scenario: &Scenario, report: &Report) -> Vec<String> {
             ));
         }
     }
+    if let Some(want) = &expect.stop_reason {
+        let found =
+            field(report, "stop_reason").and_then(|value| value.as_str().map(str::to_owned));
+        if found.as_deref() != Some(want.as_str()) {
+            failures.push(format!(
+                "stop_reason: expected {want:?}, found {}",
+                found.map_or_else(|| "null".to_owned(), |found| format!("{found:?}"))
+            ));
+        }
+    }
     if let Some(want) = expect.min_steps {
         let found = field(report, "steps")
             .and_then(serde_json::Value::as_u64)
@@ -604,6 +617,34 @@ mod tests {
             check(&scenario, &report).len(),
             1,
             "a missing request fails"
+        );
+    }
+
+    #[test]
+    fn stop_reason_mismatch_is_reported() {
+        let scenario =
+            load_inline(r#"{"prompt":"p","turns":[],"expect":{"stop_reason":"end_turn"}}"#);
+        let report = |result: serde_json::Value| Report {
+            result: Some(result),
+            ..Report::default()
+        };
+        assert!(
+            check(
+                &scenario,
+                &report(serde_json::json!({"stop_reason": "end_turn"}))
+            )
+            .is_empty()
+        );
+        assert_eq!(
+            check(
+                &scenario,
+                &report(serde_json::json!({"stop_reason": "stalled"}))
+            ),
+            [r#"stop_reason: expected "end_turn", found "stalled""#]
+        );
+        assert_eq!(
+            check(&scenario, &report(serde_json::json!({"stop_reason": null}))),
+            [r#"stop_reason: expected "end_turn", found null"#]
         );
     }
 
