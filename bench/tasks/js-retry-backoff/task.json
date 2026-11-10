@@ -4,7 +4,12 @@
   "prompt": "Requests are retried one time too few, and the backoff delays are wrong and are not capped. The tests in test/ describe the intended behaviour. Fix src/ so they pass. Do not modify the tests.",
   "verify": "node --test",
   "protected": [
-    "test"
+    "test",
+    "test/hidden.test.js"
   ],
-  "timeoutMs": 600000
+  "timeoutMs": 600000,
+  "tests": "tests",
+  "tier": 2,
+  "split": "dev",
+  "language": "javascript"
 }

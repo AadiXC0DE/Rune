@@ -14,12 +14,27 @@ type Count struct {
 }
 
 // TopWords returns the n most frequent words, case-insensitively. A word is
-// a run of letters or digits in any script. Ties are ordered alphabetically.
+// a run of letters or digits in any script; an apostrophe between two
+// letters or digits stays inside the word. Ties are ordered alphabetically.
 func TopWords(text string, n int) []Count {
 	counts := map[string]int{}
-	words := strings.FieldsFunc(strings.ToLower(text), func(r rune) bool {
-		return !unicode.IsLetter(r) && !unicode.IsDigit(r)
-	})
+	runes := []rune(strings.ToLower(text))
+	isWord := func(r rune) bool { return unicode.IsLetter(r) || unicode.IsDigit(r) }
+	var words []string
+	var current []rune
+	for i, r := range runes {
+		inner := (r == '\'' || r == '\u2019') && i > 0 && i+1 < len(runes) &&
+			isWord(runes[i-1]) && isWord(runes[i+1])
+		if isWord(r) || inner {
+			current = append(current, r)
+		} else if len(current) > 0 {
+			words = append(words, string(current))
+			current = nil
+		}
+	}
+	if len(current) > 0 {
+		words = append(words, string(current))
+	}
 	for _, word := range words {
 		counts[word]++
 	}
