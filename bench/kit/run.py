@@ -74,21 +74,24 @@ class Runner:
         self.unknown_cost_noted = False
         self.cap_reached = False
 
-    def binary(self, module):
-        return resolve_binary(module, self.args.rune_bin)
+    def command(self, module):
+        return resolve_command(module, self.args.rune_bin)
 
     def version_of(self, module):
-        found = self.binary(module)
-        if not found or not os.path.isfile(found):
+        found = self.command(module)
+        if not found:
             return "unknown"
+        prefix, note = found
         try:
             done = subprocess.run(
-                [found] + list(module.VERSION_CMD),
+                list(prefix) + list(module.VERSION_CMD),
                 stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                 timeout=30,
             )
             lines = done.stdout.decode("utf-8", "replace").splitlines()
-            return lines[0].strip() if lines and lines[0].strip() else "unknown"
+            if not lines or not lines[0].strip():
+                return "unknown"
+            return lines[0].strip() + (" (%s)" % note if note else "")
         except (OSError, subprocess.SubprocessError):
             return "unknown"
 
@@ -187,8 +190,10 @@ class Runner:
 
             before = {p: kit.tree_digest(workspace / p) for p in task.protected}
             meter, port = self.start_meter(logdir, harness, task.name, trial, tmp)
+            found = self.command(module)
+            prefix = list(found[0]) if found else []
             ctx = {
-                "bin": self.binary(module), "home": home, "workspace": workspace,
+                "bin": prefix[0] if prefix else None, "cmd": prefix, "home": home, "workspace": workspace,
                 "task_dir": task.dir, "proxy_url": "http://127.0.0.1:%d" % port,
                 "model": a.model, "key": self.key, "prompt": task.prompt, "timeout_s": 0,
             }
@@ -363,6 +368,15 @@ class Runner:
         return rows
 
 
+def resolve_command(module, rune_bin):
+    """(argv prefix, note) for the harness, or None when it cannot be found."""
+    finder = getattr(module, "find_bin", None)
+    if finder is not None:
+        return finder()
+    found = resolve_binary(module, rune_bin)
+    return ([found], "") if found else None
+
+
 def resolve_binary(module, rune_bin):
     """Absolute path of the harness executable, or None when it cannot be found."""
     if getattr(module, "NAME", "") == "rune" and rune_bin:
@@ -469,21 +483,15 @@ def cmd_run(argv):
     served = set(split_names(args.upstream_dialects)) or {"chat"}
     if args.upstream_anthropic and not args.upstream_dialects:
         served.add("anthropic")
-    runnable = []
+    modules = select_harnesses(modules, served)
     for module in modules:
-        needs = list(getattr(module, "DIALECTS", ["chat"]))
-        if not served.intersection(needs):
-            print("skip %s: needs the %s API" % (module.NAME, "/".join(needs)), flush=True)
-            continue
-        if resolve_binary(module, args.rune_bin) is None and module.NAME == "rune":
+        if module.NAME == "rune" and resolve_binary(module, args.rune_bin) is None:
             print(
                 "run.py: rune binary not found at %s; build it with cargo build --release"
                 % os.path.abspath(args.rune_bin),
                 file=sys.stderr,
             )
             return 2
-        runnable.append(module)
-    modules = runnable
     if not modules:
         return 0
     tasks = kit.discover(args.tasks, split_names(args.only), args.split)
@@ -496,6 +504,18 @@ def cmd_run(argv):
         if fake is not None:
             fake.shutdown()
     return 0
+
+
+def select_harnesses(modules, served):
+    """The harnesses whose API the upstream serves; the others are announced once and dropped."""
+    runnable = []
+    for module in modules:
+        needs = list(getattr(module, "DIALECTS", ["chat"]))
+        if not set(served).intersection(needs):
+            print("skip %s: needs the %s API" % (module.NAME, "/".join(needs)), flush=True)
+            continue
+        runnable.append(module)
+    return runnable
 
 
 def require_git():
@@ -555,20 +575,21 @@ def cmd_check(argv):
     bad = 0
     for name in split_names(opts.harnesses):
         module = adapters.load(name)
-        exe = resolve_binary(module, opts.rune_bin)
-        if exe is None:
+        found = resolve_command(module, opts.rune_bin)
+        if found is None:
             bad += 1
             where = os.path.abspath(opts.rune_bin) if module.NAME == "rune" else module.BIN
             print("%-14s missing  %s" % (module.NAME, where))
             continue
-        version = Runner.version_of(argparse.Namespace(binary=lambda m: exe), module)
+        exe = " ".join(found[0])
+        version = Runner.version_of(argparse.Namespace(command=lambda m: found), module)
         help_text = ""
         commands = [list(getattr(module, "HELP_CMD", ["--help"]))]
         commands += [list(c) for c in getattr(module, "HELP_EXTRA_CMDS", [])]
         for command in commands:
             try:
                 done = subprocess.run(
-                    [exe] + command, stdin=subprocess.DEVNULL,
+                    list(found[0]) + command, stdin=subprocess.DEVNULL,
                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=10,
                 )
                 help_text += done.stdout.decode("utf-8", "replace") + "\n"
