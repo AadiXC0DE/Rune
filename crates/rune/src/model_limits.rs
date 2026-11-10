@@ -20,6 +20,8 @@ pub enum LimitSource {
     ConfiguredModel,
     /// The cached published catalog.
     Catalog,
+    /// The smallest request the model rejected as too long in an earlier run.
+    Observed,
     /// The endpoint's own model listing.
     ProviderListing,
     /// No source states it.
@@ -75,6 +77,12 @@ pub fn resolve(
         context = context.or_else(|| pick(cached.context, LimitSource::Catalog));
         output = output.or_else(|| pick(cached.output, LimitSource::Catalog));
     }
+    if context.is_none() {
+        context = pick(
+            observed(paths, &provider_key(&settings.provider), model),
+            LimitSource::Observed,
+        );
+    }
     if let Some(listed) = listing {
         context = context.or_else(|| pick(listed.context_window, LimitSource::ProviderListing));
         output = output.or_else(|| pick(listed.max_output_tokens, LimitSource::ProviderListing));
@@ -120,6 +128,89 @@ fn configured_entry<'a>(settings: &'a Settings, model: &str) -> Option<&'a Model
 fn cached(settings: &Settings, paths: &Paths, model: &str) -> Option<rune_net::models_dev::Limits> {
     let key = rune_net::models_dev::catalog_key(&settings.provider.to_string())?;
     crate::provider_setup::read_cached_limits(&paths.models_cache_file(), key)?.get(model)
+}
+
+/// File under the state root holding the observed window bounds.
+const OBSERVED_LIMITS_FILE: &str = "observed-limits.json";
+
+/// Keys the observed limits file holds; past this, the oldest is dropped.
+const MAX_OBSERVED_LIMITS: usize = 256;
+
+/// The observed limits file.
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+struct ObservedLimits {
+    version: u32,
+    limits: std::collections::BTreeMap<String, ObservedLimit>,
+}
+
+/// One model's observed bound.
+#[derive(Clone, Copy, serde::Serialize, serde::Deserialize)]
+struct ObservedLimit {
+    window_upper_bound: u64,
+    observed_at_ms: u64,
+}
+
+fn observed_key(provider: &str, model: &str) -> String {
+    format!("{provider}/{model}")
+}
+
+fn read_observed(paths: &Paths) -> Option<ObservedLimits> {
+    let text = std::fs::read_to_string(paths.state_root.join(OBSERVED_LIMITS_FILE)).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+/// Returns the observed window bound of `model` on `provider`, when one is saved.
+fn observed(paths: &Paths, provider: &str, model: &str) -> Option<u64> {
+    read_observed(paths)?
+        .limits
+        .get(&observed_key(provider, model))
+        .map(|limit| limit.window_upper_bound)
+}
+
+/// Saves that `model` on `provider` rejected a request of `tokens` as too long.
+///
+/// The smaller bound is kept for a model. A failure to write is ignored: the
+/// bound is a hint for later runs, and this run already knows it.
+pub fn record_observed(paths: &Paths, provider: &str, model: &str, tokens: u64) {
+    if tokens == 0 {
+        return;
+    }
+    let mut file = read_observed(paths).unwrap_or_default();
+    file.version = 1;
+    let observed_at_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+        });
+    let key = observed_key(provider, model);
+    let window_upper_bound = file
+        .limits
+        .get(&key)
+        .map_or(tokens, |known| known.window_upper_bound.min(tokens));
+    file.limits.insert(
+        key,
+        ObservedLimit {
+            window_upper_bound,
+            observed_at_ms,
+        },
+    );
+    while file.limits.len() > MAX_OBSERVED_LIMITS {
+        let Some(oldest) = file
+            .limits
+            .iter()
+            .min_by_key(|(_, limit)| limit.observed_at_ms)
+            .map(|(key, _)| key.clone())
+        else {
+            break;
+        };
+        file.limits.remove(&oldest);
+    }
+    let Ok(text) = serde_json::to_string(&file) else {
+        return;
+    };
+    let _ = rune_core::paths::create_dir_private(&paths.state_root);
+    let _ =
+        rune_core::paths::write_private_atomic(&paths.state_root.join(OBSERVED_LIMITS_FILE), &text);
 }
 
 #[cfg(test)]
@@ -273,6 +364,103 @@ mod tests {
         assert_eq!(limits.context_source, LimitSource::Catalog);
         assert_eq!(limits.max_output, Some(128_000));
         assert_eq!(limits.output_source, LimitSource::Catalog);
+    }
+
+    #[test]
+    fn an_observed_bound_is_used_only_without_a_catalog_value() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = camino::Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).expect("utf8");
+        let paths = temp_paths(&root);
+        write_catalog(&paths, CATALOG);
+        record_observed(&paths, "anthropic", "m", 90_000);
+        record_observed(&paths, "anthropic", "absent", 50_000);
+        let settings = Settings {
+            provider: Provider::Anthropic,
+            model: "m".to_owned(),
+            ..Settings::default()
+        };
+        let mut listed = rune_net::catalog::ModelMetadata::new("absent");
+        listed.context_window = Some(400_000);
+
+        let cataloged = resolve(&settings, &paths, "m", None);
+        assert_eq!(cataloged.context_window, Some(300_000));
+        assert_eq!(cataloged.context_source, LimitSource::Catalog);
+
+        let observed = resolve(&settings, &paths, "absent", Some(&listed));
+        assert_eq!(observed.context_window, Some(50_000));
+        assert_eq!(observed.context_source, LimitSource::Observed);
+        assert_eq!(
+            serde_json::to_value(LimitSource::Observed).expect("json"),
+            "observed"
+        );
+
+        let mut configured = settings.clone();
+        configured.context_window_override = Some(64_000);
+        let set = resolve(&configured, &paths, "absent", None);
+        assert_eq!(set.context_window, Some(64_000));
+        assert_eq!(set.context_source, LimitSource::Setting);
+
+        // Another provider's bound for the same model name does not apply.
+        let other = Settings {
+            provider: Provider::ChatCompletions,
+            model: "absent".to_owned(),
+            ..Settings::default()
+        };
+        assert_eq!(resolve(&other, &paths, "absent", None).context_window, None);
+    }
+
+    #[test]
+    fn observed_limits_round_trip_through_the_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = camino::Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).expect("utf8");
+        let paths = temp_paths(&root);
+        record_observed(&paths, "local", "m", 100_000);
+        record_observed(&paths, "local", "m", 120_000);
+        assert_eq!(observed(&paths, "local", "m"), Some(100_000));
+        record_observed(&paths, "local", "m", 85_000);
+        assert_eq!(observed(&paths, "local", "m"), Some(85_000));
+        assert_eq!(observed(&paths, "local", "other"), None);
+
+        let text =
+            std::fs::read_to_string(paths.state_root.join(OBSERVED_LIMITS_FILE)).expect("file");
+        let value: serde_json::Value = serde_json::from_str(&text).expect("json");
+        assert_eq!(value["version"], 1);
+        assert_eq!(value["limits"]["local/m"]["window_upper_bound"], 85_000);
+        assert!(value["limits"]["local/m"]["observed_at_ms"].as_u64() > Some(0));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(paths.state_root.join(OBSERVED_LIMITS_FILE))
+                .expect("metadata")
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o077, 0, "{mode:o}");
+        }
+
+        // Past the key limit the oldest observation is dropped.
+        let mut file = read_observed(&paths).expect("file");
+        for n in 0..MAX_OBSERVED_LIMITS {
+            file.limits.insert(
+                format!("old/{n}"),
+                ObservedLimit {
+                    window_upper_bound: 1_000,
+                    observed_at_ms: n as u64,
+                },
+            );
+        }
+        rune_core::paths::write_private_atomic(
+            &paths.state_root.join(OBSERVED_LIMITS_FILE),
+            &serde_json::to_string(&file).expect("json"),
+        )
+        .expect("write");
+        record_observed(&paths, "local", "new", 70_000);
+        let kept = read_observed(&paths).expect("file");
+        assert_eq!(kept.limits.len(), MAX_OBSERVED_LIMITS);
+        assert!(!kept.limits.contains_key("old/0"));
+        assert!(!kept.limits.contains_key("old/1"));
+        assert!(kept.limits.contains_key("old/2"));
+        assert_eq!(observed(&paths, "local", "new"), Some(70_000));
+        assert_eq!(observed(&paths, "local", "m"), Some(85_000));
     }
 
     #[test]

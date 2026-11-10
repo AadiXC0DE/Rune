@@ -219,20 +219,61 @@ pub fn compact(
     })
 }
 
-/// Compacts now, whatever the trigger says, for a request the provider
-/// refused as too long.
+/// Returns `window` lowered to the bound learned for `model`, if any.
 ///
-/// Returns `Ok(false)` when the history is too short to cut. The history's own
-/// size is measured before and after, for the compaction event.
-pub fn compact_now(history: &mut History, host: &dyn Host, client: &dyn Fetch) -> Result<bool> {
-    let Some(compaction_plan) = plan_for(history, &host.limits(), host.dialect()) else {
-        return Ok(false);
-    };
+/// A known bound also makes an unknown window, stated as zero, known.
+#[must_use]
+pub fn bounded_window(window: Window, history: &History, model: &str) -> Window {
+    match history.window_bound(model) {
+        Some(bound) if window.0 == 0 => Window(bound),
+        Some(bound) => Window(window.0.min(bound)),
+        None => window,
+    }
+}
+
+/// Compacts now, whatever the trigger says, for a request the provider
+/// refused as too long, aiming at `target_tokens` for the next request.
+///
+/// An unsigned history first has its old tool results replaced by receipts;
+/// when that brings the request to the target, no summary is asked for.
+/// Otherwise the summary keeps a verbatim tail of at most a quarter of the
+/// target. Returns `Ok(true)` when anything changed, even if the request is
+/// still above the target, and `Ok(false)` when nothing could be cut.
+pub fn compact_now(
+    history: &mut History,
+    host: &dyn Host,
+    client: &dyn Fetch,
+    target_tokens: u64,
+) -> Result<bool> {
     let size = |history: &History| -> Result<u64> {
         let bytes = serde_json::to_vec(&history.to_messages())
             .map_err(|err| RuneError::new(ErrorCode::Internal, err.to_string()))?
             .len() as u64;
         Ok(crate::tokens::estimate_tokens(bytes))
+    };
+    let mut pruned = false;
+    if !history.is_signed(host.dialect()) {
+        let before = request_tokens(history, host)?;
+        let report = crate::prune::prune(history, host.dialect());
+        if report.results > 0 {
+            pruned = true;
+            let after = request_tokens(history, host)?;
+            host.emit(Event::ContextPruned {
+                results: report.results,
+                tokens_freed: before.saturating_sub(after),
+            });
+            if after <= target_tokens {
+                return Ok(true);
+            }
+        }
+    }
+    let limits = host.limits();
+    let keep = limits
+        .get(LimitName::CompactionKeepTokens)
+        .effective(u64::MAX)
+        .min(target_tokens / 4);
+    let Some(compaction_plan) = plan_keeping(history, keep, host.dialect()) else {
+        return Ok(pruned);
     };
     let before_tokens = size(history)?;
     let cancellation = host.cancellation();
@@ -249,6 +290,22 @@ pub fn compact_now(history: &mut History, host: &dyn Host, client: &dyn Fetch) -
         settled: false,
     });
     Ok(true)
+}
+
+/// Estimates the next request built from `history`, as the loop would build it.
+fn request_tokens(history: &History, host: &dyn Host) -> Result<u64> {
+    let mut plan = RequestPlan::new(host.model());
+    plan.instructions = host.instructions();
+    plan.messages = history.to_messages();
+    plan.tools = host.tools();
+    let measure = crate::tokens::measure(host.dialect(), &plan)?;
+    Ok(estimate_input(
+        measure,
+        history.anchor(),
+        host.dialect().name(),
+        &plan.model,
+    )
+    .0)
 }
 
 /// Compacts before a request when the estimate reaches the ceiling, or early
@@ -283,6 +340,7 @@ pub fn auto_compact_encoded(
     window: Window,
 ) -> Result<(Option<AutoCompaction>, String)> {
     let limits = host.limits();
+    let window = bounded_window(window, history, &request.model);
     let ceiling = crate::tokens::ceiling(window.0, &limits);
     let window = Window(crate::tokens::effective_window(window.0, &limits));
     let (mut encoded, estimate) =
@@ -453,6 +511,11 @@ pub fn plan(history: &History, limits: &BudgetSet) -> Option<Plan> {
     let keep = limits
         .get(LimitName::CompactionKeepTokens)
         .effective(u64::MAX);
+    plan_with_tail(history, keep)
+}
+
+/// Plans a compaction that keeps a verbatim tail of about `keep` tokens.
+fn plan_with_tail(history: &History, keep: u64) -> Option<Plan> {
     let cut_at = history.tail_start(keep)?;
     if cut_at <= 1 {
         // Nothing precedes the cut, so a summary would replace nothing.
@@ -488,6 +551,13 @@ pub fn plan(history: &History, limits: &BudgetSet) -> Option<Plan> {
 #[must_use]
 pub fn plan_for(history: &History, limits: &BudgetSet, dialect: &dyn Provider) -> Option<Plan> {
     let mut plan = plan(history, limits)?;
+    plan.signed = history.is_signed(dialect);
+    Some(plan)
+}
+
+/// [`plan_for`] with a verbatim tail of about `keep` tokens.
+fn plan_keeping(history: &History, keep: u64, dialect: &dyn Provider) -> Option<Plan> {
+    let mut plan = plan_with_tail(history, keep)?;
     plan.signed = history.is_signed(dialect);
     Some(plan)
 }
@@ -901,6 +971,23 @@ mod tests {
     use rune_core::budget::Budget;
     use rune_core::config::Layer;
     use rune_core::id::ToolCallId;
+
+    #[test]
+    fn a_learned_bound_lowers_or_supplies_the_window_of_its_model() {
+        let mut history = History::new();
+        assert_eq!(
+            bounded_window(Window(200_000), &history, "m"),
+            Window(200_000)
+        );
+        history.learn_window_bound("m", 8_000);
+        assert_eq!(
+            bounded_window(Window(200_000), &history, "m"),
+            Window(8_000)
+        );
+        assert_eq!(bounded_window(Window(4_000), &history, "m"), Window(4_000));
+        assert_eq!(bounded_window(Window(0), &history, "m"), Window(8_000));
+        assert_eq!(bounded_window(Window(0), &history, "other"), Window(0));
+    }
 
     fn call(id: &str) -> ContentPart {
         ContentPart::ToolCall {

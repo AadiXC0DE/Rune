@@ -605,9 +605,21 @@ impl Host for SessionHost {
         &self,
         history: &mut History,
         client: &dyn rune_net::fetch::Fetch,
-        _reason: turn::CompactReason,
+        reason: turn::CompactReason,
     ) -> Result<bool> {
-        rune_agent::compaction::compact_now(history, self, client)
+        let turn::CompactReason::Overflow { target_tokens, .. } = reason;
+        rune_agent::compaction::compact_now(history, self, client, target_tokens)
+    }
+
+    fn observed_overflow(&self, model: &str, tokens: u64) {
+        if let Some(paths) = &self.usage_paths {
+            crate::model_limits::record_observed(
+                paths,
+                &rune_core::config::provider_key(&self.permission_settings.provider),
+                model,
+                tokens,
+            );
+        }
     }
 
     fn before_compaction(&self, history: &History) {

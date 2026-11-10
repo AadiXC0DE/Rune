@@ -37,6 +37,7 @@ const SCENARIOS: &[&str] = &[
     "verified_after_fix",
     "cut_mid_frame_then_ok",
     "prune_long_run",
+    "overflow_ladder",
 ];
 
 /// Scenarios built in Rust, which have no file.
@@ -218,6 +219,13 @@ fn unknown_window_no_compaction() {
 #[test]
 fn context_overflow() {
     run_scenario("context_overflow");
+}
+
+#[test]
+fn overflow_ladder() {
+    // Two rejections in a row: each compacts toward a smaller target and the
+    // step is sent again.
+    run_scenario("overflow_ladder");
 }
 
 #[test]

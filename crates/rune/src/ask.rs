@@ -627,6 +627,8 @@ struct AskHost<'a> {
     /// first request's prefix.
     cache_key: std::sync::OnceLock<String>,
     settings: &'a Settings,
+    /// State paths, where an overflow's bound is saved for later runs.
+    paths: &'a Paths,
     instructions: String,
     /// The instructions with the repository map, fixed for the run.
     mapped: rune_context::prompt::MappedInstructions,
@@ -823,9 +825,19 @@ impl Host for AskHost<'_> {
         &self,
         history: &mut History,
         client: &dyn rune_net::fetch::Fetch,
-        _reason: turn::CompactReason,
+        reason: turn::CompactReason,
     ) -> Result<bool> {
-        rune_agent::compaction::compact_now(history, self, client)
+        let turn::CompactReason::Overflow { target_tokens, .. } = reason;
+        rune_agent::compaction::compact_now(history, self, client, target_tokens)
+    }
+
+    fn observed_overflow(&self, model: &str, tokens: u64) {
+        crate::model_limits::record_observed(
+            self.paths,
+            &rune_core::config::provider_key(&self.settings.provider),
+            model,
+            tokens,
+        );
     }
 
     #[cfg(not(target_family = "wasm"))]
@@ -1270,6 +1282,7 @@ pub fn run(
         effort,
         cache_key: std::sync::OnceLock::new(),
         settings,
+        paths,
         instructions: rune_context::prompt::base_instructions_for(
             context.workspace(),
             &paths.config_root,

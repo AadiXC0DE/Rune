@@ -166,6 +166,10 @@ pub struct History {
     /// without them. Not persisted: a resumed session asks again.
     #[serde(skip)]
     reasoning_summary_refused: bool,
+    /// The smallest request a provider rejected as too long, in estimated
+    /// tokens, with the model it was sent to.
+    #[serde(skip)]
+    window_bound: Option<(String, u64)>,
 }
 
 /// Reads whose file digest is kept; past this, one is dropped to make room.
@@ -196,6 +200,7 @@ impl Default for History {
             pruned: std::collections::BTreeSet::new(),
             settled_turn: None,
             reasoning_summary_refused: false,
+            window_bound: None,
         }
     }
 }
@@ -220,6 +225,7 @@ impl History {
             pruned: std::collections::BTreeSet::new(),
             settled_turn: None,
             reasoning_summary_refused: false,
+            window_bound: None,
         }
     }
 
@@ -232,6 +238,26 @@ impl History {
     /// Sends later requests of this conversation without reasoning summaries.
     pub const fn refuse_reasoning_summary(&mut self) {
         self.reasoning_summary_refused = true;
+    }
+
+    /// Records that `model` rejected a request of `tokens` as too long.
+    ///
+    /// The smaller bound is kept for the same model; a bound for another model
+    /// is replaced, since it says nothing about this one.
+    pub fn learn_window_bound(&mut self, model: &str, tokens: u64) {
+        match &mut self.window_bound {
+            Some((known, bound)) if known == model => *bound = (*bound).min(tokens),
+            _ => self.window_bound = Some((model.to_owned(), tokens)),
+        }
+    }
+
+    /// Returns the learned upper bound of `model`'s window, when one is known.
+    #[must_use]
+    pub fn window_bound(&self, model: &str) -> Option<u64> {
+        self.window_bound
+            .as_ref()
+            .filter(|(known, _)| known == model)
+            .map(|(_, bound)| *bound)
     }
 
     /// Records the digest of the file a successful `read_file` call read.
@@ -745,6 +771,7 @@ impl History {
             pruned: self.pruned.clone(),
             settled_turn: None,
             reasoning_summary_refused: self.reasoning_summary_refused,
+            window_bound: self.window_bound.clone(),
         }
     }
 
@@ -800,6 +827,21 @@ pub fn invalid_history(err: &RuneError) -> RuneError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_window_bound_keeps_the_smaller_value_per_model() {
+        let mut history = History::new();
+        assert_eq!(history.window_bound("a"), None);
+        history.learn_window_bound("a", 100_000);
+        history.learn_window_bound("a", 120_000);
+        assert_eq!(history.window_bound("a"), Some(100_000));
+        history.learn_window_bound("a", 85_000);
+        assert_eq!(history.window_bound("a"), Some(85_000));
+        assert_eq!(history.window_bound("b"), None);
+        history.learn_window_bound("b", 90_000);
+        assert_eq!(history.window_bound("b"), Some(90_000));
+        assert_eq!(history.window_bound("a"), None);
+    }
 
     #[test]
     fn retained_store_snapshots_and_branches_remain_independent_on_a_spill() {

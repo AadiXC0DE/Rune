@@ -1501,12 +1501,13 @@ impl rune_agent::turn::Host for SdkHost<'_> {
         &self,
         history: &mut History,
         client: &dyn rune_net::fetch::Fetch,
-        _reason: rune_agent::turn::CompactReason,
+        reason: rune_agent::turn::CompactReason,
     ) -> Result<bool> {
         if self.context.auto_compact.is_none() {
             return Ok(false);
         }
-        compaction::compact_now(history, self, client)
+        let rune_agent::turn::CompactReason::Overflow { target_tokens, .. } = reason;
+        compaction::compact_now(history, self, client, target_tokens)
     }
 
     fn context_replaced(&self, report: &compaction::CompactionReport) {

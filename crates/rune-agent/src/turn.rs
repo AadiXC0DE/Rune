@@ -412,6 +412,10 @@ pub trait Host {
         Ok(false)
     }
 
+    /// Called when `model` rejected a request of an estimated `tokens` input
+    /// tokens as too long, so a host can remember the bound for later runs.
+    fn observed_overflow(&self, _model: &str, _tokens: u64) {}
+
     /// Called after a summary is accepted and before it replaces earlier turns.
     fn before_compaction(&self, _history: &History) {}
 
@@ -738,8 +742,17 @@ fn check_failed_note(record: &verify::CheckRecord) -> String {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum CompactReason {
     /// The provider rejected the request as longer than the context window.
-    Overflow,
+    Overflow {
+        /// Estimated input tokens of the rejected request.
+        rejected_tokens: u64,
+        /// Estimated input tokens the next request should stay under.
+        target_tokens: u64,
+    },
 }
+
+/// Share of the rejected request, in percent, that each successive overflow
+/// compaction aims for.
+const OVERFLOW_TARGETS: [u64; 4] = [85, 70, 50, 35];
 
 /// Hint for a request the provider rejected as too long, once compacting
 /// cannot or did not help.
@@ -1543,13 +1556,27 @@ fn stream_with_retry(
                     continue;
                 }
                 if err.kind() == rune_net::error::FailureKind::ContextTooLong {
-                    if overflow_compactions < 2
-                        && host.compact_now(history, client, CompactReason::Overflow)?
-                    {
-                        // The loop top reports the restart and rebuilds the
-                        // request from the shortened history.
-                        overflow_compactions = overflow_compactions.saturating_add(1);
-                        continue;
+                    if let Some(percent) = OVERFLOW_TARGETS.get(overflow_compactions).copied() {
+                        let model = host.model();
+                        let (rejected_tokens, _) = crate::tokens::estimate_input(
+                            measure,
+                            history.anchor(),
+                            host.dialect().name(),
+                            &plan.model,
+                        );
+                        let target_tokens = rejected_tokens.saturating_mul(percent) / 100;
+                        history.learn_window_bound(&model, rejected_tokens);
+                        host.observed_overflow(&model, rejected_tokens);
+                        let reason = CompactReason::Overflow {
+                            rejected_tokens,
+                            target_tokens,
+                        };
+                        if host.compact_now(history, client, reason)? {
+                            // The loop top reports the restart and rebuilds the
+                            // request from the shortened history.
+                            overflow_compactions = overflow_compactions.saturating_add(1);
+                            continue;
+                        }
                     }
                     return Err(err.to_rune_error().with_hint(OVERFLOW_HINT));
                 }

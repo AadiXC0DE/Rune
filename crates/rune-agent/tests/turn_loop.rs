@@ -74,6 +74,8 @@ struct TestHost {
     encoded_request: Mutex<Option<String>>,
     /// Whether `compact_now` compacts, through the shared helper.
     compacts: bool,
+    /// Every reason `compact_now` was called with.
+    compact_reasons: Mutex<Vec<rune_agent::turn::CompactReason>>,
     /// Models what a host does with an unresolved call in `auto` mode: review
     /// it and, when nothing is concerning, allow it. A host that cannot review
     /// leaves the call unresolved, which the loop reports rather than running.
@@ -132,6 +134,7 @@ impl TestHost {
             objective_budget: Mutex::new(None),
             encoded_request: Mutex::new(None),
             compacts: false,
+            compact_reasons: Mutex::new(Vec::new()),
             resolve_ask: true,
             private_authority: None,
             private_decisions: Mutex::new(Vec::new()),
@@ -337,12 +340,14 @@ impl Host for TestHost {
         &self,
         history: &mut rune_agent::History,
         client: &dyn rune_net::fetch::Fetch,
-        _reason: rune_agent::turn::CompactReason,
+        reason: rune_agent::turn::CompactReason,
     ) -> Result<bool> {
+        self.compact_reasons.lock().expect("reasons").push(reason);
         if !self.compacts {
             return Ok(false);
         }
-        rune_agent::compaction::compact_now(history, self, client)
+        let rune_agent::turn::CompactReason::Overflow { target_tokens, .. } = reason;
+        rune_agent::compaction::compact_now(history, self, client, target_tokens)
     }
 
     fn objective_tokens_remaining(&self) -> Option<u64> {
@@ -2933,6 +2938,101 @@ fn a_host_without_compaction_reports_the_overflow_hint() {
     let error = outcome.error.expect("the overflow error");
     assert_eq!(error.hint(), Some(rune_agent::turn::OVERFLOW_HINT));
     assert_eq!(outcome.steps, 5);
+}
+
+/// A host that compacts on overflow and keeps no verbatim tail.
+fn overflow_host(scripts: Vec<Script>) -> TestHost {
+    let mut host =
+        single_attempt(TestHost::new(MockEndpoint::start(scripts)).with_tools(vec![read_tool()]));
+    host.compacts = true;
+    host.limits
+        .set(
+            rune_core::LimitName::CompactionKeepTokens,
+            rune_core::budget::Budget::Bounded(0),
+            rune_core::config::Layer::CommandLine,
+        )
+        .expect("tail budget");
+    host
+}
+
+fn overflow_status() -> Script {
+    Script::Status {
+        code: 400,
+        body: "context length exceeded".to_owned(),
+    }
+}
+
+fn overflow_summary() -> Script {
+    Script::text("The user asked for five files to be read; all five were read.")
+}
+
+#[test]
+fn the_overflow_ladder_shrinks_the_target_each_time() {
+    let host = overflow_host(overflow_scripts(vec![
+        overflow_summary(),
+        overflow_status(),
+        overflow_summary(),
+        Script::text("finished"),
+    ]));
+    let mut history = rune_agent::History::new();
+    history.push_user("read five files");
+    let outcome = run_turn(&mut history, &host).expect("the step is resent");
+    assert_eq!(outcome.text, "finished");
+    let reasons = host.compact_reasons.lock().expect("reasons").clone();
+    let sizes: Vec<(u64, u64)> = reasons
+        .iter()
+        .map(|reason| {
+            let rune_agent::turn::CompactReason::Overflow {
+                rejected_tokens,
+                target_tokens,
+            } = *reason;
+            (rejected_tokens, target_tokens)
+        })
+        .collect();
+    assert_eq!(sizes.len(), 2, "{sizes:?}");
+    let (first, first_target) = sizes[0];
+    let (second, second_target) = sizes[1];
+    assert!(first > 0 && second < first, "{sizes:?}");
+    assert_eq!(first_target, first * 85 / 100);
+    assert_eq!(second_target, second * 70 / 100);
+    assert_eq!(history.window_bound(&host.model()), Some(second));
+    assert_eq!(history.window_bound("another-model"), None);
+    history.validate().expect("valid history");
+}
+
+#[test]
+fn a_fifth_overflow_stops_with_the_hint() {
+    let mut after = Vec::new();
+    for _ in 0..4 {
+        after.push(overflow_summary());
+        after.push(overflow_status());
+    }
+    let host = overflow_host(overflow_scripts(after));
+    let mut history = rune_agent::History::new();
+    history.push_user("read five files");
+    let outcome = run_turn(&mut history, &host).expect("a partial outcome");
+    let error = outcome.error.expect("the overflow error");
+    assert_eq!(error.hint(), Some(rune_agent::turn::OVERFLOW_HINT));
+    let compactions = host
+        .events()
+        .iter()
+        .filter(|event| matches!(event, Event::ContextCompacted { .. }))
+        .count();
+    assert_eq!(compactions, 4);
+    let reasons = host.compact_reasons.lock().expect("reasons").clone();
+    assert_eq!(reasons.len(), 4, "{reasons:?}");
+    for (reason, percent) in reasons.iter().zip([85, 70, 50, 35]) {
+        let rune_agent::turn::CompactReason::Overflow {
+            rejected_tokens,
+            target_tokens,
+        } = *reason;
+        assert_eq!(
+            target_tokens,
+            rejected_tokens * percent / 100,
+            "{reasons:?}"
+        );
+    }
+    history.validate().expect("valid history");
 }
 
 fn single_attempt(mut host: TestHost) -> TestHost {
