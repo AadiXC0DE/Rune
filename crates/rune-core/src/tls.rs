@@ -49,6 +49,11 @@ pub fn system_bundle() -> Option<(&'static str, Vec<u8>)> {
 
 /// Reads a bundle file, refusing a directory or one over the size limit.
 fn read_bundle(path: &str) -> Result<Vec<u8>, String> {
+    // Checked before opening: Windows refuses to open a directory as a file
+    // and would report it as a permission failure.
+    if std::fs::metadata(path).is_ok_and(|meta| meta.is_dir()) {
+        return Err("it is a directory".to_owned());
+    }
     let file = std::fs::File::open(path).map_err(|err| describe(&err))?;
     let meta = file.metadata().map_err(|err| describe(&err))?;
     if meta.is_dir() {
