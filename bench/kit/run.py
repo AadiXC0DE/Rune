@@ -70,6 +70,9 @@ class Runner:
         self.spent = 0.0
         self.key = os.environ.get(args.key_env, "") if args.key_env else ""
         self.quiet = getattr(args, "quiet", False)
+        self.done = set()
+        self.unknown_cost_noted = False
+        self.cap_reached = False
 
     def binary(self, module):
         return resolve_binary(module, self.args.rune_bin)
@@ -108,7 +111,7 @@ class Runner:
             argv += ["--key-env", a.key_env]
         remaining = self.remaining_cost()
         if remaining is not None:
-            argv += ["--max-cost", "%.6f" % remaining]
+            argv += ["--max-cost", "%.10f" % remaining]
         env = dict(os.environ)
         if a.key_env:
             env[a.key_env] = self.key
@@ -274,8 +277,7 @@ class Runner:
             ordered["kept_dir"] = row["kept_dir"]
         line = json.dumps(ordered, separators=(",", ":"), ensure_ascii=False)
         with self.lock:
-            if isinstance(ordered["cost_usd"], (int, float)):
-                self.spent += ordered["cost_usd"]
+            self.note_cost(ordered["cost_usd"])
             with open(str(self.out / "results.jsonl"), "a", encoding="utf-8") as f:
                 f.write(line + "\n")
                 f.flush()
@@ -286,20 +288,69 @@ class Runner:
             shutil.rmtree(str(tmp), ignore_errors=True)
         return ordered
 
+    def note_cost(self, cost):
+        if isinstance(cost, (int, float)):
+            self.spent += cost
+        elif not self.unknown_cost_noted:
+            self.unknown_cost_noted = True
+            if not self.quiet:
+                print("cost unknown for model %s; the cap does not see it" % self.args.model, flush=True)
+
+    def load_recorded(self):
+        path = self.out / "results.jsonl"
+        if not path.is_file():
+            return 0
+        count = 0
+        for line in path.read_text(encoding="utf-8").splitlines():
+            try:
+                row = json.loads(line)
+            except ValueError:
+                continue
+            self.done.add((row.get("harness"), row.get("task"), row.get("trial")))
+            self.note_cost(row.get("cost_usd"))
+            count += 1
+        return count
+
+    def over_cap(self):
+        cap = self.args.max_cost
+        if cap is None:
+            return False
+        with self.lock:
+            if self.spent < cap:
+                return False
+            if not self.cap_reached:
+                self.cap_reached = True
+                print(
+                    "spend cap reached: $%.4f of $%.2f; no new runs start" % (self.spent, cap),
+                    flush=True,
+                )
+            return True
+
     def execute(self, tasks, modules):
         self.versions = {m.NAME: self.version_of(m) for m in modules}
         self.out.mkdir(parents=True, exist_ok=True)
         a = self.args
-        (self.out / "run.json").write_text(json.dumps({
-            "command": shlex.join(sys.argv), "started_utc": kit.utc_now(), "model": a.model,
-            "harnesses": [m.NAME for m in modules], "harness_versions": self.versions,
-            "trials": a.trials, "tasks": len(tasks), "split": a.split, "dry_run": False,
-        }, indent=2) + "\n")
+        if a.resume:
+            print("resume: %d runs already recorded" % self.load_recorded(), flush=True)
+        else:
+            (self.out / "run.json").write_text(json.dumps({
+                "command": shlex.join(sys.argv), "started_utc": kit.utc_now(), "model": a.model,
+                "harnesses": [m.NAME for m in modules], "harness_versions": self.versions,
+                "trials": a.trials, "tasks": len(tasks), "split": a.split,
+                "dry_run": bool(a.dry_run),
+            }, indent=2) + "\n")
         groups = [(t, task) for t in range(1, a.trials + 1) for task in tasks]
 
         def work(group):
             trial, task = group
-            return [self.run_one(task, m, trial) for m in modules]
+            made = []
+            for m in modules:
+                if (m.NAME, task.name, trial) in self.done:
+                    continue
+                if self.over_cap():
+                    break
+                made.append(self.run_one(task, m, trial))
+            return made
 
         rows = []
         if a.jobs <= 1:
@@ -365,6 +416,8 @@ def build_parser():
     p.add_argument("--timeout", type=float)
     p.add_argument("--max-cost", type=float)
     p.add_argument("--jobs", type=int, default=1)
+    p.add_argument("--resume", action="store_true")
+    p.add_argument("--dry-run", action="store_true")
     p.add_argument("--keep", action="store_true")
     p.add_argument("--upstream-dialects")
     p.add_argument("--rune-bin", default=str(ROOT / "target" / "release" / "rune"))
@@ -380,12 +433,35 @@ def split_names(text):
 def cmd_run(argv):
     parser = build_parser()
     args = parser.parse_args(argv)
+    fake = None
+    if args.dry_run:
+        fake, _thread = fake_upstream.serve()
+        url = "http://127.0.0.1:%d" % fake.server_address[1]
+        args.upstream = args.upstream_anthropic = url
+        args.upstream_dialects = "chat,anthropic"
+        args.key_env = "RUNE_KIT_DRY_RUN_KEY"
+        os.environ[args.key_env] = "dry-run-key"
+        args.model = args.model or "fake"
     for name in ("model", "upstream", "key_env"):
         if not getattr(args, name):
             parser.error("--%s is required" % name.replace("_", "-"))
     if not args.harnesses:
         parser.error("--harnesses is required")
     require_git()
+    if args.resume:
+        if not args.out or not os.path.isdir(args.out):
+            print("run.py: --resume needs --out to name an existing directory", file=sys.stderr)
+            return 2
+        try:
+            recorded = json.loads((Path(args.out) / "run.json").read_text(encoding="utf-8"))["model"]
+        except (OSError, ValueError, KeyError):
+            recorded = args.model
+        if recorded != args.model:
+            print(
+                "run.py: --resume needs the same model as the recorded run (%s)" % recorded,
+                file=sys.stderr,
+            )
+            return 2
     if args.out is None:
         args.out = str(ROOT / "bench" / "results" / datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ"))
     adapters = Adapters(args.adapter_path)
@@ -414,8 +490,12 @@ def cmd_run(argv):
     if not tasks:
         print("run.py: no tasks selected", file=sys.stderr)
         return 2
-    rows = Runner(args, adapters).execute(tasks, modules)
-    return 0 if rows else 1
+    try:
+        rows = Runner(args, adapters).execute(tasks, modules)
+    finally:
+        if fake is not None:
+            fake.shutdown()
+    return 0
 
 
 def require_git():
@@ -440,7 +520,7 @@ def cmd_validate(argv):
             tasks=opts.tasks, trials=1, model="fake", upstream="http://127.0.0.1:%d" % server.server_address[1],
             upstream_anthropic=None, key_env="RUNE_KIT_VALIDATE_KEY", out=out, timeout=None,
             max_cost=None, jobs=1, keep=False, rune_bin="", prices=str(HERE / "prices.json"),
-            split="all", quiet=True,
+            split="all", quiet=True, resume=False, dry_run=False,
         )
         adapters = Adapters(opts.adapter_path)
         modules = [adapters.load("oracle"), adapters.load("noop")]

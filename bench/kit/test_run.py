@@ -42,9 +42,10 @@ class RunnerCase(unittest.TestCase):
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True,
         )
 
-    def do_run(self, harnesses, tasks=TASKS, extra=()):
+    def do_run(self, harnesses, tasks=TASKS, extra=(), env_extra=None):
         out = self.dir / "out"
         env = {"PATH": "/usr/bin:/bin:/usr/local/bin", "KIT_KEY": "secret-key"}
+        env.update(env_extra or {})
         proc = subprocess.run(
             [sys.executable, RUN, "--tasks", str(tasks), "--harnesses", harnesses, "--model", "fake",
              "--upstream", self.url, "--key-env", "KIT_KEY", "--out", str(out),
@@ -180,6 +181,89 @@ class RunnerCase(unittest.TestCase):
         proc, rows, _ = self.do_run("anthropic_only,oracle", extra=["--only", "value-file"])
         self.assertIn("skip anthropic_only: needs the anthropic API", proc.stdout)
         self.assertEqual([r["harness"] for r in rows], ["oracle"])
+
+    def dry_run(self, harnesses, extra=(), tasks=TASKS):
+        out = self.dir / "out"
+        proc = subprocess.run(
+            [sys.executable, RUN, "--tasks", str(tasks), "--harnesses", harnesses, "--dry-run",
+             "--out", str(out), "--adapter-path", str(ADAPTERS)] + list(extra),
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True,
+            env={"PATH": "/usr/bin:/bin:/usr/local/bin"},
+        )
+        results = out / "results.jsonl"
+        rows = [json.loads(l) for l in results.read_text().splitlines()] if results.exists() else []
+        return proc, rows, out
+
+    def test_dry_run_meters_a_ping_adapter(self):
+        proc, rows, out = self.dry_run("ping", ["--only", "value-file"])
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["requests"], 1)
+        self.assertEqual(rows[0]["input_tokens"], 100)
+        self.assertEqual(rows[0]["model"], "fake")
+        self.assertTrue(json.loads((out / "run.json").read_text())["dry_run"])
+
+    def test_dry_run_writes_eight_rows_for_oracle_and_noop(self):
+        proc, rows, _ = self.dry_run("oracle,noop", ["--trials", "2"])
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(len(rows), 8)
+
+    def test_resume_skips_recorded_runs(self):
+        proc, rows, out = self.do_run("oracle", extra=["--trials", "2"])
+        self.assertEqual(len(rows), 4, proc.stderr)
+        results = out / "results.jsonl"
+        lines = results.read_text().splitlines()
+        results.write_text("\n".join(lines[:-1]) + "\n")
+        proc, rows, _ = self.do_run("oracle", extra=["--trials", "2", "--resume"])
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("resume: 3 runs already recorded", proc.stdout)
+        self.assertEqual(len(rows), 4)
+        self.assertEqual(rows[-1]["trial"], 2)
+        self.assertEqual(len(proc.stdout.strip().splitlines()), 2)
+
+    def test_resume_with_another_model_is_refused(self):
+        self.do_run("oracle", extra=["--only", "value-file"])
+        out = self.dir / "out"
+        proc = subprocess.run(
+            [sys.executable, RUN, "--tasks", str(TASKS), "--harnesses", "oracle", "--model", "other",
+             "--upstream", self.url, "--key-env", "KIT_KEY", "--out", str(out), "--resume"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True,
+            env={"PATH": "/usr/bin:/bin", "KIT_KEY": "k"},
+        )
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn("--resume needs the same model as the recorded run (fake)", proc.stderr)
+
+    def test_spend_cap_stops_new_runs(self):
+        out = self.dir / "out"
+        proc = subprocess.run(
+            [sys.executable, RUN, "--tasks", str(TASKS), "--harnesses", "ping", "--model",
+             "deepseek-flash", "--upstream", self.url, "--key-env", "KIT_KEY", "--out", str(out),
+             "--adapter-path", str(ADAPTERS), "--max-cost", "0.0000001"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True,
+            env={"PATH": "/usr/bin:/bin:/usr/local/bin", "KIT_KEY": "k"},
+        )
+        rows = [json.loads(l) for l in (out / "results.jsonl").read_text().splitlines()]
+        self.assertEqual(len(rows), 1, proc.stdout + proc.stderr)
+        self.assertGreater(rows[0]["cost_usd"], 0)
+        self.assertIn("spend cap reached:", proc.stdout)
+        self.assertIn("no new runs start", proc.stdout)
+
+    def test_jobs_never_overlap_harnesses_on_one_task(self):
+        events = self.dir / "events.txt"
+        proc, rows, _ = self.do_run(
+            "events_a,events_b", extra=["--jobs", "4"], env_extra={"KIT_EVENTS": str(events)},
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(len(rows), 4)
+        spans = {}
+        for line in events.read_text().splitlines():
+            harness, task, kind, stamp = line.split()
+            spans.setdefault((harness, task), {})[kind] = float(stamp)
+        for task in ("value-file", "hidden-check"):
+            a, b = spans[("events_a", task)], spans[("events_b", task)]
+            self.assertTrue(a["end"] <= b["start"] or b["end"] <= a["start"], task)
+        first, second = spans[("events_a", "value-file")], spans[("events_a", "hidden-check")]
+        self.assertLess(max(first["start"], second["start"]), min(first["end"], second["end"]))
 
 
 if __name__ == "__main__":

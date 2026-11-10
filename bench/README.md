@@ -6,7 +6,7 @@ suites also use, so the same tasks can measure each of them.
 ```sh
 rune bench bench/tasks                 # every task, once
 rune bench bench/tasks --trials 3      # three runs of each
-python3 bench/kit/run.py validate --tasks bench/tasks   # prove each task is solvable and unsolved as shipped
+python3 bench/kit/run.py validate --tasks bench/tasks   # each task: oracle passes, noop fails
 ```
 
 | Task | Language | What it takes |
@@ -58,3 +58,8 @@ Writing a task:
 The JavaScript tasks run `node --test`, which finds `*.test.js` files on every
 supported Node release. Passing a directory such as `node --test test/` is read
 as a file on Node 22 and fails before any test runs.
+
+## Cross-harness runs
+
+`python3 bench/kit/run.py` runs any set of harnesses over these tasks behind a metering proxy and
+judges them with hidden tests. See `bench/kit/README.md` for the commands and the result format.
