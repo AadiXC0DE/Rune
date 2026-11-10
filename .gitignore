@@ -11,6 +11,9 @@ build/
 # Node bindings
 node_modules/
 
+# Python bytecode
+__pycache__/
+
 # Editors and operating system files
 .DS_Store
 .idea/
