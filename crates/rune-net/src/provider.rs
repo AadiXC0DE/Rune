@@ -59,6 +59,9 @@ pub struct RequestPlan {
     pub effort: Effort,
     /// Whether fast mode is requested.
     pub fast_mode: bool,
+    /// Whether the reasoning text is shown, so a dialect that can omit it
+    /// should return it.
+    pub show_reasoning: bool,
     /// Output token ceiling, when one applies.
     pub max_output_tokens: Option<u64>,
     /// Ordered upstream provider preference, applied where the endpoint supports it.
@@ -87,6 +90,7 @@ impl RequestPlan {
             parallel_tool_calls: true,
             effort: Effort::Auto,
             fast_mode: false,
+            show_reasoning: false,
             max_output_tokens: None,
             provider_order: Vec::new(),
             provider_strict: false,
@@ -473,6 +477,7 @@ mod routing_tests {
             parallel_tool_calls: false,
             effort: Effort::Auto,
             fast_mode: false,
+            show_reasoning: false,
             max_output_tokens: None,
             provider_order: order.iter().map(|s| (*s).to_owned()).collect(),
             provider_strict: strict,

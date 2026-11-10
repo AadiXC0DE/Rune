@@ -73,6 +73,7 @@ fn send(endpoint: &Endpoint, dialect: &dyn Dialect) -> Result<(), rune_core::err
         parallel_tool_calls: false,
         effort: rune_core::config::Effort::Auto,
         fast_mode: false,
+        show_reasoning: false,
         max_output_tokens: None,
         provider_order: Vec::new(),
         provider_strict: false,

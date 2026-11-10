@@ -769,10 +769,7 @@ fn traits_for(model: &str) -> (ModelTraits, Vec<Applied>) {
             }
             traits.images = Images::Yes;
         }
-        Family::Claude => {
-            traits.images = Images::Yes;
-            traits.claude_thinking = ClaudeThinking::Budget;
-        }
+        Family::Claude => traits.images = Images::Yes,
         Family::Gemini => {
             traits.images = Images::Yes;
             traits.sampling = Sampling {
@@ -802,7 +799,147 @@ fn traits_for(model: &str) -> (ModelTraits, Vec<Applied>) {
         &traits.fields(),
         &format!("model family {}", family.as_str()),
     );
+    if family == Family::Claude {
+        let rule = claude_controls(&id, &mut traits);
+        record(&mut applied, &traits.fields(), &rule);
+    }
     (traits, applied)
+}
+
+/// The tier of a Claude model.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Tier {
+    /// Fable.
+    Fable,
+    /// Mythos.
+    Mythos,
+    /// Opus.
+    Opus,
+    /// Sonnet.
+    Sonnet,
+    /// Haiku.
+    Haiku,
+}
+
+impl Tier {
+    /// Every tier.
+    const ALL: [Self; 5] = [
+        Self::Fable,
+        Self::Mythos,
+        Self::Opus,
+        Self::Sonnet,
+        Self::Haiku,
+    ];
+
+    /// Returns the name used in model ids.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Fable => "fable",
+            Self::Mythos => "mythos",
+            Self::Opus => "opus",
+            Self::Sonnet => "sonnet",
+            Self::Haiku => "haiku",
+        }
+    }
+}
+
+/// Returns the tier and version of a Claude model id.
+///
+/// The version is the first one or two numbers next to the tier word, after it
+/// (`claude-opus-5-5`) or, when none follows, before it
+/// (`claude-3-5-sonnet-20241022`). A number of more than two digits is a date
+/// and ends the version.
+#[must_use]
+pub fn claude_version(model: &str) -> Option<(Tier, u32, u32)> {
+    let id = model.to_ascii_lowercase();
+    let id = id
+        .strip_prefix("anthropic/")
+        .or_else(|| id.strip_prefix("anthropic."))
+        .unwrap_or(&id);
+    let tokens: Vec<&str> = id
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .collect();
+    let (at, tier) = tokens.iter().enumerate().find_map(|(at, token)| {
+        Tier::ALL
+            .into_iter()
+            .find(|tier| tier.as_str() == *token)
+            .map(|tier| (at, tier))
+    })?;
+    let number = |token: &&str| -> Option<u32> {
+        if token.len() <= 2 && token.bytes().all(|byte| byte.is_ascii_digit()) {
+            token.parse().ok()
+        } else {
+            None
+        }
+    };
+    let mut version: Vec<u32> = tokens
+        .get(at.saturating_add(1)..)
+        .unwrap_or_default()
+        .iter()
+        .map_while(number)
+        .take(2)
+        .collect();
+    if version.is_empty() {
+        version = tokens
+            .get(..at)
+            .unwrap_or_default()
+            .iter()
+            .rev()
+            .map_while(number)
+            .take(2)
+            .collect();
+        version.reverse();
+    }
+    let major = *version.first()?;
+    let minor = version.get(1).copied().unwrap_or(0);
+    Some((tier, major, minor))
+}
+
+/// Every effort except `xhigh`.
+const EFFORTS_WITHOUT_XHIGH: &[Effort] = &[
+    Effort::Auto,
+    Effort::None,
+    Effort::Minimal,
+    Effort::Low,
+    Effort::Medium,
+    Effort::High,
+    Effort::Max,
+];
+
+/// Sets the thinking controls of a Claude model and returns the rule name.
+fn claude_controls(id: &str, traits: &mut ModelTraits) -> String {
+    let Some((tier, major, minor)) = claude_version(id) else {
+        traits.claude_thinking = ClaudeThinking::AdaptiveAlwaysOn;
+        traits.forced_tool_choice = false;
+        return "model claude".to_owned();
+    };
+    let version = (major, minor);
+    let (thinking, forced, efforts) = match tier {
+        Tier::Fable | Tier::Mythos if version >= (5, 1) => {
+            (ClaudeThinking::AdaptiveAlwaysOn, false, ALL_EFFORTS)
+        }
+        Tier::Fable | Tier::Mythos => (ClaudeThinking::AdaptiveAlwaysOn, true, ALL_EFFORTS),
+        Tier::Opus if version >= (5, 5) => (ClaudeThinking::AdaptiveAlwaysOn, false, ALL_EFFORTS),
+        Tier::Sonnet if version >= (5, 5) => {
+            (ClaudeThinking::AdaptiveBetweenTools, false, ALL_EFFORTS)
+        }
+        Tier::Opus | Tier::Sonnet | Tier::Haiku if major >= 5 => {
+            (ClaudeThinking::Adaptive, true, ALL_EFFORTS)
+        }
+        Tier::Opus if version == (4, 7) || version == (4, 8) => {
+            (ClaudeThinking::Adaptive, true, ALL_EFFORTS)
+        }
+        Tier::Opus | Tier::Sonnet if version == (4, 6) => {
+            (ClaudeThinking::Adaptive, true, EFFORTS_WITHOUT_XHIGH)
+        }
+        _ => (ClaudeThinking::Budget, true, ALL_EFFORTS),
+    };
+    traits.claude_thinking = thinking;
+    traits.forced_tool_choice = forced;
+    traits.efforts = efforts;
+    format!("model {} {major}.{minor}", tier.as_str())
 }
 
 /// Returns the host of a base URL, lower-cased.
@@ -1110,7 +1247,8 @@ mod tests {
         ("ollama", Some("http://localhost:11434/v1"), "my-model", "reasoning_replay", "none"),
         ("chat_completions", GENERIC, "my-model", "tool_call_id", "any"),
         ("chat_completions", GENERIC, "claude-opus-5-5", "family", "claude"),
-        ("chat_completions", GENERIC, "claude-opus-5-5", "claude_thinking", "budget"),
+        ("chat_completions", GENERIC, "claude-opus-5-5", "claude_thinking", "adaptive_always_on"),
+        ("chat_completions", GENERIC, "claude-haiku-4-5", "claude_thinking", "budget"),
         ("chat_completions", GENERIC, "gpt-5.1-codex", "family", "gpt"),
         ("chat_completions", GENERIC, "gpt-5.1-codex", "edit_tool", "patch"),
         ("chat_completions", GENERIC, "openai/o3-mini", "family", "gpt"),
@@ -1162,6 +1300,39 @@ mod tests {
                 "tool_call_id"
             ),
             "model family mistral"
+        );
+    }
+
+    #[test]
+    fn claude_versions_parse_from_every_id_form() {
+        let cases = [
+            ("claude-opus-5-5", Some((Tier::Opus, 5, 5))),
+            ("claude-sonnet-5-5", Some((Tier::Sonnet, 5, 5))),
+            ("claude-opus-4-6", Some((Tier::Opus, 4, 6))),
+            ("claude-haiku-4-5", Some((Tier::Haiku, 4, 5))),
+            ("anthropic/claude-sonnet-5.5", Some((Tier::Sonnet, 5, 5))),
+            ("claude-opus-4-5-20251101", Some((Tier::Opus, 4, 5))),
+            ("claude-fable-5-1", Some((Tier::Fable, 5, 1))),
+            ("claude-mythos-5-1", Some((Tier::Mythos, 5, 1))),
+            ("claude-sonnet-5", Some((Tier::Sonnet, 5, 0))),
+            ("claude-3-5-sonnet-20241022", Some((Tier::Sonnet, 3, 5))),
+            ("anthropic.claude-opus-4-7-v1:0", Some((Tier::Opus, 4, 7))),
+            ("claude-sonnet-4@20250514", Some((Tier::Sonnet, 4, 0))),
+            ("claude-mythos-preview", None),
+            ("claude", None),
+        ];
+        for (id, expected) in cases {
+            assert_eq!(claude_version(id), expected, "{id}");
+        }
+        let resolution = explain("anthropic", None, "claude-sonnet-5-5");
+        assert_eq!(rule(&resolution, "claude_thinking"), "model sonnet 5.5");
+        assert_eq!(rule(&resolution, "forced_tool_choice"), "model sonnet 5.5");
+        assert_eq!(
+            rule(
+                &explain("anthropic", None, "claude-mythos-preview"),
+                "claude_thinking"
+            ),
+            "model claude"
         );
     }
 

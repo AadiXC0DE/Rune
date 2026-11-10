@@ -545,6 +545,8 @@ impl Host for SessionHost {
         plan: &mut rune_net::provider::RequestPlan,
         client: &dyn rune_net::fetch::Fetch,
     ) -> Result<()> {
+        // The terminal shows reasoning as it streams.
+        plan.show_reasoning = true;
         self.tool_images.hydrate(plan);
         self.check_spend()?;
         let estimate = request_estimate(self, plan, history.anchor())?;

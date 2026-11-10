@@ -10,6 +10,7 @@ use rune_core::config::Effort;
 use rune_core::error::{Result, RuneError};
 use rune_core::id::ToolCallId;
 
+use crate::compat::ClaudeThinking;
 use crate::message::{ContentPart, Message, Role};
 use crate::provider::{Provider, RequestPlan, ToolChoice};
 use crate::stream::{
@@ -29,6 +30,12 @@ pub const PATH: &str = "/v1/messages";
 /// With extended thinking, the fallback also includes the thinking budget so
 /// this many tokens remain available for the reply.
 pub const DEFAULT_MAX_TOKENS: u64 = 8192;
+
+/// Output ceiling for an adaptive-thinking model when the plan names none.
+///
+/// Thinking shares the ceiling with the reply, so it needs more room than
+/// `DEFAULT_MAX_TOKENS`.
+pub const ADAPTIVE_MAX_TOKENS: u64 = 32_768;
 
 /// The dialect.
 #[derive(Clone, Copy, Debug, Default)]
@@ -85,17 +92,40 @@ impl Provider for Anthropic {
             merge_adjacent(&mut messages, encoded);
         }
 
-        let requested_budget = thinking_budget(plan.effort);
-        let max_tokens = plan
-            .max_output_tokens
-            .unwrap_or(DEFAULT_MAX_TOKENS.saturating_add(requested_budget.unwrap_or_default()));
+        let adaptive = matches!(
+            plan.traits.claude_thinking,
+            ClaudeThinking::Adaptive
+                | ClaudeThinking::AdaptiveAlwaysOn
+                | ClaudeThinking::AdaptiveBetweenTools
+        );
+        let requested_budget = if adaptive {
+            None
+        } else {
+            thinking_budget(plan.effort)
+        };
+        let max_tokens = plan.max_output_tokens.unwrap_or(if adaptive {
+            ADAPTIVE_MAX_TOKENS
+        } else {
+            DEFAULT_MAX_TOKENS.saturating_add(requested_budget.unwrap_or_default())
+        });
         let mut body = serde_json::Map::new();
         body.insert("model".to_owned(), serde_json::json!(plan.model));
         body.insert("max_tokens".to_owned(), serde_json::json!(max_tokens));
         body.insert("stream".to_owned(), serde_json::json!(true));
         body.insert("messages".to_owned(), serde_json::Value::Array(messages));
 
-        if let Some(budget) = requested_budget {
+        if adaptive {
+            let (thinking, effort) = adaptive_controls(plan);
+            if let Some(thinking) = thinking {
+                body.insert("thinking".to_owned(), thinking);
+            }
+            if let Some(effort) = effort {
+                body.insert(
+                    "output_config".to_owned(),
+                    serde_json::json!({ "effort": effort }),
+                );
+            }
+        } else if let Some(budget) = requested_budget {
             // Manual thinking needs at least 1024 tokens and a budget strictly
             // below the total output ceiling. Keep an explicit ceiling intact.
             if max_tokens <= 1024 {
@@ -152,7 +182,9 @@ impl Provider for Anthropic {
                 // The endpoint spells a required tool call `any`, not the
                 // `required` the OpenAI shapes use.
                 let choice = match plan.tool_choice {
-                    ToolChoice::Required => "any",
+                    ToolChoice::Required if plan.traits.forced_tool_choice => "any",
+                    // Models that refuse a forced choice get the closest one they accept.
+                    ToolChoice::Required => "auto",
                     other => other.as_str(),
                 };
                 let mut choice = serde_json::json!({ "type": choice });
@@ -166,6 +198,35 @@ impl Provider for Anthropic {
         mark_cache_breakpoints(&mut body);
         Ok(serde_json::Value::Object(body))
     }
+}
+
+/// Returns the `thinking` and `output_config.effort` values for a model with
+/// adaptive thinking.
+fn adaptive_controls(plan: &RequestPlan) -> (Option<serde_json::Value>, Option<&'static str>) {
+    let effort = match plan.effort {
+        Effort::Auto => return (None, None),
+        Effort::None => {
+            return match plan.traits.claude_thinking {
+                // Thinking cannot be turned off, so ask for as little as possible.
+                ClaudeThinking::AdaptiveAlwaysOn => (None, Some("low")),
+                ClaudeThinking::AdaptiveBetweenTools => {
+                    (Some(serde_json::json!({ "type": "between_tools" })), None)
+                }
+                _ => (Some(serde_json::json!({ "type": "disabled" })), None),
+            };
+        }
+        Effort::Minimal | Effort::Low => "low",
+        Effort::Medium => "medium",
+        Effort::High => "high",
+        Effort::Xhigh if !plan.traits.efforts.contains(&Effort::Xhigh) => "high",
+        Effort::Xhigh => "xhigh",
+        Effort::Max => "max",
+    };
+    let mut thinking = serde_json::json!({ "type": "adaptive" });
+    if plan.show_reasoning {
+        thinking["display"] = serde_json::json!("summarized");
+    }
+    (Some(thinking), Some(effort))
 }
 
 /// Encodes one message into a role with content blocks.
@@ -1415,6 +1476,243 @@ mod tests {
         assert_eq!(thinking_budget(Effort::Minimal), Some(1024));
         assert_eq!(thinking_budget(Effort::Max), Some(65_536));
         assert!(thinking_budget(Effort::High) > thinking_budget(Effort::Low));
+    }
+
+    /// Returns a plan for a Claude model with the traits the resolver gives it.
+    fn claude_plan(model: &str, effort: Effort) -> RequestPlan {
+        let mut plan = plan_with_user("hi");
+        plan.model = model.to_owned();
+        plan.traits = crate::compat::resolve("anthropic", None, model).1;
+        plan.effort = effort;
+        plan
+    }
+
+    fn with_tool(mut plan: RequestPlan, choice: ToolChoice) -> RequestPlan {
+        plan.tools = vec![ToolSpec {
+            name: "read".to_owned(),
+            description: "read a file".to_owned(),
+            input_schema: serde_json::json!({"type": "object"}),
+        }];
+        plan.tool_choice = choice;
+        plan
+    }
+
+    #[test]
+    fn every_claude_row_maps_each_effort() {
+        let adaptive = serde_json::json!({"type": "adaptive"});
+        let disabled = serde_json::json!({"type": "disabled"});
+        let between = serde_json::json!({"type": "between_tools"});
+        let absent = serde_json::Value::Null;
+        let effort = |level: &str| serde_json::json!({ "effort": level });
+        // (model, effort, thinking, output_config)
+        let rows = [
+            ("claude-opus-5-5", Effort::Auto, &absent, absent.clone()),
+            ("claude-opus-5-5", Effort::None, &absent, effort("low")),
+            ("claude-opus-5-5", Effort::Minimal, &adaptive, effort("low")),
+            ("claude-opus-5-5", Effort::Low, &adaptive, effort("low")),
+            (
+                "claude-opus-5-5",
+                Effort::Medium,
+                &adaptive,
+                effort("medium"),
+            ),
+            ("claude-opus-5-5", Effort::High, &adaptive, effort("high")),
+            ("claude-opus-5-5", Effort::Xhigh, &adaptive, effort("xhigh")),
+            ("claude-opus-5-5", Effort::Max, &adaptive, effort("max")),
+            ("claude-fable-5-1", Effort::None, &absent, effort("low")),
+            ("claude-sonnet-5-5", Effort::Auto, &absent, absent.clone()),
+            ("claude-sonnet-5-5", Effort::None, &between, absent.clone()),
+            (
+                "claude-sonnet-5-5",
+                Effort::Minimal,
+                &adaptive,
+                effort("low"),
+            ),
+            ("claude-sonnet-5-5", Effort::Low, &adaptive, effort("low")),
+            (
+                "claude-sonnet-5-5",
+                Effort::Medium,
+                &adaptive,
+                effort("medium"),
+            ),
+            ("claude-sonnet-5-5", Effort::High, &adaptive, effort("high")),
+            (
+                "claude-sonnet-5-5",
+                Effort::Xhigh,
+                &adaptive,
+                effort("xhigh"),
+            ),
+            ("claude-sonnet-5-5", Effort::Max, &adaptive, effort("max")),
+            ("claude-opus-4-7", Effort::Auto, &absent, absent.clone()),
+            ("claude-opus-4-7", Effort::None, &disabled, absent.clone()),
+            ("claude-opus-4-7", Effort::Minimal, &adaptive, effort("low")),
+            ("claude-opus-4-7", Effort::Low, &adaptive, effort("low")),
+            (
+                "claude-opus-4-7",
+                Effort::Medium,
+                &adaptive,
+                effort("medium"),
+            ),
+            ("claude-opus-4-7", Effort::High, &adaptive, effort("high")),
+            ("claude-opus-4-7", Effort::Xhigh, &adaptive, effort("xhigh")),
+            ("claude-opus-4-7", Effort::Max, &adaptive, effort("max")),
+            ("claude-haiku-5-5", Effort::None, &disabled, absent.clone()),
+            ("claude-opus-4-6", Effort::Xhigh, &adaptive, effort("high")),
+            (
+                "claude-sonnet-4-6",
+                Effort::Xhigh,
+                &adaptive,
+                effort("high"),
+            ),
+            ("claude-sonnet-4-6", Effort::Max, &adaptive, effort("max")),
+        ];
+        for (model, level, thinking, output_config) in rows {
+            let body = Anthropic
+                .build_request(&claude_plan(model, level))
+                .expect("build");
+            assert_eq!(body["thinking"], *thinking, "{model} {level:?}");
+            assert_eq!(body["output_config"], output_config, "{model} {level:?}");
+        }
+    }
+
+    #[test]
+    fn an_older_claude_keeps_its_thinking_budget() {
+        let body = Anthropic
+            .build_request(&claude_plan("claude-haiku-4-5", Effort::High))
+            .expect("build");
+        assert_eq!(
+            body["thinking"],
+            serde_json::json!({"type": "enabled", "budget_tokens": 16_384})
+        );
+        assert_eq!(body["max_tokens"], DEFAULT_MAX_TOKENS + 16_384);
+        assert!(body.get("output_config").is_none());
+        let opus = Anthropic
+            .build_request(&claude_plan("claude-opus-4-5-20251101", Effort::Low))
+            .expect("build");
+        assert_eq!(opus["thinking"]["budget_tokens"], 2048);
+    }
+
+    #[test]
+    fn forced_tool_choice_degrades_where_refused() {
+        for model in ["claude-fable-5-1", "claude-opus-5-5", "claude-sonnet-5-5"] {
+            let body = Anthropic
+                .build_request(&with_tool(
+                    claude_plan(model, Effort::High),
+                    ToolChoice::Required,
+                ))
+                .expect("build");
+            assert_eq!(
+                body["tool_choice"],
+                serde_json::json!({"type": "auto"}),
+                "{model}"
+            );
+            let mut single = with_tool(claude_plan(model, Effort::High), ToolChoice::Required);
+            single.parallel_tool_calls = false;
+            let body = Anthropic.build_request(&single).expect("build");
+            assert_eq!(
+                body["tool_choice"],
+                serde_json::json!({"type": "auto", "disable_parallel_tool_use": true}),
+                "{model}"
+            );
+        }
+        for model in ["claude-opus-4-7", "claude-fable-5"] {
+            let body = Anthropic
+                .build_request(&with_tool(
+                    claude_plan(model, Effort::High),
+                    ToolChoice::Required,
+                ))
+                .expect("build");
+            assert_eq!(
+                body["tool_choice"],
+                serde_json::json!({"type": "any"}),
+                "{model}"
+            );
+        }
+    }
+
+    #[test]
+    fn tool_choice_none_is_sent_with_adaptive_thinking() {
+        for model in [
+            "claude-opus-5-5",
+            "claude-sonnet-5-5",
+            "claude-opus-4-7",
+            "claude-fable-5-1",
+        ] {
+            let body = Anthropic
+                .build_request(&with_tool(
+                    claude_plan(model, Effort::High),
+                    ToolChoice::None,
+                ))
+                .expect("build");
+            assert_eq!(
+                body["tool_choice"],
+                serde_json::json!({"type": "none"}),
+                "{model}"
+            );
+            assert_eq!(body["thinking"]["type"], "adaptive", "{model}");
+        }
+    }
+
+    #[test]
+    fn a_session_asks_for_summarized_thinking() {
+        let mut plan = claude_plan("claude-opus-5-5", Effort::High);
+        plan.show_reasoning = true;
+        let body = Anthropic.build_request(&plan).expect("build");
+        assert_eq!(
+            body["thinking"],
+            serde_json::json!({"type": "adaptive", "display": "summarized"})
+        );
+        let quiet = Anthropic
+            .build_request(&claude_plan("claude-opus-5-5", Effort::High))
+            .expect("build");
+        assert_eq!(quiet["thinking"], serde_json::json!({"type": "adaptive"}));
+        // `between_tools` accepts no other field.
+        let mut off = claude_plan("claude-sonnet-5-5", Effort::None);
+        off.show_reasoning = true;
+        let body = Anthropic.build_request(&off).expect("build");
+        assert_eq!(
+            body["thinking"],
+            serde_json::json!({"type": "between_tools"})
+        );
+    }
+
+    #[test]
+    fn no_sampling_parameter_reaches_claude() {
+        for model in [
+            "claude-opus-5-5",
+            "claude-sonnet-5-5",
+            "claude-fable-5-1",
+            "claude-opus-4-7",
+            "claude-opus-4-6",
+            "claude-haiku-4-5",
+            "claude-3-5-sonnet-20241022",
+            "claude",
+        ] {
+            for &level in crate::provider::ALL_EFFORTS {
+                let body = Anthropic
+                    .build_request(&claude_plan(model, level))
+                    .expect("build");
+                for field in ["temperature", "top_p", "top_k"] {
+                    assert!(body.get(field).is_none(), "{model} {level:?} {field}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn an_adaptive_model_without_a_known_ceiling_gets_room_to_think() {
+        for model in ["claude-opus-5-5", "claude-sonnet-5-5", "claude-opus-4-7"] {
+            for &level in crate::provider::ALL_EFFORTS {
+                let body = Anthropic
+                    .build_request(&claude_plan(model, level))
+                    .expect("build");
+                assert_eq!(body["max_tokens"], ADAPTIVE_MAX_TOKENS, "{model} {level:?}");
+            }
+        }
+        let mut known = claude_plan("claude-opus-5-5", Effort::Max);
+        known.max_output_tokens = Some(4096);
+        let body = Anthropic.build_request(&known).expect("build");
+        assert_eq!(body["max_tokens"], 4096);
     }
 
     /// Runs a reducer over frames.
