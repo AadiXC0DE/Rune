@@ -25,6 +25,7 @@ const SCENARIOS: &[&str] = &[
     "time_limit",
     "spend_limit",
     "max_cost_without_prices",
+    "parallel_reads",
 ];
 
 /// Scenarios built in Rust, which have no file.
@@ -275,6 +276,68 @@ fn rate_limited_then_ok_jsonl_reports_the_retry() {
     assert_eq!(retries.len(), 1, "{records:?}");
     assert_eq!(retries[0]["kind"], "rate_limited");
     assert_eq!(retries[0]["attempt"], 2);
+}
+
+/// The order of `tool_call` and `tool_result` records in a run of
+/// `parallel_reads` with these global flags.
+fn tool_record_order(global_args: &[&str]) -> Vec<String> {
+    let path = directory().join("parallel_reads.json");
+    let mut loaded = scenario::load(&path).unwrap_or_else(|err| panic!("{err}"));
+    loaded.global_args = global_args.iter().map(|arg| (*arg).to_owned()).collect();
+    let report = scenario::run(Path::new(env!("CARGO_BIN_EXE_rune")), &loaded);
+    let failures = scenario::check(&loaded, &report);
+    assert!(
+        failures.is_empty(),
+        "{}\n{}",
+        failures.join("\n"),
+        report.stderr
+    );
+    report
+        .stdout
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("a record"))
+        .filter_map(|record| record["type"].as_str().map(str::to_owned))
+        .filter(|kind| kind == "tool_call" || kind == "tool_result")
+        .collect()
+}
+
+#[test]
+fn parallel_reads() {
+    // Every read starts before the first one is answered.
+    let order = tool_record_order(&[]);
+    assert_eq!(
+        order,
+        [
+            "tool_call",
+            "tool_call",
+            "tool_call",
+            "tool_call",
+            "tool_result",
+            "tool_result",
+            "tool_result",
+            "tool_result"
+        ],
+        "{order:?}"
+    );
+}
+
+#[test]
+fn parallel_reads_run_in_order_at_a_limit_of_one() {
+    let order = tool_record_order(&["--limit", "parallel_tool_calls=1"]);
+    assert_eq!(
+        order,
+        [
+            "tool_call",
+            "tool_result",
+            "tool_call",
+            "tool_result",
+            "tool_call",
+            "tool_result",
+            "tool_call",
+            "tool_result"
+        ],
+        "{order:?}"
+    );
 }
 
 #[test]

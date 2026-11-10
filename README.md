@@ -564,8 +564,10 @@ as `2026-11-10T09:12:03.123Z`, and a count the provider did not report is `null`
 | `plan_updated` | `update` |
 | `final` | `result`, with the same fields as `--json`, including failures and saved session IDs |
 
-A step's `step_finish` comes after its text and before its tool calls, and each
-`tool_call` is followed by its `tool_result`. The sum of `step_finish` input
+A step's `step_finish` comes after its text and before its tool calls. Each
+`tool_call` comes before its `tool_result`; independent reads in one reply run
+together, so several `tool_call` records can come before their results, which
+are matched by `id`. The sum of `step_finish` input
 tokens is the run's input usage, except summary requests, which only `final`
 counts. Deltas from earlier tool steps are intermediate text; the answer is in
 `final`. Diagnostics go only to stderr. Each record is capped at 1 MiB including

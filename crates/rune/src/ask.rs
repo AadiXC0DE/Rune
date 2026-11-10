@@ -11,7 +11,6 @@
 //! provider did not report is `null`, and a reported zero stays `0`, because the
 //! difference matters to a caller summing them.
 
-use std::cell::{Cell, RefCell};
 use std::io::Write;
 
 use rune_agent::history::History;
@@ -507,42 +506,42 @@ struct AskHost<'a> {
     limits: BudgetSet,
     steering: SteeringQueue,
     cancellation: Cancellation,
-    incomplete_tool_call: Cell<bool>,
+    incomplete_tool_call: std::sync::atomic::AtomicBool,
     jsonl: bool,
-    step: Cell<u32>,
-    emit_error: RefCell<Option<RuneError>>,
+    step: std::sync::atomic::AtomicU32,
+    emit_error: std::sync::Mutex<Option<RuneError>>,
     /// The model's context window, which decides when the run compacts.
     window: rune_agent::compaction::Window,
     /// Usage of summary requests, which the turn's own usage does not count.
-    compaction_usage: Cell<Usage>,
+    compaction_usage: std::sync::Mutex<Usage>,
     /// The request `prepare_request` serialized, for the loop to send.
-    encoded_request: RefCell<Option<String>>,
+    encoded_request: std::sync::Mutex<Option<String>>,
     /// Prices of the model, when known, to estimate what the run spends.
     prices: Option<rune_net::models_dev::Prices>,
     /// Estimated spend so far in millionths of a dollar; unknown until a
     /// priced response arrives.
-    spent: Cell<Option<u64>>,
+    spent: std::sync::Mutex<Option<u64>>,
     /// Spending limit in millionths of a dollar.
     spend_limit: Option<u64>,
     /// Calls of the current step that have a `tool_call` record.
-    announced: RefCell<std::collections::BTreeSet<String>>,
+    announced: std::sync::Mutex<std::collections::BTreeSet<String>>,
 }
 
 impl AskHost<'_> {
     /// Writes one JSONL record; a failure to write cancels the run once.
     fn record(&self, write: impl FnOnce(&mut std::io::StdoutLock<'_>) -> Result<()>) {
-        if !self.jsonl || self.emit_error.borrow().is_some() {
+        if !self.jsonl || lock(&self.emit_error).is_some() {
             return;
         }
         if let Err(error) = write(&mut std::io::stdout().lock()) {
-            *self.emit_error.borrow_mut() = Some(error);
+            *lock(&self.emit_error) = Some(error);
             self.cancellation.cancel();
         }
     }
 
     /// Writes the `tool_call` record for a call, once per call.
     fn announce(&self, out: &mut std::io::StdoutLock<'_>, call: &turn::PreparedCall) -> Result<()> {
-        if !self.announced.borrow_mut().insert(call.id.clone()) {
+        if !lock(&self.announced).insert(call.id.clone()) {
             return Ok(());
         }
         let arguments = serde_json::from_str(&call.arguments)
@@ -550,7 +549,7 @@ impl AskHost<'_> {
         write_jsonl(
             out,
             &JsonlEvent::ToolCall {
-                step: self.step.get(),
+                step: self.step.load(std::sync::atomic::Ordering::Relaxed),
                 id: &call.id,
                 name: &call.name,
                 arguments,
@@ -562,8 +561,8 @@ impl AskHost<'_> {
     /// Adds one request's estimated cost to the run's spend.
     fn add_spend(&self, usage: &Usage) {
         if let Some(cost) = self.prices.and_then(|prices| prices.cost(usage)) {
-            self.spent
-                .set(Some(self.spent.get().unwrap_or(0).saturating_add(cost)));
+            let mut spent = lock(&self.spent);
+            *spent = Some(spent.unwrap_or(0).saturating_add(cost));
         }
     }
 }
@@ -625,12 +624,12 @@ impl Host for AskHost<'_> {
         client: &dyn rune_net::fetch::Fetch,
     ) -> Result<()> {
         // Checked before compacting, whose summary request costs money too.
-        crate::spend::check(self.spent.get(), self.spend_limit, "run").map_err(|err| {
+        crate::spend::check(*lock(&self.spent), self.spend_limit, "run").map_err(|err| {
             err.with_hint("raise it with --max-cost, or with session_spend_cents")
         })?;
         let (_, encoded) =
             rune_agent::compaction::auto_compact_encoded(history, plan, self, client, self.window)?;
-        *self.encoded_request.borrow_mut() = Some(encoded);
+        *lock(&self.encoded_request) = Some(encoded);
         Ok(())
     }
 
@@ -643,14 +642,21 @@ impl Host for AskHost<'_> {
         rune_agent::compaction::compact_now(history, self, client)
     }
 
+    #[cfg(not(target_family = "wasm"))]
+    fn concurrent_tool_host(&self, name: &str) -> Option<&(dyn Host + Sync)> {
+        // Independent reads in one reply run together, as in the session.
+        self.registry.get(name)?.is_read_only().then_some(self)
+    }
+
     fn take_encoded_request(&self) -> Option<String> {
-        self.encoded_request.borrow_mut().take()
+        lock(&self.encoded_request).take()
     }
 
     fn context_replaced(&self, report: &rune_agent::compaction::CompactionReport) {
         self.mapped.refresh();
-        self.compaction_usage
-            .set(self.compaction_usage.get().merge_sum(report.usage));
+        let mut usage = lock(&self.compaction_usage);
+        *usage = usage.merge_sum(report.usage);
+        drop(usage);
         self.add_spend(&report.usage);
     }
 
@@ -668,7 +674,7 @@ impl Host for AskHost<'_> {
 
     fn observe_response(&self, outcome: &StreamOutcome) {
         self.add_spend(&outcome.usage);
-        let step = self.step.get();
+        let step = self.step.load(std::sync::atomic::Ordering::Relaxed);
         self.record(|out| {
             let reasoning = outcome.reasoning();
             if !reasoning.trim().is_empty() {
@@ -696,17 +702,18 @@ impl Host for AskHost<'_> {
                 },
             )
         });
-        self.incomplete_tool_call.set(
+        self.incomplete_tool_call.store(
             outcome.finish == Some(FinishReason::ToolCalls) && outcome.tool_calls().is_empty(),
+            std::sync::atomic::Ordering::Relaxed,
         );
     }
 
     fn emit(&self, event: Event) {
         if let Event::TurnStarted { step } = event {
-            self.step.set(step);
-            self.announced.borrow_mut().clear();
+            self.step.store(step, std::sync::atomic::Ordering::Relaxed);
+            lock(&self.announced).clear();
         }
-        let step = self.step.get();
+        let step = self.step.load(std::sync::atomic::Ordering::Relaxed);
         self.record(|out| match &event {
             Event::TurnStarted { step } => write_jsonl(
                 out,
@@ -971,22 +978,22 @@ pub fn run(
         context,
         steering: SteeringQueue::from_limits(&limits),
         cancellation: Cancellation::new(),
-        incomplete_tool_call: Cell::new(false),
+        incomplete_tool_call: std::sync::atomic::AtomicBool::new(false),
         jsonl: options.jsonl,
-        step: Cell::new(0),
-        emit_error: RefCell::new(None),
+        step: std::sync::atomic::AtomicU32::new(0),
+        emit_error: std::sync::Mutex::new(None),
         window: rune_agent::compaction::Window(
             settings
                 .context_window
                 .or_else(|| crate::provider_setup::cached_context_window(settings, paths))
                 .unwrap_or(rune_net::catalog::DEFAULT_CONTEXT_WINDOW),
         ),
-        compaction_usage: Cell::new(Usage::default()),
-        encoded_request: RefCell::new(None),
+        compaction_usage: std::sync::Mutex::new(Usage::default()),
+        encoded_request: std::sync::Mutex::new(None),
         prices,
-        spent: Cell::new(None),
+        spent: std::sync::Mutex::new(None),
         spend_limit,
-        announced: RefCell::new(std::collections::BTreeSet::new()),
+        announced: std::sync::Mutex::new(std::collections::BTreeSet::new()),
         limits,
     };
     let watchdog = options.timeout.map(|limit| {
@@ -1026,17 +1033,20 @@ pub fn run(
         }
         (_, outcome) => outcome,
     };
-    if let Some(error) = host.emit_error.borrow_mut().take() {
+    if let Some(error) = lock(&host.emit_error).take() {
         return Err(error);
     }
     let outcome = outcome?;
     // Summary requests are billed too, so they are part of what the run used.
-    let usage = outcome.usage.merge_sum(host.compaction_usage.get());
+    let usage = outcome.usage.merge_sum(*lock(&host.compaction_usage));
     // A turn that failed after a completed request still reports its usage,
     // steps and calls, with the failure as the error.
     let error = if let Some(error) = outcome.error.clone() {
         Some(error)
-    } else if host.incomplete_tool_call.get() {
+    } else if host
+        .incomplete_tool_call
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
         Some(RuneError::new(
             ErrorCode::UnsupportedToolCall,
             "the provider requested tools without a completed tool call",
@@ -1198,6 +1208,13 @@ impl rune_net::fetch::Fetch for CancellableFetch {
     }
 }
 
+/// Locks a host field, recovering it if a panicking holder poisoned it.
+fn lock<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// Cancels a run at its deadline, from a thread of its own.
 struct Watchdog {
     done: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -1336,6 +1353,13 @@ pub fn report(result: &JsonResult, options: &Options) -> Result<u8> {
 mod tests {
     use super::*;
     use rune_core::config::{EnvironmentOverrides, Provider};
+
+    #[test]
+    fn ask_host_is_sync() {
+        // Parallel reads hand the host to worker threads.
+        fn assert_sync<T: Sync>() {}
+        assert_sync::<AskHost<'static>>();
+    }
 
     #[test]
     fn tool_result_preview_cuts_at_a_character_boundary() {

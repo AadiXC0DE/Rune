@@ -39,6 +39,8 @@ Notable changes, newest first. Each entry describes what a user can observe.
 - `rune ask` compacts a long run before it reaches the context window, as the
   interactive session does, and counts the summary requests in its usage and
   cost.
+- `rune ask` runs independent read-only calls in one reply at the same time, as
+  the interactive session does (`parallel_tool_calls` still caps them).
 - `rune ask --jsonl` streams tool calls, tool results, per-step usage and
   cost, reasoning, retries and compactions with timestamps; the `start` record
   gains `schema` 2, the session id, model, provider, workspace and version, and
