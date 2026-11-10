@@ -492,7 +492,6 @@ impl Host for SessionHost {
         plan: &mut rune_net::provider::RequestPlan,
         client: &dyn rune_net::fetch::Fetch,
     ) -> Result<()> {
-        use rune_agent::compaction::{self, Trigger};
         self.check_spend()?;
         let estimate = request_estimate(self, plan)?;
         if self.context_used.load(std::sync::atomic::Ordering::Relaxed) == 0
@@ -504,44 +503,30 @@ impl Host for SessionHost {
         {
             self.record_context_estimate(estimate.input_tokens);
         }
-        let compaction_plan = compaction::plan(history, &self.limits);
-        let retained_estimate = if let Some(cut) = &compaction_plan {
-            let mut retained_plan = plan.clone();
-            let mut retained_history = history.clone();
-            retained_history.keep_from(cut.cut_at);
-            retained_plan.messages = retained_history.to_messages();
-            request_estimate(self, &retained_plan)?
-        } else {
-            estimate
-        };
-        match compaction::trigger(&estimate, &retained_estimate, &self.limits) {
-            Trigger::NotNeeded | Trigger::Approaching => return Ok(()),
-            Trigger::Impossible => return Err(compaction::cannot_fit_error()),
-            Trigger::Required => {}
+        let window = rune_agent::compaction::Window(
+            self.context_limit
+                .load(std::sync::atomic::Ordering::Relaxed),
+        );
+        if let Some(done) =
+            rune_agent::compaction::auto_compact(history, plan, self, client, window)?
+        {
+            self.record_context_estimate(done.after_tokens);
         }
-        let Some(compaction_plan) = compaction_plan else {
-            // A short conversation can cross the trigger while still fitting.
-            return Ok(());
-        };
-        let removed = summarize_history(self, history, &compaction_plan, client, false, &|| {
-            self.cancellation.is_cancelled()
-        })?;
+        Ok(())
+    }
+
+    fn before_compaction(&self, history: &History) {
+        self.capture_history(history);
+    }
+
+    fn context_replaced(&self, report: &rune_agent::compaction::CompactionReport) {
         // The history prefix changed, so the cache is already lost; this is
         // where a fresh map costs nothing extra.
         self.mapped.refresh();
-        plan.instructions = self.instructions();
-        plan.messages = history.to_messages();
-        self.emit(Event::ContextCompacted {
-            removed_turns: removed,
-            remaining_turns: history.len(),
-        });
         self.forget_context();
-        let compacted_estimate = request_estimate(self, plan)?;
-        self.record_context_estimate(compacted_estimate.input_tokens);
-        if compacted_estimate.input_tokens > estimate.capacity {
-            return Err(compaction::cannot_fit_error());
-        }
-        Ok(())
+        self.transcript_history_len
+            .store(report.remaining_turns, std::sync::atomic::Ordering::Relaxed);
+        self.record_usage(&report.usage);
     }
 
     fn record_child_usage(&self, model: &str, usage: &rune_net::stream::Usage) {
@@ -698,6 +683,7 @@ impl Host for SessionHost {
             Event::ContextCompacted {
                 removed_turns,
                 remaining_turns,
+                ..
             } => self.draw_notice(&format!(
                 "compacted {removed_turns} earlier turn(s); {remaining_turns} turn(s) remain"
             )),
@@ -4315,19 +4301,12 @@ fn compact_history(
         );
     }
 
-    match summarize_history(
-        host,
-        history,
-        &plan,
-        &rune_net::transport::agent(),
-        true,
-        &|| false,
-    ) {
-        Ok(removed) => {
-            host.mapped.refresh();
+    match compact_session(host, history, &plan, &rune_net::transport::agent(), true) {
+        Ok(done) => {
+            let removed = done.removed_turns;
             // The meter keeps the largest reading, so without a reset it would
-            // go on showing the size of the conversation before compaction.
-            host.forget_context();
+            // go on showing the size of the conversation before compaction;
+            // `context_replaced` cleared it.
             if let Err(err) = host.estimate_context(history) {
                 host.draw_notice(&format!("context size was not estimated: {err}"));
             }
@@ -4350,105 +4329,54 @@ fn request_estimate(
     host: &SessionHost,
     plan: &rune_net::provider::RequestPlan,
 ) -> Result<rune_agent::tokens::Estimate> {
-    let body = host.dialect.build_request(plan)?;
-    let bytes = serde_json::to_vec(&body)
-        .map_err(|err| RuneError::new(ErrorCode::Internal, err.to_string()))?
-        .len() as u64;
-    // Include dialect defaults such as Anthropic's max_tokens reserve.
-    let output = ["max_tokens", "max_completion_tokens", "max_output_tokens"]
-        .iter()
-        .find_map(|key| body.get(key).and_then(serde_json::Value::as_u64))
-        .unwrap_or(0);
-    let capacity = rune_agent::tokens::usable_input_tokens(
-        host.context_limit
-            .load(std::sync::atomic::Ordering::Relaxed),
-        output,
-    );
-    Ok(rune_agent::tokens::Estimate::new(
-        bytes,
-        rune_agent::tokens::estimate_tokens(bytes),
-        capacity,
-    ))
+    rune_agent::compaction::request_estimate(
+        host.dialect.as_ref(),
+        plan,
+        rune_agent::compaction::Window(
+            host.context_limit
+                .load(std::sync::atomic::Ordering::Relaxed),
+        ),
+    )
 }
 
-/// Shares the summarizer between manual and automatic compaction.
-/// History changes only after a usable summary has arrived.
-fn summarize_history(
+/// Keeps the turns a manual compaction removes in the session's archive.
+struct RecorderArchive<'a>(&'a Mutex<Recorder>);
+
+impl rune_agent::compaction::Archive for RecorderArchive<'_> {
+    fn archive(&self, removed: &[rune_agent::history::Turn]) -> Result<()> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .archive_messages(removed)
+    }
+}
+
+/// Runs the shared summarizer for this session, archiving the removed turns
+/// first when `archive` is set, and records what it did.
+fn compact_session(
     host: &SessionHost,
     history: &mut History,
     plan: &rune_agent::compaction::Plan,
     client: &dyn rune_net::fetch::Fetch,
     archive: bool,
-    cancelled: &dyn Fn() -> bool,
-) -> Result<usize> {
-    turn::check_objective_budget(host)?;
-    let request = rune_agent::compaction::render_summary_request(history, plan);
-    let mut request_plan = rune_net::provider::RequestPlan::new(host.model());
-    rune_agent::compaction::SUMMARY_INSTRUCTIONS.clone_into(&mut request_plan.instructions);
-    request_plan.messages = rune_net::transport::one_shot_messages(&request);
-    let mut accounting = turn::ObjectiveAccounting::begin(host, &mut request_plan)?;
-    let response = rune_net::transport::stream_completion_observed(
-        client,
-        &host.endpoint,
-        host.dialect.as_ref(),
-        &request_plan,
-        rune_net::transport::RequestTimeouts {
-            head: compaction_timeout(host),
-            ..rune_net::transport::RequestTimeouts::from_limits(&host.limits)
-        },
-        cancelled,
-        &mut |event| accounting.observe(event),
-    );
-    accounting.finish(host, response.as_ref().ok().map(|outcome| outcome.usage))?;
-    let outcome = response.map_err(|err| {
-        RuneError::new(
-            err.kind().code(),
-            format!("compaction failed, nothing was changed: {err}"),
-        )
-    })?;
-    if outcome.finish == Some(rune_net::stream::FinishReason::MaxTokens) {
-        return Err(RuneError::new(
-            ErrorCode::InvalidState,
-            "compaction produced an incomplete summary: the summarizer reached the token limit; nothing was changed",
-        ));
-    }
-    let summary = outcome.text();
-    rune_agent::compaction::validate_summary(&summary).map_err(|err| {
-        RuneError::new(
-            err.code(),
-            format!("compaction produced nothing usable: {err}"),
-        )
-    })?;
-    if archive {
-        let recorder = host.recorder.as_ref().ok_or_else(|| {
+) -> Result<rune_agent::compaction::CompactionReport> {
+    let recorder = if archive {
+        Some(host.recorder.as_ref().ok_or_else(|| {
             RuneError::new(
                 ErrorCode::InvalidState,
                 "manual compaction requires a session archive",
             )
-        })?;
-        recorder
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .archive_messages(&history.turns()[..plan.removed_turns])
-            .map_err(|err| {
-                RuneError::new(
-                    err.code(),
-                    format!(
-                        "compaction could not archive original messages; history unchanged: {err}"
-                    ),
-                )
-            })?;
-    }
-    host.capture_history(history);
-    let removed = rune_agent::compaction::apply(
-        history,
-        plan,
-        rune_agent::compaction::wrap_summary(&summary),
-    );
-    host.transcript_history_len
-        .store(history.len(), std::sync::atomic::Ordering::Relaxed);
-    host.record_usage(&outcome.usage);
-    Ok(removed)
+        })?)
+    } else {
+        None
+    };
+    let archive = recorder.map(|recorder| RecorderArchive(recorder));
+    let archive: Option<&dyn rune_agent::compaction::Archive> = archive
+        .as_ref()
+        .map(|archive| -> &dyn rune_agent::compaction::Archive { archive });
+    let report = rune_agent::compaction::compact(history, plan, host, client, archive, &|| false)?;
+    host.context_replaced(&report);
+    Ok(report)
 }
 
 /// Commits one line of command output through the renderer.
@@ -4456,20 +4384,6 @@ fn report(host: &SessionHost, sink: &mut LockedSink, line: &str) -> Result<Step>
     flush_lines(host, sink, &output_lines(line.as_bytes()))?;
     Ok(Step::Continue)
 }
-
-/// How long a compaction request waits.
-///
-/// Taken from the configured head timeout, so a slow endpoint that has been
-/// given more room to answer is not cut off here at a smaller number.
-fn compaction_timeout(host: &SessionHost) -> std::time::Duration {
-    host.limits
-        .get_usize(rune_core::budget::LimitName::ProviderHeadTimeoutMs)
-        .try_into()
-        .map_or(DEFAULT_COMPACTION_TIMEOUT, std::time::Duration::from_millis)
-}
-
-/// How long a compaction request waits when no limit is configured.
-const DEFAULT_COMPACTION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// Puts back what the session changed and reports each file.
 ///
@@ -6619,9 +6533,9 @@ mod tests {
             "Earlier fixture work has been summarized. Continue the remaining task.",
         );
         let plan = rune_agent::compaction::plan(&history, &host.limits).expect("plan");
-        summarize_history(&host, &mut history, &plan, &client, false, &|| false).expect("summary");
+        compact_session(&host, &mut history, &plan, &client, false).expect("summary");
         assert_eq!(host.objective_tokens_remaining(), Some(0));
-        let err = summarize_history(&host, &mut history, &plan, &client, false, &|| false)
+        let err = compact_session(&host, &mut history, &plan, &client, false)
             .expect_err("blocked summary");
         assert_eq!(
             err.detail().invariant.as_deref(),
@@ -9575,7 +9489,7 @@ mod tests {
         let fetch = SummaryFixture::new(
             "The earlier fixture exchanges established the task and its current progress.",
         );
-        let error = summarize_history(&host, &mut history, &plan, &fetch, true, &|| false)
+        let error = compact_session(&host, &mut history, &plan, &fetch, true)
             .expect_err("archive failure must prevent replacement");
         assert_eq!(error.code(), ErrorCode::CorruptRecord);
         assert!(error.message().contains("history unchanged"));
@@ -9916,7 +9830,7 @@ mod tests {
                     .expect_err("automatic compaction must reject a truncated summary")
             } else {
                 let plan = rune_agent::compaction::plan(&history, &host.limits).expect("plan");
-                summarize_history(&host, &mut history, &plan, &fetch, true, &|| false)
+                compact_session(&host, &mut history, &plan, &fetch, false)
                     .expect_err("the shared summarizer must reject a truncated summary")
             };
             assert_eq!(error.code(), ErrorCode::InvalidState);

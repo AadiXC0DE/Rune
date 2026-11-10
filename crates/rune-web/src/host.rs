@@ -450,6 +450,7 @@ fn encode(event: &Event) -> serde_json::Value {
         Event::ContextCompacted {
             removed_turns,
             remaining_turns,
+            ..
         } => json!({
             "kind": "compacted",
             "removed_turns": removed_turns,

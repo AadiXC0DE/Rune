@@ -2398,6 +2398,69 @@ fn an_error_frame_is_surfaced_as_a_failure() {
     assert!(err.message().contains("overloaded"), "{}", err.message());
 }
 
+/// Six alternating turns, with a result cap small enough that compaction
+/// keeps only the last two.
+fn compactable(endpoint: MockEndpoint) -> (TestHost, rune_agent::History) {
+    let mut host = TestHost::new(endpoint);
+    host.limits
+        .set(
+            rune_core::LimitName::MaxToolResultBytes,
+            rune_core::budget::Budget::Bounded(1024),
+            rune_core::config::Layer::User,
+        )
+        .expect("result cap");
+    let mut history = rune_agent::History::new();
+    for index in 0..3 {
+        history.push_user(format!("question {index}"));
+        history.push_assistant(vec![rune_net::message::ContentPart::Text {
+            text: format!("answer {index}"),
+        }]);
+    }
+    (host, history)
+}
+
+#[test]
+fn compact_replaces_old_turns_and_returns_the_summary_usage() {
+    let endpoint = MockEndpoint::start(vec![Script::text(
+        "summary of the work so far, long enough to keep",
+    )]);
+    let (host, mut history) = compactable(endpoint);
+    let plan = rune_agent::compaction::plan(&history, &host.limits).expect("a plan");
+    let client = host.fetch();
+    let report =
+        rune_agent::compaction::compact(&mut history, &plan, &host, client.as_ref(), None, &|| {
+            false
+        })
+        .expect("compaction");
+    assert_eq!(report.removed_turns, plan.removed_turns);
+    assert_eq!(report.remaining_turns, history.len());
+    assert!(report.remaining_turns < 6);
+    let first = format!("{:?}", history.turns()[0].parts);
+    assert!(first.contains("<context_handoff>"), "{first}");
+    assert_eq!(report.usage.input_tokens, Some(10));
+    history.validate().expect("valid history");
+}
+
+#[test]
+fn compact_leaves_history_unchanged_on_a_short_summary() {
+    let endpoint = MockEndpoint::start(vec![Script::text("ok")]);
+    let (host, mut history) = compactable(endpoint);
+    let before = history.clone();
+    let plan = rune_agent::compaction::plan(&history, &host.limits).expect("a plan");
+    let client = host.fetch();
+    let err =
+        rune_agent::compaction::compact(&mut history, &plan, &host, client.as_ref(), None, &|| {
+            false
+        })
+        .expect_err("a two-byte summary is refused");
+    assert!(
+        err.message().contains("nothing usable"),
+        "{}",
+        err.message()
+    );
+    assert_eq!(history.turns(), before.turns());
+}
+
 fn single_attempt(mut host: TestHost) -> TestHost {
     host.limits
         .set(

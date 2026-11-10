@@ -17,8 +17,216 @@ use std::fmt::Write as _;
 use rune_core::budget::{BudgetSet, LimitName};
 use rune_core::error::{ErrorCode, Result, RuneError};
 
+use rune_net::fetch::Fetch;
+use rune_net::provider::{Provider, RequestPlan};
+use rune_net::stream::{FinishReason, Usage};
+use rune_net::transport::{self, RequestTimeouts};
+
 use crate::history::History;
 use crate::tokens::{CapacityDecision, Estimate, UsageTotals, decide_capacity};
+use crate::turn::{self, Event, Host};
+
+/// A model's context window, in tokens.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Window(pub u64);
+
+/// Keeps the turns a compaction removes, so they can be read back later.
+pub trait Archive {
+    /// Stores `removed` before the summary replaces them.
+    fn archive(&self, removed: &[crate::history::Turn]) -> Result<()>;
+}
+
+/// What one compaction did.
+#[derive(Clone, Copy, Debug)]
+pub struct CompactionReport {
+    /// Original turns replaced by the summary.
+    pub removed_turns: usize,
+    /// Turns left, including the summary.
+    pub remaining_turns: usize,
+    /// Usage of the summary request.
+    pub usage: Usage,
+}
+
+/// What an automatic compaction did, with the request size around it.
+#[derive(Clone, Copy, Debug)]
+pub struct AutoCompaction {
+    /// The compaction itself.
+    pub report: CompactionReport,
+    /// Estimated request tokens before.
+    pub before_tokens: u64,
+    /// Estimated request tokens after.
+    pub after_tokens: u64,
+}
+
+/// How long a compaction request waits when no limit is configured.
+pub const DEFAULT_COMPACTION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// How long a compaction request waits.
+///
+/// Taken from the configured head timeout, so a slow endpoint that has been
+/// given more room to answer is not cut off here at a smaller number.
+fn compaction_timeout(limits: &BudgetSet) -> std::time::Duration {
+    limits
+        .get_usize(LimitName::ProviderHeadTimeoutMs)
+        .try_into()
+        .map_or(DEFAULT_COMPACTION_TIMEOUT, std::time::Duration::from_millis)
+}
+
+/// Estimates the actual dialect body, including instructions and tool schemas.
+pub fn request_estimate(
+    dialect: &dyn Provider,
+    plan: &RequestPlan,
+    window: Window,
+) -> Result<Estimate> {
+    let body = dialect.build_request(plan)?;
+    let bytes = serde_json::to_vec(&body)
+        .map_err(|err| RuneError::new(ErrorCode::Internal, err.to_string()))?
+        .len() as u64;
+    // Include dialect defaults such as Anthropic's max_tokens reserve.
+    let output = ["max_tokens", "max_completion_tokens", "max_output_tokens"]
+        .iter()
+        .find_map(|key| body.get(key).and_then(serde_json::Value::as_u64))
+        .unwrap_or(0);
+    let capacity = crate::tokens::usable_input_tokens(window.0, output);
+    Ok(Estimate::new(
+        bytes,
+        crate::tokens::estimate_tokens(bytes),
+        capacity,
+    ))
+}
+
+/// Summarizes the turns `plan` removes and installs the summary.
+///
+/// The summary is produced by the model, because nothing else can compress a
+/// conversation without discarding what makes it useful. History changes only
+/// after a usable summary has arrived: a failed request, an incomplete or
+/// unusable summary, or a failed archive leaves it exactly as it was. The
+/// summary request's usage is returned, not recorded.
+pub fn compact(
+    history: &mut History,
+    plan: &Plan,
+    host: &dyn Host,
+    client: &dyn Fetch,
+    archive: Option<&dyn Archive>,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<CompactionReport> {
+    turn::check_objective_budget(host)?;
+    let limits = host.limits();
+    let request = render_summary_request(history, plan);
+    let mut request_plan = RequestPlan::new(host.model());
+    SUMMARY_INSTRUCTIONS.clone_into(&mut request_plan.instructions);
+    request_plan.messages = transport::one_shot_messages(&request);
+    let mut accounting = turn::ObjectiveAccounting::begin(host, &mut request_plan)?;
+    let response = transport::stream_completion_observed(
+        client,
+        host.endpoint(),
+        host.dialect(),
+        &request_plan,
+        RequestTimeouts {
+            head: compaction_timeout(&limits),
+            ..RequestTimeouts::from_limits(&limits)
+        },
+        cancelled,
+        &mut |event| accounting.observe(event),
+    );
+    accounting.finish(host, response.as_ref().ok().map(|outcome| outcome.usage))?;
+    let outcome = response.map_err(|err| {
+        RuneError::new(
+            err.kind().code(),
+            format!("compaction failed, nothing was changed: {err}"),
+        )
+    })?;
+    if outcome.finish == Some(FinishReason::MaxTokens) {
+        return Err(RuneError::new(
+            ErrorCode::InvalidState,
+            "compaction produced an incomplete summary: the summarizer reached the token limit; nothing was changed",
+        ));
+    }
+    let summary = outcome.text();
+    validate_summary(&summary).map_err(|err| {
+        RuneError::new(
+            err.code(),
+            format!("compaction produced nothing usable: {err}"),
+        )
+    })?;
+    if let Some(archive) = archive {
+        archive
+            .archive(&history.turns()[..plan.removed_turns])
+            .map_err(|err| {
+                RuneError::new(
+                    err.code(),
+                    format!(
+                        "compaction could not archive original messages; history unchanged: {err}"
+                    ),
+                )
+            })?;
+    }
+    host.before_compaction(history);
+    let removed_turns = apply(history, plan, wrap_summary(&summary));
+    Ok(CompactionReport {
+        removed_turns,
+        remaining_turns: history.len(),
+        usage: outcome.usage,
+    })
+}
+
+/// Compacts before a request when the trigger says it must.
+///
+/// Returns `Ok(None)` when no compaction was needed or none is possible yet
+/// because the conversation is short, and an error when the request cannot
+/// fit even after compacting. On success `request` is rebuilt from the new
+/// history.
+pub fn auto_compact(
+    history: &mut History,
+    request: &mut RequestPlan,
+    host: &dyn Host,
+    client: &dyn Fetch,
+    window: Window,
+) -> Result<Option<AutoCompaction>> {
+    let limits = host.limits();
+    let estimate = request_estimate(host.dialect(), request, window)?;
+    let compaction_plan = plan(history, &limits);
+    let retained_estimate = if let Some(cut) = &compaction_plan {
+        let mut retained_plan = request.clone();
+        let mut retained_history = history.clone();
+        retained_history.keep_from(cut.cut_at);
+        retained_plan.messages = retained_history.to_messages();
+        request_estimate(host.dialect(), &retained_plan, window)?
+    } else {
+        estimate
+    };
+    match trigger(&estimate, &retained_estimate, &limits) {
+        Trigger::NotNeeded | Trigger::Approaching => return Ok(None),
+        Trigger::Impossible => return Err(cannot_fit_error()),
+        Trigger::Required => {}
+    }
+    let Some(compaction_plan) = compaction_plan else {
+        // A short conversation can cross the trigger while still fitting.
+        return Ok(None);
+    };
+    let cancellation = host.cancellation();
+    let report = compact(history, &compaction_plan, host, client, None, &|| {
+        cancellation.is_cancelled()
+    })?;
+    host.context_replaced(&report);
+    request.instructions = host.instructions();
+    request.messages = history.to_messages();
+    let after = request_estimate(host.dialect(), request, window)?;
+    host.emit(Event::ContextCompacted {
+        removed_turns: report.removed_turns,
+        remaining_turns: history.len(),
+        before_tokens: estimate.input_tokens,
+        after_tokens: after.input_tokens,
+    });
+    if after.input_tokens > estimate.capacity {
+        return Err(cannot_fit_error());
+    }
+    Ok(Some(AutoCompaction {
+        report,
+        before_tokens: estimate.input_tokens,
+        after_tokens: after.input_tokens,
+    }))
+}
 
 /// Instruction given to the summarizer.
 ///

@@ -196,6 +196,10 @@ pub enum Event {
         removed_turns: usize,
         /// Turns remaining, including the summary.
         remaining_turns: usize,
+        /// Estimated request tokens before the compaction.
+        before_tokens: u64,
+        /// Estimated request tokens after it.
+        after_tokens: u64,
     },
     /// A turn that changed files without checking them was asked to verify.
     VerificationRequested,
@@ -332,6 +336,15 @@ pub trait Host {
     /// Observes a completed provider response before recording or executing it.
     /// Hosts may retain finish metadata needed by their output contract.
     fn observe_response(&self, _outcome: &StreamOutcome) {}
+
+    /// Called after a summary is accepted and before it replaces earlier turns.
+    fn before_compaction(&self, _history: &History) {}
+
+    /// Called after earlier turns were replaced, before the request is rebuilt.
+    ///
+    /// The report carries the summary request's usage, which no other path
+    /// records, so a host that counts usage adds it here.
+    fn context_replaced(&self, _report: &crate::compaction::CompactionReport) {}
 
     /// Records delegated provider usage without adding child conversation events.
     fn record_child_usage(&self, _model: &str, _usage: &Usage) {}
