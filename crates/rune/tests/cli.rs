@@ -2164,6 +2164,54 @@ fn connecting_with_the_key_exported_succeeds() {
 }
 
 #[test]
+fn an_alias_or_a_number_connects_under_the_preset_name() {
+    for (named, preset, variable, endpoint) in [
+        (
+            "kimi",
+            "moonshot",
+            "MOONSHOT_API_KEY",
+            "https://api.moonshot.ai/v1",
+        ),
+        (
+            "4",
+            "deepseek",
+            "DEEPSEEK_API_KEY",
+            "https://api.deepseek.com",
+        ),
+    ] {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let output = Command::new(binary())
+            .args(["connect", named, "--json"])
+            .isolated_env()
+            .env("HOME", dir.path())
+            .env("RUNE_HOME", dir.path().join("state"))
+            .env("XDG_CONFIG_HOME", dir.path().join("config"))
+            .env("XDG_DATA_HOME", dir.path().join("data"))
+            .env(variable, "scratch-key")
+            .output()
+            .expect("run binary");
+        assert!(
+            output.status.success(),
+            "{named}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let value: serde_json::Value = serde_json::from_slice(&output.stdout).expect("valid json");
+        assert_eq!(value["provider"], preset, "{named}");
+        let saved =
+            std::fs::read_to_string(dir.path().join("config").join("rune").join("config.toml"))
+                .expect("config written");
+        assert!(
+            saved.contains(&format!("provider = \"{preset}\"")),
+            "{named}: {saved}"
+        );
+        assert!(
+            saved.contains(&format!("base_url = \"{endpoint}\"")),
+            "{named}: {saved}"
+        );
+    }
+}
+
+#[test]
 fn concurrent_connect_processes_preserve_both_credentials_after_reopening() {
     use rune_core::paths::{self, Paths};
     use std::process::Stdio;

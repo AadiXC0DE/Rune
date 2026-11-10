@@ -9,7 +9,7 @@ Accepted anywhere on the command line.
 | Flag | Value | Description |
 |---|---|---|
 | `--model` | `id` | Override the model for this process. |
-| `--provider` | `name` | Override the provider for this process. |
+| `--provider` | `name` | Override the provider for this process. Run `rune connect` to list them. |
 | `--effort` | `level` | Override the reasoning effort: auto, none, minimal, low, medium, high, xhigh, max. |
 | `--fast` | - | Request fast mode where the provider supports it. |
 | `--no-fast` | - | Disable fast mode for this process. |

@@ -141,25 +141,13 @@ impl ProviderLimits {
 
 /// Maps a provider name to its key in the catalog.
 ///
-/// The keys are not always the name this program uses: a compatible endpoint is
-/// unknown to the catalog, and a name that is absent yields nothing rather than
-/// a guess.
+/// The keys are not always the name this program uses, so they are read from
+/// the provider table. A compatible or local endpoint is unknown to the
+/// catalog, and a name the table does not list yields nothing rather than a
+/// guess.
 #[must_use]
 pub fn catalog_key(provider: &str) -> Option<&'static str> {
-    match provider {
-        "anthropic" => Some("anthropic"),
-        "openai" | "responses" => Some("openai"),
-        "opencode" => Some("opencode"),
-        "opencode-go" => Some("opencode-go"),
-        "google" | "gemini" => Some("google"),
-        "groq" => Some("groq"),
-        "mistral" => Some("mistral"),
-        "xai" => Some("xai"),
-        "deepseek" => Some("deepseek"),
-        // A self-hosted or unknown endpoint is not described by any published
-        // catalog, so nothing is claimed for it.
-        _ => None,
-    }
+    crate::providers::lookup(provider).and_then(|entry| entry.models_dev_key)
 }
 
 /// Reads the capacity for one provider out of a catalog document.

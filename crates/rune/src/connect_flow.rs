@@ -57,23 +57,53 @@ pub fn choose_provider() -> Result<&'static KnownProvider> {
         );
     }
 
-    // A number is accepted as well as a name, because the list is printed with
-    // an order and reaching for the number is natural.
-    if let Ok(index) = answer.parse::<usize>()
-        && let Some(entry) = index
-            .checked_sub(1)
-            .and_then(|position| providers::KNOWN_PROVIDERS.get(position))
-    {
-        return Ok(entry);
-    }
-
-    providers::lookup(&answer).ok_or_else(|| {
+    resolve_choice(&answer).ok_or_else(|| {
         RuneError::new(
             ErrorCode::InvalidConfiguration,
             format!("`{answer}` is not a provider this build knows"),
         )
         .with_hint("run `rune connect` to see the list")
     })
+}
+
+/// Returns the entry an answer names, by its printed number or by a name it
+/// answers to.
+///
+/// A number is accepted as well as a name, because the list is printed with an
+/// order and reaching for the number is natural.
+#[must_use]
+pub fn resolve_choice(answer: &str) -> Option<&'static KnownProvider> {
+    let answer = answer.trim();
+    if let Ok(index) = answer.parse::<usize>() {
+        return index
+            .checked_sub(1)
+            .and_then(|position| providers::KNOWN_PROVIDERS.get(position));
+    }
+    providers::lookup(answer)
+}
+
+/// Returns the provider name a connection named on the command line writes.
+///
+/// A number or an alias of a preset becomes the preset's own name, so
+/// `rune connect kimi` stores `moonshot`. A name that selects a dialect keeps
+/// its spelling, because rewriting `responses` to the entry it is listed under
+/// would select a different dialect, and a name the table does not know is
+/// kept as typed.
+#[must_use]
+pub fn connection_name(named: &str) -> String {
+    let named = named.trim();
+    match resolve_choice(named) {
+        Some(entry)
+            if named.parse::<usize>().is_ok()
+                || matches!(
+                    rune_core::config::parse_provider(named),
+                    rune_core::config::Provider::Named(_)
+                ) =>
+        {
+            entry.name.to_owned()
+        }
+        _ => named.to_owned(),
+    }
 }
 
 /// Asks for the credential of a provider, explaining where it comes from.
@@ -292,6 +322,34 @@ mod tests {
                 entry.name
             );
         }
+    }
+
+    #[test]
+    fn a_number_selects_the_entry_printed_with_it() {
+        let rendered = providers::render_choices();
+        assert!(rendered.contains("\n  4. deepseek "), "{rendered}");
+        assert_eq!(
+            resolve_choice("4").map(|entry| entry.name),
+            Some("deepseek")
+        );
+        assert_eq!(
+            resolve_choice(" 18 ").map(|entry| entry.name),
+            Some("llamacpp")
+        );
+        assert!(resolve_choice("0").is_none());
+        assert!(resolve_choice("19").is_none());
+        assert_eq!(connection_name("4"), "deepseek");
+    }
+
+    #[test]
+    fn an_alias_connects_under_the_preset_name() {
+        assert_eq!(connection_name("kimi"), "moonshot");
+        assert_eq!(connection_name("llama.cpp"), "llamacpp");
+        assert_eq!(connection_name("deepseek"), "deepseek");
+        // A dialect name selects that dialect, so it is not rewritten to the
+        // entry it is listed under.
+        assert_eq!(connection_name("responses"), "responses");
+        assert_eq!(connection_name("my-self-hosted"), "my-self-hosted");
     }
 
     #[test]

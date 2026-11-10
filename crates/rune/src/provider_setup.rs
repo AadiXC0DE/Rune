@@ -1325,6 +1325,76 @@ mod tests {
     }
 
     #[test]
+    fn every_preset_round_trips_through_the_config() {
+        for entry in providers::KNOWN_PROVIDERS {
+            let dir = tempfile::tempdir().expect("temp");
+            let root = camino::Utf8Path::from_path(dir.path()).expect("utf8");
+            let paths = paths(root);
+            // Saved the way a connection saves it: the table's endpoint, or one
+            // the user gave when the table has none.
+            let endpoint = entry.base_url.unwrap_or("http://127.0.0.1:9000/v1");
+            save_selection(
+                &paths,
+                &Selection {
+                    provider: entry.name.to_owned(),
+                    model: None,
+                    base_url: Some(endpoint.to_owned()),
+                },
+            )
+            .expect("saved");
+
+            let loaded = rune_core::config::load(
+                None,
+                Some(&paths.config_file(None)),
+                &rune_core::config::EnvironmentOverrides::default(),
+            );
+            assert!(
+                loaded.diagnostics.is_empty(),
+                "{}: {:#?}",
+                entry.name,
+                loaded.diagnostics
+            );
+            assert_eq!(loaded.provider, entry.provider(), "{}", entry.name);
+            assert_eq!(
+                configured_base_url(&loaded).as_deref(),
+                Some(endpoint),
+                "{}",
+                entry.name
+            );
+            assert_eq!(
+                auth::default_variables(loaded.provider.as_str())
+                    .first()
+                    .copied(),
+                entry.key_variable,
+                "{}",
+                entry.name
+            );
+            assert_eq!(
+                loaded.anonymous,
+                entry.credential == providers::CredentialKind::AnonymousLoopback,
+                "{}",
+                entry.name
+            );
+        }
+    }
+
+    #[test]
+    fn a_preset_named_only_in_the_environment_finds_its_endpoint() {
+        let env = rune_core::config::EnvironmentOverrides::from_lookup(|key| {
+            (key == "RUNE_PROVIDER").then(|| "deepseek".to_owned())
+        });
+        let loaded = rune_core::config::load(None, None, &env);
+        assert_eq!(
+            configured_base_url(&loaded).as_deref(),
+            Some("https://api.deepseek.com")
+        );
+        assert_eq!(
+            auth::default_variables(loaded.provider.as_str()),
+            &["DEEPSEEK_API_KEY"]
+        );
+    }
+
+    #[test]
     fn saving_a_selection_preserves_keys_it_does_not_set() {
         // A whole-file write would discard whatever the user configured by hand.
         let dir = tempfile::tempdir().expect("temp");

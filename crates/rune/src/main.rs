@@ -699,7 +699,10 @@ fn run_connect(
     output: &OutputFlags,
 ) -> Result<ExitCode> {
     settings.require_valid_user_config()?;
-    let named = launch.args.first().map(|value| value.trim().to_owned());
+    let named = launch
+        .args
+        .first()
+        .map(|value| connect_flow::connection_name(value));
     if named.is_none() && !output.json {
         let entry = connect_flow::choose_provider()?;
         connect_flow::run(paths, settings, entry)?;

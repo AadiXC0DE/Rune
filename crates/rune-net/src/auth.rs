@@ -262,6 +262,15 @@ pub fn default_variables(provider: &str) -> &'static [&'static str] {
         "chat_completions" | "openai" => &["OPENAI_API_KEY"],
         "responses" => &["OPENAI_API_KEY"],
         "opencode" | "opencode-go" => &["OPENCODE_API_KEY"],
+        "deepseek" => &["DEEPSEEK_API_KEY"],
+        "zai" | "glm" | "z.ai" => &["ZAI_API_KEY", "ZHIPU_API_KEY"],
+        "moonshot" | "kimi" => &["MOONSHOT_API_KEY"],
+        "minimax" => &["MINIMAX_API_KEY"],
+        "xai" | "grok" => &["XAI_API_KEY"],
+        "groq" => &["GROQ_API_KEY"],
+        "mistral" => &["MISTRAL_API_KEY"],
+        "openrouter" => &["OPENROUTER_API_KEY"],
+        "vercel" | "ai-gateway" => &["AI_GATEWAY_API_KEY"],
         _ => &[],
     }
 }

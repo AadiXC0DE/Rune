@@ -115,7 +115,7 @@ pub const GLOBAL_FLAGS: &[FlagSpec] = &[
     option(
         "--provider",
         "name",
-        "Override the provider for this process.",
+        "Override the provider for this process. Run `rune connect` to list them.",
     ),
     option(
         "--effort",

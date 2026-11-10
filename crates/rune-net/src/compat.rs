@@ -609,31 +609,13 @@ const ENDPOINT_RULES: &[EndpointRule] = &[
     on(Key::Family(Family::Claude), claude),
 ];
 
-/// Names presets are known by that the provider table does not list.
-const PRESET_ALIASES: &[(&str, &str)] = &[
-    ("glm", "zai"),
-    ("z.ai", "zai"),
-    ("kimi", "moonshot"),
-    ("grok", "xai"),
-    ("lm-studio", "lmstudio"),
-    ("llama.cpp", "llamacpp"),
-    ("llama-server", "llamacpp"),
-    ("ai-gateway", "vercel"),
-];
-
 /// Returns the canonical preset name for a provider name or alias.
 ///
 /// A name that is neither a preset nor an alias is returned lower-cased.
 #[must_use]
 pub fn canonical_preset(provider: &str) -> String {
     let wanted = provider.trim().to_ascii_lowercase();
-    if let Some(entry) = crate::providers::lookup(&wanted) {
-        return entry.name.to_owned();
-    }
-    PRESET_ALIASES
-        .iter()
-        .find(|(alias, _)| *alias == wanted)
-        .map_or(wanted, |(_, name)| (*name).to_owned())
+    crate::providers::lookup(&wanted).map_or(wanted, |entry| entry.name.to_owned())
 }
 
 /// Returns the family of a model id.
