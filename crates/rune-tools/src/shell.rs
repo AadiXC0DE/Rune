@@ -21,7 +21,7 @@ use crate::workspace::{
     FileLimits, bool_arg, head_and_tail, resolve, string_arg, truncate_to_bytes, usize_arg,
 };
 use rune_exec::command::Exit;
-use rune_exec::session::{Input, POLL_INTERVAL, Process};
+use rune_exec::session::{Input, POLL_INTERVAL, Process, SpawnOptions, Streams};
 
 /// Yield window a `run` uses when none is requested.
 pub const DEFAULT_RUN_YIELD_MS: u64 = 30_000;
@@ -531,7 +531,7 @@ impl Tool for Shell {
                 },
                 "pty": {
                     "type": "boolean",
-                    "description": "Linux only: run under a terminal, with merged output.",
+                    "description": "Linux only: run under a terminal.",
                 },
                 "rows": {
                     "type": "integer",
@@ -755,12 +755,15 @@ fn start(
         };
         RuneError::new(code, format!("`{workspace}` cannot be started in: {err}"))
     })?;
-    Process::start_argv(
+    Process::start_argv_with(
         &wrapped.argv,
         Some(start_in.as_std_path()),
         cap,
         &environment,
         input,
+        SpawnOptions {
+            streams: Streams::Merged,
+        },
     )
     .map_err(|err| {
         let hint = match cwd {
@@ -797,8 +800,9 @@ fn observe(
     cap: usize,
     runs: Option<&Mutex<BTreeMap<String, String>>>,
 ) -> (String, Option<String>) {
+    // Standard error shares the standard output pipe, so this one stream holds
+    // everything in the order the command wrote it.
     let stdout = process.stdout().since(seen.0);
-    let stderr = process.stderr().since(seen.1);
     // An ended command is observed for the last time, so the newest bytes of a
     // stream that outgrew its head follow that head, once.
     let ended = process.exit().is_some();
@@ -806,10 +810,6 @@ fn observe(
     let mut full = None;
     if ended {
         push_tail(&mut body, process.stdout());
-    }
-    body.push_str(&String::from_utf8_lossy(&stderr.bytes));
-    if ended {
-        push_tail(&mut body, process.stderr());
         // A finished test run leads with its verdict, which the cut below
         // always keeps, because the start of the output survives it.
         if let Some(counts) = crate::test_report::parse(&body) {
@@ -834,29 +834,20 @@ fn observe(
         }
     }
     seen.0 = stdout.next;
-    seen.1 = stderr.next;
 
-    // A stream whose capture stopped at the cap says so, because the bytes the
-    // command printed and the bytes retained are then different numbers, and
-    // only the pair makes the shortfall visible. The comparison is the retained
-    // head against total production; what a caller has not yet read says
-    // nothing about the capture.
-    let clipped = [
-        ("standard output", process.stdout().totals()),
-        ("standard error", process.stderr().totals()),
-    ];
-    let mut note = String::new();
-    for (name, (retained, total)) in clipped {
-        if total > retained as u64 {
-            if !note.is_empty() {
-                note.push(' ');
-            }
-            let _ = write!(
-                note,
-                "[{name} capture stopped after {retained} bytes, the stream produced {total} bytes]"
-            );
-        }
-    }
+    // A capture that stopped at the cap says so, because the bytes the command
+    // printed and the bytes retained are then different numbers, and only the
+    // pair makes the shortfall visible. The comparison is the retained head
+    // against total production; what a caller has not yet read says nothing
+    // about the capture.
+    let (retained, total) = process.stdout().totals();
+    let note = if total > retained as u64 {
+        format!(
+            "[output capture stopped after {retained} bytes, the command produced {total} bytes]"
+        )
+    } else {
+        String::new()
+    };
     let full = full.map(|full| render(command, full, &note, state, usize::MAX));
     (render(command, body, &note, state, cap), full)
 }
@@ -1877,6 +1868,26 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn standard_error_appears_where_it_was_written() {
+        let (_dir, context) = workspace();
+        let output = call(
+            &Shell::default(),
+            &context,
+            &serde_json::json!({
+                "action": "run",
+                "command": "printf 'o1\\n'; printf 'e1\\n' >&2; printf 'o2\\n'; printf 'e2\\n' >&2",
+            }),
+        );
+        assert!(!output.is_error, "{}", output.text);
+        assert!(
+            output.text.contains("\no1\ne1\no2\ne2\n"),
+            "{}",
+            output.text
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn a_signal_that_ends_a_command_is_reported_by_name() {
         let (_dir, context) = workspace();
         let output = call(
@@ -2023,7 +2034,7 @@ mod tests {
         let head = observed.find('\n').expect("the command line") + 1;
         let after = marker + observed[marker..].find("]\n").expect("marker end") + 2;
         // The end runs to the capture note or, without one, the state line.
-        let state = ["\n[standard output", "\n[exited"]
+        let state = ["\n[output capture", "\n[exited"]
             .iter()
             .filter_map(|line| observed[after..].find(line))
             .min()
@@ -2050,8 +2061,10 @@ mod tests {
                 "yield_time_ms": 2_000,
             }),
         );
-        assert!(started.contains("capture stopped after"), "{started}");
-        assert!(started.contains("standard output"), "{started}");
+        assert!(
+            started.contains("output capture stopped after"),
+            "{started}"
+        );
         let (id, _group) = running(&started);
         let _ = stop(&tool, &context, &id);
     }

@@ -178,6 +178,30 @@ pub enum Input {
     Pty { rows: u16, cols: u16 },
 }
 
+/// How a child's standard output and standard error reach the caller.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Streams {
+    /// Two pipes, read into `stdout()` and `stderr()`.
+    Separate,
+    /// One pipe for both, read into `stdout()` in the order the child wrote;
+    /// `stderr()` stays empty.
+    Merged,
+}
+
+/// Choices made when a child is spawned.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct SpawnOptions {
+    pub streams: Streams,
+}
+
+impl Default for SpawnOptions {
+    fn default() -> Self {
+        Self {
+            streams: Streams::Separate,
+        }
+    }
+}
+
 /// A child process in its own group, with the bytes it produced.
 #[derive(Debug)]
 pub struct Process {
@@ -306,6 +330,27 @@ impl Process {
         environment: &BTreeMap<String, String>,
         input: Input,
     ) -> io::Result<Self> {
+        Self::start_argv_with(
+            argv,
+            cwd,
+            capture_bytes,
+            environment,
+            input,
+            SpawnOptions::default(),
+        )
+    }
+
+    /// Starts a command from an explicit argv, with the given spawn options.
+    ///
+    /// A PTY ignores `streams`: a terminal already merges its output.
+    pub fn start_argv_with(
+        argv: &[String],
+        cwd: Option<&Path>,
+        capture_bytes: usize,
+        environment: &BTreeMap<String, String>,
+        input: Input,
+        options: SpawnOptions,
+    ) -> io::Result<Self> {
         let Some((program, arguments)) = argv.split_first() else {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -327,11 +372,21 @@ impl Process {
         };
         let mut spec = Command::new(program);
         add_arguments(&mut spec, program, arguments);
-        spec.env_clear()
-            .envs(environment)
-            .stdin(stdin)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+        spec.env_clear().envs(environment).stdin(stdin);
+        // Both streams share one pipe, so the reader sees bytes in the order the
+        // child wrote them. The write ends move into the command, which is
+        // dropped after the spawn, so the reader sees end of file once the
+        // child's group closes them.
+        let merged = if options.streams == Streams::Merged && !matches!(input, Input::Pty { .. }) {
+            let (reader, writer) = io::pipe()?;
+            let error_writer = writer.try_clone()?;
+            spec.stdout(Stdio::from(writer))
+                .stderr(Stdio::from(error_writer));
+            Some(reader)
+        } else {
+            spec.stdout(Stdio::piped()).stderr(Stdio::piped());
+            None
+        };
         if let Some(cwd) = cwd {
             spec.current_dir(cwd);
         }
@@ -387,6 +442,7 @@ impl Process {
             return Err(err);
         }
         let started = spawn_waiter(Arc::clone(&inner))
+            .and_then(|()| attach(&inner, merged, Pipe::Output))
             .and_then(|()| attach(&inner, stdout, Pipe::Output))
             .and_then(|()| attach(&inner, stderr, Pipe::Error));
         if let Err(err) = started {
@@ -908,6 +964,61 @@ mod tests {
         let exit = exit_of(&process);
         assert_eq!(exit, Exit::Code(3));
         assert!(text(process.stdout()).contains("out"));
+        assert!(text(process.stderr()).contains("err"));
+    }
+
+    /// Returns the argv that runs `command` under the platform shell.
+    fn shell_argv(command: &str) -> [String; 3] {
+        [
+            SHELL.to_owned(),
+            String::from(SHELL_FLAG),
+            command.to_owned(),
+        ]
+    }
+
+    #[test]
+    fn merged_streams_keep_the_order_the_command_wrote() {
+        let command = if cfg!(windows) {
+            "echo o1& echo e1 1>&2& echo o2& echo e2 1>&2"
+        } else {
+            "printf 'o1\\n'; printf 'e1\\n' >&2; printf 'o2\\n'; printf 'e2\\n' >&2"
+        };
+        let process = Process::start_argv_with(
+            &shell_argv(command),
+            None,
+            CAPTURE_BYTES,
+            &crate::command::minimal_environment(),
+            Input::Closed,
+            SpawnOptions {
+                streams: Streams::Merged,
+            },
+        )
+        .expect("start");
+        assert!(exit_of(&process).is_success());
+        let output = text(process.stdout());
+        if cfg!(windows) {
+            let lines: Vec<&str> = output.lines().map(str::trim).collect();
+            assert_eq!(lines, ["o1", "e1", "o2", "e2"], "{output:?}");
+        } else {
+            assert_eq!(output, "o1\ne1\no2\ne2\n");
+        }
+        assert_eq!(process.stderr().totals(), (0, 0));
+    }
+
+    #[test]
+    fn separate_streams_are_unchanged_by_default() {
+        let process = Process::start_argv_with(
+            &shell_argv(&echo_both_and_exit(0)),
+            None,
+            CAPTURE_BYTES,
+            &crate::command::minimal_environment(),
+            Input::Closed,
+            SpawnOptions::default(),
+        )
+        .expect("start");
+        assert!(exit_of(&process).is_success());
+        assert!(text(process.stdout()).contains("out"));
+        assert!(!text(process.stdout()).contains("err"));
         assert!(text(process.stderr()).contains("err"));
     }
 
