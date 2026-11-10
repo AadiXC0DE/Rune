@@ -922,18 +922,26 @@ impl Host for SessionHost {
         }
 
         // In automatic mode an unresolved action gets one narrow review rather
-        // than a person's attention. The review never opens a prompt and never
-        // ends the turn: a caution or an unreachable reviewer holds the action
-        // and hands the agent guidance.
+        // than a person's attention. A caution holds the action and hands the
+        // agent guidance. A reviewer that could not answer made no judgment, so
+        // the user is asked instead, as if there were no reviewer.
         if mode == PermissionMode::Auto
             && let Some(reviewer) = &self.reviewer
         {
             let action = target.unwrap_or(name).to_owned();
             let request = ReviewRequest::new(action.clone(), vec![action.clone()], name, "");
-            let mut session = lock_review(&self.review_session);
-            return match session.review(reviewer.as_ref(), &request) {
+            let outcome = lock_review(&self.review_session).review(reviewer.as_ref(), &request);
+            return match outcome {
                 ReviewOutcome::Clear { .. } => {
                     (Outcome::Allow, format!("{reason}; cleared by review"))
+                }
+                ReviewOutcome::Unavailable { reason: failure } => {
+                    let mut entries = self.take_narration();
+                    entries.push(Entry::notice(format!(
+                        "the safety reviewer could not answer ({failure}); asking you instead"
+                    )));
+                    self.commit(&entries);
+                    self.request_approval(name, target.unwrap_or(name), reason)
                 }
                 other => (
                     Outcome::Deny,
@@ -7767,15 +7775,52 @@ mod tests {
     }
 
     #[test]
-    fn a_review_that_cannot_complete_holds_the_action_without_ending_the_turn() {
-        // An unavailable reviewer is not a judgment about the action, and it
-        // must not become an approval.
+    fn a_failed_review_asks_the_user_with_a_notice() {
+        // An unavailable reviewer is not a judgment about the action, so it
+        // neither holds nor approves it: the user is asked, and told why.
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let out: LiveSink = Arc::new(Mutex::new(SharedSink(Arc::clone(&bytes))));
+        let host = host_with_reviewer(ReviewOutcome::Unavailable {
+            reason: "the reviewer could not be reached".to_owned(),
+        });
+        *host.live_out.lock().expect("lock") = Some(out);
+        let (answers, requests) = mpsc::channel::<ApprovalRequest>();
+        *host.approval_requests.lock().expect("approvals") = Some(answers);
+        let user = std::thread::spawn(move || {
+            let request = requests.recv().expect("an approval prompt");
+            assert_eq!(request.target, "rm -rf /tmp/x");
+            request
+                .answer
+                .send(ApprovalOutcome::RunOnce)
+                .expect("answered");
+        });
+
+        let (outcome, reason) = host.decide("shell", Some("rm -rf /tmp/x"));
+        user.join().expect("the prompt was answered");
+        assert_eq!(outcome, Outcome::Allow, "{reason}");
+        assert!(reason.contains("approved for this call"), "{reason}");
+
+        let mut grid = rune_term::Grid::new(80, 24).expect("grid");
+        grid.feed(&bytes.lock().expect("bytes")).expect("feed");
+        // The notice wraps at the terminal width, so it is read row by row.
+        let text = grid.text();
+        for part in [
+            "the safety reviewer could not answer (the reviewer could not be reached);",
+            "asking you instead",
+        ] {
+            assert!(text.contains(part), "{text}");
+        }
+    }
+
+    #[test]
+    fn a_failed_review_without_a_person_stays_unresolved() {
+        // Nobody to ask leaves the action as unresolved as it was, not denied
+        // and not approved.
         let host = host_with_reviewer(ReviewOutcome::Unavailable {
             reason: "the reviewer could not be reached".to_owned(),
         });
         let (outcome, reason) = host.decide("shell", Some("rm -rf /tmp/x"));
-        assert_eq!(outcome, Outcome::Deny, "{reason}");
-        assert!(reason.contains("could not be reached"), "{reason}");
+        assert_eq!(outcome, Outcome::Ask, "{reason}");
     }
 
     #[test]

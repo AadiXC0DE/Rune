@@ -227,6 +227,70 @@ fn imports_two_local_models_without_a_remote_catalog_and_keeps_inference_working
 }
 
 #[test]
+fn offline_works_with_a_local_server() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("fixture");
+    listener.set_nonblocking(true).expect("nonblocking");
+    let base = format!("http://{}/v1", listener.local_addr().expect("address"));
+    let dir = profile();
+    write_config(
+        dir.path(),
+        &format!(
+            "provider = 'ollama'\nbase_url = '{base}'\nanonymous = true\n[models]\nollama = 'llama:latest'\n"
+        ),
+    );
+
+    let server = std::thread::spawn(move || {
+        let started = Instant::now();
+        let mut stream = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break stream,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(started.elapsed() < Duration::from_secs(10), "no request");
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("accept: {error}"),
+            }
+        };
+        stream
+            .set_nonblocking(false)
+            .expect("blocking request socket");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("read timeout");
+        let mut reader = std::io::BufReader::new(&mut stream);
+        let mut line = String::new();
+        reader.read_line(&mut line).expect("request line");
+        let path = line.split_whitespace().nth(1).expect("path").to_owned();
+        let mut length = 0;
+        loop {
+            line.clear();
+            assert!(reader.read_line(&mut line).expect("header") > 0);
+            if line == "\r\n" {
+                break;
+            }
+            let (name, value) = line.split_once(':').expect("header pair");
+            if name.eq_ignore_ascii_case("content-length") {
+                length = value.trim().parse().expect("content length");
+            }
+        }
+        let mut body = vec![0; length];
+        reader.read_exact(&mut body).expect("body");
+        drop(reader);
+        let response = "data: {\"choices\":[{\"delta\":{\"content\":\"offline local answer\"}}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+        write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}", response.len()).expect("response");
+        path
+    });
+
+    let answer = run(dir.path(), &["ask", "--json", "--offline", "say hello"]);
+    assert!(answer.status.success(), "{answer:?}");
+    let answer: serde_json::Value = serde_json::from_slice(&answer.stdout).expect("answer JSON");
+    assert_eq!(answer["output"], "offline local answer");
+    assert_eq!(server.join().expect("server"), "/v1/chat/completions");
+    // The models.dev catalog stays out of reach offline.
+    assert!(!dir.path().join("state/models-dev.json").exists());
+}
+
+#[test]
 fn connecting_ollama_to_a_remote_host_is_refused_without_saving() {
     let dir = profile();
     let config = "provider = 'ollama'\nbase_url = 'https://example.com/v1'\n";

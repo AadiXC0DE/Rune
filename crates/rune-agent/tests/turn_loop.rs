@@ -2282,6 +2282,9 @@ fn an_uncapped_turn_runs_past_sixteen_steps() {
 #[test]
 fn an_offline_turn_refuses_without_fetch_calls_or_retry_delay() {
     let mut host = TestHost::new(MockEndpoint::start(vec![Script::text("unused")]));
+    // Offline still reaches a loopback server, so the refusal is shown on a
+    // remote endpoint.
+    host.endpoint.base_url = "https://api.example.com/v1".to_owned();
     host.endpoint.offline = true;
     let fetch_calls = Arc::new(AtomicUsize::new(0));
     host.offline_fetch_calls = Some(Arc::clone(&fetch_calls));

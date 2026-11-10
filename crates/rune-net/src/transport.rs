@@ -140,7 +140,7 @@ pub struct Endpoint {
     /// user agent. Both are facts about the endpoint rather than about a
     /// dialect, so they live here rather than in the request builder.
     pub headers: Vec<(String, String)>,
-    /// Whether outbound requests are refused entirely.
+    /// Whether outbound requests are refused, except to a loopback host.
     pub offline: bool,
     /// Where each request and its response are recorded, when tracing is on.
     pub trace: Option<std::sync::Arc<TraceSink>>,
@@ -203,7 +203,7 @@ impl Endpoint {
         self
     }
 
-    /// Refuses every request when set.
+    /// Refuses every request to a host other than loopback when set.
     #[must_use]
     pub const fn offline(mut self, offline: bool) -> Self {
         self.offline = offline;
@@ -345,6 +345,17 @@ fn host_of(after_scheme: &str) -> &str {
 /// Returns true when a host is a loopback address.
 fn is_loopback_host(host: &str) -> bool {
     matches!(host, "127.0.0.1" | "localhost" | "::1")
+}
+
+/// Returns true when a URL names a loopback host.
+///
+/// Offline mode still reaches a model server on this machine, so the offline
+/// checks ask this rather than refusing every endpoint.
+#[must_use]
+pub fn is_loopback_url(url: &str) -> bool {
+    let lower = url.trim().to_ascii_lowercase();
+    let rest = lower.split_once("://").map_or("", |(_, rest)| rest);
+    is_loopback_host(host_of(rest))
 }
 
 /// Outcome of one streaming request.
@@ -635,7 +646,7 @@ pub fn stream_completion_encoded(
     cancel: &dyn Fn() -> bool,
     observe: &mut dyn FnMut(&ProviderEvent),
 ) -> NetResult<StreamOutcome> {
-    if endpoint.offline {
+    if endpoint.offline && !is_loopback_url(&endpoint.base_url) {
         return Err(
             NetError::new(FailureKind::PolicyDenied, "outbound requests are disabled")
                 .with_hint("remove the offline setting to reach a provider"),
@@ -1001,7 +1012,7 @@ pub fn list_models(
     provider: &dyn Provider,
     timeout: Duration,
 ) -> NetResult<String> {
-    if endpoint.offline {
+    if endpoint.offline && !is_loopback_url(&endpoint.base_url) {
         return Err(
             NetError::new(FailureKind::PolicyDenied, "outbound requests are disabled")
                 .with_hint("remove the offline setting to reach a provider"),
@@ -2710,6 +2721,53 @@ mod tests {
         assert_eq!(err.kind(), FailureKind::PolicyDenied);
         assert!(!err.is_retryable());
         assert!(err.message().contains("disabled"));
+    }
+
+    #[test]
+    fn an_offline_loopback_endpoint_is_still_reached() {
+        /// Records the URLs it is asked for and answers none of them.
+        struct Recording(std::sync::Mutex<Vec<String>>);
+
+        impl Fetch for Recording {
+            fn send(&self, request: FetchRequest) -> NetResult<crate::fetch::FetchResponse> {
+                if let Ok(mut urls) = self.0.lock() {
+                    urls.push(request.url.clone());
+                }
+                Err(NetError::new(FailureKind::Network, "connection refused"))
+            }
+        }
+
+        for base in [
+            "http://127.0.0.1:11434/v1",
+            "http://localhost:8080/v1",
+            "http://[::1]:8080/v1",
+        ] {
+            let endpoint = Endpoint::new(base, "k").offline(true);
+            let client = Recording(std::sync::Mutex::new(Vec::new()));
+            let err = stream_completion(
+                &client,
+                &endpoint,
+                &crate::chat_completions::ChatCompletions,
+                &RequestPlan::new("m"),
+                DEFAULT_HEAD_TIMEOUT,
+                &|| false,
+            )
+            .expect_err("the fixture answers nothing");
+            assert_ne!(err.kind(), FailureKind::PolicyDenied, "{base}: {err:?}");
+            let err = list_models(
+                &client,
+                &endpoint,
+                &crate::chat_completions::ChatCompletions,
+                DEFAULT_HEAD_TIMEOUT,
+            )
+            .expect_err("the fixture answers nothing");
+            assert_ne!(err.kind(), FailureKind::PolicyDenied, "{base}: {err:?}");
+            let urls = client.0.lock().expect("urls");
+            assert_eq!(urls.len(), 2, "{base}: {urls:?}");
+            assert!(urls.iter().all(|url| url.starts_with(base)), "{urls:?}");
+        }
+        assert!(!is_loopback_url("https://api.deepseek.com"));
+        assert!(!is_loopback_url("http://127.0.0.1.example.com/v1"));
     }
 
     #[test]

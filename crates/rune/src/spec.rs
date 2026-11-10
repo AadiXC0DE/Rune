@@ -148,7 +148,7 @@ pub const GLOBAL_FLAGS: &[FlagSpec] = &[
     ),
     flag(
         "--offline",
-        "Refuse provider requests, disable web tools, skip remote MCP checks and restrict sandboxed shell networking. Local MCP and unsandboxed commands can still use the network.",
+        "Refuse provider requests except to a model server on this machine, disable web tools, skip remote MCP checks and restrict sandboxed shell networking. Local MCP and unsandboxed commands can still use the network.",
     ),
     flag(
         "--allow-unsandboxed",

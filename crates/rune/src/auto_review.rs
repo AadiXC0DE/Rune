@@ -1,22 +1,22 @@
 //! Reviewing an unresolved action with a model.
 //!
 //! The reviewer sends the exact action and its targets to a model and accepts one
-//! structured decision. It never opens a human prompt: a concern, an incomplete
-//! answer, or a reviewer that cannot be reached all hold the action and return
-//! guidance to the agent, so a turn keeps moving instead of stopping.
+//! structured decision. It never opens a human prompt itself: a concern or an
+//! incomplete answer holds the action and returns guidance to the agent, and a
+//! reviewer that cannot be reached is reported so the session can ask the user.
 
 use std::fmt::Write as _;
 use std::time::Duration;
 
-use rune_core::config::Settings;
+use rune_core::config::{Effort, Settings};
 use rune_core::error::Result;
 use rune_core::paths::Paths;
 use rune_net::error::FailureKind;
 use rune_net::error::NetError;
 use rune_net::message::Message;
 use rune_net::provider::{Provider, RequestPlan};
-use rune_net::transport::{Endpoint, RequestTimeouts, agent, stream_completion};
-use rune_policy::review::{ReviewOutcome, ReviewRequest, Reviewer};
+use rune_net::transport::{Endpoint, RequestTimeouts, agent, is_loopback_url, stream_completion};
+use rune_policy::review::{ReviewOutcome, ReviewRequest, Reviewer, ReviewerKind, reviewer_for};
 
 /// Most characters of one evidence excerpt kept in the prompt.
 ///
@@ -34,17 +34,29 @@ const RETRIES: u64 = 1;
 
 /// Builds the reviewer for a session.
 ///
-/// Returns `None` when no review model is configured, which the caller reports
-/// rather than silently running the action.
+/// The reviewer is a model the configured endpoint serves: the one the user
+/// configured, else the provider's small model on its own endpoint, else the
+/// session model. Returns `None` only when no endpoint or credential is
+/// configured, or no model is selected yet, so an unresolved action asks the
+/// user instead.
 pub fn build(settings: &Settings, paths: &Paths) -> Result<Option<Box<dyn Reviewer>>> {
-    let Some(model) = settings.review_model.clone() else {
+    let Some(reviewer) = configure(settings, paths)? else {
         return Ok(None);
     };
-    if model.trim().is_empty() {
-        return Ok(None);
-    }
+    Ok(Some(Box::new(reviewer)))
+}
 
-    if crate::provider_setup::configured_base_url(settings).is_none() {
+/// Chooses the reviewer's model, effort and endpoint for [`build`].
+fn configure(settings: &Settings, paths: &Paths) -> Result<Option<ModelReviewer>> {
+    let Some(base_url) = crate::provider_setup::configured_base_url(settings) else {
+        return Ok(None);
+    };
+    let kind = reviewer_for(
+        settings.review_model.as_deref(),
+        vendor_review_model(settings.provider.as_str(), &base_url),
+        settings.model.trim(),
+    );
+    if kind.model().is_empty() {
         return Ok(None);
     }
     let endpoint = match crate::provider_setup::configured_endpoint(settings, paths) {
@@ -55,15 +67,15 @@ pub fn build(settings: &Settings, paths: &Paths) -> Result<Option<Box<dyn Review
         Err(error) => return Err(error),
     };
 
-    let dialect: Box<dyn Provider> = match settings.provider {
-        rune_core::config::Provider::Anthropic => Box::new(rune_net::anthropic::Anthropic),
-        rune_core::config::Provider::Responses => Box::new(rune_net::responses::Responses),
-        rune_core::config::Provider::Gemini => Box::new(rune_net::gemini::Gemini),
-        _ => Box::new(rune_net::chat_completions::ChatCompletions),
+    let dialect = crate::provider_setup::dialect_for(&settings.provider);
+    let effort = match kind {
+        ReviewerKind::SessionModel { .. } => review_effort(dialect.capabilities().efforts),
+        ReviewerKind::Fixed { .. } | ReviewerKind::Custom { .. } => Effort::Auto,
     };
 
-    Ok(Some(Box::new(ModelReviewer {
-        model,
+    Ok(Some(ModelReviewer {
+        model: kind.model().to_owned(),
+        effort,
         dialect,
         endpoint,
         timeout: Duration::from_millis(
@@ -73,12 +85,37 @@ pub fn build(settings: &Settings, paths: &Paths) -> Result<Option<Box<dyn Review
         ),
         request_timeout: RequestTimeouts::from_limits(&settings.limits).total,
         attempts: RETRIES,
-    })))
+    }))
+}
+
+/// Returns the provider's small review model when requests go to the
+/// provider's own endpoint.
+///
+/// A proxy, a gateway or a local server at another address may not serve that
+/// model, so it gets none and the session model reviews instead.
+fn vendor_review_model(provider: &str, base_url: &str) -> Option<&'static str> {
+    let entry = rune_net::providers::lookup(provider)?;
+    let own = entry.base_url?;
+    (own.trim_end_matches('/') == base_url.trim().trim_end_matches('/'))
+        .then_some(entry.review_model)
+        .flatten()
+}
+
+/// Returns the least reasoning a session model can be asked for.
+///
+/// A review is one short answer, so the lowest of `minimal` and `low` the
+/// model accepts is used, and the provider's default when it takes neither.
+fn review_effort(accepted: &[Effort]) -> Effort {
+    [Effort::Minimal, Effort::Low]
+        .into_iter()
+        .find(|effort| accepted.contains(effort))
+        .unwrap_or(Effort::Auto)
 }
 
 /// A reviewer that asks a model.
 struct ModelReviewer {
     model: String,
+    effort: Effort,
     dialect: Box<dyn Provider>,
     endpoint: Endpoint,
     timeout: Duration,
@@ -93,6 +130,7 @@ impl std::fmt::Debug for ModelReviewer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ModelReviewer")
             .field("model", &self.model)
+            .field("effort", &self.effort)
             .field("attempts", &self.attempts)
             .finish_non_exhaustive()
     }
@@ -146,7 +184,7 @@ impl Reviewer for ModelReviewer {
 impl ModelReviewer {
     /// Sends one review request and returns the model's text.
     fn ask(&self, request: &ReviewRequest) -> std::result::Result<String, NetError> {
-        if self.endpoint.offline {
+        if self.endpoint.offline && !is_loopback_url(&self.endpoint.base_url) {
             return Err(NetError::new(
                 FailureKind::Network,
                 "the reviewer is unavailable because outbound requests are disabled",
@@ -157,6 +195,7 @@ impl ModelReviewer {
         INSTRUCTIONS.clone_into(&mut plan.instructions);
         plan.messages = vec![Message::user(render_request(request))];
         plan.max_output_tokens = Some(200);
+        plan.effort = self.effort;
 
         let outcome = stream_completion(
             &agent(),
@@ -333,37 +372,128 @@ mod tests {
         );
     }
 
-    #[test]
-    fn no_review_model_means_no_reviewer() {
-        let settings = Settings::default();
-        let dir = tempfile::tempdir().expect("temp");
-        let paths = Paths::resolve(
+    fn paths(dir: &tempfile::TempDir) -> Paths {
+        Paths::resolve(
             Some(dir.path().to_str().expect("utf8")),
             None,
             None,
             None,
             None,
+        )
+    }
+
+    #[test]
+    fn no_selected_model_means_no_reviewer() {
+        let dir = tempfile::tempdir().expect("temp");
+        assert!(
+            build(&Settings::default(), &paths(&dir))
+                .expect("built")
+                .is_none()
         );
-        assert!(build(&settings, &paths).expect("built").is_none());
+    }
+
+    #[test]
+    fn a_local_server_reviews_with_the_session_model_at_the_least_effort() {
+        let mut settings = Settings {
+            provider: rune_core::config::Provider::ChatCompletions,
+            base_url: Some("http://127.0.0.1:8080/v1".to_owned()),
+            anonymous: true,
+            model: "qwen3-coder".to_owned(),
+            ..Settings::default()
+        };
+        let dir = tempfile::tempdir().expect("temp");
+        let reviewer = configure(&settings, &paths(&dir))
+            .expect("built")
+            .expect("a reviewer without a configured review model");
+        assert_eq!(reviewer.model, "qwen3-coder");
+        assert_eq!(reviewer.effort, Effort::Minimal);
+        assert_eq!(reviewer.endpoint.base_url, "http://127.0.0.1:8080/v1");
+
+        settings.review_model = Some("gpt-5-mini".to_owned());
+        let reviewer = configure(&settings, &paths(&dir))
+            .expect("built")
+            .expect("the configured reviewer");
+        assert_eq!(reviewer.model, "gpt-5-mini");
+        assert_eq!(reviewer.effort, Effort::Auto);
+    }
+
+    #[test]
+    fn the_vendor_small_model_needs_the_vendors_own_endpoint() {
+        assert_eq!(
+            vendor_review_model("anthropic", "https://api.anthropic.com"),
+            Some("claude-haiku-5-5")
+        );
+        assert_eq!(
+            vendor_review_model("responses", "https://api.openai.com/v1/"),
+            Some("gpt-6-luna")
+        );
+        assert_eq!(
+            vendor_review_model("gemini", "https://generativelanguage.googleapis.com/v1beta"),
+            Some("gemini-3.5-flash-lite")
+        );
+        // A proxy in front of the vendor may not serve the vendor's small model.
+        assert_eq!(
+            vendor_review_model("anthropic", "https://proxy.example.com"),
+            None
+        );
+        assert_eq!(
+            vendor_review_model("chat_completions", "http://127.0.0.1:8080/v1"),
+            None
+        );
+        assert_eq!(
+            vendor_review_model("ollama", "http://127.0.0.1:11434/v1"),
+            None
+        );
+        assert_eq!(
+            vendor_review_model("opencode", "https://opencode.ai/zen/v1"),
+            None
+        );
+    }
+
+    #[test]
+    fn the_review_effort_is_the_least_the_model_accepts() {
+        assert_eq!(
+            review_effort(rune_net::provider::ALL_EFFORTS),
+            Effort::Minimal
+        );
+        assert_eq!(
+            review_effort(&[Effort::Auto, Effort::Low, Effort::High]),
+            Effort::Low
+        );
+        assert_eq!(review_effort(&[Effort::Auto]), Effort::Auto);
     }
 
     #[test]
     fn an_offline_reviewer_reports_that_it_is_unavailable() {
         // Offline is not a judgment about the action, so it must never be
         // remembered as one.
-        let reviewer = ModelReviewer {
+        let reviewer = |base: &str| ModelReviewer {
             model: "review/test".to_owned(),
+            effort: Effort::Auto,
             dialect: Box::new(rune_net::chat_completions::ChatCompletions),
-            endpoint: Endpoint::new("http://127.0.0.1:1/v1", "k").offline(true),
+            endpoint: Endpoint::new(base, "k").offline(true),
             timeout: Duration::from_millis(10),
             request_timeout: None,
             attempts: 0,
         };
-        let outcome = reviewer.review(&request());
+        let outcome = reviewer("https://reviewer.example.invalid/v1").review(&request());
         assert!(outcome.holds());
+        let ReviewOutcome::Unavailable { reason } = outcome else {
+            panic!("{outcome:?}");
+        };
         assert!(
-            matches!(outcome, ReviewOutcome::Unavailable { .. }),
-            "{outcome:?}"
+            reason.contains("outbound requests are disabled"),
+            "{reason}"
+        );
+
+        // A reviewer on this machine is still asked offline.
+        let outcome = reviewer("http://127.0.0.1:1/v1").review(&request());
+        let ReviewOutcome::Unavailable { reason } = outcome else {
+            panic!("{outcome:?}");
+        };
+        assert!(
+            !reason.contains("outbound requests are disabled"),
+            "{reason}"
         );
     }
 
@@ -371,6 +501,7 @@ mod tests {
     fn an_unreachable_reviewer_is_unavailable_and_not_cautioned() {
         let reviewer = ModelReviewer {
             model: "review/test".to_owned(),
+            effort: Effort::Auto,
             dialect: Box::new(rune_net::chat_completions::ChatCompletions),
             endpoint: Endpoint::new("http://127.0.0.1:1/v1", "k"),
             timeout: Duration::from_millis(30),
@@ -393,6 +524,7 @@ mod tests {
         assert_eq!(FailureKind::Timeout, FailureKind::Timeout);
         let reviewer = ModelReviewer {
             model: "review/test".to_owned(),
+            effort: Effort::Auto,
             dialect: Box::new(rune_net::chat_completions::ChatCompletions),
             endpoint: Endpoint::new("http://127.0.0.1:1/v1", "k"),
             timeout: Duration::from_millis(20),

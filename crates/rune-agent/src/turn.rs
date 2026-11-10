@@ -1322,7 +1322,8 @@ impl ObjectiveAccounting {
     /// Persists the charge before the next request or tool execution.
     pub fn finish(self, host: &dyn Host, reported: Option<Usage>) -> Result<()> {
         // An offline refusal never reached a provider and consumes no tokens.
-        if host.endpoint().offline {
+        // A loopback server is still reached offline, so its use is counted.
+        if host.endpoint().offline && !transport::is_loopback_url(&host.endpoint().base_url) {
             return Ok(());
         }
         let Some(input_estimate) = self.input_estimate else {

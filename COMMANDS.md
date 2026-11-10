@@ -17,7 +17,7 @@ Accepted anywhere on the command line.
 | `--limit` | `name=value` | Override one limit. Repeatable. Use off to disable a limit. |
 | `--add-dir` | `path` | Add a workspace directory for this process. Repeatable. |
 | `--no-additional-dirs` | - | Ignore saved additional directories for this process. |
-| `--offline` | - | Refuse provider requests, disable web tools, skip remote MCP checks and restrict sandboxed shell networking. Local MCP and unsandboxed commands can still use the network. |
+| `--offline` | - | Refuse provider requests except to a model server on this machine, disable web tools, skip remote MCP checks and restrict sandboxed shell networking. Local MCP and unsandboxed commands can still use the network. |
 | `--allow-unsandboxed` | - | Run commands where the host has no sandbox backend. Without this, such a host refuses them. Also RUNE_ALLOW_UNSANDBOXED=1. |
 | `--network` | - | Let sandboxed shell commands use the network. --offline still wins. |
 | `--json` | - | Emit machine-readable output where supported. |

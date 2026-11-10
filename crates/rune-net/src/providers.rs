@@ -44,6 +44,12 @@ pub struct KnownProvider {
     /// without it rather than falling back to something slower, so it is part
     /// of connecting rather than an optimization.
     pub required_headers: &'static [(&'static str, &'static str)],
+    /// Small model the provider publishes, used to review actions in `auto`
+    /// mode when requests go to `base_url` itself.
+    ///
+    /// `None` where the endpoint serves models nobody can name in advance, so
+    /// the session model reviews instead.
+    pub review_model: Option<&'static str>,
 }
 
 impl KnownProvider {
@@ -77,6 +83,7 @@ pub const KNOWN_PROVIDERS: &[KnownProvider] = &[
         credential: CredentialKind::ApiKey,
         implemented: true,
         required_headers: &[],
+        review_model: Some("claude-haiku-5-5"),
     },
     KnownProvider {
         name: "openai",
@@ -86,6 +93,7 @@ pub const KNOWN_PROVIDERS: &[KnownProvider] = &[
         credential: CredentialKind::ApiKey,
         implemented: true,
         required_headers: &[],
+        review_model: Some("gpt-6-luna"),
     },
     KnownProvider {
         name: "gemini",
@@ -95,6 +103,7 @@ pub const KNOWN_PROVIDERS: &[KnownProvider] = &[
         credential: CredentialKind::ApiKey,
         implemented: true,
         required_headers: &[],
+        review_model: Some("gemini-3.5-flash-lite"),
     },
     KnownProvider {
         name: "opencode",
@@ -104,6 +113,7 @@ pub const KNOWN_PROVIDERS: &[KnownProvider] = &[
         credential: CredentialKind::ApiKey,
         implemented: true,
         required_headers: &[("user-agent", USER_AGENT)],
+        review_model: None,
     },
     KnownProvider {
         name: "opencode-go",
@@ -116,6 +126,7 @@ pub const KNOWN_PROVIDERS: &[KnownProvider] = &[
         // than degrading, so it is sent with every request rather than on the
         // ones that happen to carry a session.
         required_headers: &[("user-agent", USER_AGENT), ("x-opencode-session", "rune")],
+        review_model: None,
     },
     KnownProvider {
         name: "chat_completions",
@@ -125,6 +136,7 @@ pub const KNOWN_PROVIDERS: &[KnownProvider] = &[
         credential: CredentialKind::ApiKey,
         implemented: true,
         required_headers: &[],
+        review_model: None,
     },
     KnownProvider {
         name: "ollama",
@@ -134,6 +146,7 @@ pub const KNOWN_PROVIDERS: &[KnownProvider] = &[
         credential: CredentialKind::AnonymousLoopback,
         implemented: true,
         required_headers: &[],
+        review_model: None,
     },
 ];
 

@@ -101,17 +101,24 @@ fn settle() {
 
 #[test]
 fn offline_mode_produces_no_connection() {
-    let counter = Counter::start();
-    let endpoint = Endpoint::new(counter.url(), "test-key").offline(true);
+    // The refusal comes before name resolution, so a remote host that does not
+    // exist still reports the policy rather than a lookup failure.
+    let endpoint = Endpoint::new("https://provider.example.invalid/v1", "test-key").offline(true);
     let err =
         send(&endpoint, &rune_net::chat_completions::ChatCompletions).expect_err("offline refuses");
     assert_eq!(err.code(), rune_core::error::ErrorCode::TransportFailure);
+    assert_eq!(err.message(), "outbound requests are disabled");
+}
+
+#[test]
+fn offline_mode_still_reaches_a_loopback_server() {
+    let counter = Counter::start();
+    let endpoint = Endpoint::new(counter.url(), "test-key").offline(true);
+    let _ = send(&endpoint, &rune_net::chat_completions::ChatCompletions);
     settle();
-    assert_eq!(
-        counter.count(),
-        0,
-        "offline mode opened {} connection(s)",
-        counter.count()
+    assert!(
+        counter.count() >= 1,
+        "offline mode refused a model server on this machine"
     );
 }
 

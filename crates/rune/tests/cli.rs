@@ -1885,6 +1885,9 @@ impl Listener {
     }
 }
 
+/// A remote endpoint, which offline mode refuses before resolving its name.
+const REMOTE_BASE_URL: (&str, &str) = ("RUNE_BASE_URL", "https://provider.example.invalid/v1");
+
 /// Runs the binary against a provider served at the listener's port.
 fn run_against(
     listener: &Listener,
@@ -1925,12 +1928,13 @@ fn run_against(
 #[test]
 fn offline_after_the_command_refuses_the_request() {
     // Offline after the command refuses the request just as it does before it.
+    // A loopback server is still reached offline, so the endpoint is remote.
     let listener = Listener::start();
     for args in [
         vec!["ask", "--offline", "hi"],
         vec!["ask", "hi", "--offline"],
     ] {
-        let out = run_against(&listener, Some("m"), &[], &args);
+        let out = run_against(&listener, Some("m"), &[REMOTE_BASE_URL], &args);
         assert_eq!(out.status, Some(1), "{args:?}: {}", out.stderr);
         assert!(out.stderr.contains("disabled"), "{args:?}: {}", out.stderr);
     }
@@ -1960,14 +1964,14 @@ fn offline_in_the_user_file_preserves_the_model_and_refuses_requests() {
 offline = true
 web_tools = true
 provider = "chat_completions"
-base_url = "http://127.0.0.1:{}/v1"
+base_url = "{}"
 api_key_env = "RUNE_CLI_TEST_KEY"
 [models]
 chat_completions = "configured-model"
 [limits]
 provider_request_timeout_ms = 1000
 "#,
-            listener.port
+            REMOTE_BASE_URL.1
         ),
     )
     .expect("write config");
@@ -2012,7 +2016,7 @@ fn a_model_named_after_the_command_is_used() {
     let out = run_against(
         &listener,
         None,
-        &[],
+        &[REMOTE_BASE_URL],
         &["ask", "--model", "m", "--offline", "hi"],
     );
     assert!(
