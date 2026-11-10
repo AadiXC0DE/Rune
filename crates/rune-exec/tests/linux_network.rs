@@ -189,7 +189,7 @@ fn unavailable_isolation_is_explicit_and_fails_on_a_declared_runner() {
             let reason = if installed {
                 "fixture-namespace-denied"
             } else {
-                "not on PATH"
+                "the bubblewrap helper (bwrap) is not installed"
             };
             assert!(stderr.contains(reason), "{output:?}");
             if required {
