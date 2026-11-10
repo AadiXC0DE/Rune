@@ -290,3 +290,106 @@ fn export_reports_output_write_failures() {
         std::io::ErrorKind::WriteZero
     );
 }
+
+/// A run killed mid-turn keeps every step it completed, because `ask` writes
+/// the session as it goes.
+#[cfg(unix)]
+#[test]
+fn a_killed_ask_run_keeps_its_completed_steps() {
+    use std::io::BufRead as _;
+    use std::process::Stdio;
+
+    use rune_testkit::scripted::{ScriptedProvider, Turn};
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let root = Utf8PathBuf::from_path_buf(temp.path().canonicalize().expect("canonical root"))
+        .expect("utf8");
+    let workspace = root.join("workspace");
+    std::fs::create_dir_all(&workspace).expect("workspace");
+    std::fs::write(workspace.join("a.txt"), "alpha\n").expect("a.txt");
+    std::fs::write(workspace.join("b.txt"), "beta\n").expect("b.txt");
+    let mut slow = Turn::text("never");
+    slow.delay_ms = 30_000;
+    let provider = ScriptedProvider::start(vec![
+        Turn::call("c1", "read_file", r#"{"path":"a.txt"}"#),
+        Turn::call("c2", "read_file", r#"{"path":"b.txt"}"#),
+        slow,
+    ]);
+    let command = |args: &[&str]| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_rune"));
+        command
+            .isolated_env()
+            .env("HOME", root.join("home"))
+            .env("RUNE_HOME", root.join("state"))
+            .env("XDG_CONFIG_HOME", root.join("config"))
+            .env("XDG_DATA_HOME", root.join("data"))
+            .env("XDG_STATE_HOME", root.join("xdg-state"))
+            .env("RUNE_PROVIDER", "chat_completions")
+            .env("RUNE_BASE_URL", provider.base_url())
+            .env("RUNE_MODEL", "scripted")
+            .env("RUNE_API_KEY_ENV", "RUNE_KILL_TEST_KEY")
+            .env("RUNE_KILL_TEST_KEY", "kill-test-key")
+            .current_dir(&workspace)
+            .args(args);
+        command
+    };
+    let mut child = command(&[
+        "--permission-mode",
+        "full-access",
+        "--allow-unsandboxed",
+        "ask",
+        "--jsonl",
+        "--",
+        "Read a.txt and b.txt.",
+    ])
+    .stdin(Stdio::null())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::null())
+    .spawn()
+    .expect("ask");
+
+    // Kept open until the kill: a closed pipe would fail the run's next write.
+    let mut lines = std::io::BufReader::new(child.stdout.take().expect("stdout")).lines();
+    let mut session_id = String::new();
+    let mut results = 0;
+    for line in lines.by_ref() {
+        let record: serde_json::Value =
+            serde_json::from_str(&line.expect("a line")).expect("a record");
+        if record["type"] == "start" {
+            session_id = record["session_id"].as_str().expect("an id").to_owned();
+        }
+        if record["type"] == "tool_result" {
+            results += 1;
+            if results == 2 {
+                break;
+            }
+        }
+    }
+    assert_eq!(results, 2);
+    assert!(!session_id.is_empty());
+    // The stream reports a result as the tool finishes and the log records it
+    // just after, so wait for the third request, which follows both.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while provider.request_count() < 3 {
+        assert!(std::time::Instant::now() < deadline, "no third request");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    // The third request waits 30 s; the run is killed while it does.
+    child.kill().expect("kill");
+    child.wait().expect("reaped");
+    drop(lines);
+
+    let export = command(&["session", "export", &session_id])
+        .output()
+        .expect("export");
+    assert!(
+        export.status.success(),
+        "{}",
+        String::from_utf8_lossy(&export.stderr)
+    );
+    let text = String::from_utf8_lossy(&export.stdout);
+    for expected in ["\"c1\"", "\"c2\"", "alpha", "beta"] {
+        assert!(text.contains(expected), "{expected} missing from:\n{text}");
+    }
+    assert!(!text.contains("turn_failed"), "{text}");
+}

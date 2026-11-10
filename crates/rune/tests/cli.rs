@@ -1934,6 +1934,16 @@ fn offline_in_the_user_file_preserves_the_model_and_refuses_requests() {
     let dir = tempfile::TempDir::new().expect("tempdir");
     let config_dir = dir.path().join("config").join("rune");
     std::fs::create_dir_all(&config_dir).expect("mkdir");
+    // Private, as Rune creates it: `ask` opens its session before the first
+    // request, and a session refuses a configuration directory others can read.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        for private in [dir.path().join("config"), config_dir.clone()] {
+            std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o700))
+                .expect("private configuration directory");
+        }
+    }
     std::fs::write(
         config_dir.join("config.toml"),
         format!(

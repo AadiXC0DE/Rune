@@ -396,6 +396,52 @@ impl SessionStore {
         &self,
         events: impl IntoIterator<Item = SessionEvent>,
     ) -> Result<AppendReport> {
+        self.append_batch(events, true)
+    }
+
+    /// Appends events without syncing them or refreshing the metadata.
+    ///
+    /// The bytes reach the log file, so they outlive the process if it is
+    /// killed, but not necessarily a power loss until [`SessionStore::sync`]
+    /// runs. For a writer that records every step of a long run as it
+    /// happens, where a sync per step would cost more than the step.
+    pub fn append_unsynced(
+        &self,
+        events: impl IntoIterator<Item = SessionEvent>,
+    ) -> Result<AppendReport> {
+        self.append_batch(events, false)
+    }
+
+    /// Makes every appended event durable and refreshes the metadata.
+    pub fn sync(&self) -> Result<AppendReport> {
+        self.log.sync_data()?;
+        let projection = self.projection.borrow();
+        let seq = projection.last_seq;
+        Ok(AppendReport {
+            seq,
+            metadata_warning: self.metadata_warning(&projection, seq),
+        })
+    }
+
+    /// The warning for a metadata refresh that failed after `seq` was written.
+    fn metadata_warning(&self, projection: &Projection, seq: EventSeq) -> Option<RuneError> {
+        self.write_metadata(projection).err().map(|error| {
+            RuneError::new(
+                error.code(),
+                format!(
+                    "session `{}` event {seq} is durable, but metadata refresh failed: {error}; repair session.json after fixing the filesystem, or reopen the session; do not retry this event",
+                    self.id
+                ),
+            )
+            .with_hint("fix the metadata path, then rebuild metadata or reopen the session")
+        })
+    }
+
+    fn append_batch(
+        &self,
+        events: impl IntoIterator<Item = SessionEvent>,
+        durable: bool,
+    ) -> Result<AppendReport> {
         let mut projection = self.projection.borrow_mut();
         let mut staged = projection.clone();
         let mut bytes = Vec::new();
@@ -437,21 +483,19 @@ impl SessionStore {
 
         let file = &self.log;
         (&*file).write_all(&bytes)?;
+        if !durable {
+            *projection = staged;
+            return Ok(AppendReport {
+                seq,
+                metadata_warning: None,
+            });
+        }
         file.sync_data()?;
         *projection = staged;
 
         // Refreshed after every durable append. Until replacement completes,
         // readers can still see the previous complete projection.
-        let metadata_warning = self.write_metadata(&projection).err().map(|error| {
-            RuneError::new(
-                error.code(),
-                format!(
-                    "session `{}` event {seq} is durable, but metadata refresh failed: {error}; repair session.json after fixing the filesystem, or reopen the session; do not retry this event",
-                    self.id
-                ),
-            )
-            .with_hint("fix the metadata path, then rebuild metadata or reopen the session")
-        });
+        let metadata_warning = self.metadata_warning(&projection, seq);
         Ok(AppendReport {
             seq,
             metadata_warning,

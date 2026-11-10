@@ -525,9 +525,28 @@ struct AskHost<'a> {
     spend_limit: Option<u64>,
     /// Calls of the current step that have a `tool_call` record.
     announced: std::sync::Mutex<std::collections::BTreeSet<String>>,
+    /// The session, written as the run goes; absent with `--no-save`.
+    log: Option<LiveLog>,
+    /// The first failure to write the session, which stops the run.
+    log_error: std::sync::Mutex<Option<RuneError>>,
 }
 
 impl AskHost<'_> {
+    /// Writes to the session log; the first failure stops the run, because a
+    /// run whose record is incomplete should not go on spending.
+    fn log(&self, write: impl FnOnce(&LiveLog) -> Result<()>) {
+        let Some(log) = &self.log else {
+            return;
+        };
+        if lock(&self.log_error).is_some() {
+            return;
+        }
+        if let Err(error) = write(log) {
+            *lock(&self.log_error) = Some(error);
+            self.cancellation.cancel();
+        }
+    }
+
     /// Writes one JSONL record; a failure to write cancels the run once.
     fn record(&self, write: impl FnOnce(&mut std::io::StdoutLock<'_>) -> Result<()>) {
         if !self.jsonl || lock(&self.emit_error).is_some() {
@@ -658,6 +677,7 @@ impl Host for AskHost<'_> {
         *usage = usage.merge_sum(report.usage);
         drop(usage);
         self.add_spend(&report.usage);
+        self.log(|log| log.usage(&report.usage));
     }
 
     fn settles_cancellation(&self) -> bool {
@@ -674,6 +694,7 @@ impl Host for AskHost<'_> {
 
     fn observe_response(&self, outcome: &StreamOutcome) {
         self.add_spend(&outcome.usage);
+        self.log(|log| log.response(outcome));
         let step = self.step.load(std::sync::atomic::Ordering::Relaxed);
         self.record(|out| {
             let reasoning = outcome.reasoning();
@@ -806,6 +827,7 @@ impl Host for AskHost<'_> {
     }
 
     fn post_tool(&self, result: &turn::CallResult) {
+        self.log(|log| log.result(result));
         if let Some(message) = crate::post_tool_hook::notify(
             self.settings.post_tool_hook.as_ref(),
             result,
@@ -994,6 +1016,16 @@ pub fn run(
         spent: std::sync::Mutex::new(None),
         spend_limit,
         announced: std::sync::Mutex::new(std::collections::BTreeSet::new()),
+        log: if options.no_save {
+            None
+        } else {
+            Some(LiveLog::open(
+                paths,
+                options.session_id.unwrap_or_else(SessionId::generate),
+                &options.prompt,
+            )?)
+        },
+        log_error: std::sync::Mutex::new(None),
         limits,
     };
     let watchdog = options.timeout.map(|limit| {
@@ -1034,6 +1066,9 @@ pub fn run(
         (_, outcome) => outcome,
     };
     if let Some(error) = lock(&host.emit_error).take() {
+        return Err(error);
+    }
+    if let Some(error) = lock(&host.log_error).take() {
         return Err(error);
     }
     let outcome = outcome?;
@@ -1108,18 +1143,12 @@ pub fn run(
             }
         })
         .collect();
-    let session_id = if options.no_save {
-        String::new()
-    } else {
-        save_exchange(
-            paths,
-            options.session_id.unwrap_or_else(SessionId::generate),
-            &options.prompt,
-            &history,
-            &usage,
-            error.as_ref(),
-        )?
-        .to_string()
+    let session_id = match &host.log {
+        Some(log) => {
+            log.finish(error.as_ref())?;
+            log.id.to_string()
+        }
+        None => String::new(),
     };
 
     Ok(JsonResult {
@@ -1270,52 +1299,118 @@ impl Watchdog {
     }
 }
 
-/// Saves a completed request before its identifier is reported to the caller.
-fn save_exchange(
-    paths: &Paths,
+/// The session of a run, written while it happens.
+///
+/// Each response and each tool result is appended as it arrives, so a run
+/// that is killed or times out keeps every step it completed. Appends are not
+/// synced one by one, which would cost more than the steps; `finish` makes the
+/// whole log durable once.
+struct LiveLog {
+    store: std::sync::Mutex<SessionStore>,
     id: SessionId,
-    prompt: &str,
-    history: &History,
-    usage: &Usage,
-    error: Option<&RuneError>,
-) -> Result<SessionId> {
-    let workspace = crate::current_workspace()?;
-    let store = SessionStore::create(paths, &id)?;
-    // One write and one sync for the whole exchange: syncing each event made
-    // saving a long run cost more than running it.
-    let mut events = vec![
-        SessionEvent::WorkspaceSet {
-            workspace: rune_policy::trust::canonical_workspace(&workspace).to_string(),
-        },
-        SessionEvent::TitleSet {
-            title: crate::session_log::derive_title(prompt),
-        },
-        SessionEvent::UserMessage {
-            text: prompt.to_owned(),
-        },
-        SessionEvent::TurnStarted { turn: 1 },
-    ];
-    for turn in history.turns().iter().skip(1) {
-        events.extend(crate::session_log::message_events(turn, 1)?);
+    warning: std::sync::Mutex<Option<RuneError>>,
+}
+
+impl LiveLog {
+    /// Creates the session and records what the run starts from.
+    fn open(paths: &Paths, id: SessionId, prompt: &str) -> Result<Self> {
+        let workspace = crate::current_workspace()?;
+        let store = SessionStore::create(paths, &id)?;
+        store.append_unsynced([
+            SessionEvent::WorkspaceSet {
+                workspace: rune_policy::trust::canonical_workspace(&workspace).to_string(),
+            },
+            SessionEvent::TitleSet {
+                title: crate::session_log::derive_title(prompt),
+            },
+            SessionEvent::UserMessage {
+                text: prompt.to_owned(),
+            },
+            SessionEvent::TurnStarted { turn: 1 },
+        ])?;
+        Ok(Self {
+            store: std::sync::Mutex::new(store),
+            id,
+            warning: std::sync::Mutex::new(None),
+        })
     }
-    if let (Some(input_tokens), Some(output_tokens)) = (usage.input_tokens, usage.output_tokens) {
-        events.push(SessionEvent::UsageRecorded {
-            input_tokens,
-            output_tokens,
-        });
+
+    fn append(&self, events: Vec<SessionEvent>) -> Result<()> {
+        lock(&self.store).append_unsynced(events).map(|_| ())
     }
-    if let Some(error) = error {
-        events.push(SessionEvent::TurnFailed {
-            turn: 1,
-            code: error.code(),
-            message: error.message().to_owned(),
-        });
+
+    /// Records one turn of the conversation: an assistant message with its
+    /// calls, or the results of those calls.
+    fn message(&self, turn: &rune_agent::history::Turn) -> Result<()> {
+        self.append(crate::session_log::message_events(turn, 1)?)
     }
-    let metadata_warning = store.append_all(events)?.metadata_warning;
-    if let Some(warning) = metadata_warning {
-        let _ = writeln!(std::io::stderr(), "warning: {warning}");
+
+    /// Records a completed response and its usage.
+    fn response(&self, outcome: &StreamOutcome) -> Result<()> {
+        let mut parts = Vec::new();
+        let text = outcome.text();
+        if !text.is_empty() {
+            parts.push(ContentPart::Text { text });
+        }
+        let reasoning = outcome.reasoning();
+        if !reasoning.is_empty() {
+            parts.push(ContentPart::Reasoning { text: reasoning });
+        }
+        for (id, name, arguments) in outcome.tool_calls() {
+            parts.push(ContentPart::ToolCall {
+                id: rune_core::id::ToolCallId::new(id)?,
+                name,
+                arguments,
+            });
+        }
+        let mut message = rune_agent::history::Turn::assistant(0, parts);
+        message.replay.clone_from(&outcome.replay);
+        if !message.parts.is_empty() {
+            self.message(&message)?;
+        }
+        self.usage(&outcome.usage)
     }
-    Ok(id)
+
+    /// Records the usage of one request; a request with no counts adds none.
+    fn usage(&self, usage: &Usage) -> Result<()> {
+        if let (Some(input_tokens), Some(output_tokens)) = (usage.input_tokens, usage.output_tokens)
+        {
+            self.append(vec![SessionEvent::UsageRecorded {
+                input_tokens,
+                output_tokens,
+            }])?;
+        }
+        Ok(())
+    }
+
+    /// Records a call's result.
+    fn result(&self, result: &turn::CallResult) -> Result<()> {
+        self.append(vec![SessionEvent::ToolResult {
+            call_id: result.call.id.clone(),
+            ok: !result.output.is_error,
+            output: result.output.text.clone(),
+        }])
+    }
+
+    /// Records how the run failed, when it did, and makes the log durable.
+    fn finish(&self, error: Option<&RuneError>) -> Result<()> {
+        let store = lock(&self.store);
+        if let Some(error) = error {
+            store.append_unsynced([SessionEvent::TurnFailed {
+                turn: 1,
+                code: error.code(),
+                message: error.message().to_owned(),
+            }])?;
+        }
+        let report = store.sync()?;
+        if let Some(warning) = report
+            .metadata_warning
+            .or_else(|| lock(&self.warning).take())
+        {
+            let _ = writeln!(std::io::stderr(), "warning: {warning}");
+        }
+        Ok(())
+    }
 }
 
 /// Writes a result to the two output streams.
@@ -1428,15 +1523,13 @@ mod tests {
             content: "found".into(),
             is_error: false,
         }]);
-        let saved = save_exchange(
-            &paths,
-            SessionId::generate(),
-            "lookup",
-            &history,
-            &Usage::default(),
-            None,
-        )
-        .expect("save");
+        let saved = SessionId::generate();
+        let log = LiveLog::open(&paths, saved, "lookup").expect("open");
+        for turn in history.turns().iter().skip(1) {
+            log.message(turn).expect("message");
+        }
+        log.finish(None).expect("finish");
+        drop(log);
         let (_, restored) = crate::session_log::load(&paths, &saved).expect("resume");
         restored.validate().expect("history");
         let mut plan = RequestPlan::new("gemini-fixture");
