@@ -72,14 +72,11 @@ class Runner:
         self.quiet = getattr(args, "quiet", False)
 
     def binary(self, module):
-        if getattr(module, "NAME", "") == "rune" and self.args.rune_bin:
-            return self.args.rune_bin
-        return module.BIN
+        return resolve_binary(module, self.args.rune_bin)
 
     def version_of(self, module):
-        exe = self.binary(module)
-        found = shutil.which(exe) or (exe if os.path.isfile(exe) else None)
-        if not found:
+        found = self.binary(module)
+        if not found or not os.path.isfile(found):
             return "unknown"
         try:
             done = subprocess.run(
@@ -315,6 +312,14 @@ class Runner:
         return rows
 
 
+def resolve_binary(module, rune_bin):
+    """Absolute path of the harness executable, or None when it cannot be found."""
+    if getattr(module, "NAME", "") == "rune" and rune_bin:
+        path = os.path.abspath(rune_bin)
+        return path if os.path.isfile(path) else None
+    return shutil.which(module.BIN)
+
+
 def stop_process(proc):
     if proc.poll() is None:
         proc.send_signal(signal.SIGTERM)
@@ -361,6 +366,7 @@ def build_parser():
     p.add_argument("--max-cost", type=float)
     p.add_argument("--jobs", type=int, default=1)
     p.add_argument("--keep", action="store_true")
+    p.add_argument("--upstream-dialects")
     p.add_argument("--rune-bin", default=str(ROOT / "target" / "release" / "rune"))
     p.add_argument("--prices", default=str(HERE / "prices.json"))
     p.add_argument("--adapter-path", action="append", default=[])
@@ -384,6 +390,26 @@ def cmd_run(argv):
         args.out = str(ROOT / "bench" / "results" / datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ"))
     adapters = Adapters(args.adapter_path)
     modules = [adapters.load(n) for n in split_names(args.harnesses)]
+    served = set(split_names(args.upstream_dialects)) or {"chat"}
+    if args.upstream_anthropic and not args.upstream_dialects:
+        served.add("anthropic")
+    runnable = []
+    for module in modules:
+        needs = list(getattr(module, "DIALECTS", ["chat"]))
+        if not served.intersection(needs):
+            print("skip %s: needs the %s API" % (module.NAME, "/".join(needs)), flush=True)
+            continue
+        if resolve_binary(module, args.rune_bin) is None and module.NAME == "rune":
+            print(
+                "run.py: rune binary not found at %s; build it with cargo build --release"
+                % os.path.abspath(args.rune_bin),
+                file=sys.stderr,
+            )
+            return 2
+        runnable.append(module)
+    modules = runnable
+    if not modules:
+        return 0
     tasks = kit.discover(args.tasks, split_names(args.only), args.split)
     if not tasks:
         print("run.py: no tasks selected", file=sys.stderr)
@@ -439,10 +465,52 @@ def cmd_validate(argv):
     return 1 if bad else 0
 
 
+def cmd_check(argv):
+    p = argparse.ArgumentParser(prog="run.py check")
+    p.add_argument("--harnesses", required=True)
+    p.add_argument("--rune-bin", default=str(ROOT / "target" / "release" / "rune"))
+    p.add_argument("--adapter-path", action="append", default=[])
+    opts = p.parse_args(argv)
+    adapters = Adapters(opts.adapter_path)
+    bad = 0
+    for name in split_names(opts.harnesses):
+        module = adapters.load(name)
+        exe = resolve_binary(module, opts.rune_bin)
+        if exe is None:
+            bad += 1
+            where = os.path.abspath(opts.rune_bin) if module.NAME == "rune" else module.BIN
+            print("%-14s missing  %s" % (module.NAME, where))
+            continue
+        version = Runner.version_of(argparse.Namespace(binary=lambda m: exe), module)
+        help_text = ""
+        commands = [list(getattr(module, "HELP_CMD", ["--help"]))]
+        commands += [list(c) for c in getattr(module, "HELP_EXTRA_CMDS", [])]
+        for command in commands:
+            try:
+                done = subprocess.run(
+                    [exe] + command, stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=10,
+                )
+                help_text += done.stdout.decode("utf-8", "replace") + "\n"
+            except (OSError, subprocess.SubprocessError):
+                pass
+        absent = [f for f in module.HELP_FLAGS if f not in help_text]
+        flags = "flags ok" if not absent else "flags missing: " + ", ".join(absent)
+        line = "%-14s found    %s  %s  %s" % (module.NAME, exe, version, flags)
+        if not getattr(module, "VERIFIED", True):
+            line += "  [unverified]"
+        if absent:
+            bad += 1
+        print(line)
+    return 1 if bad else 0
+
+
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     if argv and argv[0] == "validate":
         return cmd_validate(argv[1:])
+    if argv and argv[0] == "check":
+        return cmd_check(argv[1:])
     if argv and argv[0] == "run":
         argv = argv[1:]
     return cmd_run(argv)

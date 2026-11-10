@@ -132,6 +132,55 @@ class RunnerCase(unittest.TestCase):
         self.assertFalse(rows[0]["passed"])
         self.assertEqual(rows[0]["verify_exit"], 0)
 
+    def test_rune_adapter_builds_the_documented_command(self):
+        sys.path.insert(0, str(HERE / "adapters"))
+        try:
+            import rune as adapter
+        finally:
+            sys.path.pop(0)
+        ctx = {
+            "bin": "/opt/rune", "home": "/tmp/h", "workspace": "/tmp/w", "task_dir": "/t",
+            "proxy_url": "http://127.0.0.1:9", "model": "m1", "key": "k", "prompt": "fix it",
+            "timeout_s": 5,
+        }
+        launch = adapter.prepare(ctx)
+        self.assertEqual(launch["argv"], [
+            "/opt/rune", "--permission-mode", "full-access", "ask", "--json", "--no-save",
+            "--", "fix it",
+        ])
+        self.assertEqual(launch["env"], {
+            "RUNE_HOME": "/tmp/h/.rune-state", "RUNE_PROVIDER": "chat_completions",
+            "RUNE_BASE_URL": "http://127.0.0.1:9/v1", "RUNE_MODEL": "m1",
+            "RUNE_API_KEY_ENV": "BENCH_KEY", "BENCH_KEY": "k",
+        })
+        self.assertTrue(launch["env"]["RUNE_BASE_URL"].endswith("/v1"))
+
+    def test_check_reports_missing_binaries_and_missing_flags(self):
+        proc = subprocess.run(
+            [sys.executable, RUN, "check", "--harnesses", "nobin,noflag,oracle",
+             "--adapter-path", str(ADAPTERS)],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True,
+        )
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        lines = proc.stdout.splitlines()
+        self.assertTrue(lines[0].startswith("nobin") and "missing" in lines[0], lines[0])
+        self.assertIn("flags missing: --absent, --also-absent", lines[1])
+        self.assertTrue(lines[1].endswith("[unverified]"), lines[1])
+        self.assertIn("found", lines[2])
+        self.assertIn("flags ok", lines[2])
+
+    def test_a_missing_rune_binary_stops_run_before_the_first_run(self):
+        proc, rows, _ = self.do_run("rune", extra=["--rune-bin", str(self.dir / "nope")])
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn("run.py: rune binary not found at", proc.stderr)
+        self.assertIn("build it with cargo build --release", proc.stderr)
+        self.assertEqual(rows, [])
+
+    def test_a_harness_needing_an_unserved_dialect_is_skipped(self):
+        proc, rows, _ = self.do_run("anthropic_only,oracle", extra=["--only", "value-file"])
+        self.assertIn("skip anthropic_only: needs the anthropic API", proc.stdout)
+        self.assertEqual([r["harness"] for r in rows], ["oracle"])
+
 
 if __name__ == "__main__":
     unittest.main()
