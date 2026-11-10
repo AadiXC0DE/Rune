@@ -725,6 +725,27 @@ fn ask_stops_rate_limit_retries_at_the_configured_attempt_cap() {
 }
 
 #[test]
+fn ask_stops_at_once_when_the_requested_delay_is_longer_than_the_run_allows() {
+    let started = Instant::now();
+    let (output, _, requests) = run_responses_fixture_with_setup(
+        vec![error_response("429 Too Many Requests", 3600)],
+        true,
+        true,
+        Some(1),
+        |dir| write_retry_limits(dir, 3),
+    );
+    assert!(started.elapsed() < Duration::from_secs(5));
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(requests.len(), 1);
+    let result: Value = serde_json::from_slice(&output.stdout).expect("ask JSON");
+    assert_eq!(result["error_code"], "rate_limited");
+    assert_eq!(
+        result["error_detail"]["hint"],
+        "the provider asked to wait 3600 s, longer than this run allows"
+    );
+}
+
+#[test]
 fn ask_never_retries_an_invalid_credential_even_with_retry_after() {
     for status in ["401 Unauthorized", "403 Forbidden"] {
         let (output, _, requests) = run_responses_fixture_with_setup(
@@ -1436,6 +1457,11 @@ fn ask_jsonl_marks_retry_resets_and_keeps_the_recovered_final_result() {
     );
     assert_eq!(events[3]["delta"], "Discard this attempt.");
     assert_eq!(events[4]["attempt"], 2);
+    // The next attempt's time, in the same form as `ts` and no earlier.
+    let retry_at = events[4]["retry_at"].as_str().expect("retry_at");
+    let ts = events[4]["ts"].as_str().expect("ts");
+    assert_eq!(retry_at.len(), ts.len(), "{retry_at}");
+    assert!(retry_at.ends_with('Z') && retry_at >= ts, "{retry_at} {ts}");
     assert_eq!(events[5]["step"], 1);
     assert_eq!(events[6]["step"], 1);
     assert_eq!(events[7]["step"], 1);

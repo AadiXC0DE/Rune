@@ -1649,6 +1649,8 @@ impl rune_net::fetch::Fetch for SdkFetch {
             status: response.status,
             content_type: "text/event-stream".to_owned(),
             retry_after,
+            retry_after_ms: None,
+            should_retry: None,
             location: None,
             body: Box::new(StoppingBody {
                 body: response.body,

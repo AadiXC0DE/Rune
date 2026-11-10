@@ -607,7 +607,7 @@ as `2026-11-10T09:12:03.123Z`, and a count the provider did not report is `null`
 | `step_finish` | `step`, `finish`, `usage` (`input_tokens`, `cached_tokens`, `cache_write_tokens`, `output_tokens`, `reasoning_tokens`), `cost_usd` (when prices are known), `ts` |
 | `tool_call` | `step`, `id`, `name`, `arguments` (parsed JSON, or the raw string), `ts` |
 | `tool_result` | `step`, `id`, `ok`, `executed` (false for a refused or repeated call), `elapsed_ms`, `bytes`, `preview` (first 2 KiB), `ts` |
-| `retry` | `step`, `attempt`, `wait_ms`, `kind` (such as `rate_limited`), `ts` |
+| `retry` | `step`, `attempt`, `wait_ms`, `retry_at` (when the next attempt is sent), `kind` (such as `rate_limited`), `ts` |
 | `compaction` | `before_tokens`, `after_tokens`, `ts` |
 | `step_restart` | `step`: discard the deltas of the failed attempt of that step |
 | `plan_updated` | `update` |

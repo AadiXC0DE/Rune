@@ -34,6 +34,10 @@ pub enum FailureKind {
     Timeout,
     /// The connection failed.
     Network,
+    /// No route to the endpoint: its host name did not resolve or the network
+    /// is down. Retried on a time budget of its own, since an outage says
+    /// nothing about the request.
+    Unreachable,
     /// The response could not be decoded.
     Decode,
     /// The stream ended before a terminal event.
@@ -64,6 +68,7 @@ impl FailureKind {
             Self::Unavailable => "unavailable",
             Self::Timeout => "timeout",
             Self::Network => "network",
+            Self::Unreachable => "unreachable",
             Self::Decode => "decode",
             Self::IncompleteStream => "incomplete_stream",
             Self::ProtocolViolation => "protocol_violation",
@@ -87,6 +92,7 @@ impl FailureKind {
                 | Self::Unavailable
                 | Self::Timeout
                 | Self::Network
+                | Self::Unreachable
                 | Self::IncompleteStream
                 | Self::ProviderError
         )
@@ -116,7 +122,9 @@ impl FailureKind {
             Self::RateLimited => ErrorCode::RateLimited,
             Self::ModelNotFound => ErrorCode::NotFound,
             Self::ContextTooLong => ErrorCode::TooLarge,
-            Self::Unavailable | Self::Network | Self::Decode => ErrorCode::TransportFailure,
+            Self::Unavailable | Self::Network | Self::Unreachable | Self::Decode => {
+                ErrorCode::TransportFailure
+            }
             Self::Timeout => ErrorCode::Timeout,
             Self::IncompleteStream => ErrorCode::IncompleteStream,
             Self::ProtocolViolation => ErrorCode::ProtocolViolation,
@@ -139,6 +147,8 @@ pub struct NetError {
     status: Option<u16>,
     /// Delay the endpoint asked for before a retry.
     retry_after_ms: Option<u64>,
+    /// The endpoint's own verdict on whether a retry can succeed.
+    should_retry: Option<bool>,
     /// Provider error code, when one was reported.
     provider_code: Option<String>,
     /// Repair hint.
@@ -184,6 +194,7 @@ impl NetError {
             message: message.into(),
             status: None,
             retry_after_ms: None,
+            should_retry: None,
             provider_code: None,
             hint: None,
             source: None,
@@ -201,6 +212,13 @@ impl NetError {
     #[must_use]
     pub const fn with_retry_after(mut self, millis: u64) -> Self {
         self.retry_after_ms = Some(millis);
+        self
+    }
+
+    /// Attaches the endpoint's verdict on whether a retry can succeed.
+    #[must_use]
+    pub const fn with_should_retry(mut self, should_retry: bool) -> Self {
+        self.should_retry = Some(should_retry);
         self
     }
 
@@ -240,6 +258,13 @@ impl NetError {
     #[must_use]
     pub const fn retry_after_ms(&self) -> Option<u64> {
         self.retry_after_ms
+    }
+
+    /// Returns the endpoint's verdict on whether a retry can succeed, when it
+    /// gave one.
+    #[must_use]
+    pub const fn should_retry(&self) -> Option<bool> {
+        self.should_retry
     }
 
     /// Returns the provider's error code.
@@ -594,14 +619,67 @@ impl From<RuneError> for NetError {
 
 /// Parses a `Retry-After` header value into milliseconds.
 ///
-/// The header is either a number of seconds or an HTTP date. A date is not
-/// parsed here because the endpoints that use one are rare and a wrong value is
-/// worse than none; only the numeric form is honored.
+/// The header is a number of seconds, whole or decimal, or an HTTP date. A
+/// date already past means the retry may go at once.
 #[must_use]
-pub fn parse_retry_after(raw: &str) -> Option<u64> {
+pub fn parse_retry_after(raw: &str, now: jiff::Timestamp) -> Option<u64> {
     let trimmed = raw.trim();
-    let seconds: u64 = trimmed.parse().ok()?;
-    Some(seconds.saturating_mul(1000))
+    if let Some(millis) = parse_decimal(trimmed, 1000) {
+        return Some(millis);
+    }
+    let date = jiff::fmt::rfc2822::DateTimeParser::new()
+        .parse_timestamp(trimmed)
+        .ok()?;
+    let ahead = date.as_millisecond().saturating_sub(now.as_millisecond());
+    Some(u64::try_from(ahead).unwrap_or(0))
+}
+
+/// Parses a `retry-after-ms` header value, a whole or decimal number of
+/// milliseconds.
+#[must_use]
+pub fn parse_retry_after_ms(raw: &str) -> Option<u64> {
+    parse_decimal(raw.trim(), 1)
+}
+
+/// Parses an `x-should-retry` header value; anything but `true` or `false`
+/// says nothing.
+#[must_use]
+pub fn parse_should_retry(raw: &str) -> Option<bool> {
+    let trimmed = raw.trim();
+    if trimmed.eq_ignore_ascii_case("true") {
+        Some(true)
+    } else if trimmed.eq_ignore_ascii_case("false") {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+/// Reads a non-negative decimal number and scales it to milliseconds, rounding
+/// a fraction of a millisecond up so a retry never goes early.
+fn parse_decimal(text: &str, millis_per_unit: u64) -> Option<u64> {
+    let (whole, fraction) = text.split_once('.').unwrap_or((text, ""));
+    let digits = |part: &str| part.bytes().all(|byte| byte.is_ascii_digit());
+    if whole.is_empty() || !digits(whole) || !digits(fraction) || text.ends_with('.') {
+        return None;
+    }
+    let whole_millis = whole
+        .parse::<u64>()
+        .unwrap_or(u64::MAX)
+        .saturating_mul(millis_per_unit);
+    // Up to nine fractional digits are kept; finer ones only round up.
+    let kept = &fraction[..fraction.len().min(9)];
+    let scale = 10_u64.pow(u32::try_from(kept.len()).unwrap_or(0));
+    let numerator = kept
+        .parse::<u64>()
+        .unwrap_or(0)
+        .saturating_mul(millis_per_unit);
+    let mut fraction_millis = numerator.checked_div(scale).unwrap_or(0);
+    let remainder = numerator.checked_rem(scale).unwrap_or(0);
+    if remainder != 0 || fraction[kept.len()..].bytes().any(|byte| byte != b'0') {
+        fraction_millis = fraction_millis.saturating_add(1);
+    }
+    Some(whole_millis.saturating_add(fraction_millis))
 }
 
 #[cfg(test)]
@@ -625,6 +703,7 @@ mod tests {
             FailureKind::Unavailable,
             FailureKind::Timeout,
             FailureKind::Network,
+            FailureKind::Unreachable,
             FailureKind::Decode,
             FailureKind::IncompleteStream,
             FailureKind::ProtocolViolation,
@@ -646,6 +725,7 @@ mod tests {
             FailureKind::Unavailable,
             FailureKind::Timeout,
             FailureKind::Network,
+            FailureKind::Unreachable,
             FailureKind::IncompleteStream,
             FailureKind::ProviderError,
         ] {
@@ -956,22 +1036,41 @@ mod tests {
     }
 
     #[test]
-    fn retry_after_parses_seconds() {
-        assert_eq!(parse_retry_after("5"), Some(5000));
-        assert_eq!(parse_retry_after(" 12 "), Some(12_000));
-        assert_eq!(parse_retry_after("0"), Some(0));
-    }
-
-    #[test]
-    fn retry_after_rejects_a_date_and_nonsense() {
-        assert_eq!(parse_retry_after("Wed, 21 Oct 2026 07:28:00 GMT"), None);
-        assert_eq!(parse_retry_after("soon"), None);
-        assert_eq!(parse_retry_after("-1"), None);
-    }
-
-    #[test]
-    fn retry_after_saturates_instead_of_overflowing() {
-        assert_eq!(parse_retry_after(&u64::MAX.to_string()), Some(u64::MAX));
+    fn every_retry_after_form_is_read() {
+        let now: jiff::Timestamp = "2026-10-21T07:27:40Z".parse().expect("time");
+        // Seconds, whole and decimal.
+        assert_eq!(parse_retry_after("5", now), Some(5000));
+        assert_eq!(parse_retry_after(" 12 ", now), Some(12_000));
+        assert_eq!(parse_retry_after("0", now), Some(0));
+        assert_eq!(parse_retry_after("1.5", now), Some(1500));
+        assert_eq!(parse_retry_after("0.0001", now), Some(1));
+        // An HTTP date 20 s ahead, and one already past.
+        assert_eq!(
+            parse_retry_after("Wed, 21 Oct 2026 07:28:00 GMT", now),
+            Some(20_000)
+        );
+        assert_eq!(
+            parse_retry_after("Wed, 21 Oct 2026 07:00:00 GMT", now),
+            Some(0)
+        );
+        // Milliseconds, whole and decimal.
+        assert_eq!(parse_retry_after_ms("1500"), Some(1500));
+        assert_eq!(parse_retry_after_ms(" 250.5 "), Some(251));
+        assert_eq!(parse_retry_after_ms("0"), Some(0));
+        // Nonsense says nothing.
+        for raw in ["soon", "-1", "", "1.", ".5", "+3", "1e3", "inf", "1.2.3"] {
+            assert_eq!(parse_retry_after(raw, now), None, "{raw}");
+            assert_eq!(parse_retry_after_ms(raw), None, "{raw}");
+        }
+        // A huge value saturates instead of overflowing.
+        assert_eq!(
+            parse_retry_after(&u64::MAX.to_string(), now),
+            Some(u64::MAX)
+        );
+        // The retry verdict is read without regard to case.
+        assert_eq!(parse_should_retry("true"), Some(true));
+        assert_eq!(parse_should_retry(" FALSE "), Some(false));
+        assert_eq!(parse_should_retry("yes"), None);
     }
 
     #[test]

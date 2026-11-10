@@ -14,6 +14,7 @@
 use std::io::Write;
 
 use rune_agent::history::History;
+use rune_agent::retry::RetryPolicy;
 use rune_agent::steering::{Cancellation, SteeringQueue};
 use rune_agent::turn::{self, Event, Host, StopReason};
 use rune_core::budget::{Budget, BudgetSet, LimitName};
@@ -226,6 +227,7 @@ enum JsonlEvent<'a> {
         step: u32,
         attempt: usize,
         wait_ms: u64,
+        retry_at: String,
         kind: &'static str,
         ts: String,
     },
@@ -271,7 +273,12 @@ impl From<&Usage> for StepUsage {
 /// The current UTC time with millisecond precision, such as
 /// `2026-11-10T09:12:03.123Z`.
 fn jsonl_timestamp() -> String {
-    let millis = std::time::SystemTime::now()
+    rfc3339(std::time::SystemTime::now())
+}
+
+/// Formats a time as RFC 3339 UTC with milliseconds.
+fn rfc3339(time: std::time::SystemTime) -> String {
+    let millis = time
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |elapsed| {
             i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX)
@@ -600,6 +607,8 @@ struct AskHost<'a> {
     log: Option<LiveLog>,
     /// The first failure to write the session, which stops the run.
     log_error: std::sync::Mutex<Option<RuneError>>,
+    /// When `--timeout` ends the run, so a retry never waits past it.
+    deadline: Option<std::time::Instant>,
 }
 
 impl AskHost<'_> {
@@ -873,6 +882,7 @@ impl Host for AskHost<'_> {
                 step,
                 next_attempt,
                 delay,
+                retry_at,
                 kind,
                 ..
             } => write_jsonl(
@@ -881,6 +891,7 @@ impl Host for AskHost<'_> {
                     step: *step,
                     attempt: *next_attempt,
                     wait_ms: u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
+                    retry_at: rfc3339(*retry_at),
                     kind,
                     ts: jsonl_timestamp(),
                 },
@@ -978,6 +989,13 @@ impl Host for AskHost<'_> {
 
     fn steering(&self) -> &SteeringQueue {
         &self.steering
+    }
+
+    fn retry_policy(&self, max_attempts: usize) -> RetryPolicy {
+        let remaining = self
+            .deadline
+            .map(|deadline| deadline.saturating_duration_since(std::time::Instant::now()));
+        RetryPolicy::headless(max_attempts, remaining)
     }
 }
 
@@ -1125,6 +1143,9 @@ pub fn run(
             )?)
         },
         log_error: std::sync::Mutex::new(None),
+        deadline: options
+            .timeout
+            .and_then(|limit| std::time::Instant::now().checked_add(limit)),
         limits,
     };
     let watchdog = options.timeout.map(|limit| {

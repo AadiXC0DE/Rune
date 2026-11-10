@@ -125,6 +125,12 @@ pub struct FetchResponse {
     /// A rate limited or unavailable endpoint uses it to say when a retry can
     /// succeed, which is better than any delay the caller would guess.
     pub retry_after: Option<String>,
+    /// The `retry-after-ms` header as sent, a delay in milliseconds that some
+    /// endpoints send alongside `Retry-After` with a finer resolution.
+    pub retry_after_ms: Option<String>,
+    /// The `x-should-retry` header as sent, the endpoint's own verdict on
+    /// whether repeating the request can succeed.
+    pub should_retry: Option<String>,
     /// The `Location` header as sent, when the server sent one.
     pub location: Option<String>,
     /// Body, read by the caller as it arrives.
@@ -138,6 +144,8 @@ impl fmt::Debug for FetchResponse {
             .field("status", &self.status)
             .field("content_type", &self.content_type)
             .field("retry_after", &self.retry_after)
+            .field("retry_after_ms", &self.retry_after_ms)
+            .field("should_retry", &self.should_retry)
             .field("location", &self.location)
             .finish_non_exhaustive()
     }

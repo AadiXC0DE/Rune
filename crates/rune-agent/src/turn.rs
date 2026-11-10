@@ -32,7 +32,7 @@ use rune_tools::{Registry, Tool};
 
 use crate::history::History;
 use crate::repair::{self, Resolved};
-use crate::retry::{self, RetryPolicy};
+use crate::retry::{self, Decision, RetryPolicy, RetryState};
 use crate::steering::{Boundary, Cancellation, SteeringQueue};
 
 /// How a turn ended.
@@ -138,6 +138,8 @@ pub enum Event {
         max_attempts: usize,
         /// Wait before the next attempt, including a provider Retry-After.
         delay: Duration,
+        /// When the next attempt is sent: now plus `delay`.
+        retry_at: std::time::SystemTime,
         /// What failed, as the failure kind's wire name, such as `rate_limited`.
         kind: &'static str,
     },
@@ -493,6 +495,11 @@ pub trait Host {
 
     /// Returns the steering queue for this turn.
     fn steering(&self) -> &SteeringQueue;
+
+    /// Returns the retry policy for a step allowed `max_attempts` requests.
+    fn retry_policy(&self, max_attempts: usize) -> RetryPolicy {
+        RetryPolicy::interactive(max_attempts)
+    }
 
     /// Returns true when a cancelled turn should end with
     /// [`StopReason::Cancelled`] and the work done so far, rather than with a
@@ -1383,8 +1390,8 @@ fn stream_with_retry(
 ) -> Result<(StreamOutcome, bool, crate::tokens::Measure)> {
     let steering = host.steering();
     let mut attempt = 0_usize;
-    let mut last: Option<RuneError> = None;
-    let retry_policy = RetryPolicy::new(max_attempts);
+    let retry_policy = host.retry_policy(max_attempts);
+    let mut retry_state = RetryState::default();
     // Resends after compacting for an overflow, which do not use up the
     // provider attempts: the request changed, it did not fail transiently.
     let mut overflow_compactions = 0_usize;
@@ -1393,11 +1400,6 @@ fn stream_with_retry(
         cancellation.check()?;
 
         check_objective_budget(host)?;
-        if attempt >= max_attempts.saturating_add(overflow_compactions) {
-            return Err(last.unwrap_or_else(|| {
-                RuneError::new(ErrorCode::TransportFailure, "the request did not succeed")
-            }));
-        }
         if attempt > 0 {
             host.emit(Event::StepRestarted { step });
             // Include corrections from the failed stream or retry delay before
@@ -1493,17 +1495,24 @@ fn stream_with_retry(
                     }
                     return Err(err.to_rune_error().with_hint(OVERFLOW_HINT));
                 }
-                let Some(delay) = retry_policy.delay(attempt, err.kind(), err.retry_after_ms())
-                else {
-                    return Err(err.to_rune_error());
+                let delay = match retry_policy.decide(&mut retry_state, &err) {
+                    Decision::Wait(delay) => delay,
+                    Decision::Stop => return Err(err.to_rune_error()),
+                    Decision::TooLong(requested) => {
+                        let seconds = requested.as_millis().div_ceil(1000);
+                        return Err(err.to_rune_error().with_hint(format!(
+                            "the provider asked to wait {seconds} s, longer than this run allows"
+                        )));
+                    }
                 };
                 check_objective_budget(host)?;
-                last = Some(err.to_rune_error());
+                let now = std::time::SystemTime::now();
                 host.emit(Event::ProviderRetry {
                     step,
                     next_attempt: attempt.saturating_add(1),
                     max_attempts,
                     delay,
+                    retry_at: now.checked_add(delay).unwrap_or(now),
                     kind: err.kind().as_str(),
                 });
                 retry::wait(delay, cancellation)?;

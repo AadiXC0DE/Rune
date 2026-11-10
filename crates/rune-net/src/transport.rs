@@ -527,11 +527,15 @@ fn send_over(
     let content_type =
         header("content-type").unwrap_or_else(|| "application/octet-stream".to_owned());
     let retry_after = header("retry-after");
+    let retry_after_ms = header("retry-after-ms");
+    let should_retry = header("x-should-retry");
     let location = header("location");
     Ok(FetchResponse {
         status,
         content_type,
         retry_after,
+        retry_after_ms,
+        should_retry,
         location,
         body: Box::new(response.into_body().into_reader()),
     })
@@ -700,10 +704,21 @@ pub fn stream_completion_encoded(
     check_request_timeout(started, timeouts.total)?;
 
     if response.status >= 400 {
+        // The finer `retry-after-ms` wins when both are sent.
         let retry_after = response
-            .retry_after
+            .retry_after_ms
             .as_deref()
-            .and_then(crate::error::parse_retry_after);
+            .and_then(crate::error::parse_retry_after_ms)
+            .or_else(|| {
+                response
+                    .retry_after
+                    .as_deref()
+                    .and_then(|raw| crate::error::parse_retry_after(raw, now_timestamp()))
+            });
+        let should_retry = response
+            .should_retry
+            .as_deref()
+            .and_then(crate::error::parse_should_retry);
         let text = read_bounded_text(response.body, 64 * 1024);
         if let Some(mut entry) = trace {
             entry.chunk(text.as_bytes());
@@ -722,6 +737,9 @@ pub fn stream_completion_encoded(
         // attached, and the caller's backoff decides.
         if let Some(millis) = retry_after {
             error = error.with_retry_after(millis);
+        }
+        if let Some(verdict) = should_retry {
+            error = error.with_should_retry(verdict);
         }
         return Err(error);
     }
@@ -1373,13 +1391,36 @@ fn classify_transport_error(err: &ureq::Error) -> NetError {
     let message = redact::redact(&err.to_string());
     let kind = match err {
         ureq::Error::Timeout(_) => FailureKind::Timeout,
+        ureq::Error::Io(io) if is_unreachable(io.kind()) => FailureKind::Unreachable,
         ureq::Error::Io(_) => FailureKind::Network,
         ureq::Error::ConnectionFailed => FailureKind::Network,
-        ureq::Error::HostNotFound => FailureKind::Network,
+        ureq::Error::HostNotFound => FailureKind::Unreachable,
         ureq::Error::RedirectFailed => FailureKind::InvalidRequest,
         _ => FailureKind::Network,
     };
     NetError::new(kind, message)
+}
+
+/// The current time, for reading a `Retry-After` date.
+fn now_timestamp() -> jiff::Timestamp {
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX)
+        });
+    jiff::Timestamp::from_millisecond(millis).unwrap_or(jiff::Timestamp::UNIX_EPOCH)
+}
+
+/// Returns true for an I/O failure that means no route to the endpoint, as
+/// opposed to an endpoint that answered and refused.
+#[cfg(not(target_family = "wasm"))]
+const fn is_unreachable(kind: std::io::ErrorKind) -> bool {
+    matches!(
+        kind,
+        std::io::ErrorKind::NetworkUnreachable
+            | std::io::ErrorKind::HostUnreachable
+            | std::io::ErrorKind::NetworkDown
+    )
 }
 
 /// Builds a request plan's message list for a one-shot request.
@@ -1509,6 +1550,8 @@ mod tests {
                 status: 200,
                 content_type: "text/event-stream".to_owned(),
                 retry_after: None,
+                retry_after_ms: None,
+                should_retry: None,
                 location: None,
                 body: PacedBody::body(vec![
                     (Duration::ZERO, DELTA),
@@ -1967,6 +2010,8 @@ mod tests {
                 status: self.status,
                 content_type: "application/json".to_owned(),
                 retry_after: self.retry_after.map(str::to_owned),
+                retry_after_ms: None,
+                should_retry: None,
                 location: None,
                 body: Box::new(std::io::Cursor::new(b"{}".to_vec())),
             })
@@ -2000,7 +2045,7 @@ mod tests {
 
     #[test]
     fn a_rate_limit_without_a_delay_leaves_the_backoff_to_the_caller() {
-        for retry_after in [None, Some("Wed, 21 Oct 2026 07:28:00 GMT")] {
+        for retry_after in [None, Some("soon")] {
             let err = complete_over(&CannedFetch {
                 status: 429,
                 retry_after,
@@ -2064,6 +2109,54 @@ mod tests {
             .expect("answered");
         assert_eq!(response.status, 429);
         assert_eq!(response.retry_after.as_deref(), Some("3"));
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn an_unresolved_host_or_a_down_network_is_unreachable() {
+        use std::io::{Error, ErrorKind};
+        let kind = |err: ureq::Error| classify_transport_error(&err).kind();
+        assert_eq!(kind(ureq::Error::HostNotFound), FailureKind::Unreachable);
+        for io in [
+            ErrorKind::NetworkUnreachable,
+            ErrorKind::HostUnreachable,
+            ErrorKind::NetworkDown,
+        ] {
+            assert_eq!(
+                kind(ureq::Error::Io(Error::from(io))),
+                FailureKind::Unreachable
+            );
+        }
+        assert_eq!(
+            kind(ureq::Error::Io(Error::from(ErrorKind::ConnectionRefused))),
+            FailureKind::Network
+        );
+        assert_eq!(kind(ureq::Error::ConnectionFailed), FailureKind::Network);
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn retry_headers_reach_the_error() {
+        let base = answering_endpoint(
+            "HTTP/1.1 503 Service Unavailable\r\nretry-after: 30\r\nretry-after-ms: 1500\r\n\
+             x-should-retry: False\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                .to_owned(),
+        );
+        let mut plan = RequestPlan::new("m");
+        plan.messages = vec![Message::user("hi")];
+        let err = stream_completion(
+            &UreqFetch::new(),
+            &Endpoint::new(base, "k"),
+            &crate::chat_completions::ChatCompletions,
+            &plan,
+            DEFAULT_HEAD_TIMEOUT,
+            &|| false,
+        )
+        .expect_err("unavailable");
+        assert_eq!(err.kind(), FailureKind::Unavailable);
+        // The millisecond header wins over the coarser one.
+        assert_eq!(err.retry_after_ms(), Some(1500));
+        assert_eq!(err.should_retry(), Some(false));
     }
 
     #[cfg(not(target_family = "wasm"))]

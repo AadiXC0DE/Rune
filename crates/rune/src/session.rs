@@ -7080,6 +7080,7 @@ mod tests {
                 next_attempt: attempt,
                 max_attempts: 3,
                 delay: std::time::Duration::from_millis(delay),
+                retry_at: std::time::SystemTime::now(),
                 kind: "rate_limited",
             });
             let screen = replay(&mut grid);
@@ -7116,6 +7117,7 @@ mod tests {
                 next_attempt: 2,
                 max_attempts: 3,
                 delay: std::time::Duration::from_millis(250),
+                retry_at: std::time::SystemTime::now(),
                 kind: "rate_limited",
             });
             replay(&mut grid);
@@ -9596,6 +9598,8 @@ mod tests {
                 status: self.status,
                 content_type: "text/event-stream".to_owned(),
                 retry_after: None,
+                retry_after_ms: None,
+                should_retry: None,
                 location: None,
                 body: Box::new(std::io::Cursor::new(body.into_bytes())),
             })

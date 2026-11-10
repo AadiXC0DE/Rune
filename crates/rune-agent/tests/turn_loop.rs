@@ -512,6 +512,11 @@ impl Host for TestHost {
     fn steering(&self) -> &SteeringQueue {
         &self.steering
     }
+
+    // The shortest jitter keeps the waits these tests observe exact.
+    fn retry_policy(&self, max_attempts: usize) -> rune_agent::retry::RetryPolicy {
+        rune_agent::retry::RetryPolicy::interactive(max_attempts).with_jitter(|| 0)
+    }
 }
 
 /// Records attempts at the Fetch seam without sending anything to a socket.
@@ -2406,9 +2411,9 @@ fn two_failures_report_the_next_attempt_and_backoff_before_each_restart() {
     assert_eq!(
         retries,
         [
-            (1, 2, 10, 250),
+            (1, 2, 10, 500),
             (1, 0, 0, 0),
-            (1, 3, 10, 500),
+            (1, 3, 10, 1000),
             (1, 0, 0, 0),
             (1, 0, 0, 1),
         ]

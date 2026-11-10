@@ -241,6 +241,8 @@ mod tests {
                 status,
                 content_type: "application/json".to_owned(),
                 retry_after: None,
+                retry_after_ms: None,
+                should_retry: None,
                 location: None,
                 body: Box::new(std::io::Cursor::new(body.into_bytes())),
             })
