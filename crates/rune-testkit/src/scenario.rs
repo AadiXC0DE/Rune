@@ -76,6 +76,9 @@ pub struct Expect {
     /// Upper bound on `usage.input_tokens`.
     #[serde(default)]
     pub max_input_tokens: Option<u64>,
+    /// Upper bound on every request's prompt tokens.
+    #[serde(default)]
+    pub max_request_tokens: Option<u64>,
     /// Exact prefix break count.
     #[serde(default)]
     pub prefix_breaks: Option<usize>,
@@ -485,6 +488,19 @@ pub fn check(scenario: &Scenario, report: &Report) -> Vec<String> {
             ));
         }
     }
+    if let Some(max) = expect.max_request_tokens
+        && let Some((index, request)) = report
+            .requests
+            .iter()
+            .enumerate()
+            .find(|(_, request)| request.prompt_tokens > max)
+    {
+        failures.push(format!(
+            "max_request_tokens: request {} had {} prompt tokens, more than {max}",
+            index.saturating_add(1),
+            request.prompt_tokens
+        ));
+    }
     if let Some(want) = expect.prefix_breaks
         && report.prefix_breaks != want
     {
@@ -639,6 +655,31 @@ mod tests {
         scenario.expect.any_request_contains.clear();
         report.requests.clear();
         assert!(check(&scenario, &report).is_empty());
+    }
+
+    #[test]
+    fn max_request_tokens_reports_the_first_request_over_it() {
+        let scenario =
+            load_inline(r#"{"prompt":"p","turns":[],"expect":{"max_request_tokens":100}}"#);
+        let request = |prompt_tokens: u64| RecordedRequest {
+            path: String::new(),
+            body: String::new(),
+            bytes: 0,
+            prompt_tokens,
+            cached_tokens: 0,
+            completion_tokens: 0,
+        };
+        let mut report = Report {
+            requests: vec![request(90), request(100)],
+            ..Report::default()
+        };
+        assert!(check(&scenario, &report).is_empty());
+        report.requests.push(request(101));
+        report.requests.push(request(150));
+        assert_eq!(
+            check(&scenario, &report),
+            ["max_request_tokens: request 3 had 101 prompt tokens, more than 100"]
+        );
     }
 
     #[test]

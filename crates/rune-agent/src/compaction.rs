@@ -40,9 +40,22 @@ pub trait Archive {
     fn archive(&self, removed: &[Turn]) -> Result<()>;
 }
 
+/// How a compaction made room.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CompactionKind {
+    /// Old tool results became receipts, and that was enough.
+    Pruned,
+    /// Earlier turns were replaced by a summary.
+    Checkpoint,
+}
+
 /// What one compaction did.
 #[derive(Clone, Copy, Debug)]
 pub struct CompactionReport {
+    /// How it made room.
+    pub kind: CompactionKind,
+    /// Tool results replaced by receipts before any summary.
+    pub pruned_results: usize,
     /// Original turns replaced by the summary.
     pub removed_turns: usize,
     /// Turns left, including the summary.
@@ -197,6 +210,8 @@ pub fn compact(
     host.before_compaction(history);
     let removed_turns = apply(history, plan, wrap_summary(&summary));
     Ok(CompactionReport {
+        kind: CompactionKind::Checkpoint,
+        pruned_results: 0,
         removed_turns,
         remaining_turns: history.len(),
         usage: outcome.usage,
@@ -238,6 +253,11 @@ pub fn compact_now(history: &mut History, host: &dyn Host, client: &dyn Fetch) -
 /// Compacts before a request when the estimate reaches the ceiling, or early
 /// at a settled point once it is past seventy percent of the ceiling.
 ///
+/// At the ceiling, an unsigned history first has its old tool results
+/// replaced by receipts. When that brings the request to sixty percent of the
+/// ceiling or under, no summary is asked for; otherwise the summary is made
+/// from the pruned history.
+///
 /// Returns `Ok(None)` when no compaction was needed or none is possible yet:
 /// the window is unknown, a tool call is still waiting for its result, or the
 /// conversation is short. Returns an error when the request cannot fit even
@@ -264,7 +284,8 @@ pub fn auto_compact_encoded(
     let limits = host.limits();
     let ceiling = crate::tokens::ceiling(window.0, &limits);
     let window = Window(crate::tokens::effective_window(window.0, &limits));
-    let (encoded, estimate) = encode_request(host.dialect(), request, window, history.anchor())?;
+    let (mut encoded, estimate) =
+        encode_request(host.dialect(), request, window, history.anchor())?;
     // An unknown window gives no threshold to compact against. The request is
     // sent as it is, and an overflow the provider reports is recovered from.
     let Some(ceiling) = ceiling else {
@@ -287,6 +308,36 @@ pub fn auto_compact_encoded(
     if !required && !settled {
         return Ok((None, encoded));
     }
+    let mut pruned = None;
+    if required && !history.is_signed(host.dialect()) {
+        let report = crate::prune::prune(history, host.dialect());
+        if report.results > 0 {
+            request.messages = history.to_messages();
+            let (pruned_encoded, after) =
+                encode_request(host.dialect(), request, window, history.anchor())?;
+            encoded = pruned_encoded;
+            host.emit(Event::ContextPruned {
+                results: report.results,
+                tokens_freed: estimate.input_tokens.saturating_sub(after.input_tokens),
+            });
+            let done = AutoCompaction {
+                report: CompactionReport {
+                    kind: CompactionKind::Pruned,
+                    pruned_results: report.results,
+                    removed_turns: 0,
+                    remaining_turns: history.len(),
+                    usage: Usage::default(),
+                },
+                before_tokens: estimate.input_tokens,
+                after_tokens: after.input_tokens,
+                settled: false,
+            };
+            if after.input_tokens <= ceiling.saturating_mul(3) / 5 {
+                return Ok((Some(done), encoded));
+            }
+            pruned = Some(done);
+        }
+    }
     let compaction_plan = plan_for(history, &limits, host.dialect());
     if required {
         let retained_estimate = if let Some(cut) = &compaction_plan {
@@ -304,19 +355,20 @@ pub fn auto_compact_encoded(
             estimate
         };
         match trigger(&estimate, &retained_estimate, ceiling) {
-            Trigger::NotNeeded | Trigger::Approaching => return Ok((None, encoded)),
+            Trigger::NotNeeded | Trigger::Approaching => return Ok((pruned, encoded)),
             Trigger::Impossible => return Err(cannot_fit_error()),
             Trigger::Required => {}
         }
     }
     let Some(compaction_plan) = compaction_plan else {
         // A short conversation can cross the ceiling while still fitting.
-        return Ok((None, encoded));
+        return Ok((pruned, encoded));
     };
     let cancellation = host.cancellation();
-    let report = compact(history, &compaction_plan, host, client, None, &|| {
+    let mut report = compact(history, &compaction_plan, host, client, None, &|| {
         cancellation.is_cancelled()
     })?;
+    report.pruned_results = pruned.map_or(0, |done| done.report.pruned_results);
     host.context_replaced(&report);
     request.instructions = host.instructions();
     request.messages = history.to_messages();
@@ -1459,6 +1511,106 @@ mod tests {
         assert!(!done.settled);
         assert_eq!(fetch.requests(), 1);
         assert_eq!(host.settled_events(), vec![false]);
+    }
+
+    /// Fails the test on any request, for a run that must not summarize.
+    struct NoSummaryFetch;
+
+    impl Fetch for NoSummaryFetch {
+        fn send(
+            &self,
+            _request: rune_net::fetch::FetchRequest,
+        ) -> rune_net::error::NetResult<rune_net::fetch::FetchResponse> {
+            panic!("no summary request was expected");
+        }
+    }
+
+    /// Exchanges whose `grep` results are `result_bytes` long, each after a
+    /// question padded by `question_bytes`.
+    fn bulky_history(count: usize, result_bytes: usize, question_bytes: usize) -> History {
+        let mut history = History::new();
+        for index in 0..count {
+            let id = ToolCallId::new(format!("g{index}")).expect("id");
+            history.push_user(format!("question {index} {}", "q".repeat(question_bytes)));
+            history.push_assistant(vec![ContentPart::ToolCall {
+                id: id.clone(),
+                name: "grep".to_owned(),
+                arguments: "{}".to_owned(),
+            }]);
+            history.push_tool_results(vec![ContentPart::ToolResult {
+                id,
+                name: "grep".to_owned(),
+                content: "r".repeat(result_bytes),
+                is_error: false,
+            }]);
+            history.push_assistant(vec![ContentPart::Text {
+                text: format!("answer {index}"),
+            }]);
+        }
+        history
+    }
+
+    fn pruned_events(host: &SummaryHost) -> Vec<usize> {
+        host.events
+            .lock()
+            .expect("events")
+            .iter()
+            .filter_map(|event| match event {
+                Event::ContextPruned { results, .. } => Some(*results),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn pruning_that_reaches_sixty_percent_skips_the_summary() {
+        let host = SummaryHost::new();
+        let mut history = bulky_history(24, 16 * 1024, 0);
+        let before = input_tokens(&host, &history);
+        let window = window_at(before, 105);
+        let ceiling = crate::tokens::ceiling(window.0, &BudgetSet::new()).expect("ceiling");
+        assert!(before >= ceiling);
+        let mut request = request_for(&host, &history);
+
+        let done = auto_compact(&mut history, &mut request, &host, &NoSummaryFetch, window)
+            .expect("pruned")
+            .expect("room was made");
+
+        assert_eq!(done.report.kind, CompactionKind::Pruned);
+        assert!(done.report.pruned_results > 0);
+        assert_eq!(done.report.removed_turns, 0);
+        assert_eq!(done.report.remaining_turns, history.len());
+        assert!(
+            done.after_tokens <= ceiling * 3 / 5,
+            "{}",
+            done.after_tokens
+        );
+        assert_eq!(pruned_events(&host), vec![done.report.pruned_results]);
+        assert!(host.settled_events().is_empty());
+        assert_eq!(request.messages, history.to_messages());
+        assert!(history.is_pruned("g0"));
+        history.validate().expect("valid after pruning");
+    }
+
+    #[test]
+    fn pruning_that_frees_too_little_goes_on_to_the_summary() {
+        let host = SummaryHost::new();
+        let fetch = SummaryFetch::default();
+        let mut history = bulky_history(24, 2048, 8192);
+        let window = window_at(input_tokens(&host, &history), 105);
+        let mut request = request_for(&host, &history);
+
+        let done = auto_compact(&mut history, &mut request, &host, &fetch, window)
+            .expect("compaction")
+            .expect("compacted");
+
+        assert_eq!(done.report.kind, CompactionKind::Checkpoint);
+        assert!(done.report.pruned_results > 0);
+        assert_eq!(pruned_events(&host), vec![done.report.pruned_results]);
+        assert_eq!(fetch.requests(), 1);
+        assert_eq!(host.settled_events(), vec![false]);
+        assert_eq!(request.messages, history.to_messages());
+        history.validate().expect("valid after compaction");
     }
 
     fn user_text(history: &History) -> String {

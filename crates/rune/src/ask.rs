@@ -263,6 +263,10 @@ enum JsonlEvent<'a> {
         kind: &'static str,
         ts: String,
     },
+    ContextPruned {
+        results: usize,
+        tokens_freed: u64,
+    },
     Compaction {
         before_tokens: u64,
         after_tokens: u64,
@@ -959,6 +963,16 @@ impl Host for AskHost<'_> {
                     retry_at: rfc3339(*retry_at),
                     kind,
                     ts: jsonl_timestamp(),
+                },
+            ),
+            Event::ContextPruned {
+                results,
+                tokens_freed,
+            } => write_jsonl(
+                out,
+                &JsonlEvent::ContextPruned {
+                    results: *results,
+                    tokens_freed: *tokens_freed,
                 },
             ),
             Event::ContextCompacted {

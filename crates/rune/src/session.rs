@@ -745,6 +745,13 @@ impl Host for SessionHost {
             Event::PlanUpdated { update } => {
                 self.draw_notice(&plan_summary(update));
             }
+            Event::ContextPruned {
+                results,
+                tokens_freed,
+            } => self.draw_notice(&format!(
+                "replaced {results} old tool results with receipts, about {} tokens freed",
+                footer::format_tokens(*tokens_freed)
+            )),
             Event::ContextCompacted {
                 removed_turns,
                 remaining_turns,

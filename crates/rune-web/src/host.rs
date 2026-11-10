@@ -460,6 +460,14 @@ fn encode(event: &Event) -> serde_json::Value {
             "arguments": call.arguments,
             "reason": reason,
         }),
+        Event::ContextPruned {
+            results,
+            tokens_freed,
+        } => json!({
+            "kind": "pruned",
+            "results": results,
+            "tokens_freed": tokens_freed,
+        }),
         Event::ContextCompacted {
             removed_turns,
             remaining_turns,

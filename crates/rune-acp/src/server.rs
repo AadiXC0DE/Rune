@@ -1506,6 +1506,7 @@ impl<W: Write + Send + 'static> Host for TurnHost<W> {
             | Event::CallRepaired { .. }
             | Event::SteeringApplied { .. }
             | Event::VerificationRequested
+            | Event::ContextPruned { .. }
             | Event::ContextCompacted { .. }
             | Event::ProviderRetry { .. }
             | Event::ProviderRetryFinished { .. } => {}

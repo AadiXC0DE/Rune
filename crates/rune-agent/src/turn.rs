@@ -216,6 +216,13 @@ pub enum Event {
         /// How many messages were applied.
         count: usize,
     },
+    /// Old tool results were replaced by receipts before a model request.
+    ContextPruned {
+        /// Results replaced.
+        results: usize,
+        /// Estimated request tokens freed.
+        tokens_freed: u64,
+    },
     /// Earlier context was summarized before a model request.
     ContextCompacted {
         /// Original turns replaced by the summary.

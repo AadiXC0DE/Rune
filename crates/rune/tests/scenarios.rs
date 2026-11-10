@@ -36,10 +36,11 @@ const SCENARIOS: &[&str] = &[
     "failed_check_note",
     "verified_after_fix",
     "cut_mid_frame_then_ok",
+    "prune_long_run",
 ];
 
 /// Scenarios built in Rust, which have no file.
-const BUILT_IN: &[&str] = &["long_150_steps"];
+const BUILT_IN: &[&str] = &["long_150_steps", "prune_long_run"];
 
 fn directory() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/scenarios")
@@ -614,6 +615,59 @@ fn long_150_steps_completes() {
     );
     let result = report.result.expect("a result");
     assert_eq!(result["steps"], 151);
+}
+
+#[test]
+fn prune_long_run() {
+    // Sixty reads of 8,000 bytes pass the ceiling of a 128,000 token window.
+    // Old results become receipts, which is enough, so no summary is asked for.
+    let line = format!("{}\n", "x".repeat(79));
+    let workspace = (1..=60)
+        .map(|n| (format!("f{n:02}.txt"), line.repeat(100)))
+        .collect::<BTreeMap<_, _>>();
+    let mut turns: Vec<Turn> = (1..=60)
+        .map(|n| Turn {
+            tool_calls: vec![ScriptedCall {
+                id: format!("call_{n}"),
+                name: "read_file".to_owned(),
+                arguments: serde_json::json!({"path": format!("f{n:02}.txt")}),
+            }],
+            ..Turn::default()
+        })
+        .collect();
+    turns.push(Turn {
+        text: Some("Read them all.".to_owned()),
+        ..Turn::default()
+    });
+    let long = Scenario {
+        name: "prune_long_run".to_owned(),
+        prompt: "Read f01.txt to f60.txt, one at a time.".to_owned(),
+        workspace,
+        global_args: Vec::new(),
+        ask_args: vec!["--json".to_owned(), "--no-save".to_owned()],
+        env: BTreeMap::from([("RUNE_CONTEXT_WINDOW".to_owned(), "128000".to_owned())]),
+        user_config: None,
+        timeout_s: 120,
+        turns,
+        expect: Expect {
+            exit_code: Some(0),
+            requests: Some(61),
+            max_request_tokens: Some(108_800),
+            request_contains: vec![scenario::RequestContains {
+                request: 61,
+                text: "removed to save context".to_owned(),
+            }],
+            ..Expect::default()
+        },
+    };
+    let report = scenario::run(Path::new(env!("CARGO_BIN_EXE_rune")), &long);
+    let failures = scenario::check(&long, &report);
+    assert!(
+        failures.is_empty(),
+        "prune_long_run failed:\n{}\nstderr:\n{}",
+        failures.join("\n"),
+        report.stderr
+    );
 }
 
 #[test]
