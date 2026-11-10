@@ -137,15 +137,31 @@ impl Exit {
         matches!(self, Self::Code(0))
     }
 
+    /// Returns the status a shell reports for this exit: the code itself, or
+    /// 128 plus the signal for a signal death.
+    #[must_use]
+    pub const fn status(self) -> Option<i32> {
+        match self {
+            Self::Code(code) => Some(code),
+            Self::Signal(signal) => Some(signal.saturating_add(128)),
+            Self::Unknown => None,
+        }
+    }
+
     /// Returns a phrase describing how the command ended.
     #[must_use]
     pub fn describe(self) -> String {
         match self {
             Self::Code(code) => format!("exited with status {code}"),
-            Self::Signal(signal) => match signal_name(signal) {
-                Some(name) => format!("killed by signal {signal} ({name})"),
-                None => format!("killed by signal {signal}"),
-            },
+            Self::Signal(signal) => {
+                let status = signal.saturating_add(128);
+                match signal_name(signal) {
+                    Some(name) => {
+                        format!("killed by signal {signal} ({name}), exit status {status}")
+                    }
+                    None => format!("killed by signal {signal}, exit status {status}"),
+                }
+            }
             Self::Unknown => String::from("ended with an unknown status"),
         }
     }
@@ -1283,6 +1299,21 @@ mod tests {
     /// Returns a condition that never cancels.
     fn never() -> bool {
         false
+    }
+
+    #[test]
+    fn a_signal_exit_reports_status_128_plus_the_signal() {
+        assert_eq!(Exit::Signal(9).status(), Some(137));
+        assert_eq!(Exit::Code(3).status(), Some(3));
+        assert_eq!(Exit::Unknown.status(), None);
+        assert_eq!(
+            Exit::Signal(9).describe(),
+            "killed by signal 9 (SIGKILL), exit status 137"
+        );
+        assert_eq!(
+            Exit::Signal(64).describe(),
+            "killed by signal 64, exit status 192"
+        );
     }
 
     /// Returns a temporary workspace and the guard that owns it.

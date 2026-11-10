@@ -21,7 +21,7 @@ use crate::workspace::{
     FileLimits, bool_arg, head_and_tail, resolve, string_arg, truncate_to_bytes, usize_arg,
 };
 use rune_exec::command::Exit;
-use rune_exec::session::{Input, POLL_INTERVAL, Process, SpawnOptions, Streams};
+use rune_exec::session::{Input, Leftovers, POLL_INTERVAL, Process, SpawnOptions, Streams};
 
 /// Yield window a `run` uses when none is requested.
 pub const DEFAULT_RUN_YIELD_MS: u64 = 30_000;
@@ -36,7 +36,15 @@ pub const DEFAULT_INTERACT_MS: u64 = 5_000;
 pub const MAX_YIELD_MS: u64 = 600_000;
 
 /// Time spent collecting the last bytes a command writes as it exits.
-const DRAIN_WINDOW: Duration = Duration::from_millis(250);
+const DRAIN_WINDOW: Duration = Duration::from_millis(200);
+
+/// Finished commands whose background processes are kept; past this, the
+/// oldest group is ended.
+const MAX_LEFTOVERS: usize = 16;
+
+/// Line added after the state of a finished command whose group still runs.
+const BACKGROUND_NOTICE: &str =
+    "[processes started by this command are still running in the background]";
 
 /// Bounds on the time an `interact` waits for a session to take its input.
 ///
@@ -67,6 +75,9 @@ static COMMANDS: Mutex<BTreeMap<String, String>> = Mutex::new(BTreeMap::new());
 static STARTED: AtomicU64 = AtomicU64::new(0);
 
 /// Runs commands and holds the ones that outlive their call.
+///
+/// Background processes a finished command started, such as `server &`, keep
+/// running until the tool is dropped or the run ends.
 #[derive(Debug)]
 pub struct Shell {
     limits: FileLimits,
@@ -99,6 +110,28 @@ struct State {
     sessions: BTreeMap<String, Arc<Session>>,
     /// Commands that are starting but do not yet have a session entry.
     starting: usize,
+    /// Finished commands whose groups still have processes running, oldest
+    /// first.
+    leftovers: Vec<Leftover>,
+}
+
+/// A finished command whose group still has processes running.
+#[derive(Debug)]
+enum Leftover {
+    /// A command that finished within its `run`.
+    Run(Process),
+    /// A session that ended.
+    Session(Arc<Session>),
+}
+
+impl Leftover {
+    /// Returns the process whose group is kept.
+    fn process(&self) -> &Process {
+        match self {
+            Self::Run(process) => process,
+            Self::Session(session) => &session.process,
+        }
+    }
 }
 
 /// A slot in the session bound, held while a command starts.
@@ -260,6 +293,33 @@ impl Shell {
         lock(&self.state).sessions.len()
     }
 
+    /// Keeps a finished command whose group still has processes running, and
+    /// says so after the result's state line. Past the bound, the oldest kept
+    /// group is ended.
+    fn keep_leftovers(&self, leftover: Leftover, text: &mut String) {
+        if !leftover.process().group_alive() {
+            return;
+        }
+        if !text.is_empty() && !text.ends_with('\n') {
+            text.push('\n');
+        }
+        text.push_str(BACKGROUND_NOTICE);
+        text.push('\n');
+        let evicted = {
+            let mut state = lock(&self.state);
+            let evicted = if state.leftovers.len() >= MAX_LEFTOVERS {
+                Some(state.leftovers.remove(0))
+            } else {
+                None
+            };
+            state.leftovers.push(leftover);
+            evicted
+        };
+        if let Some(evicted) = evicted {
+            evicted.process().end_leftovers();
+        }
+    }
+
     /// Starts a command and returns either its finished output or a session.
     fn run(&self, arguments: &serde_json::Value, context: &ExecutionContext) -> Result<ToolOutput> {
         let command = string_arg(arguments, "command")?
@@ -295,6 +355,16 @@ impl Shell {
             Input::Closed
         };
         let cap = self.limits.output_cap(context);
+        // Kept groups whose processes have all ended need no more holding.
+        let ended: Vec<Leftover> = {
+            let mut state = lock(&self.state);
+            let (alive, ended) = std::mem::take(&mut state.leftovers)
+                .into_iter()
+                .partition(|leftover| leftover.process().group_alive());
+            state.leftovers = alive;
+            ended
+        };
+        drop(ended);
         // The slot is reserved before the command is spawned, so two starts
         // racing for the last one cannot both win it, and a start that fails or
         // returns a finished command gives the slot back.
@@ -305,7 +375,7 @@ impl Shell {
         let (process, network_denied) = start(&command, cwd.as_deref(), cap, context, input)?;
         if let Some(exit) = wait_for_exit(&process, window, context)? {
             process.drain_output(DRAIN_WINDOW);
-            let (text, full_text) = observe(
+            let (mut text, full_text) = observe(
                 &process,
                 &command,
                 &exit.describe(),
@@ -313,6 +383,7 @@ impl Shell {
                 cap,
                 Some(&self.runs),
             );
+            self.keep_leftovers(Leftover::Run(process), &mut text);
             let mut output = finish(text, exit, network_denied);
             output.full_text = full_text;
             return Ok(output);
@@ -413,7 +484,7 @@ impl Shell {
             None => format!("session {id} running, {}", ended_by(session.process.id())),
         };
         let mut seen = lock(&session.seen);
-        let (text, _) = observe(
+        let (mut text, _) = observe(
             &session.process,
             &session.command,
             &state,
@@ -425,6 +496,7 @@ impl Shell {
             // A session that has ended is observed once more and then dropped,
             // so a later call cannot report output that was already returned.
             let _ = lock(&self.state).sessions.remove(&id);
+            self.keep_leftovers(Leftover::Session(Arc::clone(&held)), &mut text);
             return Ok(finish(text, exit, session.network_denied));
         }
         Ok(ToolOutput::success(text))
@@ -458,7 +530,7 @@ impl Shell {
             None => format!("session {id} survived the grace period"),
         };
         let mut seen = lock(&session.seen);
-        let (text, _) = observe(
+        let (mut text, _) = observe(
             &session.process,
             &session.command,
             &state,
@@ -466,6 +538,9 @@ impl Shell {
             cap,
             None,
         );
+        if session.process.exit().is_some() {
+            self.keep_leftovers(Leftover::Session(Arc::clone(&held)), &mut text);
+        }
         // A stop that ended the group succeeded even though the command was
         // killed: the signal is how it was asked to stop, not a failure of the
         // stop itself, and the status is stated in the result.
@@ -483,6 +558,17 @@ impl Default for Shell {
     }
 }
 
+impl Drop for Shell {
+    fn drop(&mut self) {
+        // Sessions end their groups when they are dropped; kept groups of
+        // finished commands are ended here.
+        let leftovers = std::mem::take(&mut lock(&self.state).leftovers);
+        for leftover in &leftovers {
+            leftover.process().end_leftovers();
+        }
+    }
+}
+
 impl Tool for Shell {
     fn name(&self) -> &'static str {
         "shell"
@@ -492,15 +578,26 @@ impl Tool for Shell {
     /// after the grace period. They are stopped together, so many sessions
     /// take one grace period rather than one each.
     fn shutdown(&self) {
-        let sessions: Vec<Arc<Session>> = {
+        let (sessions, leftovers): (Vec<Arc<Session>>, Vec<Leftover>) = {
             let mut state = lock(&self.state);
-            std::mem::take(&mut state.sessions).into_values().collect()
+            (
+                std::mem::take(&mut state.sessions).into_values().collect(),
+                std::mem::take(&mut state.leftovers),
+            )
         };
         std::thread::scope(|scope| {
             for session in &sessions {
                 scope.spawn(|| session.process.terminate(false));
             }
         });
+        // A leader that ended leaves its kept group behind, and so does a
+        // finished command that started background processes.
+        for session in &sessions {
+            session.process.end_leftovers();
+        }
+        for leftover in &leftovers {
+            leftover.process().end_leftovers();
+        }
     }
 
     fn description(&self) -> &'static str {
@@ -763,6 +860,7 @@ fn start(
         input,
         SpawnOptions {
             streams: Streams::Merged,
+            leftovers: Leftovers::Keep,
         },
     )
     .map_err(|err| {
@@ -1733,6 +1831,15 @@ mod tests {
             "{}",
             observed.text
         );
+        // `findstr` that matches nothing exits with 1, so only `cat` has a
+        // status to pin.
+        if cfg!(unix) {
+            assert!(
+                observed.text.contains("exited with status 0"),
+                "{}",
+                observed.text
+            );
+        }
         assert_eq!(tool.live_sessions(), 0);
     }
 
@@ -1901,6 +2008,103 @@ mod tests {
             "{}",
             output.text
         );
+        assert!(
+            output
+                .text
+                .contains("[killed by signal 9 (SIGKILL), exit status 137]"),
+            "{}",
+            output.text
+        );
+    }
+
+    /// Runs `sleep 30 & echo $!` to completion and returns the result and the
+    /// pid of the background process.
+    #[cfg(unix)]
+    fn run_background(tool: &Shell, context: &ExecutionContext) -> (ToolOutput, String) {
+        let output = call(
+            tool,
+            context,
+            &serde_json::json!({ "action": "run", "command": "sleep 30 & echo $!" }),
+        );
+        let pid = output
+            .text
+            .lines()
+            .find(|line| is_pid(line))
+            .unwrap_or_else(|| panic!("no pid in {}", output.text))
+            .trim()
+            .to_owned();
+        (output, pid)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_background_process_is_reported_and_left_running() {
+        let tool = Shell::default();
+        let (_dir, context) = workspace();
+        let began = Instant::now();
+        let (output, pid) = run_background(&tool, &context);
+        assert!(
+            began.elapsed() < Duration::from_secs(2),
+            "the call waited {:?}",
+            began.elapsed()
+        );
+        assert!(!output.is_error, "{}", output.text);
+        assert!(
+            output.text.contains("[exited with status 0]\n"),
+            "{}",
+            output.text
+        );
+        assert!(
+            output.text.ends_with(&format!("{BACKGROUND_NOTICE}\n")),
+            "{}",
+            output.text
+        );
+        assert!(alive(&pid), "the background process was ended");
+
+        let quiet = text(
+            &tool,
+            &context,
+            &serde_json::json!({ "action": "run", "command": "echo hi" }),
+        );
+        assert!(!quiet.contains(BACKGROUND_NOTICE), "{quiet}");
+        drop(tool);
+        assert!(wait_until(|| !alive(&pid), Duration::from_secs(5)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dropping_the_tool_ends_leftover_background_processes() {
+        let tool = Shell::default();
+        let (_dir, context) = workspace();
+        let (_, pid) = run_background(&tool, &context);
+        assert!(alive(&pid));
+        drop(tool);
+        assert!(
+            wait_until(|| !alive(&pid), Duration::from_secs(2)),
+            "a background process outlived the tool"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn leftover_groups_are_bounded() {
+        let tool = Shell::default();
+        let (_dir, context) = workspace();
+        let pids: Vec<String> = (0..=MAX_LEFTOVERS)
+            .map(|_| run_background(&tool, &context).1)
+            .collect();
+        let (oldest, rest) = pids.split_first().expect("pids");
+        assert!(
+            wait_until(|| !alive(oldest), Duration::from_secs(5)),
+            "the oldest kept group was not ended"
+        );
+        assert!(rest.iter().all(|pid| alive(pid)));
+        assert_eq!(lock(&tool.state).leftovers.len(), MAX_LEFTOVERS);
+        drop(tool);
+        assert!(wait_until(
+            || rest.iter().all(|pid| !alive(pid)),
+            Duration::from_secs(5)
+        ));
     }
 
     #[cfg(unix)]

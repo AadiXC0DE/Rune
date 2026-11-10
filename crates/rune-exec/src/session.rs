@@ -47,6 +47,9 @@ const GRACEFUL_SIGNAL: &str = "TERM";
 /// Signal sent when a graceful stop leaves something running.
 const FORCE_SIGNAL: &str = "KILL";
 
+/// Signal that freezes a group before it is killed, on macOS.
+const STOP_SIGNAL: &str = "STOP";
+
 /// Time a termination waits, before escalating and again after escalating.
 pub const GRACE_PERIOD: Duration = Duration::from_millis(2_000);
 
@@ -188,16 +191,31 @@ pub enum Streams {
     Merged,
 }
 
+/// What happens to the rest of a child's group when the child exits.
+///
+/// On Windows `Keep` behaves like `End`: the tree is ended when the child
+/// exits. A background process that leaves the group, for example through
+/// `setsid`, is neither detected nor ended.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Leftovers {
+    /// End the group as soon as the child is reaped (the default).
+    End,
+    /// Leave the group running; the owner ends it with `end_leftovers`.
+    Keep,
+}
+
 /// Choices made when a child is spawned.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct SpawnOptions {
     pub streams: Streams,
+    pub leftovers: Leftovers,
 }
 
 impl Default for SpawnOptions {
     fn default() -> Self {
         Self {
             streams: Streams::Separate,
+            leftovers: Leftovers::End,
         }
     }
 }
@@ -283,6 +301,8 @@ struct Inner {
     stderr: Buffer,
     /// Group to signal. The child leads its own group, so this is the child id.
     group: u32,
+    /// Whether the waiter leaves the group running after the child exits.
+    leftovers: Leftovers,
     #[cfg(target_os = "linux")]
     terminal: Option<std::fs::File>,
 }
@@ -432,6 +452,7 @@ impl Process {
             stdout: Buffer::new(capture_bytes),
             stderr: Buffer::new(capture_bytes),
             group,
+            leftovers: options.leftovers,
             #[cfg(target_os = "linux")]
             terminal,
         });
@@ -600,10 +621,34 @@ impl Process {
         self.wait_for_exit(GRACE_PERIOD)
     }
 
-    /// Sends the forceful signal, falling back to the direct child when no
+    /// Returns true while any process in the child's group is alive (Unix);
+    /// always false elsewhere.
+    #[must_use]
+    pub fn group_alive(&self) -> bool {
+        #[cfg(unix)]
+        {
+            i32::try_from(self.inner.group)
+                .ok()
+                .and_then(rustix::process::Pid::from_raw)
+                .is_some_and(|group| rustix::process::test_kill_process_group(group).is_ok())
+        }
+        #[cfg(not(unix))]
+        {
+            false
+        }
+    }
+
+    /// Ends what is left of the group, if anything is.
+    pub fn end_leftovers(&self) {
+        if self.group_alive() {
+            force_group(self.inner.group);
+        }
+    }
+
+    /// Sends the forceful stop, falling back to the direct child when no
     /// signal program is available.
     fn end_group(&self) {
-        if !self.signal(FORCE_SIGNAL) {
+        if !force_group(self.inner.group) {
             self.kill_leader();
         }
     }
@@ -641,7 +686,7 @@ impl Process {
 impl Inner {
     /// Ends the group and reaps the child, best effort.
     fn shutdown(&self) {
-        signal_group(self.group, FORCE_SIGNAL);
+        force_group(self.group);
         if let Some(mut child) = lock(&self.child).take() {
             let _ = child.kill();
             let _ = child.wait();
@@ -717,9 +762,12 @@ impl Drop for Process {
         // A dropped handle has nobody left to read a graceful exit, and a
         // leaked handle would leave a command running forever, so the group is
         // ended outright rather than asked politely. A leader that has already
-        // exited took its group with it, so only a running one is left here.
+        // exited took its group with it, unless the group was kept, in which
+        // case what is left of it ends here.
         if self.is_running() {
             self.terminate(true);
+        } else if self.inner.leftovers == Leftovers::Keep {
+            self.end_leftovers();
         }
     }
 }
@@ -797,8 +845,11 @@ fn spawn_waiter(inner: Arc<Inner>) -> io::Result<()> {
             // now rather than at some later drop. Now is also when the id is
             // safe to signal: a group id stays taken while any member lives,
             // and a process id stays taken while its handle is open, which is
-            // why the child is released only afterwards.
-            signal_group(inner.group, FORCE_SIGNAL);
+            // why the child is released only afterwards. An owner that keeps
+            // the group ends it later, where the platform has groups to keep.
+            if inner.leftovers == Leftovers::End || cfg!(not(unix)) {
+                force_group(inner.group);
+            }
             drop(child);
             *lock(&inner.exit) = Some(exit);
         })?;
@@ -822,6 +873,19 @@ fn signal_group(group: u32, name: &str) -> bool {
             .status()
             .is_ok()
     })
+}
+
+/// Ends a process group outright, returning whether the signal was delivered.
+///
+/// On macOS the group is stopped before it is killed. A kill reaches the
+/// members one at a time there, so a shell whose current command dies first
+/// could otherwise start the next command of a list before the kill reaches
+/// the shell itself.
+fn force_group(group: u32) -> bool {
+    if cfg!(target_os = "macos") {
+        signal_group(group, STOP_SIGNAL);
+    }
+    signal_group(group, FORCE_SIGNAL)
 }
 
 /// Returns how a child ended.
@@ -991,6 +1055,7 @@ mod tests {
             Input::Closed,
             SpawnOptions {
                 streams: Streams::Merged,
+                ..SpawnOptions::default()
             },
         )
         .expect("start");
@@ -1339,6 +1404,87 @@ mod tests {
             );
         }
         assert!(!alive(&child));
+    }
+
+    /// Starts `command` under the shell with its group kept past its exit.
+    #[cfg(unix)]
+    fn start_kept(command: &str, cwd: Option<&Path>) -> Process {
+        Process::start_argv_with(
+            &shell_argv(command),
+            cwd,
+            CAPTURE_BYTES,
+            &crate::command::minimal_environment(),
+            Input::Closed,
+            SpawnOptions {
+                streams: Streams::Merged,
+                leftovers: Leftovers::Keep,
+            },
+        )
+        .expect("start")
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_kept_group_outlives_its_leader_until_ended() {
+        let process = start_kept("sleep 30 & echo $!", None);
+        assert!(
+            wait_until(|| forked_child(&process).is_some(), Duration::from_secs(10)),
+            "the shell did not report the child it forked"
+        );
+        let child = forked_child(&process).expect("a forked pid");
+        assert_eq!(exit_of(&process), Exit::Code(0));
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(alive(&child), "a kept group ended with its leader");
+        process.end_leftovers();
+        assert!(
+            wait_until(|| !alive(&child), Duration::from_secs(10)),
+            "ending the leftovers left the child running"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn group_alive_reports_a_background_child() {
+        let quiet = start_kept("exit 0", None);
+        let _ = exit_of(&quiet);
+        assert!(!quiet.group_alive(), "an empty group was reported alive");
+
+        let process = start_kept("sleep 30 & echo $!", None);
+        assert!(wait_until(
+            || forked_child(&process).is_some(),
+            Duration::from_secs(10)
+        ));
+        let child = forked_child(&process).expect("a forked pid");
+        let _ = exit_of(&process);
+        assert!(process.group_alive(), "the background child was not seen");
+        drop(process);
+        assert!(
+            wait_until(|| !alive(&child), Duration::from_secs(10)),
+            "a dropped handle left its kept group running"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_stopped_list_does_not_start_its_next_command() {
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let process = Process::start(
+            "echo ready; sleep 30; touch marker",
+            Some(dir.path()),
+            CAPTURE_BYTES,
+            Input::Closed,
+        )
+        .expect("start");
+        assert!(wait_until(
+            || text(process.stdout()).contains("ready"),
+            Duration::from_secs(10)
+        ));
+        assert!(process.terminate(true), "the group did not end");
+        std::thread::sleep(Duration::from_secs(1));
+        assert!(
+            !dir.path().join("marker").exists(),
+            "the next command of the list ran after the kill"
+        );
     }
 
     #[cfg(unix)]
