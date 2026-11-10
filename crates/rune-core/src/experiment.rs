@@ -3,7 +3,7 @@
 use crate::error::{Result, RuneError};
 
 /// The keys `RUNE_EXPERIMENT` accepts.
-const KEYS: &[&str] = &["map", "run_note"];
+const KEYS: &[&str] = &["map", "question_nudge", "run_note"];
 
 /// Switches for behaviour under measurement. The default is the shipped behaviour.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -12,6 +12,8 @@ pub struct Experiments {
     pub run_note: bool,
     /// `map=on|off`: forces the repository map on or off; `None` leaves the setting in force.
     pub map: Option<bool>,
+    /// `question_nudge=on|off`: tells an `ask` run that ends on a question to decide and continue.
+    pub question_nudge: bool,
 }
 
 impl Default for Experiments {
@@ -19,6 +21,7 @@ impl Default for Experiments {
         Self {
             run_note: true,
             map: None,
+            question_nudge: true,
         }
     }
 }
@@ -64,6 +67,7 @@ impl Experiments {
             };
             match key {
                 "run_note" => experiments.run_note = on,
+                "question_nudge" => experiments.question_nudge = on,
                 _ => experiments.map = Some(on),
             }
         }
@@ -92,6 +96,9 @@ impl Experiments {
         }
         if self.run_note != default.run_note {
             parts.push(format!("run_note={}", spelling(self.run_note)));
+        }
+        if self.question_nudge != default.question_nudge {
+            parts.push(format!("question_nudge={}", spelling(self.question_nudge)));
         }
         parts.sort();
         parts.join(",")
@@ -136,7 +143,10 @@ mod tests {
     fn an_unknown_key_names_the_known_keys() {
         let error = Experiments::parse("snapshot=on").unwrap_err();
         assert_eq!(error.message(), "unknown experiment key `snapshot`");
-        assert_eq!(error.hint(), Some("known keys are map, run_note"));
+        assert_eq!(
+            error.hint(),
+            Some("known keys are map, question_nudge, run_note")
+        );
         assert_eq!(error.field(), Some("RUNE_EXPERIMENT"));
         assert_eq!(message("map"), "`map` is not in key=value form");
     }
@@ -162,5 +172,8 @@ mod tests {
             "map=off,run_note=off"
         );
         assert_eq!(Experiments::parse("run_note=on").unwrap().render(), "");
+        let quiet = Experiments::parse("question_nudge=off").unwrap();
+        assert!(!quiet.question_nudge);
+        assert_eq!(quiet.render(), "question_nudge=off");
     }
 }

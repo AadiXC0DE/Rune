@@ -38,6 +38,8 @@ const SCENARIOS: &[&str] = &[
     "cut_mid_frame_then_ok",
     "prune_long_run",
     "overflow_ladder",
+    "question_nudge",
+    "question_nudge_off",
 ];
 
 /// Scenarios built in Rust, which have no file.
@@ -219,6 +221,17 @@ fn unknown_window_no_compaction() {
 #[test]
 fn context_overflow() {
     run_scenario("context_overflow");
+}
+
+#[test]
+fn question_nudge() {
+    // A headless reply that ends on a question is told once to decide.
+    run_scenario("question_nudge");
+}
+
+#[test]
+fn question_nudge_off() {
+    run_scenario("question_nudge_off");
 }
 
 #[test]

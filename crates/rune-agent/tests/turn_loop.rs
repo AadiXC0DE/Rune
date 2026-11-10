@@ -1199,6 +1199,17 @@ fn a_refused_summary_is_dropped_and_the_step_continues() {
 }
 
 #[test]
+fn the_question_nudge_is_off_for_hosts_that_do_not_ask_for_it() {
+    let endpoint = MockEndpoint::start(vec![Script::text("Should I also update the docs?")]);
+    let host = TestHost::new(endpoint);
+    let mut history = rune_agent::History::new();
+    history.push_user("fix it");
+    let outcome = run_turn(&mut history, &host).expect("turn");
+    assert_eq!(outcome.stop_reason, StopReason::Completed);
+    assert_eq!(host.server.as_ref().expect("endpoint").request_count(), 1);
+}
+
+#[test]
 fn a_refused_temperature_is_announced_once() {
     let endpoint = MockEndpoint::start(vec![Script::text("hi"), Script::text("again")]);
     let mut host = TestHost::new(endpoint);

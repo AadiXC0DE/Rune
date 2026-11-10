@@ -876,6 +876,10 @@ impl Host for AskHost<'_> {
         self.settings.temperature
     }
 
+    fn nudges_questions(&self) -> bool {
+        self.settings.experiments.question_nudge
+    }
+
     fn cache_key(&self) -> Option<String> {
         Some(
             self.cache_key

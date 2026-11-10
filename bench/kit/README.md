@@ -62,6 +62,7 @@ Experiment keys (`RUNE_EXPERIMENT`, comma-separated `key=value`, values `on` or 
 | Key | Default | Effect |
 | --- | --- | --- |
 | `run_note` | `on` | The note on non-interactive runs in the first message of `ask`. |
+| `question_nudge` | `on` | One note to an `ask` run whose reply ends on a question: decide and continue. |
 | `map` | unset | Forces the repository map on or off. |
 
 ## Adapters

@@ -1,0 +1,23 @@
+{
+  "prompt": "Fix the typo in README.md.",
+  "workspace": "workspaces/readme_only.json",
+  "turns": [
+    {
+      "text": "Should I also update the docs?"
+    },
+    {
+      "text": "Assumed no: the docs do not mention this. Nothing else changed."
+    }
+  ],
+  "expect": {
+    "exit_code": 0,
+    "final_output": "Assumed no: the docs do not mention this. Nothing else changed.",
+    "requests": 2,
+    "request_contains": [
+      {
+        "request": 2,
+        "text": "Nobody can answer in this run."
+      }
+    ]
+  }
+}

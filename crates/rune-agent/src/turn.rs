@@ -571,6 +571,12 @@ pub trait Host {
         None
     }
 
+    /// Whether a reply that ends on a question is told once that nobody can
+    /// answer, as in a headless run. False by default.
+    fn nudges_questions(&self) -> bool {
+        false
+    }
+
     /// The sampling temperature the user chose, over the model's default.
     /// None by default.
     fn temperature(&self) -> Option<f64> {
@@ -807,6 +813,8 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
         .unwrap_or(0);
     // A failing last check is pointed out once; the harness does not insist.
     let mut failure_noted = false;
+    // A headless question is answered with the nudge once per turn.
+    let mut question_nudged = false;
     let max_attempts = limits.get_usize(LimitName::ProviderMaxAttempts).max(1);
     let timeouts =
         transport::RequestTimeouts::from_settings(&limits, host.provider_head_timeout_ms());
@@ -1105,6 +1113,19 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
             // once when its last check failed, and asked once to check work
             // nothing checked. No extra request is spent on a turn that
             // checked, changed nothing, or ended for another reason.
+            // A headless reply that ends on a question is told once that
+            // nobody will answer, before the other finish notes.
+            if !last_step
+                && finish == FinishReason::Stop
+                && !question_nudged
+                && host.nudges_questions()
+                && text.trim_end().ends_with('?')
+                && host.objective_tokens_remaining() != Some(0)
+            {
+                question_nudged = true;
+                history.push_harness_note(QUESTION_NUDGE);
+                continue;
+            }
             if !last_step
                 && finish == FinishReason::Stop
                 && host.objective_tokens_remaining() != Some(0)
@@ -1654,6 +1675,10 @@ fn parallel_groups(calls: &[PreparedCall], width: usize) -> Vec<&[PreparedCall]>
     }
     groups
 }
+
+/// Tells a headless run that a question at the end will not be answered.
+const QUESTION_NUDGE: &str = "<harness_check>Nobody can answer in this run. Decide, state the \
+assumption in one line, and continue the work.</harness_check>";
 
 /// Shown once when the provider will not return reasoning summaries.
 pub const SUMMARY_REFUSED_NOTICE: &str =

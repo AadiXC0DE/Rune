@@ -1,0 +1,8 @@
+{
+  "description": "No nudge when an ask run ends on a question.",
+  "env": {
+    "RUNE_EXPERIMENT": "question_nudge=off"
+  },
+  "flags": [],
+  "files": {}
+}

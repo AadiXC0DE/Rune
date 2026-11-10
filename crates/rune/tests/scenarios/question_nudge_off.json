@@ -1,0 +1,17 @@
+{
+  "prompt": "Fix the typo in README.md.",
+  "workspace": "workspaces/readme_only.json",
+  "env": {
+    "RUNE_EXPERIMENT": "question_nudge=off"
+  },
+  "turns": [
+    {
+      "text": "Should I also update the docs?"
+    }
+  ],
+  "expect": {
+    "exit_code": 0,
+    "final_output": "Should I also update the docs?",
+    "requests": 1
+  }
+}
