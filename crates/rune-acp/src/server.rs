@@ -19,7 +19,7 @@ use std::fmt;
 use std::fs::OpenOptions;
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -1040,7 +1040,8 @@ fn run_one<W: Write + Send + 'static>(server: &Arc<Server<W>>, queued: Queued) {
     let host = TurnHost {
         server: Arc::clone(server),
         prompt: queued.prompt,
-        prompt_seq,
+        prompt_seq: AtomicU64::new(prompt_seq),
+        prompt_from_end: AtomicUsize::new(usize::MAX),
         session: session.clone(),
         context_window: server.context_window(&snapshot.config.model),
         config: snapshot.config.clone(),
@@ -1195,7 +1196,11 @@ impl<W: Write + Send + 'static> Server<W> {
 /// The host a turn runs against.
 struct TurnHost<W: Write + Send + 'static> {
     prompt: Prompt,
-    prompt_seq: u64,
+    /// Position of this turn's prompt, which compaction renumbers.
+    prompt_seq: AtomicU64,
+    /// The prompt's distance from the end of the history while a compaction
+    /// is applied, which the retained tail preserves; `usize::MAX` otherwise.
+    prompt_from_end: AtomicUsize,
     server: Arc<Server<W>>,
     session: String,
     config: SessionConfig,
@@ -1312,10 +1317,43 @@ impl<W: Write + Send + 'static> Host for TurnHost<W> {
         &self,
         history: &mut History,
         plan: &mut RequestPlan,
-        _client: &dyn rune_net::fetch::Fetch,
+        client: &dyn rune_net::fetch::Fetch,
     ) -> Result<()> {
-        self.prompt.hydrate(self.prompt_seq, history, plan);
+        // Attachments are projected first so the size estimate counts them.
+        self.prompt
+            .hydrate(self.prompt_seq.load(Ordering::Relaxed), history, plan);
+        let window = rune_agent::compaction::Window(self.context_window);
+        if rune_agent::compaction::auto_compact(history, plan, self, client, window)?.is_some() {
+            // The request was rebuilt from the compacted history, so the
+            // prompt's attachments are projected again at its new position.
+            self.prompt
+                .hydrate(self.prompt_seq.load(Ordering::Relaxed), history, plan);
+        }
         Ok(())
+    }
+
+    fn before_compaction(&self, history: &History) {
+        let seq = self.prompt_seq.load(Ordering::Relaxed);
+        let from_end = history
+            .turns()
+            .iter()
+            .rev()
+            .position(|turn| turn.seq == seq)
+            .unwrap_or(usize::MAX);
+        self.prompt_from_end.store(from_end, Ordering::Relaxed);
+    }
+
+    fn context_replaced(&self, report: &rune_agent::compaction::CompactionReport) {
+        // Turns are numbered from one after a compaction, with the summary
+        // first. A prompt inside the retained tail keeps its distance from the
+        // end; one in the removed prefix has no position left.
+        let from_end = self.prompt_from_end.swap(usize::MAX, Ordering::Relaxed);
+        let seq = if from_end.saturating_add(1) < report.remaining_turns {
+            u64::try_from(report.remaining_turns.saturating_sub(from_end)).unwrap_or(0)
+        } else {
+            0
+        };
+        self.prompt_seq.store(seq, Ordering::Relaxed);
     }
 
     fn dialect(&self) -> &dyn Provider {

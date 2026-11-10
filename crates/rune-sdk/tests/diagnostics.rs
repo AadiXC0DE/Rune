@@ -34,6 +34,8 @@ impl HostFetch for FixtureFetch {
 
 fn options(fetch: Arc<FixtureFetch>) -> AgentOptions {
     AgentOptions {
+        auto_compact: false,
+        context_window: None,
         api_key: "private-credential-9271".to_owned(),
         model: Some("private-model-9271".to_owned()),
         instructions: Some(vec!["private-instructions-9271".to_owned()]),

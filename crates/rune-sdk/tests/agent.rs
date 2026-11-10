@@ -98,6 +98,8 @@ impl HostFetch for SlowFetch {
 /// Builds options pointed at a mock endpoint.
 fn options(base_url: &str, fetch: Arc<dyn HostFetch>) -> AgentOptions {
     AgentOptions {
+        auto_compact: false,
+        context_window: None,
         api_key: "sk-embedder-credential-9271".to_owned(),
         model: Some("mock-model".to_owned()),
         instructions: Some(vec!["You are a meticulous assistant.".to_owned()]),

@@ -571,6 +571,10 @@ pub struct AgentOptions {
     pub dialect: Dialect,
     /// Network access. When absent, the workspace HTTP client is used.
     pub fetch: Option<Arc<dyn HostFetch>>,
+    /// Compact the conversation automatically before it outgrows the window. Off by default.
+    pub auto_compact: bool,
+    /// Context window in tokens used for that decision; the built-in default when absent.
+    pub context_window: Option<u64>,
 }
 
 impl fmt::Debug for AgentOptions {
@@ -586,6 +590,8 @@ impl fmt::Debug for AgentOptions {
                 "fetch",
                 &self.fetch.as_ref().map_or("built-in", |_| "host-supplied"),
             )
+            .field("auto_compact", &self.auto_compact)
+            .field("context_window", &self.context_window)
             .finish_non_exhaustive()
     }
 }
@@ -790,6 +796,8 @@ pub struct Agent {
     tools: Arc<Vec<HostTool>>,
     specs: Arc<Vec<ToolSpec>>,
     limits: BudgetSet,
+    /// The window automatic compaction decides against, when it is on.
+    auto_compact: Option<compaction::Window>,
     sources: AgentSources,
     conversation: Arc<Conversation>,
     /// Cancellation for the turn started last, which is the only one that can
@@ -902,6 +910,13 @@ impl Agent {
             specs: Arc::new(specs),
             tools: Arc::new(options.tools),
             limits: BudgetSet::new(),
+            auto_compact: options.auto_compact.then(|| {
+                compaction::Window(
+                    options
+                        .context_window
+                        .unwrap_or(rune_net::catalog::DEFAULT_CONTEXT_WINDOW),
+                )
+            }),
             sources,
             conversation: Arc::new(Conversation {
                 history: Mutex::new(history),
@@ -1132,6 +1147,7 @@ impl Agent {
             tools: Arc::clone(&self.tools),
             specs: Arc::clone(&self.specs),
             limits: self.limits.clone(),
+            auto_compact: self.auto_compact,
             max_steps: if options.max_steps == 0 {
                 self.limits
                     .get(LimitName::MaxAgentSteps)
@@ -1325,6 +1341,7 @@ struct TurnContext {
     specs: Arc<Vec<ToolSpec>>,
     limits: BudgetSet,
     max_steps: u64,
+    auto_compact: Option<compaction::Window>,
 }
 
 impl TurnContext {
@@ -1464,6 +1481,25 @@ impl rune_agent::turn::Host for SdkHost<'_> {
 
     fn observe_response(&self, outcome: &StreamOutcome) {
         self.context.store_usage(outcome.usage);
+    }
+
+    fn prepare_request(
+        &self,
+        history: &mut History,
+        plan: &mut rune_net::provider::RequestPlan,
+        client: &dyn rune_net::fetch::Fetch,
+    ) -> Result<()> {
+        match self.context.auto_compact {
+            Some(window) => {
+                compaction::auto_compact(history, plan, self, client, window).map(|_| ())
+            }
+            None => Ok(()),
+        }
+    }
+
+    fn context_replaced(&self, report: &compaction::CompactionReport) {
+        // The summary request is billed like any other.
+        self.context.store_usage(report.usage);
     }
 
     fn emit(&self, event: Event) {

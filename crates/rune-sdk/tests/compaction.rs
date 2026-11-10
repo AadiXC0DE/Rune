@@ -52,6 +52,8 @@ impl HostFetch for FixtureFetch {
 
 fn options(fetch: Arc<dyn HostFetch>) -> AgentOptions {
     AgentOptions {
+        auto_compact: false,
+        context_window: None,
         api_key: "fixture-secret".to_owned(),
         model: Some("fixture-model".to_owned()),
         instructions: Some(vec!["fixture host instructions".to_owned()]),
@@ -436,4 +438,94 @@ fn running_turns_and_closed_agents_refuse_compaction_before_calling_the_host() {
         ErrorCode::InvalidState
     );
     assert_eq!(agent.checkpoint().expect("after"), before);
+}
+
+/// Answers the summary request with a usable summary and anything else with
+/// a short reply, recording every request body.
+#[derive(Default)]
+struct SummaryFetch {
+    requests: Mutex<Vec<String>>,
+}
+
+impl HostFetch for SummaryFetch {
+    fn post(&self, request: FetchRequest) -> Result<FetchResponse> {
+        let text = if request
+            .body
+            .contains("Summarize the earlier portion of this conversation")
+        {
+            SUMMARY
+        } else {
+            "continued"
+        };
+        self.requests.lock().expect("requests").push(request.body);
+        let frames = [
+            json!({"type": "message_start", "message": {"usage": {"input_tokens": 10, "output_tokens": 0}}}),
+            json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": text}}),
+            json!({"type": "content_block_stop", "index": 0}),
+            json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 5}}),
+            json!({"type": "message_stop"}),
+        ];
+        let mut body = String::new();
+        for frame in frames {
+            write!(body, "data: {frame}\n\n").expect("write SSE frame");
+        }
+        Ok(FetchResponse::new(200, body))
+    }
+}
+
+#[test]
+fn auto_compact_summarises_before_the_window_is_reached() {
+    let fetch = Arc::new(SummaryFetch::default());
+    let mut options = options(fetch.clone());
+    options.auto_compact = true;
+    // The Anthropic dialect reserves 8,192 output tokens; 1,000 remain, and
+    // the restored conversation is about 950 tokens, past the 80% trigger.
+    options.context_window = Some(8_192 + 1_000);
+    let mut agent = Agent::restore(options, &fixture(false)).expect("fixture");
+    let before = agent.usage();
+    for _ in 0..2 {
+        agent
+            .prompt("continue", PromptOptions::default())
+            .expect("turn")
+            .result()
+            .expect("result");
+    }
+    let requests = fetch.requests.lock().expect("requests");
+    let summaries = requests
+        .iter()
+        .filter(|body| body.contains("Summarize the earlier portion"))
+        .count();
+    assert!(
+        summaries >= 1,
+        "no summary request among {}",
+        requests.len()
+    );
+    let last = requests.last().expect("a request");
+    assert!(last.contains("<context_handoff>"), "{last}");
+    assert!(!last.contains("question 0"), "{last}");
+    // The summary request is billed like the others.
+    let after = agent.usage();
+    let billed = after.input_tokens.unwrap_or(0) - before.input_tokens.unwrap_or(0);
+    assert_eq!(billed, 10 * u64::try_from(requests.len()).expect("count"));
+}
+
+#[test]
+fn auto_compact_off_by_default_sends_the_whole_history() {
+    let fetch = Arc::new(SummaryFetch::default());
+    let mut options = options(fetch.clone());
+    options.context_window = Some(2_000);
+    let mut agent = Agent::restore(options, &fixture(false)).expect("fixture");
+    for _ in 0..2 {
+        agent
+            .prompt("continue", PromptOptions::default())
+            .expect("turn")
+            .result()
+            .expect("result");
+    }
+    let requests = fetch.requests.lock().expect("requests");
+    assert_eq!(requests.len(), 2);
+    for body in requests.iter() {
+        assert!(!body.contains("Summarize the earlier portion"), "{body}");
+        assert!(body.contains("question 0"), "{body}");
+    }
 }

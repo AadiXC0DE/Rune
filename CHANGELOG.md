@@ -39,6 +39,10 @@ Notable changes, newest first. Each entry describes what a user can observe.
 - `rune ask` compacts a long run before it reaches the context window, as the
   interactive session does, and counts the summary requests in its usage and
   cost.
+- The ACP server compacts an editor session automatically before it outgrows
+  the model's window; images attached to the current prompt are kept. The SDK
+  offers the same as an option (`AgentOptions.auto_compact`, with
+  `context_window`), off by default.
 - A call that already failed the same way `max_consecutive_tool_failures` times
   is refused with a nudge and the turn goes on; sending it again after two
   refusals stops the run as `stalled`, instead of the turn ending at once.

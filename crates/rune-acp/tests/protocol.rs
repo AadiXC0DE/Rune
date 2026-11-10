@@ -302,6 +302,18 @@ impl Harness {
         files: Vec<(&str, &str)>,
         dialect: Dialect,
     ) -> Self {
+        Self::start_windowed(scripts, mode, limits, files, dialect, None)
+    }
+
+    /// Starts a server whose model has the given context window.
+    fn start_windowed(
+        scripts: Vec<Script>,
+        mode: PermissionMode,
+        limits: BudgetSet,
+        files: Vec<(&str, &str)>,
+        dialect: Dialect,
+        window: Option<u64>,
+    ) -> Self {
         let root = tempfile::tempdir().expect("tempdir");
         let workspace =
             Utf8PathBuf::from_path_buf(root.path().join("workspace")).expect("utf8 workspace");
@@ -325,6 +337,10 @@ impl Harness {
         .with_limits(limits)
         .expect("limits")
         .with_log_file(Some(log_file.clone()));
+        let config = match window {
+            Some(tokens) => config.with_context_window(tokens),
+            None => config,
+        };
 
         let (server_side, client_side) = UnixStream::pair().expect("socket pair");
         let output = server_side.try_clone().expect("clone");
@@ -633,6 +649,64 @@ fn images_survive_retries_and_tool_steps_but_are_not_replayed_on_later_prompts()
     assert!(!body.contains(IMAGE));
     assert!(!body.contains("image-ref:"));
 }
+
+#[test]
+fn a_long_prompt_turn_compacts() {
+    let mut limits = BudgetSet::new();
+    // A small result cap keeps two recent turns, so the third prompt's request
+    // can drop the first exchange.
+    limits
+        .set(
+            LimitName::MaxToolResultBytes,
+            Budget::Bounded(1024),
+            Layer::User,
+        )
+        .expect("result cap");
+    let mut harness = Harness::start_windowed(
+        vec![
+            Script::text("first answer"),
+            Script::text("second answer"),
+            Script::text("The user asked two questions; both were answered in full."),
+            Script::text("third answer"),
+        ],
+        PermissionMode::Auto,
+        limits,
+        Vec::new(),
+        Dialect::ChatCompletions,
+        Some(WINDOW),
+    );
+    let session = harness.open_session();
+    let padding = "first question padding ".repeat(300);
+    for (id, prompt_text) in [(3, padding.as_str()), (4, "second question")] {
+        let response = harness
+            .client()
+            .call(id, "session/prompt", &prompt(&session, prompt_text));
+        assert_eq!(response["result"]["stopReason"], "end_turn", "{response}");
+    }
+    // About 3,800 tokens per request so far; the third prompt's own text lifts
+    // it past 80% of the window, and dropping the first prompt brings it back.
+    let third = format!("third question {}", "third padding ".repeat(300));
+    let response = harness.client().call(
+        5,
+        "session/prompt",
+        &json!({"sessionId": session, "prompt": [{"type": "text", "text": third}, image_block()]}),
+    );
+    assert_eq!(response["result"]["stopReason"], "end_turn", "{response}");
+    assert_eq!(harness.mock.request_count(), 4);
+    let body = harness
+        .mock
+        .last_body()
+        .expect("request after compaction")
+        .to_string();
+    assert!(body.contains("<context_handoff>"), "{body}");
+    assert!(!body.contains("first question padding"), "{body}");
+    assert!(body.contains("third padding"), "{body}");
+    // The image belongs to the prompt that survived the cut, at its new position.
+    assert!(body.contains(IMAGE), "{body}");
+}
+
+/// Context window of the compaction test's model, in tokens.
+const WINDOW: u64 = 5_500;
 
 #[test]
 fn malformed_image_blocks_reject_the_whole_prompt_before_provider_or_session_changes() {
