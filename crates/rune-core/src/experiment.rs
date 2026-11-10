@@ -3,7 +3,7 @@
 use crate::error::{Result, RuneError};
 
 /// The keys `RUNE_EXPERIMENT` accepts.
-const KEYS: &[&str] = &["map", "question_nudge", "run_note"];
+const KEYS: &[&str] = &["map", "question_nudge", "run_note", "snapshot"];
 
 /// Switches for behaviour under measurement. The default is the shipped behaviour.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -14,6 +14,9 @@ pub struct Experiments {
     pub map: Option<bool>,
     /// `question_nudge=on|off`: tells an `ask` run that ends on a question to decide and continue.
     pub question_nudge: bool,
+    /// `snapshot=on|off`: adds the branch, changed files and top-level names to the first
+    /// message of `ask`.
+    pub snapshot: bool,
 }
 
 impl Default for Experiments {
@@ -22,6 +25,7 @@ impl Default for Experiments {
             run_note: true,
             map: None,
             question_nudge: true,
+            snapshot: false,
         }
     }
 }
@@ -68,6 +72,7 @@ impl Experiments {
             match key {
                 "run_note" => experiments.run_note = on,
                 "question_nudge" => experiments.question_nudge = on,
+                "snapshot" => experiments.snapshot = on,
                 _ => experiments.map = Some(on),
             }
         }
@@ -99,6 +104,9 @@ impl Experiments {
         }
         if self.question_nudge != default.question_nudge {
             parts.push(format!("question_nudge={}", spelling(self.question_nudge)));
+        }
+        if self.snapshot != default.snapshot {
+            parts.push(format!("snapshot={}", spelling(self.snapshot)));
         }
         parts.sort();
         parts.join(",")
@@ -141,11 +149,11 @@ mod tests {
 
     #[test]
     fn an_unknown_key_names_the_known_keys() {
-        let error = Experiments::parse("snapshot=on").unwrap_err();
-        assert_eq!(error.message(), "unknown experiment key `snapshot`");
+        let error = Experiments::parse("unknown=on").unwrap_err();
+        assert_eq!(error.message(), "unknown experiment key `unknown`");
         assert_eq!(
             error.hint(),
-            Some("known keys are map, question_nudge, run_note")
+            Some("known keys are map, question_nudge, run_note, snapshot")
         );
         assert_eq!(error.field(), Some("RUNE_EXPERIMENT"));
         assert_eq!(message("map"), "`map` is not in key=value form");
@@ -175,5 +183,10 @@ mod tests {
         let quiet = Experiments::parse("question_nudge=off").unwrap();
         assert!(!quiet.question_nudge);
         assert_eq!(quiet.render(), "question_nudge=off");
+        assert!(Experiments::parse("snapshot=on").unwrap().snapshot);
+        assert_eq!(
+            Experiments::parse("snapshot=on").unwrap().render(),
+            "snapshot=on"
+        );
     }
 }

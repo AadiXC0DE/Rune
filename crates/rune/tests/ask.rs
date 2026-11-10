@@ -363,6 +363,30 @@ fn offered_tools(request: &Value) -> Vec<String> {
 }
 
 #[test]
+fn ask_adds_the_workspace_snapshot_only_when_switched_on() {
+    for (switched_on, expected) in [(true, true), (false, false)] {
+        let (output, _, requests) = run_responses_fixture_command(
+            vec![completion_response(&json!({"content": "ok"}), "stop")],
+            Some("--json"),
+            true,
+            None,
+            (&["ask"], &[]),
+            |_, command| {
+                if switched_on {
+                    command.env("RUNE_EXPERIMENT", "snapshot=on");
+                }
+            },
+        );
+        assert_eq!(output.status.code(), Some(0), "{output:?}");
+        let body = requests[0].to_string();
+        assert_eq!(body.contains("<workspace_snapshot>"), expected, "{body}");
+        if expected {
+            assert!(body.contains("top level: "), "{body}");
+        }
+    }
+}
+
+#[test]
 fn ask_offers_the_subagent_tool() {
     let (output, _, requests) = run_responses_fixture_command(
         vec![completion_response(&json!({"content": "ok"}), "stop")],
@@ -2209,7 +2233,7 @@ fn ask_refuses_an_unknown_experiment_key_before_any_request() {
         None,
         (&["ask"], &[]),
         |_, command| {
-            command.env("RUNE_EXPERIMENT", "snapshot=on");
+            command.env("RUNE_EXPERIMENT", "unknown=on");
         },
     );
     assert_eq!(output.status.code(), Some(1), "{output:?}");

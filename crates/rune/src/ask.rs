@@ -1276,6 +1276,14 @@ pub fn run(
         ),
     }];
     parts.extend(attachments.parts());
+    if options.tool_loop
+        && settings.experiments.snapshot
+        && let Some(block) = crate::workspace_snapshot::render(&crate::current_workspace()?)
+    {
+        parts.push(ContentPart::Text {
+            text: format!("\n\n{block}"),
+        });
+    }
     history.prepend(rune_net::message::Role::User, parts);
     let mut context = ExecutionContext::new(crate::current_workspace()?)
         .with_offline(settings.offline)

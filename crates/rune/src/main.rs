@@ -41,6 +41,7 @@ mod subagent;
 mod version;
 mod vision_client;
 mod web_client;
+mod workspace_snapshot;
 
 use std::io::Write;
 use std::process::ExitCode;
