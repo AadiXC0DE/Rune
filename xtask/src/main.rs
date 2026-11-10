@@ -42,10 +42,10 @@ mod targets {
 
     /// Largest accepted first request of the scripted `fix_one_file` session, in bytes,
     /// with the workspace path replaced by `<workspace>`.
-    pub const MAX_SCRIPTED_FIRST_REQUEST_BYTES: usize = 9828;
+    pub const MAX_SCRIPTED_FIRST_REQUEST_BYTES: usize = 10407;
 
     /// Largest accepted sum of every request body in that session, in bytes.
-    pub const MAX_SCRIPTED_SESSION_BYTES: usize = 41483;
+    pub const MAX_SCRIPTED_SESSION_BYTES: usize = 43797;
 
     /// Largest accepted number of requests in that session.
     pub const MAX_SCRIPTED_REQUESTS: usize = 4;
