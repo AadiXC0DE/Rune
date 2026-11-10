@@ -13,6 +13,9 @@ use crate::workspace::{FileLimits, bool_arg, resolve, truncate_to_bytes, usize_a
 const TRUNCATION: &str = "\n[diff truncated at byte cap]\n";
 const CONFIG_BYTES: usize = 16 * 1024;
 const TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_PATHS: usize = 16;
+const UNTRACKED_BYTES: usize = 16 * 1024;
+const UNTRACKED_SHOWN: usize = 20;
 
 /// Inspects tracked changes under the workspace without staging or editing them.
 #[derive(Clone, Copy, Debug, Default)]
@@ -35,7 +38,7 @@ impl Tool for GitDiff {
 
     fn description(&self) -> &'static str {
         "Show uncommitted changes to tracked files: unstaged by default, or staged. \
-         Untracked files are not shown."
+         Untracked files are listed after the diff."
     }
 
     fn input_schema(&self) -> serde_json::Value {
@@ -44,6 +47,16 @@ impl Tool for GitDiff {
             "properties": {
                 "staged": {
                     "type": "boolean",
+                },
+                "paths": {
+                    "type": "array",
+                    "maxItems": MAX_PATHS,
+                    "items": {"type": "string"},
+                    "description": "Limit to these paths."
+                },
+                "stat": {
+                    "type": "boolean",
+                    "description": "Per-file summary only."
                 },
                 "max_bytes": {
                     "type": "integer",
@@ -68,6 +81,7 @@ impl Tool for GitDiff {
         context.check_cancelled()?;
         validate_closed_arguments(arguments, &self.input_schema())?;
         let staged = bool_arg(arguments, "staged")?.unwrap_or(false);
+        let stat = bool_arg(arguments, "stat")?.unwrap_or(false);
         let cap = usize_arg(arguments, "max_bytes")?
             .unwrap_or(usize::MAX)
             .min(self.limits.output_cap(context));
@@ -85,6 +99,7 @@ impl Tool for GitDiff {
             .with_hint("increase max_bytes and the host output budget"));
         }
         let workspace = resolve(context, ".")?.path;
+        let pathspecs = pathspecs(arguments, context, &workspace)?;
         let started = Instant::now();
         let environment = environment();
 
@@ -111,7 +126,7 @@ impl Tool for GitDiff {
             started,
         )?;
         if config.exit != Exit::Code(1) && !config.exit.is_success() {
-            return Ok(render(label, &config.stderr, cap, true));
+            return Ok(render(label, &config.stderr, cap, true, ""));
         }
         if config.stdout.produced > CONFIG_BYTES as u64 {
             return Err(RuneError::new(
@@ -146,32 +161,130 @@ impl Tool for GitDiff {
                 }
             ));
         }
+        argv.push("--literal-pathspecs".to_owned());
+        let mut untracked_argv = argv.clone();
         argv.extend(
             [
                 "diff",
-                "--patch",
+                if stat { "--stat=120" } else { "--patch" },
                 "--no-ext-diff",
                 "--no-textconv",
                 "--no-color",
                 "--no-renames",
                 "--ignore-submodules=all",
                 "--relative",
-                "--unified=3",
             ]
             .map(str::to_owned),
         );
+        // A context length implies a patch, so a summary leaves it out.
+        if !stat {
+            argv.push("--unified=3".to_owned());
+        }
         if staged {
             argv.push("--cached".to_owned());
         }
-        argv.extend(["--".to_owned(), ".".to_owned()]);
+        argv.push("--".to_owned());
+        argv.extend(pathspecs.iter().cloned());
         let diff = inspect(&argv, &workspace, cap, &environment, context, started)?;
         let failed = !diff.exit.is_success();
+        let untracked = if failed {
+            String::new()
+        } else {
+            untracked_argv.extend(
+                ["ls-files", "--others", "--exclude-standard", "-z", "--"].map(str::to_owned),
+            );
+            untracked_argv.extend(pathspecs);
+            match inspect(
+                &untracked_argv,
+                &workspace,
+                UNTRACKED_BYTES,
+                &environment,
+                context,
+                started,
+            ) {
+                Ok(listing) if listing.exit.is_success() => untracked_line(&listing.stdout),
+                Err(err) if err.code() == ErrorCode::Cancelled => return Err(err),
+                _ => String::new(),
+            }
+        };
         Ok(render(
             label,
             if failed { &diff.stderr } else { &diff.stdout },
             cap,
             failed,
+            &untracked,
         ))
+    }
+}
+
+/// Decodes `paths` into pathspecs relative to the workspace, `.` when absent.
+fn pathspecs(
+    arguments: &serde_json::Value,
+    context: &ExecutionContext,
+    workspace: &camino::Utf8Path,
+) -> Result<Vec<String>> {
+    let entries: &[serde_json::Value] = match arguments.get("paths") {
+        None | Some(serde_json::Value::Null) => &[],
+        Some(serde_json::Value::Array(entries)) => entries,
+        Some(_) => {
+            return Err(RuneError::invalid_field(
+                "paths",
+                "expected an array of strings",
+            ));
+        }
+    };
+    if entries.len() > MAX_PATHS {
+        return Err(RuneError::too_large("paths", entries.len(), MAX_PATHS));
+    }
+    let mut specs = Vec::with_capacity(entries.len().max(1));
+    for entry in entries {
+        let raw = entry
+            .as_str()
+            .ok_or_else(|| RuneError::invalid_field("paths", "expected an array of strings"))?;
+        let path = resolve(context, raw)?.path;
+        let spec = match path.strip_prefix(workspace) {
+            Ok(relative) => relative
+                .components()
+                .map(|component| component.as_str())
+                .collect::<Vec<_>>()
+                .join("/"),
+            Err(_) => path.into_string(),
+        };
+        specs.push(if spec.is_empty() {
+            ".".to_owned()
+        } else {
+            spec
+        });
+    }
+    if specs.is_empty() {
+        specs.push(".".to_owned());
+    }
+    Ok(specs)
+}
+
+/// Formats a NUL-separated untracked listing as one bracketed line, or nothing.
+fn untracked_line(listing: &Reading) -> String {
+    let cut = listing.produced > listing.bytes.len() as u64;
+    let text = String::from_utf8_lossy(&listing.bytes);
+    let mut names = text.split('\0').collect::<Vec<_>>();
+    // The piece after the last NUL is empty, or a name cut by the cap.
+    names.pop();
+    names.retain(|name| !name.is_empty());
+    if names.is_empty() {
+        return String::new();
+    }
+    let shown = names.len().min(UNTRACKED_SHOWN);
+    let rest = names.len().saturating_sub(shown);
+    let names = names[..shown].join(", ");
+    if cut {
+        format!(
+            "[untracked: {names}, and at least {} more]\n",
+            rest.saturating_add(1)
+        )
+    } else if rest > 0 {
+        format!("[untracked: {names}, and {rest} more]\n")
+    } else {
+        format!("[untracked: {names}]\n")
     }
 }
 
@@ -260,7 +373,7 @@ fn inspect(
     })
 }
 
-fn render(label: &str, reading: &Reading, cap: usize, failed: bool) -> ToolOutput {
+fn render(label: &str, reading: &Reading, cap: usize, failed: bool, untracked: &str) -> ToolOutput {
     let body = String::from_utf8_lossy(&reading.bytes);
     let body = if body.is_empty() {
         if failed {
@@ -271,20 +384,45 @@ fn render(label: &str, reading: &Reading, cap: usize, failed: bool) -> ToolOutpu
     } else {
         body.as_ref()
     };
-    let truncated = reading.produced > reading.bytes.len() as u64
-        || label.len().saturating_add(body.len()) > cap;
+    let cut = reading.produced > reading.bytes.len() as u64;
+    let whole = !cut
+        && label
+            .len()
+            .saturating_add(body.len())
+            .saturating_add(untracked.len())
+            <= cap;
+    let line = if whole
+        || label
+            .len()
+            .saturating_add(TRUNCATION.len())
+            .saturating_add(untracked.len())
+            <= cap
+    {
+        untracked
+    } else {
+        ""
+    };
+    let truncated = cut
+        || label
+            .len()
+            .saturating_add(body.len())
+            .saturating_add(line.len())
+            > cap;
     let room = cap
         .saturating_sub(label.len())
-        .saturating_sub(if truncated { TRUNCATION.len() } else { 0 });
+        .saturating_sub(if truncated { TRUNCATION.len() } else { 0 })
+        .saturating_sub(line.len());
     let mut text = String::from(label);
     text.push_str(truncate_to_bytes(body, room));
     if truncated {
         text.push_str(TRUNCATION);
     }
+    text.push_str(line);
     ToolOutput {
         produced_bytes: reading
             .produced
             .saturating_add(label.len() as u64)
+            .saturating_add(untracked.len() as u64)
             .max(text.len() as u64),
         text,
         is_error: failed,
@@ -386,7 +524,8 @@ mod tests {
                 assert!(result.text.starts_with("Unstaged diff:\n"));
                 assert!(result.text.contains("-staged content\n+unstaged content"));
             }
-            assert!(!result.text.contains("untracked.txt"));
+            assert!(result.text.ends_with("\n[untracked: untracked.txt]\n"));
+            assert!(!result.text.contains("untracked secret"));
             assert!(!result.text.contains("truncated"));
             assert_eq!(snapshot(directory.path()), before);
         }
@@ -427,7 +566,11 @@ mod tests {
                 } else {
                     "Unstaged diff:\n"
                 }));
-                assert!(output.text.ends_with(TRUNCATION));
+                assert!(
+                    output
+                        .text
+                        .ends_with(&format!("{TRUNCATION}[untracked: untracked.txt]\n"))
+                );
                 assert!(output.produced_bytes > output.text.len() as u64);
             }
             assert_eq!(requested, host);
@@ -495,6 +638,7 @@ mod tests {
         for file in ["text.txt", "nested/inside.txt"] {
             std::fs::write(root.join(file), "staged content\n").expect("restore worktree");
         }
+        std::fs::remove_file(root.join("untracked.txt")).expect("remove untracked");
         let output = GitDiff::default()
             .call(&json!({}), &ExecutionContext::new(root.to_owned()))
             .expect("clean");
@@ -513,6 +657,192 @@ mod tests {
         assert!(output.is_error);
         assert!(output.text.len() <= 128);
         assert!(output.text.starts_with("Unstaged diff:\n"));
+    }
+
+    #[test]
+    fn paths_limit_the_diff() {
+        let directory = fixture();
+        let root = Utf8Path::from_path(directory.path()).expect("root");
+        std::fs::write(root.join("nested/new.txt"), "new\n").expect("untracked nested");
+        let context = ExecutionContext::new(root.to_owned());
+        for staged in [false, true] {
+            let output = GitDiff::default()
+                .call(&json!({"staged": staged, "paths": ["nested"]}), &context)
+                .expect("diff");
+            assert!(!output.is_error, "{}", output.text);
+            assert!(output.text.contains("nested/inside.txt"));
+            assert!(!output.text.contains("a/text.txt"));
+            assert!(!output.text.contains("untracked.txt"));
+            assert!(output.text.ends_with("\n[untracked: nested/new.txt]\n"));
+        }
+        let output = GitDiff::default()
+            .call(&json!({"paths": []}), &context)
+            .expect("empty paths");
+        assert!(output.text.contains("a/text.txt"));
+        assert!(output.text.contains("nested/inside.txt"));
+        assert!(
+            output
+                .text
+                .ends_with("[untracked: nested/new.txt, untracked.txt]\n")
+        );
+    }
+
+    #[test]
+    fn stat_returns_a_summary() {
+        let directory = fixture();
+        let root = Utf8Path::from_path(directory.path()).expect("root");
+        let context = ExecutionContext::new(root.to_owned());
+        for (staged, label, counts) in [
+            (false, "Unstaged diff:\n", "| 2 +-"),
+            (true, "Staged diff:\n", "| 1 +"),
+        ] {
+            let output = GitDiff::default()
+                .call(&json!({"staged": staged, "stat": true}), &context)
+                .expect("stat");
+            assert!(!output.is_error, "{}", output.text);
+            assert!(output.text.starts_with(label));
+            for file in ["text.txt", "nested/inside.txt"] {
+                assert!(
+                    output
+                        .text
+                        .lines()
+                        .any(|line| line.trim_start().starts_with(file) && line.ends_with(counts)),
+                    "{}",
+                    output.text
+                );
+            }
+            assert!(output.text.contains("2 files changed"));
+            assert!(!output.text.contains("@@"));
+            assert!(!output.text.contains("+unstaged content"));
+            assert!(output.text.ends_with("[untracked: untracked.txt]\n"));
+        }
+    }
+
+    #[test]
+    fn untracked_files_are_listed_after_the_diff() {
+        let directory = fixture();
+        let root = Utf8Path::from_path(directory.path()).expect("root");
+        let context = ExecutionContext::new(root.to_owned());
+        let unstaged = GitDiff::default()
+            .call(&json!({}), &context)
+            .expect("unstaged");
+        assert!(
+            unstaged
+                .text
+                .ends_with("+unstaged content\n[untracked: untracked.txt]\n")
+        );
+        let staged = GitDiff::default()
+            .call(&json!({"staged": true}), &context)
+            .expect("staged");
+        assert!(
+            staged
+                .text
+                .ends_with("+staged content\n[untracked: untracked.txt]\n")
+        );
+        let minimum = "Unstaged diff:\n".len() + TRUNCATION.len();
+        let tiny = GitDiff::default()
+            .call(&json!({"max_bytes": minimum}), &context)
+            .expect("tiny cap");
+        assert!(tiny.text.len() <= minimum);
+        assert!(tiny.text.ends_with(TRUNCATION));
+        assert!(!tiny.text.contains("[untracked"));
+        for file in ["text.txt", "nested/inside.txt"] {
+            std::fs::write(root.join(file), "staged content\n").expect("restore worktree");
+        }
+        let only = GitDiff::default()
+            .call(&json!({}), &context)
+            .expect("untracked only");
+        assert!(!only.is_error);
+        assert_eq!(
+            only.text,
+            "Unstaged diff:\nNo changes.\n[untracked: untracked.txt]\n"
+        );
+    }
+
+    #[test]
+    fn many_untracked_files_are_summarised_after_twenty() {
+        let directory = fixture();
+        let root = Utf8Path::from_path(directory.path()).expect("root");
+        for number in 0..24 {
+            std::fs::write(root.join(format!("f{number:02}.txt")), "new\n").expect("untracked");
+        }
+        let output = GitDiff::default()
+            .call(&json!({}), &ExecutionContext::new(root.to_owned()))
+            .expect("diff");
+        let names = (0..20)
+            .map(|number| format!("f{number:02}.txt"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        assert!(
+            output
+                .text
+                .ends_with(&format!("\n[untracked: {names}, and 5 more]\n")),
+            "{}",
+            output.text
+        );
+        let cut = Reading {
+            bytes: b"a.txt\0b.txt\0partial".to_vec(),
+            next: 19,
+            produced: 64,
+        };
+        assert_eq!(
+            untracked_line(&cut),
+            "[untracked: a.txt, b.txt, and at least 1 more]\n"
+        );
+    }
+
+    #[test]
+    fn ignored_files_are_not_listed() {
+        let directory = fixture();
+        let root = Utf8Path::from_path(directory.path()).expect("root");
+        std::fs::write(root.join(".gitignore"), "ignored.log\n").expect("ignore rules");
+        std::fs::write(root.join("ignored.log"), "noise\n").expect("ignored file");
+        let output = GitDiff::default()
+            .call(&json!({}), &ExecutionContext::new(root.to_owned()))
+            .expect("diff");
+        assert!(
+            output
+                .text
+                .ends_with("[untracked: .gitignore, untracked.txt]\n")
+        );
+        assert!(!output.text.contains("ignored.log"));
+    }
+
+    #[test]
+    fn paths_outside_the_workspace_are_refused() {
+        let directory = fixture();
+        let root = Utf8Path::from_path(directory.path()).expect("root");
+        let context = ExecutionContext::new(root.join("nested"));
+        let error = GitDiff::default()
+            .call(&json!({"paths": ["../text.txt"]}), &context)
+            .expect_err("outside");
+        assert_eq!(error.code(), ErrorCode::PathOutsideWorkspace);
+        let error = GitDiff::default()
+            .call(
+                &json!({"paths": ["../outside"]}),
+                &ExecutionContext::new(root.to_owned()),
+            )
+            .expect_err("outside");
+        assert_eq!(error.code(), ErrorCode::PathOutsideWorkspace);
+    }
+
+    #[test]
+    fn more_than_sixteen_paths_are_refused() {
+        let context = ExecutionContext::new("/unused".into());
+        let paths = (0..17)
+            .map(|number| format!("f{number}"))
+            .collect::<Vec<_>>();
+        let error = GitDiff::default()
+            .call(&json!({"paths": paths}), &context)
+            .expect_err("too many paths");
+        assert_eq!(error.code(), ErrorCode::TooLarge);
+        for paths in [json!("text.txt"), json!(["text.txt", 3])] {
+            let error = GitDiff::default()
+                .call(&json!({"paths": paths}), &context)
+                .expect_err("not strings");
+            assert_eq!(error.code(), ErrorCode::InvalidField);
+            assert_eq!(error.message(), "expected an array of strings");
+        }
     }
 
     #[test]
@@ -551,7 +881,7 @@ mod tests {
                 bytes,
             };
             for cap in label.len() + TRUNCATION.len()..160 {
-                let output = render(label, &reading, cap, false);
+                let output = render(label, &reading, cap, false, "");
                 assert!(output.text.len() <= cap);
                 assert!(output.text.ends_with(TRUNCATION));
             }
@@ -561,7 +891,13 @@ mod tests {
             next: 4,
             produced: 4,
         };
-        let exact = render(label, &reading, label.len() + reading.bytes.len(), false);
+        let exact = render(
+            label,
+            &reading,
+            label.len() + reading.bytes.len(),
+            false,
+            "",
+        );
         assert_eq!(exact.text, "Staged diff:\nabc\n");
     }
 
