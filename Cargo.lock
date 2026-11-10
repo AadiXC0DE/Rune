@@ -1083,6 +1083,7 @@ version = "0.1.17"
 dependencies = [
  "camino",
  "jiff",
+ "regex",
  "rune-core",
  "serde",
  "serde_json",

@@ -332,7 +332,8 @@ const TRANSIENT_FAILURES: &[&str] = &[
 /// when it arrives mid-stream as when it arrives as a status, so it is reported
 /// as a rejection the transport retries. Anything else, such as a request the
 /// endpoint refused, fails the same way when repeated and is reported as an
-/// invalid request.
+/// invalid request, except a context overflow, which is reported so that
+/// overflow recovery sees it.
 #[must_use]
 pub fn stream_failure(error: &serde_json::Value, fallback: &str) -> RuneError {
     let message = error
@@ -340,12 +341,17 @@ pub fn stream_failure(error: &serde_json::Value, fallback: &str) -> RuneError {
         .and_then(serde_json::Value::as_str)
         .or_else(|| error.as_str())
         .unwrap_or(fallback);
-    let code = if is_transient_failure(error) {
-        ErrorCode::RequestRejected
-    } else {
-        ErrorCode::InvalidField
-    };
-    RuneError::new(code, message.to_owned())
+    if is_transient_failure(error) {
+        return RuneError::new(ErrorCode::RequestRejected, message.to_owned());
+    }
+    let code = ["code", "type"]
+        .iter()
+        .find_map(|key| error.get(*key).and_then(serde_json::Value::as_str));
+    if crate::error::is_overflow(None, code, message) {
+        return RuneError::new(ErrorCode::TooLarge, message.to_owned())
+            .with_provider_code("context_overflow");
+    }
+    RuneError::new(ErrorCode::InvalidField, message.to_owned())
 }
 
 /// Returns true when a reported failure names a transient condition.
@@ -549,6 +555,18 @@ mod tests {
             assert!(!err.is_retryable(), "{error} was retried");
             assert_eq!(err.kind(), crate::error::FailureKind::InvalidRequest);
         }
+    }
+
+    #[test]
+    fn an_overflow_reported_in_the_stream_is_an_overflow() {
+        let frame: serde_json::Value =
+            serde_json::from_str(r#"{"type":"error","error":{"message":"prompt is too long"}}"#)
+                .expect("frame");
+        let failure = stream_failure(&frame["error"], "failed");
+        assert_eq!(failure.code(), ErrorCode::TooLarge);
+        let err = crate::error::NetError::from(failure);
+        assert_eq!(err.kind(), crate::error::FailureKind::ContextTooLong);
+        assert!(!err.is_retryable());
     }
 
     #[test]

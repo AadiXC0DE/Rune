@@ -687,10 +687,13 @@ pub fn stream_completion_encoded(
         let text = read_bounded_text(response.body, 64 * 1024);
         check_request_timeout(started, timeouts.total)?;
         let sanitized = redact::redact(&text);
-        let mut error = NetError::classify_status(response.status, &sanitized).with_hint(format!(
-            "provider `{}` rejected the request",
-            provider.name()
-        ));
+        let mut error = NetError::classify_status(response.status, &sanitized);
+        if error.hint().is_none() {
+            error = error.with_hint(format!(
+                "provider `{}` rejected the request",
+                provider.name()
+            ));
+        }
         // The endpoint's own delay is used when it named one. Otherwise none is
         // attached, and the caller's backoff decides.
         if let Some(millis) = retry_after {
@@ -1717,6 +1720,61 @@ mod tests {
             drop(connection);
         });
         (format!("http://127.0.0.1:{port}"), hold)
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn a_classification_hint_survives_the_transport() {
+        use std::io::{BufRead as _, Write as _};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let address = listener.local_addr().expect("address");
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut reader = std::io::BufReader::new(stream.try_clone().expect("clone"));
+            let mut length = 0_usize;
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).expect("request head") == 0 || line.trim().is_empty()
+                {
+                    break;
+                }
+                if let Some((name, value)) = line.split_once(':')
+                    && name.eq_ignore_ascii_case("content-length")
+                {
+                    length = value.trim().parse().expect("content length");
+                }
+            }
+            reader
+                .read_exact(&mut vec![0_u8; length])
+                .expect("request body");
+            let body = r#"{"error":{"code":"insufficient_quota","message":"You exceeded your current quota"}}"#;
+            write!(
+                stream,
+                "HTTP/1.1 429 Too Many Requests\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .expect("response");
+        });
+        let mut plan = RequestPlan::new("m");
+        plan.messages = vec![Message::user("hi")];
+        let err = stream_completion(
+            &UreqFetch::new(),
+            &Endpoint::new(format!("http://{address}"), "k"),
+            &crate::chat_completions::ChatCompletions,
+            &plan,
+            Duration::from_secs(5),
+            &|| false,
+        )
+        .expect_err("refused");
+        server.join().expect("fixture server");
+        assert_eq!(err.kind(), FailureKind::QuotaExceeded, "{err}");
+        assert!(!err.is_retryable());
+        assert!(
+            err.hint()
+                .is_some_and(|hint| hint.contains("out of credit or quota")),
+            "{err}"
+        );
     }
 
     #[cfg(not(target_family = "wasm"))]
