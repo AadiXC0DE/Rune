@@ -35,6 +35,7 @@ fi
 
 step "benchmark kit tests"
 python3 -m unittest discover -s bench/kit -p 'test_*.py'
+python3 -m unittest discover -s bench/harbor -p 'test_*.py'
 
 if [[ "${1:-}" != "--quick" ]]; then
     step "workspace tests"
