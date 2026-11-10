@@ -726,46 +726,16 @@ pub(crate) fn is_check_command(arguments: &str) -> bool {
     !command.is_empty() && !reads.contains(&program) && !git_read
 }
 
-/// Returns true for a shell call that runs a known test, build or lint
-/// command and nothing else: no redirection, chaining or substitution, so
-/// running it again with nothing changed cannot have another effect.
-fn is_repeatable_check(arguments: &str) -> bool {
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(arguments) else {
-        return false;
-    };
+/// Returns the command of a shell `run` call.
+fn shell_run_command(arguments: &str) -> Option<String> {
+    let value = serde_json::from_str::<serde_json::Value>(arguments).ok()?;
     if value.get("action").and_then(serde_json::Value::as_str) != Some("run") {
-        return false;
+        return None;
     }
-    let command = value
+    value
         .get("command")
         .and_then(serde_json::Value::as_str)
-        .unwrap_or_default()
-        .trim();
-    // Output may be piped into a reader; anything that writes or chains is out.
-    let plain = command.replace("2>&1", "");
-    if ["&&", "||", ";", ">", "`", "$(", " tee "]
-        .iter()
-        .any(|operator| plain.contains(operator))
-    {
-        return false;
-    }
-    let runner = command.split('|').next().unwrap_or_default().trim();
-    let words: Vec<&str> = runner.split_whitespace().collect();
-    match words.as_slice() {
-        ["cargo", sub, ..] => ["test", "build", "check", "clippy", "nextest"].contains(sub),
-        ["npm" | "pnpm" | "yarn" | "bun", "test", ..] => true,
-        ["npm" | "pnpm" | "yarn" | "bun", "run", script, ..] => {
-            ["test", "build", "lint", "check", "typecheck"].contains(script)
-        }
-        ["npx" | "pnpx" | "bunx", tool, ..] => {
-            ["jest", "vitest", "tsc", "eslint", "mocha"].contains(tool)
-        }
-        ["node", "--test", ..] | ["pytest" | "tsc" | "jest" | "vitest", ..] => true,
-        ["python" | "python3", "-m", module, ..] => ["pytest", "unittest", "mypy"].contains(module),
-        ["go", sub, ..] => ["test", "build", "vet"].contains(sub),
-        ["make", target, ..] => ["test", "check", "lint"].contains(target),
-        _ => false,
-    }
+        .map(|command| command.trim().to_owned())
 }
 
 /// Asks the model to check a change before the turn ends.
@@ -1847,7 +1817,9 @@ fn repeat_guard(
     let activity_now = activity(&call.name);
     // A test, build or check command run again with nothing changed since says
     // what it said before, failures included, so it is answered the same way.
-    let check = call.name == "shell" && is_repeatable_check(&call.arguments);
+    let check = call.name == "shell"
+        && shell_run_command(&call.arguments)
+            .is_some_and(|command| rune_policy::checks::is_repeatable_check(&command));
     // A retained-result page depends on the remaining budget, not only its arguments.
     if !(reads(activity_now) || check) || call.name == "read_tool_result" {
         return None;
@@ -2259,7 +2231,10 @@ fn retain_result(
             history.record_view(resolved_path(host, raw), digest);
         }
     }
-    if result.executed && result.call.name == "shell" && is_repeatable_check(&result.call.arguments)
+    if result.executed
+        && result.call.name == "shell"
+        && shell_run_command(&result.call.arguments)
+            .is_some_and(|command| rune_policy::checks::is_repeatable_check(&command))
     {
         history.record_check_generation(&result.call.id, rune_tools::shell::background().1);
     }
@@ -3066,36 +3041,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn only_plain_test_build_and_lint_commands_are_repeatable() {
-        let run = |command: &str| {
-            is_repeatable_check(
-                &serde_json::json!({"action": "run", "command": command}).to_string(),
-            )
-        };
-        for yes in [
-            "cargo test -p core",
-            "cargo test 2>&1 | tail -40",
-            "npm test",
-            "npm run lint",
-            "npx vitest run",
-            "python -m pytest -q",
-            "go test ./...",
-            "node --test test/",
-        ] {
-            assert!(run(yes), "{yes}");
-        }
-        for no in [
-            "sed -i 's/a/b/' x",
-            "cargo fmt && cargo test",
-            "cargo test > out.txt",
-            "npm install",
-            "npm run deploy",
-            "cargo test | tee log",
-            "make install",
-        ] {
-            assert!(!run(no), "{no}");
-        }
-        assert!(!is_repeatable_check(r#"{"action":"read","session":"s1"}"#));
+    fn only_a_shell_run_has_a_command() {
+        assert_eq!(
+            shell_run_command(r#"{"action":"run","command":" cargo test "}"#).as_deref(),
+            Some("cargo test")
+        );
+        assert_eq!(
+            shell_run_command(r#"{"action":"read","session":"s1"}"#),
+            None
+        );
+        assert_eq!(shell_run_command("not json"), None);
     }
 
     #[test]

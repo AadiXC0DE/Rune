@@ -4,6 +4,7 @@
 #![cfg_attr(test, allow(clippy::expect_used, clippy::unwrap_used, clippy::panic))]
 
 pub mod approval;
+pub mod checks;
 pub mod command;
 pub mod command_line;
 pub mod decision;

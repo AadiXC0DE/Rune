@@ -233,42 +233,7 @@ pub fn builtin_rules(mode: &PermissionMode) -> RuleSet {
     // the same terms: inside the sandbox, one command at a time, with any
     // chained command, substitution or redirection judged on its own. Without
     // them a run outside Rust could not verify its own change.
-    for pattern in [
-        "cargo test*",
-        "cargo build*",
-        "cargo check*",
-        "cargo clippy*",
-        "npm test*",
-        "npm run test*",
-        "npm run build*",
-        "npm run lint*",
-        "npm run typecheck*",
-        "pnpm test*",
-        "pnpm run test*",
-        "yarn test*",
-        "bun test*",
-        "deno test*",
-        "node --test*",
-        "npx vitest*",
-        "npx jest*",
-        "npx tsc*",
-        "pytest*",
-        "python -m pytest*",
-        "python3 -m pytest*",
-        "python -m unittest*",
-        "python3 -m unittest*",
-        "go test*",
-        "go build*",
-        "go vet*",
-        "make test*",
-        "make check*",
-        "mvn test*",
-        "gradle test*",
-        "./gradlew test*",
-        "dotnet test*",
-        "bundle exec rspec*",
-        "mix test*",
-    ] {
+    for pattern in rune_policy::checks::allow_patterns() {
         rules.push(Rule::allow("shell", pattern, Layer::Default));
     }
 
@@ -492,6 +457,57 @@ mod tests {
         // Ask mode keeps asking about every command.
         let ask = builtin_rules(&PermissionMode::Ask);
         assert!(!explain(&ask, PermissionMode::Ask, "shell", "npm test").contains(": allowed"));
+    }
+
+    #[test]
+    fn the_default_rules_keep_every_earlier_check_pattern() {
+        let rules = builtin_rules(&PermissionMode::Auto);
+        let shell: Vec<&str> = rules
+            .rules()
+            .iter()
+            .filter(|rule| rule.tool == "shell" && rule.outcome == Outcome::Allow)
+            .map(|rule| rule.pattern.as_str())
+            .collect();
+        let earlier = [
+            "cargo test*",
+            "cargo build*",
+            "cargo check*",
+            "cargo clippy*",
+            "npm test*",
+            "npm run test*",
+            "npm run build*",
+            "npm run lint*",
+            "npm run typecheck*",
+            "pnpm test*",
+            "pnpm run test*",
+            "yarn test*",
+            "bun test*",
+            "deno test*",
+            "node --test*",
+            "npx vitest*",
+            "npx jest*",
+            "npx tsc*",
+            "pytest*",
+            "python -m pytest*",
+            "python3 -m pytest*",
+            "python -m unittest*",
+            "python3 -m unittest*",
+            "go test*",
+            "go build*",
+            "go vet*",
+            "make test*",
+            "make check*",
+            "mvn test*",
+            "gradle test*",
+            "./gradlew test*",
+            "dotnet test*",
+            "bundle exec rspec*",
+            "mix test*",
+        ];
+        assert_eq!(earlier.len(), 34);
+        for pattern in earlier {
+            assert!(shell.contains(&pattern), "{pattern}");
+        }
     }
 
     #[test]
