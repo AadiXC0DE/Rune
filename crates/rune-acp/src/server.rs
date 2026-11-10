@@ -160,6 +160,8 @@ pub struct ServerConfig {
     pub additional_roots: Vec<Utf8PathBuf>,
     /// What shell commands receive beyond the minimal environment.
     pub environment: Arc<rune_tools::EnvironmentPolicy>,
+    /// Whether sandboxed shell commands may use the network.
+    pub network: bool,
 }
 
 impl fmt::Debug for ServerConfig {
@@ -211,6 +213,7 @@ impl ServerConfig {
             context_window,
             additional_roots: Vec::new(),
             environment: Arc::default(),
+            network: false,
         })
     }
 
@@ -1053,7 +1056,8 @@ fn run_one<W: Write + Send + 'static>(server: &Arc<Server<W>>, queued: Queued) {
             .context
             .clone()
             .with_offline(server.config.endpoint.offline)
-            .with_environment(Arc::clone(&server.config.environment)),
+            .with_environment(Arc::clone(&server.config.environment))
+            .with_network(server.config.network),
         cancellation: cancellation.clone(),
         steering: snapshot.steering,
         tools,

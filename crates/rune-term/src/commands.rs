@@ -38,6 +38,11 @@ pub const BUILTINS: &[Builtin] = &[
         summary: "show or set the session's spend limit",
     },
     Builtin {
+        name: "network",
+        arguments: "[on|off]",
+        summary: "show or set network access for shell commands",
+    },
+    Builtin {
         name: "plan",
         arguments: "[task|off]",
         summary: "plan read-only before acting, or leave plan mode",

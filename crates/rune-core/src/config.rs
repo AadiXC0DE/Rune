@@ -429,6 +429,10 @@ pub struct UserConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub web_tools: Option<bool>,
 
+    /// Whether sandboxed shell commands may use the network. Off by default; offline mode overrules it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shell_network: Option<bool>,
+
     /// Model per provider, either a bare identifier or a table describing it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub models: Option<BTreeMap<String, ModelEntry>>,
@@ -597,6 +601,8 @@ pub struct Settings {
     pub configured_models: BTreeMap<String, ModelEntry>,
     /// Whether the web tools may reach the network.
     pub web_tools: bool,
+    /// Whether sandboxed shell commands may use the network.
+    pub shell_network: bool,
     /// Input capacity the configured model accepts, when one is declared.
     ///
     /// Held here rather than looked up at the point it is needed, because the
@@ -666,6 +672,7 @@ impl Default for Settings {
             pre_tool_hook: None,
             post_tool_hook: None,
             web_tools: false,
+            shell_network: false,
             context_window: None,
             base_url: None,
             api_key_env: None,
@@ -814,6 +821,7 @@ impl Settings {
             ),
             ("ascii", self.ascii.to_string()),
             ("web_tools", self.web_tools.to_string()),
+            ("shell_network", self.shell_network.to_string()),
             (
                 "post_tool_hook",
                 self.post_tool_hook
@@ -918,6 +926,8 @@ pub struct EnvironmentOverrides {
     pub offline: Option<bool>,
     /// Whether the web tools may reach the network.
     pub web_tools: Option<bool>,
+    /// `RUNE_NETWORK`: whether sandboxed shell commands may use the network.
+    pub network: Option<bool>,
     /// Boolean variables whose value was not a boolean, with that value.
     ///
     /// Kept so the value is reported rather than silently ignored: an
@@ -974,6 +984,7 @@ impl EnvironmentOverrides {
             review_model: lookup("RUNE_REVIEW_MODEL"),
             offline: boolean(&mut lookup, "RUNE_OFFLINE"),
             web_tools: boolean(&mut lookup, "RUNE_WEB_TOOLS"),
+            network: boolean(&mut lookup, "RUNE_NETWORK"),
             invalid_booleans: Vec::new(),
         };
         out.invalid_booleans = invalid_booleans;
@@ -1247,6 +1258,12 @@ fn apply_user(settings: &mut Settings, user: &UserConfig, layer: Layer) {
         // owner's call rather than the repository's.
         settings.web_tools = web_tools;
         settings.sources.record("web_tools", layer);
+    }
+    if let Some(network) = user.shell_network {
+        // Not in a project file either: a repository cannot grant its own
+        // commands the network.
+        settings.shell_network = network;
+        settings.sources.record("shell_network", layer);
     }
     if let Some(provider) = &user.provider {
         settings.provider = provider.clone();
@@ -1583,6 +1600,10 @@ fn apply_environment(settings: &mut Settings, env: &EnvironmentOverrides) {
     if let Some(web_tools) = env.web_tools {
         settings.web_tools = web_tools;
         settings.sources.record("web_tools", layer);
+    }
+    if let Some(network) = env.network {
+        settings.shell_network = network;
+        settings.sources.record("shell_network", layer);
     }
     if let Some(offline) = env.offline {
         settings.offline = offline;
@@ -2014,6 +2035,38 @@ mod tests {
             assert_eq!(settings.web_tools, !enabled);
             assert_eq!(settings.source_of("web_tools"), Layer::Environment);
         }
+    }
+
+    #[test]
+    fn shell_network_comes_from_user_and_environment_only() {
+        let dir = TempDir::new().expect("tempdir");
+        assert!(!load(None, None, &empty_env()).shell_network);
+        let user = write(&dir, "config.toml", "shell_network = true\n");
+        let settings = load(None, Some(&user), &empty_env());
+        assert!(settings.shell_network);
+        assert_eq!(settings.source_of("shell_network"), Layer::User);
+
+        let env = EnvironmentOverrides::from_lookup(|key| {
+            (key == "RUNE_NETWORK").then(|| "false".to_owned())
+        });
+        let settings = load(None, Some(&user), &env);
+        assert!(!settings.shell_network);
+        assert_eq!(settings.source_of("shell_network"), Layer::Environment);
+
+        // A repository cannot grant itself network.
+        let project = write(&dir, "project.toml", "shell_network = true\n");
+        let settings = load(Some(&project), None, &empty_env());
+        assert!(!settings.shell_network);
+
+        let env = EnvironmentOverrides::from_lookup(|key| {
+            (key == "RUNE_NETWORK").then(|| "maybe".to_owned())
+        });
+        let settings = load(None, None, &env);
+        assert!(!settings.shell_network);
+        assert!(
+            !settings.diagnostics.is_empty(),
+            "an invalid boolean is reported"
+        );
     }
 
     #[test]

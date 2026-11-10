@@ -182,6 +182,8 @@ struct Session {
     process: Process,
     seen: Mutex<(usize, usize)>,
     input: Input,
+    /// Whether the sandbox kept this command off the network.
+    network_denied: bool,
 }
 
 impl Session {
@@ -192,6 +194,7 @@ impl Session {
         process: Process,
         seen: (usize, usize),
         input: Input,
+        network_denied: bool,
     ) -> Self {
         let _ = lock(&COMMANDS).insert(id.clone(), command.clone());
         Self {
@@ -200,6 +203,7 @@ impl Session {
             process,
             seen: Mutex::new(seen),
             input,
+            network_denied,
         }
     }
 }
@@ -298,7 +302,7 @@ impl Shell {
 
         // The start happens outside the map lock, because a command that runs
         // for its whole yield window would otherwise hold every other call up.
-        let process = start(&command, cwd.as_deref(), cap, context, input)?;
+        let (process, network_denied) = start(&command, cwd.as_deref(), cap, context, input)?;
         if let Some(exit) = wait_for_exit(&process, window, context)? {
             process.drain_output(DRAIN_WINDOW);
             let (text, full_text) = observe(
@@ -309,7 +313,7 @@ impl Shell {
                 cap,
                 Some(&self.runs),
             );
-            let mut output = finish(text, exit);
+            let mut output = finish(text, exit, network_denied);
             output.full_text = full_text;
             return Ok(output);
         }
@@ -317,7 +321,14 @@ impl Shell {
         let state = format!("session {id} running, {}", ended_by(process.id()));
         let mut seen = (0, 0);
         let (text, _) = observe(&process, &command, &state, &mut seen, cap, None);
-        let session = Arc::new(Session::new(id.clone(), command, process, seen, input));
+        let session = Arc::new(Session::new(
+            id.clone(),
+            command,
+            process,
+            seen,
+            input,
+            network_denied,
+        ));
         slot.hand_over(id, session);
         Ok(ToolOutput::success(text))
     }
@@ -414,7 +425,7 @@ impl Shell {
             // A session that has ended is observed once more and then dropped,
             // so a later call cannot report output that was already returned.
             let _ = lock(&self.state).sessions.remove(&id);
-            return Ok(finish(text, exit));
+            return Ok(finish(text, exit, session.network_denied));
         }
         Ok(ToolOutput::success(text))
     }
@@ -646,9 +657,25 @@ pub fn sandbox_policy(context: &ExecutionContext) -> rune_exec::SandboxPolicy {
     rune_exec::SandboxPolicy::new(
         context.workspace.clone(),
         context.additional_roots.clone(),
-        context.external_access && !context.offline,
+        (context.external_access || context.network) && !context.offline,
     )
 }
+
+/// Added once to a failed command's output when the sandbox kept it off the
+/// network and its output looks like a failed connection.
+const NETWORK_NOTICE: &str =
+    "[commands in this run have no network access; the user can allow it with --network]";
+
+/// What a failed connection prints, in the tools agents run most.
+const NETWORK_FAILURES: &[&str] = &[
+    "could not resolve host",
+    "temporary failure in name resolution",
+    "getaddrinfo",
+    "enotfound",
+    "eai_again",
+    "network is unreachable",
+    "failed to connect",
+];
 
 /// Returns the command to run, wrapped by `backend` unless the context says no
 /// sandbox applies.
@@ -685,7 +712,7 @@ fn start(
     cap: usize,
     context: &ExecutionContext,
     input: Input,
-) -> Result<Process> {
+) -> Result<(Process, bool)> {
     let workspace = cwd.unwrap_or(&context.workspace);
     // The shell tool exists to run shell commands, so its input always goes to a
     // shell: routing a bare word to direct argv would break builtins such as
@@ -705,6 +732,9 @@ fn start(
     // host backend, which is the path production takes.
     let backend = rune_exec::detect();
     let wrapped = confined(&prepared, &policy, context, input, &*backend)?;
+    // Only a command the sandbox actually confines without network can blame
+    // a failed connection on it; the unsandboxed fallback had network.
+    let network_denied = context.sandboxed && !policy.network && backend.support().is_full();
 
     // The working directory is the resolved workspace, which is the path the
     // sandbox rule was built from. Starting in the path as written would leave
@@ -738,6 +768,7 @@ fn start(
         };
         RuneError::from(err).with_hint(hint)
     })
+    .map(|process| (process, network_denied))
 }
 
 /// Returns the total bytes both streams have produced.
@@ -935,12 +966,25 @@ fn unknown_session(state: &State, id: &str) -> RuneError {
 }
 
 /// Marks a finished result as a failure when the command did not succeed.
-fn finish(text: String, exit: Exit) -> ToolOutput {
+/// Builds a command's result; a failure that looks like a blocked connection
+/// from a command kept off the network says how the user can allow it.
+fn finish(mut text: String, exit: Exit, network_denied: bool) -> ToolOutput {
     if exit.is_success() {
-        ToolOutput::success(text)
-    } else {
-        ToolOutput::failure(text)
+        return ToolOutput::success(text);
     }
+    let lower = text.to_ascii_lowercase();
+    if network_denied
+        && NETWORK_FAILURES
+            .iter()
+            .any(|failure| lower.contains(failure))
+        && !text.contains(NETWORK_NOTICE)
+    {
+        if !text.ends_with('\n') {
+            text.push('\n');
+        }
+        text.push_str(NETWORK_NOTICE);
+    }
+    ToolOutput::failure(text)
 }
 
 /// Resolves the yield window from the arguments.
@@ -2451,6 +2495,84 @@ mod tests {
         assert!(output.text.contains("SHELL_STARTED"), "{}", output.text);
         let error = listener.accept().expect_err("offline opened no connection");
         assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_network_grant_reaches_a_local_fixture() {
+        use std::io::Read;
+        use std::net::TcpListener;
+
+        let backend = rune_exec::detect();
+        if !backend.support().is_full() {
+            eprintln!("skipping live Linux sandbox test: {:?}", backend.support());
+            return;
+        }
+        let dir = tempfile::tempdir().expect("workspace");
+        let root = Utf8Path::from_path(dir.path()).expect("utf8");
+        let listener = TcpListener::bind("127.0.0.1:0").expect("fixture");
+        listener.set_nonblocking(true).expect("nonblocking");
+        let port = listener.local_addr().expect("address").port();
+        let arguments = serde_json::json!({
+            "action": "run",
+            "command": format!(
+                "printf 'SHELL_STARTED\\n'; /bin/bash -c 'printf FIXTURE_DATA > /dev/tcp/127.0.0.1/{port}'"
+            ),
+            "yield_time_ms": 2_000,
+        });
+        let tool = shell(4, TEST_CAP);
+
+        // Without the grant the sandbox keeps the command off the network.
+        let denied = call(&tool, &ExecutionContext::new(root.to_owned()), &arguments);
+        assert!(denied.is_error, "{}", denied.text);
+        let error = listener.accept().expect_err("no grant, no connection");
+        assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+
+        let granted = ExecutionContext::new(root.to_owned()).with_network(true);
+        text(&tool, &granted, &arguments);
+        listener.set_nonblocking(false).expect("blocking");
+        let (mut stream, _) = listener.accept().expect("granted connection");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("read deadline");
+        let mut received = String::new();
+        stream.read_to_string(&mut received).expect("fixture data");
+        assert_eq!(received, "FIXTURE_DATA");
+    }
+
+    #[test]
+    fn network_context_grants_the_sandbox_network() {
+        let context = ExecutionContext::new(Utf8PathBuf::from("/work"));
+        assert!(!sandbox_policy(&context).network);
+        let granted = context.clone().with_network(true);
+        assert!(sandbox_policy(&granted).network);
+        assert!(!sandbox_policy(&granted.with_offline(true)).network);
+        // The network grant does not reach outside the workspace for files.
+        assert!(!context.with_network(true).external_access);
+    }
+
+    #[test]
+    fn a_name_resolution_failure_names_the_network_flag() {
+        let text = "curl: (6) Could not resolve host: example.com".to_owned();
+        let denied = finish(text.clone(), Exit::Code(6), true);
+        assert!(denied.is_error);
+        assert!(denied.text.ends_with(NETWORK_NOTICE), "{}", denied.text);
+        assert_eq!(denied.text.matches(NETWORK_NOTICE).count(), 1);
+        assert!(
+            !finish(text.clone(), Exit::Code(6), false)
+                .text
+                .contains(NETWORK_NOTICE)
+        );
+        assert!(
+            !finish(text, Exit::Code(0), true)
+                .text
+                .contains(NETWORK_NOTICE)
+        );
+        assert!(
+            !finish("ordinary failure".to_owned(), Exit::Code(1), true)
+                .text
+                .contains(NETWORK_NOTICE)
+        );
     }
 
     #[test]

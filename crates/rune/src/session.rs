@@ -278,6 +278,8 @@ struct SessionHost {
     prices: Mutex<Option<rune_net::models_dev::Prices>>,
     /// Estimated spend, in millionths of a dollar, at which requests stop.
     spend_limit: Mutex<Option<u64>>,
+    /// Whether sandboxed shell commands may use the network; `/network` sets it.
+    network: std::sync::atomic::AtomicBool,
     /// Present while the meter uses an estimate rather than provider usage.
     context_source: Mutex<Option<&'static str>>,
     /// Size of the context window, zero when the provider stated none.
@@ -926,7 +928,9 @@ impl Host for SessionHost {
     fn context(&self) -> ExecutionContext {
         // Sharing the cancellation flag is what lets a cancel reach every tool
         // in the turn rather than only the one running when it arrived.
-        self.context.fork()
+        self.context
+            .fork()
+            .with_network(self.network.load(std::sync::atomic::Ordering::Relaxed))
     }
 
     fn limits(&self) -> BudgetSet {
@@ -2155,6 +2159,7 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
         provider_retry: Mutex::new(None),
         context_used: std::sync::atomic::AtomicU64::new(initial_context),
         prices: Mutex::new(None),
+        network: std::sync::atomic::AtomicBool::new(config.settings.shell_network),
         spend_limit: Mutex::new(
             config
                 .settings
@@ -2524,6 +2529,7 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                         note(set_permissions(&host, requested.as_deref()));
                     }
                     Handled::Budget(requested) => note(set_budget(&host, requested.as_deref())),
+                    Handled::Network(requested) => note(set_network(&host, requested.as_deref())),
                     Handled::Plan(argument) => {
                         let leave = argument.as_deref() == Some("off");
                         host.planning
@@ -5027,6 +5033,29 @@ fn render_cost(info: &SessionInfo<'_>) -> String {
 }
 
 /// Shows the spend limit, or sets it from an amount in dollars, or turns it off.
+/// Shows or sets whether sandboxed shell commands may use the network.
+fn set_network(host: &SessionHost, requested: Option<&str>) -> String {
+    use std::sync::atomic::Ordering;
+    let state = |on: bool| if on { "on" } else { "off" };
+    match requested {
+        None => {
+            let on = host.network.load(Ordering::Relaxed);
+            let offline = if host.endpoint.offline {
+                " (offline mode overrides it)"
+            } else {
+                ""
+            };
+            format!("shell network: {}{offline}", state(on))
+        }
+        Some(choice @ ("on" | "off")) => {
+            let on = choice == "on";
+            host.network.store(on, Ordering::Relaxed);
+            format!("shell network: {} for this session", state(on))
+        }
+        Some(_) => "usage: /network on|off".to_owned(),
+    }
+}
+
 fn set_budget(host: &SessionHost, requested: Option<&str>) -> String {
     let spent = host
         .totals
@@ -5370,6 +5399,8 @@ enum Handled {
     Plan(Option<String>),
     /// Show the spend limit, or set it in dollars, or turn it off.
     Budget(Option<String>),
+    /// Show whether shell commands may use the network, or switch it.
+    Network(Option<String>),
     /// Ask the user to choose a model from a list.
     PickModel,
     /// Put back the files the session changed.
@@ -5652,6 +5683,9 @@ fn handle_command<W: std::io::Write>(
             Ok(Handled::SetModel(requested.to_owned()))
         }
         "budget" => Ok(Handled::Budget(
+            (!arguments.trim().is_empty()).then(|| arguments.trim().to_owned()),
+        )),
+        "network" => Ok(Handled::Network(
             (!arguments.trim().is_empty()).then(|| arguments.trim().to_owned()),
         )),
         "plan" => Ok(Handled::Plan(
@@ -10825,6 +10859,25 @@ mod tests {
     }
 
     #[test]
+    fn network_command_shows_and_switches_shell_network() {
+        let host = test_host();
+        assert_eq!(set_network(&host, None), "shell network: off");
+        assert!(!host.context().network);
+        assert_eq!(
+            set_network(&host, Some("on")),
+            "shell network: on for this session"
+        );
+        assert!(host.context().network, "the next call's context has it");
+        assert_eq!(set_network(&host, None), "shell network: on");
+        assert_eq!(
+            set_network(&host, Some("off")),
+            "shell network: off for this session"
+        );
+        assert_eq!(set_network(&host, Some("bogus")), "usage: /network on|off");
+        assert!(!host.context().network);
+    }
+
+    #[test]
     fn a_spent_limit_refuses_the_next_request_until_it_is_raised() {
         let host = test_host();
         assert_eq!(
@@ -11365,6 +11418,7 @@ mod tests {
             context_used: std::sync::atomic::AtomicU64::new(0),
             prices: Mutex::new(None),
             spend_limit: Mutex::new(None),
+            network: std::sync::atomic::AtomicBool::new(false),
             output_limit: std::sync::atomic::AtomicU64::new(0),
             context_source: Mutex::new(None),
             context_limit: std::sync::atomic::AtomicU64::new(

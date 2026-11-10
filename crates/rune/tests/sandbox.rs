@@ -264,6 +264,40 @@ fn offline_overrides_an_explicit_context_grant_and_reports_its_source() {
 }
 
 #[test]
+fn sandbox_explain_reports_the_network_flag() {
+    let fixture = Fixture::new();
+    let granted = fixture.json(&["--network", "sandbox", "explain", "--json", "--", "curl x"]);
+    assert_eq!(granted["network"]["value"], true, "{granted}");
+    assert!(
+        granted["network"]["source"]
+            .as_str()
+            .expect("source")
+            .contains("shell_network=true"),
+        "{granted}"
+    );
+    let denied = fixture.json(&["sandbox", "explain", "--json", "--", "curl x"]);
+    assert_eq!(denied["network"]["value"], false, "{denied}");
+    // --offline still wins over --network.
+    let offline = fixture.json(&[
+        "--offline",
+        "--network",
+        "sandbox",
+        "explain",
+        "--json",
+        "--",
+        "curl x",
+    ]);
+    assert_eq!(offline["network"]["value"], false, "{offline}");
+    assert!(
+        offline["network"]["source"]
+            .as_str()
+            .expect("source")
+            .contains("offline=true"),
+        "{offline}"
+    );
+}
+
+#[test]
 fn saved_roots_can_be_ignored_while_command_line_roots_remain() {
     let fixture = Fixture::new();
     let added = fixture.dir.path().join("added");

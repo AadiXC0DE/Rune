@@ -833,8 +833,12 @@ failure within the available output budget.
   command. The preview uses the current workspace and configured additional
   directories (`--add-dir` adds roots;
   `--no-additional-dirs` ignores saved roots).
-  Network access requires an explicit shell context grant, previewed with
-  `--external-access`; offline mode overrides it. `--json` emits the same report.
+  Sandboxed commands have no network access unless `--network`,
+  `RUNE_NETWORK=1` or `shell_network = true` in the user configuration allows it
+  (`/network on` in a session); `--offline` overrides all three. Permission modes
+  never grant network access. A failed command whose output looks like a blocked
+  connection says so and names `--network`. `sandbox explain` previews the policy,
+  also with `--external-access`; `--json` emits the same report.
   Refused commands apply no protections; an unsandboxed fallback has unrestricted
   access. This explains sandbox policy, independently of command approval.
 - **Offline mode.** `--offline` refuses provider requests, disables web tools,

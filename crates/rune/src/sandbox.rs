@@ -68,7 +68,8 @@ pub fn explain(
     let mut context = ExecutionContext::new(workspace.to_owned())
         .with_offline(settings.offline)
         .with_allow_unsandboxed(settings.allow_unsandboxed)
-        .with_external_access(launch.has_flag("--external-access"));
+        .with_external_access(launch.has_flag("--external-access"))
+        .with_network(settings.shell_network);
     if launch.no_additional_dirs {
         context.additional_roots = launch.add_dirs.iter().map(Into::into).collect();
     } else {
@@ -145,6 +146,11 @@ fn report(
         )
     } else if launch.has_flag("--external-access") {
         "command_line --external-access (explicit shell context grant)".into()
+    } else if settings.shell_network {
+        format!(
+            "{} shell_network=true (--network, RUNE_NETWORK or shell_network)",
+            settings.source_of("shell_network")
+        )
     } else {
         "shell context default external_access=false; permission mode does not grant network access"
             .into()

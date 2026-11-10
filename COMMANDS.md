@@ -19,6 +19,7 @@ Accepted anywhere on the command line.
 | `--no-additional-dirs` | - | Ignore saved additional directories for this process. |
 | `--offline` | - | Refuse provider requests, disable web tools, skip remote MCP checks and restrict sandboxed shell networking. Local MCP and unsandboxed commands can still use the network. |
 | `--allow-unsandboxed` | - | Run commands where the host has no sandbox backend. Without this, such a host refuses them. |
+| `--network` | - | Let sandboxed shell commands use the network. --offline still wins. |
 | `--json` | - | Emit machine-readable output where supported. |
 | `--accessible` | - | Use append-only labelled session output and line input for screen readers. |
 | `--ascii` | - | Use ASCII terminal decorations, preserving message text. |

@@ -219,6 +219,11 @@ pub struct ExecutionContext {
     cancelled: Arc<AtomicBool>,
     /// What shell commands receive beyond the minimal environment.
     pub environment: Arc<rune_exec::EnvironmentPolicy>,
+    /// Whether sandboxed shell commands may use the network.
+    ///
+    /// Separate from `external_access`, which also lets file tools reach
+    /// outside the workspace: granting network must not grant that.
+    pub network: bool,
 }
 
 impl ExecutionContext {
@@ -238,7 +243,15 @@ impl ExecutionContext {
             live_plan: Arc::default(),
             cancelled: Arc::new(AtomicBool::new(false)),
             environment: Arc::default(),
+            network: false,
         }
+    }
+
+    /// Sets whether sandboxed shell commands may use the network.
+    #[must_use]
+    pub const fn with_network(mut self, network: bool) -> Self {
+        self.network = network;
+        self
     }
 
     /// Sets what shell commands receive beyond the minimal environment.
@@ -348,6 +361,7 @@ impl ExecutionContext {
             live_plan: Arc::clone(&self.live_plan),
             cancelled: Arc::clone(&self.cancelled),
             environment: Arc::clone(&self.environment),
+            network: self.network,
         }
     }
 

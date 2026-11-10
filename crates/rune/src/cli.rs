@@ -162,6 +162,8 @@ pub struct Launch {
     pub offline: bool,
     /// Whether a command may run where the host has no sandbox backend.
     pub allow_unsandboxed: bool,
+    /// Whether sandboxed shell commands may use the network.
+    pub network: bool,
     /// Whether sessions use append-only, labelled output and line input.
     pub accessible: bool,
     /// Whether output is machine readable.
@@ -251,6 +253,7 @@ pub fn parse(args: Vec<OsString>, benchmark: bool) -> Result<Launch> {
         provider_strict: None,
         offline: false,
         allow_unsandboxed: false,
+        network: false,
         accessible: false,
         json: false,
         args: Vec::new(),
@@ -420,6 +423,7 @@ fn take_global(launch: &mut Launch, tokens: &[String], index: &mut usize) -> Res
             | "--no-provider-strict"
             | "--offline"
             | "--allow-unsandboxed"
+            | "--network"
             | "--json"
             | "--accessible"
             | "--ascii"
@@ -438,6 +442,7 @@ fn take_global(launch: &mut Launch, tokens: &[String], index: &mut usize) -> Res
             "--no-provider-strict" => launch.provider_strict = Some(false),
             "--offline" => launch.offline = true,
             "--allow-unsandboxed" => launch.allow_unsandboxed = true,
+            "--network" => launch.network = true,
             "--accessible" => launch.accessible = true,
             "--ascii" => launch.ascii = true,
             _ => launch.json = true,

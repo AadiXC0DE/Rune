@@ -154,6 +154,10 @@ pub const GLOBAL_FLAGS: &[FlagSpec] = &[
         "--allow-unsandboxed",
         "Run commands where the host has no sandbox backend. Without this, such a host refuses them.",
     ),
+    flag(
+        "--network",
+        "Let sandboxed shell commands use the network. --offline still wins.",
+    ),
     flag("--json", "Emit machine-readable output where supported."),
     flag(
         "--accessible",

@@ -179,6 +179,11 @@ fn run(launch: &Launch) -> Result<ExitCode> {
             .record("allow_unsandboxed", Layer::CommandLine);
     }
 
+    if launch.network {
+        settings.shell_network = true;
+        settings.sources.record("shell_network", Layer::CommandLine);
+    }
+
     if launch.offline {
         // Set on the settings rather than only recorded, so every endpoint a
         // command builds carries the refusal rather than just the label.
@@ -1530,6 +1535,7 @@ fn run_acp(
             .unwrap_or(rune_net::catalog::DEFAULT_CONTEXT_WINDOW),
         additional_roots: settings.additional_directories.clone(),
         environment: provider_setup::command_environment(settings),
+        network: settings.shell_network,
     };
 
     let server = std::sync::Arc::new(rune_acp::Server::new(config, std::io::stdout())?);

@@ -39,6 +39,10 @@ Notable changes, newest first. Each entry describes what a user can observe.
 - `rune ask` compacts a long run before it reaches the context window, as the
   interactive session does, and counts the summary requests in its usage and
   cost.
+- `--network`, `RUNE_NETWORK=1` or `shell_network = true` lets sandboxed shell
+  commands use the network, and `/network on|off` switches it in a session;
+  `--offline` still wins and a repository cannot grant it. A command that fails
+  on a blocked connection says how the user can allow it.
 - Shell commands receive the build and test variables a task sets (`CI`,
   `PYTHONPATH`, `NODE_PATH`, `LD_LIBRARY_PATH` and more), `shell_env` and
   `RUNE_SHELL_ENV` pass others by name or pattern, credentials stay withheld,
