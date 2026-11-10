@@ -1,0 +1,15 @@
+{
+  "title": "Fix the monthly sales report columns, quoted headers and blank lines",
+  "kind": "bugfix",
+  "prompt": "The monthly sales report sums the wrong column and breaks when the header has quoted names. It should also skip blank lines.",
+  "verify": "sh tests/run.sh",
+  "protected": [
+    "tests",
+    "tests/run.sh"
+  ],
+  "timeoutMs": 600000,
+  "tests": "tests",
+  "tier": 2,
+  "split": "heldout",
+  "language": "shell"
+}

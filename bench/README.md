@@ -33,6 +33,15 @@ python3 bench/kit/run.py validate --tasks bench/tasks   # each task: oracle pass
 | `py-graph-topo` | Python | Three layered faults in a dependency ordering tool, one after another |
 | `py-pipeline-long-log` | Python | A record format hidden in about 400 lines of test output |
 | `py-background-server` | Python | A byte versus character length bug between a JSON client and a server run in a thread |
+| `go-humanize-bytes` | Go | IEC byte units with one decimal, unit switching at 1024 and carry on rounding |
+| `go-ring-buffer` | Go | Eviction timing and iteration order of a ring buffer after wrap-around |
+| `go-config-env` | Go | Layered settings from defaults, a file and the environment, with empty variables ignored |
+| `go-worker-pool` | Go | A generic worker pool with three layered faults: a hang, result order and shutdown on error |
+| `go-diff-lines` | Go | Unified diff hunk headers; the obvious start fix breaks the empty-file form |
+| `sh-log-rotate` | Shell | Log rotation count and unsafe quoting of names with spaces and leading dashes |
+| `sh-makefile-deps` | Shell | A makefile missing a shared header dependency and an always-run phony target |
+| `sh-awk-report` | Shell | A sales report from CSV: columns by header name, quoted fields and blank lines |
+| `sh-env-render` | Shell | A template renderer with reversed precedence, `${NAME:-fallback}` and chained references |
 
 Each task directory holds `task.json` and these paths:
 

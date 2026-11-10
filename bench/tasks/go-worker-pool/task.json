@@ -1,0 +1,18 @@
+{
+  "title": "Fix the worker pool hang, result order and error shutdown",
+  "kind": "bugfix",
+  "prompt": "Processing a batch with the worker pool sometimes hangs and the results come back in a different order than the inputs. Results must match input order and the pool must stop cleanly on the first error.",
+  "verify": "go test ./...",
+  "protected": [
+    "pool/pool_test.go",
+    "pool/hidden_test.go"
+  ],
+  "timeoutMs": 900000,
+  "tests": "tests",
+  "tier": 3,
+  "split": "dev",
+  "language": "go",
+  "tags": [
+    "long-debug"
+  ]
+}
