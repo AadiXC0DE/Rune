@@ -8,6 +8,7 @@ use rune_core::config::Effort;
 use rune_core::error::{Result, RuneError};
 use rune_core::id::ToolCallId;
 
+use crate::compat::{CacheMarkers, EmptyContent, EndpointCompat, ThinkingFormat, shape_call_id};
 use crate::message::{ContentPart, Message, Role};
 use crate::provider::{Provider, RequestPlan};
 use crate::stream::{
@@ -71,23 +72,32 @@ impl Provider for ChatCompletions {
     }
 
     fn build_request(&self, plan: &RequestPlan) -> Result<serde_json::Value> {
+        let compat = &plan.compat;
         let mut messages: Vec<serde_json::Value> = Vec::new();
 
         // The system lane is emitted first and separately, because the
         // conversation model keeps it out of the message list.
         if !plan.instructions.is_empty() {
             messages.push(serde_json::json!({
-                "role": "system",
+                "role": compat.system_role.as_str(),
                 "content": plan.instructions,
             }));
         }
 
-        for message in &plan.messages {
+        for (index, message) in plan.messages.iter().enumerate() {
             if message.role == Role::Tool {
                 // One tool message can carry a whole batch of results, because
                 // the history groups them, so it expands to one wire message per
                 // result rather than being collapsed to its first.
                 messages.extend(encode_tool_messages(message, plan));
+                if compat.assistant_after_tool_result
+                    && plan
+                        .messages
+                        .get(index.saturating_add(1))
+                        .is_some_and(|next| next.role == Role::User)
+                {
+                    messages.push(serde_json::json!({ "role": "assistant", "content": "Done." }));
+                }
                 continue;
             }
             messages.push(encode_message(message, plan)?);
@@ -96,7 +106,7 @@ impl Provider for ChatCompletions {
         let mut body = serde_json::Map::new();
         body.insert("model".to_owned(), serde_json::json!(plan.model));
         body.insert("stream".to_owned(), serde_json::json!(true));
-        if Self::INCLUDE_USAGE {
+        if Self::INCLUDE_USAGE && compat.stream_usage {
             body.insert(
                 "stream_options".to_owned(),
                 serde_json::json!({ "include_usage": true }),
@@ -109,13 +119,19 @@ impl Provider for ChatCompletions {
                 .tools
                 .iter()
                 .map(|tool| {
+                    let mut function = serde_json::json!({
+                        "name": tool.name,
+                        "description": tool.description,
+                        "parameters": tool.input_schema,
+                    });
+                    if compat.strict_schema
+                        && let Some(function) = function.as_object_mut()
+                    {
+                        function.insert("strict".to_owned(), serde_json::json!(true));
+                    }
                     Ok(serde_json::json!({
                         "type": "function",
-                        "function": {
-                            "name": tool.name,
-                            "description": tool.description,
-                            "parameters": tool.input_schema,
-                        }
+                        "function": function,
                     }))
                 })
                 .collect();
@@ -124,27 +140,120 @@ impl Provider for ChatCompletions {
                 "tool_choice".to_owned(),
                 serde_json::json!(plan.tool_choice.as_str()),
             );
-            body.insert(
-                "parallel_tool_calls".to_owned(),
-                serde_json::json!(plan.parallel_tool_calls),
-            );
+            if compat.parallel_tool_calls_field {
+                body.insert(
+                    "parallel_tool_calls".to_owned(),
+                    serde_json::json!(plan.parallel_tool_calls),
+                );
+            }
+        } else if compat.tools_with_tool_history
+            && plan.messages.iter().any(|message| {
+                message
+                    .parts
+                    .iter()
+                    .any(|part| matches!(part, ContentPart::ToolCall { .. }))
+            })
+        {
+            body.insert("tools".to_owned(), serde_json::json!([]));
         }
 
-        if let Some(effort) = effort_wire(plan.effort) {
+        // The other thinking formats ask for reasoning the way most compatible
+        // servers understand until they have their own fields.
+        if compat.thinking_format != ThinkingFormat::None
+            && let Some(effort) = effort_wire(plan.effort)
+        {
             body.insert("reasoning_effort".to_owned(), serde_json::json!(effort));
         }
 
         if let Some(max) = plan.max_output_tokens {
-            // `max_tokens` rather than `max_completion_tokens`, because the
-            // compatible-server ecosystem understands the former.
-            body.insert("max_tokens".to_owned(), serde_json::json!(max));
+            body.insert(
+                compat.max_tokens_field.as_str().to_owned(),
+                serde_json::json!(max),
+            );
         }
 
         if let Some(options) = crate::provider::provider_options(plan) {
             body.insert("provider".to_owned(), options);
         }
 
+        if compat.prompt_cache_key {
+            body.insert(
+                "prompt_cache_key".to_owned(),
+                serde_json::json!(plan.cache_key.clone().unwrap_or_else(|| {
+                    crate::provider::prefix_cache_key(&plan.instructions, &plan.tools)
+                })),
+            );
+        }
+
+        if compat.cache_control == CacheMarkers::Anthropic
+            && let Some(messages) = body
+                .get_mut("messages")
+                .and_then(serde_json::Value::as_array_mut)
+        {
+            mark_cache_breakpoints(messages, !plan.instructions.is_empty());
+        }
+
         Ok(serde_json::Value::Object(body))
+    }
+}
+
+/// Marks the system message and the newest user or assistant message that has
+/// text as prompt cache breakpoints. Tool messages are never marked.
+fn mark_cache_breakpoints(messages: &mut [serde_json::Value], has_system: bool) {
+    let is_text = |part: &serde_json::Value| {
+        part.get("type").and_then(serde_json::Value::as_str) == Some("text")
+    };
+    let has_text = |message: &serde_json::Value| match message.get("content") {
+        Some(serde_json::Value::String(text)) => !text.is_empty(),
+        Some(serde_json::Value::Array(parts)) => parts.iter().any(|part| {
+            is_text(part)
+                && part
+                    .get("text")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|text| !text.is_empty())
+        }),
+        _ => false,
+    };
+    let newest = messages
+        .iter()
+        .enumerate()
+        .skip(usize::from(has_system))
+        .rev()
+        .find(|(_, message)| {
+            matches!(
+                message.get("role").and_then(serde_json::Value::as_str),
+                Some("user" | "assistant")
+            ) && has_text(message)
+        })
+        .map(|(index, _)| index);
+    for index in has_system.then_some(0).into_iter().chain(newest) {
+        let Some(content) = messages
+            .get_mut(index)
+            .and_then(|message| message.get_mut("content"))
+        else {
+            continue;
+        };
+        let marker = serde_json::json!({ "type": "ephemeral" });
+        match content {
+            serde_json::Value::String(text) => {
+                *content = serde_json::json!([{
+                    "type": "text",
+                    "text": std::mem::take(text),
+                    "cache_control": marker,
+                }]);
+            }
+            serde_json::Value::Array(parts) => {
+                if let Some(part) = parts
+                    .iter_mut()
+                    .rev()
+                    .find(|part| is_text(part))
+                    .and_then(serde_json::Value::as_object_mut)
+                {
+                    part.insert("cache_control".to_owned(), marker);
+                }
+            }
+            _ => {}
+        }
     }
 }
 
@@ -156,7 +265,7 @@ fn encode_message(message: &Message, plan: &RequestPlan) -> Result<serde_json::V
             "system content must be supplied as instructions, not as a message",
         )),
         Role::User => Ok(encode_user(message, plan)),
-        Role::Assistant => Ok(encode_assistant(message)),
+        Role::Assistant => Ok(encode_assistant(message, &plan.compat)),
         // Tool results are expanded before this point, because one message can
         // carry several of them and this returns a single message.
         Role::Tool => Err(RuneError::invariant(
@@ -200,7 +309,7 @@ fn encode_user(message: &Message, plan: &RequestPlan) -> serde_json::Value {
 }
 
 /// Encodes an assistant message, including any tool calls.
-fn encode_assistant(message: &Message) -> serde_json::Value {
+fn encode_assistant(message: &Message, compat: &EndpointCompat) -> serde_json::Value {
     let calls: Vec<serde_json::Value> = message
         .parts
         .iter()
@@ -210,7 +319,7 @@ fn encode_assistant(message: &Message) -> serde_json::Value {
                 name,
                 arguments,
             } => Some(serde_json::json!({
-                "id": id.as_str(),
+                "id": shape_call_id(id.as_str(), compat.tool_call_id),
                 "type": "function",
                 "function": { "name": name, "arguments": arguments },
             })),
@@ -225,14 +334,15 @@ fn encode_assistant(message: &Message) -> serde_json::Value {
     if calls.is_empty() {
         value.insert("content".to_owned(), serde_json::json!(text));
     } else {
-        // A message carrying tool calls sends a null content field, which is
-        // what the reference implementation does.
+        // A message carrying only tool calls sends a null content field, which
+        // is what the reference implementation does, unless the endpoint
+        // refuses one.
         value.insert(
             "content".to_owned(),
-            if text.is_empty() {
-                serde_json::Value::Null
-            } else {
-                serde_json::json!(text)
+            match (text.is_empty(), compat.assistant_content_when_only_calls) {
+                (true, EmptyContent::Null) => serde_json::Value::Null,
+                (true, EmptyContent::EmptyString) => serde_json::json!(""),
+                (false, _) => serde_json::json!(text),
             },
         );
         value.insert("tool_calls".to_owned(), serde_json::Value::Array(calls));
@@ -257,18 +367,26 @@ fn encode_tool_messages(message: &Message, plan: &RequestPlan) -> Vec<serde_json
         .filter_map(|part| match part {
             ContentPart::ToolResult {
                 id,
+                name,
                 content,
                 is_error,
-                ..
-            } => Some(serde_json::json!({
-                "role": "tool",
-                "content": content,
-                "tool_call_id": id.as_str(),
-                // The compatible-server ecosystem reads a failure from this
-                // field rather than from the text, and the text is still sent
-                // so a server that ignores the field loses nothing.
-                "is_error": is_error,
-            })),
+            } => {
+                let mut result = serde_json::json!({
+                    "role": "tool",
+                    "content": content,
+                    "tool_call_id": shape_call_id(id.as_str(), plan.compat.tool_call_id),
+                    // The compatible-server ecosystem reads a failure from this
+                    // field rather than from the text, and the text is still
+                    // sent so a server that ignores the field loses nothing.
+                    "is_error": is_error,
+                });
+                if plan.compat.tool_result_name
+                    && let Some(result) = result.as_object_mut()
+                {
+                    result.insert("name".to_owned(), serde_json::json!(name));
+                }
+                Some(result)
+            }
             _ => None,
         })
         .collect();
@@ -1622,5 +1740,246 @@ mod tests {
             "[DONE]",
         ]);
         assert_eq!(reducer.finish().expect("finished"), FinishReason::Stop);
+    }
+
+    fn default_body_plan() -> RequestPlan {
+        let mut plan = plan_with_user("start");
+        plan.tools = vec![ToolSpec {
+            name: "read_file".to_owned(),
+            description: "Read a file".to_owned(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": { "path": { "type": "string" } },
+                "required": ["path"],
+            }),
+        }];
+        plan.tool_choice = ToolChoice::Auto;
+        plan.effort = Effort::High;
+        plan.max_output_tokens = Some(1024);
+        plan.messages
+            .push(Message::assistant(vec![ContentPart::ToolCall {
+                id: ToolCallId::new("call_1").expect("id"),
+                name: "read_file".to_owned(),
+                arguments: "{\"path\":\"a\"}".to_owned(),
+            }]));
+        plan.messages.push(Message {
+            role: Role::Tool,
+            parts: vec![result("call_1", "contents")],
+            replay: None,
+        });
+        plan.messages.push(Message::user("thanks"));
+        plan
+    }
+
+    /// The body a default plan produced before the endpoint table shaped it.
+    const TODAYS_BODY: &str = r#"{"model":"test/model","stream":true,"stream_options":{"include_usage":true},"messages":[{"role":"system","content":"be helpful"},{"role":"user","content":"start"},{"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"a\"}"}}]},{"role":"tool","content":"contents","tool_call_id":"call_1","is_error":false},{"role":"user","content":"thanks"}],"tools":[{"type":"function","function":{"name":"read_file","description":"Read a file","parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}}}],"tool_choice":"auto","parallel_tool_calls":true,"reasoning_effort":"high","max_tokens":1024}"#;
+
+    fn shaped(change: impl FnOnce(&mut EndpointCompat)) -> serde_json::Value {
+        let mut plan = default_body_plan();
+        change(&mut plan.compat);
+        ChatCompletions.build_request(&plan).expect("build")
+    }
+
+    fn without_tools(change: impl FnOnce(&mut EndpointCompat)) -> serde_json::Value {
+        let mut plan = default_body_plan();
+        plan.tools.clear();
+        change(&mut plan.compat);
+        ChatCompletions.build_request(&plan).expect("build")
+    }
+
+    #[test]
+    fn a_default_compat_sends_todays_body() {
+        let body = ChatCompletions
+            .build_request(&default_body_plan())
+            .expect("build");
+        assert_eq!(serde_json::to_string(&body).expect("json"), TODAYS_BODY);
+    }
+
+    #[test]
+    fn the_developer_role_carries_the_instructions() {
+        let body = shaped(|compat| compat.system_role = crate::compat::SystemRole::Developer);
+        assert_eq!(body["messages"][0]["role"], "developer");
+        assert_eq!(body["messages"][0]["content"], "be helpful");
+    }
+
+    #[test]
+    fn usage_is_not_requested_when_the_endpoint_refuses_it() {
+        let body = shaped(|compat| compat.stream_usage = false);
+        assert!(body.get("stream_options").is_none(), "{body}");
+        assert_eq!(body["stream"], true);
+    }
+
+    #[test]
+    fn the_ceiling_uses_the_configured_field_name() {
+        let body = shaped(|compat| {
+            compat.max_tokens_field = crate::compat::MaxTokensField::MaxCompletionTokens;
+        });
+        assert_eq!(body["max_completion_tokens"], 1024);
+        assert!(body.get("max_tokens").is_none(), "{body}");
+    }
+
+    #[test]
+    fn a_call_only_message_can_send_an_empty_string() {
+        let body = shaped(|compat| {
+            compat.assistant_content_when_only_calls = EmptyContent::EmptyString;
+        });
+        assert_eq!(body["messages"][2]["content"], "");
+        assert_eq!(body["messages"][2]["tool_calls"][0]["id"], "call_1");
+    }
+
+    #[test]
+    fn a_tool_result_can_carry_its_tool_name() {
+        let body = shaped(|compat| compat.tool_result_name = true);
+        assert_eq!(body["messages"][3]["role"], "tool");
+        assert_eq!(body["messages"][3]["name"], "read_file");
+        let default = shaped(|_| {});
+        assert!(default["messages"][3].get("name").is_none());
+    }
+
+    #[test]
+    fn history_with_calls_and_no_tools_sends_an_empty_tool_list() {
+        let body = without_tools(|compat| compat.tools_with_tool_history = true);
+        assert_eq!(body["tools"], serde_json::json!([]));
+        assert!(body.get("tool_choice").is_none(), "{body}");
+        assert!(body.get("parallel_tool_calls").is_none(), "{body}");
+
+        let plain = without_tools(|_| {});
+        assert!(plain.get("tools").is_none(), "{plain}");
+
+        let mut no_calls = plan_with_user("hi");
+        no_calls.compat.tools_with_tool_history = true;
+        let body = ChatCompletions.build_request(&no_calls).expect("build");
+        assert!(body.get("tools").is_none(), "{body}");
+
+        let with_tools = shaped(|compat| compat.tools_with_tool_history = true);
+        assert_eq!(with_tools, shaped(|_| {}));
+    }
+
+    #[test]
+    fn an_assistant_turn_separates_a_tool_result_from_a_user_message() {
+        let body = shaped(|compat| compat.assistant_after_tool_result = true);
+        let messages = body["messages"].as_array().expect("array");
+        assert_eq!(messages.len(), 6);
+        assert_eq!(messages[3]["role"], "tool");
+        assert_eq!(
+            messages[4],
+            serde_json::json!({ "role": "assistant", "content": "Done." })
+        );
+        assert_eq!(messages[5]["content"], "thanks");
+
+        // Followed by an assistant message, or ending the list: nothing added.
+        let mut plan = default_body_plan();
+        plan.compat.assistant_after_tool_result = true;
+        plan.messages.pop();
+        let ends = ChatCompletions.build_request(&plan).expect("build");
+        assert_eq!(ends["messages"].as_array().expect("array").len(), 4);
+        plan.messages
+            .push(Message::assistant(vec![ContentPart::Text {
+                text: "read it".to_owned(),
+            }]));
+        let answered = ChatCompletions.build_request(&plan).expect("build");
+        let messages = answered["messages"].as_array().expect("array");
+        assert_eq!(messages.len(), 5);
+        assert_eq!(messages[4]["content"], "read it");
+    }
+
+    #[test]
+    fn the_parallel_flag_can_be_left_out() {
+        let body = shaped(|compat| compat.parallel_tool_calls_field = false);
+        assert!(body.get("parallel_tool_calls").is_none(), "{body}");
+        assert_eq!(body["tool_choice"], "auto");
+    }
+
+    #[test]
+    fn call_ids_are_shaped_the_same_on_call_and_result() {
+        let mut plan = default_body_plan();
+        let long = "call_with.a:long/identifier-that-goes-past-forty-bytes";
+        plan.messages[1] = Message::assistant(vec![ContentPart::ToolCall {
+            id: ToolCallId::new(long).expect("id"),
+            name: "read_file".to_owned(),
+            arguments: "{}".to_owned(),
+        }]);
+        plan.messages[2] = Message {
+            role: Role::Tool,
+            parts: vec![result(long, "contents")],
+            replay: None,
+        };
+        for shape in [
+            crate::compat::CallIdShape::ClaudeSafe,
+            crate::compat::CallIdShape::Max40,
+            crate::compat::CallIdShape::Alnum9,
+        ] {
+            plan.compat.tool_call_id = shape;
+            let body = ChatCompletions.build_request(&plan).expect("build");
+            let call = body["messages"][2]["tool_calls"][0]["id"]
+                .as_str()
+                .expect("call id");
+            assert_eq!(call, shape_call_id(long, shape));
+            assert_ne!(call, long, "{shape:?}");
+            assert_eq!(body["messages"][3]["tool_call_id"], call, "{shape:?}");
+        }
+    }
+
+    #[test]
+    fn cache_markers_go_on_the_system_and_newest_message() {
+        let body = shaped(|compat| compat.cache_control = CacheMarkers::Anthropic);
+        let marker = serde_json::json!({ "type": "ephemeral" });
+        let messages = body["messages"].as_array().expect("array");
+        assert_eq!(
+            messages[0]["content"],
+            serde_json::json!([{ "type": "text", "text": "be helpful", "cache_control": marker }])
+        );
+        assert_eq!(messages[1]["content"], "start");
+        assert!(messages[2]["content"].is_null());
+        assert_eq!(messages[3]["content"], "contents");
+        assert_eq!(
+            messages[4]["content"],
+            serde_json::json!([{ "type": "text", "text": "thanks", "cache_control": marker }])
+        );
+
+        // An array body is marked on its last text part.
+        let mut plan = default_body_plan();
+        plan.compat.cache_control = CacheMarkers::Anthropic;
+        plan.messages.push(Message::user_parts(vec![
+            ContentPart::Text {
+                text: "first".to_owned(),
+            },
+            image(7),
+            ContentPart::Text {
+                text: "second".to_owned(),
+            },
+        ]));
+        let body = ChatCompletions.build_request(&plan).expect("build");
+        let parts = body["messages"][5]["content"].as_array().expect("parts");
+        assert!(parts[0].get("cache_control").is_none());
+        assert_eq!(parts[2]["text"], "second");
+        assert_eq!(parts[2]["cache_control"], marker);
+        assert_eq!(body["messages"][4]["content"], "thanks");
+    }
+
+    #[test]
+    fn a_cache_key_is_sent_when_enabled() {
+        let body = shaped(|compat| compat.prompt_cache_key = true);
+        let plan = default_body_plan();
+        assert_eq!(
+            body["prompt_cache_key"],
+            crate::provider::prefix_cache_key(&plan.instructions, &plan.tools)
+        );
+        let mut keyed = default_body_plan();
+        keyed.compat.prompt_cache_key = true;
+        keyed.cache_key = Some("session-key".to_owned());
+        let body = ChatCompletions.build_request(&keyed).expect("build");
+        assert_eq!(body["prompt_cache_key"], "session-key");
+        assert!(shaped(|_| {}).get("prompt_cache_key").is_none());
+    }
+
+    #[test]
+    fn strict_schemas_and_no_thinking_format_shape_the_body() {
+        let strict = shaped(|compat| compat.strict_schema = true);
+        assert_eq!(strict["tools"][0]["function"]["strict"], true);
+        let silent = shaped(|compat| compat.thinking_format = ThinkingFormat::None);
+        assert!(silent.get("reasoning_effort").is_none(), "{silent}");
+        let other = shaped(|compat| compat.thinking_format = ThinkingFormat::DeepSeek);
+        assert_eq!(other["reasoning_effort"], "high");
     }
 }

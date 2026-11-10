@@ -5,6 +5,7 @@
 //! comes from are reported, so a user can see what the harness will use without
 //! reading the stored secret.
 
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
 use rune_core::config::{Provider, Settings};
@@ -388,6 +389,58 @@ pub fn compat_for(settings: &Settings, model: &str) -> Result<rune_net::compat::
         rune_net::compat::apply_overrides(&mut resolution, name, &entry.compat)?;
     }
     Ok(resolution)
+}
+
+/// What decides how requests to the active provider are shaped, kept so each
+/// request resolves the model it is actually sent to.
+#[derive(Clone, Debug, Default)]
+pub struct CompatSource {
+    provider: String,
+    base_url: Option<String>,
+    name: String,
+    overrides: BTreeMap<String, String>,
+}
+
+impl CompatSource {
+    /// Captures the provider, endpoint and the user's compatibility settings.
+    #[must_use]
+    pub fn from_settings(settings: &Settings) -> Self {
+        let provider = settings.provider.as_str().to_owned();
+        let canonical = rune_net::compat::canonical_preset(&provider);
+        let (name, overrides) = settings
+            .provider_settings(&canonical)
+            .map(|(name, entry)| (name.to_owned(), entry.compat.clone()))
+            .unwrap_or_default();
+        Self {
+            provider,
+            base_url: configured_base_url(settings),
+            name,
+            overrides,
+        }
+    }
+
+    /// Resolves the request shape for a model.
+    ///
+    /// The overrides were validated when the session started, so one that
+    /// fails here leaves the built-in table in force rather than failing a
+    /// request.
+    #[must_use]
+    pub fn resolve(
+        &self,
+        model: &str,
+    ) -> (
+        rune_net::compat::EndpointCompat,
+        rune_net::compat::ModelTraits,
+    ) {
+        let resolution = rune_net::compat::explain(&self.provider, self.base_url.as_deref(), model);
+        let mut adjusted = resolution.clone();
+        let chosen =
+            match rune_net::compat::apply_overrides(&mut adjusted, &self.name, &self.overrides) {
+                Ok(()) => adjusted,
+                Err(_) => resolution,
+            };
+        (chosen.endpoint, chosen.model)
+    }
 }
 
 /// Projects the selected controls onto an empty preflight request.

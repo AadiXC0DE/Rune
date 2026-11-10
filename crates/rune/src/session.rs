@@ -240,6 +240,8 @@ struct SessionHost {
     ascii: bool,
     recorder: Option<Arc<Mutex<Recorder>>>,
     endpoint: Endpoint,
+    /// How requests to the endpoint are shaped, per model.
+    compat: crate::provider_setup::CompatSource,
     dialect: Box<dyn Provider>,
     /// Model the session sends to, changeable while the session runs.
     ///
@@ -419,6 +421,16 @@ impl Host for SessionHost {
 
     fn endpoint(&self) -> &Endpoint {
         &self.endpoint
+    }
+
+    fn compat(
+        &self,
+        model: &str,
+    ) -> (
+        rune_net::compat::EndpointCompat,
+        rune_net::compat::ModelTraits,
+    ) {
+        self.compat.resolve(model)
     }
 
     fn model(&self) -> String {
@@ -2222,6 +2234,7 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
         ascii: config.settings.ascii,
         recorder: Some(Arc::clone(&recorder)),
         endpoint: config.endpoint,
+        compat: crate::provider_setup::CompatSource::from_settings(&config.settings),
         dialect: config.dialect,
         model: Mutex::new(config.settings.model.clone()),
         instructions: prompt.instructions,
@@ -11640,6 +11653,7 @@ mod tests {
             ascii: false,
             recorder: None,
             endpoint: Endpoint::new("https://example.invalid", "k"),
+            compat: crate::provider_setup::CompatSource::default(),
             dialect: Box::new(rune_net::chat_completions::ChatCompletions),
             model: Mutex::new("test".to_owned()),
             instructions: String::new(),

@@ -20,6 +20,7 @@ use camino::{Utf8Path, Utf8PathBuf};
 use rune_core::budget::{BudgetSet, LimitName, window_result_bytes};
 use rune_core::config::{Effort, PermissionMode};
 use rune_core::error::{ErrorCode, Result, RuneError};
+use rune_net::compat::{EndpointCompat, ModelTraits};
 use rune_net::fetch::Fetch;
 use rune_net::message::{ContentPart, ToolSpec};
 use rune_net::provider::{Provider, RequestPlan, ToolChoice};
@@ -351,6 +352,11 @@ pub trait Host {
     /// Returns whether requests are restricted to that preference.
     fn provider_strict(&self) -> bool {
         false
+    }
+
+    /// Returns how requests for this model are shaped.
+    fn compat(&self, _model: &str) -> (EndpointCompat, ModelTraits) {
+        (EndpointCompat::default(), ModelTraits::default())
     }
 
     /// Prepares context immediately before sending a model request.
@@ -1429,6 +1435,7 @@ fn stream_with_retry(
         let mut plan = RequestPlan::new(host.model());
         plan.instructions = host.instructions();
         plan.messages = history.to_messages();
+        (plan.compat, plan.traits) = host.compat(&plan.model);
         plan.tools = host.tools();
         plan.tool_choice = if plan.tools.is_empty() {
             ToolChoice::None

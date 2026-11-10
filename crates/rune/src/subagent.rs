@@ -296,6 +296,15 @@ impl Host for ChildHost<'_> {
     fn provider_strict(&self) -> bool {
         self.parent.provider_strict()
     }
+    fn compat(
+        &self,
+        model: &str,
+    ) -> (
+        rune_net::compat::EndpointCompat,
+        rune_net::compat::ModelTraits,
+    ) {
+        self.parent.compat(model)
+    }
     // Child deltas and finish events belong to the child, not the parent's UI
     // or recorder. The parent displays and records the returned tool result.
     fn emit(&self, _event: Event) {}

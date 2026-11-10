@@ -65,6 +65,12 @@ pub struct RequestPlan {
     pub provider_order: Vec<String>,
     /// Whether the request is restricted to the listed providers.
     pub provider_strict: bool,
+    /// How the endpoint wants requests shaped.
+    pub compat: crate::compat::EndpointCompat,
+    /// How the model family behaves.
+    pub traits: crate::compat::ModelTraits,
+    /// Session-stable cache routing key, when the host supplies one.
+    pub cache_key: Option<String>,
 }
 
 impl RequestPlan {
@@ -84,6 +90,9 @@ impl RequestPlan {
             max_output_tokens: None,
             provider_order: Vec::new(),
             provider_strict: false,
+            compat: crate::compat::EndpointCompat::default(),
+            traits: crate::compat::ModelTraits::default(),
+            cache_key: None,
         }
     }
 
@@ -123,6 +132,36 @@ pub(crate) fn tool_turn_images<'a>(
         "Images from the tool results above."
     };
     Some((text, images))
+}
+
+/// Names the cacheable prefix of a request: the instructions and the tools.
+///
+/// The endpoint routes requests with the same key to the same cache, which is
+/// what makes a long shared prefix actually hit. Deriving the key from the
+/// prefix itself means two requests share a key exactly when they share that
+/// prefix, across turns and across sessions in one workspace, with no
+/// identifier leaving the machine that is not already implied by the request.
+#[must_use]
+pub fn prefix_cache_key(instructions: &str, tools: &[ToolSpec]) -> String {
+    use sha2::{Digest as _, Sha256};
+    use std::fmt::Write as _;
+
+    let mut hasher = Sha256::new();
+    hasher.update(instructions.as_bytes());
+    for tool in tools {
+        hasher.update(b"\x1e");
+        hasher.update(tool.name.as_bytes());
+        hasher.update(b"\x1f");
+        hasher.update(tool.description.as_bytes());
+        hasher.update(b"\x1f");
+        hasher.update(tool.input_schema.to_string().as_bytes());
+    }
+    let digest = hasher.finalize();
+    let mut key = String::from("rune-");
+    for byte in digest.iter().take(16) {
+        let _ = write!(key, "{byte:02x}");
+    }
+    key
 }
 
 /// Rune effort selections expressible by the full reasoning dialects.
@@ -437,6 +476,9 @@ mod routing_tests {
             max_output_tokens: None,
             provider_order: order.iter().map(|s| (*s).to_owned()).collect(),
             provider_strict: strict,
+            compat: crate::compat::EndpointCompat::default(),
+            traits: crate::compat::ModelTraits::default(),
+            cache_key: None,
         }
     }
 

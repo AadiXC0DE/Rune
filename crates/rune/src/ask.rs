@@ -609,6 +609,8 @@ struct AskHost<'a> {
     mapped: rune_context::prompt::MappedInstructions,
     dialect: Box<dyn Provider>,
     endpoint: Endpoint,
+    /// How requests to the endpoint are shaped, per model.
+    compat: crate::provider_setup::CompatSource,
     registry: Registry,
     read_only: bool,
     rules: RuleSet,
@@ -715,6 +717,16 @@ impl Host for AskHost<'_> {
 
     fn model(&self) -> String {
         self.settings.model.clone()
+    }
+
+    fn compat(
+        &self,
+        model: &str,
+    ) -> (
+        rune_net::compat::EndpointCompat,
+        rune_net::compat::ModelTraits,
+    ) {
+        self.compat.resolve(model)
     }
 
     fn instructions(&self) -> String {
@@ -1061,6 +1073,7 @@ pub fn run(
     // who has not set an endpoint is told that rather than being told about a
     // credential for an endpoint that does not exist.
     let endpoint = crate::provider_setup::configured_endpoint(settings, paths)?;
+    let compat = crate::provider_setup::CompatSource::from_settings(settings);
 
     crate::provider_setup::refresh_catalog_in_background(settings, paths);
     // Read from configuration and the cache only, so a run never waits on the
@@ -1170,6 +1183,7 @@ pub fn run(
         mapped: rune_context::prompt::MappedInstructions::default(),
         dialect,
         endpoint,
+        compat,
         registry,
         read_only: options.read_only,
         rules: crate::permissions::validated(settings)?,

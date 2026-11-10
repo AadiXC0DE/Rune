@@ -92,7 +92,10 @@ impl Provider for Responses {
         body.insert("instructions".to_owned(), serde_json::json!(instructions));
         body.insert(
             "prompt_cache_key".to_owned(),
-            serde_json::json!(prefix_cache_key(&instructions, &plan.tools)),
+            serde_json::json!(crate::provider::prefix_cache_key(
+                &instructions,
+                &plan.tools
+            )),
         );
         body.insert("input".to_owned(), serde_json::Value::Array(input));
         body.insert(
@@ -807,35 +810,6 @@ fn parse_usage(value: &serde_json::Value) -> Usage {
             .and_then(|details| details.get("reasoning_tokens"))
             .and_then(serde_json::Value::as_u64),
     }
-}
-
-/// Names the cacheable prefix of a request: the instructions and the tools.
-///
-/// The endpoint routes requests with the same key to the same cache, which is
-/// what makes a long shared prefix actually hit. Deriving the key from the
-/// prefix itself means two requests share a key exactly when they share that
-/// prefix, across turns and across sessions in one workspace, with no
-/// identifier leaving the machine that is not already implied by the request.
-fn prefix_cache_key(instructions: &str, tools: &[crate::message::ToolSpec]) -> String {
-    use sha2::{Digest as _, Sha256};
-    use std::fmt::Write as _;
-
-    let mut hasher = Sha256::new();
-    hasher.update(instructions.as_bytes());
-    for tool in tools {
-        hasher.update(b"\x1e");
-        hasher.update(tool.name.as_bytes());
-        hasher.update(b"\x1f");
-        hasher.update(tool.description.as_bytes());
-        hasher.update(b"\x1f");
-        hasher.update(tool.input_schema.to_string().as_bytes());
-    }
-    let digest = hasher.finalize();
-    let mut key = String::from("rune-");
-    for byte in digest.iter().take(16) {
-        let _ = write!(key, "{byte:02x}");
-    }
-    key
 }
 
 #[cfg(test)]

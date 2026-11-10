@@ -76,6 +76,9 @@ fn send(endpoint: &Endpoint, dialect: &dyn Dialect) -> Result<(), rune_core::err
         max_output_tokens: None,
         provider_order: Vec::new(),
         provider_strict: false,
+        compat: rune_net::compat::EndpointCompat::default(),
+        traits: rune_net::compat::ModelTraits::default(),
+        cache_key: None,
     };
     rune_net::transport::stream_completion(
         &rune_net::transport::agent(),

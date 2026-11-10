@@ -6,10 +6,13 @@
 //! a resolver that reports which rule set each value, keeps them in one place
 //! and lets `rune models --explain` show the reason behind every value.
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 
 use rune_core::config::{EditToolSetting, Effort};
 use rune_core::error::{Result, RuneError};
+use sha2::{Digest as _, Sha256};
 
 pub use rune_core::config::EditTool;
 
@@ -905,9 +908,119 @@ pub fn edit_tool(setting: EditToolSetting, model_id: &str) -> EditTool {
     }
 }
 
+/// Returns a tool call identifier in the shape an endpoint accepts.
+///
+/// An identifier that already fits is returned unchanged. The mapping depends
+/// on the identifier alone, so a call and its result always agree and a call
+/// maps the same way on every request of a session.
+#[must_use]
+pub fn shape_call_id(id: &str, shape: CallIdShape) -> Cow<'_, str> {
+    let safe = |c: char| c.is_ascii_alphanumeric() || c == '_' || c == '-';
+    match shape {
+        CallIdShape::Any => Cow::Borrowed(id),
+        CallIdShape::ClaudeSafe if id.chars().all(safe) => Cow::Borrowed(id),
+        CallIdShape::ClaudeSafe => {
+            Cow::Owned(id.chars().map(|c| if safe(c) { c } else { '_' }).collect())
+        }
+        CallIdShape::Max40 if id.len() <= 40 => Cow::Borrowed(id),
+        CallIdShape::Max40 => {
+            let mut cut = 31;
+            while !id.is_char_boundary(cut) {
+                cut = cut.saturating_sub(1);
+            }
+            let mut shaped = id.get(..cut).unwrap_or_default().to_owned();
+            shaped.push('_');
+            for byte in Sha256::digest(id.as_bytes()).iter().take(4) {
+                let _ = write!(shaped, "{byte:02x}");
+            }
+            Cow::Owned(shaped)
+        }
+        CallIdShape::Alnum9 if id.len() == 9 && id.bytes().all(|b| b.is_ascii_alphanumeric()) => {
+            Cow::Borrowed(id)
+        }
+        CallIdShape::Alnum9 => {
+            const DIGITS: &[u8; 62] =
+                b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+            let mut number = Sha256::digest(id.as_bytes())
+                .iter()
+                .take(8)
+                .fold(0_u64, |acc, byte| (acc << 8) | u64::from(*byte));
+            let mut reversed = Vec::new();
+            loop {
+                reversed.push(DIGITS[(number % 62) as usize]);
+                number /= 62;
+                if number == 0 {
+                    break;
+                }
+            }
+            while reversed.len() < 9 {
+                reversed.push(b'0');
+            }
+            Cow::Owned(
+                reversed
+                    .iter()
+                    .rev()
+                    .take(9)
+                    .map(|byte| char::from(*byte))
+                    .collect(),
+            )
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn call_id_shapes_are_stable_and_distinct() {
+        assert_eq!(shape_call_id("call:1/x", CallIdShape::Any), "call:1/x");
+        assert_eq!(
+            shape_call_id("toolu_01-Ab", CallIdShape::ClaudeSafe),
+            "toolu_01-Ab"
+        );
+        assert_eq!(
+            shape_call_id("call:1/x.y", CallIdShape::ClaudeSafe),
+            "call_1_x_y"
+        );
+
+        let short = "a".repeat(40);
+        assert_eq!(shape_call_id(&short, CallIdShape::Max40), short.as_str());
+        // A multi-byte character starting at byte 30 spans byte 31.
+        let wide = format!("{}é{}", "a".repeat(30), "b".repeat(9));
+        assert_eq!(wide.len(), 41);
+        let shaped = shape_call_id(&wide, CallIdShape::Max40);
+        assert_eq!(shaped.len(), 39);
+        assert!(
+            shaped.starts_with(&format!("{}_", "a".repeat(30))),
+            "{shaped}"
+        );
+        let prefix = "p".repeat(31);
+        let first = format!("{prefix}{}", "x".repeat(19));
+        let second = format!("{prefix}{}", "y".repeat(19));
+        let (first, second) = (
+            shape_call_id(&first, CallIdShape::Max40),
+            shape_call_id(&second, CallIdShape::Max40),
+        );
+        assert_eq!(first.len(), 40);
+        assert_eq!(second.len(), 40);
+        assert_ne!(first, second);
+
+        assert_eq!(shape_call_id("Ab3dE6gH9", CallIdShape::Alnum9), "Ab3dE6gH9");
+        let nine = shape_call_id("call_0123456789", CallIdShape::Alnum9);
+        assert_eq!(nine.len(), 9);
+        assert!(nine.bytes().all(|b| b.is_ascii_alphanumeric()), "{nine}");
+        assert_ne!(nine, shape_call_id("call_0123456788", CallIdShape::Alnum9));
+
+        for shape in [
+            CallIdShape::ClaudeSafe,
+            CallIdShape::Max40,
+            CallIdShape::Alnum9,
+        ] {
+            let id = "call.with:odd/characters-and-a-long-tail-0123456789";
+            assert_eq!(shape_call_id(id, shape), shape_call_id(id, shape));
+        }
+    }
 
     fn value(resolution: &Resolution, field: &str) -> String {
         resolution
