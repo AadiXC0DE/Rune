@@ -600,7 +600,7 @@ impl Verification {
                 && !call.output.is_error
                 && matches!(
                     call.call.name.as_str(),
-                    "write_file" | "edit_file" | "rename_file"
+                    "write_file" | "edit_file" | "apply_patch" | "rename_file"
                 )
         };
         let Some(last_change) = calls.iter().rposition(|call| changed(&call)) else {
@@ -1960,7 +1960,40 @@ fn prepare_call(
     };
 
     let target = host.tool_permission_target(&call.name, &arguments);
-    let (outcome, reason) = host.decide_with_arguments(&call.name, target.as_deref(), &arguments);
+    // A patch is decided path by path, each as the edit or write it makes.
+    // One that does not parse runs, so the tool reports the parse error.
+    let patch = if call.name == "apply_patch" {
+        arguments
+            .get("input")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|input| rune_tools::apply_patch::parse(input).ok())
+    } else {
+        None
+    };
+    let (outcome, reason) = if let Some(patch) = &patch {
+        for (name, path) in patch_decisions(patch) {
+            let (outcome, reason) =
+                host.decide_with_arguments(name, Some(path), &serde_json::json!({ "path": path }));
+            if outcome != Outcome::Allow {
+                host.emit(Event::ToolDenied {
+                    call: call.clone(),
+                    reason: reason.clone(),
+                });
+                return Err(CallResult {
+                    call: call.clone(),
+                    output: ToolOutput::failure(format!(
+                        "patch path `{path}` was not approved: {reason}"
+                    )),
+                    executed: false,
+                });
+            }
+        }
+        (Outcome::Allow, String::new())
+    } else if call.name == "apply_patch" {
+        (Outcome::Allow, String::new())
+    } else {
+        host.decide_with_arguments(&call.name, target.as_deref(), &arguments)
+    };
 
     match outcome {
         Outcome::Deny => {
@@ -2113,12 +2146,39 @@ fn prepare_call(
             host.decide_quietly("read_file", read_target.as_deref()) == Outcome::Allow,
         );
     }
+    if let Some(patch) = &patch {
+        context = context.with_quote_files(
+            patch_decisions(patch)
+                .iter()
+                .all(|(_, path)| host.decide_quietly("read_file", Some(path)) == Outcome::Allow),
+        );
+    }
 
     host.emit(Event::ToolStarted {
         call: call.clone(),
         activity,
     });
     Ok((arguments, context))
+}
+
+/// Every path a patch touches with the tool it is decided as, in patch order:
+/// sources it changes or deletes as `edit_file`, files it creates as `write_file`.
+fn patch_decisions(patch: &rune_tools::apply_patch::Patch) -> Vec<(&'static str, &str)> {
+    use rune_tools::apply_patch::Section;
+    let mut decisions = Vec::new();
+    for section in &patch.sections {
+        match section {
+            Section::Add { path, .. } => decisions.push(("write_file", path.as_str())),
+            Section::Delete { path } => decisions.push(("edit_file", path.as_str())),
+            Section::Update { path, move_to, .. } => {
+                decisions.push(("edit_file", path.as_str()));
+                if let Some(dest) = move_to {
+                    decisions.push(("write_file", dest.as_str()));
+                }
+            }
+        }
+    }
+    decisions
 }
 
 /// Executes one offered, policy-approved call and preserves batch cancellation.
@@ -2205,7 +2265,7 @@ fn infer_activity(name: &str) -> Activity {
         "glob_files" => Activity::List,
         "grep_files" => Activity::Search,
         "write_file" | "rename_file" | "create_directory" => Activity::Write,
-        "edit_file" => Activity::Edit,
+        "edit_file" | "apply_patch" => Activity::Edit,
         "shell" => Activity::Execute,
         "web_fetch" | "web_search" => Activity::Network,
         "subagent" => Activity::Delegate,
@@ -2360,6 +2420,10 @@ fn infer_target_standalone(name: &str, arguments: &serde_json::Value) -> Option<
             .get("path")
             .and_then(serde_json::Value::as_str)
             .map(str::to_owned),
+        "apply_patch" => arguments
+            .get("input")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|input| rune_tools::apply_patch::paths(input).into_iter().next()),
         "shell" => arguments
             .get("command")
             .and_then(serde_json::Value::as_str)

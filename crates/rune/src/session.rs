@@ -774,6 +774,13 @@ impl Host for SessionHost {
         if let Some(path) = mutating_path(name, arguments) {
             self.remember(path);
         }
+        if name == "apply_patch"
+            && let Some(input) = arguments.get("input").and_then(serde_json::Value::as_str)
+        {
+            for path in rune_tools::apply_patch::paths(input) {
+                self.remember(Utf8Path::new(&path));
+            }
+        }
         if name == "rename_file"
             && let (Some(source), Some(destination)) = (
                 arguments.get("path").and_then(serde_json::Value::as_str),
@@ -6011,6 +6018,7 @@ fn result_summary(name: &str, output: &ToolOutput, ascii: bool) -> String {
                 plural(count, if name == "grep_files" { "line" } else { "path" })
             }
         }
+        "apply_patch" => shorten(headline.trim_end_matches(':'), 64, ascii),
         // The detail reads like `1 replacement, +3 -1, lines 4-6`; the line
         // counts are the part a reader scans for.
         "edit_file" | "write_file" => headline
@@ -6067,15 +6075,25 @@ fn turn_summary(
             !call.output.is_error
                 && matches!(
                     call.call.name.as_str(),
-                    "write_file" | "edit_file" | "rename_file"
+                    "write_file" | "edit_file" | "apply_patch" | "rename_file"
                 )
         })
-        .filter_map(|call| {
-            serde_json::from_str::<serde_json::Value>(&call.call.arguments)
-                .ok()?
-                .get("path")?
-                .as_str()
+        .flat_map(|call| {
+            let arguments =
+                serde_json::from_str::<serde_json::Value>(&call.call.arguments).unwrap_or_default();
+            if call.call.name == "apply_patch" {
+                return arguments
+                    .get("input")
+                    .and_then(serde_json::Value::as_str)
+                    .map(rune_tools::apply_patch::paths)
+                    .unwrap_or_default();
+            }
+            arguments
+                .get("path")
+                .and_then(serde_json::Value::as_str)
                 .map(str::to_owned)
+                .into_iter()
+                .collect()
         })
         .collect();
     changed.sort();
@@ -11087,6 +11105,45 @@ mod tests {
             result_summary("write_file", &created, false),
             "new file, 12 lines"
         );
+    }
+
+    #[test]
+    fn a_patch_row_shows_its_first_line() {
+        let patched = ToolOutput::success("Updated 2 files:\nM a.rs (+1 -1)\nA b.rs (+3)");
+        assert_eq!(
+            result_summary("apply_patch", &patched, false),
+            "Updated 2 files"
+        );
+    }
+
+    #[test]
+    fn a_turn_summary_counts_every_file_a_patch_changed() {
+        let patch = turn::CallResult {
+            call: turn::PreparedCall {
+                id: "p".to_owned(),
+                name: "apply_patch".to_owned(),
+                arguments: serde_json::json!({
+                    "input": "*** Begin Patch\n*** Add File: a.rs\n+x\n*** Delete File: b.rs\n*** End Patch"
+                })
+                .to_string(),
+            },
+            output: ToolOutput::success("Updated 2 files:\nA a.rs (+1)\nD b.rs"),
+            executed: true,
+        };
+        let outcome = turn::TurnOutcome {
+            error: None,
+            stop_reason: StopReason::Completed,
+            text: String::new(),
+            narration: Vec::new(),
+            reasoning: String::new(),
+            usage: rune_net::stream::Usage::default(),
+            last_request: rune_net::stream::Usage::default(),
+            steps: 1,
+            verification: turn::Verification::NotApplicable,
+            calls: vec![patch],
+        };
+        let summary = turn_summary(&outcome, None, None, true).expect("summary");
+        assert!(summary.starts_with("1 call, 2 files changed"), "{summary}");
     }
 
     #[test]

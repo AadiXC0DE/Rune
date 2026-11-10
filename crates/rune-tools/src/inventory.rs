@@ -10,6 +10,7 @@ use rune_core::error::Result;
 use rune_core::tool::ToolSpec;
 use sha2::{Digest as _, Sha256};
 
+use crate::apply_patch::ApplyPatch;
 use crate::ask_user::{Answerer, AskUserQuestion, Unavailable};
 use crate::contract::{Tool, model_spec};
 use crate::registry::Registry;
@@ -36,6 +37,7 @@ pub const ADVERTISEMENT_ORDER: &[&str] = &[
     "syntax_diagnostics",
     "write_file",
     "edit_file",
+    "apply_patch",
     "rename_file",
     "create_directory",
     "shell",
@@ -175,6 +177,7 @@ pub fn builtin_with_vision(
     registry.insert(Box::new(SyntaxDiagnostics::with_limits(*limits)))?;
     registry.insert(Box::new(WriteFile))?;
     registry.insert(Box::new(EditFile))?;
+    registry.insert(Box::new(ApplyPatch::new(false)))?;
     registry.insert(Box::new(RenameFile))?;
     registry.insert(Box::new(CreateDirectory::with_limits(*limits)))?;
     registry.insert(Box::new(Shell::new(budget)))?;
@@ -359,8 +362,10 @@ mod tests {
 
     #[test]
     fn a_run_without_a_backend_leaves_exactly_those_tools_unadvertised() {
-        // These are the tools a default run cannot execute: no question
-        // channel, no web transport, no image analysis, and no skills.
+        // These are the tools a default run does not offer: the patch tool,
+        // which is not advertised by default, and the ones it cannot execute
+        // (no question channel, no web transport, no image analysis, and no
+        // skills).
         let registry = builtin_default().expect("built");
         let advertised: Vec<String> = advertisement(&registry)
             .into_iter()
@@ -374,6 +379,7 @@ mod tests {
         assert_eq!(
             hidden,
             [
+                "apply_patch",
                 "ask_user_question",
                 "web_fetch",
                 "web_search",
@@ -545,7 +551,13 @@ mod tests {
         ] {
             assert!(read_only.contains(&name), "`{name}` should be read only");
         }
-        for name in ["write_file", "edit_file", "rename_file", "create_directory"] {
+        for name in [
+            "write_file",
+            "edit_file",
+            "apply_patch",
+            "rename_file",
+            "create_directory",
+        ] {
             assert!(!read_only.contains(&name), "`{name}` must not be read only");
         }
     }

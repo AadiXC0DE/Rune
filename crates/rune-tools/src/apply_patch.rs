@@ -1,8 +1,15 @@
 //! The file patch format: `*** Begin Patch`, file sections, `*** End Patch`.
 
-use rune_core::error::{ErrorCode, Result, RuneError};
+use std::sync::Mutex;
 
+use camino::{Utf8Path, Utf8PathBuf};
+use rune_core::error::{ErrorCode, Result, RuneError};
+use serde_json::json;
+
+use crate::contract::{Activity, ExecutionContext, Tool, ToolOutput, validate_closed_arguments};
 use crate::matching::{closest_lines, fold};
+use crate::mutation;
+use crate::workspace::{display_path, resolve};
 
 const BEGIN: &str = "*** Begin Patch";
 const END: &str = "*** End Patch";
@@ -759,6 +766,277 @@ fn expected_lines(
         .with_hint("read the file again; nothing was written")
 }
 
+/// A file's text and the hash of its bytes, as read.
+type Snapshot = (String, [u8; 32]);
+
+/// Edits, adds, deletes and renames files from one patch, all or nothing.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ApplyPatch {
+    advertised: bool,
+}
+
+impl ApplyPatch {
+    /// Creates the tool; `advertised` decides whether models are offered it.
+    #[must_use]
+    pub const fn new(advertised: bool) -> Self {
+        Self { advertised }
+    }
+}
+
+impl Tool for ApplyPatch {
+    fn name(&self) -> &'static str {
+        "apply_patch"
+    }
+
+    fn description(&self) -> &'static str {
+        "Edit files with a patch, passed whole as input:
+*** Begin Patch
+*** Update File: src/app.py
+@@ def greet():
+-    print(\"Hi\")
++    print(\"Hello\")
+*** Add File: notes.txt
++first line
+*** Delete File: old.txt
+*** End Patch
+In an update, \"@@ <text>\" names a line just above the change; then each line starts with \" \" (unchanged, about 3 around each change), \"-\" (removed) or \"+\" (added). \"*** Move to: <path>\" after an Update header renames. Paths are relative to the workspace root. Nothing is written unless every change applies."
+    }
+
+    fn input_schema(&self) -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "input": {"type": "string", "description": "The whole patch."}
+            },
+            "required": ["input"],
+            "additionalProperties": false
+        })
+    }
+
+    fn activity(&self) -> Activity {
+        Activity::Edit
+    }
+
+    fn permission_target(&self, arguments: &serde_json::Value) -> Option<String> {
+        arguments
+            .get("input")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|input| paths(input).into_iter().next())
+    }
+
+    fn is_advertised(&self) -> bool {
+        self.advertised
+    }
+
+    fn validate(&self, arguments: &serde_json::Value) -> Result<()> {
+        validate_closed_arguments(arguments, &self.input_schema())?;
+        mutation::required_string(self.name(), arguments, "input")?;
+        Ok(())
+    }
+
+    fn call(
+        &self,
+        arguments: &serde_json::Value,
+        context: &ExecutionContext,
+    ) -> Result<ToolOutput> {
+        context.check_cancelled()?;
+        validate_closed_arguments(arguments, &self.input_schema())?;
+        let input = mutation::required_string(self.name(), arguments, "input")?;
+        let staged = stage(input, context)?;
+        context.check_cancelled()?;
+        commit(staged, context)
+    }
+}
+
+/// A patch computed and prepared, not yet written.
+struct Staged {
+    writes: Vec<mutation::Prepared>,
+    removals: Vec<(Utf8PathBuf, [u8; 32])>,
+    previews: Vec<String>,
+    lines: Vec<String>,
+}
+
+/// Computes a patch and prepares every write; writes nothing.
+fn stage(input: &str, context: &ExecutionContext) -> Result<Staged> {
+    let patch = parse(input)?;
+    let mut resolved: Vec<(String, Utf8PathBuf)> = Vec::new();
+    for raw in paths(input) {
+        if !resolved.iter().any(|(known, _)| *known == raw) {
+            let path = resolve(context, &raw)?.path;
+            resolved.push((raw, path));
+        }
+    }
+    let path_of = |raw: &str| -> Result<Utf8PathBuf> {
+        resolved
+            .iter()
+            .find(|(known, _)| known == raw)
+            .map(|(_, path)| path.clone())
+            .ok_or_else(|| RuneError::invalid_field("input", format!("unknown path `{raw}`")))
+    };
+    // What each file held when the patch was computed, so a write can
+    // refuse a file that changed since.
+    let seen: Mutex<Vec<(Utf8PathBuf, Option<Snapshot>)>> = Mutex::new(Vec::new());
+    let read = |raw: &str| -> Result<Option<String>> {
+        let path = path_of(raw)?;
+        let current = mutation::read_text(&path)?;
+        let text = current.as_ref().map(|(text, _)| text.clone());
+        if let Ok(mut seen) = seen.lock()
+            && !seen.iter().any(|(known, _)| *known == path)
+        {
+            seen.push((path, current));
+        }
+        Ok(text)
+    };
+    let changes = compute(&patch, &read, context.quote_files)?;
+    context.check_cancelled()?;
+    let seen = seen.into_inner().unwrap_or_default();
+    let original = |path: &Utf8Path| -> Option<&Snapshot> {
+        seen.iter()
+            .find(|(known, _)| known == path)
+            .and_then(|(_, state)| state.as_ref())
+    };
+
+    // The final state of every touched path, in the order first touched.
+    let mut finals: Vec<(Utf8PathBuf, Option<String>)> = Vec::new();
+    let mut set = |path: Utf8PathBuf, state: Option<String>| match finals
+        .iter_mut()
+        .find(|(known, _)| *known == path)
+    {
+        Some((_, slot)) => *slot = state,
+        None => finals.push((path, state)),
+    };
+    for change in &changes {
+        match change {
+            Change::Add { path, contents } => set(path_of(path)?, Some(contents.clone())),
+            Change::Delete { path } => set(path_of(path)?, None),
+            Change::Update {
+                path,
+                move_to,
+                contents,
+                ..
+            } => match move_to {
+                Some(dest) => {
+                    let source = path_of(path)?;
+                    let dest = path_of(dest)?;
+                    if source != dest {
+                        set(source, None);
+                    }
+                    set(dest, Some(contents.clone()));
+                }
+                None => set(path_of(path)?, Some(contents.clone())),
+            },
+        }
+    }
+
+    let mut writes = Vec::new();
+    let mut removals = Vec::new();
+    let mut previews = Vec::new();
+    for (path, state) in &finals {
+        let before = original(path);
+        match state {
+            Some(contents) => {
+                if before.is_some_and(|(text, _)| text == contents) {
+                    continue;
+                }
+                let prepared = mutation::prepare(path, contents)?;
+                mutation::check_preimage(&prepared, before.map(|(_, hash)| hash))?;
+                previews.extend(mutation::shown_diff(prepared.preview()));
+                writes.push(prepared);
+            }
+            None => {
+                if let Some((text, hash)) = before {
+                    previews.extend(mutation::shown_diff(&mutation::preview_between(text, "")));
+                    removals.push((path.clone(), *hash));
+                }
+            }
+        }
+    }
+    let shown = |raw: &str| -> Result<String> { Ok(display_path(context, &path_of(raw)?)) };
+    let mut lines: Vec<String> = Vec::with_capacity(changes.len());
+    for change in &changes {
+        lines.push(match change {
+            Change::Add { path, contents } => {
+                format!("A {} (+{})", shown(path)?, contents.lines().count())
+            }
+            Change::Delete { path } => format!("D {}", shown(path)?),
+            Change::Update {
+                path,
+                move_to: Some(dest),
+                added,
+                removed,
+                ..
+            } => format!(
+                "R {} -> {} (+{added} -{removed})",
+                shown(path)?,
+                shown(dest)?
+            ),
+            Change::Update {
+                path,
+                added,
+                removed,
+                ..
+            } => format!("M {} (+{added} -{removed})", shown(path)?),
+        });
+    }
+    Ok(Staged {
+        writes,
+        removals,
+        previews,
+        lines,
+    })
+}
+
+/// Writes a staged patch: every write, then every removal.
+fn commit(staged: Staged, context: &ExecutionContext) -> Result<ToolOutput> {
+    let Staged {
+        writes,
+        removals,
+        previews,
+        lines,
+    } = staged;
+    let mut changed: Vec<String> = Vec::new();
+    let partial = |error: RuneError, changed: &[String]| -> RuneError {
+        if changed.is_empty() {
+            return error;
+        }
+        let message = format!(
+            "{}; already changed: {}",
+            error.message(),
+            changed.join(", ")
+        );
+        let detail = error.detail();
+        let mut rebuilt = RuneError::new(error.code(), message);
+        if let Some(hint) = &detail.hint {
+            rebuilt = rebuilt.with_hint(hint.clone());
+        }
+        if let Some(invariant) = &detail.invariant {
+            rebuilt = rebuilt.with_invariant(invariant.clone());
+        }
+        if let Some(observed) = &detail.observed {
+            rebuilt = rebuilt.with_observed(observed.clone());
+        }
+        rebuilt
+    };
+    for prepared in writes {
+        let path = prepared.path().to_owned();
+        mutation::apply(prepared).map_err(|error| partial(error, &changed))?;
+        changed.push(display_path(context, &path));
+    }
+    for (path, hash) in &removals {
+        mutation::remove(path, hash).map_err(|error| partial(error, &changed))?;
+        changed.push(display_path(context, path));
+    }
+
+    let noun = if lines.len() == 1 { "file" } else { "files" };
+    let mut output = ToolOutput::success(format!(
+        "Updated {} {noun}:\n{}",
+        lines.len(),
+        lines.join("\n")
+    ));
+    output.diff = (!previews.is_empty()).then(|| previews.join("\n\n"));
+    Ok(output)
+}
+
 fn is_header(line: &str) -> bool {
     [ADD, DELETE, UPDATE]
         .iter()
@@ -1347,5 +1625,200 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    fn workspace() -> (tempfile::TempDir, ExecutionContext) {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let path = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).expect("utf8 path");
+        (dir, ExecutionContext::new(path))
+    }
+
+    fn seed(dir: &tempfile::TempDir, name: &str, body: &str) {
+        let path = dir.path().join(name);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("parent");
+        }
+        std::fs::write(path, body).expect("seed");
+    }
+
+    fn contents(dir: &tempfile::TempDir, name: &str) -> Option<String> {
+        std::fs::read_to_string(dir.path().join(name)).ok()
+    }
+
+    fn call(context: &ExecutionContext, patch: &str) -> Result<ToolOutput> {
+        ApplyPatch::new(false).call(&json!({ "input": patch }), context)
+    }
+
+    #[test]
+    fn a_patch_changes_three_files_and_reports_each() {
+        let (dir, context) = workspace();
+        seed(&dir, "src/app.py", "def greet():\n    print(\"Hi\")\n");
+        seed(&dir, "old.txt", "gone\n");
+        let patch = "*** Begin Patch
+*** Update File: src/app.py
+@@ def greet():
+-    print(\"Hi\")
++    print(\"Hello\")
+*** Add File: notes.txt
++first line
+*** Delete File: old.txt
+*** End Patch";
+        let output = call(&context, patch).unwrap();
+        assert!(!output.is_error);
+        assert_eq!(
+            output.text,
+            "Updated 3 files:\nM src/app.py (+1 -1)\nA notes.txt (+1)\nD old.txt"
+        );
+        assert_eq!(
+            contents(&dir, "src/app.py").as_deref(),
+            Some("def greet():\n    print(\"Hello\")\n")
+        );
+        assert_eq!(contents(&dir, "notes.txt").as_deref(), Some("first line\n"));
+        assert_eq!(contents(&dir, "old.txt"), None);
+        let diff = output.diff.expect("diff");
+        assert!(diff.contains("ello"), "{diff}");
+        assert!(diff.contains("+ first line"), "{diff}");
+        assert!(diff.contains("- gone"), "{diff}");
+    }
+
+    #[test]
+    fn a_move_is_reported_with_both_paths() {
+        let (dir, context) = workspace();
+        seed(&dir, "src/a.py", "one\ntwo\n");
+        let patch = "*** Begin Patch\n*** Update File: src/a.py\n*** Move to: src/b.py\n-one\n+1\n+uno\n*** End Patch";
+        let output = call(&context, patch).unwrap();
+        assert_eq!(
+            output.text,
+            "Updated 1 file:\nR src/a.py -> src/b.py (+2 -1)"
+        );
+        assert_eq!(contents(&dir, "src/a.py"), None);
+        assert_eq!(contents(&dir, "src/b.py").as_deref(), Some("1\nuno\ntwo\n"));
+    }
+
+    #[test]
+    fn a_failing_section_writes_nothing() {
+        let (dir, context) = workspace();
+        seed(&dir, "a.txt", "alpha\n");
+        seed(&dir, "b.txt", "beta\n");
+        let patch = "*** Begin Patch
+*** Update File: a.txt
+-alpha
++ALPHA
+*** Add File: c.txt
++new
+*** Update File: b.txt
+-missing
++x
+*** End Patch";
+        let error = call(&context, patch).unwrap_err();
+        assert!(
+            error.message().starts_with("section 3, chunk 1:"),
+            "{}",
+            error.message()
+        );
+        assert_eq!(contents(&dir, "a.txt").as_deref(), Some("alpha\n"));
+        assert_eq!(contents(&dir, "b.txt").as_deref(), Some("beta\n"));
+        assert_eq!(contents(&dir, "c.txt"), None);
+    }
+
+    #[test]
+    fn an_empty_add_creates_an_empty_file() {
+        let (dir, context) = workspace();
+        let patch = "*** Begin Patch\n*** Add File: pkg/__init__.py\n*** End Patch";
+        let output = call(&context, patch).unwrap();
+        assert_eq!(output.text, "Updated 1 file:\nA pkg/__init__.py (+0)");
+        assert_eq!(contents(&dir, "pkg/__init__.py").as_deref(), Some(""));
+    }
+
+    #[test]
+    fn a_file_changed_after_compute_is_not_overwritten() {
+        let (dir, context) = workspace();
+        seed(&dir, "a.txt", "alpha\n");
+        seed(&dir, "b.txt", "beta\n");
+        let patch = "*** Begin Patch
+*** Update File: a.txt
+-alpha
++ALPHA
+*** Update File: b.txt
+-beta
++BETA
+*** End Patch";
+        let staged = stage(patch, &context).unwrap();
+        seed(&dir, "b.txt", "changed elsewhere\n");
+        let error = commit(staged, &context).unwrap_err();
+        assert_eq!(error.code(), ErrorCode::StalePreimage);
+        assert!(
+            error.message().ends_with("; already changed: a.txt"),
+            "{}",
+            error.message()
+        );
+        assert_eq!(
+            contents(&dir, "b.txt").as_deref(),
+            Some("changed elsewhere\n")
+        );
+    }
+
+    #[test]
+    fn a_file_deleted_after_compute_is_not_recreated_or_removed_twice() {
+        let (dir, context) = workspace();
+        seed(&dir, "a.txt", "alpha\n");
+        let patch = "*** Begin Patch\n*** Delete File: a.txt\n*** End Patch";
+        let staged = stage(patch, &context).unwrap();
+        seed(&dir, "a.txt", "rewritten\n");
+        let error = commit(staged, &context).unwrap_err();
+        assert_eq!(error.code(), ErrorCode::StalePreimage);
+        assert_eq!(contents(&dir, "a.txt").as_deref(), Some("rewritten\n"));
+    }
+
+    #[test]
+    fn a_path_outside_the_workspace_is_refused() {
+        let (_dir, context) = workspace();
+        let patch = "*** Begin Patch\n*** Add File: ../outside.txt\n+x\n*** End Patch";
+        let error = call(&context, patch).unwrap_err();
+        assert_eq!(error.code(), ErrorCode::PathOutsideWorkspace);
+    }
+
+    #[test]
+    fn quoting_follows_the_context() {
+        let (dir, context) = workspace();
+        seed(
+            &dir,
+            "a.rs",
+            "fn main() {\n    let x = compute(1);\n    print(x);\n}\n",
+        );
+        let patch = "*** Begin Patch\n*** Update File: a.rs\n-    let x = compute(2);\n-    print(x);\n+    y();\n*** End Patch";
+        let quoted = call(&context, patch).unwrap_err();
+        assert!(
+            quoted.message().contains("compute(1)"),
+            "{}",
+            quoted.message()
+        );
+        let quiet = call(&context.clone().with_quote_files(false), patch).unwrap_err();
+        assert!(
+            !quiet.message().contains("compute(1)"),
+            "{}",
+            quiet.message()
+        );
+    }
+
+    #[test]
+    fn the_description_is_under_700_bytes() {
+        let tool = ApplyPatch::new(false);
+        assert_eq!(tool.description().len(), 527);
+        let encoded = serde_json::to_string(tool.description()).unwrap();
+        assert!(encoded.len() < 700, "{}", encoded.len());
+        assert!(!tool.is_advertised());
+        assert!(ApplyPatch::new(true).is_advertised());
+    }
+
+    #[test]
+    fn the_permission_target_is_the_first_path() {
+        let tool = ApplyPatch::new(false);
+        assert_eq!(
+            tool.permission_target(&json!({ "input": EXAMPLE }))
+                .as_deref(),
+            Some("hello.txt")
+        );
+        assert_eq!(tool.permission_target(&json!({ "input": "nope" })), None);
     }
 }

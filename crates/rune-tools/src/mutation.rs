@@ -309,7 +309,7 @@ pub fn line_changes(before: &str, after: &str) -> LineChanges {
 
 /// Returns a preview as the lines shown under a call's row, or nothing when
 /// the change has no textual difference. A cut preview ends with `...`.
-pub(crate) fn shown_diff(preview: &Preview) -> Option<String> {
+pub fn shown_diff(preview: &Preview) -> Option<String> {
     if preview.text.is_empty() {
         return None;
     }
@@ -723,6 +723,63 @@ pub fn apply(prepared: Prepared) -> Result<Applied> {
         created: identity.is_none(),
         relaxed,
     })
+}
+
+/// Reads a file as text with the hash of its bytes, or `None` when it does
+/// not exist. Refuses what `prepare` refuses: symlinks, multiply-linked and
+/// oversized files, and bytes that are not UTF-8.
+///
+/// # Errors
+///
+/// Returns the refusal or the I/O failure.
+pub fn read_text(path: &Utf8Path) -> Result<Option<(String, [u8; 32])>> {
+    let Some(snapshot) = read_preimage(path)? else {
+        return Ok(None);
+    };
+    let text = String::from_utf8(snapshot.bytes).map_err(|_| not_text(path))?;
+    Ok(Some((text, snapshot.hash)))
+}
+
+/// Checks that a prepared write starts from the state that was read:
+/// the file with `expected` hash, or no file when `expected` is `None`.
+///
+/// # Errors
+///
+/// Returns `stale` when the file changed since.
+pub fn check_preimage(prepared: &Prepared, expected: Option<&[u8; 32]>) -> Result<()> {
+    let unchanged = match expected {
+        Some(hash) => !prepared.creates_file() && prepared.preimage_hash() == hash,
+        None => prepared.creates_file(),
+    };
+    if unchanged {
+        Ok(())
+    } else {
+        Err(stale(prepared.path()))
+    }
+}
+
+/// Removes a file that still has the bytes hashed as `expected_hash`.
+///
+/// # Errors
+///
+/// Returns `stale` when the file changed or is gone, and refuses symlinks,
+/// directories and multiply-linked files.
+pub fn remove(path: &Utf8Path, expected_hash: &[u8; 32]) -> Result<()> {
+    match read_preimage(path)? {
+        Some(snapshot) if &snapshot.hash == expected_hash => {}
+        _ => return Err(stale(path)),
+    }
+    std::fs::remove_file(path.as_std_path()).map_err(|err| io_error(path, err))?;
+    if let Some(directory) = path.parent() {
+        sync_directory(directory);
+    }
+    Ok(())
+}
+
+/// The bounded preview of replacing `before` with `after`.
+#[must_use]
+pub fn preview_between(before: &str, after: &str) -> Preview {
+    preview_of(before, after, changed_region(before, after).as_ref())
 }
 
 /// Maps an I/O failure to a typed error that names the path involved.

@@ -4554,3 +4554,128 @@ fn a_repeated_test_command_with_nothing_changed_is_answered_from_the_last_run() 
     assert_eq!(repeat_pointers(&host), 1);
     assert!(!outcome.calls[1].executed);
 }
+
+/// Runs one `apply_patch` call with the real tools and the given rules.
+fn run_patch(
+    workspace: &tempfile::TempDir,
+    patch: &str,
+    rules: RuleSet,
+) -> (TestHost, rune_agent::turn::TurnOutcome) {
+    let arguments = serde_json::json!({ "input": patch }).to_string();
+    let endpoint = MockEndpoint::start(vec![
+        Script::tool_call("patch", "apply_patch", &arguments),
+        Script::text("done"),
+    ]);
+    let registry = rune_tools::inventory::builtin_default().expect("builtins");
+    let mut tools = registry.all_schemas();
+    tools.push(rune_tools::contract::model_spec(
+        &rune_tools::apply_patch::ApplyPatch::new(true),
+    ));
+    let mut host = TestHost::new(endpoint).with_tools(tools).with_rules(rules);
+    host.workspace = Utf8PathBuf::from_path_buf(workspace.path().to_owned()).expect("UTF-8 path");
+    host.registry = Some(registry);
+    let mut history = rune_agent::History::new();
+    history.push_user("apply the patch");
+    let outcome = run_turn(&mut history, &host).expect("turn");
+    (host, outcome)
+}
+
+#[test]
+fn each_patch_path_is_decided_as_an_edit_or_a_write() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    std::fs::write(workspace.path().join("a.txt"), "one\n").expect("fixture");
+    std::fs::write(workspace.path().join("b.txt"), "two\n").expect("fixture");
+    let patch = "*** Begin Patch
+*** Update File: a.txt
+*** Move to: c.txt
+-one
++1
+*** Add File: d.txt
++new
+*** Delete File: b.txt
+*** End Patch";
+    let mut rules = RuleSet::new();
+    rules.push(Rule::allow("edit_file", "*", Layer::User));
+    rules.push(Rule::allow("write_file", "*", Layer::User));
+    let (host, outcome) = run_patch(&workspace, patch, rules);
+    assert!(
+        !outcome.calls[0].output.is_error,
+        "{}",
+        outcome.calls[0].output.text
+    );
+    assert_eq!(
+        *host.decisions.lock().expect("lock"),
+        [
+            ("edit_file".to_owned(), Some("a.txt".to_owned())),
+            ("write_file".to_owned(), Some("c.txt".to_owned())),
+            ("write_file".to_owned(), Some("d.txt".to_owned())),
+            ("edit_file".to_owned(), Some("b.txt".to_owned())),
+        ]
+    );
+    assert_eq!(
+        std::fs::read_to_string(workspace.path().join("c.txt")).expect("moved"),
+        "1\n"
+    );
+    assert!(!workspace.path().join("a.txt").exists());
+    assert!(!workspace.path().join("b.txt").exists());
+    assert!(workspace.path().join("d.txt").exists());
+
+    // A deny rule on an edit refuses the whole patch before anything is written.
+    let workspace = tempfile::tempdir().expect("workspace");
+    std::fs::create_dir(workspace.path().join("secret")).expect("dir");
+    std::fs::write(workspace.path().join("secret/a"), "keep\n").expect("fixture");
+    std::fs::write(workspace.path().join("open.txt"), "x\n").expect("fixture");
+    let patch = "*** Begin Patch
+*** Update File: open.txt
+-x
++y
+*** Update File: secret/a
+-keep
++lost
+*** End Patch";
+    let mut rules = RuleSet::new();
+    rules.push(Rule::allow("edit_file", "*", Layer::Default));
+    rules.push(Rule::deny("edit_file", "secret/*", Layer::User));
+    let (host, outcome) = run_patch(&workspace, patch, rules);
+    let result = &outcome.calls[0];
+    assert!(result.output.is_error);
+    assert!(!result.executed);
+    assert!(
+        result
+            .output
+            .text
+            .starts_with("patch path `secret/a` was not approved:"),
+        "{}",
+        result.output.text
+    );
+    assert!(host.executed_calls().is_empty());
+    assert_eq!(
+        std::fs::read_to_string(workspace.path().join("open.txt")).expect("read"),
+        "x\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(workspace.path().join("secret/a")).expect("read"),
+        "keep\n"
+    );
+}
+
+#[test]
+fn a_patch_counts_as_a_change_for_verification() {
+    use rune_agent::turn::{CallResult, PreparedCall, Verification};
+    let call = |name: &str, arguments: &str| CallResult {
+        call: PreparedCall {
+            id: name.to_owned(),
+            name: name.to_owned(),
+            arguments: arguments.to_owned(),
+        },
+        output: ToolOutput::success("ok"),
+        executed: true,
+    };
+    let patch = call("apply_patch", "{}");
+    let test = call("shell", r#"{"action":"run","command":"npm test"}"#);
+    assert_eq!(
+        Verification::of(std::slice::from_ref(&patch)),
+        Verification::Unverified
+    );
+    assert_eq!(Verification::of(&[patch, test]), Verification::Verified);
+}
