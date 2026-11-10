@@ -4515,6 +4515,42 @@ fn a_repeated_read_is_answered_from_the_earlier_result_once() {
 }
 
 #[test]
+fn a_repeated_read_runs_again_after_its_result_was_pruned() {
+    use std::fmt::Write as _;
+    let directory = tempfile::tempdir().expect("workspace");
+    let file = directory.path().join("lib.rs");
+    std::fs::write(&file, "fn main() {}").expect("file");
+    let arguments = &serde_json::json!({"path": file}).to_string();
+    let endpoint = MockEndpoint::start(vec![
+        Script::tool_call("first", "read_file", arguments),
+        Script::text("read"),
+        Script::tool_call("second", "read_file", arguments),
+        Script::text("done"),
+    ]);
+    let mut numbered = String::new();
+    for line in 1..=40 {
+        let _ = writeln!(numbered, "{line:>6}\tfn main() {{}} // padding for size");
+    }
+    let host = TestHost::new(endpoint)
+        .with_tools(vec![read_tool()])
+        .with_tool_response(ToolOutput::success(numbered));
+    let mut history = rune_agent::History::new();
+    history.push_user("read it");
+    run_turn(&mut history, &host).expect("first turn");
+
+    history.push_user(format!("now read it again {}", "x".repeat(130_000)));
+    let report =
+        rune_agent::prune::prune(&mut history, &rune_net::chat_completions::ChatCompletions);
+    assert_eq!(report.results, 1);
+    assert!(history.is_pruned("first"));
+
+    let outcome = run_turn(&mut history, &host).expect("second turn");
+    assert_eq!(host.executed_calls().len(), 2);
+    assert_eq!(repeat_pointers(&host), 0);
+    assert!(outcome.calls[0].executed);
+}
+
+#[test]
 fn a_change_between_identical_searches_lets_the_second_run() {
     let arguments = r#"{"pattern":"fn main"}"#;
     let mut grep = read_tool();

@@ -61,6 +61,17 @@ impl Provider for Responses {
         Box::new(Reducer::new())
     }
 
+    fn replay_is_signed(&self, replay: &str) -> bool {
+        let Ok(serde_json::Value::Array(items)) = serde_json::from_str(replay) else {
+            return false;
+        };
+        items.iter().any(|item| {
+            item.get("encrypted_content")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|content| !content.is_empty())
+        })
+    }
+
     fn build_request(&self, plan: &RequestPlan) -> Result<serde_json::Value> {
         let mut input: Vec<serde_json::Value> = Vec::new();
 
@@ -1271,6 +1282,15 @@ mod tests {
             r#"{"type":"response.completed","response":{"status":"completed","output":[]}}"#,
         ]);
         assert!(reducer.replay().is_none());
+    }
+
+    #[test]
+    fn replay_is_signed_for_encrypted_reasoning_only() {
+        let signed = r#"[{"type":"reasoning","id":"rs_1","encrypted_content":"opaque"}]"#;
+        let plain = r#"[{"type":"reasoning","id":"rs_1","summary":[],"encrypted_content":""}]"#;
+        assert!(Responses.replay_is_signed(signed));
+        assert!(!Responses.replay_is_signed(plain));
+        assert!(!Responses.replay_is_signed("not json"));
     }
 
     #[test]

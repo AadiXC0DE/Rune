@@ -62,6 +62,22 @@ impl Provider for Gemini {
         Box::new(Reducer::default())
     }
 
+    fn replay_is_signed(&self, replay: &str) -> bool {
+        let Ok(value) = serde_json::from_str::<Value>(replay) else {
+            return false;
+        };
+        value
+            .get("gemini_parts")
+            .and_then(Value::as_array)
+            .is_some_and(|parts| {
+                parts.iter().any(|part| {
+                    part.get("thoughtSignature")
+                        .and_then(Value::as_str)
+                        .is_some_and(|signature| !signature.is_empty())
+                })
+            })
+    }
+
     fn build_request(&self, plan: &RequestPlan) -> Result<Value> {
         self.validate(plan)?;
         self.completion_path(plan)?;
@@ -416,6 +432,20 @@ mod tests {
 
     fn feed(reducer: &mut Reducer, frame: &Value, out: &mut Vec<ProviderEvent>) -> Result<()> {
         reducer.apply(Some(&frame.to_string()), out)
+    }
+
+    #[test]
+    fn replay_is_signed_for_parts_with_a_thought_signature_only() {
+        let signed = json!({"gemini_parts": [
+            {"text": "thinking", "thought": true, "thoughtSignature": "signature"},
+            {"text": "answer"},
+        ]})
+        .to_string();
+        let plain =
+            json!({"gemini_parts": [{"text": "answer", "thoughtSignature": ""}]}).to_string();
+        assert!(Gemini.replay_is_signed(&signed));
+        assert!(!Gemini.replay_is_signed(&plain));
+        assert!(!Gemini.replay_is_signed("not json"));
     }
 
     #[test]

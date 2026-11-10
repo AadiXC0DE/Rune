@@ -1853,8 +1853,12 @@ fn repeat_pointer(
     }
 }
 
-/// Returns whether the history still holds a call's result.
+/// Returns whether the history still holds a call's result. A result that
+/// was replaced by a receipt no longer counts.
 fn result_retained(history: &History, id: &str) -> bool {
+    if history.is_pruned(id) {
+        return false;
+    }
     history.turns().iter().any(|turn| {
         turn.parts.iter().any(|part| {
             matches!(part, ContentPart::ToolResult { id: held, .. } if held.to_string() == id)
@@ -1880,6 +1884,9 @@ fn latest_identical_result(history: &History, call: &PreparedCall) -> Option<(St
             _ => None,
         })
     })?;
+    if history.is_pruned(&id) {
+        return None;
+    }
     history.turns().iter().find_map(|turn| {
         turn.parts.iter().find_map(|part| match part {
             ContentPart::ToolResult {

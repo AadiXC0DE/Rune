@@ -61,6 +61,22 @@ impl Provider for Anthropic {
         vec![("anthropic-version", "2023-06-01".to_owned())]
     }
 
+    fn replay_is_signed(&self, replay: &str) -> bool {
+        let Ok(serde_json::Value::Array(blocks)) = serde_json::from_str(replay) else {
+            return false;
+        };
+        blocks.iter().any(
+            |block| match block.get("type").and_then(serde_json::Value::as_str) {
+                Some("redacted_thinking") => true,
+                Some("thinking") => block
+                    .get("signature")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|signature| !signature.is_empty()),
+                _ => false,
+            },
+        )
+    }
+
     fn build_request(&self, plan: &RequestPlan) -> Result<serde_json::Value> {
         let mut messages: Vec<serde_json::Value> = Vec::new();
 
@@ -1699,6 +1715,19 @@ mod tests {
             r#"{"type":"message_stop"}"#,
         ]);
         assert!(reducer.replay().is_none());
+    }
+
+    #[test]
+    fn replay_is_signed_for_signed_or_redacted_thinking_only() {
+        let signed =
+            r#"[{"type":"thinking","thinking":"a","signature":"s1"},{"type":"text","text":"b"}]"#;
+        let redacted = r#"[{"type":"redacted_thinking","data":"opaque"}]"#;
+        let unsigned =
+            r#"[{"type":"thinking","thinking":"a","signature":""},{"type":"text","text":"b"}]"#;
+        assert!(Anthropic.replay_is_signed(signed));
+        assert!(Anthropic.replay_is_signed(redacted));
+        assert!(!Anthropic.replay_is_signed(unsigned));
+        assert!(!Anthropic.replay_is_signed("not json"));
     }
 
     #[test]

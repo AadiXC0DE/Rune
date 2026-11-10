@@ -6,6 +6,7 @@
 pub mod compaction;
 pub mod history;
 pub mod ledger;
+pub mod prune;
 pub mod repair;
 pub mod retry;
 pub mod steering;

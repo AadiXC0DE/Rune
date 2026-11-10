@@ -295,6 +295,12 @@ pub trait Provider: Send + Sync {
     fn routing(&self) -> Routing {
         Routing::Unsupported
     }
+
+    /// Returns true when this replay value carries reasoning that is signed or encrypted
+    /// and valid only after the exact history that produced it.
+    fn replay_is_signed(&self, _replay: &str) -> bool {
+        false
+    }
 }
 
 /// How a dialect handles an upstream provider preference.

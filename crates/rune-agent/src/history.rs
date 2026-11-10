@@ -10,6 +10,7 @@ use std::sync::Arc;
 use rune_core::error::{ErrorCode, Result, RuneError};
 use rune_core::id::ToolCallId;
 use rune_net::message::{ContentPart, Message, Role, validate};
+use rune_net::provider::Provider;
 use rune_tools::result_store::Store;
 use serde::{Deserialize, Serialize};
 
@@ -155,6 +156,9 @@ pub struct History {
     /// Files, checks and shells the turn loop saw, kept across compaction.
     #[serde(default)]
     ledger: crate::ledger::Ledger,
+    /// Call ids whose result was replaced by a receipt.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
+    pruned: std::collections::BTreeSet<String>,
 }
 
 /// Reads whose file digest is kept; past this, one is dropped to make room.
@@ -182,6 +186,7 @@ impl Default for History {
             check_generations: std::collections::BTreeMap::new(),
             anchor: None,
             ledger: crate::ledger::Ledger::default(),
+            pruned: std::collections::BTreeSet::new(),
         }
     }
 }
@@ -203,6 +208,7 @@ impl History {
             check_generations: std::collections::BTreeMap::new(),
             anchor: None,
             ledger: crate::ledger::Ledger::default(),
+            pruned: std::collections::BTreeSet::new(),
         }
     }
 
@@ -530,6 +536,43 @@ impl History {
         self.anchor = None;
     }
 
+    /// Returns true when a retained turn carries replay state the dialect
+    /// reports as signed, which makes any edit of earlier turns invalid.
+    #[must_use]
+    pub fn is_signed(&self, dialect: &dyn Provider) -> bool {
+        self.turns.iter().any(|turn| {
+            turn.replay
+                .as_deref()
+                .is_some_and(|replay| dialect.replay_is_signed(replay))
+        })
+    }
+
+    /// Returns true when the result of this call was replaced by a receipt.
+    #[must_use]
+    pub fn is_pruned(&self, id: &str) -> bool {
+        self.pruned.contains(id)
+    }
+
+    /// Replaces the content of a tool result with a receipt. Returns false
+    /// when no result answers the call.
+    pub(crate) fn replace_result(&mut self, id: &str, receipt: String) -> bool {
+        let part = self.turns.iter_mut().find_map(|turn| {
+            turn.parts.iter_mut().find_map(|part| match part {
+                ContentPart::ToolResult {
+                    id: held, content, ..
+                } if held.as_str() == id => Some(content),
+                _ => None,
+            })
+        });
+        let Some(content) = part else {
+            return false;
+        };
+        *content = receipt;
+        self.pruned.insert(id.to_owned());
+        self.clear_anchor();
+        true
+    }
+
     /// Truncates to the first `count` turns.
     ///
     /// Used by compaction, which replaces an old prefix with a summary.
@@ -655,6 +698,7 @@ impl History {
             check_generations: self.check_generations.clone(),
             anchor: None,
             ledger: self.ledger.clone(),
+            pruned: self.pruned.clone(),
         }
     }
 
