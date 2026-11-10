@@ -5,6 +5,7 @@
 
 pub mod compaction;
 pub mod history;
+pub mod ledger;
 pub mod repair;
 pub mod retry;
 pub mod steering;

@@ -152,6 +152,9 @@ pub struct History {
     /// Reported input of the latest completed request, for the next estimate.
     #[serde(skip)]
     anchor: Option<crate::tokens::Anchor>,
+    /// Files, checks and shells the turn loop saw, kept across compaction.
+    #[serde(default)]
+    ledger: crate::ledger::Ledger,
 }
 
 /// Reads whose file digest is kept; past this, one is dropped to make room.
@@ -178,6 +181,7 @@ impl Default for History {
             refused_overwrites: std::collections::BTreeSet::new(),
             check_generations: std::collections::BTreeMap::new(),
             anchor: None,
+            ledger: crate::ledger::Ledger::default(),
         }
     }
 }
@@ -198,6 +202,7 @@ impl History {
             refused_overwrites: std::collections::BTreeSet::new(),
             check_generations: std::collections::BTreeMap::new(),
             anchor: None,
+            ledger: crate::ledger::Ledger::default(),
         }
     }
 
@@ -274,6 +279,16 @@ impl History {
 
     pub(crate) fn shared_result_store(&self) -> Arc<Store> {
         Arc::clone(&self.result_store)
+    }
+
+    /// Returns what the turn loop recorded about files, checks and shells.
+    #[must_use]
+    pub fn ledger(&self) -> &crate::ledger::Ledger {
+        &self.ledger
+    }
+
+    pub(crate) fn ledger_mut(&mut self) -> &mut crate::ledger::Ledger {
+        &mut self.ledger
     }
 
     pub(crate) fn shared_live_plan(&self) -> Arc<std::sync::Mutex<rune_tools::PlanUpdate>> {
@@ -639,6 +654,7 @@ impl History {
             refused_overwrites: self.refused_overwrites.clone(),
             check_generations: self.check_generations.clone(),
             anchor: None,
+            ledger: self.ledger.clone(),
         }
     }
 

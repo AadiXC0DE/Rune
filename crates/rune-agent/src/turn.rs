@@ -688,7 +688,7 @@ impl Verification {
 }
 
 /// Returns true when a shell call ran something other than a plain read.
-fn is_check_command(arguments: &str) -> bool {
+pub(crate) fn is_check_command(arguments: &str) -> bool {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(arguments) else {
         return false;
     };
@@ -1195,6 +1195,9 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
                 is_error: result.output.is_error,
             });
             result_parts.extend(host.tool_attachments(result));
+        }
+        for result in &results {
+            history.ledger_mut().record(result);
         }
         history.push_tool_results(result_parts);
         calls.extend(results);

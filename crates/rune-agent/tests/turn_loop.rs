@@ -4538,6 +4538,33 @@ fn a_change_between_identical_searches_lets_the_second_run() {
 }
 
 #[test]
+fn the_turn_loop_records_changes_in_the_ledger() {
+    let test = r#"{"action":"run","command":"npm test"}"#;
+    let mut edit = read_tool();
+    edit.name = "edit_file".to_owned();
+    let mut shell = read_tool();
+    shell.name = "shell".to_owned();
+    let endpoint = MockEndpoint::start(vec![
+        Script::tool_call("change", "edit_file", r#"{"path":"src/lib.rs"}"#),
+        Script::tool_call("check", "shell", test),
+        Script::text("done"),
+    ]);
+    let host = TestHost::new(endpoint)
+        .with_tools(vec![edit, shell])
+        .with_tool_response(ToolOutput::success("ok\n[exited with status 0]"));
+    let mut history = rune_agent::History::new();
+    history.push_user("edit, then test");
+    run_turn(&mut history, &host).expect("turn");
+    let ledger = history.ledger();
+    assert_eq!(ledger.changed.len(), 1);
+    assert_eq!(ledger.changed[0].path, "src/lib.rs");
+    assert_eq!(ledger.checks.len(), 1);
+    assert_eq!(ledger.checks[0].command, "npm test");
+    assert_eq!(ledger.checks[0].exit, Some(0));
+    assert!(ledger.settled);
+}
+
+#[test]
 fn identical_reads_in_one_batch_run_once() {
     let directory = tempfile::tempdir().expect("workspace");
     let file = directory.path().join("lib.rs");
