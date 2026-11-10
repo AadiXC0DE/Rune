@@ -266,6 +266,12 @@ impl History {
         Arc::make_mut(&mut self.result_store)
     }
 
+    /// Keeps retained results under `directory` as well, and loads what an
+    /// earlier run of the same session stored there.
+    pub fn attach_result_directory(&mut self, directory: camino::Utf8PathBuf) -> Result<()> {
+        self.result_store_mut().attach_directory(directory)
+    }
+
     pub(crate) fn shared_result_store(&self) -> Arc<Store> {
         Arc::clone(&self.result_store)
     }

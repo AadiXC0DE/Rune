@@ -2157,6 +2157,7 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
         recorder.set_workspace(&config.workspace)?;
         (recorder, History::new())
     };
+    let results_notice = attach_results(&mut history, &config.paths, &recorder.id());
 
     // Opened once. A history that failed to load is not fatal: recall is a
     // convenience, and losing it must not cost the session.
@@ -2339,6 +2340,7 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
         opening.extend(
             mcp_warnings
                 .iter()
+                .chain(results_notice.iter())
                 .flat_map(|warning| render_entries(&[Entry::notice(warning)], &host)),
         );
         // Replay only for an interactive resume. These settled rows enter the
@@ -2477,6 +2479,9 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner) = fresh;
                         history = History::new();
+                        if let Some(notice) = attach_results(&mut history, &config.paths, &id) {
+                            note(notice);
+                        }
                         host.transcript_history_len
                             .store(0, std::sync::atomic::Ordering::Relaxed);
                         host.transcript
@@ -3752,6 +3757,19 @@ fn view_transcript(reader: &rune_term::input::KeyReader, host: &SessionHost) -> 
         }
     }
     Ok(())
+}
+
+/// Keeps a session's retained tool results in its directory, so a resumed
+/// session can still read them. Returns the notice to show when that fails.
+pub(crate) fn attach_results(
+    history: &mut History,
+    paths: &Paths,
+    id: &SessionId,
+) -> Option<String> {
+    history
+        .attach_result_directory(paths.session_dir(id).join("results"))
+        .err()
+        .map(|err| format!("stored tool results will not survive a restart: {err}"))
 }
 
 /// Adds process interruption boundaries to the saved transcript without putting

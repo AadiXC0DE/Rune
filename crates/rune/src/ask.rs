@@ -1148,6 +1148,11 @@ pub fn run(
             .and_then(|limit| std::time::Instant::now().checked_add(limit)),
         limits,
     };
+    if let Some(log) = &host.log
+        && let Some(notice) = crate::session::attach_results(&mut history, paths, &log.id)
+    {
+        let _ = writeln!(std::io::stderr(), "warning: {notice}");
+    }
     let watchdog = options.timeout.map(|limit| {
         Watchdog::start(
             limit,
