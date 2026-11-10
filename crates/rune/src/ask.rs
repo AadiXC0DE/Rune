@@ -1067,9 +1067,41 @@ pub fn run(
             },
         )
     });
+    // A termination signal stops the run the way its limits do, so a runner
+    // that ends it on a timeout still gets its record and no stray commands.
+    let shutdown = {
+        let run = host.cancellation.clone();
+        let tools = host.context.cancellation();
+        crate::shutdown::Shutdown::install(move || {
+            run.cancel();
+            tools.cancel();
+        })?
+    };
     let outcome = turn::run_turn(&mut history, &host);
+    // Whatever ended the run, nothing it started keeps running.
+    host.registry.shutdown();
     let timed_out = watchdog.is_some_and(Watchdog::finish);
-    let outcome = match (timed_out, outcome) {
+    let signal = shutdown.received();
+    let outcome = match (signal, outcome) {
+        // The cancellation was the signal's; a run that finished as it
+        // arrived keeps its own ending.
+        (Some(signal), Ok(mut outcome)) if outcome.stop_reason == StopReason::Cancelled => {
+            outcome.error = Some(crate::shutdown::stopped_by(signal));
+            Ok(outcome)
+        }
+        (Some(signal), Err(err)) if err.code() == ErrorCode::Cancelled => {
+            Err(crate::shutdown::stopped_by(signal))
+        }
+        (_, outcome) => outcome,
+    };
+    // The signal that stopped the run, which decides its exit code.
+    let signalled = signal.filter(|_| {
+        matches!(&outcome, Ok(outcome) if outcome
+            .error
+            .as_ref()
+            .is_some_and(|error| error.code() == ErrorCode::Cancelled))
+    });
+    let outcome = match (timed_out && signalled.is_none(), outcome) {
         // The run settled when it was cancelled; the cancellation was the
         // time limit, so that is the reason it stopped.
         // A run that finished as the deadline passed keeps its own ending.
@@ -1128,7 +1160,9 @@ pub fn run(
     } else {
         None
     };
-    let exit_code = if error.is_none() && outcome.stop_reason == StopReason::Completed {
+    let exit_code = if let Some(signal) = signalled {
+        crate::shutdown::exit_code(signal)
+    } else if error.is_none() && outcome.stop_reason == StopReason::Completed {
         i32::from(EXIT_OK)
     } else {
         i32::from(EXIT_FAILURE)
@@ -1177,6 +1211,7 @@ pub fn run(
     Ok(JsonResult {
         // A run stopped by one of its bounds has a usable partial answer.
         final_output: if error.is_none()
+            || signalled.is_some()
             || matches!(
                 outcome.stop_reason,
                 StopReason::StepLimit | StopReason::TimeLimit | StopReason::SpendLimit

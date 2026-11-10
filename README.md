@@ -548,6 +548,12 @@ should choose, say why, and continue. The note is in the first user message, not
 the system prompt, which stays the same as an interactive session's; the saved
 session keeps the prompt without it.
 
+SIGINT, SIGTERM or SIGHUP stops a run the way its limits do: the turn is
+cancelled, every command it started is asked to exit and killed after two
+seconds, the session is recorded, and `--json` or `--jsonl` still prints the
+result, with `error_code` `cancelled`. The exit code is 130 for SIGINT and 143
+for SIGTERM and SIGHUP. A second signal exits at once.
+
 `rune ask --jsonl "prompt"` streams one JSON object per stdout line, flushing
 each record as it arrives. `--jsonl` takes precedence over `--json`. The stream
 is enough to rebuild every step, tool call, result and its usage without reading

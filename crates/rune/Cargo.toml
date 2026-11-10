@@ -34,6 +34,9 @@ jiff.workspace = true
 sha2.workspace = true
 flate2.workspace = true
 
+[target.'cfg(unix)'.dependencies]
+signal-hook.workspace = true
+
 [dev-dependencies]
 tempfile.workspace = true
 rune-testkit.workspace = true

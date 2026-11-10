@@ -360,6 +360,134 @@ fn run_context_is_not_in_the_system_message() {
     assert!(user.to_string().contains("<run_context>"), "{user}");
 }
 
+/// Starts a run whose first step leaves a background command running and
+/// whose second request never answers, signals it once the second request
+/// is pending, and returns the exit code, stdout and the command's marker.
+#[cfg(unix)]
+fn signalled_run(signal: &str) -> (Option<i32>, String, String) {
+    use rune_testkit::scripted::{ScriptedProvider, Turn};
+    let marker = format!("600.{}{}", std::process::id(), signal.len());
+    let mut shell = Turn::call(
+        "s1",
+        "shell",
+        &serde_json::json!({
+            "action": "run",
+            "command": format!("sleep {marker} & wait"),
+            "yield_time_ms": 200,
+        })
+        .to_string(),
+    );
+    shell.finish = Some("tool_calls".to_owned());
+    let mut never = Turn::text("never");
+    never.delay_ms = 30_000;
+    let provider = ScriptedProvider::start(vec![shell, never]);
+    let temp = tempfile::tempdir().expect("tempdir");
+    let root = temp.path();
+    let workspace = root.join("workspace");
+    std::fs::create_dir_all(&workspace).expect("workspace");
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_rune"))
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("HOME", root.join("home"))
+        .env("RUNE_HOME", root.join("state"))
+        .env("XDG_CONFIG_HOME", root.join("config"))
+        .env("XDG_DATA_HOME", root.join("data"))
+        .env("RUNE_PROVIDER", "chat_completions")
+        .env("RUNE_BASE_URL", provider.base_url())
+        .env("RUNE_MODEL", "scripted")
+        .env("RUNE_API_KEY_ENV", "RUNE_SIGNAL_TEST_KEY")
+        .env("RUNE_SIGNAL_TEST_KEY", "signal-test-key")
+        .current_dir(&workspace)
+        .args([
+            "--permission-mode",
+            "full-access",
+            "--allow-unsandboxed",
+            "ask",
+            "--json",
+            "--no-save",
+            "--",
+            "Start the command, then wait.",
+        ])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("ask");
+    let started = std::time::Instant::now();
+    while provider.request_count() < 2 {
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(20),
+            "no second request"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let status = std::process::Command::new("kill")
+        .args([signal, &child.id().to_string()])
+        .status()
+        .expect("kill");
+    assert!(status.success());
+    let signalled = std::time::Instant::now();
+    let code = loop {
+        if let Some(status) = child.try_wait().expect("wait") {
+            break status.code();
+        }
+        assert!(
+            signalled.elapsed() < std::time::Duration::from_secs(10),
+            "the run did not stop"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    let output = child.wait_with_output().expect("output");
+    (
+        code,
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+        marker,
+    )
+}
+
+/// Asserts that no process runs `sleep <marker>`.
+#[cfg(unix)]
+fn assert_no_survivor(marker: &str) {
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    let found = std::process::Command::new("pgrep")
+        .args(["-f", &format!("sleep {marker}")])
+        .output()
+        .expect("pgrep");
+    assert_eq!(
+        found.status.code(),
+        Some(1),
+        "a command survived: {}",
+        String::from_utf8_lossy(&found.stdout)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn sigterm_stops_background_commands() {
+    let (code, stdout, marker) = signalled_run("-TERM");
+    assert_eq!(code, Some(143), "{stdout}");
+    let result: serde_json::Value = serde_json::from_str(stdout.trim()).expect("one JSON object");
+    assert_eq!(result["error_code"], "cancelled", "{result}");
+    assert_eq!(result["steps"], 1, "{result}");
+    assert!(
+        result["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("SIGTERM")),
+        "{result}"
+    );
+    assert_no_survivor(&marker);
+}
+
+#[cfg(unix)]
+#[test]
+fn sigint_exits_130() {
+    let (code, stdout, marker) = signalled_run("-INT");
+    assert_eq!(code, Some(130), "{stdout}");
+    let result: serde_json::Value = serde_json::from_str(stdout.trim()).expect("one JSON object");
+    assert_eq!(result["error_code"], "cancelled", "{result}");
+    assert_no_survivor(&marker);
+}
+
 #[test]
 fn long_150_steps_completes() {
     let workspace = BTreeMap::from([(

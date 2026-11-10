@@ -51,6 +51,13 @@ impl Registry {
         self.tools.get(name).map(AsRef::as_ref)
     }
 
+    /// Ends whatever every tool keeps running between calls.
+    pub fn shutdown(&self) {
+        for tool in self.tools.values() {
+            tool.shutdown();
+        }
+    }
+
     /// Returns every tool name, in a stable order.
     #[must_use]
     pub fn names(&self) -> Vec<&str> {

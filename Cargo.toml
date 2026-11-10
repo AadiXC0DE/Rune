@@ -80,6 +80,7 @@ jiff = { version = "0.2", default-features = false }
 
 # Hashing
 sha2 = "0.10"
+signal-hook = "0.3"
 getrandom = "0.2"
 rustix = { version = "1", default-features = false, features = ["std"] }
 

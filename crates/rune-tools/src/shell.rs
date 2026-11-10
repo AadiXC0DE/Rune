@@ -477,6 +477,21 @@ impl Tool for Shell {
         "shell"
     }
 
+    /// Stops every session this tool started, each asked to exit and killed
+    /// after the grace period. They are stopped together, so many sessions
+    /// take one grace period rather than one each.
+    fn shutdown(&self) {
+        let sessions: Vec<Arc<Session>> = {
+            let mut state = lock(&self.state);
+            std::mem::take(&mut state.sessions).into_values().collect()
+        };
+        std::thread::scope(|scope| {
+            for session in &sessions {
+                scope.spawn(|| session.process.terminate(false));
+            }
+        });
+    }
+
     fn description(&self) -> &'static str {
         "Run a shell command. `run` returns the output and exit status, or a session_id \
          when the command is still running after yield_time_ms. `interact` reads new output \
@@ -1168,6 +1183,43 @@ mod tests {
         let (id, group) = running(&started);
         assert!(started.contains("ready"), "{started}");
         (id, group)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shutdown_ends_every_session_gracefully() {
+        let tool = shell(4, TEST_CAP);
+        let (_dir, context) = workspace();
+        // One ignores TERM and must be killed after the grace period; the
+        // other ends on TERM. They are stopped together.
+        let group = |command: &str| {
+            let (_, group) = start_ready(&tool, &context, command);
+            group
+                .strip_prefix("process group ")
+                .expect("group id")
+                .to_owned()
+        };
+        let stubborn = group("trap '' TERM; echo ready; sleep 30");
+        let polite = group("echo ready; sleep 30");
+        assert!(group_alive(&stubborn) && group_alive(&polite));
+        let started = Instant::now();
+        tool.shutdown();
+        let took = started.elapsed();
+        assert!(
+            wait_until(
+                || !group_alive(&stubborn) && !group_alive(&polite),
+                Duration::from_secs(5)
+            ),
+            "a session survived shutdown"
+        );
+        assert!(took >= rune_exec::session::GRACE_PERIOD, "{took:?}");
+        assert!(
+            took < rune_exec::session::GRACE_PERIOD
+                .saturating_mul(2)
+                .saturating_add(Duration::from_secs(1)),
+            "{took:?}"
+        );
+        assert_eq!(tool.live_sessions(), 0);
     }
 
     /// Returns true when `observed` contains `expected` as a path.

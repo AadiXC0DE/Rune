@@ -33,6 +33,7 @@ mod reference;
 mod sandbox;
 mod session;
 mod session_log;
+mod shutdown;
 mod spec;
 mod spend;
 mod subagent;

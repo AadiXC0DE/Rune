@@ -448,6 +448,12 @@ pub trait Tool: Send + Sync {
     /// A failure here is returned to the model as a tool error, so a malformed
     /// call teaches the model rather than ending the turn. Checks required
     /// names and closed objects; argument types are decoded by the tool.
+    /// Ends any work the tool keeps running between calls.
+    ///
+    /// Called once when the run that owns the tool stops, so nothing it
+    /// started outlives the run.
+    fn shutdown(&self) {}
+
     fn validate(&self, arguments: &serde_json::Value) -> Result<()> {
         let schema = self.input_schema();
         validate_closed_arguments(arguments, &schema)?;
