@@ -385,7 +385,7 @@ impl LimitName {
             Self::MaxConsecutiveToolFailures => Budget::Bounded(3),
             Self::VerificationReminders => Budget::Bounded(1),
             Self::SessionSpendCents => Budget::Unbounded,
-            Self::MaxToolResultBytes => Budget::Bounded(64 * 1024),
+            Self::MaxToolResultBytes => Budget::Bounded(32 * 1024),
             Self::MaxTurnResultBytes => Budget::Bounded(8 * 1024 * 1024),
             Self::SkillCatalogBytes => Budget::Bounded(32768),
             Self::SkillDescriptionBytes => Budget::Bounded(256),
@@ -398,7 +398,7 @@ impl LimitName {
             Self::ProjectInstructionsTotalBytes => Budget::Bounded(128 * 1024),
             Self::RepositoryMapBytes => Budget::Bounded(4096),
             Self::ImageAdapterOutputBytes => Budget::Bounded(20 * 1024),
-            Self::CommandOutputBytes => Budget::Bounded(64 * 1024),
+            Self::CommandOutputBytes => Budget::Bounded(32 * 1024),
             Self::ReadFileLines => Budget::Bounded(2000),
             Self::ReadFileLineBytes => Budget::Bounded(2000),
             Self::ListEntries => Budget::Bounded(1000),
@@ -687,6 +687,37 @@ pub const fn skill_catalog_bytes(context_window: Option<u64>) -> u64 {
                 EMERGENCY_CEILING_BYTES
             } else {
                 share
+            }
+        }
+    }
+}
+
+/// Smallest per-result cap a context window can lower a result to.
+pub const MIN_WINDOW_RESULT_BYTES: u64 = 4 * 1024;
+
+/// Share of the context window one tool result may occupy, as a divisor.
+const WINDOW_RESULT_DIVISOR: u64 = 10;
+
+/// Per-result byte cap for a model's context window: a tenth of the window,
+/// at four bytes a token, never above `configured` and never below
+/// `MIN_WINDOW_RESULT_BYTES`. An unknown or zero window keeps `configured`.
+#[must_use]
+pub const fn window_result_bytes(configured: u64, context_window: Option<u64>) -> u64 {
+    match context_window {
+        None | Some(0) => configured,
+        Some(window) => {
+            let share = window
+                .saturating_mul(BYTES_PER_CHARACTER)
+                .saturating_div(WINDOW_RESULT_DIVISOR);
+            let floored = if share < MIN_WINDOW_RESULT_BYTES {
+                MIN_WINDOW_RESULT_BYTES
+            } else {
+                share
+            };
+            if floored < configured {
+                floored
+            } else {
+                configured
             }
         }
     }
@@ -1046,5 +1077,48 @@ mod tests {
             (SKILL_CATALOG_MIN_BYTES..=EMERGENCY_CEILING_BYTES).contains(&fallback),
             "the fallback escapes the clamp: {fallback}"
         );
+    }
+
+    #[test]
+    fn result_caps_default_to_thirty_two_kib() {
+        for name in [LimitName::MaxToolResultBytes, LimitName::CommandOutputBytes] {
+            assert_eq!(name.default_value(), Budget::Bounded(32 * 1024), "{name:?}");
+        }
+        assert_eq!(
+            LimitName::ReadFileLines.default_value(),
+            Budget::Bounded(2000)
+        );
+    }
+
+    #[test]
+    fn the_window_cap_is_a_tenth_of_the_window_in_bytes() {
+        assert_eq!(window_result_bytes(32 * 1024, Some(16_000)), 6_400);
+        // A tenth of a large window is above the configured cap, which applies.
+        assert_eq!(window_result_bytes(32 * 1024, Some(128_000)), 32 * 1024);
+    }
+
+    #[test]
+    fn the_window_cap_never_drops_below_four_kib() {
+        assert_eq!(
+            window_result_bytes(32 * 1024, Some(2_000)),
+            MIN_WINDOW_RESULT_BYTES
+        );
+        assert_eq!(
+            window_result_bytes(32 * 1024, Some(1)),
+            MIN_WINDOW_RESULT_BYTES
+        );
+    }
+
+    #[test]
+    fn an_unknown_window_keeps_the_configured_cap() {
+        assert_eq!(window_result_bytes(32 * 1024, None), 32 * 1024);
+        assert_eq!(window_result_bytes(32 * 1024, Some(0)), 32 * 1024);
+    }
+
+    #[test]
+    fn a_smaller_configured_cap_wins() {
+        assert_eq!(window_result_bytes(2_048, Some(16_000)), 2_048);
+        assert_eq!(window_result_bytes(2_048, Some(2_000)), 2_048);
+        assert_eq!(window_result_bytes(0, Some(16_000)), 0);
     }
 }

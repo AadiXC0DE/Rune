@@ -222,6 +222,15 @@ mod tests {
         for limit in [LimitName::MaxToolResultBytes, LimitName::MaxTurnResultBytes] {
             for cap in [128, MAX_READ_BYTES * 2] {
                 let mut budget = BudgetSet::new();
+                // The per-result default is below the hard cap, so it is raised
+                // above it and the hard cap is what the turn limit meets.
+                budget
+                    .set(
+                        LimitName::MaxToolResultBytes,
+                        Budget::Bounded(MAX_READ_BYTES as u64 * 2),
+                        Layer::User,
+                    )
+                    .expect("cap");
                 budget
                     .set(limit, Budget::Bounded(cap as u64), Layer::User)
                     .expect("cap");

@@ -229,7 +229,7 @@ fn compact_preserves_tool_pairs_signed_replay_and_checkpoint_continuation() {
             })
             .expect("compact");
         assert_eq!(calls, 1);
-        assert_eq!(removed, if single_prompt { 9 } else { 20 });
+        assert_eq!(removed, if single_prompt { 11 } else { 20 });
         assert_eq!(agent.usage(), usage);
         assert!(fetch.requests.lock().expect("requests").is_empty());
 

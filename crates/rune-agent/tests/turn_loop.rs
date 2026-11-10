@@ -81,6 +81,8 @@ struct TestHost {
     cancel_on_execute: Mutex<bool>,
     /// Largest answer the model is described as producing.
     max_output: Option<u64>,
+    /// Context window the model is described as having, in tokens.
+    context_window: Option<u64>,
     /// Output ceilings of the plans that reached request preparation.
     planned_output: Mutex<Vec<Option<u64>>>,
     /// Whether the model is described as seeing images tools attach.
@@ -123,6 +125,7 @@ impl TestHost {
             submit_on_first_delta: Mutex::new(None),
             cancel_on_execute: Mutex::new(false),
             max_output: None,
+            context_window: None,
             planned_output: Mutex::new(Vec::new()),
             accepts_images: false,
             tool_images: Mutex::new(std::collections::BTreeMap::new()),
@@ -250,6 +253,10 @@ impl Host for TestHost {
 
     fn max_output_tokens(&self) -> Option<u64> {
         self.max_output
+    }
+
+    fn context_window(&self) -> Option<u64> {
+        self.context_window
     }
 
     fn prepare_request(
@@ -841,7 +848,7 @@ fn oversized_tool_results_have_a_bounded_preview_and_a_readable_full_body() {
         assert!(shown.text.contains("FULL-TAIL"), "{}", shown.text);
         assert!(shown.text.contains("omitted; read_tool_result reads them"));
         assert!(!shown.text.contains("MIDDLE-ONLY"));
-        assert!(shown.text.len() <= 65_536);
+        assert!(shown.text.len() <= 32_768);
         assert_eq!(shown.produced_bytes, content.len() as u64);
         assert_eq!(shown.is_error, is_error);
         let handle = retained_handle(&shown.text);
@@ -898,6 +905,52 @@ fn oversized_tool_results_have_a_bounded_preview_and_a_readable_full_body() {
                 .text,
             "FULL-TAIL"
         );
+    }
+}
+
+#[test]
+fn a_small_context_window_lowers_the_result_cap() {
+    let content = format!("START {} END", "x".repeat(20 * 1024));
+    for (window, configured) in [
+        (Some(16_000), None),
+        (None, None),
+        (Some(16_000), Some(2_048)),
+    ] {
+        let endpoint = MockEndpoint::start(vec![
+            Script::tool_call("large", "read_file", "{\"path\":\"a.rs\"}"),
+            Script::text("done"),
+        ]);
+        let mut host = TestHost::new(endpoint)
+            .with_tools(vec![read_tool()])
+            .with_tool_response(ToolOutput::success(content.clone()));
+        host.context_window = window;
+        if let Some(cap) = configured {
+            host.limits
+                .set(
+                    rune_core::LimitName::MaxToolResultBytes,
+                    rune_core::budget::Budget::Bounded(cap),
+                    rune_core::config::Layer::User,
+                )
+                .expect("limit");
+        }
+        let mut history = rune_agent::History::new();
+        history.push_user("read");
+        let outcome = run_turn(&mut history, &host).expect("turn");
+        let shown = &outcome.calls[0].output.text;
+        match (window, configured) {
+            (Some(_), None) => {
+                // A tenth of 16,000 tokens at four bytes a token, handle line included.
+                assert!(shown.len() <= 6_400, "{}", shown.len());
+                assert!(shown.len() > 4_096, "{}", shown.len());
+                let handle = retained_handle(shown);
+                assert_eq!(
+                    history.result_store().describe(&handle),
+                    Some(("read_file", content.len() as u64, false))
+                );
+            }
+            (None, _) => assert_eq!(shown, &content),
+            (Some(_), Some(cap)) => assert!(shown.len() <= cap as usize, "{}", shown.len()),
+        }
     }
 }
 

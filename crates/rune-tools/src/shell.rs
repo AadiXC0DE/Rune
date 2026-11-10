@@ -20,7 +20,7 @@ use rune_core::error::{ErrorCode, Result, RuneError};
 
 use crate::contract::{Activity, ExecutionContext, Tool, ToolOutput, validate_closed_arguments};
 use crate::workspace::{
-    FileLimits, bool_arg, head_and_tail, resolve, string_arg, truncate_to_bytes, usize_arg,
+    FileLimits, bool_arg, head_and_tail_split, resolve, string_arg, truncate_to_bytes, usize_arg,
 };
 use rune_exec::command::Exit;
 use rune_exec::session::{Input, Leftovers, POLL_INTERVAL, Process, SpawnOptions, Streams};
@@ -1012,8 +1012,9 @@ fn observe(
     } else {
         String::new()
     };
-    let full = full.map(|full| render(command, full, &note, state, usize::MAX));
-    (render(command, body, &note, state, cap), full)
+    let failed = process.exit().is_some_and(|exit| !exit.is_success()) || process.timed_out();
+    let full = full.map(|full| render(command, full, &note, state, usize::MAX, failed));
+    (render(command, body, &note, state, cap, failed), full)
 }
 
 /// Appends a stream's newest bytes past its retained head, with the gap.
@@ -1035,8 +1036,16 @@ fn push_tail(body: &mut String, stream: &rune_exec::Buffer) {
 /// retained, because a result that is merely short looks like a command that
 /// printed nothing. A cut keeps the start and the end and drops the middle:
 /// a build names its first error at the top, and a test run puts its failures
-/// and its summary at the bottom.
-fn render(command: &str, mut body: String, note: &str, state: &str, cap: usize) -> String {
+/// and its summary at the bottom. A command that failed keeps more of its end,
+/// where the error usually is.
+fn render(
+    command: &str,
+    mut body: String,
+    note: &str,
+    state: &str,
+    cap: usize,
+    failed: bool,
+) -> String {
     if cap == 0 {
         return String::new();
     }
@@ -1070,20 +1079,27 @@ fn render(command: &str, mut body: String, note: &str, state: &str, cap: usize) 
         out.push_str(&body);
     } else {
         let total = body.len();
+        let share = if failed { 5 } else { 3 };
         let mut kept = room;
         // The marker states how many bytes were kept, so its own length depends
         // on the answer. Two passes settle it; the loop is a bound, not a guess.
         for _ in 0..8 {
-            let (start, end) =
-                head_and_tail(&body, room.saturating_sub(marker(kept, total, cap).len()));
+            let (start, end) = head_and_tail_split(
+                &body,
+                room.saturating_sub(marker(kept, total, cap).len()),
+                share,
+            );
             let settled = start.len().saturating_add(end.len());
             if settled == kept {
                 break;
             }
             kept = settled;
         }
-        let (start, end) =
-            head_and_tail(&body, room.saturating_sub(marker(kept, total, cap).len()));
+        let (start, end) = head_and_tail_split(
+            &body,
+            room.saturating_sub(marker(kept, total, cap).len()),
+            share,
+        );
         out.push_str(start);
         if room > kept {
             out.push_str(&marker(kept, total, cap));
@@ -2559,6 +2575,42 @@ mod tests {
         // reports what failed.
         assert!(observed[after..state].contains("2000"), "{observed}");
         assert!(observed[head..marker].contains('1'), "{observed}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_command_keeps_more_of_its_tail() {
+        let tool = shell(4, TEST_CAP);
+        let (_dir, context) = workspace();
+        // Returns the bytes kept before and after the cut marker.
+        let sides = |code: i32| {
+            let output = call(
+                &tool,
+                &context,
+                &serde_json::json!({
+                    "action": "run",
+                    "command": format!("{}; {}", numbered_lines(2000), exit_with(code)),
+                }),
+            );
+            assert_eq!(output.is_error, code != 0, "{}", output.text);
+            let text = output.text;
+            assert!(text.contains("line 2000 padding"), "{text}");
+            let head = text.find('\n').expect("the command line") + 1;
+            let marker = text.find("\n[output truncated").expect("a marker");
+            let after = marker + text[marker..].find("]\n").expect("marker end") + 2;
+            let state = ["\n[output capture", "\n[exited"]
+                .iter()
+                .filter_map(|line| text[after..].find(line))
+                .min()
+                .map(|offset| after + offset + 1)
+                .expect("the state line");
+            (marker - head, state - after)
+        };
+        let (head, tail) = sides(1);
+        assert!(tail >= head * 3, "head {head}, tail {tail}");
+        let (head, tail) = sides(0);
+        assert!(tail < head * 3, "head {head}, tail {tail}");
+        assert!(tail > head, "head {head}, tail {tail}");
     }
 
     #[test]

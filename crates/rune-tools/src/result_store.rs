@@ -21,6 +21,9 @@ use crate::workspace::truncate_to_bytes;
 /// Preview size shown to the model when a result is retained.
 pub const DEFAULT_PREVIEW_BYTES: usize = 4096;
 
+/// Largest preview a spilled result keeps in the conversation.
+pub const SPILL_PREVIEW_BYTES: usize = 16 * 1024;
+
 /// Largest byte range one read may return.
 pub const MAX_READ_BYTES: usize = 64 * 1024;
 
@@ -231,7 +234,7 @@ impl Store {
             &content,
             &handle,
             is_error,
-            preview_bytes.min(DEFAULT_PREVIEW_BYTES),
+            preview_bytes.min(SPILL_PREVIEW_BYTES),
         );
         self.entries.insert(
             handle.clone(),
@@ -604,15 +607,38 @@ mod tests {
     }
 
     #[test]
+    fn a_spill_previews_up_to_sixteen_kib() {
+        let mut store = store();
+        let content = format!("HEAD\n{}TAIL", "line of output\n".repeat(40 * 1024 / 15));
+        let preview = store
+            .spill("shell", "call-1", content.clone(), false, 32 * 1024)
+            .expect("spilled");
+        assert!(preview.text.len() <= SPILL_PREVIEW_BYTES);
+        assert!(
+            preview.text.len() > SPILL_PREVIEW_BYTES - 512,
+            "{}",
+            preview.text.len()
+        );
+        assert!(preview.text.starts_with("HEAD\n"));
+        assert!(preview.text.ends_with("TAIL"));
+
+        // A smaller cap still bounds the preview.
+        let preview = store
+            .spill("shell", "call-2", content, false, 6_000)
+            .expect("spilled");
+        assert!(preview.text.len() <= 6_000);
+    }
+
+    #[test]
     fn a_large_result_is_retained_and_previewed() {
         let mut store = store();
-        let content = "x".repeat(50_000);
+        let content = "x".repeat(30_000);
         let preview = store
             .retain(&limits(), "shell", "call-1", &content, false)
             .expect("retained");
         assert_eq!(store.len(), 1);
         assert!(preview.text.len() <= DEFAULT_PREVIEW_BYTES);
-        assert_eq!(preview.retained_bytes, 50_000);
+        assert_eq!(preview.retained_bytes, 30_000);
     }
 
     #[test]
@@ -751,12 +777,12 @@ mod tests {
     #[test]
     fn the_rendered_preview_states_the_size_and_handle() {
         let mut store = store();
-        let content = "y".repeat(50_000);
+        let content = "y".repeat(30_000);
         let preview = store
             .retain(&limits(), "shell", "call-1", &content, false)
             .expect("retained");
         let rendered = preview.render();
-        assert!(rendered.contains("50000 bytes retained"), "{rendered}");
+        assert!(rendered.contains("30000 bytes retained"), "{rendered}");
         assert!(rendered.contains(preview.handle.as_str()), "{rendered}");
         assert!(rendered.contains("read_tool_result"), "{rendered}");
     }
@@ -810,13 +836,13 @@ mod tests {
     #[test]
     fn reading_past_the_end_returns_nothing_rather_than_failing() {
         let mut store = store();
-        let content = "z".repeat(50_000);
+        let content = "z".repeat(30_000);
         let preview = store
             .retain(&limits(), "shell", "call-1", &content, false)
             .expect("retained");
         let outcome = store.read(&preview.handle, 10_000_000, 10).expect("read");
         assert!(outcome.text.is_empty());
-        assert_eq!(outcome.total_bytes, 50_000);
+        assert_eq!(outcome.total_bytes, 30_000);
     }
 
     #[test]
@@ -889,7 +915,7 @@ mod tests {
     #[test]
     fn an_empty_search_query_is_rejected() {
         let mut store = store();
-        let content = "x".repeat(50_000);
+        let content = "x".repeat(30_000);
         let preview = store
             .retain(&limits(), "shell", "call-1", &content, false)
             .expect("retained");
@@ -899,7 +925,7 @@ mod tests {
     #[test]
     fn the_retained_count_is_bounded() {
         let mut store = store();
-        let content = "x".repeat(50_000);
+        let content = "x".repeat(30_000);
         for index in 0..MAX_RETAINED_RESULTS {
             store
                 .retain(
@@ -1048,7 +1074,7 @@ mod tests {
     #[test]
     fn describe_reports_the_tool_and_size() {
         let mut store = store();
-        let content = "x".repeat(50_000);
+        let content = "x".repeat(30_000);
         let preview = store
             .retain(&limits(), "read_file", "call-1", &content, false)
             .expect("retained");
@@ -1061,7 +1087,7 @@ mod tests {
     #[test]
     fn clearing_drops_everything() {
         let mut store = store();
-        let content = "x".repeat(50_000);
+        let content = "x".repeat(30_000);
         store
             .retain(&limits(), "shell", "call-1", &content, false)
             .expect("retained");

@@ -317,7 +317,7 @@ Every limit takes a count, or `off` to remove it. A hard ceiling still applies t
 | `max_consecutive_tool_failures` | 3 | items | 1 to 10000 | Consecutive identical tool failures allowed before refusing the next duplicate. |
 | `verification_reminders` | 1 | items | 0 to 8 | Times a turn that changed files without a check afterwards is asked to verify. |
 | `session_spend_cents` | off | cents | 1 to unbounded | Estimated spend at which an interactive session stops sending requests. |
-| `max_tool_result_bytes` | 65536 | bytes | 0 to unbounded | Bytes retained from one tool result before spilling. |
+| `max_tool_result_bytes` | 32768 | bytes | 0 to unbounded | Bytes retained from one tool result before spilling. |
 | `max_turn_result_bytes` | 8388608 | bytes | 0 to unbounded | Tool-result bytes one turn retains across its steps. |
 | `skill_catalog_bytes` | 32768 | bytes | 0 to unbounded | Combined size of the skill catalog placed in the prompt. |
 | `skill_description_bytes` | 256 | bytes | 0 to unbounded | Size of one skill description in the catalog. |
@@ -330,7 +330,7 @@ Every limit takes a count, or `off` to remove it. A hard ceiling still applies t
 | `project_instructions_total_bytes` | 131072 | bytes | 0 to unbounded | Combined size of all applicable project instructions. |
 | `repository_map_bytes` | 4096 | bytes | 0 to unbounded | Rendered Rust repository symbol map bytes; zero disables it. |
 | `image_adapter_output_bytes` | 20480 | bytes | 0 to unbounded | Text produced by an image analysis adapter. |
-| `command_output_bytes` | 65536 | bytes | 0 to unbounded | Bytes retained from one command's output. |
+| `command_output_bytes` | 32768 | bytes | 0 to unbounded | Bytes retained from one command's output. |
 | `read_file_lines` | 2000 | items | 0 to unbounded | Lines returned by one file read. |
 | `read_file_line_bytes` | 2000 | bytes | 0 to unbounded | Bytes per line before truncation in a file read. |
 | `list_entries` | 1000 | bytes | 0 to unbounded | Entries returned by one listing or glob. |

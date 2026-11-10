@@ -1635,8 +1635,12 @@ mod tests {
         let before = "before\n".repeat(MAX_CONTEXT_LINES);
         let after = "after\n".repeat(MAX_CONTEXT_LINES);
         repo.write("fixture.txt", &format!("{before}x\n{after}"));
+        let limits = FileLimits {
+            output_bytes: 64 * 1024,
+            ..FileLimits::default()
+        };
         for context_lines in [0, MAX_CONTEXT_LINES] {
-            let output = GrepFiles::default()
+            let output = GrepFiles::with_limits(limits)
                 .call(
                     &serde_json::json!({
                         "pattern": "x",

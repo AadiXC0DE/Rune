@@ -695,6 +695,10 @@ impl Host for AskHost<'_> {
         self.settings.model_output_limit()
     }
 
+    fn context_window(&self) -> Option<u64> {
+        Some(self.window.0)
+    }
+
     fn fast_mode(&self) -> bool {
         self.settings.fast_mode
     }

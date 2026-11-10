@@ -90,7 +90,7 @@ fn fixture_turns_compact_before_the_next_cli_model_request() {
                     )
                 } else {
                     (
-                        json!({"content": format!("fixture answer {normal_count}: {}", "x".repeat(20_000))}),
+                        json!({"content": format!("fixture answer {normal_count}: {}", "x".repeat(30_000))}),
                         "stop",
                     )
                 }

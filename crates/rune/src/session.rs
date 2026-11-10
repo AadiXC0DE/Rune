@@ -510,6 +510,13 @@ impl Host for SessionHost {
             .filter(|limit| *limit > 0)
     }
 
+    fn context_window(&self) -> Option<u64> {
+        Some(
+            self.context_limit
+                .load(std::sync::atomic::Ordering::Relaxed),
+        )
+    }
+
     fn fast_mode(&self) -> bool {
         self.fast_mode
     }

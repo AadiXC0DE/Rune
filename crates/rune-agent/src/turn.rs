@@ -17,7 +17,7 @@ use std::fmt::Write as _;
 use std::time::{Duration, Instant};
 
 use camino::{Utf8Path, Utf8PathBuf};
-use rune_core::budget::{BudgetSet, LimitName};
+use rune_core::budget::{BudgetSet, LimitName, window_result_bytes};
 use rune_core::config::{Effort, PermissionMode};
 use rune_core::error::{ErrorCode, Result, RuneError};
 use rune_net::fetch::Fetch;
@@ -306,6 +306,14 @@ pub trait Host {
 
     /// Returns the largest answer the model is known to produce, if known.
     fn max_output_tokens(&self) -> Option<u64> {
+        None
+    }
+
+    /// Returns the model's context window in tokens, if known.
+    ///
+    /// A known window lowers the per-result cap to a share of it, so a model
+    /// with a small window is not handed results that crowd out the rest.
+    fn context_window(&self) -> Option<u64> {
         None
     }
 
@@ -1512,7 +1520,11 @@ fn execute_batch(
     let offered = host.tools();
     let turn_cap = limits.get_usize(LimitName::MaxTurnResultBytes);
     let retains = host.retains_results();
-    let tool_cap = limits.get_usize(LimitName::MaxToolResultBytes);
+    let tool_cap = usize::try_from(window_result_bytes(
+        limits.get_bytes(LimitName::MaxToolResultBytes),
+        host.context_window(),
+    ))
+    .unwrap_or(usize::MAX);
     // Only the initial independent reads may overlap. Retained-result reads
     // depend on earlier spills and on the exact remaining budget, so flush the
     // prefix before them and keep the rest of the batch sequential.
@@ -1567,7 +1579,7 @@ fn execute_batch(
                     .or_else(|| repeat_guard(&view, host, history, previous, &results, cancelled));
                 let prepared = match blocked {
                     Some(result) => Err(result),
-                    None => prepare_call(call, host, &offered, &mut cancelled, repaired),
+                    None => prepare_call(call, host, &offered, &mut cancelled, tool_cap, repaired),
                 };
                 let execution = match prepared {
                     Ok(Cleared {
@@ -1643,7 +1655,16 @@ fn execute_batch(
             .or_else(|| repeat_guard(&view, host, history, previous, &results, cancelled))
             .or_else(|| overwrite_guard(&view, host, history))
             .unwrap_or_else(|| {
-                execute_call(call, host, &offered, &mut cancelled, history, cap, repaired)
+                execute_call(
+                    call,
+                    host,
+                    &offered,
+                    &mut cancelled,
+                    history,
+                    cap,
+                    tool_cap,
+                    repaired,
+                )
             });
         retain_result(
             result,
@@ -2140,6 +2161,7 @@ fn prepare_call(
     host: &dyn Host,
     offered: &[ToolSpec],
     cancelled: &mut bool,
+    tool_cap: usize,
     repaired: &mut Vec<(String, Resolved)>,
 ) -> std::result::Result<Cleared, CallResult> {
     if *cancelled || host.cancellation().is_cancelled() {
@@ -2202,7 +2224,7 @@ fn prepare_call(
     } else {
         call.clone()
     };
-    match authorize(&effective, resolved.arguments, host, cancelled) {
+    match authorize(&effective, resolved.arguments, host, cancelled, tool_cap) {
         Ok((arguments, context)) => Ok(Cleared {
             call: effective,
             arguments,
@@ -2231,6 +2253,7 @@ fn authorize(
     arguments: serde_json::Value,
     host: &dyn Host,
     cancelled: &mut bool,
+    tool_cap: usize,
 ) -> std::result::Result<(serde_json::Value, ExecutionContext), CallResult> {
     let activity = host
         .tool_activity(&call.name)
@@ -2415,6 +2438,10 @@ fn authorize(
         });
     }
     let mut context = host.context().with_private_network_access(private_access);
+    // Tools cut their own output to the result cap, so what they keep is what
+    // the model is shown.
+    let output_cap = context.max_output_bytes.min(tool_cap);
+    context = context.with_output_cap(output_cap);
     if call.name == "edit_file" {
         // A missed edit may quote the file's closest lines, which is only
         // fair when reading the file would not need an approval.
@@ -2462,6 +2489,7 @@ fn patch_decisions(patch: &rune_tools::apply_patch::Patch) -> Vec<(&'static str,
 }
 
 /// Executes one offered, policy-approved call and preserves batch cancellation.
+#[allow(clippy::too_many_arguments)]
 fn execute_call(
     call: &PreparedCall,
     host: &dyn Host,
@@ -2469,6 +2497,7 @@ fn execute_call(
     cancelled: &mut bool,
     history: &mut History,
     output_cap: usize,
+    tool_cap: usize,
     repaired: &mut Vec<(String, Resolved)>,
 ) -> CallResult {
     let Cleared {
@@ -2476,7 +2505,7 @@ fn execute_call(
         arguments,
         context,
         note,
-    } = match prepare_call(call, host, offered, cancelled, repaired) {
+    } = match prepare_call(call, host, offered, cancelled, tool_cap, repaired) {
         Ok(cleared) => cleared,
         Err(result) => return result,
     };
