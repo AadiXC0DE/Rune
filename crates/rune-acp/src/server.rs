@@ -1127,7 +1127,10 @@ fn run_one<W: Write + Send + 'static>(server: &Arc<Server<W>>, queued: Queued) {
 pub const fn stop_reason(reason: StopReason) -> &'static str {
     match reason {
         StopReason::Completed => "end_turn",
-        StopReason::StepLimit | StopReason::Stalled => "max_turn_requests",
+        StopReason::StepLimit
+        | StopReason::Stalled
+        | StopReason::TimeLimit
+        | StopReason::SpendLimit => "max_turn_requests",
         StopReason::OutputLimit | StopReason::ObjectiveBudget => "max_tokens",
         StopReason::Refused | StopReason::ContentFilter => "refusal",
         StopReason::Cancelled => "cancelled",

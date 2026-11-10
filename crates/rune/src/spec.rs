@@ -210,6 +210,16 @@ pub const RUN: &[CommandSpec] = &[
                 "n",
                 "Stop after this many model steps; the last one answers without tools. 0 means no limit.",
             ),
+            option(
+                "--timeout",
+                "seconds",
+                "Stop the run after this many seconds and report what it did.",
+            ),
+            option(
+                "--max-cost",
+                "usd",
+                "Stop the run once its estimated cost reaches this many dollars.",
+            ),
         ],
         requirements: Requirements::FULL,
         supports_json: true,

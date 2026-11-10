@@ -45,6 +45,8 @@ Run one bounded turn without an interactive session
 | `--no-save` | Do not create a session. |
 | `--image <path>` | Attach a PNG, JPEG, GIF, or WebP file. Repeatable; 8 MiB total, at most 16 images. |
 | `--max-steps <n>` | Stop after this many model steps; the last one answers without tools. 0 means no limit. |
+| `--timeout <seconds>` | Stop the run after this many seconds and report what it did. |
+| `--max-cost <usd>` | Stop the run once its estimated cost reaches this many dollars. |
 ### `rune acp [--log-file <path>]`
 
 Serve the Agent Client Protocol over standard input and output

@@ -320,6 +320,32 @@ impl ModelEntry {
             Self::Detailed(settings) => settings.max_output_tokens,
         }
     }
+
+    /// Returns the declared prices, when they are stated.
+    #[must_use]
+    pub fn prices(&self) -> Option<ModelPrices> {
+        match self {
+            Self::Id(_) => None,
+            Self::Detailed(settings) => settings.prices,
+        }
+    }
+}
+
+/// Prices of one model in millionths of a dollar per million tokens, the unit
+/// of the models.dev catalog: $0.28 per million tokens is 280,000.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelPrices {
+    /// Uncached input.
+    pub input: u64,
+    /// Output, reasoning included.
+    pub output: u64,
+    /// Input read from a prompt cache; the input price when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_read: Option<u64>,
+    /// Input written to a prompt cache; the input price when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write: Option<u64>,
 }
 
 /// What a model accepts, as declared in a configuration file.
@@ -339,6 +365,9 @@ pub struct ModelSettings {
     /// Largest answer the model will produce.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_output_tokens: Option<u64>,
+    /// Prices in millionths of a dollar per million tokens, for endpoints the catalog does not price.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prices: Option<ModelPrices>,
 }
 
 /// A user-authorized command that may veto an otherwise allowed tool call.
@@ -666,6 +695,15 @@ impl Settings {
             .values()
             .filter(|entry| entry.id() == self.model)
             .find_map(ModelEntry::max_output_tokens)
+    }
+
+    /// Returns the prices declared for the selected model, when any are.
+    #[must_use]
+    pub fn model_prices(&self) -> Option<ModelPrices> {
+        self.configured_models
+            .values()
+            .filter(|entry| entry.id() == self.model)
+            .find_map(ModelEntry::prices)
     }
 
     /// Returns true when any layer produced a diagnostic.
@@ -2556,6 +2594,38 @@ max_agent_steps = 50
             .expect("entry");
         assert_eq!(entry.id(), "claude-x");
         assert_eq!(entry.context_window(), Some(1_000_000));
+    }
+
+    #[test]
+    fn model_prices_are_read_from_a_detailed_model_entry() {
+        let dir = TempDir::new().expect("tempdir");
+        let user = write(
+            &dir,
+            "config.toml",
+            "[models.anthropic]\nid = \"claude-x\"\nprices = { input = 280000, output = 420000 }\n",
+        );
+        let mut settings = Settings {
+            provider: Provider::Anthropic,
+            ..Settings::default()
+        };
+        apply_user(
+            &mut settings,
+            &read_user(&user).expect("read").expect("present"),
+            Layer::User,
+        );
+        assert_eq!(
+            settings.model_prices(),
+            Some(ModelPrices {
+                input: 280_000,
+                output: 420_000,
+                cache_read: None,
+                cache_write: None,
+            })
+        );
+        let unknown: std::result::Result<UserConfig, _> = toml::from_str(
+            "[models.anthropic]\nid = \"claude-x\"\nprices = { input = 1, output = 1, extra = 1 }\n",
+        );
+        assert!(unknown.is_err());
     }
 
     #[test]

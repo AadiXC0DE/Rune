@@ -1,0 +1,19 @@
+{
+  "prompt": "Say done.",
+  "workspace": "workspaces/readme_only.json",
+  "ask_args": [
+    "--json",
+    "--no-save",
+    "--max-cost",
+    "1"
+  ],
+  "turns": [
+    {
+      "text": "Done."
+    }
+  ],
+  "expect": {
+    "exit_code": 1,
+    "requests": 0
+  }
+}

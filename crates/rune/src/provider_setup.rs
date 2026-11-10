@@ -473,6 +473,16 @@ fn fetch_provider_limits(
 /// without delaying it. Absent when nothing has been cached yet or the catalog
 /// does not describe the provider or model.
 pub fn cached_prices(settings: &Settings, paths: &Paths) -> Option<rune_net::models_dev::Prices> {
+    // Prices declared for the model come first: they exist for endpoints the
+    // catalog does not price, or prices it has wrong.
+    if let Some(declared) = settings.model_prices() {
+        return Some(rune_net::models_dev::Prices {
+            input: declared.input,
+            output: declared.output,
+            cache_read: declared.cache_read,
+            cache_write: declared.cache_write,
+        });
+    }
     let key = rune_net::models_dev::catalog_key(&settings.provider.to_string())?;
     read_cached_limits(&paths.models_cache_file(), key)?
         .get(&settings.model)?

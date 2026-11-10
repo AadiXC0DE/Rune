@@ -34,6 +34,7 @@ mod sandbox;
 mod session;
 mod session_log;
 mod spec;
+mod spend;
 mod subagent;
 mod version;
 mod vision_client;
@@ -358,12 +359,39 @@ fn run_ask(
         })?),
         None => None,
     };
+    let timeout = match launch.flag("--timeout") {
+        Some(raw) => Some(std::time::Duration::from_secs(
+            raw.parse::<u64>()
+                .ok()
+                .filter(|seconds| *seconds > 0)
+                .ok_or_else(|| {
+                    RuneError::invalid_field(
+                        "--timeout",
+                        format!("`{raw}` is not a positive number of seconds"),
+                    )
+                    .with_hint("pass a whole number of seconds, such as --timeout 600")
+                })?,
+        )),
+        None => None,
+    };
+    let max_cost_cents = match launch.flag("--max-cost") {
+        Some(raw) => Some(ask::parse_cents(raw).ok_or_else(|| {
+            RuneError::invalid_field(
+                "--max-cost",
+                format!("`{raw}` is not a dollar amount with at most two decimals"),
+            )
+            .with_hint("pass dollars, such as --max-cost 2.50")
+        })?),
+        None => None,
+    };
 
     let options = ask::Options {
         prompt,
         json: output.json,
         jsonl,
         max_steps,
+        timeout,
+        max_cost_cents,
         no_save: launch.has_flag("--no-save"),
         tool_loop: true,
         read_only: false,
@@ -448,6 +476,8 @@ fn run_review(
         tool_loop: true,
         read_only: true,
         max_steps: None,
+        timeout: None,
+        max_cost_cents: None,
         images: Vec::new(),
     };
 

@@ -313,6 +313,23 @@ Setting `RUNE_MODEL` to a different identifier discards the configured model's
 declared window. Until the new model's capacity is resolved, configuration
 reports the default 128000-token window.
 
+A model the models.dev catalog does not price can declare its prices, in
+millionths of a dollar per million tokens ($0.28 and $0.42 here). Costs, `/budget`
+and `rune ask --max-cost` then use them:
+
+```toml
+[models.chat_completions]
+id = "my-model"
+prices = { input = 280000, output = 420000 }
+```
+
+`cache_read` and `cache_write` are optional and default to the input price.
+
+`rune ask --timeout SECONDS` and `rune ask --max-cost USD` bound a run. Reaching
+either stops it with the steps, usage and answer so far, and an error naming the
+limit; `--max-cost` needs known prices and checks the spend before each request,
+so the request that crosses the limit is the last.
+
 The providers that ship in the table are:
 
 | Provider | What it is |

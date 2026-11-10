@@ -22,6 +22,9 @@ const SCENARIOS: &[&str] = &[
     "same_failure_five_times",
     "ask_compacts",
     "context_overflow",
+    "time_limit",
+    "spend_limit",
+    "max_cost_without_prices",
 ];
 
 /// Scenarios built in Rust, which have no file.
@@ -147,6 +150,50 @@ fn ask_compacts() {
 #[test]
 fn context_overflow() {
     run_scenario("context_overflow");
+}
+
+#[test]
+fn time_limit() {
+    // The second reply would take 20 s; the run stops at 2 s with what it did.
+    let started = std::time::Instant::now();
+    let report = run_scenario("time_limit");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(8),
+        "took {:?}",
+        started.elapsed()
+    );
+    let result = report.result.expect("a result");
+    assert_eq!(result["steps"], 1, "{result}");
+    assert!(
+        result["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("time limit of 2 seconds")),
+        "{result}"
+    );
+    assert!(
+        result["usage"]["input_tokens"].as_u64().unwrap_or(0) > 0,
+        "{result}"
+    );
+}
+
+#[test]
+fn spend_limit() {
+    // At $100 per million tokens the first request alone passes $0.10.
+    let report = run_scenario("spend_limit");
+    let result = report.result.expect("a result");
+    assert_eq!(result["steps"], 1, "{result}");
+    assert!(result["cost_usd"].is_string(), "{result}");
+}
+
+#[test]
+fn max_cost_without_prices() {
+    let report = run_scenario("max_cost_without_prices");
+    assert!(
+        report.stdout.contains("needs prices for") || report.stderr.contains("needs prices for"),
+        "stdout: {}\nstderr: {}",
+        report.stdout,
+        report.stderr
+    );
 }
 
 #[test]

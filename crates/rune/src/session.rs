@@ -1893,18 +1893,9 @@ impl SessionHost {
     fn check_spend(&self) -> Result<()> {
         let limit = self.spend_limit.lock().ok().and_then(|limit| *limit);
         let spent = self.totals.lock().ok().and_then(|totals| totals.cost);
-        match (limit, spent) {
-            (Some(limit), Some(spent)) if spent >= limit => Err(RuneError::new(
-                ErrorCode::LimitExceeded,
-                format!(
-                    "this session has spent about ${}, which reaches its ${} limit",
-                    rune_net::models_dev::dollars(spent),
-                    rune_net::models_dev::dollars(limit)
-                ),
-            )
-            .with_hint("raise it with /budget <dollars> or session_spend_cents, or start /new")),
-            _ => Ok(()),
-        }
+        crate::spend::check(spent, limit, "session").map_err(|err| {
+            err.with_hint("raise it with /budget <dollars> or session_spend_cents, or start /new")
+        })
     }
 
     /// Returns what a running call is doing, such as `Reading src/app.js`.

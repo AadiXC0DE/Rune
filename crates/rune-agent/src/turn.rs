@@ -55,6 +55,10 @@ pub enum StopReason {
     ProviderFailure,
     /// The model kept sending a call that failed, after it was refused twice.
     Stalled,
+    /// The run reached its wall-clock limit.
+    TimeLimit,
+    /// The run reached its spending limit.
+    SpendLimit,
 }
 
 impl StopReason {
@@ -71,6 +75,8 @@ impl StopReason {
             Self::ContentFilter => "content_filter",
             Self::ProviderFailure => "provider_error",
             Self::Stalled => "stalled",
+            Self::TimeLimit => "time_limit",
+            Self::SpendLimit => "spend_limit",
         }
     }
 
@@ -545,6 +551,8 @@ pub fn stop_reason_for(error: &RuneError) -> StopReason {
         (ErrorCode::Cancelled, _) => StopReason::Cancelled,
         (_, Some("objective_token_budget")) => StopReason::ObjectiveBudget,
         (_, Some("max_consecutive_tool_failures")) => StopReason::Stalled,
+        (_, Some("session_spend_cents")) => StopReason::SpendLimit,
+        (_, Some("run_timeout")) => StopReason::TimeLimit,
         _ => StopReason::ProviderFailure,
     }
 }
@@ -858,7 +866,9 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
                 if host.settles_cancellation()
                     && (err.code() == ErrorCode::Cancelled || cancellation.is_cancelled()) =>
             {
-                settle!(StopReason::Cancelled);
+                // The step cut off by the cancellation is not counted, as a
+                // failed step is not: steps are requests that completed.
+                settle!(@end StopReason::Cancelled, completed, None)
             }
             Err(err) => fail!(err),
         };

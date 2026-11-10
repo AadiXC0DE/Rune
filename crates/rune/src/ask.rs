@@ -59,6 +59,29 @@ pub struct Options {
     pub read_only: bool,
     /// Step cap from the command line: `Some(0)` removes any cap.
     pub max_steps: Option<u64>,
+    /// Wall-clock limit for the whole run.
+    pub timeout: Option<std::time::Duration>,
+    /// Spending limit from `--max-cost`, in cents.
+    pub max_cost_cents: Option<u64>,
+}
+
+/// Reads a dollar amount with at most two decimals, such as `2.50`, as cents.
+#[must_use]
+pub fn parse_cents(raw: &str) -> Option<u64> {
+    let (whole, fraction) = raw.split_once('.').unwrap_or((raw, ""));
+    let digits = |text: &str| text.bytes().all(|byte| byte.is_ascii_digit());
+    if whole.is_empty() || !digits(whole) || fraction.len() > 2 || !digits(fraction) {
+        return None;
+    }
+    if raw.contains('.') && fraction.is_empty() {
+        return None;
+    }
+    let cents = format!("{fraction:0<2}").parse::<u64>().ok()?;
+    whole
+        .parse::<u64>()
+        .ok()?
+        .checked_mul(100)?
+        .checked_add(cents)
 }
 
 /// Hard cap for one JSONL record, including its terminating newline.
@@ -346,6 +369,23 @@ struct AskHost<'a> {
     compaction_usage: Cell<Usage>,
     /// The request `prepare_request` serialized, for the loop to send.
     encoded_request: RefCell<Option<String>>,
+    /// Prices of the model, when known, to estimate what the run spends.
+    prices: Option<rune_net::models_dev::Prices>,
+    /// Estimated spend so far in millionths of a dollar; unknown until a
+    /// priced response arrives.
+    spent: Cell<Option<u64>>,
+    /// Spending limit in millionths of a dollar.
+    spend_limit: Option<u64>,
+}
+
+impl AskHost<'_> {
+    /// Adds one request's estimated cost to the run's spend.
+    fn add_spend(&self, usage: &Usage) {
+        if let Some(cost) = self.prices.and_then(|prices| prices.cost(usage)) {
+            self.spent
+                .set(Some(self.spent.get().unwrap_or(0).saturating_add(cost)));
+        }
+    }
 }
 
 impl Host for AskHost<'_> {
@@ -404,6 +444,10 @@ impl Host for AskHost<'_> {
         plan: &mut rune_net::provider::RequestPlan,
         client: &dyn rune_net::fetch::Fetch,
     ) -> Result<()> {
+        // Checked before compacting, whose summary request costs money too.
+        crate::spend::check(self.spent.get(), self.spend_limit, "run").map_err(|err| {
+            err.with_hint("raise it with --max-cost, or with session_spend_cents")
+        })?;
         let (_, encoded) =
             rune_agent::compaction::auto_compact_encoded(history, plan, self, client, self.window)?;
         *self.encoded_request.borrow_mut() = Some(encoded);
@@ -427,9 +471,23 @@ impl Host for AskHost<'_> {
         self.mapped.refresh();
         self.compaction_usage
             .set(self.compaction_usage.get().merge_sum(report.usage));
+        self.add_spend(&report.usage);
+    }
+
+    fn settles_cancellation(&self) -> bool {
+        // A run stopped by its time limit reports what it did.
+        true
+    }
+
+    fn fetch(&self) -> Box<dyn rune_net::fetch::Fetch> {
+        Box::new(CancellableFetch {
+            inner: std::sync::Arc::new(rune_net::transport::UreqFetch::new()),
+            cancellation: self.cancellation.clone(),
+        })
     }
 
     fn observe_response(&self, outcome: &StreamOutcome) {
+        self.add_spend(&outcome.usage);
         self.incomplete_tool_call.set(
             outcome.finish == Some(FinishReason::ToolCalls) && outcome.tool_calls().is_empty(),
         );
@@ -556,6 +614,28 @@ pub fn run(
     let dialect = attachments.provider(crate::provider_setup::dialect_for(&settings.provider));
 
     let mut limits = settings.limits.clone();
+    if let Some(cents) = options.max_cost_cents {
+        limits.set(
+            LimitName::SessionSpendCents,
+            Budget::Bounded(cents),
+            Layer::CommandLine,
+        )?;
+    }
+    let prices = crate::provider_setup::cached_prices(settings, paths);
+    if options.max_cost_cents.is_some() && prices.is_none() {
+        return Err(RuneError::invalid_field(
+            "--max-cost",
+            format!(
+                "`--max-cost` needs prices for `{}`, and none are known",
+                settings.model
+            ),
+        )
+        .with_hint("declare prices for the model under [models.<provider>] in config.toml, or run rune models once while online to cache the catalog"));
+    }
+    let spend_limit = limits
+        .get(LimitName::SessionSpendCents)
+        .value()
+        .map(|cents| cents.saturating_mul(10_000));
     if !options.tool_loop {
         limits.set(
             LimitName::MaxAgentSteps,
@@ -632,9 +712,39 @@ pub fn run(
         ),
         compaction_usage: Cell::new(Usage::default()),
         encoded_request: RefCell::new(None),
+        prices,
+        spent: Cell::new(None),
+        spend_limit,
         limits,
     };
+    let watchdog = options.timeout.map(|limit| {
+        Watchdog::start(
+            limit,
+            host.cancellation.clone(),
+            host.context.cancellation(),
+        )
+    });
     let outcome = turn::run_turn(&mut history, &host);
+    let timed_out = watchdog.is_some_and(Watchdog::finish);
+    let outcome = match (timed_out, outcome) {
+        // The run settled when it was cancelled; the cancellation was the
+        // time limit, so that is the reason it stopped.
+        // A run that finished as the deadline passed keeps its own ending.
+        (true, Ok(mut outcome)) if outcome.stop_reason == StopReason::Cancelled => {
+            let secs = options.timeout.map_or(0, |limit| limit.as_secs());
+            outcome.stop_reason = StopReason::TimeLimit;
+            outcome.error = Some(
+                RuneError::new(
+                    ErrorCode::LimitExceeded,
+                    format!("the run reached its time limit of {secs} seconds"),
+                )
+                .with_hint("raise it with --timeout")
+                .with_invariant("run_timeout"),
+            );
+            Ok(outcome)
+        }
+        (_, outcome) => outcome,
+    };
     if let Some(error) = host.emit_error.borrow_mut().take() {
         return Err(error);
     }
@@ -714,7 +824,12 @@ pub fn run(
     };
 
     Ok(JsonResult {
-        final_output: if error.is_none() || outcome.stop_reason == StopReason::StepLimit {
+        // A run stopped by one of its bounds has a usable partial answer.
+        final_output: if error.is_none()
+            || matches!(
+                outcome.stop_reason,
+                StopReason::StepLimit | StopReason::TimeLimit | StopReason::SpendLimit
+            ) {
             outcome.text.clone()
         } else {
             String::new()
@@ -744,6 +859,109 @@ pub fn run(
             .filter(|error| !error.detail().is_empty())
             .map(|error| error.detail().clone()),
     })
+}
+
+/// Sends each request on a helper thread, so a cancellation is noticed while
+/// the endpoint has not answered yet.
+///
+/// Reading a response stream is already interruptible; waiting for its first
+/// bytes is not, and a time limit must stop a run whose provider is silent.
+/// A request abandoned this way finishes or times out on its own thread.
+struct CancellableFetch {
+    inner: std::sync::Arc<rune_net::transport::UreqFetch>,
+    cancellation: Cancellation,
+}
+
+impl rune_net::fetch::Fetch for CancellableFetch {
+    fn send(
+        &self,
+        request: rune_net::fetch::FetchRequest,
+    ) -> rune_net::error::NetResult<rune_net::fetch::FetchResponse> {
+        use rune_net::error::{FailureKind, NetError};
+        let cancelled = || NetError::new(FailureKind::Cancelled, "the request was cancelled");
+        if self.cancellation.is_cancelled() {
+            return Err(cancelled());
+        }
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let inner = std::sync::Arc::clone(&self.inner);
+        std::thread::Builder::new()
+            .name("rune-ask-request".to_owned())
+            .spawn(move || {
+                let _ = sender.send(rune_net::fetch::Fetch::send(inner.as_ref(), request));
+            })
+            .map_err(|err| NetError::new(FailureKind::Network, err.to_string()))?;
+        loop {
+            match receiver.recv_timeout(std::time::Duration::from_millis(25)) {
+                Ok(response) => return response,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    if self.cancellation.is_cancelled() {
+                        return Err(cancelled());
+                    }
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(NetError::new(
+                        FailureKind::Network,
+                        "the request thread ended without a response",
+                    ));
+                }
+            }
+        }
+    }
+}
+
+/// Cancels a run at its deadline, from a thread of its own.
+struct Watchdog {
+    done: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    fired: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    thread: std::thread::JoinHandle<()>,
+}
+
+impl Watchdog {
+    /// Starts counting down `limit`; at the deadline both cancellations are
+    /// set, which stops the provider stream and any running tool.
+    fn start(
+        limit: std::time::Duration,
+        run: Cancellation,
+        tools: rune_tools::contract::Cancellation,
+    ) -> Self {
+        use std::sync::atomic::Ordering;
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let fired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let started = std::time::Instant::now();
+        let thread = {
+            let done = std::sync::Arc::clone(&done);
+            let fired = std::sync::Arc::clone(&fired);
+            std::thread::spawn(move || {
+                while !done.load(Ordering::Relaxed) {
+                    let elapsed = started.elapsed();
+                    if elapsed >= limit {
+                        fired.store(true, Ordering::Relaxed);
+                        run.cancel();
+                        tools.cancel();
+                        return;
+                    }
+                    std::thread::sleep(
+                        limit
+                            .saturating_sub(elapsed)
+                            .min(std::time::Duration::from_millis(25)),
+                    );
+                }
+            })
+        };
+        Self {
+            done,
+            fired,
+            thread,
+        }
+    }
+
+    /// Stops the countdown and returns whether the deadline was reached.
+    fn finish(self) -> bool {
+        use std::sync::atomic::Ordering;
+        self.done.store(true, Ordering::Relaxed);
+        let _ = self.thread.join();
+        self.fired.load(Ordering::Relaxed)
+    }
 }
 
 /// Saves a completed request before its identifier is reported to the caller.
@@ -829,6 +1047,17 @@ pub fn report(result: &JsonResult, options: &Options) -> Result<u8> {
 mod tests {
     use super::*;
     use rune_core::config::{EnvironmentOverrides, Provider};
+
+    #[test]
+    fn dollar_amounts_are_read_as_cents() {
+        assert_eq!(parse_cents("0.10"), Some(10));
+        assert_eq!(parse_cents("2.5"), Some(250));
+        assert_eq!(parse_cents("3"), Some(300));
+        assert_eq!(parse_cents("0"), Some(0));
+        for bad in ["", "1.234", "-1", "1.", ".5", "abc", "1,50", "1.5x", " 1"] {
+            assert_eq!(parse_cents(bad), None, "{bad:?}");
+        }
+    }
 
     fn settings_with(provider: Provider, model: &str) -> Settings {
         Settings {

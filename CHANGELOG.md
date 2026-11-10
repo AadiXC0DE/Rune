@@ -39,6 +39,9 @@ Notable changes, newest first. Each entry describes what a user can observe.
 - `rune ask` compacts a long run before it reaches the context window, as the
   interactive session does, and counts the summary requests in its usage and
   cost.
+- `rune ask --timeout SECONDS` and `--max-cost USD` stop a run at a wall-clock
+  or estimated spend limit, reporting what it did so far. Models can declare
+  `prices` in configuration for endpoints the catalog does not price.
 - When a provider rejects a request as longer than the context window, the
   interactive session, `rune ask`, the ACP server and an SDK agent with
   `auto_compact` compact the conversation and send the step again, up to twice,
