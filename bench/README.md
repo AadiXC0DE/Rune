@@ -17,6 +17,14 @@ python3 bench/kit/run.py validate --tasks bench/tasks   # each task: oracle pass
 | `py-ini-parser` | Python | Values containing `=`, inline comments outside quotes, keys before any section |
 | `go-wordfreq` | Go | Unicode-aware word splitting, case folding and alphabetical ties |
 | `rust-semver` | Rust | Pre-release precedence from Semantic Versioning 2.0.0, strict parsing |
+| `js-event-emitter-once` | JavaScript | `once` listeners that never unregister and removal while emitting |
+| `ts-money-format` | TypeScript | Sign loss, rounding of negative halves, digit grouping and a total that disagrees with its rows |
+| `js-csv-export` | JavaScript | Quoting rules and column order from a schema |
+| `ts-config-merge` | TypeScript | Layered settings: deep merge, array replacement, null removal and layer order |
+| `js-rate-limiter` | JavaScript | Token bucket refill units and cap, plus a multi-token removal |
+| `js-router-params` | JavaScript | Trailing slashes, route specificity and percent-decoding |
+| `js-monorepo-instructions` | JavaScript | A shared pricing bug in a monorepo with nested instructions; the obvious fix breaks another package |
+| `ts-scheduler-stable` | TypeScript | A stable priority queue where the obvious fix breaks re-queued job order |
 
 Each task directory holds `task.json` and these paths:
 

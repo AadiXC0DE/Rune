@@ -1,0 +1,16 @@
+{
+  "title": "Fix token bucket refill and add multi-token removal",
+  "kind": "bugfix",
+  "prompt": "The rate limiter lets bursts through after a pause and refills far too slowly. Also add a way to take several tokens at once without taking any when not enough are available.",
+  "verify": "node --test",
+  "protected": [
+    "test",
+    "test/hidden.test.js"
+  ],
+  "timeoutMs": 600000,
+  "tests": "tests",
+  "tier": 2,
+  "split": "heldout",
+  "language": "javascript",
+  "tags": []
+}
