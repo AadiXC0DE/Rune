@@ -51,6 +51,18 @@
     "final_output": "Set max_items to 10; check.sh passes.",
     "min_steps": 4,
     "requests": 4,
-    "prefix_breaks": 0
+    "prefix_breaks": 0,
+    "request_contains": [
+      {
+        "request": 1,
+        "text": "<run_context>This is a non-interactive run."
+      }
+    ],
+    "request_absent": [
+      {
+        "request": 1,
+        "text": "This is the last step allowed in this run."
+      }
+    ]
   }
 }

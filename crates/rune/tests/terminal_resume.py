@@ -32,7 +32,8 @@ class Provider(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         requests.append(request)
-        prompt = request["messages"][-1]["content"]
+        # `ask` appends a note that the run is non-interactive; match the prompt.
+        prompt = request["messages"][-1]["content"].split("\n\n<run_context>")[0]
         answer = long_reply if prompt == "long saved prompt" else (
             "CONTINUED-REPLY" if prompt == "continue saved prompt" else reply
         )

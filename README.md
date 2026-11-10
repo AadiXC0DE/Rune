@@ -542,6 +542,12 @@ return an empty ID.
 
 ### Headless runs
 
+`rune ask` and `rune review` add a short note after the prompt saying the run is
+non-interactive: nobody can answer questions or approve actions, so the model
+should choose, say why, and continue. The note is in the first user message, not
+the system prompt, which stays the same as an interactive session's; the saved
+session keeps the prompt without it.
+
 `rune ask --jsonl "prompt"` streams one JSON object per stdout line, flushing
 each record as it arrives. `--jsonl` takes precedence over `--json`. The stream
 is enough to rebuild every step, tool call, result and its usage without reading

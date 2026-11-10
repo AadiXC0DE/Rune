@@ -67,6 +67,29 @@ pub struct Options {
     pub session_id: Option<SessionId>,
 }
 
+/// Appended to the prompt of a run nobody can answer.
+pub const RUN_CONTEXT: &str = "<run_context>This is a non-interactive run. Nobody can answer questions or approve actions. When a choice is yours to make, choose and continue. When it is truly the user's, pick the most reasonable option, say which and why, and continue. End with what changed, how it was checked, and what remains.</run_context>";
+
+/// The same note for a read-only review, which changes nothing.
+pub const REVIEW_RUN_CONTEXT: &str = "<run_context>This is a non-interactive run. Nobody can answer questions or approve actions. When a choice is yours to make, choose and continue. When it is truly the user's, pick the most reasonable option, say which and why, and continue. End with what you found, how it was checked, and what remains.</run_context>";
+
+/// The text of a run's first user message: the prompt, then, when the run
+/// uses tools, the note that nobody can answer it.
+///
+/// The note is in the user turn rather than the system prompt so the system
+/// prompt stays the same as an interactive session's, cache prefix included.
+fn first_message(prompt: &str, tool_loop: bool, read_only: bool) -> String {
+    if !tool_loop {
+        return prompt.to_owned();
+    }
+    let note = if read_only {
+        REVIEW_RUN_CONTEXT
+    } else {
+        RUN_CONTEXT
+    };
+    format!("{prompt}\n\n{note}")
+}
+
 /// Reads a dollar amount with at most two decimals, such as `2.50`, as cents.
 #[must_use]
 pub fn parse_cents(raw: &str) -> Option<u64> {
@@ -974,7 +997,7 @@ pub fn run(
     };
     let mut history = History::new();
     let mut parts = vec![ContentPart::Text {
-        text: options.prompt.clone(),
+        text: first_message(&options.prompt, options.tool_loop, options.read_only),
     }];
     parts.extend(attachments.parts());
     history.prepend(rune_net::message::Role::User, parts);
@@ -1448,6 +1471,19 @@ pub fn report(result: &JsonResult, options: &Options) -> Result<u8> {
 mod tests {
     use super::*;
     use rune_core::config::{EnvironmentOverrides, Provider};
+
+    #[test]
+    fn review_uses_the_read_only_note() {
+        assert_eq!(
+            first_message("check it", true, true),
+            format!("check it\n\n{REVIEW_RUN_CONTEXT}")
+        );
+        assert_eq!(
+            first_message("fix it", true, false),
+            format!("fix it\n\n{RUN_CONTEXT}")
+        );
+        assert_eq!(first_message("plain", false, false), "plain");
+    }
 
     #[test]
     fn ask_host_is_sync() {

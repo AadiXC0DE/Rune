@@ -1750,6 +1750,15 @@ fn an_unknown_workspace_subcommand_is_rejected() {
 }
 
 #[test]
+fn prompt_show_has_no_run_context() {
+    // The headless note goes in `ask`'s user turn, never the system prompt.
+    let out = run(&["--offline", "prompt", "--show"]);
+    assert_eq!(out.status, Some(0), "{}", out.stderr);
+    assert!(!out.stdout.is_empty());
+    assert!(!out.stdout.contains("run_context"), "{}", out.stdout);
+}
+
+#[test]
 fn prompt_reports_the_built_in_source() {
     let out = run(&["prompt"]);
     assert_eq!(out.status, Some(0));

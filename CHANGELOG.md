@@ -39,6 +39,9 @@ Notable changes, newest first. Each entry describes what a user can observe.
 - `rune ask` compacts a long run before it reaches the context window, as the
   interactive session does, and counts the summary requests in its usage and
   cost.
+- `rune ask` and `rune review` tell the model, after the prompt, that nobody can
+  answer questions in this run, so it decides and continues instead of waiting.
+  The system prompt is unchanged.
 - `rune ask` writes its session while it runs, so a run that is killed or
   times out keeps every completed step for `rune session export`. Harness notes
   such as the last-step note are no longer written to the saved session.

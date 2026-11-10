@@ -937,7 +937,12 @@ fn ask_sends_the_resolved_instructions_shown_by_prompt_show() {
             assert_eq!(request["messages"][0]["role"], "system");
             assert_eq!(request["messages"][0]["content"], shown.trim_end());
             assert_eq!(request["messages"][1]["role"], "user");
-            assert_eq!(request["messages"][1]["content"], "run the fixture command");
+            // The prompt, then the note that nobody can answer this run.
+            let user = request["messages"][1]["content"].as_str().expect("text");
+            assert!(
+                user.starts_with("run the fixture command\n\n<run_context>"),
+                "{user}"
+            );
         }
     }
 }
@@ -1540,12 +1545,19 @@ fn ask_attaches_one_png_content_part_on_every_tool_step() {
             .filter(|message| message["role"] == "user")
             .collect();
         assert_eq!(users.len(), 1);
+        // The prompt and the run note come first, then the image.
+        let content = users[0]["content"].as_array().expect("parts");
+        assert_eq!(content.len(), 2);
+        assert_eq!(content[0]["type"], "text");
+        assert!(
+            content[0]["text"]
+                .as_str()
+                .is_some_and(|text| text.starts_with("run the fixture command\n\n<run_context>")),
+            "{content:?}"
+        );
         assert_eq!(
-            users[0]["content"],
-            json!([
-                {"type": "text", "text": "run the fixture command"},
-                {"type": "image_url", "image_url": {"url": format!("data:image/png;base64,{ATTACHMENT_PNG_BASE64}")}}
-            ])
+            content[1],
+            json!({"type": "image_url", "image_url": {"url": format!("data:image/png;base64,{ATTACHMENT_PNG_BASE64}")}})
         );
     }
     let result: Value = serde_json::from_slice(&output.stdout).expect("JSON result");

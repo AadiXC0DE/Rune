@@ -79,6 +79,9 @@ pub struct Expect {
     /// Text that a request body must contain.
     #[serde(default)]
     pub request_contains: Vec<RequestContains>,
+    /// Text that a request body must not contain.
+    #[serde(default)]
+    pub request_absent: Vec<RequestContains>,
     /// Each string must appear in at least one recorded request body.
     #[serde(default)]
     pub any_request_contains: Vec<String>,
@@ -469,6 +472,23 @@ pub fn check(scenario: &Scenario, report: &Report) -> Vec<String> {
             Some(_) => {}
         }
     }
+    for entry in &expect.request_absent {
+        let body = entry
+            .request
+            .checked_sub(1)
+            .and_then(|index| report.requests.get(index));
+        match body {
+            None => failures.push(format!(
+                "request_absent: request {} does not exist",
+                entry.request
+            )),
+            Some(request) if request.body.contains(&entry.text) => failures.push(format!(
+                "request_absent: request {} contains {:?}",
+                entry.request, entry.text
+            )),
+            Some(_) => {}
+        }
+    }
     failures
 }
 
@@ -557,6 +577,34 @@ mod tests {
         scenario.expect.any_request_contains.clear();
         report.requests.clear();
         assert!(check(&scenario, &report).is_empty());
+    }
+
+    #[test]
+    fn request_absent_fails_when_the_text_is_there() {
+        let scenario = load_inline(
+            r#"{"prompt":"p","turns":[],"expect":{"request_absent":[{"request":1,"text":"secret"}]}}"#,
+        );
+        let request = |body: &str| RecordedRequest {
+            path: String::new(),
+            body: body.to_owned(),
+            bytes: body.len(),
+            prompt_tokens: 0,
+            cached_tokens: 0,
+            completion_tokens: 0,
+        };
+        let mut report = Report {
+            requests: vec![request("nothing to see")],
+            ..Report::default()
+        };
+        assert!(check(&scenario, &report).is_empty());
+        report.requests[0] = request("the secret is here");
+        assert_eq!(check(&scenario, &report).len(), 1);
+        report.requests.clear();
+        assert_eq!(
+            check(&scenario, &report).len(),
+            1,
+            "a missing request fails"
+        );
     }
 
     fn load_inline(text: &str) -> Scenario {

@@ -341,6 +341,26 @@ fn parallel_reads_run_in_order_at_a_limit_of_one() {
 }
 
 #[test]
+fn run_context_is_not_in_the_system_message() {
+    let path = directory().join("fix_one_file.json");
+    let loaded = scenario::load(&path).unwrap_or_else(|err| panic!("{err}"));
+    let report = scenario::run(Path::new(env!("CARGO_BIN_EXE_rune")), &loaded);
+    let first: serde_json::Value =
+        serde_json::from_str(&report.requests[0].body).expect("request 1 is JSON");
+    let messages = first["messages"].as_array().expect("messages");
+    let system = messages
+        .iter()
+        .find(|message| message["role"] == "system")
+        .expect("a system message");
+    assert!(!system.to_string().contains("run_context"), "{system}");
+    let user = messages
+        .iter()
+        .find(|message| message["role"] == "user")
+        .expect("a user message");
+    assert!(user.to_string().contains("<run_context>"), "{user}");
+}
+
+#[test]
 fn long_150_steps_completes() {
     let workspace = BTreeMap::from([(
         "a.txt".to_owned(),
