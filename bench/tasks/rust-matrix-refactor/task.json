@@ -1,0 +1,16 @@
+{
+  "title": "Unify row and column helpers and fix non-square transpose",
+  "kind": "refactor",
+  "prompt": "Row and column operations are implemented twice with small differences. Unify them behind one helper and fix transpose for non-square matrices, keeping the current behaviour otherwise.",
+  "verify": "cargo test --quiet --offline",
+  "protected": [
+    "tests/basic.rs",
+    "tests/hidden.rs"
+  ],
+  "timeoutMs": 600000,
+  "verifyTimeoutMs": 300000,
+  "tests": "tests",
+  "tier": 2,
+  "split": "dev",
+  "language": "rust"
+}

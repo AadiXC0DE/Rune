@@ -1,0 +1,16 @@
+{
+  "title": "Fix unary minus and decimal forms in the tokenizer",
+  "kind": "bugfix",
+  "prompt": "The tokenizer in src/lib.rs mishandles unary minus and decimal numbers like .5 and 2. so expressions are split wrongly.",
+  "verify": "cargo test --quiet --offline",
+  "protected": [
+    "tests/basic.rs",
+    "tests/hidden.rs"
+  ],
+  "timeoutMs": 600000,
+  "verifyTimeoutMs": 300000,
+  "tests": "tests",
+  "tier": 1,
+  "split": "dev",
+  "language": "rust"
+}

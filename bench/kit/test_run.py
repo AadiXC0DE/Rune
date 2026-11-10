@@ -266,5 +266,42 @@ class RunnerCase(unittest.TestCase):
         self.assertLess(max(first["start"], second["start"]), min(first["end"], second["end"]))
 
 
+class SuiteMix(unittest.TestCase):
+    def test_the_suite_has_the_planned_mix(self):
+        root = HERE.parent / "tasks"
+        tasks = []
+        for path in sorted(root.glob("*/task.json")):
+            tasks.append((path.parent, json.loads(path.read_text(encoding="utf-8"))))
+        self.assertEqual(len(tasks), 40)
+        for key in ("tests", "tier", "split", "language"):
+            for folder, spec in tasks:
+                self.assertIn(key, spec, "%s lacks %s" % (folder.name, key))
+
+        def count(key):
+            counts = {}
+            for _, spec in tasks:
+                counts[spec[key]] = counts.get(spec[key], 0) + 1
+            return counts
+
+        languages = count("language")
+        self.assertEqual(languages.get("javascript", 0) + languages.get("typescript", 0), 10)
+        self.assertEqual(languages["python"], 10)
+        self.assertEqual(languages["go"], 6)
+        self.assertEqual(languages["rust"], 6)
+        self.assertEqual(languages["java"], 4)
+        self.assertEqual(languages["shell"], 4)
+        self.assertEqual(count("tier"), {1: 10, 2: 20, 3: 10})
+        self.assertEqual(count("split"), {"dev": 24, "heldout": 16})
+
+        unnamed = 0
+        for folder, spec in tasks:
+            repo = folder / "repo"
+            files = [p.relative_to(repo).as_posix() for p in repo.rglob("*") if p.is_file()]
+            names = set(files) | {Path(f).name for f in files}
+            if not any(name in spec["prompt"] for name in names):
+                unnamed += 1
+        self.assertGreaterEqual(unnamed, 28)
+
+
 if __name__ == "__main__":
     unittest.main()

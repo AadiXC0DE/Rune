@@ -42,6 +42,28 @@ python3 bench/kit/run.py validate --tasks bench/tasks   # each task: oracle pass
 | `sh-makefile-deps` | Shell | A makefile missing a shared header dependency and an always-run phony target |
 | `sh-awk-report` | Shell | A sales report from CSV: columns by header name, quoted fields and blank lines |
 | `sh-env-render` | Shell | A template renderer with reversed precedence, `${NAME:-fallback}` and chained references |
+| `rust-tokenizer` | Rust | Unary minus, and decimals such as `.5` and `2.`, in an expression tokenizer |
+| `rust-bitset` | Rust | Set operations and iteration at 64-bit word boundaries |
+| `rust-path-normalize` | Rust | Path cleaning: `..` at the root, repeated slashes, trailing dots and relative parents |
+| `rust-matrix-refactor` | Rust | Row and column helpers merged into one, and transpose for non-square matrices |
+| `rust-expr-eval` | Rust | A calculator with wrong associativity, panics on division by zero and integer overflow |
+| `java-stack-calculator` | Java | An RPN calculator that crashes on division by zero and reads negative numbers as operators |
+| `java-bank-transfer` | Java | Overdrafts from a balance check made after debiting, and cents lost in currency conversion |
+| `java-text-wrap` | Java | Word wrapping that splits words needlessly, drops long words and keeps repeated spaces |
+| `java-event-replay` | Java | Rebuilding a balance from a snapshot; the obvious timestamp fix breaks events sharing a millisecond |
+
+The tasks were proven on these toolchains:
+
+| Toolchain | Version |
+|---|---|
+| Node | v22.21.1 |
+| Python | 3.13.2 |
+| Go | 1.23.4 |
+| cargo | 1.98.1 |
+| OpenJDK | 17.0.15 |
+| POSIX `sh` | macOS 15 `/bin/sh` (bash 3.2.57 in POSIX mode) |
+| `awk` | BSD awk 20200816 |
+| GNU Make | 3.81 |
 
 Each task directory holds `task.json` and these paths:
 
