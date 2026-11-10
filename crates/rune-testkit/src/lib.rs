@@ -10,5 +10,7 @@
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 
 pub mod mock;
+pub mod scripted;
 
 pub use mock::{MockEndpoint, Script};
+pub use scripted::{RecordedRequest, ScriptedProvider, Turn};
