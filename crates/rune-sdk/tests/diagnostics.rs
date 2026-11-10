@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use rune_agent::turn::StopReason;
 use rune_core::budget::{Budget, BudgetSet, EMERGENCY_CEILING_BYTES, LimitName};
-use rune_core::config::{Effort, Layer};
+use rune_core::config::Layer;
 use rune_net::provider::ToolStreaming;
 use rune_sdk::{
     Agent, AgentDiagnostics, AgentOptions, DiagnosticSource, Dialect, EVENT_QUEUE_CAPACITY,
@@ -222,7 +222,7 @@ fn each_dialect_reports_its_implementation_capabilities_without_fetching() {
             ToolStreaming::CompleteCalls,
             false,
             false,
-            &[Effort::Auto][..],
+            rune_net::provider::ALL_EFFORTS,
         ),
     ] {
         let mut opts = options(fetch.clone());

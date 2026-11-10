@@ -150,7 +150,7 @@ models may impose further restrictions. Gemini reports complete tool calls in
 stream frames; the other dialects support incremental tool arguments. Use
 `--require-images` or `--require-tool-streaming` to require image content or
 incremental tool arguments. An unsupported requirement or selected control,
-such as `rune capabilities --provider gemini --effort high`, exits 1 and reports
+such as `rune capabilities --provider gemini --fast`, exits 1 and reports
 the rejection. Actual requests reject unsupported effort, fast mode, image
 content, and routing selections before sending them.
 

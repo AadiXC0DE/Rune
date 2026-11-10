@@ -1504,12 +1504,35 @@ mod tests {
         }
     }
 
+    /// A dialect with the default capabilities, which accept no explicit effort.
+    struct NoEffortDialect;
+
+    impl Provider for NoEffortDialect {
+        fn name(&self) -> &'static str {
+            "no-effort"
+        }
+
+        fn build_request(&self, plan: &RequestPlan) -> Result<serde_json::Value> {
+            self.validate(plan)?;
+            Ok(serde_json::json!({"model": plan.model}))
+        }
+
+        fn request_path(&self) -> &'static str {
+            "/v1/fixture"
+        }
+
+        fn reducer(&self) -> Box<dyn crate::stream::StreamReducer> {
+            crate::gemini::Gemini.reducer()
+        }
+    }
+
     #[test]
     fn unsupported_capability_selections_never_reach_the_http_client() {
         use rune_core::config::Effort;
         let endpoint = Endpoint::new("https://fixture.invalid", "unused");
-        let selections: [(&dyn Provider, Effort, bool, &str); 3] = [
-            (&crate::gemini::Gemini, Effort::High, false, "effort"),
+        let selections: [(&dyn Provider, Effort, bool, &str); 4] = [
+            (&NoEffortDialect, Effort::High, false, "effort"),
+            (&crate::gemini::Gemini, Effort::High, true, "fast_mode"),
             (
                 &crate::anthropic::Anthropic,
                 Effort::Auto,

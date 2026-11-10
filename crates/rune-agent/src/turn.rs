@@ -1407,21 +1407,11 @@ impl ObjectiveAccounting {
         // Every dialect reports the whole prompt as input, cached parts
         // included, so the cache counts are not added again.
         let input = usage.input_tokens.unwrap_or(input_estimate);
-        let output = usage.output_tokens.map_or_else(
-            || {
-                self.output_bytes
-                    .div_ceil(crate::tokens::DEFAULT_BYTES_PER_TOKEN)
-            },
-            |output| {
-                // Gemini reports thinking separately from candidate output. Other
-                // dialects already include reasoning in their output totals.
-                if host.dialect().name() == "gemini" {
-                    output.saturating_add(usage.reasoning_tokens.unwrap_or(0))
-                } else {
-                    output
-                }
-            },
-        );
+        // Every dialect includes reasoning in its output count.
+        let output = usage.output_tokens.unwrap_or_else(|| {
+            self.output_bytes
+                .div_ceil(crate::tokens::DEFAULT_BYTES_PER_TOKEN)
+        });
         host.account_objective_tokens(input.saturating_add(output))
     }
 }

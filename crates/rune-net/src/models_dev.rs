@@ -281,6 +281,27 @@ mod tests {
     }
 
     #[test]
+    fn a_cached_gemini_prompt_is_priced_at_the_cache_rate() {
+        let doc = r#"{"google": {"id": "google", "models": {
+            "gemini-3.8-flash": { "id": "gemini-3.8-flash",
+                                  "limit": { "context": 1048576, "output": 65536 },
+                                  "cost": { "input": 0.75, "output": 3.75, "cache_read": 0.075 } }
+        }}}"#;
+        let prices = parse(doc, "google")
+            .and_then(|limits| limits.get("gemini-3.8-flash"))
+            .and_then(|limits| limits.prices)
+            .expect("prices");
+        let usage = crate::stream::Usage {
+            input_tokens: Some(1_000),
+            cache_read_tokens: Some(800),
+            ..crate::stream::Usage::default()
+        };
+        // 200 uncached at 0.75 and 800 cached at 0.075, per million: 150 + 60
+        // millionths.
+        assert_eq!(prices.cost(&usage), Some(210));
+    }
+
+    #[test]
     fn a_model_the_catalog_does_not_describe_yields_nothing() {
         // A figure that is absent must not become a number here, or a model the
         // catalog has never heard of would be budgeted against a guess.

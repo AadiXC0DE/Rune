@@ -4516,9 +4516,10 @@ fn gemini_thinking_tokens_exhaust_the_objective_before_another_request() {
     *host.objective_budget.lock().expect("budget") = Some((1000, 0));
     let mut plan = rune_net::provider::RequestPlan::new("test");
     let mut accounting = ObjectiveAccounting::begin(&host, &mut plan).expect("begin");
+    // The dialect reports 10 answer tokens and 1000 thought tokens as 1010 out.
     let usage = Usage {
         input_tokens: Some(100),
-        output_tokens: Some(10),
+        output_tokens: Some(1010),
         reasoning_tokens: Some(1000),
         ..Usage::default()
     };

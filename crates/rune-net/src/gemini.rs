@@ -26,7 +26,7 @@ impl Provider for Gemini {
 
     fn capabilities(&self) -> crate::provider::ProviderCapabilities {
         crate::provider::ProviderCapabilities {
-            efforts: &[Effort::Auto],
+            efforts: crate::provider::ALL_EFFORTS,
             images: true,
             tool_streaming: crate::provider::ToolStreaming::CompleteCalls,
             fast_mode: false,
@@ -116,8 +116,15 @@ impl Provider for Gemini {
         if !instructions.is_empty() {
             body["systemInstruction"] = json!({"parts": instructions});
         }
+        let mut generation = serde_json::Map::new();
         if let Some(max) = plan.max_output_tokens {
-            body["generationConfig"] = json!({"maxOutputTokens": max});
+            generation.insert("maxOutputTokens".to_owned(), json!(max));
+        }
+        if let Some(thinking) = thinking_config(&plan.model, plan.effort) {
+            generation.insert("thinkingConfig".to_owned(), thinking);
+        }
+        if !generation.is_empty() {
+            body["generationConfig"] = Value::Object(generation);
         }
         if plan.has_tools() {
             let declarations: Vec<_> = plan
@@ -145,6 +152,74 @@ impl Provider for Gemini {
         }
         Ok(body)
     }
+}
+
+/// Reads the `<major>.<minor>` or `<major>` version after `gemini-` in a model id.
+fn gemini_version(model: &str) -> Option<(u32, u32)> {
+    let model = model.to_ascii_lowercase();
+    let (_, rest) = model.split_once("gemini-")?;
+    let mut numbers = rest
+        .split(|c: char| !c.is_ascii_digit() && c != '.')
+        .next()?
+        .split('.');
+    let major = numbers.next()?.parse().ok()?;
+    let minor = match numbers.next() {
+        Some(minor) => minor.parse().ok()?,
+        None => 0,
+    };
+    Some((major, minor))
+}
+
+/// Maps an effort onto `thinkingConfig`: a level from Gemini 3, a token
+/// budget on 2.5, nothing on models that do not think.
+fn thinking_config(model: &str, effort: Effort) -> Option<Value> {
+    let version = gemini_version(model);
+    if version.is_some_and(|version| version < (2, 5)) {
+        return None;
+    }
+    let id = model.to_ascii_lowercase();
+    let mut config = json!({"includeThoughts": true});
+    if effort == Effort::Auto {
+        return Some(config);
+    }
+    if version.is_none_or(|version| version >= (3, 0)) {
+        let level = match effort {
+            Effort::Low => "LOW",
+            Effort::Medium => "MEDIUM",
+            Effort::High | Effort::Xhigh | Effort::Max => "HIGH",
+            Effort::Auto | Effort::None | Effort::Minimal => "MINIMAL",
+        };
+        let level = if id.contains("gemini-3-pro") {
+            match level {
+                "MINIMAL" => "LOW",
+                "MEDIUM" => "HIGH",
+                other => other,
+            }
+        } else if ["pro", "argon", "carbon", "3.8-flash"]
+            .iter()
+            .any(|name| id.contains(name))
+            && level == "MINIMAL"
+        {
+            "LOW"
+        } else {
+            level
+        };
+        config["thinkingLevel"] = json!(level);
+    } else {
+        let pro = id.contains("pro");
+        let budget = match effort {
+            Effort::None if pro => 128,
+            Effort::Auto | Effort::None => 0,
+            Effort::Minimal => 1024,
+            Effort::Low => 2048,
+            Effort::Medium => 8192,
+            Effort::High => 16384,
+            Effort::Xhigh | Effort::Max if pro => 32768,
+            Effort::Xhigh | Effort::Max => 24576,
+        };
+        config["thinkingBudget"] = json!(budget);
+    }
+    Some(config)
 }
 
 fn encode_parts(
@@ -355,7 +430,12 @@ impl StreamReducer for Reducer {
             let count = |name| usage.get(name).and_then(Value::as_u64);
             let usage = Usage {
                 input_tokens: count("promptTokenCount"),
-                output_tokens: count("candidatesTokenCount"),
+                output_tokens: match (count("candidatesTokenCount"), count("thoughtsTokenCount")) {
+                    (None, None) => None,
+                    (answer, thoughts) => {
+                        Some(answer.unwrap_or(0).saturating_add(thoughts.unwrap_or(0)))
+                    }
+                },
                 cache_read_tokens: count("cachedContentTokenCount"),
                 cache_write_tokens: None,
                 reasoning_tokens: count("thoughtsTokenCount"),
@@ -547,14 +627,10 @@ mod tests {
     #[test]
     fn unsupported_generation_controls_are_rejected() {
         let mut plan = RequestPlan::new("gemini-fixture");
-        plan.effort = Effort::High;
-        assert_eq!(
-            Gemini
-                .build_request(&plan)
-                .expect_err("effort unsupported")
-                .code(),
-            ErrorCode::Unsupported
-        );
+        for effort in crate::provider::ALL_EFFORTS {
+            plan.effort = *effort;
+            assert!(Gemini.build_request(&plan).is_ok(), "{effort:?}");
+        }
         plan.effort = Effort::Auto;
         plan.fast_mode = true;
         assert_eq!(
@@ -564,6 +640,138 @@ mod tests {
                 .code(),
             ErrorCode::Unsupported
         );
+    }
+
+    fn thinking(model: &str, effort: Effort) -> Value {
+        let mut plan = RequestPlan::new(model);
+        plan.effort = effort;
+        let body = Gemini.build_request(&plan).expect("body");
+        body["generationConfig"]["thinkingConfig"].clone()
+    }
+
+    #[test]
+    fn effort_maps_to_a_thinking_level_on_gemini_3() {
+        for (effort, level) in [
+            (Effort::None, "MINIMAL"),
+            (Effort::Minimal, "MINIMAL"),
+            (Effort::Low, "LOW"),
+            (Effort::Medium, "MEDIUM"),
+            (Effort::High, "HIGH"),
+            (Effort::Xhigh, "HIGH"),
+            (Effort::Max, "HIGH"),
+        ] {
+            assert_eq!(
+                thinking("gemini-3.6-flash", effort),
+                json!({"includeThoughts": true, "thinkingLevel": level}),
+                "{effort:?}"
+            );
+        }
+        assert_eq!(
+            thinking("models/gemini-3.6-flash", Effort::Auto),
+            json!({"includeThoughts": true})
+        );
+        assert_eq!(
+            thinking("gemini-fixture", Effort::Low),
+            json!({"includeThoughts": true, "thinkingLevel": "LOW"})
+        );
+        assert_eq!(
+            gemini_version("models/Gemini-3.1-pro-preview"),
+            Some((3, 1))
+        );
+        assert_eq!(gemini_version("gemini-3-pro-preview"), Some((3, 0)));
+        assert_eq!(gemini_version("gemini-fixture"), None);
+    }
+
+    #[test]
+    fn effort_maps_to_a_budget_on_gemini_2_5() {
+        for (effort, pro, flash) in [
+            (Effort::None, 128, 0),
+            (Effort::Minimal, 1024, 1024),
+            (Effort::Low, 2048, 2048),
+            (Effort::Medium, 8192, 8192),
+            (Effort::High, 16384, 16384),
+            (Effort::Xhigh, 32768, 24576),
+            (Effort::Max, 32768, 24576),
+        ] {
+            assert_eq!(
+                thinking("gemini-2.5-pro", effort),
+                json!({"includeThoughts": true, "thinkingBudget": pro}),
+                "{effort:?}"
+            );
+            assert_eq!(
+                thinking("gemini-2.5-flash", effort),
+                json!({"includeThoughts": true, "thinkingBudget": flash}),
+                "{effort:?}"
+            );
+        }
+        assert_eq!(
+            thinking("gemini-2.5-flash-lite", Effort::Auto),
+            json!({"includeThoughts": true})
+        );
+        let mut plan = RequestPlan::new("gemini-2.0-flash");
+        for effort in [Effort::Auto, Effort::High] {
+            plan.effort = effort;
+            let body = Gemini.build_request(&plan).expect("body");
+            assert!(body.get("generationConfig").is_none(), "{effort:?}");
+        }
+    }
+
+    #[test]
+    fn levels_are_clamped_to_what_the_model_accepts() {
+        for (model, effort, level) in [
+            ("gemini-3-pro-preview", Effort::Medium, "HIGH"),
+            ("gemini-3-pro-preview", Effort::Minimal, "LOW"),
+            ("gemini-3-pro-preview", Effort::Low, "LOW"),
+            ("gemini-3.1-pro-preview", Effort::None, "LOW"),
+            ("gemini-3.1-pro-preview", Effort::Medium, "MEDIUM"),
+            ("gemini-4-argon", Effort::Minimal, "LOW"),
+            ("gemini-4-carbon", Effort::Minimal, "LOW"),
+            ("gemini-3.8-flash", Effort::None, "LOW"),
+            ("gemini-3.8-flash", Effort::High, "HIGH"),
+            ("gemini-3.5-flash-lite", Effort::Minimal, "MINIMAL"),
+            ("gemini-3-flash-preview", Effort::None, "MINIMAL"),
+        ] {
+            assert_eq!(
+                thinking(model, effort)["thinkingLevel"],
+                level,
+                "{model} {effort:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn thinking_config_merges_with_the_output_ceiling() {
+        let mut plan = RequestPlan::new("gemini-3.8-flash");
+        plan.max_output_tokens = Some(4096);
+        plan.effort = Effort::High;
+        let body = Gemini.build_request(&plan).expect("body");
+        assert_eq!(
+            body["generationConfig"],
+            json!({
+                "maxOutputTokens": 4096,
+                "thinkingConfig": {"includeThoughts": true, "thinkingLevel": "HIGH"},
+            })
+        );
+    }
+
+    #[test]
+    fn thought_tokens_count_as_output() {
+        let mut out = Vec::new();
+        for (usage, output, reasoning) in [
+            (
+                json!({"promptTokenCount": 5, "candidatesTokenCount": 10, "thoughtsTokenCount": 90}),
+                Some(100),
+                Some(90),
+            ),
+            (json!({"thoughtsTokenCount": 7}), Some(7), Some(7)),
+            (json!({"candidatesTokenCount": 3}), Some(3), None),
+            (json!({"promptTokenCount": 5}), None, None),
+        ] {
+            let mut reducer = Reducer::default();
+            feed(&mut reducer, &json!({"usageMetadata": usage}), &mut out).expect("usage");
+            assert_eq!(reducer.usage().output_tokens, output, "{usage}");
+            assert_eq!(reducer.usage().reasoning_tokens, reasoning, "{usage}");
+        }
     }
 
     #[test]
