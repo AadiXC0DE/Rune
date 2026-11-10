@@ -418,6 +418,9 @@ pub fn effort_wire(effort: Effort) -> Option<&'static str> {
     }
 }
 
+/// The text fields reasoning arrives in, in the order they are read.
+const REASONING_FIELDS: [&str; 3] = ["reasoning_content", "reasoning", "reasoning_text"];
+
 /// Accumulates one tool call across streamed deltas.
 #[derive(Debug, Default)]
 struct PartialCall {
@@ -441,6 +444,13 @@ pub struct Reducer {
     saw_done: bool,
     saw_role: bool,
     event_count: usize,
+    /// Every reasoning delta emitted, in order.
+    reasoning: String,
+    /// Every `reasoning_details` entry, verbatim, because some endpoints need
+    /// them sent back exactly.
+    reasoning_details: Vec<serde_json::Value>,
+    /// The field reasoning first arrived in.
+    observed_field: Option<&'static str>,
 }
 
 impl Default for Reducer {
@@ -463,6 +473,9 @@ impl Reducer {
             saw_done: false,
             saw_role: false,
             event_count: 0,
+            reasoning: String::new(),
+            reasoning_details: Vec::new(),
+            observed_field: None,
         }
     }
 
@@ -570,15 +583,41 @@ impl Reducer {
             });
         }
 
-        for field in ["reasoning", "reasoning_content"] {
-            if let Some(text) = delta
+        // Servers name the reasoning field differently and some send it under
+        // two names at once, so the first that carries text is the only one read.
+        let text_field = REASONING_FIELDS.into_iter().find_map(|field| {
+            delta
                 .get(field)
                 .and_then(serde_json::Value::as_str)
                 .filter(|text| !text.is_empty())
-            {
-                out.push(crate::stream::ProviderEvent::ReasoningDelta {
-                    delta: text.to_owned(),
-                });
+                .map(|text| (field, text))
+        });
+        if let Some((field, text)) = text_field {
+            self.observed_field.get_or_insert(field);
+            self.push_reasoning(text, out)?;
+        }
+        if let Some(details) = delta
+            .get("reasoning_details")
+            .and_then(serde_json::Value::as_array)
+            .filter(|details| !details.is_empty())
+        {
+            self.observed_field.get_or_insert("reasoning_details");
+            for entry in details {
+                let key = match entry.get("type").and_then(serde_json::Value::as_str) {
+                    Some("reasoning.text") => Some("text"),
+                    Some("reasoning.summary") => Some("summary"),
+                    _ => None,
+                };
+                let text = key
+                    .and_then(|key| entry.get(key))
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|text| !text.is_empty());
+                if text_field.is_none()
+                    && let Some(text) = text
+                {
+                    self.push_reasoning(text, out)?;
+                }
+                self.reasoning_details.push(entry.clone());
             }
         }
 
@@ -609,6 +648,26 @@ impl Reducer {
             }
         }
 
+        Ok(())
+    }
+
+    /// Records and emits one reasoning delta.
+    fn push_reasoning(
+        &mut self,
+        text: &str,
+        out: &mut Vec<crate::stream::ProviderEvent>,
+    ) -> Result<()> {
+        self.reasoning.push_str(text);
+        if self.reasoning.len() > self.limits.max_content_bytes {
+            return Err(RuneError::too_large(
+                "stream.reasoning",
+                self.reasoning.len(),
+                self.limits.max_content_bytes,
+            ));
+        }
+        out.push(crate::stream::ProviderEvent::ReasoningDelta {
+            delta: text.to_owned(),
+        });
         Ok(())
     }
 
@@ -1304,20 +1363,109 @@ mod tests {
         assert_eq!(text, "Hello world");
     }
 
-    #[test]
-    fn reasoning_deltas_use_both_known_field_names() {
-        let (events, _) = reduce(&[
-            r#"{"choices":[{"index":0,"delta":{"reasoning":"step one"}}]}"#,
-            r#"{"choices":[{"index":0,"delta":{"reasoning_content":" step two"}}]}"#,
-        ]);
-        let text: String = events
+    fn reasoning_text(events: &[ProviderEvent]) -> String {
+        events
             .iter()
             .filter_map(|event| match event {
                 ProviderEvent::ReasoningDelta { delta } => Some(delta.as_str()),
                 _ => None,
             })
+            .collect()
+    }
+
+    /// Reduces a recorded stream file, one `data:` line per frame.
+    fn reduce_recorded(recorded: &str) -> (Vec<ProviderEvent>, Reducer) {
+        let frames: Vec<&str> = recorded
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
             .collect();
-        assert_eq!(text, "step one step two");
+        reduce(&frames)
+    }
+
+    #[test]
+    fn reasoning_is_read_under_every_field_name() {
+        for (recorded, text, field) in [
+            (
+                include_str!("../tests/fixtures/chat_completions/reasoning_content/response.txt"),
+                "Check the file first. Then answer.",
+                "reasoning_content",
+            ),
+            (
+                include_str!("../tests/fixtures/chat_completions/reasoning/response.txt"),
+                "Check the file first. Then answer.",
+                "reasoning",
+            ),
+            (
+                include_str!("../tests/fixtures/chat_completions/reasoning_text/response.txt"),
+                "Check the file first. Then answer.",
+                "reasoning_text",
+            ),
+            (
+                include_str!("../tests/fixtures/chat_completions/reasoning_details/response.txt"),
+                "Check the file first. Then answer.",
+                "reasoning",
+            ),
+        ] {
+            let (events, reducer) = reduce_recorded(recorded);
+            reducer.finish().expect("finished");
+            assert_eq!(reasoning_text(&events), text, "{field}");
+            assert_eq!(reducer.reasoning, text, "{field}");
+            assert_eq!(reducer.observed_field, Some(field));
+        }
+
+        let (_, reducer) = reduce_recorded(include_str!(
+            "../tests/fixtures/chat_completions/reasoning_details/response.txt"
+        ));
+        assert_eq!(reducer.reasoning_details.len(), 3);
+        assert_eq!(
+            reducer.reasoning_details[2]["type"], "reasoning.encrypted",
+            "{:?}",
+            reducer.reasoning_details
+        );
+    }
+
+    #[test]
+    fn a_reasoning_field_and_its_alias_are_not_doubled() {
+        let (events, reducer) = reduce(&[
+            r#"{"choices":[{"index":0,"delta":{"reasoning":"step one","reasoning_content":"step one"}}]}"#,
+        ]);
+        assert_eq!(reasoning_text(&events), "step one");
+        assert_eq!(reducer.observed_field, Some("reasoning_content"));
+
+        let (events, reducer) = reduce(&[
+            r#"{"choices":[{"index":0,"delta":{"reasoning":"","reasoning_content":"x"}}]}"#,
+        ]);
+        assert_eq!(reasoning_text(&events), "x");
+        assert_eq!(reducer.observed_field, Some("reasoning_content"));
+
+        let (events, reducer) = reduce(&[
+            r#"{"choices":[{"index":0,"delta":{"reasoning_details":[{"type":"reasoning.encrypted","data":"opaque","id":"r1","format":"openai-responses-v1","index":0}]}}]}"#,
+        ]);
+        assert!(reasoning_text(&events).is_empty(), "{events:?}");
+        assert_eq!(reducer.reasoning_details.len(), 1);
+        assert_eq!(reducer.observed_field, Some("reasoning_details"));
+
+        let (events, reducer) = reduce(&[
+            r#"{"choices":[{"index":0,"delta":{"reasoning_details":[{"type":"reasoning.summary","summary":"plan"},{"type":"reasoning.text","text":" and act"}]}}]}"#,
+        ]);
+        assert_eq!(reasoning_text(&events), "plan and act");
+        assert_eq!(reducer.observed_field, Some("reasoning_details"));
+    }
+
+    #[test]
+    fn reasoning_past_the_content_bound_is_rejected() {
+        let mut reducer = Reducer::new().with_limits(Limit {
+            max_content_bytes: 4,
+            ..Limit::default()
+        });
+        let mut events = Vec::new();
+        let err = reducer
+            .apply(
+                Some(r#"{"choices":[{"index":0,"delta":{"reasoning_content":"far too long"}}]}"#),
+                &mut events,
+            )
+            .expect_err("rejected");
+        assert_eq!(err.code(), ErrorCode::TooLarge);
     }
 
     #[test]
