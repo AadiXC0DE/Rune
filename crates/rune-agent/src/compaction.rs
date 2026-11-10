@@ -720,6 +720,12 @@ pub fn render_recent_context(turns: &[Turn]) -> String {
                 } => {
                     tool = name;
                     let label = if *is_error { "error" } else { "result" };
+                    if name == "skill" && content.len() > crate::prune::MAX_KEPT_SKILL_BYTES {
+                        let receipt = crate::prune::SKILL_RECEIPT
+                            .replace("{name}", &crate::prune::skill_name(content, None));
+                        let _ = writeln!(out, "{label} skill: {receipt}");
+                        continue;
+                    }
                     let content = clip_middle(content, RECENT_RESULT_CHARS);
                     let _ = writeln!(out, "{label} {name}: {content}");
                 }
@@ -1558,6 +1564,36 @@ mod tests {
             carried,
             "<message>\nplan the change\n</message>\n<message>\nbefore  after\n</message>\n"
         );
+    }
+
+    #[test]
+    fn recent_context_drops_skill_bodies() {
+        let mut history = History::new();
+        history.push_user("use alpha");
+        history.push_assistant(vec![ContentPart::ToolCall {
+            id: ToolCallId::new("s1").expect("id"),
+            name: "skill".to_owned(),
+            arguments: "{}".to_owned(),
+        }]);
+        let body = format!(
+            "<skill_content name=\"alpha\">\n{}\n</skill_content>\n",
+            "x".repeat(3000)
+        );
+        history.push_tool_results(vec![ContentPart::ToolResult {
+            id: ToolCallId::new("s1").expect("id"),
+            name: "skill".to_owned(),
+            content: body,
+            is_error: false,
+        }]);
+        let text = render_recent_context(history.turns());
+        assert!(
+            text.contains(
+                "result skill: [skill alpha was loaded here and removed to save context; call the \
+                 skill tool again if it is needed]"
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("xxxx"), "{text}");
     }
 
     #[test]

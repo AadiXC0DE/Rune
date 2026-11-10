@@ -349,6 +349,77 @@ fn fill(template: &str, values: &[(&str, &str)]) -> String {
     out
 }
 
+/// The receipt that replaces a skill body once its turn is over.
+pub const SKILL_RECEIPT: &str = "[skill {name} was loaded here and removed to save context; call the skill tool again if it is needed]";
+
+/// Skill results at or under this many bytes stay where they are.
+pub const MAX_KEPT_SKILL_BYTES: usize = 2048;
+
+/// Replaces every large `skill` result from before the newest user turn with
+/// a receipt, and returns how many it replaced. A signed history is left as
+/// it is; its next checkpoint drops the bodies.
+pub fn unload_skills(history: &mut History, dialect: &dyn Provider) -> usize {
+    if history.is_signed(dialect) {
+        return 0;
+    }
+    let turns = history.turns();
+    let Some(newest_user) = turns
+        .iter()
+        .rposition(|turn| turn.role == Role::User && !is_harness_text(turn))
+    else {
+        return 0;
+    };
+    let mut replacements = Vec::new();
+    for (index, turn) in turns.iter().enumerate().take(newest_user) {
+        for part in &turn.parts {
+            let ContentPart::ToolResult {
+                id, name, content, ..
+            } = part
+            else {
+                continue;
+            };
+            if name != "skill"
+                || content.len() <= MAX_KEPT_SKILL_BYTES
+                || history.is_pruned(id.as_str())
+            {
+                continue;
+            }
+            let arguments =
+                producing_call(turns, index, id.as_str()).map(|(_, arguments)| arguments);
+            let receipt = fill(
+                SKILL_RECEIPT,
+                &[("name", &skill_name(content, arguments.as_deref()))],
+            );
+            replacements.push((id.as_str().to_owned(), receipt));
+        }
+    }
+    replacements
+        .into_iter()
+        .filter(|(id, receipt)| history.replace_result(id, receipt.clone()))
+        .count()
+}
+
+/// The skill a result loaded: the `name` of a leading `<skill_content>`, else
+/// the last component of the call's `location` without `/SKILL.md`.
+pub fn skill_name(content: &str, arguments: Option<&str>) -> String {
+    if let Some(rest) = content.strip_prefix("<skill_content name=\"")
+        && let Some((name, _)) = rest.split_once('"')
+        && !name.is_empty()
+    {
+        return name.to_owned();
+    }
+    arguments
+        .and_then(|arguments| serde_json::from_str::<serde_json::Value>(arguments).ok())
+        .and_then(|value| value.get("location")?.as_str().map(str::to_owned))
+        .map(|location| {
+            let trimmed = location.trim_end_matches('/');
+            let trimmed = trimmed.strip_suffix("/SKILL.md").unwrap_or(trimmed);
+            trimmed.rsplit('/').next().unwrap_or(trimmed).to_owned()
+        })
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "skill".to_owned())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -714,5 +785,64 @@ mod tests {
             prune(&mut history, &ChatCompletions),
             PruneReport::default()
         );
+    }
+
+    #[test]
+    fn a_skill_body_from_an_earlier_turn_becomes_a_receipt() {
+        let mut history = History::new();
+        history.push_user("use the alpha skill");
+        let body = format!(
+            "<skill_content name=\"alpha\">\n{}\n</skill_content>\n",
+            "a".repeat(4096)
+        );
+        exchange(
+            &mut history,
+            "load",
+            "skill",
+            r#"{"location":"skills/alpha/SKILL.md"}"#,
+            &body,
+        );
+        history.push_assistant(vec![ContentPart::Text {
+            text: "done".to_owned(),
+        }]);
+        history.push_user("next task");
+        assert_eq!(unload_skills(&mut history, &ChatCompletions), 1);
+        assert_eq!(
+            content_of(&history, "load"),
+            "[skill alpha was loaded here and removed to save context; call the skill tool again if it is needed]"
+        );
+        assert!(history.is_pruned("load"));
+        assert_eq!(unload_skills(&mut history, &ChatCompletions), 0);
+        assert_eq!(
+            skill_name("plain body", Some(r#"{"location":"skills/beta/SKILL.md"}"#)),
+            "beta"
+        );
+    }
+
+    #[test]
+    fn a_skill_body_in_the_current_turn_stays() {
+        let mut history = History::new();
+        history.push_user("use the alpha skill");
+        let body = "b".repeat(4096);
+        exchange(&mut history, "load", "skill", "{}", &body);
+        exchange(&mut history, "small", "skill", "{}", &"s".repeat(1500));
+        assert_eq!(unload_skills(&mut history, &ChatCompletions), 0);
+        assert_eq!(content_of(&history, "load"), body);
+        history.push_user("next task");
+        assert_eq!(unload_skills(&mut history, &ChatCompletions), 1);
+        assert_eq!(content_of(&history, "small"), "s".repeat(1500));
+    }
+
+    #[test]
+    fn a_signed_history_keeps_skill_bodies() {
+        let mut history = History::new();
+        history.push_user("use the alpha skill");
+        history
+            .push_assistant_with_replay(vec![call("load", "skill", "{}")], Some("[]".to_owned()));
+        let body = "c".repeat(4096);
+        history.push_tool_results(vec![result("load", "skill", &body, false)]);
+        history.push_user("next task");
+        assert_eq!(unload_skills(&mut history, &Signed), 0);
+        assert_eq!(content_of(&history, "load"), body);
     }
 }

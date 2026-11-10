@@ -834,6 +834,7 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
 
     let instructions = host.instructions();
     history.set_instructions(instructions);
+    crate::prune::unload_skills(history, host.dialect());
     history.validate()?;
 
     let client = host.fetch();
