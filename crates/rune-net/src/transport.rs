@@ -607,6 +607,29 @@ pub fn stream_completion_observed(
     cancel: &dyn Fn() -> bool,
     observe: &mut dyn FnMut(&ProviderEvent),
 ) -> NetResult<StreamOutcome> {
+    stream_completion_encoded(
+        client, endpoint, provider, plan, None, timeouts, cancel, observe,
+    )
+}
+
+/// Like [`stream_completion_observed`], sending `encoded` as the body when it
+/// is given.
+///
+/// `encoded` must be exactly the JSON text `provider.build_request(plan)`
+/// serializes to. A caller that already serialized the request, to measure
+/// it, passes that text here so a long conversation is not serialized twice
+/// for every request.
+#[allow(clippy::too_many_arguments)]
+pub fn stream_completion_encoded(
+    client: &dyn Fetch,
+    endpoint: &Endpoint,
+    provider: &dyn Provider,
+    plan: &RequestPlan,
+    encoded: Option<String>,
+    timeouts: impl Into<RequestTimeouts>,
+    cancel: &dyn Fn() -> bool,
+    observe: &mut dyn FnMut(&ProviderEvent),
+) -> NetResult<StreamOutcome> {
     if endpoint.offline {
         return Err(
             NetError::new(FailureKind::PolicyDenied, "outbound requests are disabled")
@@ -618,15 +641,19 @@ pub fn stream_completion_observed(
         .validate(plan)
         .map_err(|err| NetError::new(FailureKind::InvalidRequest, err.message().to_owned()))?;
 
-    let body = provider
-        .build_request(plan)
-        .map_err(|err| NetError::new(FailureKind::InvalidRequest, err.message().to_owned()))?;
+    let encoded = if let Some(encoded) = encoded {
+        encoded
+    } else {
+        let body = provider
+            .build_request(plan)
+            .map_err(|err| NetError::new(FailureKind::InvalidRequest, err.message().to_owned()))?;
+        serde_json::to_string(&body)?
+    };
 
     let path = provider
         .completion_path(plan)
         .map_err(|err| NetError::new(FailureKind::InvalidRequest, err.message().to_owned()))?;
     let url = endpoint.url_for(&path);
-    let encoded = serde_json::to_string(&body)?;
     let timeouts = timeouts.into();
 
     let mut request = endpoint.authenticate(

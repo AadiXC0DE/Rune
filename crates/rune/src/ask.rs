@@ -344,6 +344,8 @@ struct AskHost<'a> {
     window: rune_agent::compaction::Window,
     /// Usage of summary requests, which the turn's own usage does not count.
     compaction_usage: Cell<Usage>,
+    /// The request `prepare_request` serialized, for the loop to send.
+    encoded_request: RefCell<Option<String>>,
 }
 
 impl Host for AskHost<'_> {
@@ -402,7 +404,14 @@ impl Host for AskHost<'_> {
         plan: &mut rune_net::provider::RequestPlan,
         client: &dyn rune_net::fetch::Fetch,
     ) -> Result<()> {
-        rune_agent::compaction::auto_compact(history, plan, self, client, self.window).map(|_| ())
+        let (_, encoded) =
+            rune_agent::compaction::auto_compact_encoded(history, plan, self, client, self.window)?;
+        *self.encoded_request.borrow_mut() = Some(encoded);
+        Ok(())
+    }
+
+    fn take_encoded_request(&self) -> Option<String> {
+        self.encoded_request.borrow_mut().take()
     }
 
     fn context_replaced(&self, report: &rune_agent::compaction::CompactionReport) {
@@ -613,6 +622,7 @@ pub fn run(
                 .unwrap_or(rune_net::catalog::DEFAULT_CONTEXT_WINDOW),
         ),
         compaction_usage: Cell::new(Usage::default()),
+        encoded_request: RefCell::new(None),
         limits,
     };
     let outcome = turn::run_turn(&mut history, &host);
@@ -738,41 +748,37 @@ fn save_exchange(
     let workspace = crate::current_workspace()?;
     let id = SessionId::generate();
     let store = SessionStore::create(paths, &id)?;
-    let mut metadata_warning = None;
-    let mut append = |event| -> Result<()> {
-        let report = store.append(event)?;
-        metadata_warning = report.metadata_warning;
-        Ok(())
-    };
-    append(SessionEvent::WorkspaceSet {
-        workspace: rune_policy::trust::canonical_workspace(&workspace).to_string(),
-    })?;
-    append(SessionEvent::TitleSet {
-        title: crate::session_log::derive_title(prompt),
-    })?;
-    append(SessionEvent::UserMessage {
-        text: prompt.to_owned(),
-    })?;
-    append(SessionEvent::TurnStarted { turn: 1 })?;
+    // One write and one sync for the whole exchange: syncing each event made
+    // saving a long run cost more than running it.
+    let mut events = vec![
+        SessionEvent::WorkspaceSet {
+            workspace: rune_policy::trust::canonical_workspace(&workspace).to_string(),
+        },
+        SessionEvent::TitleSet {
+            title: crate::session_log::derive_title(prompt),
+        },
+        SessionEvent::UserMessage {
+            text: prompt.to_owned(),
+        },
+        SessionEvent::TurnStarted { turn: 1 },
+    ];
     for turn in history.turns().iter().skip(1) {
-        for event in crate::session_log::message_events(turn, 1)? {
-            append(event)?;
-        }
+        events.extend(crate::session_log::message_events(turn, 1)?);
     }
-
     if let (Some(input_tokens), Some(output_tokens)) = (usage.input_tokens, usage.output_tokens) {
-        append(SessionEvent::UsageRecorded {
+        events.push(SessionEvent::UsageRecorded {
             input_tokens,
             output_tokens,
-        })?;
+        });
     }
     if let Some(error) = error {
-        append(SessionEvent::TurnFailed {
+        events.push(SessionEvent::TurnFailed {
             turn: 1,
             code: error.code(),
             message: error.message().to_owned(),
-        })?;
+        });
     }
+    let metadata_warning = store.append_all(events)?.metadata_warning;
     if let Some(warning) = metadata_warning {
         let _ = writeln!(std::io::stderr(), "warning: {warning}");
     }

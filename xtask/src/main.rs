@@ -57,7 +57,7 @@ mod targets {
 /// Measured on macOS arm64; other hosts print their numbers without a gate.
 mod perf_baseline {
     pub const LONG_TURN_PEAK_RSS_BYTES: u64 = 20_238_000;
-    pub const LONG_TURN_CPU_SECONDS: f64 = 10.67;
+    pub const LONG_TURN_CPU_SECONDS: f64 = 2.98;
     pub const FIRST_FRAME_MEDIAN_MS: f64 = 52.5;
     /// A measurement more than this fraction above its baseline fails.
     pub const ALLOWED_REGRESSION: f64 = 0.25;
@@ -89,7 +89,7 @@ fn main() -> ExitCode {
             Ok(())
         }
         "budget" => budget(),
-        "perf" => perf(),
+        "perf" => perf(&extra),
         "gate" => gate(),
         "release" => release(&extra),
         "verify-release" => macos::verify_release(&extra),
@@ -684,11 +684,13 @@ fn perf_failures(rss: u64, cpu: f64, frame: f64) -> Vec<String> {
     failures
 }
 
-/// The scripted 1,000-step run: one `read_file` call per request, then an answer.
-fn long_turn_scenario() -> rune_testkit::scenario::Scenario {
-    let lines: Vec<String> = (1..=1100).map(|line| format!("line {line}")).collect();
+/// The scripted long run: one `read_file` call per request, then an answer.
+fn long_turn_scenario(steps: usize) -> rune_testkit::scenario::Scenario {
+    let lines: Vec<String> = (1..=steps.saturating_add(100))
+        .map(|line| format!("line {line}"))
+        .collect();
     let workspace = std::iter::once(("data.txt".to_owned(), lines.join("\n") + "\n")).collect();
-    let mut turns: Vec<rune_testkit::scripted::Turn> = (1..=LONG_TURN_STEPS)
+    let mut turns: Vec<rune_testkit::scripted::Turn> = (1..=steps)
         .map(|step| {
             rune_testkit::scripted::Turn::call(
                 &format!("call_{step}"),
@@ -707,19 +709,23 @@ fn long_turn_scenario() -> rune_testkit::scenario::Scenario {
         global_args: Vec::new(),
         ask_args: Vec::new(),
         env: std::collections::BTreeMap::new(),
-        user_config: None,
+        // A window no run here can fill, so the measurement is the turn loop
+        // and never a compaction (1,000 steps come close to 80% of 128k).
+        user_config: Some(
+            "[models.chat_completions]\nid = \"scripted\"\ncontext_window = 100000000\n".to_owned(),
+        ),
         timeout_s: 600,
         turns,
         expect: rune_testkit::scenario::Expect {
             exit_code: Some(0),
-            requests: Some(LONG_TURN_STEPS + 1),
+            requests: Some(steps.saturating_add(1)),
             ..Default::default()
         },
     }
 }
 
 /// Runs the long turn under `time` and returns its peak memory and CPU.
-fn measure_long_turn(binary: &Path) -> Result<TimeUsage, String> {
+fn measure_long_turn(binary: &Path, steps: usize) -> Result<TimeUsage, String> {
     let time = Path::new("/usr/bin/time");
     if !time.exists() {
         return Err("perf needs /usr/bin/time".to_owned());
@@ -730,15 +736,17 @@ fn measure_long_turn(binary: &Path) -> Result<TimeUsage, String> {
         "-v"
     };
     let wrapper = vec!["/usr/bin/time".to_owned(), flag.to_owned()];
-    let scenario = long_turn_scenario();
+    let scenario = long_turn_scenario(steps);
     let provider =
         rune_testkit::scripted::ScriptedProvider::start_without_bodies(scenario.turns.clone());
     let report = rune_testkit::scenario::run_wrapped(binary, &wrapper, &scenario, provider);
     let failures = rune_testkit::scenario::check(&scenario, &report);
     if !failures.is_empty() {
+        let tail: Vec<&str> = report.stderr.lines().rev().take(25).collect();
         return Err(format!(
-            "long-turn scenario did not finish: {}",
-            failures.join("; ")
+            "long-turn scenario did not finish: {}\n{}",
+            failures.join("; "),
+            tail.into_iter().rev().collect::<Vec<_>>().join("\n")
         ));
     }
     parse_time_output(&report.stderr).ok_or_else(|| {
@@ -773,10 +781,33 @@ fn measure_first_frame(binary: &Path) -> Result<f64, String> {
 }
 
 /// Measures long-turn memory and CPU and the time to the first frame.
-fn perf() -> Result<(), String> {
+///
+/// `--steps N` (not in the help) runs only the long turn at another length
+/// and prints its numbers, for checking how cost grows with the turn.
+fn perf(extra: &[String]) -> Result<(), String> {
+    let steps = match extra {
+        [] => None,
+        [flag, value] if flag == "--steps" => Some(
+            value
+                .parse::<usize>()
+                .ok()
+                .filter(|steps| *steps > 0)
+                .ok_or_else(|| format!("--steps needs a positive whole number, not `{value}`"))?,
+        ),
+        _ => return Err(format!("perf: unexpected arguments {extra:?}")),
+    };
     cargo(&["build", "--release", "-p", "rune"])?;
     let binary = release_binary_path();
-    let usage = measure_long_turn(&binary)?;
+    if let Some(steps) = steps {
+        let usage = measure_long_turn(&binary, steps)?;
+        println!(
+            "long turn    {steps} steps: peak resident {:.1} MiB, cpu {:.2} s",
+            usage.peak_rss_bytes as f64 / 1_048_576.0,
+            usage.cpu_seconds
+        );
+        return Ok(());
+    }
+    let usage = measure_long_turn(&binary, LONG_TURN_STEPS)?;
     let frame = measure_first_frame(&binary)?;
     let mib = |bytes: u64| bytes as f64 / 1_048_576.0;
     println!(

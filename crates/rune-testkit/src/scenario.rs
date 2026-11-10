@@ -187,6 +187,15 @@ fn write_user_config(root: &Path, scenario: &Scenario) {
     if let Some(text) = &scenario.user_config {
         let directory = root.join("config").join("rune");
         std::fs::create_dir_all(&directory).expect("a configuration directory");
+        // Rune refuses a configuration directory others can read.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            for private in [root.join("config"), directory.clone()] {
+                std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o700))
+                    .expect("a private configuration directory");
+            }
+        }
         std::fs::write(directory.join("config.toml"), text).expect("a configuration file");
     }
 }

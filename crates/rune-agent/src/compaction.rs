@@ -23,7 +23,7 @@ use rune_net::stream::{FinishReason, Usage};
 use rune_net::transport::{self, RequestTimeouts};
 
 use crate::history::History;
-use crate::tokens::{CapacityDecision, Estimate, UsageTotals, decide_capacity};
+use crate::tokens::{CapacityDecision, Estimate, UsageTotals, decide_capacity, trigger_percent};
 use crate::turn::{self, Event, Host};
 
 /// A model's context window, in tokens.
@@ -78,20 +78,31 @@ pub fn request_estimate(
     plan: &RequestPlan,
     window: Window,
 ) -> Result<Estimate> {
+    encode_request(dialect, plan, window).map(|(_, estimate)| estimate)
+}
+
+/// Serializes the request exactly as the transport would and estimates it.
+///
+/// The text is what `transport::stream_completion_encoded` can send, so the
+/// request is serialized once for both purposes.
+pub fn encode_request(
+    dialect: &dyn Provider,
+    plan: &RequestPlan,
+    window: Window,
+) -> Result<(String, Estimate)> {
     let body = dialect.build_request(plan)?;
-    let bytes = serde_json::to_vec(&body)
-        .map_err(|err| RuneError::new(ErrorCode::Internal, err.to_string()))?
-        .len() as u64;
+    let encoded = serde_json::to_string(&body)
+        .map_err(|err| RuneError::new(ErrorCode::Internal, err.to_string()))?;
+    let bytes = encoded.len() as u64;
     // Include dialect defaults such as Anthropic's max_tokens reserve.
     let output = ["max_tokens", "max_completion_tokens", "max_output_tokens"]
         .iter()
         .find_map(|key| body.get(key).and_then(serde_json::Value::as_u64))
         .unwrap_or(0);
     let capacity = crate::tokens::usable_input_tokens(window.0, output);
-    Ok(Estimate::new(
-        bytes,
-        crate::tokens::estimate_tokens(bytes),
-        capacity,
+    Ok((
+        encoded,
+        Estimate::new(bytes, crate::tokens::estimate_tokens(bytes), capacity),
     ))
 }
 
@@ -183,8 +194,28 @@ pub fn auto_compact(
     client: &dyn Fetch,
     window: Window,
 ) -> Result<Option<AutoCompaction>> {
+    auto_compact_encoded(history, request, host, client, window).map(|(done, _)| done)
+}
+
+/// [`auto_compact`], also returning the request serialized as it now stands,
+/// for a host that sends it through `Host::take_encoded_request`.
+pub fn auto_compact_encoded(
+    history: &mut History,
+    request: &mut RequestPlan,
+    host: &dyn Host,
+    client: &dyn Fetch,
+    window: Window,
+) -> Result<(Option<AutoCompaction>, String)> {
     let limits = host.limits();
-    let estimate = request_estimate(host.dialect(), request, window)?;
+    let (encoded, estimate) = encode_request(host.dialect(), request, window)?;
+    // A request under the trigger needs no look at the retained tail, which
+    // costs a second serialization of nearly the whole conversation: the tail
+    // is smaller, so it fits whenever the whole request does.
+    if estimate.total_tokens() <= estimate.capacity
+        && estimate.used_percent() < trigger_percent(&limits)
+    {
+        return Ok((None, encoded));
+    }
     let compaction_plan = plan(history, &limits);
     let retained_estimate = if let Some(cut) = &compaction_plan {
         let mut retained_plan = request.clone();
@@ -196,13 +227,13 @@ pub fn auto_compact(
         estimate
     };
     match trigger(&estimate, &retained_estimate, &limits) {
-        Trigger::NotNeeded | Trigger::Approaching => return Ok(None),
+        Trigger::NotNeeded | Trigger::Approaching => return Ok((None, encoded)),
         Trigger::Impossible => return Err(cannot_fit_error()),
         Trigger::Required => {}
     }
     let Some(compaction_plan) = compaction_plan else {
         // A short conversation can cross the trigger while still fitting.
-        return Ok(None);
+        return Ok((None, encoded));
     };
     let cancellation = host.cancellation();
     let report = compact(history, &compaction_plan, host, client, None, &|| {
@@ -211,7 +242,7 @@ pub fn auto_compact(
     host.context_replaced(&report);
     request.instructions = host.instructions();
     request.messages = history.to_messages();
-    let after = request_estimate(host.dialect(), request, window)?;
+    let (encoded, after) = encode_request(host.dialect(), request, window)?;
     host.emit(Event::ContextCompacted {
         removed_turns: report.removed_turns,
         remaining_turns: history.len(),
@@ -221,11 +252,14 @@ pub fn auto_compact(
     if after.input_tokens > estimate.capacity {
         return Err(cannot_fit_error());
     }
-    Ok(Some(AutoCompaction {
-        report,
-        before_tokens: estimate.input_tokens,
-        after_tokens: after.input_tokens,
-    }))
+    Ok((
+        Some(AutoCompaction {
+            report,
+            before_tokens: estimate.input_tokens,
+            after_tokens: after.input_tokens,
+        }),
+        encoded,
+    ))
 }
 
 /// Instruction given to the summarizer.

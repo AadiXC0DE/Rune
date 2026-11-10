@@ -383,39 +383,62 @@ impl SessionStore {
     /// Once the event sync succeeds, projection failure cannot fail the append.
     /// Callers should report `metadata_warning` without retrying the event.
     pub fn append(&self, event: SessionEvent) -> Result<AppendReport> {
-        let mut projection = self.projection.borrow_mut();
-        let seq = projection.last_seq.next();
-        let timestamp_ms = event::now_millis().max(projection.last_ts);
-        let frame = EventFrame::new(seq, timestamp_ms, event);
-        let line = frame.encode()?;
+        self.append_all(std::iter::once(event))
+    }
 
-        let mut bytes = line.into_bytes();
-        bytes.push(b'\n');
-        event::check_log_capacity(projection.bytes, bytes.len())?;
+    /// Appends several events with one write, one sync and one metadata
+    /// refresh, returning the report of the last.
+    ///
+    /// The whole batch is checked against the log's capacity before anything
+    /// is written, so a batch that would not fit leaves the log unchanged. A
+    /// batch of one is exactly `append`.
+    pub fn append_all(
+        &self,
+        events: impl IntoIterator<Item = SessionEvent>,
+    ) -> Result<AppendReport> {
+        let mut projection = self.projection.borrow_mut();
+        let mut staged = projection.clone();
+        let mut bytes = Vec::new();
+        for event in events {
+            let seq = staged.last_seq.next();
+            let timestamp_ms = event::now_millis().max(staged.last_ts);
+            let frame = EventFrame::new(seq, timestamp_ms, event);
+            let mut line = frame.encode()?.into_bytes();
+            line.push(b'\n');
+            event::check_log_capacity(staged.bytes, line.len())?;
+            staged.bytes = staged.bytes.saturating_add(line.len() as u64);
+            staged.frames = staged.frames.saturating_add(1);
+            staged.last_seq = seq;
+            staged.last_ts = timestamp_ms;
+            match frame.event {
+                SessionEvent::TurnStarted { .. } => {
+                    staged.turns = staged.turns.saturating_add(1);
+                }
+                SessionEvent::UsageRecorded {
+                    input_tokens,
+                    output_tokens,
+                } => staged.usage.record(input_tokens, output_tokens),
+                SessionEvent::TitleSet { title } => staged.title = Some(title),
+                SessionEvent::WorkspaceSet { workspace } => {
+                    staged.workspace = Some(workspace.clone());
+                }
+                SessionEvent::ChildOf { parent } => staged.parent = Some(parent.clone()),
+                _ => {}
+            }
+            bytes.extend_from_slice(&line);
+        }
+        let seq = staged.last_seq;
+        if bytes.is_empty() {
+            return Ok(AppendReport {
+                seq,
+                metadata_warning: None,
+            });
+        }
 
         let file = &self.log;
         (&*file).write_all(&bytes)?;
         file.sync_data()?;
-
-        projection.bytes = projection.bytes.saturating_add(bytes.len() as u64);
-        projection.frames = projection.frames.saturating_add(1);
-        projection.last_seq = seq;
-        projection.last_ts = timestamp_ms;
-        match frame.event {
-            SessionEvent::TurnStarted { .. } => {
-                projection.turns = projection.turns.saturating_add(1);
-            }
-            SessionEvent::UsageRecorded {
-                input_tokens,
-                output_tokens,
-            } => projection.usage.record(input_tokens, output_tokens),
-            SessionEvent::TitleSet { title } => projection.title = Some(title),
-            SessionEvent::WorkspaceSet { workspace } => {
-                projection.workspace = Some(workspace.clone());
-            }
-            SessionEvent::ChildOf { parent } => projection.parent = Some(parent.clone()),
-            _ => {}
-        }
+        *projection = staged;
 
         // Refreshed after every durable append. Until replacement completes,
         // readers can still see the previous complete projection.
@@ -793,6 +816,65 @@ mod tests {
                 truncated_at: None
             }
         );
+    }
+
+    #[test]
+    fn a_batch_appends_like_single_events_and_refreshes_metadata_once() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let (_paths, store) = store_in(&root);
+        store.append(user("before")).expect("append");
+        let events = vec![
+            SessionEvent::TurnStarted { turn: 1 },
+            user("first"),
+            SessionEvent::UsageRecorded {
+                input_tokens: 12,
+                output_tokens: 4,
+            },
+            SessionEvent::TitleSet {
+                title: "a title".to_owned(),
+            },
+        ];
+        let report = store.append_all(events.clone()).expect("batch");
+        assert!(report.metadata_warning.is_none());
+        assert_eq!(report.seq, EventSeq(5));
+        assert_eq!(store.next_seq(), EventSeq(6));
+
+        let read = store.read().expect("read");
+        assert_eq!(read.events.len(), 5);
+        for (frame, event) in read.events[1..].iter().zip(events.iter()) {
+            assert_eq!(&frame.event, event);
+        }
+        let seqs: Vec<u64> = read.events.iter().map(|frame| frame.seq.0).collect();
+        assert_eq!(seqs, [1, 2, 3, 4, 5]);
+        assert_eq!(read.turns, 1);
+        assert_eq!(read.usage.input_tokens, 12);
+        assert_eq!(read.title.as_deref(), Some("a title"));
+        let metadata = std::fs::read_to_string(store.metadata_path()).expect("metadata");
+        assert!(metadata.contains("\"events\": 5"), "{metadata}");
+
+        // An empty batch writes nothing.
+        let report = store.append_all(Vec::new()).expect("empty batch");
+        assert_eq!(report.seq, EventSeq(5));
+        assert_eq!(store.read().expect("read").events.len(), 5);
+    }
+
+    #[test]
+    fn a_batch_over_the_log_limit_writes_none_of_it() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let (_paths, store) = store_in(&root);
+        store.append(user("kept")).expect("append");
+        let before = std::fs::read(store.events_path()).expect("log");
+        // Room for one more small event, not two.
+        store.projection.borrow_mut().bytes = event::MAX_LOG_BYTES - 150;
+        let err = store
+            .append_all([user("one"), user("two")])
+            .expect_err("over the limit");
+        assert_eq!(err.detail().invariant.as_deref(), Some("log_size"));
+        assert_eq!(std::fs::read(store.events_path()).expect("log"), before);
+        assert_eq!(store.next_seq(), EventSeq(2));
+        store
+            .append(user("one"))
+            .expect("a single event still fits");
     }
 
     #[test]

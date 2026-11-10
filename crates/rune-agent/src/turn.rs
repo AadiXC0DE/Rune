@@ -337,6 +337,15 @@ pub trait Host {
     /// Hosts may retain finish metadata needed by their output contract.
     fn observe_response(&self, _outcome: &StreamOutcome) {}
 
+    /// Returns the request body `prepare_request` serialized, when it
+    /// serialized the plan exactly as it left it, so the loop sends that text
+    /// instead of serializing the whole conversation a second time.
+    ///
+    /// A host that changes the plan after serializing it returns `None`.
+    fn take_encoded_request(&self) -> Option<String> {
+        None
+    }
+
     /// Called after a summary is accepted and before it replaces earlier turns.
     fn before_compaction(&self, _history: &History) {}
 
@@ -1268,7 +1277,11 @@ fn stream_with_retry(
         plan.provider_order = host.provider_order();
         plan.provider_strict = host.provider_strict();
         host.prepare_request(history, &mut plan, client)?;
+        let encoded = host.take_encoded_request();
         cancellation.check()?;
+        // An active objective caps the output tokens here, which changes the
+        // request, so the host's serialization no longer matches it.
+        let encoded = encoded.filter(|_| host.objective_tokens_remaining().is_none());
         let mut accounting = ObjectiveAccounting::begin(host, &mut plan)?;
 
         // Each event is handed to the host as it is decoded, so text appears
@@ -1292,11 +1305,12 @@ fn stream_with_retry(
             }
         };
 
-        let response = transport::stream_completion_observed(
+        let response = transport::stream_completion_encoded(
             client,
             host.endpoint(),
             host.dialect(),
             &plan,
+            encoded,
             timeouts,
             &|| cancellation.is_cancelled(),
             &mut observe,

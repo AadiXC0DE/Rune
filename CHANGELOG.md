@@ -46,6 +46,9 @@ Notable changes, newest first. Each entry describes what a user can observe.
 - A call that already failed the same way `max_consecutive_tool_failures` times
   is refused with a nudge and the turn goes on; sending it again after two
   refusals stops the run as `stalled`, instead of the turn ending at once.
+- A 1,000-step `rune ask` run uses about a quarter of the CPU it did: the saved
+  session is written with one sync instead of one per event, and each request is
+  serialized once instead of twice.
 - The startup work budgets for `--version` and `--help` are 2 ms each, down from
   5 ms and 8 ms.
 - The tool schemas sent with each request fell from 17,379 to 9,154 bytes in

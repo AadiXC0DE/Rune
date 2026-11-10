@@ -216,6 +216,17 @@ impl CapacityDecision {
 /// Percentage points below the trigger at which the caller is warned.
 const APPROACHING_BAND_PERCENT: u8 = 10;
 
+/// The percent of usable input at which a request is compacted.
+#[must_use]
+pub fn trigger_percent(limits: &BudgetSet) -> u8 {
+    u8::try_from(
+        limits
+            .get_usize(LimitName::CompactionTriggerPercent)
+            .min(99),
+    )
+    .unwrap_or(80)
+}
+
 /// Decides what to do about the current capacity.
 ///
 /// The trigger is a percentage of usable input, taken from the limits so it can
@@ -230,12 +241,7 @@ pub fn decide_capacity(
     retained_estimate: &Estimate,
     limits: &BudgetSet,
 ) -> CapacityDecision {
-    let trigger = u8::try_from(
-        limits
-            .get_usize(LimitName::CompactionTriggerPercent)
-            .min(99),
-    )
-    .unwrap_or(80);
+    let trigger = trigger_percent(limits);
     let used = estimate.used_percent();
 
     if retained_estimate.total_tokens() > estimate.capacity {

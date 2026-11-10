@@ -63,6 +63,8 @@ struct TestHost {
     workspace: Utf8PathBuf,
     limits: BudgetSet,
     objective_budget: Mutex<Option<(u64, u64)>>,
+    /// Body handed to the loop in place of its own serialization, once.
+    encoded_request: Mutex<Option<String>>,
     /// Models what a host does with an unresolved call in `auto` mode: review
     /// it and, when nothing is concerning, allow it. A host that cannot review
     /// leaves the call unresolved, which the loop reports rather than running.
@@ -107,6 +109,7 @@ impl TestHost {
             workspace: Utf8PathBuf::from("/tmp/rune-test"),
             limits: BudgetSet::new(),
             objective_budget: Mutex::new(None),
+            encoded_request: Mutex::new(None),
             resolve_ask: true,
             private_authority: None,
             private_decisions: Mutex::new(Vec::new()),
@@ -259,6 +262,10 @@ impl Host for TestHost {
         } else {
             Box::new(rune_net::transport::UreqFetch::new())
         }
+    }
+
+    fn take_encoded_request(&self) -> Option<String> {
+        self.encoded_request.lock().expect("encoded").take()
     }
 
     fn objective_tokens_remaining(&self) -> Option<u64> {
@@ -2459,6 +2466,66 @@ fn compact_leaves_history_unchanged_on_a_short_summary() {
         err.message()
     );
     assert_eq!(history.turns(), before.turns());
+}
+
+#[test]
+fn a_host_encoded_request_is_sent_as_given() {
+    let endpoint = MockEndpoint::start(vec![Script::text("done")]);
+    let host = TestHost::new(endpoint);
+    *host.encoded_request.lock().expect("encoded") = Some(
+        r#"{"model":"test-model","stream":true,"messages":[{"role":"user","content":"hi"}],"marker":"from the host"}"#
+            .to_owned(),
+    );
+    let mut history = rune_agent::History::new();
+    history.push_user("hello");
+    run_turn(&mut history, &host).expect("turn");
+    let body = host
+        .server
+        .as_ref()
+        .expect("endpoint")
+        .last_body()
+        .expect("body");
+    assert_eq!(body["marker"], "from the host");
+}
+
+#[test]
+fn an_active_objective_discards_the_host_encoded_request() {
+    // The objective caps output tokens after the host serialized the plan,
+    // so its text no longer matches and the loop serializes afresh.
+    let endpoint = MockEndpoint::start(vec![Script::text("done")]);
+    let host = TestHost::new(endpoint);
+    *host.objective_budget.lock().expect("budget") = Some((100_000, 0));
+    *host.encoded_request.lock().expect("encoded") =
+        Some(r#"{"model":"test-model","stream":true,"messages":[],"marker":"stale"}"#.to_owned());
+    let mut history = rune_agent::History::new();
+    history.push_user("hello");
+    run_turn(&mut history, &host).expect("turn");
+    let body = host
+        .server
+        .as_ref()
+        .expect("endpoint")
+        .last_body()
+        .expect("body");
+    assert!(body.get("marker").is_none(), "{body}");
+    assert!(body["messages"].to_string().contains("hello"), "{body}");
+}
+
+#[test]
+fn encode_request_matches_the_transport_body() {
+    let (host, history) = compactable(MockEndpoint::start(Vec::new()));
+    let mut plan = rune_net::provider::RequestPlan::new("test-model");
+    plan.instructions = "instructions".to_owned();
+    plan.messages = history.to_messages();
+    plan.tools = vec![read_tool()];
+    let (encoded, estimate) = rune_agent::compaction::encode_request(
+        host.dialect.as_ref(),
+        &plan,
+        rune_agent::compaction::Window(100_000),
+    )
+    .expect("encoded");
+    let body = host.dialect.build_request(&plan).expect("body");
+    assert_eq!(encoded, serde_json::to_string(&body).expect("json"));
+    assert_eq!(estimate.serialized_bytes, encoded.len() as u64);
 }
 
 fn single_attempt(mut host: TestHost) -> TestHost {
