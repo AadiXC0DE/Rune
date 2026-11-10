@@ -1090,7 +1090,9 @@ mod tests {
         write_task(
             &root,
             "hang",
-            r#"{"prompt":"p","verify":"true","timeoutMs":1500}"#,
+            // Long enough for a loaded machine to start the shell and write the
+            // pid before the timeout fires.
+            r#"{"prompt":"p","verify":"true","timeoutMs":5000}"#,
         );
         let pidfile = root.join("child.pid");
         let agent = fake_agent(&root, &format!("sleep 30 & echo $! > {pidfile}; wait"));
@@ -1137,13 +1139,29 @@ mod tests {
         let (_dir, root) = temp_root();
         write_task(&root, "b", r#"{"prompt":"p","verify":"true"}"#);
         write_task(&root, "a", r#"{"prompt":"p","verify":"true"}"#);
-        let agent = fake_agent(&root, "sleep 2; echo '{\"steps\":1}'");
+        // Each run marks that it started, then waits for the other to start.
+        // Run one after the other, the first would give up and report no steps.
+        let agent = fake_agent(
+            &root,
+            &format!(
+                "touch {root}/started.$$\n\
+                 i=0\n\
+                 while [ $i -lt 200 ]; do\n\
+                 set -- {root}/started.*\n\
+                 if [ $# -ge 2 ]; then echo '{{\"steps\":1}}'; exit 0; fi\n\
+                 sleep 0.05; i=$((i+1))\n\
+                 done\n\
+                 echo '{{\"steps\":0}}'"
+            ),
+        );
         let found = discover(&root).expect("discovered");
-        let started = Instant::now();
         let runs = run_all(&agent, &[], &found, 1, 2, None, &|_| {}).expect("runs");
-        assert!(started.elapsed() < Duration::from_millis(3500));
         let ids: Vec<&str> = runs.iter().map(|run| run.task.as_str()).collect();
         assert_eq!(ids, ["a", "b"]);
+        assert!(
+            runs.iter().all(|run| run.steps == 1),
+            "the runs did not overlap"
+        );
     }
 
     #[test]
