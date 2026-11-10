@@ -2129,3 +2129,67 @@ fn ask_max_steps_rejects_a_non_number() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("is not a whole number"), "{stderr}");
 }
+
+#[test]
+fn ask_refuses_an_unknown_experiment_key_before_any_request() {
+    let (output, _dir, requests) = run_responses_fixture_command(
+        Vec::new(),
+        Some("--json"),
+        true,
+        None,
+        (&["ask"], &[]),
+        |_, command| {
+            command.env("RUNE_EXPERIMENT", "snapshot=on");
+        },
+    );
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(requests.is_empty());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stderr.contains("unknown experiment key") || stdout.contains("unknown experiment key"),
+        "{output:?}"
+    );
+}
+
+#[test]
+fn ask_json_names_the_experiment_that_ran() {
+    let (output, _dir, requests) = run_responses_fixture_command(
+        vec![completion_response(&json!({"content": "Done."}), "stop")],
+        Some("--json"),
+        true,
+        None,
+        (&["ask"], &[]),
+        |_, command| {
+            command.env("RUNE_EXPERIMENT", "run_note=off");
+        },
+    );
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let result: Value = serde_json::from_slice(&output.stdout).expect("one JSON result");
+    assert_eq!(result["experiment"], "run_note=off");
+    assert_eq!(requests.len(), 1);
+    assert!(!requests[0].to_string().contains("<run_context>"));
+}
+
+#[test]
+fn rune_tool_text_changes_the_advertised_description() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let text = dir.path().join("tool-text.json");
+    std::fs::write(&text, r#"{"shell":{"description":"Run a command."}}"#).expect("tool text");
+    let output = Command::new(env!("CARGO_BIN_EXE_rune"))
+        .args(["prompt", "--tools"])
+        .current_dir(dir.path())
+        .env("RUNE_HOME", dir.path().join("state"))
+        .env("XDG_CONFIG_HOME", dir.path().join("config"))
+        .env("XDG_DATA_HOME", dir.path().join("data"))
+        .env("RUNE_TOOL_TEXT", &text)
+        .output()
+        .expect("run binary");
+    assert!(output.status.success(), "{output:?}");
+    let shell = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .find(|spec| spec["name"] == "shell")
+        .expect("shell advertised");
+    assert_eq!(shell["description"], "Run a command.");
+}

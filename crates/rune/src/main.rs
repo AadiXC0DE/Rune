@@ -152,11 +152,15 @@ fn run(launch: &Launch) -> Result<ExitCode> {
         let config_override = std::env::var("RUNE_CONFIG").ok();
         let config_file = paths.config_file(config_override.as_deref());
         let env = EnvironmentOverrides::from_process();
-        config::load(
+        let mut settings = config::load(
             Some(&workspace.join(".rune.toml")),
             Some(&config_file),
             &env,
-        )
+        );
+        // A typo in a switch ends the run before any request.
+        settings.experiments =
+            rune_core::experiment::Experiments::from_lookup(|key| std::env::var(key).ok())?;
+        settings
     } else {
         Settings::default()
     };
@@ -605,6 +609,8 @@ fn run_interactive(
             Some(&paths.config_file(std::env::var("RUNE_CONFIG").ok().as_deref())),
             &EnvironmentOverrides::from_process(),
         );
+        settings.experiments =
+            rune_core::experiment::Experiments::from_lookup(|key| std::env::var(key).ok())?;
         cli::apply_to_settings(launch, &mut settings);
         // The connection flow has already named what it connected, so the
         // session says only what it is doing next.

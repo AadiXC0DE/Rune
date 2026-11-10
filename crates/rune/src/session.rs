@@ -426,9 +426,11 @@ impl Host for SessionHost {
     }
 
     fn instructions(&self) -> String {
-        let mut instructions =
-            self.mapped
-                .get(&self.instructions, self.context.workspace(), &self.limits);
+        let mut instructions = self.mapped.get(
+            &self.instructions,
+            self.context.workspace(),
+            &crate::ask::map_limits(&self.limits, self.permission_settings.experiments),
+        );
         if let Some(recorder) = &self.recorder {
             let recorder = recorder
                 .lock()
@@ -6507,6 +6509,9 @@ fn session_registry(
         Some((settings.clone(), paths.clone())),
     );
     registry.insert(subagent.registered())?;
+    if let Some(text) = rune_tools::tool_text::from_env()? {
+        registry.set_tool_text(text)?;
+    }
     Ok((registry, subagent))
 }
 

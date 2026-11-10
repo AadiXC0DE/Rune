@@ -129,6 +129,38 @@ fn first_message(prompt: &str, tool_loop: bool, read_only: bool) -> String {
     format!("{prompt}\n\n{note}")
 }
 
+/// The limits instructions are built with, after the `map` experiment: `off`
+/// turns the repository map off, `on` turns it on at its default size when the
+/// configured size is zero.
+pub(crate) fn map_limits(
+    limits: &BudgetSet,
+    experiments: rune_core::experiment::Experiments,
+) -> std::borrow::Cow<'_, BudgetSet> {
+    let bytes = match experiments.map {
+        None => return std::borrow::Cow::Borrowed(limits),
+        Some(false) => Budget::Bounded(0),
+        Some(true) => {
+            if limits
+                .get(LimitName::RepositoryMapBytes)
+                .value()
+                .unwrap_or(0)
+                > 0
+            {
+                return std::borrow::Cow::Borrowed(limits);
+            }
+            LimitName::RepositoryMapBytes.default_value()
+        }
+    };
+    let mut forced = limits.clone();
+    if forced
+        .set(LimitName::RepositoryMapBytes, bytes, Layer::Environment)
+        .is_err()
+    {
+        return std::borrow::Cow::Borrowed(limits);
+    }
+    std::borrow::Cow::Owned(forced)
+}
+
 /// Reads a dollar amount with at most two decimals, such as `2.50`, as cents.
 #[must_use]
 pub fn parse_cents(raw: &str) -> Option<u64> {
@@ -475,6 +507,9 @@ pub struct JsonResult {
     /// prices of a cached model catalog. Absent when no price is known.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cost_usd: Option<String>,
+    /// Experiment keys that differ from the default, as `key=value` pairs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub experiment: Option<String>,
     /// Whether a check ran after the last change to a file: `verified`,
     /// `unverified`, or `not_applicable` when nothing changed. Absent when the
     /// run failed before finishing.
@@ -528,6 +563,7 @@ impl JsonResult {
             repaired_calls: 0,
             narration: Vec::new(),
             cost_usd: None,
+            experiment: None,
             verification: None,
             error: Some(error.message().to_owned()),
             error_code: Some(error.code()),
@@ -682,8 +718,11 @@ impl Host for AskHost<'_> {
     }
 
     fn instructions(&self) -> String {
-        self.mapped
-            .get(&self.instructions, self.context.workspace(), &self.limits)
+        self.mapped.get(
+            &self.instructions,
+            self.context.workspace(),
+            &map_limits(&self.limits, self.settings.experiments),
+        )
     }
 
     fn tools(&self) -> Vec<ToolSpec> {
@@ -1095,13 +1134,20 @@ pub fn run(
                 edit_tool: rune_net::compat::edit_tool(settings.edit_tool, &settings.model),
             },
         );
+        if let Some(text) = rune_tools::tool_text::from_env()? {
+            registry.set_tool_text(text)?;
+        }
         registry
     } else {
         Registry::new()
     };
     let mut history = History::new();
     let mut parts = vec![ContentPart::Text {
-        text: first_message(&options.prompt, options.tool_loop, options.read_only),
+        text: first_message(
+            &options.prompt,
+            options.tool_loop && settings.experiments.run_note,
+            options.read_only,
+        ),
     }];
     parts.extend(attachments.parts());
     history.prepend(rune_net::message::Role::User, parts);
@@ -1343,6 +1389,7 @@ pub fn run(
         cost_usd: crate::provider_setup::cached_prices(settings, paths)
             .and_then(|prices| prices.cost(&usage))
             .map(rune_net::models_dev::dollars),
+        experiment: Some(settings.experiments.render()).filter(|keys| !keys.is_empty()),
         verification: error.is_none().then(|| outcome.verification.as_str()),
         error: error.as_ref().map(|error| error.message().to_owned()),
         error_code: error.as_ref().map(RuneError::code),
@@ -1974,6 +2021,7 @@ mod tests {
             repaired_calls: 0,
             narration: Vec::new(),
             cost_usd: None,
+            experiment: None,
             verification: Some("not_applicable"),
             error: None,
             error_code: None,

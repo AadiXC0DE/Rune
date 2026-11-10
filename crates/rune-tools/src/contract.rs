@@ -689,7 +689,17 @@ pub const MAX_DESCRIPTION_BYTES: usize = 1024;
 /// Describes a tool for the model.
 #[must_use]
 pub fn model_spec(tool: &dyn Tool) -> ToolSpec {
-    let mut description = tool.description().to_owned();
+    ToolSpec {
+        name: tool.name().to_owned(),
+        description: bounded_description(tool.description()),
+        input_schema: tool.input_schema(),
+    }
+}
+
+/// A tool description cut to [`MAX_DESCRIPTION_BYTES`].
+#[must_use]
+pub fn bounded_description(text: &str) -> String {
+    let mut description = text.to_owned();
     if description.len() > MAX_DESCRIPTION_BYTES {
         // Truncation is explicit rather than silent, because a description cut
         // mid-sentence without a marker looks like a bug in the tool.
@@ -697,11 +707,7 @@ pub fn model_spec(tool: &dyn Tool) -> ToolSpec {
         description.truncate(end);
         description.push_str("... [truncated]");
     }
-    ToolSpec {
-        name: tool.name().to_owned(),
-        description,
-        input_schema: tool.input_schema(),
-    }
+    description
 }
 
 #[cfg(test)]

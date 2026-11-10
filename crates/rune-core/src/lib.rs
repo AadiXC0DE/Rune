@@ -12,6 +12,7 @@
 pub mod budget;
 pub mod config;
 pub mod error;
+pub mod experiment;
 pub mod id;
 pub mod paths;
 pub mod tool;

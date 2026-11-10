@@ -23,6 +23,7 @@ pub mod shell;
 pub mod skill;
 pub mod syntax_diagnostics;
 pub mod test_report;
+pub mod tool_text;
 pub mod update_plan;
 pub mod vision;
 pub mod web;

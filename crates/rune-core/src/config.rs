@@ -687,6 +687,8 @@ pub struct Settings {
     pub web_tools: bool,
     /// Which file-edit tool models are offered.
     pub edit_tool: EditToolSetting,
+    /// Switches for behaviour under measurement, from `RUNE_EXPERIMENT`.
+    pub experiments: crate::experiment::Experiments,
     /// Whether sandboxed shell commands may use the network.
     pub shell_network: bool,
     /// The configured cache directory list, replacing the defaults when set.
@@ -768,6 +770,7 @@ impl Default for Settings {
             post_tool_hook: None,
             web_tools: false,
             edit_tool: EditToolSetting::Auto,
+            experiments: crate::experiment::Experiments::default(),
             shell_network: false,
             sandbox_cache_roots: None,
             context_window: None,
