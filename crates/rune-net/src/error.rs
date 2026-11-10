@@ -324,7 +324,9 @@ impl NetError {
         }
 
         if kind == FailureKind::ContextTooLong {
-            error = error.with_hint("reduce the conversation or start a new session");
+            error = error.with_hint(
+                "the conversation no longer fits the model's context window; start a new session or lower the size of tool results",
+            );
         }
         if kind == FailureKind::Unauthorized {
             error = error.with_hint("check the credential for this provider");

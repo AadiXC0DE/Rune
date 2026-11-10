@@ -21,6 +21,7 @@ const SCENARIOS: &[&str] = &[
     "provider_fails_at_step_4",
     "same_failure_five_times",
     "ask_compacts",
+    "context_overflow",
 ];
 
 /// Scenarios built in Rust, which have no file.
@@ -141,6 +142,11 @@ fn ask_compacts() {
         .sum();
     let result = report.result.expect("a result");
     assert_eq!(result["usage"]["input_tokens"], billed, "{result}");
+}
+
+#[test]
+fn context_overflow() {
+    run_scenario("context_overflow");
 }
 
 #[test]

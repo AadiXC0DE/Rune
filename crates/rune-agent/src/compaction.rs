@@ -181,6 +181,37 @@ pub fn compact(
     })
 }
 
+/// Compacts now, whatever the trigger says, for a request the provider
+/// refused as too long.
+///
+/// Returns `Ok(false)` when the history is too short to cut. The history's own
+/// size is measured before and after, for the compaction event.
+pub fn compact_now(history: &mut History, host: &dyn Host, client: &dyn Fetch) -> Result<bool> {
+    let Some(compaction_plan) = plan(history, &host.limits()) else {
+        return Ok(false);
+    };
+    let size = |history: &History| -> Result<u64> {
+        let bytes = serde_json::to_vec(&history.to_messages())
+            .map_err(|err| RuneError::new(ErrorCode::Internal, err.to_string()))?
+            .len() as u64;
+        Ok(crate::tokens::estimate_tokens(bytes))
+    };
+    let before_tokens = size(history)?;
+    let cancellation = host.cancellation();
+    let report = compact(history, &compaction_plan, host, client, None, &|| {
+        cancellation.is_cancelled()
+    })?;
+    host.context_replaced(&report);
+    let after_tokens = size(history)?;
+    host.emit(Event::ContextCompacted {
+        removed_turns: report.removed_turns,
+        remaining_turns: history.len(),
+        before_tokens,
+        after_tokens,
+    });
+    Ok(true)
+}
+
 /// Compacts before a request when the trigger says it must.
 ///
 /// Returns `Ok(None)` when no compaction was needed or none is possible yet

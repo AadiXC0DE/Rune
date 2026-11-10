@@ -1497,6 +1497,18 @@ impl rune_agent::turn::Host for SdkHost<'_> {
         }
     }
 
+    fn compact_now(
+        &self,
+        history: &mut History,
+        client: &dyn rune_net::fetch::Fetch,
+        _reason: rune_agent::turn::CompactReason,
+    ) -> Result<bool> {
+        if self.context.auto_compact.is_none() {
+            return Ok(false);
+        }
+        compaction::compact_now(history, self, client)
+    }
+
     fn context_replaced(&self, report: &compaction::CompactionReport) {
         // The summary request is billed like any other.
         self.context.store_usage(report.usage);

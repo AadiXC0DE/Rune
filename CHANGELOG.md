@@ -39,6 +39,11 @@ Notable changes, newest first. Each entry describes what a user can observe.
 - `rune ask` compacts a long run before it reaches the context window, as the
   interactive session does, and counts the summary requests in its usage and
   cost.
+- When a provider rejects a request as longer than the context window, the
+  interactive session, `rune ask`, the ACP server and an SDK agent with
+  `auto_compact` compact the conversation and send the step again, up to twice,
+  without using a provider attempt. Otherwise the error says to start a new
+  session or lower the size of tool results.
 - The ACP server compacts an editor session automatically before it outgrows
   the model's window; images attached to the current prompt are kept. The SDK
   offers the same as an option (`AgentOptions.auto_compact`, with

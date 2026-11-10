@@ -1332,6 +1332,15 @@ impl<W: Write + Send + 'static> Host for TurnHost<W> {
         Ok(())
     }
 
+    fn compact_now(
+        &self,
+        history: &mut History,
+        client: &dyn rune_net::fetch::Fetch,
+        _reason: rune_agent::turn::CompactReason,
+    ) -> Result<bool> {
+        rune_agent::compaction::compact_now(history, self, client)
+    }
+
     fn before_compaction(&self, history: &History) {
         let seq = self.prompt_seq.load(Ordering::Relaxed);
         let from_end = history

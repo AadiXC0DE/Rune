@@ -65,6 +65,8 @@ struct TestHost {
     objective_budget: Mutex<Option<(u64, u64)>>,
     /// Body handed to the loop in place of its own serialization, once.
     encoded_request: Mutex<Option<String>>,
+    /// Whether `compact_now` compacts, through the shared helper.
+    compacts: bool,
     /// Models what a host does with an unresolved call in `auto` mode: review
     /// it and, when nothing is concerning, allow it. A host that cannot review
     /// leaves the call unresolved, which the loop reports rather than running.
@@ -110,6 +112,7 @@ impl TestHost {
             limits: BudgetSet::new(),
             objective_budget: Mutex::new(None),
             encoded_request: Mutex::new(None),
+            compacts: false,
             resolve_ask: true,
             private_authority: None,
             private_decisions: Mutex::new(Vec::new()),
@@ -266,6 +269,18 @@ impl Host for TestHost {
 
     fn take_encoded_request(&self) -> Option<String> {
         self.encoded_request.lock().expect("encoded").take()
+    }
+
+    fn compact_now(
+        &self,
+        history: &mut rune_agent::History,
+        client: &dyn rune_net::fetch::Fetch,
+        _reason: rune_agent::turn::CompactReason,
+    ) -> Result<bool> {
+        if !self.compacts {
+            return Ok(false);
+        }
+        rune_agent::compaction::compact_now(history, self, client)
     }
 
     fn objective_tokens_remaining(&self) -> Option<u64> {
@@ -2526,6 +2541,72 @@ fn encode_request_matches_the_transport_body() {
     let body = host.dialect.build_request(&plan).expect("body");
     assert_eq!(encoded, serde_json::to_string(&body).expect("json"));
     assert_eq!(estimate.serialized_bytes, encoded.len() as u64);
+}
+
+/// Five read steps, then a request the provider refuses as too long.
+fn overflow_scripts(after: Vec<Script>) -> Vec<Script> {
+    let mut scripts: Vec<Script> = (1..=5)
+        .map(|n| {
+            Script::tool_call(
+                &format!("c{n}"),
+                "read_file",
+                &format!("{{\"path\":\"{n}.rs\"}}"),
+            )
+        })
+        .collect();
+    scripts.push(Script::Status {
+        code: 400,
+        body: "context length exceeded".to_owned(),
+    });
+    scripts.extend(after);
+    scripts
+}
+
+#[test]
+fn an_overflow_compacts_and_resends_the_step() {
+    let endpoint = MockEndpoint::start(overflow_scripts(vec![
+        Script::text("The user asked for five files to be read; all five were read."),
+        Script::text("finished"),
+    ]));
+    let mut host = single_attempt(TestHost::new(endpoint).with_tools(vec![read_tool()]));
+    host.compacts = true;
+    let mut history = rune_agent::History::new();
+    history.push_user("read five files");
+    let outcome = run_turn(&mut history, &host).expect("the step is resent");
+    assert_eq!(outcome.stop_reason, StopReason::Completed);
+    assert_eq!(outcome.text, "finished");
+    let events = host.events();
+    let compactions = events
+        .iter()
+        .filter(|event| matches!(event, Event::ContextCompacted { .. }))
+        .count();
+    assert_eq!(compactions, 1);
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, Event::StepRestarted { step: 6 })),
+        "{events:?}"
+    );
+    let body = host
+        .server
+        .as_ref()
+        .expect("endpoint")
+        .last_body()
+        .expect("body");
+    assert!(body.to_string().contains("<context_handoff>"), "{body}");
+    history.validate().expect("valid history");
+}
+
+#[test]
+fn a_host_without_compaction_reports_the_overflow_hint() {
+    let endpoint = MockEndpoint::start(overflow_scripts(Vec::new()));
+    let host = single_attempt(TestHost::new(endpoint).with_tools(vec![read_tool()]));
+    let mut history = rune_agent::History::new();
+    history.push_user("read five files");
+    let outcome = run_turn(&mut history, &host).expect("a partial outcome");
+    let error = outcome.error.expect("the overflow error");
+    assert_eq!(error.hint(), Some(rune_agent::turn::OVERFLOW_HINT));
+    assert_eq!(outcome.steps, 5);
 }
 
 fn single_attempt(mut host: TestHost) -> TestHost {

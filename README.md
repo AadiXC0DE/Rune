@@ -668,6 +668,8 @@ including one stopped at the token limit, preserves the conversation and stops
 that request with an explicit error. `rune ask` uses the configured
 `context_window`, else the cached models.dev window, else 128,000 tokens, and
 its reported usage and cost include the summary requests.
+A request the provider rejects as longer than the context window is compacted
+and sent again, at most twice per step and without using a provider attempt.
 
 Use `/compact preview` to see the exact counts of conversation records that
 manual compaction would summarize and retain verbatim. Records are the current

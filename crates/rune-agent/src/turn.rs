@@ -346,6 +346,19 @@ pub trait Host {
         None
     }
 
+    /// Compacts now, returning true when the history was shortened.
+    ///
+    /// The client is the turn's own, so the summary request goes the same way
+    /// the rejected one did.
+    fn compact_now(
+        &self,
+        _history: &mut History,
+        _client: &dyn Fetch,
+        _reason: CompactReason,
+    ) -> Result<bool> {
+        Ok(false)
+    }
+
     /// Called after a summary is accepted and before it replaces earlier turns.
     fn before_compaction(&self, _history: &History) {}
 
@@ -666,6 +679,17 @@ fn is_repeatable_check(arguments: &str) -> bool {
 const VERIFICATION_REMINDER: &str = "<harness_check>Files were changed and nothing has \
 run since the last change to check it. Run the focused test, build, or command that \
 exercises the change and report what it shows, or say why it cannot be run.</harness_check>";
+
+/// Why a host is asked to compact outside its own trigger.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CompactReason {
+    /// The provider rejected the request as longer than the context window.
+    Overflow,
+}
+
+/// Hint for a request the provider rejected as too long, once compacting
+/// cannot or did not help.
+pub const OVERFLOW_HINT: &str = "the conversation no longer fits the model's context window; start a new session or lower the size of tool results";
 
 /// Tells the model the request it is answering is the last one the run allows.
 pub const LAST_STEP_NOTE: &str = "<harness_check>This is the last step allowed in this run. \
@@ -1235,12 +1259,15 @@ fn stream_with_retry(
     let mut attempt = 0_usize;
     let mut last: Option<RuneError> = None;
     let retry_policy = RetryPolicy::new(max_attempts);
+    // Resends after compacting for an overflow, which do not use up the
+    // provider attempts: the request changed, it did not fail transiently.
+    let mut overflow_compactions = 0_usize;
 
     loop {
         cancellation.check()?;
 
         check_objective_budget(host)?;
-        if attempt >= max_attempts {
+        if attempt >= max_attempts.saturating_add(overflow_compactions) {
             return Err(last.unwrap_or_else(|| {
                 RuneError::new(ErrorCode::TransportFailure, "the request did not succeed")
             }));
@@ -1325,6 +1352,17 @@ fn stream_with_retry(
                 return Ok((outcome, !steering.is_empty()));
             }
             Err(err) => {
+                if err.kind() == rune_net::error::FailureKind::ContextTooLong {
+                    if overflow_compactions < 2
+                        && host.compact_now(history, client, CompactReason::Overflow)?
+                    {
+                        // The loop top reports the restart and rebuilds the
+                        // request from the shortened history.
+                        overflow_compactions = overflow_compactions.saturating_add(1);
+                        continue;
+                    }
+                    return Err(err.to_rune_error().with_hint(OVERFLOW_HINT));
+                }
                 let Some(delay) = retry_policy.delay(attempt, err.kind(), err.retry_after_ms())
                 else {
                     return Err(err.to_rune_error());

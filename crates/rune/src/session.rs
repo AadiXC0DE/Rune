@@ -515,6 +515,15 @@ impl Host for SessionHost {
         Ok(())
     }
 
+    fn compact_now(
+        &self,
+        history: &mut History,
+        client: &dyn rune_net::fetch::Fetch,
+        _reason: turn::CompactReason,
+    ) -> Result<bool> {
+        rune_agent::compaction::compact_now(history, self, client)
+    }
+
     fn before_compaction(&self, history: &History) {
         self.capture_history(history);
     }

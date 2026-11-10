@@ -410,6 +410,15 @@ impl Host for AskHost<'_> {
         Ok(())
     }
 
+    fn compact_now(
+        &self,
+        history: &mut History,
+        client: &dyn rune_net::fetch::Fetch,
+        _reason: turn::CompactReason,
+    ) -> Result<bool> {
+        rune_agent::compaction::compact_now(history, self, client)
+    }
+
     fn take_encoded_request(&self) -> Option<String> {
         self.encoded_request.borrow_mut().take()
     }
