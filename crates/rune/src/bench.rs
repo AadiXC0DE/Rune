@@ -204,7 +204,6 @@ pub fn run_task(binary: &Utf8Path, overrides: &[String], found: &Found, trial: u
     let workspace = scratch.join("workspace");
     let pristine = found.dir.join("repo");
     copy_tree(&pristine, &workspace)?;
-    initialize_repository(&workspace);
 
     let mut run = Run {
         task: found.id.clone(),
@@ -225,6 +224,9 @@ pub fn run_task(binary: &Utf8Path, overrides: &[String], found: &Found, trial: u
             return Ok(run);
         }
     }
+    // The starting commit comes after setup, so setup's changes are part of the
+    // starting state and never counted as the agent's work.
+    initialize_repository(&workspace);
     let timeout = found
         .task
         .timeout_ms

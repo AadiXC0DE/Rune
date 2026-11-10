@@ -113,6 +113,21 @@ class RunnerCase(unittest.TestCase):
         self.assertEqual((log / "diff.patch").read_text(), "")
         self.assertEqual(rows[0]["verify_exit"], 1)
 
+    def test_setup_changes_belong_to_the_starting_state(self):
+        tasks = self.dir / "tasks"
+        repo = tasks / "setup-file" / "repo"
+        repo.mkdir(parents=True)
+        (repo / "a.txt").write_text("a\n")
+        (tasks / "setup-file" / "task.json").write_text(json.dumps({
+            "prompt": "p", "verify": "test -f made-by-setup.txt",
+            "setup": "printf made > made-by-setup.txt",
+        }))
+        proc, rows, out = self.do_run("noop", tasks=tasks)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(rows[0]["verify_exit"], 0)
+        self.assertEqual(rows[0]["files_changed"], 0)
+        self.assertEqual((out / "logs" / "noop" / "setup-file-t1" / "diff.patch").read_text(), "")
+
     def test_a_timed_out_harness_is_killed_with_its_children(self):
         started = time.monotonic()
         proc, rows, _ = self.do_run("sleeper", extra=["--only", "value-file", "--timeout", "1"])
@@ -267,6 +282,18 @@ class RunnerCase(unittest.TestCase):
 
 
 class SuiteMix(unittest.TestCase):
+    def test_no_task_ships_live_instruction_files(self):
+        # A file with one of these names inside a task would be read as this
+        # repository's own instructions by any agent working here. Tasks store
+        # them as AGENTS.task.md and rename them in their setup command.
+        root = HERE.parent / "tasks"
+        live = [
+            str(path.relative_to(root))
+            for name in ("AGENTS.md", "CLAUDE.md")
+            for path in root.rglob(name)
+        ]
+        self.assertEqual(live, [])
+
     def test_the_suite_has_the_planned_mix(self):
         root = HERE.parent / "tasks"
         tasks = []

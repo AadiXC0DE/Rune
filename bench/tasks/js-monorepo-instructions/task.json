@@ -3,6 +3,7 @@
   "kind": "bugfix",
   "prompt": "In this monorepo, the price shown by the shop package is wrong for discounted bundles. Fix it without breaking the other packages.",
   "verify": "cd packages/shop && node --test && cd ../billing && node --test && cd ../pricing && node --test",
+  "setup": "find . -name AGENTS.task.md -exec sh -c 'mv \"$1\" \"$(dirname \"$1\")/AGENTS.md\"' _ {} \\;",
   "protected": [
     "packages/pricing/test",
     "packages/shop/test",

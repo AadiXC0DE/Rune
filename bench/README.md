@@ -84,7 +84,7 @@ Fields of `task.json`:
 | `protected` | no | Paths restored from `repo/` before verifying; edits are detected | none |
 | `timeoutMs` | no | Agent time limit in milliseconds | 600000 |
 | `tests` | no | Directory in the task whose entries are copied into the workspace just before verify | none |
-| `setup` | no | Shell command run in the workspace before the agent starts; a failure fails the run | none |
+| `setup` | no | Shell command run in the workspace before the starting commit and before the agent starts, so its changes are never counted as the agent's; a failure fails the run | none |
 | `verifyTimeoutMs` | no | Verify time limit in milliseconds | 180000 |
 | `tier` | no | Difficulty: 1 one file, 2 several files, 3 long or tricky | none |
 | `split` | no | `dev` or `heldout`; `rune bench --split` filters on it | `dev` |
@@ -100,6 +100,9 @@ Writing a task:
 - solution/ holds the files that, copied over repo/, make verify pass.
 - Tests are deterministic and finish in under 20 seconds.
 - Write the prompt the way a user would ask; do not name the grading command.
+- An instruction file a task needs in its workspace is stored as `AGENTS.task.md` and renamed to
+  `AGENTS.md` by the task's `setup` command. A live `AGENTS.md` inside a task would be read as
+  this repository's own instructions by any agent working here.
 - A v1 task (prompt, verify, protected, timeoutMs) is a valid v2 task.
 
 The JavaScript tasks run `node --test`, which finds `*.test.js` files on every

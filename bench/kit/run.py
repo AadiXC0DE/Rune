@@ -165,6 +165,20 @@ class Runner:
             for sub in (".config", ".local/share", ".local/state", ".cache"):
                 (home / sub).mkdir(parents=True, exist_ok=True)
             (tmp / "tmp").mkdir()
+            env = kit.minimal_env(home, tmp / "tmp")
+
+            # Setup runs before the starting commit, so what it changes belongs to the
+            # starting state and is never counted as the harness's work.
+            if task.setup:
+                with open(str(verify_path), "ab") as sout:
+                    code, _ = kit.run_group(
+                        ["/bin/sh", "-c", task.setup], workspace, env,
+                        sout, subprocess.STDOUT, kit.SETUP_TIMEOUT_S,
+                    )
+                if code != 0:
+                    row["error"] = "setup failed with exit %s" % code
+                    return self.finish(row, task, tmp, logdir)
+
             dates = {"GIT_AUTHOR_DATE": kit.GIT_DATE, "GIT_COMMITTER_DATE": kit.GIT_DATE}
             self.git(workspace, "init", "-q")
             self.git(workspace, "add", "-A")
@@ -176,17 +190,6 @@ class Runner:
             info = workspace / ".git" / "info"
             info.mkdir(parents=True, exist_ok=True)
             (info / "exclude").write_text("\n".join(kit.EXCLUDES) + "\n")
-            env = kit.minimal_env(home, tmp / "tmp")
-
-            if task.setup:
-                with open(str(verify_path), "ab") as sout:
-                    code, _ = kit.run_group(
-                        ["/bin/sh", "-c", task.setup], workspace, env,
-                        sout, subprocess.STDOUT, kit.SETUP_TIMEOUT_S,
-                    )
-                if code != 0:
-                    row["error"] = "setup failed with exit %s" % code
-                    return self.finish(row, task, tmp, logdir)
 
             before = {p: kit.tree_digest(workspace / p) for p in task.protected}
             meter, port = self.start_meter(logdir, harness, task.name, trial, tmp)
