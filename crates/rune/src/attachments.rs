@@ -134,6 +134,9 @@ impl Provider for AttachedProvider {
     fn reducer(&self) -> Box<dyn StreamReducer> {
         self.dialect.reducer()
     }
+    fn reducer_for(&self, plan: &RequestPlan) -> Box<dyn StreamReducer> {
+        self.dialect.reducer_for(plan)
+    }
     fn extra_headers(&self) -> Vec<(&'static str, String)> {
         self.dialect.extra_headers()
     }

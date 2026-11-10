@@ -751,6 +751,7 @@ pub fn stream_completion_encoded(
     read_stream_started(
         response.body,
         provider,
+        Some(plan),
         timeouts,
         started,
         cancel,
@@ -1136,6 +1137,7 @@ pub fn read_stream(
     read_stream_started(
         body,
         provider,
+        None,
         timeouts.into(),
         Instant::now(),
         cancel,
@@ -1144,16 +1146,18 @@ pub fn read_stream(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn read_stream_started(
     body: Box<dyn Read + Send>,
     provider: &dyn Provider,
+    plan: Option<&RequestPlan>,
     timeouts: RequestTimeouts,
     started: Instant,
     cancel: &dyn Fn() -> bool,
     observe: &mut dyn FnMut(&ProviderEvent),
     trace: Option<TraceEntry>,
 ) -> NetResult<StreamOutcome> {
-    let mut state = StreamState::new(provider, observe, timeouts, started, trace);
+    let mut state = StreamState::new(provider, plan, observe, timeouts, started, trace);
     feed(body, &mut state, cancel)?;
     state.finish()
 }
@@ -1268,6 +1272,7 @@ struct StreamState<'a> {
 impl<'a> StreamState<'a> {
     fn new(
         provider: &dyn Provider,
+        plan: Option<&RequestPlan>,
         observe: &'a mut dyn FnMut(&ProviderEvent),
         timeouts: RequestTimeouts,
         request_started: Instant,
@@ -1275,7 +1280,7 @@ impl<'a> StreamState<'a> {
     ) -> Self {
         Self {
             decoder: Decoder::new(provider.limits()),
-            reducer: provider.reducer(),
+            reducer: plan.map_or_else(|| provider.reducer(), |plan| provider.reducer_for(plan)),
             outcome: StreamOutcome::default(),
             frames: Vec::new(),
             observe,
@@ -1363,10 +1368,19 @@ impl<'a> StreamState<'a> {
             entry.finish();
         }
         self.check_request_timeout()?;
+        // An event still open at the end was cut with the connection, so one
+        // that does not parse is a dropped stream, which is retried, rather
+        // than a malformed one.
+        let cut_mid_frame = !self.decoder.is_idle();
         self.decoder
             .finish(&mut self.frames)
             .map_err(NetError::from)?;
-        self.reduce_frames()?;
+        match self.reduce_frames() {
+            Err(err) if cut_mid_frame && err.kind() == FailureKind::ProtocolViolation => {
+                return Err(NetError::from(crate::stream::incomplete_stream()));
+            }
+            result => result?,
+        }
 
         // Signals end of transport. A reducer that never saw a legal terminator
         // reports an incomplete stream, which is retryable, rather than allowing
@@ -1836,6 +1850,32 @@ mod tests {
         assert_eq!(err.kind(), FailureKind::InvalidRequest, "{err}");
         let read = served.load(Ordering::SeqCst);
         assert!(read < 4 * 1024 * 1024, "read {read} bytes before refusing");
+    }
+
+    fn read_bytes(bytes: &'static [u8]) -> NetResult<StreamOutcome> {
+        read_stream(
+            Box::new(std::io::Cursor::new(bytes)),
+            &crate::chat_completions::ChatCompletions,
+            DEFAULT_HEAD_TIMEOUT,
+            &|| false,
+            &mut |_| {},
+        )
+    }
+
+    #[test]
+    fn a_connection_cut_inside_a_frame_is_an_incomplete_stream() {
+        let err = read_bytes(
+            b"data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"}}]}\n\ndata: {\"choices\":[{\"ind",
+        )
+        .expect_err("cut");
+        assert_eq!(err.kind(), FailureKind::IncompleteStream, "{err}");
+    }
+
+    #[test]
+    fn a_whole_frame_that_does_not_parse_is_a_protocol_violation() {
+        let err =
+            read_bytes(b"data: {\"choices\":[{\"ind\n\ndata: [DONE]\n\n").expect_err("malformed");
+        assert_eq!(err.kind(), FailureKind::ProtocolViolation, "{err}");
     }
 
     /// A local endpoint that accepts one connection and never answers it.

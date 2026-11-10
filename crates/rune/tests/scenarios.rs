@@ -35,6 +35,7 @@ const SCENARIOS: &[&str] = &[
     "cut_empty_then_text",
     "failed_check_note",
     "verified_after_fix",
+    "cut_mid_frame_then_ok",
 ];
 
 /// Scenarios built in Rust, which have no file.
@@ -136,6 +137,11 @@ fn verified_after_fix() {
     let result = report.result.expect("a result");
     assert_eq!(result["verification"], "verified", "{result}");
     assert_eq!(result["tests_modified"], false, "{result}");
+}
+
+#[test]
+fn cut_mid_frame_then_ok() {
+    run_scenario("cut_mid_frame_then_ok");
 }
 
 #[test]

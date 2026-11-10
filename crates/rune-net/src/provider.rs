@@ -282,6 +282,12 @@ pub trait Provider: Send + Sync {
     /// Creates a reducer for one response.
     fn reducer(&self) -> Box<dyn StreamReducer>;
 
+    /// Creates a reducer for the response to `plan`, for a dialect whose
+    /// reading depends on the endpoint.
+    fn reducer_for(&self, _plan: &RequestPlan) -> Box<dyn StreamReducer> {
+        self.reducer()
+    }
+
     /// Returns the request headers a dialect requires beyond the defaults.
     ///
     /// The credential is passed separately so a dialect never handles it.

@@ -71,6 +71,10 @@ impl Provider for ChatCompletions {
         Box::new(Reducer::new())
     }
 
+    fn reducer_for(&self, plan: &RequestPlan) -> Box<dyn StreamReducer> {
+        Box::new(Reducer::new().with_done_marker(plan.compat.needs_done_marker))
+    }
+
     fn build_request(&self, plan: &RequestPlan) -> Result<serde_json::Value> {
         let compat = &plan.compat;
         let mut messages: Vec<serde_json::Value> = Vec::new();
@@ -535,6 +539,10 @@ pub struct Reducer {
     finish_reason: Option<FinishReason>,
     saw_terminal: bool,
     saw_done: bool,
+    /// Whether the endpoint must end the stream with `[DONE]`.
+    needs_done_marker: bool,
+    /// Whether the stream ended without `[DONE]` in a state taken as complete.
+    ended_without_marker: bool,
     saw_role: bool,
     event_count: usize,
     /// Every reasoning delta emitted, in order.
@@ -564,6 +572,8 @@ impl Reducer {
             finish_reason: None,
             saw_terminal: false,
             saw_done: false,
+            needs_done_marker: false,
+            ended_without_marker: false,
             saw_role: false,
             event_count: 0,
             reasoning: String::new(),
@@ -576,6 +586,13 @@ impl Reducer {
     #[must_use]
     pub fn with_limits(mut self, limits: Limit) -> Self {
         self.limits = limits;
+        self
+    }
+
+    /// Sets whether a stream that ends without `[DONE]` is incomplete.
+    #[must_use]
+    pub fn with_done_marker(mut self, needs_done_marker: bool) -> Self {
+        self.needs_done_marker = needs_done_marker;
         self
     }
 
@@ -657,7 +674,10 @@ impl Reducer {
 
         // Functions and audio are deliberately unsupported; accepting them
         // silently would let an unimplemented feature appear to work.
-        if delta.get("function_call").is_some() {
+        if delta
+            .get("function_call")
+            .is_some_and(|call| !is_empty_function_call(call))
+        {
             return Err(protocol_violation(
                 "the stream used the deprecated function_call field",
             ));
@@ -770,11 +790,25 @@ impl Reducer {
         call: &serde_json::Value,
         out: &mut Vec<crate::stream::ProviderEvent>,
     ) -> Result<()> {
-        let index = call
-            .get("index")
-            .and_then(serde_json::Value::as_u64)
-            .and_then(|value| usize::try_from(value).ok())
-            .ok_or_else(|| protocol_violation("a tool call delta carried no index"))?;
+        let index = match call.get("index").filter(|index| !index.is_null()) {
+            Some(index) => index
+                .as_u64()
+                .and_then(|value| usize::try_from(value).ok())
+                .ok_or_else(|| protocol_violation("a tool call delta carried no index"))?,
+            // Some servers omit the index; a repeated identifier then names the
+            // call, and anything else starts a new one.
+            None => call
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|id| {
+                    self.calls.iter().position(|slot| {
+                        slot.id
+                            .as_ref()
+                            .is_some_and(|existing| existing.as_str() == id)
+                    })
+                })
+                .unwrap_or(self.calls.len()),
+        };
 
         if index >= self.limits.max_tool_calls {
             return Err(RuneError::too_large(
@@ -889,6 +923,59 @@ impl Reducer {
         }
         Ok(())
     }
+
+    /// Closes every open call at the end of a turn that has a finish reason.
+    ///
+    /// Several compatible servers end a tool turn with `stop`, so every call
+    /// that started is closed whatever the reason, and a turn that made calls
+    /// is reported as one.
+    fn close_turn(&mut self, out: &mut Vec<crate::stream::ProviderEvent>) -> Result<()> {
+        self.close_tool_calls(out)?;
+        if self.finish_reason == Some(FinishReason::Stop) && self.has_started_calls() {
+            self.finish_reason = Some(FinishReason::ToolCalls);
+        }
+        Ok(())
+    }
+
+    fn has_started_calls(&self) -> bool {
+        self.calls.iter().any(|call| call.started)
+    }
+
+    /// Decides whether a stream that ended without `[DONE]` is complete.
+    ///
+    /// It is when a finish reason arrived, or when it made calls whose
+    /// arguments are all whole JSON values. Anything else may have been cut.
+    fn end_without_marker(&mut self, out: &mut Vec<crate::stream::ProviderEvent>) -> Result<()> {
+        if self.finish_reason.is_none() {
+            let calls_complete =
+                self.has_started_calls()
+                    && self.calls.iter().filter(|call| call.started).all(|call| {
+                        serde_json::from_str::<serde_json::Value>(&call.arguments).is_ok()
+                    });
+            if !calls_complete {
+                return Ok(());
+            }
+            self.finish_reason = Some(FinishReason::ToolCalls);
+        }
+        self.close_turn(out)?;
+        self.ended_without_marker = true;
+        Ok(())
+    }
+}
+
+/// Whether a legacy `function_call` value carries nothing.
+///
+/// Some servers send an empty one beside `tool_calls`; one that names a
+/// function or carries arguments is still refused.
+fn is_empty_function_call(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Null => true,
+        serde_json::Value::Object(map) => ["name", "arguments"].into_iter().all(|key| {
+            map.get(key)
+                .is_none_or(|field| field.is_null() || field.as_str() == Some(""))
+        }),
+        _ => false,
+    }
 }
 
 impl StreamReducer for Reducer {
@@ -900,26 +987,26 @@ impl StreamReducer for Reducer {
         let Some(payload) = payload else {
             // End of transport. A stream that never reported a terminal reason
             // is incomplete, which the caller surfaces as a retryable failure.
+            if !self.saw_done && !self.needs_done_marker {
+                self.end_without_marker(out)?;
+            }
             return Ok(());
         };
 
         if payload.trim() == "[DONE]" {
             self.saw_done = true;
             if self.finish_reason.is_none() {
-                return Err(protocol_violation(
-                    "the stream ended without a finish reason",
-                ));
+                if self.has_started_calls() {
+                    self.finish_reason = Some(FinishReason::ToolCalls);
+                } else if !self.content.is_empty() {
+                    self.finish_reason = Some(FinishReason::Stop);
+                } else {
+                    return Err(protocol_violation(
+                        "the stream ended without a finish reason",
+                    ));
+                }
             }
-            // Several compatible servers end a tool turn with `stop`, so every
-            // call that started is closed whatever the reason, and a turn that
-            // made calls is reported as one.
-            self.close_tool_calls(out)?;
-            if self.finish_reason == Some(FinishReason::Stop)
-                && self.calls.iter().any(|call| call.started)
-            {
-                self.finish_reason = Some(FinishReason::ToolCalls);
-            }
-            return Ok(());
+            return self.close_turn(out);
         }
 
         self.event_count = self.event_count.saturating_add(1);
@@ -928,7 +1015,7 @@ impl StreamReducer for Reducer {
     }
 
     fn is_finished(&self) -> bool {
-        self.saw_done
+        self.saw_done || self.ended_without_marker
     }
 
     fn usage(&self) -> Usage {
@@ -965,7 +1052,7 @@ impl StreamReducer for Reducer {
     }
 
     fn finish(&self) -> Result<FinishReason> {
-        if !self.saw_done {
+        if !self.saw_done && !self.ended_without_marker {
             return Err(incomplete_stream());
         }
         if let Some(reason) = self.finish_reason {
@@ -1741,7 +1828,7 @@ mod tests {
     }
 
     #[test]
-    fn a_done_without_a_finish_reason_is_rejected() {
+    fn a_done_without_a_finish_reason_or_content_is_rejected() {
         let mut reducer = Reducer::new();
         let mut events = Vec::new();
         let err = reducer
