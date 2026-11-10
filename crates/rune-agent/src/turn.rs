@@ -136,6 +136,8 @@ pub enum Event {
         max_attempts: usize,
         /// Wait before the next attempt, including a provider Retry-After.
         delay: Duration,
+        /// What failed, as the failure kind's wire name, such as `rate_limited`.
+        kind: &'static str,
     },
     /// A retried provider request succeeded, before any tool decisions begin.
     ProviderRetryFinished {
@@ -1384,6 +1386,7 @@ fn stream_with_retry(
                     next_attempt: attempt.saturating_add(1),
                     max_attempts,
                     delay,
+                    kind: err.kind().as_str(),
                 });
                 retry::wait(delay, cancellation)?;
             }

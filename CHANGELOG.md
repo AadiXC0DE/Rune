@@ -39,6 +39,10 @@ Notable changes, newest first. Each entry describes what a user can observe.
 - `rune ask` compacts a long run before it reaches the context window, as the
   interactive session does, and counts the summary requests in its usage and
   cost.
+- `rune ask --jsonl` streams tool calls, tool results, per-step usage and
+  cost, reasoning, retries and compactions with timestamps; the `start` record
+  gains `schema` 2, the session id, model, provider, workspace and version, and
+  a `prompt` record follows it.
 - `rune ask --timeout SECONDS` and `--max-cost USD` stop a run at a wall-clock
   or estimated spend limit, reporting what it did so far. Models can declare
   `prices` in configuration for endpoints the catalog does not price.

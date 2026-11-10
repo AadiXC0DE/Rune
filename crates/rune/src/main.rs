@@ -316,8 +316,10 @@ fn run_ask(
     output: &OutputFlags,
 ) -> Result<ExitCode> {
     let jsonl = launch.has_flag("--jsonl");
+    // Chosen now so the stream's first record can name the saved session.
+    let session_id = (!launch.has_flag("--no-save")).then(rune_core::id::SessionId::generate);
     if jsonl {
-        ask::start_jsonl()?;
+        ask::start_jsonl(settings, session_id.as_ref())?;
     }
     let submitted: String = launch.args.join(" ");
     let prompt = if submitted.trim().is_empty() {
@@ -392,6 +394,7 @@ fn run_ask(
         max_steps,
         timeout,
         max_cost_cents,
+        session_id,
         no_save: launch.has_flag("--no-save"),
         tool_loop: true,
         read_only: false,
@@ -478,6 +481,7 @@ fn run_review(
         max_steps: None,
         timeout: None,
         max_cost_cents: None,
+        session_id: None,
         images: Vec::new(),
     };
 

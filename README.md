@@ -540,21 +540,40 @@ Completed exchanges are saved as sessions for the current workspace, and
 `--json` reports their `session_id`. Pass `--no-save` to create no session and
 return an empty ID.
 
+### Headless runs
+
 `rune ask --jsonl "prompt"` streams one JSON object per stdout line, flushing
 each record as it arrives. `--jsonl` takes precedence over `--json`. The stream
-begins with `{"type":"start"}` before prompt validation, then emits `step_start`
-with a `step` number and `text_delta` records with `step` and `delta`. A
-`step_restart` tells consumers to discard deltas from the failed attempt of
-that step. Deltas from earlier tool steps are intermediate text; the final
-answer is in the last record, `{"type":"final","result":{...}}`, whose `result`
-has the same fields as `--json`, including failures and saved session IDs.
-Diagnostics go only to stderr. Each record is capped at 1 MiB including its
-newline; deltas are split at UTF-8 boundaries into at most 8 KiB of raw text.
-Serialization stages at most one bounded record, and a slow stdout reader
-applies backpressure instead of growing an event queue. An oversized final
-result produces a small `too_large` final failure and exit 1, after any deltas
-already delivered. Its model and session ID are empty; a completed exchange
-may already have been saved unless `--no-save` was used.
+is enough to rebuild every step, tool call, result and its usage without reading
+the session log. Every record has a `type`; `ts` is UTC with milliseconds, such
+as `2026-11-10T09:12:03.123Z`, and a count the provider did not report is `null`.
+
+| `type` | Fields |
+| --- | --- |
+| `start` | `schema` (2), `session_id` (`""` with `--no-save`), `model`, `provider`, `cwd`, `version`, `ts`. Written before the prompt is validated. |
+| `prompt` | `text` (cut to 512 KiB), `ts` |
+| `step_start` | `step`, `ts` |
+| `text_delta` | `step`, `delta` (at most 8 KiB, split at character boundaries) |
+| `reasoning` | `step`, `text` (cut to 256 KiB), `truncated` |
+| `step_finish` | `step`, `finish`, `usage` (`input_tokens`, `cached_tokens`, `cache_write_tokens`, `output_tokens`, `reasoning_tokens`), `cost_usd` (when prices are known), `ts` |
+| `tool_call` | `step`, `id`, `name`, `arguments` (parsed JSON, or the raw string), `ts` |
+| `tool_result` | `step`, `id`, `ok`, `executed` (false for a refused or repeated call), `elapsed_ms`, `bytes`, `preview` (first 2 KiB), `ts` |
+| `retry` | `step`, `attempt`, `wait_ms`, `kind` (such as `rate_limited`), `ts` |
+| `compaction` | `before_tokens`, `after_tokens`, `ts` |
+| `step_restart` | `step`: discard the deltas of the failed attempt of that step |
+| `plan_updated` | `update` |
+| `final` | `result`, with the same fields as `--json`, including failures and saved session IDs |
+
+A step's `step_finish` comes after its text and before its tool calls, and each
+`tool_call` is followed by its `tool_result`. The sum of `step_finish` input
+tokens is the run's input usage, except summary requests, which only `final`
+counts. Deltas from earlier tool steps are intermediate text; the answer is in
+`final`. Diagnostics go only to stderr. Each record is capped at 1 MiB including
+its newline. Serialization stages at most one bounded record, and a slow stdout
+reader applies backpressure instead of growing an event queue. An oversized
+final result produces a small `too_large` final failure and exit 1, after any
+records already delivered. Its model and session ID are empty; a completed
+exchange may already have been saved unless `--no-save` was used.
 
 `rune ask --json` failures include `error_detail` when structured context is available.
 Provider failures retain the redacted `provider_code` and numeric

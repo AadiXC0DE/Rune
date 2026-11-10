@@ -1273,8 +1273,11 @@ fn streaming_jsonl_fixture(delta: &str, complete: bool) -> (Vec<Value>, Output) 
             break;
         }
     }
-    assert_eq!(events[0], json!({"type": "start"}));
-    assert_eq!(events[1], json!({"type": "step_start", "step": 1}));
+    assert_eq!(events[0]["type"], "start");
+    assert_eq!(events[0]["schema"], 2);
+    assert_eq!(events[1]["type"], "prompt");
+    assert_eq!(events[2]["type"], "step_start");
+    assert_eq!(events[2]["step"], 1);
     assert!(child.try_wait().expect("running status").is_none());
     release.send(()).expect("release provider completion");
     while let Ok(line) = receive.recv_timeout(Duration::from_secs(5)) {
@@ -1368,7 +1371,8 @@ fn ask_jsonl_validation_failures_emit_start_and_final_only() {
             .map(|line| serde_json::from_str(line).expect("JSON event"))
             .collect();
         assert_eq!(events.len(), 2);
-        assert_eq!(events[0], json!({"type": "start"}));
+        assert_eq!(events[0]["type"], "start");
+        assert_eq!(events[0]["schema"], 2);
         assert_eq!(events[1]["type"], "final");
         assert_eq!(events[1]["result"]["error_code"], code);
         assert_eq!(
@@ -1415,18 +1419,23 @@ fn ask_jsonl_marks_retry_resets_and_keeps_the_recovered_final_result() {
             .collect::<Vec<_>>(),
         [
             "start",
+            "prompt",
             "step_start",
             "text_delta",
+            "retry",
             "step_restart",
             "text_delta",
+            "step_finish",
             "final"
         ]
     );
-    assert_eq!(events[2]["delta"], "Discard this attempt.");
-    assert_eq!(events[3]["step"], 1);
-    assert_eq!(events[4]["step"], 1);
-    assert_eq!(events[5]["result"]["final_output"], "Recovered.");
-    assert_eq!(events[5]["result"]["steps"], 1);
+    assert_eq!(events[3]["delta"], "Discard this attempt.");
+    assert_eq!(events[4]["attempt"], 2);
+    assert_eq!(events[5]["step"], 1);
+    assert_eq!(events[6]["step"], 1);
+    assert_eq!(events[7]["step"], 1);
+    assert_eq!(events[8]["result"]["final_output"], "Recovered.");
+    assert_eq!(events[8]["result"]["steps"], 1);
 }
 
 #[test]
@@ -1459,17 +1468,25 @@ fn ask_jsonl_preserves_tool_steps_and_saved_exchange() {
             .collect::<Vec<_>>(),
         [
             "start",
+            "prompt",
             "step_start",
             "text_delta",
+            "step_finish",
+            "tool_call",
+            "tool_result",
             "step_start",
             "text_delta",
+            "step_finish",
             "final"
         ]
     );
-    assert_eq!(events[2]["step"], 1);
-    assert_eq!(events[2]["delta"], "Reading.");
-    assert_eq!(events[4]["step"], 2);
-    let result = &events[5]["result"];
+    assert_eq!(events[3]["step"], 1);
+    assert_eq!(events[3]["delta"], "Reading.");
+    assert_eq!(events[5]["id"], events[6]["id"]);
+    assert_eq!(events[5]["arguments"], json!({"path": "fixture.txt"}));
+    assert_eq!(events[6]["ok"], true);
+    assert_eq!(events[8]["step"], 2);
+    let result = &events[10]["result"];
     assert_eq!(result["final_output"], "Final answer.");
     assert_eq!(
         result["tool_calls"],

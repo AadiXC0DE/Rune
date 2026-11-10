@@ -414,6 +414,7 @@ fn encode(event: &Event) -> serde_json::Value {
             next_attempt,
             max_attempts,
             delay,
+            ..
         } => json!({
             "kind": "provider_retry",
             "step": step,

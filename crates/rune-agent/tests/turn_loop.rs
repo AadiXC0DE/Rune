@@ -2239,6 +2239,7 @@ fn two_failures_report_the_next_attempt_and_backoff_before_each_restart() {
                 next_attempt,
                 max_attempts,
                 delay,
+                ..
             } => Some((step, next_attempt, max_attempts, delay.as_millis())),
             Event::StepRestarted { step } => Some((step, 0, 0, 0)),
             Event::ProviderRetryFinished { step } => Some((step, 0, 0, 1)),

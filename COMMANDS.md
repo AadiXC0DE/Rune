@@ -41,7 +41,7 @@ Run one bounded turn without an interactive session
 | Flag | Description |
 |---|---|
 | `--json` | Print one JSON object instead of Markdown. |
-| `--jsonl` | Stream bounded JSONL events (takes precedence over --json). |
+| `--jsonl` | Stream bounded JSONL events (takes precedence over --json); the records are listed in the README under Headless runs. |
 | `--no-save` | Do not create a session. |
 | `--image <path>` | Attach a PNG, JPEG, GIF, or WebP file. Repeatable; 8 MiB total, at most 16 images. |
 | `--max-steps <n>` | Stop after this many model steps; the last one answers without tools. 0 means no limit. |

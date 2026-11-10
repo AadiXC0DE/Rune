@@ -6951,6 +6951,7 @@ mod tests {
                 next_attempt: attempt,
                 max_attempts: 3,
                 delay: std::time::Duration::from_millis(delay),
+                kind: "rate_limited",
             });
             let screen = replay(&mut grid);
             assert_eq!(screen.matches("provider retry").count(), 1, "{screen}");
@@ -6986,6 +6987,7 @@ mod tests {
                 next_attempt: 2,
                 max_attempts: 3,
                 delay: std::time::Duration::from_millis(250),
+                kind: "rate_limited",
             });
             replay(&mut grid);
         }

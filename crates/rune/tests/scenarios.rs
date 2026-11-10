@@ -196,6 +196,87 @@ fn max_cost_without_prices() {
     );
 }
 
+/// Runs a scenario file with `--jsonl` and returns the parsed records.
+fn jsonl_records(name: &str) -> Vec<serde_json::Value> {
+    let path = directory().join(format!("{name}.json"));
+    let mut loaded = scenario::load(&path).unwrap_or_else(|err| panic!("{err}"));
+    loaded.ask_args = vec!["--jsonl".to_owned(), "--no-save".to_owned()];
+    let report = scenario::run(Path::new(env!("CARGO_BIN_EXE_rune")), &loaded);
+    let failures = scenario::check(&loaded, &report);
+    assert!(
+        failures.is_empty(),
+        "{name} with --jsonl failed:\n{}\nstderr:\n{}",
+        failures.join("\n"),
+        report.stderr
+    );
+    report
+        .stdout
+        .lines()
+        .map(|line| {
+            assert!(line.len() < 1024 * 1024, "a record over 1 MiB");
+            serde_json::from_str(line).unwrap_or_else(|err| panic!("{err}: {line}"))
+        })
+        .collect()
+}
+
+#[test]
+fn fix_one_file_jsonl_records() {
+    let records = jsonl_records("fix_one_file");
+    let kind = |record: &serde_json::Value| record["type"].as_str().unwrap_or("").to_owned();
+    assert_eq!(kind(&records[0]), "start");
+    assert_eq!(records[0]["schema"], 2);
+    assert_eq!(kind(&records[1]), "prompt");
+    assert_eq!(kind(records.last().expect("records")), "final");
+
+    // Steps open and close in order, and every call has one result.
+    let mut open_step = None;
+    let mut calls = BTreeMap::new();
+    let mut input = 0;
+    for record in &records[2..records.len() - 1] {
+        match kind(record).as_str() {
+            "step_start" => {
+                assert!(open_step.is_none(), "a step started inside another");
+                open_step = record["step"].as_u64();
+                assert!(record["ts"].as_str().is_some_and(|ts| ts.ends_with('Z')));
+            }
+            "step_finish" => {
+                assert_eq!(open_step, record["step"].as_u64(), "{record}");
+                open_step = None;
+                input += record["usage"]["input_tokens"].as_u64().expect("input");
+            }
+            "tool_call" => {
+                assert!(calls.insert(record["id"].to_string(), false).is_none());
+            }
+            "tool_result" => {
+                let seen = calls
+                    .get_mut(&record["id"].to_string())
+                    .expect("a call before its result");
+                assert!(!*seen, "two results for one call");
+                *seen = true;
+            }
+            "text_delta" | "reasoning" => {}
+            other => panic!("unexpected record {other}: {record}"),
+        }
+    }
+    assert!(open_step.is_none());
+    assert!(!calls.is_empty());
+    assert!(calls.values().all(|seen| *seen), "{calls:?}");
+    let result = &records.last().expect("final")["result"];
+    assert_eq!(result["usage"]["input_tokens"], input);
+}
+
+#[test]
+fn rate_limited_then_ok_jsonl_reports_the_retry() {
+    let records = jsonl_records("rate_limited_then_ok");
+    let retries: Vec<_> = records
+        .iter()
+        .filter(|record| record["type"] == "retry")
+        .collect();
+    assert_eq!(retries.len(), 1, "{records:?}");
+    assert_eq!(retries[0]["kind"], "rate_limited");
+    assert_eq!(retries[0]["attempt"], 2);
+}
+
 #[test]
 fn long_150_steps_completes() {
     let workspace = BTreeMap::from([(

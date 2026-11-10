@@ -197,7 +197,7 @@ pub const RUN: &[CommandSpec] = &[
             flag("--json", "Print one JSON object instead of Markdown."),
             flag(
                 "--jsonl",
-                "Stream bounded JSONL events (takes precedence over --json).",
+                "Stream bounded JSONL events (takes precedence over --json); the records are listed in the README under Headless runs.",
             ),
             flag("--no-save", "Do not create a session."),
             option(

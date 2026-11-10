@@ -63,6 +63,9 @@ pub struct Options {
     pub timeout: Option<std::time::Duration>,
     /// Spending limit from `--max-cost`, in cents.
     pub max_cost_cents: Option<u64>,
+    /// Id to save the run under, chosen before the run so the JSONL `start`
+    /// record can name it; one is generated when absent.
+    pub session_id: Option<SessionId>,
 }
 
 /// Reads a dollar amount with at most two decimals, such as `2.50`, as cents.
@@ -90,15 +93,144 @@ pub const MAX_JSONL_EVENT_BYTES: usize = 1024 * 1024;
 /// Raw delta chunk cap, allowing even six-byte JSON escapes within the record cap.
 const MAX_JSONL_DELTA_BYTES: usize = 8 * 1024;
 
+/// Version of the JSONL record set, in the `start` record.
+const JSONL_SCHEMA: u32 = 2;
+
+/// Longest prompt text in the `prompt` record.
+const MAX_JSONL_PROMPT_BYTES: usize = 512 * 1024;
+
+/// Longest reasoning text in a `reasoning` record.
+const MAX_JSONL_REASONING_BYTES: usize = 256 * 1024;
+
+/// Longest tool output kept in a `tool_result` record's preview.
+const MAX_JSONL_PREVIEW_BYTES: usize = 2048;
+
 #[derive(Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum JsonlEvent<'a> {
-    Start {},
-    StepStart { step: u32 },
-    StepRestart { step: u32 },
-    TextDelta { step: u32, delta: &'a str },
-    PlanUpdated { update: &'a rune_tools::PlanUpdate },
-    Final { result: &'a JsonResult },
+    Start {
+        schema: u32,
+        session_id: String,
+        model: &'a str,
+        provider: String,
+        cwd: String,
+        version: &'static str,
+        ts: String,
+    },
+    Prompt {
+        text: &'a str,
+        ts: String,
+    },
+    StepStart {
+        step: u32,
+        ts: String,
+    },
+    StepRestart {
+        step: u32,
+    },
+    TextDelta {
+        step: u32,
+        delta: &'a str,
+    },
+    Reasoning {
+        step: u32,
+        text: &'a str,
+        truncated: bool,
+    },
+    StepFinish {
+        step: u32,
+        finish: &'static str,
+        usage: StepUsage,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cost_usd: Option<String>,
+        ts: String,
+    },
+    ToolCall {
+        step: u32,
+        id: &'a str,
+        name: &'a str,
+        arguments: serde_json::Value,
+        ts: String,
+    },
+    ToolResult {
+        step: u32,
+        id: &'a str,
+        ok: bool,
+        executed: bool,
+        elapsed_ms: u64,
+        bytes: usize,
+        preview: &'a str,
+        ts: String,
+    },
+    Retry {
+        step: u32,
+        attempt: usize,
+        wait_ms: u64,
+        kind: &'static str,
+        ts: String,
+    },
+    Compaction {
+        before_tokens: u64,
+        after_tokens: u64,
+        ts: String,
+    },
+    PlanUpdated {
+        update: &'a rune_tools::PlanUpdate,
+    },
+    Final {
+        result: &'a JsonResult,
+    },
+}
+
+/// One step's usage as the provider reported it; an unreported count is null.
+///
+/// The field names are the record's wire names, shared with the `usage` of the
+/// final result, so the repeated suffix stays.
+#[allow(clippy::struct_field_names)]
+#[derive(Serialize)]
+struct StepUsage {
+    input_tokens: Option<u64>,
+    cached_tokens: Option<u64>,
+    cache_write_tokens: Option<u64>,
+    output_tokens: Option<u64>,
+    reasoning_tokens: Option<u64>,
+}
+
+impl From<&Usage> for StepUsage {
+    fn from(usage: &Usage) -> Self {
+        Self {
+            input_tokens: usage.input_tokens,
+            cached_tokens: usage.cache_read_tokens,
+            cache_write_tokens: usage.cache_write_tokens,
+            output_tokens: usage.output_tokens,
+            reasoning_tokens: usage.reasoning_tokens,
+        }
+    }
+}
+
+/// The current UTC time with millisecond precision, such as
+/// `2026-11-10T09:12:03.123Z`.
+fn jsonl_timestamp() -> String {
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX)
+        });
+    jiff::Timestamp::from_millisecond(millis)
+        .map(|timestamp| format!("{timestamp:.3}"))
+        .unwrap_or_default()
+}
+
+/// The longest prefix of `text` within `limit` bytes that ends on a character.
+fn cut_at_boundary(text: &str, limit: usize) -> &str {
+    if text.len() <= limit {
+        return text;
+    }
+    let mut end = limit;
+    while !text.is_char_boundary(end) {
+        end = end.saturating_sub(1);
+    }
+    &text[..end]
 }
 
 /// Stages one complete record without ever growing beyond the wire cap.
@@ -175,8 +307,24 @@ fn write_text_deltas(writer: &mut impl Write, step: u32, mut delta: &str) -> Res
 }
 
 /// Starts the JSONL stream before prompt validation or provider setup.
-pub fn start_jsonl() -> Result<()> {
-    write_jsonl(&mut std::io::stdout().lock(), &JsonlEvent::Start {})
+///
+/// `session_id` is the id the run will be saved under, or `None` with
+/// `--no-save`.
+pub fn start_jsonl(settings: &Settings, session_id: Option<&SessionId>) -> Result<()> {
+    write_jsonl(
+        &mut std::io::stdout().lock(),
+        &JsonlEvent::Start {
+            schema: JSONL_SCHEMA,
+            session_id: session_id.map(ToString::to_string).unwrap_or_default(),
+            model: &settings.model,
+            provider: settings.provider.to_string(),
+            cwd: crate::current_workspace()
+                .map(|workspace| workspace.to_string())
+                .unwrap_or_default(),
+            version: crate::version::VERSION,
+            ts: jsonl_timestamp(),
+        },
+    )
 }
 
 /// Emits a final record, replacing an oversized result with a bounded failure.
@@ -376,9 +524,41 @@ struct AskHost<'a> {
     spent: Cell<Option<u64>>,
     /// Spending limit in millionths of a dollar.
     spend_limit: Option<u64>,
+    /// Calls of the current step that have a `tool_call` record.
+    announced: RefCell<std::collections::BTreeSet<String>>,
 }
 
 impl AskHost<'_> {
+    /// Writes one JSONL record; a failure to write cancels the run once.
+    fn record(&self, write: impl FnOnce(&mut std::io::StdoutLock<'_>) -> Result<()>) {
+        if !self.jsonl || self.emit_error.borrow().is_some() {
+            return;
+        }
+        if let Err(error) = write(&mut std::io::stdout().lock()) {
+            *self.emit_error.borrow_mut() = Some(error);
+            self.cancellation.cancel();
+        }
+    }
+
+    /// Writes the `tool_call` record for a call, once per call.
+    fn announce(&self, out: &mut std::io::StdoutLock<'_>, call: &turn::PreparedCall) -> Result<()> {
+        if !self.announced.borrow_mut().insert(call.id.clone()) {
+            return Ok(());
+        }
+        let arguments = serde_json::from_str(&call.arguments)
+            .unwrap_or_else(|_| serde_json::Value::String(call.arguments.clone()));
+        write_jsonl(
+            out,
+            &JsonlEvent::ToolCall {
+                step: self.step.get(),
+                id: &call.id,
+                name: &call.name,
+                arguments,
+                ts: jsonl_timestamp(),
+            },
+        )
+    }
+
     /// Adds one request's estimated cost to the run's spend.
     fn add_spend(&self, usage: &Usage) {
         if let Some(cost) = self.prices.and_then(|prices| prices.cost(usage)) {
@@ -488,34 +668,125 @@ impl Host for AskHost<'_> {
 
     fn observe_response(&self, outcome: &StreamOutcome) {
         self.add_spend(&outcome.usage);
+        let step = self.step.get();
+        self.record(|out| {
+            let reasoning = outcome.reasoning();
+            if !reasoning.trim().is_empty() {
+                let text = cut_at_boundary(&reasoning, MAX_JSONL_REASONING_BYTES);
+                write_jsonl(
+                    out,
+                    &JsonlEvent::Reasoning {
+                        step,
+                        text,
+                        truncated: text.len() < reasoning.len(),
+                    },
+                )?;
+            }
+            write_jsonl(
+                out,
+                &JsonlEvent::StepFinish {
+                    step,
+                    finish: outcome.finish.map_or("stop", FinishReason::as_str),
+                    usage: StepUsage::from(&outcome.usage),
+                    cost_usd: self
+                        .prices
+                        .and_then(|prices| prices.cost(&outcome.usage))
+                        .map(rune_net::models_dev::dollars),
+                    ts: jsonl_timestamp(),
+                },
+            )
+        });
         self.incomplete_tool_call.set(
             outcome.finish == Some(FinishReason::ToolCalls) && outcome.tool_calls().is_empty(),
         );
     }
 
     fn emit(&self, event: Event) {
-        if !self.jsonl || self.emit_error.borrow().is_some() {
-            return;
+        if let Event::TurnStarted { step } = event {
+            self.step.set(step);
+            self.announced.borrow_mut().clear();
         }
-        let mut stdout = std::io::stdout().lock();
-        let result = match event {
-            Event::TurnStarted { step } => {
-                self.step.set(step);
-                write_jsonl(&mut stdout, &JsonlEvent::StepStart { step })
-            }
+        let step = self.step.get();
+        self.record(|out| match &event {
+            Event::TurnStarted { step } => write_jsonl(
+                out,
+                &JsonlEvent::StepStart {
+                    step: *step,
+                    ts: jsonl_timestamp(),
+                },
+            ),
             Event::StepRestarted { step } => {
-                write_jsonl(&mut stdout, &JsonlEvent::StepRestart { step })
+                write_jsonl(out, &JsonlEvent::StepRestart { step: *step })
             }
-            Event::PlanUpdated { update } => {
-                write_jsonl(&mut stdout, &JsonlEvent::PlanUpdated { update: &update })
+            Event::PlanUpdated { update } => write_jsonl(out, &JsonlEvent::PlanUpdated { update }),
+            Event::TextDelta { delta } => write_text_deltas(out, step, delta),
+            Event::ToolStarted { call, .. } => self.announce(out, call),
+            Event::ToolFinished {
+                call,
+                output,
+                elapsed,
+            } => {
+                self.announce(out, call)?;
+                write_jsonl(
+                    out,
+                    &JsonlEvent::ToolResult {
+                        step,
+                        id: &call.id,
+                        ok: !output.is_error,
+                        executed: !output.text.starts_with(turn::REPEAT_MARKER),
+                        elapsed_ms: u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
+                        bytes: output.text.len(),
+                        preview: cut_at_boundary(&output.text, MAX_JSONL_PREVIEW_BYTES),
+                        ts: jsonl_timestamp(),
+                    },
+                )
             }
-            Event::TextDelta { delta } => write_text_deltas(&mut stdout, self.step.get(), &delta),
+            Event::ToolDenied { call, reason } => {
+                self.announce(out, call)?;
+                write_jsonl(
+                    out,
+                    &JsonlEvent::ToolResult {
+                        step,
+                        id: &call.id,
+                        ok: false,
+                        executed: false,
+                        elapsed_ms: 0,
+                        bytes: reason.len(),
+                        preview: cut_at_boundary(reason, MAX_JSONL_PREVIEW_BYTES),
+                        ts: jsonl_timestamp(),
+                    },
+                )
+            }
+            Event::ProviderRetry {
+                step,
+                next_attempt,
+                delay,
+                kind,
+                ..
+            } => write_jsonl(
+                out,
+                &JsonlEvent::Retry {
+                    step: *step,
+                    attempt: *next_attempt,
+                    wait_ms: u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
+                    kind,
+                    ts: jsonl_timestamp(),
+                },
+            ),
+            Event::ContextCompacted {
+                before_tokens,
+                after_tokens,
+                ..
+            } => write_jsonl(
+                out,
+                &JsonlEvent::Compaction {
+                    before_tokens: *before_tokens,
+                    after_tokens: *after_tokens,
+                    ts: jsonl_timestamp(),
+                },
+            ),
             _ => Ok(()),
-        };
-        if let Err(error) = result {
-            *self.emit_error.borrow_mut() = Some(error);
-            self.cancellation.cancel();
-        }
+        });
     }
 
     fn pre_tool(&self, call: &turn::PreparedCall) -> Result<Option<turn::HookVeto>> {
@@ -715,6 +986,7 @@ pub fn run(
         prices,
         spent: Cell::new(None),
         spend_limit,
+        announced: RefCell::new(std::collections::BTreeSet::new()),
         limits,
     };
     let watchdog = options.timeout.map(|limit| {
@@ -722,6 +994,15 @@ pub fn run(
             limit,
             host.cancellation.clone(),
             host.context.cancellation(),
+        )
+    });
+    host.record(|out| {
+        write_jsonl(
+            out,
+            &JsonlEvent::Prompt {
+                text: cut_at_boundary(&options.prompt, MAX_JSONL_PROMPT_BYTES),
+                ts: jsonl_timestamp(),
+            },
         )
     });
     let outcome = turn::run_turn(&mut history, &host);
@@ -820,7 +1101,15 @@ pub fn run(
     let session_id = if options.no_save {
         String::new()
     } else {
-        save_exchange(paths, &options.prompt, &history, &usage, error.as_ref())?.to_string()
+        save_exchange(
+            paths,
+            options.session_id.unwrap_or_else(SessionId::generate),
+            &options.prompt,
+            &history,
+            &usage,
+            error.as_ref(),
+        )?
+        .to_string()
     };
 
     Ok(JsonResult {
@@ -967,13 +1256,13 @@ impl Watchdog {
 /// Saves a completed request before its identifier is reported to the caller.
 fn save_exchange(
     paths: &Paths,
+    id: SessionId,
     prompt: &str,
     history: &History,
     usage: &Usage,
     error: Option<&RuneError>,
 ) -> Result<SessionId> {
     let workspace = crate::current_workspace()?;
-    let id = SessionId::generate();
     let store = SessionStore::create(paths, &id)?;
     // One write and one sync for the whole exchange: syncing each event made
     // saving a long run cost more than running it.
@@ -1049,6 +1338,25 @@ mod tests {
     use rune_core::config::{EnvironmentOverrides, Provider};
 
     #[test]
+    fn tool_result_preview_cuts_at_a_character_boundary() {
+        // "é" is two bytes; one starting at byte 2,047 does not fit in 2,048.
+        let text = format!("{}é tail", "a".repeat(MAX_JSONL_PREVIEW_BYTES - 1));
+        let preview = cut_at_boundary(&text, MAX_JSONL_PREVIEW_BYTES);
+        assert_eq!(preview.len(), MAX_JSONL_PREVIEW_BYTES - 1);
+        assert!(preview.chars().all(|c| c == 'a'));
+        assert_eq!(cut_at_boundary("short", MAX_JSONL_PREVIEW_BYTES), "short");
+        let big = "x".repeat(5 * 1024 * 1024);
+        assert_eq!(cut_at_boundary(&big, MAX_JSONL_PREVIEW_BYTES).len(), 2048);
+    }
+
+    #[test]
+    fn jsonl_timestamps_are_utc_with_milliseconds() {
+        let ts = jsonl_timestamp();
+        assert_eq!(ts.len(), "2026-11-10T09:12:03.123Z".len(), "{ts}");
+        assert!(ts.ends_with('Z') && ts.as_bytes()[19] == b'.', "{ts}");
+    }
+
+    #[test]
     fn dollar_amounts_are_read_as_cents() {
         assert_eq!(parse_cents("0.10"), Some(10));
         assert_eq!(parse_cents("2.5"), Some(250));
@@ -1096,8 +1404,15 @@ mod tests {
             content: "found".into(),
             is_error: false,
         }]);
-        let saved =
-            save_exchange(&paths, "lookup", &history, &Usage::default(), None).expect("save");
+        let saved = save_exchange(
+            &paths,
+            SessionId::generate(),
+            "lookup",
+            &history,
+            &Usage::default(),
+            None,
+        )
+        .expect("save");
         let (_, restored) = crate::session_log::load(&paths, &saved).expect("resume");
         restored.validate().expect("history");
         let mut plan = RequestPlan::new("gemini-fixture");

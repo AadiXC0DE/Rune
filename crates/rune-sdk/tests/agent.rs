@@ -998,7 +998,7 @@ fn a_429_retry_after_is_honored_once_without_consuming_another_step() {
     assert_eq!(agent.usage(), result.usage);
     assert!(
         matches!(events.iter().find(|event| matches!(event, Event::ProviderRetry { .. })),
-        Some(Event::ProviderRetry { step: 1, next_attempt: 2, max_attempts: 2, delay })
+        Some(Event::ProviderRetry { step: 1, next_attempt: 2, max_attempts: 2, delay, .. })
         if *delay == Duration::from_secs(1))
     );
     assert_eq!(
