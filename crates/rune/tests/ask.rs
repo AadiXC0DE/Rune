@@ -2193,3 +2193,53 @@ fn rune_tool_text_changes_the_advertised_description() {
         .expect("shell advertised");
     assert_eq!(shell["description"], "Run a command.");
 }
+
+#[cfg(unix)]
+#[test]
+fn ask_counts_files_changed_by_commands() {
+    let arguments = json!({"action": "run", "command": "echo x > made.txt"}).to_string();
+    let (output, dir, _) = run_responses_fixture_command(
+        vec![
+            completion_response(&call_delta("shell", &arguments), "tool_calls"),
+            completion_response(&json!({"content": "Made the file."}), "stop"),
+        ],
+        Some("--json"),
+        true,
+        Some(3),
+        (&["--permission-mode", "full-access", "ask"], &[]),
+        |dir, command| {
+            command.with_external_programs();
+            std::fs::write(dir.path().join(".gitignore"), "state/\nconfig/\ndata/\n")
+                .expect("ignore file");
+            let git = |arguments: &[&str]| {
+                let status = Command::new("git")
+                    .args([
+                        "-c",
+                        "user.name=Fixture",
+                        "-c",
+                        "user.email=fixture@example.com",
+                    ])
+                    .args(arguments)
+                    .current_dir(dir.path())
+                    .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                    .env("GIT_CONFIG_NOSYSTEM", "1")
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status()
+                    .expect("fixture git");
+                assert!(status.success(), "git {arguments:?}");
+            };
+            git(&["init", "-q"]);
+            git(&["add", "."]);
+            git(&["commit", "-q", "-m", "fixture"]);
+        },
+    );
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("made.txt")).expect("made by the command"),
+        "x\n"
+    );
+    let result: Value = serde_json::from_slice(&output.stdout).expect("one JSON result");
+    assert_eq!(result["changed_files"], 1, "{result}");
+    assert_eq!(result["tests_modified"], false, "{result}");
+}

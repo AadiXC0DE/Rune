@@ -1258,9 +1258,19 @@ pub fn run(
             tools.cancel();
         })?
     };
+    // Files a command changes are seen by comparing the repository status
+    // before and after the run; outside a repository only tool changes count.
+    let workspace = host.context.workspace().to_owned();
+    let status_before = options
+        .tool_loop
+        .then(|| rune_tools::git_diff::status_entries(&workspace, STATUS_LIMIT))
+        .flatten();
     let outcome = turn::run_turn(&mut history, &host);
     // Whatever ended the run, nothing it started keeps running.
     host.registry.shutdown();
+    let command_changes = status_before
+        .map(|before| changed_by_commands(&workspace, &before))
+        .unwrap_or_default();
     let timed_out = watchdog.is_some_and(Watchdog::finish);
     let signal = shutdown.received();
     let outcome = match (signal, outcome) {
@@ -1413,10 +1423,22 @@ pub fn run(
             .map(rune_net::models_dev::dollars),
         experiment: Some(settings.experiments.render()).filter(|keys| !keys.is_empty()),
         verification: error.is_none().then(|| outcome.verification.as_str()),
-        tests_modified: error.is_none().then_some(outcome.checks.tests_modified),
-        changed_files: error
-            .is_none()
-            .then(|| u32::try_from(outcome.checks.changed_files.len()).unwrap_or(u32::MAX)),
+        tests_modified: error.is_none().then(|| {
+            outcome.checks.tests_modified
+                || command_changes
+                    .iter()
+                    .any(|path| rune_agent::verify::is_test_path(path))
+        }),
+        changed_files: error.is_none().then(|| {
+            let mut changed: std::collections::BTreeSet<String> = outcome
+                .checks
+                .changed_files
+                .iter()
+                .map(|path| workspace_relative(&workspace, path))
+                .collect();
+            changed.extend(command_changes.iter().cloned());
+            u32::try_from(changed.len()).unwrap_or(u32::MAX)
+        }),
         error: error.as_ref().map(|error| error.message().to_owned()),
         error_code: error.as_ref().map(RuneError::code),
         error_detail: error
@@ -1424,6 +1446,39 @@ pub fn run(
             .filter(|error| !error.detail().is_empty())
             .map(|error| error.detail().clone()),
     })
+}
+
+/// How long one repository status snapshot may take before it is given up.
+const STATUS_LIMIT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Returns the workspace-relative paths whose repository status entry is new
+/// or different since `before`, or nothing when a snapshot cannot be taken.
+fn changed_by_commands(
+    workspace: &camino::Utf8Path,
+    before: &std::collections::BTreeMap<String, String>,
+) -> Vec<String> {
+    let Some(after) = rune_tools::git_diff::status_entries(workspace, STATUS_LIMIT) else {
+        return Vec::new();
+    };
+    // Status paths are relative to the repository root.
+    let Some(prefix) =
+        rune_tools::git_diff::git_output(workspace, &["rev-parse", "--show-prefix"], STATUS_LIMIT)
+    else {
+        return Vec::new();
+    };
+    let prefix = prefix.trim_end_matches('\n');
+    after
+        .into_iter()
+        .filter(|(path, status)| before.get(path) != Some(status))
+        .filter_map(|(path, _)| path.strip_prefix(prefix).map(str::to_owned))
+        .collect()
+}
+
+/// Returns a path an edit tool named, relative to the workspace.
+fn workspace_relative(workspace: &camino::Utf8Path, path: &str) -> String {
+    let path = camino::Utf8Path::new(path);
+    let relative = path.strip_prefix(workspace).unwrap_or(path).as_str();
+    relative.trim_start_matches("./").to_owned()
 }
 
 /// Sends each request on a helper thread, so a cancellation is noticed while

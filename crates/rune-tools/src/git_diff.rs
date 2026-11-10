@@ -320,6 +320,74 @@ const fn null_device() -> &'static str {
     if cfg!(windows) { "NUL" } else { "/dev/null" }
 }
 
+/// Most bytes of standard output `git_output` reads; longer output is `None`.
+const OUTPUT_BYTES: usize = 8 * 1024 * 1024;
+
+/// Runs `git` with the inspection environment and returns standard output, or `None` on
+/// any failure or when `limit` passes (the process group is stopped).
+#[must_use]
+pub fn git_output(workspace: &camino::Utf8Path, args: &[&str], limit: Duration) -> Option<String> {
+    let started = Instant::now();
+    let mut argv = base_argv();
+    argv.extend(args.iter().map(|arg| (*arg).to_owned()));
+    let process = Process::start_argv(
+        &argv,
+        Some(workspace.as_std_path()),
+        OUTPUT_BYTES,
+        &environment(),
+        Input::Closed,
+    )
+    .ok()?;
+    let exit = loop {
+        if started.elapsed() >= limit {
+            let _ = process.terminate(true);
+            return None;
+        }
+        if let Some(exit) = process.exit() {
+            break exit;
+        }
+        std::thread::sleep(POLL_INTERVAL);
+    };
+    process.drain_output(Duration::from_millis(250));
+    let (retained, produced) = process.stdout().totals();
+    if !exit.is_success() || produced > retained as u64 {
+        return None;
+    }
+    String::from_utf8(process.stdout().since(0).bytes).ok()
+}
+
+/// `git status --porcelain=v1 -z --untracked-files=all` entries as (path, status) pairs.
+///
+/// Paths are relative to the repository root, and a rename is listed under its new
+/// path. A path changed before a snapshot and changed again afterwards keeps the
+/// same entry, so comparing two snapshots does not see the second change.
+#[must_use]
+pub fn status_entries(
+    workspace: &camino::Utf8Path,
+    limit: Duration,
+) -> Option<BTreeMap<String, String>> {
+    let output = git_output(
+        workspace,
+        &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+        limit,
+    )?;
+    let mut entries = BTreeMap::new();
+    let mut fields = output.split('\0');
+    while let Some(field) = fields.next() {
+        if field.is_empty() {
+            continue;
+        }
+        let status = field.get(..2)?;
+        let path = field.get(3..)?;
+        // A rename or copy is followed by the path it came from.
+        if status.starts_with(['R', 'C']) {
+            let _ = fields.next();
+        }
+        entries.insert(path.to_owned(), status.to_owned());
+    }
+    Some(entries)
+}
+
 struct Inspection {
     stdout: Reading,
     stderr: Reading,
@@ -500,6 +568,66 @@ mod tests {
         let mut files = BTreeMap::new();
         visit(root, root, &mut files);
         files
+    }
+
+    #[test]
+    fn status_entries_lists_new_modified_and_renamed_paths() {
+        let directory = tempfile::tempdir().expect("fixture directory");
+        let root = Utf8Path::from_path(directory.path()).expect("UTF-8 root");
+        git(root, &["init", "-q"]);
+        for file in ["kept.txt", "edited.txt", "moved.txt"] {
+            std::fs::write(root.join(file), format!("{file}\n")).expect("fixture file");
+        }
+        git(root, &["add", "."]);
+        git(
+            root,
+            &[
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.com",
+                "commit",
+                "-q",
+                "-m",
+                "fixture",
+            ],
+        );
+        std::fs::write(root.join("edited.txt"), "changed\n").expect("edit");
+        git(root, &["mv", "moved.txt", "renamed.txt"]);
+        std::fs::create_dir(root.join("new")).expect("new directory");
+        std::fs::write(root.join("new/made.txt"), "made\n").expect("new file");
+
+        let entries = status_entries(root, Duration::from_secs(10)).expect("a status");
+        let expected: BTreeMap<String, String> = [
+            ("edited.txt", " M"),
+            ("new/made.txt", "??"),
+            ("renamed.txt", "R "),
+        ]
+        .into_iter()
+        .map(|(path, status)| (path.to_owned(), status.to_owned()))
+        .collect();
+        assert_eq!(entries, expected);
+        assert_eq!(
+            git_output(
+                root,
+                &["rev-parse", "--show-prefix"],
+                Duration::from_secs(10)
+            )
+            .as_deref(),
+            Some("\n")
+        );
+
+        let plain = tempfile::tempdir().expect("plain directory");
+        let plain = Utf8Path::from_path(plain.path()).expect("UTF-8 root");
+        assert_eq!(status_entries(plain, Duration::from_secs(10)), None);
+    }
+
+    #[test]
+    fn git_output_returns_none_past_its_limit() {
+        let directory = fixture();
+        let root = Utf8Path::from_path(directory.path()).expect("root");
+        assert_eq!(git_output(root, &["status"], Duration::ZERO), None);
+        assert!(git_output(root, &["status"], Duration::from_secs(10)).is_some());
     }
 
     #[test]
