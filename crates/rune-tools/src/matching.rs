@@ -70,7 +70,6 @@ pub struct Matches {
 /// Runs the tiers in order and stops at the first that finds at least one match.
 #[must_use]
 pub fn search(source: &str, needle: &str, tiers: Tiers) -> Option<Matches> {
-    let _ = tiers;
     let exact = spans_of(source, needle);
     if !exact.is_empty() {
         return Some(found(Tier::Exact, exact));
@@ -93,7 +92,69 @@ pub fn search(source: &str, needle: &str, tiers: Tiers) -> Option<Matches> {
             return Some(found(Tier::Punctuation, spans));
         }
     }
+    // The line tiers can widen a match, so only a hunk that must match once
+    // may use them.
+    if tiers == Tiers::Selectable {
+        return None;
+    }
+    let spans = line_windows(&source_folded, &needle_folded.text, |file, wanted| {
+        file.trim_end_matches([' ', '\t']) == wanted.trim_end_matches([' ', '\t'])
+    });
+    if !spans.is_empty() {
+        return Some(found(Tier::TrailingWhitespace, spans));
+    }
     None
+}
+
+/// Whole-line windows of `view` whose lines match the needle's, line by line.
+///
+/// The needle is compared with whole file lines, never a fragment of one, so
+/// `foo(` inside `let x = foo(1);` cannot match. A needle ending in a newline
+/// takes the last line's terminator with it; one without leaves the file's
+/// terminator in place. A needle of only blank lines matches nothing.
+fn line_windows(view: &View, needle: &str, same: impl Fn(&str, &str) -> bool) -> Vec<Range<usize>> {
+    let (body, ends_with_newline) = match needle.strip_suffix('\n') {
+        Some(body) => (body, true),
+        None => (needle, false),
+    };
+    let wanted: Vec<&str> = body.split('\n').collect();
+    if wanted
+        .iter()
+        .all(|line| line.trim_matches([' ', '\t']).is_empty())
+    {
+        return Vec::new();
+    }
+    // Each file line as (start, end of content, start of the next line).
+    let text = &view.text;
+    let mut lines = Vec::new();
+    let mut start = 0usize;
+    for (at, byte) in text.bytes().enumerate() {
+        if byte == b'\n' {
+            lines.push((start, at, at.saturating_add(1)));
+            start = at.saturating_add(1);
+        }
+    }
+    if start < text.len() {
+        lines.push((start, text.len(), text.len()));
+    }
+    let count = wanted.len();
+    let mut spans = Vec::new();
+    let mut index = 0usize;
+    while index.saturating_add(count) <= lines.len() {
+        let matched = wanted.iter().enumerate().all(|(offset, line)| {
+            let (from, to, _) = lines[index.saturating_add(offset)];
+            same(&text[from..to], line)
+        });
+        if matched {
+            let last = lines[index.saturating_add(count).saturating_sub(1)];
+            let end = if ends_with_newline { last.2 } else { last.1 };
+            spans.push(view.to_source(lines[index].0)..view.to_source(end));
+            index = index.saturating_add(count);
+        } else {
+            index = index.saturating_add(1);
+        }
+    }
+    spans
 }
 
 fn found(tier: Tier, spans: Vec<Range<usize>>) -> Matches {
@@ -282,6 +343,70 @@ mod tests {
         for span in &matches.spans {
             assert_eq!(&source[span.clone()], "it\u{2019}s");
         }
+    }
+
+    #[test]
+    fn trailing_spaces_in_the_file_match_at_the_trailing_whitespace_tier() {
+        let source = "fn main() {\n    let x = 1;   \n}\n";
+        let matches = search(source, "    let x = 1;\n", Tiers::Unique).expect("a match");
+        assert_eq!(matches.tier, Tier::TrailingWhitespace);
+        assert_eq!(&source[matches.spans[0].clone()], "    let x = 1;   \n");
+        assert!(search(source, "    let x = 1;\n", Tiers::Selectable).is_none());
+    }
+
+    #[test]
+    fn trailing_tabs_in_the_search_match_at_the_trailing_whitespace_tier() {
+        let source = "a\nb\nc\n";
+        let matches = search(source, "a\t\nb\t\t", Tiers::Unique).expect("a match");
+        assert_eq!(matches.tier, Tier::TrailingWhitespace);
+        assert_eq!(&source[matches.spans[0].clone()], "a\nb");
+    }
+
+    #[test]
+    fn a_window_keeps_the_file_terminator_when_the_search_has_none() {
+        let source = "one  \ntwo\n";
+        let without = search(source, "one", Tiers::Unique).expect("a match");
+        assert_eq!(
+            without.tier,
+            Tier::Exact,
+            "a plain fragment matches exactly first"
+        );
+        let matches = search(source, "one \t", Tiers::Unique).expect("a match");
+        assert_eq!(matches.tier, Tier::TrailingWhitespace);
+        assert_eq!(&source[matches.spans[0].clone()], "one  ");
+        // A final line with no terminator: a search ending in a newline still
+        // reaches the end of the text.
+        let last = "x\nend  ";
+        let matches = search(last, "end\n", Tiers::Unique).expect("a match");
+        assert_eq!(&last[matches.spans[0].clone()], "end  ");
+    }
+
+    #[test]
+    fn a_fragment_of_a_line_never_matches_a_line_tier() {
+        let source = "let x = foo(1);  \n";
+        assert!(search(source, "foo(  ", Tiers::Unique).is_none());
+        assert!(
+            search(" \n\t\n", "  \n", Tiers::Unique).is_none(),
+            "blank needles never match"
+        );
+    }
+
+    #[test]
+    fn two_trailing_whitespace_windows_are_ambiguous() {
+        let source = "x = 1 \ny\nx = 1\t\n";
+        let matches = search(source, "x = 1  ", Tiers::Unique).expect("matches");
+        assert_eq!(matches.tier, Tier::TrailingWhitespace);
+        assert_eq!(matches.spans.len(), 2);
+    }
+
+    #[test]
+    fn a_crlf_window_ends_before_the_carriage_return() {
+        let source = "one  \r\ntwo\r\n";
+        let matches = search(source, "one", Tiers::Unique).expect("a match");
+        assert_eq!(matches.tier, Tier::Exact);
+        let matches = search(source, "one\t", Tiers::Unique).expect("a match");
+        assert_eq!(matches.tier, Tier::TrailingWhitespace);
+        assert_eq!(&source[matches.spans[0].clone()], "one  ");
     }
 
     #[test]

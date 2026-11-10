@@ -1424,6 +1424,19 @@ mod tests {
     }
 
     #[test]
+    fn a_trailing_whitespace_match_replaces_the_spaces_on_the_line() {
+        // Without the newline the search is an exact substring of the line
+        // and matches at the exact tier; with it, only the line tier matches.
+        let (after, relaxed) = edited(
+            "fn f() {\n    let x = 1;   \n}\n",
+            "    let x = 1;\n",
+            "    let x = 2;\n",
+        );
+        assert_eq!(after, "fn f() {\n    let x = 2;\n}\n");
+        assert_eq!(relaxed, [crate::matching::Tier::TrailingWhitespace]);
+    }
+
+    #[test]
     fn a_folded_match_found_twice_is_ambiguous() {
         let dir = dir();
         let path = file_in(&dir, "twice.txt");
