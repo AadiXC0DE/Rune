@@ -3,6 +3,7 @@
 #![forbid(unsafe_code)]
 #![cfg_attr(test, allow(clippy::expect_used, clippy::unwrap_used, clippy::panic))]
 
+pub mod apply_patch;
 pub mod ask_user;
 pub mod contract;
 pub mod create_directory;
