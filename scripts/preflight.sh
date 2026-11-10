@@ -4,6 +4,9 @@
 #   scripts/preflight.sh          format, lint, budget, demo module, tests
 #   scripts/preflight.sh --quick  everything but the workspace test suite
 #
+# Run `cargo xtask perf` before each release and after any change to the turn loop,
+# history, session log or renderer.
+#
 # Every step must pass; the workspace suite has no known failures on macOS.
 set -euo pipefail
 cd "$(dirname "$0")/.."

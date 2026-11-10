@@ -54,6 +54,15 @@ mod targets {
     pub const MAX_SCRIPTED_PREFIX_BREAKS: usize = 0;
 }
 
+/// Measured on macOS arm64; other hosts print their numbers without a gate.
+mod perf_baseline {
+    pub const LONG_TURN_PEAK_RSS_BYTES: u64 = 20_238_000;
+    pub const LONG_TURN_CPU_SECONDS: f64 = 10.67;
+    pub const FIRST_FRAME_MEDIAN_MS: f64 = 52.5;
+    /// A measurement more than this fraction above its baseline fails.
+    pub const ALLOWED_REGRESSION: f64 = 0.25;
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let task = args.first().map_or("check", String::as_str);
@@ -80,6 +89,7 @@ fn main() -> ExitCode {
             Ok(())
         }
         "budget" => budget(),
+        "perf" => perf(),
         "gate" => gate(),
         "release" => release(&extra),
         "verify-release" => macos::verify_release(&extra),
@@ -117,6 +127,9 @@ fn print_help() {
     println!("  lint     run clippy with warnings denied");
     println!("  test     run the workspace test suite");
     println!("  budget   build the release profile and check size and startup");
+    println!(
+        "  perf     measure long-turn memory and CPU and time to first frame against stored baselines"
+    );
     println!("  gate     format, lint, budget, and the full workspace test suite");
     println!("  release  stage a release artifact, its checksum, and a manifest");
     println!("  benchmark  print raw size and startup JSON for an existing executable");
@@ -590,6 +603,202 @@ fn run(program: &str, args: &[&str]) -> Result<(), String> {
         Ok(())
     } else {
         Err(format!("`{program} {}` failed", args.join(" ")))
+    }
+}
+
+/// Steps in the long-turn measurement.
+const LONG_TURN_STEPS: usize = 1000;
+
+/// Resources the long-turn run used, from the output of `time`.
+#[derive(Debug, PartialEq)]
+struct TimeUsage {
+    peak_rss_bytes: u64,
+    cpu_seconds: f64,
+}
+
+/// Reads peak memory and user plus system CPU from `/usr/bin/time -l` (macOS)
+/// or `/usr/bin/time -v` (Linux) output.
+fn parse_time_output(text: &str) -> Option<TimeUsage> {
+    let mut rss = None;
+    let mut user = None;
+    let mut system = None;
+    let mut mac_cpu = None;
+    for line in text.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_suffix("maximum resident set size") {
+            rss = rest.trim().parse::<u64>().ok();
+        } else if let Some(rest) = line.strip_prefix("Maximum resident set size (kbytes):") {
+            rss = rest
+                .trim()
+                .parse::<u64>()
+                .ok()
+                .map(|kib| kib.saturating_mul(1024));
+        } else if let Some(rest) = line.strip_prefix("User time (seconds):") {
+            user = rest.trim().parse::<f64>().ok();
+        } else if let Some(rest) = line.strip_prefix("System time (seconds):") {
+            system = rest.trim().parse::<f64>().ok();
+        } else if line.contains(" real ") && line.contains(" user ") && line.ends_with(" sys") {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            let number = |label: &str| {
+                let at = fields.iter().position(|field| *field == label)?;
+                fields.get(at.checked_sub(1)?)?.parse::<f64>().ok()
+            };
+            mac_cpu = Some(number("user")? + number("sys")?);
+        }
+    }
+    let cpu_seconds = match (user, system, mac_cpu) {
+        (Some(user), Some(system), _) => user + system,
+        (_, _, Some(cpu)) => cpu,
+        _ => return None,
+    };
+    Some(TimeUsage {
+        peak_rss_bytes: rss?,
+        cpu_seconds,
+    })
+}
+
+/// Compares measurements with the stored baselines.
+fn perf_failures(rss: u64, cpu: f64, frame: f64) -> Vec<String> {
+    let limit = 1.0 + perf_baseline::ALLOWED_REGRESSION;
+    let percent = (perf_baseline::ALLOWED_REGRESSION * 100.0).round();
+    let mut failures = Vec::new();
+    if rss as f64 > perf_baseline::LONG_TURN_PEAK_RSS_BYTES as f64 * limit {
+        failures.push(format!(
+            "long-turn peak memory {:.1} MiB is more than {percent}% above its baseline {:.1} MiB",
+            rss as f64 / 1_048_576.0,
+            perf_baseline::LONG_TURN_PEAK_RSS_BYTES as f64 / 1_048_576.0
+        ));
+    }
+    if cpu > perf_baseline::LONG_TURN_CPU_SECONDS * limit {
+        failures.push(format!(
+            "long-turn CPU time {cpu:.2} s is more than {percent}% above its baseline {:.2} s",
+            perf_baseline::LONG_TURN_CPU_SECONDS
+        ));
+    }
+    if frame > perf_baseline::FIRST_FRAME_MEDIAN_MS * limit {
+        failures.push(format!(
+            "first frame {frame:.1} ms is more than {percent}% above its baseline {:.1} ms",
+            perf_baseline::FIRST_FRAME_MEDIAN_MS
+        ));
+    }
+    failures
+}
+
+/// The scripted 1,000-step run: one `read_file` call per request, then an answer.
+fn long_turn_scenario() -> rune_testkit::scenario::Scenario {
+    let lines: Vec<String> = (1..=1100).map(|line| format!("line {line}")).collect();
+    let workspace = std::iter::once(("data.txt".to_owned(), lines.join("\n") + "\n")).collect();
+    let mut turns: Vec<rune_testkit::scripted::Turn> = (1..=LONG_TURN_STEPS)
+        .map(|step| {
+            rune_testkit::scripted::Turn::call(
+                &format!("call_{step}"),
+                "read_file",
+                &format!("{{\"path\":\"data.txt\",\"start_line\":{step},\"line_count\":1}}"),
+            )
+        })
+        .collect();
+    turns.push(rune_testkit::scripted::Turn::text("Done."));
+    rune_testkit::scenario::Scenario {
+        name: "long_turn".to_owned(),
+        prompt: "Read the file one line at a time.".to_owned(),
+        workspace,
+        global_args: vec![
+            "--limit".to_owned(),
+            format!("max_agent_steps={}", LONG_TURN_STEPS + 1),
+        ],
+        ask_args: Vec::new(),
+        env: std::collections::BTreeMap::new(),
+        timeout_s: 600,
+        turns,
+        expect: rune_testkit::scenario::Expect {
+            exit_code: Some(0),
+            requests: Some(LONG_TURN_STEPS + 1),
+            ..Default::default()
+        },
+    }
+}
+
+/// Runs the long turn under `time` and returns its peak memory and CPU.
+fn measure_long_turn(binary: &Path) -> Result<TimeUsage, String> {
+    let time = Path::new("/usr/bin/time");
+    if !time.exists() {
+        return Err("perf needs /usr/bin/time".to_owned());
+    }
+    let flag = if cfg!(target_os = "macos") {
+        "-l"
+    } else {
+        "-v"
+    };
+    let wrapper = vec!["/usr/bin/time".to_owned(), flag.to_owned()];
+    let scenario = long_turn_scenario();
+    let provider =
+        rune_testkit::scripted::ScriptedProvider::start_without_bodies(scenario.turns.clone());
+    let report = rune_testkit::scenario::run_wrapped(binary, &wrapper, &scenario, provider);
+    let failures = rune_testkit::scenario::check(&scenario, &report);
+    if !failures.is_empty() {
+        return Err(format!(
+            "long-turn scenario did not finish: {}",
+            failures.join("; ")
+        ));
+    }
+    parse_time_output(&report.stderr).ok_or_else(|| {
+        format!(
+            "could not read resource use from `time` output:\n{}",
+            report.stderr
+        )
+    })
+}
+
+/// Median of the samples the first-frame script prints.
+fn measure_first_frame(binary: &Path) -> Result<f64, String> {
+    let output = Command::new("python3")
+        .arg("-c")
+        .arg(include_str!("first_frame.py"))
+        .arg(binary)
+        .output()
+        .map_err(|err| format!("could not run python3: {err}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "first frame measurement failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let value: serde_json::Value = serde_json::from_str(text.trim())
+        .map_err(|err| format!("first frame output is not JSON: {err}"))?;
+    value
+        .get("median_ms")
+        .and_then(serde_json::Value::as_f64)
+        .ok_or_else(|| "first frame output has no median_ms".to_owned())
+}
+
+/// Measures long-turn memory and CPU and the time to the first frame.
+fn perf() -> Result<(), String> {
+    cargo(&["build", "--release", "-p", "rune"])?;
+    let binary = release_binary_path();
+    let usage = measure_long_turn(&binary)?;
+    let frame = measure_first_frame(&binary)?;
+    let mib = |bytes: u64| bytes as f64 / 1_048_576.0;
+    println!(
+        "long turn    {LONG_TURN_STEPS} steps: peak resident {:.1} MiB (baseline {:.1} MiB), cpu {:.2} s (baseline {:.2} s)",
+        mib(usage.peak_rss_bytes),
+        mib(perf_baseline::LONG_TURN_PEAK_RSS_BYTES),
+        usage.cpu_seconds,
+        perf_baseline::LONG_TURN_CPU_SECONDS
+    );
+    println!(
+        "first frame  median of 11 {frame:.1} ms (baseline {:.1} ms)",
+        perf_baseline::FIRST_FRAME_MEDIAN_MS
+    );
+    if !cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+        println!("no baseline for this host; numbers printed only");
+        return Ok(());
+    }
+    let failures = perf_failures(usage.peak_rss_bytes, usage.cpu_seconds, frame);
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(failures.join("; "))
     }
 }
 
@@ -1384,6 +1593,49 @@ mod tests {
     #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 
     use super::*;
+
+    #[test]
+    fn the_perf_gate_allows_25_percent_and_fails_above() {
+        let rss = perf_baseline::LONG_TURN_PEAK_RSS_BYTES;
+        let cpu = perf_baseline::LONG_TURN_CPU_SECONDS;
+        let frame = perf_baseline::FIRST_FRAME_MEDIAN_MS;
+        assert!(perf_failures(rss, cpu, frame).is_empty());
+        assert!(perf_failures(rss * 125 / 100, cpu * 1.25, frame * 1.25).is_empty());
+        let over = perf_failures(rss * 126 / 100, cpu * 1.26, frame * 1.26);
+        assert_eq!(over.len(), 3, "{over:?}");
+        assert!(over[0].starts_with("long-turn peak memory"));
+        assert!(over[1].starts_with("long-turn CPU time"));
+        assert!(over[2].starts_with("first frame"));
+        assert_eq!(perf_failures(rss * 126 / 100, cpu, frame).len(), 1);
+        assert_eq!(perf_failures(rss, cpu * 1.26, frame).len(), 1);
+        assert_eq!(perf_failures(rss, cpu, frame * 1.26).len(), 1);
+    }
+
+    #[test]
+    fn time_output_is_parsed_on_both_hosts() {
+        let macos = "        2.50 real         1.20 user         0.30 sys\n\
+                     \x20          9830400  maximum resident set size\n\
+                     \x20                 0  average shared memory size\n";
+        assert_eq!(
+            parse_time_output(macos),
+            Some(TimeUsage {
+                peak_rss_bytes: 9_830_400,
+                cpu_seconds: 1.5
+            })
+        );
+        let linux = "\tCommand being timed: \"rune\"\n\
+                     \tUser time (seconds): 1.20\n\
+                     \tSystem time (seconds): 0.30\n\
+                     \tMaximum resident set size (kbytes): 9600\n";
+        assert_eq!(
+            parse_time_output(linux),
+            Some(TimeUsage {
+                peak_rss_bytes: 9_830_400,
+                cpu_seconds: 1.5
+            })
+        );
+        assert_eq!(parse_time_output("nothing useful"), None);
+    }
 
     #[test]
     fn a_module_record_round_trips_and_rejects_a_partial_file() {

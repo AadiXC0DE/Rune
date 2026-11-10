@@ -184,6 +184,17 @@ pub fn run(binary: &Path, scenario: &Scenario) -> Report {
 
 /// Runs the scenario against a provider the caller built.
 pub fn run_with(binary: &Path, scenario: &Scenario, provider: ScriptedProvider) -> Report {
+    run_wrapped(binary, &[], scenario, provider)
+}
+
+/// Runs the scenario with the binary started by a wrapper command, such as a
+/// resource meter: `wrapper[0]`, then `wrapper[1..]`, then the binary path.
+pub fn run_wrapped(
+    binary: &Path,
+    wrapper: &[String],
+    scenario: &Scenario,
+    provider: ScriptedProvider,
+) -> Report {
     let temp = tempfile::TempDir::new().expect("a temporary directory");
     let root = temp.path();
     let workspace = root.join("workspace");
@@ -197,7 +208,14 @@ pub fn run_with(binary: &Path, scenario: &Scenario, provider: ScriptedProvider) 
         std::fs::write(&target, contents).expect("a workspace file");
     }
 
-    let mut command = Command::new(binary);
+    let mut command = match wrapper.split_first() {
+        Some((program, rest)) => {
+            let mut command = Command::new(program);
+            command.args(rest).arg(binary);
+            command
+        }
+        None => Command::new(binary),
+    };
     command.env_clear();
     if let Some(path) = std::env::var_os("PATH") {
         command.env("PATH", path);
