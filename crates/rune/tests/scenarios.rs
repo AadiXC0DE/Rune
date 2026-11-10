@@ -40,6 +40,7 @@ const SCENARIOS: &[&str] = &[
     "overflow_ladder",
     "question_nudge",
     "question_nudge_off",
+    "deepseek_thinking_tools",
 ];
 
 /// Scenarios built in Rust, which have no file.
@@ -68,6 +69,11 @@ fn run_scenario(name: &str) -> scenario::Report {
 #[test]
 fn fix_one_file() {
     run_scenario("fix_one_file");
+}
+
+#[test]
+fn deepseek_thinking_tools() {
+    run_scenario("deepseek_thinking_tools");
 }
 
 #[test]
@@ -615,6 +621,7 @@ fn long_150_steps_completes() {
         global_args: Vec::new(),
         ask_args: vec!["--json".to_owned(), "--no-save".to_owned()],
         env: BTreeMap::new(),
+        provider: None,
         user_config: None,
         timeout_s: 120,
         turns,
@@ -667,6 +674,7 @@ fn prune_long_run() {
         global_args: Vec::new(),
         ask_args: vec!["--json".to_owned(), "--no-save".to_owned()],
         env: BTreeMap::from([("RUNE_CONTEXT_WINDOW".to_owned(), "128000".to_owned())]),
+        provider: None,
         user_config: None,
         timeout_s: 120,
         turns,

@@ -167,11 +167,13 @@ impl Provider for ChatCompletions {
             body.insert("tools".to_owned(), serde_json::json!([]));
         }
 
-        // The other thinking formats ask for reasoning the way most compatible
-        // servers understand until they have their own fields.
-        if compat.thinking_format != ThinkingFormat::None
+        if compat.thinking_format == ThinkingFormat::DeepSeek {
+            insert_deepseek_thinking(&mut body, plan.effort);
+        } else if compat.thinking_format != ThinkingFormat::None
             && let Some(effort) = effort_wire(plan.effort)
         {
+            // The other thinking formats ask for reasoning the way most
+            // compatible servers understand until they have their own fields.
             body.insert("reasoning_effort".to_owned(), serde_json::json!(effort));
         }
         let sampling = plan.sampling;
@@ -528,6 +530,29 @@ pub fn effort_wire(effort: Effort) -> Option<&'static str> {
         Effort::Xhigh => Some("xhigh"),
         Effort::Max => Some("max"),
     }
+}
+
+/// Writes DeepSeek's thinking switch and its three effort levels. `Auto`
+/// sends nothing, which leaves the server default of thinking at high effort.
+fn insert_deepseek_thinking(body: &mut serde_json::Map<String, serde_json::Value>, effort: Effort) {
+    let level = match effort {
+        Effort::Auto => return,
+        Effort::None => {
+            body.insert(
+                "thinking".to_owned(),
+                serde_json::json!({ "type": "disabled" }),
+            );
+            return;
+        }
+        Effort::Minimal | Effort::Low => "low",
+        Effort::Medium | Effort::High | Effort::Xhigh => "high",
+        Effort::Max => "max",
+    };
+    body.insert(
+        "thinking".to_owned(),
+        serde_json::json!({ "type": "enabled" }),
+    );
+    body.insert("reasoning_effort".to_owned(), serde_json::json!(level));
 }
 
 /// The text fields reasoning arrives in, in the order they are read.
@@ -1102,10 +1127,13 @@ fn parse_usage(value: &serde_json::Value) -> Usage {
     Usage {
         input_tokens: field("prompt_tokens"),
         output_tokens: field("completion_tokens"),
+        // DeepSeek reports hits at the top level; its `prompt_tokens` already
+        // counts them.
         cache_read_tokens: value
             .get("prompt_tokens_details")
             .and_then(|details| details.get("cached_tokens"))
-            .and_then(serde_json::Value::as_u64),
+            .and_then(serde_json::Value::as_u64)
+            .or_else(|| field("prompt_cache_hit_tokens")),
         cache_write_tokens: value
             .get("prompt_tokens_details")
             .and_then(|details| details.get("cache_write_tokens"))
@@ -2486,5 +2514,54 @@ mod tests {
         assert!(silent.get("reasoning_effort").is_none(), "{silent}");
         let other = shaped(|compat| compat.thinking_format = ThinkingFormat::DeepSeek);
         assert_eq!(other["reasoning_effort"], "high");
+    }
+
+    #[test]
+    fn deepseek_effort_maps_onto_thinking_and_effort() {
+        let enabled = Some(serde_json::json!({ "type": "enabled" }));
+        for (effort, thinking, level) in [
+            (Effort::Auto, None, None),
+            (
+                Effort::None,
+                Some(serde_json::json!({ "type": "disabled" })),
+                None,
+            ),
+            (Effort::Minimal, enabled.clone(), Some("low")),
+            (Effort::Low, enabled.clone(), Some("low")),
+            (Effort::Medium, enabled.clone(), Some("high")),
+            (Effort::High, enabled.clone(), Some("high")),
+            (Effort::Xhigh, enabled.clone(), Some("high")),
+            (Effort::Max, enabled.clone(), Some("max")),
+        ] {
+            let mut plan = default_body_plan();
+            plan.compat.thinking_format = ThinkingFormat::DeepSeek;
+            plan.effort = effort;
+            let body = ChatCompletions.build_request(&plan).expect("build");
+            assert_eq!(body.get("thinking").cloned(), thinking, "{effort}");
+            assert_eq!(
+                body.get("reasoning_effort")
+                    .and_then(serde_json::Value::as_str),
+                level,
+                "{effort}"
+            );
+        }
+    }
+
+    #[test]
+    fn deepseek_cache_hits_count_as_cached_input() {
+        let usage = parse_usage(&serde_json::json!({
+            "prompt_tokens": 100,
+            "completion_tokens": 10,
+            "prompt_cache_hit_tokens": 70,
+            "prompt_cache_miss_tokens": 30,
+        }));
+        assert_eq!(usage.input_tokens, Some(100));
+        assert_eq!(usage.cache_read_tokens, Some(70));
+        let both = parse_usage(&serde_json::json!({
+            "prompt_tokens": 100,
+            "prompt_tokens_details": { "cached_tokens": 60 },
+            "prompt_cache_hit_tokens": 70,
+        }));
+        assert_eq!(both.cache_read_tokens, Some(60));
     }
 }

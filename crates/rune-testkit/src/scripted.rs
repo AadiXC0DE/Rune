@@ -35,6 +35,9 @@ use serde::Deserialize;
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Turn {
+    /// Reasoning streamed as `delta.reasoning_content` before the content.
+    #[serde(default)]
+    pub reasoning: Option<String>,
     /// Text streamed as content.
     #[serde(default)]
     pub text: Option<String>,
@@ -149,7 +152,12 @@ impl Turn {
         if self.http_error.is_some() {
             return 0;
         }
-        let text = self.text.as_ref().map_or(0, String::len);
+        let text = self
+            .text
+            .iter()
+            .chain(&self.reasoning)
+            .map(String::len)
+            .fold(0, usize::saturating_add);
         self.tool_calls.iter().fold(text, |sum, call| {
             sum.saturating_add(call.name.len())
                 .saturating_add(call.argument_string().len())
@@ -461,6 +469,9 @@ fn stream_body(turn: &Turn, usage: (u64, u64, u64)) -> Vec<u8> {
     use serde_json::json;
 
     let mut events = vec![json!({"choices":[{"index":0,"delta":{"role":"assistant"}}]})];
+    if let Some(reasoning) = &turn.reasoning {
+        events.push(json!({"choices":[{"index":0,"delta":{"reasoning_content":reasoning}}]}));
+    }
     if let Some(text) = &turn.text {
         events.push(json!({"choices":[{"index":0,"delta":{"content":text}}]}));
     }

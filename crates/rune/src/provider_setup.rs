@@ -606,6 +606,8 @@ pub fn cached_prices(settings: &Settings, paths: &Paths) -> Option<rune_net::mod
             output: declared.output,
             cache_read: declared.cache_read,
             cache_write: declared.cache_write,
+            off_peak: None,
+            schedule: None,
         });
     }
     let key = rune_net::models_dev::catalog_key(&settings.provider.to_string())?;

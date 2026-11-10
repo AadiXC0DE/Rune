@@ -713,6 +713,7 @@ fn long_turn_scenario(steps: usize) -> rune_testkit::scenario::Scenario {
         global_args: Vec::new(),
         ask_args: Vec::new(),
         env: std::collections::BTreeMap::new(),
+        provider: None,
         // A window no run here can fill, so the measurement is the turn loop
         // and never a compaction (1,000 steps come close to 80% of 128k).
         user_config: Some(

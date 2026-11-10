@@ -1504,8 +1504,9 @@ fn classify_transport_error(err: &ureq::Error) -> NetError {
     NetError::new(kind, message)
 }
 
-/// The current time, for reading a `Retry-After` date.
-fn now_timestamp() -> jiff::Timestamp {
+/// The current time, for reading a `Retry-After` date or pricing a request.
+#[must_use]
+pub fn now_timestamp() -> jiff::Timestamp {
     let millis = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |elapsed| {

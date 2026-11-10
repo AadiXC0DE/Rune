@@ -2906,7 +2906,9 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                     .lock()
                     .ok()
                     .and_then(|prices| *prices)
-                    .and_then(|prices| prices.cost(&outcome.usage));
+                    .and_then(|prices| {
+                        prices.cost_at(&outcome.usage, rune_net::transport::now_timestamp())
+                    });
                 record_usage(&config.paths, &host.model(), &outcome, cost);
                 if let Some(cost) = cost
                     && let Ok(mut totals) = host.totals.lock()

@@ -730,7 +730,10 @@ impl AskHost<'_> {
 
     /// Adds one request's estimated cost to the run's spend.
     fn add_spend(&self, usage: &Usage) {
-        if let Some(cost) = self.prices.and_then(|prices| prices.cost(usage)) {
+        if let Some(cost) = self
+            .prices
+            .and_then(|prices| prices.cost_at(usage, rune_net::transport::now_timestamp()))
+        {
             let mut spent = lock(&self.spent);
             *spent = Some(spent.unwrap_or(0).saturating_add(cost));
         }
@@ -940,7 +943,9 @@ impl Host for AskHost<'_> {
                     usage: StepUsage::from(&outcome.usage),
                     cost_usd: self
                         .prices
-                        .and_then(|prices| prices.cost(&outcome.usage))
+                        .and_then(|prices| {
+                            prices.cost_at(&outcome.usage, rune_net::transport::now_timestamp())
+                        })
                         .map(rune_net::models_dev::dollars),
                     ts: jsonl_timestamp(),
                 },
@@ -1542,7 +1547,7 @@ pub fn run(
         repaired_calls: outcome.repaired_calls,
         narration,
         cost_usd: crate::provider_setup::cached_prices(settings, paths)
-            .and_then(|prices| prices.cost(&usage))
+            .and_then(|prices| prices.cost_at(&usage, rune_net::transport::now_timestamp()))
             .map(rune_net::models_dev::dollars),
         experiment: Some(settings.experiments.render()).filter(|keys| !keys.is_empty()),
         verification: error.is_none().then(|| outcome.verification.as_str()),

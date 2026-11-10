@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use rune_core::id::ToolCallId;
 use rune_net::chat_completions::ChatCompletions;
 use rune_net::compat::ReasoningReplay;
-use rune_net::message::{ContentPart, Message, ToolSpec};
+use rune_net::message::{ContentPart, Message, Role, ToolSpec};
 use rune_net::provider::{Provider as _, RequestPlan};
 use rune_net::transport::{Endpoint, StreamOutcome, UreqFetch, stream_completion};
 use serde_json::Value;
@@ -214,4 +214,58 @@ fn streamed_reasoning_replays_in_the_field_each_endpoint_reads() {
             assert_eq!(fields, vec![("reasoning", &text)], "{observed}");
         }
     }
+}
+
+#[test]
+fn a_deepseek_tool_exchange_sends_reasoning_back_on_every_assistant_turn() {
+    let recorded = include_str!("fixtures/chat_completions/deepseek_two_step/response-1.txt");
+    let outcome = stream(recorded);
+    let reasoning = "The user wants a.txt read. I will call read_file\nwith its path.";
+    assert_eq!(outcome.reasoning(), reasoning);
+    assert_eq!(outcome.usage.input_tokens, Some(120));
+    assert_eq!(outcome.usage.cache_read_tokens, Some(64));
+
+    let call = ToolCallId::new("call_00_ds1").expect("id");
+    let mut assistant = Message::assistant(vec![
+        ContentPart::Reasoning {
+            text: outcome.reasoning(),
+        },
+        ContentPart::ToolCall {
+            id: call.clone(),
+            name: "read_file".to_owned(),
+            arguments: "{\"path\":\"a.txt\"}".to_owned(),
+        },
+    ]);
+    assistant.replay.clone_from(&outcome.replay);
+    let (compat, traits) = rune_net::compat::resolve("deepseek", None, "deepseek-flash");
+    let mut plan = RequestPlan::new("deepseek-flash");
+    plan.compat = compat;
+    plan.traits = traits;
+    plan.instructions = "be helpful".to_owned();
+    plan.tools = vec![ToolSpec {
+        name: "read_file".to_owned(),
+        description: "Read a file".to_owned(),
+        input_schema: serde_json::json!({ "type": "object" }),
+    }];
+    plan.messages = vec![
+        Message::user("read a.txt"),
+        assistant,
+        Message {
+            role: Role::Tool,
+            parts: vec![ContentPart::ToolResult {
+                id: call,
+                name: "read_file".to_owned(),
+                content: "hello".to_owned(),
+                is_error: false,
+            }],
+            replay: None,
+        },
+    ];
+    let body = ChatCompletions.build_request(&plan).expect("build");
+    assert_eq!(body["messages"][2]["role"], "assistant", "{body}");
+    assert_eq!(
+        body["messages"][2]["reasoning_content"], reasoning,
+        "{body}"
+    );
+    assert!(body.get("thinking").is_none(), "{body}");
 }

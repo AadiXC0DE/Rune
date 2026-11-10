@@ -35,6 +35,9 @@ pub struct Scenario {
     pub ask_args: Vec<String>,
     /// Extra environment, added last.
     pub env: BTreeMap<String, String>,
+    /// The provider name passed as `RUNE_PROVIDER`; the base URL still points
+    /// at the scripted server.
+    pub provider: Option<String>,
     /// TOML written to the user configuration file before the run.
     pub user_config: Option<String>,
     /// Seconds before the child is killed.
@@ -94,6 +97,25 @@ pub struct Expect {
     /// Text that the result of a tool call, as sent back in a request, must contain.
     #[serde(default)]
     pub result_contains: Vec<ResultContains>,
+    /// Values at JSON pointers in recorded request bodies.
+    #[serde(default)]
+    pub request_fields: Vec<RequestField>,
+}
+
+/// One assertion on a field of a recorded request body.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RequestField {
+    /// The POST number, 1-based.
+    pub request: usize,
+    /// A JSON pointer into the body, such as `/messages/2/role`.
+    pub pointer: String,
+    /// The value that must be there.
+    #[serde(default)]
+    pub equals: Option<serde_json::Value>,
+    /// When true, nothing may be at the pointer.
+    #[serde(default)]
+    pub absent: bool,
 }
 
 /// One tool result assertion.
@@ -161,6 +183,8 @@ struct RawScenario {
     #[serde(default)]
     env: BTreeMap<String, String>,
     #[serde(default)]
+    provider: Option<String>,
+    #[serde(default)]
     user_config: Option<String>,
     #[serde(default)]
     timeout_s: Option<u64>,
@@ -219,6 +243,7 @@ pub fn load(path: &Path) -> Result<Scenario, String> {
             .ask_args
             .unwrap_or_else(|| vec!["--json".to_owned(), "--no-save".to_owned()]),
         env: raw.env,
+        provider: raw.provider,
         user_config: raw.user_config,
         timeout_s: raw.timeout_s.unwrap_or(60),
         turns: raw.turns,
@@ -299,7 +324,10 @@ pub fn run_wrapped(
         .env("XDG_CONFIG_HOME", root.join("config"))
         .env("XDG_DATA_HOME", root.join("data"))
         .env("XDG_STATE_HOME", root.join("xdg-state"))
-        .env("RUNE_PROVIDER", "chat_completions")
+        .env(
+            "RUNE_PROVIDER",
+            scenario.provider.as_deref().unwrap_or("chat_completions"),
+        )
         .env("RUNE_BASE_URL", provider.base_url())
         .env("RUNE_MODEL", "scripted")
         .env("RUNE_API_KEY_ENV", "RUNE_SCENARIO_KEY")
@@ -567,7 +595,43 @@ pub fn check(scenario: &Scenario, report: &Report) -> Vec<String> {
             Some(_) => {}
         }
     }
+    for entry in &expect.request_fields {
+        failures.extend(check_request_field(entry, &report.requests));
+    }
     failures
+}
+
+/// Checks one `request_fields` entry; `None` when it holds.
+fn check_request_field(entry: &RequestField, requests: &[RecordedRequest]) -> Option<String> {
+    let at = format!(
+        "request_fields: request {} {}",
+        entry.request, entry.pointer
+    );
+    let Some(request) = entry
+        .request
+        .checked_sub(1)
+        .and_then(|index| requests.get(index))
+    else {
+        return Some(format!(
+            "request_fields: request {} does not exist",
+            entry.request
+        ));
+    };
+    let Ok(body) = serde_json::from_str::<serde_json::Value>(&request.body) else {
+        return Some(format!("{at}: the body is not JSON"));
+    };
+    let found = body.pointer(&entry.pointer);
+    if entry.absent {
+        return found.map(|value| format!("{at}: expected nothing, found {value}"));
+    }
+    let Some(want) = &entry.equals else {
+        return Some(format!("{at}: needs `equals` or `absent`"));
+    };
+    match found {
+        Some(value) if value == want => None,
+        Some(value) => Some(format!("{at}: expected {want}, found {value}")),
+        None => Some(format!("{at}: expected {want}, found nothing")),
+    }
 }
 
 fn field<'a>(report: &'a Report, key: &str) -> Option<&'a serde_json::Value> {
@@ -735,6 +799,40 @@ mod tests {
     }
 
     #[test]
+    fn request_fields_compare_the_value_at_a_pointer() {
+        let scenario = load_inline(
+            r#"{"prompt":"p","turns":[],"expect":{"request_fields":[
+                {"request":1,"pointer":"/messages/0/reasoning_content","equals":"look"},
+                {"request":1,"pointer":"/thinking","absent":true}]}}"#,
+        );
+        let request = |body: &str| RecordedRequest {
+            path: String::new(),
+            body: body.to_owned(),
+            bytes: body.len(),
+            prompt_tokens: 0,
+            cached_tokens: 0,
+            completion_tokens: 0,
+        };
+        let mut report = Report {
+            requests: vec![request(r#"{"messages":[{"reasoning_content":"look"}]}"#)],
+            ..Report::default()
+        };
+        assert!(check(&scenario, &report).is_empty());
+        report.requests[0] = request(
+            r#"{"thinking":{"type":"enabled"},"messages":[{"reasoning_content":"other"}]}"#,
+        );
+        assert_eq!(
+            check(&scenario, &report),
+            [
+                r#"request_fields: request 1 /messages/0/reasoning_content: expected "look", found "other""#,
+                r#"request_fields: request 1 /thinking: expected nothing, found {"type":"enabled"}"#,
+            ]
+        );
+        report.requests.clear();
+        assert_eq!(check(&scenario, &report).len(), 2);
+    }
+
+    #[test]
     fn stop_reason_mismatch_is_reported() {
         let scenario =
             load_inline(r#"{"prompt":"p","turns":[],"expect":{"stop_reason":"end_turn"}}"#);
@@ -778,6 +876,7 @@ mod tests {
             global_args: Vec::new(),
             ask_args: Vec::new(),
             env: BTreeMap::new(),
+            provider: None,
             user_config: None,
             timeout_s: 60,
             turns: Vec::new(),
