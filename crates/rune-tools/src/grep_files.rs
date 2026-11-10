@@ -1,4 +1,5 @@
-//! Literal text search with pagination, counts, and explicit truncation.
+//! Regular-expression and plain-text search with pagination, counts, and
+//! explicit truncation.
 
 use std::collections::VecDeque;
 use std::fmt::Write as _;
@@ -26,14 +27,15 @@ const MAX_LISTED_NAMES: usize = 20;
 /// Largest context window a model may request, bounding the ring allocation.
 const MAX_CONTEXT_LINES: usize = 1000;
 
-/// Characters that make a pattern look like a regular expression.
-///
-/// Only a hint is produced: the match is literal whatever the pattern contains.
-const REGEX_HINTS: &[&str] = &[
-    r"\d", r"\w", r"\s", r"\b", ".*", ".+", "[^", "(?", "^", "$", "|", "(", ")", "[", "]",
+/// Characters that make a pattern a regular expression rather than plain text.
+const REGEX_METACHARACTERS: &[char] = &[
+    '\\', '.', '+', '*', '?', '(', ')', '[', ']', '{', '}', '^', '$', '|',
 ];
 
-/// Searches file contents for literal text.
+/// Largest compiled regular expression, in bytes.
+const REGEX_SIZE_LIMIT: usize = 1 << 20;
+
+/// Searches file contents with a regular expression, or for plain text.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct GrepFiles {
     limits: FileLimits,
@@ -59,7 +61,7 @@ impl Tool for GrepFiles {
     }
 
     fn description(&self) -> &'static str {
-        "Search file contents for literal text, not a regular expression. Binary files are skipped."
+        "Search file contents with a regular expression. Skips binary files."
     }
 
     fn input_schema(&self) -> serde_json::Value {
@@ -68,6 +70,10 @@ impl Tool for GrepFiles {
             "properties": {
                 "pattern": {
                     "type": "string",
+                },
+                "literal": {
+                    "type": "boolean",
+                    "description": "Match the pattern as plain text.",
                 },
                 "path": {
                     "type": "string",
@@ -185,8 +191,49 @@ struct Query {
     head_limit: usize,
     offset: usize,
     context_lines: usize,
-    /// True when the pattern carries regular-expression syntax.
-    looks_like_regex: bool,
+    /// How each line is tested.
+    matcher: Pattern,
+    /// Why a pattern that looked like a regular expression was searched as
+    /// plain text.
+    fallback: Option<String>,
+}
+
+/// How a line is tested against the pattern.
+enum Pattern {
+    /// The streaming plain-text matcher.
+    Literal,
+    /// A compiled regular expression, tested on each line without its terminator.
+    Regex(regex::bytes::Regex),
+}
+
+/// Chooses the matcher for a pattern, falling back to plain text with a reason
+/// when the pattern does not compile.
+fn compile(pattern: &str, literal: bool, case_insensitive: bool) -> (Pattern, Option<String>) {
+    if literal || !pattern.contains(REGEX_METACHARACTERS) {
+        return (Pattern::Literal, None);
+    }
+    let built = regex::bytes::RegexBuilder::new(pattern)
+        .case_insensitive(case_insensitive)
+        .unicode(true)
+        .multi_line(true)
+        .size_limit(REGEX_SIZE_LIMIT)
+        .build();
+    match built {
+        Ok(regex) => (Pattern::Regex(regex), None),
+        Err(err) => {
+            let reason = match err {
+                regex::Error::Syntax(text) => text
+                    .lines()
+                    .filter_map(|line| line.strip_prefix("error: "))
+                    .next_back()
+                    .unwrap_or("unsupported pattern")
+                    .to_owned(),
+                regex::Error::CompiledTooBig(_) => "the compiled pattern is over 1 MiB".to_owned(),
+                _ => "unsupported pattern".to_owned(),
+            };
+            (Pattern::Literal, Some(reason))
+        }
+    }
 }
 
 /// Parses and validates the arguments.
@@ -231,12 +278,16 @@ fn parse(
         Some(value) => value.min(tool.limits.list_entries),
         None => tool.limits.list_entries,
     };
+    let case_insensitive = bool_arg(arguments, "case_insensitive")?.unwrap_or(false);
+    let literal = bool_arg(arguments, "literal")?.unwrap_or(false);
+    let (matcher, fallback) = compile(&pattern, literal, case_insensitive);
     Ok(Query {
-        looks_like_regex: REGEX_HINTS.iter().any(|hint| pattern.contains(hint)),
         pattern,
         root,
         include: string_arg(arguments, "include")?.map(str::to_owned),
-        case_insensitive: bool_arg(arguments, "case_insensitive")?.unwrap_or(false),
+        case_insensitive,
+        matcher,
+        fallback,
         mode: Mode::of(arguments)?,
         head_limit,
         offset: usize_arg(arguments, "offset")?.unwrap_or(0),
@@ -335,6 +386,10 @@ fn scan(
 }
 
 /// Scans buffered chunks with cancellation checks, including oversized lines.
+///
+/// The plain-text matcher sees every byte of a line. A regular expression is
+/// tested on the retained head of the line, so only the first
+/// `MAX_MATCH_LINE_BYTES` of a longer line can match it.
 fn scan_reader<R: BufRead>(
     reader: &mut R,
     display: &str,
@@ -355,7 +410,10 @@ fn scan_reader<R: BufRead>(
     } else {
         query.pattern.clone()
     };
-    let matcher = LiteralMatcher::new(&needle, query.case_insensitive)?;
+    let literal = match &query.matcher {
+        Pattern::Literal => Some(LiteralMatcher::new(&needle, query.case_insensitive)?),
+        Pattern::Regex(_) => None,
+    };
 
     // Findings are staged locally and merged only when the whole file has been
     // read, so a file rejected partway through leaves no trace in the report.
@@ -377,13 +435,17 @@ fn scan_reader<R: BufRead>(
     let mut buffer = Vec::new();
 
     loop {
-        let mut matching = matcher.line();
+        let mut matching = literal.as_ref().map(LiteralMatcher::line);
         let line = read_line_bounded_observed(
             reader,
             &mut buffer,
             MAX_MATCH_LINE_BYTES,
             || context.check_cancelled(),
-            |chunk| matching.feed(chunk),
+            |chunk| {
+                if let Some(matching) = &mut matching {
+                    matching.feed(chunk);
+                }
+            },
         )
         .map_err(|err: RuneError| {
             if err.code() == ErrorCode::Cancelled {
@@ -403,8 +465,17 @@ fn scan_reader<R: BufRead>(
         number = number.saturating_add(1);
         let text = String::from_utf8_lossy(&buffer);
         let text = text.trim_end_matches(['\n', '\r']);
-        // All source chunks are searched independently of the retained head.
-        let matched = matching.finish();
+        let matched = match &query.matcher {
+            Pattern::Regex(regex) => {
+                let end = buffer
+                    .iter()
+                    .rposition(|byte| !matches!(byte, b'\n' | b'\r'))
+                    .map_or(0, |index| index.saturating_add(1));
+                regex.is_match(&buffer[..end])
+            }
+            // All source chunks are searched independently of the retained head.
+            Pattern::Literal => matching.is_some_and(MatchingLine::finish),
+        };
         let shown = truncate_line(text, line.length, MAX_MATCH_LINE_BYTES);
         let mut recorded = false;
         if matched {
@@ -677,6 +748,12 @@ fn render(query: &Query, label: &str, report: &Report, walker: &Walker, cap: usi
     let mut body = String::new();
     let mut footer = String::new();
 
+    if let Some(reason) = &query.fallback {
+        let _ = writeln!(
+            body,
+            "[not a valid regular expression ({reason}); searched for it as plain text]"
+        );
+    }
     match query.mode {
         Mode::Count => {}
         Mode::FilesWithMatches => {
@@ -739,13 +816,6 @@ fn render(query: &Query, label: &str, report: &Report, walker: &Walker, cap: usi
     }
     if query.context_lines > 0 && query.mode != Mode::Matches {
         footer.push_str("[context_lines applies only to matches mode]\n");
-    }
-    if query.looks_like_regex {
-        let _ = writeln!(
-            footer,
-            "[the pattern `{}` contains regex metacharacters, which were matched literally]",
-            query.pattern
-        );
     }
     if !report.binary.is_empty() {
         let _ = writeln!(
@@ -1041,32 +1111,262 @@ mod tests {
         assert!(whole.text.contains("README.md"), "{}", whole.text);
     }
 
-    #[test]
-    fn the_pattern_is_literal_and_the_result_says_so() {
-        let repo = Repo::new();
-        repo.write("literal/a.txt", "value .+ here\nvalue xyz here\n");
+    /// Runs a search and returns its text.
+    fn grep(repo: &Repo, arguments: &serde_json::Value) -> String {
         let output = GrepFiles::default()
-            .call(&serde_json::json!({ "pattern": ".+" }), &repo.context())
+            .call(arguments, &repo.context())
             .expect("call");
-        assert!(output.text.contains("literal/a.txt"), "{}", output.text);
-        assert!(
-            output
-                .text
-                .contains("contains regex metacharacters, which were matched literally"),
-            "{}",
-            output.text
-        );
-        // A regex would have matched both lines.
-        assert!(!output.text.contains("value xyz here"), "{}", output.text);
+        assert!(!output.is_error, "{}", output.text);
+        output.text
+    }
+
+    /// Returns the text of the matching lines listed for `file`, without context.
+    fn matched(text: &str, file: &str) -> Vec<String> {
+        lines_for(text, file)
+            .into_iter()
+            .filter_map(|line| {
+                let (number, rest) = line.split_once(':')?;
+                number.trim().parse::<usize>().ok()?;
+                Some(rest.to_owned())
+            })
+            .collect()
     }
 
     #[test]
-    fn a_pattern_without_metacharacters_carries_no_note() {
+    fn alternation_finds_either_word() {
         let repo = Repo::new();
-        let output = GrepFiles::default()
-            .call(&serde_json::json!({ "pattern": "needle" }), &repo.context())
-            .expect("call");
-        assert!(!output.text.contains("metacharacters"), "{}", output.text);
+        repo.write("alt/a.txt", "foo here\nbar there\nbaz elsewhere\n");
+        let text = grep(
+            &repo,
+            &serde_json::json!({ "pattern": "foo|bar", "path": "alt" }),
+        );
+        assert_eq!(
+            matched(&text, "alt/a.txt"),
+            ["foo here", "bar there"],
+            "{text}"
+        );
+        assert!(!text.contains("not a valid"), "{text}");
+    }
+
+    #[test]
+    fn anchors_match_line_starts_and_ends() {
+        let repo = Repo::new();
+        repo.write(
+            "anchor/a.rs",
+            "fn main() {\n    let x = 1;\n    fn inner() {}\n}\nlet y = 2\n",
+        );
+        let starts = grep(
+            &repo,
+            &serde_json::json!({ "pattern": "^fn ", "path": "anchor" }),
+        );
+        assert_eq!(matched(&starts, "anchor/a.rs"), ["fn main() {"], "{starts}");
+        let ends = grep(
+            &repo,
+            &serde_json::json!({ "pattern": ";$", "path": "anchor" }),
+        );
+        assert_eq!(matched(&ends, "anchor/a.rs"), ["    let x = 1;"], "{ends}");
+        let every = grep(
+            &repo,
+            &serde_json::json!({ "pattern": ".*", "path": "anchor", "mode": "count" }),
+        );
+        assert!(
+            summary(&every).contains("5 matching lines in 1 files"),
+            "{every}"
+        );
+    }
+
+    #[test]
+    fn word_boundaries_and_classes_work() {
+        let repo = Repo::new();
+        repo.write(
+            "words/a.txt",
+            "value = 1\nvalues = 2\nuser_id = 3\nid = 4\n",
+        );
+        let bounded = grep(
+            &repo,
+            &serde_json::json!({ "pattern": r"\bvalue\b", "path": "words" }),
+        );
+        assert_eq!(matched(&bounded, "words/a.txt"), ["value = 1"], "{bounded}");
+        let class = grep(
+            &repo,
+            &serde_json::json!({ "pattern": r"\w+_id", "path": "words" }),
+        );
+        assert_eq!(matched(&class, "words/a.txt"), ["user_id = 3"], "{class}");
+    }
+
+    #[test]
+    fn an_invalid_pattern_is_searched_as_plain_text_and_says_so() {
+        let repo = Repo::new();
+        repo.write("paren/a.txt", "call(x)\nno paren\n");
+        let text = grep(
+            &repo,
+            &serde_json::json!({ "pattern": "(", "path": "paren" }),
+        );
+        assert_eq!(
+            text.lines().next(),
+            Some(
+                "[not a valid regular expression (unclosed group); searched for it as plain text]"
+            ),
+            "{text}"
+        );
+        assert_eq!(matched(&text, "paren/a.txt"), ["call(x)"], "{text}");
+
+        repo.write("paren/b.txt", "a(?=x)b\n");
+        for mode in ["matches", "files_with_matches", "count"] {
+            let text = grep(
+                &repo,
+                &serde_json::json!({ "pattern": "(?=x)", "path": "paren", "mode": mode }),
+            );
+            assert!(
+                text.starts_with("[not a valid regular expression (look-around"),
+                "{text}"
+            );
+            assert!(text.contains("\n[1 matching lines in 1 files"), "{text}");
+        }
+    }
+
+    #[test]
+    fn literal_mode_matches_metacharacters_as_text() {
+        let repo = Repo::new();
+        repo.write("lit/a.txt", "a.b\naxb\n");
+        let literal = grep(
+            &repo,
+            &serde_json::json!({ "pattern": "a.b", "path": "lit", "literal": true }),
+        );
+        assert_eq!(matched(&literal, "lit/a.txt"), ["a.b"], "{literal}");
+        let regex = grep(
+            &repo,
+            &serde_json::json!({ "pattern": "a.b", "path": "lit" }),
+        );
+        assert_eq!(matched(&regex, "lit/a.txt"), ["a.b", "axb"], "{regex}");
+    }
+
+    #[test]
+    fn a_plain_pattern_uses_the_literal_matcher() {
+        let repo = Repo::new();
+        let context = repo.context();
+        let query = |pattern: &str| {
+            parse(
+                &GrepFiles::new(),
+                &serde_json::json!({ "pattern": pattern }),
+                &context,
+            )
+            .expect("query")
+        };
+        for plain in ["alpha", "needle", "fn main"] {
+            let parsed = query(plain);
+            assert!(matches!(parsed.matcher, Pattern::Literal), "{plain}");
+            assert!(parsed.fallback.is_none(), "{plain}");
+        }
+        for regex in [r"\d+", "a.*b", "[abc]"] {
+            assert!(matches!(query(regex).matcher, Pattern::Regex(_)), "{regex}");
+        }
+
+        repo.write("plain/a.txt", "alpha one\nbeta two\n");
+        let text = grep(
+            &repo,
+            &serde_json::json!({ "pattern": "alpha", "path": "plain" }),
+        );
+        assert_eq!(matched(&text, "plain/a.txt"), ["alpha one"], "{text}");
+        assert!(!text.contains("regular expression"), "{text}");
+        assert!(!text.contains("plain text"), "{text}");
+    }
+
+    #[test]
+    fn case_insensitive_regex_folds_non_ascii() {
+        let repo = Repo::new();
+        repo.write("fold/a.txt", "äpfel\nbirne\n");
+        let insensitive = grep(
+            &repo,
+            &serde_json::json!({ "pattern": "ÄPF.L", "path": "fold", "case_insensitive": true }),
+        );
+        assert_eq!(
+            matched(&insensitive, "fold/a.txt"),
+            ["äpfel"],
+            "{insensitive}"
+        );
+        let sensitive = grep(
+            &repo,
+            &serde_json::json!({ "pattern": "ÄPF.L", "path": "fold" }),
+        );
+        assert!(matched(&sensitive, "fold/a.txt").is_empty(), "{sensitive}");
+    }
+
+    #[test]
+    fn a_crlf_line_matches_an_end_anchor() {
+        let repo = Repo::new();
+        repo.write("crlfend/a.txt", "abx\r\nxab\r\n");
+        let text = grep(
+            &repo,
+            &serde_json::json!({ "pattern": "x$", "path": "crlfend" }),
+        );
+        assert_eq!(matched(&text, "crlfend/a.txt"), ["abx"], "{text}");
+        assert!(!text.contains('\r'), "{text:?}");
+    }
+
+    #[test]
+    fn regex_matches_respect_context_lines_and_paging() {
+        let repo = Repo::new();
+        repo.write("ctx/block.txt", "before\nneedle here\nafter\n");
+        let output = grep(
+            &repo,
+            &serde_json::json!({ "pattern": r"needle\s+here", "context_lines": 1 }),
+        );
+        assert!(output.contains("-before"), "{output}");
+        assert!(output.contains("-after"), "{output}");
+        assert!(output.contains(":needle here"), "{output}");
+
+        let repo = Repo::new();
+        let page = |offset: usize| {
+            grep(
+                &repo,
+                &serde_json::json!({
+                    "pattern": "need(l)e",
+                    "head_limit": 3,
+                    "offset": offset,
+                }),
+            )
+        };
+        let pages = [page(0), page(3), page(6)];
+        let entries = |text: &str| {
+            text.lines()
+                .filter(|line| !line.starts_with('['))
+                .filter(|line| line.contains("needle"))
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        };
+        let first = entries(&pages[0]);
+        let second = entries(&pages[1]);
+        let third = entries(&pages[2]);
+        assert_eq!(first.len(), 3, "{}", pages[0]);
+        assert_eq!(second.len(), 3, "{}", pages[1]);
+        assert_eq!(third.len(), 3, "{}", pages[2]);
+        assert!(pages[0].contains("pass offset=3"), "{}", pages[0]);
+        assert!(pages[1].contains("pass offset=6"), "{}", pages[1]);
+
+        let mut union = first
+            .into_iter()
+            .chain(second)
+            .chain(third)
+            .collect::<Vec<_>>();
+        let count = union.len();
+        union.sort();
+        union.dedup();
+        assert_eq!(union.len(), count, "pages overlap: {union:?}");
+        assert_eq!(union.len(), MATCH_LINES);
+    }
+
+    #[test]
+    fn the_schema_grows_by_at_most_sixty_bytes() {
+        let spec = crate::contract::model_spec(&GrepFiles::default());
+        let bytes = serde_json::json!({
+            "name": spec.name,
+            "description": spec.description,
+            "input_schema": spec.input_schema,
+        })
+        .to_string()
+        .len();
+        assert!(bytes <= 850 + 60, "{bytes} bytes");
     }
 
     #[test]
@@ -2061,15 +2361,5 @@ mod tests {
             schema["properties"]["mode"]["enum"],
             serde_json::json!(["matches", "files_with_matches", "count"])
         );
-    }
-
-    #[test]
-    fn the_regex_hint_recognises_the_common_escapes() {
-        let hints = |pattern: &str| REGEX_HINTS.iter().any(|hint| pattern.contains(hint));
-        assert!(hints(r"\d+"));
-        assert!(hints("a.*b"));
-        assert!(hints("[abc]"));
-        assert!(!hints("needle"));
-        assert!(!hints("fn main"));
     }
 }
