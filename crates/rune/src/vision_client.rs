@@ -43,7 +43,10 @@ pub fn backend(settings: &Settings, paths: &Paths) -> Result<Option<Arc<dyn Visi
         kind: settings.provider.clone(),
         endpoint,
         model: model.to_owned(),
-        timeouts: RequestTimeouts::from_limits(&settings.limits),
+        timeouts: RequestTimeouts::from_settings(
+            &settings.limits,
+            crate::provider_setup::provider_head_timeout_ms(settings),
+        ),
         provider_order: settings.provider_order.clone(),
         provider_strict: settings.provider_strict,
     })))

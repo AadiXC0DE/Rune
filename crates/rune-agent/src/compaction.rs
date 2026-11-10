@@ -145,7 +145,7 @@ pub fn compact(
         &request_plan,
         RequestTimeouts {
             head: compaction_timeout(&limits),
-            ..RequestTimeouts::from_limits(&limits)
+            ..RequestTimeouts::from_settings(&limits, host.provider_head_timeout_ms())
         },
         cancelled,
         &mut |event| accounting.observe(event),

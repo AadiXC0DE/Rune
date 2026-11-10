@@ -969,7 +969,7 @@ impl Agent {
     #[must_use]
     pub fn diagnostics(&self) -> AgentDiagnostics {
         let provider = self.dialect.provider();
-        let timeouts = rune_net::transport::RequestTimeouts::from_limits(&self.limits);
+        let timeouts = rune_net::transport::RequestTimeouts::from_settings(&self.limits, None);
         let limits = self
             .limits
             .describe()
@@ -1468,7 +1468,7 @@ impl rune_agent::turn::Host for SdkHost<'_> {
         Box::new(SdkFetch {
             fetch: Arc::clone(&self.context.fetch),
             cancel: self.context.cancel.clone(),
-            head: rune_net::transport::RequestTimeouts::from_limits(&self.limits).head,
+            head: rune_net::transport::RequestTimeouts::from_settings(&self.limits, None).head,
             attempts: Arc::clone(&self.attempts),
         })
     }

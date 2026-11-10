@@ -551,7 +551,9 @@ allowed request still lists the tools but forbids calling them and tells the
 model it is the last step, so the run ends with its final answer.
 Transient provider failures retry within each step up to `provider_max_attempts`,
 honoring `Retry-After` or using bounded backoff. Each attempt uses the configured
-`provider_head_timeout_ms` and `provider_request_timeout_ms` deadlines.
+`provider_head_timeout_ms` and `provider_request_timeout_ms` deadlines; a
+provider's own `head_timeout_ms` under `[providers.<name>]` in the user
+configuration replaces the first, for example for a slow local model.
 Rejected credentials never retry. Retries consume no extra model steps or usage.
 Reaching the cap exits 3 with `limit_exceeded`; the last step's answer is the
 `final_output`. JSON reports the steps, summed usage, and each tool's

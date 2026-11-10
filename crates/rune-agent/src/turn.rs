@@ -532,6 +532,12 @@ pub trait Host {
     fn accepts_images(&self) -> bool {
         false
     }
+
+    /// The provider's own time to wait for a reply's first byte, in
+    /// milliseconds, over the `provider_head_timeout_ms` limit. None by default.
+    fn provider_head_timeout_ms(&self) -> Option<u64> {
+        None
+    }
 }
 
 /// One entry of what a turn said and did, in the order it happened.
@@ -801,7 +807,8 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
         .value()
         .unwrap_or(0);
     let max_attempts = limits.get_usize(LimitName::ProviderMaxAttempts).max(1);
-    let timeouts = transport::RequestTimeouts::from_limits(&limits);
+    let timeouts =
+        transport::RequestTimeouts::from_settings(&limits, host.provider_head_timeout_ms());
 
     let instructions = host.instructions();
     history.set_instructions(instructions);

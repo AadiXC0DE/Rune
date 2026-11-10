@@ -483,6 +483,10 @@ impl Host for SessionHost {
         self.tool_images.attach(result)
     }
 
+    fn provider_head_timeout_ms(&self) -> Option<u64> {
+        crate::provider_setup::provider_head_timeout_ms(&self.permission_settings)
+    }
+
     fn accepts_images(&self) -> bool {
         if !self.dialect().capabilities().images {
             return false;
@@ -9794,7 +9798,7 @@ mod tests {
                 &host.endpoint,
                 host.dialect.as_ref(),
                 &plan,
-                rune_net::transport::RequestTimeouts::from_limits(&host.limits),
+                rune_net::transport::RequestTimeouts::from_settings(&host.limits, None),
                 &|| false,
             )
             .expect("following provider request");
@@ -9885,7 +9889,7 @@ mod tests {
             &host.endpoint,
             host.dialect.as_ref(),
             &plan,
-            rune_net::transport::RequestTimeouts::from_limits(&host.limits),
+            rune_net::transport::RequestTimeouts::from_settings(&host.limits, None),
             &|| false,
         )
         .expect("next model request");

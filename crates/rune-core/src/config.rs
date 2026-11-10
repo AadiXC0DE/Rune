@@ -585,6 +585,10 @@ pub struct ProviderEntry {
     /// Request shape settings that replace the built-in ones for this provider.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compat: Option<BTreeMap<String, toml::Value>>,
+    /// Time to wait for the first byte of a reply, in milliseconds, over the
+    /// `provider_head_timeout_ms` limit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head_timeout_ms: Option<u64>,
 }
 
 /// The resolved settings of one provider.
@@ -592,6 +596,8 @@ pub struct ProviderEntry {
 pub struct ProviderSettings {
     /// Request shape settings by name, each value as written.
     pub compat: BTreeMap<String, String>,
+    /// Time to wait for the first byte of a reply, in milliseconds.
+    pub head_timeout_ms: Option<u64>,
 }
 
 /// A diagnostic produced while loading configuration.
@@ -1525,7 +1531,7 @@ fn apply_user(settings: &mut Settings, user: &UserConfig, layer: Layer) {
     );
 }
 
-/// Merges `[providers.<name>.compat]` tables, keeping each value as text.
+/// Merges `[providers.<name>]` tables: `compat` values are kept as text.
 ///
 /// Every setting is a name or a boolean, so any other value type is reported
 /// and skipped rather than guessed at.
@@ -1535,6 +1541,13 @@ fn apply_providers(
     layer: Layer,
 ) {
     for (name, entry) in providers {
+        if let Some(head) = entry.head_timeout_ms.filter(|ms| *ms > 0) {
+            settings
+                .providers
+                .entry(name.clone())
+                .or_default()
+                .head_timeout_ms = Some(head);
+        }
         let Some(compat) = &entry.compat else {
             continue;
         };
@@ -2349,6 +2362,37 @@ mod tests {
         assert_eq!(settings.edit_tool, EditToolSetting::Auto);
         assert_eq!(settings.source_of("edit_tool"), Layer::Default);
         assert!(!settings.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn a_provider_head_timeout_is_read_from_its_table() {
+        let dir = TempDir::new().expect("tempdir");
+        let user = write(
+            &dir,
+            "config.toml",
+            "[providers.ollama]\nhead_timeout_ms = 600000\n\n[providers.openai]\nhead_timeout_ms = 0\n",
+        );
+        let settings = load(None, Some(&user), &empty_env());
+        assert!(
+            settings.diagnostics.is_empty(),
+            "{:?}",
+            settings.diagnostics
+        );
+        assert_eq!(
+            settings
+                .providers
+                .get("ollama")
+                .and_then(|entry| entry.head_timeout_ms),
+            Some(600_000)
+        );
+        // Zero is not a timeout, so the limit applies.
+        assert_eq!(
+            settings
+                .providers
+                .get("openai")
+                .and_then(|entry| entry.head_timeout_ms),
+            None
+        );
     }
 
     #[test]

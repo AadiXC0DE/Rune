@@ -860,6 +860,16 @@ pub fn environment_credential(provider: &str, configured: Option<&str>) -> Optio
     credential_from_environment(provider, configured)
 }
 
+/// The connected provider's own `head_timeout_ms`, from its `[providers.<name>]`
+/// table.
+#[must_use]
+pub fn provider_head_timeout_ms(settings: &Settings) -> Option<u64> {
+    let canonical = rune_net::compat::canonical_preset(settings.provider.as_str());
+    settings
+        .provider_settings(&canonical)
+        .and_then(|(_, provider)| provider.head_timeout_ms)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

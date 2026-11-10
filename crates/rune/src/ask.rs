@@ -762,6 +762,10 @@ impl Host for AskHost<'_> {
         self.dialect().capabilities().images && self.vision
     }
 
+    fn provider_head_timeout_ms(&self) -> Option<u64> {
+        crate::provider_setup::provider_head_timeout_ms(self.settings)
+    }
+
     fn take_encoded_request(&self) -> Option<String> {
         lock(&self.encoded_request).take()
     }

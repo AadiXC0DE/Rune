@@ -59,18 +59,22 @@ pub struct RequestTimeouts {
 }
 
 impl RequestTimeouts {
-    /// Resolves the provider time budgets from configuration.
+    /// Resolves the provider time budgets from configuration: a provider's
+    /// own `head_timeout_ms` wins over the `provider_head_timeout_ms` limit.
     #[must_use]
-    pub fn from_limits(limits: &rune_core::budget::BudgetSet) -> Self {
+    pub fn from_settings(
+        limits: &rune_core::budget::BudgetSet,
+        provider_head_timeout_ms: Option<u64>,
+    ) -> Self {
         use rune_core::budget::LimitName;
 
         Self {
-            head: Duration::from_millis(
+            head: Duration::from_millis(provider_head_timeout_ms.unwrap_or_else(|| {
                 limits
                     .get(LimitName::ProviderHeadTimeoutMs)
                     .value()
-                    .unwrap_or(120_000),
-            ),
+                    .unwrap_or(120_000)
+            })),
             total: limits
                 .get(LimitName::ProviderRequestTimeoutMs)
                 .value()
@@ -1316,7 +1320,10 @@ impl<'a> StreamState<'a> {
                 FailureKind::Timeout,
                 "the endpoint produced no output within the head timeout",
             )
-            .with_hint("raise provider_head_timeout_ms for a slow local model"));
+            .with_hint(
+                "raise `head_timeout_ms` under [providers.<name>], or the \
+                 provider_head_timeout_ms limit, for a slow local model",
+            ));
         }
         Ok(())
     }
@@ -1446,6 +1453,30 @@ pub fn diagnostic_for(plan: &RequestPlan, error: &NetError) -> serde_json::Value
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_provider_head_timeout_wins_over_the_limit() {
+        let mut limits = rune_core::budget::BudgetSet::new();
+        assert_eq!(
+            RequestTimeouts::from_settings(&limits, None).head,
+            Duration::from_secs(120)
+        );
+        limits
+            .set(
+                rune_core::budget::LimitName::ProviderHeadTimeoutMs,
+                rune_core::budget::Budget::Bounded(5_000),
+                rune_core::config::Layer::User,
+            )
+            .expect("limit");
+        assert_eq!(
+            RequestTimeouts::from_settings(&limits, None).head,
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            RequestTimeouts::from_settings(&limits, Some(600_000)).head,
+            Duration::from_secs(600)
+        );
+    }
 
     /// A client that fails the test if a request reaches it.
     ///
@@ -1614,7 +1645,7 @@ mod tests {
             &Endpoint::new("https://api.example.com", "k"),
             &crate::chat_completions::ChatCompletions,
             &RequestPlan::new("m"),
-            RequestTimeouts::from_limits(&limits),
+            RequestTimeouts::from_settings(&limits, None),
             &|| false,
         )
         .expect("completion with no total deadline");

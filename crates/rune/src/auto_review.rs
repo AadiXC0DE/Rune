@@ -97,7 +97,11 @@ fn configure(settings: &Settings, paths: &Paths) -> Result<Option<ModelReviewer>
                 .limits
                 .get_bytes(rune_core::budget::LimitName::ReviewTimeoutMs),
         ),
-        request_timeout: RequestTimeouts::from_limits(&settings.limits).total,
+        request_timeout: RequestTimeouts::from_settings(
+            &settings.limits,
+            crate::provider_setup::provider_head_timeout_ms(settings),
+        )
+        .total,
         attempts: RETRIES,
     }))
 }
