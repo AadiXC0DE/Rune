@@ -8,7 +8,9 @@ use rune_core::config::Effort;
 use rune_core::error::{Result, RuneError};
 use rune_core::id::ToolCallId;
 
-use crate::compat::{CacheMarkers, EmptyContent, ReasoningReplay, ThinkingFormat, shape_call_id};
+use crate::compat::{
+    CacheMarkers, EmptyContent, Family, ReasoningReplay, ThinkingFormat, shape_call_id,
+};
 use crate::message::{ContentPart, Message, Role};
 use crate::provider::{Provider, RequestPlan};
 use crate::stream::{
@@ -171,6 +173,19 @@ impl Provider for ChatCompletions {
             && let Some(effort) = effort_wire(plan.effort)
         {
             body.insert("reasoning_effort".to_owned(), serde_json::json!(effort));
+        }
+        let sampling = plan.sampling;
+        if let Some(temperature) = sampling.temperature {
+            body.insert("temperature".to_owned(), serde_json::json!(temperature));
+        }
+        if let Some(top_p) = sampling.top_p {
+            body.insert("top_p".to_owned(), serde_json::json!(top_p));
+        }
+        // Only the families that serve `top_k` on compatible routes get it.
+        if let Some(top_k) = sampling.top_k
+            && matches!(plan.traits.family, Family::Gemini | Family::Qwen)
+        {
+            body.insert("top_k".to_owned(), serde_json::json!(top_k));
         }
 
         if let Some(max) = plan.max_output_tokens {
@@ -1134,6 +1149,60 @@ mod tests {
         plan.instructions = "be helpful".to_owned();
         plan.messages = vec![Message::user(text)];
         plan
+    }
+
+    /// A plan for `model` on a generic endpoint, sampled as the loop samples it.
+    fn sampled_plan(model: &str) -> RequestPlan {
+        let mut plan = plan_with_user("hi");
+        plan.model = model.to_owned();
+        (plan.compat, plan.traits) = crate::compat::resolve("chat_completions", None, model);
+        plan.sampling = plan.traits.sampling;
+        plan
+    }
+
+    #[test]
+    fn family_sampling_defaults_are_sent() {
+        let sampled = |model: &str| {
+            let body = ChatCompletions
+                .build_request(&sampled_plan(model))
+                .expect("build");
+            ["temperature", "top_p", "top_k"].map(|field| body.get(field).cloned())
+        };
+        let json = |value: serde_json::Value| Some(value);
+        assert_eq!(
+            sampled("qwen3-coder"),
+            [json(serde_json::json!(0.55)), None, None]
+        );
+        assert_eq!(
+            sampled("gemini-3.8-flash"),
+            [
+                json(serde_json::json!(1.0)),
+                json(serde_json::json!(0.95)),
+                json(serde_json::json!(64))
+            ]
+        );
+        assert_eq!(
+            sampled("glm-4.7"),
+            [json(serde_json::json!(1.0)), None, None]
+        );
+        assert_eq!(
+            sampled("minimax-m3"),
+            [
+                json(serde_json::json!(1.0)),
+                json(serde_json::json!(0.95)),
+                None
+            ]
+        );
+        assert_eq!(sampled("test/model"), [None, None, None]);
+    }
+
+    #[test]
+    fn a_user_temperature_overrides_the_default() {
+        let mut plan = sampled_plan("gemini-3.8-flash");
+        plan.sampling.temperature = Some(0.2);
+        let body = ChatCompletions.build_request(&plan).expect("build");
+        assert_eq!(body["temperature"], 0.2);
+        assert_eq!(body["top_p"], 0.95);
     }
 
     #[test]

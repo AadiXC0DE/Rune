@@ -123,6 +123,15 @@ impl Provider for Gemini {
         if let Some(thinking) = thinking_config(&plan.model, plan.effort) {
             generation.insert("thinkingConfig".to_owned(), thinking);
         }
+        if let Some(temperature) = plan.sampling.temperature {
+            generation.insert("temperature".to_owned(), json!(temperature));
+        }
+        if let Some(top_p) = plan.sampling.top_p {
+            generation.insert("topP".to_owned(), json!(top_p));
+        }
+        if let Some(top_k) = plan.sampling.top_k {
+            generation.insert("topK".to_owned(), json!(top_k));
+        }
         if !generation.is_empty() {
             body["generationConfig"] = Value::Object(generation);
         }
@@ -737,6 +746,19 @@ mod tests {
                 "{model} {effort:?}"
             );
         }
+    }
+
+    #[test]
+    fn gemini_sampling_goes_into_the_generation_config() {
+        let mut plan = RequestPlan::new("gemini-3.8-flash");
+        let (_, traits) = crate::compat::resolve("gemini", None, "gemini-3.8-flash");
+        plan.sampling = traits.sampling;
+        let body = Gemini.build_request(&plan).expect("body");
+        let generation = &body["generationConfig"];
+        assert_eq!(generation["temperature"], 1.0);
+        assert_eq!(generation["topP"], 0.95);
+        assert_eq!(generation["topK"], 64);
+        assert!(body.get("temperature").is_none());
     }
 
     #[test]

@@ -336,6 +336,9 @@ impl Host for ChildHost<'_> {
     fn cache_key(&self) -> Option<String> {
         self.parent.cache_key()
     }
+    fn temperature(&self) -> Option<f64> {
+        self.parent.temperature()
+    }
     fn provider_order(&self) -> Vec<String> {
         self.parent.provider_order()
     }

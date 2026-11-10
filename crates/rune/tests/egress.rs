@@ -81,6 +81,7 @@ fn send(endpoint: &Endpoint, dialect: &dyn Dialect) -> Result<(), rune_core::err
         traits: rune_net::compat::ModelTraits::default(),
         cache_key: None,
         reasoning_summary: true,
+        sampling: rune_net::compat::Sampling::default(),
     };
     rune_net::transport::stream_completion(
         &rune_net::transport::agent(),

@@ -1689,9 +1689,10 @@ mod tests {
             "claude",
         ] {
             for &level in crate::provider::ALL_EFFORTS {
-                let body = Anthropic
-                    .build_request(&claude_plan(model, level))
-                    .expect("build");
+                // A user temperature that reached the plan is still not sent.
+                let mut plan = claude_plan(model, level);
+                plan.sampling.temperature = Some(0.2);
+                let body = Anthropic.build_request(&plan).expect("build");
                 for field in ["temperature", "top_p", "top_k"] {
                     assert!(body.get(field).is_none(), "{model} {level:?} {field}");
                 }

@@ -77,6 +77,8 @@ pub struct RequestPlan {
     /// Whether readable reasoning summaries are requested where the dialect
     /// supports them.
     pub reasoning_summary: bool,
+    /// Sampling values sent where the dialect carries them; none by default.
+    pub sampling: crate::compat::Sampling,
 }
 
 impl RequestPlan {
@@ -101,6 +103,7 @@ impl RequestPlan {
             traits: crate::compat::ModelTraits::default(),
             cache_key: None,
             reasoning_summary: true,
+            sampling: crate::compat::Sampling::default(),
         }
     }
 
@@ -495,6 +498,7 @@ mod routing_tests {
             traits: crate::compat::ModelTraits::default(),
             cache_key: None,
             reasoning_summary: true,
+            sampling: crate::compat::Sampling::default(),
         }
     }
 

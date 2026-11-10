@@ -510,6 +510,10 @@ impl Host for SessionHost {
         crate::provider_setup::provider_head_timeout_ms(&self.permission_settings)
     }
 
+    fn temperature(&self) -> Option<f64> {
+        self.permission_settings.temperature
+    }
+
     fn cache_key(&self) -> Option<String> {
         Some(
             self.cache_key

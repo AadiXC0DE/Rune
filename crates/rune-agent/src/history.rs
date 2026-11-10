@@ -166,6 +166,9 @@ pub struct History {
     /// without them. Not persisted: a resumed session asks again.
     #[serde(skip)]
     reasoning_summary_refused: bool,
+    /// Set once the user was told their temperature is not sent. Not persisted.
+    #[serde(skip)]
+    temperature_noticed: bool,
     /// The smallest request a provider rejected as too long, in estimated
     /// tokens, with the model it was sent to.
     #[serde(skip)]
@@ -200,6 +203,7 @@ impl Default for History {
             pruned: std::collections::BTreeSet::new(),
             settled_turn: None,
             reasoning_summary_refused: false,
+            temperature_noticed: false,
             window_bound: None,
         }
     }
@@ -225,6 +229,7 @@ impl History {
             pruned: std::collections::BTreeSet::new(),
             settled_turn: None,
             reasoning_summary_refused: false,
+            temperature_noticed: false,
             window_bound: None,
         }
     }
@@ -233,6 +238,14 @@ impl History {
     #[must_use]
     pub const fn reasoning_summary_refused(&self) -> bool {
         self.reasoning_summary_refused
+    }
+
+    /// Records that the refused temperature was announced, and returns whether
+    /// this is the first time.
+    pub const fn notice_temperature_once(&mut self) -> bool {
+        let first = !self.temperature_noticed;
+        self.temperature_noticed = true;
+        first
     }
 
     /// Sends later requests of this conversation without reasoning summaries.
@@ -771,6 +784,7 @@ impl History {
             pruned: self.pruned.clone(),
             settled_turn: None,
             reasoning_summary_refused: self.reasoning_summary_refused,
+            temperature_noticed: self.temperature_noticed,
             window_bound: self.window_bound.clone(),
         }
     }

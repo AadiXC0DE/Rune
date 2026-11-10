@@ -290,6 +290,12 @@ command that is only `apply_patch <<'EOF'` ... `EOF` (optionally after
 `cd <dir> && `) is applied as a patch, under the same policy as the edit
 tools, whichever tool is offered.
 
+Models whose vendors publish sampling values get them: Qwen, Gemini, GLM 4.6
+and later, and MiniMax. Set `temperature` (0 to 2) in the user configuration
+(or `RUNE_TEMPERATURE`) to replace the default temperature. Claude, GPT and
+Kimi models, and DeepSeek while it thinks, are sent no sampling values; a set
+temperature is then reported once per session instead.
+
 For image analysis, set `vision_model = "<image-capable-model>"` in the user
 configuration. Interactive sessions, `rune ask`, and ACP use that model with
 the active provider's endpoint and credential. A permitted `vision` call with

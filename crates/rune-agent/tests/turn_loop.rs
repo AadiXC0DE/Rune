@@ -98,6 +98,11 @@ struct TestHost {
     planned_output: Mutex<Vec<Option<u64>>>,
     /// The cache key every request of the run is given.
     cache_key: Option<String>,
+    /// The temperature the user chose.
+    temperature: Option<f64>,
+    /// Whether the model is resolved through the compat table rather than as
+    /// an unknown model.
+    table_compat: bool,
     /// Cache key and whether summaries were asked for, per planned request.
     planned_cache: Mutex<Vec<(Option<String>, bool)>>,
     /// Whether the model is described as seeing images tools attach.
@@ -145,6 +150,8 @@ impl TestHost {
             context_window: None,
             planned_output: Mutex::new(Vec::new()),
             cache_key: None,
+            temperature: None,
+            table_compat: false,
             planned_cache: Mutex::new(Vec::new()),
             accepts_images: false,
             tool_images: Mutex::new(std::collections::BTreeMap::new()),
@@ -228,6 +235,24 @@ impl Host for TestHost {
 
     fn cache_key(&self) -> Option<String> {
         self.cache_key.clone()
+    }
+
+    fn temperature(&self) -> Option<f64> {
+        self.temperature
+    }
+
+    fn compat(
+        &self,
+        model: &str,
+    ) -> (
+        rune_net::compat::EndpointCompat,
+        rune_net::compat::ModelTraits,
+    ) {
+        if self.table_compat {
+            rune_net::compat::resolve("chat_completions", None, model)
+        } else {
+            Default::default()
+        }
     }
 
     fn endpoint(&self) -> &Endpoint {
@@ -1170,6 +1195,65 @@ fn a_refused_summary_is_dropped_and_the_step_continues() {
             .iter()
             .any(|event| matches!(event, Event::ProviderRetry { .. })),
         "the resend is not a provider retry"
+    );
+}
+
+#[test]
+fn a_refused_temperature_is_announced_once() {
+    let endpoint = MockEndpoint::start(vec![Script::text("hi"), Script::text("again")]);
+    let mut host = TestHost::new(endpoint);
+    host.model = "claude-sonnet-5-5".to_owned();
+    host.temperature = Some(0.2);
+    host.table_compat = true;
+    let mut history = rune_agent::History::new();
+    history.push_user("hello");
+    run_turn(&mut history, &host).expect("turn");
+    history.push_user("hello again");
+    run_turn(&mut history, &host).expect("second turn");
+
+    let notices: Vec<String> = host
+        .events()
+        .iter()
+        .filter_map(|event| match event {
+            Event::Notice { text } => Some(text.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        notices,
+        ["temperature is not sent to claude-sonnet-5-5: it does not accept one"]
+    );
+    let body = host
+        .server
+        .as_ref()
+        .expect("endpoint")
+        .last_body()
+        .expect("request");
+    assert!(body.get("temperature").is_none(), "{body}");
+}
+
+#[test]
+fn a_user_temperature_reaches_a_model_that_accepts_one() {
+    let endpoint = MockEndpoint::start(vec![Script::text("hi")]);
+    let mut host = TestHost::new(endpoint);
+    host.model = "qwen3-coder".to_owned();
+    host.temperature = Some(0.2);
+    host.table_compat = true;
+    let mut history = rune_agent::History::new();
+    history.push_user("hello");
+    run_turn(&mut history, &host).expect("turn");
+    let body = host
+        .server
+        .as_ref()
+        .expect("endpoint")
+        .last_body()
+        .expect("request");
+    assert_eq!(body["temperature"], 0.2);
+    assert!(
+        !host
+            .events()
+            .iter()
+            .any(|event| matches!(event, Event::Notice { .. }))
     );
 }
 

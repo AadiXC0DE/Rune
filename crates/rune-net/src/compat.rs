@@ -897,6 +897,17 @@ pub fn claude_version(model: &str) -> Option<(Tier, u32, u32)> {
     Some((tier, major, minor))
 }
 
+/// Whether sampling values may be sent to a model: never to Claude, GPT or
+/// Kimi models, and to DeepSeek's thinking mode only with effort `none`,
+/// since it ignores them while thinking.
+#[must_use]
+pub fn accepts_sampling(traits: &ModelTraits, effort: Effort, compat: &EndpointCompat) -> bool {
+    if matches!(traits.family, Family::Claude | Family::Gpt | Family::Kimi) {
+        return false;
+    }
+    compat.thinking_format != ThinkingFormat::DeepSeek || effort == Effort::None
+}
+
 /// The place of an effort in the order used for clamping, lowest first.
 /// `Auto` has none.
 const fn effort_rank(effort: Effort) -> Option<u8> {
@@ -1599,5 +1610,21 @@ mod tests {
         assert_eq!(effective_effort(Effort::Xhigh, true, &traits), Effort::High);
         let plain = ModelTraits::default();
         assert_eq!(effective_effort(Effort::Auto, false, &plain), Effort::Auto);
+    }
+
+    #[test]
+    fn sampling_is_withheld_from_models_that_reject_it() {
+        let accepts = |provider: &str, model: &str, effort: Effort| {
+            let (compat, traits) = resolve(provider, None, model);
+            accepts_sampling(&traits, effort, &compat)
+        };
+        for model in ["claude-sonnet-5-5", "gpt-5.5", "kimi-k2.6"] {
+            assert!(!accepts("chat_completions", model, Effort::Auto), "{model}");
+        }
+        for model in ["qwen3-coder", "gemini-3.8-flash", "glm-4.7", "minimax-m3"] {
+            assert!(accepts("chat_completions", model, Effort::Auto), "{model}");
+        }
+        assert!(!accepts("deepseek", "deepseek-flash", Effort::Auto));
+        assert!(accepts("deepseek", "deepseek-flash", Effort::None));
     }
 }

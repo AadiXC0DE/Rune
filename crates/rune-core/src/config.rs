@@ -517,6 +517,10 @@ pub struct UserConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<Effort>,
 
+    /// Sampling temperature, 0 to 2, sent to models that accept one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f64>,
+
     /// Whether fast mode is requested where supported.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fast_mode: Option<bool>,
@@ -724,6 +728,8 @@ pub struct Settings {
     pub allow_unsandboxed: bool,
     /// Reasoning effort.
     pub effort: Effort,
+    /// Sampling temperature chosen by the user, over the model's default.
+    pub temperature: Option<f64>,
     /// Whether fast mode is requested.
     pub fast_mode: bool,
     /// Theme selection.
@@ -787,6 +793,7 @@ impl Default for Settings {
             permission_mode: PermissionMode::default(),
             allow_unsandboxed: false,
             effort: Effort::default(),
+            temperature: None,
             fast_mode: false,
             theme: None,
             ascii: false,
@@ -1024,6 +1031,8 @@ pub struct EnvironmentOverrides {
     pub permission_mode: Option<String>,
     /// Reasoning effort.
     pub effort: Option<String>,
+    /// `RUNE_TEMPERATURE`, as written.
+    pub temperature: Option<String>,
     /// Fast mode.
     pub fast_mode: Option<bool>,
     /// Theme.
@@ -1104,6 +1113,7 @@ impl EnvironmentOverrides {
             api_key_env: lookup("RUNE_API_KEY_ENV"),
             permission_mode: lookup("RUNE_PERMISSION_MODE"),
             effort: lookup("RUNE_EFFORT"),
+            temperature: lookup("RUNE_TEMPERATURE"),
             fast_mode: boolean(&mut lookup, "RUNE_FAST_MODE"),
             theme: lookup("RUNE_THEME"),
             ascii: boolean(&mut lookup, "RUNE_ASCII"),
@@ -1187,6 +1197,7 @@ const PROFILE_ONLY_KEYS: &[&str] = &[
     "permission_mode",
     "permission",
     "effort",
+    "temperature",
     "edit_tool",
     "fast_mode",
     "theme",
@@ -1478,6 +1489,9 @@ fn apply_user(settings: &mut Settings, user: &UserConfig, layer: Layer) {
     if let Some(effort) = user.effort {
         settings.effort = effort;
         settings.sources.record("effort", layer);
+    }
+    if let Some(temperature) = user.temperature {
+        set_temperature(settings, temperature, &temperature.to_string(), layer);
     }
     if let Some(fast) = user.fast_mode {
         settings.fast_mode = fast;
@@ -1825,6 +1839,19 @@ fn apply_environment(settings: &mut Settings, env: &EnvironmentOverrides) {
             ),
         }
     }
+    if let Some(raw) = &env.temperature {
+        match raw.trim().parse::<f64>() {
+            Ok(temperature) => set_temperature(settings, temperature, raw.trim(), layer),
+            Err(_) => settings.diagnostics.push(
+                Diagnostic::new(
+                    layer,
+                    ErrorCode::InvalidField,
+                    format!("RUNE_TEMPERATURE is `{raw}`, which is not a number"),
+                )
+                .with_key("temperature"),
+            ),
+        }
+    }
     if let Some(fast) = env.fast_mode {
         settings.fast_mode = fast;
         settings.sources.record("fast_mode", layer);
@@ -1962,6 +1989,23 @@ fn apply_environment(settings: &mut Settings, env: &EnvironmentOverrides) {
 ///
 /// Anything else is reported and ignored, so a mistyped window falls back to
 /// the next source rather than budgeting against a zero.
+/// Sets the temperature when it is within 0 to 2, and reports it otherwise.
+fn set_temperature(settings: &mut Settings, temperature: f64, raw: &str, layer: Layer) {
+    if (0.0..=2.0).contains(&temperature) {
+        settings.temperature = Some(temperature);
+        settings.sources.record("temperature", layer);
+    } else {
+        settings.diagnostics.push(
+            Diagnostic::new(
+                layer,
+                ErrorCode::InvalidField,
+                format!("`{raw}` is outside 0 to 2"),
+            )
+            .with_key("temperature"),
+        );
+    }
+}
+
 fn token_count(settings: &mut Settings, variable: &str, key: &str, raw: &str) -> Option<u64> {
     let parsed = raw.trim().parse::<u64>().ok().filter(|value| *value > 0);
     if parsed.is_none() {
@@ -3699,5 +3743,21 @@ max_agent_steps = 50
     fn unconfigured_provider_renders_as_text() {
         assert_eq!(Provider::Unconfigured.to_string(), "unconfigured");
         assert_eq!(provider_key(&Provider::Unconfigured), "default");
+    }
+
+    #[test]
+    fn the_temperature_is_read_and_held_to_its_range() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let user = write(&dir, "config.toml", "temperature = 0.2\n");
+        assert_eq!(load(None, Some(&user), &empty_env()).temperature, Some(0.2));
+        let env = EnvironmentOverrides::from_lookup(|key| {
+            (key == "RUNE_TEMPERATURE").then(|| "3".to_owned())
+        });
+        let settings = load(None, Some(&user), &env);
+        assert_eq!(settings.temperature, Some(0.2));
+        assert!(settings.diagnostics.iter().any(|diagnostic| {
+            diagnostic.message == "`3` is outside 0 to 2"
+                && diagnostic.key.as_deref() == Some("temperature")
+        }));
     }
 }

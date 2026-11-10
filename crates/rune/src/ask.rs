@@ -872,6 +872,10 @@ impl Host for AskHost<'_> {
         crate::provider_setup::provider_head_timeout_ms(self.settings)
     }
 
+    fn temperature(&self) -> Option<f64> {
+        self.settings.temperature
+    }
+
     fn cache_key(&self) -> Option<String> {
         Some(
             self.cache_key

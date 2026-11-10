@@ -571,6 +571,12 @@ pub trait Host {
         None
     }
 
+    /// The sampling temperature the user chose, over the model's default.
+    /// None by default.
+    fn temperature(&self) -> Option<f64> {
+        None
+    }
+
     /// Steps this run may still take, when its step limit is bounded. None by
     /// default.
     fn remaining_steps(&self) -> Option<u64> {
@@ -1482,6 +1488,20 @@ fn stream_with_retry(
         plan.parallel_tool_calls =
             host.limits().get(LimitName::ParallelToolCalls).value() != Some(1);
         plan.effort = host.effort();
+        let temperature = host.temperature();
+        if rune_net::compat::accepts_sampling(&plan.traits, plan.effort, &plan.compat) {
+            plan.sampling = plan.traits.sampling;
+            if temperature.is_some() {
+                plan.sampling.temperature = temperature;
+            }
+        } else if temperature.is_some() && history.notice_temperature_once() {
+            host.emit(Event::Notice {
+                text: format!(
+                    "temperature is not sent to {}: it does not accept one",
+                    plan.model
+                ),
+            });
+        }
         if host.dialect().capabilities().requires_output_ceiling {
             plan.max_output_tokens = host
                 .max_output_tokens()
