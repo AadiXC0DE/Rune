@@ -68,17 +68,57 @@ pub fn configured_endpoint(
     if settings.anonymous {
         let mut anonymous = rune_net::transport::Endpoint::anonymous(&base_url)?;
         anonymous.headers = endpoint(&settings.provider, &base_url, "", settings.offline).headers;
-        return Ok(anonymous.offline(settings.offline));
+        return traced(settings, anonymous.offline(settings.offline));
     }
     let provider = settings.provider.as_str();
     let credential = auth::resolve(paths, provider, settings.api_key_env.as_deref())?
         .ok_or_else(|| auth::missing_credential_error(provider, settings.api_key_env.as_deref()))?;
-    Ok(endpoint(
-        &settings.provider,
-        &base_url,
-        credential.expose(),
-        settings.offline,
-    ))
+    traced(
+        settings,
+        endpoint(
+            &settings.provider,
+            &base_url,
+            credential.expose(),
+            settings.offline,
+        ),
+    )
+}
+
+/// The trace every endpoint of this process writes to, so numbering is shared.
+static TRACE: std::sync::Mutex<Option<std::sync::Arc<rune_net::trace::TraceSink>>> =
+    std::sync::Mutex::new(None);
+
+/// Attaches the trace directory, when one is configured.
+fn traced(
+    settings: &Settings,
+    mut endpoint: rune_net::transport::Endpoint,
+) -> Result<rune_net::transport::Endpoint> {
+    let Some(dir) = settings.trace_dir.as_deref() else {
+        return Ok(endpoint);
+    };
+    let secrets: Vec<String> = std::iter::once(endpoint.credential.clone())
+        .chain(
+            endpoint
+                .headers
+                .iter()
+                .filter(|(name, _)| rune_net::redact::is_secret_header(name))
+                .map(|(_, value)| value.clone()),
+        )
+        .collect();
+    let mut held = TRACE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let sink = if let Some(sink) = held.as_ref().filter(|sink| sink.dir() == dir) {
+        sink.add_secrets(secrets);
+        std::sync::Arc::clone(sink)
+    } else {
+        let sink = rune_net::trace::TraceSink::open(dir, secrets)?;
+        eprintln!("rune: tracing provider requests to {dir} (credentials redacted)");
+        *held = Some(std::sync::Arc::clone(&sink));
+        sink
+    };
+    endpoint.trace = Some(sink);
+    Ok(endpoint)
 }
 
 /// Reads a credential from the environment for a provider.

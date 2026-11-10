@@ -26,6 +26,7 @@ use crate::provider::{Provider, RequestPlan, summarize_plan};
 use crate::redact;
 use crate::sse::{Decoder, Event};
 use crate::stream::ProviderEvent;
+use crate::trace::{TraceEntry, TraceSink};
 
 #[cfg(not(target_family = "wasm"))]
 mod interrupt;
@@ -141,6 +142,8 @@ pub struct Endpoint {
     pub headers: Vec<(String, String)>,
     /// Whether outbound requests are refused entirely.
     pub offline: bool,
+    /// Where each request and its response are recorded, when tracing is on.
+    pub trace: Option<std::sync::Arc<TraceSink>>,
 }
 
 impl fmt::Debug for Endpoint {
@@ -151,6 +154,7 @@ impl fmt::Debug for Endpoint {
             .field("auth", &self.auth)
             .field("headers", &self.headers)
             .field("offline", &self.offline)
+            .field("trace", &if self.trace.is_some() { "on" } else { "off" })
             .finish()
     }
 }
@@ -172,6 +176,7 @@ impl Endpoint {
             auth: AuthStyle::Bearer,
             headers: Vec::new(),
             offline: false,
+            trace: None,
         }
     }
 
@@ -675,8 +680,12 @@ pub fn stream_completion_encoded(
         request = request.with_header(name, value);
     }
 
+    let mut trace = begin_trace(endpoint, &request);
     let started = Instant::now();
     let response = client.send(request)?;
+    if let Some(entry) = trace.as_mut() {
+        entry.status(response.status);
+    }
     check_request_timeout(started, timeouts.total)?;
 
     if response.status >= 400 {
@@ -685,6 +694,10 @@ pub fn stream_completion_encoded(
             .as_deref()
             .and_then(crate::error::parse_retry_after);
         let text = read_bounded_text(response.body, 64 * 1024);
+        if let Some(mut entry) = trace {
+            entry.chunk(text.as_bytes());
+            entry.finish();
+        }
         check_request_timeout(started, timeouts.total)?;
         let sanitized = redact::redact(&text);
         let mut error = NetError::classify_status(response.status, &sanitized);
@@ -702,7 +715,23 @@ pub fn stream_completion_encoded(
         return Err(error);
     }
 
-    read_stream_started(response.body, provider, timeouts, started, cancel, observe)
+    read_stream_started(
+        response.body,
+        provider,
+        timeouts,
+        started,
+        cancel,
+        observe,
+        trace,
+    )
+}
+
+/// Records a request about to be sent, when the endpoint is traced.
+fn begin_trace(endpoint: &Endpoint, request: &FetchRequest) -> Option<TraceEntry> {
+    endpoint
+        .trace
+        .as_ref()
+        .map(|sink| sink.begin(&request.url, &request.headers, &request.body))
 }
 
 /// One response to an outbound request that is not a model completion.
@@ -1004,9 +1033,16 @@ pub fn list_models(
 
     // Each request supplies its own total budget. A listing is a small
     // document, so it gets the caller's listing budget here.
-    let response = client.send(request.with_timeout(Some(timeout)))?;
+    let request = request.with_timeout(Some(timeout));
+    let trace = begin_trace(endpoint, &request);
+    let response = client.send(request)?;
 
     let text = read_bounded_text(response.body, 1024 * 1024);
+    if let Some(mut entry) = trace {
+        entry.status(response.status);
+        entry.chunk(text.as_bytes());
+        entry.finish();
+    }
     if response.status >= 400 {
         return Err(
             NetError::classify_status(response.status, &redact::redact(&text)).with_hint(format!(
@@ -1071,6 +1107,7 @@ pub fn read_stream(
         Instant::now(),
         cancel,
         observe,
+        None,
     )
 }
 
@@ -1081,8 +1118,9 @@ fn read_stream_started(
     started: Instant,
     cancel: &dyn Fn() -> bool,
     observe: &mut dyn FnMut(&ProviderEvent),
+    trace: Option<TraceEntry>,
 ) -> NetResult<StreamOutcome> {
-    let mut state = StreamState::new(provider, observe, timeouts, started);
+    let mut state = StreamState::new(provider, observe, timeouts, started, trace);
     feed(body, &mut state, cancel)?;
     state.finish()
 }
@@ -1190,6 +1228,8 @@ struct StreamState<'a> {
     request_started: Instant,
     /// Whether any event has been decoded, which ends the wait for output.
     saw_event: bool,
+    /// Receives the raw bytes as they arrive, when the request is traced.
+    trace: Option<TraceEntry>,
 }
 
 impl<'a> StreamState<'a> {
@@ -1198,6 +1238,7 @@ impl<'a> StreamState<'a> {
         observe: &'a mut dyn FnMut(&ProviderEvent),
         timeouts: RequestTimeouts,
         request_started: Instant,
+        trace: Option<TraceEntry>,
     ) -> Self {
         Self {
             decoder: Decoder::new(provider.limits()),
@@ -1210,11 +1251,15 @@ impl<'a> StreamState<'a> {
             request_timeout: timeouts.total,
             request_started,
             saw_event: false,
+            trace,
         }
     }
 
     /// Decodes one chunk, reducing and reporting every event it completes.
     fn push(&mut self, chunk: &[u8]) -> NetResult<()> {
+        if let Some(entry) = self.trace.as_mut() {
+            entry.chunk(chunk);
+        }
         self.check_request_timeout()?;
         self.decoder
             .push(chunk, &mut self.frames)
@@ -1278,6 +1323,9 @@ impl<'a> StreamState<'a> {
 
     /// Ends the stream and returns what it produced.
     fn finish(mut self) -> NetResult<StreamOutcome> {
+        if let Some(entry) = self.trace.take() {
+            entry.finish();
+        }
         self.check_request_timeout()?;
         self.decoder
             .finish(&mut self.frames)
@@ -2005,6 +2053,51 @@ mod tests {
             .expect("answered");
         assert_eq!(response.status, 429);
         assert_eq!(response.retry_after.as_deref(), Some("3"));
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn a_traced_endpoint_records_a_rejected_request_without_its_credential() {
+        let body = r#"{"error":"bad key traced-credential-value"}"#;
+        let base = answering_endpoint(format!(
+            "HTTP/1.1 401 Unauthorized\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        ));
+        let temp = tempfile::tempdir().expect("tempdir");
+        let dir = camino::Utf8PathBuf::from_path_buf(temp.path().join("trace")).expect("utf8");
+        let mut endpoint = Endpoint::new(base, "traced-credential-value");
+        endpoint.trace = Some(
+            TraceSink::open(&dir, vec![endpoint.credential.clone()]).expect("trace directory"),
+        );
+        let mut plan = RequestPlan::new("m");
+        plan.messages = vec![Message::user("hi")];
+        let err = stream_completion(
+            &UreqFetch::new(),
+            &endpoint,
+            &crate::chat_completions::ChatCompletions,
+            &plan,
+            DEFAULT_HEAD_TIMEOUT,
+            &|| false,
+        )
+        .expect_err("rejected");
+        assert_eq!(err.kind(), FailureKind::Unauthorized);
+
+        let request = std::fs::read_to_string(dir.join("0001-request.json")).expect("request");
+        let response = std::fs::read_to_string(dir.join("0001-response.txt")).expect("response");
+        assert!(!request.contains("traced-credential-value"), "{request}");
+        assert!(!response.contains("traced-credential-value"), "{response}");
+        let parsed: serde_json::Value = serde_json::from_str(&request).expect("json");
+        assert!(
+            parsed["url"]
+                .as_str()
+                .expect("url")
+                .ends_with("/chat/completions")
+        );
+        assert_eq!(parsed["headers"]["authorization"], "[REDACTED]");
+        assert_eq!(parsed["body"]["model"], "m");
+        assert!(response.starts_with("status: 401\n\n"), "{response}");
+        assert!(response.contains("bad key [REDACTED]"), "{response}");
+        assert!(format!("{endpoint:?}").contains("trace: \"on\""));
     }
 
     /// A local endpoint that counts the requests it receives and answers none.

@@ -160,6 +160,8 @@ pub struct Launch {
     pub provider_strict: Option<bool>,
     /// Whether every outbound request is refused.
     pub offline: bool,
+    /// Directory provider requests and responses are traced to.
+    pub trace: Option<String>,
     /// Whether a command may run where the host has no sandbox backend.
     pub allow_unsandboxed: bool,
     /// Whether sandboxed shell commands may use the network.
@@ -252,6 +254,7 @@ pub fn parse(args: Vec<OsString>, benchmark: bool) -> Result<Launch> {
         provider_order: None,
         provider_strict: None,
         offline: false,
+        trace: None,
         allow_unsandboxed: false,
         network: false,
         accessible: false,
@@ -461,6 +464,7 @@ fn take_global(launch: &mut Launch, tokens: &[String], index: &mut usize) -> Res
             | "--add-dir"
             | "--theme"
             | "--provider-order"
+            | "--trace"
     ) {
         return Ok(false);
     }
@@ -499,6 +503,7 @@ fn take_global(launch: &mut Launch, tokens: &[String], index: &mut usize) -> Res
         "--add-dir" => launch.add_dirs.push(value),
         "--theme" => launch.theme = Some(value),
         "--provider-order" => launch.provider_order = Some(value),
+        "--trace" => launch.trace = Some(value),
         _ => match value.split_once('=') {
             Some((key, limit)) if !key.is_empty() => {
                 launch
@@ -754,6 +759,10 @@ pub fn apply_to_settings(launch: &Launch, settings: &mut rune_core::config::Sett
     if let Some(strict) = launch.provider_strict {
         settings.provider_strict = strict;
         settings.sources.record("provider_strict", layer);
+    }
+    if let Some(dir) = &launch.trace {
+        settings.trace_dir = Some(camino::Utf8PathBuf::from(dir));
+        settings.sources.record("trace_dir", layer);
     }
 
     for directory in &launch.add_dirs {

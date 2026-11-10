@@ -26,6 +26,7 @@ Accepted anywhere on the command line.
 | `--theme` | `name` | Override the theme for this process. |
 | `--provider-order` | `a,b` | Prefer these upstream providers in order. |
 | `--provider-strict` | - | Restrict requests to the listed providers. |
+| `--trace` | `dir` | Write each provider request and response, redacted, to this directory. |
 | `-h, --help` | - | Print help. |
 | `-v, --version` | - | Print the version. |
 

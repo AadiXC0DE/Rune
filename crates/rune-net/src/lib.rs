@@ -19,6 +19,7 @@ pub mod redact;
 pub mod responses;
 pub mod sse;
 pub mod stream;
+pub mod trace;
 pub mod transport;
 
 pub use auth::{Credential, CredentialSource};

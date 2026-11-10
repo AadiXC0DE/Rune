@@ -8,6 +8,7 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
+mod fixture;
 mod macos;
 mod windows;
 
@@ -96,6 +97,7 @@ fn main() -> ExitCode {
         "benchmark" => benchmark(&extra),
         "web" => web(),
         "verify-web" => verify_web(&extra),
+        "fixture" => fixture::run(&extra),
         "help" | "--help" | "-h" => {
             print_help();
             Ok(())
@@ -136,6 +138,7 @@ fn print_help() {
     println!("  verify-release  check a signed macOS archive against a trusted identity");
     println!("  web      build the harness for the landing page into site/demo/rune.wasm");
     println!("  verify-web  fail unless site/demo/rune.wasm matches a fresh build");
+    println!("  fixture  copy one traced provider exchange into a conformance fixture");
     println!();
     println!(
         "  release takes: cargo xtask release <channel> [version] [target] [--sign-identity <certificate SHA-1>]"
@@ -144,6 +147,7 @@ fn print_help() {
         "  verify-release takes: cargo xtask verify-release <manifest-path> <certificate SHA-1>"
     );
     println!("  benchmark takes: cargo xtask benchmark <executable-path>");
+    println!("  fixture takes: cargo xtask fixture <trace-dir> <name> [--pair NNNN]");
     println!();
     print_budget_help();
 }

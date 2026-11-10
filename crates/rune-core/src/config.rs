@@ -667,6 +667,8 @@ pub struct Settings {
     pub vision_model: Option<String>,
     /// Model used for automatic permission review.
     pub review_model: Option<String>,
+    /// Directory provider requests and responses are traced to, when set.
+    pub trace_dir: Option<Utf8PathBuf>,
     /// Where each value came from.
     pub sources: MergeReport,
     /// Diagnostics produced while loading.
@@ -706,6 +708,7 @@ impl Default for Settings {
             shell_env: Vec::new(),
             vision_model: None,
             review_model: None,
+            trace_dir: None,
             sources: MergeReport::default(),
             diagnostics: Vec::new(),
         }
@@ -941,6 +944,8 @@ pub struct EnvironmentOverrides {
     pub network: Option<bool>,
     /// `RUNE_ALLOW_UNSANDBOXED`: the environment form of `--allow-unsandboxed`.
     pub allow_unsandboxed: Option<bool>,
+    /// `RUNE_TRACE`: the environment form of `--trace`.
+    pub trace: Option<String>,
     /// Boolean variables whose value was not a boolean, with that value.
     ///
     /// Kept so the value is reported rather than silently ignored: an
@@ -999,6 +1004,7 @@ impl EnvironmentOverrides {
             web_tools: boolean(&mut lookup, "RUNE_WEB_TOOLS"),
             network: boolean(&mut lookup, "RUNE_NETWORK"),
             allow_unsandboxed: boolean(&mut lookup, "RUNE_ALLOW_UNSANDBOXED"),
+            trace: lookup("RUNE_TRACE"),
             invalid_booleans: Vec::new(),
         };
         out.invalid_booleans = invalid_booleans;
@@ -1636,6 +1642,10 @@ fn apply_environment(settings: &mut Settings, env: &EnvironmentOverrides) {
     if let Some(offline) = env.offline {
         settings.offline = offline;
         settings.sources.record("offline", layer);
+    }
+    if let Some(dir) = &env.trace {
+        settings.trace_dir = Some(Utf8PathBuf::from(dir.trim()));
+        settings.sources.record("trace_dir", layer);
     }
     if !env.additional_directories.is_empty() {
         settings
@@ -2287,6 +2297,20 @@ max_agent_steps = 50
             assert_eq!(settings.offline, !offline);
             assert_eq!(settings.source_of("offline"), Layer::Environment);
         }
+    }
+
+    #[test]
+    fn the_trace_directory_comes_from_the_environment_and_is_off_by_default() {
+        assert_eq!(load(None, None, &empty_env()).trace_dir, None);
+        let env = EnvironmentOverrides::from_lookup(|key| {
+            (key == "RUNE_TRACE").then(|| String::from("/tmp/rune-trace"))
+        });
+        let settings = load(None, None, &env);
+        assert_eq!(
+            settings.trace_dir.as_deref(),
+            Some(Utf8Path::new("/tmp/rune-trace"))
+        );
+        assert_eq!(settings.source_of("trace_dir"), Layer::Environment);
     }
 
     #[test]

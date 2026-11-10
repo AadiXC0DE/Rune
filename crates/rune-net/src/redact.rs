@@ -49,6 +49,23 @@ const SECRET_PREFIXES: &[&str] = &[
     "eyJ",
 ];
 
+/// Whether a header carries a credential, so its value must never be shown.
+#[must_use]
+pub fn is_secret_header(name: &str) -> bool {
+    let lower = name.trim().to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "authorization"
+            | "proxy-authorization"
+            | "cookie"
+            | "x-api-key"
+            | "api-key"
+            | "x-goog-api-key"
+    ) || ["key", "token", "secret", "auth"]
+        .iter()
+        .any(|part| lower.contains(part))
+}
+
 /// Redacts credential-shaped content from a string.
 ///
 /// Covers the three shapes that actually leak: a `NAME=value` assignment, a

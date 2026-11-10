@@ -177,6 +177,11 @@ pub const GLOBAL_FLAGS: &[FlagSpec] = &[
         "--provider-strict",
         "Restrict requests to the listed providers.",
     ),
+    option(
+        "--trace",
+        "dir",
+        "Write each provider request and response, redacted, to this directory.",
+    ),
     flag("-h, --help", "Print help."),
     flag("-v, --version", "Print the version."),
 ];

@@ -2410,3 +2410,85 @@ fn malformed_user_config_names_the_field_for_provider_commands() {
     let report: serde_json::Value = serde_json::from_slice(&doctor.stdout).expect("doctor report");
     assert!(report.to_string().contains("unknown field `model`"));
 }
+
+#[test]
+fn trace_flag_writes_pairs_for_an_ask_run() {
+    use rune_testkit::scripted::{ScriptedProvider, Turn};
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canonical root");
+    let workspace = root.join("workspace");
+    std::fs::create_dir_all(&workspace).expect("workspace");
+    std::fs::write(workspace.join("a.txt"), "alpha\n").expect("a.txt");
+    let provider = ScriptedProvider::start(vec![
+        Turn::call("c1", "read_file", r#"{"path":"a.txt"}"#),
+        Turn::text("done"),
+    ]);
+    let trace = root.join("trace");
+    let output = Command::new(binary())
+        .isolated_env()
+        .env("HOME", root.join("home"))
+        .env("RUNE_HOME", root.join("state"))
+        .env("XDG_CONFIG_HOME", root.join("config"))
+        .env("XDG_DATA_HOME", root.join("data"))
+        .env("XDG_STATE_HOME", root.join("xdg-state"))
+        .env("RUNE_PROVIDER", "chat_completions")
+        .env("RUNE_BASE_URL", provider.base_url())
+        .env("RUNE_MODEL", "scripted")
+        .env("RUNE_API_KEY_ENV", "RUNE_TRACE_TEST_KEY")
+        .env("RUNE_TRACE_TEST_KEY", "test-key")
+        .current_dir(&workspace)
+        .arg("--trace")
+        .arg(&trace)
+        .args(["ask", "Read a.txt."])
+        .output()
+        .expect("ask");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("rune: tracing provider requests to")
+            && stderr.contains("(credentials redacted)"),
+        "{stderr}"
+    );
+    assert_eq!(provider.request_count(), 2);
+
+    let mut names: Vec<String> = std::fs::read_dir(&trace)
+        .expect("trace directory")
+        .map(|entry| {
+            entry
+                .expect("entry")
+                .file_name()
+                .into_string()
+                .expect("name")
+        })
+        .collect();
+    names.sort();
+    assert_eq!(
+        names,
+        [
+            "0001-request.json",
+            "0001-response.txt",
+            "0002-request.json",
+            "0002-response.txt",
+        ]
+    );
+    for name in &names {
+        let text = std::fs::read_to_string(trace.join(name)).expect("trace file");
+        assert!(!text.contains("test-key"), "{name} holds the credential");
+    }
+    let request: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(trace.join("0002-request.json")).expect("request"),
+    )
+    .expect("request json");
+    assert!(
+        request["url"]
+            .as_str()
+            .expect("url")
+            .ends_with("/chat/completions")
+    );
+    assert_eq!(request["headers"]["authorization"], "[REDACTED]");
+    assert_eq!(request["body"]["model"], "scripted");
+    let response = std::fs::read_to_string(trace.join("0001-response.txt")).expect("response");
+    assert!(response.starts_with("status: 200\n\n"), "{response}");
+    assert!(response.contains("read_file"), "{response}");
+}
