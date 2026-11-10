@@ -594,7 +594,11 @@ pub fn run(
         return Err(error);
     }
     let outcome = outcome?;
-    let error = if host.incomplete_tool_call.get() {
+    // A turn that failed after a completed request still reports its usage,
+    // steps and calls, with the failure as the error.
+    let error = if let Some(error) = outcome.error.clone() {
+        Some(error)
+    } else if host.incomplete_tool_call.get() {
         Some(RuneError::new(
             ErrorCode::UnsupportedToolCall,
             "the provider requested tools without a completed tool call",

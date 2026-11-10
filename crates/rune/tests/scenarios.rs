@@ -18,6 +18,7 @@ const SCENARIOS: &[&str] = &[
     "cut_stream_then_ok",
     "step_cap_graceful",
     "long_150_steps",
+    "provider_fails_at_step_4",
 ];
 
 /// Scenarios built in Rust, which have no file.
@@ -27,7 +28,7 @@ fn directory() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/scenarios")
 }
 
-fn run_scenario(name: &str) {
+fn run_scenario(name: &str) -> scenario::Report {
     let path = directory().join(format!("{name}.json"));
     let loaded = scenario::load(&path).unwrap_or_else(|err| panic!("{err}"));
     let report = scenario::run(Path::new(env!("CARGO_BIN_EXE_rune")), &loaded);
@@ -40,6 +41,7 @@ fn run_scenario(name: &str) {
         report.stdout,
         report.stderr
     );
+    report
 }
 
 #[test]
@@ -83,6 +85,22 @@ fn step_cap_graceful() {
 }
 
 #[test]
+fn provider_fails_at_step_4() {
+    let report = run_scenario("provider_fails_at_step_4");
+    let result = report.result.expect("a result");
+    assert_eq!(result["steps"], 3, "{result}");
+    assert!(
+        result["usage"]["input_tokens"].as_u64().unwrap_or(0) > 0,
+        "{result}"
+    );
+    assert_eq!(
+        result["tool_calls"].as_array().map(Vec::len),
+        Some(3),
+        "{result}"
+    );
+}
+
+#[test]
 fn long_150_steps_completes() {
     let workspace = BTreeMap::from([(
         "a.txt".to_owned(),
@@ -112,6 +130,7 @@ fn long_150_steps_completes() {
         global_args: Vec::new(),
         ask_args: vec!["--json".to_owned(), "--no-save".to_owned()],
         env: BTreeMap::new(),
+        user_config: None,
         timeout_s: 120,
         turns,
         expect: Expect {

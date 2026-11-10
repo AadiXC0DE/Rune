@@ -1366,7 +1366,7 @@ fn run_turn(context: &TurnContext) -> Result<TurnProduct> {
         // The conversation is not readable while a turn runs, so the history
         // is held for the whole turn.
         let mut history = lock(&context.conversation.history);
-        rune_agent::turn::run_turn(&mut history, &host)?
+        rune_agent::turn::run_turn(&mut history, &host).and_then(TurnOutcome::into_strict)?
     };
     // The SDK's answer is the text of every step, not only the last one.
     let mut outcome = outcome;

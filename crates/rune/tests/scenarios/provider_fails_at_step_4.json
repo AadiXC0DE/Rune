@@ -1,0 +1,52 @@
+{
+  "prompt": "Read the three files, then summarise them.",
+  "workspace": "workspaces/three_test_runs.json",
+  "user_config": "[limits]\nprovider_max_attempts = 1\n",
+  "turns": [
+    {
+      "tool_calls": [
+        {
+          "id": "call_1",
+          "name": "read_file",
+          "arguments": {
+            "path": "src/a.txt"
+          }
+        }
+      ]
+    },
+    {
+      "tool_calls": [
+        {
+          "id": "call_2",
+          "name": "read_file",
+          "arguments": {
+            "path": "src/b.txt"
+          }
+        }
+      ]
+    },
+    {
+      "tool_calls": [
+        {
+          "id": "call_3",
+          "name": "read_file",
+          "arguments": {
+            "path": "check.sh"
+          }
+        }
+      ]
+    },
+    {
+      "http_error": {
+        "status": 400,
+        "body": "{\"error\":{\"message\":\"bad request\"}}"
+      }
+    }
+  ],
+  "expect": {
+    "exit_code": 1,
+    "error_code": "invalid_field",
+    "final_output": "",
+    "requests": 4
+  }
+}

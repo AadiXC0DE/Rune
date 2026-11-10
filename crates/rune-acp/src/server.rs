@@ -1058,7 +1058,8 @@ fn run_one<W: Write + Send + 'static>(server: &Arc<Server<W>>, queued: Queued) {
         permission_timeout: OnceLock::new(),
     };
 
-    let outcome = run_turn(&mut history, &host);
+    let outcome =
+        run_turn(&mut history, &host).and_then(rune_agent::turn::TurnOutcome::into_strict);
     // The host cancels work when an approval expires. Preserve the deadline
     // error so the prompt reports a timeout rather than a user cancellation.
     let permission_timeout = host.permission_timeout.get();

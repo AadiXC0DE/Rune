@@ -1461,6 +1461,7 @@ mod tests {
 
     fn outcome(text: &str) -> TurnOutcome {
         TurnOutcome {
+            error: None,
             stop_reason: StopReason::Completed,
             text: text.to_owned(),
             narration: Vec::new(),

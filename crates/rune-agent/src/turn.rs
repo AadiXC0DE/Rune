@@ -485,6 +485,29 @@ pub struct TurnOutcome {
     pub calls: Vec<CallResult>,
     /// Whether a check ran after the turn's last change to a file.
     pub verification: Verification,
+    /// Why the turn stopped early, when it did. Usage, steps and text still
+    /// describe everything that completed before the failure.
+    pub error: Option<RuneError>,
+}
+
+impl TurnOutcome {
+    /// Returns the error as `Err` for hosts that end the exchange on any failure.
+    pub fn into_strict(self) -> Result<Self> {
+        match self.error {
+            Some(error) => Err(error),
+            None => Ok(self),
+        }
+    }
+}
+
+/// The stop reason a turn reports when it ends on `error`.
+#[must_use]
+pub fn stop_reason_for(error: &RuneError) -> StopReason {
+    match (error.code(), error.detail().invariant.as_deref()) {
+        (ErrorCode::Cancelled, _) => StopReason::Cancelled,
+        (_, Some("objective_token_budget")) => StopReason::ObjectiveBudget,
+        _ => StopReason::ProviderFailure,
+    }
 }
 
 /// Whether a turn checked its own change.
@@ -659,6 +682,9 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
     // Reasoning accumulated across steps, so a multi-step turn keeps all of it.
     let mut reasoning = String::new();
     let mut steps: u32 = 0;
+    // Requests that returned a response, which is what a failed turn reports
+    // as its steps: a step that failed is not counted.
+    let mut completed: u32 = 0;
     // Tool-result bytes this turn has retained, shared across its steps.
     let mut result_bytes: usize = 0;
     // The latest step's answer, kept so a turn stopped at the step limit still
@@ -666,10 +692,18 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
     let mut text = String::new();
     let mut narration: Vec<Narration> = Vec::new();
 
-    // Ends the turn with what it has so far.
+    // Ends the turn with what it has so far. The two-argument form ends it on
+    // a failure, counting only the requests that completed.
     macro_rules! settle {
         ($reason:expr) => {{
+            settle!(@end $reason, steps, None)
+        }};
+        ($reason:expr, $error:expr) => {{
+            settle!(@end $reason, completed, Some($error))
+        }};
+        (@end $reason:expr, $steps:expr, $error:expr) => {{
             let stop_reason = $reason;
+            let steps = $steps;
             host.emit(Event::Finished {
                 reason: stop_reason,
                 usage,
@@ -686,7 +720,19 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
                 steps,
                 verification: Verification::of(&calls),
                 calls,
+                error: $error,
             });
+        }};
+    }
+    // A failure before any request completed is still an error; after one,
+    // the turn keeps what it has.
+    macro_rules! fail {
+        ($error:expr) => {{
+            let error = $error;
+            if completed == 0 {
+                return Err(error);
+            }
+            settle!(stop_reason_for(&error), error)
         }};
     }
 
@@ -694,7 +740,9 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
         if host.settles_cancellation() && cancellation.is_cancelled() {
             settle!(StopReason::Cancelled);
         }
-        cancellation.check()?;
+        if let Err(err) = cancellation.check() {
+            fail!(err);
+        }
 
         // A step limit of zero means unlimited, which is the documented default.
         let stop_reason = if host.objective_tokens_remaining() == Some(0) {
@@ -715,6 +763,7 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
                 steps,
                 verification: Verification::of(&calls),
                 calls,
+                error: None,
             };
             host.emit(Event::Finished {
                 reason: stop_reason,
@@ -749,7 +798,10 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
             max_attempts,
             &cancellation,
         ) {
-            Ok(streamed) => streamed,
+            Ok(streamed) => {
+                completed = completed.saturating_add(1);
+                streamed
+            }
             // Once the turn is cancelled, whatever the stream failed with is
             // the cancellation's doing.
             Err(err)
@@ -758,7 +810,7 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
             {
                 settle!(StopReason::Cancelled);
             }
-            Err(err) => return Err(err),
+            Err(err) => fail!(err),
         };
 
         host.observe_response(&outcome);
@@ -916,6 +968,7 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
                 steps,
                 verification: Verification::of(&calls),
                 calls,
+                error: None,
             });
         }
 
@@ -952,8 +1005,12 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
         let mut result_parts = Vec::new();
         for result in &results {
             host.post_tool(result);
+            let id = match rune_core::id::ToolCallId::new(result.call.id.clone()) {
+                Ok(id) => id,
+                Err(err) => fail!(err),
+            };
             result_parts.push(ContentPart::ToolResult {
-                id: rune_core::id::ToolCallId::new(result.call.id.clone())?,
+                id,
                 name: result.call.name.clone(),
                 content: result.output.render(),
                 is_error: result.output.is_error,
@@ -994,6 +1051,7 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
                 steps,
                 verification: Verification::of(&calls),
                 calls,
+                error: None,
             });
         }
 

@@ -227,7 +227,7 @@ impl Session {
         self.control.cancellation.reset();
         let mut history = std::mem::take(&mut self.history);
         history.push_user(text);
-        let result = turn::run_turn(&mut history, &*self);
+        let result = turn::run_turn(&mut history, &*self).and_then(TurnOutcome::into_strict);
         self.history = history;
         result
     }

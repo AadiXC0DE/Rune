@@ -1355,6 +1355,7 @@ fn cancelling_concurrent_reads_answers_the_remaining_calls_without_running_them(
         worker
             .join()
             .expect("turn worker")
+            .and_then(rune_agent::turn::TurnOutcome::into_strict)
             .expect_err("cancelled turn")
     });
     assert_eq!(error.code(), rune_core::ErrorCode::Cancelled);
@@ -2397,6 +2398,92 @@ fn an_error_frame_is_surfaced_as_a_failure() {
     assert!(err.message().contains("overloaded"), "{}", err.message());
 }
 
+fn single_attempt(mut host: TestHost) -> TestHost {
+    host.limits
+        .set(
+            rune_core::LimitName::ProviderMaxAttempts,
+            rune_core::budget::Budget::Bounded(1),
+            rune_core::config::Layer::User,
+        )
+        .expect("attempt cap");
+    host
+}
+
+#[test]
+fn a_failure_after_a_completed_request_returns_the_partial_outcome() {
+    let billed = |id: &str, path: &str| {
+        let Script::Frames(mut frames) =
+            Script::tool_call(id, "read_file", &format!("{{\"path\":\"{path}\"}}"))
+        else {
+            panic!("frames");
+        };
+        frames.insert(
+            frames.len() - 1,
+            r#"{"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":5}}"#.to_owned(),
+        );
+        Script::Frames(frames)
+    };
+    let endpoint = MockEndpoint::start(vec![
+        billed("first", "a.rs"),
+        billed("second", "b.rs"),
+        Script::provider_error("bad"),
+    ]);
+    let host = single_attempt(TestHost::new(endpoint).with_tools(vec![read_tool()]));
+    let mut history = rune_agent::History::new();
+    history.push_user("read two files");
+
+    let outcome = run_turn(&mut history, &host).expect("a partial outcome");
+    assert_eq!(outcome.steps, 2);
+    assert_eq!(outcome.usage.input_tokens, Some(20));
+    assert!(outcome.error.is_some());
+    assert_eq!(outcome.stop_reason, StopReason::ProviderFailure);
+    assert_eq!(outcome.calls.len(), 2);
+    assert!(outcome.calls.iter().all(|call| call.executed));
+    assert_eq!(host.executed_calls().len(), 2);
+    history.validate().expect("valid history");
+}
+
+#[test]
+fn a_failure_before_any_request_completes_is_still_an_error() {
+    let endpoint = MockEndpoint::start(vec![Script::provider_error("bad")]);
+    let host = single_attempt(TestHost::new(endpoint));
+    let mut history = rune_agent::History::new();
+    history.push_user("hello");
+
+    let err = run_turn(&mut history, &host).expect_err("no request completed");
+    assert!(err.message().contains("bad"), "{}", err.message());
+}
+
+#[test]
+fn into_strict_turns_a_partial_outcome_into_its_error() {
+    let endpoint = MockEndpoint::start(vec![
+        Script::tool_call("first", "read_file", "{\"path\":\"a.rs\"}"),
+        Script::provider_error("bad"),
+    ]);
+    let host = single_attempt(TestHost::new(endpoint).with_tools(vec![read_tool()]));
+    let mut history = rune_agent::History::new();
+    history.push_user("read a file");
+
+    let outcome = run_turn(&mut history, &host).expect("a partial outcome");
+    let message = outcome
+        .error
+        .as_ref()
+        .expect("an error")
+        .message()
+        .to_owned();
+    let err = outcome
+        .into_strict()
+        .expect_err("strict hosts see the error");
+    assert_eq!(err.message(), message);
+
+    let endpoint = MockEndpoint::start(vec![Script::text("done")]);
+    let host = TestHost::new(endpoint);
+    let mut history = rune_agent::History::new();
+    history.push_user("hello");
+    let outcome = run_turn(&mut history, &host).expect("turn");
+    assert!(outcome.into_strict().is_ok());
+}
+
 #[test]
 fn cancellation_stops_the_turn() {
     let endpoint = MockEndpoint::start(vec![Script::text("never seen")]);
@@ -2423,7 +2510,11 @@ fn a_call_left_unrun_by_a_cancellation_is_still_answered() {
     let mut history = rune_agent::History::new();
     history.push_user("read two files");
 
-    let err = run_turn(&mut history, &host).expect_err("cancelled");
+    // The request completed before the cancellation, so the turn keeps it.
+    let outcome = run_turn(&mut history, &host).expect("a partial outcome");
+    assert_eq!(outcome.stop_reason, StopReason::Cancelled);
+    assert_eq!(outcome.steps, 1);
+    let err = outcome.into_strict().expect_err("cancelled");
     assert_eq!(err.code(), rune_core::error::ErrorCode::Cancelled);
     assert_eq!(
         host.executed_calls().len(),
@@ -3255,7 +3346,9 @@ fn cancellation_of_identical_calls_preserves_the_cancellation_outcome() {
     set_failure_cap(&mut host, rune_core::budget::Budget::Bounded(1));
     let mut history = rune_agent::History::new();
     history.push_user("cancel during the first call");
-    let error = run_turn(&mut history, &host).expect_err("cancelled turn");
+    let error = run_turn(&mut history, &host)
+        .and_then(rune_agent::turn::TurnOutcome::into_strict)
+        .expect_err("cancelled turn");
     assert_eq!(error.code(), rune_core::ErrorCode::Cancelled);
     assert_eq!(host.executed_calls().len(), 1);
     history.validate().expect("all cancelled calls answered");

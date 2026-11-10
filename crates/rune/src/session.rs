@@ -2913,7 +2913,7 @@ fn run_turn_accessible(
         .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(questions);
     let (outcome, diagnostic) = run_on_worker(
         history,
-        |taken| turn::run_turn(taken, host),
+        |taken| turn::run_turn(taken, host).and_then(turn::TurnOutcome::into_strict),
         || {
             if let Ok(request) = pending.try_recv() {
                 let mut lines = approval_lines(&request, usize::MAX);
@@ -3029,7 +3029,7 @@ fn run_turn_steerable(
         // Without a terminal there are no keys to read, so the turn runs here
         // and the steering path is simply unused.
         return SteeredTurn {
-            outcome: turn::run_turn(history, host),
+            outcome: turn::run_turn(history, host).and_then(turn::TurnOutcome::into_strict),
             diagnostic: None,
             applied: Vec::new(),
             unsent: Vec::new(),
@@ -3057,7 +3057,7 @@ fn run_turn_steerable(
 
     let (result, diagnostic) = run_on_worker(
         history,
-        |taken| turn::run_turn(taken, host),
+        |taken| turn::run_turn(taken, host).and_then(turn::TurnOutcome::into_strict),
         || {
             if let Ok(request) = pending.try_recv() {
                 gesture.disarm();
@@ -10750,6 +10750,7 @@ mod tests {
     fn a_reported_turn_yields_its_text_as_lines() {
         let host = test_host();
         let outcome = turn::TurnOutcome {
+            error: None,
             stop_reason: StopReason::Completed,
             text: "the answer".to_owned(),
             narration: Vec::new(),
@@ -10771,6 +10772,7 @@ mod tests {
     fn reporting_a_step_limit_names_it() {
         let host = test_host();
         let outcome = turn::TurnOutcome {
+            error: None,
             stop_reason: StopReason::StepLimit,
             text: String::new(),
             narration: Vec::new(),
@@ -10852,6 +10854,7 @@ mod tests {
             reason: "denied by a rule".to_owned(),
         });
         let outcome = turn::TurnOutcome {
+            error: None,
             stop_reason: StopReason::Completed,
             text: String::new(),
             narration: Vec::new(),
@@ -11111,6 +11114,7 @@ mod tests {
             executed: true,
         };
         let outcome = turn::TurnOutcome {
+            error: None,
             stop_reason: StopReason::Completed,
             text: String::new(),
             narration: Vec::new(),

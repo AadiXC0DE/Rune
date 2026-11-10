@@ -702,12 +702,12 @@ fn long_turn_scenario() -> rune_testkit::scenario::Scenario {
         name: "long_turn".to_owned(),
         prompt: "Read the file one line at a time.".to_owned(),
         workspace,
-        global_args: vec![
-            "--limit".to_owned(),
-            format!("max_agent_steps={}", LONG_TURN_STEPS + 1),
-        ],
+        // No step cap: `ask` has none by default, and a cap equal to the
+        // request count would make the last request the graceful final step.
+        global_args: Vec::new(),
         ask_args: Vec::new(),
         env: std::collections::BTreeMap::new(),
+        user_config: None,
         timeout_s: 600,
         turns,
         expect: rune_testkit::scenario::Expect {

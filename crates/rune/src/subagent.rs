@@ -174,7 +174,8 @@ impl Delegate for Runner<'_> {
                 .clone()
                 .ok_or_else(|| RuneError::missing_field("task"))?,
         );
-        let outcome = turn::run_turn(&mut history, &child)?;
+        let outcome =
+            turn::run_turn(&mut history, &child).and_then(turn::TurnOutcome::into_strict)?;
         // A child told its last step had come still reports what it found;
         // only a stop with nothing said is a failure.
         let capped_with_report =

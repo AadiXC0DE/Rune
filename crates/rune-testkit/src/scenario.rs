@@ -35,6 +35,8 @@ pub struct Scenario {
     pub ask_args: Vec<String>,
     /// Extra environment, added last.
     pub env: BTreeMap<String, String>,
+    /// TOML written to the user configuration file before the run.
+    pub user_config: Option<String>,
     /// Seconds before the child is killed.
     pub timeout_s: u64,
     /// The scripted replies.
@@ -111,6 +113,8 @@ struct RawScenario {
     #[serde(default)]
     env: BTreeMap<String, String>,
     #[serde(default)]
+    user_config: Option<String>,
+    #[serde(default)]
     timeout_s: Option<u64>,
     turns: Vec<Turn>,
     #[serde(default)]
@@ -167,10 +171,21 @@ pub fn load(path: &Path) -> Result<Scenario, String> {
             .ask_args
             .unwrap_or_else(|| vec!["--json".to_owned(), "--no-save".to_owned()]),
         env: raw.env,
+        user_config: raw.user_config,
         timeout_s: raw.timeout_s.unwrap_or(60),
         turns: raw.turns,
         expect: raw.expect,
     })
+}
+
+/// Writes `scenario.user_config` to `<root>/config/rune/config.toml`, the file
+/// the child reads through `XDG_CONFIG_HOME`.
+fn write_user_config(root: &Path, scenario: &Scenario) {
+    if let Some(text) = &scenario.user_config {
+        let directory = root.join("config").join("rune");
+        std::fs::create_dir_all(&directory).expect("a configuration directory");
+        std::fs::write(directory.join("config.toml"), text).expect("a configuration file");
+    }
 }
 
 /// Runs the scenario against a fresh provider that keeps request bodies.
@@ -207,6 +222,7 @@ pub fn run_wrapped(
         }
         std::fs::write(&target, contents).expect("a workspace file");
     }
+    write_user_config(root, scenario);
 
     let mut command = match wrapper.split_first() {
         Some((program, rest)) => {
@@ -473,6 +489,29 @@ mod tests {
     }
 
     #[test]
+    fn user_config_is_written_before_the_run() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let path = dir.path().join("s.json");
+        std::fs::write(
+            &path,
+            r#"{"prompt":"p","turns":[],"user_config":"[limits]\nprovider_max_attempts = 1\n"}"#,
+        )
+        .expect("write");
+        let scenario = load(&path).expect("a scenario");
+        let root = dir.path().join("run");
+        write_user_config(&root, &scenario);
+        let written = std::fs::read_to_string(root.join("config/rune/config.toml"))
+            .expect("the configuration file");
+        assert_eq!(written, "[limits]\nprovider_max_attempts = 1\n");
+
+        let mut plain = scenario;
+        plain.user_config = None;
+        let empty = dir.path().join("empty");
+        write_user_config(&empty, &plain);
+        assert!(!empty.join("config").exists());
+    }
+
+    #[test]
     fn check_reports_each_failed_expectation() {
         let scenario = Scenario {
             name: "synthetic".to_owned(),
@@ -481,6 +520,7 @@ mod tests {
             global_args: Vec::new(),
             ask_args: Vec::new(),
             env: BTreeMap::new(),
+            user_config: None,
             timeout_s: 60,
             turns: Vec::new(),
             expect: Expect {
