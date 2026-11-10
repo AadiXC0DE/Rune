@@ -151,9 +151,10 @@ fn compact_restart_and_retrieve_every_removed_message_and_complete_tool_batch() 
                 )
             } else {
                 let request: Value = serde_json::from_slice(&bytes).expect("JSON");
-                assert_eq!(
-                    request["messages"][0]["content"],
-                    rune_agent::compaction::SUMMARY_INSTRUCTIONS
+                assert!(
+                    request["messages"][0]["content"].as_str().is_some_and(
+                        |text| text.starts_with(rune_agent::compaction::CHECKPOINT_OPENING)
+                    )
                 );
                 summaries.push(request);
                 (
@@ -161,7 +162,7 @@ fn compact_restart_and_retrieve_every_removed_message_and_complete_tool_batch() 
                     format!(
                         "data: {}\n\ndata: [DONE]\n\n",
                         json!({
-                            "choices": [{"delta": {"content": "The earlier fixture established the task. Continue using the retained tool results."}, "finish_reason": "stop"}]
+                            "choices": [{"delta": {"content": "## Goal\n- finish the fixture task\n## Constraints\n- none\n## Decisions\n- none\n## State\n### Done\n- the earlier fixture established the task\n### In progress\n- none\n### Blocked\n- none\n## Next steps\n- continue using the retained tool results\n## Files that matter\n- fixture.txt\n## Facts to keep\n- none"}, "finish_reason": "stop"}]
                         })
                     ),
                 )
@@ -251,7 +252,7 @@ fn compact_restart_and_retrieve_every_removed_message_and_complete_tool_batch() 
         records[12]["message"]["parts"][0]["text"]
             .as_str()
             .expect("summary")
-            .contains("<context_handoff>")
+            .contains("<conversation-checkpoint>")
     );
     for selector in ["0", "-1", "invalid", "18446744073709551616", "14"] {
         let output = run(&["session", id.as_str(), "--record", selector, "--json"]);

@@ -6814,9 +6814,7 @@ mod tests {
         let mut recorder = Recorder::create(&paths, &SessionId::generate()).expect("create");
         recorder.set_budgeted_objective("work", 1).expect("goal");
         host.recorder = Some(Arc::new(Mutex::new(recorder)));
-        let client = SummaryFixture::new(
-            "Earlier fixture work has been summarized. Continue the remaining task.",
-        );
+        let client = SummaryFixture::new(CHECKPOINT_REPLY);
         let plan = rune_agent::compaction::plan(&history, &host.limits).expect("plan");
         compact_session(&host, &mut history, &plan, &client, false).expect("summary");
         assert_eq!(host.objective_tokens_remaining(), Some(0));
@@ -9716,6 +9714,9 @@ mod tests {
         assert_eq!(history.len(), 1, "the conversation was changed anyway");
     }
 
+    /// A summarizer reply in the checkpoint shape.
+    const CHECKPOINT_REPLY: &str = "## Goal\n- finish the fixture task\n## Constraints\n- none\n## Decisions\n- none\n## State\n### Done\n- the earlier fixture exchanges established the task and its progress\n### In progress\n- none\n### Blocked\n- none\n## Next steps\n- continue using the retained conversation\n## Files that matter\n- none\n## Facts to keep\n- none";
+
     struct SummaryFixture {
         reply: String,
         status: u16,
@@ -9743,7 +9744,7 @@ mod tests {
         ) -> rune_net::error::NetResult<rune_net::fetch::FetchResponse> {
             let body: serde_json::Value =
                 serde_json::from_slice(&request.body).expect("request JSON");
-            if body.to_string().contains("<context_handoff>") {
+            if body.to_string().contains("<conversation-checkpoint>") {
                 let events = self
                     .events
                     .as_ref()
@@ -9829,9 +9830,7 @@ mod tests {
         host.recorder = Some(Arc::new(Mutex::new(recorder)));
         let before = history.clone();
         let plan = rune_agent::compaction::plan(&history, &host.limits).expect("plan");
-        let fetch = SummaryFixture::new(
-            "The earlier fixture exchanges established the task and its current progress.",
-        );
+        let fetch = SummaryFixture::new(CHECKPOINT_REPLY);
         let error = compact_session(&host, &mut history, &plan, &fetch, true)
             .expect_err("archive failure must prevent replacement");
         assert_eq!(error.code(), ErrorCode::CorruptRecord);
@@ -9879,9 +9878,7 @@ mod tests {
         for constraint in constraints {
             history.pin_constraint(constraint).expect("pin");
         }
-        let mut fetch = SummaryFixture::new(
-            "Earlier exchanges established progress. Continue using the retained conversation.",
-        );
+        let mut fetch = SummaryFixture::new(CHECKPOINT_REPLY);
         fetch.events = Some(Arc::clone(&host.events));
         for round in 0..3 {
             if round > 0 {
@@ -9962,9 +9959,7 @@ mod tests {
     #[test]
     fn crossing_the_configured_trigger_compacts_before_the_next_request() {
         let (host, mut history, mut plan) = compaction_fixture();
-        let mut fetch = SummaryFixture::new(
-            "The earlier fixture exchanges established the task and its current progress.",
-        );
+        let mut fetch = SummaryFixture::new(CHECKPOINT_REPLY);
         fetch.events = Some(Arc::clone(&host.events));
         let before = history.clone();
         let cut = rune_agent::compaction::plan(&history, &host.limits)
@@ -9981,7 +9976,11 @@ mod tests {
                 .contains("<conversation>")
         );
         assert_eq!(plan.messages, history.to_messages());
-        assert!(history.turns()[0].text().contains("<context_handoff>"));
+        assert!(
+            history.turns()[0]
+                .text()
+                .contains("<conversation-checkpoint>")
+        );
         for (retained, original) in history.turns()[1..].iter().zip(&before.turns()[cut..]) {
             assert_eq!(retained.parts, original.parts);
         }
@@ -10039,9 +10038,7 @@ mod tests {
         assert!(estimate.input_tokens > estimate.capacity);
         let cut = rune_agent::compaction::plan(&history, &host.limits).expect("cut");
         let retained = history.to_messages()[cut.removed_turns..].to_vec();
-        let fetch = SummaryFixture::new(
-            "The earlier fixture exchanges established the task and its current progress.",
-        );
+        let fetch = SummaryFixture::new(CHECKPOINT_REPLY);
 
         host.prepare_request(&mut history, &mut plan, &fetch)
             .expect("the removable prefix can be compacted");
@@ -10182,7 +10179,8 @@ mod tests {
             assert!(error.message().contains("nothing was changed"), "{error}");
             assert_eq!(history.turns(), before.turns());
             assert_eq!(request_plan.messages, before.to_messages());
-            assert_eq!(fetch.requests.lock().expect("requests").len(), 1);
+            // The cut reply is never kept; the nudge gets the same answer.
+            assert_eq!(fetch.requests.lock().expect("requests").len(), 2);
             assert!(host.events.lock().expect("events").is_empty());
             assert_eq!(
                 *host.transcript.lock().expect("transcript"),
@@ -10222,9 +10220,7 @@ mod tests {
         }]);
         history.push_user("steered correction");
         plan.messages = history.to_messages();
-        let fetch = SummaryFixture::new(
-            "The earlier exchanges established the task and its current progress.",
-        );
+        let fetch = SummaryFixture::new(CHECKPOINT_REPLY);
         host.prepare_request(&mut history, &mut plan, &fetch)
             .expect("compacted");
         let start = host

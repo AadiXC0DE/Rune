@@ -22,7 +22,7 @@ use rune_net::provider::{Provider, RequestPlan};
 use rune_net::stream::{FinishReason, Usage};
 use rune_net::transport::{self, RequestTimeouts};
 
-use rune_net::message::{ContentPart, Role};
+use rune_net::message::{ContentPart, Message, Role};
 
 use crate::history::{History, Turn};
 use crate::tokens::{
@@ -140,8 +140,11 @@ pub fn encode_request(
 /// The summary is produced by the model, because nothing else can compress a
 /// conversation without discarding what makes it useful. History changes only
 /// after a usable summary has arrived: a failed request, an incomplete or
-/// unusable summary, or a failed archive leaves it exactly as it was. The
-/// summary request's usage is returned, not recorded.
+/// unusable summary, or a failed archive leaves it exactly as it was.
+///
+/// A reply without the checkpoint headings gets one nudge asking for them; if
+/// that reply still lacks them, a complete free-form reply is kept. The usage
+/// of the summary requests is returned, not recorded.
 pub fn compact(
     history: &mut History,
     plan: &Plan,
@@ -154,42 +157,40 @@ pub fn compact(
     let limits = host.limits();
     let request = render_summary_request(history, plan);
     let mut request_plan = RequestPlan::new(host.model());
-    SUMMARY_INSTRUCTIONS.clone_into(&mut request_plan.instructions);
+    request_plan.instructions = checkpoint_instruction(false);
     request_plan.messages = transport::one_shot_messages(&request);
     request_plan.cache_key = host.cache_key();
-    let mut accounting = turn::ObjectiveAccounting::begin(host, &mut request_plan)?;
-    let response = transport::stream_completion_observed(
-        client,
-        host.endpoint(),
-        host.dialect(),
-        &request_plan,
-        RequestTimeouts {
-            head: compaction_timeout(&limits),
-            ..RequestTimeouts::from_settings(&limits, host.provider_head_timeout_ms())
-        },
-        cancelled,
-        &mut |event| accounting.observe(event),
-    );
-    accounting.finish(host, response.as_ref().ok().map(|outcome| outcome.usage))?;
-    let outcome = response.map_err(|err| {
-        RuneError::new(
-            err.kind().code(),
-            format!("compaction failed, nothing was changed: {err}"),
-        )
-    })?;
-    if outcome.finish == Some(FinishReason::MaxTokens) {
-        return Err(RuneError::new(
-            ErrorCode::InvalidState,
-            "compaction produced an incomplete summary: the summarizer reached the token limit; nothing was changed",
-        ));
-    }
-    let summary = outcome.text();
-    validate_summary(&summary).map_err(|err| {
-        RuneError::new(
-            err.code(),
-            format!("compaction produced nothing usable: {err}"),
-        )
-    })?;
+    let first = summarize(host, client, &limits, &mut request_plan, cancelled)?;
+    let mut usage = first.usage;
+    let summary = if is_checkpoint_reply(&first) {
+        first.text()
+    } else {
+        let reply = first.text();
+        if !reply.is_empty() {
+            request_plan
+                .messages
+                .push(Message::assistant(vec![ContentPart::Text { text: reply }]));
+        }
+        request_plan.messages.push(Message::user(CHECKPOINT_NUDGE));
+        let second = summarize(host, client, &limits, &mut request_plan, cancelled)?;
+        usage = usage.merge_sum(second.usage);
+        let free_form =
+            second.finish == Some(FinishReason::Stop) && validate_summary(&second.text()).is_ok();
+        if is_checkpoint_reply(&second) || free_form {
+            second.text()
+        } else if second.finish == Some(FinishReason::MaxTokens) {
+            return Err(RuneError::new(
+                ErrorCode::InvalidState,
+                "compaction produced an incomplete summary: the summarizer reached the token limit; nothing was changed",
+            ));
+        } else {
+            return Err(RuneError::new(
+                ErrorCode::InvalidState,
+                "compaction produced nothing usable: the summarizer did not return a checkpoint",
+            )
+            .with_hint("the previous context was kept"));
+        }
+    };
     if let Some(archive) = archive {
         // A signed plan keeps no turn as a message, so every turn is archived.
         let removed = if plan.signed {
@@ -209,14 +210,51 @@ pub fn compact(
             })?;
     }
     host.before_compaction(history);
-    let removed_turns = apply(history, plan, wrap_summary(&summary));
+    let removed_turns = apply(history, plan, &summary);
     Ok(CompactionReport {
         kind: CompactionKind::Checkpoint,
         pruned_results: 0,
         removed_turns,
         remaining_turns: history.len(),
-        usage: outcome.usage,
+        usage,
     })
+}
+
+/// Sends one summarizer request, charging it to the objective.
+fn summarize(
+    host: &dyn Host,
+    client: &dyn Fetch,
+    limits: &BudgetSet,
+    request_plan: &mut RequestPlan,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<transport::StreamOutcome> {
+    let mut accounting = turn::ObjectiveAccounting::begin(host, request_plan)?;
+    let response = transport::stream_completion_observed(
+        client,
+        host.endpoint(),
+        host.dialect(),
+        request_plan,
+        RequestTimeouts {
+            head: compaction_timeout(limits),
+            ..RequestTimeouts::from_settings(limits, host.provider_head_timeout_ms())
+        },
+        cancelled,
+        &mut |event| accounting.observe(event),
+    );
+    accounting.finish(host, response.as_ref().ok().map(|outcome| outcome.usage))?;
+    response.map_err(|err| {
+        RuneError::new(
+            err.kind().code(),
+            format!("compaction failed, nothing was changed: {err}"),
+        )
+    })
+}
+
+/// Returns true for a complete reply that has the checkpoint headings.
+///
+/// Only the text is judged; a reply cut at the output limit never counts.
+fn is_checkpoint_reply(outcome: &transport::StreamOutcome) -> bool {
+    outcome.finish != Some(FinishReason::MaxTokens) && validate_checkpoint(&outcome.text())
 }
 
 /// Returns `window` lowered to the bound learned for `model`, if any.
@@ -456,20 +494,78 @@ pub fn auto_compact_encoded(
     ))
 }
 
-/// Instruction given to the summarizer.
+/// Opening of the summarizer instruction for a first checkpoint.
+pub const CHECKPOINT_OPENING: &str = "Write a checkpoint of the conversation above so the work can continue after older messages are removed. Reply with text only and call no tools. Use exactly these headings, in this order:";
+
+/// Opening of the summarizer instruction when the conversation starts with an
+/// earlier checkpoint.
+pub const CHECKPOINT_UPDATE_OPENING: &str = "The conversation above starts with an earlier checkpoint. Write one updated checkpoint that replaces it, so the work can continue after older messages are removed: keep what still holds, let newer messages win where they disagree, move finished work from \"In progress\" to \"Done\", and drop blockers that were resolved. Do not copy the checkpoint's tags. Reply with text only and call no tools. Use exactly these headings, in this order:";
+
+/// Headings the checkpoint must use, and what goes under each.
 ///
-/// Kept explicit about what must survive, because a summary that drops the
-/// user's current intent or an unresolved blocker is worse than no summary.
-pub const SUMMARY_INSTRUCTIONS: &str = "\
-Summarize the earlier portion of this conversation so work can continue in a \
-fresh context window. Preserve, in this order:
-1. What the user is trying to achieve, in their own terms.
-2. Decisions already made and the reason for each.
-3. Every unresolved blocker, open question, or failed attempt with its error.
-4. The state of any verification: what was run, what passed, what did not.
-5. Concrete facts discovered that would be expensive to rediscover, such as \
-file paths, symbol names, and command invocations.
-Omit routine tool output. Do not add commentary about the summary itself.";
+/// Explicit about what must survive, because a summary that drops the user's
+/// current intent or an unresolved blocker is worse than no summary.
+pub const CHECKPOINT_TEMPLATE: &str = "## Goal\n## Constraints\n## Decisions\n## State\n### Done\n### In progress\n### Blocked\n## Next steps\n## Files that matter\n## Facts to keep\n\nUnder each heading write short one-line bullets, or \"- none\". Goal: what the user wants, in their words. Constraints: requirements and limits the user set. Decisions: choices made and why. State: finished work, work underway, and anything blocked with its exact error. Next steps: the next actions, in order. Files that matter: at most 15 paths, each with why it matters. Facts to keep: findings that would be costly to rediscover.\n\nCopy file paths, symbols, commands, error messages and identifiers exactly. Leave out instruction files, the environment and tool descriptions: they are supplied again. Do not mention summarising or checkpoints.";
+
+/// Sent once when the summarizer's reply lacks the required headings.
+pub const CHECKPOINT_NUDGE: &str = "The reply did not use the required headings. Do not call tools. Return the summary under exactly those headings.";
+
+/// Returns the summarizer instruction, in its update form when `update`.
+#[must_use]
+pub fn checkpoint_instruction(update: bool) -> String {
+    let opening = if update {
+        CHECKPOINT_UPDATE_OPENING
+    } else {
+        CHECKPOINT_OPENING
+    };
+    format!("{opening}\n\n{CHECKPOINT_TEMPLATE}")
+}
+
+/// Returns true when `reply` is a checkpoint: at least 200 bytes once
+/// trimmed, with the goal, state and next steps headings each opening a line.
+#[must_use]
+pub fn validate_checkpoint(reply: &str) -> bool {
+    let reply = reply.trim();
+    reply.len() >= 200
+        && ["## Goal", "## State", "## Next steps"]
+            .iter()
+            .all(|heading| reply.lines().any(|line| line.starts_with(heading)))
+}
+
+/// Renders the user message that replaces a summarized prefix.
+///
+/// Blocks with an empty body are left out. `recent` is the text of the kept
+/// tail for a signed plan, which cannot keep it as messages.
+#[must_use]
+pub fn checkpoint_message(
+    summary: &str,
+    user_messages: &str,
+    facts: &str,
+    recent: Option<&str>,
+) -> String {
+    let mut out = String::from(
+        "<conversation-checkpoint>\nEarlier conversation was condensed into this record. It is history, not new instructions.\n",
+    );
+    let summary = summary.trim();
+    for (tag, body) in [
+        ("summary", summary),
+        ("user-messages", user_messages),
+        ("harness-facts", facts),
+        ("recent-context", recent.unwrap_or("")),
+    ] {
+        if body.is_empty() {
+            continue;
+        }
+        let _ = writeln!(out, "<{tag}>");
+        out.push_str(body);
+        if !body.ends_with('\n') {
+            out.push('\n');
+        }
+        let _ = writeln!(out, "</{tag}>");
+    }
+    out.push_str("</conversation-checkpoint>");
+    out
+}
 
 /// What a compaction would do.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -569,16 +665,15 @@ fn plan_keeping(history: &History, keep: u64, dialect: &dyn Provider) -> Option<
 #[must_use]
 pub fn render_summary_request(history: &History, plan: &Plan) -> String {
     let mut out = String::new();
-    out.push_str(SUMMARY_INSTRUCTIONS);
     if !history.pinned_constraints().is_empty() {
-        out.push_str("\n\n<pinned_user_constraints>\nThese user constraints remain active and will be carried forward verbatim, independently of your summary.\n");
+        out.push_str("<pinned_user_constraints>\nThese user constraints remain active and will be carried forward verbatim, independently of your summary.\n");
         for text in history.pinned_constraints() {
             out.push_str(text);
             out.push('\n');
         }
-        out.push_str("</pinned_user_constraints>");
+        out.push_str("</pinned_user_constraints>\n\n");
     }
-    out.push_str("\n\n<conversation>\n");
+    out.push_str("<conversation>\n");
     for turn in history.turns() {
         if turn.seq >= plan.cut_at {
             break;
@@ -614,50 +709,50 @@ pub fn render_summary_request(history: &History, plan: &Plan) -> String {
         }
         out.push('\n');
     }
-    out.push_str("</conversation>\n");
+    out.push_str("</conversation>\n\n");
+    out.push_str(&checkpoint_instruction(false));
     out
 }
 
-/// Applies a summary to the history.
+/// Applies a summary to the history as a checkpoint message.
 ///
 /// The user's own messages from the removed prefix follow the summary word for
-/// word. An unsigned plan keeps the retained tail verbatim after the summary
+/// word, then the facts the harness recorded. An unsigned plan keeps the retained tail verbatim after the summary
 /// turn, so the resulting length is the retained count plus one. A signed plan
 /// keeps the summary turn alone, with the tail written into it as text, because
 /// signed replay state cannot follow a rewritten prefix. Returns the number of
 /// turns removed, which is the retained count subtracted from the previous
 /// length, not the difference in length after the summary was added.
-pub fn apply(history: &mut History, plan: &Plan, summary: impl Into<String>) -> usize {
-    let mut summary = summary.into();
+pub fn apply(history: &mut History, plan: &Plan, summary: &str) -> usize {
     let carried = carried_user_messages(history, plan.cut_at);
-    if !carried.is_empty() {
-        let _ = write!(summary, "\n\n<user-messages>\n{carried}</user-messages>");
-    }
-    let keep_from = if plan.signed {
+    let facts = {
+        let live_plan = history.shared_live_plan();
+        let live_plan = live_plan
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        history
+            .ledger()
+            .render(&live_plan, history.pinned_constraints())
+    };
+    let (recent, keep_from) = if plan.signed {
         let start = history
             .turns()
             .iter()
             .position(|turn| turn.seq >= plan.cut_at)
             .unwrap_or(history.len());
-        let recent = render_recent_context(&history.turns()[start..]);
-        let _ = write!(summary, "\n<recent-context>\n{recent}</recent-context>");
-        history.next_seq()
+        (
+            Some(render_recent_context(&history.turns()[start..])),
+            history.next_seq(),
+        )
     } else {
-        plan.cut_at
+        (None, plan.cut_at)
     };
+    let message = checkpoint_message(summary, &carried, &facts, recent.as_deref());
     let before = history.len();
-    history.replace_with_summary(summary, keep_from);
+    history.replace_with_summary(message, keep_from);
     let after = history.len();
     // The summary replaces the removed prefix with exactly one turn.
     before.saturating_sub(after.saturating_sub(1))
-}
-
-/// Wraps a summary so the model can tell it apart from a user request.
-#[must_use]
-pub fn wrap_summary(summary: &str) -> String {
-    format!(
-        "<context_handoff>\nThe following is a summary of earlier conversation, provided so work can continue.\n\n{summary}\n</context_handoff>"
-    )
 }
 
 /// Characters of one carried user message.
@@ -674,7 +769,7 @@ const RECENT_ARGUMENT_CHARS: usize = 300;
 
 /// Returns true for text that opens a summary installed by compaction.
 fn is_checkpoint(text: &str) -> bool {
-    text.starts_with("<conversation-checkpoint>") || text.starts_with("<context_handoff>")
+    text.starts_with("<conversation-checkpoint>")
 }
 
 /// Returns the user messages a summary at the front of the history carries.
@@ -1059,7 +1154,7 @@ mod tests {
         // The newest prompt: its question, two calls with results, the answer.
         assert_eq!(plan.kept_turns, 6);
 
-        apply(&mut history, &plan, wrap_summary("what happened so far"));
+        apply(&mut history, &plan, "what happened so far");
         history.validate().expect("still valid");
     }
 
@@ -1096,7 +1191,7 @@ mod tests {
     fn applying_a_summary_leaves_a_valid_history() {
         let mut history = long_history();
         let plan = plan(&history, &keep_none()).expect("a plan");
-        let removed = apply(&mut history, &plan, wrap_summary("what happened so far"));
+        let removed = apply(&mut history, &plan, "what happened so far");
         assert_eq!(removed, plan.removed_turns);
         history.validate().expect("still valid");
     }
@@ -1150,7 +1245,7 @@ mod tests {
         let history = long_history();
         let plan = plan(&history, &keep_none()).expect("a plan");
         let request = render_summary_request(&history, &plan);
-        assert!(request.contains(SUMMARY_INSTRUCTIONS));
+        assert!(request.contains(CHECKPOINT_OPENING));
 
         let kept: Vec<String> = history
             .turns()
@@ -1175,14 +1270,6 @@ mod tests {
         let plan = plan(&history, &keep_none()).expect("a plan");
         let request = render_summary_request(&history, &plan);
         assert!(request.contains("calls read_file"), "{request}");
-    }
-
-    #[test]
-    fn a_wrapped_summary_is_delimited() {
-        let wrapped = wrap_summary("the summary");
-        assert!(wrapped.contains("<context_handoff>"));
-        assert!(wrapped.contains("</context_handoff>"));
-        assert!(wrapped.contains("the summary"));
     }
 
     #[test]
@@ -1326,11 +1413,229 @@ mod tests {
             let Some(plan) = plan(&history, &keep_none()) else {
                 break;
             };
-            apply(&mut history, &plan, format!("summary at {}", plan.cut_at));
+            apply(&mut history, &plan, &format!("summary at {}", plan.cut_at));
             history.validate().expect("valid after compaction");
         }
         // The history stays valid and never becomes empty.
         assert!(!history.is_empty());
+    }
+
+    /// A reply in the checkpoint shape.
+    const CHECKPOINT_REPLY: &str = "## Goal\n- answer the questions\n## Constraints\n- none\n## Decisions\n- none\n## State\n### Done\n- the earlier questions were answered from file contents\n### In progress\n- none\n### Blocked\n- none\n## Next steps\n- answer the newest question\n## Files that matter\n- none\n## Facts to keep\n- none";
+
+    /// Answers requests in order from `replies`, each a text and a finish
+    /// reason, and keeps every request body.
+    struct ReplyFetch {
+        replies: std::sync::Mutex<std::collections::VecDeque<(String, &'static str)>>,
+        bodies: std::sync::Mutex<Vec<serde_json::Value>>,
+    }
+
+    impl ReplyFetch {
+        fn new(replies: &[(&str, &'static str)]) -> Self {
+            Self {
+                replies: std::sync::Mutex::new(
+                    replies
+                        .iter()
+                        .map(|(text, finish)| ((*text).to_owned(), *finish))
+                        .collect(),
+                ),
+                bodies: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn bodies(&self) -> Vec<serde_json::Value> {
+            self.bodies.lock().expect("bodies").clone()
+        }
+    }
+
+    impl Fetch for ReplyFetch {
+        fn send(
+            &self,
+            request: rune_net::fetch::FetchRequest,
+        ) -> rune_net::error::NetResult<rune_net::fetch::FetchResponse> {
+            self.bodies
+                .lock()
+                .expect("bodies")
+                .push(serde_json::from_slice(&request.body).expect("request JSON"));
+            let (text, finish) = self
+                .replies
+                .lock()
+                .expect("replies")
+                .pop_front()
+                .expect("a scripted reply");
+            let chunk = serde_json::json!({
+                "choices": [{"delta": {"content": text}, "finish_reason": finish}]
+            });
+            let body = format!("data: {chunk}\n\ndata: [DONE]\n\n");
+            Ok(rune_net::fetch::FetchResponse {
+                status: 200,
+                content_type: "text/event-stream".to_owned(),
+                retry_after: None,
+                retry_after_ms: None,
+                should_retry: None,
+                location: None,
+                body: Box::new(std::io::Cursor::new(body.into_bytes())),
+            })
+        }
+    }
+
+    fn short_history() -> History {
+        let mut history = History::new();
+        for index in 0..3 {
+            history.push_user(format!("question {index}"));
+            history.push_assistant(vec![ContentPart::Text {
+                text: format!("answer {index}"),
+            }]);
+        }
+        history
+    }
+
+    /// Compacts a short history with `fetch` as the summarizer.
+    fn compact_with(fetch: &ReplyFetch) -> (History, History, Result<CompactionReport>) {
+        let host = SummaryHost::new();
+        let mut history = short_history();
+        let before = history.clone();
+        let cut = plan(&history, &host.limits()).expect("a plan");
+        let result = compact(&mut history, &cut, &host, fetch, None, &|| false);
+        (before, history, result)
+    }
+
+    const NO_HEADINGS: &str = "Here is what happened so far, without any headings.";
+
+    #[test]
+    fn an_invalid_reply_gets_one_nudge() {
+        let fetch = ReplyFetch::new(&[(NO_HEADINGS, "stop"), (CHECKPOINT_REPLY, "stop")]);
+        let (_, history, result) = compact_with(&fetch);
+        result.expect("the second reply is a checkpoint");
+        let bodies = fetch.bodies();
+        assert_eq!(bodies.len(), 2);
+        let first = bodies[0]["messages"].as_array().expect("messages");
+        let second = bodies[1]["messages"].as_array().expect("messages");
+        assert_eq!(second.len(), first.len() + 2);
+        assert_eq!(second[..first.len()], first[..]);
+        assert_eq!(second[first.len()]["role"], "assistant");
+        assert_eq!(second[first.len()]["content"], NO_HEADINGS);
+        assert_eq!(second[first.len() + 1]["role"], "user");
+        assert_eq!(second[first.len() + 1]["content"], CHECKPOINT_NUDGE);
+        let text = history.turns()[0].text();
+        assert!(text.contains("<summary>\n## Goal\n"), "{text}");
+    }
+
+    #[test]
+    fn a_free_form_reply_is_kept_after_a_failed_nudge() {
+        let free_form = "The questions were answered; continue with the newest one.";
+        let fetch = ReplyFetch::new(&[(NO_HEADINGS, "stop"), (free_form, "stop")]);
+        let (_, history, result) = compact_with(&fetch);
+        result.expect("a usable free-form reply");
+        assert_eq!(fetch.bodies().len(), 2);
+        let text = history.turns()[0].text();
+        assert!(
+            text.contains(&format!("<summary>\n{free_form}\n</summary>")),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_short_reply_after_the_nudge_leaves_the_history_unchanged() {
+        let fetch = ReplyFetch::new(&[("no headings here", "stop"), ("still none", "stop")]);
+        let (before, history, result) = compact_with(&fetch);
+        let err = result.expect_err("nothing usable");
+        assert_eq!(
+            err.message(),
+            "compaction produced nothing usable: the summarizer did not return a checkpoint"
+        );
+        assert_eq!(fetch.bodies().len(), 2);
+        assert_eq!(history.turns(), before.turns());
+    }
+
+    #[test]
+    fn a_reply_cut_at_the_output_limit_is_never_kept() {
+        let fetch = ReplyFetch::new(&[(CHECKPOINT_REPLY, "length"), (CHECKPOINT_REPLY, "length")]);
+        let (before, history, result) = compact_with(&fetch);
+        let err = result.expect_err("a cut reply is refused");
+        assert!(err.message().contains("token limit"), "{}", err.message());
+        assert_eq!(fetch.bodies().len(), 2);
+        assert_eq!(history.turns(), before.turns());
+    }
+
+    #[test]
+    fn the_instructions_stay_under_1400_bytes() {
+        let first = checkpoint_instruction(false);
+        let update = checkpoint_instruction(true);
+        assert_eq!(first.len(), 967);
+        assert_eq!(update.len(), 1216);
+        assert!(first.len() < 1400 && update.len() < 1400);
+        let literal = "Write a checkpoint of the conversation above so the work can continue after older messages are removed. Reply with text only and call no tools. Use exactly these headings, in this order:
+
+## Goal
+## Constraints
+## Decisions
+## State
+### Done
+### In progress
+### Blocked
+## Next steps
+## Files that matter
+## Facts to keep
+
+Under each heading write short one-line bullets, or \"- none\". Goal: what the user wants, in their words. Constraints: requirements and limits the user set. Decisions: choices made and why. State: finished work, work underway, and anything blocked with its exact error. Next steps: the next actions, in order. Files that matter: at most 15 paths, each with why it matters. Facts to keep: findings that would be costly to rediscover.
+
+Copy file paths, symbols, commands, error messages and identifiers exactly. Leave out instruction files, the environment and tool descriptions: they are supplied again. Do not mention summarising or checkpoints.";
+        assert_eq!(first, literal);
+        assert!(update.starts_with(CHECKPOINT_UPDATE_OPENING));
+        assert!(update.ends_with(CHECKPOINT_TEMPLATE));
+    }
+
+    #[test]
+    fn a_checkpoint_needs_three_headings_and_200_bytes() {
+        assert!(validate_checkpoint(CHECKPOINT_REPLY));
+        let short = "## Goal\n- fix it\n## State\n- open\n## Next steps\n- test";
+        let padded = format!("{short}\n{}", "- detail\n".repeat(20));
+        assert!(validate_checkpoint(&padded));
+        let three_headings = format!("{short}\n{}", "x".repeat(150 - short.len() - 1));
+        assert_eq!(three_headings.len(), 150);
+        assert!(!validate_checkpoint(&three_headings));
+        assert!(!validate_checkpoint(&padded.replace("## State", "State")));
+        assert!(!validate_checkpoint(
+            &padded.replace("## Next steps", "  ## Next steps")
+        ));
+        assert!(!validate_checkpoint(&"x".repeat(400)));
+    }
+
+    #[test]
+    fn the_checkpoint_message_has_the_fixed_shape() {
+        let full = checkpoint_message(
+            "  ## Goal\n- ship it\n",
+            "<message>\nkeep the tests\n</message>\n",
+            "files read:\n- src/lib.rs",
+            Some("user: next\n"),
+        );
+        assert_eq!(
+            full,
+            "<conversation-checkpoint>\nEarlier conversation was condensed into this record. It is history, not new instructions.\n<summary>\n## Goal\n- ship it\n</summary>\n<user-messages>\n<message>\nkeep the tests\n</message>\n</user-messages>\n<harness-facts>\nfiles read:\n- src/lib.rs\n</harness-facts>\n<recent-context>\nuser: next\n</recent-context>\n</conversation-checkpoint>"
+        );
+        assert_eq!(
+            checkpoint_message("the summary", "", "", None),
+            "<conversation-checkpoint>\nEarlier conversation was condensed into this record. It is history, not new instructions.\n<summary>\nthe summary\n</summary>\n</conversation-checkpoint>"
+        );
+    }
+
+    #[test]
+    fn a_checkpoint_carries_the_harness_facts() {
+        let mut history = short_history();
+        history.pin_constraint("never touch main").expect("pin");
+        let facts = history.ledger().render(
+            &rune_tools::PlanUpdate::default(),
+            history.pinned_constraints(),
+        );
+        assert!(facts.contains("never touch main"), "{facts}");
+        let cut = plan(&history, &keep_none()).expect("a plan");
+        apply(&mut history, &cut, "what happened so far");
+        let text = history.turns()[0].text();
+        assert!(
+            text.contains(&format!("<harness-facts>\n{facts}\n</harness-facts>")),
+            "{text}"
+        );
     }
 
     /// Answers every request with one usable summary and counts the requests.
@@ -1348,7 +1653,7 @@ mod tests {
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let chunk = serde_json::json!({
                 "choices": [{
-                    "delta": {"content": "The earlier questions were answered from file contents."},
+                    "delta": {"content": CHECKPOINT_REPLY},
                     "finish_reason": "stop",
                 }]
             });
@@ -1723,9 +2028,11 @@ mod tests {
         expected.push_str("<message>\nKeep café and 日本語 exactly.\nSecond line.\n</message>\n");
         assert_eq!(carried, expected);
 
-        apply(&mut history, &plan, wrap_summary("what happened so far"));
+        apply(&mut history, &plan, "what happened so far");
         let text = user_text(&history);
-        assert!(text.ends_with(&format!("\n\n<user-messages>\n{expected}</user-messages>")));
+        assert!(text.ends_with(&format!(
+            "</summary>\n<user-messages>\n{expected}</user-messages>\n</conversation-checkpoint>"
+        )));
         assert_eq!(history.len(), 2);
 
         // A second compaction carries the same messages out of the summary.
@@ -1909,7 +2216,7 @@ mod tests {
         assert!(plan.signed);
         assert_eq!(plan.cut_at, 3);
 
-        let removed = apply(&mut history, &plan, wrap_summary("what happened so far"));
+        let removed = apply(&mut history, &plan, "what happened so far");
         assert_eq!(removed, 4);
         assert_eq!(history.len(), 1);
         assert!(!history.is_signed(&dialect));
@@ -1917,7 +2224,8 @@ mod tests {
         let text = user_text(&history);
         assert!(text.ends_with(
             "<user-messages>\n<message>\nfirst question\n</message>\n</user-messages>\n\
-             <recent-context>\nuser: second question\nassistant: second answer\n</recent-context>"
+             <recent-context>\nuser: second question\nassistant: second answer\n</recent-context>\n\
+             </conversation-checkpoint>"
         ));
     }
 }

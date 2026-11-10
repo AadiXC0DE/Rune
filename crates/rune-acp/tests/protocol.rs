@@ -681,7 +681,9 @@ fn a_long_prompt_turn_compacts() {
         vec![
             text_without_usage("first answer"),
             text_without_usage("second answer"),
-            text_without_usage("The user asked two questions; both were answered in full."),
+            text_without_usage(
+                "## Goal\n- answer the questions\n## Constraints\n- none\n## Decisions\n- none\n## State\n### Done\n- the user asked two questions; both were answered in full\n### In progress\n- none\n### Blocked\n- none\n## Next steps\n- answer the next question\n## Files that matter\n- none\n## Facts to keep\n- none",
+            ),
             text_without_usage("third answer"),
         ],
         PermissionMode::Auto,
@@ -713,7 +715,7 @@ fn a_long_prompt_turn_compacts() {
         .last_body()
         .expect("request after compaction")
         .to_string();
-    assert!(body.contains("<context_handoff>"), "{body}");
+    assert!(body.contains("<conversation-checkpoint>"), "{body}");
     // The first prompt is carried into the checkpoint, cut, never whole.
     assert!(body.contains("<user-messages>"), "{body}");
     assert!(body.contains("more characters]"), "{body}");

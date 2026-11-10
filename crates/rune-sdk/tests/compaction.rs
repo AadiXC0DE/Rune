@@ -21,8 +21,7 @@ use rune_sdk::{Agent, AgentOptions, CHECKPOINT_VERSION, Dialect, FetchRequest, F
 use rune_sdk::{HostFetch, PromptOptions};
 use serde_json::{Value, json};
 
-const SUMMARY: &str =
-    "Earlier lookups completed successfully. Continue the current work with the retained results.";
+const SUMMARY: &str = "## Goal\n- look up the keys the user named\n## Constraints\n- none\n## Decisions\n- none\n## State\n### Done\n- earlier lookups completed successfully\n### In progress\n- none\n### Blocked\n- none\n## Next steps\n- continue the current work with the retained results\n## Files that matter\n- none\n## Facts to keep\n- none";
 
 #[derive(Default)]
 struct FixtureFetch {
@@ -258,7 +257,11 @@ fn compact_preserves_tool_pairs_signed_replay_and_checkpoint_continuation() {
         assert_eq!(history.len(), original.len() - removed + 1);
         assert!(compacted.len() < before.len());
         assert!(history.turns()[0].text().contains(SUMMARY));
-        assert!(history.turns()[0].text().contains("<context_handoff>"));
+        assert!(
+            history.turns()[0]
+                .text()
+                .contains("<conversation-checkpoint>")
+        );
         let text = String::from_utf8_lossy(&compacted);
         assert!(!text.contains("fixture-secret"));
         assert!(!text.contains("fixture host instructions"));
@@ -473,7 +476,7 @@ impl HostFetch for SummaryFetch {
     fn post(&self, request: FetchRequest) -> Result<FetchResponse> {
         let text = if request
             .body
-            .contains("Summarize the earlier portion of this conversation")
+            .contains("Write a checkpoint of the conversation above")
         {
             SUMMARY
         } else {
@@ -516,7 +519,7 @@ fn auto_compact_summarises_before_the_window_is_reached() {
     let requests = fetch.requests.lock().expect("requests");
     let summaries = requests
         .iter()
-        .filter(|body| body.contains("Summarize the earlier portion"))
+        .filter(|body| body.contains("Write a checkpoint of the conversation"))
         .count();
     assert!(
         summaries >= 1,
@@ -524,7 +527,7 @@ fn auto_compact_summarises_before_the_window_is_reached() {
         requests.len()
     );
     let last = requests.last().expect("a request");
-    assert!(last.contains("<context_handoff>"), "{last}");
+    assert!(last.contains("<conversation-checkpoint>"), "{last}");
     // The earlier prompt survives only as a carried user message.
     assert!(!last.contains("value_0_0"), "{last}");
     assert_eq!(last.matches("question 0").count(), 1, "{last}");
@@ -554,7 +557,10 @@ fn auto_compact_off_by_default_sends_the_whole_history() {
     let requests = fetch.requests.lock().expect("requests");
     assert_eq!(requests.len(), 2);
     for body in requests.iter() {
-        assert!(!body.contains("Summarize the earlier portion"), "{body}");
+        assert!(
+            !body.contains("Write a checkpoint of the conversation"),
+            "{body}"
+        );
         assert!(body.contains("question 0"), "{body}");
     }
 }

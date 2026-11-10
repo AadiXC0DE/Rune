@@ -2860,9 +2860,7 @@ fn compactable(endpoint: MockEndpoint) -> (TestHost, rune_agent::History) {
 
 #[test]
 fn compact_replaces_old_turns_and_returns_the_summary_usage() {
-    let endpoint = MockEndpoint::start(vec![Script::text(
-        "summary of the work so far, long enough to keep",
-    )]);
+    let endpoint = MockEndpoint::start(vec![Script::text(CHECKPOINT_SUMMARY)]);
     let (host, mut history) = compactable(endpoint);
     let plan = rune_agent::compaction::plan(&history, &host.limits).expect("a plan");
     let client = host.fetch();
@@ -2876,7 +2874,7 @@ fn compact_replaces_old_turns_and_returns_the_summary_usage() {
     // The summary, then the newest question and its answer.
     assert_eq!(report.remaining_turns, 3);
     let first = format!("{:?}", history.turns()[0].parts);
-    assert!(first.contains("<context_handoff>"), "{first}");
+    assert!(first.contains("<conversation-checkpoint>"), "{first}");
     assert_eq!(report.usage.input_tokens, Some(10));
     history.validate().expect("valid history");
 }
@@ -2962,6 +2960,9 @@ fn encode_request_matches_the_transport_body() {
     assert_eq!(estimate.serialized_bytes, encoded.len() as u64);
 }
 
+/// A summarizer reply in the checkpoint shape.
+const CHECKPOINT_SUMMARY: &str = "## Goal\n- read five files\n## Constraints\n- none\n## Decisions\n- none\n## State\n### Done\n- all five files were read\n### In progress\n- none\n### Blocked\n- none\n## Next steps\n- report what the files contain\n## Files that matter\n- 1.rs to 5.rs, the files the user asked for\n## Facts to keep\n- none";
+
 /// Five read steps, then a request the provider refuses as too long.
 fn overflow_scripts(after: Vec<Script>) -> Vec<Script> {
     let mut scripts: Vec<Script> = (1..=5)
@@ -2984,7 +2985,7 @@ fn overflow_scripts(after: Vec<Script>) -> Vec<Script> {
 #[test]
 fn an_overflow_compacts_and_resends_the_step() {
     let endpoint = MockEndpoint::start(overflow_scripts(vec![
-        Script::text("The user asked for five files to be read; all five were read."),
+        Script::text(CHECKPOINT_SUMMARY),
         Script::text("finished"),
     ]));
     let mut host = single_attempt(TestHost::new(endpoint).with_tools(vec![read_tool()]));
@@ -3019,7 +3020,10 @@ fn an_overflow_compacts_and_resends_the_step() {
         .expect("endpoint")
         .last_body()
         .expect("body");
-    assert!(body.to_string().contains("<context_handoff>"), "{body}");
+    assert!(
+        body.to_string().contains("<conversation-checkpoint>"),
+        "{body}"
+    );
     history.validate().expect("valid history");
 }
 
@@ -3058,7 +3062,7 @@ fn overflow_status() -> Script {
 }
 
 fn overflow_summary() -> Script {
-    Script::text("The user asked for five files to be read; all five were read.")
+    Script::text(CHECKPOINT_SUMMARY)
 }
 
 #[test]

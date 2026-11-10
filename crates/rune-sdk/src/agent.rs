@@ -1096,7 +1096,7 @@ impl Agent {
         };
         let summary = summarizer(&compaction::render_summary_request(&history, &plan))?;
         compaction::validate_summary(&summary)?;
-        let removed = compaction::apply(&mut history, &plan, compaction::wrap_summary(&summary));
+        let removed = compaction::apply(&mut history, &plan, &summary);
         history.validate()?;
         // Check replayability before installing anything. A host may compact
         // precisely because the current checkpoint is too large.

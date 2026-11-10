@@ -74,7 +74,7 @@
     "request_absent": [
       {
         "request": 6,
-        "text": "<context_handoff>"
+        "text": "<conversation-checkpoint>"
       }
     ],
     "stop_reason": "end_turn"

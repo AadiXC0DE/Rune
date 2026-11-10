@@ -73,8 +73,8 @@
       ]
     },
     {
-      "match": "Summarize the earlier portion of this conversation",
-      "text": "The user asked for the six files to be read. Files a.txt to d.txt were read; e.txt and f.txt remain."
+      "match": "Write a checkpoint of the conversation above",
+      "text": "## Goal\n- read the files the user named\n## Constraints\n- none\n## Decisions\n- none\n## State\n### Done\n- a.txt to d.txt were read\n### In progress\n- none\n### Blocked\n- none\n## Next steps\n- read e.txt and f.txt\n## Files that matter\n- the .txt files in the workspace\n## Facts to keep\n- none"
     },
     {
       "text": "All six files were read."
@@ -84,7 +84,7 @@
     "exit_code": 0,
     "final_output": "All six files were read.",
     "any_request_contains": [
-      "<context_handoff>"
+      "<conversation-checkpoint>"
     ],
     "requests": 8,
     "stop_reason": "end_turn"

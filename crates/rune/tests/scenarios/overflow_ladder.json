@@ -73,12 +73,12 @@
       }
     },
     {
-      "match": "Summarize the earlier portion of this conversation",
-      "text": "The user asked for five files to be read; a.txt to e.txt were all read."
+      "match": "Write a checkpoint of the conversation above",
+      "text": "## Goal\n- read the files the user named\n## Constraints\n- none\n## Decisions\n- none\n## State\n### Done\n- a.txt to e.txt were all read\n### In progress\n- none\n### Blocked\n- none\n## Next steps\n- report that every file was read\n## Files that matter\n- the .txt files in the workspace\n## Facts to keep\n- none"
     },
     {
-      "match": "Summarize the earlier portion of this conversation",
-      "text": "The user asked for five files to be read; a.txt to e.txt were all read."
+      "match": "Write a checkpoint of the conversation above",
+      "text": "## Goal\n- read the files the user named\n## Constraints\n- none\n## Decisions\n- none\n## State\n### Done\n- a.txt to e.txt were all read\n### In progress\n- none\n### Blocked\n- none\n## Next steps\n- report that every file was read\n## Files that matter\n- the .txt files in the workspace\n## Facts to keep\n- none"
     },
     {
       "text": "Finished after compacting twice."
@@ -88,7 +88,7 @@
     "exit_code": 0,
     "final_output": "Finished after compacting twice.",
     "any_request_contains": [
-      "<context_handoff>"
+      "<conversation-checkpoint>"
     ],
     "requests": 10,
     "stop_reason": "end_turn"

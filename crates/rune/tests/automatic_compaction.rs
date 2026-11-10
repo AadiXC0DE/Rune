@@ -71,12 +71,13 @@ fn fixture_turns_compact_before_the_next_cli_model_request() {
                 continue;
             }
             let request: Value = serde_json::from_slice(&bytes).expect("request JSON");
-            let summary = request["messages"][0]["content"].as_str()
-                == Some(rune_agent::compaction::SUMMARY_INSTRUCTIONS);
+            let summary = request["messages"][0]["content"]
+                .as_str()
+                .is_some_and(|text| text.starts_with(rune_agent::compaction::CHECKPOINT_OPENING));
             requests.push((summary, request));
             let (delta, finish) = if summary {
                 (
-                    json!({"content": "The fixture exchanges established the task. Continue using the recent conversation and tool results."}),
+                    json!({"content": "## Goal\n- finish the fixture task\n## Constraints\n- none\n## Decisions\n- none\n## State\n### Done\n- the fixture exchanges established the task\n### In progress\n- none\n### Blocked\n- none\n## Next steps\n- continue using the recent conversation and tool results\n## Files that matter\n- fixture.txt\n## Facts to keep\n- none"}),
                     "stop",
                 )
             } else {
@@ -204,7 +205,7 @@ provider_request_timeout_ms = 5000
         if pair[0].0 {
             compactions += 1;
             assert!(!pair[1].0, "the next request should resume the task");
-            assert!(pair[1].1.to_string().contains("<context_handoff>"));
+            assert!(pair[1].1.to_string().contains("<conversation-checkpoint>"));
             let bytes = serde_json::to_vec(&pair[1].1).expect("body").len() as u64;
             assert!(
                 rune_agent::tokens::estimate_tokens(bytes) < 20_000,
@@ -234,7 +235,11 @@ provider_request_timeout_ms = 5000
         .filter(|message| message.contains("REMOVED_SYMBOL"))
         .collect();
     assert_eq!(holding.len(), 1, "{holding:?}");
-    assert!(holding[0].contains("<context_handoff>"), "{}", holding[0]);
+    assert!(
+        holding[0].contains("<conversation-checkpoint>"),
+        "{}",
+        holding[0]
+    );
     assert!(
         holding[0].contains(
             r"<user-messages>\n<message>\nfixture question 1 REMOVED_SYMBOL_CAFÉ[x].*\n</message>"
