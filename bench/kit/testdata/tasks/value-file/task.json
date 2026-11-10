@@ -1,0 +1,7 @@
+{
+  "title": "Set the value to 2",
+  "prompt": "Change the number in value.txt to 2.",
+  "verify": "test \"$(cat value.txt)\" = 2",
+  "tier": 1,
+  "language": "shell"
+}

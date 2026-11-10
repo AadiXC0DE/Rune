@@ -20,6 +20,9 @@ __pycache__/
 .vscode/
 *.swp
 
+# Benchmark run output
+bench/results/
+
 # Local documentation and planning notes
 docs/
 /PLAN.md

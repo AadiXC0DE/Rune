@@ -16,7 +16,7 @@ Notable changes, newest first. Each entry describes what a user can observe.
   a spend limit.
 - `rune bench` runs tasks in the Sutra task format and reports pass, time,
   tokens, cache share and cost; `bench/tasks` holds six harder tasks in four
-  languages, each proven solvable by `bench/check.sh`.
+  languages, each proven solvable by `python3 bench/kit/run.py validate`.
 - Live turn rendering: narration and one row per tool call in the order they
   happened, a spinner with elapsed time, a summary line per turn, Markdown with
   aligned tables, highlighted code fences, and the lines an edit changed under

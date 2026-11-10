@@ -6,7 +6,7 @@ suites also use, so the same tasks can measure each of them.
 ```sh
 rune bench bench/tasks                 # every task, once
 rune bench bench/tasks --trials 3      # three runs of each
-bench/check.sh                         # prove each task is solvable and unsolved as shipped
+python3 bench/kit/run.py validate --tasks bench/tasks   # prove each task is solvable and unsolved as shipped
 ```
 
 | Task | Language | What it takes |

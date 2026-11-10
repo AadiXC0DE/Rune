@@ -369,7 +369,7 @@ tokens per run, cache share, and cost where the model's prices are known.
 run and the summary as one object. Runs use your configuration, so a model or
 provider given to `rune bench` applies to each of them. The exit status is 0
 only when every run passed. `bench/tasks/` holds six tasks in JavaScript, Python, Go
-and Rust, each with a `solution/` that `bench/check.sh` uses to prove the task
+and Rust, each with a `solution/` that `python3 bench/kit/run.py validate` uses to prove the task
 fails as shipped and passes once solved; see `bench/README.md`.
 
 Enable Bash completion for command names, aliases, and flags in the current
