@@ -1501,7 +1501,9 @@ fn unanswered_permissions_time_out_without_blocking_later_prompts_or_granting_ac
         ],
         PermissionMode::Ask,
         limits,
-        vec![("notes.txt", "original")],
+        // Empty, so the guard on overwriting an unread file leaves the write
+        // to the permission prompt this test is about.
+        vec![("notes.txt", "")],
     );
     harness.client().approval = Approval::Ignore;
     let session = harness.open_session();
@@ -1527,7 +1529,7 @@ fn unanswered_permissions_time_out_without_blocking_later_prompts_or_granting_ac
     assert_eq!(
         std::fs::read_to_string(harness.root.path().join("workspace/notes.txt"))
             .expect("unchanged file"),
-        "original"
+        ""
     );
     assert!(harness.client().updates("tool_call").is_empty());
     assert_eq!(

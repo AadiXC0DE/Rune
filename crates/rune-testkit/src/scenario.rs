@@ -88,6 +88,42 @@ pub struct Expect {
     /// Each string must appear in at least one recorded request body.
     #[serde(default)]
     pub any_request_contains: Vec<String>,
+    /// Text that the result of a tool call, as sent back in a request, must contain.
+    #[serde(default)]
+    pub result_contains: Vec<ResultContains>,
+}
+
+/// One tool result assertion.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResultContains {
+    /// The tool call id.
+    pub call: String,
+    /// The text the result must contain.
+    pub text: String,
+}
+
+/// The text of every tool result for `call` in a request body.
+fn tool_results(body: &str, call: &str) -> Vec<String> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
+        return Vec::new();
+    };
+    let Some(messages) = value.get("messages").and_then(serde_json::Value::as_array) else {
+        return Vec::new();
+    };
+    messages
+        .iter()
+        .filter(|message| {
+            message
+                .get("tool_call_id")
+                .and_then(serde_json::Value::as_str)
+                == Some(call)
+        })
+        .filter_map(|message| match message.get("content")? {
+            serde_json::Value::String(text) => Some(text.clone()),
+            other => Some(other.to_string()),
+        })
+        .collect()
 }
 
 /// One body assertion.
@@ -485,6 +521,19 @@ pub fn check(scenario: &Scenario, report: &Report) -> Vec<String> {
             Some(_) => {}
         }
     }
+    for entry in &expect.result_contains {
+        let found = report.requests.iter().any(|request| {
+            tool_results(&request.body, &entry.call)
+                .iter()
+                .any(|text| text.contains(&entry.text))
+        });
+        if !found {
+            failures.push(format!(
+                "result_contains: no result of call {:?} contains {:?}",
+                entry.call, entry.text
+            ));
+        }
+    }
     for entry in &expect.request_absent {
         let body = entry
             .request
@@ -589,6 +638,30 @@ mod tests {
         assert!(check(&scenario, &report).is_empty());
         scenario.expect.any_request_contains.clear();
         report.requests.clear();
+        assert!(check(&scenario, &report).is_empty());
+    }
+
+    #[test]
+    fn result_contains_reads_the_tool_result_of_one_call() {
+        let scenario = load_inline(
+            r#"{"prompt":"p","turns":[],"expect":{"result_contains":[{"call":"w1","text":"refused"}]}}"#,
+        );
+        let request = |body: &str| RecordedRequest {
+            path: String::new(),
+            body: body.to_owned(),
+            bytes: body.len(),
+            prompt_tokens: 0,
+            cached_tokens: 0,
+            completion_tokens: 0,
+        };
+        let other = r#"{"messages":[{"role":"tool","tool_call_id":"w2","content":"refused"}]}"#;
+        let mut report = Report {
+            requests: vec![request(other)],
+            ..Report::default()
+        };
+        assert_eq!(check(&scenario, &report).len(), 1);
+        let right = r#"{"messages":[{"role":"tool","tool_call_id":"w1","content":"was refused"}]}"#;
+        report.requests.push(request(right));
         assert!(check(&scenario, &report).is_empty());
     }
 

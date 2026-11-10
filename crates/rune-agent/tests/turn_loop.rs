@@ -4781,3 +4781,247 @@ fn an_image_read_reaches_the_next_request() {
         "{body}"
     );
 }
+
+/// A host running the real file tools in `workspace` with reads and changes allowed.
+fn file_host(workspace: &tempfile::TempDir, scripts: Vec<Script>) -> TestHost {
+    let endpoint = MockEndpoint::start(scripts);
+    let registry = rune_tools::inventory::builtin_default().expect("builtins");
+    let mut rules = RuleSet::new();
+    for tool in ["read_file", "edit_file", "write_file", "rename_file"] {
+        rules.push(Rule::allow(tool, "*", Layer::User));
+    }
+    let mut host = TestHost::new(endpoint)
+        .with_tools(registry.all_schemas())
+        .with_rules(rules);
+    host.workspace = Utf8PathBuf::from_path_buf(workspace.path().to_owned()).expect("UTF-8 path");
+    host.registry = Some(registry);
+    host
+}
+
+fn read_call(id: &str, path: &str) -> Script {
+    Script::tool_call(
+        id,
+        "read_file",
+        &serde_json::json!({ "path": path }).to_string(),
+    )
+}
+
+fn edit_call(id: &str, path: &str, old: &str, new: &str) -> Script {
+    Script::tool_call(
+        id,
+        "edit_file",
+        &serde_json::json!({ "path": path, "old_string": old, "new_string": new }).to_string(),
+    )
+}
+
+fn write_call(id: &str, path: &str, content: &str) -> Script {
+    Script::tool_call(
+        id,
+        "write_file",
+        &serde_json::json!({ "path": path, "content": content }).to_string(),
+    )
+}
+
+const STALE_NOTICE: &str = "[the file had changed on disk since you last read it]";
+
+#[test]
+fn an_edit_after_an_outside_change_says_the_file_had_changed() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    std::fs::write(workspace.path().join("a.rs"), "one\ntwo\n").expect("fixture");
+    let host = file_host(
+        &workspace,
+        vec![
+            read_call("read", "a.rs"),
+            Script::text("read"),
+            edit_call("edit", "a.rs", "two", "2"),
+            Script::text("done"),
+        ],
+    );
+    let mut history = rune_agent::History::new();
+    history.push_user("read it");
+    run_turn(&mut history, &host).expect("first turn");
+    std::fs::write(workspace.path().join("a.rs"), "ONE\ntwo\n").expect("outside change");
+    history.push_user("now edit it");
+    let outcome = run_turn(&mut history, &host).expect("second turn");
+    let edit = &outcome.calls[0];
+    assert!(!edit.output.is_error, "{}", edit.output.text);
+    assert!(
+        edit.output.text.ends_with(STALE_NOTICE),
+        "{}",
+        edit.output.text
+    );
+    assert_eq!(
+        std::fs::read_to_string(workspace.path().join("a.rs")).expect("read"),
+        "ONE\n2\n"
+    );
+}
+
+#[test]
+fn an_edit_of_an_unchanged_read_file_adds_no_notice() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    std::fs::write(workspace.path().join("a.rs"), "one\ntwo\n").expect("fixture");
+    std::fs::write(workspace.path().join("b.rs"), "three\n").expect("fixture");
+    let host = file_host(
+        &workspace,
+        vec![
+            read_call("read", "a.rs"),
+            edit_call("edit", "a.rs", "two", "2"),
+            edit_call("again", "a.rs", "2", "II"),
+            edit_call("unread", "b.rs", "three", "3"),
+            Script::text("done"),
+        ],
+    );
+    let mut history = rune_agent::History::new();
+    history.push_user("read and edit");
+    let outcome = run_turn(&mut history, &host).expect("turn");
+    for call in &outcome.calls[1..] {
+        assert!(!call.output.is_error, "{}", call.output.text);
+        assert!(
+            !call.output.text.contains("changed on disk"),
+            "{}",
+            call.output.text
+        );
+    }
+}
+
+#[test]
+fn writing_over_an_unread_file_is_refused_once_then_allowed() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let original = "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n";
+    std::fs::write(workspace.path().join("notes.txt"), original).expect("fixture");
+    let host = file_host(
+        &workspace,
+        vec![
+            write_call("w1", "notes.txt", "new\n"),
+            Script::text("refused"),
+            write_call("w2", "notes.txt", "new\n"),
+            Script::text("done"),
+        ],
+    );
+    let mut history = rune_agent::History::new();
+    history.push_user("replace the notes");
+    let first = run_turn(&mut history, &host).expect("first turn");
+    assert!(!first.calls[0].executed);
+    assert_eq!(
+        first.calls[0].output.text,
+        "`notes.txt` already exists (12 lines) and has not been read in this session. Read it \
+         first, or send this same call again to overwrite it."
+    );
+    assert_eq!(
+        std::fs::read_to_string(workspace.path().join("notes.txt")).expect("read"),
+        original
+    );
+    history.push_user("yes, overwrite it");
+    let second = run_turn(&mut history, &host).expect("second turn");
+    assert!(second.calls[0].executed);
+    assert!(
+        !second.calls[0].output.is_error,
+        "{}",
+        second.calls[0].output.text
+    );
+    assert_eq!(
+        std::fs::read_to_string(workspace.path().join("notes.txt")).expect("read"),
+        "new\n"
+    );
+}
+
+#[test]
+fn writing_over_a_file_the_agent_created_is_not_refused() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let host = file_host(
+        &workspace,
+        vec![
+            write_call("create", "new.txt", "first\n"),
+            write_call("replace", "new.txt", "second\n"),
+            Script::text("done"),
+        ],
+    );
+    let mut history = rune_agent::History::new();
+    history.push_user("write twice");
+    let outcome = run_turn(&mut history, &host).expect("turn");
+    assert!(
+        outcome
+            .calls
+            .iter()
+            .all(|call| call.executed && !call.output.is_error)
+    );
+    assert_eq!(
+        std::fs::read_to_string(workspace.path().join("new.txt")).expect("read"),
+        "second\n"
+    );
+}
+
+#[test]
+fn writing_over_an_empty_file_is_not_refused() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    std::fs::write(workspace.path().join("empty.txt"), "").expect("fixture");
+    let host = file_host(
+        &workspace,
+        vec![write_call("w", "empty.txt", "text\n"), Script::text("done")],
+    );
+    let mut history = rune_agent::History::new();
+    history.push_user("fill it");
+    let outcome = run_turn(&mut history, &host).expect("turn");
+    assert!(outcome.calls[0].executed && !outcome.calls[0].output.is_error);
+}
+
+#[test]
+fn a_renamed_file_keeps_its_record() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    std::fs::write(workspace.path().join("a.rs"), "fn a() {}\n").expect("fixture");
+    let host = file_host(
+        &workspace,
+        vec![
+            read_call("read", "./a.rs"),
+            Script::tool_call(
+                "rename",
+                "rename_file",
+                &serde_json::json!({ "path": "a.rs", "new_path": "b.rs" }).to_string(),
+            ),
+            write_call("write", "b.rs", "fn b() {}\n"),
+            Script::text("done"),
+        ],
+    );
+    let mut history = rune_agent::History::new();
+    history.push_user("read, rename, rewrite");
+    let outcome = run_turn(&mut history, &host).expect("turn");
+    for call in &outcome.calls {
+        assert!(
+            call.executed && !call.output.is_error,
+            "{}",
+            call.output.text
+        );
+    }
+    assert_eq!(
+        std::fs::read_to_string(workspace.path().join("b.rs")).expect("read"),
+        "fn b() {}\n"
+    );
+}
+
+#[test]
+fn a_write_policy_refuses_is_left_to_policy_by_the_overwrite_guard() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    std::fs::write(workspace.path().join("notes.txt"), "keep\n").expect("fixture");
+    let endpoint = MockEndpoint::start(vec![
+        write_call("w", "notes.txt", "new\n"),
+        Script::text("refused"),
+    ]);
+    let registry = rune_tools::inventory::builtin_default().expect("builtins");
+    let mut rules = RuleSet::new();
+    rules.push(Rule::deny("write_file", "*", Layer::User));
+    let mut host = TestHost::new(endpoint)
+        .with_tools(registry.all_schemas())
+        .with_rules(rules);
+    host.workspace = Utf8PathBuf::from_path_buf(workspace.path().to_owned()).expect("UTF-8 path");
+    host.registry = Some(registry);
+    let mut history = rune_agent::History::new();
+    history.push_user("overwrite it");
+    let outcome = run_turn(&mut history, &host).expect("turn");
+    let text = &outcome.calls[0].output.text;
+    assert!(text.contains("refused by policy"), "{text}");
+    assert!(!text.contains("has not been read"), "{text}");
+    assert_eq!(
+        std::fs::read_to_string(workspace.path().join("notes.txt")).expect("read"),
+        "keep\n"
+    );
+}

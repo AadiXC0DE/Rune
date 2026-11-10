@@ -16,7 +16,7 @@
 use std::fmt::Write as _;
 use std::time::{Duration, Instant};
 
-use camino::Utf8Path;
+use camino::{Utf8Path, Utf8PathBuf};
 use rune_core::budget::{BudgetSet, LimitName};
 use rune_core::config::{Effort, PermissionMode};
 use rune_core::error::{ErrorCode, Result, RuneError};
@@ -1551,6 +1551,7 @@ fn execute_batch(
         };
         let result = blocked
             .or_else(|| repeat_guard(call, host, history, previous, &results, cancelled))
+            .or_else(|| overwrite_guard(call, host, history))
             .unwrap_or_else(|| execute_call(call, host, &offered, &mut cancelled, history, cap));
         retain_result(
             result,
@@ -1734,16 +1735,103 @@ fn latest_identical_result(history: &History, call: &PreparedCall) -> Option<(St
 
 /// Digests the file a `read_file` call names, as it is now.
 fn file_digest(host: &dyn Host, arguments: &str) -> Option<[u8; 32]> {
-    use sha2::{Digest as _, Sha256};
     let value: serde_json::Value = serde_json::from_str(arguments).ok()?;
-    let path = Utf8Path::new(value.get("path")?.as_str()?);
-    let path = if path.is_absolute() {
-        path.to_owned()
-    } else {
-        host.context().workspace().join(path)
-    };
+    digest_of(&resolved_path(host, value.get("path")?.as_str()?))
+}
+
+/// The path a file tool would use for `raw`: resolved like the tools resolve
+/// it, else joined to the workspace when relative.
+fn resolved_path(host: &dyn Host, raw: &str) -> Utf8PathBuf {
+    let context = host.context();
+    rune_tools::resolve(&context, raw).map_or_else(
+        |_| {
+            let path = Utf8Path::new(raw);
+            if path.is_absolute() {
+                path.to_owned()
+            } else {
+                context.workspace().join(path)
+            }
+        },
+        |resolved| resolved.path,
+    )
+}
+
+/// SHA-256 of a file's bytes, `None` when it cannot be read.
+fn digest_of(path: &Utf8Path) -> Option<[u8; 32]> {
+    use sha2::{Digest as _, Sha256};
     let bytes = std::fs::read(path).ok()?;
     Some(Sha256::digest(&bytes).into())
+}
+
+/// The paths a write, edit or patch changes, as the model wrote them.
+fn changed_paths(name: &str, arguments: &serde_json::Value) -> Vec<String> {
+    match name {
+        "write_file" | "edit_file" => arguments
+            .get("path")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+            .into_iter()
+            .collect(),
+        "apply_patch" => arguments
+            .get("input")
+            .and_then(serde_json::Value::as_str)
+            .map(rune_tools::apply_patch::paths)
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    }
+}
+
+/// Answers a `write_file` over an existing file the model has not seen, once.
+///
+/// The identical call sent again runs, so a deliberate overwrite costs one
+/// extra step and a blind one is caught.
+fn overwrite_guard(
+    call: &PreparedCall,
+    host: &dyn Host,
+    history: &mut History,
+) -> Option<CallResult> {
+    use sha2::{Digest as _, Sha256};
+    if call.name != "write_file" {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_str(&call.arguments).ok()?;
+    let raw = value.get("path")?.as_str()?;
+    let path = resolved_path(host, raw);
+    let metadata = std::fs::symlink_metadata(&path).ok()?;
+    if !metadata.is_file() || metadata.len() == 0 || history.view(&path).is_some() {
+        return None;
+    }
+    // A write policy refuses anyway is left to policy: sending it again would
+    // not overwrite anything, so the advice below would be wrong.
+    if host.decide_quietly(&call.name, Some(raw)) == Outcome::Deny {
+        return None;
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(call.name.as_bytes());
+    hasher.update([0]);
+    hasher.update(call.arguments.as_bytes());
+    if !history.refuse_overwrite(hasher.finalize().into()) {
+        return None;
+    }
+    let bytes = std::fs::read(&path).ok()?;
+    // Pieces between newlines, less the empty one after a final newline.
+    let lines = bytes
+        .split(|&byte| byte == b'\n')
+        .count()
+        .saturating_sub(usize::from(bytes.ends_with(b"\n")));
+    let text = format!(
+        "`{raw}` already exists ({lines} lines) and has not been read in this session. Read it \
+         first, or send this same call again to overwrite it."
+    );
+    host.emit(Event::ToolDenied {
+        call: call.clone(),
+        reason: text.clone(),
+    });
+    Some(CallResult {
+        call: call.clone(),
+        output: ToolOutput::failure(text),
+        executed: false,
+    })
 }
 
 /// Answer for a call refused because it already failed the same way.
@@ -1879,6 +1967,14 @@ fn retain_result(
         && let Some(digest) = file_digest(host, &result.call.arguments)
     {
         history.record_read(&result.call.id, digest);
+        if let Some(raw) = serde_json::from_str::<serde_json::Value>(&result.call.arguments)
+            .ok()
+            .as_ref()
+            .and_then(|value| value.get("path"))
+            .and_then(serde_json::Value::as_str)
+        {
+            history.record_view(resolved_path(host, raw), digest);
+        }
     }
     let cap = turn_cap.saturating_sub(*result_bytes).min(tool_cap);
     let mut text = std::mem::take(&mut result.output.text);
@@ -2196,13 +2292,23 @@ fn execute_call(
     host: &dyn Host,
     offered: &[String],
     cancelled: &mut bool,
-    history: &History,
+    history: &mut History,
     output_cap: usize,
 ) -> CallResult {
     let (arguments, context) = match prepare_call(call, host, offered, cancelled) {
         Ok(prepared) => prepared,
         Err(result) => return result,
     };
+    // Each changed path as written, resolved, and as it was before the call.
+    let targets: Vec<(String, Utf8PathBuf, Option<[u8; 32]>)> =
+        changed_paths(&call.name, &arguments)
+            .into_iter()
+            .map(|raw| {
+                let path = resolved_path(host, &raw);
+                let before = digest_of(&path);
+                (raw, path, before)
+            })
+            .collect();
     // Retained output is owned by the history rather than the host. Supply
     // that store only after advertisement and policy checks have passed.
     let started = Instant::now();
@@ -2221,7 +2327,63 @@ fn execute_call(
             &context.with_live_plan(history.shared_live_plan()),
         )
     };
+    let execution = execution.map(|mut output| {
+        if !output.is_error {
+            note_changes(call, host, history, &arguments, &targets, &mut output);
+        }
+        output
+    });
     finish_call(call, host, execution, started.elapsed(), cancelled)
+}
+
+/// After a successful change, records what the model now knows of each path
+/// and says when a file had changed on disk since it last saw it.
+fn note_changes(
+    call: &PreparedCall,
+    host: &dyn Host,
+    history: &mut History,
+    arguments: &serde_json::Value,
+    targets: &[(String, Utf8PathBuf, Option<[u8; 32]>)],
+    output: &mut ToolOutput,
+) {
+    if call.name == "rename_file"
+        && let (Some(source), Some(destination)) = (
+            arguments.get("path").and_then(serde_json::Value::as_str),
+            arguments
+                .get("new_path")
+                .and_then(serde_json::Value::as_str),
+        )
+        && let Some(digest) = history.forget_view(&resolved_path(host, source))
+    {
+        history.record_view(resolved_path(host, destination), digest);
+    }
+    let mut stale: Vec<&str> = Vec::new();
+    for (raw, path, before) in targets {
+        if let (Some(before), Some(seen)) = (before, history.view(path))
+            && *before != seen
+            && !stale.contains(&raw.as_str())
+        {
+            stale.push(raw);
+        }
+        match digest_of(path) {
+            Some(after) => history.record_view(path.clone(), after),
+            None => {
+                history.forget_view(path);
+            }
+        }
+    }
+    let notice = match stale.as_slice() {
+        [] => return,
+        [_] => "[the file had changed on disk since you last read it]".to_owned(),
+        several => format!(
+            "[these files had changed on disk since you last read them: {}]",
+            several.join(", ")
+        ),
+    };
+    if !output.text.is_empty() && !output.text.ends_with('\n') {
+        output.text.push('\n');
+    }
+    output.text.push_str(&notice);
 }
 
 /// Reports execution and preserves a cancellation for calls still pending.

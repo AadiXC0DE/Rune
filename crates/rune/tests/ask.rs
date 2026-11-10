@@ -1772,7 +1772,9 @@ fn model_plan_updates_emit_versioned_events_without_duplicates_or_workspace_muta
 #[cfg(unix)]
 #[test]
 fn user_pre_tool_hook_veto_preserves_the_pair_and_reports_its_named_reason() {
-    let arguments = json!({"path": "fixture.txt", "content": "MUST_NOT_WRITE"}).to_string();
+    // A new file, so the veto is the hook's and not the guard on overwriting
+    // a file that was never read.
+    let arguments = json!({"path": "protected.txt", "content": "MUST_NOT_WRITE"}).to_string();
     let (output, dir, requests) = run_responses_fixture_command(
         vec![
             completion_response(&call_delta("write_file", &arguments), "tool_calls"),
@@ -1805,10 +1807,7 @@ printf '%s' '{"decision":"veto","reason":"protected fixture"}'
         },
     );
     assert!(output.status.success(), "{output:?}");
-    assert_eq!(
-        std::fs::read_to_string(dir.path().join("fixture.txt")).expect("file"),
-        "ALLOWED_READ_RESULT"
-    );
+    assert!(!dir.path().join("protected.txt").exists());
     let input: Value = serde_json::from_slice(
         &std::fs::read(dir.path().join("hook-input.json")).expect("hook input"),
     )

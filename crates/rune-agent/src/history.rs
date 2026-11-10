@@ -137,10 +137,21 @@ pub struct History {
     /// digest is unchanged can point at that result instead of running.
     #[serde(skip)]
     read_digests: std::collections::BTreeMap<String, [u8; 32]>,
+    /// Digest of each file as the model last saw it: after its last successful
+    /// read, write, edit or patch of that path. Keyed by resolved path. Not
+    /// persisted: a resumed session starts with none.
+    #[serde(skip)]
+    file_views: std::collections::BTreeMap<camino::Utf8PathBuf, [u8; 32]>,
+    /// Digests of `write_file` calls refused once by the overwrite guard.
+    #[serde(skip)]
+    refused_overwrites: std::collections::BTreeSet<[u8; 32]>,
 }
 
 /// Reads whose file digest is kept; past this, one is dropped to make room.
 const MAX_READ_DIGESTS: usize = 256;
+
+/// Files whose last seen digest is kept; past this, one is dropped to make room.
+const MAX_FILE_VIEWS: usize = 1024;
 
 fn new_result_store() -> Arc<Store> {
     Arc::new(Store::new(rune_core::id::SessionId::generate().to_string()))
@@ -156,6 +167,8 @@ impl Default for History {
             result_store: new_result_store(),
             live_plan: Arc::default(),
             read_digests: std::collections::BTreeMap::new(),
+            file_views: std::collections::BTreeMap::new(),
+            refused_overwrites: std::collections::BTreeSet::new(),
         }
     }
 }
@@ -172,6 +185,8 @@ impl History {
             result_store: new_result_store(),
             live_plan: Arc::default(),
             read_digests: std::collections::BTreeMap::new(),
+            file_views: std::collections::BTreeMap::new(),
+            refused_overwrites: std::collections::BTreeSet::new(),
         }
     }
 
@@ -186,6 +201,29 @@ impl History {
     /// Returns the digest recorded for a `read_file` call, if any.
     pub(crate) fn read_digest(&self, call_id: &str) -> Option<[u8; 32]> {
         self.read_digests.get(call_id).copied()
+    }
+
+    /// Records a file's digest as the model now knows it.
+    pub(crate) fn record_view(&mut self, path: camino::Utf8PathBuf, digest: [u8; 32]) {
+        if self.file_views.len() >= MAX_FILE_VIEWS && !self.file_views.contains_key(&path) {
+            self.file_views.pop_first();
+        }
+        self.file_views.insert(path, digest);
+    }
+
+    /// Returns the digest of a file as the model last saw it, if it has.
+    pub(crate) fn view(&self, path: &camino::Utf8Path) -> Option<[u8; 32]> {
+        self.file_views.get(path).copied()
+    }
+
+    /// Drops the record of a file, returning it.
+    pub(crate) fn forget_view(&mut self, path: &camino::Utf8Path) -> Option<[u8; 32]> {
+        self.file_views.remove(path)
+    }
+
+    /// Notes a refused overwrite; false when the same call was refused before.
+    pub(crate) fn refuse_overwrite(&mut self, digest: [u8; 32]) -> bool {
+        self.refused_overwrites.insert(digest)
     }
 
     /// Returns the full tool results spilled from this live conversation.
@@ -521,6 +559,8 @@ impl History {
             result_store: self.result_store.clone(),
             live_plan: Arc::default(),
             read_digests: self.read_digests.clone(),
+            file_views: self.file_views.clone(),
+            refused_overwrites: self.refused_overwrites.clone(),
         }
     }
 

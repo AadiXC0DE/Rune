@@ -27,6 +27,7 @@ const SCENARIOS: &[&str] = &[
     "max_cost_without_prices",
     "parallel_reads",
     "env_passthrough",
+    "overwrite_guard",
 ];
 
 /// Scenarios built in Rust, which have no file.
@@ -65,6 +66,11 @@ fn three_test_runs() {
 #[test]
 fn repeat_read() {
     run_scenario("repeat_read");
+}
+
+#[test]
+fn overwrite_guard() {
+    run_scenario("overwrite_guard");
 }
 
 #[test]
