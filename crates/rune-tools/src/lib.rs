@@ -11,6 +11,7 @@ pub mod git_diff;
 pub mod glob_files;
 pub mod grep_files;
 pub mod inventory;
+pub mod matching;
 pub mod mutation;
 pub mod read_file;
 pub mod read_tool_result;

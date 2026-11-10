@@ -25,10 +25,10 @@ impl Tool for EditFile {
     }
 
     fn description(&self) -> &'static str {
-        "Replace exact text in a file. old_string must match once, whitespace included, \
-         unless occurrence or replace_all is set. Pass edits for several replacements in \
-         one atomic write; each sees the previous result. Refused if the file changed since \
-         it was read."
+        "Replace exact text in a file. old_string must match once unless occurrence or \
+         replace_all is set; a unique match differing only in whitespace or quotes is \
+         accepted. Pass edits for several replacements in one atomic write; each sees the \
+         previous result."
     }
 
     fn input_schema(&self) -> serde_json::Value {
@@ -127,8 +127,19 @@ impl Tool for EditFile {
         context.check_cancelled()?;
         let diff = mutation::shown_diff(prepared.preview());
         let applied = mutation::apply(prepared)?;
+        // A match that needed a normalisation is named, so the model checks
+        // the result rather than trusting a near miss.
+        let relaxed = if applied.relaxed().is_empty() {
+            String::new()
+        } else {
+            let clauses: Vec<&str> = applied.relaxed().iter().map(|tier| tier.clause()).collect();
+            format!(
+                "; matched after normalising {}, check the result",
+                clauses.join(" and ")
+            )
+        };
         let mut output = ToolOutput::success(format!(
-            "Edited `{}` ({}, {})",
+            "Edited `{}` ({}, {}{relaxed})",
             applied.path(),
             count_phrase(applied.replacements()),
             mutation::detail(&applied)
@@ -644,6 +655,66 @@ mod tests {
             )
             .expect_err("missing");
         assert_eq!(err.code(), ErrorCode::NotFound);
+    }
+
+    #[test]
+    fn the_result_names_the_normalisation_that_matched() {
+        let (dir, context) = workspace();
+        seed(&dir, "quote.txt", "say \u{201C}hi\u{201D}\n");
+        let output = EditFile
+            .call(
+                &json!({ "path": "quote.txt", "old_string": "\"hi\"", "new_string": "\"bye\"" }),
+                &context,
+            )
+            .expect("call");
+        assert!(
+            output
+                .text
+                .ends_with("; matched after normalising punctuation, check the result)"),
+            "{}",
+            output.text
+        );
+    }
+
+    #[test]
+    fn an_exact_match_adds_no_normalisation_clause() {
+        let (dir, context) = workspace();
+        seed(&dir, "plain.txt", "alpha\n");
+        let output = EditFile
+            .call(
+                &json!({ "path": "plain.txt", "old_string": "alpha", "new_string": "beta" }),
+                &context,
+            )
+            .expect("call");
+        assert!(!output.text.contains("normalising"), "{}", output.text);
+    }
+
+    #[test]
+    fn each_hunk_is_tiered_against_the_running_content() {
+        let (dir, context) = workspace();
+        let path = seed(&dir, "two.txt", "first\nit\u{2019}s second\n");
+        let output = EditFile
+            .call(
+                &json!({ "path": "two.txt", "edits": [
+                    { "old_string": "first", "new_string": "one" },
+                    { "old_string": "it's second", "new_string": "two" },
+                ] }),
+                &context,
+            )
+            .expect("call");
+        assert!(
+            output
+                .text
+                .contains("matched after normalising punctuation,"),
+            "{}",
+            output.text
+        );
+        assert_eq!(std::fs::read_to_string(path).expect("read"), "one\ntwo\n");
+    }
+
+    #[test]
+    fn the_description_stays_within_its_old_length() {
+        assert!(EditFile.description().len() <= 254);
     }
 
     #[test]

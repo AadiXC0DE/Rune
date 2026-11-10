@@ -7,8 +7,10 @@
 //! file is still the one that was read, and renames it into place, so a reader
 //! sees either the whole old file or the whole new one.
 //!
-//! Content is never normalized. Matching is byte exact and the postimage is
-//! written verbatim, so CRLF and lone CR endings survive a round trip.
+//! Content is never normalized. Matching tries exact bytes first and then
+//! lossless normalisations (line endings, typographic punctuation); a match
+//! found that way is mapped back to the original bytes, and every byte outside
+//! a match is written verbatim, so CRLF and lone CR endings survive.
 
 use std::fs::{File, OpenOptions, Permissions};
 use std::io::{ErrorKind, Read, Write};
@@ -130,9 +132,17 @@ pub struct Prepared {
     span: Option<ChangeSpan>,
     lines: LineChanges,
     replacements: usize,
+    /// Distinct non-exact tiers the hunks matched at, sorted.
+    relaxed: Vec<crate::matching::Tier>,
 }
 
 impl Prepared {
+    /// The normalisations an edit needed to match, if any.
+    #[must_use]
+    pub fn relaxed(&self) -> &[crate::matching::Tier] {
+        &self.relaxed
+    }
+
     /// Returns the resolved path the mutation targets.
     #[must_use]
     pub fn path(&self) -> &Utf8Path {
@@ -192,9 +202,17 @@ pub struct Applied {
     lines: LineChanges,
     replacements: usize,
     created: bool,
+    /// Distinct non-exact tiers the hunks matched at, sorted.
+    relaxed: Vec<crate::matching::Tier>,
 }
 
 impl Applied {
+    /// The normalisations an edit needed to match, if any.
+    #[must_use]
+    pub fn relaxed(&self) -> &[crate::matching::Tier] {
+        &self.relaxed
+    }
+
     /// Returns the resolved path that was written.
     #[must_use]
     pub fn path(&self) -> &Utf8Path {
@@ -372,6 +390,7 @@ pub fn prepare(path: &Utf8Path, desired: &str) -> Result<Prepared> {
         span: region.as_ref().map(|region| region.span),
         lines: line_changes(before, desired),
         replacements: 1,
+        relaxed: Vec::new(),
     })
 }
 
@@ -419,12 +438,17 @@ pub fn prepare_edits(path: &Utf8Path, edits: &[LiteralEdit<'_>]) -> Result<Prepa
     let before = std::str::from_utf8(&snapshot.bytes).map_err(|_| not_text(path))?;
     let mut postimage = before.to_owned();
     let mut replacements = 0usize;
+    let mut relaxed = Vec::new();
     for (index, edit) in edits.iter().enumerate() {
-        let (next, count) = replace_literal(path, &postimage, edit, before.len())
+        let (next, count, tier) = replace_literal(path, &postimage, edit, before.len())
             .map_err(|err| hunk_error(err, index, edits.len()))?;
         postimage = next;
         replacements = replacements.saturating_add(count);
+        if tier != crate::matching::Tier::Exact && !relaxed.contains(&tier) {
+            relaxed.push(tier);
+        }
     }
+    relaxed.sort();
     let region = changed_region(before, &postimage);
     let preview = preview_of(before, &postimage, region.as_ref());
     let lines = line_changes(before, &postimage);
@@ -439,6 +463,7 @@ pub fn prepare_edits(path: &Utf8Path, edits: &[LiteralEdit<'_>]) -> Result<Prepa
         span: region.as_ref().map(|region| region.span),
         lines,
         replacements,
+        relaxed,
     })
 }
 
@@ -480,35 +505,42 @@ fn replace_literal(
     before: &str,
     edit: &LiteralEdit<'_>,
     preimage_len: usize,
-) -> Result<(String, usize)> {
+) -> Result<(String, usize, crate::matching::Tier)> {
+    use crate::matching::{Tiers, search};
     let LiteralEdit {
         old,
         new,
         occurrence,
     } = *edit;
-    let count = count_occurrences(before, old);
-    if count == 0 {
+    let tiers = if occurrence == Occurrence::Unique {
+        Tiers::Unique
+    } else {
+        Tiers::Selectable
+    };
+    let Some(matches) = search(before, old, tiers) else {
         return Err(no_match(path));
-    }
-    let replacements = match occurrence {
+    };
+    let count = matches.spans.len();
+    let chosen: Vec<Range<usize>> = match occurrence {
         Occurrence::Unique => {
             if count != 1 {
                 return Err(ambiguous(path, count));
             }
-            1
+            matches.spans
         }
-        Occurrence::All => count,
+        Occurrence::All => matches.spans,
         Occurrence::Index(index) => {
             if index == 0 || index > count {
                 return Err(index_out_of_range(path, index, count));
             }
-            1
+            vec![matches.spans[index.saturating_sub(1)].clone()]
         }
     };
+    let removed: usize = chosen.iter().map(ExactSizeIterator::len).sum();
     let postimage_len = before
         .len()
-        .saturating_sub(old.len().saturating_mul(replacements))
-        .saturating_add(new.len().saturating_mul(replacements));
+        .saturating_sub(removed)
+        .saturating_add(new.len().saturating_mul(chosen.len()));
     if postimage_len > MAX_WRITE_BYTES {
         return Err(RuneError::too_large(
             "content",
@@ -520,13 +552,27 @@ fn replace_literal(
     if total > MAX_TOTAL_BYTES {
         return Err(RuneError::too_large("content", total, MAX_TOTAL_BYTES));
     }
-    let postimage = match occurrence {
-        Occurrence::All => before.replace(old, new),
-        Occurrence::Unique => replace_one(before, old, new, 1).ok_or_else(|| no_match(path))?,
-        Occurrence::Index(index) => replace_one(before, old, new, index)
-            .ok_or_else(|| index_out_of_range(path, index, count))?,
-    };
-    Ok((postimage, replacements))
+    Ok((
+        splice(before, &chosen, new, postimage_len),
+        chosen.len(),
+        matches.tier,
+    ))
+}
+
+/// Builds the postimage: `source` with each range replaced by `replacement`.
+///
+/// The ranges are non-overlapping and in order; everything between them is
+/// copied as it was.
+fn splice(source: &str, spans: &[Range<usize>], replacement: &str, capacity: usize) -> String {
+    let mut out = String::with_capacity(capacity);
+    let mut copied = 0usize;
+    for span in spans {
+        out.push_str(&source[copied..span.start]);
+        out.push_str(replacement);
+        copied = span.end;
+    }
+    out.push_str(&source[copied..]);
+    out
 }
 
 /// Applies a prepared mutation.
@@ -545,6 +591,7 @@ pub fn apply(prepared: Prepared) -> Result<Applied> {
         span,
         lines,
         replacements,
+        relaxed,
         ..
     } = prepared;
     let Some(directory) = resolved
@@ -590,6 +637,7 @@ pub fn apply(prepared: Prepared) -> Result<Applied> {
         lines,
         replacements,
         created: identity.is_none(),
+        relaxed,
     })
 }
 
@@ -988,35 +1036,6 @@ fn truncate_chars(text: &str, max: usize) -> &str {
     }
 }
 
-/// Counts non-overlapping occurrences of `needle`.
-fn count_occurrences(haystack: &str, needle: &str) -> usize {
-    if needle.is_empty() {
-        return 0;
-    }
-    haystack.match_indices(needle).count()
-}
-
-/// Replaces only the occurrence at the given one-based index.
-fn replace_one(haystack: &str, needle: &str, replacement: &str, index: usize) -> Option<String> {
-    let mut seen = 0usize;
-    for (offset, _) in haystack.match_indices(needle) {
-        seen = seen.saturating_add(1);
-        if seen == index {
-            let mut out = String::with_capacity(
-                haystack
-                    .len()
-                    .saturating_sub(needle.len())
-                    .saturating_add(replacement.len()),
-            );
-            out.push_str(&haystack[..offset]);
-            out.push_str(replacement);
-            out.push_str(&haystack[offset.saturating_add(needle.len())..]);
-            return Some(out);
-        }
-    }
-    None
-}
-
 /// Hashes bytes with SHA-256.
 fn hash_of(bytes: &[u8]) -> [u8; 32] {
     let mut hasher = Sha256::new();
@@ -1346,6 +1365,71 @@ mod tests {
             std::fs::read(&path).expect("read"),
             b"alpha\r\nBETA\r\ngamma\r\n"
         );
+    }
+
+    /// Seeds a file, runs one unique edit and returns the result and the tiers.
+    fn edited(body: &str, old: &str, new: &str) -> (String, Vec<crate::matching::Tier>) {
+        let dir = dir();
+        let path = file_in(&dir, "file.txt");
+        std::fs::write(&path, body).expect("seed");
+        let applied = apply(prepare_edit(&path, old, new, Occurrence::Unique).expect("prepare"))
+            .expect("apply");
+        (
+            std::fs::read_to_string(&path).expect("read"),
+            applied.relaxed().to_vec(),
+        )
+    }
+
+    #[test]
+    fn a_crlf_file_matches_an_lf_search_at_the_line_endings_tier() {
+        let (after, relaxed) = edited("one\r\ntwo\r\nthree\r\n", "one\ntwo", "ONE\nTWO");
+        assert_eq!(after, "ONE\nTWO\r\nthree\r\n");
+        assert_eq!(relaxed, [crate::matching::Tier::LineEndings]);
+    }
+
+    #[test]
+    fn curly_quotes_dashes_and_no_break_spaces_match_at_the_punctuation_tier() {
+        let body = "say \u{201C}don\u{2019}t\u{201D} \u{2014} now\u{00A0}please\n";
+        let (after, relaxed) = edited(body, "\"don't\" - now please", "quiet");
+        assert_eq!(after, "say quiet\n");
+        assert_eq!(relaxed, [crate::matching::Tier::Punctuation]);
+    }
+
+    #[test]
+    fn text_outside_a_folded_match_keeps_its_original_characters() {
+        let body = "\u{2018}a\u{2019} it\u{2019}s \u{201C}b\u{201D}";
+        let (after, _) = edited(body, "it's", "it is");
+        assert_eq!(after, "\u{2018}a\u{2019} it is \u{201C}b\u{201D}");
+    }
+
+    #[test]
+    fn the_replacement_is_written_without_folding() {
+        let (after, _) = edited("it\u{2019}s\n", "it's", "it\u{2019}s fine");
+        assert_eq!(after, "it\u{2019}s fine\n");
+    }
+
+    #[test]
+    fn replace_all_and_occurrence_use_only_the_first_three_tiers() {
+        let dir = dir();
+        let path = file_in(&dir, "quotes.txt");
+        std::fs::write(&path, "\u{201C}a\u{201D} \u{201C}b\u{201D}\n").expect("seed");
+        let applied = apply(prepare_edit(&path, "\"", "'", Occurrence::All).expect("prepare"))
+            .expect("apply");
+        assert_eq!(applied.replacements(), 4);
+        assert_eq!(applied.relaxed(), [crate::matching::Tier::Punctuation]);
+        assert_eq!(std::fs::read_to_string(&path).expect("read"), "'a' 'b'\n");
+        let applied = apply(prepare_edit(&path, "b", "c", Occurrence::Index(1)).expect("prepare"))
+            .expect("apply");
+        assert!(applied.relaxed().is_empty());
+    }
+
+    #[test]
+    fn a_folded_match_found_twice_is_ambiguous() {
+        let dir = dir();
+        let path = file_in(&dir, "twice.txt");
+        std::fs::write(&path, "it\u{2019}s and it\u{2019}s\n").expect("seed");
+        let err = prepare_edit(&path, "it's", "it is", Occurrence::Unique).expect_err("ambiguous");
+        assert!(err.message().contains('2'), "{}", err.message());
     }
 
     fn literal<'a>(old: &'a str, new: &'a str) -> LiteralEdit<'a> {
