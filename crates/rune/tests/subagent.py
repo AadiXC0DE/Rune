@@ -39,9 +39,15 @@ def run_fixture(case):
             try:
                 request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
                 requests.append(request)
-                last = request["messages"][-1]
+                tool_messages = [msg for msg in request["messages"] if msg["role"] == "tool"]
                 is_child = request["model"] == "child-model"
-                if not is_child and last["role"] == "user":
+                # Every session here is capped at two steps, so a second
+                # request is the last one: it carries the harness note and
+                # forbids tool calls.
+                if tool_messages:
+                    assert request.get("tool_choice") == "none", request.get("tool_choice")
+                    assert "This is the last step allowed in this run." in json.dumps(request)
+                if not is_child and not tool_messages:
                     assert any(tool["function"]["name"] == "subagent"
                                for tool in request["tools"]), "parent cannot delegate"
                     task = {"action": "run", "task": "Read fixture.txt", "model": "child-model",
@@ -67,7 +73,7 @@ def run_fixture(case):
                         assert "ROLE_INSTRUCTION_MARKER" in json.dumps(request)
                     assert "PARENT_PRIVATE_HISTORY" not in json.dumps(request), "child inherited parent history"
                     assert request["reasoning_effort"] == "low", request
-                    if last["role"] == "user" or case == "cap":
+                    if not tool_messages or case == "cap":
                         calls = [call("read_file", {"path": "fixture.txt"})]
                         if case in ["success", "role"]:
                             calls += [
@@ -91,8 +97,7 @@ def run_fixture(case):
                             assert "there is no tool named" in results[5]["content"], results[5]
                         delta = {"content": "CHILD_READ_RESULT: ALLOWED_CHILD_READ"}
                 else:
-                    assert last["role"] == "tool", last
-                    result = last["content"]
+                    result = tool_messages[-1]["content"]
                     if case == "role":
                         results = [msg["content"] for msg in request["messages"]
                                    if msg["role"] == "tool"]
@@ -101,6 +106,7 @@ def run_fixture(case):
                             assert f"child child-{index}: CHILD_READ_RESULT: ALLOWED_CHILD_READ" in result, result
                     elif case == "success":
                         assert "child child-1: CHILD_READ_RESULT: ALLOWED_CHILD_READ" in result, result
+                        assert "(the child reached its step limit)" in result, result
                     elif case == "cap":
                         assert "child stopped: max_model_turns" in result, result
                     else:

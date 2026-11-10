@@ -616,7 +616,20 @@ fn prompt_step_limits_inherit_agent_limits_unless_overridden() {
         assert_eq!(fetch.hits(), expected_steps as usize);
         assert_eq!(endpoint.request_count(), expected_steps as usize);
         assert_eq!(result.calls.len(), expected_steps.min(3) as usize);
-        assert!(result.calls.iter().all(|call| call.executed));
+        // A call made on the last allowed step is answered, not run.
+        let executed = result.calls.iter().filter(|call| call.executed).count();
+        let expected_executed = if expected_stop == StopReason::StepLimit {
+            expected_steps.min(3) as usize - 1
+        } else {
+            3
+        };
+        assert_eq!(executed, expected_executed, "{budget}, {prompt_options:?}");
+        assert!(
+            result
+                .calls
+                .last()
+                .is_some_and(|call| call.executed == (expected_stop == StopReason::Completed))
+        );
     }
 }
 

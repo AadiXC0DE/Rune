@@ -40,9 +40,6 @@ pub const EXIT_FAILURE: u8 = 1;
 /// Largest prompt accepted from standard input.
 pub const MAX_STDIN_PROMPT_BYTES: usize = 8 * 1024 * 1024;
 
-/// Default finite bound when the configured step limit is zero or unbounded.
-pub const DEFAULT_MAX_STEPS: u64 = 16;
-
 /// Options for one run.
 #[derive(Clone, Debug, Default)]
 pub struct Options {
@@ -60,6 +57,8 @@ pub struct Options {
     pub tool_loop: bool,
     /// Refuse tools that do not declare themselves read-only, before policy grants.
     pub read_only: bool,
+    /// Step cap from the command line: `Some(0)` removes any cap.
+    pub max_steps: Option<u64>,
 }
 
 /// Hard cap for one JSONL record, including its terminating newline.
@@ -520,17 +519,24 @@ pub fn run(
     let dialect = attachments.provider(crate::provider_setup::dialect_for(&settings.provider));
 
     let mut limits = settings.limits.clone();
-    let step_cap = limits
+    if !options.tool_loop {
+        limits.set(
+            LimitName::MaxAgentSteps,
+            Budget::Bounded(1),
+            Layer::CommandLine,
+        )?;
+    } else if let Some(requested) = options.max_steps {
+        let budget = if requested > 0 {
+            Budget::Bounded(requested)
+        } else {
+            Budget::Unbounded
+        };
+        limits.set(LimitName::MaxAgentSteps, budget, Layer::CommandLine)?;
+    }
+    let step_cap: Option<u64> = limits
         .get(LimitName::MaxAgentSteps)
         .value()
-        .filter(|cap| *cap > 0)
-        .unwrap_or(DEFAULT_MAX_STEPS);
-    let step_cap = if options.tool_loop { step_cap } else { 1 };
-    limits.set(
-        LimitName::MaxAgentSteps,
-        Budget::Bounded(step_cap),
-        Layer::CommandLine,
-    )?;
+        .filter(|cap| *cap > 0);
     let registry = if options.tool_loop {
         let catalog = rune_context::skills::discover(
             &crate::current_workspace()?,
@@ -607,7 +613,7 @@ pub fn run(
     } else if outcome.stop_reason == StopReason::StepLimit {
         Some(RuneError::new(
             ErrorCode::LimitExceeded,
-            turn::step_limit_notice(step_cap),
+            turn::step_limit_notice(step_cap.unwrap_or_default()),
         ))
     } else {
         None
@@ -664,7 +670,7 @@ pub fn run(
     };
 
     Ok(JsonResult {
-        final_output: if error.is_none() {
+        final_output: if error.is_none() || outcome.stop_reason == StopReason::StepLimit {
             outcome.text.clone()
         } else {
             String::new()
@@ -762,7 +768,7 @@ pub fn report(result: &JsonResult, options: &Options) -> Result<u8> {
         let mut stdout = std::io::stdout().lock();
         writeln!(stdout, "{}", result.render()?)
             .map_err(|err| RuneError::new(ErrorCode::Internal, err.to_string()))?;
-    } else if !options.jsonl && result.error.is_none() {
+    } else if !options.jsonl && !result.final_output.is_empty() {
         let mut stdout = std::io::stdout().lock();
         write!(stdout, "{}", result.final_output)
             .map_err(|err| RuneError::new(ErrorCode::Internal, err.to_string()))?;

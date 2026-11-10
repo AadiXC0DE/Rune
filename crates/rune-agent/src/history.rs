@@ -279,6 +279,21 @@ impl History {
         seq
     }
 
+    /// Adds a note from the harness to the conversation.
+    ///
+    /// Joins the last turn when it is a user turn, so two user turns never
+    /// follow each other; otherwise it becomes a new user turn.
+    pub fn push_harness_note(&mut self, text: &str) {
+        match self.turns.last_mut() {
+            Some(turn) if turn.role == Role::User => turn.parts.push(ContentPart::Text {
+                text: text.to_owned(),
+            }),
+            _ => {
+                self.push_user(text);
+            }
+        }
+    }
+
     /// Appends an assistant turn.
     ///
     /// Returns the sequence number assigned.

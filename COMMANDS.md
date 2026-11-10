@@ -44,6 +44,7 @@ Run one bounded turn without an interactive session
 | `--jsonl` | Stream bounded JSONL events (takes precedence over --json). |
 | `--no-save` | Do not create a session. |
 | `--image <path>` | Attach a PNG, JPEG, GIF, or WebP file. Repeatable; 8 MiB total, at most 16 images. |
+| `--max-steps <n>` | Stop after this many model steps; the last one answers without tools. 0 means no limit. |
 ### `rune acp [--log-file <path>]`
 
 Serve the Agent Client Protocol over standard input and output

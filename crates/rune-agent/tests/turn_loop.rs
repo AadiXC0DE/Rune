@@ -2058,6 +2058,93 @@ fn a_turn_stopped_at_the_step_limit_keeps_its_last_words() {
 }
 
 #[test]
+fn the_last_step_offers_tools_but_forbids_calls() {
+    let endpoint = MockEndpoint::start(vec![
+        Script::tool_call("first", "read_file", "{\"path\":\"a.rs\"}"),
+        Script::tool_call("second", "read_file", "{\"path\":\"b.rs\"}"),
+    ]);
+    let host = TestHost::new(endpoint)
+        .with_tools(vec![read_tool()])
+        .with_step_limit(2);
+
+    let mut history = rune_agent::History::new();
+    history.push_user("read two files");
+
+    let outcome = run_turn(&mut history, &host).expect("turn");
+    assert_eq!(outcome.stop_reason, StopReason::StepLimit);
+    assert_eq!(outcome.steps, 2);
+
+    let body = host
+        .server
+        .as_ref()
+        .expect("endpoint")
+        .last_body()
+        .expect("body");
+    assert_eq!(body["tool_choice"], "none");
+    assert!(!body["tools"].as_array().expect("tools").is_empty());
+    assert!(body.to_string().contains(LAST_STEP_NOTE_TEXT));
+
+    assert_eq!(outcome.calls.len(), 2);
+    assert!(outcome.calls[0].executed);
+    assert!(!outcome.calls[1].executed);
+    assert_eq!(
+        outcome.calls[1].output.text,
+        "not run: the step limit was reached"
+    );
+    assert_eq!(host.executed_calls().len(), 1);
+    history.validate().expect("valid history");
+}
+
+/// The part of the last-step note that survives JSON escaping.
+const LAST_STEP_NOTE_TEXT: &str = "This is the last step allowed in this run.";
+
+#[test]
+fn the_last_step_skips_the_verification_reminder() {
+    let endpoint = MockEndpoint::start(vec![
+        Script::tool_call("w", "write_file", "{\"path\":\"a.txt\",\"content\":\"x\"}"),
+        Script::text("Wrote it; nothing was run."),
+    ]);
+    let host = TestHost::new(endpoint)
+        .with_tools(vec![ToolSpec {
+            name: "write_file".to_owned(),
+            description: "Write a file.".to_owned(),
+            input_schema: serde_json::json!({"type": "object"}),
+        }])
+        .with_tool_response(ToolOutput::success("Wrote `a.txt` (new file, 1 line)"))
+        .with_step_limit(2);
+
+    let mut history = rune_agent::History::new();
+    history.push_user("write a file");
+
+    let outcome = run_turn(&mut history, &host).expect("turn");
+    assert_eq!(host.server.as_ref().expect("endpoint").request_count(), 2);
+    assert_eq!(outcome.stop_reason, StopReason::StepLimit);
+    assert_eq!(outcome.text, "Wrote it; nothing was run.");
+}
+
+#[test]
+fn an_uncapped_turn_runs_past_sixteen_steps() {
+    let mut scripts: Vec<Script> = (0..20)
+        .map(|index| {
+            Script::tool_call(
+                &format!("call_{index}"),
+                "read_file",
+                &format!("{{\"path\":\"f{index}.rs\"}}"),
+            )
+        })
+        .collect();
+    scripts.push(Script::text("All read."));
+    let host = TestHost::new(MockEndpoint::start(scripts)).with_tools(vec![read_tool()]);
+
+    let mut history = rune_agent::History::new();
+    history.push_user("read many files");
+
+    let outcome = run_turn(&mut history, &host).expect("turn");
+    assert_eq!(outcome.stop_reason, StopReason::Completed);
+    assert_eq!(outcome.steps, 21);
+}
+
+#[test]
 fn an_offline_turn_refuses_without_fetch_calls_or_retry_delay() {
     let mut host = TestHost::new(MockEndpoint::start(vec![Script::text("unused")]));
     host.endpoint.offline = true;

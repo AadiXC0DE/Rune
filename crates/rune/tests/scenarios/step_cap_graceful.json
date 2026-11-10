@@ -1,0 +1,93 @@
+{
+  "prompt": "Read notes.txt a few times, then report.",
+  "workspace": "workspaces/repeat_read.json",
+  "ask_args": [
+    "--json",
+    "--no-save",
+    "--max-steps",
+    "5"
+  ],
+  "turns": [
+    {
+      "tool_calls": [
+        {
+          "id": "call_1",
+          "name": "read_file",
+          "arguments": {
+            "path": "notes.txt",
+            "start_line": 1,
+            "line_count": 1
+          }
+        }
+      ]
+    },
+    {
+      "tool_calls": [
+        {
+          "id": "call_2",
+          "name": "read_file",
+          "arguments": {
+            "path": "notes.txt",
+            "start_line": 1,
+            "line_count": 2
+          }
+        }
+      ]
+    },
+    {
+      "tool_calls": [
+        {
+          "id": "call_3",
+          "name": "read_file",
+          "arguments": {
+            "path": "notes.txt",
+            "start_line": 1,
+            "line_count": 3
+          }
+        }
+      ]
+    },
+    {
+      "tool_calls": [
+        {
+          "id": "call_4",
+          "name": "read_file",
+          "arguments": {
+            "path": "notes.txt",
+            "start_line": 1,
+            "line_count": 4
+          }
+        }
+      ]
+    },
+    {
+      "text": "Done: edited a.txt; checked with test -f; nothing remains.",
+      "tool_calls": [
+        {
+          "id": "call_5",
+          "name": "read_file",
+          "arguments": {
+            "path": "notes.txt",
+            "start_line": 2,
+            "line_count": 1
+          }
+        }
+      ],
+      "finish": "tool_calls"
+    }
+  ],
+  "expect": {
+    "final_output": "Done: edited a.txt; checked with test -f; nothing remains.",
+    "requests": 5,
+    "request_contains": [
+      {
+        "request": 5,
+        "text": "\"tool_choice\":\"none\""
+      },
+      {
+        "request": 5,
+        "text": "This is the last step allowed in this run."
+      }
+    ]
+  }
+}

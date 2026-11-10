@@ -17,6 +17,11 @@ fn run_fixture(delta: &Value, finish: &str, json_output: bool) -> Output {
     run_fixture_with_options(delta, finish, json_output, false).0
 }
 
+/// Serves one completion to a run whose step cap is one.
+fn run_capped_fixture(delta: &Value, finish: &str, json_output: bool) -> Output {
+    run_fixture_with_cap(delta, finish, json_output, false, Some(1)).0
+}
+
 fn isolated_command(dir: &tempfile::TempDir) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_rune"));
     command
@@ -138,6 +143,16 @@ fn run_fixture_with_options(
     json_output: bool,
     no_save: bool,
 ) -> (Output, tempfile::TempDir) {
+    run_fixture_with_cap(delta, finish, json_output, no_save, None)
+}
+
+fn run_fixture_with_cap(
+    delta: &Value,
+    finish: &str,
+    json_output: bool,
+    no_save: bool,
+    cap: Option<u64>,
+) -> (Output, tempfile::TempDir) {
     let body = format!(
         "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
         json!({"choices": [{"delta": delta, "finish_reason": null}]}),
@@ -153,6 +168,7 @@ fn run_fixture_with_options(
         ),
         json_output,
         no_save,
+        cap,
     )
 }
 
@@ -160,8 +176,9 @@ fn run_response_fixture(
     response: String,
     json_output: bool,
     no_save: bool,
+    cap: Option<u64>,
 ) -> (Output, tempfile::TempDir) {
-    let (output, dir, _) = run_responses_fixture(vec![response], json_output, no_save, Some(1));
+    let (output, dir, _) = run_responses_fixture(vec![response], json_output, no_save, cap);
     (output, dir)
 }
 
@@ -404,7 +421,7 @@ fn tool_call_delta() -> Value {
 #[test]
 fn ask_json_reports_tool_errors_and_stops_at_the_configured_cap() {
     for finish in ["tool_calls", "stop", "length"] {
-        let output = run_fixture(&tool_call_delta(), finish, true);
+        let output = run_capped_fixture(&tool_call_delta(), finish, true);
         assert_eq!(output.status.code(), Some(1), "finish: {finish}");
         let result: Value = serde_json::from_slice(&output.stdout).expect("one JSON result");
         assert_eq!(result["exit_code"], 1);
@@ -419,7 +436,7 @@ fn ask_json_reports_tool_errors_and_stops_at_the_configured_cap() {
             ])
         );
         assert_eq!(result["output"], "I will run the command.");
-        assert_eq!(result["final_output"], "");
+        assert_eq!(result["final_output"], "I will run the command.");
         assert_eq!(result["steps"], 1);
         assert_eq!(result["narration"][0]["text"], "I will run the command.");
         assert_eq!(result["narration"][1]["tool"], "shell");
@@ -437,10 +454,10 @@ fn ask_json_reports_tool_errors_and_stops_at_the_configured_cap() {
 }
 
 #[test]
-fn ask_plain_text_step_limit_does_not_print_a_final_answer() {
-    let output = run_fixture(&tool_call_delta(), "tool_calls", false);
+fn ask_plain_text_step_limit_prints_the_final_text() {
+    let output = run_capped_fixture(&tool_call_delta(), "tool_calls", false);
     assert_eq!(output.status.code(), Some(1));
-    assert!(output.stdout.is_empty());
+    assert_eq!(output.stdout, b"I will run the command.\n");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("limit of 1 model steps"), "{stderr}");
     assert!(!stderr.contains("SHOULD_NOT_RUN"), "{stderr}");
@@ -593,7 +610,8 @@ fn ask_no_save_creates_no_session() {
 
 #[test]
 fn ask_saves_a_tool_exchange_stopped_at_the_step_cap() {
-    let (output, dir) = run_fixture_with_options(&tool_call_delta(), "tool_calls", true, false);
+    let (output, dir) =
+        run_fixture_with_cap(&tool_call_delta(), "tool_calls", true, false, Some(1));
     assert_eq!(output.status.code(), Some(1));
     let result: Value = serde_json::from_slice(&output.stdout).expect("ask JSON");
     let session_id = result["session_id"].as_str().expect("saved session id");
@@ -642,7 +660,7 @@ fn write_retry_limits(dir: &tempfile::TempDir, attempts: u64) {
     std::fs::write(
         dir.path().join("config/rune/config.toml"),
         format!(
-            "[limits]\nmax_agent_steps = 1\nprovider_max_attempts = {attempts}\n\
+            "[limits]\nmax_agent_steps = 2\nprovider_max_attempts = {attempts}\n\
              provider_head_timeout_ms = 5000\nprovider_request_timeout_ms = 5000\n"
         ),
     )
@@ -669,7 +687,7 @@ fn ask_retries_a_rate_limit_after_the_requested_delay_within_the_configured_dead
         ],
         true,
         true,
-        Some(1),
+        Some(2),
         |dir| write_retry_limits(dir, 2),
     );
     let elapsed = started.elapsed();
@@ -783,7 +801,7 @@ fn review_refuses_mutations_by_a_named_rule_and_still_reads_in_every_permission_
             ],
             Some("--json"),
             false,
-            Some(3),
+            Some(4),
             (&["--permission-mode", mode, "review"], &[]),
             |dir, command| {
                 command.with_external_programs();
@@ -872,7 +890,7 @@ fn ask_sends_the_resolved_instructions_shown_by_prompt_show() {
             ],
             true,
             true,
-            Some(2),
+            Some(3),
             |dir| {
                 std::fs::write(
                     dir.path().join("AGENTS.md"),
@@ -891,7 +909,7 @@ fn ask_sends_the_resolved_instructions_shown_by_prompt_show() {
                 } else if variant == "bounded" {
                     std::fs::write(
                         dir.path().join("config/rune/config.toml"),
-                        "[limits]\nmax_agent_steps = 2\nproject_instructions_total_bytes = 512\n",
+                        "[limits]\nmax_agent_steps = 3\nproject_instructions_total_bytes = 512\n",
                     )
                     .expect("instruction limit");
                 }
@@ -935,7 +953,7 @@ fn ask_keeps_a_capped_repository_map_fixed_across_an_edit() {
         ],
         true,
         true,
-        Some(2),
+        Some(3),
         |dir| {
             std::fs::create_dir(dir.path().join("src")).expect("sources");
             std::fs::write(
@@ -963,7 +981,7 @@ fn ask_keeps_a_capped_repository_map_fixed_across_an_edit() {
                 .expect("references");
             std::fs::write(
                 dir.path().join("config/rune/config.toml"),
-                "[limits]\nmax_agent_steps = 2\nrepository_map_bytes = 512\nverification_reminders = 0\n",
+                "[limits]\nmax_agent_steps = 3\nrepository_map_bytes = 512\nverification_reminders = 0\n",
             )
             .expect("map cap");
         },
@@ -1027,7 +1045,7 @@ fn ask_reads_an_allowed_file_and_sends_its_result_before_the_final_answer() {
             ],
             json_output,
             false,
-            Some(2),
+            Some(3),
         );
         assert!(
             output.status.success(),
@@ -1104,7 +1122,7 @@ fn ask_returns_denied_unknown_and_malformed_calls_to_the_model_without_running_t
             ],
             true,
             true,
-            Some(2),
+            Some(3),
         );
         assert!(
             output.status.success(),
@@ -1126,29 +1144,51 @@ fn ask_returns_denied_unknown_and_malformed_calls_to_the_model_without_running_t
 }
 
 #[test]
-fn ask_bounds_repeated_tool_requests_with_configured_and_default_step_caps() {
-    for configured_cap in [Some(2), Some(0), None] {
-        let expected_steps = configured_cap.filter(|cap| *cap > 0).unwrap_or(16);
-        let responses = (0..expected_steps)
-            .map(|_| {
-                completion_response(
-                    &call_delta("read_file", r#"{"path":"fixture.txt"}"#),
-                    "tool_calls",
-                )
-            })
-            .collect();
-        let (output, _, requests) = run_responses_fixture(responses, true, true, configured_cap);
-        assert_eq!(output.status.code(), Some(1));
+fn ask_stops_repeated_tool_requests_at_the_configured_step_cap() {
+    let responses = (0..2)
+        .map(|_| {
+            completion_response(
+                &call_delta("read_file", r#"{"path":"fixture.txt"}"#),
+                "tool_calls",
+            )
+        })
+        .collect();
+    let (output, _, requests) = run_responses_fixture(responses, true, true, Some(2));
+    assert_eq!(output.status.code(), Some(1));
+    let result: Value = serde_json::from_slice(&output.stdout).expect("one JSON result");
+    assert_eq!(result["steps"], 2);
+    assert_eq!(requests.len(), 2);
+    assert_eq!(result["error_code"], "limit_exceeded");
+    assert_eq!(result["final_output"], "Checking the fixture.");
+    assert_eq!(result["tool_calls"].as_array().expect("calls").len(), 2);
+    assert_eq!(result["usage"]["input_tokens"], 22);
+}
+
+#[test]
+fn ask_without_a_step_cap_runs_twenty_tool_steps() {
+    let mut responses: Vec<String> = (0..20)
+        .map(|index| {
+            completion_response(
+                &call_delta(
+                    "read_file",
+                    &format!(r#"{{"path":"fixture.txt","start_line":{}}}"#, index + 1),
+                ),
+                "tool_calls",
+            )
+        })
+        .collect();
+    responses.push(completion_response(
+        &json!({"content": "All read."}),
+        "stop",
+    ));
+    for configured_cap in [None, Some(0)] {
+        let (output, _, requests) =
+            run_responses_fixture(responses.clone(), true, true, configured_cap);
+        assert_eq!(output.status.code(), Some(0), "{configured_cap:?}");
         let result: Value = serde_json::from_slice(&output.stdout).expect("one JSON result");
-        assert_eq!(result["steps"], expected_steps);
-        assert_eq!(requests.len() as u64, expected_steps);
-        assert_eq!(result["error_code"], "limit_exceeded");
-        assert_eq!(result["final_output"], "");
-        assert_eq!(
-            result["tool_calls"].as_array().expect("calls").len() as u64,
-            expected_steps
-        );
-        assert_eq!(result["usage"]["input_tokens"], expected_steps * 11);
+        assert_eq!(result["steps"], 21);
+        assert_eq!(requests.len(), 21);
+        assert_eq!(result["final_output"], "All read.");
     }
 }
 
@@ -1357,7 +1397,7 @@ fn ask_jsonl_marks_retry_resets_and_keeps_the_recovered_final_result() {
         ],
         Some("--jsonl"),
         true,
-        Some(1),
+        Some(2),
         |dir| write_retry_limits(dir, 2),
     );
     assert!(output.status.success(), "{:?}", output.stderr);
@@ -1401,7 +1441,7 @@ fn ask_jsonl_preserves_tool_steps_and_saved_exchange() {
         ],
         Some("--jsonl"),
         false,
-        Some(2),
+        Some(3),
         |_| {},
     );
     assert!(output.status.success(), "{:?}", output.stderr);
@@ -1462,7 +1502,7 @@ fn ask_attaches_one_png_content_part_on_every_tool_step() {
         ],
         Some("--json"),
         true,
-        Some(2),
+        Some(3),
         &["attachment.png"],
         |dir| {
             std::fs::write(dir.path().join("attachment.png"), ATTACHMENT_PNG).expect("fixture PNG");
@@ -1504,7 +1544,7 @@ fn ask_repeated_image_flags_preserve_attachment_order() {
         )],
         None,
         true,
-        Some(1),
+        Some(2),
         &["first.png", "second.gif"],
         |dir| {
             std::fs::write(dir.path().join("first.png"), ATTACHMENT_PNG).expect("fixture PNG");
@@ -1623,7 +1663,7 @@ fn model_plan_updates_emit_versioned_events_without_duplicates_or_workspace_muta
         "stop",
     ));
     let (output, dir, requests) =
-        run_responses_fixture_with_format(responses, Some("--jsonl"), true, Some(6), |_| {});
+        run_responses_fixture_with_format(responses, Some("--jsonl"), true, Some(7), |_| {});
     assert!(output.status.success(), "{:?}", output.stderr);
     assert!(output.stderr.is_empty());
     assert_eq!(requests.len(), 6);
@@ -1711,7 +1751,7 @@ fn user_pre_tool_hook_veto_preserves_the_pair_and_reports_its_named_reason() {
         ],
         Some("--json"),
         false,
-        Some(2),
+        Some(3),
         (&["--permission-mode", "full-access", "ask"], &[]),
         |dir, command| {
             command.with_external_programs();
@@ -1808,7 +1848,7 @@ fn pre_tool_allow_runs_the_tool_and_hook_failures_hold_it() {
             ],
             Some("--json"),
             true,
-            Some(2),
+            Some(3),
             (&["ask"], &[]),
             |dir, command| {
                 command.with_external_programs();
@@ -1854,7 +1894,7 @@ fn user_post_tool_hook_receives_one_redacted_result_without_changing_the_tool_pa
         ],
         Some("--json"),
         false,
-        Some(2),
+        Some(3),
         (&["ask"], &[]),
         |dir, command| {
             command.with_external_programs();
@@ -1960,7 +2000,7 @@ fn post_tool_timeout_and_nonzero_exit_preserve_completed_results_and_continue() 
             ],
             Some("--json"),
             true,
-            Some(2),
+            Some(3),
             (&["ask"], &[]),
             |dir, command| {
                 command.with_external_programs();
@@ -2000,4 +2040,16 @@ fn post_tool_timeout_and_nonzero_exit_preserve_completed_results_and_continue() 
                 .contains("ALLOWED_READ_RESULT")
         );
     }
+}
+
+#[test]
+fn ask_max_steps_rejects_a_non_number() {
+    let dir = tempfile::tempdir().expect("isolated state");
+    let output = isolated_command(&dir)
+        .args(["ask", "--max-steps", "x", "hello"])
+        .output()
+        .expect("ask");
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("is not a whole number"), "{stderr}");
 }

@@ -177,7 +177,13 @@ fn retained_result_bytes(history: &History) -> usize {
         .iter()
         .flat_map(|turn| turn.parts.iter())
         .filter_map(|part| match part {
-            ContentPart::ToolResult { content, .. } => Some(content.len()),
+            // The answer given to a call made on the last allowed step is a
+            // fixed harness line, not a tool result the bound applies to.
+            ContentPart::ToolResult { content, .. }
+                if content != "not run: the step limit was reached" =>
+            {
+                Some(content.len())
+            }
             _ => None,
         })
         .fold(0_usize, usize::saturating_add)

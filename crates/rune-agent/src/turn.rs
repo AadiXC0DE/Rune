@@ -618,6 +618,13 @@ const VERIFICATION_REMINDER: &str = "<harness_check>Files were changed and nothi
 run since the last change to check it. Run the focused test, build, or command that \
 exercises the change and report what it shows, or say why it cannot be run.</harness_check>";
 
+/// Tells the model the request it is answering is the last one the run allows.
+pub const LAST_STEP_NOTE: &str = "<harness_check>This is the last step allowed in this run. \
+Do not call tools. Say what is done, what was checked and how, and what remains.</harness_check>";
+
+/// Answer recorded for a call the model made on the last allowed step.
+const LAST_STEP_REFUSAL: &str = "not run: the step limit was reached";
+
 /// Asks again after a reply the output limit cut off before it said anything.
 const OUTPUT_LIMIT_RETRY: &str = "<harness_check>Your last reply reached the output \
 token limit before giving any answer. Answer again more briefly: think less, and split \
@@ -722,6 +729,13 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
         // latest guidance in the same turn rather than the next one.
         apply_steering(history, steering, Boundary::Model, host);
 
+        let last_step = step_limit > 0
+            && u64::from(steps).saturating_add(1) == step_limit
+            && !host.tools().is_empty();
+        if last_step {
+            history.push_harness_note(LAST_STEP_NOTE);
+        }
+
         steps = steps.saturating_add(1);
         host.emit(Event::TurnStarted { step: steps });
 
@@ -730,6 +744,7 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
             host,
             history,
             steps,
+            last_step,
             timeouts,
             max_attempts,
             &cancellation,
@@ -833,13 +848,14 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
             // It is drained here rather than left for the next model boundary,
             // so it is recorded and reported once, at the boundary it actually
             // arrived at.
-            if !steering.is_empty() && host.objective_tokens_remaining() != Some(0) {
+            if !last_step && !steering.is_empty() && host.objective_tokens_remaining() != Some(0) {
                 apply_steering(history, steering, Boundary::Finalizing, host);
                 continue;
             }
             // A reply cut off before any answer is asked for once more, shorter.
             // An assistant turn is recorded first, so the roles still alternate.
-            if finish == FinishReason::MaxTokens
+            if !last_step
+                && finish == FinishReason::MaxTokens
                 && limit_retry
                 && text.trim().is_empty()
                 && host.objective_tokens_remaining() != Some(0)
@@ -856,7 +872,8 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
             // A turn that changed files and stopped of its own accord is asked
             // once to check its work. No extra request is spent on a turn that
             // already checked, changed nothing, or ended for another reason.
-            if finish == FinishReason::Stop
+            if !last_step
+                && finish == FinishReason::Stop
                 && reminders > 0
                 && host.objective_tokens_remaining() != Some(0)
                 && Verification::of(&calls) == Verification::Unverified
@@ -870,6 +887,9 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
                 StopReason::ObjectiveBudget
             } else {
                 match finish {
+                    FinishReason::Stop | FinishReason::ToolCalls if last_step => {
+                        StopReason::StepLimit
+                    }
                     FinishReason::Stop => StopReason::Completed,
                     FinishReason::MaxTokens => StopReason::OutputLimit,
                     FinishReason::Refused => StopReason::Refused,
@@ -900,15 +920,34 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
         }
 
         // Execute the batch. Policy is resolved per call before anything runs,
-        // so a denial never reaches a tool.
-        let (results, failure_limit_reached) = execute_batch(
-            &pending_calls,
-            host,
-            history,
-            &mut result_bytes,
-            &limits,
-            &calls,
-        );
+        // so a denial never reaches a tool. On the last step nothing runs: each
+        // call is answered as refused so the record stays well formed.
+        let (results, failure_limit_reached) = if last_step {
+            let refused = pending_calls
+                .iter()
+                .map(|call| {
+                    host.emit(Event::ToolDenied {
+                        call: call.clone(),
+                        reason: LAST_STEP_REFUSAL.to_owned(),
+                    });
+                    CallResult {
+                        call: call.clone(),
+                        output: ToolOutput::failure(LAST_STEP_REFUSAL),
+                        executed: false,
+                    }
+                })
+                .collect();
+            (refused, false)
+        } else {
+            execute_batch(
+                &pending_calls,
+                host,
+                history,
+                &mut result_bytes,
+                &limits,
+                &calls,
+            )
+        };
 
         let mut result_parts = Vec::new();
         for result in &results {
@@ -923,6 +962,10 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
         }
         history.push_tool_results(result_parts);
         calls.extend(results);
+
+        if last_step {
+            settle!(StopReason::StepLimit);
+        }
 
         if failure_limit_reached {
             return Err(RuneError::new(
@@ -1087,11 +1130,13 @@ impl ObjectiveAccounting {
 /// Applies queued steering before rebuilding a retry request. Returns the
 /// outcome together with a flag saying whether steering is queued after the
 /// successful attempt, for the caller to apply at the next boundary.
+#[allow(clippy::too_many_arguments)]
 fn stream_with_retry(
     client: &dyn Fetch,
     host: &dyn Host,
     history: &mut History,
     step: u32,
+    last_step: bool,
     timeouts: transport::RequestTimeouts,
     max_attempts: usize,
     cancellation: &Cancellation,
@@ -1127,6 +1172,9 @@ fn stream_with_retry(
         } else {
             ToolChoice::Auto
         };
+        if last_step {
+            plan.tool_choice = ToolChoice::None;
+        }
         plan.parallel_tool_calls =
             host.limits().get(LimitName::ParallelToolCalls).value() != Some(1);
         plan.effort = host.effort();

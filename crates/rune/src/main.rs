@@ -351,10 +351,19 @@ fn run_ask(
         return Err(err);
     }
 
+    let max_steps = match launch.flag("--max-steps") {
+        Some(raw) => Some(raw.parse::<u64>().map_err(|_| {
+            RuneError::invalid_field("--max-steps", format!("`{raw}` is not a whole number"))
+                .with_hint("pass a number of steps, or 0 for no limit")
+        })?),
+        None => None,
+    };
+
     let options = ask::Options {
         prompt,
         json: output.json,
         jsonl,
+        max_steps,
         no_save: launch.has_flag("--no-save"),
         tool_loop: true,
         read_only: false,
@@ -438,6 +447,7 @@ fn run_review(
         no_save: false,
         tool_loop: true,
         read_only: true,
+        max_steps: None,
         images: Vec::new(),
     };
 

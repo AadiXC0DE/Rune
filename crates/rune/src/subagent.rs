@@ -175,7 +175,11 @@ impl Delegate for Runner<'_> {
                 .ok_or_else(|| RuneError::missing_field("task"))?,
         );
         let outcome = turn::run_turn(&mut history, &child)?;
-        if outcome.stop_reason != StopReason::Completed {
+        // A child told its last step had come still reports what it found;
+        // only a stop with nothing said is a failure.
+        let capped_with_report =
+            outcome.stop_reason == StopReason::StepLimit && !outcome.text.trim().is_empty();
+        if outcome.stop_reason != StopReason::Completed && !capped_with_report {
             return Err(RuneError::new(
                 ErrorCode::LimitExceeded,
                 format!("child stopped: {}", outcome.stop_reason.as_str()),
@@ -190,7 +194,11 @@ impl Delegate for Runner<'_> {
             label: format!("child-{seq}"),
             // A role is reusable; it is not the name of a persistent child.
             name: None,
-            summary: outcome.text,
+            summary: if capped_with_report {
+                format!("{}\n(the child reached its step limit)", outcome.text)
+            } else {
+                outcome.text
+            },
         })
     }
 }

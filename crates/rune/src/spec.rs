@@ -205,6 +205,11 @@ pub const RUN: &[CommandSpec] = &[
                 "path",
                 "Attach a PNG, JPEG, GIF, or WebP file. Repeatable; 8 MiB total, at most 16 images.",
             ),
+            option(
+                "--max-steps",
+                "n",
+                "Stop after this many model steps; the last one answers without tools. 0 means no limit.",
+            ),
         ],
         requirements: Requirements::FULL,
         supports_json: true,
