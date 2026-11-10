@@ -407,13 +407,110 @@ fn environment(workspace: &Utf8Path) -> Option<String> {
     } else {
         ""
     };
+    let tests = detect_test_command(workspace)
+        .map(|command| format!(" Tests run with `{command}`."))
+        .unwrap_or_default();
     Some(format!(
         "Environment: {platform} on {arch}. Commands run through `{shell} {flag}`. The workspace \
-         is {workspace}{repository}.",
+         is {workspace}{repository}.{tests}",
         arch = std::env::consts::ARCH,
         shell = rune_exec::command::default_shell(),
         flag = rune_exec::command::SHELL_COMMAND_FLAG,
     ))
+}
+
+/// Names the command that runs the project's tests, when the workspace root
+/// states one.
+///
+/// Only files at the root are read, at most 64 KiB of each, and the first rule
+/// that matches wins.
+#[cfg(not(target_family = "wasm"))]
+pub fn detect_test_command(workspace: &Utf8Path) -> Option<String> {
+    let text = |name: &str| read_head(&workspace.join(name));
+    let exists = |name: &str| workspace.join(name).is_file();
+
+    if text("package.json").is_some_and(|manifest| has_npm_test_script(&manifest)) {
+        let runner = if exists("pnpm-lock.yaml") {
+            "pnpm test"
+        } else if exists("yarn.lock") {
+            "yarn test"
+        } else if exists("bun.lock") || exists("bun.lockb") {
+            "bun run test"
+        } else {
+            "npm test"
+        };
+        return Some(runner.to_owned());
+    }
+    if exists("Cargo.toml") {
+        return Some("cargo test".to_owned());
+    }
+    if exists("go.mod") {
+        return Some("go test ./...".to_owned());
+    }
+    let pytest = exists("pytest.ini")
+        || ["pyproject.toml", "tox.ini", "setup.cfg"]
+            .iter()
+            .any(|name| text(name).is_some_and(|body| body.contains("pytest")))
+        || has_python_test_file(&workspace.join("tests"));
+    if pytest {
+        return Some("python -m pytest".to_owned());
+    }
+    let make_test = text("Makefile").is_some_and(|body| {
+        body.lines().any(|line| {
+            line.strip_prefix("test")
+                .is_some_and(|rest| rest.trim_start().starts_with(':'))
+        })
+    });
+    make_test.then(|| "make test".to_owned())
+}
+
+/// Names the command that runs the project's tests; a browser host has no
+/// workspace to read.
+#[cfg(target_family = "wasm")]
+pub fn detect_test_command(_workspace: &Utf8Path) -> Option<String> {
+    None
+}
+
+/// Reads the start of a regular file as text.
+#[cfg(not(target_family = "wasm"))]
+fn read_head(path: &Utf8Path) -> Option<String> {
+    use std::io::Read as _;
+    const LIMIT: u64 = 64 * 1024;
+    let file = std::fs::File::open(path).ok()?;
+    if !file.metadata().ok()?.is_file() {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    file.take(LIMIT).read_to_end(&mut bytes).ok()?;
+    Some(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// Whether a `package.json` declares a test script other than npm's placeholder.
+#[cfg(not(target_family = "wasm"))]
+fn has_npm_test_script(manifest: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(manifest)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("scripts")?
+                .get("test")?
+                .as_str()
+                .map(|script| !script.contains("no test specified"))
+        })
+        .unwrap_or(false)
+}
+
+/// Whether a directory holds a `test_*.py` file among its first 200 entries.
+#[cfg(not(target_family = "wasm"))]
+fn has_python_test_file(dir: &Utf8Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    entries.take(200).flatten().any(|entry| {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        name.starts_with("test_") && name.ends_with(".py") && entry.path().is_file()
+    })
 }
 
 /// Describes the machine a command will run on, in one line.
@@ -814,6 +911,152 @@ mod tests {
         std::fs::create_dir(root.join("nested")).expect("nested");
         let nested = environment(&root.join("nested")).expect("native environment");
         assert!(nested.ends_with("and is a git repository."), "{nested}");
+
+        std::fs::write(root.join("Cargo.toml"), "[package]\nname = \"x\"\n").expect("manifest");
+        let tested = environment(&root).expect("native environment");
+        assert!(
+            tested.ends_with("and is a git repository. Tests run with `cargo test`."),
+            "{tested}"
+        );
+    }
+
+    /// Detects the test command in a temporary workspace holding `files`.
+    #[cfg(not(target_family = "wasm"))]
+    fn detect(files: &[(&str, &str)]) -> Option<String> {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).expect("utf8 tempdir");
+        for (path, body) in files {
+            let path = root.join(path);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).expect("create parent");
+            }
+            std::fs::write(&path, body).expect("write file");
+        }
+        detect_test_command(&root)
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    const NPM_TEST: &str = r#"{"scripts":{"test":"vitest run"}}"#;
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn a_package_test_script_runs_through_npm() {
+        assert_eq!(
+            detect(&[("package.json", NPM_TEST)]).as_deref(),
+            Some("npm test")
+        );
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn a_pnpm_lockfile_runs_the_script_through_pnpm() {
+        let found = detect(&[("package.json", NPM_TEST), ("pnpm-lock.yaml", "")]);
+        assert_eq!(found.as_deref(), Some("pnpm test"));
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn a_yarn_lockfile_runs_the_script_through_yarn() {
+        let found = detect(&[("package.json", NPM_TEST), ("yarn.lock", "")]);
+        assert_eq!(found.as_deref(), Some("yarn test"));
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn a_bun_lockfile_runs_the_script_through_bun() {
+        let text = detect(&[("package.json", NPM_TEST), ("bun.lock", "")]);
+        assert_eq!(text.as_deref(), Some("bun run test"));
+        let binary = detect(&[("package.json", NPM_TEST), ("bun.lockb", "")]);
+        assert_eq!(binary.as_deref(), Some("bun run test"));
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn the_npm_placeholder_is_not_a_test_command() {
+        let placeholder = r#"{"scripts":{"test":"echo \"Error: no test specified\" && exit 1"}}"#;
+        assert_eq!(detect(&[("package.json", placeholder)]), None);
+        let found = detect(&[("package.json", placeholder), ("Cargo.toml", "")]);
+        assert_eq!(found.as_deref(), Some("cargo test"));
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn a_package_manifest_that_is_not_json_falls_through() {
+        let found = detect(&[("package.json", "{\"scripts\": "), ("go.mod", "module x\n")]);
+        assert_eq!(found.as_deref(), Some("go test ./..."));
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn a_cargo_manifest_runs_cargo_test() {
+        let found = detect(&[("Cargo.toml", "[package]\nname = \"x\"\n")]);
+        assert_eq!(found.as_deref(), Some("cargo test"));
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn a_cargo_manifest_that_is_a_directory_does_not_match() {
+        assert_eq!(detect(&[("Cargo.toml/inner", "")]), None);
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn a_go_module_runs_go_test() {
+        let found = detect(&[("go.mod", "module example.com/x\n")]);
+        assert_eq!(found.as_deref(), Some("go test ./..."));
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn python_projects_that_name_pytest_run_it() {
+        let expected = Some("python -m pytest");
+        assert_eq!(detect(&[("pytest.ini", "[pytest]\n")]).as_deref(), expected);
+        for name in ["pyproject.toml", "tox.ini", "setup.cfg"] {
+            let found = detect(&[(name, "[tool.pytest.ini_options]\n")]);
+            assert_eq!(found.as_deref(), expected, "{name}");
+        }
+        let found = detect(&[("tests/test_app.py", "def test_x(): pass\n")]);
+        assert_eq!(found.as_deref(), expected);
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn a_python_project_without_pytest_has_no_command() {
+        let found = detect(&[
+            ("pyproject.toml", "[project]\nname = \"x\"\n"),
+            ("tests/helpers.py", ""),
+        ]);
+        assert_eq!(found, None);
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn a_makefile_test_target_runs_make_test() {
+        let found = detect(&[("Makefile", "build:\n\tcc main.c\n\ntest :\n\t./run\n")]);
+        assert_eq!(found.as_deref(), Some("make test"));
+        assert_eq!(detect(&[("Makefile", "test-unit:\n\t./run\n")]), None);
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn the_first_matching_rule_wins() {
+        let found = detect(&[
+            ("package.json", NPM_TEST),
+            ("Cargo.toml", ""),
+            ("go.mod", ""),
+            ("pytest.ini", ""),
+            ("Makefile", "test:\n"),
+        ]);
+        assert_eq!(found.as_deref(), Some("npm test"));
+        let found = detect(&[("go.mod", ""), ("Cargo.toml", ""), ("Makefile", "test:\n")]);
+        assert_eq!(found.as_deref(), Some("cargo test"));
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn no_project_files_adds_nothing() {
+        assert_eq!(detect(&[]), None);
+        assert_eq!(detect(&[("README.md", "test:\n")]), None);
     }
 
     #[test]
