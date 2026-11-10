@@ -30,6 +30,8 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Changed
 
+- The startup work budgets for `--version` and `--help` are 2 ms each, down from
+  5 ms and 8 ms.
 - The tool schemas sent with each request fell from 17,379 to 9,154 bytes in
   the interactive default, and tools this host cannot run are no longer offered.
   The instructions are byte-stable for a session, so the cached prefix holds.

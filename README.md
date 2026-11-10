@@ -1098,7 +1098,7 @@ then the workspace tests. A failed step stops the gate immediately.
 `budget` reports raw process latency for `--version` and `--help`, including
 minimum-of-31, median and p95 (nearest rank, the 30th sorted sample). Each run
 measures wall time from process spawn through exit with stdout and stderr discarded.
-The enforced work budgets are 5 ms for `--version` and 8 ms for `--help`: the
+The enforced work budgets are 2 ms for `--version` and for `--help`: the
 minimum-of-31 minus the process baseline minimum-of-31, clamped to zero.
 The baseline is system `true` on Unix, an empty Rust executable on Windows.
 The Windows baseline is compiled with release settings and no dependencies; its

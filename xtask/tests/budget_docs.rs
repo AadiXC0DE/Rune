@@ -80,8 +80,7 @@ fn landing_page_size_claims_and_work_ceilings_match_the_audit() {
         assert!(claim.contains("5.45 MiB"), "{claim}");
     }
     assert!(page.contains("8 MiB binary size ceiling"));
-    assert!(page.contains("5 ms for <code>--version</code>"));
-    assert!(page.contains("8 ms for <code>--help</code>"));
+    assert!(page.contains("2 ms for <code>--version</code> and <code>--help</code>"));
     assert!(page.contains("baseline-subtracted minimum-of-31"));
     assert!(page.contains("system <code>true</code> on Unix"));
     assert!(page.contains("an empty Rust executable on Windows"));

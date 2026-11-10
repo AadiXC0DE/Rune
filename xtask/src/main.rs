@@ -20,10 +20,10 @@ mod targets {
     pub const MAX_BINARY_BYTES: u64 = 8 * 1024 * 1024;
 
     /// Baseline-subtracted minimum-of-31 work for `rune --version`, in milliseconds.
-    pub const MAX_VERSION_MS: f64 = 5.0;
+    pub const MAX_VERSION_MS: f64 = 2.0;
 
     /// Baseline-subtracted minimum-of-31 work for `rune --help`, in milliseconds.
-    pub const MAX_HELP_MS: f64 = 8.0;
+    pub const MAX_HELP_MS: f64 = 2.0;
 
     /// Largest accepted assembled system prompt, in bytes.
     ///
@@ -1408,7 +1408,7 @@ mod tests {
         assert!(metrics.work_ms(0.5) <= targets::MAX_VERSION_MS);
         assert_eq!(
             metrics.report("--version", 0.5, targets::MAX_VERSION_MS),
-            "startup --version  raw process latency: minimum-of-31 1.00 ms, median 16.00 ms, p95 30.00 ms; baseline-subtracted work 0.50 ms (budget 5 ms)"
+            "startup --version  raw process latency: minimum-of-31 1.00 ms, median 16.00 ms, p95 30.00 ms; baseline-subtracted work 0.50 ms (budget 2 ms)"
         );
     }
 
@@ -1418,7 +1418,7 @@ mod tests {
         assert!(metrics.work_ms(2.0).abs() < f64::EPSILON);
         assert_eq!(
             metrics.report("--help", 2.0, targets::MAX_HELP_MS),
-            "startup --help     raw process latency: minimum-of-31 1.00 ms, median 1.00 ms, p95 1.00 ms; baseline-subtracted work 0.00 ms (budget 8 ms)"
+            "startup --help     raw process latency: minimum-of-31 1.00 ms, median 1.00 ms, p95 1.00 ms; baseline-subtracted work 0.00 ms (budget 2 ms)"
         );
     }
 
@@ -1475,7 +1475,7 @@ mod tests {
         );
         assert_eq!(
             metrics.report("--version", 6.0, targets::MAX_VERSION_MS),
-            "startup --version  raw process latency: minimum-of-31 7.31 ms, median 7.31 ms, p95 7.31 ms; baseline-subtracted work 1.31 ms (budget 5 ms)"
+            "startup --version  raw process latency: minimum-of-31 7.31 ms, median 7.31 ms, p95 7.31 ms; baseline-subtracted work 1.31 ms (budget 2 ms)"
         );
     }
 
