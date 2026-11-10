@@ -211,11 +211,40 @@ fn encode_user_blocks(message: &Message, plan: &RequestPlan) -> Vec<serde_json::
     blocks
 }
 
+/// Whether a block is a thinking or a redacted thinking block.
+fn is_thinking_block(block: &serde_json::Value) -> bool {
+    matches!(
+        block.get("type").and_then(serde_json::Value::as_str),
+        Some("thinking" | "redacted_thinking")
+    )
+}
+
 /// Encodes assistant content blocks, including tool use and thinking.
 fn encode_assistant_blocks(message: &Message) -> Vec<serde_json::Value> {
-    // A thinking block must be replayed with the turn that produced it, so it
-    // comes first in the block list.
-    let mut blocks = replay_blocks(message);
+    let stored = replay_blocks(message);
+
+    // A replay holding the whole turn is sent back as it was produced, so the
+    // thinking blocks keep their place between the calls, as long as the
+    // message still makes the same calls in the same order.
+    if stored.iter().any(|block| !is_thinking_block(block)) {
+        let stored_ids = stored
+            .iter()
+            .filter(|block| {
+                block.get("type").and_then(serde_json::Value::as_str) == Some("tool_use")
+            })
+            .map(|block| block.get("id").and_then(serde_json::Value::as_str));
+        let message_ids = message.parts.iter().filter_map(|part| match part {
+            ContentPart::ToolCall { id, .. } => Some(Some(id.as_str())),
+            _ => None,
+        });
+        if stored_ids.eq(message_ids) {
+            return stored;
+        }
+    }
+
+    // Otherwise the stored thinking blocks must still be replayed with the
+    // turn that produced them, so they come first in the block list.
+    let mut blocks: Vec<serde_json::Value> = stored.into_iter().filter(is_thinking_block).collect();
 
     for part in &message.parts {
         match part {
@@ -395,6 +424,8 @@ struct PartialBlock {
     name: Option<String>,
     arguments: String,
     text: String,
+    signature: String,
+    raw: Option<serde_json::Value>,
     ended: bool,
 }
 
@@ -403,8 +434,11 @@ struct PartialBlock {
 pub struct Reducer {
     limits: Limit,
     blocks: std::collections::BTreeMap<u64, PartialBlock>,
-    thinking: Vec<serde_json::Value>,
+    /// Finished blocks in the order they stopped, kept for replay.
+    ordered: Vec<serde_json::Value>,
     content: String,
+    /// Bytes of thinking text and signatures, bounded with the content.
+    reasoning_bytes: usize,
     usage: Usage,
     stop_reason: Option<FinishReason>,
     finished: bool,
@@ -424,8 +458,9 @@ impl Reducer {
         Self {
             limits: Limit::default(),
             blocks: std::collections::BTreeMap::new(),
-            thinking: Vec::new(),
+            ordered: Vec::new(),
             content: String::new(),
+            reasoning_bytes: 0,
             usage: Usage::default(),
             stop_reason: None,
             finished: false,
@@ -529,17 +564,27 @@ impl Reducer {
                 }
             }
             "thinking" => {
-                // Retained verbatim for replay.
-                self.thinking.push(block.clone());
-                if let Some(text) = block
-                    .get("thinking")
-                    .and_then(serde_json::Value::as_str)
-                    .filter(|text| !text.is_empty())
-                {
+                let field = |name: &str| {
+                    block
+                        .get(name)
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned()
+                };
+                partial.text = field("thinking");
+                partial.signature = field("signature");
+                self.add_reasoning_bytes(
+                    partial.text.len().saturating_add(partial.signature.len()),
+                )?;
+                if !partial.text.is_empty() {
                     out.push(crate::stream::ProviderEvent::ReasoningDelta {
-                        delta: text.to_owned(),
+                        delta: partial.text.clone(),
                     });
                 }
+            }
+            "redacted_thinking" => {
+                // Passed back byte for byte.
+                partial.raw = Some(block.clone());
             }
             "tool_use" => {
                 let id = block
@@ -601,10 +646,11 @@ impl Reducer {
                 {
                     block.text.push_str(text);
                     self.content.push_str(text);
-                    if self.content.len() > self.limits.max_content_bytes {
+                    let total = self.content.len().saturating_add(self.reasoning_bytes);
+                    if total > self.limits.max_content_bytes {
                         return Err(RuneError::too_large(
                             "stream.content",
-                            self.content.len(),
+                            total,
                             self.limits.max_content_bytes,
                         ));
                     }
@@ -619,9 +665,18 @@ impl Reducer {
                     .and_then(serde_json::Value::as_str)
                     .filter(|text| !text.is_empty())
                 {
+                    block.text.push_str(text);
+                    self.add_reasoning_bytes(text.len())?;
                     out.push(crate::stream::ProviderEvent::ReasoningDelta {
                         delta: text.to_owned(),
                     });
+                }
+            }
+            Some("signature_delta") => {
+                if let Some(signature) = delta.get("signature").and_then(serde_json::Value::as_str)
+                {
+                    block.signature.push_str(signature);
+                    self.add_reasoning_bytes(signature.len())?;
                 }
             }
             Some("input_json_delta") => {
@@ -664,22 +719,69 @@ impl Reducer {
         let Some(block) = self.blocks.get_mut(&index) else {
             return Ok(());
         };
-        if block.ended || block.kind.as_deref() != Some("tool_use") {
-            block.ended = true;
+        if block.ended {
             return Ok(());
         }
         block.ended = true;
-        let id = block
-            .id
-            .clone()
-            .ok_or_else(|| protocol_violation("a tool use block lost its identifier"))?;
-        // An empty argument string means no arguments were supplied.
-        let arguments = if block.arguments.is_empty() {
-            "{}".to_owned()
-        } else {
-            block.arguments.clone()
-        };
-        out.push(crate::stream::ProviderEvent::ToolCallEnd { id, arguments });
+        match block.kind.as_deref() {
+            Some("thinking") => {
+                // A block with neither text nor signature carries nothing to replay.
+                if !block.text.is_empty() || !block.signature.is_empty() {
+                    self.ordered.push(serde_json::json!({
+                        "type": "thinking",
+                        "thinking": block.text,
+                        "signature": block.signature,
+                    }));
+                }
+            }
+            Some("redacted_thinking") => {
+                if let Some(raw) = block.raw.take() {
+                    self.ordered.push(raw);
+                }
+            }
+            Some("text") => {
+                if !block.text.is_empty() {
+                    self.ordered
+                        .push(serde_json::json!({ "type": "text", "text": block.text }));
+                }
+            }
+            Some("tool_use") => {
+                let id = block
+                    .id
+                    .clone()
+                    .ok_or_else(|| protocol_violation("a tool use block lost its identifier"))?;
+                // An empty argument string means no arguments were supplied.
+                let arguments = if block.arguments.is_empty() {
+                    "{}".to_owned()
+                } else {
+                    block.arguments.clone()
+                };
+                let input: serde_json::Value =
+                    serde_json::from_str(&arguments).unwrap_or_else(|_| serde_json::json!({}));
+                self.ordered.push(serde_json::json!({
+                    "type": "tool_use",
+                    "id": id.as_str(),
+                    "name": block.name.as_deref().unwrap_or_default(),
+                    "input": input,
+                }));
+                out.push(crate::stream::ProviderEvent::ToolCallEnd { id, arguments });
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Counts thinking text or a signature against the content bound.
+    fn add_reasoning_bytes(&mut self, bytes: usize) -> Result<()> {
+        self.reasoning_bytes = self.reasoning_bytes.saturating_add(bytes);
+        let total = self.content.len().saturating_add(self.reasoning_bytes);
+        if total > self.limits.max_content_bytes {
+            return Err(RuneError::too_large(
+                "stream.content",
+                total,
+                self.limits.max_content_bytes,
+            ));
+        }
         Ok(())
     }
 
@@ -727,10 +829,10 @@ impl StreamReducer for Reducer {
     }
 
     fn replay(&self) -> Option<String> {
-        if self.thinking.is_empty() {
+        if !self.ordered.iter().any(is_thinking_block) {
             return None;
         }
-        serde_json::to_string(&self.thinking).ok()
+        serde_json::to_string(&self.ordered).ok()
     }
 
     fn finish(&self) -> Result<FinishReason> {
@@ -1387,6 +1489,207 @@ mod tests {
         );
         let replay = reducer.replay().expect("replay");
         assert!(replay.contains("sig"));
+    }
+
+    fn replayed(reducer: &Reducer) -> Vec<serde_json::Value> {
+        let replay = reducer.replay().expect("replay");
+        serde_json::from_str(&replay).expect("replay is a block array")
+    }
+
+    #[test]
+    fn a_signature_delivered_as_a_delta_is_replayed() {
+        let (_, reducer) = reduce(&[
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"","signature":""}}"#,
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"first "}}"#,
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"second"}}"#,
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"EqQBsig"}}"#,
+            r#"{"type":"content_block_stop","index":0}"#,
+            r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"}}"#,
+            r#"{"type":"message_stop"}"#,
+        ]);
+        let blocks = replayed(&reducer);
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0]["type"], "thinking");
+        assert_eq!(blocks[0]["thinking"], "first second");
+        assert_eq!(blocks[0]["signature"], "EqQBsig");
+    }
+
+    #[test]
+    fn thinking_text_from_deltas_is_replayed() {
+        let (events, reducer) = reduce(&[
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"","signature":""}}"#,
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"weigh "}}"#,
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"both"}}"#,
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"s1"}}"#,
+            r#"{"type":"content_block_stop","index":0}"#,
+            // Omitted display: an empty text delta, then only the signature.
+            r#"{"type":"content_block_start","index":1,"content_block":{"type":"thinking","thinking":"","signature":""}}"#,
+            r#"{"type":"content_block_delta","index":1,"delta":{"type":"thinking_delta","thinking":""}}"#,
+            r#"{"type":"content_block_delta","index":1,"delta":{"type":"signature_delta","signature":"s2"}}"#,
+            r#"{"type":"content_block_stop","index":1}"#,
+            // Neither text nor signature: nothing to replay.
+            r#"{"type":"content_block_start","index":2,"content_block":{"type":"thinking","thinking":"","signature":""}}"#,
+            r#"{"type":"content_block_stop","index":2}"#,
+            r#"{"type":"content_block_start","index":3,"content_block":{"type":"text","text":""}}"#,
+            r#"{"type":"content_block_delta","index":3,"delta":{"type":"text_delta","text":"done"}}"#,
+            r#"{"type":"content_block_stop","index":3}"#,
+            // Cut before its stop: stored nowhere.
+            r#"{"type":"content_block_start","index":4,"content_block":{"type":"thinking","thinking":"","signature":""}}"#,
+            r#"{"type":"content_block_delta","index":4,"delta":{"type":"thinking_delta","thinking":"partial"}}"#,
+        ]);
+        let reasoning: String = events
+            .iter()
+            .filter_map(|event| match event {
+                ProviderEvent::ReasoningDelta { delta } => Some(delta.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(reasoning, "weigh bothpartial");
+        assert_eq!(
+            replayed(&reducer),
+            vec![
+                serde_json::json!({"type": "thinking", "thinking": "weigh both", "signature": "s1"}),
+                serde_json::json!({"type": "thinking", "thinking": "", "signature": "s2"}),
+                serde_json::json!({"type": "text", "text": "done"}),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_redacted_block_is_kept_in_place() {
+        let redacted = r#"{"type":"redacted_thinking","data":"EmwKAhgBEgy3va3pzix/LafPsn4a"}"#;
+        let start =
+            format!(r#"{{"type":"content_block_start","index":1,"content_block":{redacted}}}"#);
+        let (_, reducer) = reduce(&[
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"a","signature":"s1"}}"#,
+            r#"{"type":"content_block_stop","index":0}"#,
+            &start,
+            r#"{"type":"content_block_stop","index":1}"#,
+            r#"{"type":"content_block_start","index":2,"content_block":{"type":"thinking","thinking":"b","signature":"s2"}}"#,
+            r#"{"type":"content_block_stop","index":2}"#,
+            r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"}}"#,
+            r#"{"type":"message_stop"}"#,
+        ]);
+        let blocks = replayed(&reducer);
+        assert_eq!(blocks.len(), 3);
+        assert_eq!(blocks[0]["thinking"], "a");
+        assert_eq!(
+            blocks[1],
+            serde_json::from_str::<serde_json::Value>(redacted).expect("redacted block")
+        );
+        assert_eq!(blocks[2]["thinking"], "b");
+
+        let mut message = Message::assistant(vec![]);
+        message.replay = reducer.replay();
+        let mut plan = RequestPlan::new("m");
+        plan.messages = vec![message];
+        let body = Anthropic.build_request(&plan).expect("build");
+        assert_eq!(
+            body["messages"][0]["content"][1]["data"],
+            "EmwKAhgBEgy3va3pzix/LafPsn4a"
+        );
+    }
+
+    fn call(id: &str) -> ContentPart {
+        ContentPart::ToolCall {
+            id: ToolCallId::new(id).expect("call id"),
+            name: "read_file".to_owned(),
+            arguments: r#"{"path":"a.rs"}"#.to_owned(),
+        }
+    }
+
+    #[test]
+    fn interleaved_thinking_keeps_its_order() {
+        let (_, reducer) = reduce(&[
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"","signature":""}}"#,
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"s1"}}"#,
+            r#"{"type":"content_block_stop","index":0}"#,
+            r#"{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_1","name":"read_file","input":{}}}"#,
+            r#"{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"path\":\"a.rs\"}"}}"#,
+            r#"{"type":"content_block_stop","index":1}"#,
+            r#"{"type":"content_block_start","index":2,"content_block":{"type":"thinking","thinking":"","signature":""}}"#,
+            r#"{"type":"content_block_delta","index":2,"delta":{"type":"thinking_delta","thinking":"Reading the next file."}}"#,
+            r#"{"type":"content_block_delta","index":2,"delta":{"type":"signature_delta","signature":"s2"}}"#,
+            r#"{"type":"content_block_stop","index":2}"#,
+            r#"{"type":"content_block_start","index":3,"content_block":{"type":"tool_use","id":"toolu_2","name":"read_file","input":{}}}"#,
+            r#"{"type":"content_block_delta","index":3,"delta":{"type":"input_json_delta","partial_json":"{\"path\":\"a.rs\"}"}}"#,
+            r#"{"type":"content_block_stop","index":3}"#,
+            r#"{"type":"message_delta","delta":{"stop_reason":"tool_use"}}"#,
+            r#"{"type":"message_stop"}"#,
+        ]);
+        let stored = replayed(&reducer);
+        let kinds: Vec<&str> = stored
+            .iter()
+            .filter_map(|block| block["type"].as_str())
+            .collect();
+        assert_eq!(kinds, ["thinking", "tool_use", "thinking", "tool_use"]);
+
+        let mut message = Message::assistant(vec![call("toolu_1"), call("toolu_2")]);
+        message.replay = reducer.replay();
+        let mut plan = RequestPlan::new("m");
+        plan.messages = vec![message];
+        let body = Anthropic.build_request(&plan).expect("build");
+        let content = body["messages"][0]["content"]
+            .as_array()
+            .expect("content blocks");
+        assert_eq!(content.len(), 4);
+        for (sent, kept) in content.iter().zip(&stored) {
+            let mut sent = sent.clone();
+            // The newest turn may carry a cache marker on its last block.
+            if let Some(block) = sent.as_object_mut() {
+                block.remove("cache_control");
+            }
+            assert_eq!(&sent, kept);
+        }
+    }
+
+    #[test]
+    fn an_older_thinking_only_replay_still_goes_first() {
+        let thinking =
+            serde_json::json!({"type": "thinking", "thinking": "outline", "signature": "s"});
+        let mut message = Message::assistant(vec![
+            ContentPart::Text {
+                text: "reading".to_owned(),
+            },
+            call("toolu_1"),
+        ]);
+        message.replay = Some(serde_json::to_string(&vec![thinking.clone()]).expect("encode"));
+        let mut plan = RequestPlan::new("m");
+        plan.messages = vec![message];
+        let body = Anthropic.build_request(&plan).expect("build");
+        let content = &body["messages"][0]["content"];
+        assert_eq!(content[0], thinking);
+        assert_eq!(content[1]["type"], "text");
+        assert_eq!(content[2]["type"], "tool_use");
+        assert_eq!(content[2]["id"], "toolu_1");
+    }
+
+    #[test]
+    fn a_history_with_changed_calls_falls_back_to_thinking_first() {
+        let thinking =
+            serde_json::json!({"type": "thinking", "thinking": "outline", "signature": "s"});
+        let stored = vec![
+            thinking.clone(),
+            serde_json::json!({"type": "text", "text": "reading"}),
+            serde_json::json!({"type": "tool_use", "id": "toolu_1", "name": "read_file", "input": {}}),
+        ];
+        let mut message = Message::assistant(vec![
+            ContentPart::Text {
+                text: "reading".to_owned(),
+            },
+            call("toolu_9"),
+        ]);
+        message.replay = Some(serde_json::to_string(&stored).expect("encode"));
+        let mut plan = RequestPlan::new("m");
+        plan.messages = vec![message];
+        let body = Anthropic.build_request(&plan).expect("build");
+        let content = body["messages"][0]["content"]
+            .as_array()
+            .expect("content blocks");
+        assert_eq!(content.len(), 3);
+        assert_eq!(content[0], thinking);
+        assert_eq!(content[1]["type"], "text");
+        assert_eq!(content[2]["id"], "toolu_9");
     }
 
     #[test]
