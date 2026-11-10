@@ -952,7 +952,7 @@ fn tasks_in_loadavg(text: &str) -> Option<u64> {
 /// Callers fall back to ending the direct child, which is the only process the
 /// standard library can stop without a signal.
 #[cfg(not(unix))]
-fn signal_group(_group: u32, _name: &str) -> bool {
+pub fn signal_group(_group: u32, _name: &str) -> bool {
     false
 }
 
@@ -962,7 +962,7 @@ fn signal_group(_group: u32, _name: &str) -> bool {
 /// be signalled, and there is nothing left to stop, so the caller treats a
 /// failed delivery as complete.
 #[cfg(unix)]
-fn signal_group(group: u32, name: &str) -> bool {
+pub fn signal_group(group: u32, name: &str) -> bool {
     let target = format!("-{group}");
     KILL_PROGRAMS.iter().any(|program| {
         Command::new(program)

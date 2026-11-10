@@ -1599,29 +1599,47 @@ fn run_bench(launch: &Launch, output: &OutputFlags) -> Result<ExitCode> {
         .ok()
         .and_then(|path| Utf8PathBuf::from_path_buf(path).ok())
         .ok_or_else(|| RuneError::new(ErrorCode::Internal, "cannot locate this binary"))?;
-    // The model and provider chosen for this process apply to every run.
-    let mut overrides = Vec::new();
-    for (flag, value) in [
-        ("--model", &launch.model),
-        ("--provider", &launch.provider),
-        ("--effort", &launch.effort),
-    ] {
-        if let Some(value) = value {
-            overrides.push(flag.to_owned());
-            overrides.push(value.clone());
-        }
-    }
+    let jobs = match launch.flag("--jobs") {
+        None => 1,
+        Some(raw) => raw
+            .parse::<usize>()
+            .ok()
+            .filter(|count| (1..=16).contains(count))
+            .ok_or_else(|| RuneError::invalid_field("--jobs", "expected 1 to 16"))?,
+    };
+    let logs = launch.flag("--logs").map(Utf8PathBuf::from);
+    let cwd = std::env::current_dir()
+        .ok()
+        .and_then(|path| Utf8PathBuf::from_path_buf(path).ok())
+        .ok_or_else(|| RuneError::new(ErrorCode::Internal, "cannot read the working directory"))?;
+    // The global flags chosen for this process apply to every run.
+    let overrides = bench::overrides(
+        &bench::Forwarded {
+            model: launch.model.as_deref(),
+            provider: launch.provider.as_deref(),
+            effort: launch.effort.as_deref(),
+            limits: &launch.limit_overrides,
+            add_dirs: &launch.add_dirs,
+            allow_unsandboxed: launch.allow_unsandboxed,
+            offline: launch.offline,
+        },
+        &cwd,
+    );
 
-    let mut runs = Vec::new();
-    for trial in 1..=trials {
-        for task in &tasks {
-            let run = bench::run_task(&binary, &overrides, task, trial)?;
-            if !output.json {
-                println!("{}", bench::row(&run));
+    let json = output.json;
+    let runs = bench::run_all(
+        &binary,
+        &overrides,
+        &tasks,
+        trials,
+        jobs,
+        logs.as_deref(),
+        &|run| {
+            if !json {
+                println!("{}", bench::row(run));
             }
-            runs.push(run);
-        }
-    }
+        },
+    )?;
     let summary = bench::summarize(&runs);
     if output.json {
         let value = serde_json::json!({ "runs": runs, "summary": summary });

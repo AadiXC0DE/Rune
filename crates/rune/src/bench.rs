@@ -8,9 +8,10 @@
 //! the same tasks measure each of them.
 
 use std::collections::BTreeMap;
+use std::collections::VecDeque;
 use std::fmt::Write as _;
-use std::io::Read as _;
 use std::process::{Command, Stdio};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use camino::{Utf8Path, Utf8PathBuf};
@@ -199,7 +200,13 @@ pub fn discover(root: &Utf8Path) -> Result<Vec<Found>> {
 }
 
 /// Runs one trial of a task and reports what happened.
-pub fn run_task(binary: &Utf8Path, overrides: &[String], found: &Found, trial: u32) -> Result<Run> {
+pub fn run_task(
+    binary: &Utf8Path,
+    overrides: &[String],
+    found: &Found,
+    trial: u32,
+    logs: Option<&Utf8Path>,
+) -> Result<Run> {
     let scratch = tempdir()?;
     let workspace = scratch.join("workspace");
     let pristine = found.dir.join("repo");
@@ -249,6 +256,14 @@ pub fn run_task(binary: &Utf8Path, overrides: &[String], found: &Found, trial: u
     run.seconds = started.elapsed().as_secs_f64();
     run.timed_out = finished.timed_out;
     read_report(&finished.stdout, &mut run);
+    if let Some(logs) = logs {
+        std::fs::create_dir_all(logs).map_err(|err| io_error(&err))?;
+        let stem = format!("{}-t{trial}", found.id);
+        std::fs::write(logs.join(format!("{stem}.stderr.txt")), &finished.stderr)
+            .map_err(|err| io_error(&err))?;
+        std::fs::write(logs.join(format!("{stem}.json")), &finished.stdout)
+            .map_err(|err| io_error(&err))?;
+    }
 
     for path in &found.task.protected {
         let original = pristine.join(path);
@@ -286,6 +301,134 @@ pub fn run_task(binary: &Utf8Path, overrides: &[String], found: &Found, trial: u
     Ok(run)
 }
 
+/// Global flags of the parent run that every child run receives.
+pub struct Forwarded<'a> {
+    /// Model override.
+    pub model: Option<&'a str>,
+    /// Provider override.
+    pub provider: Option<&'a str>,
+    /// Reasoning effort override.
+    pub effort: Option<&'a str>,
+    /// Limit overrides as `name`, `value` pairs.
+    pub limits: &'a [(String, String)],
+    /// Additional directories.
+    pub add_dirs: &'a [String],
+    /// Whether commands may run where the host has no sandbox.
+    pub allow_unsandboxed: bool,
+    /// Whether every outbound request is refused.
+    pub offline: bool,
+}
+
+/// Builds the child's leading arguments. Relative `--add-dir` paths are made
+/// absolute against `cwd`, because children run in their own workspace.
+#[must_use]
+pub fn overrides(forwarded: &Forwarded<'_>, cwd: &Utf8Path) -> Vec<String> {
+    let mut args = Vec::new();
+    for (flag, value) in [
+        ("--model", forwarded.model),
+        ("--provider", forwarded.provider),
+        ("--effort", forwarded.effort),
+    ] {
+        if let Some(value) = value {
+            args.push(flag.to_owned());
+            args.push(value.to_owned());
+        }
+    }
+    for (name, value) in forwarded.limits {
+        args.push("--limit".to_owned());
+        args.push(format!("{name}={value}"));
+    }
+    for dir in forwarded.add_dirs {
+        args.push("--add-dir".to_owned());
+        args.push(absolute(cwd, dir).into_string());
+    }
+    if forwarded.allow_unsandboxed {
+        args.push("--allow-unsandboxed".to_owned());
+    }
+    if forwarded.offline {
+        args.push("--offline".to_owned());
+    }
+    args
+}
+
+/// Joins `path` onto `cwd` and resolves `.` and `..` without touching the disk.
+fn absolute(cwd: &Utf8Path, path: &str) -> Utf8PathBuf {
+    use camino::Utf8Component;
+    let path = Utf8Path::new(path);
+    let mut out = if path.is_absolute() {
+        Utf8PathBuf::new()
+    } else {
+        cwd.to_owned()
+    };
+    for part in path.components() {
+        match part {
+            Utf8Component::CurDir => {}
+            Utf8Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other.as_str()),
+        }
+    }
+    out
+}
+
+/// Runs every (trial, task) pair, `jobs` at a time, and returns the runs
+/// sorted by trial and task. `on_run` sees each run as it finishes. The first
+/// error stops scheduling and is returned once running workers finish.
+pub fn run_all(
+    binary: &Utf8Path,
+    overrides: &[String],
+    tasks: &[Found],
+    trials: u32,
+    jobs: usize,
+    logs: Option<&Utf8Path>,
+    on_run: &(dyn Fn(&Run) + Sync),
+) -> Result<Vec<Run>> {
+    let queue: Mutex<VecDeque<(u32, &Found)>> = Mutex::new(
+        (1..=trials)
+            .flat_map(|trial| tasks.iter().map(move |task| (trial, task)))
+            .collect(),
+    );
+    let done: Mutex<Vec<Run>> = Mutex::new(Vec::new());
+    let failure: Mutex<Option<RuneError>> = Mutex::new(None);
+    std::thread::scope(|scope| {
+        for _ in 0..jobs.max(1) {
+            scope.spawn(|| {
+                loop {
+                    if failure.lock().is_ok_and(|failure| failure.is_some()) {
+                        return;
+                    }
+                    let Some((trial, task)) =
+                        queue.lock().ok().and_then(|mut jobs| jobs.pop_front())
+                    else {
+                        return;
+                    };
+                    match run_task(binary, overrides, task, trial, logs) {
+                        Ok(run) => {
+                            on_run(&run);
+                            if let Ok(mut done) = done.lock() {
+                                done.push(run);
+                            }
+                        }
+                        Err(err) => {
+                            if let Ok(mut failure) = failure.lock() {
+                                failure.get_or_insert(err);
+                            }
+                            return;
+                        }
+                    }
+                }
+            });
+        }
+    });
+    if let Some(err) = failure.into_inner().ok().flatten() {
+        return Err(err);
+    }
+    let mut runs = done.into_inner().unwrap_or_default();
+    runs.sort_by(|left, right| (left.trial, &left.task).cmp(&(right.trial, &right.task)));
+    Ok(runs)
+}
+
 /// Copies what `rune ask --json` reported into a run.
 fn read_report(stdout: &str, run: &mut Run) {
     let Some(value) = stdout
@@ -318,24 +461,36 @@ struct Finished {
     code: Option<i32>,
     timed_out: bool,
     stdout: String,
+    stderr: String,
 }
 
-/// Runs a command, killing it if it outlives `timeout`.
+/// Time a child gets to exit after the termination signal before it is killed.
+const TERM_GRACE: Duration = Duration::from_secs(5);
+
+/// Reads a pipe to its end on a thread of its own.
+fn drain<R: std::io::Read + Send + 'static>(pipe: Option<R>) -> std::thread::JoinHandle<String> {
+    std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        if let Some(mut pipe) = pipe {
+            let _ = pipe.read_to_end(&mut bytes);
+        }
+        String::from_utf8_lossy(&bytes).into_owned()
+    })
+}
+
+/// Runs a command in a process group of its own, ending the whole group if it
+/// outlives `timeout` and after it exits, so no stray process keeps a pipe open.
 fn run_with_timeout(command: &mut Command, timeout: Duration) -> Result<Finished> {
+    rune_exec::command::own_group(command);
     let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
         .map_err(|err| RuneError::new(ErrorCode::Internal, format!("could not start: {err}")))?;
-    let mut pipe = child.stdout.take();
-    let reader = std::thread::spawn(move || {
-        let mut text = String::new();
-        if let Some(pipe) = pipe.as_mut() {
-            let _ = pipe.read_to_string(&mut text);
-        }
-        text
-    });
+    let group = child.id();
+    let stdout_reader = drain(child.stdout.take());
+    let stderr_reader = drain(child.stderr.take());
     let deadline = Instant::now().checked_add(timeout);
     let mut timed_out = false;
     let status = loop {
@@ -344,17 +499,32 @@ fn run_with_timeout(command: &mut Command, timeout: Duration) -> Result<Finished
         }
         if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             timed_out = true;
-            let _ = child.kill();
-            break child.wait().ok();
+            rune_exec::command::signal_group(group, "TERM");
+            let grace = Instant::now();
+            let mut exited = None;
+            while grace.elapsed() < TERM_GRACE {
+                exited = child.try_wait().map_err(|err| io_error(&err))?;
+                if exited.is_some() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            if exited.is_none() && !rune_exec::command::signal_group(group, "KILL") {
+                let _ = child.kill();
+            }
+            break exited.or_else(|| child.wait().ok());
         }
         std::thread::sleep(Duration::from_millis(50));
     };
-    let stdout = reader.join().unwrap_or_default();
+    rune_exec::command::signal_group(group, "KILL");
+    let stdout = stdout_reader.join().unwrap_or_default();
+    let stderr = stderr_reader.join().unwrap_or_default();
     Ok(Finished {
         success: status.is_some_and(|status| status.success()),
         code: status.and_then(|status| status.code()),
         timed_out,
         stdout,
+        stderr,
     })
 }
 
@@ -792,7 +962,7 @@ mod tests {
             r#"printf '{"steps":1,"error":"%s"}\n' "$(ls -A | tr '\n' ' ')""#,
         );
         let found = discover(&root).expect("discovered");
-        let run = run_task(&agent, &[], &found[0], 1).expect("run");
+        let run = run_task(&agent, &[], &found[0], 1, None).expect("run");
         assert!(run.passed, "{run:?}");
         let seen = run.error.unwrap_or_default();
         assert!(!seen.contains("check.sh"), "{seen}");
@@ -814,9 +984,9 @@ mod tests {
         );
         let agent = fake_agent(&root, r#"echo '{"steps":1}'"#);
         let found = discover(&root).expect("discovered");
-        let ok = run_task(&agent, &[], &found[0], 1).expect("run");
+        let ok = run_task(&agent, &[], &found[0], 1, None).expect("run");
         assert!(ok.passed, "{ok:?}");
-        let bad = run_task(&agent, &[], &found[1], 1).expect("run");
+        let bad = run_task(&agent, &[], &found[1], 1, None).expect("run");
         assert!(!bad.passed);
         assert_eq!(bad.error.as_deref(), Some("setup failed with exit 3"));
         assert_eq!(bad.steps, 0);
@@ -834,8 +1004,150 @@ mod tests {
         let agent = fake_agent(&root, r#"echo '{"steps":1}'"#);
         let found = discover(&root).expect("discovered");
         let started = Instant::now();
-        let run = run_task(&agent, &[], &found[0], 1).expect("run");
+        let run = run_task(&agent, &[], &found[0], 1, None).expect("run");
         assert!(!run.passed);
         assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_verify_timeout_ends_a_forked_child() {
+        let (_dir, root) = temp_root();
+        write_task(
+            &root,
+            "slow",
+            r#"{"prompt":"p","verify":"sleep 5; true","verifyTimeoutMs":200}"#,
+        );
+        let agent = fake_agent(&root, r#"echo '{"steps":1}'"#);
+        let found = discover(&root).expect("discovered");
+        let started = Instant::now();
+        let run = run_task(&agent, &[], &found[0], 1, None).expect("run");
+        assert!(!run.passed);
+        assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    #[test]
+    fn overrides_forward_the_global_flags_in_order() {
+        let limits = [("steps".to_owned(), "9".to_owned())];
+        let dirs = ["../shared".to_owned(), "/abs/dir".to_owned()];
+        let args = overrides(
+            &Forwarded {
+                model: Some("m"),
+                provider: Some("p"),
+                effort: Some("high"),
+                limits: &limits,
+                add_dirs: &dirs,
+                allow_unsandboxed: true,
+                offline: true,
+            },
+            Utf8Path::new("/work"),
+        );
+        assert_eq!(
+            args,
+            [
+                "--model",
+                "m",
+                "--provider",
+                "p",
+                "--effort",
+                "high",
+                "--limit",
+                "steps=9",
+                "--add-dir",
+                "/shared",
+                "--add-dir",
+                "/abs/dir",
+                "--allow-unsandboxed",
+                "--offline",
+            ]
+        );
+        let none = overrides(
+            &Forwarded {
+                model: None,
+                provider: None,
+                effort: None,
+                limits: &[],
+                add_dirs: &[],
+                allow_unsandboxed: false,
+                offline: false,
+            },
+            Utf8Path::new("/work"),
+        );
+        assert!(none.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_timeout_ends_the_agents_process_group() {
+        let (_dir, root) = temp_root();
+        write_task(
+            &root,
+            "hang",
+            r#"{"prompt":"p","verify":"true","timeoutMs":1500}"#,
+        );
+        let pidfile = root.join("child.pid");
+        let agent = fake_agent(&root, &format!("sleep 30 & echo $! > {pidfile}; wait"));
+        let found = discover(&root).expect("discovered");
+        let run = run_task(&agent, &[], &found[0], 1, None).expect("run");
+        assert!(run.timed_out);
+        let pid = std::fs::read_to_string(&pidfile)
+            .expect("pid file")
+            .trim()
+            .to_owned();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let alive = Command::new("kill")
+                .args(["-0", &pid])
+                .stderr(Stdio::null())
+                .status()
+                .is_ok_and(|status| status.success());
+            if !alive {
+                break;
+            }
+            assert!(Instant::now() < deadline, "process {pid} is still running");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn logs_keep_each_runs_stderr_and_report() {
+        let (_dir, root) = temp_root();
+        write_task(&root, "noisy", r#"{"prompt":"p","verify":"true"}"#);
+        let agent = fake_agent(&root, "echo 'agent diagnostics' >&2\necho '{\"steps\":2}'");
+        let found = discover(&root).expect("discovered");
+        let logs = root.join("logs/nested");
+        run_task(&agent, &[], &found[0], 2, Some(&logs)).expect("run");
+        let stderr = std::fs::read_to_string(logs.join("noisy-t2.stderr.txt")).expect("stderr");
+        assert_eq!(stderr.trim(), "agent diagnostics");
+        let report = std::fs::read_to_string(logs.join("noisy-t2.json")).expect("report");
+        assert_eq!(report.trim(), r#"{"steps":2}"#);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn jobs_run_tasks_at_the_same_time() {
+        let (_dir, root) = temp_root();
+        write_task(&root, "b", r#"{"prompt":"p","verify":"true"}"#);
+        write_task(&root, "a", r#"{"prompt":"p","verify":"true"}"#);
+        let agent = fake_agent(&root, "sleep 2; echo '{\"steps\":1}'");
+        let found = discover(&root).expect("discovered");
+        let started = Instant::now();
+        let runs = run_all(&agent, &[], &found, 1, 2, None, &|_| {}).expect("runs");
+        assert!(started.elapsed() < Duration::from_millis(3500));
+        let ids: Vec<&str> = runs.iter().map(|run| run.task.as_str()).collect();
+        assert_eq!(ids, ["a", "b"]);
+    }
+
+    #[test]
+    fn a_failed_report_keeps_its_usage() {
+        let mut parsed = Run::default();
+        read_report(
+            r#"{"steps":3,"usage":{"input_tokens":900,"output_tokens":40},"error":"boom"}"#,
+            &mut parsed,
+        );
+        assert_eq!(parsed.steps, 3);
+        assert_eq!((parsed.input_tokens, parsed.output_tokens), (900, 40));
+        assert_eq!(parsed.error.as_deref(), Some("boom"));
     }
 }

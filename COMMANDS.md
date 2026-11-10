@@ -60,7 +60,7 @@ Aliases:
 - `pr`: Same as `rune review`; reviews pending workspace changes with optional context.
 - `issue`: Same as `rune review`; reviews pending workspace changes with optional context.
 
-### `rune bench <tasks-dir> [--only <ids>] [--trials <n>] [--split <name>] [--json]`
+### `rune bench <tasks-dir> [--only <ids>] [--trials <n>] [--split <name>] [--jobs <n>] [--logs <dir>] [--json]`
 
 Measure the configured model and harness on coding tasks
 
@@ -69,6 +69,8 @@ Measure the configured model and harness on coding tasks
 | `--only <ids>` | Run only these comma-separated task identifiers. |
 | `--trials <n>` | Run each task this many times, 1 to 20. |
 | `--split <name>` | Run only tasks of this split: dev, heldout or all. |
+| `--jobs <n>` | Run this many tasks at once, 1 to 16. |
+| `--logs <dir>` | Keep each run's stderr and JSON report in this directory. |
 | `--json` | Print one JSON object with every run and the summary. |
 ### `rune connect [<name>] [--json]`
 
