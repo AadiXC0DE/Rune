@@ -170,7 +170,7 @@ fn encode_message(message: &Message, plan: &RequestPlan) -> Result<serde_json::V
         // Tool results are user-role content blocks in this dialect.
         Role::Tool => Ok(serde_json::json!({
             "role": "user",
-            "content": encode_tool_blocks(message),
+            "content": encode_tool_blocks(message, plan),
         })),
     }
 }
@@ -252,22 +252,44 @@ fn encode_assistant_blocks(message: &Message) -> Vec<serde_json::Value> {
 }
 
 /// Encodes tool results as user content blocks.
-fn encode_tool_blocks(message: &Message) -> Vec<serde_json::Value> {
-    let mut blocks = Vec::new();
+///
+/// An image that follows a result joins that result's content, which then
+/// becomes a list of a text block and image blocks. An image whose data the
+/// plan does not hold is left out.
+fn encode_tool_blocks(message: &Message, plan: &RequestPlan) -> Vec<serde_json::Value> {
+    let mut blocks: Vec<serde_json::Value> = Vec::new();
     for part in &message.parts {
-        if let ContentPart::ToolResult {
-            id,
-            content,
-            is_error,
-            ..
-        } = part
-        {
-            blocks.push(serde_json::json!({
+        match part {
+            ContentPart::ToolResult {
+                id,
+                content,
+                is_error,
+                ..
+            } => blocks.push(serde_json::json!({
                 "type": "tool_result",
                 "tool_use_id": id.as_str(),
                 "content": content,
                 "is_error": is_error,
-            }));
+            })),
+            ContentPart::Image { image } => {
+                let Some(data) = plan.image_data.get(&image.id) else {
+                    continue;
+                };
+                let Some(content) = blocks.last_mut().and_then(|block| block.get_mut("content"))
+                else {
+                    continue;
+                };
+                if let serde_json::Value::String(text) = content {
+                    *content = serde_json::json!([{ "type": "text", "text": text }]);
+                }
+                if let serde_json::Value::Array(items) = content {
+                    items.push(serde_json::json!({
+                        "type": "image",
+                        "source": {"type": "base64", "media_type": image.media_type, "data": data.as_ref()},
+                    }));
+                }
+            }
+            _ => {}
         }
     }
     blocks
@@ -1098,6 +1120,84 @@ mod tests {
         assert_eq!(message["role"], "user");
         assert_eq!(message["content"][0]["type"], "tool_result");
         assert_eq!(message["content"][0]["tool_use_id"], "toolu_1");
+    }
+
+    fn tool_turn(parts: Vec<ContentPart>) -> RequestPlan {
+        let mut plan = RequestPlan::new("m");
+        plan.messages = vec![Message {
+            role: Role::Tool,
+            parts,
+            replay: None,
+        }];
+        plan
+    }
+
+    fn result(id: &str, content: &str) -> ContentPart {
+        ContentPart::ToolResult {
+            id: ToolCallId::new(id).expect("id"),
+            name: "read_file".to_owned(),
+            content: content.to_owned(),
+            is_error: false,
+        }
+    }
+
+    fn image(id: u64) -> ContentPart {
+        ContentPart::Image {
+            image: crate::message::ImageRef {
+                id,
+                media_type: "image/png".to_owned(),
+                encoded_bytes: 4,
+            },
+        }
+    }
+
+    #[test]
+    fn a_tool_image_is_sent_inside_its_tool_result() {
+        let mut plan = tool_turn(vec![
+            result("toolu_1", "image shot.png attached"),
+            image(1),
+            result("toolu_2", "contents"),
+        ]);
+        plan.image_data.insert(1, "QUJD".into());
+        let body = Anthropic.build_request(&plan).expect("build");
+        let blocks = &body["messages"][0]["content"];
+        assert_eq!(
+            blocks[0]["content"],
+            serde_json::json!([
+                {"type": "text", "text": "image shot.png attached"},
+                {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "QUJD"}},
+            ])
+        );
+        assert_eq!(blocks[1]["content"], "contents");
+    }
+
+    #[test]
+    fn a_tool_turn_without_images_is_encoded_as_before() {
+        let plan = tool_turn(vec![result("toolu_1", "contents")]);
+        let body = Anthropic.build_request(&plan).expect("build");
+        assert_eq!(
+            body["messages"],
+            serde_json::json!([{
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_1",
+                    "content": "contents",
+                    "is_error": false,
+                    "cache_control": {"type": "ephemeral"},
+                }],
+            }])
+        );
+    }
+
+    #[test]
+    fn a_missing_image_is_left_out() {
+        let plan = tool_turn(vec![result("toolu_1", "image shot.png attached"), image(9)]);
+        let body = Anthropic.build_request(&plan).expect("build");
+        let blocks = body["messages"][0]["content"].as_array().expect("blocks");
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0]["content"], "image shot.png attached");
+        assert!(!body.to_string().contains("image_ref"));
     }
 
     #[test]

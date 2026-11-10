@@ -152,7 +152,7 @@ fn encode_message(
             Ok(())
         }
         Role::Tool => {
-            encode_tool(message, out);
+            encode_tool(message, plan, out);
             Ok(())
         }
     }
@@ -230,7 +230,10 @@ fn encode_assistant(message: &Message, out: &mut Vec<serde_json::Value>) {
 }
 
 /// Encodes tool results as function call output items.
-fn encode_tool(message: &Message, out: &mut Vec<serde_json::Value>) {
+///
+/// An output item carries text only, so images attached to the results follow
+/// the outputs in one user message.
+fn encode_tool(message: &Message, plan: &RequestPlan, out: &mut Vec<serde_json::Value>) {
     for part in &message.parts {
         if let ContentPart::ToolResult {
             id,
@@ -250,6 +253,17 @@ fn encode_tool(message: &Message, out: &mut Vec<serde_json::Value>) {
                 "output": output,
             }));
         }
+    }
+    if let Some((text, images)) = crate::provider::tool_turn_images(message, plan) {
+        let mut content = vec![serde_json::json!({ "type": "input_text", "text": text })];
+        content.extend(images.into_iter().map(|(media_type, data)| {
+            serde_json::json!({
+                "type": "input_image",
+                "detail": "auto",
+                "image_url": format!("data:{media_type};base64,{data}"),
+            })
+        }));
+        out.push(serde_json::json!({ "role": "user", "content": content }));
     }
 }
 
@@ -980,6 +994,89 @@ mod tests {
         let body = Responses.build_request(&plan).expect("build");
         assert_eq!(body["input"][0], item);
         assert_eq!(body["input"][1]["type"], "message");
+    }
+
+    fn tool_turn(parts: Vec<ContentPart>) -> RequestPlan {
+        let mut plan = RequestPlan::new("m");
+        plan.messages = vec![Message {
+            role: Role::Tool,
+            parts,
+            replay: None,
+        }];
+        plan
+    }
+
+    fn result(id: &str, content: &str) -> ContentPart {
+        ContentPart::ToolResult {
+            id: ToolCallId::new(id).expect("id"),
+            name: "read_file".to_owned(),
+            content: content.to_owned(),
+            is_error: false,
+        }
+    }
+
+    fn image(id: u64) -> ContentPart {
+        ContentPart::Image {
+            image: crate::message::ImageRef {
+                id,
+                media_type: "image/png".to_owned(),
+                encoded_bytes: 4,
+            },
+        }
+    }
+
+    #[test]
+    fn a_tool_image_follows_the_tool_messages_as_a_user_message() {
+        let mut plan = tool_turn(vec![
+            result("call_1", "image a.png attached"),
+            image(1),
+            result("call_2", "contents"),
+        ]);
+        plan.image_data.insert(1, "QUJD".into());
+        let body = Responses.build_request(&plan).expect("build");
+        let input = body["input"].as_array().expect("array");
+        assert_eq!(input.len(), 3);
+        assert_eq!(input[0]["type"], "function_call_output");
+        assert_eq!(input[0]["output"], "image a.png attached");
+        assert_eq!(input[1]["call_id"], "call_2");
+        assert_eq!(
+            input[2],
+            serde_json::json!({
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": "Images from the tool results above."},
+                    {"type": "input_image", "detail": "auto", "image_url": "data:image/png;base64,QUJD"},
+                ],
+            })
+        );
+    }
+
+    #[test]
+    fn a_tool_turn_without_images_is_encoded_as_before() {
+        let plan = tool_turn(vec![result("call_1", "contents")]);
+        let body = Responses.build_request(&plan).expect("build");
+        assert_eq!(
+            body["input"],
+            serde_json::json!([{
+                "type": "function_call_output",
+                "call_id": "call_1",
+                "output": "contents",
+            }])
+        );
+    }
+
+    #[test]
+    fn a_missing_image_is_left_out() {
+        let plan = tool_turn(vec![result("call_1", "image a.png attached"), image(1)]);
+        let body = Responses.build_request(&plan).expect("build");
+        assert_eq!(
+            body["input"][1]["content"],
+            serde_json::json!([{
+                "type": "input_text",
+                "text": "Images from the tool results above are no longer available.",
+            }])
+        );
+        assert!(!body.to_string().contains("image-ref"));
     }
 
     #[test]

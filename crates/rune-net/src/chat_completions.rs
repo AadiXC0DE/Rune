@@ -87,7 +87,7 @@ impl Provider for ChatCompletions {
                 // One tool message can carry a whole batch of results, because
                 // the history groups them, so it expands to one wire message per
                 // result rather than being collapsed to its first.
-                messages.extend(encode_tool_messages(message));
+                messages.extend(encode_tool_messages(message, plan));
                 continue;
             }
             messages.push(encode_message(message, plan)?);
@@ -247,8 +247,11 @@ fn encode_assistant(message: &Message) -> serde_json::Value {
 /// calls were made. A message holding several results is the shape a batch
 /// produces, and emitting only the first leaves the other calls unanswered,
 /// which an endpoint rejects as a malformed conversation.
-fn encode_tool_messages(message: &Message) -> Vec<serde_json::Value> {
-    message
+///
+/// A tool message carries text only in this dialect, so images attached to
+/// the results follow them in one user message.
+fn encode_tool_messages(message: &Message, plan: &RequestPlan) -> Vec<serde_json::Value> {
+    let mut messages: Vec<serde_json::Value> = message
         .parts
         .iter()
         .filter_map(|part| match part {
@@ -268,7 +271,18 @@ fn encode_tool_messages(message: &Message) -> Vec<serde_json::Value> {
             })),
             _ => None,
         })
-        .collect()
+        .collect();
+    if let Some((text, images)) = crate::provider::tool_turn_images(message, plan) {
+        let mut content = vec![serde_json::json!({ "type": "text", "text": text })];
+        content.extend(images.into_iter().map(|(media_type, data)| {
+            serde_json::json!({
+                "type": "image_url",
+                "image_url": { "url": format!("data:{media_type};base64,{data}") },
+            })
+        }));
+        messages.push(serde_json::json!({ "role": "user", "content": content }));
+    }
+    messages
 }
 
 /// Maps a reasoning effort onto the dialect's spelling.
@@ -944,6 +958,105 @@ mod tests {
         }];
         let body = ChatCompletions.build_request(&plan).expect("build");
         assert!(body["messages"].as_array().expect("array").is_empty());
+    }
+
+    fn tool_turn(parts: Vec<ContentPart>) -> RequestPlan {
+        let mut plan = RequestPlan::new("m");
+        plan.messages = vec![Message {
+            role: Role::Tool,
+            parts,
+            replay: None,
+        }];
+        plan
+    }
+
+    fn result(id: &str, content: &str) -> ContentPart {
+        ContentPart::ToolResult {
+            id: ToolCallId::new(id).expect("id"),
+            name: "read_file".to_owned(),
+            content: content.to_owned(),
+            is_error: false,
+        }
+    }
+
+    fn image(id: u64) -> ContentPart {
+        ContentPart::Image {
+            image: crate::message::ImageRef {
+                id,
+                media_type: "image/png".to_owned(),
+                encoded_bytes: 4,
+            },
+        }
+    }
+
+    #[test]
+    fn a_tool_image_follows_the_tool_messages_as_a_user_message() {
+        let mut plan = tool_turn(vec![
+            result("call_1", "image a.png attached"),
+            image(1),
+            result("call_2", "image b.png attached"),
+            image(2),
+        ]);
+        plan.image_data.insert(1, "QUJD".into());
+        plan.image_data.insert(2, "REVG".into());
+        let body = ChatCompletions.build_request(&plan).expect("build");
+        let messages = body["messages"].as_array().expect("array");
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0]["tool_call_id"], "call_1");
+        assert_eq!(messages[0]["content"], "image a.png attached");
+        assert_eq!(messages[1]["tool_call_id"], "call_2");
+        assert_eq!(
+            messages[2],
+            serde_json::json!({
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Images from the tool results above."},
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,QUJD"}},
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,REVG"}},
+                ],
+            })
+        );
+    }
+
+    #[test]
+    fn a_tool_turn_without_images_is_encoded_as_before() {
+        let plan = tool_turn(vec![result("call_1", "contents")]);
+        let body = ChatCompletions.build_request(&plan).expect("build");
+        assert_eq!(
+            body["messages"],
+            serde_json::json!([{
+                "role": "tool",
+                "content": "contents",
+                "tool_call_id": "call_1",
+                "is_error": false,
+            }])
+        );
+    }
+
+    #[test]
+    fn a_missing_image_is_left_out() {
+        let mut plan = tool_turn(vec![
+            result("call_1", "image a.png attached"),
+            image(1),
+            result("call_2", "image b.png attached"),
+            image(2),
+        ]);
+        plan.image_data.insert(2, "REVG".into());
+        let body = ChatCompletions.build_request(&plan).expect("build");
+        let content = body["messages"][2]["content"].as_array().expect("parts");
+        assert_eq!(content.len(), 2);
+        assert_eq!(content[1]["image_url"]["url"], "data:image/png;base64,REVG");
+
+        let plan = tool_turn(vec![result("call_1", "image a.png attached"), image(1)]);
+        let body = ChatCompletions.build_request(&plan).expect("build");
+        assert_eq!(
+            body["messages"][1]["content"],
+            serde_json::json!([{
+                "type": "text",
+                "text": "Images from the tool results above are no longer available.",
+            }])
+        );
+        assert!(!body.to_string().contains("image-ref"));
     }
 
     #[test]

@@ -94,6 +94,37 @@ impl RequestPlan {
     }
 }
 
+/// The images a tool turn carries, for dialects that send them after the
+/// results in a user message.
+///
+/// Returns `None` when the turn holds no image. Otherwise returns the text that
+/// introduces the images and the media type and base64 data of each image whose
+/// data the plan holds; an image without data is left out.
+pub(crate) fn tool_turn_images<'a>(
+    message: &'a Message,
+    plan: &'a RequestPlan,
+) -> Option<(&'static str, Vec<(&'a str, &'a str)>)> {
+    let mut any = false;
+    let mut images = Vec::new();
+    for part in &message.parts {
+        if let ContentPart::Image { image } = part {
+            any = true;
+            if let Some(data) = plan.image_data.get(&image.id) {
+                images.push((image.media_type.as_str(), data.as_ref()));
+            }
+        }
+    }
+    if !any {
+        return None;
+    }
+    let text = if images.is_empty() {
+        "Images from the tool results above are no longer available."
+    } else {
+        "Images from the tool results above."
+    };
+    Some((text, images))
+}
+
 /// Rune effort selections expressible by the full reasoning dialects.
 pub const ALL_EFFORTS: &[Effort] = &[
     Effort::Auto,
