@@ -168,13 +168,14 @@ Check provider capabilities and context provenance before a turn
 | `--require-images` | Require image content support in the dialect. |
 | `--require-tool-streaming` | Require incremental tool argument streaming. |
 | `--json` | Emit JSON. |
-### `rune models [--refresh] [--json]`
+### `rune models [--refresh] [--explain [<model>]] [--json]`
 
 List the models of the connected provider
 
 | Flag | Description |
 |---|---|
 | `--refresh` | Download the published model catalog now. |
+| `--explain` | Show how requests to this model are shaped, and why. |
 | `--json` | Emit JSON. |
 ### `rune mcp list [--json] | rune mcp check [server] [--json] | rune mcp import claude-desktop <file>`
 

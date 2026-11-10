@@ -372,7 +372,22 @@ pub fn validate_controls(settings: &Settings) -> Result<()> {
     if plan.model.trim().is_empty() {
         "unselected".clone_into(&mut plan.model);
     }
+    compat_for(settings, &plan.model)?;
     dialect_for(&settings.provider).validate(&plan)
+}
+
+/// Resolves how requests to a model on the active provider are shaped, with
+/// the user's `[providers.<name>.compat]` settings applied over the built-in
+/// rules.
+pub fn compat_for(settings: &Settings, model: &str) -> Result<rune_net::compat::Resolution> {
+    let provider = settings.provider.as_str();
+    let mut resolution =
+        rune_net::compat::explain(provider, configured_base_url(settings).as_deref(), model);
+    let canonical = rune_net::compat::canonical_preset(provider);
+    if let Some((name, entry)) = settings.provider_settings(&canonical) {
+        rune_net::compat::apply_overrides(&mut resolution, name, &entry.compat)?;
+    }
+    Ok(resolution)
 }
 
 /// Projects the selected controls onto an empty preflight request.

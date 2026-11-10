@@ -2067,6 +2067,42 @@ fn listing_models_offline_reports_the_configured_model_without_a_request() {
     );
 }
 
+#[test]
+fn models_explain_names_the_rule_for_each_setting() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = camino::Utf8Path::from_path(dir.path()).expect("utf8");
+    let explain = |args: &[&str]| {
+        config_mutation_command(root)
+            .env("RUNE_PROVIDER", "deepseek")
+            .env("RUNE_MODEL", "deepseek-flash")
+            .args(args)
+            .output()
+            .expect("models --explain")
+    };
+
+    let out = explain(&["--offline", "models", "--explain"]);
+    assert!(out.status.success(), "{out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.lines().any(|line| line.contains("thinking_format")
+            && line.contains("deepseek")
+            && line.contains("preset deepseek")),
+        "{stdout}"
+    );
+    assert!(stdout.contains("model     deepseek-flash"), "{stdout}");
+
+    let out = explain(&["--offline", "models", "--explain", "--json"]);
+    assert!(out.status.success(), "{out:?}");
+    let value: serde_json::Value = serde_json::from_slice(&out.stdout).expect("valid json");
+    assert_eq!(value["provider"], "deepseek");
+    assert_eq!(value["model"], "deepseek-flash");
+    assert_eq!(value["compat"].as_array().map(Vec::len), Some(16));
+    assert!(value["traits"].as_array().is_some_and(|rows| {
+        rows.iter()
+            .any(|row| row["field"] == "family" && row["value"] == "deepseek")
+    }));
+}
+
 /// Runs `rune connect` for a machine caller, with or without the key exported.
 fn connect_json(key: Option<&str>) -> (Output, tempfile::TempDir) {
     let dir = tempfile::TempDir::new().expect("tempdir");

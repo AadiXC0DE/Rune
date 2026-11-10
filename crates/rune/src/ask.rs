@@ -1088,7 +1088,7 @@ pub fn run(
             &inventory::Tailoring {
                 workspace: &crate::current_workspace()?,
                 interactive: false,
-                edit_tool: rune_net::family::edit_tool(settings.edit_tool, &settings.model),
+                edit_tool: rune_net::compat::edit_tool(settings.edit_tool, &settings.model),
             },
         );
         registry

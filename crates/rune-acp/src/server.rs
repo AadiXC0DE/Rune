@@ -198,7 +198,7 @@ impl ServerConfig {
             &rune_tools::inventory::Tailoring {
                 workspace: &workspace,
                 interactive: true,
-                edit_tool: rune_net::family::edit_tool_for(&model),
+                edit_tool: rune_net::compat::edit_tool_for(&model),
             },
         );
         let context_window = Catalog::new("acp")
@@ -289,7 +289,7 @@ impl ServerConfig {
             &rune_tools::inventory::Tailoring {
                 workspace: &self.workspace,
                 interactive: true,
-                edit_tool: rune_net::family::edit_tool_for(&self.model),
+                edit_tool: rune_net::compat::edit_tool_for(&self.model),
             },
         );
         self.limits = limits;

@@ -6483,7 +6483,7 @@ fn session_registry(
         &inventory::Tailoring {
             workspace,
             interactive: true,
-            edit_tool: rune_net::family::edit_tool(settings.edit_tool, &settings.model),
+            edit_tool: rune_net::compat::edit_tool(settings.edit_tool, &settings.model),
         },
     );
     let mut tools: Vec<String> = registry.names().into_iter().map(str::to_owned).collect();

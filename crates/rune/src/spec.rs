@@ -452,9 +452,13 @@ pub const ACCOUNT: &[CommandSpec] = &[
         name: "models",
         aliases: &[],
         summary: "List the models of the connected provider",
-        usage: "rune models [--refresh] [--json]",
+        usage: "rune models [--refresh] [--explain [<model>]] [--json]",
         flags: &[
             flag("--refresh", "Download the published model catalog now."),
+            flag(
+                "--explain",
+                "Show how requests to this model are shaped, and why.",
+            ),
             flag("--json", "Emit JSON."),
         ],
         requirements: Requirements::NETWORK,

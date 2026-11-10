@@ -69,7 +69,21 @@ fn configure(settings: &Settings, paths: &Paths) -> Result<Option<ModelReviewer>
 
     let dialect = crate::provider_setup::dialect_for(&settings.provider);
     let effort = match kind {
-        ReviewerKind::SessionModel { .. } => review_effort(dialect.capabilities().efforts),
+        ReviewerKind::SessionModel { .. } => {
+            let (_, traits) = rune_net::compat::resolve(
+                settings.provider.as_str(),
+                Some(&base_url),
+                kind.model(),
+            );
+            let accepted: Vec<Effort> = dialect
+                .capabilities()
+                .efforts
+                .iter()
+                .copied()
+                .filter(|effort| traits.efforts.contains(effort))
+                .collect();
+            review_effort(&accepted)
+        }
         ReviewerKind::Fixed { .. } | ReviewerKind::Custom { .. } => Effort::Auto,
     };
 

@@ -815,6 +815,9 @@ fn run_models(
         }
         return Ok(ExitCode::from(EXIT_OK));
     }
+    if launch.has_flag("--explain") {
+        return run_models_explain(settings, launch, output);
+    }
     if settings.offline {
         let catalog = provider_setup::catalog_for(settings);
         if output.json {
@@ -830,6 +833,59 @@ fn run_models(
         println!("{}", serde_json::to_string_pretty(&catalog.to_json())?);
     } else {
         println!("{}", provider_setup::render_catalog(&catalog));
+    }
+    Ok(ExitCode::from(EXIT_OK))
+}
+
+/// Prints how requests to a model are shaped and the rule behind each value.
+///
+/// Read from the configuration and the built-in table alone, so it never
+/// reaches the network.
+fn run_models_explain(
+    settings: &Settings,
+    launch: &Launch,
+    output: &OutputFlags,
+) -> Result<ExitCode> {
+    let model = launch
+        .args
+        .first()
+        .map_or(settings.model.trim(), |model| model.trim())
+        .to_owned();
+    if model.is_empty() {
+        return Err(config::unconfigured_model_error());
+    }
+    let resolution = provider_setup::compat_for(settings, &model)?;
+    let endpoint = provider_setup::configured_base_url(settings);
+    if output.json {
+        let rows = |rows: &[rune_net::compat::Applied]| {
+            rows.iter()
+                .map(|row| {
+                    serde_json::json!({"field": row.field, "value": row.value, "rule": row.rule})
+                })
+                .collect::<Vec<_>>()
+        };
+        let value = serde_json::json!({
+            "provider": settings.provider.as_str(),
+            "endpoint": endpoint,
+            "model": model,
+            "compat": rows(resolution.compat_rows()),
+            "traits": rows(resolution.trait_rows()),
+        });
+        println!("{}", serde_json::to_string_pretty(&value)?);
+        return Ok(ExitCode::from(EXIT_OK));
+    }
+    println!("provider  {}", settings.provider);
+    println!("endpoint  {}", endpoint.as_deref().unwrap_or("not set"));
+    println!("model     {model}");
+    println!();
+    for (heading, rows) in [
+        ("endpoint compatibility", resolution.compat_rows()),
+        ("model traits", resolution.trait_rows()),
+    ] {
+        println!("{heading}");
+        for row in rows {
+            println!("  {:<34}  {:<22}  {}", row.field, row.value, row.rule);
+        }
     }
     Ok(ExitCode::from(EXIT_OK))
 }
@@ -1540,7 +1596,7 @@ fn run_acp(
         &rune_tools::inventory::Tailoring {
             workspace,
             interactive: true,
-            edit_tool: rune_net::family::edit_tool(settings.edit_tool, &settings.model),
+            edit_tool: rune_net::compat::edit_tool(settings.edit_tool, &settings.model),
         },
     );
 

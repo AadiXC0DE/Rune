@@ -493,6 +493,10 @@ pub struct UserConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub models: Option<BTreeMap<String, ModelEntry>>,
 
+    /// Per-provider settings, keyed by provider name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub providers: Option<BTreeMap<String, ProviderEntry>>,
+
     /// Endpoint for the active provider.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
@@ -572,6 +576,22 @@ pub struct UserConfig {
     /// Extra variables passed to shell commands: exact names, PREFIX_* patterns, or * for the whole environment. Names containing KEY, TOKEN, SECRET, PASSWORD, PASSWD or CREDENTIAL pass only when listed exactly.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shell_env: Option<Vec<String>>,
+}
+
+/// One `[providers.<name>]` table as written.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderEntry {
+    /// Request shape settings that replace the built-in ones for this provider.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compat: Option<BTreeMap<String, toml::Value>>,
+}
+
+/// The resolved settings of one provider.
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+pub struct ProviderSettings {
+    /// Request shape settings by name, each value as written.
+    pub compat: BTreeMap<String, String>,
 }
 
 /// A diagnostic produced while loading configuration.
@@ -655,6 +675,8 @@ pub struct Settings {
     pub model: String,
     /// User-configured models retained for environment and command-line provider selection.
     pub configured_models: BTreeMap<String, ModelEntry>,
+    /// Per-provider settings from the user configuration, keyed by provider name.
+    pub providers: BTreeMap<String, ProviderSettings>,
     /// Whether the web tools may reach the network.
     pub web_tools: bool,
     /// Which file-edit tool models are offered.
@@ -735,6 +757,7 @@ impl Default for Settings {
             provider: Provider::default(),
             model: String::new(),
             configured_models: BTreeMap::new(),
+            providers: BTreeMap::new(),
             pre_tool_hook: None,
             post_tool_hook: None,
             web_tools: false,
@@ -789,6 +812,19 @@ impl Settings {
             .values()
             .filter(|entry| entry.id() == self.model)
             .find_map(ModelEntry::prices)
+    }
+
+    /// Returns the active provider's settings and the name they are stored under.
+    ///
+    /// The provider's own name is looked up first, then `canonical`, the
+    /// preset name it is an alias of, so `[providers.zai]` also applies when
+    /// the provider is written `glm`.
+    #[must_use]
+    pub fn provider_settings(&self, canonical: &str) -> Option<(&str, &ProviderSettings)> {
+        [self.provider.as_str(), canonical]
+            .into_iter()
+            .find_map(|name| self.providers.get_key_value(name))
+            .map(|(name, entry)| (name.as_str(), entry))
     }
 
     /// Returns true when any layer produced a diagnostic.
@@ -1418,6 +1454,9 @@ fn apply_user(settings: &mut Settings, user: &UserConfig, layer: Layer) {
             }
         }
     }
+    if let Some(providers) = &user.providers {
+        apply_providers(settings, providers, layer);
+    }
     if let Some(mode) = user.permission_mode {
         settings.permission_mode = mode;
         settings.sources.record("permission_mode", layer);
@@ -1484,6 +1523,42 @@ fn apply_user(settings: &mut Settings, user: &UserConfig, layer: Layer) {
         layer,
         &mut settings.diagnostics,
     );
+}
+
+/// Merges `[providers.<name>.compat]` tables, keeping each value as text.
+///
+/// Every setting is a name or a boolean, so any other value type is reported
+/// and skipped rather than guessed at.
+fn apply_providers(
+    settings: &mut Settings,
+    providers: &BTreeMap<String, ProviderEntry>,
+    layer: Layer,
+) {
+    for (name, entry) in providers {
+        let Some(compat) = &entry.compat else {
+            continue;
+        };
+        let target = settings.providers.entry(name.clone()).or_default();
+        for (key, value) in compat {
+            let text = match value {
+                toml::Value::String(text) => text.clone(),
+                toml::Value::Boolean(flag) => flag.to_string(),
+                _ => {
+                    settings.diagnostics.push(
+                        Diagnostic::new(
+                            layer,
+                            ErrorCode::InvalidField,
+                            format!("`{key}` takes a string or a boolean"),
+                        )
+                        .with_key(format!("providers.{name}.compat.{key}")),
+                    );
+                    continue;
+                }
+            };
+            target.compat.insert(key.clone(), text);
+        }
+    }
+    settings.sources.record("providers", layer);
 }
 
 /// Applies a project configuration, ignoring anything not repository safe.
@@ -2274,6 +2349,64 @@ mod tests {
         assert_eq!(settings.edit_tool, EditToolSetting::Auto);
         assert_eq!(settings.source_of("edit_tool"), Layer::Default);
         assert!(!settings.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn a_provider_compat_table_round_trips() {
+        let text = "provider = \"glm\"\n\n\
+                    [providers.deepseek.compat]\n\
+                    thinking_format = \"none\"\n\
+                    reasoning_always = false\n\n\
+                    [providers.zai.compat]\n\
+                    strict_schema = true\n\
+                    tool_call_id = 9\n";
+        let parsed: UserConfig = toml::from_str(text).expect("parse");
+        let written = toml::to_string(&parsed).expect("serialize");
+        let reparsed: UserConfig = toml::from_str(&written).expect("reparse");
+        assert_eq!(
+            reparsed.providers.as_ref().map(BTreeMap::len),
+            parsed.providers.as_ref().map(BTreeMap::len)
+        );
+
+        let dir = TempDir::new().expect("tempdir");
+        let user = write(&dir, "config.toml", text);
+        let settings = load(None, Some(&user), &empty_env());
+        assert_eq!(
+            settings
+                .providers
+                .get("deepseek")
+                .map(|entry| &entry.compat),
+            Some(&BTreeMap::from([
+                ("reasoning_always".to_owned(), "false".to_owned()),
+                ("thinking_format".to_owned(), "none".to_owned()),
+            ]))
+        );
+        assert_eq!(
+            settings.providers.get("zai").map(|entry| &entry.compat),
+            Some(&BTreeMap::from([(
+                "strict_schema".to_owned(),
+                "true".to_owned()
+            )]))
+        );
+        let diagnostic = settings
+            .diagnostics
+            .iter()
+            .find(|diagnostic| {
+                diagnostic.key.as_deref() == Some("providers.zai.compat.tool_call_id")
+            })
+            .expect("a non-scalar value is reported");
+        assert_eq!(
+            diagnostic.message,
+            "`tool_call_id` takes a string or a boolean"
+        );
+        assert!(settings.require_valid_user_config().is_ok());
+        assert_eq!(
+            settings
+                .provider_settings("zai")
+                .map(|(name, entry)| (name, entry.compat.len())),
+            Some(("zai", 1))
+        );
+        assert!(settings.provider_settings("glm").is_none());
     }
 
     #[test]

@@ -326,7 +326,7 @@ pub fn validate_url(url: &str) -> Result<()> {
 ///
 /// A bracketed IPv6 literal is returned with its brackets removed, because the
 /// colons inside it are not a port separator.
-fn host_of(after_scheme: &str) -> &str {
+pub(crate) fn host_of(after_scheme: &str) -> &str {
     let authority = after_scheme
         .split(['/', '?', '#'])
         .next()
@@ -343,7 +343,7 @@ fn host_of(after_scheme: &str) -> &str {
 }
 
 /// Returns true when a host is a loopback address.
-fn is_loopback_host(host: &str) -> bool {
+pub(crate) fn is_loopback_host(host: &str) -> bool {
     matches!(host, "127.0.0.1" | "localhost" | "::1")
 }
 
