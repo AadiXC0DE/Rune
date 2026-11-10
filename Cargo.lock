@@ -985,6 +985,7 @@ dependencies = [
  "rune-policy",
  "rune-session",
  "rune-term",
+ "rune-testkit",
  "rune-tools",
  "serde",
  "serde_json",

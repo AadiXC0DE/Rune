@@ -36,3 +36,4 @@ flate2.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+rune-testkit.workspace = true

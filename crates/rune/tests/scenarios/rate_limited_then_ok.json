@@ -1,0 +1,23 @@
+{
+  "prompt": "Say done.",
+  "workspace": "workspaces/readme_only.json",
+  "turns": [
+    {
+      "http_error": {
+        "status": 429,
+        "body": "{\"error\":{\"message\":\"rate limited\"}}",
+        "headers": {
+          "retry-after": "0"
+        }
+      }
+    },
+    {
+      "text": "Done."
+    }
+  ],
+  "expect": {
+    "exit_code": 0,
+    "final_output": "Done.",
+    "requests": 2
+  }
+}
