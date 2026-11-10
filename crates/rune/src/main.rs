@@ -1578,10 +1578,16 @@ fn run_bench(launch: &Launch, output: &OutputFlags) -> Result<ExitCode> {
                 .collect()
         })
         .unwrap_or_default();
+    let split = match launch.flag("--split") {
+        None => bench::SplitFilter::All,
+        Some(raw) => bench::SplitFilter::parse(raw)
+            .ok_or_else(|| RuneError::invalid_field("--split", "expected dev, heldout or all"))?,
+    };
     let mut tasks = bench::discover(Utf8Path::new(root))?;
     if !only.is_empty() {
         tasks.retain(|task| only.contains(&task.id.as_str()));
     }
+    tasks.retain(|task| split.admits(&task.task));
     if tasks.is_empty() {
         return Err(RuneError::new(
             ErrorCode::NotFound,

@@ -244,7 +244,7 @@ pub const RUN: &[CommandSpec] = &[
         name: "bench",
         aliases: &[],
         summary: "Measure the configured model and harness on coding tasks",
-        usage: "rune bench <tasks-dir> [--only <ids>] [--trials <n>] [--json]",
+        usage: "rune bench <tasks-dir> [--only <ids>] [--trials <n>] [--split <name>] [--json]",
         flags: &[
             option(
                 "--only",
@@ -252,6 +252,11 @@ pub const RUN: &[CommandSpec] = &[
                 "Run only these comma-separated task identifiers.",
             ),
             option("--trials", "n", "Run each task this many times, 1 to 20."),
+            option(
+                "--split",
+                "name",
+                "Run only tasks of this split: dev, heldout or all.",
+            ),
             flag(
                 "--json",
                 "Print one JSON object with every run and the summary.",
