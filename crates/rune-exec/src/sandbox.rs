@@ -264,8 +264,50 @@ pub fn detect() -> Box<dyn Sandbox> {
     Box::new(NullSandbox)
 }
 
+/// Returns true when this process appears to run inside a container.
+///
+/// Docker leaves `/.dockerenv`, Podman `/run/.containerenv`, and systemd-nspawn
+/// and others set `container`. A container is usually its own isolation
+/// boundary, which changes the advice for a refused command.
+#[must_use]
+pub fn in_container() -> bool {
+    in_container_with(
+        |path| std::path::Path::new(path).exists(),
+        std::env::var("container").ok(),
+    )
+}
+
+/// [`in_container`] with the file check and the variable supplied.
+fn in_container_with(exists: impl Fn(&str) -> bool, variable: Option<String>) -> bool {
+    exists("/.dockerenv")
+        || exists("/run/.containerenv")
+        || variable.is_some_and(|value| !value.is_empty())
+}
+
+/// What the namespace helper's failure output most likely means.
+fn namespace_failure(helper: &str, observed: &str) -> String {
+    const PERMISSION: &[&str] = &[
+        "no permissions to create new namespace",
+        "operation not permitted",
+        "setting up uid map",
+        "creating new namespace failed",
+    ];
+    let lower = observed.to_ascii_lowercase();
+    if PERMISSION.iter().any(|marker| lower.contains(marker)) {
+        let first = observed.lines().next().unwrap_or(observed).trim();
+        format!("unprivileged user namespaces are unavailable here ({first})")
+    } else {
+        format!("`{helper}` could not build a namespace: {observed}")
+    }
+}
+
 /// Builds the error for a restriction that cannot be applied.
 fn unavailable(backend: &str, support: &Support) -> RuneError {
+    unavailable_with(backend, support, in_container())
+}
+
+/// [`unavailable`] with whether this is a container supplied.
+fn unavailable_with(backend: &str, support: &Support, container: bool) -> RuneError {
     let reason = support.reason().unwrap_or("the backend cannot enforce it");
     let refused = match support {
         Support::Full => "the backend reported full enforcement but produced no command",
@@ -276,9 +318,13 @@ fn unavailable(backend: &str, support: &Support) -> RuneError {
         ErrorCode::Unsupported,
         format!("{backend} refused to run the command: {refused}: {reason}"),
     )
-    .with_hint(format!(
-        "pass {UNSANDBOXED_OVERRIDE} to run the command with no sandbox"
-    ))
+    .with_hint(if container {
+        format!(
+            "this looks like a container; pass {UNSANDBOXED_OVERRIDE} to run commands without Rune's sandbox"
+        )
+    } else {
+        format!("pass {UNSANDBOXED_OVERRIDE} to run the command with no sandbox")
+    })
 }
 
 /// Returns the error for a path the backend cannot express a rule about.
@@ -930,10 +976,7 @@ fn find_on_path(program: &str) -> Option<Utf8PathBuf> {
 fn probe_namespaces(helper: Option<&Utf8Path>) -> Support {
     let Some(helper) = helper else {
         return Support::Unsupported {
-            reason: format!(
-                "the `{NAMESPACE_HELPER}` helper is not on PATH on {}",
-                std::env::consts::OS
-            ),
+            reason: "the bubblewrap helper (bwrap) is not installed".to_owned(),
         };
     };
     match Command::new(helper.as_str())
@@ -950,10 +993,7 @@ fn probe_namespaces(helper: Option<&Utf8Path>) -> Support {
     {
         Ok(output) if output.status.success() => Support::Full,
         Ok(output) => Support::Partial {
-            reason: format!(
-                "`{helper}` could not build a namespace: {}",
-                observed(&output)
-            ),
+            reason: namespace_failure(helper.as_str(), &observed(&output)),
         },
         Err(err) => Support::Unsupported {
             reason: format!("`{helper}` could not be run: {err}"),
@@ -965,6 +1005,58 @@ fn probe_namespaces(helper: Option<&Utf8Path>) -> Support {
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+
+    #[test]
+    fn container_markers_are_detected() {
+        let only = |marker: &'static str| move |path: &str| path == marker;
+        assert!(in_container_with(only("/.dockerenv"), None));
+        assert!(in_container_with(only("/run/.containerenv"), None));
+        assert!(in_container_with(|_| false, Some("podman".to_owned())));
+        assert!(!in_container_with(|_| false, Some(String::new())));
+        assert!(!in_container_with(|_| false, None));
+    }
+
+    #[test]
+    fn a_namespace_permission_failure_is_named() {
+        let message = "exit status: 1: bwrap: No permissions to create new namespace, likely because the kernel does not allow non-privileged user namespaces";
+        let reason = namespace_failure("/usr/bin/bwrap", message);
+        assert!(
+            reason.starts_with("unprivileged user namespaces are unavailable here ("),
+            "{reason}"
+        );
+        assert!(
+            reason.contains("No permissions to create new namespace"),
+            "{reason}"
+        );
+        let other = namespace_failure("/usr/bin/bwrap", "exit status: 1: bwrap: something else");
+        assert!(
+            other.starts_with("`/usr/bin/bwrap` could not build a namespace"),
+            "{other}"
+        );
+    }
+
+    #[test]
+    fn the_container_hint_replaces_the_default_hint() {
+        let support = Support::Unsupported {
+            reason: "the bubblewrap helper (bwrap) is not installed".to_owned(),
+        };
+        let container = unavailable_with("namespaces", &support, true);
+        assert_eq!(
+            container.hint(),
+            Some(
+                "this looks like a container; pass --allow-unsandboxed to run commands without Rune's sandbox"
+            )
+        );
+        assert!(
+            container.message().contains("bwrap) is not installed"),
+            "{container}"
+        );
+        let host = unavailable_with("namespaces", &support, false);
+        assert_eq!(
+            host.hint(),
+            Some("pass --allow-unsandboxed to run the command with no sandbox")
+        );
+    }
 
     use tempfile::TempDir;
 

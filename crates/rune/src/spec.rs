@@ -152,7 +152,7 @@ pub const GLOBAL_FLAGS: &[FlagSpec] = &[
     ),
     flag(
         "--allow-unsandboxed",
-        "Run commands where the host has no sandbox backend. Without this, such a host refuses them.",
+        "Run commands where the host has no sandbox backend. Without this, such a host refuses them. Also RUNE_ALLOW_UNSANDBOXED=1.",
     ),
     flag(
         "--network",

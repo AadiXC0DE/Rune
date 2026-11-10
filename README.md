@@ -357,6 +357,20 @@ usage use the native wire format. The Rust SDK selects it with `Dialect::Gemini`
 This dialect uses the model's automatic thinking settings; explicit reasoning
 effort and fast mode currently return `unsupported`.
 
+## Running in a container
+
+Containers usually cannot create the namespaces Rune's Linux sandbox needs, so
+commands are refused there, with a message that says so. The container is the
+isolation boundary; run Rune without its own sandbox:
+
+```sh
+RUNE_PROVIDER=openai RUNE_MODEL=<model> OPENAI_API_KEY=<key> \
+rune --permission-mode full-access --allow-unsandboxed ask --json -- "<task>"
+```
+
+`RUNE_ALLOW_UNSANDBOXED=1` does the same as `--allow-unsandboxed`. Commands then
+have the container's network unless the container itself restricts it.
+
 ## Use
 
 ```sh

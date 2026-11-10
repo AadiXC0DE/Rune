@@ -39,6 +39,9 @@ Notable changes, newest first. Each entry describes what a user can observe.
 - `rune ask` compacts a long run before it reaches the context window, as the
   interactive session does, and counts the summary requests in its usage and
   cost.
+- A refused command in a container says it looks like a container and to pass
+  `--allow-unsandboxed`, and a missing or blocked bubblewrap is named in plain
+  words. `RUNE_ALLOW_UNSANDBOXED=1` is the environment form of the flag.
 - `--network`, `RUNE_NETWORK=1` or `shell_network = true` lets sandboxed shell
   commands use the network, and `/network on|off` switches it in a session;
   `--offline` still wins and a repository cannot grant it. A command that fails

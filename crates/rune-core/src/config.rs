@@ -928,6 +928,8 @@ pub struct EnvironmentOverrides {
     pub web_tools: Option<bool>,
     /// `RUNE_NETWORK`: whether sandboxed shell commands may use the network.
     pub network: Option<bool>,
+    /// `RUNE_ALLOW_UNSANDBOXED`: the environment form of `--allow-unsandboxed`.
+    pub allow_unsandboxed: Option<bool>,
     /// Boolean variables whose value was not a boolean, with that value.
     ///
     /// Kept so the value is reported rather than silently ignored: an
@@ -985,6 +987,7 @@ impl EnvironmentOverrides {
             offline: boolean(&mut lookup, "RUNE_OFFLINE"),
             web_tools: boolean(&mut lookup, "RUNE_WEB_TOOLS"),
             network: boolean(&mut lookup, "RUNE_NETWORK"),
+            allow_unsandboxed: boolean(&mut lookup, "RUNE_ALLOW_UNSANDBOXED"),
             invalid_booleans: Vec::new(),
         };
         out.invalid_booleans = invalid_booleans;
@@ -1605,6 +1608,10 @@ fn apply_environment(settings: &mut Settings, env: &EnvironmentOverrides) {
         settings.shell_network = network;
         settings.sources.record("shell_network", layer);
     }
+    if let Some(allow) = env.allow_unsandboxed {
+        settings.allow_unsandboxed = allow;
+        settings.sources.record("allow_unsandboxed", layer);
+    }
     if let Some(offline) = env.offline {
         settings.offline = offline;
         settings.sources.record("offline", layer);
@@ -2035,6 +2042,30 @@ mod tests {
             assert_eq!(settings.web_tools, !enabled);
             assert_eq!(settings.source_of("web_tools"), Layer::Environment);
         }
+    }
+
+    #[test]
+    fn allow_unsandboxed_reads_its_environment_variable() {
+        let with = |value: &'static str| {
+            load(
+                None,
+                None,
+                &EnvironmentOverrides::from_lookup(move |key| {
+                    (key == "RUNE_ALLOW_UNSANDBOXED").then(|| value.to_owned())
+                }),
+            )
+        };
+        assert!(!load(None, None, &empty_env()).allow_unsandboxed);
+        let settings = with("1");
+        assert!(settings.allow_unsandboxed);
+        assert_eq!(settings.source_of("allow_unsandboxed"), Layer::Environment);
+        assert!(with("yes").allow_unsandboxed);
+        let invalid = with("nope");
+        assert!(!invalid.allow_unsandboxed);
+        assert!(
+            !invalid.diagnostics.is_empty(),
+            "an invalid boolean is reported"
+        );
     }
 
     #[test]
