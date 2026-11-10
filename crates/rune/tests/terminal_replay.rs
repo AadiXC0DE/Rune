@@ -43,6 +43,40 @@ fn record(script: &str, scenario: Option<&str>) -> Vec<u8> {
     output.stdout
 }
 
+/// Replaces each figure of the context estimate and of the room left with `#`.
+///
+/// The estimate counts the system prompt, which holds the temporary workspace
+/// path, and that path is longer on some platforms than on others. The width
+/// is kept, so the layout of the status line is still compared exactly.
+fn mask_estimates(line: &str) -> String {
+    let figure = |c: char| c.is_ascii_digit() || c == '.';
+    let hidden = |count: usize| "#".repeat(count);
+    let mut after_estimate = String::with_capacity(line.len());
+    for (index, piece) in line.split("ctx ~").enumerate() {
+        if index == 0 {
+            after_estimate.push_str(piece);
+            continue;
+        }
+        let tail = piece.trim_start_matches(figure);
+        after_estimate.push_str("ctx ~");
+        after_estimate.push_str(&hidden(piece.len().saturating_sub(tail.len())));
+        after_estimate.push_str(tail);
+    }
+    let pieces: Vec<&str> = after_estimate.split("k left)").collect();
+    let mut masked = String::with_capacity(line.len());
+    for (index, piece) in pieces.iter().enumerate() {
+        if index.saturating_add(1) == pieces.len() {
+            masked.push_str(piece);
+            break;
+        }
+        let head = piece.trim_end_matches(figure);
+        masked.push_str(head);
+        masked.push_str(&hidden(piece.len().saturating_sub(head.len())));
+        masked.push_str("k left)");
+    }
+    masked
+}
+
 fn screen_snapshot(stage: &str, cols: u16, rows: u16, grid: &Grid) -> String {
     let cursor = grid.cursor();
     let mut snapshot = format!(
@@ -55,10 +89,11 @@ fn screen_snapshot(stage: &str, cols: u16, rows: u16, grid: &Grid) -> String {
             line = "session ".to_owned() + &"*".repeat(id.len());
         }
         // The fixture's temporary path and session id vary each launch. Only
-        // that suffix is masked; model, context, prompt and menu stay exact.
+        // that suffix is masked; model, prompt and menu stay exact.
         let line = line
             .split_once(" | /")
             .map_or(line.as_str(), |(status, _)| status);
+        let line = mask_estimates(line);
         writeln!(snapshot, "{row:02}|{line}|").expect("snapshot row");
     }
     snapshot
