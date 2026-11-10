@@ -529,7 +529,7 @@ impl Host for SessionHost {
     ) -> Result<()> {
         self.tool_images.hydrate(plan);
         self.check_spend()?;
-        let estimate = request_estimate(self, plan)?;
+        let estimate = request_estimate(self, plan, history.anchor())?;
         if self.context_used.load(std::sync::atomic::Ordering::Relaxed) == 0
             || self
                 .context_source
@@ -1371,7 +1371,7 @@ impl SessionHost {
         plan.fast_mode = self.fast_mode;
         plan.provider_order.clone_from(&self.provider_order);
         plan.provider_strict = self.provider_strict;
-        self.record_context_estimate(request_estimate(self, &plan)?.input_tokens);
+        self.record_context_estimate(request_estimate(self, &plan, history.anchor())?.input_tokens);
         Ok(())
     }
 
@@ -4407,6 +4407,7 @@ fn compact_history(
 fn request_estimate(
     host: &SessionHost,
     plan: &rune_net::provider::RequestPlan,
+    anchor: Option<&rune_agent::tokens::Anchor>,
 ) -> Result<rune_agent::tokens::Estimate> {
     rune_agent::compaction::request_estimate(
         host.dialect.as_ref(),
@@ -4415,6 +4416,7 @@ fn request_estimate(
             host.context_limit
                 .load(std::sync::atomic::Ordering::Relaxed),
         ),
+        anchor,
     )
 }
 
@@ -9625,7 +9627,7 @@ mod tests {
         host.capture_history(&history);
         let mut plan = rune_net::provider::RequestPlan::new(host.model());
         plan.messages = history.to_messages();
-        let tokens = request_estimate(&host, &plan)
+        let tokens = request_estimate(&host, &plan, None)
             .expect("estimate")
             .input_tokens;
         host.context_limit.store(
@@ -9793,7 +9795,7 @@ mod tests {
         let cut = rune_agent::compaction::plan(&history, &host.limits)
             .expect("plan")
             .removed_turns;
-        let estimate = request_estimate(&host, &plan).expect("estimate");
+        let estimate = request_estimate(&host, &plan, None).expect("estimate");
         assert!(estimate.used_percent() >= 50 && estimate.used_percent() < 80);
         host.prepare_request(&mut history, &mut plan, &fetch)
             .expect("automatic compaction");
@@ -9813,7 +9815,7 @@ mod tests {
             Some(Event::ContextCompacted { .. })
         ));
         assert!(
-            request_estimate(&host, &plan)
+            request_estimate(&host, &plan, None)
                 .expect("estimate")
                 .used_percent()
                 < 50
@@ -9858,7 +9860,7 @@ mod tests {
         plan.max_output_tokens = Some(128);
         host.context_limit
             .store(10_000, std::sync::atomic::Ordering::Relaxed);
-        let estimate = request_estimate(&host, &plan).expect("estimate");
+        let estimate = request_estimate(&host, &plan, None).expect("estimate");
         assert!(estimate.input_tokens > estimate.capacity);
         let cut = rune_agent::compaction::plan(&history, &host.limits).expect("cut");
         let retained = history.to_messages()[cut.removed_turns..].to_vec();
@@ -9873,7 +9875,7 @@ mod tests {
         assert_eq!(&history.to_messages()[1..], retained);
         assert_eq!(plan.messages, history.to_messages());
         assert!(
-            request_estimate(&host, &plan)
+            request_estimate(&host, &plan, None)
                 .expect("estimate")
                 .input_tokens
                 <= estimate.capacity
@@ -9893,7 +9895,7 @@ mod tests {
             let cut = rune_agent::compaction::plan(&history, &host.limits).expect("cut");
             let mut retained_plan = plan.clone();
             retained_plan.messages.drain(..cut.removed_turns);
-            let tail_tokens = request_estimate(&host, &retained_plan)
+            let tail_tokens = request_estimate(&host, &retained_plan, None)
                 .expect("tail estimate")
                 .input_tokens;
             match overhead {
@@ -9903,7 +9905,7 @@ mod tests {
             }
             retained_plan.instructions.clone_from(&plan.instructions);
             retained_plan.tools.clone_from(&plan.tools);
-            let retained_tokens = request_estimate(&host, &retained_plan)
+            let retained_tokens = request_estimate(&host, &retained_plan, None)
                 .expect("retained request estimate")
                 .input_tokens;
             if overhead != "tail" {
@@ -10022,10 +10024,10 @@ mod tests {
             .store(20_000, std::sync::atomic::Ordering::Relaxed);
         let mut plan = rune_net::provider::RequestPlan::new(host.model());
         plan.messages = rune_net::transport::one_shot_messages("hello");
-        let small = request_estimate(&host, &plan).expect("estimate");
+        let small = request_estimate(&host, &plan, None).expect("estimate");
         plan.instructions = "instructions ".repeat(100);
         plan.tools = inventory::advertisement(&host.registry);
-        let full = request_estimate(&host, &plan).expect("estimate");
+        let full = request_estimate(&host, &plan, None).expect("estimate");
         assert!(full.input_tokens > small.input_tokens);
         assert_eq!(
             full.capacity,

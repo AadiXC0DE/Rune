@@ -145,6 +145,9 @@ pub struct History {
     /// Digests of `write_file` calls refused once by the overwrite guard.
     #[serde(skip)]
     refused_overwrites: std::collections::BTreeSet<[u8; 32]>,
+    /// Reported input of the latest completed request, for the next estimate.
+    #[serde(skip)]
+    anchor: Option<crate::tokens::Anchor>,
 }
 
 /// Reads whose file digest is kept; past this, one is dropped to make room.
@@ -169,6 +172,7 @@ impl Default for History {
             read_digests: std::collections::BTreeMap::new(),
             file_views: std::collections::BTreeMap::new(),
             refused_overwrites: std::collections::BTreeSet::new(),
+            anchor: None,
         }
     }
 }
@@ -187,6 +191,7 @@ impl History {
             read_digests: std::collections::BTreeMap::new(),
             file_views: std::collections::BTreeMap::new(),
             refused_overwrites: std::collections::BTreeSet::new(),
+            anchor: None,
         }
     }
 
@@ -466,10 +471,27 @@ impl History {
         })
     }
 
+    /// Returns the reported input of the latest completed request.
+    #[must_use]
+    pub fn anchor(&self) -> Option<&crate::tokens::Anchor> {
+        self.anchor.as_ref()
+    }
+
+    /// Records the reported input of a completed request.
+    pub fn set_anchor(&mut self, anchor: crate::tokens::Anchor) {
+        self.anchor = Some(anchor);
+    }
+
+    /// Forgets the anchor, after earlier turns changed.
+    pub fn clear_anchor(&mut self) {
+        self.anchor = None;
+    }
+
     /// Truncates to the first `count` turns.
     ///
     /// Used by compaction, which replaces an old prefix with a summary.
     pub fn truncate_to(&mut self, count: usize) {
+        self.clear_anchor();
         self.turns.truncate(count);
     }
 
@@ -477,12 +499,14 @@ impl History {
     ///
     /// Used when a compaction summary replaces everything before `start`.
     pub fn keep_from(&mut self, start: u64) {
+        self.clear_anchor();
         self.turns.retain(|turn| turn.seq >= start);
         self.renumber();
     }
 
     /// Drops turns matching a sequence number.
     pub fn drop_seq(&mut self, seq: u64) {
+        self.clear_anchor();
         self.turns.retain(|turn| turn.seq != seq);
         self.renumber();
     }
@@ -504,6 +528,7 @@ impl History {
     ///
     /// Used to place a compaction summary before the retained tail.
     pub fn prepend(&mut self, role: Role, parts: Vec<ContentPart>) {
+        self.clear_anchor();
         self.turns.insert(0, Turn::new(0, role, parts));
         self.renumber();
     }
@@ -513,6 +538,7 @@ impl History {
     /// This is the shape a compaction produces: one summary turn, then the
     /// recent turns verbatim.
     pub fn replace_with_summary(&mut self, summary: impl Into<String>, keep_from_seq: u64) {
+        self.clear_anchor();
         let mut retained: Vec<Turn> = self
             .turns
             .iter()
@@ -583,6 +609,7 @@ impl History {
             read_digests: self.read_digests.clone(),
             file_views: self.file_views.clone(),
             refused_overwrites: self.refused_overwrites.clone(),
+            anchor: None,
         }
     }
 
@@ -679,6 +706,34 @@ mod tests {
             content: "ok".to_owned(),
             is_error: false,
         }
+    }
+
+    #[test]
+    fn rewriting_the_history_clears_the_anchor() {
+        let anchor = crate::tokens::Anchor {
+            dialect: "chat_completions".to_owned(),
+            model: "model-a".to_owned(),
+            input_tokens: 100,
+            measure: crate::tokens::Measure {
+                text_bytes: 400,
+                images: 0,
+            },
+        };
+        let mut history = History::new();
+        history.push_user("one");
+        history.push_assistant(vec![ContentPart::Text {
+            text: "two".to_owned(),
+        }]);
+        history.push_user("three");
+
+        history.set_anchor(anchor.clone());
+        assert_eq!(history.anchor(), Some(&anchor));
+        history.replace_with_summary("summary", 3);
+        assert_eq!(history.anchor(), None);
+
+        history.set_anchor(anchor);
+        history.keep_from(2);
+        assert_eq!(history.anchor(), None);
     }
 
     #[test]

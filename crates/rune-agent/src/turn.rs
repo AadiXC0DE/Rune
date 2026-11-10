@@ -918,7 +918,7 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
         steps = steps.saturating_add(1);
         host.emit(Event::TurnStarted { step: steps });
 
-        let (outcome, steering_arrived) = match stream_with_retry(
+        let (outcome, steering_arrived, measure) = match stream_with_retry(
             client.as_ref(),
             host,
             history,
@@ -948,6 +948,16 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
         host.observe_response(&outcome);
         usage = usage.merge_sum(outcome.usage);
         last_request = outcome.usage;
+        if let Some(input_tokens) = outcome.usage.input_tokens
+            && input_tokens > 0
+        {
+            history.set_anchor(crate::tokens::Anchor {
+                dialect: host.dialect().name().to_owned(),
+                model: host.model(),
+                input_tokens,
+                measure,
+            });
+        }
 
         text = outcome.text();
         // Reasoning is accumulated across steps, so a turn that used several
@@ -1358,7 +1368,8 @@ impl ObjectiveAccounting {
 ///
 /// Applies queued steering before rebuilding a retry request. Returns the
 /// outcome together with a flag saying whether steering is queued after the
-/// successful attempt, for the caller to apply at the next boundary.
+/// successful attempt, for the caller to apply at the next boundary, and the
+/// measure of the request that succeeded.
 #[allow(clippy::too_many_arguments)]
 fn stream_with_retry(
     client: &dyn Fetch,
@@ -1369,7 +1380,7 @@ fn stream_with_retry(
     timeouts: transport::RequestTimeouts,
     max_attempts: usize,
     cancellation: &Cancellation,
-) -> Result<(StreamOutcome, bool)> {
+) -> Result<(StreamOutcome, bool, crate::tokens::Measure)> {
     let steering = host.steering();
     let mut attempt = 0_usize;
     let mut last: Option<RuneError> = None;
@@ -1425,6 +1436,10 @@ fn stream_with_retry(
         // request, so the host's serialization no longer matches it.
         let encoded = encoded.filter(|_| host.objective_tokens_remaining().is_none());
         let mut accounting = ObjectiveAccounting::begin(host, &mut plan)?;
+        let measure = match &encoded {
+            Some(body) => crate::tokens::measure_body(body.len() as u64, &plan),
+            None => crate::tokens::measure(host.dialect(), &plan)?,
+        };
 
         // Each event is handed to the host as it is decoded, so text appears
         // while it is being produced rather than once the response has ended.
@@ -1464,7 +1479,7 @@ fn stream_with_retry(
                 if attempt > 1 {
                     host.emit(Event::ProviderRetryFinished { step });
                 }
-                return Ok((outcome, !steering.is_empty()));
+                return Ok((outcome, !steering.is_empty(), measure));
             }
             Err(err) => {
                 if err.kind() == rune_net::error::FailureKind::ContextTooLong {

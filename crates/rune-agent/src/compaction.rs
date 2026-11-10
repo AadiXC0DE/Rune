@@ -23,7 +23,10 @@ use rune_net::stream::{FinishReason, Usage};
 use rune_net::transport::{self, RequestTimeouts};
 
 use crate::history::History;
-use crate::tokens::{CapacityDecision, Estimate, UsageTotals, decide_capacity, trigger_percent};
+use crate::tokens::{
+    Anchor, CapacityDecision, Estimate, UsageTotals, decide_capacity, estimate_input, measure_body,
+    trigger_percent,
+};
 use crate::turn::{self, Event, Host};
 
 /// A model's context window, in tokens.
@@ -77,8 +80,9 @@ pub fn request_estimate(
     dialect: &dyn Provider,
     plan: &RequestPlan,
     window: Window,
+    anchor: Option<&Anchor>,
 ) -> Result<Estimate> {
-    encode_request(dialect, plan, window).map(|(_, estimate)| estimate)
+    encode_request(dialect, plan, window, anchor).map(|(_, estimate)| estimate)
 }
 
 /// Serializes the request exactly as the transport would and estimates it.
@@ -89,6 +93,7 @@ pub fn encode_request(
     dialect: &dyn Provider,
     plan: &RequestPlan,
     window: Window,
+    anchor: Option<&Anchor>,
 ) -> Result<(String, Estimate)> {
     let body = dialect.build_request(plan)?;
     let encoded = serde_json::to_string(&body)
@@ -100,10 +105,15 @@ pub fn encode_request(
         .find_map(|key| body.get(key).and_then(serde_json::Value::as_u64))
         .unwrap_or(0);
     let capacity = crate::tokens::usable_input_tokens(window.0, output);
-    Ok((
-        encoded,
-        Estimate::new(bytes, crate::tokens::estimate_tokens(bytes), capacity),
-    ))
+    let (input_tokens, anchored) = estimate_input(
+        measure_body(bytes, plan),
+        anchor,
+        dialect.name(),
+        &plan.model,
+    );
+    let mut estimate = Estimate::new(bytes, input_tokens, capacity);
+    estimate.calibrated = anchored;
+    Ok((encoded, estimate))
 }
 
 /// Summarizes the turns `plan` removes and installs the summary.
@@ -238,7 +248,7 @@ pub fn auto_compact_encoded(
     window: Window,
 ) -> Result<(Option<AutoCompaction>, String)> {
     let limits = host.limits();
-    let (encoded, estimate) = encode_request(host.dialect(), request, window)?;
+    let (encoded, estimate) = encode_request(host.dialect(), request, window, history.anchor())?;
     // A request under the trigger needs no look at the retained tail, which
     // costs a second serialization of nearly the whole conversation: the tail
     // is smaller, so it fits whenever the whole request does.
@@ -253,7 +263,12 @@ pub fn auto_compact_encoded(
         let mut retained_history = history.clone();
         retained_history.keep_from(cut.cut_at);
         retained_plan.messages = retained_history.to_messages();
-        request_estimate(host.dialect(), &retained_plan, window)?
+        request_estimate(
+            host.dialect(),
+            &retained_plan,
+            window,
+            retained_history.anchor(),
+        )?
     } else {
         estimate
     };
@@ -273,7 +288,7 @@ pub fn auto_compact_encoded(
     host.context_replaced(&report);
     request.instructions = host.instructions();
     request.messages = history.to_messages();
-    let (encoded, after) = encode_request(host.dialect(), request, window)?;
+    let (encoded, after) = encode_request(host.dialect(), request, window, history.anchor())?;
     host.emit(Event::ContextCompacted {
         removed_turns: report.removed_turns,
         remaining_turns: history.len(),

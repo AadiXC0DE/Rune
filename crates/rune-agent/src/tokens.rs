@@ -1,29 +1,106 @@
 //! Token accounting and context budgets.
 //!
-//! The estimator drives the compaction trigger, so its accuracy matters: too
-//! coarse and compaction fires late and the request is rejected, too eager and
-//! the session summarizes constantly. It is a byte-derived heuristic calibrated
-//! per model from observed usage, and the calibration is stored rather than
-//! recomputed.
+//! The estimate drives the compaction trigger. It is the provider's reported
+//! input for the latest request, plus four bytes per token for whatever was
+//! added since; with no report yet it is four bytes per token for the whole
+//! request.
 
 use rune_core::budget::{BudgetSet, LimitName};
+use rune_core::error::{ErrorCode, Result, RuneError};
+use rune_net::message::ContentPart;
+use rune_net::provider::{Provider, RequestPlan};
 use serde::{Deserialize, Serialize};
 
 /// Divisor applied to a byte count to estimate tokens.
 ///
 /// Four bytes per token is the long-standing working figure for English text and
-/// source code in the byte-pair vocabularies the current models use. It is a
-/// starting point that calibration replaces.
+/// source code in the byte-pair vocabularies the current models use. It applies
+/// to whatever the provider has not yet counted.
 pub const DEFAULT_BYTES_PER_TOKEN: u64 = 4;
 
-/// Plausible range for an observed bytes-per-token ratio.
-///
-/// An observation outside this range is not a measurement of the tokenizer: it
-/// is a degenerate report, such as a byte count with a near-zero token count.
-/// Folding one in would corrupt the estimate for every later decision, so it is
-/// rejected rather than clamped.
-const MIN_PLAUSIBLE_BYTES_PER_TOKEN: f64 = 1.0;
-const MAX_PLAUSIBLE_BYTES_PER_TOKEN: f64 = 16.0;
+/// Tokens charged for one image, whatever its encoded size.
+pub const IMAGE_TOKENS: u64 = 1_500;
+
+/// The size of one built request, measured the way the estimate needs it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct Measure {
+    /// Serialized body bytes, minus the base64 bytes of attached images.
+    pub text_bytes: u64,
+    /// Image parts in the request.
+    pub images: u64,
+}
+
+/// Reported input of one completed request, kept to anchor the next estimate.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Anchor {
+    /// Dialect name (`Provider::name`) and model the request went to.
+    pub dialect: String,
+    pub model: String,
+    /// Input tokens the provider reported, cached parts included.
+    pub input_tokens: u64,
+    /// The measure of that request.
+    pub measure: Measure,
+}
+
+/// Measures a plan as the dialect would send it.
+pub fn measure(dialect: &dyn Provider, plan: &RequestPlan) -> Result<Measure> {
+    let body = dialect.build_request(plan)?;
+    let bytes = serde_json::to_vec(&body)
+        .map_err(|err| RuneError::new(ErrorCode::Internal, err.to_string()))?
+        .len() as u64;
+    Ok(measure_body(bytes, plan))
+}
+
+/// Measures a plan whose serialized body is `body_bytes` long.
+pub(crate) fn measure_body(body_bytes: u64, plan: &RequestPlan) -> Measure {
+    let mut measure = Measure {
+        text_bytes: body_bytes,
+        images: 0,
+    };
+    for part in plan.messages.iter().flat_map(|message| &message.parts) {
+        if let ContentPart::Image { image } = part {
+            measure.images = measure.images.saturating_add(1);
+            if let Some(data) = plan.image_data.get(&image.id) {
+                measure.text_bytes = measure.text_bytes.saturating_sub(data.len() as u64);
+            }
+        }
+    }
+    measure
+}
+
+/// Estimates the input tokens of a request.
+/// Returns the estimate and whether it was anchored.
+#[must_use]
+pub fn estimate_input(
+    now: Measure,
+    anchor: Option<&Anchor>,
+    dialect: &str,
+    model: &str,
+) -> (u64, bool) {
+    if let Some(anchor) = anchor
+        && anchor.dialect == dialect
+        && anchor.model == model
+        && now.text_bytes >= anchor.measure.text_bytes
+        && now.images >= anchor.measure.images
+    {
+        let appended = estimate_tokens(now.text_bytes.saturating_sub(anchor.measure.text_bytes));
+        let images = now
+            .images
+            .saturating_sub(anchor.measure.images)
+            .saturating_mul(IMAGE_TOKENS);
+        return (
+            anchor
+                .input_tokens
+                .saturating_add(appended)
+                .saturating_add(images),
+            true,
+        );
+    }
+    (
+        estimate_tokens(now.text_bytes).saturating_add(now.images.saturating_mul(IMAGE_TOKENS)),
+        false,
+    )
+}
 
 /// An estimate of the tokens a request will occupy.
 ///
@@ -41,7 +118,7 @@ pub struct Estimate {
     pub output_tokens: u64,
     /// Usable input capacity for this model.
     pub capacity: u64,
-    /// Whether the estimate was calibrated against observed usage.
+    /// Whether the estimate was anchored on provider-reported usage.
     pub calibrated: bool,
 }
 
@@ -92,81 +169,10 @@ impl Estimate {
     }
 }
 
-/// Estimates tokens from a byte count.
-///
-/// The divisor is not a guess at the model's tokenizer: it is a stable working
-/// figure that the calibration below corrects once a real response reports its
-/// own counts.
+/// Estimates tokens from a byte count, rounding up.
 #[must_use]
 pub fn estimate_tokens(bytes: u64) -> u64 {
-    bytes.saturating_div(DEFAULT_BYTES_PER_TOKEN)
-}
-
-/// Per-model calibration derived from observed usage.
-#[derive(Clone, Copy, PartialEq, Debug, Serialize, Deserialize)]
-pub struct Calibration {
-    /// Bytes per token observed for this model.
-    pub bytes_per_token: f64,
-    /// Requests this calibration was derived from.
-    pub samples: u32,
-}
-
-impl Default for Calibration {
-    fn default() -> Self {
-        Self {
-            bytes_per_token: DEFAULT_BYTES_PER_TOKEN as f64,
-            samples: 0,
-        }
-    }
-}
-
-impl Calibration {
-    /// Returns the divisor in use.
-    fn divisor(&self) -> f64 {
-        self.bytes_per_token
-    }
-
-    /// Folds one observed request into the calibration.
-    ///
-    /// Uses a running mean so a single unusual request moves the estimate a
-    /// little rather than a lot. An observation outside the plausible range is
-    /// rejected outright, because folding it in would corrupt every later
-    /// decision rather than merely skewing one.
-    pub fn observe(&mut self, serialized_bytes: u64, reported_input_tokens: u64) {
-        if reported_input_tokens == 0 || serialized_bytes == 0 {
-            return;
-        }
-        let observed = serialized_bytes as f64 / reported_input_tokens as f64;
-        if !observed.is_finite()
-            || observed < MIN_PLAUSIBLE_BYTES_PER_TOKEN
-            || observed > MAX_PLAUSIBLE_BYTES_PER_TOKEN
-        {
-            return;
-        }
-        let samples = f64::from(self.samples);
-        // Weight the new observation at one over the sample count, so the first
-        // sample defines the value and each later one nudges it.
-        let weight = 1.0 / (samples + 1.0);
-        self.bytes_per_token = self
-            .bytes_per_token
-            .mul_add(1.0 - weight, observed * weight);
-        self.samples = self.samples.saturating_add(1);
-    }
-
-    /// Estimates tokens with this calibration applied.
-    #[must_use]
-    pub fn estimate(&self, bytes: u64) -> u64 {
-        let divisor = self.divisor();
-        if !divisor.is_finite() || divisor < f64::EPSILON {
-            return estimate_tokens(bytes);
-        }
-        let tokens = bytes as f64 / divisor;
-        if !tokens.is_finite() || tokens < 0.0 {
-            return estimate_tokens(bytes);
-        }
-        // A saturating cast: an absurdly large input clamps rather than wrapping.
-        tokens.min(u64::MAX as f64) as u64
-    }
+    bytes.div_ceil(DEFAULT_BYTES_PER_TOKEN)
 }
 
 /// The usable input capacity for a model.
@@ -317,78 +323,90 @@ fn add(total: Option<u64>, reported: Option<u64>) -> Option<u64> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn the_default_estimator_divides_bytes_by_four() {
-        assert_eq!(estimate_tokens(0), 0);
-        assert_eq!(estimate_tokens(4), 1);
-        assert_eq!(estimate_tokens(400), 100);
-        assert_eq!(estimate_tokens(3), 0);
-    }
-
-    #[test]
-    fn calibration_starts_at_the_default() {
-        let calibration = Calibration::default();
-        assert!(
-            (calibration.bytes_per_token - DEFAULT_BYTES_PER_TOKEN as f64).abs() < f64::EPSILON
-        );
-        assert_eq!(calibration.samples, 0);
-    }
-
-    #[test]
-    fn calibration_moves_toward_the_first_observation() {
-        let mut calibration = Calibration::default();
-        // Eight bytes per token observed, so the estimate should rise.
-        calibration.observe(800, 100);
-        assert!(calibration.bytes_per_token > 4.0);
-        assert_eq!(calibration.samples, 1);
-        assert_eq!(calibration.estimate(800), 100);
-    }
-
-    #[test]
-    fn calibration_ignores_a_report_with_no_tokens() {
-        let mut calibration = Calibration::default();
-        calibration.observe(800, 0);
-        calibration.observe(0, 100);
-        assert_eq!(calibration.samples, 0);
-        assert!(
-            (calibration.bytes_per_token - DEFAULT_BYTES_PER_TOKEN as f64).abs() < f64::EPSILON
-        );
-    }
-
-    #[test]
-    fn one_outlier_moves_the_calibration_only_a_little() {
-        let mut calibration = Calibration::default();
-        for _ in 0..20 {
-            calibration.observe(400, 100);
+    fn anchor(input_tokens: u64, text_bytes: u64) -> Anchor {
+        Anchor {
+            dialect: "chat_completions".to_owned(),
+            model: "model-a".to_owned(),
+            input_tokens,
+            measure: Measure {
+                text_bytes,
+                images: 0,
+            },
         }
-        let settled = calibration.bytes_per_token;
-        calibration.observe(100_000, 10);
-        let moved = (calibration.bytes_per_token - settled).abs();
-        assert!(moved < settled, "one outlier dominated the calibration");
     }
 
     #[test]
-    fn an_implausible_observation_is_rejected_rather_than_clamped() {
-        let mut calibration = Calibration::default();
-        // A million bytes claiming one token is a degenerate report, not a
-        // measurement, so it must not move the calibration at all.
-        calibration.observe(1_000_000, 1);
-        assert_eq!(calibration.samples, 0);
-        assert!(
-            (calibration.bytes_per_token - DEFAULT_BYTES_PER_TOKEN as f64).abs() < f64::EPSILON
+    fn estimates_round_up() {
+        assert_eq!(estimate_tokens(5), 2);
+        assert_eq!(estimate_tokens(0), 0);
+    }
+
+    #[test]
+    fn an_anchor_adds_the_bytes_appended_since_it() {
+        let anchor = anchor(1_000, 4_000);
+        let now = Measure {
+            text_bytes: 4_401,
+            images: 0,
+        };
+        assert_eq!(
+            estimate_input(now, Some(&anchor), "chat_completions", "model-a"),
+            (1_101, true)
         );
-
-        // The same applies at the other extreme.
-        let mut low = Calibration::default();
-        low.observe(1, 1000);
-        assert_eq!(low.samples, 0);
     }
 
     #[test]
-    fn calibrated_estimation_is_bounded() {
-        let calibration = Calibration::default();
-        assert_eq!(calibration.estimate(0), 0);
-        assert!(calibration.estimate(u64::MAX) > 0);
+    fn an_anchor_from_another_model_is_ignored() {
+        let anchor = anchor(1_000, 4_000);
+        let now = Measure {
+            text_bytes: 4_401,
+            images: 0,
+        };
+        assert_eq!(
+            estimate_input(now, Some(&anchor), "chat_completions", "model-b"),
+            (1_101, false)
+        );
+        assert_eq!(
+            estimate_input(now, Some(&anchor), "anthropic", "model-a"),
+            (1_101, false)
+        );
+    }
+
+    #[test]
+    fn a_request_smaller_than_its_anchor_is_estimated_from_bytes() {
+        let anchor = anchor(5_000, 4_000);
+        let now = Measure {
+            text_bytes: 3_999,
+            images: 0,
+        };
+        assert_eq!(
+            estimate_input(now, Some(&anchor), "chat_completions", "model-a"),
+            (1_000, false)
+        );
+    }
+
+    #[test]
+    fn images_count_a_fixed_amount_whatever_their_size() {
+        let provider = rune_net::chat_completions::ChatCompletions;
+        let mut plan = RequestPlan::new("model-a");
+        plan.messages = vec![rune_net::message::Message::user_parts(vec![
+            ContentPart::Text {
+                text: "what is in this picture".to_owned(),
+            },
+            ContentPart::Image {
+                image: rune_net::message::ImageRef {
+                    id: 7,
+                    media_type: "image/png".to_owned(),
+                    encoded_bytes: 300_000,
+                },
+            },
+        ])];
+        plan.image_data.insert(7, "A".repeat(400_000).into());
+        let measured = measure(&provider, &plan).expect("measure");
+        assert_eq!(measured.images, 1);
+        assert!(measured.text_bytes < 2_000, "{measured:?}");
+        let (tokens, anchored) = estimate_input(measured, None, provider.name(), "model-a");
+        assert!(!anchored);
+        assert!(tokens < IMAGE_TOKENS + 500, "{tokens}");
     }
 
     #[test]

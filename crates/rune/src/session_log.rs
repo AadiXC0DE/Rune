@@ -1589,7 +1589,7 @@ mod tests {
             let (recorder, _) = load(&paths, &key).expect("resumed");
             let expected = match usage {
                 Some((input, output)) => (input.saturating_add(output), Some("saved usage")),
-                None => (1, Some("history bytes")),
+                None => (2, Some("history bytes")),
             };
             assert_eq!(recorder.resumed_context(), expected);
         }

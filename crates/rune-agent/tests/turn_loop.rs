@@ -1063,6 +1063,35 @@ fn usage_from_the_stream_is_reported() {
 }
 
 #[test]
+fn a_completed_request_anchors_the_next_estimate() {
+    let endpoint = MockEndpoint::start(vec![Script::text("hi")]);
+    let host = TestHost::new(endpoint);
+    let mut history = rune_agent::History::new();
+    history.push_user("hello");
+
+    run_turn(&mut history, &host).expect("turn");
+    let anchor = history.anchor().expect("anchor");
+    assert_eq!(anchor.input_tokens, 10);
+    assert_eq!(anchor.model, host.model);
+    assert_eq!(anchor.dialect, host.dialect.name());
+    assert!(anchor.measure.text_bytes > 0, "{anchor:?}");
+}
+
+#[test]
+fn a_failed_request_leaves_no_anchor() {
+    let endpoint = MockEndpoint::start(vec![Script::Status {
+        code: 400,
+        body: "bad request".to_owned(),
+    }]);
+    let host = TestHost::new(endpoint);
+    let mut history = rune_agent::History::new();
+    history.push_user("hello");
+
+    run_turn(&mut history, &host).expect_err("refused");
+    assert!(history.anchor().is_none());
+}
+
+#[test]
 fn usage_is_summed_across_steps_and_the_last_request_is_kept_apart() {
     // Each step is a request billed on its own, so the turn costs their sum.
     // How full the context is, though, is the last request's size alone.
@@ -2652,6 +2681,7 @@ fn encode_request_matches_the_transport_body() {
         host.dialect.as_ref(),
         &plan,
         rune_agent::compaction::Window(100_000),
+        None,
     )
     .expect("encoded");
     let body = host.dialect.build_request(&plan).expect("body");

@@ -650,6 +650,19 @@ fn images_survive_retries_and_tool_steps_but_are_not_replayed_on_later_prompts()
     assert!(!body.contains("image-ref:"));
 }
 
+/// A text reply with no usage frame.
+fn text_without_usage(answer: &str) -> Script {
+    match Script::text(answer) {
+        Script::Frames(frames) => Script::Frames(
+            frames
+                .into_iter()
+                .filter(|frame| !frame.contains("\"usage\""))
+                .collect(),
+        ),
+        status @ Script::Status { .. } => status,
+    }
+}
+
 #[test]
 fn a_long_prompt_turn_compacts() {
     let mut limits = BudgetSet::new();
@@ -662,12 +675,14 @@ fn a_long_prompt_turn_compacts() {
             Layer::User,
         )
         .expect("result cap");
+    // Replies report no usage, so the estimate counts request bytes, which is
+    // what the padding below is sized for.
     let mut harness = Harness::start_windowed(
         vec![
-            Script::text("first answer"),
-            Script::text("second answer"),
-            Script::text("The user asked two questions; both were answered in full."),
-            Script::text("third answer"),
+            text_without_usage("first answer"),
+            text_without_usage("second answer"),
+            text_without_usage("The user asked two questions; both were answered in full."),
+            text_without_usage("third answer"),
         ],
         PermissionMode::Auto,
         limits,
