@@ -3,7 +3,9 @@
 //! A session belongs to the tool instance rather than to the call that started
 //! it, so a command that outlives its call can be observed and stopped later.
 //! Every session runs in its own process group, which is what lets a stop end a
-//! whole tree rather than the one process Rune spawned.
+//! whole tree rather than the one process Rune spawned. A command given
+//! `timeout_ms` has its group killed at that deadline, whether or not a call is
+//! still waiting on it.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -32,8 +34,12 @@ pub const DEFAULT_INTERACT_MS: u64 = 5_000;
 /// Largest yield window a caller may request.
 ///
 /// Bounded so one call cannot hold a turn open indefinitely; a command that
-/// outlives its window is returned as a session instead.
+/// outlives its window is returned as a session instead. A command with
+/// `timeout_ms` is still killed at its deadline after the call has returned.
 pub const MAX_YIELD_MS: u64 = 600_000;
+
+/// Largest `timeout_ms` a caller may give.
+const MAX_TIMEOUT_MS: u64 = 3_600_000;
 
 /// Time spent collecting the last bytes a command writes as it exits.
 const DRAIN_WINDOW: Duration = Duration::from_millis(200);
@@ -217,6 +223,8 @@ struct Session {
     input: Input,
     /// Whether the sandbox kept this command off the network.
     network_denied: bool,
+    /// The deadline the command was given, in milliseconds.
+    timeout_ms: Option<u64>,
 }
 
 impl Session {
@@ -237,6 +245,26 @@ impl Session {
             seen: Mutex::new(seen),
             input,
             network_denied,
+            timeout_ms: None,
+        }
+    }
+
+    /// Returns the state line of a session that has ended this way, or its
+    /// timeout line when its deadline killed it.
+    fn ended_state(&self, exit: Exit) -> String {
+        match self.timeout_ms {
+            Some(timeout) if self.process.timed_out() => timeout_state(timeout),
+            _ => format!("session {} ended: {}", self.id, exit.describe()),
+        }
+    }
+
+    /// Returns the exit a result is judged by: the timeout status when the
+    /// deadline killed the command.
+    fn judged_exit(&self, exit: Exit) -> Exit {
+        if self.process.timed_out() {
+            Exit::Code(TIMEOUT_STATUS)
+        } else {
+            exit
         }
     }
 }
@@ -328,7 +356,15 @@ impl Shell {
         if command.trim().is_empty() {
             return Err(RuneError::invalid_field("command", "the command is empty"));
         }
-        let window = yield_window(arguments, DEFAULT_RUN_YIELD_MS)?;
+        let timeout = timeout_ms(arguments)?;
+        // A command with a deadline is waited on until just past it, so its
+        // timeout is usually reported by the call that started it.
+        let window = match timeout {
+            Some(timeout) if usize_arg(arguments, "yield_time_ms")?.is_none() => {
+                Duration::from_millis(timeout.saturating_add(1_000).min(MAX_YIELD_MS))
+            }
+            _ => yield_window(arguments, DEFAULT_RUN_YIELD_MS)?,
+        };
         let cwd = match string_arg(arguments, "cwd")? {
             Some(raw) => Some(resolve(context, raw)?.path),
             None => None,
@@ -373,12 +409,23 @@ impl Shell {
         // The start happens outside the map lock, because a command that runs
         // for its whole yield window would otherwise hold every other call up.
         let (process, network_denied) = start(&command, cwd.as_deref(), cap, context, input)?;
+        if let Some(timeout) = timeout {
+            process
+                .kill_after(Duration::from_millis(timeout))
+                .map_err(RuneError::from)?;
+        }
         if let Some(exit) = wait_for_exit(&process, window, context)? {
             process.drain_output(DRAIN_WINDOW);
+            let (state, exit) = match timeout {
+                Some(timeout) if process.timed_out() => {
+                    (timeout_state(timeout), Exit::Code(TIMEOUT_STATUS))
+                }
+                _ => (exit.describe(), exit),
+            };
             let (mut text, full_text) = observe(
                 &process,
                 &command,
-                &exit.describe(),
+                &state,
                 &mut (0, 0),
                 cap,
                 Some(&self.runs),
@@ -389,18 +436,20 @@ impl Shell {
             return Ok(output);
         }
 
-        let state = format!("session {id} running, {}", ended_by(process.id()));
+        // This first result is the one most easily read as a failure, so it
+        // says plainly what to do next.
+        let state = format!(
+            "still running after {} s as session {id} ({}). Do not run the command again. \
+             Use action \"interact\" with this session_id to wait for more output, or action \
+             \"stop\" to end it.",
+            seconds(u64::try_from(window.as_millis()).unwrap_or(u64::MAX)),
+            ended_by(process.id())
+        );
         let mut seen = (0, 0);
         let (text, _) = observe(&process, &command, &state, &mut seen, cap, None);
-        let session = Arc::new(Session::new(
-            id.clone(),
-            command,
-            process,
-            seen,
-            input,
-            network_denied,
-        ));
-        slot.hand_over(id, session);
+        let mut session = Session::new(id.clone(), command, process, seen, input, network_denied);
+        session.timeout_ms = timeout;
+        slot.hand_over(id, Arc::new(session));
         Ok(ToolOutput::success(text))
     }
 
@@ -480,7 +529,7 @@ impl Shell {
             session.process.drain_output(DRAIN_WINDOW);
         }
         let state = match ended {
-            Some(exit) => format!("session {id} ended: {}", exit.describe()),
+            Some(exit) => session.ended_state(exit),
             None => format!("session {id} running, {}", ended_by(session.process.id())),
         };
         let mut seen = lock(&session.seen);
@@ -497,7 +546,11 @@ impl Shell {
             // so a later call cannot report output that was already returned.
             let _ = lock(&self.state).sessions.remove(&id);
             self.keep_leftovers(Leftover::Session(Arc::clone(&held)), &mut text);
-            return Ok(finish(text, exit, session.network_denied));
+            return Ok(finish(
+                text,
+                session.judged_exit(exit),
+                session.network_denied,
+            ));
         }
         Ok(ToolOutput::success(text))
     }
@@ -526,7 +579,7 @@ impl Shell {
         let ended = session.process.terminate(force);
         session.process.drain_output(DRAIN_WINDOW);
         let state = match session.process.exit() {
-            Some(exit) => format!("session {id} ended: {}", exit.describe()),
+            Some(exit) => session.ended_state(exit),
             None => format!("session {id} survived the grace period"),
         };
         let mut seen = lock(&session.seen);
@@ -543,8 +596,9 @@ impl Shell {
         }
         // A stop that ended the group succeeded even though the command was
         // killed: the signal is how it was asked to stop, not a failure of the
-        // stop itself, and the status is stated in the result.
-        if ended {
+        // stop itself, and the status is stated in the result. A command its
+        // deadline had already killed is reported as the failure it was.
+        if ended && !session.process.timed_out() {
             Ok(ToolOutput::success(text))
         } else {
             Ok(ToolOutput::failure(text))
@@ -601,9 +655,9 @@ impl Tool for Shell {
     }
 
     fn description(&self) -> &'static str {
-        "Run a shell command. `run` returns the output and exit status, or a session_id \
-         when the command is still running after yield_time_ms. `interact` reads new output \
-         and sends chars; `stop` ends a session and its processes."
+        "Run a shell command. `run` returns the output and exit status, or a session_id if \
+         it is still running after yield_time_ms; never rerun a running command. `interact` \
+         reads new output and sends chars; `stop` ends it."
     }
 
     fn input_schema(&self) -> serde_json::Value {
@@ -656,6 +710,12 @@ impl Tool for Shell {
                     "maximum": MAX_YIELD_MS,
                     "description": "Wait before returning.",
                 },
+                "timeout_ms": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": MAX_TIMEOUT_MS,
+                    "description": "Kill the command after this long.",
+                },
                 "force": {
                     "type": "boolean",
                     "description": "Kill at once instead of stopping gracefully.",
@@ -706,6 +766,12 @@ impl Tool for Shell {
         let action = Action::parse(
             string_arg(arguments, "action")?.ok_or_else(|| RuneError::missing_field("action"))?,
         )?;
+        if action != Action::Run && arguments.get("timeout_ms").is_some() {
+            return Err(RuneError::invalid_field(
+                "timeout_ms",
+                "applies only to `run`",
+            ));
+        }
         match action {
             Action::Run => self.run(arguments, context),
             Action::Interact => self.interact(arguments, context),
@@ -1086,6 +1152,46 @@ fn yield_window(arguments: &serde_json::Value, default: u64) -> Result<Duration>
     Ok(Duration::from_millis(bounded))
 }
 
+/// Exit status a command killed at its deadline is reported with.
+const TIMEOUT_STATUS: i32 = 124;
+
+/// Reads `timeout_ms`, refusing a value outside its bounds.
+fn timeout_ms(arguments: &serde_json::Value) -> Result<Option<u64>> {
+    let Some(raw) = usize_arg(arguments, "timeout_ms")? else {
+        return Ok(None);
+    };
+    let raw = u64::try_from(raw).unwrap_or(u64::MAX);
+    if !(1..=MAX_TIMEOUT_MS).contains(&raw) {
+        return Err(RuneError::invalid_field(
+            "timeout_ms",
+            format!("`timeout_ms` must be between 1 and {MAX_TIMEOUT_MS}"),
+        ));
+    }
+    Ok(Some(raw))
+}
+
+/// Returns the state line of a command its deadline killed.
+fn timeout_state(timeout: u64) -> String {
+    format!(
+        "killed after {} s (timeout_ms), exit status {TIMEOUT_STATUS}. The output above is \
+         partial. If it needs longer, run it with a larger timeout_ms, or without one and \
+         wait with interact.",
+        seconds(timeout)
+    )
+}
+
+/// Writes milliseconds as seconds, with no fractional part when it is whole
+/// and the fraction trimmed of trailing zeros otherwise.
+fn seconds(ms: u64) -> String {
+    let (whole, fraction) = (ms / 1_000, ms % 1_000);
+    if fraction == 0 {
+        whole.to_string()
+    } else {
+        let fraction = format!("{fraction:03}");
+        format!("{whole}.{}", fraction.trim_end_matches('0'))
+    }
+}
+
 /// Waits for a process to end, or for the window to elapse.
 fn wait_for_exit(
     process: &Process,
@@ -1252,11 +1358,20 @@ mod tests {
     }
 
     /// Returns the session id and process group a running result reports.
+    ///
+    /// Reads both the first result of a `run` that yielded
+    /// (`still running after N s as session ID (GROUP). ...`) and the shorter
+    /// line of an `interact` (`session ID running, GROUP`).
     fn running(text: &str) -> (String, String) {
         let line = text
             .lines()
-            .find(|line| line.contains(" running, "))
+            .find(|line| line.contains("as session ") || line.contains(" running, "))
             .unwrap_or_else(|| panic!("no running session in {text}"));
+        if let Some((_, rest)) = line.split_once("as session ") {
+            let (id, rest) = rest.split_once(" (").expect("a session id and a group");
+            let group = rest.split_once(')').expect("the end of the group").0;
+            return (id.trim().to_owned(), group.trim().to_owned());
+        }
         let rest = line.split_once("session ").expect("a session id").1;
         let (id, group) = rest
             .split_once(" running, ")
@@ -2105,6 +2220,200 @@ mod tests {
             || rest.iter().all(|pid| !alive(pid)),
             Duration::from_secs(5)
         ));
+    }
+
+    /// The state line of a command killed at a 0.5 s deadline.
+    const HALF_SECOND_TIMEOUT: &str = "[killed after 0.5 s (timeout_ms), exit status 124. The \
+        output above is partial. If it needs longer, run it with a larger timeout_ms, or \
+        without one and wait with interact.]";
+
+    #[cfg(unix)]
+    #[test]
+    fn a_timeout_kills_the_group_and_says_the_output_is_partial() {
+        let tool = Shell::default();
+        let (_dir, context) = workspace();
+        let began = Instant::now();
+        let output = call(
+            &tool,
+            &context,
+            &serde_json::json!({
+                "action": "run",
+                "command": "echo start; echo $$; sleep 30",
+                "timeout_ms": 500,
+            }),
+        );
+        assert!(
+            began.elapsed() < Duration::from_secs(5),
+            "the call waited {:?}",
+            began.elapsed()
+        );
+        assert!(output.is_error, "{}", output.text);
+        assert!(output.text.contains("\nstart\n"), "{}", output.text);
+        assert_eq!(output.text.lines().last(), Some(HALF_SECOND_TIMEOUT));
+        let group = output
+            .text
+            .lines()
+            .find(|line| is_pid(line))
+            .expect("the shell's pid")
+            .trim()
+            .to_owned();
+        assert!(
+            wait_until(|| !group_alive(&group), Duration::from_secs(5)),
+            "the group outlived its timeout"
+        );
+        assert_eq!(tool.live_sessions(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_timeout_still_applies_after_the_call_yields() {
+        let tool = Shell::default();
+        let (_dir, context) = workspace();
+        let started = text(
+            &tool,
+            &context,
+            &serde_json::json!({
+                "action": "run",
+                "command": "sleep 30",
+                "timeout_ms": 2_000,
+                "yield_time_ms": 100,
+            }),
+        );
+        assert!(started.contains("still running after 0.1 s"), "{started}");
+        let (id, group) = running(&started);
+        let group = group.strip_prefix("process group ").expect("group id");
+        std::thread::sleep(Duration::from_millis(2_500));
+        assert!(!group_alive(group), "the deadline did not end the group");
+        let output = call(
+            &tool,
+            &context,
+            &serde_json::json!({ "action": "interact", "session_id": id }),
+        );
+        assert!(output.is_error, "{}", output.text);
+        assert!(
+            output.text.lines().last().is_some_and(
+                |line| line.starts_with("[killed after 2 s (timeout_ms), exit status 124.")
+            ),
+            "{}",
+            output.text
+        );
+        assert_eq!(tool.live_sessions(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn timeout_ms_is_refused_outside_run() {
+        let tool = Shell::default();
+        let (_dir, context) = workspace();
+        let started = text(
+            &tool,
+            &context,
+            &serde_json::json!({
+                "action": "run",
+                "command": echo_input_then_sleep(),
+                "interactive": true,
+                "yield_time_ms": 0,
+            }),
+        );
+        let (id, _group) = running(&started);
+        for action in ["interact", "stop"] {
+            let err = tool
+                .call(
+                    &serde_json::json!({
+                        "action": action,
+                        "session_id": id,
+                        "chars": "hello\n",
+                        "timeout_ms": 1_000,
+                    }),
+                    &context,
+                )
+                .expect_err("timeout_ms applies only to run");
+            assert_eq!(err.code(), ErrorCode::InvalidField);
+            assert_eq!(err.field(), Some("timeout_ms"));
+        }
+        let observed = text(
+            &tool,
+            &context,
+            &serde_json::json!({
+                "action": "interact", "session_id": id, "yield_time_ms": 200,
+            }),
+        );
+        assert!(!observed.contains("got hello"), "{observed}");
+        assert_eq!(
+            tool.live_sessions(),
+            1,
+            "the refused stop ended the session"
+        );
+        let _ = stop(&tool, &context, &id);
+
+        for bound in [0, 4_000_000] {
+            let err = tool
+                .call(
+                    &serde_json::json!({
+                        "action": "run", "command": "echo hi", "timeout_ms": bound,
+                    }),
+                    &context,
+                )
+                .expect_err("out of bounds");
+            assert_eq!(err.field(), Some("timeout_ms"));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_command_that_finishes_first_ignores_its_timeout() {
+        let tool = Shell::default();
+        let (_dir, context) = workspace();
+        let began = Instant::now();
+        let output = call(
+            &tool,
+            &context,
+            &serde_json::json!({
+                "action": "run", "command": "echo hi; exit 3", "timeout_ms": 10_000,
+            }),
+        );
+        assert!(began.elapsed() < Duration::from_secs(5));
+        assert!(output.is_error, "{}", output.text);
+        assert_eq!(output.text.lines().last(), Some("[exited with status 3]"));
+        assert!(!output.text.contains("timeout_ms"), "{}", output.text);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_yielded_run_says_not_to_run_the_command_again() {
+        let tool = Shell::default();
+        let (_dir, context) = workspace();
+        let started = text(
+            &tool,
+            &context,
+            &serde_json::json!({
+                "action": "run", "command": "sleep 30", "yield_time_ms": 100,
+            }),
+        );
+        let (id, group) = running(&started);
+        assert_eq!(
+            started.lines().last().map(str::to_owned),
+            Some(format!(
+                "[still running after 0.1 s as session {id} ({group}). Do not run the command \
+                 again. Use action \"interact\" with this session_id to wait for more output, \
+                 or action \"stop\" to end it.]"
+            ))
+        );
+        let _ = stop(&tool, &context, &id);
+    }
+
+    #[test]
+    fn the_description_does_not_grow() {
+        assert!(Shell::default().description().len() <= 219);
+    }
+
+    #[test]
+    fn seconds_drop_a_whole_fraction_and_trailing_zeros() {
+        assert_eq!(seconds(30_000), "30");
+        assert_eq!(seconds(1_500), "1.5");
+        assert_eq!(seconds(500), "0.5");
+        assert_eq!(seconds(1_250), "1.25");
+        assert_eq!(seconds(7), "0.007");
     }
 
     #[cfg(unix)]

@@ -11,6 +11,7 @@ use std::path::Path;
 use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
 
 use crate::command::{Exit, apply_limits, own_group, resource_limits};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, mpsc};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -303,6 +304,8 @@ struct Inner {
     group: u32,
     /// Whether the waiter leaves the group running after the child exits.
     leftovers: Leftovers,
+    /// Set when `kill_after` ended the process at its deadline.
+    timed_out: AtomicBool,
     #[cfg(target_os = "linux")]
     terminal: Option<std::fs::File>,
 }
@@ -453,6 +456,7 @@ impl Process {
             stderr: Buffer::new(capture_bytes),
             group,
             leftovers: options.leftovers,
+            timed_out: AtomicBool::new(false),
             #[cfg(target_os = "linux")]
             terminal,
         });
@@ -491,6 +495,40 @@ impl Process {
     #[must_use]
     pub fn exit(&self) -> Option<Exit> {
         *lock(&self.inner.exit)
+    }
+
+    /// Ends the process group once `limit` has passed, unless it has exited.
+    /// Runs on a thread of its own, so the limit holds whether or not anyone
+    /// is waiting on the process.
+    pub fn kill_after(&self, limit: Duration) -> io::Result<()> {
+        let inner = Arc::clone(&self.inner);
+        let deadline = Instant::now().checked_add(limit);
+        std::thread::Builder::new()
+            .name(String::from("rune-shell-timeout"))
+            .spawn(move || {
+                loop {
+                    if lock(&inner.exit).is_some() {
+                        return;
+                    }
+                    if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                        break;
+                    }
+                    std::thread::sleep(POLL_INTERVAL);
+                }
+                inner.timed_out.store(true, Ordering::SeqCst);
+                if !force_group(inner.group)
+                    && let Some(child) = lock(&inner.child).as_mut()
+                {
+                    let _ = child.kill();
+                }
+            })?;
+        Ok(())
+    }
+
+    /// Returns true when `kill_after` ended the process.
+    #[must_use]
+    pub fn timed_out(&self) -> bool {
+        self.inner.timed_out.load(Ordering::SeqCst)
     }
 
     /// Returns the captured standard output.
@@ -1462,6 +1500,42 @@ mod tests {
             wait_until(|| !alive(&child), Duration::from_secs(10)),
             "a dropped handle left its kept group running"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn kill_after_ends_the_group_at_its_deadline() {
+        let process = start_kept("sleep 30 & echo $!; wait", None);
+        assert!(
+            wait_until(|| forked_child(&process).is_some(), Duration::from_secs(10)),
+            "the shell did not report the child it forked"
+        );
+        let child = forked_child(&process).expect("a forked pid");
+        let began = Instant::now();
+        process
+            .kill_after(Duration::from_millis(300))
+            .expect("timer");
+        assert!(!process.timed_out());
+        assert_eq!(exit_of(&process), Exit::Signal(9));
+        assert!(
+            began.elapsed() >= Duration::from_millis(300),
+            "ended before its deadline"
+        );
+        assert!(
+            began.elapsed() < Duration::from_secs(5),
+            "ended {:?} after its deadline",
+            began.elapsed()
+        );
+        assert!(process.timed_out());
+        assert!(
+            wait_until(|| !alive(&child), Duration::from_secs(5)),
+            "the group outlived its deadline"
+        );
+
+        let quick = start_kept("exit 0", None);
+        quick.kill_after(Duration::from_secs(30)).expect("timer");
+        assert_eq!(exit_of(&quick), Exit::Code(0));
+        assert!(!quick.timed_out());
     }
 
     #[cfg(target_os = "macos")]
