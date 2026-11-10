@@ -2096,7 +2096,7 @@ fn models_explain_names_the_rule_for_each_setting() {
     let value: serde_json::Value = serde_json::from_slice(&out.stdout).expect("valid json");
     assert_eq!(value["provider"], "deepseek");
     assert_eq!(value["model"], "deepseek-flash");
-    assert_eq!(value["compat"].as_array().map(Vec::len), Some(16));
+    assert_eq!(value["compat"].as_array().map(Vec::len), Some(17));
     assert!(value["traits"].as_array().is_some_and(|rows| {
         rows.iter()
             .any(|row| row["field"] == "family" && row["value"] == "deepseek")

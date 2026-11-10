@@ -63,7 +63,6 @@ impl Tool for GitDiff {
                     "minimum": 1
                 }
             },
-            "required": [],
             "additionalProperties": false
         })
     }

@@ -127,7 +127,11 @@ impl Provider for Gemini {
                     json!({
                         "name": tool.name,
                         "description": tool.description,
-                        "parametersJsonSchema": tool.input_schema,
+                        "parametersJsonSchema": crate::schema::sanitize(
+                            &tool.input_schema,
+                            crate::compat::SchemaRules::Gemini,
+                            false,
+                        ),
                     })
                 })
                 .collect();

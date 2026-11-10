@@ -122,7 +122,11 @@ impl Provider for ChatCompletions {
                     let mut function = serde_json::json!({
                         "name": tool.name,
                         "description": tool.description,
-                        "parameters": tool.input_schema,
+                        "parameters": crate::schema::sanitize(
+                            &tool.input_schema,
+                            compat.schema_rules,
+                            compat.strict_schema,
+                        ),
                     });
                     if compat.strict_schema
                         && let Some(function) = function.as_object_mut()

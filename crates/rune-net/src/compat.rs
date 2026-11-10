@@ -156,6 +156,18 @@ named_enum! {
 }
 
 named_enum! {
+    /// The JSON Schema subset an endpoint accepts in tool schemas.
+    SchemaRules {
+        /// Any schema.
+        Plain => "plain",
+        /// Google's subset: string enums, one type, nullable.
+        Gemini => "gemini",
+        /// Moonshot's subset: bare references, one item schema.
+        Moonshot => "moonshot",
+    }
+}
+
+named_enum! {
     /// The model family an identifier belongs to.
     Family {
         /// Anthropic Claude.
@@ -248,6 +260,8 @@ pub struct EndpointCompat {
     pub parallel_tool_calls_field: bool,
     /// Whether tool schemas are sent with `strict`.
     pub strict_schema: bool,
+    /// The schema subset tool schemas are rewritten into.
+    pub schema_rules: SchemaRules,
 }
 
 impl Default for EndpointCompat {
@@ -269,12 +283,13 @@ impl Default for EndpointCompat {
             prompt_cache_key: false,
             parallel_tool_calls_field: true,
             strict_schema: false,
+            schema_rules: SchemaRules::Plain,
         }
     }
 }
 
 /// The names of the endpoint settings, in declaration order.
-const ENDPOINT_FIELDS: [&str; 16] = [
+const ENDPOINT_FIELDS: [&str; 17] = [
     "max_tokens_field",
     "system_role",
     "stream_usage",
@@ -291,12 +306,13 @@ const ENDPOINT_FIELDS: [&str; 16] = [
     "prompt_cache_key",
     "parallel_tool_calls_field",
     "strict_schema",
+    "schema_rules",
 ];
 
 impl EndpointCompat {
     /// Returns each setting's name and value, in declaration order.
     #[must_use]
-    pub fn fields(&self) -> [(&'static str, String); 16] {
+    pub fn fields(&self) -> [(&'static str, String); 17] {
         let values = [
             self.max_tokens_field.as_str().to_owned(),
             self.system_role.as_str().to_owned(),
@@ -314,6 +330,7 @@ impl EndpointCompat {
             self.prompt_cache_key.to_string(),
             self.parallel_tool_calls_field.to_string(),
             self.strict_schema.to_string(),
+            self.schema_rules.as_str().to_owned(),
         ];
         let mut values = values.into_iter();
         ENDPOINT_FIELDS.map(|name| (name, values.next().unwrap_or_default()))
@@ -347,6 +364,7 @@ impl EndpointCompat {
             "prompt_cache_key" => set_flag(&mut self.prompt_cache_key, value),
             "parallel_tool_calls_field" => set_flag(&mut self.parallel_tool_calls_field, value),
             "strict_schema" => set_flag(&mut self.strict_schema, value),
+            "schema_rules" => set_named(&mut self.schema_rules, value),
             _ => return None,
         })
     }
@@ -549,6 +567,11 @@ fn zai(compat: &mut EndpointCompat) {
 fn moonshot(compat: &mut EndpointCompat) {
     compat.reasoning_replay = ReasoningReplay::ReasoningContent;
     compat.reasoning_always = true;
+    compat.schema_rules = SchemaRules::Moonshot;
+}
+
+fn gemini_schemas(compat: &mut EndpointCompat) {
+    compat.schema_rules = SchemaRules::Gemini;
 }
 
 fn minimax(compat: &mut EndpointCompat) {
@@ -604,6 +627,10 @@ const ENDPOINT_RULES: &[EndpointRule] = &[
     on(Key::Host("api.minimax.io"), minimax),
     on(Key::Preset("xai"), cache_key),
     on(Key::Host("api.x.ai"), cache_key),
+    on(
+        Key::Host("generativelanguage.googleapis.com"),
+        gemini_schemas,
+    ),
     on(Key::Host("dashscope.aliyuncs.com"), qwen),
     on(Key::Host("dashscope-intl.aliyuncs.com"), qwen),
     on(Key::Preset("llamacpp"), chat_template),
@@ -1185,7 +1212,7 @@ mod tests {
             .collect();
         let named: Vec<&str> = resolution.applied.iter().map(|entry| entry.field).collect();
         assert_eq!(named, expected);
-        assert_eq!(resolution.compat_rows().len(), 16);
+        assert_eq!(resolution.compat_rows().len(), 17);
         assert_eq!(resolution.trait_rows().len(), 9);
         assert!(
             resolution

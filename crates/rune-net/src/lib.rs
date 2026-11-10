@@ -18,6 +18,7 @@ pub mod provider;
 pub mod providers;
 pub mod redact;
 pub mod responses;
+pub mod schema;
 pub mod sse;
 pub mod stream;
 pub mod trace;
