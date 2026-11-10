@@ -29,6 +29,10 @@ const SCENARIOS: &[&str] = &[
     "env_passthrough",
     "overwrite_guard",
     "unknown_window_no_compaction",
+    "cut_text_continues",
+    "cut_tool_call",
+    "cut_three_times",
+    "cut_empty_then_text",
 ];
 
 /// Scenarios built in Rust, which have no file.
@@ -92,6 +96,26 @@ fn rate_limited_then_ok() {
 #[test]
 fn cut_stream_then_ok() {
     run_scenario("cut_stream_then_ok");
+}
+
+#[test]
+fn cut_text_continues() {
+    run_scenario("cut_text_continues");
+}
+
+#[test]
+fn cut_tool_call() {
+    run_scenario("cut_tool_call");
+}
+
+#[test]
+fn cut_three_times() {
+    run_scenario("cut_three_times");
+}
+
+#[test]
+fn cut_empty_then_text() {
+    run_scenario("cut_empty_then_text");
 }
 
 #[test]

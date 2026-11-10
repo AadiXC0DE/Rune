@@ -799,6 +799,17 @@ const OUTPUT_LIMIT_RETRY: &str = "<harness_check>Your last reply reached the out
 token limit before giving any answer. Answer again more briefly: think less, and split \
 large writes into smaller steps.</harness_check>";
 
+/// Asks for the rest of a reply the output limit cut off.
+const CONTINUE_NOTE: &str = "<harness_check>Your reply was cut at the output limit. Continue \
+exactly where it stopped. Do not repeat or apologise. Write large files in smaller pieces.</harness_check>";
+
+/// Answers a tool call whose arguments the output limit cut off.
+const CUT_CALL_NOTE: &str = "<harness_check>Your tool call was cut at the output limit before \
+its arguments were complete. Send a smaller call: split a large write into several edits.</harness_check>";
+
+/// Consecutive continuations allowed before the turn stops at the output limit.
+const MAX_CONTINUATIONS: u32 = 2;
+
 /// Runs one turn to completion.
 ///
 /// Returns the outcome; a failure to reach a terminal state is an error, not a
@@ -810,6 +821,9 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
     let step_limit = limits.get(LimitName::MaxAgentSteps).value().unwrap_or(0);
     // One retry for a reply the output limit cut off before it said anything.
     let mut limit_retry = true;
+    // Cut replies continued in a row, and the cut text the next step continues.
+    let mut continuations: u32 = 0;
+    let mut carried = String::new();
     let mut reminders = limits
         .get(LimitName::VerificationReminders)
         .value()
@@ -982,6 +996,10 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
         }
 
         text = outcome.text();
+        if !carried.is_empty() {
+            text.insert_str(0, &carried);
+            carried.clear();
+        }
         // Reasoning is accumulated across steps, so a turn that used several
         // ends up with all of its thinking rather than only the last step's.
         let step_reasoning = outcome.reasoning();
@@ -993,6 +1011,9 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
         }
         let tool_calls = outcome.tool_calls();
         let finish = outcome.finish.unwrap_or(FinishReason::Stop);
+        if finish != FinishReason::MaxTokens {
+            continuations = 0;
+        }
 
         // Record the assistant turn, including any replay state the provider
         // requires on the next request.
@@ -1085,6 +1106,19 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
                 history.push_user(OUTPUT_LIMIT_RETRY);
                 continue;
             }
+            // A reply cut off after it said something is continued where it
+            // stopped, and the next step's text is joined to it.
+            if !last_step
+                && finish == FinishReason::MaxTokens
+                && continuations < MAX_CONTINUATIONS
+                && !text.trim().is_empty()
+                && host.objective_tokens_remaining() != Some(0)
+            {
+                continuations = continuations.saturating_add(1);
+                carried = text.clone();
+                history.push_harness_note(CONTINUE_NOTE);
+                continue;
+            }
             // A turn that changed files and stopped of its own accord is asked
             // once to check its work. No extra request is spent on a turn that
             // already checked, changed nothing, or ended for another reason.
@@ -1142,6 +1176,19 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
         // so a denial never reaches a tool. On the last step nothing runs: each
         // call is answered as refused so the record stays well formed.
         let mut repaired: Vec<(String, Resolved)> = Vec::new();
+        // A call whose arguments the output limit cut off is answered, not run.
+        let cut: Vec<String> = if finish == FinishReason::MaxTokens {
+            pending_calls
+                .iter()
+                .filter(|call| {
+                    !serde_json::from_str::<serde_json::Value>(&call.arguments)
+                        .is_ok_and(|value| value.is_object())
+                })
+                .map(|call| call.id.clone())
+                .collect()
+        } else {
+            Vec::new()
+        };
         let (results, stalled) = if last_step {
             let refused = pending_calls
                 .iter()
@@ -1161,6 +1208,7 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
         } else {
             execute_batch(
                 &pending_calls,
+                &cut,
                 host,
                 history,
                 &mut result_bytes,
@@ -1239,6 +1287,13 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
                 )
                 .with_invariant(LimitName::MaxConsecutiveToolFailures.as_str())
             );
+        }
+
+        if !cut.is_empty() {
+            continuations = continuations.saturating_add(1);
+            if continuations > MAX_CONTINUATIONS {
+                settle!(StopReason::OutputLimit);
+            }
         }
 
         // A provider error with tool calls in flight still ends the turn after
@@ -1555,8 +1610,10 @@ fn stream_with_retry(
 /// Every call is answered, including those left unrun by a cancellation, so
 /// the history never holds a call without its result. A conversation in that
 /// state cannot form another request.
+#[allow(clippy::too_many_arguments)]
 fn execute_batch(
     calls: &[PreparedCall],
+    cut: &[String],
     host: &dyn Host,
     history: &mut History,
     result_bytes: &mut usize,
@@ -1616,7 +1673,9 @@ fn execute_batch(
                 let view = guard_view(call, &offered);
                 // Later calls in this group differ from their predecessor,
                 // so they cannot extend an existing failure streak.
-                let blocked = if stalled.is_some() {
+                let blocked = if let Some(result) = cut_call(call, cut, host) {
+                    Some(result)
+                } else if stalled.is_some() {
                     Some(stopped_call(call, host))
                 } else if index == 0 {
                     guard_result(
@@ -1694,7 +1753,9 @@ fn execute_batch(
     for call in &calls[parallel_prefix..] {
         let view = guard_view(call, &offered);
         let cap = turn_cap.saturating_sub(*result_bytes).min(tool_cap);
-        let blocked = if stalled.is_some() {
+        let blocked = if let Some(result) = cut_call(call, cut, host) {
+            Some(result)
+        } else if stalled.is_some() {
             Some(stopped_call(call, host))
         } else {
             guard_result(
@@ -1730,6 +1791,22 @@ fn execute_batch(
         );
     }
     (results, stalled)
+}
+
+/// Answers a call the output limit cut off inside its arguments.
+fn cut_call(call: &PreparedCall, cut: &[String], host: &dyn Host) -> Option<CallResult> {
+    if !cut.contains(&call.id) {
+        return None;
+    }
+    host.emit(Event::ToolDenied {
+        call: call.clone(),
+        reason: "cut at the output limit".to_owned(),
+    });
+    Some(CallResult {
+        call: call.clone(),
+        output: ToolOutput::failure(CUT_CALL_NOTE),
+        executed: false,
+    })
 }
 
 /// Call IDs identify requests, not the operation being repeated.
