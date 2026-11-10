@@ -1030,6 +1030,13 @@ mod tests {
     fn overrides_forward_the_global_flags_in_order() {
         let limits = [("steps".to_owned(), "9".to_owned())];
         let dirs = ["../shared".to_owned(), "/abs/dir".to_owned()];
+        // A rooted path is rebuilt from its components, so it comes back with
+        // the platform's separator.
+        let rooted = if cfg!(windows) {
+            "\\abs\\dir"
+        } else {
+            "/abs/dir"
+        };
         let args = overrides(
             &Forwarded {
                 model: Some("m"),
@@ -1056,7 +1063,7 @@ mod tests {
                 "--add-dir",
                 "/shared",
                 "--add-dir",
-                "/abs/dir",
+                rooted,
                 "--allow-unsandboxed",
                 "--offline",
             ]
