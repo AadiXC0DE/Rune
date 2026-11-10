@@ -340,6 +340,7 @@ fn run_ask(
                 if jsonl {
                     ask::final_jsonl(&ask::JsonResult::failure(
                         &settings.model,
+                        settings.effort.as_str(),
                         &err,
                         i32::from(EXIT_FAILURE),
                     ))?;
@@ -355,7 +356,12 @@ fn run_ask(
         let err = RuneError::missing_field("prompt")
             .with_hint("pass the prompt as an argument, or pipe it on standard input");
         if jsonl || output.json {
-            let result = ask::JsonResult::failure(&settings.model, &err, i32::from(EXIT_FAILURE));
+            let result = ask::JsonResult::failure(
+                &settings.model,
+                settings.effort.as_str(),
+                &err,
+                i32::from(EXIT_FAILURE),
+            );
             if jsonl {
                 ask::final_jsonl(&result)?;
             } else {
@@ -424,8 +430,12 @@ fn run_ask(
         }
         Err(err) => {
             if options.jsonl || options.json {
-                let result =
-                    ask::JsonResult::failure(&settings.model, &err, i32::from(EXIT_FAILURE));
+                let result = ask::JsonResult::failure(
+                    &settings.model,
+                    settings.effort.as_str(),
+                    &err,
+                    i32::from(EXIT_FAILURE),
+                );
                 // The returned error is reported by main, including its hint.
                 if options.jsonl {
                     ask::final_jsonl(&result)?;
@@ -500,8 +510,12 @@ fn run_review(
         Ok(result) => Ok(ExitCode::from(ask::report(&result, &options)?)),
         Err(err) => {
             if options.json {
-                let result =
-                    ask::JsonResult::failure(&settings.model, &err, i32::from(EXIT_FAILURE));
+                let result = ask::JsonResult::failure(
+                    &settings.model,
+                    settings.effort.as_str(),
+                    &err,
+                    i32::from(EXIT_FAILURE),
+                );
                 let _ = ask::report(&result, &options);
             }
             Err(err)

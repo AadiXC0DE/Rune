@@ -439,7 +439,7 @@ pub fn final_jsonl(result: &JsonResult) -> Result<u8> {
     match write_jsonl(&mut std::io::stdout().lock(), &JsonlEvent::Final { result }) {
         Ok(()) => Ok(u8::try_from(result.exit_code).unwrap_or(EXIT_FAILURE)),
         Err(error) if error.code() == ErrorCode::TooLarge => {
-            let failure = JsonResult::failure("", &error, i32::from(EXIT_FAILURE));
+            let failure = JsonResult::failure("", result.effort, &error, i32::from(EXIT_FAILURE));
             write_jsonl(
                 &mut std::io::stdout().lock(),
                 &JsonlEvent::Final { result: &failure },
@@ -494,6 +494,8 @@ pub struct JsonResult {
     pub stop_reason: Option<&'static str>,
     /// Model identifier that served the request.
     pub model: String,
+    /// Reasoning effort sent with the requests, after the model's default and clamping.
+    pub effort: &'static str,
     /// Upstream provider that served it, when the endpoint reported one.
     pub resolved_provider: Option<String>,
     /// Session identifier, empty when the run was not saved.
@@ -561,13 +563,14 @@ pub struct UsageReport {
 impl JsonResult {
     /// Builds a failing result, used so `--json` always emits one object.
     #[must_use]
-    pub fn failure(model: &str, error: &RuneError, exit_code: i32) -> Self {
+    pub fn failure(model: &str, effort: &'static str, error: &RuneError, exit_code: i32) -> Self {
         Self {
             output: String::new(),
             final_output: String::new(),
             exit_code,
             stop_reason: None,
             model: model.to_owned(),
+            effort,
             resolved_provider: None,
             session_id: String::new(),
             steps: 0,
@@ -618,6 +621,8 @@ pub fn read_stdin_prompt() -> Result<String> {
 
 /// Noninteractive composition of the shared agent loop and built-in tools.
 struct AskHost<'a> {
+    /// The reasoning effort sent, after the model's default and clamping.
+    effort: rune_core::config::Effort,
     /// The cache routing key of every request of this run, taken from the
     /// first request's prefix.
     cache_key: std::sync::OnceLock<String>,
@@ -768,7 +773,7 @@ impl Host for AskHost<'_> {
     }
 
     fn effort(&self) -> rune_core::config::Effort {
-        self.settings.effort
+        self.effort
     }
 
     fn max_output_tokens(&self) -> Option<u64> {
@@ -1118,6 +1123,11 @@ pub fn run(
     // credential for an endpoint that does not exist.
     let endpoint = crate::provider_setup::configured_endpoint(settings, paths)?;
     let compat = crate::provider_setup::CompatSource::from_settings(settings);
+    let effort = rune_net::compat::effective_effort(
+        settings.effort,
+        settings.source_of("effort") != Layer::Default,
+        &compat.resolve(&settings.model).1,
+    );
 
     crate::provider_setup::refresh_catalog_in_background(settings, paths);
     // Read from configuration and the cache only, so a run never waits on the
@@ -1218,6 +1228,7 @@ pub fn run(
         .additional_roots
         .clone_from(&settings.additional_directories);
     let host = AskHost {
+        effort,
         cache_key: std::sync::OnceLock::new(),
         settings,
         instructions: rune_context::prompt::base_instructions_for(
@@ -1443,6 +1454,7 @@ pub fn run(
         exit_code: i32::from(exit_code),
         stop_reason: Some(outcome.stop_reason.as_str()),
         model: settings.model.clone(),
+        effort: host.effort.as_str(),
         resolved_provider: None,
         session_id,
         steps: outcome.steps,
@@ -1966,7 +1978,8 @@ mod tests {
 
     #[test]
     fn jsonl_rejects_oversized_serialized_records_before_writing_stdout() {
-        let mut result = JsonResult::failure("m", &RuneError::new(ErrorCode::Internal, "x"), 1);
+        let mut result =
+            JsonResult::failure("m", "auto", &RuneError::new(ErrorCode::Internal, "x"), 1);
         result.output = "\0".repeat(MAX_JSONL_EVENT_BYTES / 6);
         let mut stdout = Vec::new();
         let error = write_jsonl(&mut stdout, &JsonlEvent::Final { result: &result })
@@ -2062,7 +2075,7 @@ mod tests {
     #[test]
     fn a_failure_result_serializes_with_the_stable_code() {
         let err = RuneError::new(ErrorCode::RateLimited, "slow down");
-        let result = JsonResult::failure("m", &err, 1);
+        let result = JsonResult::failure("m", "auto", &err, 1);
         let json = result.render().expect("render");
         let value: serde_json::Value = serde_json::from_str(&json).expect("valid json");
         assert_eq!(value["error_code"], "rate_limited");
@@ -2074,7 +2087,7 @@ mod tests {
 
     #[test]
     fn the_json_object_has_the_documented_key_set() {
-        let result = JsonResult::failure("m", &RuneError::new(ErrorCode::Internal, "x"), 1);
+        let result = JsonResult::failure("m", "auto", &RuneError::new(ErrorCode::Internal, "x"), 1);
         let json = result.render().expect("render");
         let value: serde_json::Value = serde_json::from_str(&json).expect("valid json");
         let object = value.as_object().expect("object");
@@ -2096,7 +2109,7 @@ mod tests {
 
     #[test]
     fn the_json_key_order_is_stable() {
-        let result = JsonResult::failure("m", &RuneError::new(ErrorCode::Internal, "x"), 1);
+        let result = JsonResult::failure("m", "auto", &RuneError::new(ErrorCode::Internal, "x"), 1);
         let json = result.render().expect("render");
         let output = json.find("\"output\"").expect("output");
         let final_output = json.find("\"final_output\"").expect("final_output");
@@ -2131,6 +2144,7 @@ mod tests {
             exit_code: 0,
             stop_reason: Some("end_turn"),
             model: "m".to_owned(),
+            effort: "auto",
             resolved_provider: None,
             session_id: String::new(),
             steps: 1,

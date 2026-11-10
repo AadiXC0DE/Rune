@@ -263,6 +263,11 @@ struct SessionHost {
     permission_settings: Settings,
     /// Behind a lock because `/effort` changes it between turns.
     effort: Mutex<Effort>,
+    /// Whether the user chose the effort, in the settings or with `/effort`;
+    /// otherwise the model's default applies.
+    effort_set: std::sync::atomic::AtomicBool,
+    /// The model and requested level pairs whose clamping was already told.
+    effort_noticed: Mutex<std::collections::BTreeSet<(String, &'static str)>>,
     fast_mode: bool,
     limits: BudgetSet,
     context: ExecutionContext,
@@ -530,10 +535,21 @@ impl Host for SessionHost {
     }
 
     fn effort(&self) -> Effort {
-        *self
-            .effort
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        let (requested, effective) = self.effective_effort();
+        if requested != Effort::Auto && effective != requested {
+            let model = self.model_name();
+            let fresh = self
+                .effort_noticed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert((model.clone(), requested.as_str()));
+            if fresh {
+                self.draw_notice(&format!(
+                    "effort {requested} is not accepted by {model}; using {effective}"
+                ));
+            }
+        }
+        effective
     }
 
     fn max_output_tokens(&self) -> Option<u64> {
@@ -1153,6 +1169,10 @@ impl SessionHost {
             let mut current = lock_model(&self.model);
             model.clone_into(&mut current);
         }
+        self.effort_noticed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
         // What the previous model could see says nothing about this one; the
         // cache is asked for the new model instead.
         self.vision
@@ -1192,6 +1212,21 @@ impl SessionHost {
         lock_model(&self.model).clone()
     }
 
+    /// The requested effort and the level sent for the current model, after
+    /// its default and clamping.
+    fn effective_effort(&self) -> (Effort, Effort) {
+        let requested = *self
+            .effort
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (_, traits) = self.compat.resolve(&self.model_name());
+        let user_set = self.effort_set.load(std::sync::atomic::Ordering::Relaxed);
+        (
+            requested,
+            rune_net::compat::effective_effort(requested, user_set, &traits),
+        )
+    }
+
     /// Returns whether a model has been chosen.
     fn has_model(&self) -> bool {
         !lock_model(&self.model).trim().is_empty()
@@ -1225,7 +1260,7 @@ impl SessionHost {
             provider,
             endpoint,
             mode: self.mode(),
-            effort: Host::effort(self),
+            effort: self.effective_effort().1,
             session_id: self.session_id_name(),
             workspace: &self.workspace,
             context_used: self.context_used.load(std::sync::atomic::Ordering::Relaxed),
@@ -2269,6 +2304,10 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
         mode: Mutex::new(config.settings.permission_mode),
         permission_settings: config.settings.clone(),
         effort: Mutex::new(config.settings.effort),
+        effort_set: std::sync::atomic::AtomicBool::new(
+            config.settings.source_of("effort") != rune_core::config::Layer::Default,
+        ),
+        effort_noticed: Mutex::new(std::collections::BTreeSet::new()),
         fast_mode: config.settings.fast_mode,
         limits: limits.clone(),
         context,
@@ -5308,26 +5347,47 @@ fn set_permissions(host: &SessionHost, requested: Option<&str>) -> String {
 }
 
 fn set_effort(host: &SessionHost, requested: Option<&str>) -> String {
-    let supported = host.dialect.capabilities().efforts;
-    let names = supported
+    let model = host.model_name();
+    let (_, traits) = host.compat.resolve(&model);
+    let accepted = if traits.efforts.is_empty() {
+        host.dialect.capabilities().efforts
+    } else {
+        traits.efforts
+    };
+    let names = accepted
         .iter()
         .map(|effort| effort.as_str())
         .collect::<Vec<_>>()
         .join(", ");
-    let current = Host::effort(host);
     let Some(requested) = requested else {
-        return format!("effort is {current}; this provider accepts {names}");
+        let (_, current) = host.effective_effort();
+        return format!("effort is {current}; {model} accepts {names}");
     };
-    match supported.iter().find(|effort| effort.as_str() == requested) {
-        Some(effort) => {
-            *host
-                .effort
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = *effort;
-            format!("effort set to {effort} for the requests that follow")
-        }
-        None => format!("`{requested}` is not an effort this provider accepts; choose {names}"),
+    let Some(level) = rune_net::provider::ALL_EFFORTS
+        .iter()
+        .copied()
+        .find(|effort| effort.as_str() == requested)
+    else {
+        return format!("`{requested}` is not an effort this provider accepts; choose {names}");
+    };
+    *host
+        .effort
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = level;
+    host.effort_set
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    let effective = rune_net::compat::clamp_effort(level, accepted);
+    if effective == level {
+        return format!("effort set to {level} for the requests that follow");
     }
+    // The answer says it, so the next turn does not say it again.
+    host.effort_noticed
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert((model.clone(), level.as_str()));
+    format!(
+        "effort set to {effective} for the requests that follow ({level} is not accepted by {model})"
+    )
 }
 
 /// Renders the settings that govern the running session.
@@ -11217,6 +11277,27 @@ mod tests {
     }
 
     #[test]
+    fn effort_lists_the_models_levels() {
+        let host = test_host();
+        "claude-sonnet-4-6".clone_into(&mut lock_model(&host.model));
+        assert_eq!(
+            set_effort(&host, None),
+            "effort is auto; claude-sonnet-4-6 accepts auto, none, minimal, low, medium, high, max"
+        );
+        assert_eq!(
+            set_effort(&host, Some("xhigh")),
+            "effort set to max for the requests that follow (xhigh is not accepted by claude-sonnet-4-6)"
+        );
+        assert_eq!(Host::effort(&host), Effort::Max);
+        assert!(
+            host.effort_noticed
+                .lock()
+                .expect("noticed")
+                .contains(&("claude-sonnet-4-6".to_owned(), "xhigh"))
+        );
+    }
+
+    #[test]
     fn effort_is_shown_and_set_only_to_a_level_the_dialect_accepts() {
         let host = test_host();
         assert!(set_effort(&host, None).starts_with("effort is auto"));
@@ -11720,6 +11801,8 @@ mod tests {
             mode: Mutex::new(PermissionMode::Auto),
             permission_settings: Settings::default(),
             effort: Mutex::new(Effort::Auto),
+            effort_set: std::sync::atomic::AtomicBool::new(false),
+            effort_noticed: Mutex::new(std::collections::BTreeSet::new()),
             fast_mode: false,
             limits: BudgetSet::new(),
             context: ExecutionContext::new(Utf8PathBuf::from("/tmp")),

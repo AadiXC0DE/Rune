@@ -354,6 +354,26 @@ fn run_responses_fixture_command(
 }
 
 #[test]
+fn ask_json_reports_the_clamped_effort() {
+    // Claude Sonnet 4.6 accepts every named level but xhigh.
+    let (output, _, requests) = run_responses_fixture_command(
+        vec![completion_response(&json!({"content": "ok"}), "stop")],
+        Some("--json"),
+        true,
+        None,
+        (
+            &["ask", "--model", "claude-sonnet-4-6", "--effort", "xhigh"],
+            &[],
+        ),
+        |_, _| {},
+    );
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let result: Value = serde_json::from_slice(&output.stdout).expect("one JSON result");
+    assert_eq!(result["effort"], "max");
+    assert_eq!(requests[0]["reasoning_effort"], "max");
+}
+
+#[test]
 fn ask_json_preserves_provider_code_and_retry_delay_with_secrets_redacted() {
     for code in ["rate_limit_exceeded", "sk-fixture-secret-code"] {
         let secret = "sk-fixture-secret-message";

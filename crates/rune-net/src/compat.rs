@@ -897,6 +897,60 @@ pub fn claude_version(model: &str) -> Option<(Tier, u32, u32)> {
     Some((tier, major, minor))
 }
 
+/// The place of an effort in the order used for clamping, lowest first.
+/// `Auto` has none.
+const fn effort_rank(effort: Effort) -> Option<u8> {
+    match effort {
+        Effort::Auto => None,
+        Effort::None => Some(0),
+        Effort::Minimal => Some(1),
+        Effort::Low => Some(2),
+        Effort::Medium => Some(3),
+        Effort::High => Some(4),
+        Effort::Xhigh => Some(5),
+        Effort::Max => Some(6),
+    }
+}
+
+/// Moves a requested level to one the model accepts: the same level, else the
+/// nearest accepted level above it, else the nearest below. `Auto` and an
+/// empty list pass through.
+#[must_use]
+pub fn clamp_effort(requested: Effort, accepted: &[Effort]) -> Effort {
+    let Some(rank) = effort_rank(requested) else {
+        return requested;
+    };
+    if accepted.is_empty() || accepted.contains(&requested) {
+        return requested;
+    }
+    let ranked = || {
+        accepted
+            .iter()
+            .filter_map(|effort| effort_rank(*effort).map(|place| (place, *effort)))
+    };
+    ranked()
+        .filter(|(place, _)| *place > rank)
+        .min_by_key(|(place, _)| *place)
+        .or_else(|| {
+            ranked()
+                .filter(|(place, _)| *place < rank)
+                .max_by_key(|(place, _)| *place)
+        })
+        .map_or(requested, |(_, effort)| effort)
+}
+
+/// The level to send: the model's default when the user set none, then
+/// clamped to the levels the model accepts.
+#[must_use]
+pub fn effective_effort(requested: Effort, user_set: bool, traits: &ModelTraits) -> Effort {
+    let requested = if !user_set && traits.default_effort != Effort::Auto {
+        traits.default_effort
+    } else {
+        requested
+    };
+    clamp_effort(requested, traits.efforts)
+}
+
 /// Every effort except `xhigh`.
 const EFFORTS_WITHOUT_XHIGH: &[Effort] = &[
     Effort::Auto,
@@ -1503,5 +1557,47 @@ mod tests {
             EditTool::Patch
         );
         assert_eq!(edit_tool(EditToolSetting::Auto, "gpt-5"), EditTool::Patch);
+    }
+
+    #[test]
+    fn clamping_prefers_the_next_level_up() {
+        let accepted = [Effort::Low, Effort::Medium, Effort::High];
+        assert_eq!(clamp_effort(Effort::Minimal, &accepted), Effort::Low);
+        assert_eq!(clamp_effort(Effort::None, &accepted), Effort::Low);
+        assert_eq!(clamp_effort(Effort::Medium, &accepted), Effort::Medium);
+        assert_eq!(
+            clamp_effort(Effort::Xhigh, EFFORTS_WITHOUT_XHIGH),
+            Effort::Max
+        );
+    }
+
+    #[test]
+    fn clamping_falls_back_to_the_next_level_down() {
+        let accepted = [Effort::Low, Effort::Medium, Effort::High];
+        assert_eq!(clamp_effort(Effort::Xhigh, &accepted), Effort::High);
+        assert_eq!(clamp_effort(Effort::Max, &accepted), Effort::High);
+    }
+
+    #[test]
+    fn auto_and_unknown_lists_pass_through() {
+        assert_eq!(clamp_effort(Effort::Max, &[]), Effort::Max);
+        assert_eq!(clamp_effort(Effort::Auto, &[Effort::Low]), Effort::Auto);
+    }
+
+    #[test]
+    fn the_model_default_applies_only_when_the_user_set_none() {
+        let traits = ModelTraits {
+            default_effort: Effort::Medium,
+            efforts: &[Effort::Low, Effort::Medium, Effort::High],
+            ..ModelTraits::default()
+        };
+        assert_eq!(
+            effective_effort(Effort::Auto, false, &traits),
+            Effort::Medium
+        );
+        assert_eq!(effective_effort(Effort::Auto, true, &traits), Effort::Auto);
+        assert_eq!(effective_effort(Effort::Xhigh, true, &traits), Effort::High);
+        let plain = ModelTraits::default();
+        assert_eq!(effective_effort(Effort::Auto, false, &plain), Effort::Auto);
     }
 }
