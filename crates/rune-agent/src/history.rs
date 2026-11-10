@@ -159,6 +159,9 @@ pub struct History {
     /// Call ids whose result was replaced by a receipt.
     #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
     pruned: std::collections::BTreeSet<String>,
+    /// The tool-result turn whose checks last settled the ledger.
+    #[serde(skip)]
+    settled_turn: Option<u64>,
 }
 
 /// Reads whose file digest is kept; past this, one is dropped to make room.
@@ -187,6 +190,7 @@ impl Default for History {
             anchor: None,
             ledger: crate::ledger::Ledger::default(),
             pruned: std::collections::BTreeSet::new(),
+            settled_turn: None,
         }
     }
 }
@@ -209,6 +213,7 @@ impl History {
             anchor: None,
             ledger: crate::ledger::Ledger::default(),
             pruned: std::collections::BTreeSet::new(),
+            settled_turn: None,
         }
     }
 
@@ -295,6 +300,17 @@ impl History {
 
     pub(crate) fn ledger_mut(&mut self) -> &mut crate::ledger::Ledger {
         &mut self.ledger
+    }
+
+    /// Returns the seq of the tool-result turn whose checks last settled the
+    /// ledger, if any.
+    #[must_use]
+    pub fn settled_turn(&self) -> Option<u64> {
+        self.settled_turn
+    }
+
+    pub(crate) fn set_settled_turn(&mut self, seq: u64) {
+        self.settled_turn = Some(seq);
     }
 
     pub(crate) fn shared_live_plan(&self) -> Arc<std::sync::Mutex<rune_tools::PlanUpdate>> {
@@ -699,6 +715,7 @@ impl History {
             anchor: None,
             ledger: self.ledger.clone(),
             pruned: self.pruned.clone(),
+            settled_turn: None,
         }
     }
 

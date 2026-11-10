@@ -734,9 +734,11 @@ impl Host for SessionHost {
             Event::ContextCompacted {
                 removed_turns,
                 remaining_turns,
+                settled,
                 ..
             } => self.draw_notice(&format!(
-                "compacted {removed_turns} earlier turn(s); {remaining_turns} turn(s) remain"
+                "compacted {removed_turns} earlier turn(s); {remaining_turns} turn(s) remain{}",
+                if *settled { " at a settled point" } else { "" }
             )),
             // A queued message is reported once the turn ends, from the events.
             Event::SteeringApplied { .. } => {}

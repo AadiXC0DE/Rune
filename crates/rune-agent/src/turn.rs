@@ -223,6 +223,8 @@ pub enum Event {
         before_tokens: u64,
         /// Estimated request tokens after it.
         after_tokens: u64,
+        /// Whether it ran early, at a settled point, rather than at the ceiling.
+        settled: bool,
     },
     /// A turn that changed files without checking them was asked to verify.
     VerificationRequested,
@@ -1203,10 +1205,16 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
             });
             result_parts.extend(host.tool_attachments(result));
         }
+        let mut settled_now = false;
         for result in &results {
+            let was_settled = history.ledger().settled;
             history.ledger_mut().record(result);
+            settled_now |= !was_settled && history.ledger().settled;
         }
-        history.push_tool_results(result_parts);
+        let seq = history.push_tool_results(result_parts);
+        if settled_now {
+            history.set_settled_turn(seq);
+        }
         calls.extend(results);
 
         if last_step {

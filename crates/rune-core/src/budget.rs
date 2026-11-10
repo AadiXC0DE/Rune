@@ -259,6 +259,8 @@ pub enum LimitName {
     ReviewTimeoutMs,
     /// Compaction trigger as a percentage of usable input capacity.
     CompactionTriggerPercent,
+    /// Largest context window used for the compaction ceiling. Zero turns the cap off.
+    ContextCapTokens,
     /// Redirects followed by one web fetch.
     WebFetchRedirects,
     /// Bytes returned by one web fetch.
@@ -316,6 +318,7 @@ impl LimitName {
             Self::ReviewHoldsPerTurn,
             Self::ReviewTimeoutMs,
             Self::CompactionTriggerPercent,
+            Self::ContextCapTokens,
             Self::WebFetchRedirects,
             Self::WebFetchBytes,
             Self::WebFetchTimeoutMs,
@@ -365,6 +368,7 @@ impl LimitName {
             Self::ReviewHoldsPerTurn => "review_holds_per_turn",
             Self::ReviewTimeoutMs => "review_timeout_ms",
             Self::CompactionTriggerPercent => "compaction_trigger_percent",
+            Self::ContextCapTokens => "context_cap_tokens",
             Self::WebFetchRedirects => "web_fetch_redirects",
             Self::WebFetchBytes => "web_fetch_bytes",
             Self::WebFetchTimeoutMs => "web_fetch_timeout_ms",
@@ -415,6 +419,7 @@ impl LimitName {
             Self::ReviewHoldsPerTurn => Budget::Bounded(64),
             Self::ReviewTimeoutMs => Budget::Bounded(30_000),
             Self::CompactionTriggerPercent => Budget::Bounded(80),
+            Self::ContextCapTokens => Budget::Bounded(256_000),
             Self::WebFetchRedirects => Budget::Bounded(5),
             Self::WebFetchBytes => Budget::Bounded(1024 * 1024),
             Self::WebFetchTimeoutMs => Budget::Bounded(30_000),
@@ -446,6 +451,10 @@ impl LimitName {
             Self::CompactionTriggerPercent => Range {
                 min: 10,
                 max: Some(99),
+            },
+            Self::ContextCapTokens => Range {
+                min: 0,
+                max: Some(100_000_000),
             },
             Self::ParallelToolCalls => Range {
                 min: 1,
@@ -506,6 +515,7 @@ impl LimitName {
             | Self::McpRestartLimit
             | Self::ReviewHoldsPerTurn
             | Self::CompactionTriggerPercent
+            | Self::ContextCapTokens
             | Self::WebFetchRedirects
             | Self::WebSearchResults
             | Self::VisionBatchImages
@@ -570,6 +580,9 @@ impl LimitName {
             Self::ReviewHoldsPerTurn => "Safety review holds permitted in one turn.",
             Self::ReviewTimeoutMs => "Time allowed for one safety review request.",
             Self::CompactionTriggerPercent => "Compaction trigger as a percentage of usable input.",
+            Self::ContextCapTokens => {
+                "Largest context window used for the compaction ceiling, in tokens. Zero turns the cap off."
+            }
             Self::WebFetchRedirects => "Redirects followed by one web fetch.",
             Self::WebFetchBytes => "Bytes returned by one web fetch.",
             Self::WebFetchTimeoutMs => "Time allowed for one web fetch.",

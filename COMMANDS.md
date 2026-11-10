@@ -349,6 +349,7 @@ Every limit takes a count, or `off` to remove it. A hard ceiling still applies t
 | `review_holds_per_turn` | 64 | items | 0 to unbounded | Safety review holds permitted in one turn. |
 | `review_timeout_ms` | 30000 | ms | 0 to unbounded | Time allowed for one safety review request. |
 | `compaction_trigger_percent` | 80 | items | 10 to 99 | Compaction trigger as a percentage of usable input. |
+| `context_cap_tokens` | 256000 | items | 0 to 100000000 | Largest context window used for the compaction ceiling, in tokens. Zero turns the cap off. |
 | `web_fetch_redirects` | 5 | items | 0 to 20 | Redirects followed by one web fetch. |
 | `web_fetch_bytes` | 1048576 | bytes | 0 to unbounded | Bytes returned by one web fetch. |
 | `web_fetch_timeout_ms` | 30000 | ms | 0 to unbounded | Time allowed for one web fetch. |

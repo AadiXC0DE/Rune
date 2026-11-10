@@ -4598,6 +4598,17 @@ fn the_turn_loop_records_changes_in_the_ledger() {
     assert_eq!(ledger.checks[0].command, "npm test");
     assert_eq!(ledger.checks[0].exit, Some(0));
     assert!(ledger.settled);
+    let check_turn = history
+        .turns()
+        .iter()
+        .find(|turn| {
+            turn.parts.iter().any(|part| {
+                matches!(part, rune_net::message::ContentPart::ToolResult { id, .. } if id.as_str() == "check")
+            })
+        })
+        .map(|turn| turn.seq);
+    assert!(check_turn.is_some());
+    assert_eq!(history.settled_turn(), check_turn);
 }
 
 #[test]

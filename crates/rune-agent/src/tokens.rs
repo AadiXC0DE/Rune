@@ -5,7 +5,7 @@
 //! added since; with no report yet it is four bytes per token for the whole
 //! request.
 
-use rune_core::budget::{BudgetSet, LimitName};
+use rune_core::budget::{Budget, BudgetSet, LimitName};
 use rune_core::error::{ErrorCode, Result, RuneError};
 use rune_net::message::ContentPart;
 use rune_net::provider::{Provider, RequestPlan};
@@ -219,8 +219,46 @@ impl CapacityDecision {
     }
 }
 
-/// Percentage points below the trigger at which the caller is warned.
-const APPROACHING_BAND_PERCENT: u8 = 10;
+/// Percentage points below the ceiling at which the caller is warned.
+const APPROACHING_BAND_PERCENT: u64 = 10;
+
+/// Share of the window held back, and its floor for windows of 32,000 tokens or more.
+pub const RESERVE_PERCENT: u64 = 15;
+pub const RESERVE_FLOOR: u64 = 16_000;
+
+/// Smallest window the reserve floor applies to.
+const RESERVE_FLOOR_FROM: u64 = 32_000;
+
+/// The window the ceiling is computed from: the model's window, capped by
+/// `context_cap_tokens` unless that is zero.
+#[must_use]
+pub fn effective_window(window: u64, limits: &BudgetSet) -> u64 {
+    match limits.get(LimitName::ContextCapTokens) {
+        Budget::Bounded(cap) if cap > 0 => window.min(cap),
+        _ => window,
+    }
+}
+
+/// The input-token level at which compaction is required, or `None` for an unknown window.
+///
+/// An explicitly configured `compaction_trigger_percent` replaces the reserve.
+#[must_use]
+pub fn ceiling(window: u64, limits: &BudgetSet) -> Option<u64> {
+    if window == 0 {
+        return None;
+    }
+    let effective = effective_window(window, limits);
+    if limits.source(LimitName::CompactionTriggerPercent).is_some() {
+        return Some(effective.saturating_mul(u64::from(trigger_percent(limits))) / 100);
+    }
+    let floor = if effective >= RESERVE_FLOOR_FROM {
+        RESERVE_FLOOR
+    } else {
+        0
+    };
+    let reserve = (effective.saturating_mul(RESERVE_PERCENT) / 100).max(floor);
+    Some(effective.saturating_sub(reserve))
+}
 
 /// The percent of usable input at which a request is compacted.
 #[must_use]
@@ -235,8 +273,9 @@ pub fn trigger_percent(limits: &BudgetSet) -> u8 {
 
 /// Decides what to do about the current capacity.
 ///
-/// The trigger is a percentage of usable input, taken from the limits so it can
-/// be tuned without a rebuild. The approaching band sits ten points below it,
+/// Compaction is required once the input reaches `ceiling` (see [`ceiling`]),
+/// or when the input and the output reserve together exceed the capacity. The
+/// approaching band sits ten percentage points of capacity below the ceiling,
 /// which gives the caller one request of warning before compaction is required.
 /// `estimate` measures the full request; `retained_estimate` measures the request
 /// after removing the planned prefix, including any fixed request overhead. If
@@ -245,17 +284,16 @@ pub fn trigger_percent(limits: &BudgetSet) -> u8 {
 pub fn decide_capacity(
     estimate: &Estimate,
     retained_estimate: &Estimate,
-    limits: &BudgetSet,
+    ceiling: u64,
 ) -> CapacityDecision {
-    let trigger = trigger_percent(limits);
-    let used = estimate.used_percent();
+    let band = estimate.capacity.saturating_mul(APPROACHING_BAND_PERCENT) / 100;
 
     if retained_estimate.total_tokens() > estimate.capacity {
         // Only the retained request proves that removing the prefix cannot help.
         CapacityDecision::OverCapacity
-    } else if estimate.total_tokens() > estimate.capacity || used >= trigger {
+    } else if estimate.total_tokens() > estimate.capacity || estimate.input_tokens >= ceiling {
         CapacityDecision::Compact
-    } else if used.saturating_add(APPROACHING_BAND_PERCENT) >= trigger {
+    } else if estimate.input_tokens.saturating_add(band) >= ceiling {
         CapacityDecision::Approaching
     } else {
         CapacityDecision::Fits
@@ -450,69 +488,69 @@ mod tests {
 
     #[test]
     fn capacity_below_the_trigger_fits() {
-        let limits = BudgetSet::new();
+        let ceiling = 800;
         let estimate = Estimate::new(0, 10, 1000);
         assert_eq!(
-            decide_capacity(&estimate, &estimate, &limits),
+            decide_capacity(&estimate, &estimate, ceiling),
             CapacityDecision::Fits
         );
     }
 
     #[test]
     fn capacity_near_the_trigger_warns_before_compacting() {
-        let limits = BudgetSet::new();
-        // The default trigger is eighty percent, so seventy-five is inside the
-        // approaching band and still sendable.
+        let ceiling = 800;
+        // Seventy-five percent of capacity is within ten points of a ceiling at
+        // eighty, so it is inside the approaching band and still sendable.
         let estimate = Estimate::new(0, 750, 1000);
         assert_eq!(
-            decide_capacity(&estimate, &estimate, &limits),
+            decide_capacity(&estimate, &estimate, ceiling),
             CapacityDecision::Approaching
         );
     }
 
     #[test]
     fn capacity_at_the_trigger_requires_compaction() {
-        let limits = BudgetSet::new();
+        let ceiling = 800;
         let estimate = Estimate::new(0, 800, 1000);
         assert_eq!(
-            decide_capacity(&estimate, &estimate, &limits),
+            decide_capacity(&estimate, &estimate, ceiling),
             CapacityDecision::Compact
         );
     }
 
     #[test]
     fn capacity_over_the_total_is_reported_as_such() {
-        let limits = BudgetSet::new();
+        let ceiling = 800;
         let estimate = Estimate::new(0, 1200, 1000);
         assert_eq!(
-            decide_capacity(&estimate, &estimate, &limits),
+            decide_capacity(&estimate, &estimate, ceiling),
             CapacityDecision::OverCapacity
         );
     }
 
     #[test]
     fn full_history_over_capacity_is_compactable_when_the_retained_request_fits() {
-        let limits = BudgetSet::new();
+        let ceiling = 800;
         let full = Estimate::new(8000, 2000, 1000);
         let retained = Estimate::new(400, 100, 1000);
         assert_eq!(
-            decide_capacity(&full, &retained, &limits),
+            decide_capacity(&full, &retained, ceiling),
             CapacityDecision::Compact
         );
     }
 
     #[test]
     fn retained_capacity_includes_the_output_reserve_and_allows_an_exact_fit() {
-        let limits = BudgetSet::new();
+        let ceiling = 800;
         let full = Estimate::new(8000, 2000, 1000).with_output_reserve(100);
         let retained = Estimate::new(3600, 900, 1000).with_output_reserve(100);
         assert_eq!(
-            decide_capacity(&full, &retained, &limits),
+            decide_capacity(&full, &retained, ceiling),
             CapacityDecision::Compact
         );
         let too_large = retained.with_output_reserve(101);
         assert_eq!(
-            decide_capacity(&full, &too_large, &limits),
+            decide_capacity(&full, &too_large, ceiling),
             CapacityDecision::OverCapacity
         );
     }
@@ -523,15 +561,51 @@ mod tests {
         limits
             .set(
                 LimitName::CompactionTriggerPercent,
-                rune_core::budget::Budget::Bounded(50),
+                Budget::Bounded(50),
                 rune_core::config::Layer::User,
             )
             .expect("set");
         let estimate = Estimate::new(0, 600, 1000);
+        let ceiling = ceiling(1000, &limits).expect("ceiling");
         assert_eq!(
-            decide_capacity(&estimate, &estimate, &limits),
+            decide_capacity(&estimate, &estimate, ceiling),
             CapacityDecision::Compact
         );
+    }
+
+    /// A limit set with one limit set in the user file.
+    fn with_limit(name: LimitName, value: u64) -> BudgetSet {
+        let mut limits = BudgetSet::new();
+        limits
+            .set(name, Budget::Bounded(value), rune_core::config::Layer::User)
+            .expect("set");
+        limits
+    }
+
+    #[test]
+    fn the_ceiling_reserves_fifteen_percent_or_sixteen_thousand() {
+        let limits = BudgetSet::new();
+        assert_eq!(ceiling(200_000, &limits), Some(170_000));
+        assert_eq!(ceiling(128_000, &limits), Some(108_800));
+        assert_eq!(ceiling(16_000, &limits), Some(13_600));
+        assert_eq!(ceiling(1_000_000, &limits), Some(217_600));
+        let uncapped = with_limit(LimitName::ContextCapTokens, 0);
+        assert_eq!(ceiling(1_000_000, &uncapped), Some(850_000));
+        assert_eq!(effective_window(1_000_000, &limits), 256_000);
+        assert_eq!(effective_window(1_000_000, &uncapped), 1_000_000);
+    }
+
+    #[test]
+    fn an_explicit_percent_replaces_the_reserve() {
+        let limits = with_limit(LimitName::CompactionTriggerPercent, 80);
+        assert_eq!(ceiling(128_000, &limits), Some(102_400));
+    }
+
+    #[test]
+    fn an_unknown_window_has_no_ceiling() {
+        assert_eq!(ceiling(0, &BudgetSet::new()), None);
+        let limits = with_limit(LimitName::CompactionTriggerPercent, 80);
+        assert_eq!(ceiling(0, &limits), None);
     }
 
     #[test]

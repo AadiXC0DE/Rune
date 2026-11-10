@@ -478,9 +478,9 @@ fn auto_compact_summarises_before_the_window_is_reached() {
     let fetch = Arc::new(SummaryFetch::default());
     let mut options = options(fetch.clone());
     options.auto_compact = true;
-    // The Anthropic dialect reserves 8,192 output tokens; 1,000 remain, and
-    // the restored conversation is about 950 tokens, past the 80% trigger.
-    options.context_window = Some(8_192 + 1_000);
+    // The Anthropic dialect reserves 8,192 output tokens; 900 remain, and
+    // the restored conversation is about 950 tokens, so it no longer fits.
+    options.context_window = Some(8_192 + 900);
     let mut agent = Agent::restore(options, &fixture(false)).expect("fixture");
     let before = agent.usage();
     for _ in 0..2 {

@@ -25,7 +25,6 @@ use rune_net::transport::{self, RequestTimeouts};
 use crate::history::History;
 use crate::tokens::{
     Anchor, CapacityDecision, Estimate, UsageTotals, decide_capacity, estimate_input, measure_body,
-    trigger_percent,
 };
 use crate::turn::{self, Event, Host};
 
@@ -59,7 +58,12 @@ pub struct AutoCompaction {
     pub before_tokens: u64,
     /// Estimated request tokens after.
     pub after_tokens: u64,
+    /// Whether it ran early, at a settled point, rather than at the ceiling.
+    pub settled: bool,
 }
+
+/// Share of the ceiling, in percent, past which a settled point compacts early.
+pub const SETTLED_POINT_PERCENT: u64 = 70;
 
 /// How long a compaction request waits when no limit is configured.
 pub const DEFAULT_COMPACTION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
@@ -218,16 +222,18 @@ pub fn compact_now(history: &mut History, host: &dyn Host, client: &dyn Fetch) -
         remaining_turns: history.len(),
         before_tokens,
         after_tokens,
+        settled: false,
     });
     Ok(true)
 }
 
-/// Compacts before a request when the trigger says it must.
+/// Compacts before a request when the estimate reaches the ceiling, or early
+/// at a settled point once it is past seventy percent of the ceiling.
 ///
-/// Returns `Ok(None)` when no compaction was needed or none is possible yet
-/// because the conversation is short, and an error when the request cannot
-/// fit even after compacting. On success `request` is rebuilt from the new
-/// history.
+/// Returns `Ok(None)` when no compaction was needed or none is possible yet:
+/// the window is unknown, a tool call is still waiting for its result, or the
+/// conversation is short. Returns an error when the request cannot fit even
+/// after compacting. On success `request` is rebuilt from the new history.
 pub fn auto_compact(
     history: &mut History,
     request: &mut RequestPlan,
@@ -248,42 +254,55 @@ pub fn auto_compact_encoded(
     window: Window,
 ) -> Result<(Option<AutoCompaction>, String)> {
     let limits = host.limits();
+    let ceiling = crate::tokens::ceiling(window.0, &limits);
+    let window = Window(crate::tokens::effective_window(window.0, &limits));
     let (encoded, estimate) = encode_request(host.dialect(), request, window, history.anchor())?;
     // An unknown window gives no threshold to compact against. The request is
     // sent as it is, and an overflow the provider reports is recovered from.
-    if window.0 == 0 {
+    let Some(ceiling) = ceiling else {
+        return Ok((None, encoded));
+    };
+    // Never inside a batch: the cut must not separate a call from its result.
+    if !history.pending_tool_calls().is_empty() {
         return Ok((None, encoded));
     }
-    // A request under the trigger needs no look at the retained tail, which
+    // A request under the ceiling needs no look at the retained tail, which
     // costs a second serialization of nearly the whole conversation: the tail
     // is smaller, so it fits whenever the whole request does.
-    if estimate.total_tokens() <= estimate.capacity
-        && estimate.used_percent() < trigger_percent(&limits)
-    {
+    let required = estimate.total_tokens() > estimate.capacity || estimate.input_tokens >= ceiling;
+    let settled = !required
+        && estimate.input_tokens.saturating_mul(100)
+            > ceiling.saturating_mul(SETTLED_POINT_PERCENT)
+        && history.ledger().settled
+        && history.settled_turn().is_some()
+        && history.settled_turn() == history.turns().last().map(|turn| turn.seq);
+    if !required && !settled {
         return Ok((None, encoded));
     }
     let compaction_plan = plan(history, &limits);
-    let retained_estimate = if let Some(cut) = &compaction_plan {
-        let mut retained_plan = request.clone();
-        let mut retained_history = history.clone();
-        retained_history.keep_from(cut.cut_at);
-        retained_plan.messages = retained_history.to_messages();
-        request_estimate(
-            host.dialect(),
-            &retained_plan,
-            window,
-            retained_history.anchor(),
-        )?
-    } else {
-        estimate
-    };
-    match trigger(&estimate, &retained_estimate, &limits) {
-        Trigger::NotNeeded | Trigger::Approaching => return Ok((None, encoded)),
-        Trigger::Impossible => return Err(cannot_fit_error()),
-        Trigger::Required => {}
+    if required {
+        let retained_estimate = if let Some(cut) = &compaction_plan {
+            let mut retained_plan = request.clone();
+            let mut retained_history = history.clone();
+            retained_history.keep_from(cut.cut_at);
+            retained_plan.messages = retained_history.to_messages();
+            request_estimate(
+                host.dialect(),
+                &retained_plan,
+                window,
+                retained_history.anchor(),
+            )?
+        } else {
+            estimate
+        };
+        match trigger(&estimate, &retained_estimate, ceiling) {
+            Trigger::NotNeeded | Trigger::Approaching => return Ok((None, encoded)),
+            Trigger::Impossible => return Err(cannot_fit_error()),
+            Trigger::Required => {}
+        }
     }
     let Some(compaction_plan) = compaction_plan else {
-        // A short conversation can cross the trigger while still fitting.
+        // A short conversation can cross the ceiling while still fitting.
         return Ok((None, encoded));
     };
     let cancellation = host.cancellation();
@@ -294,11 +313,15 @@ pub fn auto_compact_encoded(
     request.instructions = host.instructions();
     request.messages = history.to_messages();
     let (encoded, after) = encode_request(host.dialect(), request, window, history.anchor())?;
+    if settled {
+        history.ledger_mut().settled = false;
+    }
     host.emit(Event::ContextCompacted {
         removed_turns: report.removed_turns,
         remaining_turns: history.len(),
         before_tokens: estimate.input_tokens,
         after_tokens: after.input_tokens,
+        settled,
     });
     if after.input_tokens > estimate.capacity {
         return Err(cannot_fit_error());
@@ -308,6 +331,7 @@ pub fn auto_compact_encoded(
             report,
             before_tokens: estimate.input_tokens,
             after_tokens: after.input_tokens,
+            settled,
         }),
         encoded,
     ))
@@ -539,8 +563,8 @@ impl Trigger {
 /// determines whether compaction is impossible. Neither estimate includes the
 /// future summary, so the caller must check capacity again after installing it.
 #[must_use]
-pub fn trigger(estimate: &Estimate, retained_estimate: &Estimate, limits: &BudgetSet) -> Trigger {
-    match decide_capacity(estimate, retained_estimate, limits) {
+pub fn trigger(estimate: &Estimate, retained_estimate: &Estimate, ceiling: u64) -> Trigger {
+    match decide_capacity(estimate, retained_estimate, ceiling) {
         CapacityDecision::Fits => Trigger::NotNeeded,
         CapacityDecision::Approaching => Trigger::Approaching,
         CapacityDecision::Compact => Trigger::Required,
@@ -791,12 +815,12 @@ mod tests {
 
     #[test]
     fn the_trigger_maps_from_the_capacity_decision() {
-        let limits = BudgetSet::new();
+        let ceiling = 800;
         assert_eq!(
             trigger(
                 &Estimate::new(0, 10, 1000),
                 &Estimate::new(0, 10, 1000),
-                &limits
+                ceiling
             ),
             Trigger::NotNeeded
         );
@@ -804,7 +828,7 @@ mod tests {
             trigger(
                 &Estimate::new(0, 800, 1000),
                 &Estimate::new(0, 800, 1000),
-                &limits
+                ceiling
             ),
             Trigger::Required
         );
@@ -812,7 +836,7 @@ mod tests {
             trigger(
                 &Estimate::new(0, 1200, 1000),
                 &Estimate::new(0, 1200, 1000),
-                &limits
+                ceiling
             ),
             Trigger::Impossible
         );
@@ -820,7 +844,7 @@ mod tests {
             trigger(
                 &Estimate::new(0, 1200, 1000),
                 &Estimate::new(0, 100, 1000),
-                &limits
+                ceiling
             ),
             Trigger::Required
         );
@@ -930,5 +954,260 @@ mod tests {
         }
         // The history stays valid and never becomes empty.
         assert!(!history.is_empty());
+    }
+
+    /// Answers every request with one usable summary and counts the requests.
+    #[derive(Default)]
+    struct SummaryFetch {
+        requests: std::sync::atomic::AtomicUsize,
+    }
+
+    impl Fetch for SummaryFetch {
+        fn send(
+            &self,
+            _request: rune_net::fetch::FetchRequest,
+        ) -> rune_net::error::NetResult<rune_net::fetch::FetchResponse> {
+            self.requests
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let chunk = serde_json::json!({
+                "choices": [{
+                    "delta": {"content": "The earlier questions were answered from file contents."},
+                    "finish_reason": "stop",
+                }]
+            });
+            let body = format!("data: {chunk}\n\ndata: [DONE]\n\n");
+            Ok(rune_net::fetch::FetchResponse {
+                status: 200,
+                content_type: "text/event-stream".to_owned(),
+                retry_after: None,
+                retry_after_ms: None,
+                should_retry: None,
+                location: None,
+                body: Box::new(std::io::Cursor::new(body.into_bytes())),
+            })
+        }
+    }
+
+    impl SummaryFetch {
+        fn requests(&self) -> usize {
+            self.requests.load(std::sync::atomic::Ordering::Relaxed)
+        }
+    }
+
+    /// A host whose only model traffic is the summary request.
+    struct SummaryHost {
+        endpoint: transport::Endpoint,
+        events: std::sync::Mutex<Vec<Event>>,
+        cancellation: crate::steering::Cancellation,
+        steering: crate::steering::SteeringQueue,
+    }
+
+    impl SummaryHost {
+        fn new() -> Self {
+            Self {
+                endpoint: transport::Endpoint::new("https://api.example.com", "k"),
+                events: std::sync::Mutex::new(Vec::new()),
+                cancellation: crate::steering::Cancellation::new(),
+                steering: crate::steering::SteeringQueue::new(8),
+            }
+        }
+
+        fn settled_events(&self) -> Vec<bool> {
+            self.events
+                .lock()
+                .expect("events")
+                .iter()
+                .filter_map(|event| match event {
+                    Event::ContextCompacted { settled, .. } => Some(*settled),
+                    _ => None,
+                })
+                .collect()
+        }
+    }
+
+    impl Host for SummaryHost {
+        fn dialect(&self) -> &dyn Provider {
+            &rune_net::chat_completions::ChatCompletions
+        }
+
+        fn endpoint(&self) -> &transport::Endpoint {
+            &self.endpoint
+        }
+
+        fn model(&self) -> String {
+            "test/model".to_owned()
+        }
+
+        fn instructions(&self) -> String {
+            "You are a test assistant.".to_owned()
+        }
+
+        fn tools(&self) -> Vec<rune_net::message::ToolSpec> {
+            Vec::new()
+        }
+
+        fn fetch(&self) -> Box<dyn Fetch> {
+            Box::new(SummaryFetch::default())
+        }
+
+        fn emit(&self, event: Event) {
+            self.events.lock().expect("events").push(event);
+        }
+
+        fn execute(
+            &self,
+            _name: &str,
+            _arguments: &serde_json::Value,
+        ) -> Result<rune_tools::contract::ToolOutput> {
+            Ok(rune_tools::contract::ToolOutput::success("ok"))
+        }
+
+        fn decide(
+            &self,
+            _name: &str,
+            _target: Option<&str>,
+        ) -> (rune_policy::decision::Outcome, String) {
+            (rune_policy::decision::Outcome::Allow, "allowed".to_owned())
+        }
+
+        fn context(&self) -> rune_tools::contract::ExecutionContext {
+            rune_tools::contract::ExecutionContext::new(camino::Utf8PathBuf::from("/tmp/rune-test"))
+        }
+
+        fn cancellation(&self) -> crate::steering::Cancellation {
+            self.cancellation.clone()
+        }
+
+        fn steering(&self) -> &crate::steering::SteeringQueue {
+            &self.steering
+        }
+    }
+
+    /// The request the host would send for `history`.
+    fn request_for(host: &SummaryHost, history: &History) -> RequestPlan {
+        let mut request = RequestPlan::new(host.model());
+        request.instructions = host.instructions();
+        request.messages = history.to_messages();
+        request
+    }
+
+    /// Estimated input tokens of the request for `history`.
+    fn input_tokens(host: &SummaryHost, history: &History) -> u64 {
+        request_estimate(
+            host.dialect(),
+            &request_for(host, history),
+            Window(u64::MAX),
+            None,
+        )
+        .expect("estimate")
+        .input_tokens
+    }
+
+    /// The smallest window whose ceiling puts `tokens` at `percent` of it or below.
+    fn window_at(tokens: u64, percent: u64) -> Window {
+        let limits = BudgetSet::new();
+        let mut window = tokens;
+        while crate::tokens::ceiling(window, &limits)
+            .expect("ceiling")
+            .saturating_mul(percent)
+            < tokens.saturating_mul(100)
+        {
+            window = window.saturating_add(1);
+        }
+        Window(window)
+    }
+
+    /// A long history whose newest turn holds a check run after an edit.
+    fn settled_history() -> History {
+        let mut history = long_history();
+        history.push_user("fix the parser and run the tests");
+        history.push_assistant(vec![call("check")]);
+        let seq = history.push_tool_results(vec![result("check")]);
+        history.ledger_mut().settled = true;
+        history.set_settled_turn(seq);
+        history
+    }
+
+    #[test]
+    fn a_settled_point_compacts_early() {
+        let host = SummaryHost::new();
+        let fetch = SummaryFetch::default();
+        let mut history = settled_history();
+        let window = window_at(input_tokens(&host, &history), 75);
+        let mut request = request_for(&host, &history);
+
+        let done = auto_compact(&mut history, &mut request, &host, &fetch, window)
+            .expect("compaction")
+            .expect("compacted at the settled point");
+
+        assert!(done.settled);
+        assert_eq!(fetch.requests(), 1);
+        assert_eq!(host.settled_events(), vec![true]);
+        assert!(!history.ledger().settled);
+        assert_eq!(request.messages, history.to_messages());
+        history.validate().expect("valid after compaction");
+    }
+
+    #[test]
+    fn a_settled_point_is_used_once() {
+        let host = SummaryHost::new();
+        let fetch = SummaryFetch::default();
+        let mut history = settled_history();
+        history.push_assistant(vec![call("next")]);
+        history.push_tool_results(vec![result("next")]);
+        assert!(history.ledger().settled);
+        let window = window_at(input_tokens(&host, &history), 75);
+        let mut request = request_for(&host, &history);
+
+        let done =
+            auto_compact(&mut history, &mut request, &host, &fetch, window).expect("no compaction");
+
+        assert!(done.is_none());
+        assert_eq!(fetch.requests(), 0);
+        assert!(host.settled_events().is_empty());
+
+        let mut history = settled_history();
+        let window = window_at(input_tokens(&host, &history), 75);
+        let mut request = request_for(&host, &history);
+        auto_compact(&mut history, &mut request, &host, &fetch, window)
+            .expect("compaction")
+            .expect("compacted at the settled point");
+        let mut request = request_for(&host, &history);
+        let again = auto_compact(&mut history, &mut request, &host, &fetch, window)
+            .expect("no second compaction");
+        assert!(again.is_none());
+        assert_eq!(fetch.requests(), 1);
+    }
+
+    #[test]
+    fn no_compaction_while_a_call_waits_for_its_result() {
+        let host = SummaryHost::new();
+        let fetch = SummaryFetch::default();
+        let mut history = long_history();
+        history.push_user("read one more file");
+        history.push_assistant(vec![call("waiting")]);
+        assert_eq!(history.pending_tool_calls().len(), 1);
+        let window = window_at(input_tokens(&host, &history), 105);
+        let limits = BudgetSet::new();
+        assert!(
+            input_tokens(&host, &history)
+                >= crate::tokens::ceiling(window.0, &limits).expect("ceiling")
+        );
+        let mut request = request_for(&host, &history);
+
+        let done =
+            auto_compact(&mut history, &mut request, &host, &fetch, window).expect("no compaction");
+
+        assert!(done.is_none());
+        assert_eq!(fetch.requests(), 0);
+
+        history.push_tool_results(vec![result("waiting")]);
+        let mut request = request_for(&host, &history);
+        let done = auto_compact(&mut history, &mut request, &host, &fetch, window)
+            .expect("compaction")
+            .expect("compacted once the result is in");
+        assert!(!done.settled);
+        assert_eq!(fetch.requests(), 1);
+        assert_eq!(host.settled_events(), vec![false]);
     }
 }
