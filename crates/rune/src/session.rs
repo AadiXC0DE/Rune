@@ -840,6 +840,17 @@ impl Host for SessionHost {
         self.request_approval("web_fetch_private", target, reason)
     }
 
+    fn decide_quietly(&self, name: &str, target: Option<&str>) -> Outcome {
+        turn::decide_call_in_workspace(
+            &lock_rules(&self.rules),
+            self.mode(),
+            name,
+            target,
+            self.context.workspace(),
+        )
+        .0
+    }
+
     fn decide(&self, name: &str, target: Option<&str>) -> (Outcome, String) {
         // Plan mode is enforced here, before any rule or mode, so no rule, mode
         // or approval can let a change through while the session is planning.

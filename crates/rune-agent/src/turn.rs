@@ -407,6 +407,13 @@ pub trait Host {
     /// Returns the outcome and, for an explanation, the deciding rule.
     fn decide(&self, name: &str, target: Option<&str>) -> (Outcome, String);
 
+    /// Resolves policy for a call from the rules and mode alone, without asking a
+    /// person or running a review. Used where the loop only needs to know whether
+    /// something is already allowed.
+    fn decide_quietly(&self, _name: &str, _target: Option<&str>) -> Outcome {
+        Outcome::Ask
+    }
+
     /// Resolves a call like [`Host::decide`], with its arguments in view, so
     /// an approval can show what the call would do. The arguments never
     /// change the scope that is approved.
@@ -2097,7 +2104,15 @@ fn prepare_call(
             executed: false,
         });
     }
-    let context = host.context().with_private_network_access(private_access);
+    let mut context = host.context().with_private_network_access(private_access);
+    if call.name == "edit_file" {
+        // A missed edit may quote the file's closest lines, which is only
+        // fair when reading the file would not need an approval.
+        let read_target = host.tool_permission_target("read_file", &arguments);
+        context = context.with_quote_files(
+            host.decide_quietly("read_file", read_target.as_deref()) == Outcome::Allow,
+        );
+    }
 
     host.emit(Event::ToolStarted {
         call: call.clone(),

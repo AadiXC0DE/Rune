@@ -939,6 +939,11 @@ impl Host for AskHost<'_> {
         )
     }
 
+    fn decide_quietly(&self, name: &str, target: Option<&str>) -> Outcome {
+        // `decide` here evaluates rules only; it never asks anyone.
+        self.decide(name, target).0
+    }
+
     fn context(&self) -> ExecutionContext {
         self.context.fork()
     }

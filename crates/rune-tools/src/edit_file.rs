@@ -123,7 +123,7 @@ impl Tool for EditFile {
         let raw = mutation::required_string(tool, arguments, "path")?;
         let edits = literal_edits(tool, arguments)?;
         let path = resolve(context, raw)?.path;
-        let prepared = mutation::prepare_edits(&path, &edits)?;
+        let prepared = mutation::prepare_edits_with(&path, &edits, context.quote_files)?;
         context.check_cancelled()?;
         let diff = mutation::shown_diff(prepared.preview());
         let applied = mutation::apply(prepared)?;

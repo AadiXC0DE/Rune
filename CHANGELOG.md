@@ -30,6 +30,11 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Changed
 
+- A missed `edit_file` says when `new_string` is already in the file, or quotes
+  the file's closest lines with line numbers so the next attempt can copy them,
+  with a note when the only difference is tabs against spaces; it quotes nothing
+  from a file the model could not read without approval. An ambiguous edit names
+  the line of each match and the line before it.
 - `edit_file` accepts an `old_string` that differs from the file only in line
   endings, typographic punctuation and spaces (curly quotes, dashes, no-break
   spaces) or, for whole lines, trailing whitespace or indentation, when it

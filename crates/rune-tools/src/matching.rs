@@ -309,6 +309,191 @@ impl View {
     }
 }
 
+/// Lines `first..=last` (1-based) where `new` already occurs, when it has at least
+/// 20 non-whitespace characters. Compared on the folded views.
+#[must_use]
+pub fn already_applied(source: &str, new: &str) -> Option<(usize, usize)> {
+    if new.chars().filter(|c| !c.is_whitespace()).count() < 20 {
+        return None;
+    }
+    let source_view = View::folded(source);
+    let needle = View::folded(new);
+    let start = source_view.text.find(needle.text.as_str())?;
+    let end = start.saturating_add(needle.text.len());
+    let from = source_view.to_source(start);
+    let to = source_view.to_source(end);
+    let first = line_of(source, from);
+    // A match that ends with a newline ends on the line before the next one.
+    let last = line_of(source, to.saturating_sub(1).max(from));
+    Some((first, last))
+}
+
+/// The 1-based line holding byte `offset`.
+fn line_of(source: &str, offset: usize) -> usize {
+    let offset = offset.min(source.len());
+    source[..offset].matches('\n').count().saturating_add(1)
+}
+
+/// The file lines closest to a missed search, numbered as `read_file` shows them.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Closest {
+    /// First line shown, 1-based.
+    pub first: usize,
+    /// Last line shown, 1-based, at most `first + 11`.
+    pub last: usize,
+    /// The lines in `read_file` format, one per file line.
+    pub numbered: String,
+    /// A note when the only difference looks like tabs against spaces.
+    pub indent_note: Option<&'static str>,
+}
+
+/// Lines in a file too long to search for the closest text.
+const MAX_CLOSEST_SOURCE_LINES: usize = 100_000;
+
+/// Most lines quoted, and most characters of one line.
+const MAX_CLOSEST_LINES: usize = 12;
+const MAX_CLOSEST_LINE_CHARS: usize = 200;
+const MAX_CLOSEST_BYTES: usize = 4096;
+
+/// A line's comparison key: folded, whitespace runs collapsed, trimmed.
+fn line_key(line: &str) -> String {
+    let folded: String = line.chars().map(fold).collect();
+    folded.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// The file lines most of the needle's distinctive lines agree on.
+///
+/// Each needle line with a letter or digit votes for the start position its
+/// equal file lines imply; the start with the most votes wins when at least
+/// half of those lines agree on it.
+#[must_use]
+pub fn closest_lines(source: &str, needle: &str) -> Option<Closest> {
+    let file: Vec<&str> = source
+        .split('\n')
+        .map(|line| line.strip_suffix('\r').unwrap_or(line))
+        .collect();
+    if file.len() > MAX_CLOSEST_SOURCE_LINES {
+        return None;
+    }
+    let wanted: Vec<(usize, &str)> = needle
+        .split('\n')
+        .map(|line| line.strip_suffix('\r').unwrap_or(line))
+        .enumerate()
+        .filter(|(_, line)| line.chars().any(char::is_alphanumeric))
+        .collect();
+    if wanted.is_empty() {
+        return None;
+    }
+    let mut by_key: std::collections::HashMap<String, Vec<usize>> =
+        std::collections::HashMap::new();
+    for (index, line) in file.iter().enumerate() {
+        by_key.entry(line_key(line)).or_default().push(index);
+    }
+    // start -> (votes, file lines that voted for it)
+    let mut tally: std::collections::BTreeMap<usize, (usize, Vec<(usize, usize)>)> =
+        std::collections::BTreeMap::new();
+    for &(offset, line) in &wanted {
+        let Some(lines) = by_key.get(&line_key(line)) else {
+            continue;
+        };
+        let mut voted = std::collections::BTreeSet::new();
+        for &index in lines {
+            let Some(start) = index.checked_sub(offset) else {
+                continue;
+            };
+            if voted.insert(start) {
+                let entry = tally.entry(start).or_default();
+                entry.0 = entry.0.saturating_add(1);
+                entry.1.push((offset, index));
+            }
+        }
+    }
+    let (&start, (votes, voters)) =
+        tally
+            .iter()
+            .max_by(|(left_start, left), (right_start, right)| {
+                left.0.cmp(&right.0).then(right_start.cmp(left_start))
+            })?;
+    if votes.saturating_mul(2) < wanted.len() {
+        return None;
+    }
+    // The whole window the winning start implies, so the lines that differ
+    // are shown beside the ones that agree.
+    let body = needle.strip_suffix('\n').unwrap_or(needle);
+    let window = body.split('\n').count().max(1);
+    let first = start.saturating_add(1);
+    let last = start
+        .saturating_add(window)
+        .min(file.len())
+        .min(first.saturating_add(MAX_CLOSEST_LINES.saturating_sub(1)))
+        .max(first);
+    let mut numbered = String::new();
+    for number in first..=last {
+        let text = file[number.saturating_sub(1)];
+        let shown = if text.chars().count() > MAX_CLOSEST_LINE_CHARS {
+            let cut: String = text.chars().take(MAX_CLOSEST_LINE_CHARS).collect();
+            format!("{cut}...")
+        } else {
+            text.to_owned()
+        };
+        let row = format!("{number:>6}\t{shown}");
+        let separator = usize::from(!numbered.is_empty());
+        if numbered
+            .len()
+            .saturating_add(separator)
+            .saturating_add(row.len())
+            > MAX_CLOSEST_BYTES
+        {
+            break;
+        }
+        if !numbered.is_empty() {
+            numbered.push('\n');
+        }
+        numbered.push_str(&row);
+    }
+    let needle_lines: Vec<&str> = needle
+        .split('\n')
+        .map(|line| line.strip_suffix('\r').unwrap_or(line))
+        .collect();
+    let pairs: Vec<(&str, &str)> = voters
+        .iter()
+        .filter(|&&(_, index)| index.saturating_add(1) >= first && index < last)
+        .map(|&(offset, index)| (file[index], needle_lines[offset]))
+        .filter(|(file_line, needle_line)| file_line != needle_line)
+        .collect();
+    Some(Closest {
+        first,
+        last,
+        numbered,
+        indent_note: indent_note(&pairs),
+    })
+}
+
+/// The note for a closest match whose lines differ only in tabs against spaces.
+fn indent_note(pairs: &[(&str, &str)]) -> Option<&'static str> {
+    if pairs.is_empty()
+        || !pairs.iter().all(|(file, needle)| {
+            file.trim_start_matches([' ', '\t']) == needle.trim_start_matches([' ', '\t'])
+        })
+    {
+        return None;
+    }
+    let has_tab = |line: &str| leading_indent(line).contains('\t');
+    if pairs
+        .iter()
+        .all(|(file, needle)| has_tab(file) && !has_tab(needle))
+    {
+        return Some("The file indents with tabs; old_string uses spaces.");
+    }
+    if pairs
+        .iter()
+        .all(|(file, needle)| has_tab(needle) && !has_tab(file))
+    {
+        return Some("The file indents with spaces; old_string uses tabs.");
+    }
+    None
+}
+
 /// The punctuation fold for one character.
 ///
 /// Typographic quotes, dashes and the minus sign read as their ASCII form,
@@ -327,6 +512,7 @@ pub const fn fold(c: char) -> char {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fmt::Write as _;
 
     #[test]
     fn a_view_maps_offsets_back_across_removed_carriage_returns() {
@@ -540,6 +726,100 @@ mod tests {
         assert_eq!(matches.tier, Tier::Indentation);
         assert_eq!(matches.spans.len(), 2);
         assert_eq!(matches.reindent, None);
+    }
+
+    #[test]
+    fn already_applied_needs_twenty_visible_characters() {
+        let source = "one\nlet total = compute(a, b);\nthree\n";
+        assert_eq!(
+            already_applied(source, "let total = compute(a, b);\n"),
+            Some((2, 2))
+        );
+        assert_eq!(
+            already_applied(source, "one\nlet total = compute(a, b);"),
+            Some((1, 2))
+        );
+        // Nineteen non-whitespace characters are not enough.
+        assert_eq!(
+            already_applied("abcdefghij klmnopqrs", "abcdefghij klmnopqrs"),
+            None
+        );
+        assert_eq!(
+            already_applied(source, "nothing like this appears here at all"),
+            None
+        );
+    }
+
+    #[test]
+    fn closest_lines_need_half_of_the_distinctive_lines() {
+        let source = "fn a() {\n    first();\n    second();\n}\n";
+        let closest = closest_lines(source, "    first();\n    changed();\n").expect("half agree");
+        // The window the agreeing line implies, including the line that differs.
+        assert_eq!((closest.first, closest.last), (2, 3));
+        let none = closest_lines(source, "    first();\n    x();\n    y();\n    z();\n");
+        assert_eq!(none, None, "one of four distinctive lines is not enough");
+        assert_eq!(
+            closest_lines(source, "  }\n  ;\n"),
+            None,
+            "no distinctive lines"
+        );
+    }
+
+    #[test]
+    fn closest_lines_are_numbered_like_read_file() {
+        let source = "a\nfn b() {\n    call();\n}\n";
+        let closest = closest_lines(source, "fn b() {\n    call(1);\n}\n").expect("closest");
+        assert_eq!((closest.first, closest.last), (2, 4));
+        assert_eq!(
+            closest.numbered,
+            "     2\tfn b() {\n     3\t    call();\n     4\t}"
+        );
+    }
+
+    #[test]
+    fn closest_lines_are_capped_at_twelve_lines_and_two_hundred_characters() {
+        let mut source = String::new();
+        let long = "x".repeat(5000);
+        for index in 0..20 {
+            let _ = writeln!(source, "line {index} {long}");
+        }
+        let needle = format!("line 0 {long}\nline 19 {long}\n");
+        let closest = closest_lines(
+            &source,
+            &format!("line 0 {long}\n{}line 19 {long}\n", "\n".repeat(18)),
+        )
+        .expect("closest");
+        let _ = needle;
+        assert_eq!((closest.first, closest.last), (1, 12));
+        let first = closest.numbered.lines().next().expect("a line");
+        assert!(first.ends_with("..."), "{first}");
+        assert_eq!(
+            first.split('\t').nth(1).map(|text| text.chars().count()),
+            Some(203)
+        );
+        assert!(closest.numbered.len() <= 4096);
+    }
+
+    #[test]
+    fn closest_lines_skip_files_over_one_hundred_thousand_lines() {
+        let source = "x\n".repeat(100_001);
+        assert_eq!(closest_lines(&source, "x\n"), None);
+    }
+
+    #[test]
+    fn a_tab_indented_file_gets_the_tab_note() {
+        let source = "fn f() {\n\tlet x = 1;\n\tlet y = 2;\n}\n";
+        let closest = closest_lines(source, "    let x = 1;\n    let y = 2;\n").expect("closest");
+        assert_eq!(
+            closest.indent_note,
+            Some("The file indents with tabs; old_string uses spaces.")
+        );
+        let spaces = "fn f() {\n    let x = 1;\n}\n";
+        let closest = closest_lines(spaces, "\tlet x = 1;\n").expect("closest");
+        assert_eq!(
+            closest.indent_note,
+            Some("The file indents with spaces; old_string uses tabs.")
+        );
     }
 
     #[test]

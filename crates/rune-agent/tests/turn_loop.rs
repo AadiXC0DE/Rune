@@ -352,6 +352,17 @@ impl Host for TestHost {
             .unwrap_or_else(|| ToolOutput::success("tool output")))
     }
 
+    fn decide_quietly(&self, name: &str, target: Option<&str>) -> Outcome {
+        rune_agent::turn::decide_call_in_workspace(
+            &self.rules,
+            self.mode,
+            name,
+            target,
+            &self.workspace,
+        )
+        .0
+    }
+
     fn decide(&self, name: &str, target: Option<&str>) -> (Outcome, String) {
         self.decisions
             .lock()
@@ -399,6 +410,16 @@ impl Host for TestHost {
                 .as_ref()
                 .expect("plan registry")
                 .call(name, arguments, context);
+        }
+        if name == "edit_file"
+            && let Some(registry) = &self.registry
+        {
+            // The per-call context carries whether the edit may quote the file.
+            self.executed
+                .lock()
+                .expect("lock")
+                .push((name.to_owned(), arguments.clone()));
+            return registry.call(name, arguments, context);
         }
         if name == "web_fetch" {
             assert_eq!(
@@ -3027,6 +3048,56 @@ fn a_file_rename_requires_policy_to_allow_both_normalized_paths() {
             Event::ToolStarted { .. } | Event::ToolFinished { .. }
         )));
     }
+}
+
+/// Runs one failing `edit_file` call on a file holding a secret, with the
+/// given read rule, and returns the call's result text.
+fn missed_edit_result(read_rule: Rule) -> String {
+    let workspace = tempfile::tempdir().expect("workspace");
+    std::fs::write(
+        workspace.path().join("secret.txt"),
+        "alpha\nsecret value 12345\nomega\n",
+    )
+    .expect("fixture");
+    let arguments = serde_json::json!({
+        "path": "secret.txt",
+        "old_string": "secret value 99999\nomega\n",
+        "new_string": "x\n",
+    })
+    .to_string();
+    let endpoint = MockEndpoint::start(vec![
+        Script::tool_call("edit", "edit_file", &arguments),
+        Script::text("done"),
+    ]);
+    let registry = rune_tools::inventory::builtin_default().expect("builtins");
+    let mut rules = RuleSet::new();
+    rules.push(Rule::allow("edit_file", "*", Layer::User));
+    rules.push(read_rule);
+    let mut host = TestHost::new(endpoint)
+        .with_tools(registry.all_schemas())
+        .with_rules(rules);
+    host.workspace = Utf8PathBuf::from_path_buf(workspace.path().to_owned()).expect("UTF-8 path");
+    host.registry = Some(registry);
+    let mut history = rune_agent::History::new();
+    history.push_user("edit the secret file");
+    let outcome = run_turn(&mut history, &host).expect("turn");
+    assert!(
+        outcome.calls[0].output.is_error,
+        "{}",
+        outcome.calls[0].output.text
+    );
+    outcome.calls[0].output.text.clone()
+}
+
+#[test]
+fn an_edit_of_a_file_read_would_ask_for_quotes_nothing() {
+    let quiet = missed_edit_result(Rule::ask("read_file", "*", Layer::User));
+    assert!(!quiet.contains("12345"), "{quiet}");
+    assert!(!quiet.contains("omega"), "{quiet}");
+    assert!(quiet.contains("read the file again"), "{quiet}");
+    // The same miss with reading allowed quotes the closest lines.
+    let quoted = missed_edit_result(Rule::allow("read_file", "*", Layer::User));
+    assert!(quoted.contains("secret value 12345"), "{quoted}");
 }
 
 #[test]

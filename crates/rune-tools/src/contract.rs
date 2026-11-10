@@ -226,6 +226,10 @@ pub struct ExecutionContext {
     pub network: bool,
     /// Tool cache directories sandboxed commands may write.
     pub cache_roots: Vec<Utf8PathBuf>,
+    /// Whether a tool may quote file contents in an error, such as the lines
+    /// closest to a missed edit. False when reading that file would need an
+    /// approval the model has not been given.
+    pub quote_files: bool,
 }
 
 impl ExecutionContext {
@@ -247,7 +251,15 @@ impl ExecutionContext {
             environment: Arc::default(),
             network: false,
             cache_roots: Vec::new(),
+            quote_files: true,
         }
+    }
+
+    /// Sets whether a tool may quote file contents in an error.
+    #[must_use]
+    pub const fn with_quote_files(mut self, allowed: bool) -> Self {
+        self.quote_files = allowed;
+        self
     }
 
     /// Sets the tool cache directories sandboxed commands may write.
@@ -373,6 +385,7 @@ impl ExecutionContext {
             environment: Arc::clone(&self.environment),
             network: self.network,
             cache_roots: self.cache_roots.clone(),
+            quote_files: self.quote_files,
         }
     }
 

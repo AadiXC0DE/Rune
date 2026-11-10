@@ -12,6 +12,7 @@
 //! found that way is mapped back to the original bytes, and every byte outside
 //! a match is written verbatim, so CRLF and lone CR endings survive.
 
+use std::fmt::Write as _;
 use std::fs::{File, OpenOptions, Permissions};
 use std::io::{ErrorKind, Read, Write};
 use std::ops::Range;
@@ -420,6 +421,18 @@ pub fn prepare_edit(
 /// succeed before the single postimage can be applied. Intermediate content
 /// obeys the same size limits as the final postimage.
 pub fn prepare_edits(path: &Utf8Path, edits: &[LiteralEdit<'_>]) -> Result<Prepared> {
+    prepare_edits_with(path, edits, true)
+}
+
+/// [`prepare_edits`], with whether a missed edit may quote the file's lines.
+///
+/// `quote` is false when reading the file would need an approval, so an
+/// error then names no file content.
+pub fn prepare_edits_with(
+    path: &Utf8Path,
+    edits: &[LiteralEdit<'_>],
+    quote: bool,
+) -> Result<Prepared> {
     if edits.is_empty() {
         return Err(RuneError::invalid_field("edits", "must not be empty"));
     }
@@ -440,7 +453,7 @@ pub fn prepare_edits(path: &Utf8Path, edits: &[LiteralEdit<'_>]) -> Result<Prepa
     let mut replacements = 0usize;
     let mut relaxed = Vec::new();
     for (index, edit) in edits.iter().enumerate() {
-        let (next, count, tier) = replace_literal(path, &postimage, edit, before.len())
+        let (next, count, tier) = replace_literal(path, &postimage, edit, before.len(), quote)
             .map_err(|err| hunk_error(err, index, edits.len()))?;
         postimage = next;
         replacements = replacements.saturating_add(count);
@@ -505,6 +518,7 @@ fn replace_literal(
     before: &str,
     edit: &LiteralEdit<'_>,
     preimage_len: usize,
+    quote: bool,
 ) -> Result<(String, usize, crate::matching::Tier)> {
     use crate::matching::{Tiers, search};
     let LiteralEdit {
@@ -518,13 +532,13 @@ fn replace_literal(
         Tiers::Selectable
     };
     let Some(matches) = search(before, old, tiers) else {
-        return Err(no_match(path));
+        return Err(not_found(path, before, old, new, quote));
     };
     let count = matches.spans.len();
     let chosen: Vec<Range<usize>> = match occurrence {
         Occurrence::Unique => {
             if count != 1 {
-                return Err(ambiguous(path, count));
+                return Err(ambiguous(path, before, &matches.spans, quote));
             }
             matches.spans
         }
@@ -539,9 +553,8 @@ fn replace_literal(
     // An indentation-tier match writes the replacement at the file's
     // indentation; one that cannot be re-indented does not match at all.
     let replacement = match &matches.reindent {
-        Some(reindent) => {
-            crate::matching::reindented(new, reindent).ok_or_else(|| no_match(path))?
-        }
+        Some(reindent) => crate::matching::reindented(new, reindent)
+            .ok_or_else(|| not_found(path, before, old, new, quote))?,
         None => new.to_owned(),
     };
     let new = replacement.as_str();
@@ -1062,23 +1075,96 @@ fn stale(path: &Utf8Path) -> RuneError {
     .with_hint("read the file again and retry the change")
 }
 
-/// The text to replace does not appear in the target.
-fn no_match(path: &Utf8Path) -> RuneError {
-    RuneError::new(
-        ErrorCode::NotFound,
-        format!("`old_string` was not found in `{path}`"),
-    )
-    .with_hint("read the file again to see its current contents")
+/// The error for an `old_string` no tier matched.
+///
+/// The first rule that applies decides: `new_string` already in the file
+/// says the change is applied; otherwise, when quoting is allowed, the
+/// closest lines are shown numbered so the next attempt can copy them;
+/// otherwise the advice is to read the file again.
+fn not_found(path: &Utf8Path, content: &str, old: &str, new: &str, quote: bool) -> RuneError {
+    const APPLIED: &str = "if the change is already applied, do not retry this edit";
+    let missing = format!("`old_string` was not found in `{path}`");
+    if let Some((first, last)) = crate::matching::already_applied(content, new) {
+        let lines = if first == last {
+            format!("at line {first}")
+        } else {
+            format!("at lines {first}-{last}")
+        };
+        return RuneError::new(
+            ErrorCode::NotFound,
+            format!("{missing}, and `new_string` is already there {lines}"),
+        )
+        .with_hint(APPLIED);
+    }
+    if quote && let Some(closest) = crate::matching::closest_lines(content, old) {
+        let lines = if closest.first == closest.last {
+            format!("is line {}", closest.first)
+        } else {
+            format!("is lines {}-{}", closest.first, closest.last)
+        };
+        let mut message = format!("{missing}. The closest text {lines}:\n{}", closest.numbered);
+        if let Some(note) = closest.indent_note {
+            message.push('\n');
+            message.push_str(note);
+        }
+        return RuneError::new(ErrorCode::NotFound, message)
+            .with_hint(format!("copy the exact text from these lines; {APPLIED}"));
+    }
+    RuneError::new(ErrorCode::NotFound, missing).with_hint(format!(
+        "read the file again to see its current contents; {APPLIED}"
+    ))
 }
 
 /// The text to replace appears more than once and no selector was given.
-fn ambiguous(path: &Utf8Path, count: usize) -> RuneError {
-    RuneError::new(
-        ErrorCode::AmbiguousMatch,
-        format!("the requested text occurs {count} times in `{path}`"),
-    )
-    .with_observed(count.to_string())
-    .with_hint("pass `occurrence` to pick one, or `replace_all` to change every one")
+fn ambiguous(path: &Utf8Path, content: &str, spans: &[Range<usize>], quote: bool) -> RuneError {
+    const LISTED: usize = 5;
+    let count = spans.len();
+    let places: Vec<String> = spans
+        .iter()
+        .take(LISTED)
+        .map(|span| {
+            let before = &content[..span.start.min(content.len())];
+            let line = before.matches('\n').count().saturating_add(1);
+            if !quote {
+                return format!("line {line}");
+            }
+            if line == 1 {
+                return format!("line {line} (first line)");
+            }
+            // The text before the start of the match's line, without the one
+            // newline that ends the previous line.
+            let line_start = before.rfind('\n').map_or(0, |at| at.saturating_add(1));
+            let earlier = &before[..line_start];
+            let previous = earlier
+                .strip_suffix('\n')
+                .unwrap_or(earlier)
+                .rsplit('\n')
+                .next()
+                .unwrap_or("")
+                .trim();
+            if previous.is_empty() {
+                return format!("line {line} (after a blank line)");
+            }
+            let shown = if previous.chars().count() > 80 {
+                format!("{}...", previous.chars().take(80).collect::<String>())
+            } else {
+                previous.to_owned()
+            };
+            format!("line {line} (after `{shown}`)")
+        })
+        .collect();
+    let mut message = format!(
+        "the requested text occurs {count} times in `{path}`: {}",
+        places.join(", ")
+    );
+    if count > LISTED {
+        let _ = write!(message, ", and {} more", count.saturating_sub(LISTED));
+    }
+    RuneError::new(ErrorCode::AmbiguousMatch, message)
+        .with_observed(count.to_string())
+        .with_hint(
+            "pass `occurrence` to pick one, add more surrounding text, or pass `replace_all`",
+        )
 }
 
 /// The requested occurrence does not exist in the target.
@@ -1473,6 +1559,115 @@ mod tests {
         )
         .expect_err("gives up");
         assert_eq!(err.code(), ErrorCode::NotFound, "{}", err.message());
+    }
+
+    /// The error a unique edit of `body` with `old` and `new` reports.
+    fn missed(body: &str, old: &str, new: &str, quote: bool) -> RuneError {
+        let dir = dir();
+        let path = file_in(&dir, "miss.rs");
+        std::fs::write(&path, body).expect("seed");
+        prepare_edits_with(
+            &path,
+            &[LiteralEdit {
+                old,
+                new,
+                occurrence: Occurrence::Unique,
+            }],
+            quote,
+        )
+        .expect_err("a miss")
+    }
+
+    #[test]
+    fn a_miss_on_an_applied_change_says_so() {
+        let body = "fn main() {\n    let total = compute(a, b);\n}\n";
+        let err = missed(
+            body,
+            "    let sum = add(a, b);\n",
+            "    let total = compute(a, b);\n",
+            false,
+        );
+        assert_eq!(err.code(), ErrorCode::NotFound);
+        assert!(
+            err.message()
+                .ends_with("and `new_string` is already there at line 2"),
+            "{}",
+            err.message()
+        );
+        assert_eq!(
+            err.hint(),
+            Some("if the change is already applied, do not retry this edit")
+        );
+    }
+
+    #[test]
+    fn a_miss_quotes_the_closest_lines() {
+        let body = "fn main() {\n    let x = compute(1);\n    println!(\"{x}\");\n}\n";
+        let err = missed(
+            body,
+            "    let x = compute(2);\n    println!(\"{x}\");\n",
+            "    let x = 3;\n",
+            true,
+        );
+        assert!(
+            err.message()
+                .contains("The closest text is lines 2-3:\n     2\t    let x = compute(1);"),
+            "{}",
+            err.message()
+        );
+        assert!(
+            err.hint()
+                .is_some_and(|hint| hint.starts_with("copy the exact text"))
+        );
+    }
+
+    #[test]
+    fn a_miss_without_quote_permission_quotes_nothing() {
+        let body = "fn main() {\n    let secret = compute(1);\n    println!(\"{secret}\");\n}\n";
+        let err = missed(
+            body,
+            "    let secret = compute(2);\n    println!(\"{secret}\");\n",
+            "    let x = 3;\n",
+            false,
+        );
+        let text = format!("{} {}", err.message(), err.hint().unwrap_or(""));
+        for line in body.lines().filter(|line| !line.trim().is_empty()) {
+            assert!(!text.contains(line.trim()), "quoted {line:?}: {text}");
+        }
+        assert!(
+            err.hint()
+                .is_some_and(|hint| hint.starts_with("read the file again"))
+        );
+    }
+
+    #[test]
+    fn an_ambiguous_match_lists_the_first_five_lines() {
+        let mut body = String::from("x();\n");
+        for index in 0..6 {
+            let _ = write!(body, "fn f{index}() {{\nx();\n\nx();\n");
+        }
+        let err = missed(&body, "x();", "y();", true);
+        assert_eq!(err.code(), ErrorCode::AmbiguousMatch);
+        assert_eq!(err.detail().observed.as_deref(), Some("13"));
+        assert!(
+            err.message()
+                .starts_with("the requested text occurs 13 times in `"),
+            "{}",
+            err.message()
+        );
+        assert!(
+            err.message().ends_with(
+                ": line 1 (first line), line 3 (after `fn f0() {`), line 5 (after a blank line), line 7 (after `fn f1() {`), line 9 (after a blank line), and 8 more"
+            ),
+            "{}",
+            err.message()
+        );
+        let quiet = missed(&body, "x();", "y();", false);
+        assert!(
+            quiet.message().contains(": line 1, line 3, line 5"),
+            "{}",
+            quiet.message()
+        );
     }
 
     #[test]
