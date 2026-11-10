@@ -677,6 +677,46 @@ mod tests {
     }
 
     #[test]
+    fn the_indentation_clause_is_reported() {
+        let (dir, context) = workspace();
+        let path = seed(&dir, "deep.rs", "fn f() {\n        call();\n}\n");
+        let output = EditFile
+            .call(
+                &json!({ "path": "deep.rs", "old_string": "call();\n", "new_string": "call(1);\n" }),
+                &context,
+            )
+            .expect("call");
+        assert_eq!(
+            std::fs::read_to_string(path).expect("read"),
+            "fn f() {\n        call(1);\n}\n"
+        );
+        assert!(output.text.contains("(1 occurrence"), "{}", output.text);
+        let _ = output;
+        let path = seed(
+            &dir,
+            "deeper.rs",
+            "fn g() {\n        a();\n        b();\n}\n",
+        );
+        let output = EditFile
+            .call(
+                &json!({ "path": "deeper.rs", "old_string": "    a();\n    b();\n", "new_string": "    c();\n" }),
+                &context,
+            )
+            .expect("call");
+        assert!(
+            output
+                .text
+                .contains("matched after normalising indentation, check the result"),
+            "{}",
+            output.text
+        );
+        assert_eq!(
+            std::fs::read_to_string(path).expect("read"),
+            "fn g() {\n        c();\n}\n"
+        );
+    }
+
+    #[test]
     fn an_exact_match_adds_no_normalisation_clause() {
         let (dir, context) = workspace();
         seed(&dir, "plain.txt", "alpha\n");

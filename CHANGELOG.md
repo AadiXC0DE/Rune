@@ -32,8 +32,9 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 - `edit_file` accepts an `old_string` that differs from the file only in line
   endings, typographic punctuation and spaces (curly quotes, dashes, no-break
-  spaces) or, for whole lines, trailing whitespace, when it matches exactly one
-  place that way; the result names the
+  spaces) or, for whole lines, trailing whitespace or indentation, when it
+  matches exactly one place that way (an indentation match re-indents the
+  replacement to the file's indentation); the result names the
   normalisation, and every byte outside the match is written as it was.
 - `rune ask` has no step cap unless one is set; `--max-steps N` sets one and `0`
   removes it. A capped run's last request forbids tool calls and asks for a

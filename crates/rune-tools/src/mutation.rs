@@ -536,6 +536,15 @@ fn replace_literal(
             vec![matches.spans[index.saturating_sub(1)].clone()]
         }
     };
+    // An indentation-tier match writes the replacement at the file's
+    // indentation; one that cannot be re-indented does not match at all.
+    let replacement = match &matches.reindent {
+        Some(reindent) => {
+            crate::matching::reindented(new, reindent).ok_or_else(|| no_match(path))?
+        }
+        None => new.to_owned(),
+    };
+    let new = replacement.as_str();
     let removed: usize = chosen.iter().map(ExactSizeIterator::len).sum();
     let postimage_len = before
         .len()
@@ -1434,6 +1443,36 @@ mod tests {
         );
         assert_eq!(after, "fn f() {\n    let x = 2;\n}\n");
         assert_eq!(relaxed, [crate::matching::Tier::TrailingWhitespace]);
+    }
+
+    #[test]
+    fn tabs_in_the_file_replace_spaces_in_the_replacement() {
+        let (after, relaxed) = edited(
+            "fn f() {\n\tlet x = 1;\n}\n",
+            "    let x = 1;\n",
+            "    let x = 2;\n    let y = 3;\n",
+        );
+        assert_eq!(after, "fn f() {\n\tlet x = 2;\n\tlet y = 3;\n}\n");
+        assert_eq!(relaxed, [crate::matching::Tier::Indentation]);
+    }
+
+    #[test]
+    fn an_outdented_replacement_is_not_matched_by_indentation() {
+        let dir = dir();
+        let path = file_in(&dir, "outdent.txt");
+        std::fs::write(
+            &path,
+            "fn f() {\n        let x = 1;\n        let y = 2;\n}\n",
+        )
+        .expect("seed");
+        let err = prepare_edit(
+            &path,
+            "    let x = 1;\n    let y = 2;\n",
+            "    let x = 3;\n}\n",
+            Occurrence::Unique,
+        )
+        .expect_err("gives up");
+        assert_eq!(err.code(), ErrorCode::NotFound, "{}", err.message());
     }
 
     #[test]

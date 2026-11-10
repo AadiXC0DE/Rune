@@ -103,7 +103,61 @@ pub fn search(source: &str, needle: &str, tiers: Tiers) -> Option<Matches> {
     if !spans.is_empty() {
         return Some(found(Tier::TrailingWhitespace, spans));
     }
-    None
+    let spans = line_windows(&source_folded, &needle_folded.text, |file, wanted| {
+        file.trim_matches([' ', '\t']) == wanted.trim_matches([' ', '\t'])
+    });
+    match spans.as_slice() {
+        [] => None,
+        // More than one window: the caller reports the ambiguity.
+        [_, _, ..] => Some(found(Tier::Indentation, spans)),
+        [span] => {
+            let reindent = reindent_for(source, span.start, &needle_lines.text);
+            Some(Matches {
+                tier: Tier::Indentation,
+                spans,
+                reindent,
+            })
+        }
+    }
+}
+
+/// The indentation swap for an indentation-tier match starting at `start`:
+/// the search's first non-blank line's indentation, and the file's on the
+/// line that matched it.
+fn reindent_for(source: &str, start: usize, needle: &str) -> Option<Reindent> {
+    let (skipped, first) = needle
+        .split('\n')
+        .enumerate()
+        .find(|(_, line)| !line.trim_matches([' ', '\t']).is_empty())?;
+    let file_line = source[start..].split('\n').nth(skipped)?;
+    Some(Reindent {
+        from: leading_indent(first).to_owned(),
+        to: leading_indent(file_line).to_owned(),
+    })
+}
+
+/// The spaces and tabs a line starts with.
+fn leading_indent(line: &str) -> &str {
+    let content = line.trim_start_matches([' ', '\t']);
+    &line[..line.len().saturating_sub(content.len())]
+}
+
+/// `replacement` with `reindent.from` swapped for `reindent.to` at the start
+/// of every non-blank line, or `None` when a non-blank line does not start
+/// with `from` (it is indented less than the search, so the intent is unclear).
+#[must_use]
+pub fn reindented(replacement: &str, reindent: &Reindent) -> Option<String> {
+    let mut out = String::with_capacity(replacement.len());
+    for line in replacement.split_inclusive('\n') {
+        if line.trim().is_empty() {
+            out.push_str(line);
+            continue;
+        }
+        let rest = line.strip_prefix(reindent.from.as_str())?;
+        out.push_str(&reindent.to);
+        out.push_str(rest);
+    }
+    Some(out)
 }
 
 /// Whole-line windows of `view` whose lines match the needle's, line by line.
@@ -407,6 +461,85 @@ mod tests {
         let matches = search(source, "one\t", Tiers::Unique).expect("a match");
         assert_eq!(matches.tier, Tier::TrailingWhitespace);
         assert_eq!(&source[matches.spans[0].clone()], "one  ");
+    }
+
+    #[test]
+    fn a_search_indented_differently_matches_at_the_indentation_tier() {
+        let source = "fn f() {\n        let x = 1;\n        let y = 2;\n}\n";
+        let matches =
+            search(source, "    let x = 1;\n    let y = 2;\n", Tiers::Unique).expect("a match");
+        assert_eq!(matches.tier, Tier::Indentation);
+        assert_eq!(
+            &source[matches.spans[0].clone()],
+            "        let x = 1;\n        let y = 2;\n"
+        );
+        assert_eq!(
+            matches.reindent,
+            Some(Reindent {
+                from: "    ".to_owned(),
+                to: "        ".to_owned()
+            })
+        );
+        assert!(
+            search(
+                source,
+                "    let x = 1;\n    let y = 2;\n",
+                Tiers::Selectable
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn the_replacement_is_reindented_to_the_file() {
+        let reindent = Reindent {
+            from: "    ".to_owned(),
+            to: "        ".to_owned(),
+        };
+        assert_eq!(
+            reindented("    a\n        b\n", &reindent).as_deref(),
+            Some("        a\n            b\n")
+        );
+        let from_none = Reindent {
+            from: String::new(),
+            to: "    ".to_owned(),
+        };
+        assert_eq!(
+            reindented("a\nb", &from_none).as_deref(),
+            Some("    a\n    b")
+        );
+    }
+
+    #[test]
+    fn blank_replacement_lines_stay_blank() {
+        let reindent = Reindent {
+            from: "  ".to_owned(),
+            to: "\t".to_owned(),
+        };
+        assert_eq!(
+            reindented("  a\n\n  b\n", &reindent).as_deref(),
+            Some("\ta\n\n\tb\n")
+        );
+    }
+
+    #[test]
+    fn a_replacement_outdented_past_the_search_gives_up() {
+        let reindent = Reindent {
+            from: "    ".to_owned(),
+            to: "        ".to_owned(),
+        };
+        assert_eq!(reindented("    a\n}\n", &reindent), None);
+    }
+
+    #[test]
+    fn two_indentation_windows_are_ambiguous() {
+        let source = "  x = 1\n    x = 1\n";
+        let matches = search(source, "x = 1\n", Tiers::Unique).expect("matches");
+        assert_eq!(matches.tier, Tier::Exact);
+        let matches = search(source, "\tx = 1\n", Tiers::Unique).expect("matches");
+        assert_eq!(matches.tier, Tier::Indentation);
+        assert_eq!(matches.spans.len(), 2);
+        assert_eq!(matches.reindent, None);
     }
 
     #[test]
