@@ -15,6 +15,7 @@ pub mod subagent_role;
 pub mod subagent_tool;
 pub mod tokens;
 pub mod turn;
+pub mod verify;
 
 pub use compaction::{CompactionStats, Plan, Trigger};
 pub use history::{History, Turn};

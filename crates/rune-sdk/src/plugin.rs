@@ -461,6 +461,7 @@ impl PluginHost {
             full_text: None,
             diff: None,
             image: None,
+            check: None,
         })
     }
 

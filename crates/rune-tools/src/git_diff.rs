@@ -428,6 +428,7 @@ fn render(label: &str, reading: &Reading, cap: usize, failed: bool, untracked: &
         full_text: None,
         diff: None,
         image: None,
+        check: None,
     }
 }
 

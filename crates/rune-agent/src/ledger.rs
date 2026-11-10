@@ -205,7 +205,7 @@ impl Ledger {
             self.sessions.retain(|(known, _)| known != id);
         }
         // A command still running has no result yet.
-        if started || !crate::turn::is_check_command(&result.call.arguments) {
+        if started || !crate::verify::is_check_command(&result.call.arguments) {
             return;
         }
         let full = result.output.full_text.as_deref().unwrap_or(text);

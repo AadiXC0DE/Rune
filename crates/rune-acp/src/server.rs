@@ -1528,6 +1528,7 @@ impl<W: Write + Send + 'static> Host for TurnHost<W> {
                     full_text: None,
                     diff: None,
                     image: None,
+                    check: None,
                 },
                 Err(err) => ToolOutput::from_error(&err),
             };

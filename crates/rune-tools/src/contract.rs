@@ -120,6 +120,22 @@ pub struct ToolOutput {
     pub diff: Option<String>,
     /// An image for the model to see, attached to the result by the host.
     pub image: Option<ToolImage>,
+    /// What a command reported when the call saw it end.
+    pub check: Option<CheckRun>,
+}
+
+/// What a finished command reported, for the turn's verification state.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CheckRun {
+    /// Exit status; `None` when killed by a signal or unknown.
+    pub exit_code: Option<i32>,
+    /// Failed test count from a parsed report, when one was found.
+    pub failed_tests: Option<u64>,
+    /// Failing test names, in order, at most ten.
+    pub failing: Vec<String>,
+    /// The sorted failing names joined by newlines, or, when none parse, the first 16 hex
+    /// digits of the SHA-256 of the output's last 20 lines.
+    pub signature: String,
 }
 
 /// An image a tool returns for the model to see.
@@ -142,6 +158,7 @@ impl ToolOutput {
             full_text: None,
             diff: None,
             image: None,
+            check: None,
         }
     }
 
@@ -161,6 +178,7 @@ impl ToolOutput {
             full_text: None,
             diff: None,
             image: None,
+            check: None,
         }
     }
 

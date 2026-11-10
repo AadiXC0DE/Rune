@@ -4469,9 +4469,17 @@ fn a_command_after_the_last_change_counts_as_a_check() {
         output: ToolOutput::success("ok"),
         executed: true,
     };
+    // A finished command reports how it ended; the verdict reads that.
+    let finished = |mut result: CallResult| {
+        result.output.check = Some(rune_tools::CheckRun {
+            exit_code: Some(0),
+            ..rune_tools::CheckRun::default()
+        });
+        result
+    };
     let edit = call("edit_file", "{}");
-    let test = call("shell", r#"{"action":"run","command":"npm test"}"#);
-    let read = call("shell", r#"{"action":"run","command":"cat a.js"}"#);
+    let test = finished(call("shell", r#"{"action":"run","command":"npm test"}"#));
+    let read = finished(call("shell", r#"{"action":"run","command":"cat a.js"}"#));
     assert_eq!(
         Verification::of(std::slice::from_ref(&test)),
         Verification::NotApplicable
@@ -4902,7 +4910,11 @@ fn a_patch_counts_as_a_change_for_verification() {
         executed: true,
     };
     let patch = call("apply_patch", "{}");
-    let test = call("shell", r#"{"action":"run","command":"npm test"}"#);
+    let mut test = call("shell", r#"{"action":"run","command":"npm test"}"#);
+    test.output.check = Some(rune_tools::CheckRun {
+        exit_code: Some(0),
+        ..rune_tools::CheckRun::default()
+    });
     assert_eq!(
         Verification::of(std::slice::from_ref(&patch)),
         Verification::Unverified

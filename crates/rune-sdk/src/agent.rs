@@ -1554,6 +1554,7 @@ impl rune_agent::turn::Host for SdkHost<'_> {
             full_text: None,
             diff: None,
             image: None,
+            check: None,
         })
     }
 

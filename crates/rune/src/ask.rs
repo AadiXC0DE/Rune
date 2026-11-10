@@ -510,11 +510,17 @@ pub struct JsonResult {
     /// Experiment keys that differ from the default, as `key=value` pairs.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub experiment: Option<String>,
-    /// Whether a check ran after the last change to a file: `verified`,
-    /// `unverified`, or `not_applicable` when nothing changed. Absent when the
-    /// run failed before finishing.
+    /// Whether a check ran after the last change to a file and how it ended:
+    /// `verified`, `checked`, `failed`, `unverified`, or `not_applicable` when
+    /// nothing changed. Absent when the run failed before finishing.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub verification: Option<&'static str>,
+    /// Whether any changed path looks like a test file. Absent when `verification` is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tests_modified: Option<bool>,
+    /// Files changed during the run, by the edit tools or by commands. Absent when `verification` is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub changed_files: Option<u32>,
     /// Failure detail, present only when the run failed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
@@ -565,6 +571,8 @@ impl JsonResult {
             cost_usd: None,
             experiment: None,
             verification: None,
+            tests_modified: None,
+            changed_files: None,
             error: Some(error.message().to_owned()),
             error_code: Some(error.code()),
             error_detail: (!error.detail().is_empty()).then(|| error.detail().clone()),
@@ -1405,6 +1413,10 @@ pub fn run(
             .map(rune_net::models_dev::dollars),
         experiment: Some(settings.experiments.render()).filter(|keys| !keys.is_empty()),
         verification: error.is_none().then(|| outcome.verification.as_str()),
+        tests_modified: error.is_none().then_some(outcome.checks.tests_modified),
+        changed_files: error
+            .is_none()
+            .then(|| u32::try_from(outcome.checks.changed_files.len()).unwrap_or(u32::MAX)),
         error: error.as_ref().map(|error| error.message().to_owned()),
         error_code: error.as_ref().map(RuneError::code),
         error_detail: error
@@ -2037,6 +2049,8 @@ mod tests {
             cost_usd: None,
             experiment: None,
             verification: Some("not_applicable"),
+            tests_modified: Some(false),
+            changed_files: Some(0),
             error: None,
             error_code: None,
             error_detail: None,

@@ -812,6 +812,7 @@ impl Host for SessionHost {
                     full_text: None,
                     diff: None,
                     image: None,
+                    check: None,
                 }),
                 Err(error) if error.code() == ErrorCode::Cancelled => Err(error),
                 Err(error) => Ok(ToolOutput::from_error(&error)),
@@ -6206,6 +6207,13 @@ fn turn_summary(
     if !changed.is_empty() {
         parts.push(format!("{} changed", plural(changed.len(), "file")));
     }
+    match outcome.verification {
+        turn::Verification::NotApplicable => {}
+        turn::Verification::Verified => parts.push("verified".to_owned()),
+        turn::Verification::Checked => parts.push("checked".to_owned()),
+        turn::Verification::Failed => parts.push("check failed".to_owned()),
+        turn::Verification::Unverified => parts.push("unverified".to_owned()),
+    }
     if let Some(input) = outcome.usage.input_tokens {
         let cached = outcome
             .usage
@@ -10921,6 +10929,7 @@ mod tests {
             last_request: rune_net::stream::Usage::default(),
             steps: 1,
             verification: turn::Verification::NotApplicable,
+            checks: rune_agent::verify::CheckSummary::default(),
             calls: Vec::new(),
             repairs: Vec::new(),
             repaired_calls: 0,
@@ -10945,6 +10954,7 @@ mod tests {
             last_request: rune_net::stream::Usage::default(),
             steps: 40,
             verification: turn::Verification::NotApplicable,
+            checks: rune_agent::verify::CheckSummary::default(),
             calls: Vec::new(),
             repairs: Vec::new(),
             repaired_calls: 0,
@@ -11029,6 +11039,7 @@ mod tests {
             last_request: rune_net::stream::Usage::default(),
             steps: 1,
             verification: turn::Verification::NotApplicable,
+            checks: rune_agent::verify::CheckSummary::default(),
             calls: Vec::new(),
             repairs: Vec::new(),
             repaired_calls: 0,
@@ -11322,6 +11333,7 @@ mod tests {
             last_request: rune_net::stream::Usage::default(),
             steps: 1,
             verification: turn::Verification::NotApplicable,
+            checks: rune_agent::verify::CheckSummary::default(),
             calls: vec![patch],
             repairs: Vec::new(),
             repaired_calls: 0,
@@ -11356,6 +11368,7 @@ mod tests {
             last_request: rune_net::stream::Usage::default(),
             steps: 2,
             verification: turn::Verification::NotApplicable,
+            checks: rune_agent::verify::CheckSummary::default(),
             calls: vec![edit.clone(), edit],
             repairs: Vec::new(),
             repaired_calls: 0,
@@ -11371,6 +11384,22 @@ mod tests {
             summary,
             "2 calls, 1 file changed, 12.0k in (75% cached), 640 out, $0.001523, 9.4s"
         );
+        for (verification, word) in [
+            (turn::Verification::Verified, "verified"),
+            (turn::Verification::Checked, "checked"),
+            (turn::Verification::Failed, "check failed"),
+            (turn::Verification::Unverified, "unverified"),
+        ] {
+            let judged = turn::TurnOutcome {
+                verification,
+                ..outcome.clone()
+            };
+            let summary = turn_summary(&judged, None, None, true).expect("summary");
+            assert!(
+                summary.starts_with(&format!("2 calls, 1 file changed, {word}, ")),
+                "{summary}"
+            );
+        }
     }
 
     #[test]

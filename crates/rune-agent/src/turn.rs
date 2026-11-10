@@ -35,6 +35,8 @@ use crate::history::History;
 use crate::repair::{self, Resolved};
 use crate::retry::{self, Decision, RetryPolicy, RetryState};
 use crate::steering::{Boundary, Cancellation, SteeringQueue};
+pub use crate::verify::Verification;
+use crate::verify::{self, CheckSummary};
 
 /// How a turn ended.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -590,6 +592,8 @@ pub struct TurnOutcome {
     pub repaired_calls: u32,
     /// Whether a check ran after the turn's last change to a file.
     pub verification: Verification,
+    /// The turn's changed files and its latest check after the last change.
+    pub checks: CheckSummary,
     /// Why the turn stopped early, when it did. Usage, steps and text still
     /// describe everything that completed before the failure.
     pub error: Option<RuneError>,
@@ -645,87 +649,6 @@ pub fn stop_reason_for(error: &RuneError) -> StopReason {
     }
 }
 
-/// Whether a turn checked its own change.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Verification {
-    /// The turn changed no file.
-    NotApplicable,
-    /// A command or check ran after the last change.
-    Verified,
-    /// A file changed and nothing checked it afterwards.
-    Unverified,
-}
-
-impl Verification {
-    /// Returns the stable label used in machine output.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::NotApplicable => "not_applicable",
-            Self::Verified => "verified",
-            Self::Unverified => "unverified",
-        }
-    }
-
-    /// Classifies a turn's calls.
-    ///
-    /// A change is a successful write, edit or rename. A check is any command
-    /// that is not a plain read, whatever its exit status, or a syntax check:
-    /// a failing test is still evidence, and the model has seen it.
-    #[must_use]
-    pub fn of(calls: &[CallResult]) -> Self {
-        let changed = |call: &&CallResult| {
-            call.executed
-                && !call.output.is_error
-                && matches!(
-                    call.call.name.as_str(),
-                    "write_file" | "edit_file" | "apply_patch" | "rename_file"
-                )
-        };
-        let Some(last_change) = calls.iter().rposition(|call| changed(&call)) else {
-            return Self::NotApplicable;
-        };
-        let checked = calls[last_change..].iter().any(|call| {
-            call.executed
-                && match call.call.name.as_str() {
-                    "syntax_diagnostics" => true,
-                    "shell" => is_check_command(&call.call.arguments),
-                    _ => false,
-                }
-        });
-        if checked {
-            Self::Verified
-        } else {
-            Self::Unverified
-        }
-    }
-}
-
-/// Returns true when a shell call ran something other than a plain read.
-pub(crate) fn is_check_command(arguments: &str) -> bool {
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(arguments) else {
-        return false;
-    };
-    if value.get("action").and_then(serde_json::Value::as_str) != Some("run") {
-        return false;
-    }
-    let command = value
-        .get("command")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or_default()
-        .trim();
-    let program = command.split_whitespace().next().unwrap_or_default();
-    let reads = [
-        "ls", "cat", "head", "tail", "wc", "pwd", "echo", "grep", "rg", "find", "tree", "file",
-        "stat", "which",
-    ];
-    let git_read = command.starts_with("git ")
-        && ["status", "diff", "log", "show", "branch"]
-            .iter()
-            .any(|sub| command.split_whitespace().nth(1) == Some(sub));
-    !command.is_empty() && !reads.contains(&program) && !git_read
-}
-
 /// Returns the command of a shell `run` call.
 fn shell_run_command(arguments: &str) -> Option<String> {
     let value = serde_json::from_str::<serde_json::Value>(arguments).ok()?;
@@ -745,6 +668,47 @@ fn shell_run_command(arguments: &str) -> Option<String> {
 const VERIFICATION_REMINDER: &str = "<harness_check>Files were changed and nothing has \
 run since the last change to check it. Run the focused test, build, or command that \
 exercises the change and report what it shows, or say why it cannot be run.</harness_check>";
+
+/// Tells the model its last check after a change failed, once per turn.
+const CHECK_FAILED_NOTE: &str = "<harness_check>The last check after your changes failed: \
+`{command}` ({detail}). Fix it, or say why it cannot pass, before finishing.</harness_check>";
+
+/// Longest command, in bytes, the failed-check note repeats.
+const NOTE_COMMAND_BYTES: usize = 200;
+
+/// Most failing test names the failed-check note lists.
+const NOTE_FAILING_NAMES: usize = 5;
+
+/// Fills the failed-check note for one check.
+fn check_failed_note(record: &verify::CheckRecord) -> String {
+    let mut command =
+        rune_tools::workspace::truncate_to_bytes(&record.command, NOTE_COMMAND_BYTES).to_owned();
+    if command.len() < record.command.len() {
+        command.push_str("...");
+    }
+    let detail = if record.command.starts_with("syntax_diagnostics ") && record.exit_code.is_none()
+    {
+        "diagnostics reported".to_owned()
+    } else {
+        let mut detail = match record.exit_code {
+            Some(code) => format!("exit {code}"),
+            None => "no exit status".to_owned(),
+        };
+        if !record.failing.is_empty() {
+            let names: Vec<&str> = record
+                .failing
+                .iter()
+                .take(NOTE_FAILING_NAMES)
+                .map(String::as_str)
+                .collect();
+            let _ = write!(detail, ", failing: {}", names.join(", "));
+        }
+        detail
+    };
+    CHECK_FAILED_NOTE
+        .replace("{command}", &command)
+        .replace("{detail}", &detail)
+}
 
 /// Why a host is asked to compact outside its own trigger.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -798,6 +762,8 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
         .get(LimitName::VerificationReminders)
         .value()
         .unwrap_or(0);
+    // A failing last check is pointed out once; the harness does not insist.
+    let mut failure_noted = false;
     let max_attempts = limits.get_usize(LimitName::ProviderMaxAttempts).max(1);
     let timeouts =
         transport::RequestTimeouts::from_settings(&limits, host.provider_head_timeout_ms());
@@ -852,6 +818,7 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
                 last_request,
                 steps,
                 verification: Verification::of(&calls),
+                checks: verify::summarize(&calls),
                 calls,
                 repaired_calls: u32::try_from(repairs.len()).unwrap_or(u32::MAX),
                 repairs,
@@ -897,6 +864,7 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
                 last_request,
                 steps,
                 verification: Verification::of(&calls),
+                checks: verify::summarize(&calls),
                 calls,
                 repaired_calls: u32::try_from(repairs.len()).unwrap_or(u32::MAX),
                 repairs,
@@ -1090,19 +1058,30 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
                 history.push_harness_note(CONTINUE_NOTE);
                 continue;
             }
-            // A turn that changed files and stopped of its own accord is asked
-            // once to check its work. No extra request is spent on a turn that
-            // already checked, changed nothing, or ended for another reason.
+            // A turn that changed files and stopped of its own accord is told
+            // once when its last check failed, and asked once to check work
+            // nothing checked. No extra request is spent on a turn that
+            // checked, changed nothing, or ended for another reason.
             if !last_step
                 && finish == FinishReason::Stop
-                && reminders > 0
                 && host.objective_tokens_remaining() != Some(0)
-                && Verification::of(&calls) == Verification::Unverified
             {
-                reminders = reminders.saturating_sub(1);
-                history.push_user(VERIFICATION_REMINDER);
-                host.emit(Event::VerificationRequested);
-                continue;
+                let verdict = Verification::of(&calls);
+                if verdict == Verification::Failed
+                    && !failure_noted
+                    && let Some(record) = verify::summarize(&calls).last_check
+                {
+                    failure_noted = true;
+                    history.push_harness_note(&check_failed_note(&record));
+                    host.emit(Event::VerificationRequested);
+                    continue;
+                }
+                if verdict == Verification::Unverified && reminders > 0 {
+                    reminders = reminders.saturating_sub(1);
+                    history.push_user(VERIFICATION_REMINDER);
+                    host.emit(Event::VerificationRequested);
+                    continue;
+                }
             }
             let reason = if host.objective_tokens_remaining() == Some(0) {
                 StopReason::ObjectiveBudget
@@ -1136,6 +1115,7 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
                 last_request,
                 steps,
                 verification: Verification::of(&calls),
+                checks: verify::summarize(&calls),
                 calls,
                 repaired_calls: u32::try_from(repairs.len()).unwrap_or(u32::MAX),
                 repairs,
@@ -1285,6 +1265,7 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
                 last_request,
                 steps,
                 verification: Verification::of(&calls),
+                checks: verify::summarize(&calls),
                 calls,
                 repaired_calls: u32::try_from(repairs.len()).unwrap_or(u32::MAX),
                 repairs,

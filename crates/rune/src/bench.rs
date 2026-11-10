@@ -730,6 +730,10 @@ pub fn row(run: &Run) -> String {
             run.verification.as_deref() == Some("unverified"),
             "unverified",
         ),
+        (
+            run.verification.as_deref() == Some("failed"),
+            "check failed",
+        ),
     ] {
         if flag {
             let _ = write!(out, "  [{label}]");

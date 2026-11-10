@@ -295,6 +295,7 @@ fn render(exit: Exit, stderr: &Reading, path: &str, cap: usize) -> ToolOutput {
         full_text: None,
         diff: None,
         image: None,
+        check: None,
     }
 }
 

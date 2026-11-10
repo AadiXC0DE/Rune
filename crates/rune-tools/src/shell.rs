@@ -18,12 +18,15 @@ use rune_core::LimitName;
 use rune_core::budget::BudgetSet;
 use rune_core::error::{ErrorCode, Result, RuneError};
 
-use crate::contract::{Activity, ExecutionContext, Tool, ToolOutput, validate_closed_arguments};
+use crate::contract::{
+    Activity, CheckRun, ExecutionContext, Tool, ToolOutput, validate_closed_arguments,
+};
 use crate::workspace::{
     FileLimits, bool_arg, head_and_tail_split, resolve, string_arg, truncate_to_bytes, usize_arg,
 };
 use rune_exec::command::Exit;
 use rune_exec::session::{Input, Leftovers, POLL_INTERVAL, Process, SpawnOptions, Streams};
+use sha2::{Digest as _, Sha256};
 
 /// Yield window a `run` uses when none is requested.
 pub const DEFAULT_RUN_YIELD_MS: u64 = 30_000;
@@ -476,7 +479,7 @@ impl Shell {
                 }
                 _ => (exit.describe(), exit),
             };
-            let (mut text, full_text) = observe(
+            let (mut text, full_text, check) = observe(
                 &process,
                 &command,
                 &state,
@@ -487,6 +490,7 @@ impl Shell {
             self.keep_leftovers(Leftover::Run(process), &mut text);
             let mut output = finish(text, exit, network_denied);
             output.full_text = full_text;
+            output.check = check.map(|check| with_exit(check, exit));
             return Ok(output);
         }
 
@@ -500,7 +504,7 @@ impl Shell {
             ended_by(process.id())
         );
         let mut seen = (0, 0);
-        let (text, _) = observe(&process, &command, &state, &mut seen, cap, None);
+        let (text, _, _) = observe(&process, &command, &state, &mut seen, cap, None);
         let mut session = Session::new(id.clone(), command, process, seen, input, network_denied);
         session.timeout_ms = timeout;
         let session = Arc::new(session);
@@ -589,7 +593,7 @@ impl Shell {
             None => format!("session {id} running, {}", ended_by(session.process.id())),
         };
         let mut seen = lock(&session.seen);
-        let (mut text, _) = observe(
+        let (mut text, _, check) = observe(
             &session.process,
             &session.command,
             &state,
@@ -602,11 +606,10 @@ impl Shell {
             // so a later call cannot report output that was already returned.
             let _ = lock(&self.state).sessions.remove(&id);
             self.keep_leftovers(Leftover::Session(Arc::clone(&held)), &mut text);
-            return Ok(finish(
-                text,
-                session.judged_exit(exit),
-                session.network_denied,
-            ));
+            let exit = session.judged_exit(exit);
+            let mut output = finish(text, exit, session.network_denied);
+            output.check = check.map(|check| with_exit(check, exit));
+            return Ok(output);
         }
         Ok(ToolOutput::success(text))
     }
@@ -639,7 +642,7 @@ impl Shell {
             None => format!("session {id} survived the grace period"),
         };
         let mut seen = lock(&session.seen);
-        let (mut text, _) = observe(
+        let (mut text, _, _) = observe(
             &session.process,
             &session.command,
             &state,
@@ -1009,7 +1012,9 @@ fn produced(process: &Process) -> u64 {
 /// has already seen are not repeated.
 ///
 /// With `runs`, a finished test run that repeats an earlier one is shown as
-/// what changed, and the complete rendering is returned beside it.
+/// what changed, and the complete rendering is returned beside it. An ended
+/// command also yields what it reported, with the exit status the process
+/// gave; a caller that judges the exit differently replaces it.
 fn observe(
     process: &Process,
     command: &str,
@@ -1017,17 +1022,19 @@ fn observe(
     seen: &mut (usize, usize),
     cap: usize,
     runs: Option<&Mutex<BTreeMap<String, String>>>,
-) -> (String, Option<String>) {
+) -> (String, Option<String>, Option<CheckRun>) {
     // Standard error shares the standard output pipe, so this one stream holds
     // everything in the order the command wrote it.
     let stdout = process.stdout().since(seen.0);
     // An ended command is observed for the last time, so the newest bytes of a
     // stream that outgrew its head follow that head, once.
-    let ended = process.exit().is_some();
+    let exit = process.exit();
     let mut body = String::from_utf8_lossy(&stdout.bytes).into_owned();
     let mut full = None;
-    if ended {
+    let mut check = None;
+    if let Some(exit) = exit {
         push_tail(&mut body, process.stdout());
+        check = Some(with_exit(check_run(&body), exit));
         // A finished test run leads with its verdict, which the cut below
         // always keeps, because the start of the output survives it.
         if let Some(counts) = crate::test_report::parse(&body) {
@@ -1068,7 +1075,58 @@ fn observe(
     };
     let failed = process.exit().is_some_and(|exit| !exit.is_success()) || process.timed_out();
     let full = full.map(|full| render(command, full, &note, state, usize::MAX, failed));
-    (render(command, body, &note, state, cap, failed), full)
+    (
+        render(command, body, &note, state, cap, failed),
+        full,
+        check,
+    )
+}
+
+/// Most failing test names a check run keeps.
+const MAX_CHECK_FAILING: usize = 10;
+
+/// Lines of output a check run's signature is taken from when no failing
+/// test is named.
+const SIGNATURE_LINES: usize = 20;
+
+/// Reads what a finished command's output reports, without its exit status.
+fn check_run(body: &str) -> CheckRun {
+    let failed_tests = crate::test_report::parse(body).map(|counts| counts.failed);
+    let mut names = crate::test_report::failures(body);
+    let signature = if names.is_empty() {
+        let lines: Vec<&str> = body.lines().collect();
+        let tail = lines
+            .get(lines.len().saturating_sub(SIGNATURE_LINES)..)
+            .unwrap_or_default()
+            .join("\n");
+        let digest = Sha256::digest(tail.as_bytes());
+        digest.iter().take(8).fold(String::new(), |mut out, byte| {
+            let _ = write!(out, "{byte:02x}");
+            out
+        })
+    } else {
+        let mut sorted = names.clone();
+        sorted.sort();
+        sorted.join("\n")
+    };
+    names.truncate(MAX_CHECK_FAILING);
+    CheckRun {
+        exit_code: None,
+        failed_tests,
+        failing: names,
+        signature,
+    }
+}
+
+/// Sets a check run's exit status: the code of a command that exited, else none.
+fn with_exit(check: CheckRun, exit: Exit) -> CheckRun {
+    CheckRun {
+        exit_code: match exit {
+            Exit::Code(code) => Some(code),
+            _ => None,
+        },
+        ..check
+    }
 }
 
 /// Appends a stream's newest bytes past its retained head, with the gap.
@@ -2747,6 +2805,56 @@ mod tests {
         .text;
         let second = observed.lines().nth(1).unwrap_or_default();
         assert_eq!(second, "[tests: 2 passed, 1 failed]", "{observed}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_finished_run_reports_its_exit_code_and_failing_tests() {
+        let tool = shell(4, TEST_CAP);
+        let (_dir, context) = workspace();
+        let output = call(
+            &tool,
+            &context,
+            &serde_json::json!({
+                "action": "run",
+                "command": "printf 'test a ... FAILED\\ntest result: FAILED. 0 passed; 1 failed; 0 ignored\\n'; exit 101",
+            }),
+        );
+        let check = output.check.expect("a finished command reports its check");
+        assert_eq!(check.failing, vec!["a".to_owned()]);
+        assert_eq!(check.exit_code, Some(101));
+        assert_eq!(check.failed_tests, Some(1));
+        assert_eq!(check.signature, "a");
+
+        let plain = call(
+            &tool,
+            &context,
+            &serde_json::json!({"action": "run", "command": "echo fine"}),
+        );
+        let check = plain.check.expect("a finished command reports its check");
+        assert_eq!(check.exit_code, Some(0));
+        assert_eq!(check.failed_tests, None);
+        assert_eq!(check.signature.len(), 16);
+
+        // A command still running has reported nothing yet; its end does.
+        let started = call(
+            &tool,
+            &context,
+            &serde_json::json!({
+                "action": "run",
+                "command": "sleep 0.5; exit 3",
+                "yield_time_ms": 50,
+            }),
+        );
+        assert_eq!(started.check, None, "{}", started.text);
+        let (id, _) = running(&started.text);
+        let ended = call(
+            &tool,
+            &context,
+            &serde_json::json!({"action": "interact", "session_id": id, "yield_time_ms": 10_000}),
+        );
+        let check = ended.check.expect("an ended session reports its check");
+        assert_eq!(check.exit_code, Some(3), "{}", ended.text);
     }
 
     #[cfg(unix)]

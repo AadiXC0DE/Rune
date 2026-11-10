@@ -33,6 +33,8 @@ const SCENARIOS: &[&str] = &[
     "cut_tool_call",
     "cut_three_times",
     "cut_empty_then_text",
+    "failed_check_note",
+    "verified_after_fix",
 ];
 
 /// Scenarios built in Rust, which have no file.
@@ -116,6 +118,24 @@ fn cut_three_times() {
 #[test]
 fn cut_empty_then_text() {
     run_scenario("cut_empty_then_text");
+}
+
+#[test]
+fn failed_check_note() {
+    // The model is told once that its last check failed, and the run reports it.
+    let report = run_scenario("failed_check_note");
+    let result = report.result.expect("a result");
+    assert_eq!(result["verification"], "failed", "{result}");
+    assert_eq!(result["tests_modified"], false, "{result}");
+    assert_eq!(result["changed_files"], 1, "{result}");
+}
+
+#[test]
+fn verified_after_fix() {
+    let report = run_scenario("verified_after_fix");
+    let result = report.result.expect("a result");
+    assert_eq!(result["verification"], "verified", "{result}");
+    assert_eq!(result["tests_modified"], false, "{result}");
 }
 
 #[test]

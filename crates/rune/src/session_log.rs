@@ -1502,6 +1502,7 @@ mod tests {
             },
             steps: 1,
             verification: rune_agent::turn::Verification::NotApplicable,
+            checks: rune_agent::verify::CheckSummary::default(),
             calls: Vec::new(),
             repairs: Vec::new(),
             repaired_calls: 0,
