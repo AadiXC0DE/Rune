@@ -216,6 +216,11 @@ pub enum Event {
         /// How many messages were applied.
         count: usize,
     },
+    /// A line for the user about how the run is going, outside the reply.
+    Notice {
+        /// The text to show.
+        text: String,
+    },
     /// Old tool results were replaced by receipts before a model request.
     ContextPruned {
         /// Results replaced.
@@ -553,6 +558,12 @@ pub trait Host {
     /// The provider's own time to wait for a reply's first byte, in
     /// milliseconds, over the `provider_head_timeout_ms` limit. None by default.
     fn provider_head_timeout_ms(&self) -> Option<u64> {
+        None
+    }
+
+    /// The cache routing key every request of the session carries. None by
+    /// default, so each request derives one from its own prefix.
+    fn cache_key(&self) -> Option<String> {
         None
     }
 }
@@ -1470,6 +1481,8 @@ fn stream_with_retry(
         plan.fast_mode = host.fast_mode();
         plan.provider_order = host.provider_order();
         plan.provider_strict = host.provider_strict();
+        plan.cache_key = host.cache_key();
+        plan.reasoning_summary = !history.reasoning_summary_refused();
         host.prepare_request(history, &mut plan, client)?;
         let encoded = host.take_encoded_request();
         cancellation.check()?;
@@ -1523,6 +1536,16 @@ fn stream_with_retry(
                 return Ok((outcome, !steering.is_empty(), measure));
             }
             Err(err) => {
+                if plan.reasoning_summary && summary_refused(&err) {
+                    // Sent again at once without summaries, which does not
+                    // use up a provider attempt.
+                    history.refuse_reasoning_summary();
+                    host.emit(Event::Notice {
+                        text: SUMMARY_REFUSED_NOTICE.to_owned(),
+                    });
+                    attempt = attempt.saturating_sub(1);
+                    continue;
+                }
                 if err.kind() == rune_net::error::FailureKind::ContextTooLong {
                     if overflow_compactions < 2
                         && host.compact_now(history, client, CompactReason::Overflow)?
@@ -1558,6 +1581,20 @@ fn stream_with_retry(
             }
         }
     }
+}
+
+/// Shown once when the provider will not return reasoning summaries.
+pub const SUMMARY_REFUSED_NOTICE: &str =
+    "reasoning summaries are not available for this organization; continuing without them";
+
+/// Whether a refused request was refused for asking for reasoning summaries,
+/// which some organizations must be verified to receive.
+fn summary_refused(err: &rune_net::error::NetError) -> bool {
+    if err.kind() != rune_net::error::FailureKind::InvalidRequest {
+        return false;
+    }
+    let message = err.message().to_ascii_lowercase();
+    message.contains("verified") && message.contains("summar")
 }
 
 /// Resolves and executes a batch of tool calls.

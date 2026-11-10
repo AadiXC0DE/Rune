@@ -94,6 +94,10 @@ struct TestHost {
     context_window: Option<u64>,
     /// Output ceilings of the plans that reached request preparation.
     planned_output: Mutex<Vec<Option<u64>>>,
+    /// The cache key every request of the run is given.
+    cache_key: Option<String>,
+    /// Cache key and whether summaries were asked for, per planned request.
+    planned_cache: Mutex<Vec<(Option<String>, bool)>>,
     /// Whether the model is described as seeing images tools attach.
     accepts_images: bool,
     /// Base64 data of the images tools attached, by image id.
@@ -137,6 +141,8 @@ impl TestHost {
             max_output: None,
             context_window: None,
             planned_output: Mutex::new(Vec::new()),
+            cache_key: None,
+            planned_cache: Mutex::new(Vec::new()),
             accepts_images: false,
             tool_images: Mutex::new(std::collections::BTreeMap::new()),
         }
@@ -217,6 +223,10 @@ impl Host for TestHost {
         self.dialect.as_ref()
     }
 
+    fn cache_key(&self) -> Option<String> {
+        self.cache_key.clone()
+    }
+
     fn endpoint(&self) -> &Endpoint {
         &self.endpoint
     }
@@ -279,6 +289,10 @@ impl Host for TestHost {
             .lock()
             .expect("planned output")
             .push(plan.max_output_tokens);
+        self.planned_cache
+            .lock()
+            .expect("planned cache")
+            .push((plan.cache_key.clone(), plan.reasoning_summary));
         plan.image_data
             .extend(self.tool_images.lock().expect("images").clone());
         Ok(())
@@ -1093,6 +1107,65 @@ fn a_completed_request_anchors_the_next_estimate() {
     assert_eq!(anchor.model, host.model);
     assert_eq!(anchor.dialect, host.dialect.name());
     assert!(anchor.measure.text_bytes > 0, "{anchor:?}");
+}
+
+#[test]
+fn every_request_of_a_turn_carries_the_host_cache_key() {
+    let endpoint = MockEndpoint::start(vec![
+        Script::tool_call("call_1", "read_file", "{\"path\":\"a.rs\"}"),
+        Script::text("done"),
+    ]);
+    let mut host = TestHost::new(endpoint);
+    host.tools = vec![read_tool()];
+    host.cache_key = Some("k".to_owned());
+    let mut history = rune_agent::History::new();
+    history.push_user("read a.rs");
+
+    run_turn(&mut history, &host).expect("turn");
+    let planned = host.planned_cache.lock().expect("planned").clone();
+    assert_eq!(planned.len(), 2, "{planned:?}");
+    assert!(
+        planned.iter().all(|(key, _)| key.as_deref() == Some("k")),
+        "{planned:?}"
+    );
+}
+
+#[test]
+fn a_refused_summary_is_dropped_and_the_step_continues() {
+    let endpoint = MockEndpoint::start(vec![
+        Script::Status {
+            code: 400,
+            body: r#"{"error":{"message":"Your organization must be verified to generate reasoning summaries"}}"#
+                .to_owned(),
+        },
+        Script::text("hi"),
+        Script::text("again"),
+    ]);
+    let host = TestHost::new(endpoint);
+    let mut history = rune_agent::History::new();
+    history.push_user("hello");
+
+    let outcome = run_turn(&mut history, &host).expect("the turn continues");
+    assert_eq!(outcome.stop_reason, StopReason::Completed);
+    history.push_user("hello again");
+    run_turn(&mut history, &host).expect("the second turn");
+
+    let planned = host.planned_cache.lock().expect("planned").clone();
+    let asked: Vec<bool> = planned.iter().map(|(_, summary)| *summary).collect();
+    assert_eq!(asked, vec![true, false, false]);
+    let notices = host
+        .events()
+        .iter()
+        .filter(|event| matches!(event, Event::Notice { text } if text == rune_agent::turn::SUMMARY_REFUSED_NOTICE))
+        .count();
+    assert_eq!(notices, 1);
+    assert!(
+        !host
+            .events()
+            .iter()
+            .any(|event| matches!(event, Event::ProviderRetry { .. })),
+        "the resend is not a provider retry"
+    );
 }
 
 #[test]

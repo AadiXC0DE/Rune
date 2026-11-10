@@ -233,6 +233,9 @@ impl Answerer for TerminalQuestions {
 
 /// Host state for a turn.
 struct SessionHost {
+    /// The cache routing key of every request of this session, taken from
+    /// the first request's prefix.
+    cache_key: std::sync::OnceLock<String>,
     usage_paths: Option<Paths>,
     pre_tool_hook: Option<rune_core::config::PreToolHook>,
     post_tool_hook: Option<rune_core::config::PostToolHook>,
@@ -501,6 +504,16 @@ impl Host for SessionHost {
         crate::provider_setup::provider_head_timeout_ms(&self.permission_settings)
     }
 
+    fn cache_key(&self) -> Option<String> {
+        Some(
+            self.cache_key
+                .get_or_init(|| {
+                    rune_net::provider::prefix_cache_key(&self.instructions(), &self.tools())
+                })
+                .clone(),
+        )
+    }
+
     fn accepts_images(&self) -> bool {
         if !self.dialect().capabilities().images {
             return false;
@@ -745,6 +758,7 @@ impl Host for SessionHost {
             Event::PlanUpdated { update } => {
                 self.draw_notice(&plan_summary(update));
             }
+            Event::Notice { text } => self.draw_notice(text),
             Event::ContextPruned {
                 results,
                 tokens_freed,
@@ -2237,6 +2251,7 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
         .additional_roots
         .clone_from(&config.settings.additional_directories);
     let host = SessionHost {
+        cache_key: std::sync::OnceLock::new(),
         usage_paths: Some(config.paths.clone()),
         pre_tool_hook: config.settings.pre_tool_hook.clone(),
         post_tool_hook: config.settings.post_tool_hook.clone(),
@@ -11687,6 +11702,7 @@ mod tests {
             .expect("registered");
         let questions = Arc::new(TerminalQuestions::default());
         SessionHost {
+            cache_key: std::sync::OnceLock::new(),
             usage_paths: None,
             pre_tool_hook: None,
             post_tool_hook: None,

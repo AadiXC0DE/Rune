@@ -290,6 +290,9 @@ impl Host for ChildHost<'_> {
     fn fast_mode(&self) -> bool {
         self.parent.fast_mode()
     }
+    fn cache_key(&self) -> Option<String> {
+        self.parent.cache_key()
+    }
     fn provider_order(&self) -> Vec<String> {
         self.parent.provider_order()
     }

@@ -104,7 +104,7 @@ fn auto_and_high_effort_reach_the_responses_fixture() {
     assert!(requests[0].get("reasoning").is_none());
     assert_eq!(
         requests[1]["reasoning"],
-        serde_json::json!({ "effort": "high" })
+        serde_json::json!({ "effort": "high", "summary": "auto" })
     );
     let mut high = requests[1].clone();
     high.as_object_mut()

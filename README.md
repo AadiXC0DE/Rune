@@ -610,6 +610,7 @@ as `2026-11-10T09:12:03.123Z`, and a count the provider did not report is `null`
 | `tool_call` | `step`, `id`, `name`, `arguments` (parsed JSON, or the raw string), `ts` |
 | `tool_result` | `step`, `id`, `ok`, `executed` (false for a refused or repeated call), `elapsed_ms`, `bytes`, `preview` (first 2 KiB), `ts` |
 | `retry` | `step`, `attempt`, `wait_ms`, `retry_at` (when the next attempt is sent), `kind` (such as `rate_limited`), `ts` |
+| `notice` | `text`: a line about the run, such as a feature the provider refused |
 | `context_pruned` | `results` (old tool results replaced by receipts), `tokens_freed` (estimated) |
 | `compaction` | `before_tokens`, `after_tokens`, `ts` |
 | `step_restart` | `step`: discard the deltas of the failed attempt of that step |

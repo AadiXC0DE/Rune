@@ -1509,7 +1509,8 @@ impl<W: Write + Send + 'static> Host for TurnHost<W> {
             | Event::ContextPruned { .. }
             | Event::ContextCompacted { .. }
             | Event::ProviderRetry { .. }
-            | Event::ProviderRetryFinished { .. } => {}
+            | Event::ProviderRetryFinished { .. }
+            | Event::Notice { .. } => {}
         }
     }
 

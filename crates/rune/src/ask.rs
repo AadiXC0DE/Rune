@@ -267,6 +267,9 @@ enum JsonlEvent<'a> {
         results: usize,
         tokens_freed: u64,
     },
+    Notice {
+        text: &'a str,
+    },
     Compaction {
         before_tokens: u64,
         after_tokens: u64,
@@ -615,6 +618,9 @@ pub fn read_stdin_prompt() -> Result<String> {
 
 /// Noninteractive composition of the shared agent loop and built-in tools.
 struct AskHost<'a> {
+    /// The cache routing key of every request of this run, taken from the
+    /// first request's prefix.
+    cache_key: std::sync::OnceLock<String>,
     settings: &'a Settings,
     instructions: String,
     /// The instructions with the repository map, fixed for the run.
@@ -829,6 +835,16 @@ impl Host for AskHost<'_> {
         crate::provider_setup::provider_head_timeout_ms(self.settings)
     }
 
+    fn cache_key(&self) -> Option<String> {
+        Some(
+            self.cache_key
+                .get_or_init(|| {
+                    rune_net::provider::prefix_cache_key(&self.instructions(), &self.tools())
+                })
+                .clone(),
+        )
+    }
+
     fn take_encoded_request(&self) -> Option<String> {
         lock(&self.encoded_request).take()
     }
@@ -895,6 +911,11 @@ impl Host for AskHost<'_> {
         if let Event::TurnStarted { step } = event {
             self.step.store(step, std::sync::atomic::Ordering::Relaxed);
             lock(&self.announced).clear();
+        }
+        if let Event::Notice { text } = &event
+            && !self.jsonl
+        {
+            eprintln!("rune: {text}");
         }
         let step = self.step.load(std::sync::atomic::Ordering::Relaxed);
         self.record(|out| match &event {
@@ -965,6 +986,7 @@ impl Host for AskHost<'_> {
                     ts: jsonl_timestamp(),
                 },
             ),
+            Event::Notice { text } => write_jsonl(out, &JsonlEvent::Notice { text }),
             Event::ContextPruned {
                 results,
                 tokens_freed,
@@ -1196,6 +1218,7 @@ pub fn run(
         .additional_roots
         .clone_from(&settings.additional_directories);
     let host = AskHost {
+        cache_key: std::sync::OnceLock::new(),
         settings,
         instructions: rune_context::prompt::base_instructions_for(
             context.workspace(),

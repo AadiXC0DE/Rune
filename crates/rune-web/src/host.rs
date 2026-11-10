@@ -425,6 +425,7 @@ fn encode(event: &Event) -> serde_json::Value {
         Event::ProviderRetryFinished { step } => {
             json!({ "kind": "provider_retry_finished", "step": step })
         }
+        Event::Notice { text } => json!({ "kind": "notice", "text": text }),
         Event::PlanUpdated { update } => json!({ "kind": "plan_updated", "update": update }),
         Event::TextDelta { delta } => json!({ "kind": "text", "delta": delta }),
         Event::ReasoningDelta { delta } => json!({ "kind": "reasoning", "delta": delta }),

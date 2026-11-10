@@ -162,6 +162,10 @@ pub struct History {
     /// The tool-result turn whose checks last settled the ledger.
     #[serde(skip)]
     settled_turn: Option<u64>,
+    /// Set once the provider refused reasoning summaries; later requests go
+    /// without them. Not persisted: a resumed session asks again.
+    #[serde(skip)]
+    reasoning_summary_refused: bool,
 }
 
 /// Reads whose file digest is kept; past this, one is dropped to make room.
@@ -191,6 +195,7 @@ impl Default for History {
             ledger: crate::ledger::Ledger::default(),
             pruned: std::collections::BTreeSet::new(),
             settled_turn: None,
+            reasoning_summary_refused: false,
         }
     }
 }
@@ -214,7 +219,19 @@ impl History {
             ledger: crate::ledger::Ledger::default(),
             pruned: std::collections::BTreeSet::new(),
             settled_turn: None,
+            reasoning_summary_refused: false,
         }
+    }
+
+    /// Whether the provider refused reasoning summaries in this conversation.
+    #[must_use]
+    pub const fn reasoning_summary_refused(&self) -> bool {
+        self.reasoning_summary_refused
+    }
+
+    /// Sends later requests of this conversation without reasoning summaries.
+    pub const fn refuse_reasoning_summary(&mut self) {
+        self.reasoning_summary_refused = true;
     }
 
     /// Records the digest of the file a successful `read_file` call read.
@@ -727,6 +744,7 @@ impl History {
             ledger: self.ledger.clone(),
             pruned: self.pruned.clone(),
             settled_turn: None,
+            reasoning_summary_refused: self.reasoning_summary_refused,
         }
     }
 

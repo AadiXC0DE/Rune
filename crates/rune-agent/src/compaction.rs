@@ -156,6 +156,7 @@ pub fn compact(
     let mut request_plan = RequestPlan::new(host.model());
     SUMMARY_INSTRUCTIONS.clone_into(&mut request_plan.instructions);
     request_plan.messages = transport::one_shot_messages(&request);
+    request_plan.cache_key = host.cache_key();
     let mut accounting = turn::ObjectiveAccounting::begin(host, &mut request_plan)?;
     let response = transport::stream_completion_observed(
         client,

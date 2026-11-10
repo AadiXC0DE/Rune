@@ -74,6 +74,9 @@ pub struct RequestPlan {
     pub traits: crate::compat::ModelTraits,
     /// Session-stable cache routing key, when the host supplies one.
     pub cache_key: Option<String>,
+    /// Whether readable reasoning summaries are requested where the dialect
+    /// supports them.
+    pub reasoning_summary: bool,
 }
 
 impl RequestPlan {
@@ -97,6 +100,7 @@ impl RequestPlan {
             compat: crate::compat::EndpointCompat::default(),
             traits: crate::compat::ModelTraits::default(),
             cache_key: None,
+            reasoning_summary: true,
         }
     }
 
@@ -490,6 +494,7 @@ mod routing_tests {
             compat: crate::compat::EndpointCompat::default(),
             traits: crate::compat::ModelTraits::default(),
             cache_key: None,
+            reasoning_summary: true,
         }
     }
 

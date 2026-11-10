@@ -92,10 +92,9 @@ impl Provider for Responses {
         body.insert("instructions".to_owned(), serde_json::json!(instructions));
         body.insert(
             "prompt_cache_key".to_owned(),
-            serde_json::json!(crate::provider::prefix_cache_key(
-                &instructions,
-                &plan.tools
-            )),
+            serde_json::json!(plan.cache_key.clone().unwrap_or_else(|| {
+                crate::provider::prefix_cache_key(&instructions, &plan.tools)
+            })),
         );
         body.insert("input".to_owned(), serde_json::Value::Array(input));
         body.insert(
@@ -103,11 +102,19 @@ impl Provider for Responses {
             serde_json::json!(["reasoning.encrypted_content"]),
         );
 
-        if let Some(effort) = effort_wire(plan.effort) {
-            body.insert(
-                "reasoning".to_owned(),
-                serde_json::json!({ "effort": effort }),
-            );
+        let summary = plan.reasoning_summary;
+        let reasoning = match effort_wire(plan.effort) {
+            Some(effort) if summary => {
+                Some(serde_json::json!({ "effort": effort, "summary": "auto" }))
+            }
+            Some(effort) => Some(serde_json::json!({ "effort": effort })),
+            None if summary && plan.traits.family == crate::compat::Family::Gpt => {
+                Some(serde_json::json!({ "summary": "auto" }))
+            }
+            None => None,
+        };
+        if let Some(reasoning) = reasoning {
+            body.insert("reasoning".to_owned(), reasoning);
         }
 
         if plan.has_tools() {
@@ -1108,10 +1115,41 @@ mod tests {
             let body = Responses.build_request(&plan).expect("build");
             assert_eq!(
                 body["reasoning"],
-                serde_json::json!({ "effort": wire }),
+                serde_json::json!({ "effort": wire, "summary": "auto" }),
                 "{effort}"
             );
         }
+    }
+
+    #[test]
+    fn a_reasoning_summary_is_requested() {
+        use rune_core::config::Effort;
+        let mut plan = plan_with_user("hi");
+        plan.traits.family = crate::compat::Family::Gpt;
+        let body = Responses.build_request(&plan).expect("build");
+        assert_eq!(body["reasoning"], serde_json::json!({ "summary": "auto" }));
+
+        plan.effort = Effort::None;
+        let body = Responses.build_request(&plan).expect("build");
+        assert_eq!(
+            body["reasoning"],
+            serde_json::json!({ "effort": "low", "summary": "auto" })
+        );
+
+        plan.reasoning_summary = false;
+        let body = Responses.build_request(&plan).expect("build");
+        assert_eq!(body["reasoning"], serde_json::json!({ "effort": "low" }));
+        plan.effort = Effort::Auto;
+        let body = Responses.build_request(&plan).expect("build");
+        assert!(body.get("reasoning").is_none());
+    }
+
+    #[test]
+    fn a_supplied_cache_key_wins_over_the_prefix_hash() {
+        let mut plan = plan_with_user("hi");
+        plan.cache_key = Some("session-key".to_owned());
+        let body = Responses.build_request(&plan).expect("build");
+        assert_eq!(body["prompt_cache_key"], "session-key");
     }
 
     #[test]
