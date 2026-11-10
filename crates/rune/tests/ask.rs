@@ -848,6 +848,15 @@ fn review_refuses_mutations_by_a_named_rule_and_still_reads_in_every_permission_
         for (index, result) in results.iter().enumerate() {
             assert_eq!(result["tool_call_id"], format!("denied-{index}"));
             let text = result["content"].as_str().expect("refusal");
+            // A headless run does not offer these two, so they are refused
+            // before policy is asked.
+            if matches!(denied[index].0, "create_directory" | "install_skill") {
+                assert!(
+                    text.starts_with(&format!("there is no tool named `{}`", denied[index].0)),
+                    "{text}"
+                );
+                continue;
+            }
             assert!(text.contains("refused by policy"), "{text}");
             assert!(
                 text.contains("matched `read-only review` at the session layer"),
@@ -894,7 +903,8 @@ fn review_refuses_mutations_by_a_named_rule_and_still_reads_in_every_permission_
         .expect("saved review");
         let refusals = saved.events.iter().filter(|frame| matches!(&frame.event,
             rune_session::SessionEvent::ToolResult { ok: false, output, .. } if output.contains("read-only review"))).count();
-        assert_eq!(refusals, denied.len());
+        // The two tools a headless run does not offer never reach policy.
+        assert_eq!(refusals, denied.len() - 2);
     }
 }
 

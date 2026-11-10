@@ -49,8 +49,7 @@ impl Tool for SyntaxDiagnostics {
                     "description": "Defaults to 2024."
                 },
                 "max_bytes": {
-                    "type": "integer", "minimum": 1,
-                    "description": "Output cap."
+                    "type": "integer", "minimum": 1
                 }
             },
             "required": ["path"],

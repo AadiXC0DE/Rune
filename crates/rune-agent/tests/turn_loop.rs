@@ -3243,7 +3243,7 @@ fn an_edit_of_a_file_read_would_ask_for_quotes_nothing() {
 }
 
 #[test]
-fn directory_creation_is_advertised_idempotent_and_refuses_an_outside_path() {
+fn directory_creation_when_offered_is_idempotent_and_refuses_an_outside_path() {
     let workspace = tempfile::tempdir().expect("workspace");
     let outside = tempfile::tempdir().expect("outside");
     let outside_path = outside.path().join("one/two");
@@ -3257,9 +3257,12 @@ fn directory_creation_is_advertised_idempotent_and_refuses_an_outside_path() {
     let registry = rune_tools::inventory::builtin_default().expect("builtins");
     let mut rules = RuleSet::new();
     rules.push(Rule::allow("create_directory", "*", Layer::User));
-    let mut host = TestHost::new(endpoint)
-        .with_tools(rune_tools::inventory::advertisement(&registry))
-        .with_rules(rules);
+    // Not advertised by default; a host may still offer it.
+    let mut tools = rune_tools::inventory::advertisement(&registry);
+    tools.push(rune_tools::contract::model_spec(
+        registry.get("create_directory").expect("registered"),
+    ));
+    let mut host = TestHost::new(endpoint).with_tools(tools).with_rules(rules);
     host.workspace = Utf8PathBuf::from_path_buf(workspace.path().to_owned()).expect("UTF-8 path");
     host.registry = Some(registry);
     let mut history = rune_agent::History::new();

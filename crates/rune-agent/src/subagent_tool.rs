@@ -236,15 +236,13 @@ impl Tool for Subagent {
                 },
                 "instructions": {
                     "type": "string",
-                    "description": "Instructions for the child, replacing the default."
+                    "description": "Replaces the default instructions."
                 },
                 "model": {
-                    "type": "string",
-                    "description": "Model for the child."
+                    "type": "string"
                 },
                 "effort": {
-                    "type": "string",
-                    "description": "Reasoning effort for the child."
+                    "type": "string"
                 }
             },
             "required": ["action"],

@@ -60,8 +60,7 @@ impl Tool for GitDiff {
                 },
                 "max_bytes": {
                     "type": "integer",
-                    "minimum": 1,
-                    "description": "Output cap."
+                    "minimum": 1
                 }
             },
             "required": [],

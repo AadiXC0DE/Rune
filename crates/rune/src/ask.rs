@@ -1076,9 +1076,13 @@ pub fn run(
             std::sync::Arc::new(rune_tools::skill::Fixed::new(catalog)),
             crate::vision_client::backend(settings, paths)?,
         )?;
-        inventory::select_edit_tool(
+        inventory::tailor(
             &mut registry,
-            rune_net::family::edit_tool(settings.edit_tool, &settings.model),
+            &inventory::Tailoring {
+                workspace: &crate::current_workspace()?,
+                interactive: false,
+                edit_tool: rune_net::family::edit_tool(settings.edit_tool, &settings.model),
+            },
         );
         registry
     } else {

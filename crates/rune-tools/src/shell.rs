@@ -734,7 +734,7 @@ impl Tool for Shell {
                 },
                 "interactive": {
                     "type": "boolean",
-                    "description": "Keep standard input open for `interact`.",
+                    "description": "Keep standard input open.",
                 },
                 "pty": {
                     "type": "boolean",
@@ -744,17 +744,15 @@ impl Tool for Shell {
                     "type": "integer",
                     "minimum": 1,
                     "maximum": 65535,
-                    "description": "Terminal rows; `interact` resizes.",
                 },
                 "cols": {
                     "type": "integer",
                     "minimum": 1,
                     "maximum": 65535,
-                    "description": "Terminal columns; `interact` resizes.",
                 },
                 "session_id": {
                     "type": "string",
-                    "description": "From `run`. Required by `interact` and `stop`.",
+                    "description": "From `run`.",
                 },
                 "chars": {
                     "type": "string",
@@ -774,7 +772,7 @@ impl Tool for Shell {
                 },
                 "force": {
                     "type": "boolean",
-                    "description": "Kill at once instead of stopping gracefully.",
+                    "description": "Kill at once.",
                 },
             },
             "required": ["action"],

@@ -627,8 +627,9 @@ pub const PROMPT_CEILING_BYTES: usize = 6 * 1024;
 ///
 /// Counted as compact JSON of each tool's name, description, and schema, which
 /// is the part every dialect sends with every request. With the instructions it
-/// forms the fixed cost of each model call, so it is a budget like the prompt.
-pub const TOOL_SCHEMA_CEILING_BYTES: usize = 10 * 1024;
+/// forms the fixed cost of each model call, so it is a budget like the prompt;
+/// a tool that cannot help in a run is not advertised, which keeps it under.
+pub const TOOL_SCHEMA_CEILING_BYTES: usize = 8 * 1024;
 
 /// Share of a model's context window the skill catalog may occupy, as a percent.
 const SKILL_CATALOG_WINDOW_PERCENT: u64 = 2;

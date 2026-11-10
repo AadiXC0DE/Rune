@@ -264,7 +264,7 @@ impl Tool for AskUserQuestion {
 
     fn description(&self) -> &'static str {
         "Ask the user one to four multiple-choice questions when a decision blocks progress \
-         and no tool can answer it. Not for facts you can look up or for safety decisions."
+         and no tool can answer it."
     }
 
     fn input_schema(&self) -> serde_json::Value {
@@ -282,7 +282,6 @@ impl Tool for AskUserQuestion {
                         "properties": {
                             "question": {
                                 "type": "string",
-                                "maxLength": 1024,
                                 "description": "The blocking decision, stated as a question."
                             },
                             "options": {
@@ -294,12 +293,11 @@ impl Tool for AskUserQuestion {
                                     "properties": {
                                         "label": {
                                             "type": "string",
-                                            "maxLength": 128,
                                             "description": "Short label, one to five words."
                                         },
                                         "description": {
                                             "type": "string",
-                                            "description": "Optional one-line consequence of this choice."
+                                            "description": "One-line consequence."
                                         }
                                     },
                                     "required": ["label"],
@@ -403,10 +401,11 @@ mod tests {
         let options = &questions["items"]["properties"]["options"];
         assert_eq!(options["minItems"].as_u64(), Some(MIN_OPTIONS as u64));
         assert_eq!(options["maxItems"].as_u64(), Some(MAX_OPTIONS as u64));
-        assert_eq!(
-            schema["properties"]["questions"]["items"]["properties"]["question"]["maxLength"]
-                .as_u64(),
-            Some(MAX_QUESTION_BYTES as u64)
+        // Lengths are enforced by the decoder, not advertised.
+        assert!(
+            schema["properties"]["questions"]["items"]["properties"]["question"]
+                .get("maxLength")
+                .is_none()
         );
     }
 

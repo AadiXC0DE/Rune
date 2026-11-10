@@ -25,8 +25,7 @@ impl Tool for WriteFile {
     }
 
     fn description(&self) -> &'static str {
-        "Write a whole file, creating missing parent directories. Refused if the file \
-         changed since it was read."
+        "Write a whole file, creating missing parent directories."
     }
 
     fn input_schema(&self) -> serde_json::Value {
@@ -34,8 +33,7 @@ impl Tool for WriteFile {
             "type": "object",
             "properties": {
                 "path": {
-                    "type": "string",
-                    "description": "Relative to the workspace root, or absolute."
+                    "type": "string"
                 },
                 "content": {
                     "type": "string",

@@ -6467,9 +6467,13 @@ fn session_registry(
         crate::vision_client::backend(settings, paths)?,
     )?;
     // Chosen once for the session, so the request prefix stays stable after `/model`.
-    inventory::select_edit_tool(
+    inventory::tailor(
         &mut registry,
-        rune_net::family::edit_tool(settings.edit_tool, &settings.model),
+        &inventory::Tailoring {
+            workspace,
+            interactive: true,
+            edit_tool: rune_net::family::edit_tool(settings.edit_tool, &settings.model),
+        },
     );
     let mut tools: Vec<String> = registry.names().into_iter().map(str::to_owned).collect();
     tools.push("subagent".to_owned());

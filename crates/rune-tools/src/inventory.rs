@@ -166,6 +166,37 @@ pub fn select_edit_tool(registry: &mut Registry, tool: rune_core::config::EditTo
     registry.set_advertised("edit_file", !patch);
 }
 
+/// Whether `root` holds a Rust project: a `Cargo.toml` at the root, or a `.rs`
+/// file among the first 2,000 entries a walk finds.
+#[must_use]
+pub fn rust_workspace(root: &camino::Utf8Path) -> bool {
+    if root.join("Cargo.toml").is_file() {
+        return true;
+    }
+    crate::workspace::Walker::new(root, 2000)
+        .is_ok_and(|mut walker| walker.any(|walked| walked.path.extension() == Some("rs")))
+}
+
+/// What a host knows at start that decides which tools are worth sending.
+#[derive(Clone, Copy, Debug)]
+pub struct Tailoring<'a> {
+    pub workspace: &'a camino::Utf8Path,
+    /// A person is present: an interactive or editor session.
+    pub interactive: bool,
+    pub edit_tool: rune_core::config::EditTool,
+}
+
+/// Offers only the tools that can help in this run: the model's edit tool,
+/// Rust diagnostics in a Rust workspace, and the skill installer where a
+/// person is present. Hidden tools stay registered.
+pub fn tailor(registry: &mut Registry, tailoring: &Tailoring<'_>) {
+    select_edit_tool(registry, tailoring.edit_tool);
+    registry.set_advertised("syntax_diagnostics", rust_workspace(tailoring.workspace));
+    if !tailoring.interactive {
+        registry.set_advertised("install_skill", false);
+    }
+}
+
 /// Builds the inventory with an optional host image analysis backend.
 ///
 /// An absent backend keeps the tool explicitly labelled unavailable.
@@ -372,8 +403,9 @@ mod tests {
 
     #[test]
     fn a_run_without_a_backend_leaves_exactly_those_tools_unadvertised() {
-        // These are the tools a default run does not offer: the patch tool,
-        // which is not advertised by default, and the ones it cannot execute
+        // These are the tools a default run does not offer: the patch tool and
+        // `create_directory`, which are not advertised by default, and the ones
+        // it cannot execute
         // (no question channel, no web transport, no image analysis, and no
         // skills).
         let registry = builtin_default().expect("built");
@@ -390,6 +422,7 @@ mod tests {
             hidden,
             [
                 "apply_patch",
+                "create_directory",
                 "ask_user_question",
                 "web_fetch",
                 "web_search",
@@ -605,6 +638,93 @@ mod tests {
         assert!(!names.iter().any(|name| name == "apply_patch"));
         assert!(names.iter().any(|name| name == "write_file"));
         assert!(registry.contains("apply_patch"));
+    }
+
+    fn tailored(workspace: &camino::Utf8Path, interactive: bool) -> Vec<String> {
+        let mut registry = builtin_default().expect("built");
+        tailor(
+            &mut registry,
+            &Tailoring {
+                workspace,
+                interactive,
+                edit_tool: rune_core::config::EditTool::Replace,
+            },
+        );
+        advertised_names(&registry)
+    }
+
+    fn temporary() -> (tempfile::TempDir, camino::Utf8PathBuf) {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let root = camino::Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).expect("utf8");
+        (dir, root)
+    }
+
+    #[test]
+    fn rust_workspaces_are_detected_by_manifest_or_source() {
+        let (_dir, root) = temporary();
+        assert!(!rust_workspace(&root));
+        std::fs::write(root.join("Cargo.toml"), "[package]\n").expect("manifest");
+        assert!(rust_workspace(&root));
+
+        let (_dir, root) = temporary();
+        std::fs::create_dir(root.join("src")).expect("src");
+        std::fs::write(root.join("src/main.rs"), "fn main() {}\n").expect("source");
+        assert!(rust_workspace(&root));
+
+        // Decided from the first 2,000 entries only.
+        let (_dir, root) = temporary();
+        for index in 0..2_000 {
+            std::fs::write(root.join(format!("a{index:04}.txt")), "").expect("file");
+        }
+        std::fs::create_dir(root.join("zz")).expect("dir");
+        std::fs::write(root.join("zz/late.rs"), "fn f() {}\n").expect("late source");
+        assert!(!rust_workspace(&root));
+    }
+
+    #[test]
+    fn tailoring_hides_rust_tools_outside_rust_workspaces() {
+        let (_dir, root) = temporary();
+        let names = tailored(&root, true);
+        assert!(!names.iter().any(|name| name == "syntax_diagnostics"));
+        assert!(!names.iter().any(|name| name == "create_directory"));
+        std::fs::write(root.join("Cargo.toml"), "[package]\n").expect("manifest");
+        let names = tailored(&root, true);
+        assert!(names.iter().any(|name| name == "syntax_diagnostics"));
+    }
+
+    #[test]
+    fn headless_runs_do_not_offer_install_skill() {
+        let (_dir, root) = temporary();
+        assert!(
+            tailored(&root, true)
+                .iter()
+                .any(|name| name == "install_skill")
+        );
+        let headless = tailored(&root, false);
+        assert!(!headless.iter().any(|name| name == "install_skill"));
+        assert!(!headless.iter().any(|name| name == "ask_user_question"));
+    }
+
+    #[test]
+    fn create_directory_is_registered_but_not_advertised() {
+        let registry = builtin_default().expect("built");
+        assert!(registry.contains("create_directory"));
+        assert!(
+            !advertised_names(&registry)
+                .iter()
+                .any(|name| name == "create_directory")
+        );
+        let (_dir, root) = temporary();
+        let context = crate::ExecutionContext::new(root.clone());
+        let output = registry
+            .call(
+                "create_directory",
+                &serde_json::json!({ "path": "made" }),
+                &context,
+            )
+            .expect("runs when called");
+        assert!(!output.is_error, "{}", output.text);
+        assert!(root.join("made").is_dir());
     }
 
     #[test]

@@ -77,7 +77,7 @@ impl Tool for GrepFiles {
                 },
                 "path": {
                     "type": "string",
-                    "description": "Directory or file to search. Defaults to the workspace root.",
+                    "description": "Defaults to the workspace root.",
                 },
                 "include": {
                     "type": "string",

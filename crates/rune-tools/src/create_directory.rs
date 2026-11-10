@@ -49,6 +49,12 @@ impl Tool for CreateDirectory {
         })
     }
 
+    // `write_file` creates missing parents, so this is not offered; it stays
+    // registered and runs when called.
+    fn is_advertised(&self) -> bool {
+        false
+    }
+
     fn activity(&self) -> Activity {
         Activity::Write
     }

@@ -36,8 +36,7 @@ impl Tool for EditFile {
             "type": "object",
             "properties": {
                 "path": {
-                    "type": "string",
-                    "description": "Relative to the workspace root, or absolute."
+                    "type": "string"
                 },
                 "old_string": {
                     "type": "string",
@@ -73,23 +72,6 @@ impl Tool for EditFile {
                 }
             },
             "required": ["path"],
-            "oneOf": [
-                {
-                    "required": ["old_string", "new_string"],
-                    "not": { "required": ["edits"] }
-                },
-                {
-                    "required": ["edits"],
-                    "not": {
-                        "anyOf": [
-                            { "required": ["old_string"] },
-                            { "required": ["new_string"] },
-                            { "required": ["occurrence"] },
-                            { "required": ["replace_all"] }
-                        ]
-                    }
-                }
-            ],
             "additionalProperties": false
         })
     }
@@ -279,11 +261,23 @@ mod tests {
             .filter_map(serde_json::Value::as_str)
             .collect();
         assert_eq!(required, ["path"]);
-        assert_eq!(
-            schema["oneOf"][0]["required"],
-            json!(["old_string", "new_string"])
-        );
-        assert_eq!(schema["oneOf"][1]["required"], json!(["edits"]));
+        // The forms are told apart by the decoder, whose errors say what is
+        // missing or mixed, not by the schema.
+        assert!(schema.get("oneOf").is_none());
+        for (arguments, field) in [
+            (json!({ "path": "a", "old_string": "x" }), "new_string"),
+            (
+                json!({ "path": "a", "old_string": "x", "new_string": "y", "edits": [] }),
+                "edits",
+            ),
+        ] {
+            let error = EditFile.validate(&arguments).expect_err("refused");
+            assert!(
+                error.to_string().contains(field)
+                    || error.field().is_some_and(|name| name.contains(field)),
+                "{error}"
+            );
+        }
         let batch = &schema["properties"]["edits"];
         assert_eq!(batch["minItems"], 1);
         assert_eq!(batch["maxItems"], mutation::MAX_EDIT_HUNKS);

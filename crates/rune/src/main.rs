@@ -1511,9 +1511,13 @@ fn run_acp(
         std::sync::Arc::new(rune_tools::skill::Empty),
         vision_client::backend(settings, paths)?,
     )?;
-    rune_tools::inventory::select_edit_tool(
+    rune_tools::inventory::tailor(
         &mut registry,
-        rune_net::family::edit_tool(settings.edit_tool, &settings.model),
+        &rune_tools::inventory::Tailoring {
+            workspace,
+            interactive: true,
+            edit_tool: rune_net::family::edit_tool(settings.edit_tool, &settings.model),
+        },
     );
 
     let rules = rune_policy::rules::RuleSet::new();
