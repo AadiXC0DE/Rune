@@ -30,6 +30,9 @@ else
     step "dependency policy skipped: cargo-deny is not installed (CI runs it when dependencies change)"
 fi
 
+step "benchmark kit tests"
+python3 -m unittest discover -s bench/kit -p 'test_*.py'
+
 if [[ "${1:-}" != "--quick" ]]; then
     step "workspace tests"
     cargo test --workspace --no-fail-fast
