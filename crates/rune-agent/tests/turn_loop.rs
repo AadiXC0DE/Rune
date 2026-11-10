@@ -36,6 +36,13 @@ use rune_tools::contract::{ExecutionContext, ToolOutput};
 use rune_tools::registry::Registry;
 
 /// A host that records what happened, for assertions.
+/// A hook run before each tool call of a [`TestHost`].
+type OnExecute = Box<dyn FnMut(&str) + Send>;
+
+/// Held by the tests that start shell background work or depend on there
+/// being none, since that work is counted across the whole process.
+static BACKGROUND_WORK: Mutex<()> = Mutex::new(());
+
 struct TestHost {
     /// Held so the mock server outlives the host. Dropping it closes the
     /// listener, which would make every request fail with a refused connection.
@@ -79,6 +86,8 @@ struct TestHost {
     /// Cancels the turn from inside the next tool call, as a user pressing
     /// Escape while a tool runs would.
     cancel_on_execute: Mutex<bool>,
+    /// Runs before each tool call with the tool's name.
+    on_execute: Mutex<Option<OnExecute>>,
     /// Largest answer the model is described as producing.
     max_output: Option<u64>,
     /// Context window the model is described as having, in tokens.
@@ -124,6 +133,7 @@ impl TestHost {
             private_decisions: Mutex::new(Vec::new()),
             submit_on_first_delta: Mutex::new(None),
             cancel_on_execute: Mutex::new(false),
+            on_execute: Mutex::new(None),
             max_output: None,
             context_window: None,
             planned_output: Mutex::new(Vec::new()),
@@ -372,6 +382,9 @@ impl Host for TestHost {
             .lock()
             .expect("lock")
             .push((name.to_owned(), arguments.clone()));
+        if let Some(hook) = self.on_execute.lock().expect("lock").as_mut() {
+            hook(name);
+        }
         if std::mem::take(&mut *self.cancel_on_execute.lock().expect("lock")) {
             self.cancellation.cancel();
             return Err(rune_agent::steering::cancelled_error());
@@ -4654,6 +4667,9 @@ fn a_read_in_a_later_turn_points_back_while_the_file_is_unchanged() {
 
 #[test]
 fn a_repeated_test_command_with_nothing_changed_is_answered_from_the_last_run() {
+    let _quiet = BACKGROUND_WORK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let test = r#"{"action":"run","command":"cargo test -p core 2>&1 | tail -20"}"#;
     let sed = r#"{"action":"run","command":"sed -i 's/a/aa/' notes.txt"}"#;
     let mut shell = read_tool();
@@ -5475,4 +5491,109 @@ fn a_deny_rule_refuses_an_intercepted_patch() {
         std::fs::read_to_string(workspace.path().join("a.txt")).expect("read"),
         "old\n"
     );
+}
+
+/// Starts `sleep 30` as a shell session and returns the tool and its id.
+#[cfg(unix)]
+fn background_session(workspace: &tempfile::TempDir) -> (Arc<rune_tools::shell::Shell>, String) {
+    use rune_tools::Tool as _;
+    let shell = Arc::new(rune_tools::shell::Shell::default());
+    let context = ExecutionContext::new(
+        Utf8PathBuf::from_path_buf(workspace.path().to_owned()).expect("UTF-8 path"),
+    );
+    let started = shell
+        .call(
+            &serde_json::json!({ "action": "run", "command": "sleep 30", "yield_time_ms": 100 }),
+            &context,
+        )
+        .expect("started");
+    let id = started
+        .text
+        .split_once("as session ")
+        .and_then(|(_, rest)| rest.split_once(' '))
+        .map_or_else(
+            || panic!("no session in {}", started.text),
+            |(id, _)| id.to_owned(),
+        );
+    (shell, id)
+}
+
+#[cfg(unix)]
+fn stop_session(shell: &rune_tools::shell::Shell, id: &str, workspace: &camino::Utf8Path) {
+    use rune_tools::Tool as _;
+    let _ = shell.call(
+        &serde_json::json!({ "action": "stop", "session_id": id }),
+        &ExecutionContext::new(workspace.to_owned()),
+    );
+}
+
+#[cfg(unix)]
+fn check_turn(scripts: Vec<Script>) -> TestHost {
+    let mut shell = read_tool();
+    "shell".clone_into(&mut shell.name);
+    TestHost::new(MockEndpoint::start(scripts))
+        .with_tools(vec![shell, read_tool()])
+        .with_tool_response(ToolOutput::failure("[tests: 3 passed, 1 failed]"))
+}
+
+#[cfg(unix)]
+#[test]
+fn a_check_repeated_while_a_session_runs_is_run_again() {
+    let _quiet = BACKGROUND_WORK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let workspace = tempfile::tempdir().expect("workspace");
+    let (shell, id) = background_session(&workspace);
+    let test = r#"{"action":"run","command":"cargo test -p core"}"#;
+    let host = check_turn(vec![
+        Script::tool_call("first", "shell", test),
+        Script::tool_call("same", "shell", test),
+        Script::text("done"),
+    ]);
+    let mut history = rune_agent::History::new();
+    history.push_user("test");
+    let outcome = run_turn(&mut history, &host).expect("turn");
+    stop_session(
+        &shell,
+        &id,
+        camino::Utf8Path::from_path(workspace.path()).expect("UTF-8 path"),
+    );
+    assert_eq!(host.executed_calls().len(), 2);
+    assert_eq!(repeat_pointers(&host), 0);
+    assert!(outcome.calls[1].executed);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_check_repeated_after_a_session_ended_is_run_again() {
+    let _quiet = BACKGROUND_WORK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let workspace = tempfile::tempdir().expect("workspace");
+    let root = Utf8PathBuf::from_path_buf(workspace.path().to_owned()).expect("UTF-8 path");
+    let (shell, id) = background_session(&workspace);
+    let test = r#"{"action":"run","command":"cargo test -p core"}"#;
+    let host = check_turn(vec![
+        Script::tool_call("first", "shell", test),
+        Script::tool_call("look", "read_file", r#"{"path":"README.md"}"#),
+        Script::tool_call("same", "shell", test),
+        Script::text("done"),
+    ]);
+    // The session ends during the read, which changes no files, so only the
+    // background record tells the second run apart from the first.
+    *host.on_execute.lock().expect("lock") = Some(Box::new(move |name| {
+        if name == "read_file" {
+            stop_session(&shell, &id, &root);
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while rune_tools::shell::background().0 > 0 && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+    }));
+    let mut history = rune_agent::History::new();
+    history.push_user("test");
+    let outcome = run_turn(&mut history, &host).expect("turn");
+    assert_eq!(host.executed_calls().len(), 3);
+    assert_eq!(repeat_pointers(&host), 0);
+    assert!(outcome.calls[2].executed);
 }

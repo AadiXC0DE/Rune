@@ -145,6 +145,10 @@ pub struct History {
     /// Digests of `write_file` calls refused once by the overwrite guard.
     #[serde(skip)]
     refused_overwrites: std::collections::BTreeSet<[u8; 32]>,
+    /// The background generation (`rune_tools::shell::background`) when each
+    /// repeatable check command finished, by call id.
+    #[serde(skip)]
+    check_generations: std::collections::BTreeMap<String, u64>,
     /// Reported input of the latest completed request, for the next estimate.
     #[serde(skip)]
     anchor: Option<crate::tokens::Anchor>,
@@ -172,6 +176,7 @@ impl Default for History {
             read_digests: std::collections::BTreeMap::new(),
             file_views: std::collections::BTreeMap::new(),
             refused_overwrites: std::collections::BTreeSet::new(),
+            check_generations: std::collections::BTreeMap::new(),
             anchor: None,
         }
     }
@@ -191,6 +196,7 @@ impl History {
             read_digests: std::collections::BTreeMap::new(),
             file_views: std::collections::BTreeMap::new(),
             refused_overwrites: std::collections::BTreeSet::new(),
+            check_generations: std::collections::BTreeMap::new(),
             anchor: None,
         }
     }
@@ -206,6 +212,22 @@ impl History {
     /// Returns the digest recorded for a `read_file` call, if any.
     pub(crate) fn read_digest(&self, call_id: &str) -> Option<[u8; 32]> {
         self.read_digests.get(call_id).copied()
+    }
+
+    /// Records the background generation a check command finished in.
+    pub(crate) fn record_check_generation(&mut self, call_id: &str, generation: u64) {
+        if self.check_generations.len() >= MAX_READ_DIGESTS
+            && !self.check_generations.contains_key(call_id)
+        {
+            self.check_generations.pop_first();
+        }
+        self.check_generations
+            .insert(call_id.to_owned(), generation);
+    }
+
+    /// Returns the background generation recorded for a check command, if any.
+    pub(crate) fn check_generation(&self, call_id: &str) -> Option<u64> {
+        self.check_generations.get(call_id).copied()
     }
 
     /// Records a file's digest as the model now knows it.
@@ -609,6 +631,7 @@ impl History {
             read_digests: self.read_digests.clone(),
             file_views: self.file_views.clone(),
             refused_overwrites: self.refused_overwrites.clone(),
+            check_generations: self.check_generations.clone(),
             anchor: None,
         }
     }

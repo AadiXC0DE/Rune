@@ -663,17 +663,7 @@ impl Process {
     /// always false elsewhere.
     #[must_use]
     pub fn group_alive(&self) -> bool {
-        #[cfg(unix)]
-        {
-            i32::try_from(self.inner.group)
-                .ok()
-                .and_then(rustix::process::Pid::from_raw)
-                .is_some_and(|group| rustix::process::test_kill_process_group(group).is_ok())
-        }
-        #[cfg(not(unix))]
-        {
-            false
-        }
+        group_alive(self.inner.group)
     }
 
     /// Ends what is left of the group, if anything is.
@@ -773,6 +763,24 @@ fn add_arguments(spec: &mut Command, program: &str, arguments: &[String]) {
 #[cfg(not(windows))]
 fn add_arguments(spec: &mut Command, _program: &str, arguments: &[String]) {
     spec.args(arguments);
+}
+
+/// Returns true while any process in the group is alive (Unix); always
+/// false elsewhere.
+#[must_use]
+pub fn group_alive(group: u32) -> bool {
+    #[cfg(unix)]
+    {
+        i32::try_from(group)
+            .ok()
+            .and_then(rustix::process::Pid::from_raw)
+            .is_some_and(|group| rustix::process::test_kill_process_group(group).is_ok())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = group;
+        false
+    }
 }
 
 /// Ends a process tree, on a platform with no process groups to signal.

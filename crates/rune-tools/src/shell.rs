@@ -80,6 +80,59 @@ static COMMANDS: Mutex<BTreeMap<String, String>> = Mutex::new(BTreeMap::new());
 /// two sessions share an id.
 static STARTED: AtomicU64 = AtomicU64::new(0);
 
+/// Background work started by any shell call in this process: sessions that
+/// outlived their call and groups left running after a command exited.
+static BACKGROUND: Mutex<Background> = Mutex::new(Background {
+    watched: Vec::new(),
+    generation: 0,
+});
+
+/// What [`BACKGROUND`] watches, and a number that changes with it.
+struct Background {
+    watched: Vec<Watched>,
+    generation: u64,
+}
+
+/// One piece of background work.
+enum Watched {
+    Session(std::sync::Weak<Session>),
+    Group(u32),
+}
+
+impl Watched {
+    fn alive(&self) -> bool {
+        match self {
+            Self::Session(session) => session
+                .upgrade()
+                .is_some_and(|session| session.process.is_running()),
+            Self::Group(group) => rune_exec::session::group_alive(*group),
+        }
+    }
+}
+
+/// Adds background work to the watch list.
+fn watch(watched: Watched) {
+    let mut background = lock(&BACKGROUND);
+    background.watched.push(watched);
+    background.generation = background.generation.saturating_add(1);
+}
+
+/// How much background work is alive, and a number that changes whenever some
+/// starts or ends. Ending is noticed when this is called.
+///
+/// The list is shared by every conversation in the process, so background work
+/// in one also counts for the others.
+pub fn background() -> (usize, u64) {
+    let mut background = lock(&BACKGROUND);
+    let before = background.watched.len();
+    background.watched.retain(Watched::alive);
+    let ended = before.saturating_sub(background.watched.len());
+    background.generation = background
+        .generation
+        .saturating_add(u64::try_from(ended).unwrap_or(u64::MAX));
+    (background.watched.len(), background.generation)
+}
+
 /// Runs commands and holds the ones that outlive their call.
 ///
 /// Background processes a finished command started, such as `server &`, keep
@@ -333,6 +386,7 @@ impl Shell {
         }
         text.push_str(BACKGROUND_NOTICE);
         text.push('\n');
+        watch(Watched::Group(leftover.process().id()));
         let evicted = {
             let mut state = lock(&self.state);
             let evicted = if state.leftovers.len() >= MAX_LEFTOVERS {
@@ -449,7 +503,9 @@ impl Shell {
         let (text, _) = observe(&process, &command, &state, &mut seen, cap, None);
         let mut session = Session::new(id.clone(), command, process, seen, input, network_denied);
         session.timeout_ms = timeout;
-        slot.hand_over(id, Arc::new(session));
+        let session = Arc::new(session);
+        watch(Watched::Session(Arc::downgrade(&session)));
+        slot.hand_over(id, session);
         Ok(ToolOutput::success(text))
     }
 
@@ -2200,6 +2256,48 @@ mod tests {
         assert!(!quiet.contains(BACKGROUND_NOTICE), "{quiet}");
         drop(tool);
         assert!(wait_until(|| !alive(&pid), Duration::from_secs(5)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn background_counts_a_live_session_and_notices_its_end() {
+        let tool = Shell::default();
+        let (_dir, context) = workspace();
+        let started = text(
+            &tool,
+            &context,
+            &serde_json::json!({ "action": "run", "command": "sleep 30", "yield_time_ms": 100 }),
+        );
+        let (id, _) = running(&started);
+        let (alive, before) = background();
+        assert!(alive >= 1, "{alive}");
+        let _ = text(
+            &tool,
+            &context,
+            &serde_json::json!({ "action": "stop", "session_id": id }),
+        );
+        assert!(wait_until(
+            || background().1 > before,
+            Duration::from_secs(5)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn background_counts_a_leftover_group() {
+        let tool = Shell::default();
+        let (_dir, context) = workspace();
+        let (_, before) = background();
+        let (_, pid) = run_background(&tool, &context);
+        assert!(alive(&pid));
+        let (alive_now, after) = background();
+        assert!(alive_now >= 1, "{alive_now}");
+        assert!(after > before);
+        drop(tool);
+        assert!(wait_until(
+            || background().1 > after,
+            Duration::from_secs(5)
+        ));
     }
 
     #[cfg(unix)]

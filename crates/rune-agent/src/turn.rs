@@ -1711,7 +1711,10 @@ pub const REPEAT_MARKER: &str = "[unchanged since call ";
 /// It applies within this turn, only when no call that could change anything
 /// ran since, and only while the earlier result is still in the history. A
 /// second repeat runs, so a model that knows of an outside change can still
-/// look again.
+/// look again. A check is not answered from an earlier result while
+/// background work is alive or after any of it started or ended since that
+/// result; the background list is shared by every conversation in the
+/// process, which errs toward running the check.
 fn repeat_guard(
     call: &PreparedCall,
     host: &dyn Host,
@@ -1735,6 +1738,12 @@ fn repeat_guard(
     let check = call.name == "shell" && is_repeatable_check(&call.arguments);
     // A retained-result page depends on the remaining budget, not only its arguments.
     if !(reads(activity_now) || check) || call.name == "read_tool_result" {
+        return None;
+    }
+    // A server, watcher or background build can change a check's outcome
+    // without any call in between.
+    let background = check.then(rune_tools::shell::background);
+    if background.is_some_and(|(alive, _)| alive > 0) {
         return None;
     }
     // A file read can be checked directly: an identical read of a file whose
@@ -1787,6 +1796,11 @@ fn repeat_guard(
         .iter()
         .any(|result| result.call.id == earlier.call.id);
     if !in_batch && !result_retained(history, &earlier.call.id) {
+        return None;
+    }
+    if let Some((_, generation)) = background
+        && history.check_generation(&earlier.call.id) != Some(generation)
+    {
         return None;
     }
     Some(repeat_pointer(
@@ -2125,6 +2139,10 @@ fn retain_result(
         {
             history.record_view(resolved_path(host, raw), digest);
         }
+    }
+    if result.executed && result.call.name == "shell" && is_repeatable_check(&result.call.arguments)
+    {
+        history.record_check_generation(&result.call.id, rune_tools::shell::background().1);
     }
     let cap = turn_cap.saturating_sub(*result_bytes).min(tool_cap);
     let mut text = std::mem::take(&mut result.output.text);
