@@ -56,6 +56,10 @@ pub struct Turn {
     /// When set, every other field must be absent or default.
     #[serde(default)]
     pub http_error: Option<HttpError>,
+    /// When set, the turn answers the first request whose body contains this
+    /// text, wherever it falls; turns without it answer the rest in order.
+    #[serde(default, rename = "match")]
+    pub match_text: Option<String>,
 }
 
 /// Where to cut a stream short.
@@ -173,6 +177,8 @@ pub struct RecordedRequest {
 #[derive(Debug, Default)]
 struct State {
     turns: Vec<Turn>,
+    /// Which turns have answered a request.
+    used: Vec<bool>,
     requests: Vec<RecordedRequest>,
     previous_key: Option<String>,
     keep_bodies: bool,
@@ -208,6 +214,7 @@ impl ScriptedProvider {
             Err(err) => panic!("could not read the scripted provider address: {err}"),
         };
         let state = Arc::new(Mutex::new(State {
+            used: vec![false; turns.len()],
             turns,
             keep_bodies,
             ..State::default()
@@ -351,7 +358,30 @@ fn serve(stream: TcpStream, state: &Arc<Mutex<State>>) -> std::io::Result<()> {
             return Ok(());
         };
         let index = guard.requests.len();
-        let turn = guard.turns.get(index).cloned();
+        // A turn with `match` takes the first request that contains its text;
+        // every other request takes the next unused turn without one.
+        let chosen = guard
+            .turns
+            .iter()
+            .enumerate()
+            .position(|(at, turn)| {
+                !guard.used[at]
+                    && turn
+                        .match_text
+                        .as_ref()
+                        .is_some_and(|text| body.contains(text.as_str()))
+            })
+            .or_else(|| {
+                guard
+                    .turns
+                    .iter()
+                    .enumerate()
+                    .position(|(at, turn)| !guard.used[at] && turn.match_text.is_none())
+            });
+        if let Some(at) = chosen {
+            guard.used[at] = true;
+        }
+        let turn = chosen.and_then(|at| guard.turns.get(at).cloned());
         let prompt_tokens = ceil_quarter(raw.len());
         let completion_tokens = turn.as_ref().map_or(0, |t| ceil_quarter(t.reply_bytes()));
         let key = prefix_key(&body);
@@ -509,6 +539,22 @@ mod tests {
         assert!(body.contains(r#""index":0"#), "{body}");
         assert!(body.contains(r#""index":1"#), "{body}");
         assert!(body.contains(r#""finish_reason":"tool_calls""#), "{body}");
+    }
+
+    #[test]
+    fn a_matching_turn_answers_its_request_wherever_it_falls() {
+        let mut summary = Turn::text("the summary");
+        summary.match_text = Some("Summarize".to_owned());
+        let provider =
+            ScriptedProvider::start(vec![Turn::text("first"), summary, Turn::text("second")]);
+        let (_, body) = post(&provider, r#"{"q":"plain"}"#);
+        assert!(body.contains(r#""content":"first""#), "{body}");
+        let (_, body) = post(&provider, r#"{"q":"plain again"}"#);
+        assert!(body.contains(r#""content":"second""#), "{body}");
+        let (_, body) = post(&provider, r#"{"q":"Summarize this"}"#);
+        assert!(body.contains(r#""content":"the summary""#), "{body}");
+        let (status, _) = post(&provider, r#"{"q":"one too many"}"#);
+        assert_eq!(status, 400);
     }
 
     #[test]

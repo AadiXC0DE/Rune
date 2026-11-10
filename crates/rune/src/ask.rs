@@ -340,6 +340,10 @@ struct AskHost<'a> {
     jsonl: bool,
     step: Cell<u32>,
     emit_error: RefCell<Option<RuneError>>,
+    /// The model's context window, which decides when the run compacts.
+    window: rune_agent::compaction::Window,
+    /// Usage of summary requests, which the turn's own usage does not count.
+    compaction_usage: Cell<Usage>,
 }
 
 impl Host for AskHost<'_> {
@@ -390,6 +394,21 @@ impl Host for AskHost<'_> {
 
     fn provider_strict(&self) -> bool {
         self.settings.provider_strict
+    }
+
+    fn prepare_request(
+        &self,
+        history: &mut History,
+        plan: &mut rune_net::provider::RequestPlan,
+        client: &dyn rune_net::fetch::Fetch,
+    ) -> Result<()> {
+        rune_agent::compaction::auto_compact(history, plan, self, client, self.window).map(|_| ())
+    }
+
+    fn context_replaced(&self, report: &rune_agent::compaction::CompactionReport) {
+        self.mapped.refresh();
+        self.compaction_usage
+            .set(self.compaction_usage.get().merge_sum(report.usage));
     }
 
     fn observe_response(&self, outcome: &StreamOutcome) {
@@ -587,6 +606,13 @@ pub fn run(
         jsonl: options.jsonl,
         step: Cell::new(0),
         emit_error: RefCell::new(None),
+        window: rune_agent::compaction::Window(
+            settings
+                .context_window
+                .or_else(|| crate::provider_setup::cached_context_window(settings, paths))
+                .unwrap_or(rune_net::catalog::DEFAULT_CONTEXT_WINDOW),
+        ),
+        compaction_usage: Cell::new(Usage::default()),
         limits,
     };
     let outcome = turn::run_turn(&mut history, &host);
@@ -594,6 +620,8 @@ pub fn run(
         return Err(error);
     }
     let outcome = outcome?;
+    // Summary requests are billed too, so they are part of what the run used.
+    let usage = outcome.usage.merge_sum(host.compaction_usage.get());
     // A turn that failed after a completed request still reports its usage,
     // steps and calls, with the failure as the error.
     let error = if let Some(error) = outcome.error.clone() {
@@ -663,14 +691,7 @@ pub fn run(
     let session_id = if options.no_save {
         String::new()
     } else {
-        save_exchange(
-            paths,
-            &options.prompt,
-            &history,
-            &outcome.usage,
-            error.as_ref(),
-        )?
-        .to_string()
+        save_exchange(paths, &options.prompt, &history, &usage, error.as_ref())?.to_string()
     };
 
     Ok(JsonResult {
@@ -686,15 +707,15 @@ pub fn run(
         session_id,
         steps: outcome.steps,
         usage: UsageReport {
-            input_tokens: outcome.usage.input_tokens,
-            output_tokens: outcome.usage.output_tokens,
-            cache_read_tokens: outcome.usage.cache_read_tokens,
-            cache_write_tokens: outcome.usage.cache_write_tokens,
+            input_tokens: usage.input_tokens,
+            output_tokens: usage.output_tokens,
+            cache_read_tokens: usage.cache_read_tokens,
+            cache_write_tokens: usage.cache_write_tokens,
         },
         tool_calls,
         narration,
         cost_usd: crate::provider_setup::cached_prices(settings, paths)
-            .and_then(|prices| prices.cost(&outcome.usage))
+            .and_then(|prices| prices.cost(&usage))
             .map(rune_net::models_dev::dollars),
         verification: error.is_none().then(|| outcome.verification.as_str()),
         error: error.as_ref().map(|error| error.message().to_owned()),

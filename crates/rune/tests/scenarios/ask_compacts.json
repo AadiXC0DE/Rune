@@ -1,0 +1,88 @@
+{
+  "prompt": "Read a.txt, b.txt, c.txt, d.txt, e.txt and f.txt, one at a time.",
+  "workspace": "workspaces/six_files.json",
+  "user_config": "[models.chat_completions]\nid = \"scripted\"\ncontext_window = 10500\n",
+  "turns": [
+    {
+      "tool_calls": [
+        {
+          "id": "c1",
+          "name": "read_file",
+          "arguments": {
+            "path": "a.txt"
+          }
+        }
+      ]
+    },
+    {
+      "tool_calls": [
+        {
+          "id": "c2",
+          "name": "read_file",
+          "arguments": {
+            "path": "b.txt"
+          }
+        }
+      ]
+    },
+    {
+      "tool_calls": [
+        {
+          "id": "c3",
+          "name": "read_file",
+          "arguments": {
+            "path": "c.txt"
+          }
+        }
+      ]
+    },
+    {
+      "tool_calls": [
+        {
+          "id": "c4",
+          "name": "read_file",
+          "arguments": {
+            "path": "d.txt"
+          }
+        }
+      ]
+    },
+    {
+      "tool_calls": [
+        {
+          "id": "c5",
+          "name": "read_file",
+          "arguments": {
+            "path": "e.txt"
+          }
+        }
+      ]
+    },
+    {
+      "tool_calls": [
+        {
+          "id": "c6",
+          "name": "read_file",
+          "arguments": {
+            "path": "f.txt"
+          }
+        }
+      ]
+    },
+    {
+      "match": "Summarize the earlier portion of this conversation",
+      "text": "The user asked for the six files to be read. Files a.txt to d.txt were read; e.txt and f.txt remain."
+    },
+    {
+      "text": "All six files were read."
+    }
+  ],
+  "expect": {
+    "exit_code": 0,
+    "final_output": "All six files were read.",
+    "any_request_contains": [
+      "<context_handoff>"
+    ],
+    "requests": 8
+  }
+}

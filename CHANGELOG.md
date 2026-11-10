@@ -36,6 +36,9 @@ Notable changes, newest first. Each entry describes what a user can observe.
   last step returns that report instead of failing.
 - A run that fails after its first completed request reports its usage, steps,
   tool calls and text in `ask --json` instead of zero steps and no cost.
+- `rune ask` compacts a long run before it reaches the context window, as the
+  interactive session does, and counts the summary requests in its usage and
+  cost.
 - A call that already failed the same way `max_consecutive_tool_failures` times
   is refused with a nudge and the turn goes on; sending it again after two
   refusals stops the run as `stalled`, instead of the turn ending at once.

@@ -659,13 +659,15 @@ so a team can ship a workflow with the code. Discovered project and user command
 appear alongside builtins in slash-command completion, with descriptions and
 argument hints. Up/Down selects a candidate; Tab or Enter completes a partial
 name. Enter on the complete name shows its expanded prompt for review.
-Before each CLI session request, Rune estimates the serialized input, including
-instructions and tool schemas,
+Before each request of an interactive session or a `rune ask` run, Rune estimates
+the serialized input, including instructions and tool schemas,
 and summarizes earlier turns at `compaction_trigger_percent` of usable input
 capacity. Requests above capacity remain eligible for compaction when the retained
 tail fits with instructions, tool schemas, and the output reserve. A failed summary,
 including one stopped at the token limit, preserves the conversation and stops
-that request with an explicit error.
+that request with an explicit error. `rune ask` uses the configured
+`context_window`, else the cached models.dev window, else 128,000 tokens, and
+its reported usage and cost include the summary requests.
 
 Use `/compact preview` to see the exact counts of conversation records that
 manual compaction would summarize and retain verbatim. Records are the current

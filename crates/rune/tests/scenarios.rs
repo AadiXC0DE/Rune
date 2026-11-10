@@ -20,6 +20,7 @@ const SCENARIOS: &[&str] = &[
     "long_150_steps",
     "provider_fails_at_step_4",
     "same_failure_five_times",
+    "ask_compacts",
 ];
 
 /// Scenarios built in Rust, which have no file.
@@ -126,6 +127,20 @@ fn same_failure_five_times() {
         result["usage"]["input_tokens"].as_u64().unwrap_or(0) > 0,
         "{result}"
     );
+}
+
+#[test]
+fn ask_compacts() {
+    // Five reads, the summary request, the sixth read, the answer. The
+    // summary is billed, so the reported input counts every request.
+    let report = run_scenario("ask_compacts");
+    let billed: u64 = report
+        .requests
+        .iter()
+        .map(|request| request.prompt_tokens)
+        .sum();
+    let result = report.result.expect("a result");
+    assert_eq!(result["usage"]["input_tokens"], billed, "{result}");
 }
 
 #[test]

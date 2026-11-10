@@ -479,6 +479,14 @@ pub fn cached_prices(settings: &Settings, paths: &Paths) -> Option<rune_net::mod
         .prices
 }
 
+/// Returns the configured model's context window from the cache alone.
+pub fn cached_context_window(settings: &Settings, paths: &Paths) -> Option<u64> {
+    let key = rune_net::models_dev::catalog_key(&settings.provider.to_string())?;
+    read_cached_limits(&paths.models_cache_file(), key)?
+        .get(&settings.model)?
+        .context
+}
+
 /// Reads a provider's capacity out of the cache.
 fn read_cached_limits(
     path: &camino::Utf8Path,

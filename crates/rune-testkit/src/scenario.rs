@@ -79,6 +79,9 @@ pub struct Expect {
     /// Text that a request body must contain.
     #[serde(default)]
     pub request_contains: Vec<RequestContains>,
+    /// Each string must appear in at least one recorded request body.
+    #[serde(default)]
+    pub any_request_contains: Vec<String>,
 }
 
 /// One body assertion.
@@ -429,6 +432,17 @@ pub fn check(scenario: &Scenario, report: &Report) -> Vec<String> {
             report.prefix_breaks
         ));
     }
+    for text in &expect.any_request_contains {
+        if !report
+            .requests
+            .iter()
+            .any(|request| request.body.contains(text.as_str()))
+        {
+            failures.push(format!(
+                "any_request_contains: no request contains {text:?}"
+            ));
+        }
+    }
     for entry in &expect.request_contains {
         let body = entry
             .request
@@ -509,6 +523,38 @@ mod tests {
         let empty = dir.path().join("empty");
         write_user_config(&empty, &plain);
         assert!(!empty.join("config").exists());
+    }
+
+    #[test]
+    fn any_request_contains_needs_one_matching_body() {
+        let mut scenario = load_inline(
+            r#"{"prompt":"p","turns":[],"expect":{"any_request_contains":["needle"]}}"#,
+        );
+        let request = |body: &str| RecordedRequest {
+            path: String::new(),
+            body: body.to_owned(),
+            bytes: body.len(),
+            prompt_tokens: 0,
+            cached_tokens: 0,
+            completion_tokens: 0,
+        };
+        let mut report = Report {
+            requests: vec![request("hay"), request("more hay")],
+            ..Report::default()
+        };
+        assert_eq!(check(&scenario, &report).len(), 1);
+        report.requests.push(request("a needle here"));
+        assert!(check(&scenario, &report).is_empty());
+        scenario.expect.any_request_contains.clear();
+        report.requests.clear();
+        assert!(check(&scenario, &report).is_empty());
+    }
+
+    fn load_inline(text: &str) -> Scenario {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let path = dir.path().join("inline.json");
+        std::fs::write(&path, text).expect("write");
+        load(&path).expect("a scenario")
     }
 
     #[test]
