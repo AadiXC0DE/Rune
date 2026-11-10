@@ -25,6 +25,7 @@ fn state() -> FooterState {
         model: "claude-sonnet-4".to_owned(),
         permission_mode: PermissionMode::Auto,
         planning: false,
+        unsandboxed: false,
         workspace: "/Users/dev/rune".to_owned(),
         context_used: 24_500,
         context_source: None,

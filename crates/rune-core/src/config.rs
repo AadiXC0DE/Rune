@@ -433,6 +433,14 @@ pub struct UserConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shell_network: Option<bool>,
 
+    /// Directories commands may write besides the workspace, replacing the default cache list; an empty list allows none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox_cache_roots: Option<Vec<String>>,
+
+    /// Run commands without a sandbox when no sandbox backend works on this machine.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_unsandboxed: Option<bool>,
+
     /// Model per provider, either a bare identifier or a table describing it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub models: Option<BTreeMap<String, ModelEntry>>,
@@ -603,6 +611,8 @@ pub struct Settings {
     pub web_tools: bool,
     /// Whether sandboxed shell commands may use the network.
     pub shell_network: bool,
+    /// The configured cache directory list, replacing the defaults when set.
+    pub sandbox_cache_roots: Option<Vec<String>>,
     /// Input capacity the configured model accepts, when one is declared.
     ///
     /// Held here rather than looked up at the point it is needed, because the
@@ -673,6 +683,7 @@ impl Default for Settings {
             post_tool_hook: None,
             web_tools: false,
             shell_network: false,
+            sandbox_cache_roots: None,
             context_window: None,
             base_url: None,
             api_key_env: None,
@@ -1261,6 +1272,16 @@ fn apply_user(settings: &mut Settings, user: &UserConfig, layer: Layer) {
         // owner's call rather than the repository's.
         settings.web_tools = web_tools;
         settings.sources.record("web_tools", layer);
+    }
+    if let Some(roots) = &user.sandbox_cache_roots {
+        settings.sandbox_cache_roots = Some(roots.clone());
+        settings.sources.record("sandbox_cache_roots", layer);
+    }
+    if let Some(allow) = user.allow_unsandboxed {
+        // A user choice for machines with no working backend; a project file
+        // cannot make it.
+        settings.allow_unsandboxed = allow;
+        settings.sources.record("allow_unsandboxed", layer);
     }
     if let Some(network) = user.shell_network {
         // Not in a project file either: a repository cannot grant its own
@@ -2042,6 +2063,48 @@ mod tests {
             assert_eq!(settings.web_tools, !enabled);
             assert_eq!(settings.source_of("web_tools"), Layer::Environment);
         }
+    }
+
+    #[test]
+    fn allow_unsandboxed_is_read_from_user_config() {
+        let dir = TempDir::new().expect("tempdir");
+        let user = write(
+            &dir,
+            "config.toml",
+            "allow_unsandboxed = true\nsandbox_cache_roots = [\"~/.cache\"]\n",
+        );
+        let settings = load(None, Some(&user), &empty_env());
+        assert!(settings.allow_unsandboxed);
+        assert_eq!(settings.source_of("allow_unsandboxed"), Layer::User);
+        assert_eq!(
+            settings.sandbox_cache_roots.as_deref(),
+            Some(["~/.cache".to_owned()].as_slice())
+        );
+    }
+
+    #[test]
+    fn the_environment_overrides_a_user_allow_unsandboxed() {
+        let dir = TempDir::new().expect("tempdir");
+        let user = write(&dir, "config.toml", "allow_unsandboxed = true\n");
+        let env = EnvironmentOverrides::from_lookup(|key| {
+            (key == "RUNE_ALLOW_UNSANDBOXED").then(|| "false".to_owned())
+        });
+        let settings = load(None, Some(&user), &env);
+        assert!(!settings.allow_unsandboxed);
+        assert_eq!(settings.source_of("allow_unsandboxed"), Layer::Environment);
+    }
+
+    #[test]
+    fn a_project_file_cannot_set_allow_unsandboxed() {
+        let dir = TempDir::new().expect("tempdir");
+        let project = write(
+            &dir,
+            "project.toml",
+            "allow_unsandboxed = true\nsandbox_cache_roots = [\"~\"]\n",
+        );
+        let settings = load(Some(&project), None, &empty_env());
+        assert!(!settings.allow_unsandboxed);
+        assert!(settings.sandbox_cache_roots.is_none());
     }
 
     #[test]

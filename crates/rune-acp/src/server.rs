@@ -162,6 +162,8 @@ pub struct ServerConfig {
     pub environment: Arc<rune_tools::EnvironmentPolicy>,
     /// Whether sandboxed shell commands may use the network.
     pub network: bool,
+    /// Tool cache directories sandboxed commands may write.
+    pub cache_roots: Vec<Utf8PathBuf>,
 }
 
 impl fmt::Debug for ServerConfig {
@@ -214,6 +216,7 @@ impl ServerConfig {
             additional_roots: Vec::new(),
             environment: Arc::default(),
             network: false,
+            cache_roots: Vec::new(),
         })
     }
 
@@ -1057,7 +1060,8 @@ fn run_one<W: Write + Send + 'static>(server: &Arc<Server<W>>, queued: Queued) {
             .clone()
             .with_offline(server.config.endpoint.offline)
             .with_environment(Arc::clone(&server.config.environment))
-            .with_network(server.config.network),
+            .with_network(server.config.network)
+            .with_cache_roots(server.config.cache_roots.clone()),
         cancellation: cancellation.clone(),
         steering: snapshot.steering,
         tools,

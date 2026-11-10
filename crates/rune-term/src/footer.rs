@@ -47,6 +47,9 @@ pub struct FooterState {
     pub permission_mode: PermissionMode,
     /// Whether the session is in plan mode, which overrides the mode shown.
     pub planning: bool,
+    /// Whether commands run without a sandbox, because none works here and
+    /// the user allowed that.
+    pub unsandboxed: bool,
     /// Working directory, shown as given.
     pub workspace: String,
     /// Observed or estimated conversation tokens.
@@ -248,6 +251,12 @@ fn status_row(state: &FooterState, theme: &Theme, truecolor: bool) -> String {
         state.permission_mode.label()
     });
     row.push_str(&reset(theme));
+    if state.unsandboxed {
+        row.push_str(&divider(theme, truecolor));
+        row.push_str(&paint(theme, Slot::Dim, truecolor, 0));
+        row.push_str("unsandboxed");
+        row.push_str(&reset(theme));
+    }
     row.push_str(&divider(theme, truecolor));
     row.push_str(&context_field(state, theme, truecolor));
     if let Some(cost) = &state.cost {
@@ -402,6 +411,7 @@ mod tests {
             model: "claude-sonnet-4".to_owned(),
             permission_mode: PermissionMode::Auto,
             planning: false,
+            unsandboxed: false,
             workspace: "/Users/dev/rune/".to_owned(),
             context_used: 24_500,
             context_source: None,
@@ -541,6 +551,19 @@ mod tests {
         assert!(status.starts_with("provider retry 2/3 |"), "{status}");
         assert!(!status.contains("250ms"), "{status}");
         assert!(status.is_ascii(), "{status}");
+    }
+
+    #[test]
+    fn the_footer_names_an_unsandboxed_session() {
+        let mut state = state();
+        assert!(!status_of(&state, 120).contains("unsandboxed"));
+        state.unsandboxed = true;
+        let status = status_of(&state, 120);
+        let mode = status
+            .find(state.permission_mode.label())
+            .expect("mode chip");
+        let chip = status.find("unsandboxed").expect("unsandboxed chip");
+        assert!(mode < chip, "{status}");
     }
 
     #[test]

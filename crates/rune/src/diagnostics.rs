@@ -359,6 +359,11 @@ pub fn status_json(settings: &Settings, paths: &Paths, workspace: &Utf8Path) -> 
             "provider_connected".to_owned(),
             serde_json::Value::Bool(settings.provider.is_configured()),
         );
+        let sandbox = crate::sandbox::status(settings);
+        object.insert(
+            "sandbox".to_owned(),
+            serde_json::json!({"backend": sandbox.backend, "state": sandbox.state}),
+        );
     }
     value
 }

@@ -224,6 +224,8 @@ pub struct ExecutionContext {
     /// Separate from `external_access`, which also lets file tools reach
     /// outside the workspace: granting network must not grant that.
     pub network: bool,
+    /// Tool cache directories sandboxed commands may write.
+    pub cache_roots: Vec<Utf8PathBuf>,
 }
 
 impl ExecutionContext {
@@ -244,7 +246,15 @@ impl ExecutionContext {
             cancelled: Arc::new(AtomicBool::new(false)),
             environment: Arc::default(),
             network: false,
+            cache_roots: Vec::new(),
         }
+    }
+
+    /// Sets the tool cache directories sandboxed commands may write.
+    #[must_use]
+    pub fn with_cache_roots(mut self, roots: Vec<Utf8PathBuf>) -> Self {
+        self.cache_roots = roots;
+        self
     }
 
     /// Sets whether sandboxed shell commands may use the network.
@@ -362,6 +372,7 @@ impl ExecutionContext {
             cancelled: Arc::clone(&self.cancelled),
             environment: Arc::clone(&self.environment),
             network: self.network,
+            cache_roots: self.cache_roots.clone(),
         }
     }
 

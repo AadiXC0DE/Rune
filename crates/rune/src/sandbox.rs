@@ -24,6 +24,99 @@ pub struct PathRule {
     source: String,
 }
 
+/// One writable cache directory and what added it.
+#[derive(Debug, Serialize)]
+pub struct CacheRule {
+    path: String,
+    source: String,
+}
+
+/// A cache directory entry that was not made writable, and why.
+#[derive(Debug, Serialize)]
+pub struct RefusedCache {
+    entry: String,
+    reason: &'static str,
+}
+
+/// The tool cache directories for these settings, resolved once: the
+/// writable roots and the entries refused.
+#[must_use]
+pub fn cache_roots(
+    settings: &Settings,
+) -> (Vec<rune_exec::CacheRoot>, Vec<(String, &'static str)>) {
+    let home = rune_core::paths::home_directory();
+    rune_exec::cache_roots(
+        settings.sandbox_cache_roots.as_deref(),
+        home.as_deref(),
+        &|name| std::env::var(name).ok(),
+    )
+}
+
+/// The writable cache directories for these settings.
+#[must_use]
+pub fn cache_paths(settings: &Settings) -> Vec<camino::Utf8PathBuf> {
+    cache_roots(settings)
+        .0
+        .into_iter()
+        .map(|root| root.path)
+        .collect()
+}
+
+/// How commands run on this machine with these settings.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Status {
+    /// The detected backend, such as `seatbelt` or `namespaces`.
+    pub backend: String,
+    /// `enforced`, `off` (none works and the user allowed that) or `refused`.
+    pub state: &'static str,
+    /// Why commands are refused, when they are.
+    pub reason: Option<String>,
+}
+
+/// Decides the sandbox status from the detected backend and the settings.
+#[must_use]
+pub fn status(settings: &Settings) -> Status {
+    let backend = rune_exec::detect();
+    let support = backend.support();
+    let (state, reason) = if support.is_full() {
+        ("enforced", None)
+    } else if settings.allow_unsandboxed {
+        ("off", None)
+    } else {
+        (
+            "refused",
+            Some(
+                support
+                    .reason()
+                    .unwrap_or("the backend cannot enforce a sandbox")
+                    .to_owned(),
+            ),
+        )
+    };
+    Status {
+        backend: backend.name().to_owned(),
+        state,
+        reason,
+    }
+}
+
+/// The `rune status` line for the sandbox.
+#[must_use]
+pub fn status_line(settings: &Settings, status: &Status) -> String {
+    match status.state {
+        "enforced" => format!("{}, enforced", status.backend),
+        "off" => format!(
+            "off, commands run without a sandbox (source: {})",
+            settings.source_of("allow_unsandboxed")
+        ),
+        _ => format!(
+            "{}, refusing commands: {}",
+            status.backend,
+            status.reason.as_deref().unwrap_or("no reason given")
+        ),
+    }
+}
+
 #[derive(Debug, Serialize)]
 pub struct Report {
     command: String,
@@ -39,6 +132,8 @@ pub struct Report {
     effective_network: &'static str,
     protected_paths: Vec<PathRule>,
     protections_applied: bool,
+    cache_roots: Vec<CacheRule>,
+    cache_roots_refused: Vec<RefusedCache>,
 }
 
 /// Builds a diagnostic report without starting the supplied command.
@@ -65,11 +160,14 @@ pub fn explain(
         .cloned()
         .collect::<Vec<_>>()
         .join(" ");
-    let mut context = ExecutionContext::new(workspace.to_owned())
+    let context = ExecutionContext::new(workspace.to_owned())
         .with_offline(settings.offline)
         .with_allow_unsandboxed(settings.allow_unsandboxed)
         .with_external_access(launch.has_flag("--external-access"))
         .with_network(settings.shell_network);
+    let (caches, refused_caches) = cache_roots(settings);
+    let mut context =
+        context.with_cache_roots(caches.iter().map(|root| root.path.clone()).collect());
     if launch.no_additional_dirs {
         context.additional_roots = launch.add_dirs.iter().map(Into::into).collect();
     } else {
@@ -92,9 +190,11 @@ pub fn explain(
         settings,
         saved_directory_source,
         launch,
+        (&caches, &refused_caches),
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn report(
     backend: &dyn Sandbox,
     prepared: &rune_exec::PreparedCommand,
@@ -102,8 +202,13 @@ fn report(
     settings: &Settings,
     saved_directory_source: Layer,
     launch: &Launch,
+    (caches, refused_caches): (&[rune_exec::CacheRoot], &[(String, &'static str)]),
 ) -> Result<Report> {
-    let paths = policy.resolved_paths()?;
+    let mut paths = policy.resolved_paths()?;
+    // Cache roots are reported on their own lines, with their own sources.
+    paths
+        .writable_roots
+        .retain(|path| !caches.iter().any(|cache| &cache.path == path));
     let support = backend.support();
     let (enforcement, reason) = match backend.wrap(prepared, policy, settings.allow_unsandboxed) {
         Ok(_) if support.is_full() => ("enforced", None),
@@ -214,6 +319,20 @@ fn report(
         },
         protected_paths,
         protections_applied: enforcement == "enforced",
+        cache_roots: caches
+            .iter()
+            .map(|cache| CacheRule {
+                path: cache.path.to_string(),
+                source: cache.rule.clone(),
+            })
+            .collect(),
+        cache_roots_refused: refused_caches
+            .iter()
+            .map(|(entry, reason)| RefusedCache {
+                entry: entry.clone(),
+                reason,
+            })
+            .collect(),
     })
 }
 
@@ -249,6 +368,16 @@ pub fn render(report: &Report) -> String {
         report.effective_network,
         report.network.source
     );
+    for cache in &report.cache_roots {
+        let _ = writeln!(out, "cache root: {} (source: {})", cache.path, cache.source);
+    }
+    for refused in &report.cache_roots_refused {
+        let _ = writeln!(
+            out,
+            "cache root refused: {}: {}",
+            refused.entry, refused.reason
+        );
+    }
     for (label, paths) in [
         ("writable roots", &report.writable_roots),
         ("temporary roots", &report.temporary_roots),
@@ -276,6 +405,28 @@ mod tests {
     use rune_exec::sandbox::{LinuxSandbox, MacSandbox, NullSandbox};
 
     use super::*;
+
+    #[test]
+    fn the_status_line_names_each_state() {
+        let settings = Settings::default();
+        let status = |state, reason: Option<&str>| Status {
+            backend: "namespaces".to_owned(),
+            state,
+            reason: reason.map(str::to_owned),
+        };
+        assert_eq!(
+            status_line(&settings, &status("enforced", None)),
+            "namespaces, enforced"
+        );
+        assert_eq!(
+            status_line(&settings, &status("off", None)),
+            "off, commands run without a sandbox (source: default)"
+        );
+        assert_eq!(
+            status_line(&settings, &status("refused", Some("bwrap is missing"))),
+            "namespaces, refusing commands: bwrap is missing"
+        );
+    }
 
     #[test]
     fn a_report_distinguishes_enforcement_refusal_and_explicit_fallback() {
@@ -308,6 +459,7 @@ mod tests {
                 &Settings::default(),
                 Layer::Default,
                 &launch,
+                (&[], &[]),
             )
             .expect("report");
             assert_eq!(report.enforcement, "enforced");
@@ -338,6 +490,7 @@ mod tests {
                     &settings,
                     Layer::Default,
                     &launch,
+                    (&[], &[]),
                 )
                 .expect("report");
                 assert_eq!(

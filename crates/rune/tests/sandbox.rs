@@ -298,6 +298,37 @@ fn sandbox_explain_reports_the_network_flag() {
 }
 
 #[test]
+fn sandbox_explain_lists_cache_roots() {
+    let fixture = Fixture::new();
+    std::fs::create_dir_all(fixture.dir.path().join("home/.cache")).expect("cache");
+    let report = fixture.json(&["sandbox", "explain", "--json", "--", "go build"]);
+    let caches = report["cache_roots"].as_array().expect("cache roots");
+    assert!(
+        caches.iter().any(|cache| {
+            cache["path"] == resolved(&fixture.dir.path().join("home/.cache"))
+                && cache["source"] == "default ~/.cache"
+        }),
+        "{report}"
+    );
+    let text = fixture.run(&["sandbox", "explain", "--", "go build"]);
+    let text = String::from_utf8(text.stdout).expect("utf8");
+    assert!(text.contains("cache root: "), "{text}");
+    assert!(text.contains("(source: default ~/.cache)"), "{text}");
+    // A protected directory named in the configuration is refused.
+    let config = fixture.dir.path().join("config.toml");
+    let mut contents = std::fs::read_to_string(&config).expect("config");
+    contents.push_str("sandbox_cache_roots = [\"~/.ssh\"]\n");
+    std::fs::write(&config, contents).expect("config");
+    let report = fixture.json(&["sandbox", "explain", "--json", "--", "go build"]);
+    assert_eq!(report["cache_roots"], serde_json::json!([]), "{report}");
+    assert_eq!(
+        report["cache_roots_refused"],
+        serde_json::json!([{"entry": "~/.ssh", "reason": "a protected directory"}]),
+        "{report}"
+    );
+}
+
+#[test]
 fn saved_roots_can_be_ignored_while_command_line_roots_remain() {
     let fixture = Fixture::new();
     let added = fixture.dir.path().join("added");

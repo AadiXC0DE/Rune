@@ -1046,7 +1046,8 @@ pub fn run(
         .with_offline(settings.offline)
         .with_allow_unsandboxed(settings.allow_unsandboxed)
         .with_environment(crate::provider_setup::command_environment(settings))
-        .with_network(settings.shell_network);
+        .with_network(settings.shell_network)
+        .with_cache_roots(crate::sandbox::cache_paths(settings));
     context
         .additional_roots
         .clone_from(&settings.additional_directories);

@@ -1056,6 +1056,23 @@ and `MANPAGER` set to `cat`, `GIT_TERMINAL_PROMPT=0`, `PIP_PROGRESS_BAR=off`,
 `TQDM_DISABLE=1` and `AI_AGENT=rune`; a command without a terminal also gets
 `TERM=dumb` and `NO_COLOR=1`.
 
+Sandboxed commands may also write the build tools' caches under the home
+directory: `~/.cache`, `~/Library/Caches`, `~/.cargo/registry`, `~/.cargo/git`,
+`~/.npm`, `~/.local/share/pnpm`, `~/Library/pnpm`, `~/.yarn`,
+`~/.bun/install/cache`, `~/go/pkg/mod`, `~/.gradle`, `~/.m2` and
+`~/.local/share/uv` when they exist, plus the directories `GOCACHE`,
+`GOMODCACHE`, `npm_config_cache`, `PIP_CACHE_DIR` and `UV_CACHE_DIR` name, and
+`$CARGO_HOME/registry` and `$CARGO_HOME/git`. `sandbox_cache_roots` replaces
+that list (`sandbox_cache_roots = []` allows none). The home directory itself,
+`~/.ssh`, `~/.gnupg`, `~/.config`, `~/.aws`, `~/.cargo/bin`, `~/.local/bin` and
+the credential locations are refused, and credentials stay hidden inside every
+cache root. `rune sandbox explain` lists the roots and what added each.
+
+`allow_unsandboxed = true` in the user configuration has the effect of
+`--allow-unsandboxed` on every run: on a machine where no sandbox backend works,
+commands run without one, and the footer and `rune status` say so. It never
+turns off a backend that works, and a project file cannot set it.
+
 ## Embedding
 
 `rune acp` serves the Agent Client Protocol over standard input and output.

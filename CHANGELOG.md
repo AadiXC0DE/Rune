@@ -39,6 +39,12 @@ Notable changes, newest first. Each entry describes what a user can observe.
 - `rune ask` compacts a long run before it reaches the context window, as the
   interactive session does, and counts the summary requests in its usage and
   cost.
+- Sandboxed commands can write the build tools' caches under the home
+  directory (`~/.cache`, `~/.cargo/registry`, `~/go/pkg/mod`, `~/.npm` and
+  others), replaceable with `sandbox_cache_roots`; protected and credential
+  directories are refused. `allow_unsandboxed = true` in the user configuration
+  replaces the per-run flag, and the footer and `rune status` show when
+  commands run without a sandbox.
 - A refused command in a container says it looks like a container and to pass
   `--allow-unsandboxed`, and a missing or blocked bubblewrap is named in plain
   words. `RUNE_ALLOW_UNSANDBOXED=1` is the environment form of the flag.

@@ -35,7 +35,8 @@ pub use command::{
     verify_unchanged,
 };
 pub use sandbox::{
-    LinuxSandbox, MacSandbox, NAMESPACE_HELPER, NullSandbox, SEATBELT_TOOL, Sandbox, SandboxPolicy,
-    Support, UNSANDBOXED_OVERRIDE, detect,
+    CACHE_ROOT_VARIABLES, CacheRoot, DEFAULT_CACHE_ROOTS, LinuxSandbox, MacSandbox,
+    NAMESPACE_HELPER, NullSandbox, SEATBELT_TOOL, Sandbox, SandboxPolicy, Support,
+    UNSANDBOXED_OVERRIDE, cache_roots, detect, in_container,
 };
 pub use session::{Buffer, Process, Reading};

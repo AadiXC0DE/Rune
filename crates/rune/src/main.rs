@@ -1536,6 +1536,7 @@ fn run_acp(
         additional_roots: settings.additional_directories.clone(),
         environment: provider_setup::command_environment(settings),
         network: settings.shell_network,
+        cache_roots: sandbox::cache_paths(settings),
     };
 
     let server = std::sync::Arc::new(rune_acp::Server::new(config, std::io::stdout())?);
@@ -1570,6 +1571,10 @@ fn run_status(
             }
         );
         println!("permissions    {}", settings.permission_mode.label());
+        println!(
+            "sandbox        {}",
+            sandbox::status_line(settings, &sandbox::status(settings))
+        );
         println!("config root    {}", paths.config_root);
         println!("state root     {}", paths.state_root);
         println!("data root      {}", paths.data_root);

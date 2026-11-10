@@ -382,6 +382,9 @@ struct SessionHost {
     grants: Mutex<Grants>,
     /// Whether the session is planning: only reads and plan updates may run.
     planning: std::sync::atomic::AtomicBool,
+    /// Whether commands run without a sandbox: none works here and the user
+    /// allowed that. Decided once, at the start.
+    unsandboxed: bool,
     questions: Arc<TerminalQuestions>,
 }
 
@@ -1378,6 +1381,7 @@ impl SessionHost {
             model: lock_model(&self.model).clone(),
             permission_mode: self.mode(),
             planning: self.planning.load(std::sync::atomic::Ordering::Relaxed),
+            unsandboxed: self.unsandboxed,
             workspace: self.workspace.clone(),
             context_used: self.context_used.load(std::sync::atomic::Ordering::Relaxed),
             context_source: *self
@@ -2126,7 +2130,8 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
     let mut context = ExecutionContext::new(config.workspace.clone())
         .with_offline(config.settings.offline)
         .with_allow_unsandboxed(config.settings.allow_unsandboxed)
-        .with_environment(crate::provider_setup::command_environment(&config.settings));
+        .with_environment(crate::provider_setup::command_environment(&config.settings))
+        .with_cache_roots(crate::sandbox::cache_paths(&config.settings));
     context
         .additional_roots
         .clone_from(&config.settings.additional_directories);
@@ -2210,6 +2215,7 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
         approval_preview: Mutex::new(Vec::new()),
         grants: Mutex::new(Grants::new()),
         planning: std::sync::atomic::AtomicBool::new(false),
+        unsandboxed: config.settings.allow_unsandboxed && !rune_exec::detect().support().is_full(),
         questions: config.questions,
     };
     if context_source.is_none() {
@@ -11453,6 +11459,7 @@ mod tests {
             approval_preview: Mutex::new(Vec::new()),
             grants: Mutex::new(Grants::new()),
             planning: std::sync::atomic::AtomicBool::new(false),
+            unsandboxed: false,
             questions,
         }
     }

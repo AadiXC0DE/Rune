@@ -145,6 +145,12 @@ pub struct SandboxPolicy {
     pub writable_roots: Vec<Utf8PathBuf>,
     /// Whether the command is granted network access.
     pub network: bool,
+    /// Tool cache directories that are writable too, such as `~/.cache`.
+    ///
+    /// Writable like the other roots, with credentials still masked inside
+    /// them, but not searched for nested repositories: a cache is not a
+    /// source tree, and walking one before every command would be slow.
+    pub cache_roots: Vec<Utf8PathBuf>,
 }
 
 impl SandboxPolicy {
@@ -155,7 +161,29 @@ impl SandboxPolicy {
             workspace,
             writable_roots,
             network,
+            cache_roots: Vec::new(),
         }
+    }
+
+    /// Adds tool cache directories commands may write.
+    #[must_use]
+    pub fn with_cache_roots(mut self, roots: Vec<Utf8PathBuf>) -> Self {
+        self.cache_roots = roots;
+        self
+    }
+
+    /// Adds the cache roots that still resolve to `roots`, skipping any that
+    /// vanished since they were found: a missing cache is not a reason to
+    /// refuse the command.
+    fn with_caches(&self, mut roots: Vec<Utf8PathBuf>) -> Vec<Utf8PathBuf> {
+        for cache in &self.cache_roots {
+            if let Ok(resolved) = resolve(cache, "a cache directory")
+                && !roots.contains(&resolved)
+            {
+                roots.push(resolved);
+            }
+        }
+        roots
     }
 
     /// Returns every writable path, the workspace first.
@@ -169,12 +197,14 @@ impl SandboxPolicy {
     }
 
     fn paths_with(&self, credentials: &[Utf8PathBuf]) -> Result<PolicyPaths> {
-        let writable_roots = self
+        let sources = self
             .writable()
             .map(|path| resolve(path, "a writable path"))
             .collect::<Result<Vec<_>>>()?;
+        let protected_paths = protected_paths(&sources)?;
+        let writable_roots = self.with_caches(sources);
         Ok(PolicyPaths {
-            protected_paths: protected_paths(&writable_roots)?,
+            protected_paths,
             credential_paths: masked_paths(credentials, &writable_roots),
             writable_roots,
         })
@@ -183,10 +213,11 @@ impl SandboxPolicy {
     /// Returns the credential locations a command under this policy has
     /// hidden, for a caller to assert against without repeating the list.
     pub fn credential_paths(&self) -> Result<Vec<Utf8PathBuf>> {
-        let writable = self
-            .writable()
-            .map(|path| resolve(path, "a writable path"))
-            .collect::<Result<Vec<_>>>()?;
+        let writable = self.with_caches(
+            self.writable()
+                .map(|path| resolve(path, "a writable path"))
+                .collect::<Result<Vec<_>>>()?,
+        );
         Ok(masked_paths(&existing_credential_paths(), &writable))
     }
 }
@@ -262,6 +293,136 @@ pub fn detect() -> Box<dyn Sandbox> {
         return Box::new(LinuxSandbox::detect());
     }
     Box::new(NullSandbox)
+}
+
+/// Cache directories under the home directory that build tools write.
+pub const DEFAULT_CACHE_ROOTS: &[&str] = &[
+    "~/.cache",
+    "~/Library/Caches",
+    "~/.cargo/registry",
+    "~/.cargo/git",
+    "~/.npm",
+    "~/.local/share/pnpm",
+    "~/Library/pnpm",
+    "~/.yarn",
+    "~/.bun/install/cache",
+    "~/go/pkg/mod",
+    "~/.gradle",
+    "~/.m2",
+    "~/.local/share/uv",
+];
+
+/// Variables naming a cache directory, added to the default list when set.
+pub const CACHE_ROOT_VARIABLES: &[&str] = &[
+    "GOCACHE",
+    "GOMODCACHE",
+    "npm_config_cache",
+    "PIP_CACHE_DIR",
+    "UV_CACHE_DIR",
+];
+
+/// Directories under home a cache root may never be, or lie inside.
+const PROTECTED_HOME_DIRECTORIES: &[&str] = &[
+    ".ssh",
+    ".gnupg",
+    ".config",
+    ".aws",
+    ".cargo/bin",
+    ".local/bin",
+];
+
+/// One writable cache directory and the rule that added it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CacheRoot {
+    /// The resolved directory.
+    pub path: Utf8PathBuf,
+    /// What added it: `default ~/.cache`, a variable name, `CARGO_HOME`, or
+    /// `sandbox_cache_roots`.
+    pub rule: String,
+}
+
+/// Resolves the cache roots. `configured` replaces the default list when
+/// present; an empty list allows none.
+///
+/// Only existing directories are kept. The second vector holds the entries
+/// refused, with why: the home directory itself (its startup files live
+/// there), an ancestor of it, or a protected or credential directory.
+pub fn cache_roots(
+    configured: Option<&[String]>,
+    home: Option<&Utf8Path>,
+    lookup: &dyn Fn(&str) -> Option<String>,
+) -> (Vec<CacheRoot>, Vec<(String, &'static str)>) {
+    let expand = |entry: &str| -> Option<Utf8PathBuf> {
+        match entry.strip_prefix("~/") {
+            Some(rest) => home.map(|home| home.join(rest)),
+            None if entry == "~" => home.map(Utf8Path::to_path_buf),
+            None => Some(Utf8PathBuf::from(entry)),
+        }
+    };
+    let mut candidates: Vec<(String, Utf8PathBuf, String)> = Vec::new();
+    if let Some(entries) = configured {
+        for entry in entries {
+            if let Some(path) = expand(entry) {
+                candidates.push((entry.clone(), path, "sandbox_cache_roots".to_owned()));
+            }
+        }
+    } else {
+        for &entry in DEFAULT_CACHE_ROOTS {
+            if let Some(path) = expand(entry) {
+                candidates.push((entry.to_owned(), path, format!("default {entry}")));
+            }
+        }
+        for &name in CACHE_ROOT_VARIABLES {
+            if let Some(value) = lookup(name).filter(|value| !value.is_empty()) {
+                candidates.push((value.clone(), Utf8PathBuf::from(value), name.to_owned()));
+            }
+        }
+        if let Some(cargo) = lookup("CARGO_HOME").filter(|value| !value.is_empty()) {
+            for sub in ["registry", "git"] {
+                let path = Utf8PathBuf::from(&cargo).join(sub);
+                candidates.push((path.to_string(), path, "CARGO_HOME".to_owned()));
+            }
+        }
+    }
+    let home = home.and_then(|home| home.canonicalize_utf8().ok());
+    let protected: Vec<Utf8PathBuf> = home.as_ref().map_or_else(Vec::new, |home| {
+        PROTECTED_HOME_DIRECTORIES
+            .iter()
+            .chain(CREDENTIAL_PATHS.iter())
+            .map(|relative| home.join(relative))
+            .collect()
+    });
+    let mut roots: Vec<CacheRoot> = Vec::new();
+    let mut refused = Vec::new();
+    for (entry, path, rule) in candidates {
+        let Ok(resolved) = path.canonicalize_utf8() else {
+            continue;
+        };
+        if !resolved.is_dir() {
+            continue;
+        }
+        if home
+            .as_ref()
+            .is_some_and(|home| home.starts_with(&resolved))
+        {
+            refused.push((entry, "not the home directory itself"));
+            continue;
+        }
+        if protected
+            .iter()
+            .any(|guarded| resolved.starts_with(guarded))
+        {
+            refused.push((entry, "a protected directory"));
+            continue;
+        }
+        if !roots.iter().any(|root| root.path == resolved) {
+            roots.push(CacheRoot {
+                path: resolved,
+                rule,
+            });
+        }
+    }
+    (roots, refused)
 }
 
 /// Returns true when this process appears to run inside a container.
@@ -1005,6 +1166,153 @@ fn probe_namespaces(helper: Option<&Utf8Path>) -> Support {
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+
+    /// A temporary home with the given directories created under it.
+    fn home_with(relative: &[&str]) -> (TempDir, Utf8PathBuf) {
+        let (dir, home) = tempdir();
+        for path in relative {
+            std::fs::create_dir_all(home.join(path)).expect("fixture directory");
+        }
+        let home = home.canonicalize_utf8().expect("canonical home");
+        (dir, home)
+    }
+
+    fn no_variables(_: &str) -> Option<String> {
+        None
+    }
+
+    #[test]
+    fn cache_roots_default_list_keeps_existing_directories() {
+        let (_dir, home) = home_with(&[".cache", ".npm"]);
+        let (roots, refused) = cache_roots(None, Some(&home), &no_variables);
+        let found: Vec<(&Utf8Path, &str)> = roots
+            .iter()
+            .map(|root| (root.path.as_path(), root.rule.as_str()))
+            .collect();
+        assert_eq!(
+            found,
+            [
+                (home.join(".cache").as_path(), "default ~/.cache"),
+                (home.join(".npm").as_path(), "default ~/.npm"),
+            ]
+        );
+        assert!(refused.is_empty());
+    }
+
+    #[test]
+    fn cache_roots_from_variables_and_cargo_home() {
+        let (_dir, home) = home_with(&["gocache", "cargo/registry", "cargo/git"]);
+        let gocache = home.join("gocache").to_string();
+        let cargo = home.join("cargo").to_string();
+        let lookup = move |name: &str| match name {
+            "GOCACHE" => Some(gocache.clone()),
+            "CARGO_HOME" => Some(cargo.clone()),
+            _ => None,
+        };
+        let (roots, _) = cache_roots(None, Some(&home), &lookup);
+        let rules: Vec<&str> = roots.iter().map(|root| root.rule.as_str()).collect();
+        assert_eq!(rules, ["GOCACHE", "CARGO_HOME", "CARGO_HOME"]);
+        assert_eq!(roots[1].path, home.join("cargo/registry"));
+    }
+
+    #[test]
+    fn configured_cache_roots_replace_the_defaults() {
+        let (_dir, home) = home_with(&[".cache", "mine"]);
+        let configured = vec!["~/mine".to_owned()];
+        let (roots, _) = cache_roots(Some(&configured), Some(&home), &no_variables);
+        assert_eq!(roots.len(), 1);
+        assert_eq!(roots[0].path, home.join("mine"));
+        assert_eq!(roots[0].rule, "sandbox_cache_roots");
+    }
+
+    #[test]
+    fn an_empty_cache_root_list_allows_none() {
+        let (_dir, home) = home_with(&[".cache"]);
+        let (roots, refused) = cache_roots(Some(&[]), Some(&home), &no_variables);
+        assert!(roots.is_empty() && refused.is_empty());
+    }
+
+    #[test]
+    fn home_and_protected_directories_are_refused() {
+        let (_dir, home) = home_with(&[
+            ".cache",
+            ".ssh",
+            ".cargo/bin",
+            ".cargo/registry",
+            ".config/gcloud",
+        ]);
+        let configured: Vec<String> = [
+            "~",
+            "~/.ssh",
+            "~/.cargo/bin",
+            "~/.config/gcloud",
+            "~/.cargo/registry",
+            "~/missing",
+        ]
+        .map(str::to_owned)
+        .to_vec();
+        let (roots, refused) = cache_roots(Some(&configured), Some(&home), &no_variables);
+        assert_eq!(
+            roots
+                .iter()
+                .map(|root| root.path.clone())
+                .collect::<Vec<_>>(),
+            [home.join(".cargo/registry")]
+        );
+        assert_eq!(
+            refused,
+            [
+                ("~".to_owned(), "not the home directory itself"),
+                ("~/.ssh".to_owned(), "a protected directory"),
+                ("~/.cargo/bin".to_owned(), "a protected directory"),
+                ("~/.config/gcloud".to_owned(), "a protected directory"),
+            ]
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn cache_roots_are_writable_in_the_seatbelt_profile() {
+        let (_dir, dir) = tempdir();
+        let cache = dir.join("cache");
+        std::fs::create_dir(&cache).expect("cache");
+        let workspace = dir.join("workspace");
+        std::fs::create_dir(&workspace).expect("workspace");
+        let policy = SandboxPolicy::new(workspace, Vec::new(), false)
+            .with_cache_roots(vec![cache.clone(), dir.join("vanished")]);
+        let profile = MacSandbox::profile(&policy).expect("profile");
+        let resolved = cache.canonicalize_utf8().expect("canonical cache");
+        assert!(
+            profile.contains(&format!("(allow file-write* (subpath \"{resolved}\"))")),
+            "{profile}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cache_roots_are_bound_writable_in_the_linux_argv() {
+        let (_dir, dir) = tempdir();
+        let cache = dir.join("cache");
+        std::fs::create_dir(&cache).expect("cache");
+        let workspace = dir.join("workspace");
+        std::fs::create_dir(&workspace).expect("workspace");
+        let sandbox = LinuxSandbox::with_helper(Utf8PathBuf::from("/usr/bin/bwrap"));
+        let policy = SandboxPolicy::new(workspace.clone(), Vec::new(), false)
+            .with_cache_roots(vec![cache.clone()]);
+        let prepared = prepare("true", &workspace, None, environment()).expect("prepare");
+        let wrapped = sandbox.wrap(&prepared, &policy, false).expect("wrap");
+        let resolved = cache
+            .canonicalize_utf8()
+            .expect("canonical cache")
+            .to_string();
+        assert!(
+            wrapped.argv.windows(3).any(|window| window[0] == "--bind"
+                && window[1] == resolved
+                && window[2] == resolved),
+            "{:?}",
+            wrapped.argv
+        );
+    }
 
     #[test]
     fn container_markers_are_detected() {

@@ -659,6 +659,7 @@ pub fn sandbox_policy(context: &ExecutionContext) -> rune_exec::SandboxPolicy {
         context.additional_roots.clone(),
         (context.external_access || context.network) && !context.offline,
     )
+    .with_cache_roots(context.cache_roots.clone())
 }
 
 /// Added once to a failed command's output when the sandbox kept it off the
