@@ -1912,6 +1912,7 @@ version = "0.1.17"
 dependencies = [
  "flate2",
  "rune-core",
+ "rune-testkit",
  "serde_json",
  "sha2",
 ]

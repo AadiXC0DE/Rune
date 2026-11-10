@@ -39,6 +39,19 @@ mod targets {
     /// Four is the estimator's working bytes-per-token figure, not a tokenizer:
     /// the number printed beside the byte count is an estimate at this divisor.
     pub const PROMPT_BYTES_PER_TOKEN: usize = 4;
+
+    /// Largest accepted first request of the scripted `fix_one_file` session, in bytes,
+    /// with the workspace path replaced by `<workspace>`.
+    pub const MAX_SCRIPTED_FIRST_REQUEST_BYTES: usize = 9828;
+
+    /// Largest accepted sum of every request body in that session, in bytes.
+    pub const MAX_SCRIPTED_SESSION_BYTES: usize = 41483;
+
+    /// Largest accepted number of requests in that session.
+    pub const MAX_SCRIPTED_REQUESTS: usize = 4;
+
+    /// Requests in that session whose cached share falls under one half.
+    pub const MAX_SCRIPTED_PREFIX_BREAKS: usize = 0;
 }
 
 fn main() -> ExitCode {
@@ -154,6 +167,12 @@ fn print_budget_help() {
     println!(
         "  Tokens are estimated at {} bytes per token, not a tokenizer count.",
         targets::PROMPT_BYTES_PER_TOKEN
+    );
+    println!(
+        "  A scripted session (fix_one_file) is replayed against the release binary: its first"
+    );
+    println!(
+        "  request, total request bytes, request count and prefix breaks are checked against ceilings."
     );
 }
 
@@ -595,6 +614,7 @@ fn budget() -> Result<(), String> {
     check_startup(&binary)?;
     check_prompt(&binary)?;
     check_tools(&binary)?;
+    check_scripted_session(&binary)?;
     check_duplicate_dependencies()?;
     Ok(())
 }
@@ -651,6 +671,89 @@ fn check_tools(binary: &Path) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// Replays the `fix_one_file` scenario and enforces the request-shape ceilings.
+fn check_scripted_session(binary: &Path) -> Result<(), String> {
+    let path = workspace_root()?.join("crates/rune/tests/scenarios/fix_one_file.json");
+    let scenario = rune_testkit::scenario::load(&path)?;
+    let report = rune_testkit::scenario::run(binary, &scenario);
+    let failures = rune_testkit::scenario::check(&scenario, &report);
+    if !failures.is_empty() {
+        return Err(format!(
+            "scripted session `fix_one_file` did not pass: {}",
+            failures.join("; ")
+        ));
+    }
+    let lengths: Vec<usize> = report
+        .requests
+        .iter()
+        .map(|request| normalized_len(&request.body, &[report.workspace_dir.as_str()]))
+        .collect();
+    let first = lengths.first().copied().unwrap_or(0);
+    let total: usize = lengths.iter().sum();
+    let count = lengths.len();
+    let breaks = report.prefix_breaks;
+    println!(
+        "scripted session  fix_one_file: first request {first} bytes (ceiling {}), {total} bytes over {count} requests (ceiling {}, {} requests), {breaks} prefix breaks (ceiling {})",
+        targets::MAX_SCRIPTED_FIRST_REQUEST_BYTES,
+        targets::MAX_SCRIPTED_SESSION_BYTES,
+        targets::MAX_SCRIPTED_REQUESTS,
+        targets::MAX_SCRIPTED_PREFIX_BREAKS,
+    );
+    let failures = scripted_session_failures(first, total, count, breaks);
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(failures.join("; "))
+    }
+}
+
+/// Returns the length of `body` with every path in `paths` replaced by `<workspace>`.
+///
+/// Paths are replaced as plain text: temporary directories on Unix contain no
+/// character that JSON escapes.
+fn normalized_len(body: &str, paths: &[&str]) -> usize {
+    let mut text = body.to_owned();
+    for path in paths.iter().filter(|path| !path.is_empty()) {
+        text = text.replace(path, "<workspace>");
+    }
+    text.len()
+}
+
+/// Compares the measured session against its ceilings, one message per breach.
+fn scripted_session_failures(
+    first: usize,
+    total: usize,
+    count: usize,
+    breaks: usize,
+) -> Vec<String> {
+    let mut failures = Vec::new();
+    if first > targets::MAX_SCRIPTED_FIRST_REQUEST_BYTES {
+        failures.push(format!(
+            "first scripted request is {first} bytes, ceiling {}",
+            targets::MAX_SCRIPTED_FIRST_REQUEST_BYTES
+        ));
+    }
+    if total > targets::MAX_SCRIPTED_SESSION_BYTES {
+        failures.push(format!(
+            "scripted session sent {total} bytes, ceiling {}",
+            targets::MAX_SCRIPTED_SESSION_BYTES
+        ));
+    }
+    if count > targets::MAX_SCRIPTED_REQUESTS {
+        failures.push(format!(
+            "scripted session made {count} requests, ceiling {}",
+            targets::MAX_SCRIPTED_REQUESTS
+        ));
+    }
+    if breaks > targets::MAX_SCRIPTED_PREFIX_BREAKS {
+        failures.push(format!(
+            "scripted session had {breaks} prefix breaks, ceiling {}",
+            targets::MAX_SCRIPTED_PREFIX_BREAKS
+        ));
+    }
+    failures
 }
 
 /// Runs the binary with a throwaway home, so user configuration and user skills
@@ -1190,10 +1293,16 @@ fn startup_metrics(binary: &Path, flag: &str) -> Result<StartupMetrics, String> 
 /// Each entry is a crate that two upstream dependencies pin independently.
 /// Listing them explicitly keeps the check meaningful: anything not listed is a
 /// regression worth fixing.
-const DUPLICATE_EXCEPTIONS: &[(&str, &str)] = &[(
-    "winnow",
-    "toml 0.9 parses with winnow 0.7 and writes with toml_parser, which pins winnow 1",
-)];
+const DUPLICATE_EXCEPTIONS: &[(&str, &str)] = &[
+    (
+        "winnow",
+        "toml 0.9 parses with winnow 0.7 and writes with toml_parser, which pins winnow 1",
+    ),
+    (
+        "getrandom",
+        "xtask replays scripted sessions through rune-testkit, whose tempfile uses getrandom 0.4; the shipped binary uses 0.2",
+    ),
+];
 
 /// Fails when the release dependency graph contains two versions of one crate.
 ///
@@ -1378,6 +1487,52 @@ mod tests {
         let message = prompt_ceiling_failure(targets::MAX_PROMPT_BYTES + 1)
             .expect("one byte over the ceiling was accepted");
         assert!(message.contains("assembled prompt exceeds"), "{message}");
+    }
+
+    #[test]
+    fn the_scripted_session_ceilings_fail_only_above_them() {
+        let first = targets::MAX_SCRIPTED_FIRST_REQUEST_BYTES;
+        let total = targets::MAX_SCRIPTED_SESSION_BYTES;
+        let count = targets::MAX_SCRIPTED_REQUESTS;
+        let breaks = targets::MAX_SCRIPTED_PREFIX_BREAKS;
+        assert!(scripted_session_failures(first, total, count, breaks).is_empty());
+        let cases = [
+            (
+                scripted_session_failures(first.saturating_add(1), total, count, breaks),
+                "first scripted request is",
+                first < usize::MAX,
+            ),
+            (
+                scripted_session_failures(first, total.saturating_add(1), count, breaks),
+                "scripted session sent",
+                total < usize::MAX,
+            ),
+            (
+                scripted_session_failures(first, total, count.saturating_add(1), breaks),
+                "scripted session made",
+                count < usize::MAX,
+            ),
+            (
+                scripted_session_failures(first, total, count, breaks + 1),
+                "scripted session had",
+                true,
+            ),
+        ];
+        for (failures, text, reachable) in cases {
+            if reachable {
+                assert_eq!(failures.len(), 1, "{failures:?}");
+                assert!(failures[0].contains(text), "{failures:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn workspace_paths_are_replaced_before_measuring() {
+        let body = "cwd /tmp/ws/a and /tmp/ws/b";
+        assert_eq!(
+            normalized_len(body, &["/tmp/ws"]),
+            "cwd <workspace>/a and <workspace>/b".len()
+        );
     }
 
     /// Returns the tar header of an archive, for assertions about its fields.
