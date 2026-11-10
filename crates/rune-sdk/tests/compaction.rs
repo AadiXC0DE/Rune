@@ -113,6 +113,20 @@ fn checkpoint_history(bytes: &[u8]) -> History {
     serde_json::from_value(value["history"].clone()).expect("checkpoint history")
 }
 
+/// Limits with a verbatim tail small enough for these short fixtures: the
+/// newest results and what follows them.
+fn tail_limits() -> BudgetSet {
+    let mut limits = BudgetSet::new();
+    limits
+        .set(
+            LimitName::CompactionKeepTokens,
+            Budget::Bounded(10),
+            Layer::CommandLine,
+        )
+        .expect("tail budget");
+    limits
+}
+
 #[test]
 fn three_pinned_constraints_reach_every_request_after_repeated_compaction_and_restore() {
     let constraints = [
@@ -121,7 +135,9 @@ fn three_pinned_constraints_reach_every_request_after_repeated_compaction_and_re
         "  Change only the requested item.  ",
     ];
     let fetch = Arc::new(FixtureFetch::default());
-    let mut agent = Agent::restore(options(fetch.clone()), &fixture(false)).expect("fixture");
+    let mut agent =
+        Agent::restore_with_limits(options(fetch.clone()), &fixture(false), tail_limits())
+            .expect("fixture");
     for text in constraints {
         assert!(agent.pin_constraint(text).expect("pin"));
         assert!(!agent.pin_constraint(text).expect("duplicate"));
@@ -139,7 +155,8 @@ fn three_pinned_constraints_reach_every_request_after_repeated_compaction_and_re
                 > 0
         );
         let bytes = agent.checkpoint().expect("checkpoint");
-        agent = Agent::restore(options(fetch.clone()), &bytes).expect("restore pins");
+        agent = Agent::restore_with_limits(options(fetch.clone()), &bytes, tail_limits())
+            .expect("restore pins");
         assert_eq!(checkpoint_history(&bytes).pinned_constraints(), constraints);
         for _ in 0..3 {
             agent
@@ -212,7 +229,8 @@ fn compact_preserves_tool_pairs_signed_replay_and_checkpoint_continuation() {
         let fetch = Arc::new(FixtureFetch::default());
         let before = fixture(single_prompt);
         let original = checkpoint_history(&before);
-        let mut agent = Agent::restore(options(fetch.clone()), &before).expect("restore fixture");
+        let mut agent = Agent::restore_with_limits(options(fetch.clone()), &before, tail_limits())
+            .expect("restore fixture");
         let usage = agent.usage();
         let mut calls = 0;
         let removed = agent
@@ -257,7 +275,8 @@ fn compact_preserves_tool_pairs_signed_replay_and_checkpoint_continuation() {
         }
 
         let mut restored =
-            Agent::restore(options(fetch.clone()), &compacted).expect("restore compacted");
+            Agent::restore_with_limits(options(fetch.clone()), &compacted, tail_limits())
+                .expect("restore compacted");
         assert_eq!(restored.checkpoint().expect("checkpoint again"), compacted);
         assert_eq!(restored.usage(), usage);
         let result = restored
@@ -315,7 +334,8 @@ fn compact_preserves_tool_pairs_signed_replay_and_checkpoint_continuation() {
 fn compaction_failures_preserve_the_exact_checkpoint_and_usage() {
     let fetch = Arc::new(FixtureFetch::default());
     let before = fixture(false);
-    let mut agent = Agent::restore(options(fetch.clone()), &before).expect("fixture");
+    let mut agent = Agent::restore_with_limits(options(fetch.clone()), &before, tail_limits())
+        .expect("fixture");
     let before = agent.checkpoint().expect("before");
     let usage = agent.usage();
     let error = agent
@@ -333,7 +353,7 @@ fn compaction_failures_preserve_the_exact_checkpoint_and_usage() {
         );
         assert_eq!(agent.checkpoint().expect("after invalid summary"), before);
     }
-    let mut limits = BudgetSet::new();
+    let mut limits = tail_limits();
     limits
         .set(
             LimitName::PromptHistoryBytes,
@@ -356,8 +376,10 @@ fn compaction_failures_preserve_the_exact_checkpoint_and_usage() {
 #[test]
 fn compaction_can_recover_a_conversation_above_the_checkpoint_cap() {
     let fetch = Arc::new(FixtureFetch::default());
-    let mut agent = Agent::restore(options(fetch.clone()), &fixture(false)).expect("fixture");
-    let mut limits = BudgetSet::new();
+    let mut agent =
+        Agent::restore_with_limits(options(fetch.clone()), &fixture(false), tail_limits())
+            .expect("fixture");
+    let mut limits = tail_limits();
     limits
         .set(
             LimitName::PromptHistoryBytes,
@@ -481,7 +503,8 @@ fn auto_compact_summarises_before_the_window_is_reached() {
     // The Anthropic dialect reserves 8,192 output tokens; 900 remain, and
     // the restored conversation is about 950 tokens, so it no longer fits.
     options.context_window = Some(8_192 + 900);
-    let mut agent = Agent::restore(options, &fixture(false)).expect("fixture");
+    let mut agent =
+        Agent::restore_with_limits(options, &fixture(false), tail_limits()).expect("fixture");
     let before = agent.usage();
     for _ in 0..2 {
         agent
@@ -502,7 +525,13 @@ fn auto_compact_summarises_before_the_window_is_reached() {
     );
     let last = requests.last().expect("a request");
     assert!(last.contains("<context_handoff>"), "{last}");
-    assert!(!last.contains("question 0"), "{last}");
+    // The earlier prompt survives only as a carried user message.
+    assert!(!last.contains("value_0_0"), "{last}");
+    assert_eq!(last.matches("question 0").count(), 1, "{last}");
+    assert!(
+        last.contains(r"<user-messages>\n<message>\nquestion 0\n</message>"),
+        "{last}"
+    );
     // The summary request is billed like the others.
     let after = agent.usage();
     let billed = after.input_tokens.unwrap_or(0) - before.input_tokens.unwrap_or(0);

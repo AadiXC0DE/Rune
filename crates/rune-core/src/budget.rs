@@ -261,6 +261,8 @@ pub enum LimitName {
     CompactionTriggerPercent,
     /// Largest context window used for the compaction ceiling. Zero turns the cap off.
     ContextCapTokens,
+    /// Newest conversation kept verbatim by compaction, in estimated tokens.
+    CompactionKeepTokens,
     /// Redirects followed by one web fetch.
     WebFetchRedirects,
     /// Bytes returned by one web fetch.
@@ -319,6 +321,7 @@ impl LimitName {
             Self::ReviewTimeoutMs,
             Self::CompactionTriggerPercent,
             Self::ContextCapTokens,
+            Self::CompactionKeepTokens,
             Self::WebFetchRedirects,
             Self::WebFetchBytes,
             Self::WebFetchTimeoutMs,
@@ -369,6 +372,7 @@ impl LimitName {
             Self::ReviewTimeoutMs => "review_timeout_ms",
             Self::CompactionTriggerPercent => "compaction_trigger_percent",
             Self::ContextCapTokens => "context_cap_tokens",
+            Self::CompactionKeepTokens => "compaction_keep_tokens",
             Self::WebFetchRedirects => "web_fetch_redirects",
             Self::WebFetchBytes => "web_fetch_bytes",
             Self::WebFetchTimeoutMs => "web_fetch_timeout_ms",
@@ -420,6 +424,7 @@ impl LimitName {
             Self::ReviewTimeoutMs => Budget::Bounded(30_000),
             Self::CompactionTriggerPercent => Budget::Bounded(80),
             Self::ContextCapTokens => Budget::Bounded(256_000),
+            Self::CompactionKeepTokens => Budget::Bounded(20_000),
             Self::WebFetchRedirects => Budget::Bounded(5),
             Self::WebFetchBytes => Budget::Bounded(1024 * 1024),
             Self::WebFetchTimeoutMs => Budget::Bounded(30_000),
@@ -455,6 +460,10 @@ impl LimitName {
             Self::ContextCapTokens => Range {
                 min: 0,
                 max: Some(100_000_000),
+            },
+            Self::CompactionKeepTokens => Range {
+                min: 0,
+                max: Some(1_000_000),
             },
             Self::ParallelToolCalls => Range {
                 min: 1,
@@ -516,6 +525,7 @@ impl LimitName {
             | Self::ReviewHoldsPerTurn
             | Self::CompactionTriggerPercent
             | Self::ContextCapTokens
+            | Self::CompactionKeepTokens
             | Self::WebFetchRedirects
             | Self::WebSearchResults
             | Self::VisionBatchImages
@@ -582,6 +592,9 @@ impl LimitName {
             Self::CompactionTriggerPercent => "Compaction trigger as a percentage of usable input.",
             Self::ContextCapTokens => {
                 "Largest context window used for the compaction ceiling, in tokens. Zero turns the cap off."
+            }
+            Self::CompactionKeepTokens => {
+                "Newest conversation kept verbatim by compaction, in estimated tokens."
             }
             Self::WebFetchRedirects => "Redirects followed by one web fetch.",
             Self::WebFetchBytes => "Bytes returned by one web fetch.",

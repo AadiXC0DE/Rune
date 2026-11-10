@@ -666,15 +666,15 @@ fn text_without_usage(answer: &str) -> Script {
 #[test]
 fn a_long_prompt_turn_compacts() {
     let mut limits = BudgetSet::new();
-    // A small result cap keeps two recent turns, so the third prompt's request
-    // can drop the first exchange.
+    // Keep only the newest exchange, so the third prompt's request can drop
+    // the first exchange.
     limits
         .set(
-            LimitName::MaxToolResultBytes,
-            Budget::Bounded(1024),
+            LimitName::CompactionKeepTokens,
+            Budget::Bounded(0),
             Layer::User,
         )
-        .expect("result cap");
+        .expect("tail budget");
     // Replies report no usage, so the estimate counts request bytes, which is
     // what the padding below is sized for.
     let mut harness = Harness::start_windowed(
@@ -714,7 +714,10 @@ fn a_long_prompt_turn_compacts() {
         .expect("request after compaction")
         .to_string();
     assert!(body.contains("<context_handoff>"), "{body}");
-    assert!(!body.contains("first question padding"), "{body}");
+    // The first prompt is carried into the checkpoint, cut, never whole.
+    assert!(body.contains("<user-messages>"), "{body}");
+    assert!(body.contains("more characters]"), "{body}");
+    assert!(!body.contains(padding.as_str()), "{body}");
     assert!(body.contains("third padding"), "{body}");
     // The image belongs to the prompt that survived the cut, at its new position.
     assert!(body.contains(IMAGE), "{body}");

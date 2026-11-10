@@ -1,6 +1,9 @@
 {
   "prompt": "Read a.txt, b.txt, c.txt, d.txt, e.txt and f.txt, one at a time.",
   "workspace": "workspaces/six_files.json",
+  "env": {
+    "RUNE_LIMITS": "compaction_keep_tokens=0"
+  },
   "user_config": "[models.chat_completions]\nid = \"scripted\"\ncontext_window = 8000\n",
   "turns": [
     {

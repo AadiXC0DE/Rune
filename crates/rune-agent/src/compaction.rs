@@ -22,7 +22,9 @@ use rune_net::provider::{Provider, RequestPlan};
 use rune_net::stream::{FinishReason, Usage};
 use rune_net::transport::{self, RequestTimeouts};
 
-use crate::history::History;
+use rune_net::message::{ContentPart, Role};
+
+use crate::history::{History, Turn};
 use crate::tokens::{
     Anchor, CapacityDecision, Estimate, UsageTotals, decide_capacity, estimate_input, measure_body,
 };
@@ -35,7 +37,7 @@ pub struct Window(pub u64);
 /// Keeps the turns a compaction removes, so they can be read back later.
 pub trait Archive {
     /// Stores `removed` before the summary replaces them.
-    fn archive(&self, removed: &[crate::history::Turn]) -> Result<()>;
+    fn archive(&self, removed: &[Turn]) -> Result<()>;
 }
 
 /// What one compaction did.
@@ -175,8 +177,14 @@ pub fn compact(
         )
     })?;
     if let Some(archive) = archive {
+        // A signed plan keeps no turn as a message, so every turn is archived.
+        let removed = if plan.signed {
+            history.len()
+        } else {
+            plan.removed_turns
+        };
         archive
-            .archive(&history.turns()[..plan.removed_turns])
+            .archive(&history.turns()[..removed])
             .map_err(|err| {
                 RuneError::new(
                     err.code(),
@@ -201,7 +209,7 @@ pub fn compact(
 /// Returns `Ok(false)` when the history is too short to cut. The history's own
 /// size is measured before and after, for the compaction event.
 pub fn compact_now(history: &mut History, host: &dyn Host, client: &dyn Fetch) -> Result<bool> {
-    let Some(compaction_plan) = plan(history, &host.limits()) else {
+    let Some(compaction_plan) = plan_for(history, &host.limits(), host.dialect()) else {
         return Ok(false);
     };
     let size = |history: &History| -> Result<u64> {
@@ -279,7 +287,7 @@ pub fn auto_compact_encoded(
     if !required && !settled {
         return Ok((None, encoded));
     }
-    let compaction_plan = plan(history, &limits);
+    let compaction_plan = plan_for(history, &limits, host.dialect());
     if required {
         let retained_estimate = if let Some(cut) = &compaction_plan {
             let mut retained_plan = request.clone();
@@ -363,6 +371,9 @@ pub struct Plan {
     pub kept_turns: usize,
     /// Bytes being removed.
     pub removed_bytes: usize,
+    /// Whether the history carries signed replay state, so the kept tail is
+    /// written into the summary as text instead of kept as messages.
+    pub signed: bool,
 }
 
 impl Plan {
@@ -386,8 +397,10 @@ impl Plan {
 /// case: a short conversation has no prefix worth summarizing.
 #[must_use]
 pub fn plan(history: &History, limits: &BudgetSet) -> Option<Plan> {
-    let keep = recent_target_turns(limits);
-    let cut_at = history.compaction_cut(keep)?;
+    let keep = limits
+        .get(LimitName::CompactionKeepTokens)
+        .effective(u64::MAX);
+    let cut_at = history.tail_start(keep)?;
     if cut_at <= 1 {
         // Nothing precedes the cut, so a summary would replace nothing.
         return None;
@@ -413,21 +426,17 @@ pub fn plan(history: &History, limits: &BudgetSet) -> Option<Plan> {
         removed_turns,
         kept_turns: history.len().saturating_sub(removed_turns),
         removed_bytes,
+        signed: false,
     })
 }
 
-/// Returns how many recent turns to retain.
-///
-/// A twentieth of the usable input, expressed as a turn count. The turn count is
-/// a proxy: what matters is retaining enough that the model can still see the
-/// work in progress, and a fixed fraction of capacity is a stable way to size it
-/// without counting tokens here.
+/// Plans a compaction for a history sent through `dialect`, marking it signed
+/// when a retained turn carries signed replay state.
 #[must_use]
-pub fn recent_target_turns(limits: &BudgetSet) -> usize {
-    let bytes = limits.get_usize(LimitName::MaxToolResultBytes).max(1);
-    // One turn per sixteen kibibytes of result capacity, floored so a very small
-    // configuration still keeps a few turns.
-    (bytes / (16 * 1024)).clamp(2, 16)
+pub fn plan_for(history: &History, limits: &BudgetSet, dialect: &dyn Provider) -> Option<Plan> {
+    let mut plan = plan(history, limits)?;
+    plan.signed = history.is_signed(dialect);
+    Some(plan)
 }
 
 /// Renders the request sent to the summarizer.
@@ -455,13 +464,13 @@ pub fn render_summary_request(history: &History, plan: &Plan) -> String {
         out.push_str(": ");
         for part in &turn.parts {
             match part {
-                rune_net::message::ContentPart::Text { text } => out.push_str(text),
-                rune_net::message::ContentPart::ToolCall {
+                ContentPart::Text { text } => out.push_str(text),
+                ContentPart::ToolCall {
                     name, arguments, ..
                 } => {
                     let _ = write!(out, "[calls {name} with {arguments}]");
                 }
-                rune_net::message::ContentPart::ToolResult {
+                ContentPart::ToolResult {
                     name,
                     content,
                     is_error,
@@ -474,8 +483,8 @@ pub fn render_summary_request(history: &History, plan: &Plan) -> String {
                     };
                     let _ = write!(out, "[{label} {name}: {content}]");
                 }
-                rune_net::message::ContentPart::Reasoning { .. } => {}
-                rune_net::message::ContentPart::Image { image } => {
+                ContentPart::Reasoning { .. } => {}
+                ContentPart::Image { image } => {
                     let _ = write!(out, "[image {}]", image.id);
                 }
             }
@@ -488,14 +497,33 @@ pub fn render_summary_request(history: &History, plan: &Plan) -> String {
 
 /// Applies a summary to the history.
 ///
-/// The retained tail is kept verbatim, and a summary turn is prepended, so the
-/// resulting length is the retained count plus one. Returns the number of turns
-/// removed, which is the retained count subtracted from the previous length, not
-/// the difference in length after the summary was added.
+/// The user's own messages from the removed prefix follow the summary word for
+/// word. An unsigned plan keeps the retained tail verbatim after the summary
+/// turn, so the resulting length is the retained count plus one. A signed plan
+/// keeps the summary turn alone, with the tail written into it as text, because
+/// signed replay state cannot follow a rewritten prefix. Returns the number of
+/// turns removed, which is the retained count subtracted from the previous
+/// length, not the difference in length after the summary was added.
 pub fn apply(history: &mut History, plan: &Plan, summary: impl Into<String>) -> usize {
-    let summary = summary.into();
+    let mut summary = summary.into();
+    let carried = carried_user_messages(history, plan.cut_at);
+    if !carried.is_empty() {
+        let _ = write!(summary, "\n\n<user-messages>\n{carried}</user-messages>");
+    }
+    let keep_from = if plan.signed {
+        let start = history
+            .turns()
+            .iter()
+            .position(|turn| turn.seq >= plan.cut_at)
+            .unwrap_or(history.len());
+        let recent = render_recent_context(&history.turns()[start..]);
+        let _ = write!(summary, "\n<recent-context>\n{recent}</recent-context>");
+        history.next_seq()
+    } else {
+        plan.cut_at
+    };
     let before = history.len();
-    history.replace_with_summary(summary, plan.cut_at);
+    history.replace_with_summary(summary, keep_from);
     let after = history.len();
     // The summary replaces the removed prefix with exactly one turn.
     before.saturating_sub(after.saturating_sub(1))
@@ -507,6 +535,206 @@ pub fn wrap_summary(summary: &str) -> String {
     format!(
         "<context_handoff>\nThe following is a summary of earlier conversation, provided so work can continue.\n\n{summary}\n</context_handoff>"
     )
+}
+
+/// Characters of one carried user message.
+const CARRIED_MESSAGE_CHARS: usize = 2000;
+
+/// Bytes of all carried user messages together.
+const CARRIED_MESSAGES_BYTES: usize = 16 * 1024;
+
+/// Characters of a tool result in the recent context.
+const RECENT_RESULT_CHARS: usize = 2000;
+
+/// Characters of tool call arguments in the recent context.
+const RECENT_ARGUMENT_CHARS: usize = 300;
+
+/// Returns true for text that opens a summary installed by compaction.
+fn is_checkpoint(text: &str) -> bool {
+    text.starts_with("<conversation-checkpoint>") || text.starts_with("<context_handoff>")
+}
+
+/// Returns the user messages a summary at the front of the history carries.
+fn checkpoint_messages(text: &str) -> Vec<String> {
+    const OPEN: &str = "\n<user-messages>\n";
+    const ENTRY_OPEN: &str = "<message>\n";
+    const ENTRY_CLOSE: &str = "\n</message>\n";
+    let Some(start) = text.rfind(OPEN) else {
+        return Vec::new();
+    };
+    let (_, body) = text.split_at(start);
+    let body = body.strip_prefix(OPEN).unwrap_or(body);
+    let body = body
+        .split_once("</user-messages>")
+        .map_or(body, |(inside, _)| inside);
+    let mut messages = Vec::new();
+    let mut rest = body;
+    while let Some((_, after)) = rest.split_once(ENTRY_OPEN) {
+        let Some((message, next)) = after.split_once(ENTRY_CLOSE) else {
+            break;
+        };
+        messages.push(message.to_owned());
+        rest = next;
+    }
+    messages
+}
+
+/// Removes a leading plan mode note and every context update from a user
+/// message.
+fn strip_harness_blocks(text: &str) -> String {
+    let text = text
+        .strip_prefix("<plan_mode>")
+        .and_then(|rest| rest.split_once("</plan_mode>"))
+        .map_or(text, |(_, after)| after);
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some((before, after)) = rest.split_once("<context-update>") {
+        let Some((_, next)) = after.split_once("</context-update>") else {
+            break;
+        };
+        out.push_str(before);
+        rest = next;
+    }
+    out.push_str(rest);
+    out.trim().to_owned()
+}
+
+/// Cuts a carried message after 2,000 characters, noting how many were left
+/// out.
+fn cut_message(text: &str) -> String {
+    match text.char_indices().nth(CARRIED_MESSAGE_CHARS) {
+        Some((end, _)) => {
+            let more = text[end..].chars().count();
+            format!("{}\n[{more} more characters]", &text[..end])
+        }
+        None => text.to_owned(),
+    }
+}
+
+/// Returns the user's own messages from before `cut_at`, as the body of a
+/// `<user-messages>` block.
+///
+/// Messages a previous summary carried come first, then each user turn before
+/// the cut, oldest first. Harness-written text and earlier summaries are not
+/// user messages. Each message is cut at 2,000 characters, and the oldest are
+/// left out when the whole block would pass 16 KiB.
+#[must_use]
+pub fn carried_user_messages(history: &History, cut_at: u64) -> String {
+    let mut entries: Vec<String> = Vec::new();
+    for (index, turn) in history.turns().iter().enumerate() {
+        if turn.seq >= cut_at {
+            break;
+        }
+        if turn.role != Role::User {
+            continue;
+        }
+        let text = turn.text();
+        if is_checkpoint(&text) {
+            if index == 0 {
+                entries.extend(checkpoint_messages(&text));
+            }
+            continue;
+        }
+        if text.starts_with("<harness_check>") {
+            continue;
+        }
+        let text = strip_harness_blocks(&text);
+        if !text.is_empty() {
+            entries.push(cut_message(&text));
+        }
+    }
+
+    let mut kept: Vec<String> = Vec::new();
+    let mut total = 0_usize;
+    for entry in entries.iter().rev() {
+        let rendered = format!("<message>\n{entry}\n</message>\n");
+        if total.saturating_add(rendered.len()) > CARRIED_MESSAGES_BYTES {
+            break;
+        }
+        total = total.saturating_add(rendered.len());
+        kept.push(rendered);
+    }
+    let omitted = entries.len().saturating_sub(kept.len());
+    let mut out = String::with_capacity(total.saturating_add(48));
+    if omitted > 0 {
+        let _ = writeln!(out, "[{omitted} earlier user messages omitted]");
+    }
+    for rendered in kept.iter().rev() {
+        out.push_str(rendered);
+    }
+    out
+}
+
+/// Keeps the first and last halves of `keep` characters of `text`, with a
+/// marker naming how many characters were left out between them.
+#[must_use]
+pub fn clip_middle(text: &str, keep: usize) -> String {
+    let total = text.chars().count();
+    if total <= keep {
+        return text.to_owned();
+    }
+    let head = keep / 2;
+    let tail = keep.saturating_sub(head);
+    let byte_at = |chars: usize| {
+        text.char_indices()
+            .nth(chars)
+            .map_or(text.len(), |(at, _)| at)
+    };
+    format!(
+        "{}\n[{} characters left out]\n{}",
+        &text[..byte_at(head)],
+        total.saturating_sub(keep),
+        &text[byte_at(total.saturating_sub(tail))..]
+    )
+}
+
+/// Renders turns as text, one item per part, for a summary that cannot keep
+/// them as messages.
+///
+/// Reasoning is left out; tool results are clipped to their first and last
+/// thousand characters and call arguments to 300 characters.
+#[must_use]
+pub fn render_recent_context(turns: &[Turn]) -> String {
+    let mut out = String::new();
+    for turn in turns {
+        let mut tool = "";
+        for part in &turn.parts {
+            match part {
+                ContentPart::Text { text } => {
+                    let _ = writeln!(out, "{}: {text}", turn.role.as_str());
+                }
+                ContentPart::ToolCall {
+                    name, arguments, ..
+                } => {
+                    let arguments = match arguments.char_indices().nth(RECENT_ARGUMENT_CHARS) {
+                        Some((end, _)) => format!("{}...", &arguments[..end]),
+                        None => arguments.clone(),
+                    };
+                    let _ = writeln!(out, "call {name} {arguments}");
+                }
+                ContentPart::ToolResult {
+                    name,
+                    content,
+                    is_error,
+                    ..
+                } => {
+                    tool = name;
+                    let label = if *is_error { "error" } else { "result" };
+                    let content = clip_middle(content, RECENT_RESULT_CHARS);
+                    let _ = writeln!(out, "{label} {name}: {content}");
+                }
+                ContentPart::Image { .. } => {
+                    if turn.role == Role::Tool {
+                        let _ = writeln!(out, "result {tool}: [image]");
+                    } else {
+                        let _ = writeln!(out, "{}: [image]", turn.role.as_str());
+                    }
+                }
+                ContentPart::Reasoning { .. } => {}
+            }
+        }
+    }
+    out
 }
 
 /// Rejects a summary that is unusable.
@@ -610,8 +838,10 @@ impl CompactionStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use rune_core::budget::Budget;
+    use rune_core::config::Layer;
     use rune_core::id::ToolCallId;
-    use rune_net::message::{ContentPart, Role};
 
     fn call(id: &str) -> ContentPart {
         ContentPart::ToolCall {
@@ -628,6 +858,19 @@ mod tests {
             content: "contents".to_owned(),
             is_error: false,
         }
+    }
+
+    /// Limits that keep only the newest exchange.
+    fn keep_none() -> BudgetSet {
+        let mut limits = BudgetSet::new();
+        limits
+            .set(
+                LimitName::CompactionKeepTokens,
+                Budget::Bounded(0),
+                Layer::CommandLine,
+            )
+            .expect("keep");
+        limits
     }
 
     /// Builds a history with several tool exchanges.
@@ -660,16 +903,15 @@ mod tests {
                 text: format!("answer {index}"),
             }]);
         }
-        let limits = BudgetSet::new();
-
-        let plan = plan(&history, &limits).expect("a plan");
+        let plan = plan(&history, &keep_none()).expect("a plan");
         let cut = history
             .turns()
             .iter()
             .find(|turn| turn.seq == plan.cut_at)
             .expect("present");
         assert_eq!(cut.role, Role::User);
-        assert!(plan.kept_turns >= recent_target_turns(&limits));
+        // The newest prompt: its question, two calls with results, the answer.
+        assert_eq!(plan.kept_turns, 6);
 
         apply(&mut history, &plan, wrap_summary("what happened so far"));
         history.validate().expect("still valid");
@@ -679,13 +921,13 @@ mod tests {
     fn a_short_history_has_nothing_to_compact() {
         let mut history = History::new();
         history.push_user("only");
-        assert!(plan(&history, &BudgetSet::new()).is_none());
+        assert!(plan(&history, &keep_none()).is_none());
     }
 
     #[test]
     fn a_long_history_produces_a_plan() {
         let history = long_history();
-        let plan = plan(&history, &BudgetSet::new()).expect("a plan");
+        let plan = plan(&history, &keep_none()).expect("a plan");
         assert!(plan.removed_turns > 0);
         assert!(plan.kept_turns > 0);
         assert!(plan.removed_bytes > 0);
@@ -694,7 +936,7 @@ mod tests {
     #[test]
     fn the_plan_cuts_on_a_user_turn() {
         let history = long_history();
-        let plan = plan(&history, &BudgetSet::new()).expect("a plan");
+        let plan = plan(&history, &keep_none()).expect("a plan");
         let turn = history
             .turns()
             .iter()
@@ -707,7 +949,7 @@ mod tests {
     #[test]
     fn applying_a_summary_leaves_a_valid_history() {
         let mut history = long_history();
-        let plan = plan(&history, &BudgetSet::new()).expect("a plan");
+        let plan = plan(&history, &keep_none()).expect("a plan");
         let removed = apply(&mut history, &plan, wrap_summary("what happened so far"));
         assert_eq!(removed, plan.removed_turns);
         history.validate().expect("still valid");
@@ -716,7 +958,7 @@ mod tests {
     #[test]
     fn the_summary_is_the_first_turn_after_compaction() {
         let mut history = long_history();
-        let plan = plan(&history, &BudgetSet::new()).expect("a plan");
+        let plan = plan(&history, &keep_none()).expect("a plan");
         apply(&mut history, &plan, "the summary");
         let first = history.turns().first().expect("a turn");
         assert!(first.text().contains("the summary"));
@@ -726,13 +968,9 @@ mod tests {
     fn compaction_preserves_every_recent_turn() {
         let mut history = long_history();
         let last_text = history.turns().last().expect("a turn").text();
-        let plan = plan(&history, &BudgetSet::new()).expect("a plan");
+        let plan = plan(&history, &keep_none()).expect("a plan");
         apply(&mut history, &plan, "summary");
-        let texts: Vec<String> = history
-            .turns()
-            .iter()
-            .map(crate::history::Turn::text)
-            .collect();
+        let texts: Vec<String> = history.turns().iter().map(Turn::text).collect();
         assert!(
             texts.iter().any(|text| text == &last_text),
             "the most recent turn was dropped"
@@ -753,7 +991,7 @@ mod tests {
     fn a_rejected_summary_leaves_the_history_untouched() {
         let history = long_history();
         let before = history.len();
-        let plan = plan(&history, &BudgetSet::new()).expect("a plan");
+        let plan = plan(&history, &keep_none()).expect("a plan");
         let summary = "";
         assert!(validate_summary(summary).is_err());
         // Because validation happens first, apply is never reached.
@@ -764,7 +1002,7 @@ mod tests {
     #[test]
     fn the_summary_request_contains_only_the_removed_prefix() {
         let history = long_history();
-        let plan = plan(&history, &BudgetSet::new()).expect("a plan");
+        let plan = plan(&history, &keep_none()).expect("a plan");
         let request = render_summary_request(&history, &plan);
         assert!(request.contains(SUMMARY_INSTRUCTIONS));
 
@@ -772,7 +1010,7 @@ mod tests {
             .turns()
             .iter()
             .filter(|turn| turn.seq >= plan.cut_at)
-            .map(crate::history::Turn::text)
+            .map(Turn::text)
             .collect();
         for text in kept {
             if text.is_empty() {
@@ -788,7 +1026,7 @@ mod tests {
     #[test]
     fn the_summary_request_includes_tool_activity() {
         let history = long_history();
-        let plan = plan(&history, &BudgetSet::new()).expect("a plan");
+        let plan = plan(&history, &keep_none()).expect("a plan");
         let request = render_summary_request(&history, &plan);
         assert!(request.contains("calls read_file"), "{request}");
     }
@@ -808,6 +1046,7 @@ mod tests {
             removed_turns: 4,
             kept_turns: 2,
             removed_bytes: 750,
+            signed: false,
         };
         assert_eq!(plan.removed_percent(1000), 75);
         assert_eq!(plan.removed_percent(0), 0);
@@ -883,14 +1122,6 @@ mod tests {
     }
 
     #[test]
-    fn the_recent_turn_target_is_bounded() {
-        let limits = BudgetSet::new();
-        let target = recent_target_turns(&limits);
-        assert!(target >= 2, "target was {target}");
-        assert!(target <= 16, "target was {target}");
-    }
-
-    #[test]
     fn pinned_constraints_survive_repeated_compaction_without_summary_help() {
         let constraints = [
             "Do not add dependencies.",
@@ -908,7 +1139,7 @@ mod tests {
         }
         assert!(history.pin_constraint(" \n ").is_err());
         for _ in 0..3 {
-            let plan = plan(&history, &BudgetSet::new()).expect("plan");
+            let plan = plan(&history, &keep_none()).expect("plan");
             let request = render_summary_request(&history, &plan);
             for text in constraints {
                 assert!(
@@ -946,7 +1177,7 @@ mod tests {
     fn compaction_can_run_repeatedly() {
         let mut history = long_history();
         for _ in 0..3 {
-            let Some(plan) = plan(&history, &BudgetSet::new()) else {
+            let Some(plan) = plan(&history, &keep_none()) else {
                 break;
             };
             apply(&mut history, &plan, format!("summary at {}", plan.cut_at));
@@ -1026,6 +1257,19 @@ mod tests {
     }
 
     impl Host for SummaryHost {
+        // The fixture history is short, so only the newest exchange is kept.
+        fn limits(&self) -> BudgetSet {
+            let mut limits = BudgetSet::new();
+            limits
+                .set(
+                    LimitName::CompactionKeepTokens,
+                    Budget::Bounded(0),
+                    Layer::User,
+                )
+                .expect("tail budget");
+            limits
+        }
+
         fn dialect(&self) -> &dyn Provider {
             &rune_net::chat_completions::ChatCompletions
         }
@@ -1209,5 +1453,195 @@ mod tests {
         assert!(!done.settled);
         assert_eq!(fetch.requests(), 1);
         assert_eq!(host.settled_events(), vec![false]);
+    }
+
+    fn user_text(history: &History) -> String {
+        history.turns().first().expect("a turn").text()
+    }
+
+    #[test]
+    fn user_messages_are_carried_word_for_word() {
+        let mut history = long_history();
+        history.push_user("Keep café and 日本語 exactly.\nSecond line.");
+        history.push_assistant(vec![ContentPart::Text {
+            text: "noted".to_owned(),
+        }]);
+        history.push_user("latest");
+        let plan = plan(&history, &keep_none()).expect("a plan");
+
+        let carried = carried_user_messages(&history, plan.cut_at);
+        let mut expected = String::new();
+        for index in 0..12 {
+            let _ = write!(expected, "<message>\nquestion {index}\n</message>\n");
+        }
+        expected.push_str("<message>\nKeep café and 日本語 exactly.\nSecond line.\n</message>\n");
+        assert_eq!(carried, expected);
+
+        apply(&mut history, &plan, wrap_summary("what happened so far"));
+        let text = user_text(&history);
+        assert!(text.ends_with(&format!("\n\n<user-messages>\n{expected}</user-messages>")));
+        assert_eq!(history.len(), 2);
+
+        // A second compaction carries the same messages out of the summary.
+        history.push_assistant(vec![ContentPart::Text {
+            text: "done".to_owned(),
+        }]);
+        history.push_user("after");
+        let again = super::plan(&history, &keep_none()).expect("a plan");
+        let carried = carried_user_messages(&history, again.cut_at);
+        assert_eq!(
+            carried,
+            format!("{expected}<message>\nlatest\n</message>\n")
+        );
+    }
+
+    #[test]
+    fn long_user_messages_are_cut_with_a_marker() {
+        let mut history = History::new();
+        history.push_user(format!("{}{}", "é".repeat(1999), "x".repeat(3001)));
+        history.push_assistant(vec![ContentPart::Text {
+            text: "ok".to_owned(),
+        }]);
+        history.push_user("latest");
+
+        let carried = carried_user_messages(&history, 3);
+        assert_eq!(
+            carried,
+            format!(
+                "<message>\n{}x\n[3000 more characters]\n</message>\n",
+                "é".repeat(1999)
+            )
+        );
+    }
+
+    #[test]
+    fn user_messages_past_sixteen_kibibytes_drop_the_oldest() {
+        let mut history = History::new();
+        for index in 0..20 {
+            history.push_user(format!("{index:02}{}", "m".repeat(1498)));
+            history.push_assistant(vec![ContentPart::Text {
+                text: "ok".to_owned(),
+            }]);
+        }
+        history.push_user("latest");
+
+        let carried = carried_user_messages(&history, 41);
+        assert!(carried.starts_with("[10 earlier user messages omitted]\n<message>\n10m"));
+        assert_eq!(carried.matches("<message>").count(), 10);
+        assert!(carried.ends_with(&format!("<message>\n19{}\n</message>\n", "m".repeat(1498))));
+        assert!(!carried.contains("\n09m"));
+    }
+
+    #[test]
+    fn harness_text_is_not_carried_as_a_user_message() {
+        let mut history = History::new();
+        history.push_user("<conversation-checkpoint>\nan old summary\n</conversation-checkpoint>");
+        history.push_assistant(vec![ContentPart::Text {
+            text: "ok".to_owned(),
+        }]);
+        history.push_user("<plan_mode>The session is in plan mode.</plan_mode>\n\nplan the change");
+        history.push_assistant(vec![ContentPart::Text {
+            text: "ok".to_owned(),
+        }]);
+        history.push_user("<harness_check>Files were changed.</harness_check>");
+        history.push_assistant(vec![ContentPart::Text {
+            text: "ok".to_owned(),
+        }]);
+        history.push_user("before <context-update>\nnew file\n</context-update> after");
+        history.push_assistant(vec![ContentPart::Text {
+            text: "ok".to_owned(),
+        }]);
+        history.push_user("latest");
+
+        let carried = carried_user_messages(&history, 9);
+        assert_eq!(
+            carried,
+            "<message>\nplan the change\n</message>\n<message>\nbefore  after\n</message>\n"
+        );
+    }
+
+    #[test]
+    fn recent_context_renders_one_item_per_part_without_reasoning() {
+        let mut history = History::new();
+        history.push_user("fix the test");
+        history.push_assistant(vec![
+            ContentPart::Reasoning {
+                text: "private thought".to_owned(),
+            },
+            ContentPart::Text {
+                text: "Looking.".to_owned(),
+            },
+            ContentPart::ToolCall {
+                id: ToolCallId::new("c1").expect("id"),
+                name: "read_file".to_owned(),
+                arguments: format!("{{\"path\":\"{}\"}}", "a".repeat(300)),
+            },
+            ContentPart::ToolCall {
+                id: ToolCallId::new("c2").expect("id"),
+                name: "run".to_owned(),
+                arguments: "{\"command\":\"cargo test\"}".to_owned(),
+            },
+        ]);
+        history.push_tool_results(vec![
+            ContentPart::ToolResult {
+                id: ToolCallId::new("c1").expect("id"),
+                name: "read_file".to_owned(),
+                content: format!("{}{}", "h".repeat(1000), "t".repeat(1500)),
+                is_error: false,
+            },
+            ContentPart::ToolResult {
+                id: ToolCallId::new("c2").expect("id"),
+                name: "run".to_owned(),
+                content: "1 failed".to_owned(),
+                is_error: true,
+            },
+        ]);
+
+        let rendered = render_recent_context(history.turns());
+        let expected = format!(
+            "user: fix the test\n\
+             assistant: Looking.\n\
+             call read_file {{\"path\":\"{}...\n\
+             call run {{\"command\":\"cargo test\"}}\n\
+             result read_file: {}\n[500 characters left out]\n{}\n\
+             error run: 1 failed\n",
+            "a".repeat(291),
+            "h".repeat(1000),
+            "t".repeat(1000),
+        );
+        assert_eq!(rendered, expected);
+    }
+
+    #[test]
+    fn a_signed_plan_keeps_no_real_messages() {
+        let dialect = rune_net::responses::Responses;
+        let mut history = History::new();
+        history.push_user("first question");
+        history.push_assistant_with_replay(
+            vec![ContentPart::Text {
+                text: "first answer".to_owned(),
+            }],
+            Some(r#"[{"type":"reasoning","id":"rs_1","encrypted_content":"opaque"}]"#.to_owned()),
+        );
+        history.push_user("second question");
+        history.push_assistant(vec![ContentPart::Text {
+            text: "second answer".to_owned(),
+        }]);
+
+        assert!(!plan(&history, &keep_none()).expect("a plan").signed);
+        let plan = plan_for(&history, &keep_none(), &dialect).expect("a plan");
+        assert!(plan.signed);
+        assert_eq!(plan.cut_at, 3);
+
+        let removed = apply(&mut history, &plan, wrap_summary("what happened so far"));
+        assert_eq!(removed, 4);
+        assert_eq!(history.len(), 1);
+        assert!(!history.is_signed(&dialect));
+        history.validate().expect("still valid");
+        let text = user_text(&history);
+        assert!(text.ends_with(
+            "<user-messages>\n<message>\nfirst question\n</message>\n</user-messages>\n\
+             <recent-context>\nuser: second question\nassistant: second answer\n</recent-context>"
+        ));
     }
 }

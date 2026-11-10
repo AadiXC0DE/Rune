@@ -661,27 +661,38 @@ impl History {
         self.renumber();
     }
 
-    /// Returns the sequence number where a summary should cut.
+    /// Returns the first sequence number of the tail a compaction keeps.
     ///
-    /// Keeps at least `keep_turns` recent turns. The cut is the latest user turn
-    /// that still keeps them, so the retained tail opens with a request. When
-    /// every recent prompt ran several tool steps there may be no such turn in
-    /// reach, and the cut falls on an assistant turn instead, which keeps each
-    /// call with its results. It never falls on a tool result, because a
-    /// summary followed by an orphaned result cannot form a request.
+    /// The tail is the newest `keep_tokens` estimated tokens, extended back to
+    /// the newest user turn so it opens with a request. When the only user
+    /// turn opens the conversation, it is extended back to an assistant turn
+    /// instead, which keeps each call with its results. It never starts on a
+    /// tool result, because a summary followed by an orphaned result cannot
+    /// form a request. Returns `None` when nothing would be summarized, which
+    /// includes a history smaller than `keep_tokens`.
     #[must_use]
-    pub fn compaction_cut(&self, keep_turns: usize) -> Option<u64> {
-        if self.turns.len() <= keep_turns {
-            return None;
-        }
-        let target = self.turns.len().saturating_sub(keep_turns);
-        // The first turn is out of reach, because a cut there removes nothing.
+    pub fn tail_start(&self, keep_tokens: u64) -> Option<u64> {
+        let newest = self.turns.len().checked_sub(1)?;
+        let reached = if keep_tokens == 0 {
+            newest
+        } else {
+            let mut sum: u64 = 0;
+            self.turns
+                .iter()
+                .enumerate()
+                .rev()
+                .find_map(|(index, turn)| {
+                    let bytes = u64::try_from(turn.byte_len()).unwrap_or(u64::MAX);
+                    sum = sum.saturating_add(crate::tokens::estimate_tokens(bytes));
+                    (sum >= keep_tokens).then_some(index)
+                })?
+        };
         let reach = || {
             self.turns
                 .iter()
-                .take(target.saturating_add(1))
-                .skip(1)
+                .take(reached.saturating_add(1))
                 .rev()
+                .filter(|turn| turn.seq > 1)
         };
         reach()
             .find(|turn| turn.role == Role::User)
@@ -1012,8 +1023,78 @@ mod tests {
         assert_eq!(history.turns()[1].seq, 2);
     }
 
+    fn sized_result(id: &str, bytes: usize) -> ContentPart {
+        ContentPart::ToolResult {
+            id: ToolCallId::new(id).expect("id"),
+            name: "a".to_owned(),
+            content: "r".repeat(bytes),
+            is_error: false,
+        }
+    }
+
+    fn role_at(history: &History, seq: u64) -> Role {
+        history
+            .turns()
+            .iter()
+            .find(|turn| turn.seq == seq)
+            .expect("present")
+            .role
+    }
+
     #[test]
-    fn the_compaction_cut_lands_on_a_user_turn() {
+    fn the_tail_is_measured_in_tokens_and_starts_at_a_user_turn() {
+        // Each exchange: a 100-token question, a call, a 1,001-token result
+        // and a 100-token answer, starting at seq 4i + 1.
+        let mut history = History::new();
+        for index in 0..5 {
+            let id = format!("c{index}");
+            history.push_user("q".repeat(400));
+            history.push_assistant(vec![call(&id, "a")]);
+            history.push_tool_results(vec![sized_result(&id, 4000)]);
+            history.push_assistant(vec![ContentPart::Text {
+                text: "a".repeat(400),
+            }]);
+        }
+
+        // The newest exchange is 1,202 tokens; 1,500 is reached at the result
+        // of the exchange before it, whose question is seq 13.
+        let start = history.tail_start(1500).expect("a tail");
+        assert_eq!(start, 13);
+        assert_eq!(role_at(&history, start), Role::User);
+
+        history.replace_with_summary("summary", start);
+        assert_eq!(history.len(), 9);
+        history.validate().expect("still valid");
+    }
+
+    #[test]
+    fn a_long_single_prompt_keeps_a_tail_that_starts_at_an_assistant_step() {
+        // The only user turn opens the conversation. Calls are at seq 2i + 2
+        // and their 101-token results at 2i + 3.
+        let mut history = History::new();
+        history.push_user("do everything");
+        for index in 0..10 {
+            let id = format!("c{index}");
+            history.push_assistant(vec![call(&id, "a")]);
+            history.push_tool_results(vec![sized_result(&id, 400)]);
+        }
+        history.push_assistant(vec![ContentPart::Text {
+            text: "done".to_owned(),
+        }]);
+
+        // 250 tokens are reached at the result at seq 17; the tail starts at
+        // its call.
+        let start = history.tail_start(250).expect("a tail");
+        assert_eq!(start, 16);
+        assert_eq!(role_at(&history, start), Role::Assistant);
+
+        history.replace_with_summary("summary", start);
+        assert_eq!(history.len(), 8);
+        history.validate().expect("still valid");
+    }
+
+    #[test]
+    fn a_zero_keep_budget_keeps_only_the_newest_exchange() {
         let mut history = History::new();
         history.push_user("one");
         history.push_assistant(vec![call("c1", "a")]);
@@ -1023,46 +1104,34 @@ mod tests {
             text: "answer".to_owned(),
         }]);
 
-        // Cutting mid-exchange would orphan a tool result, so the cut lands on
-        // a user turn.
-        let cut = history.compaction_cut(2).expect("a cut");
-        let turn = history
-            .turns()
-            .iter()
-            .find(|candidate| candidate.seq == cut)
-            .expect("present");
-        assert_eq!(turn.role, Role::User);
-        assert_eq!(turn.text(), "two");
+        let start = history.tail_start(0).expect("a tail");
+        assert_eq!(start, 4);
+        assert_eq!(role_at(&history, start), Role::User);
+
+        history.replace_with_summary("summary", start);
+        assert_eq!(history.len(), 3);
+        assert_eq!(history.turns()[1].text(), "two");
+        history.validate().expect("still valid");
     }
 
     #[test]
-    fn one_long_prompt_is_cut_where_no_call_loses_its_result() {
-        // The only user turn opens the conversation, so there is none to cut
-        // at. The cut falls on an assistant turn, which keeps its calls and
-        // their results together.
+    fn a_large_newest_result_keeps_its_call() {
         let mut history = History::new();
-        history.push_user("do everything");
-        for index in 0..10 {
-            let id = format!("c{index}");
-            history.push_assistant(vec![call(&id, "a")]);
-            history.push_tool_results(vec![result(&id, "a")]);
-        }
+        history.push_user("first");
         history.push_assistant(vec![ContentPart::Text {
-            text: "done".to_owned(),
+            text: "first answer".to_owned(),
         }]);
+        history.push_user("second");
+        history.push_assistant(vec![call("c1", "a")]);
+        // 30,000 tokens on its own, past the default tail.
+        history.push_tool_results(vec![sized_result("c1", 120_000)]);
 
-        let cut = history.compaction_cut(4).expect("a cut");
-        let turn = history
-            .turns()
-            .iter()
-            .find(|candidate| candidate.seq == cut)
-            .expect("present");
-        assert_eq!(turn.role, Role::Assistant);
+        let start = history.tail_start(20_000).expect("a tail");
+        assert_eq!(start, 3);
+        assert_eq!(role_at(&history, start), Role::User);
 
-        let before = history.len();
-        history.replace_with_summary("summary", cut);
-        assert!(history.len() > 4, "fewer than the recent turns were kept");
-        assert!(history.len() < before, "nothing was removed");
+        history.replace_with_summary("summary", start);
+        assert_eq!(history.len(), 4);
         history.validate().expect("still valid");
     }
 
@@ -1070,7 +1139,16 @@ mod tests {
     fn no_compaction_cut_exists_when_the_history_is_short() {
         let mut history = History::new();
         history.push_user("only");
-        assert_eq!(history.compaction_cut(5), None);
+        assert_eq!(history.tail_start(0), None);
+        assert_eq!(history.tail_start(20_000), None);
+
+        // A conversation smaller than the tail is kept whole.
+        history.push_assistant(vec![ContentPart::Text {
+            text: "answer".to_owned(),
+        }]);
+        history.push_user("again");
+        assert_eq!(history.tail_start(0), Some(3));
+        assert_eq!(history.tail_start(20_000), None);
     }
 
     #[test]

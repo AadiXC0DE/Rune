@@ -2583,17 +2583,17 @@ fn an_error_frame_is_surfaced_as_a_failure() {
     assert!(err.message().contains("overloaded"), "{}", err.message());
 }
 
-/// Six alternating turns, with a result cap small enough that compaction
-/// keeps only the last two.
+/// Six alternating turns, with a tail budget of zero so compaction keeps only
+/// the last two.
 fn compactable(endpoint: MockEndpoint) -> (TestHost, rune_agent::History) {
     let mut host = TestHost::new(endpoint);
     host.limits
         .set(
-            rune_core::LimitName::MaxToolResultBytes,
-            rune_core::budget::Budget::Bounded(1024),
-            rune_core::config::Layer::User,
+            rune_core::LimitName::CompactionKeepTokens,
+            rune_core::budget::Budget::Bounded(0),
+            rune_core::config::Layer::CommandLine,
         )
-        .expect("result cap");
+        .expect("tail budget");
     let mut history = rune_agent::History::new();
     for index in 0..3 {
         history.push_user(format!("question {index}"));
@@ -2619,7 +2619,8 @@ fn compact_replaces_old_turns_and_returns_the_summary_usage() {
         .expect("compaction");
     assert_eq!(report.removed_turns, plan.removed_turns);
     assert_eq!(report.remaining_turns, history.len());
-    assert!(report.remaining_turns < 6);
+    // The summary, then the newest question and its answer.
+    assert_eq!(report.remaining_turns, 3);
     let first = format!("{:?}", history.turns()[0].parts);
     assert!(first.contains("<context_handoff>"), "{first}");
     assert_eq!(report.usage.input_tokens, Some(10));
@@ -2734,6 +2735,13 @@ fn an_overflow_compacts_and_resends_the_step() {
     ]));
     let mut host = single_attempt(TestHost::new(endpoint).with_tools(vec![read_tool()]));
     host.compacts = true;
+    host.limits
+        .set(
+            rune_core::LimitName::CompactionKeepTokens,
+            rune_core::budget::Budget::Bounded(0),
+            rune_core::config::Layer::CommandLine,
+        )
+        .expect("tail budget");
     let mut history = rune_agent::History::new();
     history.push_user("read five files");
     let outcome = run_turn(&mut history, &host).expect("the step is resent");

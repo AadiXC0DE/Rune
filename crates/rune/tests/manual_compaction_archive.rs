@@ -172,7 +172,7 @@ fn compact_restart_and_retrieve_every_removed_message_and_complete_tool_batch() 
     });
     let config = root.join("fixture.toml");
     std::fs::write(&config, format!(
-        "provider = \"chat_completions\"\nbase_url = \"http://{address}/v1\"\n[models.chat_completions]\nid = \"fixture-model\"\n[limits]\nmax_tool_result_bytes = 32768\nprovider_request_timeout_ms = 5000\n"
+        "provider = \"chat_completions\"\nbase_url = \"http://{address}/v1\"\n[models.chat_completions]\nid = \"fixture-model\"\n[limits]\ncompaction_keep_tokens = 0\nmax_tool_result_bytes = 32768\nprovider_request_timeout_ms = 5000\n"
     )).expect("config");
     let command = || {
         let mut command = Command::new(env!("CARGO_BIN_EXE_rune"));
@@ -209,9 +209,16 @@ fn compact_restart_and_retrieve_every_removed_message_and_complete_tool_batch() 
         stdout.contains("compacted 1 earlier turn(s); 5 turn(s) remain"),
         "{stdout}"
     );
+    // The removed prefix is gone; only the user's own words are carried.
+    let second = requests[1].to_string();
     assert!(
-        !requests[1].to_string().contains("question 1"),
+        !second.contains("original result 1/"),
         "original prefix was removed"
+    );
+    assert_eq!(second.matches("question 1").count(), 1, "{second}");
+    assert!(
+        second.contains(r"<message>\nquestion 1\nCafé\n</message>"),
+        "{second}"
     );
 
     let run = |args: &[&str]| -> Output { command().args(args).output().expect("restarted CLI") };

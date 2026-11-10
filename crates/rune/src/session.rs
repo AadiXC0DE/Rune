@@ -4414,7 +4414,8 @@ fn compact_history(
     history: &mut History,
     sink: &mut LockedSink,
 ) -> Result<Step> {
-    let Some(plan) = rune_agent::compaction::plan(history, &host.limits) else {
+    let Some(plan) = rune_agent::compaction::plan_for(history, &host.limits, host.dialect.as_ref())
+    else {
         return report(
             host,
             sink,
@@ -9561,8 +9562,8 @@ mod tests {
         let text = String::from_utf8(captured.lock().expect("lock").clone()).expect("utf8");
         for line in [
             "compaction preview (history unchanged)",
-            "6 record(s) would be summarized",
-            "3 record(s) retained verbatim",
+            "8 record(s) would be summarized",
+            "1 record(s) retained verbatim",
         ] {
             assert!(text.contains(line), "{text}");
         }
@@ -9570,8 +9571,9 @@ mod tests {
         assert!(host.events.lock().expect("events").is_empty());
         let retained = history.turns()[plan.removed_turns..].to_vec();
         let removed = rune_agent::compaction::apply(&mut history, &plan, "test summary");
-        assert_eq!(removed, 6);
-        assert_eq!(history.len(), 3 + 1);
+        // Only the newest prompt is kept: four exchanges are summarized.
+        assert_eq!(removed, 8);
+        assert_eq!(history.len(), 1 + 1);
         // Applying renumbers sequence positions, but retains content verbatim.
         for (after, before) in history.turns()[1..].iter().zip(retained) {
             assert_eq!(after.role, before.role);
@@ -9684,6 +9686,7 @@ mod tests {
         for (name, value) in [
             (rune_core::budget::LimitName::MaxToolResultBytes, 16 * 1024),
             (rune_core::budget::LimitName::CompactionTriggerPercent, 50),
+            (rune_core::budget::LimitName::CompactionKeepTokens, 0),
         ] {
             host.limits
                 .set(

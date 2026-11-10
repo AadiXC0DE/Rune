@@ -117,6 +117,7 @@ id = "fixture-model"
 context_window = 40000
 [limits]
 compaction_trigger_percent = 50
+compaction_keep_tokens = 0
 max_tool_result_bytes = 32768
 provider_request_timeout_ms = 5000
 "#
@@ -222,14 +223,24 @@ provider_request_timeout_ms = 5000
         "the tool continuation reached the provider"
     );
 
+    // The removed prompt leaves the live context as a message; the summary
+    // carries the user's words alone.
+    let last = &requests.last().expect("last request").1;
+    let holding: Vec<String> = last["messages"]
+        .as_array()
+        .expect("messages")
+        .iter()
+        .map(Value::to_string)
+        .filter(|message| message.contains("REMOVED_SYMBOL"))
+        .collect();
+    assert_eq!(holding.len(), 1, "{holding:?}");
+    assert!(holding[0].contains("<context_handoff>"), "{}", holding[0]);
     assert!(
-        !requests
-            .last()
-            .expect("last request")
-            .1
-            .to_string()
-            .contains("REMOVED_SYMBOL"),
-        "the symbol must have been removed from the live model context"
+        holding[0].contains(
+            r"<user-messages>\n<message>\nfixture question 1 REMOVED_SYMBOL_CAFÉ[x].*\n</message>"
+        ),
+        "{}",
+        holding[0]
     );
     let search = Command::new(env!("CARGO_BIN_EXE_rune"))
         .isolated_env()
