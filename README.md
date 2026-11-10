@@ -1016,6 +1016,28 @@ result or retrying the hook. The deadline defaults to 5 seconds and accepts
 group. Cancellation also skips hooks for pending results. Ask, review, interactive
 sessions, and delegated child calls support it.
 
+
+Shell commands get a minimal environment, not Rune's own: the system,
+locale, toolchain, proxy and certificate variables, plus the build and test
+settings a task sets (`CI`, `PYTHONPATH`, `NODE_PATH`, `LD_LIBRARY_PATH`,
+`CARGO_TARGET_DIR`, `RUSTFLAGS`, `GOFLAGS`, `JAVA_TOOL_OPTIONS`, `CC`, `CFLAGS`,
+`MAKEFLAGS`, `DOCKER_HOST`, `KUBECONFIG` and the like; the full list is
+`ALLOWED_ENVIRONMENT` in `crates/rune-exec/src/command.rs`). Pass more with
+`shell_env` in the user configuration, or `RUNE_SHELL_ENV` (comma separated):
+
+```toml
+shell_env = ["DATABASE_URL", "MYAPP_*"]
+```
+
+Entries are exact names, `PREFIX_*` patterns, or `*` for the whole environment.
+A name containing `KEY`, `TOKEN`, `SECRET`, `PASSWORD`, `PASSWD` or `CREDENTIAL`
+passes only when listed exactly, and the active provider's credential variable
+never passes. A repository's project configuration cannot set `shell_env`. Unless
+the environment already sets them, commands get `PAGER`, `GIT_PAGER`, `GH_PAGER`
+and `MANPAGER` set to `cat`, `GIT_TERMINAL_PROMPT=0`, `PIP_PROGRESS_BAR=off`,
+`TQDM_DISABLE=1` and `AI_AGENT=rune`; a command without a terminal also gets
+`TERM=dumb` and `NO_COLOR=1`.
+
 ## Embedding
 
 `rune acp` serves the Agent Client Protocol over standard input and output.

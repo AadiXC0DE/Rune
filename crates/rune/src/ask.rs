@@ -1044,7 +1044,8 @@ pub fn run(
     history.prepend(rune_net::message::Role::User, parts);
     let mut context = ExecutionContext::new(crate::current_workspace()?)
         .with_offline(settings.offline)
-        .with_allow_unsandboxed(settings.allow_unsandboxed);
+        .with_allow_unsandboxed(settings.allow_unsandboxed)
+        .with_environment(crate::provider_setup::command_environment(settings));
     context
         .additional_roots
         .clone_from(&settings.additional_directories);

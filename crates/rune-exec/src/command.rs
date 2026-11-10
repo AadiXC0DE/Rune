@@ -346,6 +346,35 @@ pub const ALLOWED_ENVIRONMENT: &[&str] = &[
     "NODE_EXTRA_CA_CERTS",
     "REQUESTS_CA_BUNDLE",
     "CURL_CA_BUNDLE",
+    // Build and test settings a task sets for its commands.
+    "CI",
+    "PYTHONPATH",
+    "PYTHONHOME",
+    "NODE_PATH",
+    "NODE_OPTIONS",
+    "LD_LIBRARY_PATH",
+    "DYLD_LIBRARY_PATH",
+    "CARGO_TARGET_DIR",
+    "RUSTFLAGS",
+    "RUSTDOCFLAGS",
+    "GOFLAGS",
+    "GOCACHE",
+    "GOMODCACHE",
+    "JAVA_TOOL_OPTIONS",
+    "MAVEN_OPTS",
+    "GRADLE_USER_HOME",
+    "DOTNET_ROOT",
+    "CC",
+    "CXX",
+    "CFLAGS",
+    "CXXFLAGS",
+    "LDFLAGS",
+    "MAKEFLAGS",
+    "CMAKE_PREFIX_PATH",
+    "DOCKER_HOST",
+    "KUBECONFIG",
+    "SOURCE_DATE_EPOCH",
+    "DEBIAN_FRONTEND",
 ];
 
 /// Environment variables a command may receive.
@@ -400,6 +429,33 @@ pub const ALLOWED_ENVIRONMENT: &[&str] = &[
     "NODE_EXTRA_CA_CERTS",
     "REQUESTS_CA_BUNDLE",
     "CURL_CA_BUNDLE",
+    // Build and test settings a task sets for its commands.
+    "CI",
+    "PYTHONPATH",
+    "PYTHONHOME",
+    "NODE_PATH",
+    "NODE_OPTIONS",
+    "CARGO_TARGET_DIR",
+    "RUSTFLAGS",
+    "RUSTDOCFLAGS",
+    "GOFLAGS",
+    "GOCACHE",
+    "GOMODCACHE",
+    "JAVA_TOOL_OPTIONS",
+    "MAVEN_OPTS",
+    "GRADLE_USER_HOME",
+    "DOTNET_ROOT",
+    "CC",
+    "CXX",
+    "CFLAGS",
+    "CXXFLAGS",
+    "LDFLAGS",
+    "MAKEFLAGS",
+    "CMAKE_PREFIX_PATH",
+    "DOCKER_HOST",
+    "KUBECONFIG",
+    "SOURCE_DATE_EPOCH",
+    "DEBIAN_FRONTEND",
 ];
 
 /// Returns the environment a command is given when the caller names none.
@@ -422,6 +478,99 @@ pub fn minimal_environment() -> BTreeMap<String, String> {
         environment.insert("PATH".to_owned(), default_path());
     }
     environment
+}
+
+/// Extra variables a user chose to pass to commands, and the ones never passed.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct EnvironmentPolicy {
+    /// Exact names, `PREFIX_*` patterns, or the single value `*`.
+    pub passthrough: Vec<String>,
+    /// Names never passed, whatever `passthrough` says (the active credential variables).
+    pub withheld: Vec<String>,
+}
+
+/// Variables set for commands when the environment does not already hold them.
+///
+/// A pager or a credential prompt waits for a person who is not there, and a
+/// progress bar fills the output with redraws, so each is off unless the
+/// environment says otherwise.
+pub const QUIET_DEFAULTS: &[(&str, &str)] = &[
+    ("PAGER", "cat"),
+    ("GIT_PAGER", "cat"),
+    ("GH_PAGER", "cat"),
+    ("MANPAGER", "cat"),
+    ("GIT_TERMINAL_PROMPT", "0"),
+    ("PIP_PROGRESS_BAR", "off"),
+    ("TQDM_DISABLE", "1"),
+    ("AI_AGENT", "rune"),
+];
+
+/// Words that mark a variable as a secret, which a pattern never passes.
+const SECRET_WORDS: &[&str] = &["KEY", "TOKEN", "SECRET", "PASSWORD", "PASSWD", "CREDENTIAL"];
+
+/// Returns the environment for a shell command.
+///
+/// The minimal environment, plus what `policy` passes, minus what it
+/// withholds, with the quiet defaults. A command without a terminal gets
+/// `TERM=dumb` and `NO_COLOR=1`: the inherited `TERM` describes Rune's own
+/// terminal, not the pipe the command writes to.
+#[must_use]
+pub fn command_environment(policy: &EnvironmentPolicy, terminal: bool) -> BTreeMap<String, String> {
+    command_environment_from(std::env::vars_os(), policy, terminal)
+}
+
+/// [`command_environment`] over the given variables instead of this process's.
+fn command_environment_from(
+    variables: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+    policy: &EnvironmentPolicy,
+    terminal: bool,
+) -> BTreeMap<String, String> {
+    let mut environment = BTreeMap::new();
+    for (name, value) in variables {
+        // A name or value that is not valid UTF-8 is left out rather than
+        // lossily converted, as in the minimal environment.
+        let (Ok(name), Ok(value)) = (name.into_string(), value.into_string()) else {
+            continue;
+        };
+        if ALLOWED_ENVIRONMENT.contains(&name.as_str()) || passes(&name, &policy.passthrough) {
+            environment.insert(name, value);
+        }
+    }
+    if !environment.contains_key("PATH") {
+        environment.insert("PATH".to_owned(), default_path());
+    }
+    for name in &policy.withheld {
+        environment.remove(name);
+    }
+    for &(name, value) in QUIET_DEFAULTS {
+        environment
+            .entry(name.to_owned())
+            .or_insert_with(|| value.to_owned());
+    }
+    if !terminal {
+        environment.insert("TERM".to_owned(), "dumb".to_owned());
+        environment.insert("NO_COLOR".to_owned(), "1".to_owned());
+    }
+    environment
+}
+
+/// Whether `passthrough` passes the variable `name`.
+///
+/// An exact name always passes. `*` and `PREFIX_*` patterns pass a name only
+/// when it does not look like a secret, so a broad pattern cannot hand a
+/// command a token by accident.
+fn passes(name: &str, passthrough: &[String]) -> bool {
+    if passthrough.iter().any(|entry| entry == name) {
+        return true;
+    }
+    let matched = passthrough.iter().any(|entry| {
+        entry == "*"
+            || entry
+                .strip_suffix('*')
+                .is_some_and(|prefix| !prefix.is_empty() && name.starts_with(prefix))
+    });
+    let upper = name.to_ascii_uppercase();
+    matched && !SECRET_WORDS.iter().any(|word| upper.contains(word))
 }
 
 /// Returns a search path for a process that has none of its own.
@@ -1536,6 +1685,118 @@ mod tests {
             minimal_environment().contains_key("SystemRoot"),
             "a command would be unable to start a system program"
         );
+    }
+
+    /// Runs `command_environment_from` over a fixed set of variables.
+    fn environment_of(
+        variables: &[(&str, &str)],
+        passthrough: &[&str],
+        withheld: &[&str],
+        terminal: bool,
+    ) -> BTreeMap<String, String> {
+        let policy = EnvironmentPolicy {
+            passthrough: passthrough
+                .iter()
+                .map(|entry| (*entry).to_owned())
+                .collect(),
+            withheld: withheld.iter().map(|entry| (*entry).to_owned()).collect(),
+        };
+        command_environment_from(
+            variables.iter().map(|(name, value)| {
+                (
+                    std::ffi::OsString::from(name),
+                    std::ffi::OsString::from(value),
+                )
+            }),
+            &policy,
+            terminal,
+        )
+    }
+
+    #[test]
+    fn passthrough_includes_build_variables_without_configuration() {
+        let environment = environment_of(&[("PYTHONPATH", "/x"), ("OTHER", "y")], &[], &[], false);
+        assert_eq!(
+            environment.get("PYTHONPATH").map(String::as_str),
+            Some("/x")
+        );
+        assert!(!environment.contains_key("OTHER"));
+    }
+
+    #[test]
+    fn passthrough_patterns_skip_secret_names_unless_listed_exactly() {
+        let variables = [("MYAPP_TOKEN", "s"), ("MYAPP_HOST", "h")];
+        let pattern = environment_of(&variables, &["MYAPP_*"], &[], false);
+        assert!(!pattern.contains_key("MYAPP_TOKEN"));
+        assert_eq!(pattern.get("MYAPP_HOST").map(String::as_str), Some("h"));
+        let exact = environment_of(&variables, &["MYAPP_TOKEN"], &[], false);
+        assert_eq!(exact.get("MYAPP_TOKEN").map(String::as_str), Some("s"));
+    }
+
+    #[test]
+    fn passthrough_everything_still_withholds_secrets_and_credentials() {
+        let variables = [
+            ("DATABASE_URL", "postgres://db"),
+            ("GITHUB_TOKEN", "t"),
+            ("OPENAI_API_KEY", "k"),
+            ("db_password", "p"),
+        ];
+        let environment = environment_of(
+            &variables,
+            &["*", "OPENAI_API_KEY"],
+            &["OPENAI_API_KEY"],
+            false,
+        );
+        assert_eq!(
+            environment.get("DATABASE_URL").map(String::as_str),
+            Some("postgres://db")
+        );
+        assert!(!environment.contains_key("GITHUB_TOKEN"));
+        assert!(!environment.contains_key("db_password"));
+        assert!(!environment.contains_key("OPENAI_API_KEY"), "withheld wins");
+    }
+
+    #[test]
+    fn quiet_defaults_fill_only_what_is_unset() {
+        let set = environment_of(&[("PAGER", "less")], &["*"], &[], false);
+        assert_eq!(set.get("PAGER").map(String::as_str), Some("less"));
+        let unset = environment_of(&[], &[], &[], false);
+        for &(name, value) in QUIET_DEFAULTS {
+            assert_eq!(unset.get(name).map(String::as_str), Some(value), "{name}");
+        }
+    }
+
+    #[test]
+    fn quiet_defaults_make_a_pipe_dumb_but_leave_a_terminal() {
+        let piped = environment_of(&[("TERM", "xterm-256color")], &[], &[], false);
+        assert_eq!(piped.get("TERM").map(String::as_str), Some("dumb"));
+        assert_eq!(piped.get("NO_COLOR").map(String::as_str), Some("1"));
+        let terminal = environment_of(&[("TERM", "xterm-256color")], &[], &[], true);
+        assert_eq!(
+            terminal.get("TERM").map(String::as_str),
+            Some("xterm-256color")
+        );
+        assert!(!terminal.contains_key("NO_COLOR"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn passthrough_leaves_out_values_that_are_not_utf8() {
+        use std::os::unix::ffi::OsStringExt as _;
+        let policy = EnvironmentPolicy {
+            passthrough: vec!["*".to_owned()],
+            withheld: Vec::new(),
+        };
+        let environment = command_environment_from(
+            [(
+                std::ffi::OsString::from("BINARY_VALUE"),
+                std::ffi::OsString::from_vec(vec![0xff, 0xfe]),
+            )],
+            &policy,
+            false,
+        );
+        assert!(!environment.contains_key("BINARY_VALUE"));
+        assert!(environment.contains_key("PATH"));
     }
 
     #[test]

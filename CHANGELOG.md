@@ -39,6 +39,10 @@ Notable changes, newest first. Each entry describes what a user can observe.
 - `rune ask` compacts a long run before it reaches the context window, as the
   interactive session does, and counts the summary requests in its usage and
   cost.
+- Shell commands receive the build and test variables a task sets (`CI`,
+  `PYTHONPATH`, `NODE_PATH`, `LD_LIBRARY_PATH` and more), `shell_env` and
+  `RUNE_SHELL_ENV` pass others by name or pattern, credentials stay withheld,
+  and pagers, git credential prompts and progress bars are off by default.
 - `rune ask --json` reports `stop_reason`, and a run ended by a limit (steps,
   output tokens, time, spend, objective budget) now exits 3 with its answer,
   not 1, so a script can tell a limit from a failure. `rune help ask` lists

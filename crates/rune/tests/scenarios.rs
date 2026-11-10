@@ -26,6 +26,7 @@ const SCENARIOS: &[&str] = &[
     "spend_limit",
     "max_cost_without_prices",
     "parallel_reads",
+    "env_passthrough",
 ];
 
 /// Scenarios built in Rust, which have no file.
@@ -490,6 +491,11 @@ fn sigint_exits_130() {
     assert_eq!(result["stop_reason"], "cancelled", "{result}");
     assert_eq!(result["exit_code"], 130, "{result}");
     assert_no_survivor(&marker);
+}
+
+#[test]
+fn env_passthrough() {
+    run_scenario("env_passthrough");
 }
 
 #[test]

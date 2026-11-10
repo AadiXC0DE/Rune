@@ -158,6 +158,8 @@ pub struct ServerConfig {
     pub context_window: u64,
     /// Directories every session may reach in addition to the workspace.
     pub additional_roots: Vec<Utf8PathBuf>,
+    /// What shell commands receive beyond the minimal environment.
+    pub environment: Arc<rune_tools::EnvironmentPolicy>,
 }
 
 impl fmt::Debug for ServerConfig {
@@ -208,6 +210,7 @@ impl ServerConfig {
             log_file: None,
             context_window,
             additional_roots: Vec::new(),
+            environment: Arc::default(),
         })
     }
 
@@ -1049,7 +1052,8 @@ fn run_one<W: Write + Send + 'static>(server: &Arc<Server<W>>, queued: Queued) {
         context: snapshot
             .context
             .clone()
-            .with_offline(server.config.endpoint.offline),
+            .with_offline(server.config.endpoint.offline)
+            .with_environment(Arc::clone(&server.config.environment)),
         cancellation: cancellation.clone(),
         steering: snapshot.steering,
         tools,

@@ -217,6 +217,8 @@ pub struct ExecutionContext {
     live_plan: Arc<std::sync::Mutex<crate::update_plan::PlanUpdate>>,
     /// Composite cancellation flag, checked between steps of long work.
     cancelled: Arc<AtomicBool>,
+    /// What shell commands receive beyond the minimal environment.
+    pub environment: Arc<rune_exec::EnvironmentPolicy>,
 }
 
 impl ExecutionContext {
@@ -235,7 +237,15 @@ impl ExecutionContext {
             result_store: None,
             live_plan: Arc::default(),
             cancelled: Arc::new(AtomicBool::new(false)),
+            environment: Arc::default(),
         }
+    }
+
+    /// Sets what shell commands receive beyond the minimal environment.
+    #[must_use]
+    pub fn with_environment(mut self, environment: Arc<rune_exec::EnvironmentPolicy>) -> Self {
+        self.environment = environment;
+        self
     }
 
     /// Adds an additional root.
@@ -337,6 +347,7 @@ impl ExecutionContext {
             result_store: self.result_store.clone(),
             live_plan: Arc::clone(&self.live_plan),
             cancelled: Arc::clone(&self.cancelled),
+            environment: Arc::clone(&self.environment),
         }
     }
 

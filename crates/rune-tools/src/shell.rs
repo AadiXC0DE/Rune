@@ -692,8 +692,10 @@ fn start(
     // `exit`.
     // The environment is built here rather than inherited: this process holds
     // the provider credential, and a command that reaches the network must not
-    // be able to read it back out of its own environment.
-    let environment = rune_exec::minimal_environment();
+    // be able to read it back out of its own environment. A command without a
+    // terminal is told so, and pagers and prompts are off.
+    let environment =
+        rune_exec::command_environment(&context.environment, matches!(input, Input::Pty { .. }));
     let prepared =
         rune_exec::command::prepare_shell(command, workspace, None, environment.clone())?;
     let policy = sandbox_policy(context);

@@ -508,6 +508,10 @@ pub struct UserConfig {
     /// Whether to restrict requests to the listed providers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_strict: Option<bool>,
+
+    /// Extra variables passed to shell commands: exact names, PREFIX_* patterns, or * for the whole environment. Names containing KEY, TOKEN, SECRET, PASSWORD, PASSWD or CREDENTIAL pass only when listed exactly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shell_env: Option<Vec<String>>,
 }
 
 /// A diagnostic produced while loading configuration.
@@ -641,6 +645,8 @@ pub struct Settings {
     pub provider_order: Vec<String>,
     /// Whether to restrict requests to the listed providers.
     pub provider_strict: bool,
+    /// Extra variables passed to shell commands, by name or pattern.
+    pub shell_env: Vec<String>,
     /// Image analysis model on the active provider and endpoint.
     pub vision_model: Option<String>,
     /// Model used for automatic permission review.
@@ -679,6 +685,7 @@ impl Default for Settings {
             limits: BudgetSet::new(),
             provider_order: Vec::new(),
             provider_strict: false,
+            shell_env: Vec::new(),
             vision_model: None,
             review_model: None,
             sources: MergeReport::default(),
@@ -830,6 +837,14 @@ impl Settings {
             ("session_titles", self.session_titles.to_string()),
             ("context", self.context.to_string()),
             ("provider_strict", self.provider_strict.to_string()),
+            (
+                "shell_env",
+                if self.shell_env.is_empty() {
+                    "none".to_owned()
+                } else {
+                    self.shell_env.join(",")
+                },
+            ),
         ];
 
         let mut out: Vec<Explained> = rows
@@ -895,6 +910,8 @@ pub struct EnvironmentOverrides {
     pub provider_order: Option<String>,
     /// Whether to restrict to the listed providers.
     pub provider_strict: Option<bool>,
+    /// `RUNE_SHELL_ENV`: variables passed to shell commands, comma separated.
+    pub shell_env: Option<String>,
     /// Review model.
     pub review_model: Option<String>,
     /// Offline mode.
@@ -953,6 +970,7 @@ impl EnvironmentOverrides {
             limits: Vec::new(),
             provider_order: lookup("RUNE_PROVIDER_ORDER"),
             provider_strict: boolean(&mut lookup, "RUNE_PROVIDER_STRICT"),
+            shell_env: lookup("RUNE_SHELL_ENV"),
             review_model: lookup("RUNE_REVIEW_MODEL"),
             offline: boolean(&mut lookup, "RUNE_OFFLINE"),
             web_tools: boolean(&mut lookup, "RUNE_WEB_TOOLS"),
@@ -1325,6 +1343,10 @@ fn apply_user(settings: &mut Settings, user: &UserConfig, layer: Layer) {
         settings.provider_order.clone_from(order);
         settings.sources.record("provider_order", layer);
     }
+    if let Some(names) = &user.shell_env {
+        settings.shell_env.clone_from(names);
+        settings.sources.record("shell_env", layer);
+    }
     if let Some(strict) = user.provider_strict {
         settings.provider_strict = strict;
         settings.sources.record("provider_strict", layer);
@@ -1581,6 +1603,15 @@ fn apply_environment(settings: &mut Settings, env: &EnvironmentOverrides) {
             .collect();
         settings.sources.record("provider_order", layer);
     }
+    if let Some(names) = &env.shell_env {
+        settings.shell_env = names
+            .split(',')
+            .map(str::trim)
+            .filter(|part| !part.is_empty())
+            .map(str::to_owned)
+            .collect();
+        settings.sources.record("shell_env", layer);
+    }
     if let Some(strict) = env.provider_strict {
         settings.provider_strict = strict;
         settings.sources.record("provider_strict", layer);
@@ -1750,6 +1781,7 @@ pub fn to_status_json(settings: &Settings, workspace: &Utf8Path) -> serde_json::
         "additional_directories": settings.additional_directories,
         "provider_order": settings.provider_order,
         "provider_strict": settings.provider_strict,
+        "shell_env": settings.shell_env,
         "review_model": settings.review_model,
         "vision_model": settings.vision_model,
         "pre_tool_hook": settings.pre_tool_hook,
@@ -1784,6 +1816,28 @@ mod tests {
 
     fn empty_env() -> EnvironmentOverrides {
         EnvironmentOverrides::default()
+    }
+
+    #[test]
+    fn shell_env_comes_from_user_and_environment_only() {
+        let dir = TempDir::new().expect("tempdir");
+        let user = write(
+            &dir,
+            "config.toml",
+            "shell_env = [\"DATABASE_URL\", \"MYAPP_*\"]\n",
+        );
+        let project = write(&dir, "project.toml", "shell_env = [\"*\"]\n");
+        let from_user = load(None, Some(&user), &empty_env());
+        assert_eq!(from_user.shell_env, ["DATABASE_URL", "MYAPP_*"]);
+        // A repository cannot widen what commands receive.
+        let with_project = load(Some(&project), Some(&user), &empty_env());
+        assert_eq!(with_project.shell_env, ["DATABASE_URL", "MYAPP_*"]);
+        let env = EnvironmentOverrides {
+            shell_env: Some(" CI_* , EXTRA ,".to_owned()),
+            ..EnvironmentOverrides::default()
+        };
+        let from_env = load(None, Some(&user), &env);
+        assert_eq!(from_env.shell_env, ["CI_*", "EXTRA"]);
     }
 
     #[test]

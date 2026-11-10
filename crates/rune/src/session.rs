@@ -2121,7 +2121,8 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
     let recorder = Arc::new(Mutex::new(recorder));
     let mut context = ExecutionContext::new(config.workspace.clone())
         .with_offline(config.settings.offline)
-        .with_allow_unsandboxed(config.settings.allow_unsandboxed);
+        .with_allow_unsandboxed(config.settings.allow_unsandboxed)
+        .with_environment(crate::provider_setup::command_environment(&config.settings));
     context
         .additional_roots
         .clone_from(&config.settings.additional_directories);

@@ -1529,6 +1529,7 @@ fn run_acp(
             .context_window
             .unwrap_or(rune_net::catalog::DEFAULT_CONTEXT_WINDOW),
         additional_roots: settings.additional_directories.clone(),
+        environment: provider_setup::command_environment(settings),
     };
 
     let server = std::sync::Arc::new(rune_acp::Server::new(config, std::io::stdout())?);

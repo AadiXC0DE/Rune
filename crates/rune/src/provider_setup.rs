@@ -489,6 +489,23 @@ pub fn cached_prices(settings: &Settings, paths: &Paths) -> Option<rune_net::mod
         .prices
 }
 
+/// What shell commands receive beyond the minimal environment: the configured
+/// `shell_env` names, never the active provider's credential variables.
+#[must_use]
+pub fn command_environment(settings: &Settings) -> std::sync::Arc<rune_tools::EnvironmentPolicy> {
+    let mut withheld: Vec<String> = auth::default_variables(&settings.provider.to_string())
+        .iter()
+        .map(|name| (*name).to_owned())
+        .collect();
+    if let Some(name) = &settings.api_key_env {
+        withheld.push(name.clone());
+    }
+    std::sync::Arc::new(rune_tools::EnvironmentPolicy {
+        passthrough: settings.shell_env.clone(),
+        withheld,
+    })
+}
+
 /// Returns the configured model's context window from the cache alone.
 pub fn cached_context_window(settings: &Settings, paths: &Paths) -> Option<u64> {
     let key = rune_net::models_dev::catalog_key(&settings.provider.to_string())?;

@@ -39,6 +39,7 @@ pub use read_tool_result::ReadToolResult;
 pub use registry::Registry;
 pub use rename_file::RenameFile;
 pub use result_store::{Handle, Preview as ResultPreview, Store};
+pub use rune_exec::EnvironmentPolicy;
 pub use syntax_diagnostics::SyntaxDiagnostics;
 pub use update_plan::{PlanUpdate, UpdatePlan};
 pub use vision::{ImageAnalysis, Vision, VisionBackend, VisionSource};
