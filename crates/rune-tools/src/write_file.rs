@@ -114,6 +114,46 @@ mod tests {
     }
 
     #[test]
+    fn a_whole_file_write_keeps_an_existing_bom() {
+        let (dir, context) = workspace();
+        std::fs::write(path_of(&dir, "bom.txt"), "\u{FEFF}old\n").expect("seed");
+        WriteFile
+            .call(&json!({ "path": "bom.txt", "content": "new\n" }), &context)
+            .expect("call");
+        assert_eq!(
+            std::fs::read(path_of(&dir, "bom.txt")).expect("read"),
+            b"\xEF\xBB\xBFnew\n"
+        );
+    }
+
+    #[test]
+    fn a_whole_file_write_does_not_double_a_bom() {
+        let (dir, context) = workspace();
+        std::fs::write(path_of(&dir, "bom.txt"), "\u{FEFF}old\n").expect("seed");
+        WriteFile
+            .call(
+                &json!({ "path": "bom.txt", "content": "\u{FEFF}new\n" }),
+                &context,
+            )
+            .expect("call");
+        assert_eq!(
+            std::fs::read(path_of(&dir, "bom.txt")).expect("read"),
+            b"\xEF\xBB\xBFnew\n"
+        );
+        // A new file is written as given.
+        WriteFile
+            .call(
+                &json!({ "path": "plain.txt", "content": "new\n" }),
+                &context,
+            )
+            .expect("call");
+        assert_eq!(
+            std::fs::read(path_of(&dir, "plain.txt")).expect("read"),
+            b"new\n"
+        );
+    }
+
+    #[test]
     fn a_write_creates_the_file_and_reports_the_size() {
         let (dir, context) = workspace();
         let output = WriteFile

@@ -45,6 +45,8 @@ pub enum Tiers {
     Unique,
     /// T0 to T2, for `occurrence` and `replace_all`.
     Selectable,
+    /// T0 only, for an edit that changes nothing but carriage returns.
+    Exact,
 }
 
 /// New-string indentation to swap after an indentation-tier match.
@@ -74,7 +76,10 @@ pub fn search(source: &str, needle: &str, tiers: Tiers) -> Option<Matches> {
     if !exact.is_empty() {
         return Some(found(Tier::Exact, exact));
     }
-    let source_lines = View::line_endings(source);
+    if tiers == Tiers::Exact {
+        return None;
+    }
+    let source_lines = View::file(source, false);
     let needle_lines = View::line_endings(needle);
     // A view that changes neither text would only repeat the exact search.
     let lines_changed = source_lines.text != source || needle_lines.text != needle;
@@ -84,7 +89,7 @@ pub fn search(source: &str, needle: &str, tiers: Tiers) -> Option<Matches> {
             return Some(found(Tier::LineEndings, spans));
         }
     }
-    let source_folded = View::folded(source);
+    let source_folded = View::file(source, true);
     let needle_folded = View::folded(needle);
     if source_folded.text != source_lines.text || needle_folded.text != needle_lines.text {
         let spans = view_spans(&source_folded, &needle_folded.text);
@@ -262,6 +267,20 @@ impl View {
         Self::build(source, true)
     }
 
+    /// A view of a file: like [`View::line_endings`] or [`View::folded`], but
+    /// a leading byte order mark is left out, so line tiers see the first
+    /// line as written and every offset lands after the mark.
+    fn file(source: &str, fold_punctuation: bool) -> Self {
+        match source.strip_prefix('\u{FEFF}') {
+            Some(rest) => {
+                let mut view = Self::build(rest, fold_punctuation);
+                view.base = source.len().saturating_sub(rest.len());
+                view
+            }
+            None => Self::build(source, fold_punctuation),
+        }
+    }
+
     fn build(source: &str, fold_punctuation: bool) -> Self {
         let mut text = String::with_capacity(source.len());
         let mut shifts = Vec::new();
@@ -316,7 +335,7 @@ pub fn already_applied(source: &str, new: &str) -> Option<(usize, usize)> {
     if new.chars().filter(|c| !c.is_whitespace()).count() < 20 {
         return None;
     }
-    let source_view = View::folded(source);
+    let source_view = View::file(source, true);
     let needle = View::folded(new);
     let start = source_view.text.find(needle.text.as_str())?;
     let end = start.saturating_add(needle.text.len());
@@ -369,6 +388,8 @@ fn line_key(line: &str) -> String {
 #[must_use]
 pub fn closest_lines(source: &str, needle: &str) -> Option<Closest> {
     let file: Vec<&str> = source
+        .strip_prefix('\u{FEFF}')
+        .unwrap_or(source)
         .split('\n')
         .map(|line| line.strip_suffix('\r').unwrap_or(line))
         .collect();

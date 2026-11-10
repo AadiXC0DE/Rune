@@ -30,6 +30,11 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Changed
 
+- `edit_file` writes inserted lines with the line ending of the line they land
+  in, so an edit of a CRLF file no longer leaves LF lines in it; text that
+  carries its own `\r` is written as given, and an edit that only changes line
+  endings must match exactly. A file's UTF-8 byte order mark is kept through
+  edits and `write_file`.
 - A missed `edit_file` says when `new_string` is already in the file, or quotes
   the file's closest lines with line numbers so the next attempt can copy them,
   with a note when the only difference is tabs against spaces; it quotes nothing

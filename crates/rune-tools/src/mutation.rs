@@ -10,7 +10,9 @@
 //! Content is never normalized. Matching tries exact bytes first and then
 //! lossless normalisations (line endings, typographic punctuation); a match
 //! found that way is mapped back to the original bytes, and every byte outside
-//! a match is written verbatim, so CRLF and lone CR endings survive.
+//! a match is written verbatim, so CRLF and lone CR endings survive. Inserted
+//! text takes the terminator of the line it lands in unless it carries `\r`
+//! itself, and a byte order mark is kept through edits and whole-file writes.
 
 use std::fmt::Write as _;
 use std::fs::{File, OpenOptions, Permissions};
@@ -379,6 +381,25 @@ pub fn prepare(path: &Utf8Path, desired: &str) -> Result<Prepared> {
         return Err(RuneError::too_large("content", total, MAX_TOTAL_BYTES));
     }
     let before = std::str::from_utf8(bytes).map_err(|_| not_text(path))?;
+    // A file that starts with a byte order mark keeps it.
+    let kept_mark;
+    let desired = if before.starts_with('\u{FEFF}') && !desired.starts_with('\u{FEFF}') {
+        kept_mark = format!("\u{FEFF}{desired}");
+        if kept_mark.len() > MAX_WRITE_BYTES {
+            return Err(RuneError::too_large(
+                "content",
+                kept_mark.len(),
+                MAX_WRITE_BYTES,
+            ));
+        }
+        let total = bytes.len().saturating_add(kept_mark.len());
+        if total > MAX_TOTAL_BYTES {
+            return Err(RuneError::too_large("content", total, MAX_TOTAL_BYTES));
+        }
+        kept_mark.as_str()
+    } else {
+        desired
+    };
     let region = changed_region(before, desired);
     Ok(Prepared {
         resolved: path.to_owned(),
@@ -526,7 +547,12 @@ fn replace_literal(
         new,
         occurrence,
     } = *edit;
-    let tiers = if occurrence == Occurrence::Unique {
+    // An edit that changes only carriage returns is about the bytes, so it
+    // must match them exactly and is written as given.
+    let endings_only = old != new && old.replace('\r', "") == new.replace('\r', "");
+    let tiers = if endings_only {
+        Tiers::Exact
+    } else if occurrence == Occurrence::Unique {
         Tiers::Unique
     } else {
         Tiers::Selectable
@@ -557,12 +583,23 @@ fn replace_literal(
             .ok_or_else(|| not_found(path, before, old, new, quote))?,
         None => new.to_owned(),
     };
-    let new = replacement.as_str();
+    // Text that brings no `\r` of its own takes the ending of the line it
+    // lands in, span by span.
+    let crlf = replacement.replace('\n', "\r\n");
+    let keeps_its_endings = endings_only || replacement.contains('\r');
+    let inserted: Vec<&str> = chosen
+        .iter()
+        .map(|span| {
+            if !keeps_its_endings && region_ending(before, span.start) == Ending::Crlf {
+                crlf.as_str()
+            } else {
+                replacement.as_str()
+            }
+        })
+        .collect();
     let removed: usize = chosen.iter().map(ExactSizeIterator::len).sum();
-    let postimage_len = before
-        .len()
-        .saturating_sub(removed)
-        .saturating_add(new.len().saturating_mul(chosen.len()));
+    let added: usize = inserted.iter().map(|text| text.len()).sum();
+    let postimage_len = before.len().saturating_sub(removed).saturating_add(added);
     if postimage_len > MAX_WRITE_BYTES {
         return Err(RuneError::too_large(
             "content",
@@ -575,20 +612,45 @@ fn replace_literal(
         return Err(RuneError::too_large("content", total, MAX_TOTAL_BYTES));
     }
     Ok((
-        splice(before, &chosen, new, postimage_len),
+        splice(before, &chosen, &inserted, postimage_len),
         chosen.len(),
         matches.tier,
     ))
 }
 
-/// Builds the postimage: `source` with each range replaced by `replacement`.
+/// A line terminator.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Ending {
+    Lf,
+    Crlf,
+}
+
+/// The terminator of the line that holds byte `start`; for a last line
+/// without one, the terminator of the line before it; `Lf` when the source
+/// has no newline at all.
+fn region_ending(source: &str, start: usize) -> Ending {
+    let bytes = source.as_bytes();
+    let start = start.min(bytes.len());
+    let newline = bytes[start..]
+        .iter()
+        .position(|&byte| byte == b'\n')
+        .map(|at| start.saturating_add(at))
+        .or_else(|| bytes[..start].iter().rposition(|&byte| byte == b'\n'));
+    match newline {
+        Some(at) if at > 0 && bytes[at.saturating_sub(1)] == b'\r' => Ending::Crlf,
+        _ => Ending::Lf,
+    }
+}
+
+/// Builds the postimage: `source` with each range replaced by the text at the
+/// same index of `replacements`.
 ///
 /// The ranges are non-overlapping and in order; everything between them is
 /// copied as it was.
-fn splice(source: &str, spans: &[Range<usize>], replacement: &str, capacity: usize) -> String {
+fn splice(source: &str, spans: &[Range<usize>], replacements: &[&str], capacity: usize) -> String {
     let mut out = String::with_capacity(capacity);
     let mut copied = 0usize;
-    for span in spans {
+    for (span, replacement) in spans.iter().zip(replacements) {
         out.push_str(&source[copied..span.start]);
         out.push_str(replacement);
         copied = span.end;
@@ -1478,8 +1540,85 @@ mod tests {
     #[test]
     fn a_crlf_file_matches_an_lf_search_at_the_line_endings_tier() {
         let (after, relaxed) = edited("one\r\ntwo\r\nthree\r\n", "one\ntwo", "ONE\nTWO");
-        assert_eq!(after, "ONE\nTWO\r\nthree\r\n");
+        assert_eq!(after, "ONE\r\nTWO\r\nthree\r\n");
         assert_eq!(relaxed, [crate::matching::Tier::LineEndings]);
+    }
+
+    #[test]
+    fn untouched_lines_keep_their_own_terminators_in_a_mixed_file() {
+        let (after, _) = edited("one\ntwo\r\nthree\rfour\n", "two", "TWO");
+        assert_eq!(after, "one\nTWO\r\nthree\rfour\n");
+    }
+
+    #[test]
+    fn an_lf_edit_of_a_crlf_file_writes_crlf_lines() {
+        let (after, relaxed) = edited("a\r\nb\r\nc\r\nd\r\n", "b\nc", "b\nx\nc");
+        assert_eq!(after, "a\r\nb\r\nx\r\nc\r\nd\r\n");
+        assert_eq!(relaxed, [crate::matching::Tier::LineEndings]);
+        let (after, relaxed) = edited("foo\r\nend\r\n", "foo", "foo\nbar");
+        assert_eq!(after, "foo\r\nbar\r\nend\r\n");
+        assert!(relaxed.is_empty());
+    }
+
+    #[test]
+    fn inserted_lines_take_the_terminator_of_the_first_matched_line() {
+        let body = "first\nsecond\r\n";
+        let (after, _) = edited(body, "second", "second\nmore");
+        assert_eq!(after, "first\nsecond\r\nmore\r\n");
+        let (after, _) = edited(body, "first", "first\nmore");
+        assert_eq!(after, "first\nmore\nsecond\r\n");
+        // A last line without a terminator takes the one before it.
+        let (after, _) = edited("one\r\ntail", "tail", "tail\nend");
+        assert_eq!(after, "one\r\ntail\r\nend");
+    }
+
+    #[test]
+    fn every_replaced_occurrence_takes_its_own_line_ending() {
+        let dir = dir();
+        let path = file_in(&dir, "file.txt");
+        std::fs::write(&path, "x\nx\r\n").expect("seed");
+        apply(prepare_edit(&path, "x", "y\nz", Occurrence::All).expect("prepare")).expect("apply");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read"),
+            "y\nz\ny\r\nz\r\n"
+        );
+    }
+
+    #[test]
+    fn a_replacement_carrying_carriage_returns_is_written_verbatim() {
+        let (after, _) = edited("one\ntwo\n", "one", "one\r\nhalf");
+        assert_eq!(after, "one\r\nhalf\ntwo\n");
+        let (after, _) = edited("one\r\ntwo\r\n", "one", "one\nhalf\r\nmore");
+        assert_eq!(after, "one\nhalf\r\nmore\r\ntwo\r\n");
+    }
+
+    #[test]
+    fn an_edit_that_changes_only_carriage_returns_applies_exactly() {
+        let (after, relaxed) = edited("x\r\na\r\nb\r\ny\r\n", "a\r\nb", "a\nb");
+        assert_eq!(after, "x\r\na\nb\r\ny\r\n");
+        assert!(relaxed.is_empty());
+        // Without an exact match it is a miss, not a line-endings match.
+        let dir = dir();
+        let path = file_in(&dir, "file.txt");
+        std::fs::write(&path, "a\r\nb\r\n").expect("seed");
+        let err =
+            prepare_edit(&path, "a\nb", "a\r\nb", Occurrence::Unique).expect_err("no exact match");
+        assert_eq!(err.code(), ErrorCode::NotFound);
+    }
+
+    #[test]
+    fn a_bom_survives_an_edit_of_the_first_line() {
+        let body = "\u{FEFF}fn main() {   \n    run();\n}\n";
+        let (after, relaxed) = edited(body, "fn main() {\n    run();", "fn main() {\n    go();");
+        assert_eq!(after, "\u{FEFF}fn main() {\n    go();\n}\n");
+        assert_eq!(relaxed, [crate::matching::Tier::TrailingWhitespace]);
+        let (after, relaxed) = edited(
+            body,
+            "  fn main() {\n      run();",
+            "  fn start() {\n      go();",
+        );
+        assert_eq!(after, "\u{FEFF}fn start() {\n    go();\n}\n");
+        assert_eq!(relaxed, [crate::matching::Tier::Indentation]);
     }
 
     #[test]
