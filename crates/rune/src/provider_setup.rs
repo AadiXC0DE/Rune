@@ -489,6 +489,17 @@ pub fn cached_prices(settings: &Settings, paths: &Paths) -> Option<rune_net::mod
         .prices
 }
 
+/// Returns whether the configured model takes images, from the cache alone.
+///
+/// Absent when nothing has been cached yet or the catalog does not list the
+/// model's inputs.
+pub fn cached_vision(settings: &Settings, paths: &Paths) -> Option<bool> {
+    let key = rune_net::models_dev::catalog_key(&settings.provider.to_string())?;
+    read_cached_limits(&paths.models_cache_file(), key)?
+        .get(&settings.model)?
+        .vision
+}
+
 /// What shell commands receive beyond the minimal environment: the configured
 /// `shell_env` names, never the active provider's credential variables.
 #[must_use]

@@ -3,8 +3,10 @@
 use std::collections::BTreeMap;
 use std::io::Read as _;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
+use rune_agent::turn::CallResult;
 use rune_core::error::{ErrorCode, Result, RuneError};
 use rune_net::message::{ContentPart, ImageRef};
 use rune_net::provider::{Provider, ProviderCapabilities, RequestPlan, Routing};
@@ -151,6 +153,64 @@ impl Provider for AttachedProvider {
     }
 }
 
+/// First id given to a tool image.
+const FIRST_TOOL_IMAGE_ID: u64 = 1 << 32;
+
+/// Images tools returned during a conversation, by the id recorded in its history.
+#[derive(Default)]
+pub struct ToolImages {
+    next: AtomicU64,
+    data: Mutex<BTreeMap<u64, Arc<str>>>,
+}
+
+impl ToolImages {
+    /// Ids start at 1 << 32 so they never meet prompt attachment ids.
+    pub fn attach(&self, result: &CallResult) -> Vec<ContentPart> {
+        let Some(image) = result.output.image.as_ref().filter(|_| result.executed) else {
+            return Vec::new();
+        };
+        let id = FIRST_TOOL_IMAGE_ID.saturating_add(self.next.fetch_add(1, Ordering::Relaxed));
+        self.data
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(id, Arc::from(crate::session::base64_encode(&image.bytes)));
+        vec![ContentPart::Image {
+            image: ImageRef {
+                id,
+                media_type: image.media_type.to_owned(),
+                encoded_bytes: image.bytes.len() as u64,
+            },
+        }]
+    }
+
+    /// Copies every held image into the plan before a request is built.
+    ///
+    /// A tool image id already in the plan without data, as a resumed
+    /// conversation holds, is never given out again, so it cannot pick up the
+    /// data of a later image.
+    pub fn hydrate(&self, plan: &mut RequestPlan) {
+        let data = self
+            .data
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let recorded = plan
+            .messages
+            .iter()
+            .flat_map(|message| &message.parts)
+            .filter_map(|part| match part {
+                ContentPart::Image { image } if image.id >= FIRST_TOOL_IMAGE_ID => Some(image.id),
+                _ => None,
+            })
+            .max();
+        if let Some(id) = recorded {
+            let next = id.saturating_sub(FIRST_TOOL_IMAGE_ID).saturating_add(1);
+            self.next.fetch_max(next, Ordering::Relaxed);
+        }
+        plan.image_data
+            .extend(data.iter().map(|(id, encoded)| (*id, Arc::clone(encoded))));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -208,6 +268,76 @@ mod tests {
             }
             assert!(!body.to_string().contains("image-ref:"));
         }
+    }
+
+    fn image_result(id: &str, executed: bool) -> CallResult {
+        let mut output = rune_tools::ToolOutput::success("image shot.png (3 bytes) attached");
+        output.image = Some(rune_tools::ToolImage {
+            media_type: "image/png",
+            bytes: PNG.to_vec(),
+        });
+        CallResult {
+            call: rune_agent::turn::PreparedCall {
+                id: id.to_owned(),
+                name: "read_file".to_owned(),
+                arguments: r#"{"path":"shot.png"}"#.to_owned(),
+            },
+            output,
+            executed,
+        }
+    }
+
+    #[test]
+    fn tool_images_are_attached_once_and_hydrated_into_each_request() {
+        let images = ToolImages::default();
+        let first = images.attach(&image_result("a", true));
+        let second = images.attach(&image_result("b", true));
+        assert!(images.attach(&image_result("c", false)).is_empty());
+        assert!(
+            images
+                .attach(&CallResult {
+                    output: rune_tools::ToolOutput::success("text"),
+                    ..image_result("d", true)
+                })
+                .is_empty()
+        );
+        let ids: Vec<u64> = first
+            .iter()
+            .chain(&second)
+            .map(|part| match part {
+                ContentPart::Image { image } => {
+                    assert_eq!(image.media_type, "image/png");
+                    assert_eq!(image.encoded_bytes, PNG.len() as u64);
+                    image.id
+                }
+                other => panic!("not an image: {other:?}"),
+            })
+            .collect();
+        assert_eq!(ids, vec![1 << 32, (1 << 32) + 1]);
+
+        let encoded = crate::session::base64_encode(PNG);
+        for _ in 0..2 {
+            let mut plan = RequestPlan::new("fixture-model");
+            images.hydrate(&mut plan);
+            assert_eq!(plan.image_data.len(), 2);
+            assert_eq!(plan.image_data[&(1 << 32)].as_ref(), encoded);
+            assert_eq!(plan.image_data[&((1 << 32) + 1)].as_ref(), encoded);
+        }
+
+        // A resumed history may hold ids this process never gave out.
+        let resumed = ToolImages::default();
+        let mut plan = RequestPlan::new("fixture-model");
+        plan.messages = vec![Message::user_parts(vec![ContentPart::Image {
+            image: ImageRef {
+                id: (1 << 32) + 4,
+                media_type: "image/png".to_owned(),
+                encoded_bytes: 3,
+            },
+        }])];
+        resumed.hydrate(&mut plan);
+        assert!(plan.image_data.is_empty());
+        let fresh = resumed.attach(&image_result("e", true));
+        assert!(matches!(&fresh[..], [ContentPart::Image { image }] if image.id == (1 << 32) + 5));
     }
 
     #[test]

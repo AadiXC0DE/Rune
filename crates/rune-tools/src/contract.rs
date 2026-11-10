@@ -118,6 +118,15 @@ pub struct ToolOutput {
     /// call's row. It is never sent to the model, which already knows what it
     /// asked to change.
     pub diff: Option<String>,
+    /// An image for the model to see, attached to the result by the host.
+    pub image: Option<ToolImage>,
+}
+
+/// An image a tool returns for the model to see.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct ToolImage {
+    pub media_type: &'static str,
+    pub bytes: Vec<u8>,
 }
 
 impl ToolOutput {
@@ -132,6 +141,7 @@ impl ToolOutput {
             plan_update: None,
             full_text: None,
             diff: None,
+            image: None,
         }
     }
 
@@ -150,6 +160,7 @@ impl ToolOutput {
             plan_update: None,
             full_text: None,
             diff: None,
+            image: None,
         }
     }
 
@@ -230,6 +241,8 @@ pub struct ExecutionContext {
     /// closest to a missed edit. False when reading that file would need an
     /// approval the model has not been given.
     pub quote_files: bool,
+    /// Whether the model can see an image a tool attaches to its result.
+    pub accepts_images: bool,
 }
 
 impl ExecutionContext {
@@ -252,7 +265,15 @@ impl ExecutionContext {
             network: false,
             cache_roots: Vec::new(),
             quote_files: true,
+            accepts_images: false,
         }
+    }
+
+    /// Sets whether the model can see an image a tool attaches.
+    #[must_use]
+    pub const fn with_accepts_images(mut self, accepts: bool) -> Self {
+        self.accepts_images = accepts;
+        self
     }
 
     /// Sets whether a tool may quote file contents in an error.
@@ -386,6 +407,7 @@ impl ExecutionContext {
             network: self.network,
             cache_roots: self.cache_roots.clone(),
             quote_files: self.quote_files,
+            accepts_images: self.accepts_images,
         }
     }
 

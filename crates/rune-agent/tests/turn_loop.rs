@@ -83,6 +83,10 @@ struct TestHost {
     max_output: Option<u64>,
     /// Output ceilings of the plans that reached request preparation.
     planned_output: Mutex<Vec<Option<u64>>>,
+    /// Whether the model is described as seeing images tools attach.
+    accepts_images: bool,
+    /// Base64 data of the images tools attached, by image id.
+    tool_images: Mutex<std::collections::BTreeMap<u64, Arc<str>>>,
 }
 
 impl TestHost {
@@ -120,6 +124,8 @@ impl TestHost {
             cancel_on_execute: Mutex::new(false),
             max_output: None,
             planned_output: Mutex::new(Vec::new()),
+            accepts_images: false,
+            tool_images: Mutex::new(std::collections::BTreeMap::new()),
         }
     }
 
@@ -256,7 +262,32 @@ impl Host for TestHost {
             .lock()
             .expect("planned output")
             .push(plan.max_output_tokens);
+        plan.image_data
+            .extend(self.tool_images.lock().expect("images").clone());
         Ok(())
+    }
+
+    fn accepts_images(&self) -> bool {
+        self.accepts_images
+    }
+
+    fn tool_attachments(
+        &self,
+        result: &rune_agent::turn::CallResult,
+    ) -> Vec<rune_net::message::ContentPart> {
+        let Some(image) = result.output.image.as_ref().filter(|_| result.executed) else {
+            return Vec::new();
+        };
+        let mut images = self.tool_images.lock().expect("images");
+        let id = (1_u64 << 32).saturating_add(images.len() as u64);
+        images.insert(id, Arc::from(base64(&image.bytes)));
+        vec![rune_net::message::ContentPart::Image {
+            image: rune_net::message::ImageRef {
+                id,
+                media_type: image.media_type.to_owned(),
+                encoded_bytes: image.bytes.len() as u64,
+            },
+        }]
     }
 
     fn fetch(&self) -> Box<dyn rune_net::fetch::Fetch> {
@@ -404,6 +435,13 @@ impl Host for TestHost {
         arguments: &serde_json::Value,
         context: &ExecutionContext,
     ) -> Result<ToolOutput> {
+        if name == "read_file"
+            && self.accepts_images
+            && let Some(registry) = &self.registry
+        {
+            // The per-call context carries whether the model can see an image.
+            return registry.call(name, arguments, context);
+        }
         if name == "update_plan" {
             return self
                 .registry
@@ -4678,4 +4716,68 @@ fn a_patch_counts_as_a_change_for_verification() {
         Verification::Unverified
     );
     assert_eq!(Verification::of(&[patch, test]), Verification::Verified);
+}
+
+/// Standard base64 with padding, for comparing request bodies.
+fn base64(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for chunk in bytes.chunks(3) {
+        let b = [
+            chunk[0],
+            chunk.get(1).copied().unwrap_or(0),
+            chunk.get(2).copied().unwrap_or(0),
+        ];
+        let n = u32::from(b[0]) << 16 | u32::from(b[1]) << 8 | u32::from(b[2]);
+        for (i, shift) in [18, 12, 6, 0].into_iter().enumerate() {
+            if i <= chunk.len() {
+                out.push(char::from(ALPHABET[(n >> shift) as usize & 63]));
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
+}
+
+#[test]
+fn an_image_read_reaches_the_next_request() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let mut png = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+    png.extend_from_slice(&[0x00, 0x00, 0x00, 0x0D]);
+    png.extend_from_slice(b"IHDR");
+    png.extend_from_slice(&1280_u32.to_be_bytes());
+    png.extend_from_slice(&720_u32.to_be_bytes());
+    png.extend_from_slice(&[0x5A; 300]);
+    std::fs::write(workspace.path().join("shot.png"), &png).expect("fixture");
+    let endpoint = MockEndpoint::start(vec![
+        Script::tool_call("look", "read_file", r#"{"path":"shot.png"}"#),
+        Script::text("A wide screenshot."),
+    ]);
+    let mut registry = Registry::new();
+    registry
+        .insert(Box::new(rune_tools::ReadFile::new()))
+        .expect("registered");
+    let mut host = TestHost::new(endpoint).with_tools(registry.all_schemas());
+    host.workspace = Utf8PathBuf::from_path_buf(workspace.path().to_owned()).expect("UTF-8 path");
+    host.registry = Some(registry);
+    host.accepts_images = true;
+
+    let mut history = rune_agent::History::new();
+    history.push_user("what is in shot.png");
+    let outcome = run_turn(&mut history, &host).expect("turn");
+    assert_eq!(outcome.stop_reason, StopReason::Completed);
+    assert_eq!(
+        outcome.calls[0].output.text,
+        format!("image shot.png (1280x720, {} bytes) attached", png.len())
+    );
+
+    let server = host.server.as_ref().expect("server");
+    assert_eq!(server.request_count(), 2);
+    let body = server.last_body().expect("second request").to_string();
+    assert_eq!(body.matches(&base64(&png)).count(), 1, "{body}");
+    assert!(
+        body.contains("Images from the tool results above."),
+        "{body}"
+    );
 }

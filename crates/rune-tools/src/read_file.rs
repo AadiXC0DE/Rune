@@ -2,12 +2,14 @@
 
 use std::collections::VecDeque;
 use std::fmt::Write as _;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read as _};
 
 use camino::{Utf8Component, Utf8Path, Utf8PathBuf};
 use rune_core::error::{ErrorCode, Result, RuneError};
 
-use crate::contract::{Activity, ExecutionContext, Tool, ToolOutput, validate_closed_arguments};
+use crate::contract::{
+    Activity, ExecutionContext, Tool, ToolImage, ToolOutput, validate_closed_arguments,
+};
 use crate::workspace::{
     FileLimits, SUMMARY_RESERVE_BYTES, display_path, join_capped, read_line_bounded_checked,
     resolve, string_arg, truncate_line, usize_arg,
@@ -27,6 +29,9 @@ const MAX_SUGGESTIONS: usize = 3;
 
 /// Directory entries examined for a name that differs only in case.
 const LISTING_LIMIT: usize = 1_000;
+
+/// Largest image attached to a result for a model that can see it.
+const MAX_ATTACHED_IMAGE_BYTES: u64 = 5 * 1024 * 1024;
 
 /// Reads a bounded window of lines from one text file.
 #[derive(Clone, Copy, Debug, Default)]
@@ -131,8 +136,16 @@ impl Tool for ReadFile {
         let probe = reader.fill_buf().unwrap_or_default().to_vec();
         context.check_cancelled()?;
         if let Some(format) = image_format(&probe) {
+            if context.accepts_images && size <= MAX_ATTACHED_IMAGE_BYTES {
+                return attach_image(&display, format, reader);
+            }
+            let note = if context.accepts_images {
+                "It is over the 5 MiB that can be attached. "
+            } else {
+                ""
+            };
             return Ok(ToolOutput::success(image_description(
-                &display, format, size,
+                &display, format, size, note,
             )));
         }
         let content = classify(&probe);
@@ -538,12 +551,83 @@ fn image_format(bytes: &[u8]) -> Option<ImageFormat> {
 }
 
 /// Describes an image instead of returning its bytes.
-fn image_description(display: &str, format: ImageFormat, size: u64) -> String {
+fn image_description(display: &str, format: ImageFormat, size: u64, note: &str) -> String {
     format!(
-        "{display} is a {} image ({}), {size} bytes. Image bytes are not returned as text.",
+        "{display} is a {} image ({}), {size} bytes. {note}Image bytes are not returned as text.",
         format.name(),
         format.media_type()
     )
+}
+
+/// Reads a whole image and returns it attached to the result.
+fn attach_image(
+    display: &str,
+    format: ImageFormat,
+    reader: BufReader<std::fs::File>,
+) -> Result<ToolOutput> {
+    let mut bytes = Vec::new();
+    reader
+        .take(MAX_ATTACHED_IMAGE_BYTES)
+        .read_to_end(&mut bytes)
+        .map_err(|err| {
+            RuneError::new(
+                ErrorCode::InvalidState,
+                format!("`{display}` could not be read: {err}"),
+            )
+        })?;
+    let n = bytes.len();
+    let text = match dimensions(format, &bytes) {
+        Some((w, h)) => format!("image {display} ({w}x{h}, {n} bytes) attached"),
+        None => format!("image {display} ({n} bytes) attached"),
+    };
+    let mut output = ToolOutput::success(text);
+    output.image = Some(ToolImage {
+        media_type: format.media_type(),
+        bytes,
+    });
+    Ok(output)
+}
+
+/// Reads an image's width and height from its header, without decoding it.
+fn dimensions(format: ImageFormat, bytes: &[u8]) -> Option<(u32, u32)> {
+    fn field<const N: usize>(bytes: &[u8], at: usize) -> Option<[u8; N]> {
+        bytes.get(at..at.checked_add(N)?)?.try_into().ok()
+    }
+    let be16 = |at: usize| field(bytes, at).map(u16::from_be_bytes).map(u32::from);
+    let le16 = |at: usize| field(bytes, at).map(u16::from_le_bytes).map(u32::from);
+    let le24 = |at: usize| field::<3>(bytes, at).map(|[a, b, c]| u32::from_le_bytes([a, b, c, 0]));
+    match format {
+        ImageFormat::Png => Some((
+            field(bytes, 16).map(u32::from_be_bytes)?,
+            field(bytes, 20).map(u32::from_be_bytes)?,
+        )),
+        ImageFormat::Gif => Some((le16(6)?, le16(8)?)),
+        ImageFormat::Jpeg => {
+            let mut at: usize = 2;
+            loop {
+                let [tag, marker] = field(bytes, at)?;
+                if tag != 0xFF {
+                    return None;
+                }
+                if (0xC0..=0xCF).contains(&marker) && !matches!(marker, 0xC4 | 0xC8 | 0xCC) {
+                    return Some((be16(at.checked_add(7)?)?, be16(at.checked_add(5)?)?));
+                }
+                let length = usize::try_from(be16(at.checked_add(2)?)?).ok()?;
+                at = at.checked_add(2)?.checked_add(length)?;
+            }
+        }
+        ImageFormat::WebP => match &field::<4>(bytes, 12)? {
+            b"VP8 " => Some((le16(26)? & 0x3FFF, le16(28)? & 0x3FFF)),
+            b"VP8L" => {
+                let packed = field(bytes, 21).map(u32::from_le_bytes)?;
+                let width = (packed & 0x3FFF).checked_add(1)?;
+                let height = (packed.checked_shr(14)? & 0x3FFF).checked_add(1)?;
+                Some((width, height))
+            }
+            b"VP8X" => Some((le24(24)?.checked_add(1)?, le24(27)?.checked_add(1)?)),
+            _ => None,
+        },
+    }
 }
 
 /// What the leading bytes of a file say about its content.
@@ -1287,6 +1371,161 @@ mod tests {
         );
         assert_eq!(image_format(b"RIFF\x00\x00\x00\x00WAVEfmt "), None);
         assert_eq!(image_format(b"plain text"), None);
+    }
+
+    fn png_sized(width: u32, height: u32, padding: usize) -> Vec<u8> {
+        let mut bytes = png_bytes();
+        bytes.extend_from_slice(&width.to_be_bytes());
+        bytes.extend_from_slice(&height.to_be_bytes());
+        bytes.resize(bytes.len().saturating_add(padding), 0);
+        bytes
+    }
+
+    fn jpeg_sized(sof: u8, width: u16, height: u16) -> Vec<u8> {
+        let mut bytes = vec![0xFF, 0xD8];
+        bytes.extend_from_slice(&[0xFF, 0xE0, 0x00, 0x06, b'J', b'F', b'I', b'F']);
+        bytes.extend_from_slice(&[0xFF, 0xC4, 0x00, 0x04, 0x00, 0x00]);
+        bytes.extend_from_slice(&[0xFF, sof, 0x00, 0x11, 0x08]);
+        bytes.extend_from_slice(&height.to_be_bytes());
+        bytes.extend_from_slice(&width.to_be_bytes());
+        bytes.extend_from_slice(&[0x03; 10]);
+        bytes
+    }
+
+    fn webp(chunk: &[u8; 4], body: &[u8]) -> Vec<u8> {
+        let mut bytes = b"RIFF\x00\x00\x00\x00WEBP".to_vec();
+        bytes.extend_from_slice(chunk);
+        bytes.extend_from_slice(&[0x00; 4]);
+        bytes.extend_from_slice(body);
+        bytes
+    }
+
+    fn read_image(repo: &Repo, path: &str, accepts_images: bool) -> ToolOutput {
+        ReadFile::default()
+            .call(
+                &serde_json::json!({ "path": path }),
+                &repo.context().with_accepts_images(accepts_images),
+            )
+            .expect("call")
+    }
+
+    #[test]
+    fn an_image_is_attached_when_the_model_can_see() {
+        let repo = Repo::new();
+        let bytes = png_sized(1280, 720, 1000);
+        repo.write_bytes("data/shot.png", &bytes);
+        let output = read_image(&repo, "data/shot.png", true);
+        assert!(!output.is_error);
+        assert_eq!(
+            output.text,
+            format!(
+                "image data/shot.png (1280x720, {} bytes) attached",
+                bytes.len()
+            )
+        );
+        assert_eq!(
+            output.image,
+            Some(ToolImage {
+                media_type: "image/png",
+                bytes,
+            })
+        );
+    }
+
+    #[test]
+    fn an_image_is_described_when_the_model_cannot_see() {
+        let repo = Repo::new();
+        repo.write_bytes("data/shot.png", &png_sized(1280, 720, 1000));
+        let output = read_image(&repo, "data/shot.png", false);
+        assert!(!output.is_error);
+        assert_eq!(
+            output.text,
+            "data/shot.png is a PNG image (image/png), 1024 bytes. \
+             Image bytes are not returned as text."
+        );
+        assert_eq!(output.image, None);
+    }
+
+    #[test]
+    fn an_oversized_image_is_described() {
+        let repo = Repo::new();
+        let bytes = png_sized(64, 64, 6 * 1024 * 1024);
+        repo.write_bytes("data/huge.png", &bytes);
+        let output = read_image(&repo, "data/huge.png", true);
+        assert!(!output.is_error);
+        assert_eq!(
+            output.text,
+            format!(
+                "data/huge.png is a PNG image (image/png), {} bytes. It is over the 5 MiB \
+                 that can be attached. Image bytes are not returned as text.",
+                bytes.len()
+            )
+        );
+        assert_eq!(output.image, None);
+    }
+
+    #[test]
+    fn dimensions_are_read_from_every_format() {
+        assert_eq!(
+            dimensions(ImageFormat::Png, &png_sized(1280, 720, 0)),
+            Some((1280, 720))
+        );
+        let mut gif = b"GIF89a".to_vec();
+        gif.extend_from_slice(&[0x40, 0x01, 0xF0, 0x00]);
+        assert_eq!(dimensions(ImageFormat::Gif, &gif), Some((320, 240)));
+        assert_eq!(
+            dimensions(ImageFormat::Jpeg, &jpeg_sized(0xC0, 800, 600)),
+            Some((800, 600))
+        );
+        assert_eq!(
+            dimensions(ImageFormat::Jpeg, &jpeg_sized(0xC2, 1024, 768)),
+            Some((1024, 768))
+        );
+        let mut lossy = vec![0x00, 0x00, 0x00, 0x9D, 0x01, 0x2A];
+        lossy.extend_from_slice(&(0x0280_u16 | 0x4000).to_le_bytes());
+        lossy.extend_from_slice(&480_u16.to_le_bytes());
+        assert_eq!(
+            dimensions(ImageFormat::WebP, &webp(b"VP8 ", &lossy)),
+            Some((640, 480))
+        );
+        let packed: u32 = 0x63 | (0x31 << 14);
+        let mut lossless = vec![0x2F];
+        lossless.extend_from_slice(&packed.to_le_bytes());
+        assert_eq!(
+            dimensions(ImageFormat::WebP, &webp(b"VP8L", &lossless)),
+            Some((100, 50))
+        );
+        let mut extended = vec![0x00; 4];
+        extended.extend_from_slice(&69_999_u32.to_le_bytes()[..3]);
+        extended.extend_from_slice(&2_u32.to_le_bytes()[..3]);
+        assert_eq!(
+            dimensions(ImageFormat::WebP, &webp(b"VP8X", &extended)),
+            Some((70_000, 3))
+        );
+    }
+
+    #[test]
+    fn a_truncated_header_gives_no_dimensions() {
+        let png = png_sized(1280, 720, 0);
+        assert_eq!(dimensions(ImageFormat::Png, &png[..20]), None);
+        assert_eq!(dimensions(ImageFormat::Gif, b"GIF89a\x40\x01\xF0"), None);
+        let jpeg = jpeg_sized(0xC0, 800, 600);
+        assert_eq!(dimensions(ImageFormat::Jpeg, &jpeg[..22]), None);
+        assert_eq!(
+            dimensions(ImageFormat::Jpeg, &[0xFF, 0xD8, 0x00, 0xC0, 0x00]),
+            None
+        );
+        assert_eq!(dimensions(ImageFormat::WebP, &webp(b"VP8L", &[0x2F])), None);
+        assert_eq!(
+            dimensions(ImageFormat::WebP, &webp(b"ALPH", &[0; 16])),
+            None
+        );
+
+        let repo = Repo::new();
+        repo.write_bytes("data/short.png", &png[..20]);
+        let output = read_image(&repo, "data/short.png", true);
+        assert_eq!(output.text, "image data/short.png (20 bytes) attached");
+        assert!(output.image.is_some());
     }
 
     #[test]

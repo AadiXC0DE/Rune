@@ -498,6 +498,12 @@ pub trait Host {
     fn tool_attachments(&self, _result: &CallResult) -> Vec<ContentPart> {
         Vec::new()
     }
+
+    /// Returns true when the model can see an image a tool attaches to its
+    /// result. The default is false, so tools describe images instead.
+    fn accepts_images(&self) -> bool {
+        false
+    }
 }
 
 /// One entry of what a turn said and did, in the order it happened.
@@ -2152,6 +2158,9 @@ fn prepare_call(
                 .iter()
                 .all(|(_, path)| host.decide_quietly("read_file", Some(path)) == Outcome::Allow),
         );
+    }
+    if call.name == "read_file" {
+        context = context.with_accepts_images(host.accepts_images());
     }
 
     host.emit(Event::ToolStarted {

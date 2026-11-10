@@ -1510,6 +1510,7 @@ impl<W: Write + Send + 'static> Host for TurnHost<W> {
                     plan_update: None,
                     full_text: None,
                     diff: None,
+                    image: None,
                 },
                 Err(err) => ToolOutput::from_error(&err),
             };

@@ -31,13 +31,18 @@ pub struct Limits {
     pub output: Option<u64>,
     /// Published prices, when the catalog lists them.
     pub prices: Option<Prices>,
+    /// Whether the model takes images, when the catalog lists its inputs.
+    pub vision: Option<bool>,
 }
 
 impl Limits {
     /// Returns whether nothing usable was described.
     #[must_use]
     pub const fn is_empty(&self) -> bool {
-        self.context.is_none() && self.output.is_none() && self.prices.is_none()
+        self.context.is_none()
+            && self.output.is_none()
+            && self.prices.is_none()
+            && self.vision.is_none()
     }
 }
 
@@ -193,10 +198,16 @@ pub fn parse(body: &str, key: &str) -> Option<ProviderLimits> {
             }),
             _ => None,
         };
+        let vision = entry
+            .get("modalities")
+            .and_then(|m| m.get("input"))
+            .and_then(serde_json::Value::as_array)
+            .map(|inputs| inputs.iter().any(|input| input == "image"));
         let entry = Limits {
             context,
             output,
             prices,
+            vision,
         };
         if entry.is_empty() {
             continue;
@@ -346,5 +357,22 @@ mod tests {
         // A compatible endpoint is not described by any published catalog.
         assert_eq!(catalog_key("chat_completions"), None);
         assert_eq!(catalog_key("my-self-hosted"), None);
+    }
+
+    #[test]
+    fn image_input_is_read_from_the_modalities() {
+        let doc = r#"{ "p": { "models": {
+            "sees": { "limit": { "context": 1000 },
+                      "modalities": { "input": ["text", "image"], "output": ["text"] } },
+            "blind": { "limit": { "context": 1000 },
+                       "modalities": { "input": ["text"], "output": ["text"] } },
+            "silent": { "limit": { "context": 1000 } },
+            "only": { "modalities": { "input": ["image"] } }
+        } } }"#;
+        let limits = parse(doc, "p").expect("parsed");
+        assert_eq!(limits.get("sees").expect("sees").vision, Some(true));
+        assert_eq!(limits.get("blind").expect("blind").vision, Some(false));
+        assert_eq!(limits.get("silent").expect("silent").vision, None);
+        assert_eq!(limits.get("only").expect("only").vision, Some(true));
     }
 }

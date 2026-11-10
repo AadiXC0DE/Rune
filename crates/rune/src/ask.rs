@@ -582,6 +582,10 @@ struct AskHost<'a> {
     encoded_request: std::sync::Mutex<Option<String>>,
     /// Prices of the model, when known, to estimate what the run spends.
     prices: Option<rune_net::models_dev::Prices>,
+    /// Whether the cached catalog says the model takes images.
+    vision: bool,
+    /// Images tools returned, carried into every request.
+    tool_images: crate::attachments::ToolImages,
     /// Estimated spend so far in millionths of a dollar; unknown until a
     /// priced response arrives.
     spent: std::sync::Mutex<Option<u64>>,
@@ -706,6 +710,7 @@ impl Host for AskHost<'_> {
         plan: &mut rune_net::provider::RequestPlan,
         client: &dyn rune_net::fetch::Fetch,
     ) -> Result<()> {
+        self.tool_images.hydrate(plan);
         // Checked before compacting, whose summary request costs money too.
         crate::spend::check(*lock(&self.spent), self.spend_limit, "run").map_err(|err| {
             err.with_hint("raise it with --max-cost, or with session_spend_cents")
@@ -729,6 +734,14 @@ impl Host for AskHost<'_> {
     fn concurrent_tool_host(&self, name: &str) -> Option<&(dyn Host + Sync)> {
         // Independent reads in one reply run together, as in the session.
         self.registry.get(name)?.is_read_only().then_some(self)
+    }
+
+    fn tool_attachments(&self, result: &turn::CallResult) -> Vec<ContentPart> {
+        self.tool_images.attach(result)
+    }
+
+    fn accepts_images(&self) -> bool {
+        self.dialect().capabilities().images && self.vision
     }
 
     fn take_encoded_request(&self) -> Option<String> {
@@ -1085,6 +1098,8 @@ pub fn run(
         compaction_usage: std::sync::Mutex::new(Usage::default()),
         encoded_request: std::sync::Mutex::new(None),
         prices,
+        vision: crate::provider_setup::cached_vision(settings, paths).unwrap_or(false),
+        tool_images: crate::attachments::ToolImages::default(),
         spent: std::sync::Mutex::new(None),
         spend_limit,
         announced: std::sync::Mutex::new(std::collections::BTreeSet::new()),

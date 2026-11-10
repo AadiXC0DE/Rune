@@ -429,6 +429,7 @@ fn render(label: &str, reading: &Reading, cap: usize, failed: bool, untracked: &
         plan_update: None,
         full_text: None,
         diff: None,
+        image: None,
     }
 }
 

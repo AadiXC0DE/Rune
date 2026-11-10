@@ -276,6 +276,10 @@ struct SessionHost {
     output_limit: std::sync::atomic::AtomicU64,
     /// Published prices of the current model, when a catalog lists them.
     prices: Mutex<Option<rune_net::models_dev::Prices>>,
+    /// Whether the fetched catalog says the current model takes images.
+    vision: std::sync::atomic::AtomicBool,
+    /// Images tools returned, carried into every request.
+    tool_images: crate::attachments::ToolImages,
     /// Estimated spend, in millionths of a dollar, at which requests stop.
     spend_limit: Mutex<Option<u64>>,
     /// Whether sandboxed shell commands may use the network; `/network` sets it.
@@ -475,6 +479,25 @@ impl Host for SessionHost {
         self.registry.get(name)?.is_read_only().then_some(self)
     }
 
+    fn tool_attachments(&self, result: &turn::CallResult) -> Vec<rune_net::message::ContentPart> {
+        self.tool_images.attach(result)
+    }
+
+    fn accepts_images(&self) -> bool {
+        if !self.dialect().capabilities().images {
+            return false;
+        }
+        if self.vision.load(std::sync::atomic::Ordering::Relaxed) {
+            return true;
+        }
+        let Some(paths) = &self.usage_paths else {
+            return false;
+        };
+        let mut settings = self.permission_settings.clone();
+        settings.model = self.model_name();
+        crate::provider_setup::cached_vision(&settings, paths).unwrap_or(false)
+    }
+
     fn effort(&self) -> Effort {
         *self
             .effort
@@ -497,6 +520,7 @@ impl Host for SessionHost {
         plan: &mut rune_net::provider::RequestPlan,
         client: &dyn rune_net::fetch::Fetch,
     ) -> Result<()> {
+        self.tool_images.hydrate(plan);
         self.check_spend()?;
         let estimate = request_estimate(self, plan)?;
         if self.context_used.load(std::sync::atomic::Ordering::Relaxed) == 0
@@ -758,6 +782,7 @@ impl Host for SessionHost {
                     plan_update: None,
                     full_text: None,
                     diff: None,
+                    image: None,
                 }),
                 Err(error) if error.code() == ErrorCode::Cancelled => Err(error),
                 Err(error) => Ok(ToolOutput::from_error(&error)),
@@ -817,7 +842,7 @@ impl Host for SessionHost {
         arguments: &serde_json::Value,
         context: &ExecutionContext,
     ) -> Result<ToolOutput> {
-        if matches!(name, "web_fetch" | "update_plan") {
+        if matches!(name, "web_fetch" | "update_plan" | "read_file") {
             return self.registry.call(name, arguments, context);
         }
         self.execute(name, arguments)
@@ -1067,6 +1092,10 @@ impl SessionHost {
             let mut current = lock_model(&self.model);
             model.clone_into(&mut current);
         }
+        // What the previous model could see says nothing about this one; the
+        // cache is asked for the new model instead.
+        self.vision
+            .store(false, std::sync::atomic::Ordering::Relaxed);
         if let Some(window) = context_window.filter(|window| *window > 0) {
             self.context_limit
                 .store(window, std::sync::atomic::Ordering::Relaxed);
@@ -2182,6 +2211,8 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
         provider_retry: Mutex::new(None),
         context_used: std::sync::atomic::AtomicU64::new(initial_context),
         prices: Mutex::new(None),
+        vision: std::sync::atomic::AtomicBool::new(false),
+        tool_images: crate::attachments::ToolImages::default(),
         network: std::sync::atomic::AtomicBool::new(config.settings.shell_network),
         spend_limit: Mutex::new(
             config
@@ -5240,6 +5271,10 @@ fn resolve_context_window(host: &SessionHost, settings: &Settings, paths: &Paths
     let model = catalog.models.iter().find(|model| model.id == current);
     let reported = model.and_then(|model| model.context_window);
     host.adopt_context_window(reported, settings.context_window.is_some());
+    host.vision.store(
+        model.is_some_and(|model| model.capabilities.vision),
+        std::sync::atomic::Ordering::Relaxed,
+    );
     if let Some(prices) = model
         .and_then(|model| model.prices)
         .or_else(|| crate::provider_setup::cached_prices(settings, paths))
@@ -11491,6 +11526,8 @@ mod tests {
             provider_retry: Mutex::new(None),
             context_used: std::sync::atomic::AtomicU64::new(0),
             prices: Mutex::new(None),
+            vision: std::sync::atomic::AtomicBool::new(false),
+            tool_images: crate::attachments::ToolImages::default(),
             spend_limit: Mutex::new(None),
             network: std::sync::atomic::AtomicBool::new(false),
             output_limit: std::sync::atomic::AtomicU64::new(0),

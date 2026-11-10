@@ -460,6 +460,7 @@ impl PluginHost {
             plan_update: None,
             full_text: None,
             diff: None,
+            image: None,
         })
     }
 
