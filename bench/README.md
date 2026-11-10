@@ -25,6 +25,14 @@ python3 bench/kit/run.py validate --tasks bench/tasks   # each task: oracle pass
 | `js-router-params` | JavaScript | Trailing slashes, route specificity and percent-decoding |
 | `js-monorepo-instructions` | JavaScript | A shared pricing bug in a monorepo with nested instructions; the obvious fix breaks another package |
 | `ts-scheduler-stable` | TypeScript | A stable priority queue where the obvious fix breaks re-queued job order |
+| `py-roman-numerals` | Python | Strict Roman numerals for 1 to 3999 with correct subtractive forms |
+| `py-duration-parse` | Python | Duration text with days, hours, minutes and seconds, strict input and a round-trip printed form |
+| `py-inventory-ledger` | Python | Exact cents in stock totals and returns that are not sales |
+| `py-log-cli-since` | Python | A `--since` option with time zones and a case-insensitive `--level` |
+| `py-ttl-cache-refactor` | Python | Two copies of expiry logic merged into one with a single boundary rule |
+| `py-graph-topo` | Python | Three layered faults in a dependency ordering tool, one after another |
+| `py-pipeline-long-log` | Python | A record format hidden in about 400 lines of test output |
+| `py-background-server` | Python | A byte versus character length bug between a JSON client and a server run in a thread |
 
 Each task directory holds `task.json` and these paths:
 

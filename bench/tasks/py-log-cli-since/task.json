@@ -1,0 +1,15 @@
+{
+  "title": "Add a --since option and case-insensitive --level to the log tool",
+  "kind": "feature",
+  "prompt": "Add a --since option to the log tool that keeps only entries at or after a given ISO timestamp, and make --level accept lower case.",
+  "verify": "python3 -m unittest discover -q -s tests -t .",
+  "protected": [
+    "tests",
+    "tests/test_hidden.py"
+  ],
+  "timeoutMs": 600000,
+  "tests": "tests",
+  "tier": 2,
+  "split": "dev",
+  "language": "python"
+}

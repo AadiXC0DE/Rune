@@ -1,0 +1,15 @@
+{
+  "title": "Stop stock report totals drifting and count returns correctly",
+  "kind": "bugfix",
+  "prompt": "The stock report's totals drift by a cent or two after many movements, and returns are counted as sales.",
+  "verify": "python3 -m unittest discover -q -s tests -t .",
+  "protected": [
+    "tests",
+    "tests/test_hidden.py"
+  ],
+  "timeoutMs": 600000,
+  "tests": "tests",
+  "tier": 2,
+  "split": "heldout",
+  "language": "python"
+}

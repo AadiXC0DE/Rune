@@ -1,0 +1,15 @@
+{
+  "title": "Fix duration parsing and make the printed form round-trip",
+  "kind": "bugfix",
+  "prompt": "Durations like 1h30m, 90s or 2d are parsed wrongly, and garbage input is silently treated as zero. Also make the printed form round-trip.",
+  "verify": "python3 -m unittest discover -q -s tests -t .",
+  "protected": [
+    "tests",
+    "tests/test_hidden.py"
+  ],
+  "timeoutMs": 600000,
+  "tests": "tests",
+  "tier": 2,
+  "split": "dev",
+  "language": "python"
+}

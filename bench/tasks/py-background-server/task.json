@@ -1,0 +1,18 @@
+{
+  "title": "Fix non-ASCII requests between the client and the JSON server",
+  "kind": "bugfix",
+  "prompt": "The client and the little JSON server in this project disagree: requests with non-ASCII text hang or get cut off. Fix whichever side is wrong.",
+  "verify": "python3 -m unittest discover -q -s tests -t .",
+  "protected": [
+    "tests",
+    "tests/test_hidden.py"
+  ],
+  "timeoutMs": 900000,
+  "tests": "tests",
+  "tier": 3,
+  "split": "dev",
+  "language": "python",
+  "tags": [
+    "background-process"
+  ]
+}
