@@ -23,6 +23,7 @@ mod diagnostics;
 mod help;
 mod install;
 mod mcp;
+mod model_limits;
 mod path_completion;
 mod permissions;
 mod post_tool_hook;
@@ -203,7 +204,7 @@ fn run(launch: &Launch) -> Result<ExitCode> {
         Command::Usage => run_usage(&paths, launch, &output_flags),
         Command::Auth => run_auth(&settings, &paths, launch, &output_flags),
         Command::Connect => run_connect(&settings, &paths, launch, &output_flags),
-        Command::Models => run_models(&settings, &paths, &output_flags),
+        Command::Models => run_models(&settings, &paths, launch, &output_flags),
         Command::Capabilities => {
             let check = capabilities::check(&settings, &paths, launch)?;
             if output_flags.json {
@@ -790,7 +791,30 @@ fn run_connect(
 /// environment, or the configuration, reports the configured model without
 /// contacting anything, which is the answer a machine with no network needs
 /// rather than a failure.
-fn run_models(settings: &Settings, paths: &Paths, output: &OutputFlags) -> Result<ExitCode> {
+fn run_models(
+    settings: &Settings,
+    paths: &Paths,
+    launch: &Launch,
+    output: &OutputFlags,
+) -> Result<ExitCode> {
+    if launch.has_flag("--refresh") {
+        let refreshed = provider_setup::refresh_catalog(settings, paths)?;
+        if output.json {
+            let value = serde_json::json!({
+                "refreshed": true,
+                "providers": refreshed.providers,
+                "bytes": refreshed.bytes,
+                "path": refreshed.path.as_str(),
+            });
+            println!("{}", serde_json::to_string_pretty(&value)?);
+        } else {
+            println!(
+                "catalog refreshed: {} providers, {} bytes written to {}",
+                refreshed.providers, refreshed.bytes, refreshed.path
+            );
+        }
+        return Ok(ExitCode::from(EXIT_OK));
+    }
     if settings.offline {
         let catalog = provider_setup::catalog_for(settings);
         if output.json {

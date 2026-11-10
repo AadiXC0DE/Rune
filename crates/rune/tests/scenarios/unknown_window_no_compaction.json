@@ -1,0 +1,82 @@
+{
+  "prompt": "Print five long number listings, one at a time.",
+  "workspace": "workspaces/readme_only.json",
+  "user_config": "[limits]\ncompaction_trigger_percent = 10\n",
+  "turns": [
+    {
+      "tool_calls": [
+        {
+          "id": "c1",
+          "name": "shell",
+          "arguments": {
+            "action": "run",
+            "command": "seq 100000 104000"
+          }
+        }
+      ]
+    },
+    {
+      "tool_calls": [
+        {
+          "id": "c2",
+          "name": "shell",
+          "arguments": {
+            "action": "run",
+            "command": "seq 200000 204000"
+          }
+        }
+      ]
+    },
+    {
+      "tool_calls": [
+        {
+          "id": "c3",
+          "name": "shell",
+          "arguments": {
+            "action": "run",
+            "command": "seq 300000 304000"
+          }
+        }
+      ]
+    },
+    {
+      "tool_calls": [
+        {
+          "id": "c4",
+          "name": "shell",
+          "arguments": {
+            "action": "run",
+            "command": "seq 400000 404000"
+          }
+        }
+      ]
+    },
+    {
+      "tool_calls": [
+        {
+          "id": "c5",
+          "name": "shell",
+          "arguments": {
+            "action": "run",
+            "command": "seq 500000 504000"
+          }
+        }
+      ]
+    },
+    {
+      "text": "Five listings were read."
+    }
+  ],
+  "expect": {
+    "exit_code": 0,
+    "final_output": "Five listings were read.",
+    "requests": 6,
+    "request_absent": [
+      {
+        "request": 6,
+        "text": "<context_handoff>"
+      }
+    ],
+    "stop_reason": "end_turn"
+  }
+}

@@ -584,8 +584,10 @@ struct AskHost<'a> {
     jsonl: bool,
     step: std::sync::atomic::AtomicU32,
     emit_error: std::sync::Mutex<Option<RuneError>>,
-    /// The model's context window, which decides when the run compacts.
+    /// The model's context window, which decides when the run compacts; zero when unknown.
     window: rune_agent::compaction::Window,
+    /// Largest answer the model produces, when known.
+    max_output: Option<u64>,
     /// Usage of summary requests, which the turn's own usage does not count.
     compaction_usage: std::sync::Mutex<Usage>,
     /// The request `prepare_request` serialized, for the loop to send.
@@ -701,11 +703,11 @@ impl Host for AskHost<'_> {
     }
 
     fn max_output_tokens(&self) -> Option<u64> {
-        self.settings.model_output_limit()
+        self.max_output
     }
 
     fn context_window(&self) -> Option<u64> {
-        Some(self.window.0)
+        Some(self.window.0).filter(|window| *window > 0)
     }
 
     fn fast_mode(&self) -> bool {
@@ -1017,6 +1019,11 @@ pub fn run(
     // credential for an endpoint that does not exist.
     let endpoint = crate::provider_setup::configured_endpoint(settings, paths)?;
 
+    crate::provider_setup::refresh_catalog_in_background(settings, paths);
+    // Read from configuration and the cache only, so a run never waits on the
+    // network for its limits.
+    let model_limits = crate::model_limits::resolve(settings, paths, &settings.model, None);
+
     let attachments = crate::attachments::Attachments::read(&options.images)?;
     let dialect = attachments.provider(crate::provider_setup::dialect_for(&settings.provider));
 
@@ -1123,12 +1130,8 @@ pub fn run(
         jsonl: options.jsonl,
         step: std::sync::atomic::AtomicU32::new(0),
         emit_error: std::sync::Mutex::new(None),
-        window: rune_agent::compaction::Window(
-            settings
-                .context_window
-                .or_else(|| crate::provider_setup::cached_context_window(settings, paths))
-                .unwrap_or(rune_net::catalog::DEFAULT_CONTEXT_WINDOW),
-        ),
+        window: rune_agent::compaction::Window(model_limits.context_window.unwrap_or_default()),
+        max_output: model_limits.max_output,
         compaction_usage: std::sync::Mutex::new(Usage::default()),
         encoded_request: std::sync::Mutex::new(None),
         prices,

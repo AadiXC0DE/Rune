@@ -249,6 +249,11 @@ pub fn auto_compact_encoded(
 ) -> Result<(Option<AutoCompaction>, String)> {
     let limits = host.limits();
     let (encoded, estimate) = encode_request(host.dialect(), request, window, history.anchor())?;
+    // An unknown window gives no threshold to compact against. The request is
+    // sent as it is, and an overflow the provider reports is recovered from.
+    if window.0 == 0 {
+        return Ok((None, encoded));
+    }
     // A request under the trigger needs no look at the retained tail, which
     // costs a second serialization of nearly the whole conversation: the tail
     // is smaller, so it fits whenever the whole request does.

@@ -2117,6 +2117,12 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
     output: W,
 ) -> Result<u8> {
     let mut limits = config.settings.limits.clone();
+    let model_limits = crate::model_limits::resolve(
+        &config.settings,
+        &config.paths,
+        &config.settings.model,
+        None,
+    );
     // Only a window someone declared sizes the catalog. The compiled default
     // is a guess, and deriving from it would shrink the catalog for every model
     // that states no window rather than keeping the documented fallback.
@@ -2241,10 +2247,12 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                 .map(|cents| cents.saturating_mul(10_000)),
         ),
         output_limit: std::sync::atomic::AtomicU64::new(
-            config.settings.model_output_limit().unwrap_or_default(),
+            model_limits.max_output.unwrap_or_default(),
         ),
         context_source: Mutex::new(context_source),
-        context_limit: std::sync::atomic::AtomicU64::new(context_limit(&config.settings, &limits)),
+        context_limit: std::sync::atomic::AtomicU64::new(
+            model_limits.context_window.unwrap_or_default(),
+        ),
         theme,
         session_id: Mutex::new(
             recorder
@@ -2306,6 +2314,7 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
     if !config.settings.offline {
         resolve_context_window(&host, &config.settings, &config.paths);
     }
+    crate::provider_setup::refresh_catalog_in_background(&config.settings, &config.paths);
 
     // Enable raw input before announcing the session. Otherwise input sent in
     // response to the banner can have its Enter translated by canonical mode
@@ -2596,9 +2605,11 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                         }
                     }
                     Handled::SetModel(model) => {
-                        // Named inline, so no catalog entry describes it and the
-                        // window already in force is kept rather than guessed.
-                        host.set_model(&model, None, None, None);
+                        // Named inline, so no listing describes it; a window no
+                        // other source states leaves the one in force.
+                        let resolved =
+                            crate::model_limits::resolve(&settings, &config.paths, &model, None);
+                        host.set_model(&model, resolved.context_window, resolved.max_output, None);
                         note(format!("model set to {}", host.model_name()));
                     }
                     Handled::Effort(requested) => note(set_effort(&host, requested.as_deref())),
@@ -4971,10 +4982,11 @@ fn choose_model(
     // travels with the choice is the one the endpoint reported for it rather
     // than a number invented for it.
     let entry = catalog.models.iter().find(|model| model.id == chosen);
+    let resolved = crate::model_limits::resolve(settings, paths, &chosen, entry);
     host.set_model(
         &chosen,
-        entry.and_then(|model| model.context_window),
-        entry.and_then(|model| model.max_output_tokens),
+        resolved.context_window,
+        resolved.max_output,
         entry.and_then(|model| model.prices),
     );
     // Written after the change takes effect, so a failed write cannot leave the
@@ -5306,8 +5318,11 @@ fn resolve_context_window(host: &SessionHost, settings: &Settings, paths: &Paths
     };
     let current = host.model_name();
     let model = catalog.models.iter().find(|model| model.id == current);
-    let reported = model.and_then(|model| model.context_window);
-    host.adopt_context_window(reported, settings.context_window.is_some());
+    let resolved = crate::model_limits::resolve(settings, paths, &current, model);
+    host.adopt_context_window(
+        resolved.context_window,
+        stated_before_listing(resolved.context_source),
+    );
     host.vision.store(
         model.is_some_and(|model| model.capabilities.vision),
         std::sync::atomic::Ordering::Relaxed,
@@ -5319,12 +5334,22 @@ fn resolve_context_window(host: &SessionHost, settings: &Settings, paths: &Paths
     {
         *current = Some(prices);
     }
-    if settings.model_output_limit().is_none()
-        && let Some(output) = model.and_then(|model| model.max_output_tokens)
+    if !stated_before_listing(resolved.output_source)
+        && let Some(output) = resolved.max_output
     {
         host.output_limit
             .store(output, std::sync::atomic::Ordering::Relaxed);
     }
+}
+
+/// Returns whether a limit came from a source the session already applied at
+/// startup and a listing must not replace.
+const fn stated_before_listing(source: crate::model_limits::LimitSource) -> bool {
+    matches!(
+        source,
+        crate::model_limits::LimitSource::Setting
+            | crate::model_limits::LimitSource::ConfiguredModel
+    )
 }
 
 /// How long the session waits for the endpoint's model list at startup.
@@ -5407,20 +5432,6 @@ fn adopt_skill_catalog_budget(limits: &mut BudgetSet, context_window: Option<u64
         rune_core::budget::Budget::Bounded(derived),
         Layer::Default,
     );
-}
-
-/// Returns the context window a session budgets against.
-///
-/// Configuration carries no per-model window, so the compiled default applies
-/// until a provider reports one. A zero would make every request look oversized.
-fn context_limit(settings: &Settings, _limits: &BudgetSet) -> u64 {
-    // The configured window wins, because it describes the model the user
-    // selected. The compiled default is a guess that suits a small model and
-    // understates a large one, which is what made a million-token model report
-    // a hundred and twenty-eight thousand.
-    settings
-        .context_window
-        .unwrap_or(rune_net::catalog::DEFAULT_CONTEXT_WINDOW)
 }
 
 /// Returns whether the terminal can render direct color.
@@ -6477,17 +6488,20 @@ fn session_registry(
     );
     let mut tools: Vec<String> = registry.names().into_iter().map(str::to_owned).collect();
     tools.push("subagent".to_owned());
-    let subagent = crate::subagent::Bridge::new(rune_agent::Authority {
-        mode: settings.permission_mode,
-        rules: rules.clone(),
-        workspace: workspace.to_owned(),
-        roots: std::iter::once(workspace.to_owned())
-            .chain(settings.additional_directories.iter().cloned())
-            .collect(),
-        tools,
-        mcp_view: None,
-        generation: 0,
-    });
+    let subagent = crate::subagent::Bridge::new(
+        rune_agent::Authority {
+            mode: settings.permission_mode,
+            rules: rules.clone(),
+            workspace: workspace.to_owned(),
+            roots: std::iter::once(workspace.to_owned())
+                .chain(settings.additional_directories.iter().cloned())
+                .collect(),
+            tools,
+            mcp_view: None,
+            generation: 0,
+        },
+        Some((settings.clone(), paths.clone())),
+    );
     registry.insert(subagent.registered())?;
     Ok((registry, subagent))
 }
@@ -8532,23 +8546,26 @@ mod tests {
     }
 
     #[test]
-    fn a_declared_model_window_overrides_the_compiled_default() {
+    fn a_declared_model_window_is_used_and_an_undeclared_one_is_unknown() {
         // A model that accepts a million tokens must not be budgeted against a
         // hundred and twenty-eight thousand, which reports a nearly empty
         // window as a fifth full.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).expect("utf8");
+        let paths = Paths::resolve(Some(root.as_str()), None, None, None, Some(root.as_str()));
         let settings = Settings {
             context_window: Some(1_000_000),
             ..Settings::default()
         };
-        assert_eq!(context_limit(&settings, &BudgetSet::new()), 1_000_000);
+        let limits = crate::model_limits::resolve(&settings, &paths, &settings.model, None);
+        assert_eq!(limits.context_window, Some(1_000_000));
 
-        // Without a declaration the compiled default stands, because guessing
-        // high would let a conversation grow past what the model accepts.
+        // Without a declaration the window is unknown rather than a guess,
+        // because guessing high would let a conversation grow past what the
+        // model accepts and guessing low truncates it.
         let undeclared = Settings::default();
-        assert_eq!(
-            context_limit(&undeclared, &BudgetSet::new()),
-            rune_net::catalog::DEFAULT_CONTEXT_WINDOW
-        );
+        let limits = crate::model_limits::resolve(&undeclared, &paths, &undeclared.model, None);
+        assert_eq!(limits.context_window, None);
     }
 
     #[test]
@@ -8569,10 +8586,20 @@ mod tests {
             diagnostic.code == ErrorCode::InvalidField
                 && diagnostic.key.as_deref() == Some("models.anthropic.context_window")
         }));
-        assert_eq!(
-            context_limit(&settings, &settings.limits),
-            rune_core::config::DEFAULT_CONTEXT_WINDOW
+        // The zero is dropped, so the window is unknown rather than empty.
+        let limits = crate::model_limits::resolve(
+            &settings,
+            &Paths::resolve(
+                Some(dir.path().to_str().expect("utf8")),
+                None,
+                None,
+                None,
+                Some(dir.path().to_str().expect("utf8")),
+            ),
+            &settings.model,
+            None,
         );
+        assert_eq!(limits.context_window, None);
     }
 
     #[test]

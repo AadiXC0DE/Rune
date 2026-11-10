@@ -669,6 +669,10 @@ pub struct Settings {
     /// only place that knows it is the configuration file, and the session that
     /// budgets against it has no access to the raw file.
     pub context_window: Option<u64>,
+    /// `RUNE_CONTEXT_WINDOW`: a window that wins over every other source.
+    pub context_window_override: Option<u64>,
+    /// `RUNE_MAX_OUTPUT_TOKENS`: an output ceiling that wins over every other source.
+    pub max_output_override: Option<u64>,
     /// Endpoint base URL.
     pub base_url: Option<String>,
     /// Environment variable holding the credential.
@@ -738,6 +742,8 @@ impl Default for Settings {
             shell_network: false,
             sandbox_cache_roots: None,
             context_window: None,
+            context_window_override: None,
+            max_output_override: None,
             base_url: None,
             api_key_env: None,
             anonymous: false,
@@ -1000,6 +1006,10 @@ pub struct EnvironmentOverrides {
     pub trace: Option<String>,
     /// `RUNE_EDIT_TOOL`: `auto`, `replace` or `patch`.
     pub edit_tool: Option<String>,
+    /// `RUNE_CONTEXT_WINDOW`, as written.
+    pub context_window: Option<String>,
+    /// `RUNE_MAX_OUTPUT_TOKENS`, as written.
+    pub max_output_tokens: Option<String>,
     /// Boolean variables whose value was not a boolean, with that value.
     ///
     /// Kept so the value is reported rather than silently ignored: an
@@ -1060,6 +1070,8 @@ impl EnvironmentOverrides {
             allow_unsandboxed: boolean(&mut lookup, "RUNE_ALLOW_UNSANDBOXED"),
             trace: lookup("RUNE_TRACE"),
             edit_tool: lookup("RUNE_EDIT_TOOL"),
+            context_window: lookup("RUNE_CONTEXT_WINDOW"),
+            max_output_tokens: lookup("RUNE_MAX_OUTPUT_TOKENS"),
             invalid_booleans: Vec::new(),
         };
         out.invalid_booleans = invalid_booleans;
@@ -1730,6 +1742,14 @@ fn apply_environment(settings: &mut Settings, env: &EnvironmentOverrides) {
         settings.trace_dir = Some(Utf8PathBuf::from(dir.trim()));
         settings.sources.record("trace_dir", layer);
     }
+    if let Some(raw) = &env.context_window {
+        settings.context_window_override =
+            token_count(settings, "RUNE_CONTEXT_WINDOW", "context_window", raw);
+    }
+    if let Some(raw) = &env.max_output_tokens {
+        settings.max_output_override =
+            token_count(settings, "RUNE_MAX_OUTPUT_TOKENS", "max_output_tokens", raw);
+    }
     if !env.additional_directories.is_empty() {
         settings
             .additional_directories
@@ -1794,6 +1814,26 @@ fn apply_environment(settings: &mut Settings, env: &EnvironmentOverrides) {
             &mut settings.diagnostics,
         );
     }
+}
+
+/// Reads a positive token count from an environment variable.
+///
+/// Anything else is reported and ignored, so a mistyped window falls back to
+/// the next source rather than budgeting against a zero.
+fn token_count(settings: &mut Settings, variable: &str, key: &str, raw: &str) -> Option<u64> {
+    let parsed = raw.trim().parse::<u64>().ok().filter(|value| *value > 0);
+    if parsed.is_none() {
+        settings.diagnostics.push(
+            Diagnostic::new(
+                Layer::Environment,
+                ErrorCode::InvalidField,
+                format!("{variable} is `{raw}`, which is not a positive integer"),
+            )
+            .with_key(key)
+            .with_hint("set a positive token count or unset the variable"),
+        );
+    }
+    parsed
 }
 
 /// Applies one limit override written as text.
@@ -1981,6 +2021,40 @@ mod tests {
         };
         let from_env = load(None, Some(&user), &env);
         assert_eq!(from_env.shell_env, ["CI_*", "EXTRA"]);
+    }
+
+    #[test]
+    fn the_limit_variables_take_positive_token_counts() {
+        let env = EnvironmentOverrides::from_lookup(|key| match key {
+            "RUNE_CONTEXT_WINDOW" => Some("64000".to_owned()),
+            "RUNE_MAX_OUTPUT_TOKENS" => Some(" 8192 ".to_owned()),
+            _ => None,
+        });
+        let settings = load(None, None, &env);
+        assert!(
+            settings.diagnostics.is_empty(),
+            "{:?}",
+            settings.diagnostics
+        );
+        assert_eq!(settings.context_window_override, Some(64_000));
+        assert_eq!(settings.max_output_override, Some(8_192));
+
+        for raw in ["0", "-5", "lots"] {
+            let env = EnvironmentOverrides::from_lookup(|key| {
+                (key == "RUNE_CONTEXT_WINDOW").then(|| raw.to_owned())
+            });
+            let settings = load(None, None, &env);
+            assert_eq!(settings.context_window_override, None);
+            assert!(
+                settings.diagnostics.iter().any(|diagnostic| {
+                    diagnostic.code == ErrorCode::InvalidField
+                        && diagnostic.key.as_deref() == Some("context_window")
+                        && diagnostic.message.contains("RUNE_CONTEXT_WINDOW")
+                }),
+                "{:?}",
+                settings.diagnostics
+            );
+        }
     }
 
     #[test]

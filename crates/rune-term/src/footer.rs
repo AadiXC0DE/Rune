@@ -322,11 +322,15 @@ fn context_field(state: &FooterState, theme: &Theme, truecolor: bool) -> String 
         }
     } else if state.context_limit == 0 {
         field.push_str(&paint(theme, Slot::Dim, truecolor, 0));
-        let _ = write!(
-            field,
-            "ctx {} (provider-reported)",
-            format_tokens(state.context_used)
-        );
+        if state.context_used == 0 {
+            field.push_str("ctx ?");
+        } else {
+            let _ = write!(
+                field,
+                "ctx ? {} (provider-reported)",
+                format_tokens(state.context_used)
+            );
+        }
     } else {
         let slot = if state.context_is_tight() {
             Slot::Error
@@ -661,7 +665,23 @@ mod tests {
         assert_eq!(unknown.context_percent(), 0);
         assert_eq!(unknown.context_remaining(), 0);
         let status = status_of(&unknown, 100);
-        assert!(status.contains("ctx 4.2k"), "{status}");
+        assert!(
+            status.contains("ctx ? 4.2k (provider-reported)"),
+            "{status}"
+        );
+        assert!(!status.contains('%'), "{status}");
+    }
+
+    #[test]
+    fn an_unknown_window_with_nothing_spent_shows_a_question_mark() {
+        let mut unknown = state();
+        unknown.context_limit = 0;
+        unknown.context_used = 0;
+        unknown.context_source = None;
+        let status = status_of(&unknown, 100);
+        assert!(status.contains("ctx ?"), "{status}");
+        assert!(!status.contains("ctx ? 0"), "{status}");
+        assert!(!status.contains("provider-reported"), "{status}");
         assert!(!status.contains('%'), "{status}");
     }
 

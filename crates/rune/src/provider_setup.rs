@@ -557,16 +557,8 @@ pub fn command_environment(settings: &Settings) -> std::sync::Arc<rune_tools::En
     })
 }
 
-/// Returns the configured model's context window from the cache alone.
-pub fn cached_context_window(settings: &Settings, paths: &Paths) -> Option<u64> {
-    let key = rune_net::models_dev::catalog_key(&settings.provider.to_string())?;
-    read_cached_limits(&paths.models_cache_file(), key)?
-        .get(&settings.model)?
-        .context
-}
-
 /// Reads a provider's capacity out of the cache.
-fn read_cached_limits(
+pub(crate) fn read_cached_limits(
     path: &camino::Utf8Path,
     key: &str,
 ) -> Option<rune_net::models_dev::ProviderLimits> {
@@ -587,7 +579,122 @@ fn write_cached_catalog(paths: &Paths, body: &str) -> Result<()> {
     if let Some(parent) = path.parent() {
         rune_core::paths::create_dir_private(parent)?;
     }
-    rune_core::paths::write_private(&path, body)
+    // Staged and renamed, so a process reading the cache meanwhile sees the old
+    // document or the new one, never part of one.
+    rune_core::paths::write_private_atomic(&path, body)
+}
+
+/// How old the cached catalog may grow before a run refreshes it.
+const CATALOG_REFRESH_AGE: std::time::Duration = std::time::Duration::from_hours(24);
+
+/// Returns whether the cache at `path` is missing or older than a day at `now`.
+fn refresh_due(path: &camino::Utf8Path, now: std::time::SystemTime) -> bool {
+    let Ok(modified) = std::fs::metadata(path).and_then(|meta| meta.modified()) else {
+        return true;
+    };
+    now.duration_since(modified)
+        .is_ok_and(|age| age >= CATALOG_REFRESH_AGE)
+}
+
+/// Refreshes the cached catalog on a detached thread when it is due.
+///
+/// Returns whether a refresh was started. Nothing waits for it and every
+/// failure is dropped: the cache is an improvement on unknown limits, never a
+/// reason to delay or fail a run. Skipped offline, and for a provider the
+/// catalog does not describe, whose limits it can never supply.
+pub fn refresh_catalog_in_background(settings: &Settings, paths: &Paths) -> bool {
+    if settings.offline
+        || rune_net::models_dev::catalog_key(&settings.provider.to_string()).is_none()
+        || !refresh_due(&paths.models_cache_file(), std::time::SystemTime::now())
+    {
+        return false;
+    }
+    let paths = paths.clone();
+    std::thread::Builder::new()
+        .name("catalog-refresh".to_owned())
+        .spawn(move || {
+            let _ = download_catalog(&paths, MODELS_DEV_TIMEOUT);
+        })
+        .is_ok()
+}
+
+/// What a catalog download wrote.
+#[derive(Clone, Debug)]
+pub struct RefreshedCatalog {
+    /// Providers the document describes.
+    pub providers: usize,
+    /// Bytes written.
+    pub bytes: usize,
+    /// Where the cache was written.
+    pub path: camino::Utf8PathBuf,
+}
+
+/// Downloads the published catalog now and writes it to the cache.
+///
+/// Refused offline with the same error as any other outbound request.
+pub fn refresh_catalog(settings: &Settings, paths: &Paths) -> Result<RefreshedCatalog> {
+    if settings.offline {
+        return Err(rune_net::error::NetError::new(
+            rune_net::error::FailureKind::PolicyDenied,
+            "outbound requests are disabled",
+        )
+        .with_hint("remove the offline setting to reach a provider")
+        .to_rune_error());
+    }
+    download_catalog(paths, REFRESH_TIMEOUT).map_err(|err| {
+        RuneError::new(
+            err.code(),
+            format!(
+                "the model catalog could not be refreshed: {}",
+                err.message()
+            ),
+        )
+        .with_hint("check the network, or try again later")
+    })
+}
+
+/// How long `rune models --refresh` waits for the catalog.
+const REFRESH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Fetches the catalog, checks it parses, and writes it to the cache.
+fn download_catalog(paths: &Paths, timeout: std::time::Duration) -> Result<RefreshedCatalog> {
+    let fetched = rune_net::transport::fetch_url(MODELS_DEV_URL, "application/json", timeout)
+        .map_err(|err| err.to_rune_error())?;
+    if fetched.status != 200 {
+        return Err(RuneError::new(
+            ErrorCode::TransportFailure,
+            format!("the catalog answered with status {}", fetched.status),
+        ));
+    }
+    let body = String::from_utf8(fetched.body)
+        .map_err(|_| RuneError::new(ErrorCode::ProtocolViolation, "the catalog is not UTF-8"))?;
+    let providers = catalog_providers(&body).ok_or_else(|| {
+        RuneError::new(
+            ErrorCode::ProtocolViolation,
+            "the catalog was not in a shape this build reads",
+        )
+    })?;
+    write_cached_catalog(paths, &body)?;
+    Ok(RefreshedCatalog {
+        providers,
+        bytes: body.len(),
+        path: paths.models_cache_file(),
+    })
+}
+
+/// Counts the providers a catalog document describes, or `None` when it is not one.
+fn catalog_providers(body: &str) -> Option<usize> {
+    let document: serde_json::Value = serde_json::from_str(body).ok()?;
+    let providers = document
+        .as_object()?
+        .values()
+        .filter(|provider| {
+            provider
+                .get("models")
+                .is_some_and(serde_json::Value::is_object)
+        })
+        .count();
+    (providers > 0).then_some(providers)
 }
 
 /// Largest cached catalog accepted.
@@ -1441,5 +1548,59 @@ mod tests {
         };
         let err = require_base_url(&settings).expect_err("refused");
         assert_eq!(err.code(), ErrorCode::InvalidConfiguration);
+    }
+
+    #[test]
+    fn a_fresh_cache_is_not_refreshed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = camino::Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).expect("utf8");
+        let paths = temp_paths(&root);
+        let cache = paths.models_cache_file();
+        // Nothing cached yet is due.
+        assert!(refresh_due(&cache, std::time::SystemTime::now()));
+        write_cached_catalog(&paths, r#"{"anthropic":{"models":{}}}"#).expect("written");
+        let written = std::fs::metadata(&cache)
+            .and_then(|meta| meta.modified())
+            .expect("modified");
+        let hour = std::time::Duration::from_hours(1);
+        assert!(!refresh_due(&cache, written + hour));
+        assert!(!refresh_due(&cache, written + 23 * hour));
+        assert!(refresh_due(&cache, written + 24 * hour));
+        assert!(refresh_due(&cache, written + 25 * hour));
+        // A fresh cache starts no thread.
+        let online = Settings {
+            provider: Provider::Anthropic,
+            ..Settings::default()
+        };
+        assert!(!refresh_catalog_in_background(&online, &paths));
+    }
+
+    #[test]
+    fn an_offline_run_never_refreshes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = camino::Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).expect("utf8");
+        let paths = temp_paths(&root);
+        // Nothing is cached, so only the offline setting stops the refresh.
+        assert!(refresh_due(
+            &paths.models_cache_file(),
+            std::time::SystemTime::now()
+        ));
+        assert!(!refresh_catalog_in_background(
+            &offline_settings("anthropic"),
+            &paths
+        ));
+        let err = refresh_catalog(&offline_settings("anthropic"), &paths).expect_err("refused");
+        assert_eq!(err.code(), ErrorCode::PermissionDenied);
+        assert!(!paths.models_cache_file().exists());
+    }
+
+    #[test]
+    fn a_catalog_document_counts_its_providers() {
+        assert_eq!(
+            catalog_providers(r#"{"a":{"models":{}},"b":{"models":{"m":{}}},"c":1}"#),
+            Some(2)
+        );
+        assert_eq!(catalog_providers("{}"), None);
+        assert_eq!(catalog_providers("not json"), None);
     }
 }

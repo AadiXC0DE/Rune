@@ -28,6 +28,7 @@ const SCENARIOS: &[&str] = &[
     "parallel_reads",
     "env_passthrough",
     "overwrite_guard",
+    "unknown_window_no_compaction",
 ];
 
 /// Scenarios built in Rust, which have no file.
@@ -153,6 +154,14 @@ fn ask_compacts() {
         .sum();
     let result = report.result.expect("a result");
     assert_eq!(result["usage"]["input_tokens"], billed, "{result}");
+}
+
+#[test]
+fn unknown_window_no_compaction() {
+    // The model is in no catalog and nothing declares its window, so the
+    // low trigger has nothing to measure against and every request is sent
+    // as it is.
+    run_scenario("unknown_window_no_compaction");
 }
 
 #[test]
