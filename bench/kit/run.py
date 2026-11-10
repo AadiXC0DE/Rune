@@ -450,6 +450,23 @@ def split_names(text):
 def cmd_run(argv):
     parser = build_parser()
     args = parser.parse_args(argv)
+    if not args.dry_run:
+        for name in ("model", "upstream", "key_env"):
+            if not getattr(args, name):
+                parser.error("--%s is required" % name.replace("_", "-"))
+    if not args.harnesses:
+        parser.error("--harnesses is required")
+    adapters = Adapters(args.adapter_path)
+    modules = [adapters.load(n) for n in split_names(args.harnesses)]
+    code, _out = run_suite(args, modules, adapters, parser.error)
+    return code
+
+
+def run_suite(args, modules, adapters, fail):
+    """Runs every task with every harness module; returns (exit code, output directory).
+
+    `fail(message)` reports a usage error and does not return.
+    """
     fake = None
     if args.dry_run:
         fake, _thread = fake_upstream.serve()
@@ -459,54 +476,50 @@ def cmd_run(argv):
         args.key_env = "RUNE_KIT_DRY_RUN_KEY"
         os.environ[args.key_env] = "dry-run-key"
         args.model = args.model or "fake"
-    for name in ("model", "upstream", "key_env"):
-        if not getattr(args, name):
-            parser.error("--%s is required" % name.replace("_", "-"))
-    if not args.harnesses:
-        parser.error("--harnesses is required")
-    require_git()
-    if args.resume:
-        if not args.out or not os.path.isdir(args.out):
-            print("run.py: --resume needs --out to name an existing directory", file=sys.stderr)
-            return 2
-        try:
-            recorded = json.loads((Path(args.out) / "run.json").read_text(encoding="utf-8"))["model"]
-        except (OSError, ValueError, KeyError):
-            recorded = args.model
-        if recorded != args.model:
-            print(
-                "run.py: --resume needs the same model as the recorded run (%s)" % recorded,
-                file=sys.stderr,
-            )
-            return 2
-    if args.out is None:
-        args.out = str(ROOT / "bench" / "results" / datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ"))
-    adapters = Adapters(args.adapter_path)
-    modules = [adapters.load(n) for n in split_names(args.harnesses)]
-    served = set(split_names(args.upstream_dialects)) or {"chat"}
-    if args.upstream_anthropic and not args.upstream_dialects:
-        served.add("anthropic")
-    modules = select_harnesses(modules, served)
-    for module in modules:
-        if module.NAME == "rune" and resolve_binary(module, args.rune_bin) is None:
-            print(
-                "run.py: rune binary not found at %s; build it with cargo build --release"
-                % os.path.abspath(args.rune_bin),
-                file=sys.stderr,
-            )
-            return 2
-    if not modules:
-        return 0
-    tasks = kit.discover(args.tasks, split_names(args.only), args.split)
-    if not tasks:
-        print("run.py: no tasks selected", file=sys.stderr)
-        return 2
     try:
-        rows = Runner(args, adapters).execute(tasks, modules)
+        for name in ("model", "upstream", "key_env"):
+            if not getattr(args, name):
+                fail("--%s is required" % name.replace("_", "-"))
+        require_git()
+        if args.resume:
+            if not args.out or not os.path.isdir(args.out):
+                print("run.py: --resume needs --out to name an existing directory", file=sys.stderr)
+                return 2, args.out
+            try:
+                recorded = json.loads((Path(args.out) / "run.json").read_text(encoding="utf-8"))["model"]
+            except (OSError, ValueError, KeyError):
+                recorded = args.model
+            if recorded != args.model:
+                print(
+                    "run.py: --resume needs the same model as the recorded run (%s)" % recorded,
+                    file=sys.stderr,
+                )
+                return 2, args.out
+        if args.out is None:
+            args.out = str(ROOT / "bench" / "results" / datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ"))
+        served = set(split_names(args.upstream_dialects)) or {"chat"}
+        if args.upstream_anthropic and not args.upstream_dialects:
+            served.add("anthropic")
+        modules = select_harnesses(modules, served)
+        for module in modules:
+            if module.NAME.split("@")[0] == "rune" and resolve_command(module, args.rune_bin) is None:
+                print(
+                    "run.py: rune binary not found at %s; build it with cargo build --release"
+                    % os.path.abspath(args.rune_bin),
+                    file=sys.stderr,
+                )
+                return 2, args.out
+        if not modules:
+            return 0, args.out
+        tasks = kit.discover(args.tasks, split_names(args.only), args.split)
+        if not tasks:
+            print("run.py: no tasks selected", file=sys.stderr)
+            return 2, args.out
+        Runner(args, adapters).execute(tasks, modules)
     finally:
         if fake is not None:
             fake.shutdown()
-    return 0
+    return 0, args.out
 
 
 def select_harnesses(modules, served):

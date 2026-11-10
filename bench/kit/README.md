@@ -23,6 +23,47 @@ result files into `report.md`, `report.json` and `results.csv`. `check` prints o
 harness: found or `missing`, its version, and whether the flags its adapter relies on are still in
 its help text. It exits 1 when any harness is missing or a flag has gone.
 
+## Comparing Rune variants
+
+```sh
+python3 bench/kit/ab.py --variants control,CANDIDATE [--tasks bench/tasks] [--split dev] \
+  --trials N --model ID --upstream URL --key-env VAR --out DIR \
+  [--only ids] [--max-cost USD] [--jobs N] [--rune-bin PATH] [--resume] [--dry-run] [--log PATH]
+```
+
+The first variant is the control. Each variant is a file `bench/kit/variants/<name>.json`:
+
+```json
+{
+  "description": "One line saying what differs from the control.",
+  "env": {"RUNE_EXPERIMENT": "run_note=off", "RUNE_TOOL_TEXT": "{home}/tool-text.json"},
+  "flags": [],
+  "files": {"tool-text.json": "{\"shell\": {\"description\": \"Run a command.\"}}"}
+}
+```
+
+`env` overrides the Rune adapter's variables, `flags` are extra global flags placed before `ask`,
+and `files` are written under the run's home (the runner sets `XDG_CONFIG_HOME` to
+`<home>/.config`, so `.config/rune/SYSTEM.md` replaces the system prompt). `{home}` in an `env`
+value or a `files` key is the run's home. Unknown keys are refused. Each variant runs as its own
+harness row, `rune@<name>`, interleaved with the others by trial and task.
+
+After the run `ab.py` writes the usual `report.md` and `report.json` and prints, and appends to
+`decision.md`, one block per candidate with pass@1, the paired difference and its 95% interval,
+the exact McNemar p, the median input tokens and the cost per solved task. A candidate is adopted
+when the lower end of the interval is above -3 points and it saves at least 5% of median input
+tokens or of cost per solved task, or when the lower end is above 0. Otherwise the control is
+kept. `--log PATH` also appends one table row per candidate to that file. At least two tasks are
+needed; a variant whose every run fails before its first request (for example an unknown
+experiment key) stops the comparison with exit 3.
+
+Experiment keys (`RUNE_EXPERIMENT`, comma-separated `key=value`, values `on` or `off`):
+
+| Key | Default | Effect |
+| --- | --- | --- |
+| `run_note` | `on` | The note on non-interactive runs in the first message of `ask`. |
+| `map` | unset | Forces the repository map on or off. |
+
 ## Adapters
 
 An adapter is a module in `bench/kit/adapters/` (or any directory given with `--adapter-path`).
