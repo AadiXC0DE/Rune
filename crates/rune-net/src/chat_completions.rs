@@ -8,7 +8,7 @@ use rune_core::config::Effort;
 use rune_core::error::{Result, RuneError};
 use rune_core::id::ToolCallId;
 
-use crate::compat::{CacheMarkers, EmptyContent, EndpointCompat, ThinkingFormat, shape_call_id};
+use crate::compat::{CacheMarkers, EmptyContent, ReasoningReplay, ThinkingFormat, shape_call_id};
 use crate::message::{ContentPart, Message, Role};
 use crate::provider::{Provider, RequestPlan};
 use crate::stream::{
@@ -265,7 +265,7 @@ fn encode_message(message: &Message, plan: &RequestPlan) -> Result<serde_json::V
             "system content must be supplied as instructions, not as a message",
         )),
         Role::User => Ok(encode_user(message, plan)),
-        Role::Assistant => Ok(encode_assistant(message, &plan.compat)),
+        Role::Assistant => Ok(encode_assistant(message, plan)),
         // Tool results are expanded before this point, because one message can
         // carry several of them and this returns a single message.
         Role::Tool => Err(RuneError::invariant(
@@ -308,8 +308,10 @@ fn encode_user(message: &Message, plan: &RequestPlan) -> serde_json::Value {
     serde_json::json!({ "role": "user", "content": parts })
 }
 
-/// Encodes an assistant message, including any tool calls.
-fn encode_assistant(message: &Message, compat: &EndpointCompat) -> serde_json::Value {
+/// Encodes an assistant message, including any tool calls and the reasoning
+/// the endpoint wants sent back.
+fn encode_assistant(message: &Message, plan: &RequestPlan) -> serde_json::Value {
+    let compat = &plan.compat;
     let calls: Vec<serde_json::Value> = message
         .parts
         .iter()
@@ -348,7 +350,94 @@ fn encode_assistant(message: &Message, compat: &EndpointCompat) -> serde_json::V
         value.insert("tool_calls".to_owned(), serde_json::Value::Array(calls));
     }
 
+    encode_reasoning(&mut value, message, plan);
     serde_json::Value::Object(value)
+}
+
+/// Reasoning stored with an assistant message.
+#[derive(Debug, Default, serde::Deserialize)]
+struct StoredReasoning {
+    /// The field it arrived in, when known.
+    #[serde(default)]
+    field: Option<String>,
+    /// The reasoning text, exactly as streamed.
+    #[serde(default)]
+    text: String,
+    /// The `reasoning_details` entries, verbatim.
+    #[serde(default)]
+    details: Vec<serde_json::Value>,
+}
+
+/// Returns the reasoning stored with a message.
+///
+/// A message whose replay state carries none, including one recorded before
+/// that state held reasoning, falls back to its reasoning parts. A malformed
+/// state counts as absent.
+fn reasoning_of(message: &Message) -> Option<StoredReasoning> {
+    let stored = message
+        .replay
+        .as_deref()
+        .and_then(|blob| serde_json::from_str::<serde_json::Value>(blob).ok())
+        .and_then(|mut blob| blob.get_mut("reasoning").map(serde_json::Value::take))
+        .and_then(|reasoning| serde_json::from_value::<StoredReasoning>(reasoning).ok());
+    if stored.is_some() {
+        return stored;
+    }
+    let text: String = message
+        .parts
+        .iter()
+        .filter_map(|part| match part {
+            ContentPart::Reasoning { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    (!text.is_empty()).then_some(StoredReasoning {
+        field: None,
+        text,
+        details: Vec::new(),
+    })
+}
+
+/// Adds earlier reasoning to an assistant message in the field the endpoint
+/// reads it from.
+fn encode_reasoning(
+    value: &mut serde_json::Map<String, serde_json::Value>,
+    message: &Message,
+    plan: &RequestPlan,
+) {
+    let compat = &plan.compat;
+    if compat.reasoning_replay == ReasoningReplay::None {
+        return;
+    }
+    let stored = reasoning_of(message).unwrap_or_default();
+    let observed = stored.field.as_deref();
+    let details = match compat.reasoning_replay {
+        ReasoningReplay::ReasoningDetails => true,
+        ReasoningReplay::AsObserved => observed == Some("reasoning_details"),
+        _ => false,
+    };
+    let text_field = match compat.reasoning_replay {
+        ReasoningReplay::ReasoningContent => "reasoning_content",
+        ReasoningReplay::AsObserved if !details => REASONING_FIELDS
+            .into_iter()
+            .find(|field| Some(*field) == observed)
+            .unwrap_or("reasoning_content"),
+        _ => "reasoning",
+    };
+    if details && !stored.details.is_empty() {
+        value.insert(
+            "reasoning_details".to_owned(),
+            serde_json::Value::Array(stored.details),
+        );
+    } else if !stored.text.is_empty() {
+        value.insert(text_field.to_owned(), serde_json::json!(stored.text));
+        return;
+    }
+    // Some endpoints refuse a tool conversation in which any assistant
+    // message lacks the field, even an empty one.
+    if compat.reasoning_always && plan.has_tools() && !value.contains_key(text_field) {
+        value.insert(text_field.to_owned(), serde_json::json!(stored.text));
+    }
 }
 
 /// Encodes one tool result message.
@@ -843,18 +932,32 @@ impl StreamReducer for Reducer {
     }
 
     fn replay(&self) -> Option<String> {
-        // The dialect has no signed reasoning to replay, but the identifiers
-        // are recorded so a filtered history can drop a call and its result
-        // together.
+        // The identifiers are recorded so a filtered history can drop a call
+        // and its result together, and the reasoning so it can be sent back in
+        // the field the endpoint reads.
         let ids: Vec<&str> = self
             .calls
             .iter()
             .filter_map(|call| call.id.as_ref().map(ToolCallId::as_str))
             .collect();
-        if ids.is_empty() {
+        if ids.is_empty() && self.observed_field.is_none() {
             return None;
         }
-        serde_json::to_string(&serde_json::json!({ "_tool_call_ids": ids })).ok()
+        let mut replay = serde_json::Map::new();
+        replay.insert("_tool_call_ids".to_owned(), serde_json::json!(ids));
+        if let Some(field) = self.observed_field {
+            let mut reasoning = serde_json::Map::new();
+            reasoning.insert("field".to_owned(), serde_json::json!(field));
+            reasoning.insert("text".to_owned(), serde_json::json!(self.reasoning));
+            if !self.reasoning_details.is_empty() {
+                reasoning.insert(
+                    "details".to_owned(),
+                    serde_json::Value::Array(self.reasoning_details.clone()),
+                );
+            }
+            replay.insert("reasoning".to_owned(), serde_json::Value::Object(reasoning));
+        }
+        serde_json::to_string(&replay).ok()
     }
 
     fn finish(&self) -> Result<FinishReason> {
@@ -1881,6 +1984,100 @@ mod tests {
         assert!(reducer.replay().is_none());
     }
 
+    fn assistant_after(reasoning: Option<&str>) -> RequestPlan {
+        let mut plan = default_body_plan();
+        plan.compat.reasoning_replay = ReasoningReplay::ReasoningContent;
+        plan.compat.reasoning_always = true;
+        if let Some(text) = reasoning {
+            plan.messages[1].parts.insert(
+                0,
+                ContentPart::Reasoning {
+                    text: text.to_owned(),
+                },
+            );
+        }
+        plan
+    }
+
+    #[test]
+    fn reasoning_is_always_sent_with_tools_when_required() {
+        let body = ChatCompletions
+            .build_request(&assistant_after(None))
+            .expect("build");
+        assert_eq!(body["messages"][2]["role"], "assistant");
+        assert_eq!(body["messages"][2]["reasoning_content"], "");
+
+        let mut plan = assistant_after(None);
+        plan.compat.reasoning_always = false;
+        let body = ChatCompletions.build_request(&plan).expect("build");
+        assert!(body["messages"][2].get("reasoning_content").is_none());
+
+        let body = ChatCompletions
+            .build_request(&assistant_after(Some("think")))
+            .expect("build");
+        assert_eq!(body["messages"][2]["reasoning_content"], "think");
+    }
+
+    #[test]
+    fn reasoning_is_omitted_without_tools() {
+        let mut plan = assistant_after(None);
+        plan.tools.clear();
+        let body = ChatCompletions.build_request(&plan).expect("build");
+        let assistant = body["messages"][2].as_object().expect("assistant");
+        assert!(
+            !assistant.contains_key("reasoning_content"),
+            "{assistant:?}"
+        );
+        assert!(!assistant.contains_key("reasoning"), "{assistant:?}");
+    }
+
+    #[test]
+    fn an_old_history_replays_reasoning_from_its_parts() {
+        for blob in [
+            Some(r#"{"_tool_call_ids":["call_1"]}"#),
+            Some("not json"),
+            None,
+        ] {
+            let mut plan = assistant_after(Some("from the parts"));
+            plan.compat.reasoning_always = false;
+            plan.messages[1].replay = blob.map(str::to_owned);
+            let body = ChatCompletions.build_request(&plan).expect("build");
+            assert_eq!(
+                body["messages"][2]["reasoning_content"], "from the parts",
+                "{blob:?}"
+            );
+        }
+
+        let mut plan = assistant_after(Some("from the parts"));
+        plan.messages[1].replay = Some(
+            r#"{"_tool_call_ids":["call_1"],"reasoning":{"field":"reasoning","text":"stored"}}"#
+                .to_owned(),
+        );
+        let body = ChatCompletions.build_request(&plan).expect("build");
+        assert_eq!(body["messages"][2]["reasoning_content"], "stored");
+
+        plan.compat.reasoning_replay = ReasoningReplay::None;
+        let body = ChatCompletions.build_request(&plan).expect("build");
+        assert!(body["messages"][2].get("reasoning_content").is_none());
+    }
+
+    #[test]
+    fn replay_stores_the_reasoning_and_its_field() {
+        let (_, reducer) = reduce(&[
+            r#"{"choices":[{"index":0,"delta":{"reasoning_content":"a"}}]}"#,
+            r#"{"choices":[{"index":0,"delta":{"reasoning_content":"b"}}]}"#,
+        ]);
+        let replay: serde_json::Value =
+            serde_json::from_str(&reducer.replay().expect("replay")).expect("json");
+        assert_eq!(
+            replay,
+            serde_json::json!({
+                "_tool_call_ids": [],
+                "reasoning": { "field": "reasoning_content", "text": "ab" },
+            })
+        );
+    }
+
     #[test]
     fn an_empty_answer_still_finishes() {
         let (_, reducer) = reduce(&[
@@ -1922,13 +2119,13 @@ mod tests {
     /// The body a default plan produced before the endpoint table shaped it.
     const TODAYS_BODY: &str = r#"{"model":"test/model","stream":true,"stream_options":{"include_usage":true},"messages":[{"role":"system","content":"be helpful"},{"role":"user","content":"start"},{"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"a\"}"}}]},{"role":"tool","content":"contents","tool_call_id":"call_1","is_error":false},{"role":"user","content":"thanks"}],"tools":[{"type":"function","function":{"name":"read_file","description":"Read a file","parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}}}],"tool_choice":"auto","parallel_tool_calls":true,"reasoning_effort":"high","max_tokens":1024}"#;
 
-    fn shaped(change: impl FnOnce(&mut EndpointCompat)) -> serde_json::Value {
+    fn shaped(change: impl FnOnce(&mut crate::compat::EndpointCompat)) -> serde_json::Value {
         let mut plan = default_body_plan();
         change(&mut plan.compat);
         ChatCompletions.build_request(&plan).expect("build")
     }
 
-    fn without_tools(change: impl FnOnce(&mut EndpointCompat)) -> serde_json::Value {
+    fn without_tools(change: impl FnOnce(&mut crate::compat::EndpointCompat)) -> serde_json::Value {
         let mut plan = default_body_plan();
         plan.tools.clear();
         change(&mut plan.compat);
