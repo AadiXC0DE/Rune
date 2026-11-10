@@ -535,6 +535,20 @@ pub fn command_environment(policy: &EnvironmentPolicy, terminal: bool) -> BTreeM
     command_environment_from(std::env::vars_os(), policy, terminal)
 }
 
+/// The allowed spelling of a variable name, if it is allowed.
+///
+/// Windows names are case-insensitive and its search path is usually spelled
+/// `Path`, so there a name matches in any case and takes the allowed spelling.
+fn allowed_name(name: &str) -> Option<&'static str> {
+    ALLOWED_ENVIRONMENT.iter().copied().find(|allowed| {
+        if cfg!(windows) {
+            allowed.eq_ignore_ascii_case(name)
+        } else {
+            *allowed == name
+        }
+    })
+}
+
 /// [`command_environment`] over the given variables instead of this process's.
 fn command_environment_from(
     variables: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
@@ -548,7 +562,9 @@ fn command_environment_from(
         let (Ok(name), Ok(value)) = (name.into_string(), value.into_string()) else {
             continue;
         };
-        if ALLOWED_ENVIRONMENT.contains(&name.as_str()) || passes(&name, &policy.passthrough) {
+        if let Some(allowed) = allowed_name(&name) {
+            environment.insert(allowed.to_owned(), value);
+        } else if passes(&name, &policy.passthrough) {
             environment.insert(name, value);
         }
     }
@@ -1742,6 +1758,22 @@ mod tests {
             &policy,
             terminal,
         )
+    }
+
+    #[test]
+    fn the_search_path_keeps_its_value_whatever_its_spelling() {
+        let environment = environment_of(&[("Path", r"C:\Tools;C:\Windows")], &[], &[], false);
+        if cfg!(windows) {
+            assert_eq!(
+                environment.get("PATH").map(String::as_str),
+                Some(r"C:\Tools;C:\Windows")
+            );
+            assert!(!environment.contains_key("Path"));
+        } else {
+            // A different name on Unix: not the search path, and not allowed.
+            assert!(!environment.contains_key("Path"));
+            assert_eq!(environment.get("PATH"), Some(&default_path()));
+        }
     }
 
     #[test]
