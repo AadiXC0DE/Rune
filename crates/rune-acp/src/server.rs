@@ -187,12 +187,16 @@ impl ServerConfig {
         model: impl Into<String>,
     ) -> Result<Self> {
         let limits = BudgetSet::new();
-        let registry = rune_tools::inventory::builtin(
+        let mut registry = rune_tools::inventory::builtin(
             &FileLimits::from_budget(&limits),
             &limits,
             &Paths::from_process().managed_skills_dir(),
         )?;
         let model = model.into();
+        rune_tools::inventory::select_edit_tool(
+            &mut registry,
+            rune_net::family::edit_tool_for(&model),
+        );
         let context_window = Catalog::new("acp")
             .metadata_or_default(&model)
             .usable_context();
@@ -276,6 +280,10 @@ impl ServerConfig {
             &limits,
             &Paths::from_process().managed_skills_dir(),
         )?;
+        rune_tools::inventory::select_edit_tool(
+            &mut self.registry,
+            rune_net::family::edit_tool_for(&self.model),
+        );
         self.limits = limits;
         Ok(self)
     }

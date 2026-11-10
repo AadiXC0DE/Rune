@@ -280,6 +280,16 @@ them. Set `offline = true` in the user configuration to enable the
 [offline enforcement boundary](#offline-enforcement-boundary), including refusal
 of requests to the model.
 
+Models are offered one file-edit tool: GPT-5 and later, Codex and gpt-oss
+models get `apply_patch`, which takes a multi-file patch in the format they are
+trained on, and every other model gets `edit_file`. `write_file` is offered to
+both. Set `edit_tool = "replace"` or `edit_tool = "patch"` in the user
+configuration (or `RUNE_EDIT_TOOL`) to choose for every model; `auto` is the
+default. An interactive session keeps the choice made at its start. A shell
+command that is only `apply_patch <<'EOF'` ... `EOF` (optionally after
+`cd <dir> && `) is applied as a patch, under the same policy as the edit
+tools, whichever tool is offered.
+
 For image analysis, set `vision_model = "<image-capable-model>"` in the user
 configuration. Interactive sessions, `rune ask`, and ACP use that model with
 the active provider's endpoint and credential. A permitted `vision` call with

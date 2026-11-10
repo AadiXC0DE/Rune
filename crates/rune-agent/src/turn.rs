@@ -1149,14 +1149,16 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
                 .is_some_and(|replay| !replay.is_empty());
         let mut recorded_names = std::collections::HashMap::new();
         for (id, resolved) in &repaired {
-            if signed {
+            if signed || resolved.intercepted {
                 if let Some(from) = &resolved.renamed_from {
                     recorded_names.insert(id.as_str(), from.clone());
                 }
             } else {
                 history.rewrite_tool_call(id, &resolved.name, &resolved.arguments.to_string());
             }
-            repairs.push(CallRepair::new(id, resolved));
+            if !resolved.intercepted {
+                repairs.push(CallRepair::new(id, resolved));
+            }
         }
 
         let mut result_parts = Vec::new();
@@ -2207,6 +2209,40 @@ fn prepare_call(
         }
     };
     let note = repair::note(&resolved);
+    // A shell command that is only an apply_patch heredoc runs as the patch
+    // tool, whether or not that tool is offered. The recorded call stays as
+    // the model sent it.
+    if let Some(patch) = heredoc_patch(&resolved) {
+        let arguments = serde_json::json!({ "input": patch });
+        let effective = PreparedCall {
+            id: call.id.clone(),
+            name: "apply_patch".to_owned(),
+            arguments: arguments.to_string(),
+        };
+        repaired.push((
+            call.id.clone(),
+            Resolved {
+                name: effective.name.clone(),
+                arguments: arguments.clone(),
+                renamed_from: Some(call.name.clone()),
+                repairs: Vec::new(),
+                intercepted: true,
+            },
+        ));
+        let note = Some(match note {
+            Some(repair) => format!("{repair}\n{HEREDOC_NOTE}"),
+            None => HEREDOC_NOTE.to_owned(),
+        });
+        return match authorize(&effective, arguments, host, cancelled, tool_cap) {
+            Ok((arguments, context)) => Ok(Cleared {
+                call: effective,
+                arguments,
+                context,
+                note,
+            }),
+            Err(result) => Err(with_note(result, note.as_deref())),
+        };
+    }
     // An unrepaired call keeps its argument text exactly as sent, which is
     // what the repeat and failure guards compare.
     let effective = if note.is_some() {
@@ -2234,6 +2270,24 @@ fn prepare_call(
         }),
         Err(result) => Err(with_note(result, note.as_deref())),
     }
+}
+
+/// The last line of a shell heredoc that ran as the patch tool.
+const HEREDOC_NOTE: &str = "[ran as the apply_patch tool]";
+
+/// The patch of a `shell` run whose command is only an apply_patch heredoc.
+fn heredoc_patch(resolved: &Resolved) -> Option<String> {
+    if resolved.name != "shell"
+        || resolved
+            .arguments
+            .get("action")
+            .and_then(serde_json::Value::as_str)
+            != Some("run")
+    {
+        return None;
+    }
+    let command = resolved.arguments.get("command")?.as_str()?;
+    rune_tools::apply_patch::intercept(command).map(|(_, patch)| patch)
 }
 
 /// Appends a repaired call's note to the end of its result text.

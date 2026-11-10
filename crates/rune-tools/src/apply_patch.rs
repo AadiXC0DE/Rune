@@ -766,6 +766,87 @@ fn expected_lines(
         .with_hint("read the file again; nothing was written")
 }
 
+/// Recognises a shell command that is only an apply_patch heredoc: `apply_patch` or
+/// `applypatch`, then `<<EOF`, `<<'EOF'` or `<<"EOF"`, the patch, and a final `EOF`
+/// line, optionally preceded by `cd <dir> && `. Returns the directory and the patch.
+///
+/// With a directory, each relative path in a section header is rewritten to
+/// `<dir>/<path>`.
+#[must_use]
+pub fn intercept(command: &str) -> Option<(Option<String>, String)> {
+    let text = command.trim();
+    let (first, rest) = text.split_once('\n')?;
+    let first = first.trim();
+    let (dir, invocation) = match first.strip_prefix("cd ") {
+        Some(after) => {
+            let (dir, after) = shell_word(after.trim_start())?;
+            (
+                Some(dir),
+                after.trim_start().strip_prefix("&&")?.trim_start(),
+            )
+        }
+        None => (None, first),
+    };
+    let marker = invocation
+        .strip_prefix("apply_patch")
+        .or_else(|| invocation.strip_prefix("applypatch"))?;
+    if !marker.starts_with([' ', '\t']) {
+        return None;
+    }
+    if !matches!(marker.trim(), "<<EOF" | "<<'EOF'" | "<<\"EOF\"") {
+        return None;
+    }
+    let (body, last) = rest.rsplit_once('\n').unwrap_or(("", rest));
+    if last.trim() != "EOF" {
+        return None;
+    }
+    let patch = match &dir {
+        Some(dir) => body
+            .split('\n')
+            .map(|line| under_directory(line, dir))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        None => body.to_owned(),
+    };
+    Some((dir, patch))
+}
+
+/// The first shell word of `text`, plain or in single or double quotes, and
+/// what follows it.
+fn shell_word(text: &str) -> Option<(String, &str)> {
+    let quote = text.chars().next()?;
+    if quote == '\'' || quote == '"' {
+        let inner = text.get(1..)?;
+        let end = inner.find(quote)?;
+        let word = inner.get(..end)?;
+        let after = inner.get(end.saturating_add(1)..)?;
+        return (!word.is_empty()).then(|| (word.to_owned(), after));
+    }
+    let end = text.find(char::is_whitespace).unwrap_or(text.len());
+    let word = text.get(..end)?;
+    (!word.is_empty() && !word.contains(['\'', '"', ';', '|', '&', '<', '>']))
+        .then(|| (word.to_owned(), text.get(end..).unwrap_or_default()))
+}
+
+/// A section header line with a relative path, rewritten to lie under `dir`.
+fn under_directory(line: &str, dir: &str) -> String {
+    if line.starts_with([' ', '+', '-']) {
+        return line.to_owned();
+    }
+    let trimmed = line.trim_end_matches('\r');
+    for header in [ADD, DELETE, UPDATE, MOVE] {
+        if let Some(path) = trimmed.trim_start().strip_prefix(header) {
+            let path = path.trim();
+            if path.is_empty() || path.starts_with('/') || path.starts_with('~') {
+                return line.to_owned();
+            }
+            let dir = dir.trim_end_matches('/');
+            return format!("{header} {dir}/{path}");
+        }
+    }
+    line.to_owned()
+}
+
 /// A file's text and the hash of its bytes, as read.
 type Snapshot = (String, [u8; 32]);
 
@@ -1820,5 +1901,69 @@ mod tests {
             Some("hello.txt")
         );
         assert_eq!(tool.permission_target(&json!({ "input": "nope" })), None);
+    }
+
+    const HEREDOC_PATCH: &str =
+        "*** Begin Patch\n*** Update File: a.txt\n-old\n+new\n*** End Patch";
+
+    #[test]
+    fn each_heredoc_form_is_intercepted() {
+        for opener in [
+            "apply_patch <<EOF",
+            "apply_patch <<'EOF'",
+            "apply_patch <<\"EOF\"",
+            "applypatch <<'EOF'",
+        ] {
+            let command = format!("  {opener}\n{HEREDOC_PATCH}\nEOF\n");
+            assert_eq!(
+                intercept(&command),
+                Some((None, HEREDOC_PATCH.to_owned())),
+                "{opener}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_directory_prefix_moves_the_paths_under_it() {
+        let patch = "*** Begin Patch\n*** Add File: new.txt\n+x\n*** Update File: /abs/a.txt\n*** Move to: b.txt\n-a\n+b\n context *** Add File: kept\n*** End Patch";
+        let command = format!("cd sub && applypatch <<EOF\n{patch}\nEOF");
+        let (dir, rewritten) = intercept(&command).unwrap();
+        assert_eq!(dir.as_deref(), Some("sub"));
+        assert_eq!(
+            rewritten,
+            "*** Begin Patch\n*** Add File: sub/new.txt\n+x\n*** Update File: /abs/a.txt\n*** Move to: sub/b.txt\n-a\n+b\n context *** Add File: kept\n*** End Patch"
+        );
+        let quoted = format!("cd 'my dir' && apply_patch <<'EOF'\n{HEREDOC_PATCH}\nEOF");
+        let (dir, rewritten) = intercept(&quoted).unwrap();
+        assert_eq!(dir.as_deref(), Some("my dir"));
+        assert!(rewritten.contains("*** Update File: my dir/a.txt"));
+    }
+
+    #[test]
+    fn a_trailing_command_is_not_intercepted() {
+        let command = format!("apply_patch <<'EOF'\n{HEREDOC_PATCH}\nEOF && cargo test");
+        assert_eq!(intercept(&command), None);
+        let command = format!("apply_patch <<'EOF'\n{HEREDOC_PATCH}\nEOF\ncargo test");
+        assert_eq!(intercept(&command), None);
+    }
+
+    #[test]
+    fn mismatched_quotes_are_not_intercepted() {
+        let command = format!("apply_patch <<\"EOF'\n{HEREDOC_PATCH}\nEOF");
+        assert_eq!(intercept(&command), None);
+    }
+
+    #[test]
+    fn a_pipe_or_redirect_is_not_intercepted() {
+        for opener in [
+            "apply_patch <<'EOF' | cat",
+            "apply_patch <<'EOF' > out.txt",
+            "cat file | apply_patch <<'EOF'",
+        ] {
+            let command = format!("{opener}\n{HEREDOC_PATCH}\nEOF");
+            assert_eq!(intercept(&command), None, "{opener}");
+        }
+        assert_eq!(intercept("apply_patch_tool <<'EOF'\nx\nEOF"), None);
+        assert_eq!(intercept("cd a; apply_patch <<'EOF'\nx\nEOF"), None);
     }
 }

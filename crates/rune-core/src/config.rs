@@ -165,6 +165,47 @@ impl fmt::Display for Effort {
     }
 }
 
+/// Which file-edit tool a model is offered.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EditTool {
+    /// `edit_file`: exact text replacement.
+    Replace,
+    /// `apply_patch`: the file patch format.
+    Patch,
+}
+
+/// The `edit_tool` setting.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EditToolSetting {
+    /// The tool the model family is trained on.
+    #[default]
+    Auto,
+    /// Always `edit_file`.
+    Replace,
+    /// Always `apply_patch`.
+    Patch,
+}
+
+impl EditToolSetting {
+    /// Returns the configuration spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Replace => "replace",
+            Self::Patch => "patch",
+        }
+    }
+}
+
+impl fmt::Display for EditToolSetting {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Provider identity.
 ///
 /// A fresh install has no provider. Every command that needs one fails with
@@ -429,6 +470,13 @@ pub struct UserConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub web_tools: Option<bool>,
 
+    /// Which file-edit tool models are offered: `auto` (the one the model
+    /// family is trained on), `replace` (`edit_file`) or `patch`
+    /// (`apply_patch`). An interactive session keeps the choice made at its
+    /// start, also after `/model`, so the request prefix stays stable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub edit_tool: Option<EditToolSetting>,
+
     /// Whether sandboxed shell commands may use the network. Off by default; offline mode overrules it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shell_network: Option<bool>,
@@ -609,6 +657,8 @@ pub struct Settings {
     pub configured_models: BTreeMap<String, ModelEntry>,
     /// Whether the web tools may reach the network.
     pub web_tools: bool,
+    /// Which file-edit tool models are offered.
+    pub edit_tool: EditToolSetting,
     /// Whether sandboxed shell commands may use the network.
     pub shell_network: bool,
     /// The configured cache directory list, replacing the defaults when set.
@@ -684,6 +734,7 @@ impl Default for Settings {
             pre_tool_hook: None,
             post_tool_hook: None,
             web_tools: false,
+            edit_tool: EditToolSetting::Auto,
             shell_network: false,
             sandbox_cache_roots: None,
             context_window: None,
@@ -835,6 +886,7 @@ impl Settings {
             ),
             ("ascii", self.ascii.to_string()),
             ("web_tools", self.web_tools.to_string()),
+            ("edit_tool", self.edit_tool.to_string()),
             ("shell_network", self.shell_network.to_string()),
             (
                 "post_tool_hook",
@@ -946,6 +998,8 @@ pub struct EnvironmentOverrides {
     pub allow_unsandboxed: Option<bool>,
     /// `RUNE_TRACE`: the environment form of `--trace`.
     pub trace: Option<String>,
+    /// `RUNE_EDIT_TOOL`: `auto`, `replace` or `patch`.
+    pub edit_tool: Option<String>,
     /// Boolean variables whose value was not a boolean, with that value.
     ///
     /// Kept so the value is reported rather than silently ignored: an
@@ -1005,6 +1059,7 @@ impl EnvironmentOverrides {
             network: boolean(&mut lookup, "RUNE_NETWORK"),
             allow_unsandboxed: boolean(&mut lookup, "RUNE_ALLOW_UNSANDBOXED"),
             trace: lookup("RUNE_TRACE"),
+            edit_tool: lookup("RUNE_EDIT_TOOL"),
             invalid_booleans: Vec::new(),
         };
         out.invalid_booleans = invalid_booleans;
@@ -1070,6 +1125,7 @@ const PROFILE_ONLY_KEYS: &[&str] = &[
     "permission_mode",
     "permission",
     "effort",
+    "edit_tool",
     "fast_mode",
     "theme",
     "ascii",
@@ -1271,6 +1327,10 @@ fn apply_user(settings: &mut Settings, user: &UserConfig, layer: Layer) {
     if let Some(offline) = user.offline {
         settings.offline = offline;
         settings.sources.record("offline", layer);
+    }
+    if let Some(edit_tool) = user.edit_tool {
+        settings.edit_tool = edit_tool;
+        settings.sources.record("edit_tool", layer);
     }
     if let Some(web_tools) = user.web_tools {
         // A project file cannot set this: it decides whether a repository can
@@ -1627,6 +1687,29 @@ fn apply_environment(settings: &mut Settings, env: &EnvironmentOverrides) {
         settings.auto_upgrade = auto;
         settings.sources.record("auto_upgrade", layer);
     }
+    if let Some(raw) = &env.edit_tool {
+        let parsed = match raw.trim().to_ascii_lowercase().as_str() {
+            "auto" => Some(EditToolSetting::Auto),
+            "replace" => Some(EditToolSetting::Replace),
+            "patch" => Some(EditToolSetting::Patch),
+            _ => None,
+        };
+        match parsed {
+            Some(edit_tool) => {
+                settings.edit_tool = edit_tool;
+                settings.sources.record("edit_tool", layer);
+            }
+            None => settings.diagnostics.push(
+                Diagnostic::new(
+                    layer,
+                    ErrorCode::InvalidField,
+                    format!("RUNE_EDIT_TOOL is `{raw}`"),
+                )
+                .with_key("edit_tool")
+                .with_hint("accepted values are auto, replace and patch"),
+            ),
+        }
+    }
     if let Some(web_tools) = env.web_tools {
         settings.web_tools = web_tools;
         settings.sources.record("web_tools", layer);
@@ -1830,6 +1913,7 @@ pub fn to_status_json(settings: &Settings, workspace: &Utf8Path) -> serde_json::
         "permission_mode": settings.permission_mode,
         "permission_label": settings.permission_mode.label(),
         "effort": settings.effort,
+        "edit_tool": settings.edit_tool,
         "fast_mode": settings.fast_mode,
         "theme": settings.theme,
         "ascii": settings.ascii,
@@ -2073,6 +2157,49 @@ mod tests {
             assert_eq!(settings.web_tools, !enabled);
             assert_eq!(settings.source_of("web_tools"), Layer::Environment);
         }
+    }
+
+    #[test]
+    fn edit_tool_is_read_from_the_user_file_and_the_environment() {
+        let dir = TempDir::new().expect("tempdir");
+        assert_eq!(
+            load(None, None, &empty_env()).edit_tool,
+            EditToolSetting::Auto
+        );
+        let user = write(&dir, "config.toml", "edit_tool = \"patch\"\n");
+        let settings = load(None, Some(&user), &empty_env());
+        assert!(settings.diagnostics.is_empty());
+        assert_eq!(settings.edit_tool, EditToolSetting::Patch);
+        assert_eq!(settings.source_of("edit_tool"), Layer::User);
+
+        let env = EnvironmentOverrides::from_lookup(|key| {
+            (key == "RUNE_EDIT_TOOL").then(|| String::from("Replace"))
+        });
+        let settings = load(None, Some(&user), &env);
+        assert_eq!(settings.edit_tool, EditToolSetting::Replace);
+        assert_eq!(settings.source_of("edit_tool"), Layer::Environment);
+
+        let env = EnvironmentOverrides::from_lookup(|key| {
+            (key == "RUNE_EDIT_TOOL").then(|| String::from("diff"))
+        });
+        let settings = load(None, None, &env);
+        assert_eq!(settings.edit_tool, EditToolSetting::Auto);
+        assert!(
+            settings
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message == "RUNE_EDIT_TOOL is `diff`")
+        );
+    }
+
+    #[test]
+    fn edit_tool_is_ignored_in_a_project_file() {
+        let dir = TempDir::new().expect("tempdir");
+        let project = write(&dir, "project.toml", "edit_tool = \"patch\"\n");
+        let settings = load(Some(&project), None, &empty_env());
+        assert_eq!(settings.edit_tool, EditToolSetting::Auto);
+        assert_eq!(settings.source_of("edit_tool"), Layer::Default);
+        assert!(!settings.diagnostics.is_empty());
     }
 
     #[test]

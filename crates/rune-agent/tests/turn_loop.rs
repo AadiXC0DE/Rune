@@ -5351,3 +5351,98 @@ fn a_repeated_aliased_failure_is_refused_like_the_call_it_runs_as() {
     );
     history.validate().expect("paired history");
 }
+
+/// Runs one `shell` call whose command is an apply_patch heredoc, with the real tools.
+fn heredoc_turn(
+    workspace: &tempfile::TempDir,
+    rules: RuleSet,
+) -> (TestHost, rune_agent::turn::TurnOutcome) {
+    let command = "apply_patch <<'EOF'\n*** Begin Patch\n*** Update File: a.txt\n-old\n+new\n*** End Patch\nEOF";
+    let arguments = serde_json::json!({ "action": "run", "command": command }).to_string();
+    let endpoint = MockEndpoint::start(vec![
+        Script::tool_call("p", "shell", &arguments),
+        Script::text("done"),
+    ]);
+    let registry = rune_tools::inventory::builtin_default().expect("builtins");
+    let mut host = TestHost::new(endpoint)
+        .with_tools(registry.all_schemas())
+        .with_rules(rules);
+    host.workspace = Utf8PathBuf::from_path_buf(workspace.path().to_owned()).expect("UTF-8 path");
+    host.registry = Some(registry);
+    let mut history = rune_agent::History::new();
+    history.push_user("patch it");
+    let outcome = run_turn(&mut history, &host).expect("turn");
+    history.validate().expect("paired history");
+    (host, outcome)
+}
+
+#[test]
+fn a_shell_heredoc_patch_runs_as_apply_patch() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    std::fs::write(workspace.path().join("a.txt"), "old\n").expect("fixture");
+    let mut rules = RuleSet::new();
+    rules.push(Rule::allow("edit_file", "*", Layer::User));
+    let (host, outcome) = heredoc_turn(&workspace, rules);
+    let result = &outcome.calls[0];
+    assert!(
+        result.executed && !result.output.is_error,
+        "{}",
+        result.output.text
+    );
+    assert_eq!(result.call.name, "apply_patch");
+    assert!(
+        result
+            .output
+            .text
+            .ends_with("\n[ran as the apply_patch tool]"),
+        "{}",
+        result.output.text
+    );
+    assert_eq!(
+        std::fs::read_to_string(workspace.path().join("a.txt")).expect("read"),
+        "new\n"
+    );
+    assert_eq!(
+        *host.decisions.lock().expect("lock"),
+        [("edit_file".to_owned(), Some("a.txt".to_owned()))]
+    );
+    assert_eq!(outcome.repaired_calls, 0);
+    // The model's call is recorded as it sent it, and its result keeps the name.
+    let second = host
+        .server
+        .as_ref()
+        .expect("server")
+        .last_body()
+        .expect("second request");
+    let messages = second["messages"].as_array().expect("messages");
+    assert!(
+        messages
+            .iter()
+            .any(|message| message["tool_calls"][0]["function"]["name"] == "shell"),
+        "{second}"
+    );
+}
+
+#[test]
+fn a_deny_rule_refuses_an_intercepted_patch() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    std::fs::write(workspace.path().join("a.txt"), "old\n").expect("fixture");
+    let mut rules = RuleSet::new();
+    rules.push(Rule::allow("edit_file", "*", Layer::Default));
+    rules.push(Rule::deny("edit_file", "a.txt", Layer::User));
+    let (_host, outcome) = heredoc_turn(&workspace, rules);
+    let result = &outcome.calls[0];
+    assert!(!result.executed);
+    assert!(
+        result
+            .output
+            .text
+            .starts_with("patch path `a.txt` was not approved:"),
+        "{}",
+        result.output.text
+    );
+    assert_eq!(
+        std::fs::read_to_string(workspace.path().join("a.txt")).expect("read"),
+        "old\n"
+    );
+}

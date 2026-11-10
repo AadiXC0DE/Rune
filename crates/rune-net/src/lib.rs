@@ -8,6 +8,7 @@ pub mod auth;
 pub mod catalog;
 pub mod chat_completions;
 pub mod error;
+pub mod family;
 pub mod fetch;
 pub mod gemini;
 pub mod message;

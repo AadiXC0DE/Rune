@@ -20,6 +20,9 @@ pub struct Resolved {
     pub renamed_from: Option<String>,
     /// What was changed in the arguments, as short phrases.
     pub repairs: Vec<String>,
+    /// A shell command recognised as another tool's call: it runs as that
+    /// tool, and the recorded call and its result keep the model's name.
+    pub intercepted: bool,
 }
 
 /// Why a call could not be resolved.
@@ -101,6 +104,7 @@ pub fn resolve(name: &str, arguments: &str, offered: &[ToolSpec]) -> Result<Reso
             arguments: value,
             renamed_from: (spec.name != name).then(|| name.to_owned()),
             repairs,
+            intercepted: false,
         });
     }
     let alias = name.to_ascii_lowercase();
@@ -123,6 +127,7 @@ pub fn resolve(name: &str, arguments: &str, offered: &[ToolSpec]) -> Result<Reso
         arguments: value,
         renamed_from: Some(name.to_owned()),
         repairs,
+        intercepted: false,
     })
 }
 
@@ -799,6 +804,7 @@ mod tests {
                 arguments: serde_json::from_str(arguments).expect("json"),
                 renamed_from: None,
                 repairs: Vec::new(),
+                intercepted: false,
             }
         );
         assert_eq!(note(&call), None);
@@ -811,6 +817,7 @@ mod tests {
             arguments: json!({}),
             renamed_from: Some("bash".to_owned()),
             repairs: vec!["`limit` was a string".to_owned()],
+            intercepted: false,
         };
         assert_eq!(
             note(&call).as_deref(),

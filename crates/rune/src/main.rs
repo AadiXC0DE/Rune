@@ -1502,7 +1502,7 @@ fn run_acp(
         _ => rune_acp::Dialect::ChatCompletions,
     };
 
-    let registry = rune_tools::inventory::builtin_with_vision(
+    let mut registry = rune_tools::inventory::builtin_with_vision(
         &rune_tools::workspace::FileLimits::from_budget(&settings.limits),
         &settings.limits,
         &paths.managed_skills_dir(),
@@ -1511,6 +1511,10 @@ fn run_acp(
         std::sync::Arc::new(rune_tools::skill::Empty),
         vision_client::backend(settings, paths)?,
     )?;
+    rune_tools::inventory::select_edit_tool(
+        &mut registry,
+        rune_net::family::edit_tool(settings.edit_tool, &settings.model),
+    );
 
     let rules = rune_policy::rules::RuleSet::new();
 

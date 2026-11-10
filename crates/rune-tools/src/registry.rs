@@ -11,12 +11,15 @@ use crate::contract::{Activity, ExecutionContext, Tool, ToolOutput, model_spec};
 #[derive(Default)]
 pub struct Registry {
     tools: BTreeMap<String, Box<dyn Tool>>,
+    /// Whether a tool is offered, where it differs from the tool's own default.
+    advertised: BTreeMap<String, bool>,
 }
 
 impl std::fmt::Debug for Registry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Registry")
             .field("names", &self.tools.keys().collect::<Vec<_>>())
+            .field("advertised", &self.advertised)
             .finish()
     }
 }
@@ -49,6 +52,23 @@ impl Registry {
     #[must_use]
     pub fn get(&self, name: &str) -> Option<&dyn Tool> {
         self.tools.get(name).map(AsRef::as_ref)
+    }
+
+    /// Offers or hides a registered tool, overriding its own default. A hidden
+    /// tool stays registered and callable.
+    pub fn set_advertised(&mut self, name: &str, advertised: bool) {
+        self.advertised.insert(name.to_owned(), advertised);
+    }
+
+    /// Whether the named tool is offered to the model.
+    #[must_use]
+    pub fn is_advertised(&self, name: &str) -> bool {
+        self.get(name).is_some_and(|tool| {
+            self.advertised
+                .get(name)
+                .copied()
+                .unwrap_or_else(|| tool.is_advertised())
+        })
     }
 
     /// Ends whatever every tool keeps running between calls.
@@ -90,8 +110,8 @@ impl Registry {
     pub fn schemas(&self, names: &[&str]) -> Vec<ToolSpec> {
         names
             .iter()
+            .filter(|name| self.is_advertised(name))
             .filter_map(|name| self.get(name))
-            .filter(|tool| tool.is_advertised())
             .map(model_spec)
             .collect()
     }
@@ -100,9 +120,9 @@ impl Registry {
     #[must_use]
     pub fn all_schemas(&self) -> Vec<ToolSpec> {
         self.tools
-            .values()
-            .filter(|tool| tool.is_advertised())
-            .map(|tool| model_spec(tool.as_ref()))
+            .iter()
+            .filter(|(name, _)| self.is_advertised(name))
+            .map(|(_, tool)| model_spec(tool.as_ref()))
             .collect()
     }
 

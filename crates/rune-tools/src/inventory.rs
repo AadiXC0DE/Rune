@@ -156,6 +156,16 @@ pub fn builtin_with_catalog(
     builtin_with_vision(limits, budget, skills_root, web, answerer, catalog, None)
 }
 
+/// Offers the file-edit tool a model is trained on and hides the other.
+///
+/// `write_file` is offered either way. The hidden tool stays registered, so a
+/// call to it is answered as a call to a tool that was not offered.
+pub fn select_edit_tool(registry: &mut Registry, tool: rune_core::config::EditTool) {
+    let patch = tool == rune_core::config::EditTool::Patch;
+    registry.set_advertised("apply_patch", patch);
+    registry.set_advertised("edit_file", !patch);
+}
+
 /// Builds the inventory with an optional host image analysis backend.
 ///
 /// An absent backend keeps the tool explicitly labelled unavailable.
@@ -355,7 +365,7 @@ mod tests {
         let expected: Vec<&str> = ADVERTISEMENT_ORDER
             .iter()
             .copied()
-            .filter(|name| registry.get(name).is_some_and(Tool::is_advertised))
+            .filter(|name| registry.is_advertised(name))
             .collect();
         assert_eq!(names, expected);
     }
@@ -560,6 +570,41 @@ mod tests {
         ] {
             assert!(!read_only.contains(&name), "`{name}` must not be read only");
         }
+    }
+
+    fn advertised_names(registry: &Registry) -> Vec<String> {
+        advertisement(registry)
+            .into_iter()
+            .map(|spec| spec.name)
+            .collect()
+    }
+
+    #[test]
+    fn patch_models_see_apply_patch_and_not_edit_file() {
+        let mut registry = builtin_default().expect("built");
+        select_edit_tool(&mut registry, rune_core::config::EditTool::Patch);
+        let names = advertised_names(&registry);
+        assert!(names.iter().any(|name| name == "apply_patch"));
+        assert!(!names.iter().any(|name| name == "edit_file"));
+        assert!(names.iter().any(|name| name == "write_file"));
+        // Hidden, not removed.
+        assert!(registry.contains("edit_file"));
+        let at = names.iter().position(|name| name == "apply_patch");
+        let write = names.iter().position(|name| name == "write_file");
+        assert!(write < at, "{names:?}");
+    }
+
+    #[test]
+    fn replace_models_see_edit_file_and_not_apply_patch() {
+        let mut registry = builtin_default().expect("built");
+        let before = advertised_names(&registry);
+        select_edit_tool(&mut registry, rune_core::config::EditTool::Replace);
+        let names = advertised_names(&registry);
+        assert_eq!(names, before);
+        assert!(names.iter().any(|name| name == "edit_file"));
+        assert!(!names.iter().any(|name| name == "apply_patch"));
+        assert!(names.iter().any(|name| name == "write_file"));
+        assert!(registry.contains("apply_patch"));
     }
 
     #[test]
