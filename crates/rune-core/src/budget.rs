@@ -524,7 +524,7 @@ impl LimitName {
         match self {
             Self::MaxAgentSteps => "Maximum model tool-loop steps per turn; zero means unlimited.",
             Self::MaxConsecutiveToolFailures => {
-                "Consecutive identical tool failures allowed before stopping the next duplicate."
+                "Consecutive identical tool failures allowed before refusing the next duplicate."
             }
             Self::VerificationReminders => {
                 "Times a turn that changed files without a check afterwards is asked to verify."

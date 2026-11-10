@@ -19,6 +19,7 @@ const SCENARIOS: &[&str] = &[
     "step_cap_graceful",
     "long_150_steps",
     "provider_fails_at_step_4",
+    "same_failure_five_times",
 ];
 
 /// Scenarios built in Rust, which have no file.
@@ -96,6 +97,33 @@ fn provider_fails_at_step_4() {
     assert_eq!(
         result["tool_calls"].as_array().map(Vec::len),
         Some(3),
+        "{result}"
+    );
+}
+
+#[test]
+fn same_failure_five_times() {
+    // Two failures, two refusals, then the call that stalls the run.
+    let report = run_scenario("same_failure_five_times");
+    let result = report.result.expect("a result");
+    assert_eq!(
+        result["tool_calls"].as_array().map(Vec::len),
+        Some(5),
+        "{result}"
+    );
+    let statuses: Vec<&str> = result["narration"]
+        .as_array()
+        .expect("narration")
+        .iter()
+        .filter_map(|entry| entry["status"].as_str())
+        .collect();
+    assert_eq!(
+        statuses,
+        ["error", "error", "not_run", "not_run", "not_run"],
+        "{result}"
+    );
+    assert!(
+        result["usage"]["input_tokens"].as_u64().unwrap_or(0) > 0,
         "{result}"
     );
 }

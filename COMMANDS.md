@@ -301,7 +301,7 @@ Every limit takes a count, or `off` to remove it. A hard ceiling still applies t
 | Name | Default | Unit | Range | Description |
 |---|---|---|---|---|
 | `max_agent_steps` | 0 | items | 0 to 10000 | Maximum model tool-loop steps per turn; zero means unlimited. |
-| `max_consecutive_tool_failures` | 3 | items | 1 to 10000 | Consecutive identical tool failures allowed before stopping the next duplicate. |
+| `max_consecutive_tool_failures` | 3 | items | 1 to 10000 | Consecutive identical tool failures allowed before refusing the next duplicate. |
 | `verification_reminders` | 1 | items | 0 to 8 | Times a turn that changed files without a check afterwards is asked to verify. |
 | `session_spend_cents` | off | cents | 1 to unbounded | Estimated spend at which an interactive session stops sending requests. |
 | `max_tool_result_bytes` | 65536 | bytes | 0 to unbounded | Bytes retained from one tool result before spilling. |

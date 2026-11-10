@@ -53,6 +53,8 @@ pub enum StopReason {
     ContentFilter,
     /// The provider failed in a way that could not be recovered.
     ProviderFailure,
+    /// The model kept sending a call that failed, after it was refused twice.
+    Stalled,
 }
 
 impl StopReason {
@@ -68,6 +70,7 @@ impl StopReason {
             Self::Cancelled => "cancelled",
             Self::ContentFilter => "content_filter",
             Self::ProviderFailure => "provider_error",
+            Self::Stalled => "stalled",
         }
     }
 
@@ -506,6 +509,7 @@ pub fn stop_reason_for(error: &RuneError) -> StopReason {
     match (error.code(), error.detail().invariant.as_deref()) {
         (ErrorCode::Cancelled, _) => StopReason::Cancelled,
         (_, Some("objective_token_budget")) => StopReason::ObjectiveBudget,
+        (_, Some("max_consecutive_tool_failures")) => StopReason::Stalled,
         _ => StopReason::ProviderFailure,
     }
 }
@@ -975,7 +979,7 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
         // Execute the batch. Policy is resolved per call before anything runs,
         // so a denial never reaches a tool. On the last step nothing runs: each
         // call is answered as refused so the record stays well formed.
-        let (results, failure_limit_reached) = if last_step {
+        let (results, stalled) = if last_step {
             let refused = pending_calls
                 .iter()
                 .map(|call| {
@@ -990,7 +994,7 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
                     }
                 })
                 .collect();
-            (refused, false)
+            (refused, None)
         } else {
             execute_batch(
                 &pending_calls,
@@ -1024,12 +1028,18 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
             settle!(StopReason::StepLimit);
         }
 
-        if failure_limit_reached {
-            return Err(RuneError::new(
-                ErrorCode::LimitExceeded,
-                "stopped before repeating a tool call at max_consecutive_tool_failures",
-            )
-            .with_invariant(LimitName::MaxConsecutiveToolFailures.as_str()));
+        if let Some(call) = stalled {
+            settle!(
+                StopReason::Stalled,
+                RuneError::new(
+                    ErrorCode::LimitExceeded,
+                    format!(
+                        "the model sent the failing `{}` call again after it was refused twice",
+                        call.name
+                    ),
+                )
+                .with_invariant(LimitName::MaxConsecutiveToolFailures.as_str())
+            );
         }
 
         // A provider error with tool calls in flight still ends the turn after
@@ -1322,10 +1332,11 @@ fn execute_batch(
     result_bytes: &mut usize,
     limits: &BudgetSet,
     previous: &[CallResult],
-) -> (Vec<CallResult>, bool) {
+) -> (Vec<CallResult>, Option<PreparedCall>) {
     let mut results = Vec::with_capacity(calls.len());
     let mut cancelled = false;
-    let mut stopped = false;
+    // The call that stalled the run; everything after it is answered unrun.
+    let mut stalled: Option<PreparedCall> = None;
     let failure_limit = limits.get(LimitName::MaxConsecutiveToolFailures).value();
     let offered: Vec<String> = host.tools().into_iter().map(|spec| spec.name).collect();
     let turn_cap = limits.get_usize(LimitName::MaxTurnResultBytes);
@@ -1369,15 +1380,13 @@ fn execute_batch(
             for (index, call) in group.iter().enumerate() {
                 // Later calls in this group differ from their predecessor,
                 // so they cannot extend an existing failure streak.
-                let blocked = if index == 0 || stopped {
-                    failure_guard(
+                let blocked = if stalled.is_some() {
+                    Some(stopped_call(call, host))
+                } else if index == 0 {
+                    guard_result(
+                        failure_guard(call, host, previous, &results, failure_limit, cancelled),
                         call,
-                        host,
-                        previous,
-                        &results,
-                        failure_limit,
-                        cancelled,
-                        &mut stopped,
+                        &mut stalled,
                     )
                 } else {
                     None
@@ -1440,17 +1449,18 @@ fn execute_batch(
     }
     for call in &calls[parallel_prefix..] {
         let cap = turn_cap.saturating_sub(*result_bytes).min(tool_cap);
-        let result = failure_guard(
-            call,
-            host,
-            previous,
-            &results,
-            failure_limit,
-            cancelled,
-            &mut stopped,
-        )
-        .or_else(|| repeat_guard(call, host, history, previous, &results, cancelled))
-        .unwrap_or_else(|| execute_call(call, host, &offered, &mut cancelled, history, cap));
+        let blocked = if stalled.is_some() {
+            Some(stopped_call(call, host))
+        } else {
+            guard_result(
+                failure_guard(call, host, previous, &results, failure_limit, cancelled),
+                call,
+                &mut stalled,
+            )
+        };
+        let result = blocked
+            .or_else(|| repeat_guard(call, host, history, previous, &results, cancelled))
+            .unwrap_or_else(|| execute_call(call, host, &offered, &mut cancelled, history, cap));
         retain_result(
             result,
             host,
@@ -1462,7 +1472,7 @@ fn execute_batch(
             &mut results,
         );
     }
-    (results, stopped)
+    (results, stalled)
 }
 
 /// Call IDs identify requests, not the operation being repeated.
@@ -1645,7 +1655,39 @@ fn file_digest(host: &dyn Host, arguments: &str) -> Option<[u8; 32]> {
     Some(Sha256::digest(&bytes).into())
 }
 
+/// Answer for a call refused because it already failed the same way.
+fn repeated_failure_refusal(failures: usize) -> String {
+    format!(
+        "{REFUSAL_PREFIX} {failures} times in a row. Do not send it again. Read the error above \
+         and change something: different arguments, another tool, or say what is blocking you."
+    )
+}
+
+/// How every repeated-failure refusal begins.
+const REFUSAL_PREFIX: &str = "not run: this exact call has failed";
+
+/// Answer for the call that stalls the run.
+const STALLED_CALL: &str =
+    "not run: the run stopped because this call was sent again after two refusals";
+
+/// Answer for the calls after a stall in the same batch.
+const STOPPED_CALL: &str = "not run: the run stopped";
+
+/// What the failure guard decided for one call.
+enum Guard {
+    /// The call runs.
+    Run,
+    /// The call is answered with a nudge and the turn goes on.
+    Refuse(CallResult),
+    /// The call is answered and the run stops.
+    Stall(CallResult),
+}
+
 /// Checks failures in request order, across batches but only within this turn.
+///
+/// Looks at the trailing run of earlier results identical to `call` that all
+/// failed. A call that already failed enough times is refused with a nudge;
+/// one sent again after two refusals stalls the run.
 fn failure_guard(
     call: &PreparedCall,
     host: &dyn Host,
@@ -1653,36 +1695,78 @@ fn failure_guard(
     results: &[CallResult],
     limit: Option<u64>,
     cancelled: bool,
-    stopped: &mut bool,
-) -> Option<CallResult> {
+) -> Guard {
     // Cancellation retains its existing outcome and answers pending calls.
     if cancelled || host.cancellation().is_cancelled() {
-        return None;
+        return Guard::Run;
     }
-    if !*stopped {
-        let limit = limit?;
-        let failures = previous
-            .iter()
-            .chain(results)
-            .rev()
-            .take_while(|result| result.output.is_error && identical_call(&result.call, call))
-            .take(usize::try_from(limit).unwrap_or(usize::MAX))
-            .count();
-        *stopped = u64::try_from(failures).unwrap_or(u64::MAX) >= limit;
+    let Some(limit) = limit else {
+        return Guard::Run;
+    };
+    // A malformed, unoffered or denied call never runs but still failed, so
+    // the run counts every failed answer. Once it holds `limit` of them, each
+    // further identical call is answered here instead of running, so the
+    // entries past the limit are this guard's own refusals. Counting them
+    // this way does not depend on their text, which a result budget may cut.
+    let limit = usize::try_from(limit).unwrap_or(usize::MAX).max(1);
+    let run = previous
+        .iter()
+        .chain(results)
+        .rev()
+        .take_while(|result| result.output.is_error && identical_call(&result.call, call))
+        .count();
+    let failures = run.min(limit);
+    let refusals = run.saturating_sub(limit);
+    let deny = |text: String| {
+        host.emit(Event::ToolDenied {
+            call: call.clone(),
+            reason: text.clone(),
+        });
+        CallResult {
+            call: call.clone(),
+            output: ToolOutput::failure(text),
+            executed: false,
+        }
+    };
+    if refusals >= 2 {
+        return Guard::Stall(deny(STALLED_CALL.to_owned()));
     }
-    if !*stopped {
-        return None;
+    // The limit is how many identical failures in a row are allowed; the
+    // next attempt is refused.
+    if failures >= limit {
+        return Guard::Refuse(deny(repeated_failure_refusal(failures)));
     }
-    let reason = "not run: the turn reached max_consecutive_tool_failures";
+    Guard::Run
+}
+
+/// Turns a guard decision into the answer given in place of running the call,
+/// recording the call when it stalled the run.
+fn guard_result(
+    guard: Guard,
+    call: &PreparedCall,
+    stalled: &mut Option<PreparedCall>,
+) -> Option<CallResult> {
+    match guard {
+        Guard::Run => None,
+        Guard::Refuse(result) => Some(result),
+        Guard::Stall(result) => {
+            *stalled = Some(call.clone());
+            Some(result)
+        }
+    }
+}
+
+/// Answers a call that comes after a stall in the same batch.
+fn stopped_call(call: &PreparedCall, host: &dyn Host) -> CallResult {
     host.emit(Event::ToolDenied {
         call: call.clone(),
-        reason: reason.to_owned(),
+        reason: STOPPED_CALL.to_owned(),
     });
-    Some(CallResult {
+    CallResult {
         call: call.clone(),
-        output: ToolOutput::failure(reason),
+        output: ToolOutput::failure(STOPPED_CALL),
         executed: false,
-    })
+    }
 }
 
 /// Retains and charges answers in request order, regardless of execution order.

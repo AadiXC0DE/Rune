@@ -490,19 +490,24 @@ remain in force when the output limit is raised or set to `off`.
 under the configured permission mode and workspace boundaries; calls requiring
 interactive approval return an error to the model without waiting for input.
 The shared host loop allows three consecutive failures of the same tool name
-and exact argument string per turn, ignoring call IDs. The next duplicate stops
-with `limit_exceeded` naming `max_consecutive_tool_failures`, before execution.
+and exact argument string per turn, ignoring call IDs. The next duplicate is not
+run: the model is told it already failed and asked to change something, and the
+turn goes on. A duplicate sent again after two such refusals stops the run as
+`stalled`, with `limit_exceeded` naming `max_consecutive_tool_failures`, and the
+usage, steps and calls so far still reported.
 A successful call or a different call resets the streak. Configure the cap in
 `[limits]` or with `--limit max_consecutive_tool_failures=N`; `off` disables it.
 Adjacent duplicate reads run in order to enforce this cap.
-The next request includes the tool results. A positive `max_agent_steps` sets
-the model step cap; zero or an unlimited setting uses a cap of 16 for `ask`.
+The next request includes the tool results. `ask` has no step cap unless one is
+set with `--max-steps N` or a positive `max_agent_steps`. With a cap, the last
+allowed request still lists the tools but forbids calling them and tells the
+model it is the last step, so the run ends with its final answer.
 Transient provider failures retry within each step up to `provider_max_attempts`,
 honoring `Retry-After` or using bounded backoff. Each attempt uses the configured
 `provider_head_timeout_ms` and `provider_request_timeout_ms` deadlines.
 Rejected credentials never retry. Retries consume no extra model steps or usage.
-Reaching the cap before a final answer exits 1 with `limit_exceeded` and an
-empty `final_output`. JSON reports the steps, summed usage, and each tool's
+Reaching the cap exits 1 with `limit_exceeded`; the last step's answer is the
+`final_output`. JSON reports the steps, summed usage, and each tool's
 `success` or `error` status. Usage includes `cache_read_tokens` and
 `cache_write_tokens` when the provider reports them; both are parts of
 `input_tokens`.

@@ -30,6 +30,15 @@ Notable changes, newest first. Each entry describes what a user can observe.
 
 ### Changed
 
+- `rune ask` has no step cap unless one is set; `--max-steps N` sets one and `0`
+  removes it. A capped run's last request forbids tool calls and asks for a
+  final answer, which plain output now prints. A subagent that reports on its
+  last step returns that report instead of failing.
+- A run that fails after its first completed request reports its usage, steps,
+  tool calls and text in `ask --json` instead of zero steps and no cost.
+- A call that already failed the same way `max_consecutive_tool_failures` times
+  is refused with a nudge and the turn goes on; sending it again after two
+  refusals stops the run as `stalled`, instead of the turn ending at once.
 - The startup work budgets for `--version` and `--help` are 2 ms each, down from
   5 ms and 8 ms.
 - The tool schemas sent with each request fell from 17,379 to 9,154 bytes in
