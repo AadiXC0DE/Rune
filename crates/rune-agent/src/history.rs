@@ -356,6 +356,28 @@ impl History {
         seq
     }
 
+    /// Replaces the name and arguments of a recorded tool call, so a call that
+    /// ran in a repaired form is shown that way next to its result.
+    ///
+    /// The newest call with the identifier is changed; the turn's replay
+    /// state is left as it is.
+    pub fn rewrite_tool_call(&mut self, id: &str, name: &str, arguments: &str) {
+        let part = self.turns.iter_mut().rev().find_map(|turn| {
+            turn.parts.iter_mut().find(
+                |part| matches!(part, ContentPart::ToolCall { id: held, .. } if held.as_str() == id),
+            )
+        });
+        if let Some(ContentPart::ToolCall {
+            name: held_name,
+            arguments: held_arguments,
+            ..
+        }) = part
+        {
+            name.clone_into(held_name);
+            arguments.clone_into(held_arguments);
+        }
+    }
+
     /// Returns the replay state stored on the last turn, when there is one.
     #[must_use]
     pub fn last_replay(&self) -> Option<&str> {

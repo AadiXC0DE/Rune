@@ -393,6 +393,9 @@ impl Recorder {
                     arguments: call.call.arguments.clone(),
                 })?;
             }
+            for repair in &outcome.repairs {
+                self.append(repaired_event(repair))?;
+            }
             for call in &outcome.calls {
                 self.append(SessionEvent::ToolResult {
                     call_id: call.call.id.clone(),
@@ -412,6 +415,15 @@ impl Recorder {
             for message in std::mem::take(&mut self.responses) {
                 for event in message_events(&message, turn)? {
                     self.append(event)?;
+                }
+                for (id, _, _) in message.tool_calls() {
+                    if let Some(repair) = outcome
+                        .repairs
+                        .iter()
+                        .find(|repair| repair.id == id.as_str())
+                    {
+                        self.append(repaired_event(repair))?;
+                    }
                 }
                 for (id, _, _) in message.tool_calls() {
                     if let Some(result) = results
@@ -740,7 +752,8 @@ pub fn tree_of(state: &SessionState) -> Tree {
             | SessionEvent::ModelSet { .. }
             | SessionEvent::WorkspaceSet { .. }
             | SessionEvent::ForkedFrom { .. }
-            | SessionEvent::ChildOf { .. } => continue,
+            | SessionEvent::ChildOf { .. }
+            | SessionEvent::ToolCallRepaired { .. } => continue,
         };
         let node = Node::new(
             role,
@@ -928,6 +941,16 @@ pub fn load(paths: &Paths, id: &SessionId) -> Result<(Recorder, History)> {
     Ok((recorder, history))
 }
 
+/// Records that a call ran in a repaired form.
+fn repaired_event(repair: &rune_agent::turn::CallRepair) -> SessionEvent {
+    SessionEvent::ToolCallRepaired {
+        call_id: repair.id.clone(),
+        from: repair.from.clone(),
+        to: repair.to.clone(),
+        repairs: repair.repairs.clone(),
+    }
+}
+
 /// Encodes one history message without flattening provider response boundaries.
 pub fn message_events(message: &rune_agent::history::Turn, turn: u64) -> Result<Vec<SessionEvent>> {
     let mut events = Vec::new();
@@ -1066,7 +1089,8 @@ pub fn history_from(state: &SessionState) -> History {
             | SessionEvent::ChildOf { .. }
             | SessionEvent::TurnInterrupted { .. }
             | SessionEvent::TurnCancelled { .. }
-            | SessionEvent::TurnFailed { .. } => {}
+            | SessionEvent::TurnFailed { .. }
+            | SessionEvent::ToolCallRepaired { .. } => {}
         }
     }
 
@@ -1479,6 +1503,8 @@ mod tests {
             steps: 1,
             verification: rune_agent::turn::Verification::NotApplicable,
             calls: Vec::new(),
+            repairs: Vec::new(),
+            repaired_calls: 0,
         }
     }
 

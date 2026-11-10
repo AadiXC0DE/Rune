@@ -114,6 +114,17 @@ pub enum SessionEvent {
         /// Arguments as the model produced them.
         arguments: String,
     },
+    /// A tool call sent in a near-miss form ran in a repaired form.
+    ToolCallRepaired {
+        /// Identifier of the call that was repaired.
+        call_id: String,
+        /// Tool name the model sent.
+        from: String,
+        /// Tool the call ran as.
+        to: String,
+        /// What was changed in the arguments, as short phrases.
+        repairs: Vec<String>,
+    },
     /// A tool call produced a result.
     ToolResult {
         /// Identifier of the call this answers.
@@ -214,6 +225,7 @@ impl SessionEvent {
             Self::AssistantReset { .. } => "assistant_reset",
             Self::TurnInterrupted { .. } => "turn_interrupted",
             Self::ToolCall { .. } => "tool_call",
+            Self::ToolCallRepaired { .. } => "tool_call_repaired",
             Self::ToolResult { .. } => "tool_result",
             Self::Compaction { .. } => "compaction",
             Self::UsageRecorded { .. } => "usage_recorded",
@@ -776,6 +788,12 @@ mod tests {
                 call_id: "call_1".to_owned(),
                 name: "read_file".to_owned(),
                 arguments: "{\"path\":\"a.rs\"}".to_owned(),
+            },
+            SessionEvent::ToolCallRepaired {
+                call_id: "call_1".to_owned(),
+                from: "cat".to_owned(),
+                to: "read_file".to_owned(),
+                repairs: vec!["`line_count` was a string".to_owned()],
             },
             SessionEvent::ToolResult {
                 call_id: "call_1".to_owned(),

@@ -727,6 +727,8 @@ impl Host for SessionHost {
             )),
             // A queued message is reported once the turn ends, from the events.
             Event::SteeringApplied { .. } => {}
+            // The result ends with a note saying what ran.
+            Event::CallRepaired { .. } => {}
             // Said in scrollback, so the reader knows why the turn went on.
             Event::VerificationRequested => {
                 let mut entries = self.take_narration();
@@ -10781,6 +10783,8 @@ mod tests {
             steps: 1,
             verification: turn::Verification::NotApplicable,
             calls: Vec::new(),
+            repairs: Vec::new(),
+            repaired_calls: 0,
         };
         let lines = report_turn(&outcome, &host, "").expect("reported");
         assert!(
@@ -10803,6 +10807,8 @@ mod tests {
             steps: 40,
             verification: turn::Verification::NotApplicable,
             calls: Vec::new(),
+            repairs: Vec::new(),
+            repaired_calls: 0,
         };
         let lines = report_turn(&outcome, &host, "").expect("reported");
         assert!(
@@ -10885,6 +10891,8 @@ mod tests {
             steps: 1,
             verification: turn::Verification::NotApplicable,
             calls: Vec::new(),
+            repairs: Vec::new(),
+            repaired_calls: 0,
         };
         // The refusal reaches scrollback when it happens, and the end of the
         // turn does not print it a second time.
@@ -11176,6 +11184,8 @@ mod tests {
             steps: 1,
             verification: turn::Verification::NotApplicable,
             calls: vec![patch],
+            repairs: Vec::new(),
+            repaired_calls: 0,
         };
         let summary = turn_summary(&outcome, None, None, true).expect("summary");
         assert!(summary.starts_with("1 call, 2 files changed"), "{summary}");
@@ -11208,6 +11218,8 @@ mod tests {
             steps: 2,
             verification: turn::Verification::NotApplicable,
             calls: vec![edit.clone(), edit],
+            repairs: Vec::new(),
+            repaired_calls: 0,
         };
         let summary = turn_summary(
             &outcome,

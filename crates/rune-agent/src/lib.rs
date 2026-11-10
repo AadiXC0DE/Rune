@@ -5,6 +5,7 @@
 
 pub mod compaction;
 pub mod history;
+pub mod repair;
 pub mod retry;
 pub mod steering;
 pub mod subagent;

@@ -428,6 +428,18 @@ fn encode(event: &Event) -> serde_json::Value {
         Event::PlanUpdated { update } => json!({ "kind": "plan_updated", "update": update }),
         Event::TextDelta { delta } => json!({ "kind": "text", "delta": delta }),
         Event::ReasoningDelta { delta } => json!({ "kind": "reasoning", "delta": delta }),
+        Event::CallRepaired {
+            id,
+            from,
+            to,
+            repairs,
+        } => json!({
+            "kind": "call_repaired",
+            "id": id,
+            "from": from,
+            "to": to,
+            "repairs": repairs,
+        }),
         Event::ToolStarted { call, activity } => json!({
             "kind": "tool_started",
             "id": call.id,

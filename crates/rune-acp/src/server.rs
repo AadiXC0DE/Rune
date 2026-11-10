@@ -1487,6 +1487,7 @@ impl<W: Write + Send + 'static> Host for TurnHost<W> {
                 )));
             }
             Event::PlanUpdated { .. }
+            | Event::CallRepaired { .. }
             | Event::SteeringApplied { .. }
             | Event::VerificationRequested
             | Event::ContextCompacted { .. }

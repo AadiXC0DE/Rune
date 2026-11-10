@@ -5025,3 +5025,273 @@ fn a_write_policy_refuses_is_left_to_policy_by_the_overwrite_guard() {
         "keep\n"
     );
 }
+
+fn builtin_specs(names: &[&str]) -> Vec<ToolSpec> {
+    rune_tools::inventory::builtin_default()
+        .expect("registry")
+        .schemas(names)
+}
+
+/// Returns the recorded tool calls and results as (kind, id, name, text).
+fn recorded_tool_parts(
+    history: &rune_agent::History,
+) -> Vec<(&'static str, String, String, String)> {
+    history
+        .turns()
+        .iter()
+        .flat_map(|turn| turn.parts.iter())
+        .filter_map(|part| match part {
+            rune_net::message::ContentPart::ToolCall {
+                id,
+                name,
+                arguments,
+            } => Some(("call", id.to_string(), name.clone(), arguments.clone())),
+            rune_net::message::ContentPart::ToolResult {
+                id, name, content, ..
+            } => Some(("result", id.to_string(), name.clone(), content.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn a_bash_call_runs_as_shell_and_says_so() {
+    let endpoint = MockEndpoint::start(vec![
+        Script::tool_call("c1", "bash", r#"{"command":"ls"}"#),
+        Script::text("done"),
+    ]);
+    let host = TestHost::new(endpoint).with_tools(builtin_specs(&["shell", "read_file"]));
+    let mut history = rune_agent::History::new();
+    history.push_user("list the files");
+
+    let outcome = run_turn(&mut history, &host).expect("turn");
+    let note = "[note: there is no tool named `bash`; this ran as `shell`.]";
+    assert_eq!(
+        host.executed_calls(),
+        vec![(
+            "shell".to_owned(),
+            serde_json::json!({ "command": "ls", "action": "run" })
+        )]
+    );
+    assert_eq!(outcome.calls[0].call.name, "shell");
+    assert!(outcome.calls[0].executed);
+    assert_eq!(outcome.calls[0].output.text, format!("tool output\n{note}"));
+    assert_eq!(outcome.repaired_calls, 1);
+    assert_eq!(
+        outcome.repairs,
+        vec![rune_agent::turn::CallRepair {
+            id: "c1".to_owned(),
+            from: "bash".to_owned(),
+            to: "shell".to_owned(),
+            repairs: Vec::new(),
+        }]
+    );
+    let events = host.events();
+    let repaired = events
+        .iter()
+        .position(|event| {
+            matches!(event, Event::CallRepaired { from, to, .. } if from == "bash" && to == "shell")
+        })
+        .expect("a repair event");
+    let started = events
+        .iter()
+        .position(|event| matches!(event, Event::ToolStarted { .. }))
+        .expect("a started event");
+    assert!(repaired < started);
+
+    // The next request shows the call as it ran, next to its result.
+    let body = host
+        .server
+        .as_ref()
+        .expect("server")
+        .last_body()
+        .expect("request body");
+    let messages = body["messages"].as_array().expect("messages");
+    let assistant = messages
+        .iter()
+        .find(|message| message["role"] == "assistant")
+        .expect("assistant message");
+    assert_eq!(assistant["tool_calls"][0]["function"]["name"], "shell");
+    let arguments: serde_json::Value = serde_json::from_str(
+        assistant["tool_calls"][0]["function"]["arguments"]
+            .as_str()
+            .expect("arguments"),
+    )
+    .expect("json");
+    assert_eq!(
+        arguments,
+        serde_json::json!({ "command": "ls", "action": "run" })
+    );
+    let result = messages
+        .iter()
+        .find(|message| message["role"] == "tool")
+        .expect("tool message");
+    assert!(
+        result["content"].as_str().expect("content").ends_with(note),
+        "{result}"
+    );
+    history.validate().expect("paired history");
+}
+
+#[test]
+fn a_repaired_call_is_judged_by_its_real_name() {
+    let endpoint = MockEndpoint::start(vec![
+        Script::tool_call("c1", "bash", r#"{"command":"rm -rf build"}"#),
+        Script::text("it was refused"),
+    ]);
+    let mut rules = RuleSet::new();
+    rules.push(Rule::deny("shell", "*", Layer::User));
+    let host = TestHost::new(endpoint)
+        .with_tools(builtin_specs(&["shell"]))
+        .with_rules(rules);
+    let mut history = rune_agent::History::new();
+    history.push_user("clean the build");
+
+    let outcome = run_turn(&mut history, &host).expect("turn");
+    assert!(host.executed_calls().is_empty(), "a denied call ran");
+    assert!(!outcome.calls[0].executed);
+    assert_eq!(outcome.calls[0].call.name, "shell");
+    let text = &outcome.calls[0].output.text;
+    assert!(text.starts_with("`shell` was refused by policy"), "{text}");
+    assert!(
+        text.ends_with("[note: there is no tool named `bash`; this ran as `shell`.]"),
+        "{text}"
+    );
+    let decisions = host.decisions.lock().expect("lock").clone();
+    assert_eq!(decisions[0].0, "shell");
+    let denied = host.events().into_iter().find_map(|event| match event {
+        Event::ToolDenied { call, .. } => Some(call.name),
+        _ => None,
+    });
+    assert_eq!(denied.as_deref(), Some("shell"));
+}
+
+#[test]
+fn stringly_typed_arguments_are_coerced_and_reported() {
+    let endpoint = MockEndpoint::start(vec![
+        Script::tool_call(
+            "c1",
+            "read_file",
+            r#"{"path":"a.rs","start_line":"2","line_count":"3"}"#,
+        ),
+        Script::text("read"),
+    ]);
+    let host = TestHost::new(endpoint).with_tools(builtin_specs(&["read_file"]));
+    let mut history = rune_agent::History::new();
+    history.push_user("read part of a.rs");
+
+    let outcome = run_turn(&mut history, &host).expect("turn");
+    assert_eq!(
+        host.executed_calls(),
+        vec![(
+            "read_file".to_owned(),
+            serde_json::json!({ "path": "a.rs", "start_line": 2, "line_count": 3 })
+        )]
+    );
+    assert!(
+        outcome.calls[0]
+            .output
+            .text
+            .ends_with("[note: Repaired: `start_line` was a string; `line_count` was a string.]"),
+        "{}",
+        outcome.calls[0].output.text
+    );
+    assert_eq!(outcome.repaired_calls, 1);
+    assert_eq!(outcome.repairs[0].from, "read_file");
+    assert_eq!(outcome.repairs[0].to, "read_file");
+    let recorded = recorded_tool_parts(&history);
+    assert_eq!(
+        recorded[0].3, r#"{"path":"a.rs","start_line":2,"line_count":3}"#,
+        "the recorded call shows the arguments it ran with"
+    );
+}
+
+#[test]
+fn a_repaired_call_beside_signed_reasoning_is_not_rewritten() {
+    let sent = r#"{"command":"ls"}"#;
+    let tool_use = Script::Frames(vec![
+        r#"{"type":"message_start","message":{"usage":{"input_tokens":10}}}"#.to_owned(),
+        r#"{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"","signature":"sig"}}"#.to_owned(),
+        r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"list them"}}"#.to_owned(),
+        r#"{"type":"content_block_stop","index":0}"#.to_owned(),
+        r#"{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_1","name":"bash","input":{}}}"#.to_owned(),
+        serde_json::json!({
+            "type": "content_block_delta",
+            "index": 1,
+            "delta": { "type": "input_json_delta", "partial_json": sent },
+        })
+        .to_string(),
+        r#"{"type":"content_block_stop","index":1}"#.to_owned(),
+        r#"{"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":5}}"#.to_owned(),
+        r#"{"type":"message_stop"}"#.to_owned(),
+    ]);
+    let answer = Script::Frames(vec![
+        r#"{"type":"message_start","message":{"usage":{"input_tokens":10}}}"#.to_owned(),
+        r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#.to_owned(),
+        r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"done"}}"#.to_owned(),
+        r#"{"type":"content_block_stop","index":0}"#.to_owned(),
+        r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}"#.to_owned(),
+        r#"{"type":"message_stop"}"#.to_owned(),
+    ]);
+    let endpoint = MockEndpoint::start(vec![tool_use, answer]);
+    let mut host = TestHost::new(endpoint).with_tools(builtin_specs(&["shell"]));
+    host.dialect = Box::new(rune_net::anthropic::Anthropic);
+    let mut history = rune_agent::History::new();
+    history.push_user("list the files");
+
+    let outcome = run_turn(&mut history, &host).expect("turn");
+    assert_eq!(outcome.text, "done");
+    assert_eq!(host.executed_calls()[0].0, "shell");
+    assert_eq!(outcome.calls[0].call.name, "shell");
+    assert_eq!(outcome.repaired_calls, 1);
+    let recorded = recorded_tool_parts(&history);
+    assert_eq!(
+        recorded[0],
+        (
+            "call",
+            "toolu_1".to_owned(),
+            "bash".to_owned(),
+            sent.to_owned()
+        )
+    );
+    assert_eq!(recorded[1].0, "result");
+    assert_eq!(recorded[1].2, "bash", "the result keeps the recorded name");
+    assert!(
+        recorded[1]
+            .3
+            .ends_with("[note: there is no tool named `bash`; this ran as `shell`.]"),
+        "{}",
+        recorded[1].3
+    );
+    history.validate().expect("paired history");
+}
+
+#[test]
+fn a_repeated_aliased_failure_is_refused_like_the_call_it_runs_as() {
+    let arguments = r#"{"command":"make broken"}"#;
+    let endpoint = MockEndpoint::start(vec![
+        Script::tool_call("c1", "bash", arguments),
+        Script::tool_call("c2", "bash", arguments),
+        Script::tool_call("c3", "bash", arguments),
+        Script::tool_call("c4", "bash", arguments),
+        Script::text("the build is broken"),
+    ]);
+    let mut host = TestHost::new(endpoint)
+        .with_tools(builtin_specs(&["shell"]))
+        .with_tool_response(ToolOutput::failure("make: *** [broken] Error 2"));
+    set_failure_cap(&mut host, rune_core::budget::Budget::Bounded(3));
+    let mut history = rune_agent::History::new();
+    history.push_user("build it");
+    let outcome = run_turn(&mut history, &host).expect("the turn goes on");
+    assert_eq!(host.executed_calls().len(), 3);
+    assert!(!outcome.calls[3].executed);
+    assert!(
+        outcome.calls[3]
+            .output
+            .text
+            .starts_with("not run: this exact call has failed 3 times in a row."),
+        "{}",
+        outcome.calls[3].output.text
+    );
+    history.validate().expect("paired history");
+}

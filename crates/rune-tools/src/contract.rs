@@ -618,6 +618,71 @@ fn validate_closed_fields(
     Ok(())
 }
 
+/// Returns true when a value fits an argument schema.
+///
+/// Checks `type`, `enum`, `required`, `properties` with
+/// `additionalProperties: false`, and `items`, recursively. Other keywords,
+/// such as `oneOf`, `anyOf`, `not`, `minimum` and `maximum`, are not checked;
+/// the tool's own validation still runs.
+pub fn conforms(schema: &serde_json::Value, value: &serde_json::Value) -> bool {
+    let fits = |name: &str| match name {
+        "string" => value.is_string(),
+        "integer" => value.is_i64() || value.is_u64(),
+        "number" => value.is_number(),
+        "boolean" => value.is_boolean(),
+        "array" => value.is_array(),
+        "object" => value.is_object(),
+        "null" => value.is_null(),
+        _ => true,
+    };
+    let typed = match schema.get("type") {
+        Some(serde_json::Value::String(name)) => fits(name),
+        Some(serde_json::Value::Array(names)) => {
+            names.iter().filter_map(serde_json::Value::as_str).any(fits)
+        }
+        _ => true,
+    };
+    if !typed {
+        return false;
+    }
+    if let Some(options) = schema.get("enum").and_then(serde_json::Value::as_array)
+        && !options.contains(value)
+    {
+        return false;
+    }
+    if let Some(object) = value.as_object() {
+        let mut required = schema
+            .get("required")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(serde_json::Value::as_str);
+        if required.any(|key| !object.contains_key(key)) {
+            return false;
+        }
+        let properties = schema
+            .get("properties")
+            .and_then(serde_json::Value::as_object);
+        let closed = schema
+            .get("additionalProperties")
+            .and_then(serde_json::Value::as_bool)
+            == Some(false);
+        for (key, field) in object {
+            match properties.and_then(|fields| fields.get(key)) {
+                Some(field_schema) if !conforms(field_schema, field) => return false,
+                None if closed => return false,
+                _ => {}
+            }
+        }
+    }
+    if let Some(items) = schema.get("items")
+        && let Some(array) = value.as_array()
+    {
+        return array.iter().all(|item| conforms(items, item));
+    }
+    true
+}
+
 /// Largest description a tool may advertise.
 pub const MAX_DESCRIPTION_BYTES: usize = 1024;
 
@@ -1007,5 +1072,58 @@ mod tests {
         let output = ToolOutput::success("abcd");
         assert_eq!(output.produced_bytes, 4);
         assert_eq!(output.render(), "abcd");
+    }
+
+    #[test]
+    fn conforms_checks_types_required_and_closed_objects() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string" },
+                "count": { "type": "integer", "minimum": 1 },
+                "ratio": { "type": "number" },
+                "all": { "type": "boolean" },
+                "mode": { "type": "string", "enum": ["a", "b"] },
+                "steps": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": { "step": { "type": "string" } },
+                        "required": ["step"],
+                        "additionalProperties": false
+                    }
+                }
+            },
+            "required": ["path"],
+            "additionalProperties": false
+        });
+        let fits = |value: serde_json::Value| conforms(&schema, &value);
+        assert!(fits(serde_json::json!({ "path": "a" })));
+        assert!(fits(serde_json::json!({
+            "path": "a", "count": 2, "ratio": 1.5, "all": true, "mode": "b",
+            "steps": [{ "step": "one" }]
+        })));
+        // The tool's own validation checks bounds.
+        assert!(fits(serde_json::json!({ "path": "a", "count": 0 })));
+        assert!(!fits(serde_json::json!({ "count": 2 })), "missing required");
+        assert!(!fits(serde_json::json!({ "path": 1 })), "wrong type");
+        assert!(!fits(serde_json::json!({ "path": "a", "count": "2" })));
+        assert!(!fits(serde_json::json!({ "path": "a", "count": 1.5 })));
+        assert!(!fits(serde_json::json!({ "path": "a", "all": "true" })));
+        assert!(
+            !fits(serde_json::json!({ "path": "a", "mode": "c" })),
+            "enum"
+        );
+        assert!(
+            !fits(serde_json::json!({ "path": "a", "extra": 1 })),
+            "closed"
+        );
+        assert!(!fits(serde_json::json!({ "path": "a", "steps": [{}] })));
+        assert!(!fits(
+            serde_json::json!({ "path": "a", "steps": [{ "step": "x", "id": 1 }] })
+        ));
+        assert!(!fits(serde_json::json!(["path"])), "not an object");
+        let open = serde_json::json!({ "type": "object", "properties": {} });
+        assert!(conforms(&open, &serde_json::json!({ "anything": 1 })));
     }
 }

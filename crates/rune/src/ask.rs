@@ -458,6 +458,8 @@ pub struct JsonResult {
     pub usage: UsageReport,
     /// Tool calls requested by the provider, in order.
     pub tool_calls: Vec<ToolCallReport>,
+    /// Tool calls that ran after their name or arguments were repaired.
+    pub repaired_calls: u32,
     /// What the run said and which tools it called, in the order they
     /// happened, so text written between calls keeps its place.
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -516,6 +518,7 @@ impl JsonResult {
             steps: 0,
             usage: UsageReport::default(),
             tool_calls: Vec::new(),
+            repaired_calls: 0,
             narration: Vec::new(),
             cost_usd: None,
             verification: None,
@@ -1289,6 +1292,7 @@ pub fn run(
             cache_write_tokens: usage.cache_write_tokens,
         },
         tool_calls,
+        repaired_calls: outcome.repaired_calls,
         narration,
         cost_usd: crate::provider_setup::cached_prices(settings, paths)
             .and_then(|prices| prices.cost(&usage))
@@ -1873,6 +1877,7 @@ mod tests {
             "steps",
             "usage",
             "tool_calls",
+            "repaired_calls",
         ] {
             assert!(object.contains_key(key), "missing key `{key}`");
         }
@@ -1920,6 +1925,7 @@ mod tests {
             steps: 1,
             usage: UsageReport::default(),
             tool_calls: Vec::new(),
+            repaired_calls: 0,
             narration: Vec::new(),
             cost_usd: None,
             verification: Some("not_applicable"),

@@ -31,6 +31,7 @@ use rune_tools::contract::{Activity, ExecutionContext, ToolOutput};
 use rune_tools::{Registry, Tool};
 
 use crate::history::History;
+use crate::repair::{self, Resolved};
 use crate::retry::{self, RetryPolicy};
 use crate::steering::{Boundary, Cancellation, SteeringQueue};
 
@@ -94,7 +95,8 @@ pub struct PreparedCall {
     pub id: String,
     /// Tool name.
     pub name: String,
-    /// Arguments as a JSON string, exactly as the model produced them.
+    /// Arguments as a JSON string, exactly as the model produced them unless
+    /// the call was repaired.
     pub arguments: String,
 }
 
@@ -162,6 +164,17 @@ pub enum Event {
     ReasoningDelta {
         /// The appended text.
         delta: String,
+    },
+    /// A tool call sent in a near-miss form was resolved to the call it meant.
+    CallRepaired {
+        /// Identifier assigned by the model.
+        id: String,
+        /// The tool name the model sent.
+        from: String,
+        /// The tool the call runs as.
+        to: String,
+        /// What was changed in the arguments, as short phrases.
+        repairs: Vec<String>,
     },
     /// A tool call is about to run.
     ToolStarted {
@@ -542,11 +555,42 @@ pub struct TurnOutcome {
     pub steps: u32,
     /// Tool calls made, in order.
     pub calls: Vec<CallResult>,
+    /// Calls that ran in a repaired form, in order.
+    pub repairs: Vec<CallRepair>,
+    /// How many calls were repaired.
+    pub repaired_calls: u32,
     /// Whether a check ran after the turn's last change to a file.
     pub verification: Verification,
     /// Why the turn stopped early, when it did. Usage, steps and text still
     /// describe everything that completed before the failure.
     pub error: Option<RuneError>,
+}
+
+/// A call that ran in a repaired form.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct CallRepair {
+    /// Identifier assigned by the model.
+    pub id: String,
+    /// The tool name the model sent.
+    pub from: String,
+    /// The tool the call ran as.
+    pub to: String,
+    /// What was changed in the arguments, as short phrases.
+    pub repairs: Vec<String>,
+}
+
+impl CallRepair {
+    fn new(id: &str, resolved: &Resolved) -> Self {
+        Self {
+            id: id.to_owned(),
+            from: resolved
+                .renamed_from
+                .clone()
+                .unwrap_or_else(|| resolved.name.clone()),
+            to: resolved.name.clone(),
+            repairs: resolved.repairs.clone(),
+        }
+    }
 }
 
 impl TurnOutcome {
@@ -752,6 +796,7 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
     let mut usage = Usage::default();
     let mut last_request = Usage::default();
     let mut calls = Vec::new();
+    let mut repairs: Vec<CallRepair> = Vec::new();
     // Reasoning accumulated across steps, so a multi-step turn keeps all of it.
     let mut reasoning = String::new();
     let mut steps: u32 = 0;
@@ -793,6 +838,8 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
                 steps,
                 verification: Verification::of(&calls),
                 calls,
+                repaired_calls: u32::try_from(repairs.len()).unwrap_or(u32::MAX),
+                repairs,
                 error: $error,
             });
         }};
@@ -836,6 +883,8 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
                 steps,
                 verification: Verification::of(&calls),
                 calls,
+                repaired_calls: u32::try_from(repairs.len()).unwrap_or(u32::MAX),
+                repairs,
                 error: None,
             };
             host.emit(Event::Finished {
@@ -1043,6 +1092,8 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
                 steps,
                 verification: Verification::of(&calls),
                 calls,
+                repaired_calls: u32::try_from(repairs.len()).unwrap_or(u32::MAX),
+                repairs,
                 error: None,
             });
         }
@@ -1050,6 +1101,7 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
         // Execute the batch. Policy is resolved per call before anything runs,
         // so a denial never reaches a tool. On the last step nothing runs: each
         // call is answered as refused so the record stays well formed.
+        let mut repaired: Vec<(String, Resolved)> = Vec::new();
         let (results, stalled) = if last_step {
             let refused = pending_calls
                 .iter()
@@ -1074,8 +1126,30 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
                 &mut result_bytes,
                 &limits,
                 &calls,
+                &mut repaired,
             )
         };
+
+        // The next request shows a repaired call as it ran, next to its
+        // result. A call beside signed reasoning is left as the model sent
+        // it, because changing it can invalidate the signature; its result
+        // keeps the recorded name and the note says what ran.
+        let signed = matches!(host.dialect().name(), "anthropic" | "responses" | "gemini")
+            && outcome
+                .replay
+                .as_deref()
+                .is_some_and(|replay| !replay.is_empty());
+        let mut recorded_names = std::collections::HashMap::new();
+        for (id, resolved) in &repaired {
+            if signed {
+                if let Some(from) = &resolved.renamed_from {
+                    recorded_names.insert(id.as_str(), from.clone());
+                }
+            } else {
+                history.rewrite_tool_call(id, &resolved.name, &resolved.arguments.to_string());
+            }
+            repairs.push(CallRepair::new(id, resolved));
+        }
 
         let mut result_parts = Vec::new();
         for result in &results {
@@ -1086,7 +1160,10 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
             };
             result_parts.push(ContentPart::ToolResult {
                 id,
-                name: result.call.name.clone(),
+                name: recorded_names
+                    .get(result.call.id.as_str())
+                    .cloned()
+                    .unwrap_or_else(|| result.call.name.clone()),
                 content: result.output.render(),
                 is_error: result.output.is_error,
             });
@@ -1132,6 +1209,8 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
                 steps,
                 verification: Verification::of(&calls),
                 calls,
+                repaired_calls: u32::try_from(repairs.len()).unwrap_or(u32::MAX),
+                repairs,
                 error: None,
             });
         }
@@ -1423,13 +1502,14 @@ fn execute_batch(
     result_bytes: &mut usize,
     limits: &BudgetSet,
     previous: &[CallResult],
+    repaired: &mut Vec<(String, Resolved)>,
 ) -> (Vec<CallResult>, Option<PreparedCall>) {
     let mut results = Vec::with_capacity(calls.len());
     let mut cancelled = false;
     // The call that stalled the run; everything after it is answered unrun.
     let mut stalled: Option<PreparedCall> = None;
     let failure_limit = limits.get(LimitName::MaxConsecutiveToolFailures).value();
-    let offered: Vec<String> = host.tools().into_iter().map(|spec| spec.name).collect();
+    let offered = host.tools();
     let turn_cap = limits.get_usize(LimitName::MaxTurnResultBytes);
     let retains = host.retains_results();
     let tool_cap = limits.get_usize(LimitName::MaxToolResultBytes);
@@ -1469,29 +1549,36 @@ fn execute_batch(
         let group_results = std::thread::scope(|scope| {
             let mut pending = Vec::with_capacity(group.len());
             for (index, call) in group.iter().enumerate() {
+                let view = guard_view(call, &offered);
                 // Later calls in this group differ from their predecessor,
                 // so they cannot extend an existing failure streak.
                 let blocked = if stalled.is_some() {
                     Some(stopped_call(call, host))
                 } else if index == 0 {
                     guard_result(
-                        failure_guard(call, host, previous, &results, failure_limit, cancelled),
-                        call,
+                        failure_guard(&view, host, previous, &results, failure_limit, cancelled),
+                        &view,
                         &mut stalled,
                     )
                 } else {
                     None
                 };
                 let blocked = blocked
-                    .or_else(|| repeat_guard(call, host, history, previous, &results, cancelled));
+                    .or_else(|| repeat_guard(&view, host, history, previous, &results, cancelled));
                 let prepared = match blocked {
                     Some(result) => Err(result),
-                    None => prepare_call(call, host, &offered, &mut cancelled),
+                    None => prepare_call(call, host, &offered, &mut cancelled, repaired),
                 };
                 let execution = match prepared {
-                    Ok((arguments, context)) => {
+                    Ok(Cleared {
+                        call,
+                        arguments,
+                        context,
+                        note,
+                    }) => {
                         let executor = host.concurrent_tool_host(&call.name);
-                        scope.spawn(move || {
+                        let name = call.name.clone();
+                        let worker = scope.spawn(move || {
                             let started = Instant::now();
                             let execution = (|| {
                                 let executor = executor.ok_or_else(|| {
@@ -1499,28 +1586,30 @@ fn execute_batch(
                                 })?;
                                 executor.cancellation().check()?;
                                 context.check_cancelled()?;
-                                executor.execute_with_context(&call.name, &arguments, &context)
+                                executor.execute_with_context(&name, &arguments, &context)
                             })();
                             (execution, started.elapsed())
-                        })
+                        });
+                        (call, note, worker)
                     }
                     Err(result) => {
-                        pending.push((call, Err(result)));
+                        pending.push(Err(result));
                         continue;
                     }
                 };
-                pending.push((call, Ok(execution)));
+                pending.push(Ok(execution));
             }
             pending
                 .into_iter()
-                .map(|(call, pending)| match pending {
+                .map(|pending| match pending {
                     Err(result) => result,
-                    Ok(worker) => {
+                    Ok((call, note, worker)) => {
                         let (execution, elapsed) = match worker.join() {
                             Ok(finished) => finished,
                             Err(payload) => std::panic::resume_unwind(payload),
                         };
-                        finish_call(call, host, execution, elapsed, &mut cancelled)
+                        let result = finish_call(&call, host, execution, elapsed, &mut cancelled);
+                        with_note(result, note.as_deref())
                     }
                 })
                 .collect::<Vec<_>>()
@@ -1539,20 +1628,23 @@ fn execute_batch(
         }
     }
     for call in &calls[parallel_prefix..] {
+        let view = guard_view(call, &offered);
         let cap = turn_cap.saturating_sub(*result_bytes).min(tool_cap);
         let blocked = if stalled.is_some() {
             Some(stopped_call(call, host))
         } else {
             guard_result(
-                failure_guard(call, host, previous, &results, failure_limit, cancelled),
-                call,
+                failure_guard(&view, host, previous, &results, failure_limit, cancelled),
+                &view,
                 &mut stalled,
             )
         };
         let result = blocked
-            .or_else(|| repeat_guard(call, host, history, previous, &results, cancelled))
-            .or_else(|| overwrite_guard(call, host, history))
-            .unwrap_or_else(|| execute_call(call, host, &offered, &mut cancelled, history, cap));
+            .or_else(|| repeat_guard(&view, host, history, previous, &results, cancelled))
+            .or_else(|| overwrite_guard(&view, host, history))
+            .unwrap_or_else(|| {
+                execute_call(call, host, &offered, &mut cancelled, history, cap, repaired)
+            });
         retain_result(
             result,
             host,
@@ -1935,6 +2027,25 @@ fn guard_result(
     }
 }
 
+/// The call as the guards compare it: in its repaired form when repair
+/// changes it, the form earlier results are recorded in, so a repeated
+/// near-miss is recognised as the call it runs as.
+fn guard_view<'a>(
+    call: &'a PreparedCall,
+    offered: &[ToolSpec],
+) -> std::borrow::Cow<'a, PreparedCall> {
+    match repair::resolve(&call.name, &call.arguments, offered) {
+        Ok(resolved) if repair::note(&resolved).is_some() => {
+            std::borrow::Cow::Owned(PreparedCall {
+                id: call.id.clone(),
+                name: resolved.name,
+                arguments: resolved.arguments.to_string(),
+            })
+        }
+        _ => std::borrow::Cow::Borrowed(call),
+    }
+}
+
 /// Answers a call that comes after a stall in the same batch.
 fn stopped_call(call: &PreparedCall, host: &dyn Host) -> CallResult {
     host.emit(Event::ToolDenied {
@@ -2009,13 +2120,28 @@ fn retain_result(
     results.push(result);
 }
 
+/// A call cleared to run, in the form it runs as.
+struct Cleared {
+    /// The effective call: the model's own unless it was repaired.
+    call: PreparedCall,
+    arguments: serde_json::Value,
+    context: ExecutionContext,
+    /// Appended to the result of a repaired call.
+    note: Option<String>,
+}
+
 /// Resolves advertisement, arguments and authority on the turn thread.
+///
+/// The call is first resolved against the offered tools, which may repair
+/// its name or arguments. Everything after that, from policy and hooks to
+/// events, execution and the recorded result, sees the effective call.
 fn prepare_call(
     call: &PreparedCall,
     host: &dyn Host,
-    offered: &[String],
+    offered: &[ToolSpec],
     cancelled: &mut bool,
-) -> std::result::Result<(serde_json::Value, ExecutionContext), CallResult> {
+    repaired: &mut Vec<(String, Resolved)>,
+) -> std::result::Result<Cleared, CallResult> {
     if *cancelled || host.cancellation().is_cancelled() {
         *cancelled = true;
         return Err(CallResult {
@@ -2025,29 +2151,26 @@ fn prepare_call(
         });
     }
 
-    if !offered.iter().any(|name| name == &call.name) {
-        let reason = format!(
-            "there is no tool named `{}`; the tools are {}",
-            call.name,
-            offered.join(", ")
-        );
-        host.emit(Event::ToolDenied {
-            call: call.clone(),
-            reason: reason.clone(),
-        });
-        return Err(CallResult {
-            call: call.clone(),
-            output: ToolOutput::failure(reason),
-            executed: false,
-        });
-    }
-
-    let activity = host
-        .tool_activity(&call.name)
-        .unwrap_or_else(|| infer_activity(&call.name));
-    let arguments: serde_json::Value = match serde_json::from_str(&call.arguments) {
-        Ok(value) => value,
-        Err(err) => {
+    let resolved = match repair::resolve(&call.name, &call.arguments, offered) {
+        Ok(resolved) => resolved,
+        Err(repair::Unresolved::UnknownTool) => {
+            let names: Vec<&str> = offered.iter().map(|spec| spec.name.as_str()).collect();
+            let reason = format!(
+                "there is no tool named `{}`; the tools are {}",
+                call.name,
+                names.join(", ")
+            );
+            host.emit(Event::ToolDenied {
+                call: call.clone(),
+                reason: reason.clone(),
+            });
+            return Err(CallResult {
+                call: call.clone(),
+                output: ToolOutput::failure(reason),
+                executed: false,
+            });
+        }
+        Err(repair::Unresolved::InvalidJson(err)) => {
             // A malformed argument string is the model's error to correct.
             let output = ToolOutput::failure(format!(
                 "the arguments for `{}` are not valid JSON: {err}",
@@ -2060,6 +2183,58 @@ fn prepare_call(
             });
         }
     };
+    let note = repair::note(&resolved);
+    // An unrepaired call keeps its argument text exactly as sent, which is
+    // what the repeat and failure guards compare.
+    let effective = if note.is_some() {
+        host.emit(Event::CallRepaired {
+            id: call.id.clone(),
+            from: call.name.clone(),
+            to: resolved.name.clone(),
+            repairs: resolved.repairs.clone(),
+        });
+        repaired.push((call.id.clone(), resolved.clone()));
+        PreparedCall {
+            id: call.id.clone(),
+            name: resolved.name,
+            arguments: resolved.arguments.to_string(),
+        }
+    } else {
+        call.clone()
+    };
+    match authorize(&effective, resolved.arguments, host, cancelled) {
+        Ok((arguments, context)) => Ok(Cleared {
+            call: effective,
+            arguments,
+            context,
+            note,
+        }),
+        Err(result) => Err(with_note(result, note.as_deref())),
+    }
+}
+
+/// Appends a repaired call's note to the end of its result text.
+fn with_note(mut result: CallResult, note: Option<&str>) -> CallResult {
+    if let Some(note) = note {
+        let text = &mut result.output.text;
+        if !text.is_empty() && !text.ends_with('\n') {
+            text.push('\n');
+        }
+        text.push_str(note);
+    }
+    result
+}
+
+/// Resolves policy, hooks and the execution context for an effective call.
+fn authorize(
+    call: &PreparedCall,
+    arguments: serde_json::Value,
+    host: &dyn Host,
+    cancelled: &mut bool,
+) -> std::result::Result<(serde_json::Value, ExecutionContext), CallResult> {
+    let activity = host
+        .tool_activity(&call.name)
+        .unwrap_or_else(|| infer_activity(&call.name));
 
     let target = host.tool_permission_target(&call.name, &arguments);
     // A patch is decided path by path, each as the edit or write it makes.
@@ -2290,13 +2465,19 @@ fn patch_decisions(patch: &rune_tools::apply_patch::Patch) -> Vec<(&'static str,
 fn execute_call(
     call: &PreparedCall,
     host: &dyn Host,
-    offered: &[String],
+    offered: &[ToolSpec],
     cancelled: &mut bool,
     history: &mut History,
     output_cap: usize,
+    repaired: &mut Vec<(String, Resolved)>,
 ) -> CallResult {
-    let (arguments, context) = match prepare_call(call, host, offered, cancelled) {
-        Ok(prepared) => prepared,
+    let Cleared {
+        call,
+        arguments,
+        context,
+        note,
+    } = match prepare_call(call, host, offered, cancelled, repaired) {
+        Ok(cleared) => cleared,
         Err(result) => return result,
     };
     // Each changed path as written, resolved, and as it was before the call.
@@ -2329,11 +2510,12 @@ fn execute_call(
     };
     let execution = execution.map(|mut output| {
         if !output.is_error {
-            note_changes(call, host, history, &arguments, &targets, &mut output);
+            note_changes(&call, host, history, &arguments, &targets, &mut output);
         }
         output
     });
-    finish_call(call, host, execution, started.elapsed(), cancelled)
+    let result = finish_call(&call, host, execution, started.elapsed(), cancelled);
+    with_note(result, note.as_deref())
 }
 
 /// After a successful change, records what the model now knows of each path
