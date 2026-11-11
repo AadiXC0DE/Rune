@@ -250,6 +250,12 @@ impl Inline {
         // A list opened by typing goes under the line being typed, which is
         // where a reader looks for it and where it does not disturb the answer.
         rows.extend(menu.iter().map(|row| self.clip(row)));
+        // A tab moves the cursor by the terminal's own stops, so a row holding
+        // one no longer occupies the columns it was measured at.
+        debug_assert!(
+            rows.iter().all(|row| !row.contains('\t')),
+            "a live row holds a tab"
+        );
         let live_rows = u16::try_from(rows.len()).unwrap_or(u16::MAX).max(1);
 
         // Where the caret sits, as an offset from the top of the region. The
@@ -757,6 +763,20 @@ mod tests {
         let seq = escapes(&bytes);
         // A one-based column, so seven columns in is column eight.
         assert!(seq.iter().any(|s| s == "\u{1b}[8G"), "{seq:?}");
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "a live row holds a tab")]
+    fn debug_check_rejects_a_tab() {
+        let mut inline = Inline::new(20);
+        let footer = rows(&["status"]);
+        let prompt = rows(&["a\tb"]);
+        let _ = inline.frame(&Frame {
+            footer: &footer,
+            prompt: &prompt,
+            ..Frame::default()
+        });
     }
 
     #[test]

@@ -7,7 +7,7 @@
 
 use std::fmt::Write as _;
 
-use crate::width::{grapheme_width, graphemes, str_width, truncate_to_width, wrap};
+use crate::width::{expand_tabs, grapheme_width, graphemes, str_width, truncate_to_width, wrap};
 
 /// Who produced a line.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -736,18 +736,7 @@ fn assistant_line(
 
 /// Hard wraps code by grapheme, retaining every space instead of word breaks.
 fn wrap_code(source: &str, width: usize, ascii: bool) -> Vec<String> {
-    let mut expanded = String::new();
-    let mut column = 0_usize;
-    for cluster in graphemes(source) {
-        if cluster == "\t" {
-            let spaces = 8_usize.saturating_sub(column % 8);
-            expanded.extend(std::iter::repeat_n(' ', spaces));
-            column = column.saturating_add(spaces);
-        } else {
-            expanded.push_str(cluster);
-            column = column.saturating_add(grapheme_width(cluster));
-        }
-    }
+    let expanded = expand_tabs(source);
     let indent = expanded.bytes().take_while(|byte| *byte == b' ').count();
     let marker = match (ascii, width >= 3) {
         (true, true) => "> ",
