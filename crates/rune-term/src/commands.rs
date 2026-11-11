@@ -312,7 +312,11 @@ mod tests {
         for entry in BUILTINS {
             let line = lines
                 .iter()
-                .find(|line| line.contains(entry.name))
+                .find(|line| {
+                    line.strip_prefix('/')
+                        .and_then(|rest| rest.strip_prefix(entry.name))
+                        .is_some_and(|rest| rest.starts_with(' '))
+                })
                 .unwrap_or_else(|| panic!("{} is missing", entry.name));
             let at = line
                 .find(entry.summary)
