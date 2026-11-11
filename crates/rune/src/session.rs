@@ -233,6 +233,8 @@ impl Answerer for TerminalQuestions {
 
 /// Host state for a turn.
 struct SessionHost {
+    /// Whether the active objective is checked before a turn finishes.
+    goal_judge: std::sync::atomic::AtomicBool,
     /// The cache routing key of every request of this session, taken from
     /// the first request's prefix.
     cache_key: std::sync::OnceLock<String>,
@@ -467,6 +469,22 @@ impl Host for SessionHost {
 
     fn stable_instructions_len(&self) -> usize {
         self.stable_instructions_len
+    }
+
+    fn goal_judge(&self) -> Option<String> {
+        if !self.goal_judge.load(std::sync::atomic::Ordering::Relaxed) {
+            return None;
+        }
+        self.recorder
+            .as_ref()?
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .objective()
+            .map(str::to_owned)
+    }
+
+    fn lowest_effort(&self) -> Effort {
+        turn::lowest_accepted_effort(self)
     }
 
     fn objective_tokens_remaining(&self) -> Option<u64> {
@@ -2351,6 +2369,7 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
         cancellation: config.questions.cancellation.clone(),
         steering: SteeringQueue::from_limits(&limits),
         events: Arc::new(Mutex::new(Vec::new())),
+        goal_judge: std::sync::atomic::AtomicBool::new(false),
         provider_retry: Mutex::new(None),
         context_used: std::sync::atomic::AtomicU64::new(initial_context),
         prices: Mutex::new(None),
@@ -2701,26 +2720,43 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                             .set_title(&session_log::derive_title(&title))?;
                         note(format!("renamed this session to {title}"));
                     }
-                    Handled::Goal(objective) => {
+                    Handled::Goal(request) => {
                         let mut recorder = recorder
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        if let Some((objective, budget)) = objective {
-                            if let Some(budget) = budget {
-                                recorder.set_budgeted_objective(&objective, budget)?;
-                            } else {
-                                recorder.set_objective(&objective)?;
+                        let mut refused = false;
+                        if let Some(request) = request {
+                            if let Some(objective) = &request.objective {
+                                if let Some(budget) = request.budget {
+                                    recorder.set_budgeted_objective(objective, budget)?;
+                                } else {
+                                    recorder.set_objective(objective)?;
+                                }
                             }
+                            refused = request.judge && recorder.objective().is_none();
+                            host.goal_judge.store(
+                                request.judge && !refused,
+                                std::sync::atomic::Ordering::Relaxed,
+                            );
                         }
-                        note(recorder.objective().map_or_else(
-                            || "no active objective".to_owned(),
-                            |objective| format!("active objective: {objective}"),
-                        ));
-                        if let Some((budget, tokens)) = recorder.objective_budget() {
-                            note(format!(
-                                "\nobjective tokens: {tokens}/{budget}; {} remaining",
-                                budget.saturating_sub(tokens)
+                        if refused {
+                            note(GOAL_JUDGE_USAGE.to_owned());
+                        } else {
+                            note(recorder.objective().map_or_else(
+                                || "no active objective".to_owned(),
+                                |objective| format!("active objective: {objective}"),
                             ));
+                            if let Some((budget, tokens)) = recorder.objective_budget() {
+                                note(format!(
+                                    "\nobjective tokens: {tokens}/{budget}; {} remaining",
+                                    budget.saturating_sub(tokens)
+                                ));
+                            }
+                            if recorder.objective().is_some()
+                                && host.goal_judge.load(std::sync::atomic::Ordering::Relaxed)
+                            {
+                                note("\njudge: on".to_owned());
+                            }
                         }
                     }
                     Handled::SetModel(model) => {
@@ -5671,8 +5707,22 @@ enum Handled {
     /// Give the session a new title.
     Rename(String),
     /// Set an explicit objective, or inspect the current one without changes.
-    Goal(Option<(String, Option<u64>)>),
+    Goal(Option<GoalRequest>),
 }
+
+/// What a `/goal` command with arguments asks for.
+#[derive(Clone, PartialEq, Eq, Debug)]
+struct GoalRequest {
+    /// The new objective; absent when the judge is turned on for the active one.
+    objective: Option<String>,
+    /// The objective's token budget.
+    budget: Option<u64>,
+    /// Whether the objective is checked before a turn finishes.
+    judge: bool,
+}
+
+/// Printed for a `/goal --judge` that names no usable objective.
+const GOAL_JUDGE_USAGE: &str = "usage: /goal --judge [--budget <positive tokens>] <objective>";
 
 /// Token and request totals for one session.
 ///
@@ -5979,6 +6029,18 @@ fn handle_command<W: std::io::Write>(
             if arguments.is_empty() {
                 return Ok(Handled::Goal(None));
             }
+            let (first, remainder) = arguments
+                .split_once(char::is_whitespace)
+                .unwrap_or((arguments, ""));
+            let judge = first == "--judge";
+            let arguments = if judge { remainder.trim() } else { arguments };
+            if judge && arguments.is_empty() {
+                return Ok(Handled::Goal(Some(GoalRequest {
+                    objective: None,
+                    budget: None,
+                    judge,
+                })));
+            }
             let mut words = arguments.splitn(2, char::is_whitespace);
             if words.next() == Some("--budget") {
                 let rest = words.next().unwrap_or_default().trim();
@@ -5991,15 +6053,25 @@ fn handle_command<W: std::io::Write>(
                     .filter(|value| *value > 0);
                 let objective = words.next().unwrap_or_default().trim();
                 if let Some(budget) = budget.filter(|_| !objective.is_empty()) {
-                    return Ok(Handled::Goal(Some((objective.to_owned(), Some(budget)))));
+                    return Ok(Handled::Goal(Some(GoalRequest {
+                        objective: Some(objective.to_owned()),
+                        budget: Some(budget),
+                        judge,
+                    })));
                 }
-                let _ = writeln!(
-                    output,
+                let usage = if judge {
+                    GOAL_JUDGE_USAGE
+                } else {
                     "usage: /goal --budget <positive tokens> <objective>"
-                );
+                };
+                let _ = writeln!(output, "{usage}");
                 return Ok(Handled::Continue);
             }
-            Ok(Handled::Goal(Some((arguments.to_owned(), None))))
+            Ok(Handled::Goal(Some(GoalRequest {
+                objective: Some(arguments.to_owned()),
+                budget: None,
+                judge,
+            })))
         }
         "status" => {
             let _ = writeln!(output, "{}", render_status(info));
@@ -6349,6 +6421,9 @@ fn turn_summary(
         turn::Verification::Checked => parts.push("checked".to_owned()),
         turn::Verification::Failed => parts.push("check failed".to_owned()),
         turn::Verification::Unverified => parts.push("unverified".to_owned()),
+    }
+    if let Some(judge) = &outcome.judge {
+        parts.push(format!("judge {}", judge.rounds));
     }
     if let Some(input) = outcome.usage.input_tokens {
         let cached = outcome
@@ -6702,18 +6777,79 @@ mod tests {
         assert_eq!(host.instructions(), "Workspace instructions");
     }
 
+    fn goal(objective: Option<&str>, budget: Option<u64>, judge: bool) -> Handled {
+        Handled::Goal(Some(GoalRequest {
+            objective: objective.map(str::to_owned),
+            budget,
+            judge,
+        }))
+    }
+
+    #[test]
+    fn a_turn_summary_counts_the_judge_rounds() {
+        let outcome = turn::TurnOutcome {
+            stop_reason: StopReason::Completed,
+            text: String::new(),
+            narration: Vec::new(),
+            reasoning: String::new(),
+            usage: rune_net::stream::Usage::default(),
+            last_request: rune_net::stream::Usage::default(),
+            steps: 2,
+            calls: Vec::new(),
+            repairs: Vec::new(),
+            repaired_calls: 0,
+            verification: turn::Verification::NotApplicable,
+            checks: rune_agent::verify::CheckSummary::default(),
+            error: None,
+            judge: Some(turn::JudgeReport {
+                rounds: 2,
+                ..turn::JudgeReport::default()
+            }),
+        };
+        let summary = turn_summary(&outcome, None, None, None, true).expect("summary");
+        assert!(summary.contains("judge 2"), "{summary}");
+    }
+
+    #[test]
+    fn a_judge_goal_with_a_bad_budget_prints_the_judge_usage() {
+        let mut output = Vec::new();
+        let handled = handle_command(
+            "goal",
+            "--judge --budget 0 work",
+            &empty_commands(),
+            None,
+            Utf8Path::new("/w"),
+            &test_info(),
+            &mut output,
+        )
+        .expect("command");
+        assert_eq!(handled, Handled::Continue);
+        assert_eq!(
+            String::from_utf8(output).expect("utf8"),
+            format!("{GOAL_JUDGE_USAGE}\n")
+        );
+    }
+
     #[test]
     fn budgeted_goal_dispatch_requires_an_explicit_positive_budget_and_objective() {
         for (arguments, expected) in [
             ("", Handled::Goal(None)),
             (
                 "Fix café parsing",
-                Handled::Goal(Some(("Fix café parsing".to_owned(), None))),
+                goal(Some("Fix café parsing"), None, false),
             ),
             (
                 "--budget 30 Fix café parsing",
-                Handled::Goal(Some(("Fix café parsing".to_owned(), Some(30)))),
+                goal(Some("Fix café parsing"), Some(30), false),
             ),
+            ("--judge", goal(None, None, true)),
+            ("--judge Fix it", goal(Some("Fix it"), None, true)),
+            (
+                "--judge --budget 30 Fix it",
+                goal(Some("Fix it"), Some(30), true),
+            ),
+            ("--judge --budget 0 work", Handled::Continue),
+            ("--judge --budget 30", Handled::Continue),
             ("--budget 0 work", Handled::Continue),
             ("--budget -1 work", Handled::Continue),
             ("--budget 18446744073709551616 work", Handled::Continue),
@@ -11039,6 +11175,7 @@ mod tests {
         let host = test_host();
         let outcome = turn::TurnOutcome {
             error: None,
+            judge: None,
             stop_reason: StopReason::Completed,
             text: "the answer".to_owned(),
             narration: Vec::new(),
@@ -11064,6 +11201,7 @@ mod tests {
         let host = test_host();
         let outcome = turn::TurnOutcome {
             error: None,
+            judge: None,
             stop_reason: StopReason::StepLimit,
             text: String::new(),
             narration: Vec::new(),
@@ -11149,6 +11287,7 @@ mod tests {
         });
         let outcome = turn::TurnOutcome {
             error: None,
+            judge: None,
             stop_reason: StopReason::Completed,
             text: String::new(),
             narration: Vec::new(),
@@ -11464,6 +11603,7 @@ mod tests {
         };
         let outcome = turn::TurnOutcome {
             error: None,
+            judge: None,
             stop_reason: StopReason::Completed,
             text: String::new(),
             narration: Vec::new(),
@@ -11485,6 +11625,7 @@ mod tests {
     fn a_turn_summary_shows_plan_progress() {
         let outcome = turn::TurnOutcome {
             error: None,
+            judge: None,
             stop_reason: StopReason::Completed,
             text: String::new(),
             narration: Vec::new(),
@@ -11521,6 +11662,7 @@ mod tests {
         };
         let outcome = turn::TurnOutcome {
             error: None,
+            judge: None,
             stop_reason: StopReason::Completed,
             text: String::new(),
             narration: Vec::new(),
@@ -11875,6 +12017,7 @@ mod tests {
             cancellation: questions.cancellation.clone(),
             steering: SteeringQueue::new(4),
             events: Arc::new(Mutex::new(Vec::new())),
+            goal_judge: std::sync::atomic::AtomicBool::new(false),
             provider_retry: Mutex::new(None),
             context_used: std::sync::atomic::AtomicU64::new(0),
             prices: Mutex::new(None),

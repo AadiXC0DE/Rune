@@ -3,7 +3,7 @@
 use crate::error::{Result, RuneError};
 
 /// The keys `RUNE_EXPERIMENT` accepts.
-const KEYS: &[&str] = &["map", "question_nudge", "run_note", "snapshot"];
+const KEYS: &[&str] = &["goal", "map", "question_nudge", "run_note", "snapshot"];
 
 /// Switches for behaviour under measurement. The default is the shipped behaviour.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -17,6 +17,8 @@ pub struct Experiments {
     /// `snapshot=on|off`: adds the branch, changed files and top-level names to the first
     /// message of `ask`.
     pub snapshot: bool,
+    /// `goal=off|judge`: makes an `ask` run without `--goal` work toward its prompt, with a judge.
+    pub goal_judge: bool,
 }
 
 impl Default for Experiments {
@@ -26,6 +28,7 @@ impl Default for Experiments {
             map: None,
             question_nudge: true,
             snapshot: false,
+            goal_judge: false,
         }
     }
 }
@@ -61,6 +64,17 @@ impl Experiments {
                 return Err(invalid(format!("`{key}` is set twice")));
             }
             seen.push(key);
+            if key == "goal" {
+                experiments.goal_judge = match value {
+                    "judge" => true,
+                    "off" => false,
+                    _ => {
+                        return Err(invalid(format!("`{value}` is not a value of `{key}`"))
+                            .with_hint("use off or judge"));
+                    }
+                };
+                continue;
+            }
             let on = match value {
                 "on" => true,
                 "off" => false,
@@ -108,6 +122,9 @@ impl Experiments {
         if self.snapshot != default.snapshot {
             parts.push(format!("snapshot={}", spelling(self.snapshot)));
         }
+        if self.goal_judge != default.goal_judge {
+            parts.push("goal=judge".to_owned());
+        }
         parts.sort();
         parts.join(",")
     }
@@ -153,7 +170,7 @@ mod tests {
         assert_eq!(error.message(), "unknown experiment key `unknown`");
         assert_eq!(
             error.hint(),
-            Some("known keys are map, question_nudge, run_note, snapshot")
+            Some("known keys are goal, map, question_nudge, run_note, snapshot")
         );
         assert_eq!(error.field(), Some("RUNE_EXPERIMENT"));
         assert_eq!(message("map"), "`map` is not in key=value form");
@@ -170,6 +187,19 @@ mod tests {
         assert_eq!(error.message(), "`true` is not a value of `run_note`");
         assert_eq!(error.hint(), Some("use on or off"));
         assert_eq!(message("map=On"), "`On` is not a value of `map`");
+    }
+
+    #[test]
+    fn goal_takes_off_or_judge() {
+        assert!(!Experiments::default().goal_judge);
+        let judged = Experiments::parse("goal=judge").unwrap();
+        assert!(judged.goal_judge);
+        assert_eq!(judged.render(), "goal=judge");
+        assert!(!Experiments::parse("goal=off").unwrap().goal_judge);
+        assert_eq!(Experiments::parse("goal=off").unwrap().render(), "");
+        let error = Experiments::parse("goal=on").unwrap_err();
+        assert_eq!(error.message(), "`on` is not a value of `goal`");
+        assert_eq!(error.hint(), Some("use off or judge"));
     }
 
     #[test]

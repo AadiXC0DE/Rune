@@ -109,6 +109,16 @@ struct TestHost {
     accepts_images: bool,
     /// Base64 data of the images tools attached, by image id.
     tool_images: Mutex<std::collections::BTreeMap<u64, Arc<str>>>,
+    /// The objective a judge checks.
+    goal_judge: Option<String>,
+    /// The effort a judge request asks for.
+    lowest_effort: Effort,
+    /// Text submitted as steering when a judge request has finished.
+    steer_after_judge: Mutex<Option<String>>,
+    /// Cancels the turn just before the judge is asked.
+    cancel_before_judge: bool,
+    /// The efforts the model is described as accepting.
+    efforts: Option<&'static [Effort]>,
 }
 
 impl TestHost {
@@ -155,6 +165,11 @@ impl TestHost {
             planned_cache: Mutex::new(Vec::new()),
             accepts_images: false,
             tool_images: Mutex::new(std::collections::BTreeMap::new()),
+            goal_judge: None,
+            lowest_effort: Effort::Auto,
+            steer_after_judge: Mutex::new(None),
+            cancel_before_judge: false,
+            efforts: None,
         }
     }
 
@@ -251,7 +266,31 @@ impl Host for TestHost {
         if self.table_compat {
             rune_net::compat::resolve("chat_completions", None, model)
         } else {
-            Default::default()
+            let (compat, mut traits): (
+                rune_net::compat::EndpointCompat,
+                rune_net::compat::ModelTraits,
+            ) = Default::default();
+            if let Some(efforts) = self.efforts {
+                traits.efforts = efforts;
+            }
+            (compat, traits)
+        }
+    }
+
+    fn goal_judge(&self) -> Option<String> {
+        if self.cancel_before_judge {
+            self.cancellation.cancel();
+        }
+        self.goal_judge.clone()
+    }
+
+    fn lowest_effort(&self) -> Effort {
+        self.lowest_effort
+    }
+
+    fn record_judge_usage(&self, _usage: &rune_net::stream::Usage) {
+        if let Some(text) = self.steer_after_judge.lock().expect("lock").take() {
+            self.steering.submit(text).expect("queued");
         }
     }
 
@@ -6467,4 +6506,283 @@ fn a_change_between_results_resets_the_loop_count() {
     assert_eq!(host.executed_calls().len(), 8);
     assert_eq!(loop_refusals(&host), 0);
     history.validate().expect("paired history");
+}
+
+fn judge_says(status: &str, reason: &str, next: &str) -> Script {
+    Script::text(&serde_json::json!({"status": status, "reason": reason, "next": next}).to_string())
+}
+
+fn judged_host(scripts: Vec<Script>) -> TestHost {
+    let mut host = TestHost::new(MockEndpoint::start(scripts));
+    host.goal_judge = Some("make it pass".to_owned());
+    host.lowest_effort = Effort::Low;
+    host
+}
+
+fn judged_history() -> rune_agent::History {
+    let mut history = rune_agent::History::new();
+    history.push_user("make it pass");
+    history
+}
+
+#[test]
+fn a_judge_request_is_extra_billed_and_leaves_no_trace_in_the_conversation() {
+    let host = judged_host(vec![
+        Script::text("Done."),
+        judge_says("done", "the check passed.", ""),
+    ])
+    .with_tools(vec![read_tool()]);
+    let mut history = judged_history();
+
+    let outcome = run_turn(&mut history, &host).expect("turn");
+
+    let server = host.server.as_ref().expect("server");
+    assert_eq!(server.request_count(), 2);
+    let body = server.last_body().expect("judge request");
+    assert_eq!(body["tool_choice"], "none");
+    assert_eq!(body["reasoning_effort"], "low");
+    assert_eq!(body["tools"].as_array().expect("tools").len(), 1);
+    let messages = body["messages"].as_array().expect("messages");
+    let prompt = messages.last().expect("prompt")["content"]
+        .as_str()
+        .expect("text");
+    assert!(
+        prompt.starts_with("<goal_judge>\nObjective: make it pass\n"),
+        "{prompt}"
+    );
+    assert_eq!(messages[messages.len() - 2]["content"], "Done.");
+
+    assert_eq!(outcome.stop_reason, StopReason::Completed);
+    assert_eq!(outcome.text, "Done.");
+    assert_eq!(outcome.steps, 1);
+    assert_eq!(outcome.usage.input_tokens, Some(20));
+    assert_eq!(outcome.usage.output_tokens, Some(10));
+    assert_eq!(outcome.last_request.input_tokens, Some(10));
+    let judge = outcome.judge.expect("a report");
+    assert_eq!(judge.rounds, 1);
+    assert_eq!(judge.last_status, "done");
+    assert_eq!(judge.last_reason, "the check passed.");
+    assert_eq!(judge.usage.input_tokens, Some(10));
+    assert_eq!(judge.usage.output_tokens, Some(5));
+
+    assert_eq!(history.to_messages().len(), 2);
+    let shown: String = host
+        .events()
+        .iter()
+        .filter_map(|event| match event {
+            Event::TextDelta { delta } => Some(delta.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(shown, "Done.", "the judge reply is not shown");
+}
+
+#[test]
+fn without_a_judge_no_extra_request_is_sent() {
+    let host = TestHost::new(MockEndpoint::start(vec![Script::text("Done.")]));
+    let mut history = judged_history();
+    let outcome = run_turn(&mut history, &host).expect("turn");
+    assert_eq!(host.server.as_ref().expect("server").request_count(), 1);
+    assert!(outcome.judge.is_none());
+}
+
+#[test]
+fn a_continue_verdict_resumes_the_turn_with_the_next_step() {
+    let host = judged_host(vec![
+        Script::text("Done."),
+        judge_says("continue", "no check ran.", ""),
+        Script::text("Checked."),
+        judge_says("done", "ok.", ""),
+    ]);
+    let mut history = judged_history();
+
+    let outcome = run_turn(&mut history, &host).expect("turn");
+
+    let server = host.server.as_ref().expect("server");
+    assert_eq!(server.request_count(), 4);
+    assert_eq!(outcome.text, "Checked.");
+    assert_eq!(outcome.steps, 2);
+    assert_eq!(outcome.judge.expect("a report").rounds, 2);
+    let body = server.last_body().expect("second judge").to_string();
+    assert!(
+        body.contains("The objective is not met yet: no check ran. Next: decide the next step from the evidence above."),
+        "{body}"
+    );
+    assert_eq!(body.matches("<goal_judge>").count(), 1, "{body}");
+}
+
+#[test]
+fn a_blocked_verdict_settles_the_turn() {
+    let host = judged_host(vec![
+        Script::text("Stuck."),
+        judge_says("blocked", "no credentials.", ""),
+    ]);
+    let outcome = run_turn(&mut judged_history(), &host).expect("turn");
+    assert_eq!(host.server.as_ref().expect("server").request_count(), 2);
+    assert_eq!(outcome.stop_reason, StopReason::Completed);
+    let judge = outcome.judge.expect("a report");
+    assert_eq!(judge.last_status, "blocked");
+    assert_eq!(judge.last_reason, "no credentials.");
+}
+
+#[test]
+fn an_unreadable_judge_reply_settles_the_turn() {
+    let host = judged_host(vec![Script::text("Done."), Script::text("looks fine")]);
+    let outcome = run_turn(&mut judged_history(), &host).expect("turn");
+    assert_eq!(outcome.text, "Done.");
+    let judge = outcome.judge.expect("a report");
+    assert_eq!(judge.last_status, "done");
+    assert_eq!(judge.last_reason, "the judge reply could not be read");
+}
+
+#[test]
+fn a_failed_judge_request_keeps_the_answer_and_notes_the_error() {
+    let host = judged_host(vec![
+        Script::text("Done."),
+        Script::Status {
+            code: 400,
+            body: r#"{"error":{"message":"bad judge"}}"#.to_owned(),
+        },
+    ]);
+    let outcome = run_turn(&mut judged_history(), &host).expect("turn");
+    assert_eq!(outcome.stop_reason, StopReason::Completed);
+    assert_eq!(outcome.text, "Done.");
+    assert!(outcome.error.is_none());
+    let judge = outcome.judge.expect("a report");
+    assert_eq!(judge.rounds, 1);
+    assert_eq!(judge.last_status, "failed");
+    assert!(
+        judge.last_reason.starts_with("the judge request failed: "),
+        "{}",
+        judge.last_reason
+    );
+}
+
+#[test]
+fn a_retried_judge_request_does_not_restart_the_shown_step() {
+    let host = judged_host(vec![
+        Script::text("Done."),
+        Script::Status {
+            code: 503,
+            body: "{}".to_owned(),
+        },
+        judge_says("done", "ok.", ""),
+    ]);
+    let outcome = run_turn(&mut judged_history(), &host).expect("turn");
+    assert_eq!(host.server.as_ref().expect("server").request_count(), 3);
+    assert_eq!(outcome.judge.expect("a report").last_status, "done");
+    assert!(
+        !host
+            .events()
+            .iter()
+            .any(|event| matches!(event, Event::StepRestarted { .. })),
+        "a restart makes a host discard the answer it already showed"
+    );
+}
+
+#[test]
+fn cancelling_before_the_judge_is_not_reported_as_a_judge_failure() {
+    let mut host = judged_host(vec![Script::text("Done.")]);
+    host.cancel_before_judge = true;
+    let outcome = run_turn(&mut judged_history(), &host).expect("turn");
+    assert_eq!(host.server.as_ref().expect("server").request_count(), 1);
+    assert_eq!(outcome.stop_reason, StopReason::Cancelled);
+    assert!(outcome.judge.is_none());
+}
+
+#[test]
+fn the_judge_does_not_run_on_the_last_allowed_step() {
+    let host = judged_host(vec![Script::text("Out of steps.")])
+        .with_tools(vec![read_tool()])
+        .with_step_limit(1);
+    let outcome = run_turn(&mut judged_history(), &host).expect("turn");
+    assert_eq!(host.server.as_ref().expect("server").request_count(), 1);
+    assert_eq!(outcome.stop_reason, StopReason::StepLimit);
+    assert!(outcome.judge.is_none());
+}
+
+#[test]
+fn the_judge_does_not_run_when_the_step_limit_is_used_up_without_tools() {
+    let host = judged_host(vec![Script::text("Done.")]).with_step_limit(1);
+    let outcome = run_turn(&mut judged_history(), &host).expect("turn");
+    assert_eq!(host.server.as_ref().expect("server").request_count(), 1);
+    assert!(outcome.judge.is_none());
+}
+
+#[test]
+fn an_exhausted_objective_budget_sends_no_judge_request() {
+    let host = judged_host(vec![Script::text("Done.")]);
+    *host.objective_budget.lock().expect("budget") = Some((15, 0));
+    let outcome = run_turn(&mut judged_history(), &host).expect("turn");
+    assert_eq!(host.server.as_ref().expect("server").request_count(), 1);
+    assert_eq!(outcome.stop_reason, StopReason::ObjectiveBudget);
+    assert!(outcome.judge.is_none());
+}
+
+#[test]
+fn judging_stops_after_twenty_rounds() {
+    let mut scripts = Vec::new();
+    for round in 0..21 {
+        scripts.push(Script::text("Done."));
+        scripts.push(judge_says("continue", &format!("reason {round}."), "go on"));
+    }
+    let host = judged_host(scripts);
+    let outcome = run_turn(&mut judged_history(), &host).expect("turn");
+    assert_eq!(host.server.as_ref().expect("server").request_count(), 40);
+    assert_eq!(outcome.stop_reason, StopReason::Completed);
+    let judge = outcome.judge.expect("a report");
+    assert_eq!(judge.rounds, 20);
+    assert_eq!(judge.last_status, "continue");
+}
+
+#[test]
+fn a_repeated_reason_is_compared_trimmed_and_in_lower_case() {
+    let host = judged_host(vec![
+        Script::text("One."),
+        judge_says("continue", "No check ran.", "a"),
+        Script::text("Two."),
+        judge_says("continue", "  no CHECK ran.  ", "b"),
+        Script::text("Three."),
+        judge_says("continue", "no check ran.", "c"),
+    ]);
+    let outcome = run_turn(&mut judged_history(), &host).expect("turn");
+    assert_eq!(host.server.as_ref().expect("server").request_count(), 6);
+    assert_eq!(outcome.text, "Three.");
+    assert_eq!(outcome.judge.expect("a report").rounds, 3);
+}
+
+#[test]
+fn steering_that_arrives_during_the_judge_request_gets_a_response() {
+    let host = judged_host(vec![
+        Script::text("Done."),
+        judge_says("done", "ok.", ""),
+        Script::text("Adjusted."),
+        judge_says("done", "ok.", ""),
+    ]);
+    *host.steer_after_judge.lock().expect("lock") = Some("use tabs".to_owned());
+    let outcome = run_turn(&mut judged_history(), &host).expect("turn");
+    assert_eq!(host.server.as_ref().expect("server").request_count(), 4);
+    assert_eq!(outcome.text, "Adjusted.");
+    assert!(host.steering.is_empty());
+}
+
+#[test]
+fn the_lowest_effort_is_one_the_model_and_dialect_accept() {
+    let mut host = TestHost::new(MockEndpoint::start(Vec::new()));
+    assert_eq!(
+        rune_agent::turn::lowest_accepted_effort(&host),
+        Effort::None
+    );
+    host.efforts = Some(&[Effort::Medium, Effort::Low, Effort::High]);
+    assert_eq!(rune_agent::turn::lowest_accepted_effort(&host), Effort::Low);
+    host.efforts = Some(&[]);
+    assert_eq!(
+        rune_agent::turn::lowest_accepted_effort(&host),
+        Effort::Auto
+    );
+    host.efforts = Some(&[Effort::Auto]);
+    assert_eq!(
+        rune_agent::turn::lowest_accepted_effort(&host),
+        Effort::Auto
+    );
 }

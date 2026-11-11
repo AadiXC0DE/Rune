@@ -104,6 +104,10 @@ pub struct Options {
     /// Id to save the run under, chosen before the run so the JSONL `start`
     /// record can name it; one is generated when absent.
     pub session_id: Option<SessionId>,
+    /// The objective added to the instructions.
+    pub goal: Option<String>,
+    /// Check the result against the objective before finishing.
+    pub judge: bool,
 }
 
 /// Appended to the prompt of a run nobody can answer.
@@ -538,6 +542,9 @@ pub struct JsonResult {
     /// Notes the harness added because a check kept failing. Absent when zero.
     #[serde(skip_serializing_if = "is_zero")]
     pub stall_notes: u32,
+    /// The goal judge's rounds, last verdict and token use, when a judge was on.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub judge: Option<JudgeJson>,
     /// Failure detail, present only when the run failed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
@@ -547,6 +554,21 @@ pub struct JsonResult {
     /// Structured failure context, present only when nonempty.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_detail: Option<ErrorDetail>,
+}
+
+/// What the goal judge did during a run.
+#[derive(Clone, Debug, Serialize)]
+pub struct JudgeJson {
+    /// Judge requests made.
+    pub rounds: u32,
+    /// The last verdict: `done`, `continue` or `blocked`.
+    pub status: String,
+    /// The reason given with the last verdict.
+    pub reason: String,
+    /// Input tokens of the judge requests.
+    pub input_tokens: u64,
+    /// Output tokens of the judge requests.
+    pub output_tokens: u64,
 }
 
 /// Token counts as reported.
@@ -592,6 +614,7 @@ impl JsonResult {
             tests_modified: None,
             changed_files: None,
             stall_notes: 0,
+            judge: None,
             error: Some(error.message().to_owned()),
             error_code: Some(error.code()),
             error_detail: (!error.detail().is_empty()).then(|| error.detail().clone()),
@@ -693,6 +716,10 @@ struct AskHost<'a> {
     log_error: std::sync::Mutex<Option<RuneError>>,
     /// When `--timeout` ends the run, so a retry never waits past it.
     deadline: Option<std::time::Instant>,
+    /// The objective added to the instructions.
+    goal: Option<String>,
+    /// Whether the result is checked against the objective.
+    judge: bool,
 }
 
 impl AskHost<'_> {
@@ -777,11 +804,29 @@ impl Host for AskHost<'_> {
     }
 
     fn instructions(&self) -> String {
-        self.mapped.get(
+        let mut instructions = self.mapped.get(
             &self.instructions,
             self.context.workspace(),
             &map_limits(&self.limits, self.settings.experiments),
-        )
+        );
+        if let Some(goal) = &self.goal {
+            instructions.push_str("\n\nActive session objective:\n");
+            instructions.push_str(goal);
+        }
+        instructions
+    }
+
+    fn goal_judge(&self) -> Option<String> {
+        self.goal.clone().filter(|_| self.judge)
+    }
+
+    fn lowest_effort(&self) -> rune_core::config::Effort {
+        turn::lowest_accepted_effort(self)
+    }
+
+    fn record_judge_usage(&self, usage: &Usage) {
+        self.add_spend(usage);
+        self.log(|log| log.usage(usage));
     }
 
     fn tools(&self) -> Vec<ToolSpec> {
@@ -1331,7 +1376,16 @@ pub fn run(
         &settings.limits,
     );
     let tools = inventory::advertisement(&registry);
+    let (goal, judge) = match &options.goal {
+        Some(goal) => (Some(goal.clone()), options.judge),
+        None if settings.experiments.goal_judge && options.tool_loop && !options.read_only => {
+            (Some(options.prompt.clone()), true)
+        }
+        None => (None, false),
+    };
     let host = AskHost {
+        goal,
+        judge,
         effort,
         cache_key: std::sync::OnceLock::new(),
         settings,
@@ -1598,6 +1652,13 @@ pub fn run(
             u32::try_from(changed.len()).unwrap_or(u32::MAX)
         }),
         stall_notes: outcome.checks.stall_notes,
+        judge: outcome.judge.as_ref().map(|report| JudgeJson {
+            rounds: report.rounds,
+            status: report.last_status.clone(),
+            reason: report.last_reason.clone(),
+            input_tokens: report.usage.input_tokens.unwrap_or(0),
+            output_tokens: report.usage.output_tokens.unwrap_or(0),
+        }),
         error: error.as_ref().map(|error| error.message().to_owned()),
         error_code: error.as_ref().map(RuneError::code),
         error_detail: error
@@ -2269,6 +2330,7 @@ mod tests {
             tests_modified: Some(false),
             changed_files: Some(0),
             stall_notes: 0,
+            judge: None,
             error: None,
             error_code: None,
             error_detail: None,

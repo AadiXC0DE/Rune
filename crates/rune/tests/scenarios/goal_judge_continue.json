@@ -1,0 +1,80 @@
+{
+  "prompt": "Make check.sh pass.",
+  "workspace": "workspaces/goal_check.json",
+  "ask_args": [
+    "--json",
+    "--no-save",
+    "--goal",
+    "make check.sh pass",
+    "--judge"
+  ],
+  "turns": [
+    {
+      "text": "Done."
+    },
+    {
+      "text": "{\"status\":\"continue\",\"reason\":\"no check ran.\",\"next\":\"run sh check.sh\"}"
+    },
+    {
+      "tool_calls": [
+        {
+          "id": "call_1",
+          "name": "shell",
+          "arguments": {
+            "action": "run",
+            "command": "sh check.sh"
+          }
+        }
+      ]
+    },
+    {
+      "text": "It passes."
+    },
+    {
+      "text": "{\"status\":\"done\",\"reason\":\"the check passed.\",\"next\":\"\"}"
+    }
+  ],
+  "expect": {
+    "exit_code": 0,
+    "error_code": null,
+    "final_output": "It passes.",
+    "stop_reason": "end_turn",
+    "requests": 5,
+    "request_contains": [
+      {
+        "request": 1,
+        "text": "Active session objective:"
+      },
+      {
+        "request": 2,
+        "text": "\"tool_choice\":\"none\""
+      },
+      {
+        "request": 2,
+        "text": "<goal_judge>"
+      },
+      {
+        "request": 3,
+        "text": "The objective is not met yet: no check ran. Next: run sh check.sh"
+      },
+      {
+        "request": 5,
+        "text": "\"tool_choice\":\"none\""
+      },
+      {
+        "request": 5,
+        "text": "; last check `sh check.sh` passed."
+      }
+    ],
+    "request_absent": [
+      {
+        "request": 1,
+        "text": "<goal_judge>"
+      },
+      {
+        "request": 3,
+        "text": "<goal_judge>"
+      }
+    ]
+  }
+}

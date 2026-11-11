@@ -46,6 +46,11 @@ const SCENARIOS: &[&str] = &[
     "stall_same_failure",
     "stall_same_file",
     "checkpoint_same_prefix",
+    "goal_judge_continue",
+    "goal_judge_same_reason",
+    "goal_without_judge",
+    "goal_experiment_judge",
+    "goal_judge_spend",
 ];
 
 /// Scenarios built in Rust, which have no file.
@@ -191,6 +196,63 @@ fn stall_same_file() {
     let report = run_scenario("stall_same_file");
     let result = report.result.expect("a result");
     assert_eq!(result["stall_notes"], 1, "{result}");
+}
+
+#[test]
+fn goal_judge_continue() {
+    let report = run_scenario("goal_judge_continue");
+    let result = report.result.as_ref().expect("a result");
+    assert_eq!(result["judge"]["rounds"], 2, "{result}");
+    assert_eq!(result["judge"]["status"], "done", "{result}");
+    assert_eq!(result["judge"]["reason"], "the check passed.", "{result}");
+    assert_eq!(result["steps"], 3, "{result}");
+
+    // The judge request extends the conversation it was asked about, so the
+    // cached prefix holds and the tools stay listed.
+    let body = |index: usize| -> serde_json::Value {
+        serde_json::from_str(&report.requests[index].body).expect("a JSON body")
+    };
+    let (asked, judged) = (body(0), body(1));
+    let asked_messages = asked["messages"].as_array().expect("messages");
+    let judged_messages = judged["messages"].as_array().expect("messages");
+    assert_eq!(judged_messages[..asked_messages.len()], asked_messages[..]);
+    assert_eq!(judged["tools"], asked["tools"]);
+    assert_eq!(judged_messages.len(), asked_messages.len() + 2);
+}
+
+#[test]
+fn goal_judge_same_reason() {
+    // The third identical reason settles at once, without another note.
+    let report = run_scenario("goal_judge_same_reason");
+    let result = report.result.expect("a result");
+    assert_eq!(result["judge"]["rounds"], 3, "{result}");
+    assert_eq!(result["judge"]["status"], "continue", "{result}");
+}
+
+#[test]
+fn goal_judge_spend() {
+    // Only the judge reply is long enough to reach the limit.
+    let report = run_scenario("goal_judge_spend");
+    let result = report.result.expect("a result");
+    assert_eq!(result["judge"]["status"], "continue", "{result}");
+    assert_eq!(result["steps"], 1, "{result}");
+}
+
+#[test]
+fn goal_without_judge() {
+    let report = run_scenario("goal_without_judge");
+    let result = report.result.expect("a result");
+    assert!(result.get("judge").is_none(), "{result}");
+}
+
+#[test]
+fn goal_experiment_judge() {
+    let report = run_scenario("goal_experiment_judge");
+    let result = report.result.expect("a result");
+    assert_eq!(result["experiment"], "goal=judge", "{result}");
+    assert_eq!(result["judge"]["rounds"], 1, "{result}");
+    assert_eq!(result["judge"]["status"], "done", "{result}");
+    assert!(result["judge"]["input_tokens"].is_u64(), "{result}");
 }
 
 #[test]

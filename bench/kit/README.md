@@ -65,6 +65,7 @@ Experiment keys (`RUNE_EXPERIMENT`, comma-separated `key=value`, values `on` or 
 | `snapshot` | `off` | Branch, changed files and top-level names at the end of the first message of `ask`. |
 | `question_nudge` | `on` | One note to an `ask` run whose reply ends on a question: decide and continue. |
 | `map` | unset | Forces the repository map on or off. |
+| `goal` | `off` | `judge` (the other value) makes an `ask` run without `--goal` work toward its prompt, with a judge. |
 
 ## Adapters
 

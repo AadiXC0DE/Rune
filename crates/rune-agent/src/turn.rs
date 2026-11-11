@@ -22,7 +22,7 @@ use rune_core::config::{Effort, PermissionMode};
 use rune_core::error::{ErrorCode, Result, RuneError};
 use rune_net::compat::{EndpointCompat, ModelTraits};
 use rune_net::fetch::Fetch;
-use rune_net::message::{ContentPart, ToolSpec};
+use rune_net::message::{ContentPart, Message, ToolSpec};
 use rune_net::provider::{Provider, RequestPlan, ToolChoice};
 use rune_net::stream::{FinishReason, Usage};
 use rune_net::transport::{self, Endpoint, StreamOutcome};
@@ -608,6 +608,32 @@ pub trait Host {
     fn remaining_steps(&self) -> Option<u64> {
         None
     }
+
+    /// The objective to check the result against, when a judge is on. None by
+    /// default.
+    fn goal_judge(&self) -> Option<String> {
+        None
+    }
+
+    /// The effort a judge request asks for. `Auto` by default.
+    fn lowest_effort(&self) -> Effort {
+        Effort::Auto
+    }
+
+    /// Called with the usage of each judge request, which reaches no other
+    /// per-request record. The turn's usage includes it as well.
+    fn record_judge_usage(&self, _usage: &Usage) {}
+}
+
+/// The lowest effort both the model and the dialect accept, or `Auto`.
+pub fn lowest_accepted_effort(host: &dyn Host) -> Effort {
+    let (_, traits) = host.compat(&host.model());
+    let lowest = rune_net::compat::clamp_effort(Effort::None, traits.efforts);
+    if traits.efforts.contains(&lowest) && host.dialect().capabilities().efforts.contains(&lowest) {
+        lowest
+    } else {
+        Effort::Auto
+    }
 }
 
 /// One entry of what a turn said and did, in the order it happened.
@@ -657,6 +683,22 @@ pub struct TurnOutcome {
     /// Why the turn stopped early, when it did. Usage, steps and text still
     /// describe everything that completed before the failure.
     pub error: Option<RuneError>,
+    /// The goal judge's rounds and last verdict, when a judge ran.
+    pub judge: Option<JudgeReport>,
+}
+
+/// What the goal judge did during a turn.
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+pub struct JudgeReport {
+    /// Judge requests made.
+    pub rounds: u32,
+    /// The last verdict: `done`, `continue` or `blocked`, or `failed` when
+    /// the judge request itself failed.
+    pub last_status: String,
+    /// The reason given with the last verdict.
+    pub last_reason: String,
+    /// Usage of the judge requests, also counted in the turn's usage.
+    pub usage: Usage,
 }
 
 /// A call that ran in a repaired form.
@@ -858,6 +900,31 @@ its arguments were complete. Send a smaller call: split a large write into sever
 /// Consecutive continuations allowed before the turn stops at the output limit.
 const MAX_CONTINUATIONS: u32 = 2;
 
+/// Asks for a verdict on the objective from the evidence in the conversation.
+const JUDGE_PROMPT: &str = "<goal_judge>\nObjective: {objective}\nHarness record: verification {verdict}{last_check}.\n\
+Decide whether the objective is met. Only tool results in this conversation count as evidence; \
+the assistant saying the work is done is not evidence. Reply with one JSON object and nothing else:\n\
+{\"status\": \"done\" | \"continue\" | \"blocked\", \"reason\": \"one sentence\", \"next\": \"the next concrete step when status is continue\"}\n</goal_judge>";
+
+/// Resumes the turn with the judge's next step.
+const JUDGE_CONTINUE: &str =
+    "<harness_check>The objective is not met yet: {reason} Next: {next}</harness_check>";
+
+/// Judge requests allowed in one turn.
+const JUDGE_MAX_ROUNDS: u32 = 20;
+
+/// Identical reasons in a row after which the judge is no longer followed.
+const JUDGE_SAME_REASON: u32 = 3;
+
+/// Longest judge reason or next step carried into the conversation, in bytes.
+const JUDGE_TEXT_BYTES: usize = 500;
+
+/// Next step used when the judge asks to continue and names none.
+const JUDGE_DEFAULT_NEXT: &str = "decide the next step from the evidence above.";
+
+/// Reason recorded for a judge reply that does not decode.
+const JUDGE_UNREADABLE: &str = "the judge reply could not be read";
+
 /// Runs one turn to completion.
 ///
 /// Returns the outcome; a failure to reach a terminal state is an error, not a
@@ -910,6 +977,10 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
     // returns what the model said in its last step.
     let mut text = String::new();
     let mut narration: Vec<Narration> = Vec::new();
+    let mut judge: Option<JudgeReport> = None;
+    // The judge's last reason, normalized, and how many times in a row it came.
+    let mut judge_reason = String::new();
+    let mut judge_same: u32 = 0;
 
     // Ends the turn with what it has so far. The two-argument form ends it on
     // a failure, counting only the requests that completed.
@@ -943,6 +1014,7 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
                 repaired_calls: u32::try_from(repairs.len()).unwrap_or(u32::MAX),
                 repairs,
                 error: $error,
+                judge,
             });
         }};
     }
@@ -989,6 +1061,7 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
                 repaired_calls: u32::try_from(repairs.len()).unwrap_or(u32::MAX),
                 repairs,
                 error: None,
+                judge,
             };
             host.emit(Event::Finished {
                 reason: stop_reason,
@@ -1023,6 +1096,9 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
             max_attempts,
             &cancellation,
             &mut cut_continuations,
+            None,
+            None,
+            false,
         ) {
             Ok(streamed) => {
                 completed = completed.saturating_add(1);
@@ -1248,6 +1324,69 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
                     FinishReason::ProviderError => StopReason::ProviderFailure,
                 }
             };
+            // The judge sees a turn that is about to end by itself. It never
+            // runs on the last step the run allows.
+            if reason == StopReason::Completed
+                && (step_limit == 0 || u64::from(steps) < step_limit)
+                && let Some(objective) = host.goal_judge()
+            {
+                let prompt = judge_prompt(&objective, &calls, stall_noted);
+                let (verdict, spent) = match ask_judge(
+                    client.as_ref(),
+                    host,
+                    history,
+                    &prompt,
+                    steps,
+                    timeouts,
+                    max_attempts,
+                    &cancellation,
+                ) {
+                    Ok(judged) => judged,
+                    Err(err)
+                        if err.code() == ErrorCode::Cancelled || cancellation.is_cancelled() =>
+                    {
+                        if host.settles_cancellation() {
+                            settle!(@end StopReason::Cancelled, completed, None)
+                        }
+                        fail!(err)
+                    }
+                    Err(err) => (
+                        JudgeVerdict {
+                            status: "failed".to_owned(),
+                            reason: format!("the judge request failed: {}", err.message()),
+                            next: String::new(),
+                        },
+                        Usage::default(),
+                    ),
+                };
+                usage = usage.merge_sum(spent);
+                host.record_judge_usage(&spent);
+                let key = verdict.reason.trim().to_lowercase();
+                judge_same = if key == judge_reason {
+                    judge_same.saturating_add(1)
+                } else {
+                    1
+                };
+                judge_reason = key;
+                let report = judge.get_or_insert_with(JudgeReport::default);
+                report.rounds = report.rounds.saturating_add(1);
+                report.usage = report.usage.merge_sum(spent);
+                report.last_status.clone_from(&verdict.status);
+                report.last_reason.clone_from(&verdict.reason);
+                if verdict.status == "continue"
+                    && report.rounds < JUDGE_MAX_ROUNDS
+                    && judge_same < JUDGE_SAME_REASON
+                {
+                    history.push_harness_note(&judge_continue_note(&verdict.reason, &verdict.next));
+                    continue;
+                }
+                // Steering that arrived during the judge request would
+                // otherwise be dropped with the turn.
+                if !steering.is_empty() && host.objective_tokens_remaining() != Some(0) {
+                    apply_steering(history, steering, Boundary::Finalizing, host);
+                    continue;
+                }
+            }
             host.emit(Event::Finished {
                 reason,
                 usage,
@@ -1268,6 +1407,7 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
                 repaired_calls: u32::try_from(repairs.len()).unwrap_or(u32::MAX),
                 repairs,
                 error: None,
+                judge,
             });
         }
 
@@ -1417,6 +1557,7 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
                 repaired_calls: u32::try_from(repairs.len()).unwrap_or(u32::MAX),
                 repairs,
                 error: None,
+                judge,
             });
         }
 
@@ -1648,6 +1789,10 @@ pub(crate) fn request_plan(host: &dyn Host, history: &mut History) -> RequestPla
 /// outcome together with a flag saying whether steering is queued after the
 /// successful attempt, for the caller to apply at the next boundary, and the
 /// measure of the request that succeeded.
+///
+/// `extra_user` is added to the request only, never to `history`, with tools
+/// left listed but not callable. `quiet` hides the request from the host's
+/// stream: the answer already shown stays, and steering waits for the turn.
 #[allow(clippy::too_many_arguments)]
 fn stream_with_retry(
     client: &dyn Fetch,
@@ -1659,6 +1804,9 @@ fn stream_with_retry(
     max_attempts: usize,
     cancellation: &Cancellation,
     cut_continuations: &mut u8,
+    extra_user: Option<&str>,
+    effort_override: Option<Effort>,
+    quiet: bool,
 ) -> Result<(StreamOutcome, bool, crate::tokens::Measure)> {
     let steering = host.steering();
     let mut attempt = 0_usize;
@@ -1672,7 +1820,7 @@ fn stream_with_retry(
         cancellation.check()?;
 
         check_objective_budget(host)?;
-        if attempt > 0 {
+        if attempt > 0 && !quiet {
             host.emit(Event::StepRestarted { step });
             // Include corrections from the failed stream or retry delay before
             // constructing the plan and preparing its context.
@@ -1687,9 +1835,22 @@ fn stream_with_retry(
         host.prepare_request(history, &mut plan, client)?;
         let encoded = host.take_encoded_request();
         cancellation.check()?;
-        // An active objective caps the output tokens here, which changes the
-        // request, so the host's serialization no longer matches it.
-        let encoded = encoded.filter(|_| host.objective_tokens_remaining().is_none());
+        // Added after preparation, which can rebuild the messages.
+        if let Some(text) = extra_user {
+            plan.messages.push(Message::user(text));
+            plan.tool_choice = ToolChoice::None;
+        }
+        if let Some(effort) = effort_override {
+            plan.effort = effort;
+            if !rune_net::compat::accepts_sampling(&plan.traits, plan.effort, &plan.compat) {
+                plan.sampling = rune_net::compat::Sampling::default();
+            }
+        }
+        // An active objective caps the output tokens here, and an extra
+        // message changes the request, so the host's serialization no longer
+        // matches it.
+        let encoded =
+            encoded.filter(|_| extra_user.is_none() && host.objective_tokens_remaining().is_none());
         let mut accounting = ObjectiveAccounting::begin(host, &mut plan)?;
         let measure = match &encoded {
             Some(body) => crate::tokens::measure_body(body.len() as u64, &plan),
@@ -1703,12 +1864,12 @@ fn stream_with_retry(
         let mut observe = |event: &rune_net::stream::ProviderEvent| {
             accounting.observe(event);
             match event {
-                rune_net::stream::ProviderEvent::TextDelta { delta } => {
+                rune_net::stream::ProviderEvent::TextDelta { delta } if !quiet => {
                     host.emit(Event::TextDelta {
                         delta: delta.clone(),
                     });
                 }
-                rune_net::stream::ProviderEvent::ReasoningDelta { delta } => {
+                rune_net::stream::ProviderEvent::ReasoningDelta { delta } if !quiet => {
                     host.emit(Event::ReasoningDelta {
                         delta: delta.clone(),
                     });
@@ -1815,6 +1976,124 @@ fn stream_with_retry(
             }
         }
     }
+}
+
+/// One decoded verdict of the goal judge.
+#[derive(Clone, PartialEq, Eq, Debug)]
+struct JudgeVerdict {
+    status: String,
+    reason: String,
+    next: String,
+}
+
+/// Builds the judge's question from the objective and the harness record.
+fn judge_prompt(objective: &str, calls: &[CallResult], stall_noted: bool) -> String {
+    let last_check = verify::summarize(calls, stall_noted)
+        .last_check
+        .map_or_else(String::new, |record| {
+            let outcome = if record.passed { "passed" } else { "failed" };
+            format!("; last check `{}` {outcome}", record.command)
+        });
+    // Later placeholders go first, so text put in cannot be taken for one.
+    JUDGE_PROMPT
+        .replacen("{last_check}", &last_check, 1)
+        .replacen("{verdict}", Verification::of(calls).as_str(), 1)
+        .replacen("{objective}", objective, 1)
+}
+
+/// Returns `text` cut to at most `limit` bytes, on a character boundary.
+fn cut_bytes(text: &str, limit: usize) -> &str {
+    let mut end = limit.min(text.len());
+    while end > 0 && !text.is_char_boundary(end) {
+        end = end.saturating_sub(1);
+    }
+    text.get(..end).unwrap_or_default()
+}
+
+/// Reads the judge's reply; anything unreadable counts as `done`.
+fn parse_judge_reply(text: &str) -> JudgeVerdict {
+    let decoded = text
+        .find('{')
+        .zip(text.rfind('}'))
+        .and_then(|(start, end)| text.get(start..=end))
+        .and_then(|object| serde_json::from_str::<serde_json::Value>(object).ok())
+        .filter(|value| {
+            matches!(
+                value.get("status").and_then(serde_json::Value::as_str),
+                Some("done" | "continue" | "blocked")
+            )
+        });
+    let Some(value) = decoded else {
+        return JudgeVerdict {
+            status: "done".to_owned(),
+            reason: JUDGE_UNREADABLE.to_owned(),
+            next: String::new(),
+        };
+    };
+    let field = |name: &str| {
+        let text = value
+            .get(name)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        cut_bytes(text.trim(), JUDGE_TEXT_BYTES).to_owned()
+    };
+    JudgeVerdict {
+        status: field("status"),
+        reason: field("reason"),
+        next: field("next"),
+    }
+}
+
+/// Words the note that resumes the turn with the judge's next step.
+fn judge_continue_note(reason: &str, next: &str) -> String {
+    let next = if next.is_empty() {
+        JUDGE_DEFAULT_NEXT
+    } else {
+        next
+    };
+    // Later placeholders go first, so text put in cannot be taken for one.
+    JUDGE_CONTINUE
+        .replacen("{next}", next, 1)
+        .replacen("{reason}", reason, 1)
+}
+
+/// Returns the effort a judge request overrides, if any.
+///
+/// Anthropic drops its cached messages when the thinking settings change, so
+/// there the judge keeps the session's effort and reads the prefix from cache.
+fn judge_effort(dialect: &str, lowest: Effort) -> Option<Effort> {
+    (dialect != rune_net::anthropic::NAME).then_some(lowest)
+}
+
+/// Sends one judge request on the conversation as it stands.
+#[allow(clippy::too_many_arguments)]
+fn ask_judge(
+    client: &dyn Fetch,
+    host: &dyn Host,
+    history: &mut History,
+    prompt: &str,
+    step: u32,
+    timeouts: transport::RequestTimeouts,
+    max_attempts: usize,
+    cancellation: &Cancellation,
+) -> Result<(JudgeVerdict, Usage)> {
+    // A cut reply cannot be decoded, so it is sent again rather than kept.
+    let mut cuts = MAX_CUT_CONTINUATIONS;
+    let (outcome, _, _) = stream_with_retry(
+        client,
+        host,
+        history,
+        step,
+        false,
+        timeouts,
+        max_attempts,
+        cancellation,
+        &mut cuts,
+        Some(prompt),
+        judge_effort(host.dialect().name(), host.lowest_effort()),
+        true,
+    )?;
+    Ok((parse_judge_reply(&outcome.text()), outcome.usage))
 }
 
 /// Most `subagent` calls run together in one group.
@@ -3453,6 +3732,88 @@ pub fn step_limit_notice(limit: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_judge_keeps_the_session_effort_on_anthropic() {
+        assert_eq!(judge_effort(rune_net::anthropic::NAME, Effort::Low), None);
+        assert_eq!(
+            judge_effort(rune_net::chat_completions::NAME, Effort::Low),
+            Some(Effort::Low)
+        );
+    }
+
+    #[test]
+    fn a_judge_reply_is_read_from_the_outermost_braces() {
+        let verdict = parse_judge_reply(
+            "Verdict:\n{\"status\":\"continue\",\"reason\":\" no check ran. \",\"next\":\"run it\",\"extra\":1} thanks",
+        );
+        assert_eq!(verdict.status, "continue");
+        assert_eq!(verdict.reason, "no check ran.");
+        assert_eq!(verdict.next, "run it");
+    }
+
+    #[test]
+    fn an_unreadable_judge_reply_counts_as_done() {
+        for reply in [
+            "",
+            "no json",
+            "} backwards {",
+            "{not json}",
+            "[1]",
+            r#"{"reason":"no status"}"#,
+            r#"{"status":"maybe","reason":"r"}"#,
+            r#"{"status":1}"#,
+        ] {
+            let verdict = parse_judge_reply(reply);
+            assert_eq!(verdict.status, "done", "{reply}");
+            assert_eq!(verdict.reason, JUDGE_UNREADABLE, "{reply}");
+        }
+    }
+
+    #[test]
+    fn a_missing_or_null_next_is_empty() {
+        let verdict = parse_judge_reply(r#"{"status":"blocked","reason":"r","next":null}"#);
+        assert_eq!(verdict.status, "blocked");
+        assert_eq!(verdict.next, "");
+        assert_eq!(parse_judge_reply(r#"{"status":"done"}"#).reason, "");
+    }
+
+    #[test]
+    fn a_judge_reason_and_next_are_cut_on_a_character_boundary() {
+        let long = "é".repeat(400);
+        let reply = serde_json::json!({"status": "continue", "reason": long, "next": long});
+        let verdict = parse_judge_reply(&reply.to_string());
+        assert_eq!(verdict.reason.len(), 500);
+        assert_eq!(verdict.next.len(), 500);
+        assert!(verdict.reason.chars().all(|c| c == 'é'));
+        assert_eq!(cut_bytes("aé", 2), "a");
+        assert_eq!(cut_bytes("ab", 9), "ab");
+    }
+
+    #[test]
+    fn judge_text_is_not_taken_for_a_placeholder() {
+        assert_eq!(
+            judge_continue_note("see {next}", "use {reason}"),
+            "<harness_check>The objective is not met yet: see {next} Next: use {reason}</harness_check>"
+        );
+        let prompt = judge_prompt("reach {verdict} and {last_check}", &[], false);
+        assert!(
+            prompt.contains("Objective: reach {verdict} and {last_check}\n"),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains("Harness record: verification not_applicable.\n"),
+            "{prompt}"
+        );
+    }
+
+    #[test]
+    fn an_empty_next_asks_the_model_to_decide() {
+        assert_eq!(
+            judge_continue_note("r.", ""),
+            "<harness_check>The objective is not met yet: r. Next: decide the next step from the evidence above.</harness_check>"
+        );
+    }
 
     #[test]
     fn only_a_shell_run_has_a_command() {

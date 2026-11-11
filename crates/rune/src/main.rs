@@ -387,6 +387,12 @@ fn run_ask(
         return Err(err);
     }
 
+    let goal = launch.flag("--goal").map(ToOwned::to_owned);
+    let judge = launch.has_flag("--judge");
+    if judge && goal.is_none() {
+        return Err(RuneError::invalid_field("--judge", "needs --goal")
+            .with_hint("pass --goal <objective> as well"));
+    }
     let max_steps = match launch.flag("--max-steps") {
         Some(raw) => Some(raw.parse::<u64>().map_err(|_| {
             RuneError::invalid_field("--max-steps", format!("`{raw}` is not a whole number"))
@@ -431,6 +437,8 @@ fn run_ask(
         no_save: launch.has_flag("--no-save"),
         tool_loop: true,
         read_only: false,
+        goal,
+        judge,
         images: launch
             .flags
             .iter()
@@ -515,6 +523,8 @@ fn run_review(
         no_save: false,
         tool_loop: true,
         read_only: true,
+        goal: None,
+        judge: false,
         max_steps: None,
         timeout: None,
         max_cost_cents: None,

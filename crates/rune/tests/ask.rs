@@ -2216,6 +2216,22 @@ fn ask_help_lists_the_exit_codes() {
 }
 
 #[test]
+fn ask_judge_needs_a_goal() {
+    let dir = tempfile::tempdir().expect("isolated state");
+    let output = isolated_command(&dir)
+        .args(["ask", "--judge", "hello"])
+        .output()
+        .expect("ask");
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("needs --goal"), "{stderr}");
+    assert!(
+        stderr.contains("pass --goal <objective> as well"),
+        "{stderr}"
+    );
+}
+
+#[test]
 fn ask_max_steps_rejects_a_non_number() {
     let dir = tempfile::tempdir().expect("isolated state");
     let output = isolated_command(&dir)
