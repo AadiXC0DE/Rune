@@ -51,6 +51,8 @@ pub enum Command {
     Projects,
     /// Show resolved configuration.
     Config,
+    /// List the key actions and their keys.
+    Keys,
     /// List limits.
     Limits,
     /// Manage additional workspace directories.
@@ -101,6 +103,7 @@ impl Command {
             Self::Sandbox => "sandbox",
             Self::Projects => "projects",
             Self::Config => "config",
+            Self::Keys => "keys",
             Self::Limits => "limits",
             Self::Workspace => "workspace",
             Self::Prompt => "prompt",
@@ -350,6 +353,7 @@ pub fn parse(args: Vec<OsString>, benchmark: bool) -> Result<Launch> {
                 "sandbox" => Command::Sandbox,
                 "projects" => Command::Projects,
                 "config" => Command::Config,
+                "keys" => Command::Keys,
                 "limits" => Command::Limits,
                 "workspace" => Command::Workspace,
                 "prompt" => Command::Prompt,

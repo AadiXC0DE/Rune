@@ -62,6 +62,8 @@ pub mod names {
     pub const FALLBACK_INSTRUCTIONS_FILE: &str = "CLAUDE.md";
     /// User system prompt override in the config root.
     pub const SYSTEM_PROMPT_FILE: &str = "SYSTEM.md";
+    /// Key bindings in the config root.
+    pub const KEYS_FILE: &str = "keys.toml";
     /// Project configuration file name.
     pub const PROJECT_CONFIG_FILE: &str = ".rune.toml";
     /// Legacy directory used before the XDG move.
@@ -183,6 +185,12 @@ impl Paths {
     #[must_use]
     pub fn system_prompt_file(&self) -> Utf8PathBuf {
         self.config_root.join(names::SYSTEM_PROMPT_FILE)
+    }
+
+    /// Path of the optional key binding file.
+    #[must_use]
+    pub fn keys_file(&self) -> Utf8PathBuf {
+        self.config_root.join(names::KEYS_FILE)
     }
 
     /// Path of the directory skills are installed into.
@@ -639,6 +647,7 @@ mod tests {
         assert_eq!(paths.config_root, "/cfg/rune");
         assert_eq!(paths.state_root, "/st/rune");
         assert_eq!(paths.data_root, "/data/rune");
+        assert_eq!(paths.keys_file(), "/cfg/rune/keys.toml");
     }
 
     #[test]
