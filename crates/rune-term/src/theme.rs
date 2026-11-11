@@ -390,6 +390,18 @@ pub enum Base {
     Light,
     /// Bright foregrounds on black, with at least 7:1 contrast for every slot.
     HighContrast,
+    /// The dark or light palette with changes shown in blue and orange, which
+    /// colour-blind users tell apart where red and green blur.
+    Colorblind {
+        /// Built for a light terminal.
+        light: bool,
+    },
+    /// The terminal's own 16 colours for every slot, never a background, so the
+    /// user's palette decides every colour.
+    Ansi {
+        /// Built for a light terminal.
+        light: bool,
+    },
     /// No color at all, every slot left to the terminal.
     Mono,
 }
@@ -413,13 +425,13 @@ impl Theme {
 
     /// Returns the built-in dark theme.
     #[must_use]
-    pub const fn fx_dark() -> Self {
+    pub const fn dark() -> Self {
         Self::builtin(Base::Dark)
     }
 
     /// Returns the built-in light theme.
     #[must_use]
-    pub const fn fx_light() -> Self {
+    pub const fn light() -> Self {
         Self::builtin(Base::Light)
     }
 
@@ -483,7 +495,7 @@ impl Theme {
         if self.base == Base::Mono || depth == ColorDepth::None {
             return Style::new();
         }
-        if depth == ColorDepth::Ansi16 {
+        if depth == ColorDepth::Ansi16 || matches!(self.base, Base::Ansi { .. }) {
             if slot.is_background() {
                 return Style::new();
             }
@@ -584,47 +596,179 @@ impl Theme {
     /// [`Self::try_resolve`] reports why a name did not resolve; this one is
     /// the forgiving form a caller uses when any usable theme will do.
     #[must_use]
-    pub fn resolve(name: Option<&str>, dark_mode: bool, themes_dir: &Utf8Path) -> Self {
-        Self::try_resolve(name, dark_mode, themes_dir).unwrap_or_else(|_| builtin(dark_mode))
+    pub fn resolve(
+        name: Option<&str>,
+        light: bool,
+        config_themes: &Utf8Path,
+        data_themes: &Utf8Path,
+    ) -> Self {
+        Self::try_resolve(name, light, config_themes, data_themes)
+            .unwrap_or_else(|_| builtin(!light))
     }
 
     /// Resolves a configured theme name.
     ///
-    /// `dark`, `light`, `high-contrast`, `none`, and `mono` are pins that ignore
-    /// the terminal polarity.
-    /// Any other name is a theme file in `themes_dir`, optionally suffixed
-    /// `.json`. A name that does not exist falls back to the built-in theme,
-    /// but a name that exists and cannot be used is an error.
-    pub fn try_resolve(name: Option<&str>, dark_mode: bool, themes_dir: &Utf8Path) -> Result<Self> {
+    /// Empty or `auto` follows the terminal polarity. `dark`, `light`,
+    /// `high-contrast`, `colorblind`, `ansi`, `none`, `no-color` and `mono` are
+    /// built in; the first three and the colourless names ignore the polarity.
+    /// Any other name is `<name>.toml` in `config_themes`, then a theme file in
+    /// `data_themes`, optionally suffixed `.json`. A name that does not exist
+    /// falls back to the built-in theme, but a name that exists and cannot be
+    /// used is an error.
+    pub fn try_resolve(
+        name: Option<&str>,
+        light: bool,
+        config_themes: &Utf8Path,
+        data_themes: &Utf8Path,
+    ) -> Result<Self> {
+        let dark_mode = !light;
         let trimmed = name.map(str::trim).unwrap_or_default();
-        if trimmed.is_empty() {
-            return Ok(builtin(dark_mode));
-        }
         match trimmed.to_ascii_lowercase().as_str() {
-            "dark" => return Ok(Self::fx_dark()),
-            "light" => return Ok(Self::fx_light()),
+            "" | "auto" => return Ok(builtin(dark_mode)),
+            "dark" => return Ok(Self::dark()),
+            "light" => return Ok(Self::light()),
             "high-contrast" => return Ok(Self::high_contrast()),
+            "colorblind" => return Ok(Self::builtin(Base::Colorblind { light })),
+            "ansi" => return Ok(Self::builtin(Base::Ansi { light })),
             "none" | "no-color" | "mono" => return Ok(Self::no_color()),
             _ => {}
         }
-        if let Some(theme) = load(trimmed, themes_dir)? {
+        if let Some(theme) = load_toml(trimmed, config_themes)? {
+            return Ok(theme);
+        }
+        if let Some(theme) = load(trimmed, data_themes)? {
             return Ok(theme);
         }
         if let Some(alternative) = sibling(trimmed, dark_mode)
-            && let Some(theme) = load(&alternative, themes_dir)?
+            && let Some(theme) = load(&alternative, data_themes)?
         {
             return Ok(theme);
         }
         Ok(builtin(dark_mode))
     }
+
+    /// Parses a theme written as TOML: a required `base` of `dark` or `light`,
+    /// then any slot name set to a `#rrggbb` colour. Unset slots keep the base.
+    pub fn parse_toml(text: &str) -> Result<Self> {
+        let table: toml::Table = text.parse().map_err(|err| {
+            RuneError::invalid_field("theme", format!("theme file is not valid TOML: {err}"))
+        })?;
+        let base = match table.get("base").and_then(toml::Value::as_str) {
+            Some("dark") => Base::Dark,
+            Some("light") => Base::Light,
+            _ => {
+                return Err(RuneError::invalid_field(
+                    "theme",
+                    "theme file needs base = \"dark\" or base = \"light\"",
+                ));
+            }
+        };
+        let mut theme = Self::builtin(base);
+        for (key, value) in &table {
+            if key == "base" {
+                continue;
+            }
+            let Some(slot) = SLOTS.iter().copied().find(|slot| slot.name() == key) else {
+                let valid: Vec<&str> = SLOTS.iter().map(|slot| slot.name()).collect();
+                return Err(RuneError::invalid_field(
+                    "theme",
+                    format!(
+                        "unknown theme slot `{key}`; valid slots: {}",
+                        valid.join(", ")
+                    ),
+                ));
+            };
+            let color = value
+                .as_str()
+                .filter(|raw| raw.trim().len() == 7)
+                .and_then(parse_hex)
+                .ok_or_else(|| {
+                    RuneError::invalid_field(
+                        "theme",
+                        format!("`{key}` must be a colour such as #7aa2f7"),
+                    )
+                })?;
+            theme.set(slot, color);
+        }
+        Ok(theme)
+    }
+}
+
+/// Returns true when the terminal's background is light: from the probe's
+/// answer when there is one, else from `COLORFGBG`, whose last field `7` or
+/// `15` names a light background; dark otherwise.
+#[must_use]
+pub fn terminal_is_light(caps: &crate::probe::TerminalCaps) -> bool {
+    light_from(caps.background, std::env::var("COLORFGBG").ok().as_deref())
+}
+
+/// The polarity rule of [`terminal_is_light`], with its inputs stated.
+#[must_use]
+pub fn light_from(background: Option<(u8, u8, u8)>, colorfgbg: Option<&str>) -> bool {
+    if let Some(background) = background {
+        return crate::probe::is_light(background);
+    }
+    colorfgbg
+        .and_then(|value| value.rsplit(';').next())
+        .is_some_and(|last| matches!(last.trim(), "7" | "15"))
+}
+
+/// The WCAG contrast ratio of two colours, from 1 to 21.
+#[must_use]
+pub fn contrast(a: (u8, u8, u8), b: (u8, u8, u8)) -> f64 {
+    fn linear(channel: u8) -> f64 {
+        let value = f64::from(channel) / 255.0;
+        if value <= 0.040_45 {
+            value / 12.92
+        } else {
+            ((value + 0.055) / 1.055).powf(2.4)
+        }
+    }
+    let luminance =
+        |(r, g, b): (u8, u8, u8)| 0.2126 * linear(r) + 0.7152 * linear(g) + 0.0722 * linear(b);
+    let (high, low) = {
+        let (x, y) = (luminance(a), luminance(b));
+        if x >= y { (x, y) } else { (y, x) }
+    };
+    (high + 0.05) / (low + 0.05)
+}
+
+/// Loads `<name>.toml` from the configuration themes directory, if it exists.
+fn load_toml(name: &str, themes_dir: &Utf8Path) -> Result<Option<Theme>> {
+    if name.contains(['/', '\\']) || name.contains("..") {
+        return Err(RuneError::invalid_field(
+            "theme",
+            format!("`{name}` is a path, not a theme name"),
+        )
+        .with_hint("theme names resolve inside the themes directory"));
+    }
+    let path = themes_dir.join(format!("{name}.toml"));
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let size = std::fs::metadata(&path).map_or(0, |metadata| metadata.len());
+    let observed = usize::try_from(size).unwrap_or(usize::MAX);
+    if observed > MAX_THEME_BYTES {
+        return Err(
+            RuneError::too_large("theme_file", observed, MAX_THEME_BYTES)
+                .with_hint("a theme file holds colors, not content"),
+        );
+    }
+    let text = std::fs::read_to_string(&path).map_err(|err| {
+        RuneError::new(
+            ErrorCode::NotFound,
+            format!("theme file `{path}` cannot be read: {err}"),
+        )
+    })?;
+    Theme::parse_toml(&text).map(Some)
 }
 
 /// Returns the built-in theme for a terminal polarity.
 fn builtin(dark_mode: bool) -> Theme {
     if dark_mode {
-        Theme::fx_dark()
+        Theme::dark()
     } else {
-        Theme::fx_light()
+        Theme::light()
     }
 }
 
@@ -862,16 +1006,50 @@ const fn base_color(base: Base, slot: Slot) -> Color {
         Base::Dark => dark_color(slot).0,
         Base::Light => light_color(slot).0,
         Base::HighContrast => high_contrast_color(slot).0,
+        Base::Colorblind { light } => match colorblind_color(slot, light) {
+            Some(color) => color,
+            None if light => light_color(slot).0,
+            None => dark_color(slot).0,
+        },
+        Base::Ansi { .. } => base_ansi16(base, slot).color(),
     }
+}
+
+/// The colours the colour-blind palette changes: blue for what was added or
+/// went well, orange for what was removed or failed.
+const fn colorblind_color(slot: Slot, light: bool) -> Option<Color> {
+    let hex = match (slot, light) {
+        (Slot::Success | Slot::String, false) => 0x56_b4e9,
+        (Slot::Error, false) => 0xe6_9f00,
+        (Slot::DiffAddedBg, false) => 0x1d_2f45,
+        (Slot::DiffRemovedBg, false) => 0x45_301a,
+        (Slot::DiffAddedWord, false) => 0x2d_4f75,
+        (Slot::DiffRemovedWord, false) => 0x7a_5220,
+        (Slot::Success | Slot::String, true) => 0x00_72b2,
+        (Slot::Error, true) => 0xd5_5e00,
+        (Slot::DiffAddedBg, true) => 0xdc_ecf7,
+        (Slot::DiffRemovedBg, true) => 0xf9_e3d3,
+        (Slot::DiffAddedWord, true) => 0xb3_d4ec,
+        (Slot::DiffRemovedWord, true) => 0xf0_c3a0,
+        _ => return None,
+    };
+    Some(rgb(hex))
 }
 
 /// Returns the 16 color choice of a slot under a base.
 const fn base_ansi16(base: Base, slot: Slot) -> Ansi16 {
     match base {
         Base::Mono => Ansi16::Default,
-        Base::Dark => dark_color(slot).1,
-        Base::Light => light_color(slot).1,
+        Base::Dark | Base::Ansi { light: false } => dark_color(slot).1,
+        Base::Light | Base::Ansi { light: true } => light_color(slot).1,
         Base::HighContrast => high_contrast_color(slot).1,
+        Base::Colorblind { light } => match (slot, light) {
+            (Slot::Success, _) => Ansi16::Blue,
+            (Slot::Error, false) => Ansi16::Yellow,
+            (Slot::Error, true) => Ansi16::Red,
+            (_, true) => light_color(slot).1,
+            (_, false) => dark_color(slot).1,
+        },
     }
 }
 
@@ -980,14 +1158,14 @@ mod tests {
         let theme = Theme::parse(r##"{"type":"dark","colors":{"editor.foreground":"#ff0000"}}"##)
             .expect("theme");
         assert_eq!(theme.get(Slot::Fg), Color::Rgb(0xff, 0x00, 0x00));
-        assert_eq!(theme.get(Slot::Error), Theme::fx_dark().get(Slot::Error));
+        assert_eq!(theme.get(Slot::Error), Theme::dark().get(Slot::Error));
     }
 
     #[test]
     fn a_partial_theme_keeps_every_slot_resolvable() {
         let theme = Theme::parse(r#"{"type":"light","colors":{}}"#).expect("theme");
         for slot in SLOTS {
-            assert_eq!(theme.get(slot), Theme::fx_light().get(slot));
+            assert_eq!(theme.get(slot), Theme::light().get(slot));
         }
     }
 
@@ -1057,9 +1235,9 @@ mod tests {
     #[test]
     fn a_pin_ignores_the_terminal_polarity() {
         let dir = Utf8Path::new("/nonexistent-themes");
-        let dark = Theme::resolve(Some("dark"), false, dir);
+        let dark = Theme::resolve(Some("dark"), true, dir, dir);
         assert_eq!(dark.base(), Base::Dark);
-        let light = Theme::resolve(Some("light"), true, dir);
+        let light = Theme::resolve(Some("light"), false, dir, dir);
         assert_eq!(light.base(), Base::Light);
     }
 
@@ -1068,7 +1246,7 @@ mod tests {
         let dir = Utf8Path::new("/nonexistent-themes");
         for dark_mode in [false, true] {
             for name in ["high-contrast", " HIGH-CONTRAST "] {
-                let theme = Theme::try_resolve(Some(name), dark_mode, dir).expect("theme");
+                let theme = Theme::try_resolve(Some(name), !dark_mode, dir, dir).expect("theme");
                 assert_eq!(theme, Theme::high_contrast());
             }
         }
@@ -1147,11 +1325,11 @@ mod tests {
             r##"{"type":"light","colors":{"editor.foreground":"#657b83"}}"##,
         )
         .expect("write theme");
-        let theme = Theme::try_resolve(Some("solarized-dark"), false, root).expect("theme");
+        let theme = Theme::try_resolve(Some("solarized-dark"), true, root, root).expect("theme");
         assert_eq!(theme.get(Slot::Fg), Color::Rgb(0x65, 0x7b, 0x83));
         // The same name on a dark terminal has no file and no sibling to use.
-        let theme = Theme::try_resolve(Some("solarized-dark"), true, root).expect("theme");
-        assert_eq!(theme.get(Slot::Fg), Theme::fx_dark().get(Slot::Fg));
+        let theme = Theme::try_resolve(Some("solarized-dark"), false, root, root).expect("theme");
+        assert_eq!(theme.get(Slot::Fg), Theme::dark().get(Slot::Fg));
     }
 
     #[test]
@@ -1163,7 +1341,7 @@ mod tests {
             r##"{"type":"dark","colors":{"editor.foreground":"#010203"}}"##,
         )
         .expect("write theme");
-        let theme = Theme::try_resolve(Some("work"), true, root).expect("theme");
+        let theme = Theme::try_resolve(Some("work"), false, root, root).expect("theme");
         assert_eq!(theme.get(Slot::Fg), Color::Rgb(0x01, 0x02, 0x03));
         assert_eq!(theme.overrides().len(), 1);
     }
@@ -1173,21 +1351,21 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp dir");
         let root = Utf8Path::from_path(dir.path()).expect("utf8 path");
         std::fs::write(root.join("broken.json"), "{oops").expect("write theme");
-        let err = Theme::try_resolve(Some("broken"), true, root).expect_err("broken theme");
+        let err = Theme::try_resolve(Some("broken"), false, root, root).expect_err("broken theme");
         assert_eq!(err.code(), ErrorCode::InvalidField);
         // The forgiving form still produces a usable theme.
-        let theme = Theme::resolve(Some("broken"), true, root);
-        assert_eq!(theme, Theme::fx_dark());
+        let theme = Theme::resolve(Some("broken"), false, root, root);
+        assert_eq!(theme, Theme::dark());
     }
 
     #[test]
     fn a_theme_name_that_is_a_path_is_rejected() {
         let dir = Utf8Path::new("/nonexistent-themes");
-        let err = Theme::try_resolve(Some("../escape"), true, dir).expect_err("path name");
+        let err = Theme::try_resolve(Some("../escape"), false, dir, dir).expect_err("path name");
         assert_eq!(err.code(), ErrorCode::InvalidField);
         assert_eq!(
-            Theme::resolve(Some("../escape"), true, dir),
-            Theme::fx_dark()
+            Theme::resolve(Some("../escape"), false, dir, dir),
+            Theme::dark()
         );
     }
 
@@ -1197,7 +1375,7 @@ mod tests {
         let root = Utf8Path::from_path(dir.path()).expect("utf8 path");
         let filler = "x".repeat(MAX_THEME_BYTES.saturating_add(1));
         std::fs::write(root.join("huge.json"), filler).expect("write theme");
-        let err = Theme::try_resolve(Some("huge"), true, root).expect_err("oversized theme");
+        let err = Theme::try_resolve(Some("huge"), false, root, root).expect_err("oversized theme");
         assert_eq!(err.code(), ErrorCode::TooLarge);
     }
 
@@ -1211,7 +1389,7 @@ mod tests {
 
     #[test]
     fn at_256_colors_an_rgb_color_is_quantized() {
-        let theme = Theme::fx_dark();
+        let theme = Theme::dark();
         assert!(
             theme
                 .sgr(Slot::Error, ColorDepth::TrueColor)
@@ -1294,7 +1472,7 @@ mod tests {
 
     #[test]
     fn every_slot_has_a_value_at_every_depth() {
-        for theme in [Theme::fx_dark(), Theme::fx_light(), Theme::high_contrast()] {
+        for theme in [Theme::dark(), Theme::light(), Theme::high_contrast()] {
             for slot in SLOTS {
                 let pick = |style: Style| {
                     if slot.is_background() {
@@ -1326,7 +1504,7 @@ mod tests {
                 .count();
             assert!(colored >= 14, "{:?}: {colored}", theme.base());
         }
-        let light = Theme::fx_light();
+        let light = Theme::light();
         for slot in [Slot::Warning, Slot::Number, Slot::Link, Slot::Operator] {
             let fg = light.style(slot, ColorDepth::Ansi16).fg;
             assert!(
@@ -1338,7 +1516,7 @@ mod tests {
 
     #[test]
     fn background_slots_are_empty_at_sixteen_colours() {
-        for theme in [Theme::fx_dark(), Theme::fx_light(), Theme::high_contrast()] {
+        for theme in [Theme::dark(), Theme::light(), Theme::high_contrast()] {
             for slot in SLOTS.into_iter().filter(|slot| slot.is_background()) {
                 assert!(theme.sgr(slot, ColorDepth::Ansi16).is_empty(), "{slot:?}");
                 assert!(!theme.sgr(slot, ColorDepth::Ansi256).is_empty(), "{slot:?}");
@@ -1356,7 +1534,7 @@ mod tests {
             "tokenColors": [{"scope": "keyword", "settings": {"foreground": "#0000ff"}}]
         }"##;
         let theme = Theme::parse(json).expect("theme");
-        let builtin = Theme::fx_dark();
+        let builtin = Theme::dark();
         for slot in [Slot::Fg, Slot::Error, Slot::Keyword] {
             assert_eq!(
                 theme.style(slot, ColorDepth::Ansi16),
@@ -1417,5 +1595,167 @@ mod tests {
         for (index, slot) in SLOTS.iter().enumerate() {
             assert!(!SLOTS[..index].contains(slot), "{slot:?} listed twice");
         }
+    }
+
+    fn rgb_of(color: Color) -> (u8, u8, u8) {
+        match color {
+            Color::Rgb(r, g, b) => (r, g, b),
+            other => panic!("not a direct colour: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn auto_follows_the_terminal_background() {
+        assert!(light_from(Some((0xff, 0xff, 0xff)), None));
+        assert!(!light_from(Some((0x1e, 0x1e, 0x1e)), Some("0;15")));
+        let dir = Utf8Path::new("/nonexistent-themes");
+        assert_eq!(
+            Theme::try_resolve(Some("auto"), true, dir, dir).expect("theme"),
+            Theme::light()
+        );
+        assert_eq!(
+            Theme::try_resolve(None, false, dir, dir).expect("theme"),
+            Theme::dark()
+        );
+        // A pin ignores the polarity.
+        assert_eq!(
+            Theme::try_resolve(Some("light"), false, dir, dir).expect("theme"),
+            Theme::light()
+        );
+    }
+
+    #[test]
+    fn colorfgbg_last_field_decides_without_a_reply() {
+        assert!(light_from(None, Some("0;15")));
+        assert!(light_from(None, Some("0;default;7")));
+        assert!(!light_from(None, Some("15;0")));
+        assert!(!light_from(None, None));
+    }
+
+    fn toml_dir(text: &str) -> (tempfile::TempDir, camino::Utf8PathBuf) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = camino::Utf8PathBuf::from_path_buf(dir.path().to_owned()).expect("utf8");
+        std::fs::write(root.join("mine.toml"), text).expect("theme");
+        (dir, root)
+    }
+
+    #[test]
+    fn toml_theme_overrides_named_slots_and_inherits_the_rest() {
+        let (_dir, root) = toml_dir("base = \"light\"\naccent = \"#7aa2f7\"\n");
+        let empty = Utf8Path::new("/nonexistent-themes");
+        let theme = Theme::try_resolve(Some("mine"), false, &root, empty).expect("theme");
+        assert_eq!(theme.base(), Base::Light);
+        assert_eq!(theme.get(Slot::Accent), Color::Rgb(0x7a, 0xa2, 0xf7));
+        assert_eq!(theme.get(Slot::Error), Theme::light().get(Slot::Error));
+    }
+
+    #[test]
+    fn toml_theme_with_an_unknown_slot_lists_the_valid_ones() {
+        let (_dir, root) = toml_dir("base = \"dark\"\ncolour = \"#fff\"\n");
+        let empty = Utf8Path::new("/nonexistent-themes");
+        let err = Theme::try_resolve(Some("mine"), false, &root, empty).expect_err("unknown slot");
+        let message = err.to_string();
+        assert!(
+            message.contains("unknown theme slot `colour`; valid slots: fg, bg, accent"),
+            "{message}"
+        );
+        let (_dir, root) = toml_dir("base = \"dark\"\naccent = \"blue\"\n");
+        let err = Theme::try_resolve(Some("mine"), false, &root, empty).expect_err("bad colour");
+        assert!(
+            err.to_string()
+                .contains("`accent` must be a colour such as #7aa2f7"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn toml_theme_requires_a_base() {
+        let (_dir, root) = toml_dir("accent = \"#7aa2f7\"\n");
+        let empty = Utf8Path::new("/nonexistent-themes");
+        let err = Theme::try_resolve(Some("mine"), false, &root, empty).expect_err("no base");
+        assert!(
+            err.to_string()
+                .contains("theme file needs base = \"dark\" or base = \"light\""),
+            "{err}"
+        );
+        let (_dir, root) = toml_dir("base = \"sepia\"\n");
+        assert!(Theme::try_resolve(Some("mine"), false, &root, empty).is_err());
+    }
+
+    #[test]
+    fn colorblind_uses_blue_and_orange_for_changes() {
+        let dark = Theme::builtin(Base::Colorblind { light: false });
+        assert_eq!(dark.get(Slot::Success), Color::Rgb(0x56, 0xb4, 0xe9));
+        assert_eq!(dark.get(Slot::Error), Color::Rgb(0xe6, 0x9f, 0x00));
+        assert_eq!(dark.get(Slot::DiffAddedBg), Color::Rgb(0x1d, 0x2f, 0x45));
+        assert_eq!(dark.get(Slot::Accent), Theme::dark().get(Slot::Accent));
+        let light = Theme::builtin(Base::Colorblind { light: true });
+        assert_eq!(light.get(Slot::String), Color::Rgb(0x00, 0x72, 0xb2));
+        assert_eq!(light.get(Slot::Error), Color::Rgb(0xd5, 0x5e, 0x00));
+        assert_eq!(
+            light.get(Slot::DiffRemovedWord),
+            Color::Rgb(0xf0, 0xc3, 0xa0)
+        );
+        assert_eq!(
+            dark.style(Slot::Success, ColorDepth::Ansi16).fg,
+            Ansi16::Blue.color()
+        );
+        assert_eq!(
+            dark.style(Slot::Error, ColorDepth::Ansi16).fg,
+            Ansi16::Yellow.color()
+        );
+        assert_eq!(
+            light.style(Slot::Error, ColorDepth::Ansi16).fg,
+            Ansi16::Red.color()
+        );
+        let dir = Utf8Path::new("/nonexistent-themes");
+        assert_eq!(
+            Theme::try_resolve(Some("colorblind"), true, dir, dir).expect("theme"),
+            light
+        );
+    }
+
+    #[test]
+    fn ansi_theme_emits_only_sixteen_colour_codes() {
+        let theme = Theme::builtin(Base::Ansi { light: false });
+        for slot in SLOTS {
+            for depth in [
+                ColorDepth::TrueColor,
+                ColorDepth::Ansi256,
+                ColorDepth::Ansi16,
+            ] {
+                let sgr = theme.sgr(slot, depth);
+                assert!(
+                    !sgr.contains("38;2") && !sgr.contains("38;5") && !sgr.contains("48;"),
+                    "{slot:?} {depth:?}: {sgr:?}"
+                );
+            }
+            assert_eq!(theme.style(slot, ColorDepth::None), Style::new());
+        }
+        assert_ne!(theme.sgr(Slot::Error, ColorDepth::TrueColor), "");
+    }
+
+    #[test]
+    fn built_in_text_meets_the_contrast_rule() {
+        let cases = [
+            (Theme::dark(), (0x10, 0x10, 0x14)),
+            (Theme::light(), (0xff, 0xff, 0xff)),
+            (Theme::high_contrast(), (0x00, 0x00, 0x00)),
+            (
+                Theme::builtin(Base::Colorblind { light: false }),
+                (0x10, 0x10, 0x14),
+            ),
+            (
+                Theme::builtin(Base::Colorblind { light: true }),
+                (0xff, 0xff, 0xff),
+            ),
+        ];
+        for (theme, background) in cases {
+            let fg = contrast(rgb_of(theme.get(Slot::Fg)), background);
+            let dim = contrast(rgb_of(theme.get(Slot::Dim)), background);
+            assert!(fg >= 4.5, "{:?} fg {fg}", theme.base());
+            assert!(dim >= 3.0, "{:?} dim {dim}", theme.base());
+        }
+        assert!((contrast((0, 0, 0), (0xff, 0xff, 0xff)) - 21.0).abs() < 0.01);
     }
 }

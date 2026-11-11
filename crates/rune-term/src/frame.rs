@@ -897,7 +897,7 @@ mod tests {
         let footer = crate::footer::render(
             &state,
             &layout,
-            &Theme::fx_dark(),
+            &Theme::dark(),
             80,
             crate::theme::ColorDepth::TrueColor,
         );
