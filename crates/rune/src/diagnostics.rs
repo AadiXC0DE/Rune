@@ -150,7 +150,7 @@ pub fn run(settings: &Settings, paths: &Paths, workspace: &Utf8Path) -> Report {
         check_legacy_layout(),
         check_network(settings),
         check_certificates(&rune_net::roots::Roots::from_environment()),
-        check_sandbox(),
+        check_sandbox(settings),
     ];
 
     Report {
@@ -175,29 +175,50 @@ fn check_certificates(roots: &rune_net::roots::Roots) -> Check {
 ///
 /// A host with no backend is reported rather than passed over: a command that
 /// cannot be restricted is a fact the user needs before trusting one.
-fn check_sandbox() -> Check {
+fn check_sandbox(settings: &Settings) -> Check {
     let backend = rune_exec::sandbox::detect();
-    sandbox_check(backend.name(), backend.support())
+    let support = backend.support();
+    let guidance = rune_exec::sandbox::guidance(&support);
+    sandbox_check(backend.name(), support, settings, guidance)
 }
 
-/// Describes enforcement from the backend probe, including fail-closed refusal.
-fn sandbox_check(name: &str, support: rune_exec::sandbox::Support) -> Check {
-    match support {
-        rune_exec::sandbox::Support::Full => Check::ok(
+/// Describes enforcement from the backend probe: a full backend passes, a
+/// missing one is a warning while commands run without it and a problem while
+/// they are refused, with how to get a working backend as the hint.
+fn sandbox_check(
+    name: &str,
+    support: rune_exec::sandbox::Support,
+    settings: &Settings,
+    guidance: Option<String>,
+) -> Check {
+    let detail = match support {
+        rune_exec::sandbox::Support::Full => {
+            return Check::ok(
+                "sandbox",
+                format!("{name} restricts every process the command starts"),
+            );
+        }
+        rune_exec::sandbox::Support::Partial { reason } => {
+            format!("{name} cannot restrict every thread: {reason}")
+        }
+        rune_exec::sandbox::Support::Unsupported { reason } => {
+            format!("{name} cannot restrict commands here: {reason}")
+        }
+    };
+    let check = if settings.allow_unsandboxed {
+        Check::warn(
             "sandbox",
-            format!("{name} restricts every process the command starts"),
-        ),
-        rune_exec::sandbox::Support::Partial { reason } => Check::warn(
-            "sandbox",
-            format!("{name} cannot restrict every thread: {reason}"),
+            format!(
+                "commands run without a sandbox (source: {})",
+                settings.source_of("allow_unsandboxed")
+            ),
         )
-        .with_hint("shell commands are refused on this host; pass `--allow-unsandboxed` to run without sandbox enforcement"),
-        rune_exec::sandbox::Support::Unsupported { reason } => Check::warn(
-            "sandbox",
-            format!("{name} cannot restrict commands here: {reason}"),
-        )
-        .with_hint("shell commands are refused on this host; pass `--allow-unsandboxed` to run without sandbox enforcement"),
-    }
+    } else {
+        Check::fail("sandbox", ErrorCode::Unsupported, detail)
+    };
+    check.with_hint(guidance.unwrap_or_else(|| {
+        "shell commands are refused on this host; pass `--allow-unsandboxed` to run without sandbox enforcement".to_owned()
+    }))
 }
 
 /// Verifies the workspace is reachable and is a directory.
@@ -496,6 +517,10 @@ mod tests {
 
     #[test]
     fn partial_and_unsupported_sandboxes_name_the_refusal_and_override() {
+        let refusing = Settings {
+            allow_unsandboxed: false,
+            ..Settings::default()
+        };
         for support in [
             rune_exec::sandbox::Support::Partial {
                 reason: "cannot restrict every thread".to_owned(),
@@ -504,8 +529,8 @@ mod tests {
                 reason: "bwrap is not on PATH".to_owned(),
             },
         ] {
-            let check = sandbox_check("namespaces", support);
-            assert_eq!(check.outcome, Outcome::Warn);
+            let check = sandbox_check("namespaces", support, &refusing, None);
+            assert_eq!(check.outcome, Outcome::Fail);
             let hint = check.hint.expect("refusal and override");
             assert!(
                 hint.contains("shell commands are refused on this host"),
@@ -514,6 +539,46 @@ mod tests {
             assert!(hint.contains("--allow-unsandboxed"), "{hint}");
             assert!(!hint.contains("commands run unrestricted"), "{hint}");
         }
+    }
+
+    #[test]
+    fn the_sandbox_check_names_the_override_source_and_the_guidance() {
+        let missing = || rune_exec::sandbox::Support::Unsupported {
+            reason: "the bubblewrap helper (bwrap) is not installed".to_owned(),
+        };
+        let guidance = || Some("install bubblewrap: sudo apt-get install bubblewrap".to_owned());
+        let full = sandbox_check(
+            "namespaces",
+            rune_exec::sandbox::Support::Full,
+            &Settings::default(),
+            None,
+        );
+        assert_eq!(full.outcome, Outcome::Ok);
+        assert!(full.detail.contains("namespaces"), "{}", full.detail);
+        let mut allowed = Settings {
+            allow_unsandboxed: true,
+            ..Settings::default()
+        };
+        allowed.sources.record("allow_unsandboxed", Layer::User);
+        let warned = sandbox_check("namespaces", missing(), &allowed, guidance());
+        assert_eq!(warned.outcome, Outcome::Warn);
+        assert_eq!(
+            warned.detail,
+            "commands run without a sandbox (source: user)"
+        );
+        assert_eq!(warned.hint, guidance());
+        let refused = Settings {
+            allow_unsandboxed: false,
+            ..Settings::default()
+        };
+        let failed = sandbox_check("namespaces", missing(), &refused, guidance());
+        assert_eq!(failed.outcome, Outcome::Fail);
+        assert!(
+            failed.detail.contains("bwrap) is not installed"),
+            "{}",
+            failed.detail
+        );
+        assert_eq!(failed.hint, guidance());
     }
 
     #[test]

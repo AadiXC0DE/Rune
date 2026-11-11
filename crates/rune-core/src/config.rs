@@ -991,9 +991,11 @@ pub struct Settings {
     pub permission_mode: PermissionMode,
     /// Whether a command may run without a sandbox.
     ///
-    /// Off by default. A host with no usable backend refuses commands rather
-    /// than running them unrestricted, so turning this off removes the only way
-    /// to run anything on such a host.
+    /// Off by default, except on Windows, which has no backend: there commands
+    /// run under the permission mode alone unless the user file turns it off. A
+    /// host with no usable backend refuses commands rather than running them
+    /// unrestricted, so turning this off removes the only way to run anything
+    /// on such a host.
     pub allow_unsandboxed: bool,
     /// Reasoning effort.
     pub effort: Effort,
@@ -1094,7 +1096,7 @@ impl Default for Settings {
             api_key_env: None,
             anonymous: false,
             permission_mode: PermissionMode::default(),
-            allow_unsandboxed: false,
+            allow_unsandboxed: cfg!(windows),
             effort: Effort::default(),
             temperature: None,
             fast_mode: false,
@@ -4116,6 +4118,23 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn windows_defaults_to_allow_unsandboxed() {
+        let settings = load(None, None, &empty_env());
+        assert!(settings.allow_unsandboxed);
+        assert_eq!(settings.source_of("allow_unsandboxed"), Layer::Default);
+    }
+
+    #[test]
+    fn explicit_false_wins_on_windows() {
+        let dir = TempDir::new().expect("tempdir");
+        let user = write(&dir, "config.toml", "allow_unsandboxed = false\n");
+        let settings = load(None, Some(&user), &empty_env());
+        assert!(!settings.allow_unsandboxed);
+        assert_eq!(settings.source_of("allow_unsandboxed"), Layer::User);
+    }
+
     #[test]
     fn the_environment_overrides_a_user_allow_unsandboxed() {
         let dir = TempDir::new().expect("tempdir");
@@ -4137,7 +4156,8 @@ mod tests {
             "allow_unsandboxed = true\nsandbox_cache_roots = [\"~\"]\n",
         );
         let settings = load(Some(&project), None, &empty_env());
-        assert!(!settings.allow_unsandboxed);
+        assert_eq!(settings.allow_unsandboxed, cfg!(windows));
+        assert_eq!(settings.source_of("allow_unsandboxed"), Layer::Default);
         assert!(settings.sandbox_cache_roots.is_none());
     }
 
@@ -4152,13 +4172,16 @@ mod tests {
                 }),
             )
         };
-        assert!(!load(None, None, &empty_env()).allow_unsandboxed);
+        assert_eq!(
+            load(None, None, &empty_env()).allow_unsandboxed,
+            cfg!(windows)
+        );
         let settings = with("1");
         assert!(settings.allow_unsandboxed);
         assert_eq!(settings.source_of("allow_unsandboxed"), Layer::Environment);
         assert!(with("yes").allow_unsandboxed);
         let invalid = with("nope");
-        assert!(!invalid.allow_unsandboxed);
+        assert_eq!(invalid.allow_unsandboxed, cfg!(windows));
         assert!(
             !invalid.diagnostics.is_empty(),
             "an invalid boolean is reported"

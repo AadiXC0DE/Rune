@@ -1452,6 +1452,12 @@ impl Host for AskHost<'_> {
                 "warning: checkpoint for turn 1 was not ready; restoring this turn may be incomplete"
             );
         }
+        if name == "shell"
+            && let Some(notice) =
+                crate::sandbox::windows_notice(self.settings, &self.paths.state_root)
+        {
+            let _ = writeln!(std::io::stderr(), "{notice}");
+        }
         self.registry.call(name, arguments, context)
     }
 

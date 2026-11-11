@@ -8,8 +8,9 @@
 // Unsafe code is denied rather than forbidden, so that the one call that needs
 // it can say so where it is written. Child limits and a controlling tty are set
 // between fork and exec, which is `CommandExt::pre_exec`, and that is
-// unsafe by its own contract. Windows file moves have a separate documented
-// FFI boundary in rename.rs. Everywhere else the denial applies.
+// unsafe by its own contract. Windows file moves and job objects have separate
+// documented FFI boundaries in rename.rs and job.rs. Everywhere else the
+// denial applies.
 #![deny(unsafe_code)]
 // Tests assert by panicking. The guards that forbid panicking apply to the
 // shipped build, where a panic on user input is a defect.
@@ -18,6 +19,8 @@
 #[cfg(target_os = "linux")]
 mod pty;
 
+#[cfg(windows)]
+mod job;
 #[cfg(windows)]
 mod rename;
 #[cfg(windows)]
@@ -37,6 +40,6 @@ pub use command::{
 pub use sandbox::{
     CACHE_ROOT_VARIABLES, CacheRoot, DEFAULT_CACHE_ROOTS, LinuxSandbox, MacSandbox,
     NAMESPACE_HELPER, NullSandbox, SEATBELT_TOOL, Sandbox, SandboxPolicy, Support,
-    UNSANDBOXED_OVERRIDE, cache_roots, detect, in_container,
+    UNSANDBOXED_OVERRIDE, cache_roots, detect, guidance, in_container,
 };
 pub use session::{Buffer, Process, Reading};

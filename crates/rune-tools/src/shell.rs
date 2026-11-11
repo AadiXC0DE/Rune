@@ -915,7 +915,7 @@ pub fn sandbox_policy(context: &ExecutionContext) -> rune_exec::SandboxPolicy {
 
 /// Added once to a failed command's output when the sandbox kept it off the
 /// network and its output looks like a failed connection.
-const NETWORK_NOTICE: &str =
+pub const NETWORK_NOTICE: &str =
     "[commands in this run have no network access; the user can allow it with --network]";
 
 /// What a failed connection prints, in the tools agents run most.

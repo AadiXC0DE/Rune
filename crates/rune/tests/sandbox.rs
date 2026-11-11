@@ -352,7 +352,6 @@ fn saved_roots_can_be_ignored_while_command_line_roots_remain() {
 fn missing_command_invalid_action_and_missing_root_are_rejected() {
     let fixture = Fixture::new();
     for args in [
-        vec!["sandbox", "explain"],
         vec!["sandbox", "run", "echo fixture"],
         vec![
             "sandbox",
@@ -369,6 +368,47 @@ fn missing_command_invalid_action_and_missing_root_are_rejected() {
         assert!(output.stdout.is_empty());
         assert!(!output.stderr.is_empty());
     }
+}
+
+#[test]
+fn explain_without_a_command_prints_the_backend() {
+    let fixture = Fixture::new();
+    std::fs::create_dir_all(fixture.dir.path().join("home/.cache")).expect("cache");
+    let output = fixture.run(&["sandbox", "explain"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8(output.stdout).expect("utf8");
+    assert!(!text.contains("command:"), "{text}");
+    for label in [
+        "backend: ",
+        "support: ",
+        "allow_unsandboxed: ",
+        "network policy: ",
+        "cache root",
+        "writable roots:",
+        "protected paths:",
+    ] {
+        assert!(text.contains(label), "missing {label}: {text}");
+    }
+    let report = fixture.json(&["sandbox", "explain", "--json"]);
+    assert!(report["command"].is_null(), "{report}");
+    assert!(
+        !report["backend"]["value"]
+            .as_str()
+            .expect("backend")
+            .is_empty()
+    );
+    let guidance = report.get("guidance").expect("guidance key");
+    if let Some(sentence) = guidance.as_str() {
+        assert!(text.contains(&format!("guidance: {sentence}\n")), "{text}");
+    } else {
+        assert!(guidance.is_null(), "{report}");
+        assert!(!text.contains("guidance:"), "{text}");
+    }
+    assert_eq!(text.contains("job object:"), cfg!(windows), "{text}");
 }
 
 #[cfg(target_os = "linux")]
@@ -500,7 +540,7 @@ fn top_level_help_names_sandbox_and_mcp_actions() {
         .find(|line| line.trim_start().starts_with("sandbox "))
         .expect("sandbox summary");
     assert!(
-        sandbox.contains("sandbox [explain] -- <command>"),
+        sandbox.contains("sandbox [explain] [-- <command>]"),
         "{sandbox}"
     );
     let mcp = text
@@ -513,5 +553,7 @@ fn top_level_help_names_sandbox_and_mcp_actions() {
     let reference = fixture.run(&["reference"]);
     assert!(reference.status.success());
     let reference = String::from_utf8(reference.stdout).expect("reference");
-    assert!(reference.contains("rune sandbox [explain] [--external-access] [--json] -- <command>"));
+    assert!(
+        reference.contains("rune sandbox [explain] [--external-access] [--json] [-- <command>]")
+    );
 }

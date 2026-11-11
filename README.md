@@ -387,6 +387,41 @@ usage use the native wire format. The Rust SDK selects it with `Dialect::Gemini`
 This dialect uses the model's automatic thinking settings; explicit reasoning
 effort and fast mode currently return `unsupported`.
 
+### Linux sandbox
+
+Commands on Linux run inside namespaces built by bubblewrap (the `bwrap`
+program). When it is missing, commands are refused with the install command for
+your distribution:
+
+| Distribution | Install |
+| --- | --- |
+| Debian, Ubuntu | `sudo apt-get install bubblewrap` |
+| Fedora, RHEL, CentOS | `sudo dnf install bubblewrap` |
+| Arch | `sudo pacman -S bubblewrap` |
+| Alpine | `sudo apk add bubblewrap` |
+| openSUSE, SUSE | `sudo zypper install bubblewrap` |
+
+Ubuntu 24.04 and later block unprivileged user namespaces through AppArmor, so
+`bwrap` cannot start without a profile. Save this as `/etc/apparmor.d/bwrap`:
+
+```
+abi <abi/4.0>,
+include <tunables/global>
+profile bwrap /usr/bin/bwrap flags=(unconfined) {
+  userns,
+  include if exists <local/bwrap>
+}
+```
+
+then reload AppArmor:
+
+```sh
+sudo systemctl reload apparmor
+```
+
+`rune sandbox explain` and `rune doctor` show the backend in use and what to
+change when there is none.
+
 ## Running in a container
 
 Containers usually cannot create the namespaces Rune's Linux sandbox needs, so
@@ -986,6 +1021,10 @@ limits are described under [Contributing](#contributing).
 On Windows, [atomic file moves](crates/rune-exec/src/rename.rs) call
 `MoveFileExW` with live, NUL-terminated UTF-16 path buffers and zero flags.
 This keeps no-replace renames atomic without enabling copy/delete fallback.
+Each command runs in a [job object](crates/rune-exec/src/job.rs): creating it,
+setting its kill-on-close limit, assigning the child's live process handle,
+listing its processes and terminating it are FFI calls on the job handle, which
+is owned and closed exactly once.
 
 ## Configuration
 
