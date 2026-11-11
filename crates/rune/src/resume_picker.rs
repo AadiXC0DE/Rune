@@ -290,7 +290,8 @@ pub fn pick_styled(
             KeyAction::Transcript
             | KeyAction::ExternalEditor
             | KeyAction::HistorySearch
-            | KeyAction::CycleReasoning => {}
+            | KeyAction::CycleReasoning
+            | KeyAction::ModeCycle => {}
             KeyAction::Ignored => picker.set_query(reader.line()),
         }
     };

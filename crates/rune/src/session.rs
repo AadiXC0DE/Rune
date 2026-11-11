@@ -2393,8 +2393,12 @@ impl SessionHost {
             } else {
                 UiState::Idle
             }),
-            // The lowest-priority idle hint, shown only when it fits whole.
-            idle_hints: vec![self.caps.newline_hint()],
+            // Shown only when each fits whole; the newline key is the lowest priority.
+            idle_hints: if self.accessible {
+                vec![self.caps.newline_hint()]
+            } else {
+                vec!["shift-tab mode", self.caps.newline_hint()]
+            },
             fields: Some(lock_value(&self.statusline).clone()),
             branch: lock_value(&self.branch).clone(),
             effort: (effort != Effort::Auto).then(|| effort.to_string()),
@@ -2706,7 +2710,7 @@ impl SessionHost {
         // Even a frame with nothing in it is painted, because the one before it
         // may have shown a line or a notice that has to be taken off the screen.
         // A frame that changes nothing costs only a caret move.
-        let marker = rune_term::shell::prompt();
+        let marker = &prompt_marker(self);
         let width = usize::from(self.width());
         let (prompt_rows, caret) = transcript::render_draft_at(marker, line, column, width);
         let Ok(painted) = self.paint_with_menu(&[], notice, &prompt_rows, &rows, &[], caret, paced)
@@ -2822,7 +2826,7 @@ impl SessionHost {
     /// Every frame draws this, so the region is the same shape whether text is
     /// arriving or not and the caret always has a row of its own.
     fn idle_prompt(&self) -> (Vec<String>, (u16, u16)) {
-        let marker = rune_term::shell::prompt();
+        let marker = &prompt_marker(self);
         let row = transcript::render_prompt(marker, "", usize::from(self.width()));
         let caret = rune_term::width::str_width(marker);
         (vec![row], (0, u16::try_from(caret).unwrap_or(u16::MAX)))
@@ -3045,7 +3049,7 @@ impl SessionHost {
         {
             return;
         }
-        let marker = rune_term::shell::prompt();
+        let marker = &prompt_marker(self);
         let width = usize::from(self.width());
         let (prompt_rows, caret) = transcript::render_draft_at(marker, &line, column, width);
         if let Ok(painted) = self.paint(lines, None, &prompt_rows, &rows, caret) {
@@ -3929,7 +3933,7 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
             host.idle_prompt()
         } else {
             transcript::render_draft_at(
-                rune_term::shell::prompt(),
+                &prompt_marker(&host),
                 reader.line(),
                 reader.column(),
                 usize::from(host.width()),
@@ -5186,7 +5190,7 @@ fn run_steerable<T: Send>(
             host.draw_stream_with(reader.line(), reader.column());
             return;
         }
-        sync_layout(reader, host, rune_term::shell::prompt());
+        sync_layout(reader, host, &prompt_marker(host));
         let Some(key) = reader.poll_key(rune_term::shell::POLL_INTERVAL) else {
             host.flush_frame();
             host.tick();
@@ -5260,6 +5264,8 @@ fn run_steerable<T: Send>(
                 gesture.disarm();
                 host.cycle_reasoning();
             }
+            // The mode is changed only at the idle prompt.
+            KeyAction::ModeCycle => {}
             // Anything else is an edit, so a half-finished cancel gesture
             // is abandoned rather than left armed, and the line is redrawn
             // with the text that has been typed so far.
@@ -5479,6 +5485,7 @@ fn question_key(
         KeyAction::Complete
         | KeyAction::Ignored
         | KeyAction::CycleReasoning
+        | KeyAction::ModeCycle
         | KeyAction::Transcript
         | KeyAction::HistorySearch
         | KeyAction::ExternalEditor => None,
@@ -5529,6 +5536,7 @@ fn approval_key(
         KeyAction::Complete
         | KeyAction::Ignored
         | KeyAction::CycleReasoning
+        | KeyAction::ModeCycle
         | KeyAction::Transcript
         | KeyAction::HistorySearch
         | KeyAction::ExternalEditor => None,
@@ -5671,7 +5679,7 @@ fn close_turn(
             "the turn ended before this was sent; press Enter to send it",
         ));
     }
-    let marker = rune_term::shell::prompt();
+    let marker = &prompt_marker(host);
     sync_layout(reader, host, marker);
     let (prompt_rows, caret) = transcript::render_draft_at(
         marker,
@@ -5733,7 +5741,7 @@ fn edit_draft(reader: &mut rune_term::input::KeyReader, host: &SessionHost) {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (prompt, caret) = transcript::render_draft_at(
-            rune_term::shell::prompt(),
+            &prompt_marker(host),
             reader.line(),
             reader.column(),
             usize::from(host.width()),
@@ -5987,12 +5995,13 @@ fn await_submission(
     limits: &rune_tools::workspace::FileLimits,
 ) -> Result<Option<Input>> {
     let recall = prompts.here;
-    let marker = rune_term::shell::prompt();
     // Which completion row is highlighted. While the dropdown is open the
     // arrows move it rather than walking the prompt history, because the list is
     // what the user is looking at.
     let mut selected = 0_usize;
     let mut paths: Option<crate::path_completion::Paths> = None;
+    // The line naming a mode just chosen, and when it is taken down.
+    let mut flash: Option<(String, std::time::Instant)> = None;
 
     loop {
         let rows = paths.as_ref().map_or_else(
@@ -6016,13 +6025,31 @@ fn await_submission(
                 )
             },
         );
-        draw_prompt(reader, host, out, &rows, marker)?;
+        let notice = flash.as_ref().map(|(line, _)| line.as_str());
+        draw_prompt(reader, host, out, &rows, &prompt_marker(host), notice)?;
 
         let draft = reader.line().to_owned();
         let caret = reader.cursor_byte();
         reader.set_menu_open(!rows.is_empty());
-        let key = reader.read_key();
+        let key = match &flash {
+            Some((_, until)) => {
+                let left = until.saturating_duration_since(std::time::Instant::now());
+                reader.poll_key(left)
+            }
+            None => Some(reader.read_key()),
+        };
         reader.set_menu_open(false);
+        let Some(key) = key else {
+            flash = None;
+            continue;
+        };
+        if key == KeyAction::ModeCycle {
+            let line = cycle_mode(host);
+            flash = std::time::Instant::now()
+                .checked_add(std::time::Duration::from_secs(1))
+                .map(|until| (line, until));
+            continue;
+        }
         // Resize and other non-edit events still redraw the prompt, but must
         // not reset its completion selection or dismiss an open path menu.
         if key == KeyAction::Ignored && reader.line() == draft && reader.cursor_byte() == caret {
@@ -6201,7 +6228,7 @@ fn idle_key(
     recall: &[String],
 ) -> Idle {
     match key {
-        KeyAction::Suspend | KeyAction::CycleReasoning => Idle::Stay,
+        KeyAction::Suspend | KeyAction::CycleReasoning | KeyAction::ModeCycle => Idle::Stay,
         KeyAction::Submit => {
             // Enter takes the highlighted completion when the list is open
             // and the command is not yet complete, so a half-typed name is
@@ -6308,6 +6335,7 @@ fn draw_prompt(
     out: &LiveSink,
     menu: &[String],
     marker: &str,
+    notice: Option<&str>,
 ) -> Result<()> {
     sync_layout(reader, host, marker);
     let mut sink = out
@@ -6320,7 +6348,7 @@ fn draw_prompt(
         usize::from(host.width()),
     );
     let ui = (!menu.is_empty()).then_some(UiState::Menu);
-    let painted = host.paint_in(ui, &[], None, &rows, &[], menu, caret, false)?;
+    let painted = host.paint_in(ui, &[], notice, &rows, &[], menu, caret, false)?;
     if !painted.is_empty() {
         sink.write_all(&painted)?;
         sink.flush()?;
@@ -6386,7 +6414,7 @@ fn confirm_choice(
             }
             match answer.read_key() {
                 KeyAction::Suspend => suspend_session(host, out)?,
-                KeyAction::Ignored | KeyAction::CycleReasoning => {
+                KeyAction::Ignored | KeyAction::CycleReasoning | KeyAction::ModeCycle => {
                     let typed = answer.line().to_owned();
                     answer.clear();
                     match typed.as_str() {
@@ -6446,7 +6474,7 @@ fn run_picker(
         {
             *row = format!("> use {id} (not listed)");
         }
-        draw_prompt(reader, host, out, &below, marker)?;
+        draw_prompt(reader, host, out, &below, marker, None)?;
 
         match reader.read_key() {
             KeyAction::Suspend => suspend_session(host, out)?,
@@ -6470,7 +6498,7 @@ fn run_picker(
                 view_transcript(reader, host)?;
             }
             KeyAction::ExternalEditor | KeyAction::HistorySearch => {}
-            KeyAction::Ignored | KeyAction::CycleReasoning => {
+            KeyAction::Ignored | KeyAction::CycleReasoning | KeyAction::ModeCycle => {
                 picker.set_query(reader.line());
             }
         }
@@ -6518,7 +6546,7 @@ fn search_prompt_history(
                 styled(&host.theme().sgr(slot, host.depth), &preview)
             })
             .collect::<Vec<_>>();
-            draw_prompt(query, host, out, &rows, rune_term::shell::prompt())?;
+            draw_prompt(query, host, out, &rows, rune_term::shell::prompt(), None)?;
             match query.read_key() {
                 KeyAction::Suspend => suspend_session(host, out)?,
                 KeyAction::Submit | KeyAction::Complete => {
@@ -6533,7 +6561,9 @@ fn search_prompt_history(
                 KeyAction::Down => {
                     picker.down();
                 }
-                KeyAction::Ignored | KeyAction::CycleReasoning => picker.set_query(query.line()),
+                KeyAction::Ignored | KeyAction::CycleReasoning | KeyAction::ModeCycle => {
+                    picker.set_query(query.line());
+                }
                 KeyAction::HistorySearch => {
                     everywhere = !everywhere;
                     picker = switch_history_scope(&picker, everywhere, recall, all);
@@ -7913,6 +7943,61 @@ fn set_permissions(host: &SessionHost, requested: Option<&str>) -> String {
     )
 }
 
+/// Returns the mode Shift+Tab moves to, and whether it plans.
+///
+/// The cycle is ask, auto, then plan on auto's rules. Full access is never
+/// entered this way; leaving it goes to ask.
+const fn next_mode(mode: PermissionMode, planning: bool) -> (PermissionMode, bool) {
+    match (mode, planning) {
+        (_, true) | (PermissionMode::FullAccess, false) => (PermissionMode::Ask, false),
+        (PermissionMode::Ask, false) => (PermissionMode::Auto, false),
+        (PermissionMode::Auto, false) => (PermissionMode::Auto, true),
+    }
+}
+
+/// Moves to the next mode of the cycle and returns the line that names it.
+fn cycle_mode(host: &SessionHost) -> String {
+    let planning = host.planning.load(std::sync::atomic::Ordering::Relaxed);
+    let current = host.mode();
+    let (mode, plan) = next_mode(current, planning);
+    if mode != current {
+        let message = set_permissions(host, Some(mode.as_str()));
+        if host.mode() != mode {
+            return message;
+        }
+    }
+    host.planning
+        .store(plan, std::sync::atomic::Ordering::Relaxed);
+    if plan && !planning {
+        host.queue_update("Plan mode is on: only reads and plan updates run.".to_owned());
+    } else if planning && !plan {
+        host.queue_update("Plan mode is off; changes and commands may run.".to_owned());
+    }
+    format!("mode: {}", if plan { "plan" } else { mode.label() })
+}
+
+/// Returns the prompt marker, coloured for the mode and naming plan mode in
+/// words so colour is not the only signal.
+fn prompt_marker(host: &SessionHost) -> String {
+    let planning = host.planning.load(std::sync::atomic::Ordering::Relaxed);
+    let slot = if planning {
+        Slot::Warning
+    } else {
+        match host.mode() {
+            PermissionMode::Ask => Slot::Fg,
+            PermissionMode::Auto => Slot::Success,
+            PermissionMode::FullAccess => Slot::Error,
+        }
+    };
+    let open = host.theme().sgr(slot, host.depth());
+    let marker = rune_term::shell::prompt();
+    if planning {
+        format!("{} {}", styled(&open, "plan"), styled(&open, marker))
+    } else {
+        styled(&open, marker)
+    }
+}
+
 fn set_effort(host: &SessionHost, requested: Option<&str>) -> String {
     let model = host.model_name();
     let (_, traits) = host.compat.resolve(&model);
@@ -8127,7 +8212,7 @@ fn choose_theme(
     let chosen = loop {
         let room = host.menu_room();
         let below = picker_menu(&mut picker, &host.theme(), host.depth, room);
-        draw_prompt(reader, host, out, &below, marker)?;
+        draw_prompt(reader, host, out, &below, marker, None)?;
         match reader.read_key() {
             KeyAction::Suspend => suspend_session(host, out)?,
             KeyAction::Submit | KeyAction::Complete => {
@@ -8146,7 +8231,7 @@ fn choose_theme(
             }
             KeyAction::Transcript => view_transcript(reader, host)?,
             KeyAction::ExternalEditor | KeyAction::HistorySearch => {}
-            KeyAction::Ignored | KeyAction::CycleReasoning => {
+            KeyAction::Ignored | KeyAction::CycleReasoning | KeyAction::ModeCycle => {
                 picker.set_query(reader.line());
                 preview(&picker);
             }
@@ -11467,10 +11552,10 @@ mod tests {
         )
         .expect("closed");
         check(&mut grid, 2);
-        draw_prompt(&mut reader, &host, &sink.stream, &[], "> ").expect("idle prompt");
+        draw_prompt(&mut reader, &host, &sink.stream, &[], "> ", None).expect("idle prompt");
         check(&mut grid, 2);
         reader.clear();
-        draw_prompt(&mut reader, &host, &sink.stream, &[], "> ").expect("cleared");
+        draw_prompt(&mut reader, &host, &sink.stream, &[], "> ", None).expect("cleared");
         grid.feed(&std::mem::take(&mut *bytes.lock().expect("lock")))
             .expect("feed");
         assert!(!grid.text().contains("second"), "{}", grid.text());
@@ -17188,6 +17273,63 @@ mod tests {
         assert_eq!(
             set_budget(&host, Some("off")),
             "spend limit removed; $0.060000 spent"
+        );
+    }
+
+    #[test]
+    fn next_mode_never_enters_full_access() {
+        use PermissionMode::{Ask, Auto, FullAccess};
+        assert_eq!(next_mode(Ask, false), (Auto, false));
+        assert_eq!(next_mode(Auto, false), (Auto, true));
+        assert_eq!(next_mode(Auto, true), (Ask, false));
+        assert_eq!(next_mode(Ask, true), (Ask, false));
+        assert_eq!(next_mode(FullAccess, false), (Ask, false));
+        assert_eq!(next_mode(FullAccess, true), (Ask, false));
+        let mut state = (FullAccess, false);
+        for _ in 0..6 {
+            state = next_mode(state.0, state.1);
+            assert_ne!(state.0, FullAccess);
+        }
+    }
+
+    #[test]
+    fn cycling_the_mode_tells_the_model() {
+        let mut host = test_host();
+        *host.mode.get_mut().expect("mode") = PermissionMode::Ask;
+        assert_eq!(cycle_mode(&host), "mode: auto");
+        assert_eq!(host.take_updates(), ["Permission mode is now auto."]);
+        assert_eq!(cycle_mode(&host), "mode: plan");
+        assert_eq!(host.mode(), PermissionMode::Auto);
+        assert!(host.planning.load(std::sync::atomic::Ordering::Relaxed));
+        assert_eq!(
+            host.take_updates(),
+            ["Plan mode is on: only reads and plan updates run."]
+        );
+        assert_eq!(cycle_mode(&host), "mode: ask");
+        assert!(!host.planning.load(std::sync::atomic::Ordering::Relaxed));
+        assert_eq!(
+            host.take_updates(),
+            [
+                "Permission mode is now ask.",
+                "Plan mode is off; changes and commands may run."
+            ]
+        );
+    }
+
+    #[test]
+    fn prompt_marker_names_plan_without_colour() {
+        let host = test_host();
+        assert_eq!(prompt_marker(&host), "> ");
+        host.planning
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(prompt_marker(&host), "plan > ");
+        *lock_value(&host.theme) = Theme::dark();
+        let coloured = prompt_marker(&host);
+        assert_ne!(coloured, "plan > ");
+        assert_eq!(rune_term::width::str_width(&coloured), 7);
+        assert!(
+            coloured.contains("plan") && coloured.contains("> "),
+            "{coloured:?}"
         );
     }
 

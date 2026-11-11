@@ -431,15 +431,13 @@ fn field_text(
         StatusField::Model => {
             (!state.model.is_empty()).then(|| styled(Slot::Accent, flag::BOLD, &state.model))
         }
-        StatusField::Mode => Some(styled(
-            Slot::Dim,
-            0,
-            if state.planning {
-                "plan"
-            } else {
-                state.permission_mode.label()
-            },
-        )),
+        StatusField::Mode => Some(if state.planning {
+            styled(Slot::Dim, 0, "plan")
+        } else if state.permission_mode == PermissionMode::FullAccess {
+            styled(Slot::Warning, 0, state.permission_mode.label())
+        } else {
+            styled(Slot::Dim, 0, state.permission_mode.label())
+        }),
         StatusField::Unsandboxed => state
             .unsandboxed
             .then(|| styled(Slot::Warning, 0, "unsandboxed")),
@@ -933,6 +931,19 @@ mod tests {
         for row in &rows {
             assert!(!row.contains('\u{1b}'), "escape in {row:?}");
         }
+    }
+
+    #[test]
+    fn full_access_mode_is_drawn_as_a_warning() {
+        let theme = Theme::dark();
+        let warning = theme.sgr(Slot::Warning, ColorDepth::TrueColor);
+        let mut state = state();
+        state.permission_mode = PermissionMode::FullAccess;
+        let row = status_row(&state, &theme, ColorDepth::TrueColor, 200);
+        assert!(row.contains(&format!("{warning}full access")), "{row:?}");
+        state.permission_mode = PermissionMode::Auto;
+        let row = status_row(&state, &theme, ColorDepth::TrueColor, 200);
+        assert!(!row.contains(&format!("{warning}auto")), "{row:?}");
     }
 
     #[test]
