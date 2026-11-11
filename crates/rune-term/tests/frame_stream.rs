@@ -80,7 +80,7 @@ fn a_frame_costs_bytes_in_proportion_to_what_changed() {
 
 #[test]
 fn a_committed_stream_rebuilds_the_screen_on_a_cleared_terminal() {
-    let theme = Theme::fx_dark();
+    let theme = Theme::dark();
     let layout = footer::solve((80, 24), 1, false, footer::DEFAULT_MINIMUM_ROWS);
     let footer = footer::render(
         &state(),

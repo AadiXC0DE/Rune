@@ -450,7 +450,7 @@ mod tests {
         let rows = strip(&render(
             state,
             &layout,
-            &Theme::fx_dark(),
+            &Theme::dark(),
             width,
             ColorDepth::TrueColor,
         ));
@@ -474,13 +474,7 @@ mod tests {
         assert_eq!(layout.footer_rows, COMPACT_ROWS);
         assert_eq!(layout.transcript_rows, 0);
         assert_eq!(layout.prompt_rows, 0);
-        let rows = render(
-            &state(),
-            &layout,
-            &Theme::fx_dark(),
-            80,
-            ColorDepth::TrueColor,
-        );
+        let rows = render(&state(), &layout, &Theme::dark(), 80, ColorDepth::TrueColor);
         assert_eq!(rows.len(), 1);
         let message = strip(&rows).remove(0);
         assert!(
@@ -508,13 +502,7 @@ mod tests {
     #[test]
     fn a_compact_row_still_fits_a_narrow_terminal() {
         let layout = solve((12, 3), 1, false, DEFAULT_MINIMUM_ROWS);
-        let rows = render(
-            &state(),
-            &layout,
-            &Theme::fx_dark(),
-            12,
-            ColorDepth::TrueColor,
-        );
+        let rows = render(&state(), &layout, &Theme::dark(), 12, ColorDepth::TrueColor);
         assert_eq!(rows.len(), 1);
         assert!(str_width(&rows[0]) <= 12, "row too wide: {:?}", rows[0]);
     }
@@ -542,7 +530,7 @@ mod tests {
         let rows = render(
             &state(),
             &layout,
-            &Theme::fx_dark(),
+            &Theme::dark(),
             100,
             ColorDepth::TrueColor,
         );
@@ -602,13 +590,7 @@ mod tests {
         wide.model = "a-model-name-that-is-quite-long-indeed".to_owned();
         wide.context_used = 199_999;
         for width in [8usize, 20, 40, 200] {
-            let rows = render(
-                &wide,
-                &layout,
-                &Theme::fx_dark(),
-                width,
-                ColorDepth::TrueColor,
-            );
+            let rows = render(&wide, &layout, &Theme::dark(), width, ColorDepth::TrueColor);
             for row in &rows {
                 assert!(str_width(row) <= width, "row too wide for {width}: {row:?}");
             }
@@ -623,13 +605,7 @@ mod tests {
             "\u{4e2d}\u{6587}\u{4e2d}\u{6587}\u{4e2d}\u{6587}\u{1f680}\u{1f680}".to_owned();
         wide.workspace = "\u{4e2d}\u{6587}/\u{1f680}".to_owned();
         for width in [9usize, 13, 21, 55] {
-            let rows = render(
-                &wide,
-                &layout,
-                &Theme::fx_dark(),
-                width,
-                ColorDepth::TrueColor,
-            );
+            let rows = render(&wide, &layout, &Theme::dark(), width, ColorDepth::TrueColor);
             for row in &rows {
                 assert!(str_width(row) <= width, "row too wide for {width}: {row:?}");
             }
@@ -653,7 +629,7 @@ mod tests {
         let rows = strip(&render(
             &state(),
             &layout,
-            &Theme::fx_dark(),
+            &Theme::dark(),
             100,
             ColorDepth::TrueColor,
         ));
@@ -764,13 +740,7 @@ mod tests {
     #[test]
     fn at_256_colors_the_status_row_is_quantized() {
         let layout = solve((100, 40), 1, false, DEFAULT_MINIMUM_ROWS);
-        let rows = render(
-            &state(),
-            &layout,
-            &Theme::fx_dark(),
-            100,
-            ColorDepth::Ansi256,
-        );
+        let rows = render(&state(), &layout, &Theme::dark(), 100, ColorDepth::Ansi256);
         assert!(rows[1].contains("38;5;"), "{:?}", rows[1]);
         assert!(!rows[1].contains("38;2;"), "{:?}", rows[1]);
     }

@@ -506,7 +506,7 @@ mod tests {
 
     #[test]
     fn the_highlighted_row_is_colored_when_the_theme_has_color() {
-        let theme = Theme::fx_dark();
+        let theme = Theme::dark();
         let picker = Picker::new("models", items(2), DEFAULT_WINDOW);
         let rows = picker.rows(&theme, ColorDepth::TrueColor);
         assert!(

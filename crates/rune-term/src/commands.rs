@@ -78,6 +78,11 @@ pub const BUILTINS: &[Builtin] = &[
         summary: "summarize older turns, or preview record counts without changes",
     },
     Builtin {
+        name: "theme",
+        arguments: "[name]",
+        summary: "choose a colour theme, or switch to one named here",
+    },
+    Builtin {
         name: "reload",
         arguments: "",
         summary: "re-read instructions, skills and the repository map now",

@@ -323,7 +323,9 @@ struct SessionHost {
     /// status line is measured against, and the status line only has `&self`.
     context_limit: std::sync::atomic::AtomicU64,
     /// Theme the status line is drawn with.
-    theme: Theme,
+    theme: Mutex<Theme>,
+    /// The theme name in force, as the user wrote it.
+    theme_name: Mutex<String>,
     /// Session identifier, shown shortened in the status line.
     ///
     /// Behind a lock because `/new` replaces it while the session runs, and the
@@ -1423,8 +1425,23 @@ impl SessionHost {
     }
 
     /// Returns the theme the interface is drawn with.
-    fn theme(&self) -> &Theme {
-        &self.theme
+    fn theme(&self) -> Theme {
+        lock_value(&self.theme).clone()
+    }
+
+    /// Switches the theme, recolouring the reasoning lane and repainting the
+    /// live region in full so no row keeps the old colours.
+    fn set_theme(&self, theme: Theme) {
+        *lock_value(&self.reasoning) = theme.sgr(Slot::Dim, self.depth);
+        *lock_value(&self.theme) = theme;
+        if let Ok(mut inline) = self.inline.lock() {
+            inline.invalidate();
+        }
+    }
+
+    /// Returns true when the terminal's background is light.
+    fn terminal_is_light(&self) -> bool {
+        rune_term::theme::terminal_is_light(&self.caps)
     }
 
     /// Returns how many colors the terminal renders.
@@ -1814,7 +1831,7 @@ impl SessionHost {
             false,
             footer::DEFAULT_MINIMUM_ROWS,
         );
-        footer::render(&state, &layout, &self.theme, width, self.depth).join("\n")
+        footer::render(&state, &layout, &self.theme(), width, self.depth).join("\n")
     }
 
     /// Returns the line the activity line should show for a finished turn.
@@ -2073,7 +2090,7 @@ impl SessionHost {
             return Vec::new();
         };
         let width = usize::from(self.width());
-        let dim = self.theme.sgr(Slot::Dim, self.depth);
+        let dim = self.theme().sgr(Slot::Dim, self.depth);
         let reset = rune_term::engine::Style::RESET;
 
         // The fields are borrowed separately, because each lane's text and the
@@ -2202,9 +2219,9 @@ impl SessionHost {
         let text = transcript::sanitize(row);
         let reset = rune_term::engine::Style::RESET;
         let status = self
-            .theme
+            .theme()
             .sgr(if failed { Slot::Error } else { Slot::Success }, self.depth);
-        let dim = self.theme.sgr(Slot::Dim, self.depth);
+        let dim = self.theme().sgr(Slot::Dim, self.depth);
         let (glyph, rest) = text.split_once(' ').unwrap_or((text.as_str(), ""));
         let separator = if self.ascii { " - " } else { " \u{b7} " };
         match rest.split_once(separator) {
@@ -2246,7 +2263,7 @@ impl SessionHost {
         } else {
             return Vec::new();
         };
-        let sgr = |slot| self.theme.sgr(slot, self.depth);
+        let sgr = |slot| self.theme().sgr(slot, self.depth);
         let style = rune_term::diff::DiffStyle {
             added: sgr(Slot::Success),
             removed: sgr(Slot::Error),
@@ -2274,7 +2291,7 @@ impl SessionHost {
     /// draws; colours come from the theme, so a theme without them simply
     /// leaves them out.
     fn markdown_style(&self) -> rune_term::markdown::MarkdownStyle {
-        let sgr = |slot| self.theme.sgr(slot, self.depth);
+        let sgr = |slot| self.theme().sgr(slot, self.depth);
         rune_term::markdown::MarkdownStyle {
             enabled: true,
             heading: format!("\u{1b}[1m{}", sgr(Slot::Accent)),
@@ -2325,7 +2342,7 @@ impl SessionHost {
     /// Each row carries a turning glyph and the time spent so far, so a long
     /// call or a slow first token is visibly alive rather than a frozen screen.
     fn live_rows(&self) -> Vec<String> {
-        let dim = self.theme.sgr(Slot::Dim, self.depth);
+        let dim = self.theme().sgr(Slot::Dim, self.depth);
         let reset = rune_term::engine::Style::RESET;
         let row = |label: &str, started: std::time::Instant| {
             let elapsed = started.elapsed();
@@ -2536,7 +2553,8 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
     // Resolved before the host literal because the registry is moved into it,
     // and because the reasoning lane's colour has to be read off the theme
     // before the theme itself moves into the host.
-    let theme = resolve_theme(&config);
+    let (theme, theme_warning) =
+        resolve_theme(&config, rune_term::theme::terminal_is_light(&probe.caps));
     let depth = detect_depth(
         &config.settings.color,
         std::io::stdout().is_terminal(),
@@ -2632,7 +2650,14 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
         context_limit: std::sync::atomic::AtomicU64::new(
             model_limits.context_window.unwrap_or_default(),
         ),
-        theme,
+        theme: Mutex::new(theme),
+        theme_name: Mutex::new(
+            config
+                .settings
+                .theme
+                .clone()
+                .unwrap_or_else(|| "auto".to_owned()),
+        ),
         session_id: Mutex::new(
             recorder
                 .lock()
@@ -2725,8 +2750,9 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
             vec![banner]
         };
         opening.extend(
-            mcp_warnings
+            theme_warning
                 .iter()
+                .chain(mcp_warnings.iter())
                 .chain(results_notice.iter())
                 .flat_map(|warning| render_entries(&[Entry::notice(warning)], &host)),
         );
@@ -2851,6 +2877,10 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                 match handled {
                     Handled::Exit => return Ok(Step::Exit),
                     Handled::PickModel => return Ok(Step::PickModel),
+                    Handled::Theme(None) => return Ok(Step::PickTheme),
+                    Handled::Theme(Some(name)) => {
+                        note(set_theme_named(&host, &config.paths, &name));
+                    }
                     Handled::Copy if host.accessible => {
                         note("accessible mode: copy the reply from terminal scrollback".to_owned());
                     }
@@ -3270,7 +3300,7 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                     && let Some(summary) =
                         turn_summary(&outcome, plan_progress(&history), elapsed, cost, host.ascii)
                 {
-                    let dim = host.theme.sgr(Slot::Dim, host.depth);
+                    let dim = host.theme().sgr(Slot::Dim, host.depth);
                     let reset = rune_term::engine::Style::RESET;
                     lines.push(format!("{dim}  {summary}{reset}"));
                 }
@@ -3328,6 +3358,12 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                 Step::PickModel => {
                     choose_model(&mut reader, &host, &out, &settings, &config.paths)?;
                 }
+                Step::PickTheme => {
+                    let line = choose_theme(&mut reader, &host, &out, &config.paths)?;
+                    if let Some(line) = line {
+                        flush_lines(&host, &mut sink, &[line])?;
+                    }
+                }
                 Step::Undo => {
                     report_undo(&host, &mut sink)?;
                 }
@@ -3367,6 +3403,9 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                         &["use /model <id>; rune models lists model ids".to_owned()],
                     )?;
                 }
+                Step::PickTheme => {
+                    flush_lines(&host, &mut sink, &[THEME_USAGE.to_owned()])?;
+                }
                 Step::Continue => {}
             }
         }
@@ -3390,6 +3429,10 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                         sink,
                         "a model picker needs a terminal; use /model <id> and run `rune models` to list ids"
                     );
+                    Ok(Action::Continue)
+                }
+                Step::PickTheme => {
+                    let _ = writeln!(sink, "{THEME_USAGE}");
                     Ok(Action::Continue)
                 }
             }
@@ -3922,7 +3965,7 @@ fn draw_choice(
     let hint = vec![String::from(
         "Up/Down choose, Enter confirm, Esc/Ctrl-C cancel",
     )];
-    let menu = picker.rows(&host.theme, host.depth);
+    let menu = picker.rows(&host.theme(), host.depth);
     let painted = host.paint_with_menu(settled, Some(picker.title()), &hint, &[], &menu, (0, 0))?;
     let mut sink = LockedSink { stream: out };
     sink.write_all(&painted)?;
@@ -4351,7 +4394,7 @@ fn await_submission(
                     commands,
                     reader.line(),
                     selected,
-                    host.theme(),
+                    &host.theme(),
                     host.depth(),
                     host.menu_room(),
                 )
@@ -4360,7 +4403,7 @@ fn await_submission(
                 path_completion_rows(
                     paths,
                     selected,
-                    host.theme(),
+                    &host.theme(),
                     host.depth(),
                     host.menu_room(),
                 )
@@ -4679,7 +4722,7 @@ fn run_picker(
 
     let chosen = loop {
         let room = host.menu_room();
-        let mut below = picker_menu(&mut picker, &host.theme, host.depth, room);
+        let mut below = picker_menu(&mut picker, &host.theme(), host.depth, room);
         let typed = if picker.selected().is_none() {
             match catalog.choose(picker.query()) {
                 rune_net::catalog::ModelChoice::One(id) => Some(id),
@@ -4757,7 +4800,7 @@ fn search_prompt_history(
                 } else {
                     Slot::Dim
                 };
-                styled(&host.theme.sgr(slot, host.depth), &preview)
+                styled(&host.theme().sgr(slot, host.depth), &preview)
             })
             .collect::<Vec<_>>();
             draw_prompt(query, host, out, &rows, rune_term::shell::prompt())?;
@@ -5879,8 +5922,8 @@ const MODEL_PICKER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 /// A terminal that accepts no color gets the colorless theme whatever the
 /// configuration names, because the setting expresses a preference and the
 /// terminal states a capability.
-fn resolve_theme(config: &SessionConfig) -> Theme {
-    resolve_theme_for(config, std::env::var_os("NO_COLOR").is_some())
+fn resolve_theme(config: &SessionConfig, light: bool) -> (Theme, Option<String>) {
+    resolve_theme_for(config, std::env::var_os("NO_COLOR").is_some(), light)
 }
 
 /// Resolves the theme for a stated terminal capability.
@@ -5888,15 +5931,164 @@ fn resolve_theme(config: &SessionConfig) -> Theme {
 /// The capability is a parameter because reading it from the environment makes a
 /// test that asserts the colorless path pass or fail depending on the shell it
 /// happens to run in.
-fn resolve_theme_for(config: &SessionConfig, accepts_no_color: bool) -> Theme {
+fn resolve_theme_for(
+    config: &SessionConfig,
+    accepts_no_color: bool,
+    light: bool,
+) -> (Theme, Option<String>) {
     if accepts_no_color {
-        return Theme::no_color();
+        return (Theme::no_color(), None);
     }
-    Theme::resolve(
-        config.settings.theme.as_deref(),
-        true,
-        &config.paths.themes_dir(),
+    let name = config.settings.theme.as_deref();
+    match theme_named(name, light, &config.paths) {
+        Ok(theme) => (theme, None),
+        Err(err) => {
+            let (fallback, polarity) = if light {
+                (Theme::light(), "light")
+            } else {
+                (Theme::dark(), "dark")
+            };
+            let warning = format!(
+                "warning: theme {}: {}; using {polarity}",
+                name.unwrap_or_default(),
+                err.message()
+            );
+            (fallback, Some(warning))
+        }
+    }
+}
+
+/// Resolves a theme name against the configuration and data theme folders.
+fn theme_named(name: Option<&str>, light: bool, paths: &Paths) -> Result<Theme> {
+    Theme::try_resolve(
+        name,
+        light,
+        &paths.config_root.join("themes"),
+        &paths.themes_dir(),
     )
+}
+
+/// What `/theme` says where no picker can be drawn.
+const THEME_USAGE: &str = "use /theme <name>: auto, dark, light, high-contrast, colorblind, ansi, or a file in the themes folder";
+
+/// Lets the user pick a theme, previewing each highlighted one live.
+///
+/// Enter keeps and saves the highlighted theme; Esc and Ctrl-C put back the
+/// theme in force before the picker. Returns the line to report, if any.
+fn choose_theme(
+    reader: &mut rune_term::input::KeyReader,
+    host: &SessionHost,
+    out: &LiveSink,
+    paths: &Paths,
+) -> Result<Option<String>> {
+    let before = host.theme();
+    let current = lock_value(&host.theme_name).clone();
+    let mut picker = rune_term::picker::Picker::new(
+        "themes",
+        theme_names(paths),
+        rune_term::picker::DEFAULT_WINDOW,
+    )
+    .with_current(Some(current.as_str()));
+    let marker = rune_term::shell::prompt();
+    let draft = reader.line().to_owned();
+    reader.clear();
+    let light = host.terminal_is_light();
+    let preview = |picker: &rune_term::picker::Picker| {
+        if before.base() == rune_term::theme::Base::Mono {
+            return;
+        }
+        if let Some(name) = picker.selected()
+            && let Ok(theme) = theme_named(Some(name), light, paths)
+        {
+            host.set_theme(theme);
+        }
+    };
+    let chosen = loop {
+        let room = host.menu_room();
+        let below = picker_menu(&mut picker, &host.theme(), host.depth, room);
+        draw_prompt(reader, host, out, &below, marker)?;
+        match reader.read_key() {
+            KeyAction::Submit | KeyAction::Complete => {
+                if let Some(choice) = picker.selected().map(str::to_owned) {
+                    break Some(choice);
+                }
+            }
+            KeyAction::Interrupt | KeyAction::Cancel | KeyAction::Escape => break None,
+            response @ (KeyAction::Up | KeyAction::Down) => {
+                if response == KeyAction::Up {
+                    picker.up();
+                } else {
+                    picker.down();
+                }
+                preview(&picker);
+            }
+            KeyAction::Transcript => view_transcript(reader, host)?,
+            KeyAction::ExternalEditor | KeyAction::HistorySearch => {}
+            KeyAction::Ignored => {
+                picker.set_query(reader.line());
+                preview(&picker);
+            }
+        }
+    };
+    reader.replace(&draft);
+    if let Some(name) = chosen {
+        return Ok(Some(set_theme_named(host, paths, &name)));
+    }
+    host.set_theme(before);
+    Ok(None)
+}
+
+/// The built-in theme names the picker offers, before the user's own files.
+const BUILTIN_THEME_NAMES: [&str; 6] = [
+    "auto",
+    "dark",
+    "light",
+    "high-contrast",
+    "colorblind",
+    "ansi",
+];
+
+/// Returns the names `/theme` offers: the built-ins, then the stems of the
+/// TOML files in the configuration themes folder, sorted.
+fn theme_names(paths: &Paths) -> Vec<String> {
+    let mut own: Vec<String> = std::fs::read_dir(paths.config_root.join("themes"))
+        .into_iter()
+        .flatten()
+        .filter_map(std::result::Result::ok)
+        .filter_map(|entry| {
+            let name = entry.file_name().into_string().ok()?;
+            name.strip_suffix(".toml").map(str::to_owned)
+        })
+        .collect();
+    own.sort();
+    BUILTIN_THEME_NAMES
+        .iter()
+        .map(|name| (*name).to_owned())
+        .chain(own)
+        .collect()
+}
+
+/// Switches to the named theme and saves it, or reports why it cannot be used
+/// and keeps the current one.
+fn set_theme_named(host: &SessionHost, paths: &Paths, name: &str) -> String {
+    match theme_named(Some(name), host.terminal_is_light(), paths) {
+        Ok(theme) => {
+            // A terminal without colour stays without it, whatever is chosen.
+            if host.theme().base() != rune_term::theme::Base::Mono {
+                host.set_theme(theme);
+            }
+            name.clone_into(&mut lock_value(&host.theme_name));
+            match crate::provider_setup::save_key(
+                paths,
+                "theme",
+                Some(toml::Value::String(name.to_owned())),
+            ) {
+                Ok(()) => format!("theme {name}"),
+                Err(err) => format!("theme {name} for this session; it was not saved: {err}"),
+            }
+        }
+        Err(err) => format!("theme {name}: {}", err.message()),
+    }
 }
 
 /// Returns the terminal width to compose for.
@@ -6091,6 +6283,8 @@ enum Handled {
     Pin(Option<String>),
     /// Rebuild the instructions, skills and repository map now.
     Reload,
+    /// Switch to the named theme, or choose one.
+    Theme(Option<String>),
     /// Put the last reply on the terminal's clipboard.
     Copy,
     /// Start a fresh conversation in this terminal.
@@ -6391,6 +6585,8 @@ enum Step {
     Exit,
     /// Ask the user to choose a model before continuing.
     PickModel,
+    /// Ask the user to choose a theme.
+    PickTheme,
     /// Put back the files the session changed.
     Undo,
 }
@@ -6442,6 +6638,9 @@ fn handle_command<W: std::io::Write>(
         "compact" if arguments.trim() == "preview" => Ok(Handled::CompactPreview),
         "compact" => Ok(Handled::Compact),
         "reload" => Ok(Handled::Reload),
+        "theme" => Ok(Handled::Theme(
+            (!arguments.trim().is_empty()).then(|| arguments.trim().to_owned()),
+        )),
         "pin" => Ok(Handled::Pin(
             (!arguments.trim().is_empty()).then(|| arguments.to_owned()),
         )),
@@ -9527,22 +9726,88 @@ mod tests {
         // Capability beats preference: the setting expresses a wish, the
         // terminal states what it accepts, and the terminal wins.
         let config = colorless_config();
-        let theme = resolve_theme_for(&config, true);
+        let (theme, _) = resolve_theme_for(&config, true, false);
         assert_eq!(theme.base(), Theme::no_color().base());
 
         // The same configuration with a terminal that accepts color does take
         // the configured theme, which is what shows the capability is the input
         // rather than the configuration.
-        let with_color = resolve_theme_for(&config, false);
+        let (with_color, _) = resolve_theme_for(&config, false, false);
         assert_ne!(with_color.base(), Theme::no_color().base());
+    }
+
+    #[test]
+    fn a_light_terminal_gets_the_light_theme_and_a_broken_one_warns() {
+        let mut config = colorless_config();
+        let (theme, warning) = resolve_theme_for(&config, false, true);
+        assert_eq!(theme, Theme::light());
+        assert!(warning.is_none());
+        let themes = config.paths.config_root.join("themes");
+        std::fs::create_dir_all(&themes).expect("themes");
+        std::fs::write(
+            themes.join("mine.toml"),
+            "base = \"dark\"\ncolour = \"#fff\"\n",
+        )
+        .expect("theme");
+        config.settings.theme = Some("mine".to_owned());
+        let (theme, warning) = resolve_theme_for(&config, false, false);
+        assert_eq!(theme, Theme::dark());
+        let warning = warning.expect("a warning");
+        assert!(
+            warning.starts_with("warning: theme mine: unknown theme slot `colour`"),
+            "{warning}"
+        );
+        assert!(warning.ends_with("; using dark"), "{warning}");
+    }
+
+    fn theme_paths() -> (tempfile::TempDir, Paths) {
+        let root = tempfile::tempdir().expect("tempdir");
+        let base = Utf8PathBuf::from_path_buf(root.path().to_owned()).expect("utf8");
+        let paths = Paths {
+            config_root: base.join("config"),
+            state_root: base.join("state"),
+            data_root: base.join("data"),
+        };
+        rune_core::paths::create_dir_private(&paths.config_root).expect("config");
+        (root, paths)
+    }
+
+    #[test]
+    fn a_theme_command_switches_and_saves() {
+        let (_root, paths) = theme_paths();
+        let mut host = test_host();
+        host.theme = Mutex::new(Theme::dark());
+        let reply = set_theme_named(&host, &paths, "light");
+        assert_eq!(reply, "theme light");
+        assert_eq!(host.theme(), Theme::light());
+        let saved = std::fs::read_to_string(paths.config_file(None)).expect("config");
+        assert!(saved.contains("theme = \"light\""), "{saved}");
+    }
+
+    #[test]
+    fn an_unknown_theme_name_keeps_the_current_theme() {
+        let (_root, paths) = theme_paths();
+        let mut host = test_host();
+        host.theme = Mutex::new(Theme::dark());
+        let reply = set_theme_named(&host, &paths, "../elsewhere");
+        assert!(reply.contains("is a path, not a theme name"), "{reply}");
+        assert_eq!(host.theme(), Theme::dark());
+        assert!(!paths.config_file(None).exists());
+        // A colourless terminal stays colourless, whatever is named.
+        host.theme = Mutex::new(Theme::no_color());
+        assert_eq!(set_theme_named(&host, &paths, "ansi"), "theme ansi");
+        assert_eq!(host.theme(), Theme::no_color());
     }
 
     #[test]
     fn no_color_overrides_the_named_high_contrast_theme() {
         let mut config = colorless_config();
         config.settings.theme = Some("high-contrast".to_owned());
-        assert_eq!(resolve_theme_for(&config, false), Theme::high_contrast());
-        let theme = resolve_theme_for(&config, true);
+        assert_eq!(
+            resolve_theme_for(&config, false, false).0,
+            Theme::high_contrast()
+        );
+        let (theme, _) = resolve_theme_for(&config, true, false);
         assert_eq!(theme, Theme::no_color());
         for slot in rune_term::theme::SLOTS {
             for depth in ColorDepth::ALL {
@@ -9770,8 +10035,8 @@ mod tests {
     #[test]
     fn no_deeper_escape_than_the_depth_is_written() {
         let themes = [
-            Theme::fx_dark(),
-            Theme::fx_light(),
+            Theme::dark(),
+            Theme::light(),
             Theme::high_contrast(),
             Theme::no_color(),
         ];
@@ -9825,7 +10090,7 @@ mod tests {
     fn fixture_transcript(theme: &Theme, depth: ColorDepth) -> String {
         let bytes = Arc::new(Mutex::new(Vec::new()));
         let mut host = test_host();
-        host.theme = theme.clone();
+        host.theme = Mutex::new(theme.clone());
         host.depth = depth;
         *host.live_out.lock().expect("lock") =
             Some(Arc::new(Mutex::new(SharedSink(Arc::clone(&bytes)))));
@@ -12118,7 +12383,7 @@ mod tests {
             &commands,
             "/mod",
             0,
-            &Theme::fx_dark(),
+            &Theme::dark(),
             ColorDepth::TrueColor,
             usize::MAX,
         );
@@ -13002,9 +13267,9 @@ mod tests {
         let text = "```rust\n    abcdefghijklmnop\n```";
         host.streaming.lock().expect("streaming").answer = text.to_owned();
         assert!(host.status_line(100).is_ascii());
-        for theme in [Theme::no_color(), Theme::fx_dark(), Theme::high_contrast()] {
+        for theme in [Theme::no_color(), Theme::dark(), Theme::high_contrast()] {
             for depth in ColorDepth::ALL {
-                host.theme = theme.clone();
+                host.theme = Mutex::new(theme.clone());
                 host.depth = depth;
                 assert!(host.status_line(100).is_ascii());
                 let rows = completion_rows(&commands, "/", 0, &theme, depth, 8);
@@ -13018,7 +13283,7 @@ mod tests {
                 assert!(rows.iter().all(|row| row.is_ascii()));
             }
         }
-        host.theme = Theme::no_color();
+        host.theme = Mutex::new(Theme::no_color());
         let streaming = host.streaming_rows();
         let entries = [Entry::assistant(text), Entry::tool("read_file\none\ntwo")];
         let settled = render_entries(&entries, &host);
@@ -13168,7 +13433,8 @@ mod tests {
             context_limit: std::sync::atomic::AtomicU64::new(
                 rune_net::catalog::DEFAULT_CONTEXT_WINDOW,
             ),
-            theme: Theme::no_color(),
+            theme: Mutex::new(Theme::no_color()),
+            theme_name: Mutex::new("auto".to_owned()),
             session_id: Mutex::new("sessiontest1".to_owned()),
             workspace: "/tmp".to_owned(),
             caps: rune_term::probe::TerminalCaps::default(),

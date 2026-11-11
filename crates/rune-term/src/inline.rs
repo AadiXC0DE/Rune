@@ -131,6 +131,13 @@ impl Inline {
         self.shown_settled = 0;
     }
 
+    /// Forgets what was drawn, so the next frame repaints every row: used when
+    /// the colours change and no row on screen may keep the old ones.
+    pub fn invalidate(&mut self) {
+        self.shown.clear();
+        self.shown_settled = 0;
+    }
+
     /// Returns the width.
     #[must_use]
     pub const fn width(&self) -> u16 {
