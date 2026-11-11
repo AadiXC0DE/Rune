@@ -435,6 +435,13 @@ struct SessionHost {
     checkpoint_waited: std::sync::atomic::AtomicU64,
     /// Lines the checkpoint worker asked to show, not yet in the transcript.
     checkpoint_notices: Arc<Mutex<Vec<String>>>,
+    /// Where edit pre-images are kept on disk when checkpoints are on but the
+    /// workspace has no git repository.
+    preimage_dir: Option<Utf8PathBuf>,
+    /// Pre-images written to `preimage_dir` so far.
+    preimage_count: std::sync::atomic::AtomicUsize,
+    /// Whether the session said command changes cannot be undone here.
+    command_notice_shown: std::sync::atomic::AtomicBool,
     /// Review activity for the current turn.
     review_session: Arc<Mutex<ReviewSession>>,
     /// Attached only while a terminal input loop can collect an answer.
@@ -1044,6 +1051,9 @@ impl Host for SessionHost {
             return subagent.call(self, &self.registry, arguments, &self.context);
         }
         self.wait_for_checkpoint(name);
+        if name == "shell" {
+            self.note_command_without_repository();
+        }
         // Captured before the call so the bytes that were there can be put
         // back. A capture failure is not fatal: the call still runs, and `/undo`
         // reports that it had nothing to restore for this file.
@@ -1745,7 +1755,35 @@ impl SessionHost {
         // A file that is absent or unreadable is recorded as absent, so undoing
         // a creation removes the file and an unreadable file is not silently
         // reported as restored.
-        undo.insert(path.to_owned(), std::fs::read(path).ok());
+        let before = std::fs::read(path).ok();
+        if let Some(dir) = &self.preimage_dir {
+            let number = self
+                .preimage_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                .saturating_add(1);
+            if let Err(err) = persist_preimage(dir, number, path, before.as_deref()) {
+                self.checkpoint_notice(format!(
+                    "the undo record for {path} was not saved: {}",
+                    err.message()
+                ));
+            }
+        }
+        undo.insert(path.to_owned(), before);
+    }
+
+    /// Says once, before the first command runs, that changes made by commands
+    /// cannot be undone in a session without a repository. Returns whether it
+    /// was said now.
+    fn note_command_without_repository(&self) -> bool {
+        if self.preimage_dir.is_none()
+            || self
+                .command_notice_shown
+                .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            return false;
+        }
+        self.checkpoint_notice(NO_REPOSITORY_NOTICE.to_owned());
+        true
     }
 
     /// Returns whether anything is available to undo.
@@ -1832,6 +1870,12 @@ impl SessionHost {
         }
         for path in done {
             undo.remove(&path);
+        }
+        // Everything recorded was put back, so the saved pre-images are spent.
+        if let Some(dir) = &self.preimage_dir {
+            let _ = std::fs::remove_dir_all(dir);
+            self.preimage_count
+                .store(0, std::sync::atomic::Ordering::SeqCst);
         }
         Ok(report)
     }
@@ -2932,7 +2976,7 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
     let session_id = recorder.id();
     let recorder = Arc::new(Mutex::new(recorder));
     let checkpoint_notices = Arc::new(Mutex::new(Vec::new()));
-    let checkpoints = start_checkpoints(
+    let (checkpoints, no_repository) = start_checkpoints(
         &config.paths,
         &config.workspace,
         config.settings.checkpoints,
@@ -2940,6 +2984,18 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
         &recorder,
         &checkpoint_notices,
     );
+    // Without a repository the edit pre-images are kept on disk instead, so
+    // `/undo` still works after a restart.
+    let (preimage_dir, preimage_count, resumed_undo) = if no_repository {
+        let dir = config.paths.session_dir(&session_id).join("preimages");
+        let loaded = load_preimages(&dir);
+        if let Ok(mut notices) = checkpoint_notices.lock() {
+            notices.extend(loaded.notices);
+        }
+        (Some(dir), loaded.count, loaded.undo)
+    } else {
+        (None, 0, BTreeMap::new())
+    };
     let mut context = ExecutionContext::new(config.workspace.clone())
         .with_offline(config.settings.offline)
         .with_allow_unsandboxed(config.settings.allow_unsandboxed)
@@ -3103,10 +3159,13 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
         )?,
         helper_usage: config.helper_usage.clone(),
         totals: Mutex::new(initial_totals),
-        undo: Mutex::new(BTreeMap::new()),
+        undo: Mutex::new(resumed_undo),
         checkpoints,
         checkpoint_waited: std::sync::atomic::AtomicU64::new(0),
         checkpoint_notices,
+        preimage_dir,
+        preimage_count: std::sync::atomic::AtomicUsize::new(preimage_count),
+        command_notice_shown: std::sync::atomic::AtomicBool::new(false),
         review_session: Arc::new(Mutex::new(ReviewSession::new(&limits))),
         approval_requests: Mutex::new(None),
         approval_preview: Mutex::new(Vec::new()),
@@ -7308,9 +7367,9 @@ fn start_checkpoints(
     session: &str,
     recorder: &Arc<Mutex<Recorder>>,
     notices: &Arc<Mutex<Vec<String>>>,
-) -> Option<crate::checkpoint::Checkpoints> {
+) -> (Option<crate::checkpoint::Checkpoints>, bool) {
     if !enabled {
-        return None;
+        return (None, false);
     }
     let sink = Arc::clone(notices);
     let notify: crate::checkpoint::Notify = Arc::new(move |line| {
@@ -7326,18 +7385,97 @@ fn start_checkpoints(
             .workspace_checkpoint(event)
     });
     match crate::checkpoint::Shadow::open(paths, workspace) {
-        Ok(Some(shadow)) => Some(crate::checkpoint::Checkpoints::start(
-            shadow,
-            session.to_owned(),
-            record,
-            notify,
-        )),
-        Ok(None) => None,
+        Ok(Some(shadow)) => (
+            Some(crate::checkpoint::Checkpoints::start(
+                shadow,
+                session.to_owned(),
+                record,
+                notify,
+            )),
+            false,
+        ),
+        Ok(None) => (None, true),
         Err(error) => {
             notify(format!("checkpoint failed: {}", error.message()));
-            None
+            (None, false)
         }
     }
+}
+
+/// The notice a session without a repository shows the first time a command runs.
+const NO_REPOSITORY_NOTICE: &str =
+    "changes made by commands cannot be undone here (no git repository)";
+
+/// Edit pre-images read back from a session's folder.
+#[derive(Debug, Default)]
+struct LoadedPreimages {
+    /// The original bytes of each file, or `None` for a file that did not exist.
+    undo: BTreeMap<Utf8PathBuf, Option<Vec<u8>>>,
+    /// Records found, so new ones are numbered after them.
+    count: usize,
+    /// One line for each record whose bytes are missing.
+    notices: Vec<String>,
+}
+
+/// One line of `preimages/index.jsonl`.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PreimageRecord {
+    path: Utf8PathBuf,
+    file: Option<String>,
+}
+
+/// Saves the pre-image of `path` as record `number` in `dir`.
+fn persist_preimage(
+    dir: &Utf8Path,
+    number: usize,
+    path: &Utf8Path,
+    bytes: Option<&[u8]>,
+) -> Result<()> {
+    let mut file = None;
+    if let Some(bytes) = bytes {
+        let name = format!("{number}.bin");
+        rune_core::paths::write_private_bytes(&dir.join(&name), bytes)?;
+        file = Some(name);
+    }
+    let line = serde_json::to_string(&PreimageRecord {
+        path: path.to_owned(),
+        file,
+    })
+    .map_err(|err| RuneError::new(ErrorCode::Internal, err.to_string()))?;
+    let index = dir.join("index.jsonl");
+    let mut text = std::fs::read_to_string(&index).unwrap_or_default();
+    text.push_str(&line);
+    text.push('\n');
+    rune_core::paths::write_private(&index, &text)
+}
+
+/// Reads the pre-images a session saved; the first record per path wins.
+fn load_preimages(dir: &Utf8Path) -> LoadedPreimages {
+    let mut loaded = LoadedPreimages::default();
+    let Ok(text) = std::fs::read_to_string(dir.join("index.jsonl")) else {
+        return loaded;
+    };
+    for line in text.lines().filter(|line| !line.trim().is_empty()) {
+        let Ok(record) = serde_json::from_str::<PreimageRecord>(line) else {
+            continue;
+        };
+        loaded.count = loaded.count.saturating_add(1);
+        if loaded.undo.contains_key(&record.path) {
+            continue;
+        }
+        let mut bytes = None;
+        if let Some(name) = &record.file {
+            let Ok(read) = std::fs::read(dir.join(name)) else {
+                loaded
+                    .notices
+                    .push(format!("undo record for {} is missing", record.path));
+                continue;
+            };
+            bytes = Some(read);
+        }
+        loaded.undo.insert(record.path, bytes);
+    }
+    loaded
 }
 
 fn record_usage(paths: &Paths, model: &str, outcome: &turn::TurnOutcome, cost: Option<u64>) {
@@ -13049,10 +13187,10 @@ mod tests {
         let notices = Arc::new(Mutex::new(Vec::new()));
         let store = paths.state_root.join("checkpoints");
         let off = start_checkpoints(&paths, &workspace, false, id.as_str(), &recorder, &notices);
-        assert!(off.is_none());
+        assert!(off.0.is_none() && !off.1);
         assert!(!store.exists());
         let on = start_checkpoints(&paths, &workspace, true, id.as_str(), &recorder, &notices);
-        assert!(on.is_some());
+        assert!(on.0.is_some() && !on.1);
         assert!(store.exists());
         assert!(notices.lock().expect("notices").is_empty());
     }
@@ -13072,6 +13210,59 @@ mod tests {
             std::fs::read_to_string(&changed).expect("read"),
             "original\n"
         );
+    }
+
+    #[test]
+    fn preimages_survive_a_restart() {
+        let dir = tempfile::tempdir().expect("temp");
+        let root = Utf8Path::from_path(dir.path()).expect("utf8");
+        let store = root.join("session").join("preimages");
+        let kept = root.join("kept.txt");
+        let created = root.join("created.txt");
+        let lost = root.join("lost.txt");
+        std::fs::write(&kept, "original\n").expect("write");
+        std::fs::write(&lost, "gone\n").expect("write");
+
+        let mut first = test_host();
+        first.preimage_dir = Some(store.clone());
+        first.remember(&kept);
+        first.remember(&created);
+        first.remember(&lost);
+        std::fs::write(&kept, "replaced\n").expect("write");
+        std::fs::write(&created, "new\n").expect("write");
+        std::fs::remove_file(store.join("3.bin")).expect("remove");
+        drop(first);
+
+        // A later session reads the records back; the first one per path wins
+        // and a record whose bytes are gone is reported rather than guessed.
+        let loaded = load_preimages(&store);
+        assert_eq!(loaded.count, 3);
+        assert_eq!(
+            loaded.notices,
+            vec![format!("undo record for {lost} is missing")]
+        );
+        let mut second = test_host();
+        second.preimage_dir = Some(store.clone());
+        second.preimage_count = std::sync::atomic::AtomicUsize::new(loaded.count);
+        second.undo = Mutex::new(loaded.undo);
+        second.remember(&kept);
+        second.undo().expect("undo");
+        assert_eq!(std::fs::read_to_string(&kept).expect("read"), "original\n");
+        assert!(!created.exists());
+        assert!(!store.exists(), "a finished undo removes the saved records");
+    }
+
+    #[test]
+    fn the_no_repository_notice_is_shown_once() {
+        let dir = tempfile::tempdir().expect("temp");
+        let root = Utf8Path::from_path(dir.path()).expect("utf8");
+        let with_repository = test_host();
+        assert!(!with_repository.note_command_without_repository());
+
+        let mut host = test_host();
+        host.preimage_dir = Some(root.join("preimages"));
+        assert!(host.note_command_without_repository());
+        assert!(!host.note_command_without_repository());
     }
 
     #[test]
@@ -15710,6 +15901,9 @@ mod tests {
             checkpoints: None,
             checkpoint_waited: std::sync::atomic::AtomicU64::new(0),
             checkpoint_notices: Arc::default(),
+            preimage_dir: None,
+            preimage_count: std::sync::atomic::AtomicUsize::new(0),
+            command_notice_shown: std::sync::atomic::AtomicBool::new(false),
             review_session: Arc::new(Mutex::new(ReviewSession::new(&BudgetSet::new()))),
             approval_requests: Mutex::new(None),
             approval_preview: Mutex::new(Vec::new()),

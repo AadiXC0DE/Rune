@@ -402,6 +402,11 @@ fn verify_dir_mode(_path: &Utf8Path, _meta: &std::fs::Metadata) -> Result<()> {
 
 /// Writes a file with mode 0600, refusing to replace a symlink.
 pub fn write_private(path: &Utf8Path, contents: &str) -> Result<()> {
+    write_private_bytes(path, contents.as_bytes())
+}
+
+/// Writes `bytes` to a private file, as [`write_private`] writes text.
+pub fn write_private_bytes(path: &Utf8Path, bytes: &[u8]) -> Result<()> {
     use std::io::Write;
 
     // Parent directories are created without a mode check: they may be
@@ -424,7 +429,7 @@ pub fn write_private(path: &Utf8Path, contents: &str) -> Result<()> {
     set_open_mode(&mut options, FILE_MODE);
 
     let mut file = options.open(path)?;
-    file.write_all(contents.as_bytes())?;
+    file.write_all(bytes)?;
     file.sync_all()?;
     drop(file);
     set_mode(path, FILE_MODE)?;
