@@ -941,6 +941,7 @@ mod tests {
                     is_error: false,
                 }],
                 replay: None,
+                origin: None,
             },
         ];
         let body = Responses.build_request(&plan).expect("build");
@@ -963,6 +964,7 @@ mod tests {
                 is_error: true,
             }],
             replay: None,
+            origin: None,
         }];
         let body = Responses.build_request(&plan).expect("build");
         assert_eq!(body["input"][0]["output"], "error: not found");
@@ -994,6 +996,7 @@ mod tests {
             role: Role::Tool,
             parts,
             replay: None,
+            origin: None,
         }];
         plan
     }

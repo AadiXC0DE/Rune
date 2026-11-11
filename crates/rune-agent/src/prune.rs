@@ -714,6 +714,7 @@ mod tests {
         history.push_assistant_with_replay(
             vec![call("old", "grep_files", "{}")],
             Some("[]".to_owned()),
+            None,
         );
         history.push_tool_results(vec![result("old", "grep_files", &"q".repeat(4096), false)]);
         filler(&mut history);
@@ -837,8 +838,11 @@ mod tests {
     fn a_signed_history_keeps_skill_bodies() {
         let mut history = History::new();
         history.push_user("use the alpha skill");
-        history
-            .push_assistant_with_replay(vec![call("load", "skill", "{}")], Some("[]".to_owned()));
+        history.push_assistant_with_replay(
+            vec![call("load", "skill", "{}")],
+            Some("[]".to_owned()),
+            None,
+        );
         let body = "c".repeat(4096);
         history.push_tool_results(vec![result("load", "skill", &body, false)]);
         history.push_user("next task");

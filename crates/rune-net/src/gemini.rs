@@ -815,6 +815,7 @@ mod tests {
                     is_error: true,
                 }],
                 replay: None,
+                origin: None,
             },
             Message::user("try another"),
         ];

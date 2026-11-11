@@ -30,6 +30,10 @@ pub struct Turn {
     /// Provider state to replay with this turn.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replay: Option<String>,
+    /// The `dialect:model` that produced an assistant turn; none for other
+    /// turns and for sessions saved before it was recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
 }
 
 impl Turn {
@@ -41,6 +45,7 @@ impl Turn {
             role,
             parts,
             replay: None,
+            origin: None,
         }
     }
 
@@ -471,7 +476,7 @@ impl History {
     ///
     /// Returns the sequence number assigned.
     pub fn push_assistant(&mut self, parts: Vec<ContentPart>) -> u64 {
-        self.push_assistant_with_replay(parts, None)
+        self.push_assistant_with_replay(parts, None, None)
     }
 
     /// Appends an assistant turn together with provider state to replay.
@@ -483,10 +488,12 @@ impl History {
         &mut self,
         parts: Vec<ContentPart>,
         replay: Option<String>,
+        origin: Option<String>,
     ) -> u64 {
         let seq = self.take_seq();
         let mut turn = Turn::assistant(seq, parts);
         turn.replay = replay;
+        turn.origin = origin;
         self.turns.push(turn);
         seq
     }
@@ -564,6 +571,7 @@ impl History {
             }))
             .collect(),
             replay: None,
+            origin: None,
         });
         let mut messages: Vec<Message> = self
             .turns
@@ -572,6 +580,7 @@ impl History {
                 role: turn.role,
                 parts: turn.parts.clone(),
                 replay: turn.replay.clone(),
+                origin: turn.origin.clone(),
             })
             .collect();
         if let Some(pinned) = pinned {
@@ -1269,6 +1278,40 @@ mod tests {
         assert_eq!(parsed.len(), 3);
         assert_eq!(parsed.instructions(), "instructions");
         parsed.validate().expect("still valid");
+    }
+
+    #[test]
+    fn a_turn_remembers_the_model_that_produced_it() {
+        let mut history = History::new();
+        history.push_user("hello");
+        history.push_assistant_with_replay(
+            vec![ContentPart::Text {
+                text: "hi".to_owned(),
+            }],
+            None,
+            Some("anthropic:claude-opus-5-5".to_owned()),
+        );
+        history.push_assistant(vec![ContentPart::Text {
+            text: "again".to_owned(),
+        }]);
+
+        let text = serde_json::to_string(&history).expect("serialize");
+        let parsed: History = serde_json::from_str(&text).expect("deserialize");
+        let messages = parsed.to_messages();
+        assert_eq!(
+            messages[1].origin.as_deref(),
+            Some("anthropic:claude-opus-5-5")
+        );
+        assert_eq!(messages[2].origin, None);
+
+        let old = r#"{"seq":1,"role":"assistant","parts":[]}"#;
+        let turn: Turn = serde_json::from_str(old).expect("an old turn");
+        assert_eq!(turn.origin, None);
+        assert!(
+            !serde_json::to_string(&turn)
+                .expect("json")
+                .contains("origin")
+        );
     }
 
     #[test]

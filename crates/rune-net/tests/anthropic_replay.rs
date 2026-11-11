@@ -141,6 +141,7 @@ fn the_second_request_carries_the_signed_thinking_block() {
             is_error: false,
         }],
         replay: None,
+        origin: None,
     });
     let outcome = stream_completion(
         &fetch,

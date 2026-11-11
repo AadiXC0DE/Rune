@@ -10,7 +10,7 @@ use rune_core::config::Effort;
 use rune_core::error::{Result, RuneError};
 use rune_core::id::ToolCallId;
 
-use crate::compat::ClaudeThinking;
+use crate::compat::{CallIdShape, ClaudeThinking, shape_call_id};
 use crate::message::{ContentPart, Message, Role};
 use crate::provider::{Provider, RequestPlan, ToolChoice};
 use crate::stream::{
@@ -342,7 +342,7 @@ fn encode_assistant_blocks(message: &Message) -> Vec<serde_json::Value> {
                     serde_json::from_str(arguments).unwrap_or_else(|_| serde_json::json!({}));
                 blocks.push(serde_json::json!({
                     "type": "tool_use",
-                    "id": id.as_str(),
+                    "id": shape_call_id(id.as_str(), CallIdShape::ClaudeSafe),
                     "name": name,
                     "input": parsed,
                 }));
@@ -351,9 +351,6 @@ fn encode_assistant_blocks(message: &Message) -> Vec<serde_json::Value> {
         }
     }
 
-    if blocks.is_empty() {
-        blocks.push(serde_json::json!({ "type": "text", "text": "" }));
-    }
     blocks
 }
 
@@ -373,7 +370,7 @@ fn encode_tool_blocks(message: &Message, plan: &RequestPlan) -> Vec<serde_json::
                 ..
             } => blocks.push(serde_json::json!({
                 "type": "tool_result",
-                "tool_use_id": id.as_str(),
+                "tool_use_id": shape_call_id(id.as_str(), CallIdShape::ClaudeSafe),
                 "content": content,
                 "is_error": is_error,
             })),
@@ -1293,6 +1290,7 @@ mod tests {
                 is_error: false,
             }],
             replay: None,
+            origin: None,
         }];
         let body = Anthropic.build_request(&plan).expect("build");
         let message = &body["messages"][0];
@@ -1307,6 +1305,7 @@ mod tests {
             role: Role::Tool,
             parts,
             replay: None,
+            origin: None,
         }];
         plan
     }
@@ -1395,6 +1394,7 @@ mod tests {
                     is_error: false,
                 }],
                 replay: None,
+                origin: None,
             },
         ];
         let body = Anthropic.build_request(&plan).expect("build");
@@ -1461,11 +1461,25 @@ mod tests {
     }
 
     #[test]
-    fn an_assistant_message_with_no_blocks_still_encodes() {
+    fn an_assistant_message_with_no_blocks_is_not_sent_as_an_empty_text() {
         let mut plan = RequestPlan::new("m");
-        plan.messages = vec![Message::assistant(vec![])];
-        let body = Anthropic.build_request(&plan).expect("build");
-        assert_eq!(body["messages"][0]["content"][0]["type"], "text");
+        plan.messages = vec![
+            Message::user("one"),
+            Message::assistant(vec![]),
+            Message::user("two"),
+        ];
+        let sent = crate::normalize::for_request(&plan, NAME);
+        let body = Anthropic.build_request(&sent).expect("build");
+        let messages = body["messages"].as_array().expect("messages");
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["role"], "user");
+        assert!(
+            messages[0]["content"]
+                .as_array()
+                .expect("blocks")
+                .iter()
+                .all(|block| block["text"] != "")
+        );
     }
 
     #[test]

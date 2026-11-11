@@ -2307,6 +2307,7 @@ Copy file paths, symbols, commands, error messages and identifiers exactly. Leav
                 text: "first answer".to_owned(),
             }],
             Some(r#"[{"type":"reasoning","id":"rs_1","encrypted_content":"opaque"}]"#.to_owned()),
+            None,
         );
         history.push_user("second question");
         history.push_assistant(vec![ContentPart::Text {

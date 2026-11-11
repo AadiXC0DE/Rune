@@ -1115,7 +1115,11 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
             // The replay value travels with the turn that produced it, because
             // a later request must send it back unchanged and must not inherit
             // it from an earlier turn.
-            history.push_assistant_with_replay(parts, outcome.replay.clone());
+            history.push_assistant_with_replay(
+                parts,
+                outcome.replay.clone(),
+                Some(request_origin(host)),
+            );
         }
 
         if pending_calls.is_empty() {
@@ -1575,6 +1579,11 @@ fn kept_from_cut(err: &rune_net::error::NetError) -> Option<StreamOutcome> {
     })
 }
 
+/// The `dialect:model` a request goes to, recorded with the turn it produces.
+fn request_origin(host: &dyn Host) -> String {
+    format!("{}:{}", host.dialect().name(), host.model())
+}
+
 /// Streams a request, retrying a transient failure within a bounded budget.
 ///
 /// Applies queued steering before rebuilding a retry request. Returns the
@@ -1617,6 +1626,7 @@ fn stream_with_retry(
         plan.instructions = host.instructions();
         plan.messages = history.to_messages();
         (plan.compat, plan.traits) = host.compat(&plan.model);
+        plan.origin = request_origin(host);
         plan.tools = host.tools();
         plan.tool_choice = if plan.tools.is_empty() {
             ToolChoice::None

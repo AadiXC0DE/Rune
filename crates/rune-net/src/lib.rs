@@ -13,6 +13,7 @@ pub mod fetch;
 pub mod gemini;
 pub mod message;
 pub mod models_dev;
+pub mod normalize;
 pub mod ollama;
 pub mod provider;
 pub mod providers;

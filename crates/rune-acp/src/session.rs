@@ -723,7 +723,11 @@ pub fn history_from_events(frames: &[EventFrame]) -> History {
                 flush_calls(&mut history, &mut calls);
                 flush_results(&mut history, &mut results);
                 if let Ok(message) = serde_json::from_str::<rune_net::message::Message>(message) {
-                    history.push_assistant_with_replay(message.parts, message.replay);
+                    history.push_assistant_with_replay(
+                        message.parts,
+                        message.replay,
+                        message.origin,
+                    );
                     native_assistant = true;
                 }
             }

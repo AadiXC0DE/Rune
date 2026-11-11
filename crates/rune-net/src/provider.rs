@@ -79,6 +79,9 @@ pub struct RequestPlan {
     pub reasoning_summary: bool,
     /// Sampling values sent where the dialect carries them; none by default.
     pub sampling: crate::compat::Sampling,
+    /// The dialect and model of this request, as `dialect:model`; empty when
+    /// the caller does not say.
+    pub origin: String,
 }
 
 impl RequestPlan {
@@ -104,6 +107,7 @@ impl RequestPlan {
             cache_key: None,
             reasoning_summary: true,
             sampling: crate::compat::Sampling::default(),
+            origin: String::new(),
         }
     }
 
@@ -499,6 +503,7 @@ mod routing_tests {
             cache_key: None,
             reasoning_summary: true,
             sampling: crate::compat::Sampling::default(),
+            origin: String::new(),
         }
     }
 

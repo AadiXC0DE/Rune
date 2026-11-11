@@ -210,6 +210,7 @@ fn native_text_tool_result_signature_and_usage_round_trip() {
                 is_error: false,
             }],
             replay: None,
+            origin: None,
         });
         let outcome = stream_completion_observed(
             &client,

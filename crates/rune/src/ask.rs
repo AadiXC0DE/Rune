@@ -1993,6 +1993,7 @@ mod tests {
                 arguments: "{}".into(),
             }],
             Some(serde_json::json!({"gemini_parts": parts}).to_string()),
+            None,
         );
         history.push_tool_results(vec![ContentPart::ToolResult {
             id,

@@ -259,6 +259,7 @@ fn a_deepseek_tool_exchange_sends_reasoning_back_on_every_assistant_turn() {
                 is_error: false,
             }],
             replay: None,
+            origin: None,
         },
     ];
     let body = ChatCompletions.build_request(&plan).expect("build");

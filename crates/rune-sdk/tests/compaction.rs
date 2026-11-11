@@ -90,6 +90,7 @@ fn fixture(single_prompt: bool) -> Vec<u8> {
         history.push_assistant_with_replay(
             calls,
             Some(json!([{"type": "thinking", "thinking": format!("thought {index}"), "signature": format!("signature_{index}")}]).to_string()),
+            None,
         );
         history.push_tool_results(results);
         if !single_prompt || index == 5 {

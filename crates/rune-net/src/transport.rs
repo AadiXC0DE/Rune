@@ -745,6 +745,11 @@ pub fn stream_completion_encoded(
         );
     }
 
+    // A body encoded before normalising no longer matches the request.
+    let normalized = crate::normalize::for_request(plan, provider.name());
+    let encoded = encoded.filter(|_| matches!(normalized, std::borrow::Cow::Borrowed(_)));
+    let plan: &RequestPlan = &normalized;
+
     provider
         .validate(plan)
         .map_err(|err| NetError::new(FailureKind::InvalidRequest, err.message().to_owned()))?;

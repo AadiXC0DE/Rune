@@ -960,6 +960,7 @@ pub fn message_events(message: &rune_agent::history::Turn, turn: u64) -> Result<
                 role: message.role,
                 parts: message.parts.clone(),
                 replay: message.replay.clone(),
+                origin: message.origin.clone(),
             })?,
         });
         let text = message.text();
@@ -1143,7 +1144,7 @@ fn flush(
         }
     }
     if let Some(message) = assistant.take() {
-        history.push_assistant_with_replay(message.parts, message.replay);
+        history.push_assistant_with_replay(message.parts, message.replay, message.origin);
     }
     if !results.is_empty() {
         history.push_tool_results(std::mem::take(results));

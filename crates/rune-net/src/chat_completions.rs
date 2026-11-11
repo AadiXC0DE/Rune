@@ -1346,6 +1346,7 @@ mod tests {
                     is_error: false,
                 }],
                 replay: None,
+                origin: None,
             },
         ];
         let body = ChatCompletions.build_request(&plan).expect("build");
@@ -1401,6 +1402,7 @@ mod tests {
                     },
                 ],
                 replay: None,
+                origin: None,
             },
         ];
         let body = ChatCompletions.build_request(&plan).expect("build");
@@ -1430,6 +1432,7 @@ mod tests {
                 is_error: false,
             }],
             replay: None,
+            origin: None,
         }];
         let body = ChatCompletions.build_request(&plan).expect("build");
         assert_eq!(body["messages"].as_array().expect("array").len(), 1);
@@ -1444,6 +1447,7 @@ mod tests {
             role: Role::Tool,
             parts: Vec::new(),
             replay: None,
+            origin: None,
         }];
         let body = ChatCompletions.build_request(&plan).expect("build");
         assert!(body["messages"].as_array().expect("array").is_empty());
@@ -1455,6 +1459,7 @@ mod tests {
             role: Role::Tool,
             parts,
             replay: None,
+            origin: None,
         }];
         plan
     }
@@ -2345,6 +2350,7 @@ mod tests {
             role: Role::Tool,
             parts: vec![result("call_1", "contents")],
             replay: None,
+            origin: None,
         });
         plan.messages.push(Message::user("thanks"));
         plan
@@ -2482,6 +2488,7 @@ mod tests {
             role: Role::Tool,
             parts: vec![result(long, "contents")],
             replay: None,
+            origin: None,
         };
         for shape in [
             crate::compat::CallIdShape::ClaudeSafe,
