@@ -21,6 +21,7 @@ mod completion;
 mod connect_flow;
 mod diagnostics;
 mod help;
+mod helper_usage;
 mod install;
 mod mcp;
 mod model_limits;
@@ -1638,7 +1639,7 @@ fn run_acp(
         web_client::backends(settings),
         std::sync::Arc::new(rune_tools::ask_user::Unavailable),
         std::sync::Arc::new(rune_tools::skill::Empty),
-        vision_client::backend(settings, paths)?,
+        vision_client::backend(settings, paths, None)?,
     )?;
     rune_tools::inventory::tailor(
         &mut registry,

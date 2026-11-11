@@ -190,18 +190,26 @@ fn summarize_and_apply(
                 .push(Message::assistant(vec![ContentPart::Text { text: reply }]));
         }
         request_plan.messages.push(Message::user(CHECKPOINT_NUDGE));
-        let second = summarize(host, client, &limits, &mut request_plan, cancelled)?;
+        let second = match summarize(host, client, &limits, &mut request_plan, cancelled) {
+            Ok(second) => second,
+            Err(err) => {
+                host.compaction_abandoned(&usage);
+                return Err(err);
+            }
+        };
         usage = usage.merge_sum(second.usage);
         let free_form =
             second.finish == Some(FinishReason::Stop) && validate_summary(&second.text()).is_ok();
         if is_checkpoint_reply(&second) || free_form {
             second.text()
         } else if second.finish == Some(FinishReason::MaxTokens) {
+            host.compaction_abandoned(&usage);
             return Err(RuneError::new(
                 ErrorCode::InvalidState,
                 "compaction produced an incomplete summary: the summarizer reached the token limit; nothing was changed",
             ));
         } else {
+            host.compaction_abandoned(&usage);
             return Err(RuneError::new(
                 ErrorCode::InvalidState,
                 "compaction produced nothing usable: the summarizer did not return a checkpoint",
@@ -219,6 +227,7 @@ fn summarize_and_apply(
         archive
             .archive(&history.turns()[..removed])
             .map_err(|err| {
+                host.compaction_abandoned(&usage);
                 RuneError::new(
                     err.code(),
                     format!(
@@ -435,29 +444,11 @@ fn standalone_summary_request(
     let window = crate::tokens::effective_window(window.0, limits);
     let mut request = standalone_request(history, starts_with_checkpoint(history), &model, window);
     (request.compat, request.traits) = host.compat(&model);
-    request.effort = lowest_accepted(request.traits.efforts);
+    request.effort = lowest_effort(request.traits.efforts, host.dialect());
     request.provider_order = host.provider_order();
     request.provider_strict = host.provider_strict();
     request.cache_key = host.cache_key();
     request
-}
-
-/// Returns the lowest effort in `efforts`, or `Auto` when none is listed.
-fn lowest_accepted(efforts: &[rune_core::config::Effort]) -> rune_core::config::Effort {
-    use rune_core::config::Effort;
-    const ORDER: [Effort; 7] = [
-        Effort::None,
-        Effort::Minimal,
-        Effort::Low,
-        Effort::Medium,
-        Effort::High,
-        Effort::Xhigh,
-        Effort::Max,
-    ];
-    ORDER
-        .into_iter()
-        .find(|effort| efforts.contains(effort))
-        .unwrap_or(Effort::Auto)
 }
 
 /// Returns the reasoning effort of a same-prefix summarizer request.
@@ -469,7 +460,30 @@ fn summariser_effort(host: &dyn Host, request_plan: &RequestPlan) -> rune_core::
     if host.dialect().name() == rune_net::anthropic::NAME {
         return request_plan.effort;
     }
-    lowest_accepted(request_plan.traits.efforts)
+    lowest_effort(request_plan.traits.efforts, host.dialect())
+}
+
+/// Returns the least reasoning that both the model and the dialect accept, or
+/// `Auto` when they share no explicit level.
+#[must_use]
+pub fn lowest_effort(
+    traits_efforts: &[rune_core::config::Effort],
+    dialect: &dyn Provider,
+) -> rune_core::config::Effort {
+    use rune_core::config::Effort;
+    let accepted = dialect.capabilities().efforts;
+    [
+        Effort::None,
+        Effort::Minimal,
+        Effort::Low,
+        Effort::Medium,
+        Effort::High,
+        Effort::Xhigh,
+        Effort::Max,
+    ]
+    .into_iter()
+    .find(|effort| traits_efforts.contains(effort) && accepted.contains(effort))
+    .unwrap_or(Effort::Auto)
 }
 
 /// Sends one summarizer request, charging it to the objective.
@@ -1845,6 +1859,21 @@ mod tests {
     }
 
     #[test]
+    fn a_rejected_summary_still_reports_what_it_used() {
+        let fetch = ReplyFetch::new(&[("no headings here", "stop"), ("still none", "stop")]);
+        let host = SummaryHost::new();
+        let mut history = short_history();
+        let cut = plan(&history, &host.limits()).expect("a plan");
+        compact(&mut history, &cut, &host, &fetch, None, &|| false).expect_err("nothing usable");
+        assert_eq!(*host.abandoned.lock().expect("abandoned"), 1);
+
+        let fetch = ReplyFetch::new(&[(CHECKPOINT_REPLY, "stop")]);
+        let mut history = short_history();
+        compact(&mut history, &cut, &host, &fetch, None, &|| false).expect("compacts");
+        assert_eq!(*host.abandoned.lock().expect("abandoned"), 1);
+    }
+
+    #[test]
     fn a_short_reply_after_the_nudge_leaves_the_history_unchanged() {
         let fetch = ReplyFetch::new(&[("no headings here", "stop"), ("still none", "stop")]);
         let (before, history, result) = compact_with(&fetch);
@@ -2238,6 +2267,7 @@ Copy file paths, symbols, commands, error messages and identifiers exactly. Leav
         steering: crate::steering::SteeringQueue,
         window: Option<u64>,
         compaction_model: Option<String>,
+        abandoned: std::sync::Mutex<u32>,
     }
 
     impl SummaryHost {
@@ -2249,6 +2279,7 @@ Copy file paths, symbols, commands, error messages and identifiers exactly. Leav
                 steering: crate::steering::SteeringQueue::new(8),
                 window: None,
                 compaction_model: None,
+                abandoned: std::sync::Mutex::new(0),
             }
         }
 
@@ -2297,6 +2328,11 @@ Copy file paths, symbols, commands, error messages and identifiers exactly. Leav
 
         fn compaction_model(&self) -> Option<String> {
             self.compaction_model.clone()
+        }
+
+        fn compaction_abandoned(&self, _usage: &Usage) {
+            let mut abandoned = self.abandoned.lock().expect("abandoned");
+            *abandoned = abandoned.saturating_add(1);
         }
 
         fn instructions(&self) -> String {
@@ -2473,6 +2509,42 @@ Copy file paths, symbols, commands, error messages and identifiers exactly. Leav
     }
 
     /// Fails the test on any request, for a run that must not summarize.
+    /// A dialect without effort control.
+    struct NoEffort;
+
+    impl Provider for NoEffort {
+        fn name(&self) -> &'static str {
+            "no-effort"
+        }
+        fn capabilities(&self) -> rune_net::provider::ProviderCapabilities {
+            rune_net::provider::ProviderCapabilities::default()
+        }
+        fn request_path(&self) -> &'static str {
+            "/none"
+        }
+        fn build_request(&self, _plan: &RequestPlan) -> Result<serde_json::Value> {
+            Ok(serde_json::Value::Null)
+        }
+        fn reducer(&self) -> Box<dyn rune_net::stream::StreamReducer> {
+            rune_net::anthropic::Anthropic.reducer()
+        }
+    }
+
+    #[test]
+    fn the_lowest_effort_is_the_first_both_sides_accept() {
+        use rune_core::config::Effort;
+        use rune_net::anthropic::Anthropic;
+        use rune_net::provider::ALL_EFFORTS;
+
+        assert_eq!(lowest_effort(ALL_EFFORTS, &Anthropic), Effort::None);
+        assert_eq!(
+            lowest_effort(&[Effort::Auto, Effort::High, Effort::Low], &Anthropic),
+            Effort::Low
+        );
+        assert_eq!(lowest_effort(&[Effort::Auto], &Anthropic), Effort::Auto);
+        assert_eq!(lowest_effort(ALL_EFFORTS, &NoEffort), Effort::Auto);
+    }
+
     struct NoSummaryFetch;
 
     impl Fetch for NoSummaryFetch {

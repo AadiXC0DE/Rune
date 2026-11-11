@@ -916,6 +916,13 @@ fn checkpoint_same_prefix() {
         summarizer.cached_tokens,
         summarizer.prompt_tokens
     );
+    let result = report.result.as_ref().expect("the final result object");
+    let billed: u64 = report.requests.iter().map(|r| r.prompt_tokens).sum();
+    assert_eq!(result["usage"]["input_tokens"], billed, "{result}");
+    assert_eq!(
+        result["helper_usage"]["compaction"]["input_tokens"], summarizer.prompt_tokens,
+        "{result}"
+    );
 }
 
 #[test]

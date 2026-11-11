@@ -42,6 +42,8 @@ use rune_tools::registry::Registry;
 
 /// Everything a session needs to run.
 pub struct SessionConfig {
+    /// Where the reviewer and the image client leave what they used.
+    pub helper_usage: crate::helper_usage::HelperUsage,
     /// Use canonical line input and append-only labelled output.
     pub accessible: bool,
     /// Resolved settings.
@@ -379,6 +381,8 @@ struct SessionHost {
     live_out: Arc<Mutex<Option<LiveSink>>>,
     /// Reviewer for unresolved actions, absent when none is configured.
     reviewer: Option<Box<dyn Reviewer>>,
+    /// Requests made outside the main loop, waiting to be counted.
+    helper_usage: crate::helper_usage::HelperUsage,
     /// What this session has spent, for `/cost`.
     totals: Mutex<Totals>,
     /// The bytes each file held before this session first wrote to it, for
@@ -671,7 +675,15 @@ impl Host for SessionHost {
         self.forget_context();
         self.transcript_history_len
             .store(report.remaining_turns, std::sync::atomic::Ordering::Relaxed);
-        self.record_usage(&report.usage);
+        self.helper_usage
+            .record(HelperKind::Compaction, &self.model(), report.usage);
+        self.absorb_helper_usage();
+    }
+
+    fn compaction_abandoned(&self, usage: &rune_net::stream::Usage) {
+        self.helper_usage
+            .record(HelperKind::Compaction, &self.model(), *usage);
+        self.absorb_helper_usage();
     }
 
     fn record_child_usage(&self, model: &str, usage: &rune_net::stream::Usage) {
@@ -1336,6 +1348,30 @@ impl SessionHost {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .record(usage);
+    }
+
+    /// Moves finished helper requests into the session total and the ledger.
+    ///
+    /// A ledger write must never end a session, so a failure is only reported.
+    fn absorb_helper_usage(&self) {
+        for (kind, model, usage) in self.helper_usage.drain() {
+            let Some(label) = crate::helper_usage::label(kind) else {
+                continue;
+            };
+            let cost = self.usage_paths.as_ref().and_then(|paths| {
+                crate::helper_usage::cost(&self.permission_settings, paths, &model, &usage)
+            });
+            self.totals
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .record_helper(label, &usage, cost);
+            if let Some(paths) = &self.usage_paths
+                && let Err(error) =
+                    crate::helper_usage::append_to_ledger(paths, kind, &model, &usage, cost)
+            {
+                self.draw_notice(&format!("helper usage was not recorded: {error}"));
+            }
+        }
     }
 
     /// Remembers a file's contents before this session changes it.
@@ -2093,6 +2129,7 @@ impl SessionHost {
     /// Spend is what earlier turns were priced at, so the request that crosses
     /// the limit completes and the one after it is refused.
     fn check_spend(&self) -> Result<()> {
+        self.absorb_helper_usage();
         let limit = self.spend_limit.lock().ok().and_then(|limit| *limit);
         let spent = self.totals.lock().ok().and_then(|totals| totals.cost);
         crate::spend::check(spent, limit, "session").map_err(|err| {
@@ -2420,7 +2457,12 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
         turn_started: Mutex::new(None),
         live_out: Arc::new(Mutex::new(None)),
         reasoning: Mutex::new(reasoning_escape),
-        reviewer: crate::auto_review::build(&config.settings, &config.paths)?,
+        reviewer: crate::auto_review::build(
+            &config.settings,
+            &config.paths,
+            config.helper_usage.clone(),
+        )?,
+        helper_usage: config.helper_usage.clone(),
         totals: Mutex::new(initial_totals),
         undo: Mutex::new(BTreeMap::new()),
         review_session: Arc::new(Mutex::new(ReviewSession::new(&limits))),
@@ -2884,6 +2926,7 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                 } else {
                     run_turn_steerable(&mut history, &host, reader, gesture)
                 };
+                host.absorb_helper_usage();
                 recorder
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -5292,6 +5335,19 @@ fn render_cost(info: &SessionInfo<'_>) -> String {
             rune_net::models_dev::dollars(cost)
         );
     }
+    for (label, helper) in &totals.helpers {
+        let _ = write!(
+            out,
+            "  of which {label}: {} requests, {} in, {} out",
+            helper.requests,
+            footer::format_tokens(helper.input_tokens),
+            footer::format_tokens(helper.output_tokens)
+        );
+        if let Some(cost) = helper.cost {
+            let _ = write!(out, ", ${}", rune_net::models_dev::dollars(cost));
+        }
+        out.push('\n');
+    }
     out.trim_end().to_owned()
 }
 
@@ -5745,6 +5801,25 @@ struct Totals {
     /// Estimated cost of the turns run since the session started, in
     /// millionths of a dollar, each priced when it ran. Absent until one is.
     cost: Option<u64>,
+    /// The share of these totals each helper accounts for, by its label.
+    helpers: BTreeMap<&'static str, HelperTotals>,
+}
+
+/// What one kind of helper request has used in a session.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+struct HelperTotals {
+    /// Requests made.
+    requests: u64,
+    /// Input tokens reported across those requests.
+    input_tokens: u64,
+    /// Output tokens reported across those requests.
+    output_tokens: u64,
+    /// Prompt-cache reads reported across those requests.
+    cache_read_tokens: u64,
+    /// Prompt-cache writes reported across those requests.
+    cache_write_tokens: u64,
+    /// Estimated cost in millionths of a dollar. Absent until a request is priced.
+    cost: Option<u64>,
 }
 
 impl Totals {
@@ -5793,6 +5868,32 @@ impl Totals {
             input_tokens: state.usage.input_tokens,
             output_tokens: state.usage.output_tokens,
             ..Self::default()
+        }
+    }
+
+    /// Adds one helper request to the session's totals and to its own label.
+    fn record_helper(
+        &mut self,
+        label: &'static str,
+        usage: &rune_net::stream::Usage,
+        cost: Option<u64>,
+    ) {
+        fn add(total: &mut u64, value: Option<u64>) {
+            *total = total.saturating_add(value.unwrap_or(0));
+        }
+        fn add_cost(total: &mut Option<u64>, cost: u64) {
+            *total = Some(total.unwrap_or(0).saturating_add(cost));
+        }
+        self.record(usage);
+        let helper = self.helpers.entry(label).or_default();
+        helper.requests = helper.requests.saturating_add(1);
+        add(&mut helper.input_tokens, usage.input_tokens);
+        add(&mut helper.output_tokens, usage.output_tokens);
+        add(&mut helper.cache_read_tokens, usage.cache_read_tokens);
+        add(&mut helper.cache_write_tokens, usage.cache_write_tokens);
+        if let Some(cost) = cost {
+            add_cost(&mut helper.cost, cost);
+            add_cost(&mut self.cost, cost);
         }
     }
 
@@ -6662,9 +6763,18 @@ pub fn prepare(
 
     let questions = Arc::new(TerminalQuestions::default());
     let rules = crate::permissions::validated(settings)?;
-    let (registry, subagent) = session_registry(settings, paths, workspace, &rules, &questions)?;
+    let helper_usage = crate::helper_usage::HelperUsage::default();
+    let (registry, subagent) = session_registry(
+        settings,
+        paths,
+        workspace,
+        &rules,
+        &questions,
+        &helper_usage,
+    )?;
 
     Ok(SessionConfig {
+        helper_usage,
         accessible: false,
         settings: settings.clone(),
         paths: paths.clone(),
@@ -6694,7 +6804,15 @@ pub fn advertised_tools(
 ) -> Result<Vec<ToolSpec>> {
     let rules = crate::permissions::validated(settings)?;
     let questions = Arc::new(TerminalQuestions::default());
-    let (registry, _) = session_registry(settings, paths, workspace, &rules, &questions)?;
+    let helper_usage = crate::helper_usage::HelperUsage::default();
+    let (registry, _) = session_registry(
+        settings,
+        paths,
+        workspace,
+        &rules,
+        &questions,
+        &helper_usage,
+    )?;
     Ok(inventory::advertisement(&registry))
 }
 
@@ -6705,6 +6823,7 @@ fn session_registry(
     workspace: &Utf8Path,
     rules: &RuleSet,
     questions: &Arc<TerminalQuestions>,
+    helper_usage: &crate::helper_usage::HelperUsage,
 ) -> Result<(Registry, Arc<crate::subagent::Bridge>)> {
     let catalog = rune_context::skills::discover(
         workspace,
@@ -6718,7 +6837,7 @@ fn session_registry(
         crate::web_client::backends(settings),
         questions.clone(),
         Arc::new(rune_tools::skill::Fixed::new(catalog)),
-        crate::vision_client::backend(settings, paths)?,
+        crate::vision_client::backend(settings, paths, Some(helper_usage.clone()))?,
     )?;
     // Chosen once for the session, so the request prefix stays stable after `/model`.
     inventory::tailor(
@@ -9206,6 +9325,71 @@ mod tests {
         assert!(rendered.contains("Requests: 2"), "{rendered}");
         assert!(rendered.contains("1.2k in"), "{rendered}");
         assert!(rendered.contains("500 out"), "{rendered}");
+    }
+
+    #[test]
+    fn helper_usage_appears_under_its_label_in_cost() {
+        let host = test_host();
+        host.record_usage(&rune_net::stream::Usage {
+            input_tokens: Some(1_000),
+            output_tokens: Some(100),
+            ..rune_net::stream::Usage::default()
+        });
+        let usage = |input, output| rune_net::stream::Usage {
+            input_tokens: Some(input),
+            output_tokens: Some(output),
+            ..rune_net::stream::Usage::default()
+        };
+        host.helper_usage
+            .record(HelperKind::PermissionReview, "small", usage(200, 10));
+        host.helper_usage
+            .record(HelperKind::PermissionReview, "small", usage(300, 20));
+        host.helper_usage
+            .record(HelperKind::Vision, "eyes", usage(1_500, 90));
+        host.absorb_helper_usage();
+        host.context_replaced(&rune_agent::compaction::CompactionReport {
+            kind: rune_agent::compaction::CompactionKind::Checkpoint,
+            pruned_results: 0,
+            removed_turns: 1,
+            remaining_turns: 1,
+            usage: usage(2_000, 400),
+        });
+        assert_eq!(
+            render_cost(&host.info("p", "e")),
+            "Requests: 5\n\
+             Tokens:   5.0k in, 620 out\n  \
+             of which compaction: 1 requests, 2.0k in, 400 out\n  \
+             of which image analysis: 1 requests, 1.5k in, 90 out\n  \
+             of which permission review: 2 requests, 500 in, 30 out"
+        );
+        assert!(host.helper_usage.drain().is_empty());
+    }
+
+    #[test]
+    fn a_priced_helper_adds_to_the_session_cost_and_shows_its_own() {
+        let mut totals = Totals::default();
+        let usage = rune_net::stream::Usage {
+            input_tokens: Some(100),
+            output_tokens: Some(10),
+            ..rune_net::stream::Usage::default()
+        };
+        totals.record_helper("image analysis", &usage, Some(1_500_000));
+        totals.record_helper("image analysis", &usage, Some(500_000));
+        totals.record_helper("permission review", &usage, None);
+        assert_eq!(totals.cost, Some(2_000_000));
+        assert_eq!(totals.requests, 3);
+        let rendered = render_cost(&test_info_with(totals));
+        let dollars = rune_net::models_dev::dollars(2_000_000);
+        assert!(
+            rendered.contains(&format!(
+                "  of which image analysis: 2 requests, 200 in, 20 out, ${dollars}\n"
+            )),
+            "{rendered}"
+        );
+        assert!(
+            rendered.ends_with("  of which permission review: 1 requests, 100 in, 10 out"),
+            "{rendered}"
+        );
     }
 
     #[test]
@@ -11820,6 +12004,7 @@ mod tests {
     /// Builds a session config whose terminal accepts no color.
     fn colorless_config() -> SessionConfig {
         SessionConfig {
+            helper_usage: crate::helper_usage::HelperUsage::default(),
             accessible: false,
             settings: Settings::default(),
             paths: Paths::resolve(Some("/tmp"), None, None, None, Some("/tmp/s")),
@@ -12052,6 +12237,7 @@ mod tests {
             live_out: Arc::new(Mutex::new(None)),
             reasoning: Mutex::new("\u{1b}[2m".to_owned()),
             reviewer: None,
+            helper_usage: crate::helper_usage::HelperUsage::default(),
             totals: Mutex::new(Totals::default()),
             undo: Mutex::new(BTreeMap::new()),
             review_session: Arc::new(Mutex::new(ReviewSession::new(&BudgetSet::new()))),

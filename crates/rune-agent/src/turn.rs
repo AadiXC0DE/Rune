@@ -445,6 +445,10 @@ pub trait Host {
     /// records, so a host that counts usage adds it here.
     fn context_replaced(&self, _report: &crate::compaction::CompactionReport) {}
 
+    /// Called with the usage of summary requests whose compaction failed, which
+    /// no report carries, so the host can still count what they cost.
+    fn compaction_abandoned(&self, _usage: &Usage) {}
+
     /// Records delegated provider usage without adding child conversation events.
     fn record_child_usage(&self, _model: &str, _usage: &Usage) {}
 
@@ -628,12 +632,7 @@ pub trait Host {
 /// The lowest effort both the model and the dialect accept, or `Auto`.
 pub fn lowest_accepted_effort(host: &dyn Host) -> Effort {
     let (_, traits) = host.compat(&host.model());
-    let lowest = rune_net::compat::clamp_effort(Effort::None, traits.efforts);
-    if traits.efforts.contains(&lowest) && host.dialect().capabilities().efforts.contains(&lowest) {
-        lowest
-    } else {
-        Effort::Auto
-    }
+    crate::compaction::lowest_effort(traits.efforts, host.dialect())
 }
 
 /// One entry of what a turn said and did, in the order it happened.

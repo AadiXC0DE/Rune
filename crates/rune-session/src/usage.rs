@@ -71,13 +71,23 @@ pub enum HelperKind {
     PermissionReview,
     /// An image analysis request made when the model cannot read images itself.
     Vision,
+    /// A request that summarised the conversation.
+    Compaction,
+    /// A request that kept a prompt cache alive.
+    CacheWarming,
 }
 
 impl HelperKind {
     /// Every kind, in a stable order.
     #[must_use]
     pub const fn all() -> &'static [Self] {
-        &[Self::Main, Self::PermissionReview, Self::Vision]
+        &[
+            Self::Main,
+            Self::PermissionReview,
+            Self::Vision,
+            Self::Compaction,
+            Self::CacheWarming,
+        ]
     }
 
     /// Returns the wire name.
@@ -87,6 +97,8 @@ impl HelperKind {
             Self::Main => "main",
             Self::PermissionReview => "permission_review",
             Self::Vision => "vision",
+            Self::Compaction => "compaction",
+            Self::CacheWarming => "cache_warming",
         }
     }
 }
@@ -816,6 +828,28 @@ mod tests {
 
     fn timestamps(read: &LedgerRead) -> Vec<i64> {
         read.records.iter().map(|r| r.created_at_ms).collect()
+    }
+
+    #[test]
+    fn helper_kinds_have_stable_names() {
+        // These names are on disk in every ledger already written.
+        let names: Vec<&str> = HelperKind::all().iter().map(|kind| kind.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "main",
+                "permission_review",
+                "vision",
+                "compaction",
+                "cache_warming"
+            ]
+        );
+        for kind in HelperKind::all() {
+            assert_eq!(
+                serde_json::to_string(kind).expect("encode"),
+                format!("\"{kind}\"")
+            );
+        }
     }
 
     #[test]

@@ -287,6 +287,45 @@ enum JsonlEvent<'a> {
     },
 }
 
+/// What a run's helper requests used, kept apart from its own steps.
+#[derive(Debug, Default)]
+struct HelperSpend {
+    /// Usage of each helper, by its name in the JSON result.
+    by_helper: std::collections::BTreeMap<String, Usage>,
+    /// Helper usage served by the run's own model, priced with its steps.
+    same_model: Usage,
+    /// Priced helper requests served by another model, in millionths of a dollar.
+    other_models_cost: u64,
+}
+
+impl HelperSpend {
+    /// Adds one request.
+    fn add(&mut self, label: &str, usage: &Usage, cost: Option<u64>, same_model: bool) {
+        let helper = self.by_helper.entry(label.replace(' ', "_")).or_default();
+        *helper = helper.merge_sum(*usage);
+        if same_model {
+            self.same_model = self.same_model.merge_sum(*usage);
+        } else if let Some(cost) = cost {
+            self.other_models_cost = self.other_models_cost.saturating_add(cost);
+        }
+    }
+
+    /// Returns what every helper used.
+    fn total(&self) -> Usage {
+        self.by_helper
+            .values()
+            .fold(Usage::default(), |sum, usage| sum.merge_sum(*usage))
+    }
+
+    /// Returns the per-helper object of the JSON result.
+    fn report(&self) -> std::collections::BTreeMap<String, UsageReport> {
+        self.by_helper
+            .iter()
+            .map(|(name, usage)| (name.clone(), UsageReport::from(usage)))
+            .collect()
+    }
+}
+
 /// One step's usage as the provider reported it; an unreported count is null.
 ///
 /// The field names are the record's wire names, shared with the `usage` of the
@@ -513,6 +552,9 @@ pub struct JsonResult {
     pub steps: u32,
     /// Token counts. A count the provider did not report is absent.
     pub usage: UsageReport,
+    /// The part of `usage` each helper accounts for, by name. Absent when none ran.
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub helper_usage: std::collections::BTreeMap<String, UsageReport>,
     /// Tool calls requested by the provider, in order.
     pub tool_calls: Vec<ToolCallReport>,
     /// Tool calls that ran after their name or arguments were repaired.
@@ -590,6 +632,17 @@ pub struct UsageReport {
     pub cache_write_tokens: Option<u64>,
 }
 
+impl From<&Usage> for UsageReport {
+    fn from(usage: &Usage) -> Self {
+        Self {
+            input_tokens: usage.input_tokens,
+            output_tokens: usage.output_tokens,
+            cache_read_tokens: usage.cache_read_tokens,
+            cache_write_tokens: usage.cache_write_tokens,
+        }
+    }
+}
+
 impl JsonResult {
     /// Builds a failing result, used so `--json` always emits one object.
     #[must_use]
@@ -605,6 +658,7 @@ impl JsonResult {
             session_id: String::new(),
             steps: 0,
             usage: UsageReport::default(),
+            helper_usage: std::collections::BTreeMap::new(),
             tool_calls: Vec::new(),
             repaired_calls: 0,
             narration: Vec::new(),
@@ -689,8 +743,10 @@ struct AskHost<'a> {
     window: rune_agent::compaction::Window,
     /// Largest answer the model produces, when known.
     max_output: Option<u64>,
-    /// Usage of summary requests, which the turn's own usage does not count.
-    compaction_usage: std::sync::Mutex<Usage>,
+    /// Requests made outside the main loop, waiting to be counted.
+    helper_usage: crate::helper_usage::HelperUsage,
+    /// What helper requests used, which the turn's own usage does not count.
+    helper_spend: std::sync::Mutex<HelperSpend>,
     /// Tokens the run's children used, reported with the run's own.
     child_usage: std::sync::Mutex<Usage>,
     /// The run's step limit, when it is bounded.
@@ -766,6 +822,29 @@ impl AskHost<'_> {
                 ts: jsonl_timestamp(),
             },
         )
+    }
+
+    /// Moves finished helper requests into the run's totals and the ledger.
+    ///
+    /// A ledger write must not end a run, so a failure is only reported.
+    fn absorb_helper_usage(&self) {
+        for (kind, model, usage) in self.helper_usage.drain() {
+            let Some(label) = crate::helper_usage::label(kind) else {
+                continue;
+            };
+            let cost = crate::helper_usage::cost(self.settings, self.paths, &model, &usage);
+            lock(&self.helper_spend).add(label, &usage, cost, model == self.settings.model);
+            if let Some(cost) = cost {
+                let mut spent = lock(&self.spent);
+                *spent = Some(spent.unwrap_or(0).saturating_add(cost));
+            }
+            self.log(|log| log.usage(&usage));
+            if let Err(err) =
+                crate::helper_usage::append_to_ledger(self.paths, kind, &model, &usage, cost)
+            {
+                let _ = writeln!(std::io::stderr(), "usage was not recorded: {err}");
+            }
+        }
     }
 
     /// Adds one request's estimated cost to the run's spend.
@@ -885,6 +964,7 @@ impl Host for AskHost<'_> {
         client: &dyn rune_net::fetch::Fetch,
     ) -> Result<()> {
         self.tool_images.hydrate(plan);
+        self.absorb_helper_usage();
         // Checked before compacting, whose summary request costs money too.
         crate::spend::check(*lock(&self.spent), self.spend_limit, "run").map_err(|err| {
             err.with_hint("raise it with --max-cost, or with session_spend_cents")
@@ -970,11 +1050,21 @@ impl Host for AskHost<'_> {
 
     fn context_replaced(&self, report: &rune_agent::compaction::CompactionReport) {
         self.mapped.refresh();
-        let mut usage = lock(&self.compaction_usage);
-        *usage = usage.merge_sum(report.usage);
-        drop(usage);
-        self.add_spend(&report.usage);
-        self.log(|log| log.usage(&report.usage));
+        self.helper_usage.record(
+            rune_session::usage::HelperKind::Compaction,
+            &self.settings.model,
+            report.usage,
+        );
+        self.absorb_helper_usage();
+    }
+
+    fn compaction_abandoned(&self, usage: &Usage) {
+        self.helper_usage.record(
+            rune_session::usage::HelperKind::Compaction,
+            &self.settings.model,
+            *usage,
+        );
+        self.absorb_helper_usage();
     }
 
     fn settles_cancellation(&self) -> bool {
@@ -1300,6 +1390,7 @@ pub fn run(
         .value()
         .filter(|cap| *cap > 0);
     let rules = crate::permissions::validated(settings)?;
+    let helper_usage = crate::helper_usage::HelperUsage::default();
     let (registry, subagent) = if options.tool_loop {
         let catalog = rune_context::skills::discover(
             &crate::current_workspace()?,
@@ -1313,7 +1404,7 @@ pub fn run(
             crate::web_client::backends(settings),
             std::sync::Arc::new(rune_tools::ask_user::Unavailable),
             std::sync::Arc::new(rune_tools::skill::Fixed::new(catalog)),
-            crate::vision_client::backend(settings, paths)?,
+            crate::vision_client::backend(settings, paths, Some(helper_usage.clone()))?,
         )?;
         let workspace = crate::current_workspace()?;
         inventory::tailor(
@@ -1410,7 +1501,8 @@ pub fn run(
         emit_error: std::sync::Mutex::new(None),
         window: rune_agent::compaction::Window(model_limits.context_window.unwrap_or_default()),
         max_output: model_limits.max_output,
-        compaction_usage: std::sync::Mutex::new(Usage::default()),
+        helper_usage,
+        helper_spend: std::sync::Mutex::new(HelperSpend::default()),
         child_usage: std::sync::Mutex::new(Usage::default()),
         step_cap,
         encoded_request: std::sync::Mutex::new(None),
@@ -1519,6 +1611,7 @@ pub fn run(
         }
         (_, outcome) => outcome,
     };
+    host.absorb_helper_usage();
     if let Some(error) = lock(&host.emit_error).take() {
         return Err(error);
     }
@@ -1526,11 +1619,17 @@ pub fn run(
         return Err(error);
     }
     let outcome = outcome?;
-    // Summary requests are billed too, so they are part of what the run used.
+    // Helper requests are billed too, so they are part of what the run used.
+    let helpers = lock(&host.helper_spend);
+    let child_usage = *lock(&host.child_usage);
     let usage = outcome
         .usage
-        .merge_sum(*lock(&host.compaction_usage))
-        .merge_sum(*lock(&host.child_usage));
+        .merge_sum(helpers.total())
+        .merge_sum(child_usage);
+    let priced_at_run_rates = outcome
+        .usage
+        .merge_sum(helpers.same_model)
+        .merge_sum(child_usage);
     // A turn that failed after a completed request still reports its usage,
     // steps and calls, with the failure as the error.
     let error = if let Some(error) = outcome.error.clone() {
@@ -1621,17 +1720,16 @@ pub fn run(
         resolved_provider: None,
         session_id,
         steps: outcome.steps,
-        usage: UsageReport {
-            input_tokens: usage.input_tokens,
-            output_tokens: usage.output_tokens,
-            cache_read_tokens: usage.cache_read_tokens,
-            cache_write_tokens: usage.cache_write_tokens,
-        },
+        usage: UsageReport::from(&usage),
+        helper_usage: helpers.report(),
         tool_calls,
         repaired_calls: outcome.repaired_calls,
         narration,
         cost_usd: crate::provider_setup::cached_prices(settings, paths)
-            .and_then(|prices| prices.cost_at(&usage, rune_net::transport::now_timestamp()))
+            .and_then(|prices| {
+                prices.cost_at(&priced_at_run_rates, rune_net::transport::now_timestamp())
+            })
+            .map(|cost| cost.saturating_add(helpers.other_models_cost))
             .map(rune_net::models_dev::dollars),
         experiment: Some(settings.experiments.render()).filter(|keys| !keys.is_empty()),
         verification: error.is_none().then(|| outcome.verification.as_str()),
@@ -2321,6 +2419,7 @@ mod tests {
             session_id: String::new(),
             steps: 1,
             usage: UsageReport::default(),
+            helper_usage: std::collections::BTreeMap::new(),
             tool_calls: Vec::new(),
             repaired_calls: 0,
             narration: Vec::new(),
@@ -2340,6 +2439,37 @@ mod tests {
         assert!(value.get("error").is_none());
         assert!(value.get("error_code").is_none());
         assert!(value.get("error_detail").is_none());
+    }
+
+    #[test]
+    fn helper_usage_is_reported_in_json() {
+        let usage = |input| Usage {
+            input_tokens: Some(input),
+            output_tokens: Some(1),
+            ..Usage::default()
+        };
+        let mut spend = HelperSpend::default();
+        spend.add("compaction", &usage(100), None, true);
+        spend.add("image analysis", &usage(20), Some(7), false);
+        spend.add("image analysis", &usage(30), Some(5), false);
+        assert_eq!(spend.total().input_tokens, Some(150));
+        assert_eq!(spend.same_model.input_tokens, Some(100));
+        assert_eq!(spend.other_models_cost, 12);
+
+        let mut result =
+            JsonResult::failure("m", "auto", &RuneError::new(ErrorCode::Internal, "x"), 1);
+        let empty = serde_json::to_value(&result).expect("serialize");
+        assert!(empty.get("helper_usage").is_none(), "{empty}");
+
+        result.helper_usage = spend.report();
+        let json = serde_json::to_value(&result).expect("serialize");
+        assert_eq!(
+            json["helper_usage"],
+            serde_json::json!({
+                "compaction": {"input_tokens": 100, "output_tokens": 1},
+                "image_analysis": {"input_tokens": 50, "output_tokens": 2},
+            })
+        );
     }
 
     #[test]
