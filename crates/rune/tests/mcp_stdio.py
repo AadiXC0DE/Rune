@@ -270,7 +270,7 @@ def run_fixture(scenario, terminal=False):
                             transcript.extend(os.read(master, 65536))
                     cancelled = time.monotonic()
                     os.write(master, b"\x03")
-                    wait_for(b"[cancelled]")
+                    wait_for(b"[interrupted]")
                     assert time.monotonic() - cancelled < 2, transcript
                 else:
                     wait_for(b"MCP_FIXTURE_PASSED")

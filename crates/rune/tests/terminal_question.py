@@ -213,7 +213,7 @@ with tempfile.TemporaryDirectory(prefix="rune-r008-") as directory:
         for cancel in [b"\x1b", b"\x03", b"\x04"]:
             start = question()
             send(cancel)
-            wait_for("cancelled", start)
+            wait_for("[interrupted]", start)
             start = len(transcript)
             send(b"after-cancel\r")
             wait_for_committed("SESSION_STILL_USABLE", start)

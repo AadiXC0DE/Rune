@@ -191,7 +191,8 @@ with tempfile.TemporaryDirectory(prefix="rune-r073-") as directory:
                         "PageUp / PageDown", "Home / End", "Bracketed paste"]:
             assert binding in help_output, binding
         assert "within 1000 ms" in help_output
-        assert "clear a nonempty draft first" in help_output
+        assert "clear the draft (Up brings it back)" in help_output
+        assert "Interrupting:" in help_output
 
         # Each alternative spelling gets its own caret assertion.
         draft("typed", "one 界e\u0301 two".encode(), "one 界e\u0301 two", 13)
@@ -221,7 +222,8 @@ with tempfile.TemporaryDirectory(prefix="rune-r073-") as directory:
         draft("external-editor", b"draft\x07", "edited", 8)
         submit("edited")
 
-        draft("history-up", b"unfinished\x1b[A", "edited", 8)
+        # The draft Ctrl-C cleared above comes back before recorded prompts.
+        draft("history-up", b"unfinished\x1b[A", "discard", 9)
         draft("history-down", b"\x1b[B", "unfinished", 12)
         draft("history-cancel-esc", b"\x12edited\x1b", "unfinished", 12)
         draft("history-cancel-ctrl-c", b"\x12edited\x03", "unfinished", 12)
@@ -287,28 +289,29 @@ with tempfile.TemporaryDirectory(prefix="rune-r073-") as directory:
         wait_for("HELP_TURN_RUNNING")
         draft("running-ctrl-c-clear", b"correction\x03", "", 2)
         keys(b"\x04")  # Empty Ctrl-D must not stop or leave a running turn.
-        assert b"[cancelled]" not in transcript and child.poll() is None
+        assert b"[interrupted]" not in transcript and child.poll() is None
         keys(b"\x0f")  # Transcript also opens while the turn runs.
         wait_for("Transcript", len(transcript) - 1000)
         keys(b"\x03")  # Close takes precedence over cancellation.
-        assert b"[cancelled]" not in transcript
+        assert b"[interrupted]" not in transcript
         start = len(transcript)
         keys(b"steer\r")
         wait_for("steering queued for the next boundary", start)
         keys(b"\x03")
-        wait_for("[cancelled]", start)
+        wait_for("[interrupted]", start)
         releases["slow-c"].set()
         keys(b"\x15")  # Cancellation restores unsent steering as a draft.
         start = len(transcript)
         keys(b"slow-esc\r")
         wait_for("HELP_TURN_RUNNING", start)
-        draft("running-esc-clear", b"correction\x1b", "", 2)
-        assert b"[cancelled]" not in transcript[start:]
+        # Escape over typed text keeps it and waits for a second press.
+        draft("running-esc-keep", b"correction\x1b", "correction", 12)
+        assert b"[interrupted]" not in transcript[start:]
         keys(b"X")  # An intervening edit disarms the first Escape.
         keys(b"\x1b")
-        assert b"[cancelled]" not in transcript[start:]
+        assert b"[interrupted]" not in transcript[start:]
         keys(b"\x1b")
-        wait_for("[cancelled]", start)
+        wait_for("[interrupted]", start)
         releases["slow-esc"].set()
 
         # Idle Escape stays, idle Ctrl-D leaves. A second process proves Ctrl-C.
@@ -325,7 +328,7 @@ with tempfile.TemporaryDirectory(prefix="rune-r073-") as directory:
         os.close(slave)
         transcript = bytearray()
         wait_for("/ commands")
-        os.write(master, b"\x03")
+        os.write(master, b"\x03\x03")
         assert drain_wait(child, master, 10, transcript) == 0
         assert not errors, errors
         print(json.dumps(captures))

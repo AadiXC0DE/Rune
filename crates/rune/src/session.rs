@@ -144,6 +144,9 @@ impl StreamingText {
 /// Rows of an open table held back so it can still be aligned.
 const TABLE_HOLD_ROWS: usize = 40;
 
+/// How many cleared drafts Up can bring back.
+const CLEARED_DRAFTS: usize = 10;
+
 /// Returns the byte offset of the space to split an over-tall unfinished line
 /// at: the last one whose text before it fits `rows - 1` rows of `width` and
 /// leaves no code span, emphasis or link open.
@@ -442,6 +445,10 @@ struct SessionHost {
     steering: SteeringQueue,
     /// Messages to run as turns after the running one, oldest first.
     queued: Mutex<std::collections::VecDeque<String>>,
+    /// Drafts cleared by Escape or Control-C, newest last, for Up to recall.
+    cleared: Mutex<std::collections::VecDeque<String>>,
+    /// When a first Escape over a typed draft armed the interrupt.
+    escape_armed: Mutex<Option<std::time::Instant>>,
     /// Steering submitted and not yet taken in by the turn, oldest first.
     pending_steer: Mutex<Vec<String>>,
     events: Arc<Mutex<Vec<Event>>>,
@@ -1562,6 +1569,41 @@ impl SessionHost {
     fn interrupt(&self) {
         self.cancellation.cancel();
         self.turn_context_cancel();
+    }
+
+    /// Keeps a draft the user cleared, so Up can bring it back.
+    fn save_cleared(&self, text: &str) {
+        if text.trim().is_empty() {
+            return;
+        }
+        let mut cleared = lock_value(&self.cleared);
+        cleared.push_back(text.to_owned());
+        while cleared.len() > CLEARED_DRAFTS {
+            cleared.pop_front();
+        }
+    }
+
+    /// The prompts Up walks: the recorded ones, then the cleared drafts.
+    fn recall_list(&self, prompts: &[String]) -> Vec<String> {
+        let mut list = prompts.to_vec();
+        for text in lock_value(&self.cleared).iter() {
+            if list.last() != Some(text) {
+                list.push(text.clone());
+            }
+        }
+        list
+    }
+
+    /// Shows the second-Escape hint for as long as the gesture waits.
+    fn arm_escape_hint(&self, armed: bool) {
+        *lock_value(&self.escape_armed) = armed.then(std::time::Instant::now);
+    }
+
+    /// The hint row's text while a first Escape waits for its second.
+    fn escape_hint(&self) -> Option<&'static str> {
+        lock_value(&self.escape_armed)
+            .is_some_and(|armed| armed.elapsed() <= rune_term::shell::ESCAPE_CANCEL_WINDOW)
+            .then_some("esc again to interrupt")
     }
 
     /// Whether the prompt cache is kept warm while idle: the setting is on,
@@ -2754,6 +2796,11 @@ impl SessionHost {
             } else {
                 vec!["tab queue"]
             },
+            gesture_hint: if running && ui.is_none_or(|ui| ui == UiState::Running) {
+                self.escape_hint()
+            } else {
+                None
+            },
             fields: Some(lock_value(&self.statusline).clone()),
             branch: lock_value(&self.branch).clone(),
             effort: (effort != Effort::Auto).then(|| effort.to_string()),
@@ -2781,7 +2828,7 @@ impl SessionHost {
                 Some(String::from("exhausted the objective token budget"))
             }
             StopReason::StepLimit => Some(String::from("reached the step limit")),
-            StopReason::Cancelled => Some(String::from("cancelled")),
+            StopReason::Cancelled => Some(String::from("interrupted")),
             _ => None,
         }
     }
@@ -4387,6 +4434,8 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
         cancellation: config.questions.cancellation.clone(),
         steering: SteeringQueue::from_limits(&limits),
         queued: Mutex::new(std::collections::VecDeque::new()),
+        cleared: Mutex::new(std::collections::VecDeque::new()),
+        escape_armed: Mutex::new(None),
         pending_steer: Mutex::new(Vec::new()),
         events: Arc::new(Mutex::new(Vec::new())),
         goal_judge: std::sync::atomic::AtomicBool::new(false),
@@ -5856,14 +5905,19 @@ fn run_steerable<T: Send>(
         *slot = Some(questions);
     }
 
+    host.arm_escape_hint(false);
     let (result, diagnostic) = run_on_worker(history, work, || {
         // A cancellation raised elsewhere, such as by a signal, reaches the
         // running tool within one poll.
         if host.cancellation.is_cancelled() {
             host.turn_context_cancel();
         }
+        if !gesture.is_armed() {
+            host.arm_escape_hint(false);
+        }
         if let Ok(request) = pending.try_recv() {
             gesture.disarm();
+            host.arm_escape_hint(false);
             let answer = collect_approval(&request, host, reader);
             let _ = request.answer.send(answer);
             host.draw_stream_with(reader.line(), reader.column());
@@ -5871,6 +5925,7 @@ fn run_steerable<T: Send>(
         }
         if let Ok(request) = pending_questions.try_recv() {
             gesture.disarm();
+            host.arm_escape_hint(false);
             let answer = collect_questions(&request.questions, host, reader);
             let _ = request.answer.send(answer);
             host.draw_stream_with(reader.line(), reader.column());
@@ -5920,29 +5975,31 @@ fn run_steerable<T: Send>(
                 // not stay on screen as though it were still being typed.
                 host.draw_notice_with(&notice, "", 0);
             }
-            // Escape arms on the first press and cancels on the second.
-            // The first press also clears a partly typed correction, which
-            // is what the key does everywhere else.
+            // Escape over an empty draft interrupts at once. Over a typed
+            // correction it keeps the text and waits for a second press, so a
+            // stray Escape does not stop the work being steered.
             KeyAction::Escape => {
-                if gesture.record() {
+                if reader.line().is_empty() || gesture.record() {
+                    gesture.disarm();
+                    host.arm_escape_hint(false);
                     host.interrupt();
-                    host.draw_notice("cancelling the turn");
-                } else if reader.line().is_empty() {
-                    host.draw_notice("press Escape again to cancel");
+                    host.draw_notice_with("interrupting", reader.line(), reader.column());
                 } else {
-                    reader.clear();
-                    host.draw_stream_with("", 0);
+                    host.arm_escape_hint(true);
+                    host.draw_stream_with(reader.line(), reader.column());
                 }
             }
-            // Control-C clears a typed correction first, then cancels. The
-            // session is left from the prompt the cancelled turn returns
-            // to, so a press here never abandons a turn still writing.
+            // Control-C clears a typed correction first, keeping it for Up,
+            // then interrupts. The session is left from the prompt the
+            // interrupted turn returns to, so a press here never abandons a
+            // turn still writing.
             KeyAction::Cancel => {
                 gesture.disarm();
                 if reader.line().is_empty() {
                     host.interrupt();
-                    host.draw_notice("cancelling the turn");
+                    host.draw_notice("interrupting");
                 } else {
+                    host.save_cleared(reader.line());
                     reader.clear();
                     host.draw_stream_with("", 0);
                 }
@@ -6010,6 +6067,7 @@ fn run_steerable<T: Send>(
             }
         }
     });
+    host.arm_escape_hint(false);
     if let Ok(mut slot) = host.approval_requests.lock() {
         *slot = None;
     }
@@ -6830,6 +6888,9 @@ fn await_submission(
     limits: &rune_tools::workspace::FileLimits,
 ) -> Result<Option<Input>> {
     let recall = prompts.here;
+    // Recorded prompts followed by cleared drafts, rebuilt after each clear.
+    let mut recall_list = host.recall_list(recall);
+    let mut gestures = IdleGestures::default();
     // Which completion row is highlighted. While the dropdown is open the
     // arrows move it rather than walking the prompt history, because the list is
     // what the user is looking at.
@@ -6937,7 +6998,25 @@ fn await_submission(
             continue;
         }
         let had_draft = !reader.line().is_empty();
-        match idle_key(commands, key, reader, &mut selected, &rows, recall) {
+        let step = idle_key(
+            commands,
+            key,
+            reader,
+            &mut selected,
+            &rows,
+            &recall_list,
+            &mut gestures,
+        );
+        if let Some(text) = gestures.cleared.take() {
+            host.save_cleared(&text);
+            recall_list = host.recall_list(recall);
+        }
+        if let Some(hint) = gestures.hint.take() {
+            flash = std::time::Instant::now()
+                .checked_add(rune_term::shell::INTERRUPT_WINDOW)
+                .map(|until| (hint.to_owned(), until));
+        }
+        match step {
             // Clearing the draft abandons the prompt a command prepared, and
             // the model it chose with it.
             Idle::Stay
@@ -7065,6 +7144,18 @@ enum Idle {
 ///
 /// `selected` is the highlighted completion row, and `rows` are the rows drawn
 /// for the completions, empty when none are open.
+/// Key gestures of the idle prompt that span presses, and what a key left for
+/// the caller to keep or show.
+#[derive(Default)]
+struct IdleGestures {
+    /// Control-C presses on an empty draft; a second inside the window leaves.
+    interrupts: rune_term::shell::Interrupts,
+    /// A draft the key cleared, for the host to keep.
+    cleared: Option<String>,
+    /// A hint for the activity line.
+    hint: Option<&'static str>,
+}
+
 fn idle_key(
     commands: &[CommandCandidate<'_>],
     key: KeyAction,
@@ -7072,7 +7163,11 @@ fn idle_key(
     selected: &mut usize,
     rows: &[String],
     recall: &[String],
+    gestures: &mut IdleGestures,
 ) -> Idle {
+    if key != KeyAction::Cancel {
+        gestures.interrupts.clear();
+    }
     match key {
         KeyAction::Suspend
         | KeyAction::CycleReasoning
@@ -7100,21 +7195,30 @@ fn idle_key(
         // An empty line is the only thing there is to leave behind, so
         // interrupting it means leaving the session.
         KeyAction::Interrupt => Idle::Leave,
-        // Escape only clears the line. While a turn runs, a first Escape
-        // asks for a second to cancel, and a turn that ends between the two
-        // hands that second press to this prompt, where leaving would end the
-        // session the user only meant to stop a turn in.
+        // Escape only clears the line, keeping it for Up. A turn that ends
+        // between two presses hands the second to this prompt, where leaving
+        // would end the session the user only meant to stop a turn in.
         KeyAction::Escape => {
+            if !reader.line().is_empty() {
+                gestures.cleared = Some(reader.line().to_owned());
+            }
             reader.clear();
             *selected = 0;
             Idle::Stay
         }
         KeyAction::Cancel => {
             // Control-C on a partly typed line abandons the line rather
-            // than the session, matching what the key does elsewhere.
+            // than the session, matching what the key does elsewhere. On an
+            // empty line only a second press inside the window leaves.
             if reader.line().is_empty() {
-                return Idle::Leave;
+                if gestures.interrupts.record() {
+                    return Idle::Leave;
+                }
+                gestures.hint = Some("ctrl-c again to quit");
+                return Idle::Stay;
             }
+            gestures.interrupts.clear();
+            gestures.cleared = Some(reader.line().to_owned());
             reader.clear();
             *selected = 0;
             Idle::Stay
@@ -11491,7 +11595,7 @@ fn report_turn(
             notices.push(Entry::notice("exhausted the objective token budget"));
         }
         StopReason::StepLimit => notices.push(Entry::notice("reached the model step limit")),
-        StopReason::Cancelled => notices.push(Entry::notice("cancelled")),
+        StopReason::Cancelled => notices.push(Entry::notice("interrupted")),
         _ => {}
     }
 
@@ -11525,7 +11629,7 @@ fn report_failed_turn(
         after.push(Entry::notice(diagnostic));
     }
     if err.code() == ErrorCode::Cancelled {
-        after.push(Entry::notice("cancelled"));
+        after.push(Entry::notice("interrupted"));
     } else {
         after.push(Entry::error(
             format!("the turn failed: {}", err.message()),
@@ -13574,6 +13678,7 @@ mod tests {
             &mut selected,
             &[],
             &[],
+            &mut IdleGestures::default(),
         );
         assert!(matches!(step, Idle::Stay));
         assert_eq!(reader.line(), "");
@@ -13586,22 +13691,14 @@ mod tests {
             &mut selected,
             &[],
             &[],
+            &mut IdleGestures::default(),
         );
         assert!(
             matches!(step, Idle::Stay),
             "escape on an empty line ended the session"
         );
 
-        // Control-C and Control-D on an empty line are still the way out.
-        let step = idle_key(
-            &commands,
-            KeyAction::Cancel,
-            &mut reader,
-            &mut selected,
-            &[],
-            &[],
-        );
-        assert!(matches!(step, Idle::Leave));
+        // Control-D on an empty line still leaves at once.
         let step = idle_key(
             &commands,
             KeyAction::Interrupt,
@@ -13609,8 +13706,109 @@ mod tests {
             &mut selected,
             &[],
             &[],
+            &mut IdleGestures::default(),
         );
         assert!(matches!(step, Idle::Leave));
+    }
+
+    #[test]
+    fn idle_ctrl_c_needs_a_second_press_to_leave() {
+        let commands = command_candidates(&[]);
+        let mut reader = rune_term::input::KeyReader::new();
+        let mut selected = 0;
+        let mut gestures = IdleGestures::default();
+        let mut press =
+            |key, reader: &mut rune_term::input::KeyReader, gestures: &mut IdleGestures| {
+                idle_key(&commands, key, reader, &mut selected, &[], &[], gestures)
+            };
+        assert!(matches!(
+            press(KeyAction::Cancel, &mut reader, &mut gestures),
+            Idle::Stay
+        ));
+        assert_eq!(gestures.hint, Some("ctrl-c again to quit"));
+        assert!(matches!(
+            press(KeyAction::Cancel, &mut reader, &mut gestures),
+            Idle::Leave
+        ));
+
+        // Any other key between the two presses disarms the first.
+        let mut gestures = IdleGestures::default();
+        press(KeyAction::Cancel, &mut reader, &mut gestures);
+        press(KeyAction::Down, &mut reader, &mut gestures);
+        assert!(matches!(
+            press(KeyAction::Cancel, &mut reader, &mut gestures),
+            Idle::Stay
+        ));
+
+        // A press after the window has passed arms again rather than leaving.
+        let mut gestures = IdleGestures::default();
+        let start = std::time::Instant::now();
+        assert!(!gestures.interrupts.record_at(start));
+        let late = start + std::time::Duration::from_millis(1200);
+        assert!(!gestures.interrupts.record_at(late));
+
+        // Control-C over a typed draft clears it and keeps it for the host.
+        let mut gestures = IdleGestures::default();
+        reader.replace("draft one");
+        assert!(matches!(
+            press(KeyAction::Cancel, &mut reader, &mut gestures),
+            Idle::Stay
+        ));
+        assert_eq!(reader.line(), "");
+        assert_eq!(gestures.cleared.as_deref(), Some("draft one"));
+        assert_eq!(gestures.hint, None);
+    }
+
+    #[test]
+    fn cleared_drafts_are_recalled_first() {
+        let commands = command_candidates(&[]);
+        let host = test_host();
+        let prompts = vec!["older prompt".to_owned(), "draft two".to_owned()];
+        let mut reader = rune_term::input::KeyReader::new();
+        let mut selected = 0;
+        let mut gestures = IdleGestures::default();
+        reader.replace("draft one");
+        idle_key(
+            &commands,
+            KeyAction::Escape,
+            &mut reader,
+            &mut selected,
+            &[],
+            &prompts,
+            &mut gestures,
+        );
+        assert_eq!(reader.line(), "");
+        let text = gestures.cleared.take().expect("escape kept the draft");
+        host.save_cleared(&text);
+        let recall = host.recall_list(&prompts);
+        assert_eq!(recall, ["older prompt", "draft two", "draft one"]);
+        idle_key(
+            &commands,
+            KeyAction::Up,
+            &mut reader,
+            &mut selected,
+            &[],
+            &recall,
+            &mut gestures,
+        );
+        assert_eq!(reader.line(), "draft one");
+
+        // A cleared draft equal to the last recorded prompt appears once.
+        let host = test_host();
+        host.save_cleared("draft two");
+        assert_eq!(host.recall_list(&prompts), prompts);
+    }
+
+    #[test]
+    fn eleven_clears_keep_ten() {
+        let host = test_host();
+        for index in 0..11 {
+            host.save_cleared(&format!("draft {index}"));
+        }
+        let recall = host.recall_list(&[]);
+        assert_eq!(recall.len(), 10);
+        assert_eq!(recall.first().map(String::as_str), Some("draft 1"));
+        assert_eq!(recall.last().map(String::as_str), Some("draft 10"));
     }
 
     #[test]
@@ -13740,7 +13938,7 @@ mod tests {
             1,
             "{lines}"
         );
-        assert!(!lines.contains("cancelled"), "{lines}");
+        assert!(!lines.contains("interrupted"), "{lines}");
     }
 
     #[test]
@@ -13809,7 +14007,7 @@ mod tests {
     }
 
     #[test]
-    fn a_cancelled_turn_keeps_what_streamed_and_says_it_was_cancelled() {
+    fn a_cancelled_turn_keeps_what_streamed_and_says_it_was_interrupted() {
         // The reader watched the partial answer arrive, so a transcript that
         // dropped it would disagree with the screen they just saw.
         let host = test_host();
@@ -13819,7 +14017,7 @@ mod tests {
         let lines =
             report_failed_turn(&rune_agent::steering::cancelled_error(), &host, None).join("\n");
         assert!(lines.contains("half an answer"), "{lines}");
-        assert!(lines.contains("cancelled"), "{lines}");
+        assert!(lines.contains("[interrupted]"), "{lines}");
         assert!(
             !lines.contains("failed"),
             "a cancel is not a failure: {lines}"
@@ -17807,7 +18005,15 @@ mod tests {
                 &limits,
             ));
             assert!(matches!(
-                idle_key(&commands, key, &mut reader, &mut selected, &rows, &[]),
+                idle_key(
+                    &commands,
+                    key,
+                    &mut reader,
+                    &mut selected,
+                    &rows,
+                    &[],
+                    &mut IdleGestures::default()
+                ),
                 Idle::Stay
             ));
             assert_eq!(reader.line(), "/audit-command");
@@ -17827,6 +18033,7 @@ mod tests {
                 &mut selected,
                 &rows,
                 &[],
+                &mut IdleGestures::default(),
             ) else {
                 panic!("a complete custom command must submit");
             };
@@ -17928,7 +18135,8 @@ mod tests {
                             &mut reader,
                             &mut selected,
                             &rows,
-                            &[]
+                            &[],
+                            &mut IdleGestures::default()
                         ),
                         Idle::Stay
                     ));
@@ -17950,7 +18158,8 @@ mod tests {
                         &mut reader,
                         &mut selected,
                         &rows,
-                        &[]
+                        &[],
+                        &mut IdleGestures::default()
                     ),
                     Idle::Stay
                 ));
@@ -17971,7 +18180,8 @@ mod tests {
                         &mut reader,
                         &mut selected,
                         &rows,
-                        &[]
+                        &[],
+                        &mut IdleGestures::default()
                     ),
                     Idle::Stay
                 ));
@@ -20948,6 +21158,8 @@ mod tests {
             cancellation: questions.cancellation.clone(),
             steering: SteeringQueue::new(4),
             queued: Mutex::new(std::collections::VecDeque::new()),
+            cleared: Mutex::new(std::collections::VecDeque::new()),
+            escape_armed: Mutex::new(None),
             pending_steer: Mutex::new(Vec::new()),
             events: Arc::new(Mutex::new(Vec::new())),
             goal_judge: std::sync::atomic::AtomicBool::new(false),

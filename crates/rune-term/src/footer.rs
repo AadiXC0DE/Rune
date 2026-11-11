@@ -170,6 +170,9 @@ pub struct FooterState {
     /// Hints after the running set, lowest priority last; each is shown only
     /// when it fits whole.
     pub running_hints: Vec<&'static str>,
+    /// A key gesture waiting for its second press, shown in place of the
+    /// state's hints.
+    pub gesture_hint: Option<&'static str>,
     /// Fields shown, highest priority first; `None` shows every field in the
     /// default order.
     pub fields: Option<Vec<StatusField>>,
@@ -346,8 +349,9 @@ fn too_small_row(state: &FooterState, layout: &Layout, theme: &Theme, depth: Col
 
 /// Returns the hint row.
 fn hint_row(state: &FooterState, theme: &Theme, depth: ColorDepth, width: usize) -> String {
-    let mut text = hints(state.ui).to_owned();
+    let mut text = state.gesture_hint.unwrap_or(hints(state.ui)).to_owned();
     let extra: &[&str] = match state.ui {
+        _ if state.gesture_hint.is_some() => &[],
         UiState::Idle => &state.idle_hints,
         UiState::Running => &state.running_hints,
         UiState::Menu | UiState::Approval => &[],
@@ -1038,6 +1042,15 @@ mod tests {
         assert_eq!(hint_of(&state, 100), "ctrl-c interrupt   enter steer");
         state.ui = UiState::Idle;
         assert_eq!(hint_of(&state, 12), "/ commands");
+    }
+
+    #[test]
+    fn a_gesture_hint_replaces_the_state_hints() {
+        let mut state = full();
+        state.ui = UiState::Running;
+        state.running_hints = vec!["tab queue"];
+        state.gesture_hint = Some("esc again to interrupt");
+        assert_eq!(hint_of(&state, 100), "esc again to interrupt");
     }
 
     #[test]

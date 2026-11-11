@@ -250,7 +250,7 @@ with tempfile.TemporaryDirectory(prefix="rune-r070-") as directory:
         terminal.send("yes")
         terminal.wait_for("Answer: enter an option number", start)
         terminal.send("/cancel")
-        terminal.wait_for("Notice: cancelled", start)
+        terminal.wait_for("Notice: interrupted", start)
 
         start = len(terminal.output)
         terminal.send("fail")

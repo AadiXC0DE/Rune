@@ -153,7 +153,7 @@ with tempfile.TemporaryDirectory(prefix="rune-r024-") as directory:
         assert answers.count(partial) == 1, answers
         for line in partial.splitlines():
             assert sum(answer.count(line) for answer in answers) == 1, answers
-        assert all("STREAM-04" not in answer and "[cancelled]" not in answer
+        assert all("STREAM-04" not in answer and "[interrupted]" not in answer
                    for answer in answers), answers
 
     try:
@@ -165,7 +165,7 @@ with tempfile.TemporaryDirectory(prefix="rune-r024-") as directory:
         # While the turn runs, the hint row names the keys that act on it.
         wait_for("ctrl-c interrupt   enter steer", start)
         os.write(master, b"\x03")
-        wait_for("[cancelled]", start)
+        wait_for("[interrupted]", start)
         wait_for("/ commands", start)
         release_stream.set()
         log, events = saved_events()
