@@ -678,7 +678,7 @@ fn run_interactive(
     config.accessible = launch.accessible;
     let stdin = std::io::stdin();
     let input = std::io::BufReader::new(stdin.lock());
-    let code = session::run(config, input, std::io::stdout())?;
+    let code = session::run(config, input, rune_term::inline::TerminalOutput)?;
     Ok(ExitCode::from(code))
 }
 
