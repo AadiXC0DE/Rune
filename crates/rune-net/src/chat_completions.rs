@@ -9,7 +9,7 @@ use rune_core::error::{Result, RuneError};
 use rune_core::id::ToolCallId;
 
 use crate::compat::{
-    CacheMarkers, EmptyContent, Family, ReasoningReplay, ThinkingFormat, shape_call_id,
+    CacheMarkers, EmptyContent, Family, ReasoningReplay, SchemaRules, ThinkingFormat, shape_call_id,
 };
 use crate::message::{ContentPart, Message, Role};
 use crate::provider::{MarkerPolicy, Provider, RequestPlan};
@@ -170,15 +170,7 @@ impl Provider for ChatCompletions {
             body.insert("tools".to_owned(), serde_json::json!([]));
         }
 
-        if compat.thinking_format == ThinkingFormat::DeepSeek {
-            insert_deepseek_thinking(&mut body, plan.effort);
-        } else if compat.thinking_format != ThinkingFormat::None
-            && let Some(effort) = effort_wire(plan.effort)
-        {
-            // The other thinking formats ask for reasoning the way most
-            // compatible servers understand until they have their own fields.
-            body.insert("reasoning_effort".to_owned(), serde_json::json!(effort));
-        }
+        insert_thinking(&mut body, plan);
         let sampling = plan.sampling;
         if let Some(temperature) = sampling.temperature {
             body.insert("temperature".to_owned(), serde_json::json!(temperature));
@@ -445,11 +437,15 @@ fn encode_reasoning(
     }
     let stored = reasoning_of(message).unwrap_or_default();
     let observed = stored.field.as_deref();
-    let details = match compat.reasoning_replay {
-        ReasoningReplay::ReasoningDetails => true,
-        ReasoningReplay::AsObserved => observed == Some("reasoning_details"),
-        _ => false,
-    };
+    let merged = plan.traits.family == Family::Kimi
+        && compat.reasoning_replay != ReasoningReplay::ReasoningDetails
+        && !stored.details.is_empty();
+    let details = !merged
+        && match compat.reasoning_replay {
+            ReasoningReplay::ReasoningDetails => true,
+            ReasoningReplay::AsObserved => observed == Some("reasoning_details"),
+            _ => false,
+        };
     let text_field = match compat.reasoning_replay {
         ReasoningReplay::ReasoningContent => "reasoning_content",
         ReasoningReplay::AsObserved if !details => REASONING_FIELDS
@@ -458,6 +454,12 @@ fn encode_reasoning(
             .unwrap_or("reasoning_content"),
         _ => "reasoning",
     };
+    if merged {
+        value.insert(
+            "reasoning_details".to_owned(),
+            serde_json::Value::Array(merge_details(&stored.details)),
+        );
+    }
     if details && !stored.details.is_empty() {
         value.insert(
             "reasoning_details".to_owned(),
@@ -472,6 +474,50 @@ fn encode_reasoning(
     if compat.reasoning_always && plan.has_tools() && !value.contains_key(text_field) {
         value.insert(text_field.to_owned(), serde_json::json!(stored.text));
     }
+}
+
+/// Joins streamed `reasoning_details` fragments into whole entries.
+///
+/// Entries sharing an `index` form one entry at the place of the first: its
+/// `summary`, `text` and `data` strings are joined in arrival order and its
+/// other fields come from the first fragment. An entry with no `index` stands
+/// alone. The `index` key is not kept.
+fn merge_details(details: &[serde_json::Value]) -> Vec<serde_json::Value> {
+    let mut merged: Vec<serde_json::Value> = Vec::new();
+    let mut groups: Vec<(serde_json::Value, usize)> = Vec::new();
+    for entry in details {
+        let Some(fields) = entry.as_object() else {
+            merged.push(entry.clone());
+            continue;
+        };
+        let mut fields = fields.clone();
+        let index = fields.remove("index").filter(|index| !index.is_null());
+        let group = index.as_ref().and_then(|index| {
+            groups
+                .iter()
+                .find(|(known, _)| known == index)
+                .map(|(_, position)| *position)
+        });
+        let target = group.and_then(|position| merged.get_mut(position));
+        let Some(target) = target.and_then(serde_json::Value::as_object_mut) else {
+            if let Some(index) = index {
+                groups.push((index, merged.len()));
+            }
+            merged.push(serde_json::Value::Object(fields));
+            continue;
+        };
+        for key in ["summary", "text", "data"] {
+            let Some(addition) = fields.get(key).and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            let joined = match target.get(key).and_then(serde_json::Value::as_str) {
+                Some(existing) => format!("{existing}{addition}"),
+                None => addition.to_owned(),
+            };
+            target.insert(key.to_owned(), serde_json::json!(joined));
+        }
+    }
+    merged
 }
 
 /// Encodes one tool result message.
@@ -538,6 +584,99 @@ pub fn effort_wire(effort: Effort) -> Option<&'static str> {
         Effort::High => Some("high"),
         Effort::Xhigh => Some("xhigh"),
         Effort::Max => Some("max"),
+    }
+}
+
+/// Writes the reasoning controls of the endpoint's thinking format.
+fn insert_thinking(body: &mut serde_json::Map<String, serde_json::Value>, plan: &RequestPlan) {
+    let compat = &plan.compat;
+    let effort = plan.effort;
+    let id = plan.model.to_ascii_lowercase();
+    match compat.thinking_format {
+        ThinkingFormat::None => {}
+        ThinkingFormat::DeepSeek => insert_deepseek_thinking(body, effort),
+        ThinkingFormat::ReasoningEffort
+            if plan.traits.family == Family::Kimi
+                && compat.schema_rules == SchemaRules::Moonshot =>
+        {
+            insert_kimi_thinking(body, effort, &id);
+        }
+        ThinkingFormat::ReasoningEffort => {
+            if let Some(level) = effort_wire(effort) {
+                body.insert("reasoning_effort".to_owned(), serde_json::json!(level));
+            }
+        }
+        ThinkingFormat::OpenRouter => {
+            if let Some(level) = effort_wire(effort) {
+                body.insert(
+                    "reasoning".to_owned(),
+                    serde_json::json!({ "effort": level }),
+                );
+            }
+        }
+        ThinkingFormat::Zai => {
+            // GLM-5.3 cannot turn thinking off, so it stays enabled there.
+            let thinking = if effort == Effort::None && !id.contains("glm-5.3") {
+                serde_json::json!({ "type": "disabled" })
+            } else {
+                serde_json::json!({ "type": "enabled", "clear_thinking": false })
+            };
+            body.insert("thinking".to_owned(), thinking);
+        }
+        ThinkingFormat::MiniMax => {
+            body.insert("reasoning_split".to_owned(), serde_json::json!(true));
+            let level = match effort {
+                Effort::Auto | Effort::None => None,
+                Effort::Minimal => Some("low"),
+                other => effort_wire(other),
+            };
+            if let Some(level) = level.filter(|_| id.contains("m3.1-flash")) {
+                body.insert("reasoning_effort".to_owned(), serde_json::json!(level));
+            }
+        }
+        ThinkingFormat::QwenEnable => {
+            if effort != Effort::Auto {
+                body.insert(
+                    "enable_thinking".to_owned(),
+                    serde_json::json!(effort != Effort::None),
+                );
+            }
+        }
+        ThinkingFormat::ChatTemplate => {
+            if effort != Effort::Auto {
+                body.insert(
+                    "chat_template_kwargs".to_owned(),
+                    serde_json::json!({ "enable_thinking": effort != Effort::None }),
+                );
+            }
+        }
+    }
+}
+
+/// Writes Kimi's controls: `reasoning_effort` in three levels, except the
+/// K2 models, of which only K2.6 can switch thinking off.
+fn insert_kimi_thinking(
+    body: &mut serde_json::Map<String, serde_json::Value>,
+    effort: Effort,
+    id: &str,
+) {
+    let level = match effort {
+        Effort::Auto => return,
+        Effort::None => {
+            if id.contains("k2.6") {
+                body.insert(
+                    "thinking".to_owned(),
+                    serde_json::json!({ "type": "disabled" }),
+                );
+            }
+            return;
+        }
+        Effort::Minimal | Effort::Low => "low",
+        Effort::Medium | Effort::High | Effort::Xhigh => "high",
+        Effort::Max => "max",
+    };
+    if !id.contains("k2.6") && !id.contains("k2.7") {
+        body.insert("reasoning_effort".to_owned(), serde_json::json!(level));
     }
 }
 
@@ -2607,6 +2746,188 @@ mod tests {
                 "{effort}"
             );
         }
+    }
+
+    /// The request body for a model on a resolved provider at an effort.
+    fn thinking_body(
+        provider: &str,
+        base: Option<&str>,
+        model: &str,
+        effort: Effort,
+    ) -> serde_json::Value {
+        let mut plan = default_body_plan();
+        (plan.compat, plan.traits) = crate::compat::resolve(provider, base, model);
+        plan.model = model.to_owned();
+        plan.effort = effort;
+        ChatCompletions.build_request(&plan).expect("build")
+    }
+
+    const ABOVE_NONE: [Effort; 6] = [
+        Effort::Minimal,
+        Effort::Low,
+        Effort::Medium,
+        Effort::High,
+        Effort::Xhigh,
+        Effort::Max,
+    ];
+
+    #[test]
+    fn glm_keeps_its_thinking_across_turns() {
+        let kept = serde_json::json!({ "type": "enabled", "clear_thinking": false });
+        for effort in [Effort::Auto].into_iter().chain(ABOVE_NONE) {
+            let body = thinking_body("zai", None, "glm-5", effort);
+            assert_eq!(body["thinking"], kept, "{effort}");
+            assert!(body.get("reasoning_effort").is_none(), "{effort}");
+        }
+        let off = thinking_body("zai", None, "glm-5", Effort::None);
+        assert_eq!(off["thinking"], serde_json::json!({ "type": "disabled" }));
+    }
+
+    #[test]
+    fn glm_5_3_cannot_turn_thinking_off() {
+        let kept = serde_json::json!({ "type": "enabled", "clear_thinking": false });
+        for model in ["glm-5.3", "GLM-5.3-Flash"] {
+            let body = thinking_body("zai", None, model, Effort::None);
+            assert_eq!(body["thinking"], kept, "{model}");
+        }
+    }
+
+    #[test]
+    fn openrouter_effort_uses_the_reasoning_object() {
+        let model = "deepseek/deepseek-flash";
+        for (effort, level) in [
+            (Effort::None, "none"),
+            (Effort::Minimal, "minimal"),
+            (Effort::Low, "low"),
+            (Effort::Medium, "medium"),
+            (Effort::High, "high"),
+            (Effort::Xhigh, "xhigh"),
+            (Effort::Max, "max"),
+        ] {
+            let body = thinking_body("openrouter", None, model, effort);
+            assert_eq!(
+                body["reasoning"],
+                serde_json::json!({ "effort": level }),
+                "{effort}"
+            );
+            assert!(body.get("reasoning_effort").is_none(), "{effort}");
+            assert!(body.get("usage").is_none(), "{effort}");
+        }
+        let auto = thinking_body("openrouter", None, model, Effort::Auto);
+        assert!(auto.get("reasoning").is_none(), "{auto}");
+    }
+
+    #[test]
+    fn minimax_asks_for_split_reasoning() {
+        for (model, effort, level) in [
+            ("MiniMax-M3", Effort::Auto, None),
+            ("MiniMax-M3", Effort::None, None),
+            ("MiniMax-M3", Effort::High, None),
+            ("MiniMax-M3.1-Flash", Effort::Auto, None),
+            ("MiniMax-M3.1-Flash", Effort::None, None),
+            ("MiniMax-M3.1-Flash", Effort::Minimal, Some("low")),
+            ("MiniMax-M3.1-Flash", Effort::Low, Some("low")),
+            ("MiniMax-M3.1-Flash", Effort::Medium, Some("medium")),
+            ("MiniMax-M3.1-Flash", Effort::High, Some("high")),
+            ("MiniMax-M3.1-Flash", Effort::Xhigh, Some("xhigh")),
+            ("MiniMax-M3.1-Flash", Effort::Max, Some("max")),
+        ] {
+            let body = thinking_body("minimax", None, model, effort);
+            assert_eq!(body["reasoning_split"], true, "{model} {effort}");
+            assert_eq!(
+                body.get("reasoning_effort")
+                    .and_then(serde_json::Value::as_str),
+                level,
+                "{model} {effort}"
+            );
+            assert!(body.get("thinking").is_none(), "{model} {effort}");
+        }
+    }
+
+    #[test]
+    fn qwen_on_dashscope_enables_thinking() {
+        let base = Some("https://dashscope.aliyuncs.com/compatible-mode/v1");
+        let body = |effort| thinking_body("chat_completions", base, "qwen3-coder", effort);
+        assert!(body(Effort::Auto).get("enable_thinking").is_none());
+        assert_eq!(body(Effort::None)["enable_thinking"], false);
+        for effort in ABOVE_NONE {
+            assert_eq!(body(effort)["enable_thinking"], true, "{effort}");
+            assert!(body(effort).get("reasoning_effort").is_none(), "{effort}");
+        }
+    }
+
+    #[test]
+    fn a_chat_template_server_enables_thinking() {
+        let body = |effort| thinking_body("llamacpp", None, "qwen3-coder", effort);
+        assert!(body(Effort::Auto).get("chat_template_kwargs").is_none());
+        assert_eq!(
+            body(Effort::None)["chat_template_kwargs"],
+            serde_json::json!({ "enable_thinking": false })
+        );
+        for effort in ABOVE_NONE {
+            assert_eq!(
+                body(effort)["chat_template_kwargs"],
+                serde_json::json!({ "enable_thinking": true }),
+                "{effort}"
+            );
+            assert!(body(effort).get("reasoning_effort").is_none(), "{effort}");
+        }
+    }
+
+    #[test]
+    fn kimi_effort_uses_three_levels() {
+        let disabled = serde_json::json!({ "type": "disabled" });
+        for (model, effort, level, thinking) in [
+            ("kimi-k3", Effort::Auto, None, None),
+            ("kimi-k3", Effort::None, None, None),
+            ("kimi-k3", Effort::Minimal, Some("low"), None),
+            ("kimi-k3", Effort::Low, Some("low"), None),
+            ("kimi-k3", Effort::Medium, Some("high"), None),
+            ("kimi-k3", Effort::High, Some("high"), None),
+            ("kimi-k3", Effort::Xhigh, Some("high"), None),
+            ("kimi-k3.1-pro", Effort::Max, Some("max"), None),
+            ("kimi-k2.6", Effort::None, None, Some(disabled.clone())),
+            ("kimi-k2.6", Effort::High, None, None),
+            ("kimi-k2.7-code", Effort::None, None, None),
+            ("kimi-k2.7-code", Effort::Max, None, None),
+        ] {
+            let body = thinking_body("moonshot", None, model, effort);
+            assert_eq!(
+                body.get("reasoning_effort")
+                    .and_then(serde_json::Value::as_str),
+                level,
+                "{model} {effort}"
+            );
+            assert_eq!(body.get("thinking").cloned(), thinking, "{model} {effort}");
+        }
+    }
+
+    #[test]
+    fn a_kimi_model_on_an_unknown_endpoint_keeps_the_passthrough() {
+        let base = Some("https://gateway.example/v1");
+        let body = thinking_body("chat_completions", base, "kimi-k3", Effort::Medium);
+        assert_eq!(body["reasoning_effort"], "medium", "{body}");
+    }
+
+    #[test]
+    fn kimi_details_merge_by_index() {
+        let merged = merge_details(&[
+            serde_json::json!({ "type": "reasoning.summary", "summary": "Read ", "id": "a", "index": 0 }),
+            serde_json::json!({ "type": "reasoning.encrypted", "data": "x" }),
+            serde_json::json!({ "type": "reasoning.summary", "summary": "first", "id": "b", "index": 0 }),
+            serde_json::json!({ "type": "reasoning.text", "text": "one", "index": 1 }),
+            serde_json::json!({ "type": "reasoning.encrypted", "data": "y" }),
+            serde_json::json!({ "type": "reasoning.text", "text": " two", "index": 1 }),
+        ]);
+        assert_eq!(
+            merged,
+            vec![
+                serde_json::json!({ "type": "reasoning.summary", "summary": "Read first", "id": "a" }),
+                serde_json::json!({ "type": "reasoning.encrypted", "data": "x" }),
+                serde_json::json!({ "type": "reasoning.text", "text": "one two" }),
+                serde_json::json!({ "type": "reasoning.encrypted", "data": "y" }),
+            ]
+        );
     }
 
     #[test]

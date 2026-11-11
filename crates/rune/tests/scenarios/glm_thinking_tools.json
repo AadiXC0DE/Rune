@@ -1,0 +1,67 @@
+{
+  "prompt": "Set max_items to 10 in config/limits.conf.",
+  "workspace": "workspaces/fix_one_file.json",
+  "provider": "zai",
+  "turns": [
+    {
+      "reasoning": "look first",
+      "tool_calls": [
+        {
+          "id": "call_1",
+          "name": "read_file",
+          "arguments": {
+            "path": "config/limits.conf"
+          }
+        }
+      ]
+    },
+    {
+      "reasoning": "now fix",
+      "tool_calls": [
+        {
+          "id": "call_2",
+          "name": "edit_file",
+          "arguments": {
+            "path": "config/limits.conf",
+            "old_string": "max_items = 5",
+            "new_string": "max_items = 10"
+          }
+        }
+      ]
+    },
+    {
+      "text": "Set max_items to 10."
+    },
+    {
+      "text": "done"
+    }
+  ],
+  "expect": {
+    "files": {
+      "config/limits.conf": "max_items = 10\n"
+    },
+    "exit_code": 0,
+    "request_fields": [
+      {
+        "request": 1,
+        "pointer": "/thinking/type",
+        "equals": "enabled"
+      },
+      {
+        "request": 1,
+        "pointer": "/thinking/clear_thinking",
+        "equals": false
+      },
+      {
+        "request": 2,
+        "pointer": "/messages/2/reasoning_content",
+        "equals": "look first"
+      },
+      {
+        "request": 3,
+        "pointer": "/messages/4/reasoning_content",
+        "equals": "now fix"
+      }
+    ]
+  }
+}

@@ -270,3 +270,110 @@ fn a_deepseek_tool_exchange_sends_reasoning_back_on_every_assistant_turn() {
     );
     assert!(body.get("thinking").is_none(), "{body}");
 }
+
+/// Builds the request after a recorded step for a model on a preset.
+fn second_request(outcome: &StreamOutcome, preset: &str, model: &str, call: &str) -> Value {
+    let call = ToolCallId::new(call).expect("id");
+    let mut assistant = Message::assistant(vec![
+        ContentPart::Reasoning {
+            text: outcome.reasoning(),
+        },
+        ContentPart::ToolCall {
+            id: call.clone(),
+            name: "read_file".to_owned(),
+            arguments: "{\"path\":\"a.txt\"}".to_owned(),
+        },
+    ]);
+    assistant.replay.clone_from(&outcome.replay);
+    let (compat, traits) = rune_net::compat::resolve(preset, None, model);
+    let mut plan = RequestPlan::new(model);
+    plan.compat = compat;
+    plan.traits = traits;
+    "be helpful".clone_into(&mut plan.instructions);
+    plan.tools = vec![ToolSpec {
+        name: "read_file".to_owned(),
+        description: "Read a file".to_owned(),
+        input_schema: serde_json::json!({ "type": "object" }),
+    }];
+    plan.messages = vec![
+        Message::user("read a.txt"),
+        assistant,
+        Message {
+            role: Role::Tool,
+            parts: vec![ContentPart::ToolResult {
+                id: call,
+                name: "read_file".to_owned(),
+                content: "hello".to_owned(),
+                is_error: false,
+            }],
+            replay: None,
+            origin: None,
+        },
+    ];
+    ChatCompletions.build_request(&plan).expect("build")
+}
+
+#[test]
+fn kimi_replays_reasoning_content_and_merged_details() {
+    let recorded = include_str!("fixtures/chat_completions/kimi_two_step/response-1.txt");
+    let outcome = stream(recorded);
+    let reasoning = "Read the file before answering.";
+    assert_eq!(outcome.reasoning(), reasoning);
+    let body = second_request(&outcome, "moonshot", "kimi-k3", "read_file:0");
+    let message = &body["messages"][2];
+    assert_eq!(message["reasoning_content"], reasoning, "{body}");
+    assert_eq!(
+        message["reasoning_details"],
+        serde_json::json!([{
+            "type": "reasoning.summary",
+            "summary": reasoning,
+            "format": "kimi-v1",
+        }]),
+        "{body}"
+    );
+    assert_eq!(reasoning_fields(message).len(), 2, "{body}");
+}
+
+#[test]
+fn glm_replays_reasoning_exactly_as_generated() {
+    let recorded = include_str!("fixtures/chat_completions/glm_two_step/response-1.txt");
+    let reasoning = "The user wants a.txt. Read\nit.";
+    let body = second_request(&stream(recorded), "zai", "glm-5", "call_glm_1");
+    assert_eq!(
+        reasoning_fields(&body["messages"][2]),
+        vec![("reasoning_content", &serde_json::json!(reasoning))],
+        "{body}"
+    );
+    assert_eq!(
+        body["thinking"],
+        serde_json::json!({ "type": "enabled", "clear_thinking": false }),
+        "{body}"
+    );
+}
+
+#[test]
+fn minimax_replays_split_reasoning_in_reasoning_content() {
+    let recorded = include_str!("fixtures/chat_completions/minimax_two_step/response-1.txt");
+    let reasoning = "Open a.txt and report it.";
+    let body = second_request(&stream(recorded), "minimax", "MiniMax-M3", "call_mm_1");
+    assert_eq!(
+        reasoning_fields(&body["messages"][2]),
+        vec![("reasoning_content", &serde_json::json!(reasoning))],
+        "{body}"
+    );
+    assert_eq!(body["reasoning_split"], true, "{body}");
+}
+
+#[test]
+fn openrouter_replays_details_unchanged() {
+    let recorded = include_str!("fixtures/chat_completions/openrouter_two_step/response-1.txt");
+    let expected = Value::Array(recorded_details(recorded));
+    assert_eq!(expected.as_array().map(Vec::len), Some(1));
+    let body = second_request(&stream(recorded), "openrouter", "openai/gpt-5", "call_or_1");
+    assert_eq!(
+        reasoning_fields(&body["messages"][2]),
+        vec![("reasoning_details", &expected)],
+        "{body}"
+    );
+    assert_eq!(expected[0]["index"], 0, "{body}");
+}

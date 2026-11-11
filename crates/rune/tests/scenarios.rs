@@ -41,6 +41,8 @@ const SCENARIOS: &[&str] = &[
     "question_nudge",
     "question_nudge_off",
     "deepseek_thinking_tools",
+    "kimi_thinking_tools",
+    "glm_thinking_tools",
     "stall_same_failure",
     "stall_same_file",
     "checkpoint_same_prefix",
@@ -77,6 +79,16 @@ fn fix_one_file() {
 #[test]
 fn deepseek_thinking_tools() {
     run_scenario("deepseek_thinking_tools");
+}
+
+#[test]
+fn kimi_thinking_tools() {
+    run_scenario("kimi_thinking_tools");
+}
+
+#[test]
+fn glm_thinking_tools() {
+    run_scenario("glm_thinking_tools");
 }
 
 #[test]
