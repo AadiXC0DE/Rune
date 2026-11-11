@@ -235,7 +235,5 @@ fn import_validates_usage_and_help_explains_the_format() {
     }
     let help = workspace.run(&["mcp", "--help"]);
     assert!(help.status.success(), "{help:?}");
-    assert!(
-        String::from_utf8_lossy(&help.stdout).contains("rune mcp import claude-desktop <file>")
-    );
+    assert!(String::from_utf8_lossy(&help.stdout).contains("| import claude-desktop <file>"));
 }
