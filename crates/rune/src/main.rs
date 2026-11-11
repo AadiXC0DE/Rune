@@ -1949,6 +1949,13 @@ fn run_prompt(settings: &Settings, launch: &Launch, output: &OutputFlags) -> Res
             &rune_context::prompt::PromptOptions {
                 variant: settings.experiments.prompt,
                 tools: &session::tool_names(&tools),
+                overlay: Some(
+                    provider_setup::CompatSource::from_settings(settings)
+                        .resolve(&settings.model)
+                        .1
+                        .prompt_overlay,
+                ),
+                overlay_switch: settings.experiments.overlay,
             },
         );
         print!("{text}");

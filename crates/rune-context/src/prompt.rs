@@ -9,7 +9,7 @@ use std::fmt::Write as _;
 use camino::Utf8Path;
 use rune_core::budget::{BudgetSet, LimitName};
 use rune_core::error::Result;
-use rune_core::experiment::PromptVariant;
+use rune_core::experiment::{OverlaySwitch, PromptVariant};
 
 use crate::catalog::{CatalogOutput, render_catalog_within};
 use crate::instructions::{InstructionFile, render as render_instructions};
@@ -22,6 +22,8 @@ pub enum Section {
     System,
     /// Guidance about how to use the tools.
     ToolGuidance,
+    /// Notes for the model's family.
+    ModelNotes,
     /// Names and descriptions of available skills.
     SkillCatalog,
     /// Operator instructions supplied by the host.
@@ -37,6 +39,7 @@ impl Section {
         match self {
             Self::System => "system",
             Self::ToolGuidance => "tool_guidance",
+            Self::ModelNotes => "model_notes",
             Self::SkillCatalog => "skill_catalog",
             Self::HostInstructions => "host_instructions",
             Self::ProjectContext => "project_context",
@@ -108,6 +111,8 @@ pub struct Inputs<'a> {
     pub system: &'a str,
     /// Guidance about the tools, when the host supplies any.
     pub tool_guidance: Option<&'a str>,
+    /// Notes for the model's family.
+    pub model_notes: Option<&'a str>,
     /// Discovered skills.
     pub skills: &'a [Skill],
     /// Instructions supplied by the host.
@@ -118,8 +123,8 @@ pub struct Inputs<'a> {
 
 /// Assembles the prompt.
 ///
-/// The order is fixed: system, tool guidance, skill catalog, host instructions,
-/// then project context. Each section is bounded, and a section that had to be
+/// The order is fixed: system, tool guidance, model notes, skill catalog, host
+/// instructions, then project context. Each section is bounded, and a section that had to be
 /// shortened records an omission so the runtime knows content was dropped rather
 /// than silently losing it.
 pub fn assemble(inputs: &Inputs<'_>, limits: &BudgetSet) -> Result<Prompt> {
@@ -140,6 +145,14 @@ pub fn assemble(inputs: &Inputs<'_>, limits: &BudgetSet) -> Result<Prompt> {
             &mut included,
             Section::ToolGuidance,
             guidance.trim(),
+        );
+    }
+    if let Some(notes) = inputs.model_notes.filter(|text| !text.trim().is_empty()) {
+        push_section(
+            &mut instructions,
+            &mut included,
+            Section::ModelNotes,
+            notes.trim(),
         );
     }
     let stable_len = instructions.len();
@@ -422,6 +435,66 @@ pub fn tool_guidance(offered: &[&str], variant: PromptVariant) -> Option<String>
     Some(text)
 }
 
+/// Ids whose overlay is sent by default. Empty until an A/B adopts one.
+pub const ADOPTED_OVERLAYS: &[&str] = &[];
+
+const OVERLAY_HEADER: &str = "Notes for this model:";
+const GPT_PERSIST: &str = "Keep working until the task is fully done. Do not stop to ask when \
+a reasonable choice exists; make it, say which, and continue.";
+const GPT_PATCH: &str = "To change files, send one apply_patch call per logical change with \
+the patch as its input; do not print the patch as text.";
+const GPT_FINAL: &str =
+    "Keep the final message short: what changed, the check and its result, what remains.";
+const CLAUDE_NOTES: &[&str] = &[
+    "Make independent tool calls in parallel in one step.",
+    "Do not add comments, abstractions, helper files or tests the task did not ask for.",
+];
+const GEMINI_NOTES: &[&str] = &[
+    "Use paths exactly as the tools return them, absolute or relative to the workspace.",
+    "Do not restate file contents in your replies; refer to the path and line instead.",
+];
+const OPEN_WEIGHT_NOTES: &[&str] = &[
+    "Call tools through the tool interface. Never write a tool call as text in your reply.",
+    "Tool arguments are one JSON object with the documented fields.",
+    "Make one logical change per edit call.",
+];
+
+/// Returns the notes for a model family's overlay id, given the offered tool
+/// names; `None` for an unknown id.
+#[must_use]
+pub fn overlay_text(id: &str, offered: &[&str]) -> Option<String> {
+    let lines: Vec<&str> = match id {
+        "gpt" => {
+            let mut lines = vec![GPT_PERSIST];
+            if offered.contains(&"apply_patch") {
+                lines.push(GPT_PATCH);
+            }
+            lines.push(GPT_FINAL);
+            lines
+        }
+        "claude" => CLAUDE_NOTES.to_vec(),
+        "gemini" => GEMINI_NOTES.to_vec(),
+        "open_weight" => OPEN_WEIGHT_NOTES.to_vec(),
+        _ => return None,
+    };
+    let mut text = OVERLAY_HEADER.to_owned();
+    for line in lines {
+        text.push_str("\n- ");
+        text.push_str(line);
+    }
+    Some(text)
+}
+
+/// Returns whether an overlay id is sent under a switch.
+#[must_use]
+pub fn overlay_active(id: &str, switch: OverlaySwitch) -> bool {
+    match switch {
+        OverlaySwitch::On => true,
+        OverlaySwitch::Off => false,
+        OverlaySwitch::Default => ADOPTED_OVERLAYS.contains(&id),
+    }
+}
+
 /// What a host chooses about the prompt it sends.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct PromptOptions<'a> {
@@ -429,6 +502,10 @@ pub struct PromptOptions<'a> {
     pub variant: PromptVariant,
     /// Names of the tools advertised with the request.
     pub tools: &'a [&'a str],
+    /// The overlay id of the model's family.
+    pub overlay: Option<&'a str>,
+    /// Which overlay ids are sent.
+    pub overlay_switch: OverlaySwitch,
 }
 
 /// Builds the system instructions for a workspace.
@@ -592,11 +669,16 @@ fn instructions_under(
         .as_deref()
         .unwrap_or_else(|| system_prompt(options.variant));
     let guidance = tool_guidance(options.tools, options.variant);
+    let notes = options
+        .overlay
+        .filter(|id| overlay_active(id, options.overlay_switch))
+        .and_then(|id| overlay_text(id, options.tools));
     let environment = environment(workspace);
 
     let inputs = Inputs {
         system,
         tool_guidance: guidance.as_deref(),
+        model_notes: notes.as_deref(),
         skills: &skills,
         host_instructions: environment.as_deref(),
         project: &project,
@@ -881,6 +963,7 @@ mod tests {
         let inputs = Inputs {
             system: SYSTEM_PROMPT,
             tool_guidance: Some("use the smallest suitable tool"),
+            model_notes: Some("family notes"),
             skills: &skills,
             host_instructions: Some("host rules"),
             project: &project,
@@ -892,6 +975,7 @@ mod tests {
             vec![
                 Section::System,
                 Section::ToolGuidance,
+                Section::ModelNotes,
                 Section::SkillCatalog,
                 Section::HostInstructions,
                 Section::ProjectContext,
@@ -904,6 +988,7 @@ mod tests {
             .instructions
             .find("smallest suitable")
             .expect("guidance");
+        let notes_at = prompt.instructions.find("family notes").expect("notes");
         let catalog_at = prompt.instructions.find("one").expect("catalog");
         let host_at = prompt.instructions.find("host rules").expect("host");
         let project_at = prompt
@@ -911,7 +996,8 @@ mod tests {
             .find("workspace rules")
             .expect("project");
         assert!(system_at < guidance_at);
-        assert!(guidance_at < catalog_at);
+        assert!(guidance_at < notes_at);
+        assert!(notes_at < catalog_at);
         assert!(catalog_at < host_at);
         assert!(host_at < project_at);
     }
@@ -1055,6 +1141,7 @@ mod tests {
         let all = [
             Section::System,
             Section::ToolGuidance,
+            Section::ModelNotes,
             Section::SkillCatalog,
             Section::HostInstructions,
             Section::ProjectContext,
@@ -1428,7 +1515,136 @@ mod tests {
     }
 
     fn options(variant: PromptVariant, tools: &'static [&'static str]) -> PromptOptions<'static> {
-        PromptOptions { variant, tools }
+        PromptOptions {
+            variant,
+            tools,
+            ..PromptOptions::default()
+        }
+    }
+
+    fn with_overlay(
+        variant: PromptVariant,
+        tools: &'static [&'static str],
+        id: &'static str,
+        switch: OverlaySwitch,
+    ) -> PromptOptions<'static> {
+        PromptOptions {
+            overlay: Some(id),
+            overlay_switch: switch,
+            ..options(variant, tools)
+        }
+    }
+
+    const OVERLAY_IDS: [&str; 4] = ["gpt", "claude", "gemini", "open_weight"];
+
+    #[test]
+    fn every_overlay_is_at_most_600_bytes() {
+        let every: Vec<&str> = DEFAULT_TOOLS.iter().chain(PATCH_TOOLS).copied().collect();
+        let sizes: Vec<usize> = OVERLAY_IDS
+            .iter()
+            .map(|id| overlay_text(id, &every).expect("overlay").len())
+            .collect();
+        assert_eq!(sizes, [363, 161, 190, 215]);
+        for (id, size) in OVERLAY_IDS.iter().zip(&sizes) {
+            assert!(*size <= 600, "{id} is {size} bytes");
+            let text = overlay_text(id, &every).expect("overlay");
+            assert!(text.starts_with("Notes for this model:\n- "), "{text}");
+        }
+        assert_eq!(overlay_text("gpt", DEFAULT_TOOLS).expect("gpt").len(), 238);
+        assert_eq!(overlay_text("other", &every), None);
+    }
+
+    #[test]
+    fn the_gpt_overlay_mentions_apply_patch_only_when_offered() {
+        let patch = overlay_text("gpt", PATCH_TOOLS).expect("gpt");
+        assert!(
+            patch.contains("one apply_patch call per logical change"),
+            "{patch}"
+        );
+        let edit = overlay_text("gpt", DEFAULT_TOOLS).expect("gpt");
+        assert!(DEFAULT_TOOLS.contains(&"edit_file"));
+        assert!(!edit.contains("apply_patch"), "{edit}");
+        assert!(edit.ends_with("what changed, the check and its result, what remains."));
+    }
+
+    #[test]
+    fn no_overlay_is_adopted_by_default() {
+        assert!(ADOPTED_OVERLAYS.is_empty());
+        let (_dir, root) = empty_workspace();
+        let config = root.join("config");
+        let limits = BudgetSet::new();
+        let plain = instructions_under(
+            &root,
+            None,
+            &config,
+            &limits,
+            &options(PromptVariant::V2Min, DEFAULT_TOOLS),
+        );
+        for id in OVERLAY_IDS {
+            assert!(!overlay_active(id, OverlaySwitch::Default), "{id}");
+            assert!(overlay_active(id, OverlaySwitch::On), "{id}");
+            assert!(!overlay_active(id, OverlaySwitch::Off), "{id}");
+            for switch in [OverlaySwitch::Default, OverlaySwitch::Off] {
+                let prompt = instructions_under(
+                    &root,
+                    None,
+                    &config,
+                    &limits,
+                    &with_overlay(PromptVariant::V2Min, DEFAULT_TOOLS, id, switch),
+                );
+                assert_eq!(prompt, plain, "{id} {switch:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn model_notes_follow_the_guidance() {
+        let (_dir, root) = empty_workspace();
+        let config = root.join("config");
+        let limits = BudgetSet::new();
+        let prompt = instructions_under(
+            &root,
+            None,
+            &config,
+            &limits,
+            &with_overlay(
+                PromptVariant::V2Min,
+                DEFAULT_TOOLS,
+                "claude",
+                OverlaySwitch::On,
+            ),
+        );
+        let notes = overlay_text("claude", DEFAULT_TOOLS).expect("claude");
+        let stable = &prompt.instructions[..prompt.stable_len];
+        assert!(
+            stable.ends_with(&format!("{TESTS_GUIDANCE}\n\n{notes}")),
+            "{stable}"
+        );
+        assert_eq!(prompt.section_bytes(Section::ModelNotes), notes.len());
+        let order: Vec<Section> = prompt.included.iter().map(|entry| entry.section).collect();
+        assert_eq!(
+            &order[..3],
+            [Section::System, Section::ToolGuidance, Section::ModelNotes]
+        );
+
+        // The two keys are independent: the first prompt still gains the notes.
+        let first = instructions_under(
+            &root,
+            None,
+            &config,
+            &limits,
+            &with_overlay(
+                PromptVariant::V1,
+                DEFAULT_TOOLS,
+                "open_weight",
+                OverlaySwitch::On,
+            ),
+        );
+        let notes = overlay_text("open_weight", DEFAULT_TOOLS).expect("open weight");
+        assert_eq!(
+            &first.instructions[..first.stable_len],
+            format!("{SYSTEM_PROMPT}\n\n{notes}")
+        );
     }
 
     #[test]
@@ -1644,6 +1860,7 @@ mod tests {
         let inputs = Inputs {
             system: SYSTEM_PROMPT,
             tool_guidance: Some("guidance"),
+            model_notes: Some("notes"),
             skills: &skills,
             host_instructions: Some("host"),
             project: &project,

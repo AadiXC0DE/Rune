@@ -143,7 +143,8 @@ pub(crate) fn instruction_sizes(
     rune_agent::tokens::InstructionSizes {
         base: prompt
             .section_bytes(Section::System)
-            .saturating_add(prompt.section_bytes(Section::ToolGuidance)),
+            .saturating_add(prompt.section_bytes(Section::ToolGuidance))
+            .saturating_add(prompt.section_bytes(Section::ModelNotes)),
         skill_catalog: prompt.section_bytes(Section::SkillCatalog),
         project: prompt.section_bytes(Section::ProjectContext),
         map: 0,
@@ -1578,6 +1579,8 @@ pub fn run(
         &rune_context::prompt::PromptOptions {
             variant: settings.experiments.prompt,
             tools: &offered,
+            overlay: Some(compat.resolve(&settings.model).1.prompt_overlay),
+            overlay_switch: settings.experiments.overlay,
         },
     );
     let instruction_sizes = instruction_sizes(&base_prompt);

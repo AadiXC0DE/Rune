@@ -1336,6 +1336,11 @@ impl SessionHost {
         }
     }
 
+    /// The overlay id of the current model's family.
+    fn overlay_id(&self) -> &'static str {
+        self.compat.resolve(&self.model_name()).1.prompt_overlay
+    }
+
     /// Re-derives the instructions, the map and the objective from what is
     /// on disk now, and drops queued news they already carry.
     fn rebuild_prefix(&self) {
@@ -1352,6 +1357,8 @@ impl SessionHost {
             &prompt::PromptOptions {
                 variant: self.permission_settings.experiments.prompt,
                 tools: &tool_names(&self.tools),
+                overlay: Some(self.overlay_id()),
+                overlay_switch: self.permission_settings.experiments.overlay,
             },
         );
         *lock_value(&self.instruction_sizes) = crate::ask::instruction_sizes(&base);
@@ -1485,9 +1492,18 @@ impl SessionHost {
         if let Ok(mut current) = self.prices.lock() {
             *current = prices;
         }
+        let overlay = self.overlay_id();
         {
             let mut current = lock_model(&self.model);
             model.clone_into(&mut current);
+        }
+        // Another family's notes change the prefix; the same family keeps it.
+        let switch = self.permission_settings.experiments.overlay;
+        let next = self.overlay_id();
+        if next != overlay
+            && (prompt::overlay_active(overlay, switch) || prompt::overlay_active(next, switch))
+        {
+            self.rebuild_prefix();
         }
         self.effort_noticed
             .lock()
@@ -2642,12 +2658,17 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
     if let Some(client) = &mcp {
         crate::mcp::append_tools(&mut tools, client)?;
     }
+    let compat = crate::provider_setup::CompatSource::from_settings(&config.settings);
     let mut prompt = build_prompt(
         &config.workspace,
         &config.paths.config_root,
         &limits,
-        &tool_names(&tools),
-        config.settings.experiments.prompt,
+        &prompt::PromptOptions {
+            variant: config.settings.experiments.prompt,
+            tools: &tool_names(&tools),
+            overlay: Some(compat.resolve(&config.settings.model).1.prompt_overlay),
+            overlay_switch: config.settings.experiments.overlay,
+        },
     );
     let nested_rules = std::mem::take(&mut prompt.nested);
     let instruction_sizes = crate::ask::instruction_sizes(&prompt);
@@ -2779,7 +2800,7 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
         ascii: config.settings.ascii,
         recorder: Some(Arc::clone(&recorder)),
         endpoint: config.endpoint,
-        compat: crate::provider_setup::CompatSource::from_settings(&config.settings),
+        compat,
         dialect: config.dialect,
         model: Mutex::new(config.settings.model.clone()),
         instructions: Mutex::new(opening.instructions),
@@ -7905,20 +7926,14 @@ fn render_entries(entries: &[Entry], host: &SessionHost) -> Vec<String> {
     rendered.lines().map(str::to_owned).collect()
 }
 
-/// Builds the prompt for a session that offers `tools`.
+/// Builds the prompt for a session with the chosen options.
 fn build_prompt(
     workspace: &Utf8Path,
     config_root: &Utf8Path,
     limits: &BudgetSet,
-    tools: &[&str],
-    variant: rune_core::experiment::PromptVariant,
+    options: &prompt::PromptOptions<'_>,
 ) -> Prompt {
-    prompt::base_prompt_with(
-        workspace,
-        config_root,
-        limits,
-        &prompt::PromptOptions { variant, tools },
-    )
+    prompt::base_prompt_with(workspace, config_root, limits, options)
 }
 
 /// Builds the runtime configuration for an interactive session.
@@ -8091,6 +8106,46 @@ mod tests {
     }
 
     #[test]
+    fn a_model_of_another_family_rebuilds_the_notes_and_the_same_family_keeps_them() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let base = Utf8PathBuf::from_path_buf(root.path().to_owned()).expect("utf8");
+        let workspace = base.join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        let mut host = test_host();
+        host.usage_paths = Some(Paths {
+            config_root: base.join("config"),
+            state_root: base.join("state"),
+            data_root: base.join("data"),
+        });
+        host.context = ExecutionContext::new(workspace);
+        host.permission_settings.experiments.overlay = rune_core::experiment::OverlaySwitch::On;
+        host.set_model("deepseek-chat", None, None, None);
+        host.rebuild_prefix();
+        let first = host.instructions();
+        assert!(first.contains("Never write a tool call as text"), "{first}");
+
+        host.set_model("deepseek-reasoner", None, None, None);
+        assert_eq!(host.instructions(), first);
+
+        host.set_model("claude-sonnet-5-5", None, None, None);
+        let switched = host.instructions();
+        let stable = &switched[..host.stable_instructions_len()];
+        assert!(
+            stable.ends_with("tests the task did not ask for."),
+            "{stable}"
+        );
+        assert!(!switched.contains("Never write a tool call as text"));
+
+        // With no notes adopted, a family change leaves the prefix alone.
+        let mut quiet = test_host();
+        quiet.usage_paths = host.usage_paths.clone();
+        quiet.instructions = Mutex::new("Kept prefix".to_owned());
+        quiet.set_model("deepseek-chat", None, None, None);
+        quiet.set_model("claude-sonnet-5-5", None, None, None);
+        assert_eq!(quiet.instructions(), "Kept prefix");
+    }
+
+    #[test]
     fn the_active_objective_is_in_model_instructions_after_restart() {
         let root = tempfile::tempdir().expect("tempdir");
         let base = Utf8PathBuf::from_path_buf(root.path().to_owned()).expect("utf8");
@@ -8143,8 +8198,7 @@ mod tests {
             &workspace,
             &base.join("config"),
             &BudgetSet::new(),
-            &[],
-            rune_core::experiment::PromptVariant::default(),
+            &prompt::PromptOptions::default(),
         );
         let mut host = test_host();
         host.instructions = Mutex::new(built.instructions.clone());
@@ -9634,8 +9688,7 @@ mod tests {
             root,
             root,
             &BudgetSet::new(),
-            &[],
-            rune_core::experiment::PromptVariant::V1,
+            &prompt::PromptOptions::default(),
         );
         // The skills installed for this user may follow the override, so the
         // check is on what the prompt opens with rather than on all of it.
@@ -9659,8 +9712,7 @@ mod tests {
             root,
             root,
             &BudgetSet::new(),
-            &[],
-            rune_core::experiment::PromptVariant::V1,
+            &prompt::PromptOptions::default(),
         );
         assert!(prompt.instructions.starts_with(prompt::SYSTEM_PROMPT));
     }
@@ -9681,8 +9733,7 @@ mod tests {
             root,
             root,
             &BudgetSet::new(),
-            &[],
-            rune_core::experiment::PromptVariant::V1,
+            &prompt::PromptOptions::default(),
         );
         assert!(prompt.instructions.starts_with(prompt::SYSTEM_PROMPT));
     }

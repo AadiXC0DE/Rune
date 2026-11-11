@@ -427,7 +427,8 @@ pub struct ModelTraits {
     pub family: Family,
     /// The edit tool the model is trained to use.
     pub edit_tool: EditTool,
-    /// The prompt overlay for the family.
+    /// The id of the prompt notes for the family: `gpt`, `claude`, `gemini`
+    /// or `open_weight`.
     pub prompt_overlay: &'static str,
     /// The effort used when none is configured.
     pub default_effort: Effort,
@@ -448,7 +449,7 @@ impl Default for ModelTraits {
         Self {
             family: Family::Other,
             edit_tool: EditTool::Replace,
-            prompt_overlay: Family::Other.as_str(),
+            prompt_overlay: overlay_of(Family::Other),
             default_effort: Effort::Auto,
             efforts: ALL_EFFORTS,
             sampling: Sampling::default(),
@@ -648,6 +649,24 @@ pub fn canonical_preset(provider: &str) -> String {
     crate::providers::lookup(&wanted).map_or(wanted, |entry| entry.name.to_owned())
 }
 
+/// Returns the prompt overlay id of a family.
+const fn overlay_of(family: Family) -> &'static str {
+    match family {
+        Family::Gpt => "gpt",
+        Family::Claude => "claude",
+        Family::Gemini => "gemini",
+        Family::DeepSeek
+        | Family::Kimi
+        | Family::Glm
+        | Family::Qwen
+        | Family::MiniMax
+        | Family::Grok
+        | Family::Mistral
+        | Family::Llama
+        | Family::Other => "open_weight",
+    }
+}
+
 /// Returns the family of a model id.
 fn family_of(model: &str) -> Family {
     let id = model.to_ascii_lowercase();
@@ -758,7 +777,7 @@ fn traits_for(model: &str) -> (ModelTraits, Vec<Applied>) {
     let mut applied = defaults(&traits.fields());
 
     traits.family = family;
-    traits.prompt_overlay = family.as_str();
+    traits.prompt_overlay = overlay_of(family);
     match family {
         Family::Gpt => {
             if ["gpt-5", "gpt-6", "codex", "gpt-oss"]
@@ -1337,8 +1356,12 @@ mod tests {
         ("chat_completions", GENERIC, "ministral-8b", "family", "mistral"),
         ("chat_completions", GENERIC, "llama-4-maverick", "family", "llama"),
         ("chat_completions", GENERIC, "my-model", "family", "other"),
-        ("chat_completions", GENERIC, "my-model", "prompt_overlay", "other"),
-        ("chat_completions", GENERIC, "qwen3-coder", "prompt_overlay", "qwen"),
+        ("chat_completions", GENERIC, "my-model", "prompt_overlay", "open_weight"),
+        ("chat_completions", GENERIC, "qwen3-coder", "prompt_overlay", "open_weight"),
+        ("chat_completions", GENERIC, "deepseek-chat", "prompt_overlay", "open_weight"),
+        ("chat_completions", GENERIC, "gpt-5.5", "prompt_overlay", "gpt"),
+        ("anthropic", None, "claude-sonnet-5-5", "prompt_overlay", "claude"),
+        ("chat_completions", GENERIC, "gemini-3.5-pro", "prompt_overlay", "gemini"),
     ];
 
     #[test]
