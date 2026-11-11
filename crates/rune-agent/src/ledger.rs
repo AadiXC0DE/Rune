@@ -797,4 +797,51 @@ mod tests {
             assert!(line.chars().count() <= 200, "{line}");
         }
     }
+
+    #[test]
+    fn the_plan_is_kept_in_the_facts_after_a_checkpoint() {
+        use rune_core::budget::{Budget, BudgetSet, LimitName};
+        use rune_core::config::Layer;
+        use rune_tools::update_plan::Status;
+
+        let mut history = crate::History::new();
+        for index in 0..3 {
+            history.push_user(format!("question {index}"));
+            history.push_assistant(vec![rune_net::message::ContentPart::Text {
+                text: format!("answer {index}"),
+            }]);
+        }
+        *history.shared_live_plan().lock().expect("plan") = PlanUpdate {
+            version: 1,
+            explanation: None,
+            plan: [
+                ("read the parser", Status::Completed),
+                ("fix the lexer", Status::InProgress),
+                ("run the tests", Status::Pending),
+            ]
+            .into_iter()
+            .map(|(step, status)| Step {
+                step: step.to_owned(),
+                status,
+            })
+            .collect(),
+        };
+        let mut limits = BudgetSet::new();
+        limits
+            .set(
+                LimitName::CompactionKeepTokens,
+                Budget::Bounded(0),
+                Layer::CommandLine,
+            )
+            .expect("keep");
+        let cut = crate::compaction::plan(&history, &limits).expect("a plan");
+        crate::compaction::apply(&mut history, &cut, "what happened so far");
+        let checkpoint = history.turns()[0].text();
+        assert!(
+            checkpoint.contains("- [in_progress] fix the lexer"),
+            "{checkpoint}"
+        );
+        assert!(checkpoint.contains("- [completed] read the parser"));
+        assert_eq!(history.plan().plan.len(), 3);
+    }
 }

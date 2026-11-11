@@ -393,6 +393,15 @@ impl ExecutionContext {
         self
     }
 
+    /// A copy of the plan this context carries.
+    #[must_use]
+    pub fn plan_snapshot(&self) -> crate::update_plan::PlanUpdate {
+        self.live_plan
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
     pub(crate) fn live_plan(&self) -> &std::sync::Mutex<crate::update_plan::PlanUpdate> {
         &self.live_plan
     }
@@ -1149,5 +1158,22 @@ mod tests {
         assert!(!fits(serde_json::json!(["path"])), "not an object");
         let open = serde_json::json!({ "type": "object", "properties": {} });
         assert!(conforms(&open, &serde_json::json!({ "anything": 1 })));
+    }
+
+    #[test]
+    fn a_plan_snapshot_copies_the_carried_plan() {
+        let plan = Arc::new(std::sync::Mutex::new(crate::update_plan::PlanUpdate {
+            version: 2,
+            explanation: None,
+            plan: Vec::new(),
+        }));
+        let context = ExecutionContext::new(Utf8PathBuf::from("/workspace")).with_live_plan(plan);
+        assert_eq!(context.plan_snapshot().version, 2);
+        assert_eq!(
+            ExecutionContext::new(Utf8PathBuf::from("/w"))
+                .plan_snapshot()
+                .version,
+            0
+        );
     }
 }

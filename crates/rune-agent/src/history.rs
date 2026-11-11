@@ -369,6 +369,15 @@ impl History {
         self.settled_turn = Some(seq);
     }
 
+    /// A copy of the conversation's current plan.
+    #[must_use]
+    pub fn plan(&self) -> rune_tools::PlanUpdate {
+        self.live_plan
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
     pub(crate) fn shared_live_plan(&self) -> Arc<std::sync::Mutex<rune_tools::PlanUpdate>> {
         Arc::clone(&self.live_plan)
     }

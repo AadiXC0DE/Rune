@@ -2939,7 +2939,8 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                 // terminal: the region below is redrawn in place.
                 let mut lines = report_turn(&outcome, &host, &reasoning)?;
                 if !host.accessible
-                    && let Some(summary) = turn_summary(&outcome, elapsed, cost, host.ascii)
+                    && let Some(summary) =
+                        turn_summary(&outcome, plan_progress(&history), elapsed, cost, host.ascii)
                 {
                     let dim = host.theme.sgr(Slot::Dim, host.truecolor);
                     let reset = rune_term::engine::Style::RESET;
@@ -6266,8 +6267,20 @@ fn result_summary(name: &str, output: &ToolOutput, ascii: bool) -> String {
 ///
 /// Omitted for a turn that used no tool and reported no usage, where the
 /// answer is the whole story.
+/// Completed and total steps of the conversation's plan, when it has one.
+fn plan_progress(history: &History) -> Option<(usize, usize)> {
+    let plan = history.plan();
+    let done = plan
+        .plan
+        .iter()
+        .filter(|step| step.status == rune_tools::update_plan::Status::Completed)
+        .count();
+    (!plan.plan.is_empty()).then_some((done, plan.plan.len()))
+}
+
 fn turn_summary(
     outcome: &turn::TurnOutcome,
+    plan: Option<(usize, usize)>,
     elapsed: Option<std::time::Duration>,
     cost: Option<u64>,
     ascii: bool,
@@ -6309,6 +6322,9 @@ fn turn_summary(
     changed.dedup();
     if !changed.is_empty() {
         parts.push(format!("{} changed", plural(changed.len(), "file")));
+    }
+    if let Some((done, total)) = plan {
+        parts.push(format!("plan {done}/{total}"));
     }
     match outcome.verification {
         turn::Verification::NotApplicable => {}
@@ -11442,8 +11458,35 @@ mod tests {
             repairs: Vec::new(),
             repaired_calls: 0,
         };
-        let summary = turn_summary(&outcome, None, None, true).expect("summary");
+        let summary = turn_summary(&outcome, None, None, None, true).expect("summary");
         assert!(summary.starts_with("1 call, 2 files changed"), "{summary}");
+    }
+
+    #[test]
+    fn a_turn_summary_shows_plan_progress() {
+        let outcome = turn::TurnOutcome {
+            error: None,
+            stop_reason: StopReason::Completed,
+            text: String::new(),
+            narration: Vec::new(),
+            reasoning: String::new(),
+            usage: rune_net::stream::Usage {
+                output_tokens: Some(10),
+                ..rune_net::stream::Usage::default()
+            },
+            last_request: rune_net::stream::Usage::default(),
+            steps: 1,
+            verification: turn::Verification::NotApplicable,
+            checks: rune_agent::verify::CheckSummary::default(),
+            calls: Vec::new(),
+            repairs: Vec::new(),
+            repaired_calls: 0,
+        };
+        assert_eq!(
+            turn_summary(&outcome, Some((1, 3)), None, None, true).expect("summary"),
+            "plan 1/3, 10 out"
+        );
+        assert_eq!(plan_progress(&History::new()), None);
     }
 
     #[test]
@@ -11479,6 +11522,7 @@ mod tests {
         };
         let summary = turn_summary(
             &outcome,
+            None,
             Some(std::time::Duration::from_millis(9_400)),
             Some(1_523),
             true,
@@ -11498,7 +11542,7 @@ mod tests {
                 verification,
                 ..outcome.clone()
             };
-            let summary = turn_summary(&judged, None, None, true).expect("summary");
+            let summary = turn_summary(&judged, None, None, None, true).expect("summary");
             assert!(
                 summary.starts_with(&format!("2 calls, 1 file changed, {word}, ")),
                 "{summary}"
