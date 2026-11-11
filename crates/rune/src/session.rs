@@ -272,6 +272,8 @@ struct SessionHost {
     watched: Mutex<context_watch::Watched>,
     /// Instruction files below the workspace root, sent on first touch.
     nested_rules: Mutex<Vec<rune_context::InstructionFile>>,
+    /// Bytes of each instruction section, for the context breakdown.
+    instruction_sizes: Mutex<rune_agent::tokens::InstructionSizes>,
     /// The instructions with the repository map, fixed until compaction.
     mapped: prompt::MappedInstructions,
     tools: Vec<ToolSpec>,
@@ -507,6 +509,21 @@ impl Host for SessionHost {
     fn stable_instructions_len(&self) -> usize {
         self.stable_instructions_len
             .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn instruction_sizes(&self) -> rune_agent::tokens::InstructionSizes {
+        let base = lock_value(&self.instructions).clone();
+        let mapped = self.mapped.get(
+            &base,
+            self.context.workspace(),
+            &crate::ask::map_limits(&self.limits, self.permission_settings.experiments),
+        );
+        // The map follows the base after a blank line.
+        let map = mapped.len().saturating_sub(base.len().saturating_add(2));
+        rune_agent::tokens::InstructionSizes {
+            map,
+            ..*lock_value(&self.instruction_sizes)
+        }
     }
 
     fn step_appendix(
@@ -1285,6 +1302,7 @@ impl SessionHost {
         };
         let workspace = self.context.workspace().to_owned();
         let base = prompt::base_prompt(&workspace, &paths.config_root, &self.limits);
+        *lock_value(&self.instruction_sizes) = crate::ask::instruction_sizes(&base);
         *lock_value(&self.instructions) = base.instructions;
         self.stable_instructions_len
             .store(base.stable_len, std::sync::atomic::Ordering::Relaxed);
@@ -2452,6 +2470,7 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
     adopt_skill_catalog_budget(&mut limits, config.settings.context_window);
     let mut prompt = build_prompt(&config.workspace, &config.paths.config_root, &limits);
     let nested_rules = std::mem::take(&mut prompt.nested);
+    let instruction_sizes = crate::ask::instruction_sizes(&prompt);
     let connection =
         crate::mcp::connect_interactive(&config.settings, &config.paths, &config.workspace)?;
     let (mcp, mcp_warnings) = match connection {
@@ -2571,6 +2590,7 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
             &config.paths.config_root,
         )),
         nested_rules: Mutex::new(nested_rules),
+        instruction_sizes: Mutex::new(instruction_sizes),
         mapped: prompt::MappedInstructions::default(),
         tools,
         rules: Mutex::new(config.rules),
@@ -7049,14 +7069,7 @@ fn render_entries(entries: &[Entry], host: &SessionHost) -> Vec<String> {
 
 /// Builds the prompt for a session.
 fn build_prompt(workspace: &Utf8Path, config_root: &Utf8Path, limits: &BudgetSet) -> Prompt {
-    let base = prompt::base_prompt(workspace, config_root, limits);
-    Prompt {
-        instructions: base.instructions,
-        stable_len: base.stable_len,
-        nested: base.nested,
-        included: Vec::new(),
-        omissions: Vec::new(),
-    }
+    prompt::base_prompt(workspace, config_root, limits)
 }
 
 /// Builds the runtime configuration for an interactive session.
@@ -7226,6 +7239,24 @@ mod tests {
         host.recorder = Some(Arc::new(Mutex::new(fresh)));
         host.rebuild_prefix();
         assert_eq!(host.instructions(), "Workspace instructions");
+    }
+
+    #[test]
+    fn the_session_reports_its_instruction_sizes() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let base = Utf8PathBuf::from_path_buf(root.path().to_owned()).expect("utf8");
+        let workspace = base.join("work");
+        std::fs::create_dir_all(workspace.join(".git")).expect("workspace");
+        std::fs::create_dir_all(base.join("config")).expect("config");
+        std::fs::write(workspace.join("AGENTS.md"), "A project rule.\n").expect("rules");
+        let built = build_prompt(&workspace, &base.join("config"), &BudgetSet::new());
+        let mut host = test_host();
+        host.instructions = Mutex::new(built.instructions.clone());
+        host.instruction_sizes = Mutex::new(crate::ask::instruction_sizes(&built));
+        let sizes = Host::instruction_sizes(&host);
+        assert!(sizes.base >= prompt::SYSTEM_PROMPT.len(), "{sizes:?}");
+        assert!(sizes.project > "A project rule.".len(), "{sizes:?}");
+        assert_eq!(sizes.map, 0, "{sizes:?}");
     }
 
     #[test]
@@ -13107,6 +13138,7 @@ mod tests {
             pending_updates: Mutex::new(Vec::new()),
             watched: Mutex::new(context_watch::Watched::default()),
             nested_rules: Mutex::new(Vec::new()),
+            instruction_sizes: Mutex::new(rune_agent::tokens::InstructionSizes::default()),
             tools: Vec::new(),
             rules: Mutex::new(crate::permissions::validated(&Settings::default()).expect("rules")),
             mode: Mutex::new(PermissionMode::Auto),
