@@ -4714,11 +4714,28 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                 host.set_title_state("idle");
                 let mut lines = report_turn(&outcome, &host, &reasoning)?;
                 if !host.accessible
-                    && let Some(summary) =
-                        turn_summary(&outcome, plan_progress(&history), elapsed, cost, host.ascii)
+                    && let Some(segments) = summary_segments(
+                        &outcome,
+                        elapsed,
+                        cost,
+                        plan_progress(&history),
+                        usize::from(host.width()),
+                        host.ascii,
+                    )
                 {
-                    let dim = host.theme().sgr(Slot::Dim, host.depth);
+                    let theme = host.theme();
+                    let dim = theme.sgr(Slot::Dim, host.depth);
                     let reset = rune_term::engine::Style::RESET;
+                    let summary = segments
+                        .iter()
+                        .map(|segment| match segment.slot {
+                            Some(slot) => {
+                                format!("{}{}{dim}", theme.sgr(slot, host.depth), segment.text)
+                            }
+                            None => segment.text.clone(),
+                        })
+                        .collect::<Vec<_>>()
+                        .join(summary_separator(host.ascii));
                     lines.extend(
                         host.spaced(RowKind::Summary, &[format!("{dim}  {summary}{reset}")]),
                     );
@@ -9851,11 +9868,6 @@ fn result_summary(name: &str, output: &ToolOutput, ascii: bool) -> String {
     }
 }
 
-/// Summarizes a finished turn in one line: what it did, what it cost in
-/// tokens, and how long it took.
-///
-/// Omitted for a turn that used no tool and reported no usage, where the
-/// answer is the whole story.
 /// Completed and total steps of the conversation's plan, when it has one.
 fn plan_progress(history: &History) -> Option<(usize, usize)> {
     let plan = history.plan();
@@ -9867,63 +9879,130 @@ fn plan_progress(history: &History) -> Option<(usize, usize)> {
     (!plan.plan.is_empty()).then_some((done, plan.plan.len()))
 }
 
+/// One part of the turn summary row.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SummarySegment {
+    /// Dropped first when the row is too wide: the highest number goes first.
+    priority: u8,
+    text: String,
+    /// A colour of its own inside the dim row.
+    slot: Option<Slot>,
+}
+
+/// Bytes the model is taken to read as one token.
+const BYTES_PER_TOKEN: usize = 4;
+
+/// Saved tokens below this are not worth a segment.
+const SAVED_SHOWN_FROM: usize = 5_000;
+
+/// Summarizes a finished turn in one line: what changed, whether it was
+/// tested and verified, what it cost and how long it took.
+///
+/// Omitted for a turn that used no tool and reported no usage, where the
+/// answer is the whole story. The session paints `summary_segments` itself;
+/// this is the same row without colour.
+#[cfg(test)]
 fn turn_summary(
     outcome: &turn::TurnOutcome,
-    plan: Option<(usize, usize)>,
     elapsed: Option<std::time::Duration>,
     cost: Option<u64>,
+    plan: Option<(usize, usize)>,
+    width: usize,
     ascii: bool,
 ) -> Option<String> {
+    let segments = summary_segments(outcome, elapsed, cost, plan, width, ascii)?;
+    Some(
+        segments
+            .into_iter()
+            .map(|segment| segment.text)
+            .collect::<Vec<_>>()
+            .join(summary_separator(ascii)),
+    )
+}
+
+fn summary_separator(ascii: bool) -> &'static str {
+    if ascii { ", " } else { " \u{b7} " }
+}
+
+/// Builds the summary's segments in display order, dropping the least
+/// important ones until the row fits in `width` less its indent.
+fn summary_segments(
+    outcome: &turn::TurnOutcome,
+    elapsed: Option<std::time::Duration>,
+    cost: Option<u64>,
+    plan: Option<(usize, usize)>,
+    width: usize,
+    ascii: bool,
+) -> Option<Vec<SummarySegment>> {
     let executed: Vec<&turn::CallResult> =
         outcome.calls.iter().filter(|call| call.executed).collect();
-    let mut parts = Vec::new();
-    if !executed.is_empty() {
-        parts.push(plural(executed.len(), "call"));
+    let mut segments = Vec::new();
+    macro_rules! push {
+        ($priority:expr, $text:expr, $slot:expr $(,)?) => {
+            segments.push(SummarySegment {
+                priority: $priority,
+                text: $text,
+                slot: $slot,
+            })
+        };
     }
-    let mut changed: Vec<String> = executed
-        .iter()
-        .filter(|call| {
-            !call.output.is_error
-                && matches!(
-                    call.call.name.as_str(),
-                    "write_file" | "edit_file" | "apply_patch" | "rename_file"
-                )
-        })
-        .flat_map(|call| {
-            let arguments =
-                serde_json::from_str::<serde_json::Value>(&call.call.arguments).unwrap_or_default();
-            if call.call.name == "apply_patch" {
-                return arguments
-                    .get("input")
-                    .and_then(serde_json::Value::as_str)
-                    .map(rune_tools::apply_patch::paths)
-                    .unwrap_or_default();
+    let mut changed: Vec<String> = Vec::new();
+    let (mut added, mut removed) = (0usize, 0usize);
+    for call in &executed {
+        let paths = rune_agent::verify::changed_paths(call);
+        if paths.is_empty() {
+            continue;
+        }
+        for path in paths {
+            if !changed.contains(&path) {
+                changed.push(path);
             }
-            arguments
-                .get("path")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_owned)
-                .into_iter()
-                .collect()
-        })
-        .collect();
-    changed.sort();
-    changed.dedup();
-    if !changed.is_empty() {
-        parts.push(format!("{} changed", plural(changed.len(), "file")));
+        }
+        let (plus, minus) = changed_line_counts(&call.output.text);
+        added = added.saturating_add(plus);
+        removed = removed.saturating_add(minus);
     }
-    if let Some((done, total)) = plan {
-        parts.push(format!("plan {done}/{total}"));
+    if !changed.is_empty() {
+        let counts = if added == 0 && removed == 0 {
+            String::new()
+        } else {
+            format!(" +{added} -{removed}")
+        };
+        push!(
+            1,
+            format!("{}{counts}", plural(changed.len(), "file")),
+            None
+        );
+    }
+    let runs: Vec<(usize, usize)> = executed
+        .iter()
+        .filter(|call| call.call.name == "shell")
+        .filter_map(|call| test_counts(&call.output.text))
+        .collect();
+    if let Some((passed, failed)) = runs.last() {
+        let more = if runs.len() > 1 {
+            format!(" ({} runs)", runs.len())
+        } else {
+            String::new()
+        };
+        push!(
+            2,
+            format!(
+                "tests {passed}/{} passed{more}",
+                passed.saturating_add(*failed)
+            ),
+            None,
+        );
     }
     match outcome.verification {
         turn::Verification::NotApplicable => {}
-        turn::Verification::Verified => parts.push("verified".to_owned()),
-        turn::Verification::Checked => parts.push("checked".to_owned()),
-        turn::Verification::Failed => parts.push("check failed".to_owned()),
-        turn::Verification::Unverified => parts.push("unverified".to_owned()),
+        turn::Verification::Verified => push!(3, "verified".to_owned(), None),
+        turn::Verification::Checked => push!(3, "checked".to_owned(), None),
+        turn::Verification::Failed => push!(3, "check failed".to_owned(), Some(Slot::Error)),
+        turn::Verification::Unverified => push!(3, "unverified".to_owned(), Some(Slot::Warning)),
     }
     if let Some(judge) = &outcome.judge {
-        parts.push(format!("judge {}", judge.rounds));
+        push!(4, format!("judge {}", judge.rounds), None);
     }
     if let Some(input) = outcome.usage.input_tokens {
         let cached = outcome
@@ -9940,21 +10019,134 @@ fn turn_summary(
                 )
             })
             .unwrap_or_default();
-        parts.push(format!("{} in{cached}", footer::format_tokens(input)));
+        push!(
+            7,
+            format!("{} in{cached}", footer::format_tokens(input)),
+            None,
+        );
     }
     if let Some(output) = outcome.usage.output_tokens {
-        parts.push(format!("{} out", footer::format_tokens(output)));
+        push!(8, format!("{} out", footer::format_tokens(output)), None);
     }
-    if executed.is_empty() && parts.is_empty() {
+    let saved = outcome
+        .calls
+        .iter()
+        .filter_map(|call| {
+            let full = call.output.full_text.as_ref()?;
+            Some(full.len().saturating_sub(call.output.text.len()))
+        })
+        .fold(0usize, usize::saturating_add)
+        / BYTES_PER_TOKEN;
+    if saved >= SAVED_SHOWN_FROM {
+        push!(
+            9,
+            format!(
+                "saved {}",
+                footer::format_tokens(u64::try_from(saved).unwrap_or(u64::MAX))
+            ),
+            None,
+        );
+    }
+    if executed.is_empty() && segments.is_empty() && plan.is_none() {
         return None;
     }
     if let Some(cost) = cost {
-        parts.push(format!("${}", rune_net::models_dev::dollars(cost)));
+        push!(6, format!("${}", rune_net::models_dev::dollars(cost)), None);
     }
     if let Some(elapsed) = elapsed {
-        parts.push(format_elapsed(elapsed));
+        push!(5, format_elapsed(elapsed), None);
     }
-    Some(parts.join(if ascii { ", " } else { " \u{b7} " }))
+    if let Some((done, total)) = plan {
+        push!(10, format!("plan {done}/{total}"), None);
+    }
+    // Display order differs from priority: cost, time and plan close the row.
+    let rank = |priority: u8| match priority {
+        5 => 11,
+        6 => 10,
+        10 => 12,
+        other => other,
+    };
+    segments.sort_by_key(|segment| rank(segment.priority));
+    let room = width.saturating_sub(2);
+    let separator = rune_term::width::str_width(summary_separator(ascii));
+    let fits = |segments: &[SummarySegment]| {
+        let text: usize = segments
+            .iter()
+            .map(|segment| rune_term::width::str_width(&segment.text))
+            .fold(0, usize::saturating_add);
+        text.saturating_add(separator.saturating_mul(segments.len().saturating_sub(1))) <= room
+    };
+    while !fits(&segments) {
+        let Some(at) = segments
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, segment)| segment.priority)
+            .map(|(at, _)| at)
+        else {
+            break;
+        };
+        segments.remove(at);
+    }
+    (!segments.is_empty()).then_some(segments)
+}
+
+/// Lines added and removed by one change, read from the `(+A -R, ...)` or
+/// `(new file, N lines, ...)` detail at the end of each result line.
+fn changed_line_counts(text: &str) -> (usize, usize) {
+    let (mut added, mut removed) = (0usize, 0usize);
+    for line in text.lines() {
+        let Some(detail) = line
+            .trim_end()
+            .strip_suffix(')')
+            .and_then(|line| line.rsplit_once('('))
+            .map(|(_, detail)| detail)
+        else {
+            continue;
+        };
+        let mut parts = detail.split(", ").peekable();
+        while let Some(part) = parts.next() {
+            if part == "new file" {
+                let count = parts
+                    .peek()
+                    .and_then(|next| next.split_whitespace().next())
+                    .and_then(|count| count.parse::<usize>().ok());
+                added = added.saturating_add(count.unwrap_or_default());
+                continue;
+            }
+            let Some(rest) = part.strip_prefix('+') else {
+                continue;
+            };
+            let mut numbers = rest.split_whitespace();
+            let plus = numbers.next().and_then(|count| count.parse::<usize>().ok());
+            let minus = numbers
+                .next()
+                .and_then(|count| count.strip_prefix('-'))
+                .and_then(|count| count.parse::<usize>().ok());
+            if let Some(plus) = plus {
+                added = added.saturating_add(plus);
+                removed = removed.saturating_add(minus.unwrap_or_default());
+            }
+        }
+    }
+    (added, removed)
+}
+
+/// Passed and failed counts from a shell result's `[tests: ...]` header.
+fn test_counts(text: &str) -> Option<(usize, usize)> {
+    let counts = text
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("[tests: ")?.strip_suffix(']'))?;
+    let (mut passed, mut failed) = (0usize, 0usize);
+    for part in counts.split(", ") {
+        let mut words = part.split_whitespace();
+        let count = words.next().and_then(|count| count.parse::<usize>().ok());
+        match (count, words.next()) {
+            (Some(count), Some("passed")) => passed = passed.saturating_add(count),
+            (Some(count), Some("failed")) => failed = failed.saturating_add(count),
+            _ => {}
+        }
+    }
+    Some((passed, failed))
 }
 
 /// Counts something, in the singular when there is one.
@@ -10685,7 +10877,7 @@ mod tests {
                 ..turn::JudgeReport::default()
             }),
         };
-        let summary = turn_summary(&outcome, None, None, None, true).expect("summary");
+        let summary = turn_summary(&outcome, None, None, None, 120, true).expect("summary");
         assert!(summary.contains("judge 2"), "{summary}");
     }
 
@@ -17206,6 +17398,255 @@ mod tests {
         );
     }
 
+    fn summary_call(
+        name: &str,
+        arguments: &serde_json::Value,
+        output: ToolOutput,
+    ) -> turn::CallResult {
+        turn::CallResult {
+            call: turn::PreparedCall {
+                id: name.to_owned(),
+                name: name.to_owned(),
+                arguments: arguments.to_string(),
+            },
+            output,
+            executed: true,
+        }
+    }
+
+    fn summary_outcome(calls: Vec<turn::CallResult>) -> turn::TurnOutcome {
+        turn::TurnOutcome {
+            error: None,
+            judge: None,
+            stop_reason: StopReason::Completed,
+            text: String::new(),
+            narration: Vec::new(),
+            reasoning: String::new(),
+            usage: rune_net::stream::Usage::default(),
+            last_request: rune_net::stream::Usage::default(),
+            steps: 1,
+            verification: turn::Verification::NotApplicable,
+            checks: rune_agent::verify::CheckSummary::default(),
+            calls,
+            repairs: Vec::new(),
+            repaired_calls: 0,
+        }
+    }
+
+    fn test_run(counts: &str) -> turn::CallResult {
+        summary_call(
+            "shell",
+            &serde_json::json!({"command": "cargo test"}),
+            ToolOutput::success(format!("[tests: {counts}]\nok\n[exited with status 0]")),
+        )
+    }
+
+    #[test]
+    fn the_summary_lists_files_with_line_counts() {
+        let edit = summary_call(
+            "edit_file",
+            &serde_json::json!({"path": "src/a.rs"}),
+            ToolOutput::success("Edited `src/a.rs` (1 replacement, +3 -1, lines 4-6)"),
+        );
+        let write = summary_call(
+            "write_file",
+            &serde_json::json!({"path": "src/a.rs"}),
+            ToolOutput::success("Wrote `src/a.rs` (+2 -2, lines 1-2)"),
+        );
+        let created = summary_call(
+            "write_file",
+            &serde_json::json!({"path": "src/b.rs"}),
+            ToolOutput::success("Wrote `src/b.rs` (new file, 10 lines, lines 1-10)"),
+        );
+        let failed = summary_call(
+            "edit_file",
+            &serde_json::json!({"path": "src/c.rs"}),
+            ToolOutput::failure("no match for the old text (+9 -9)"),
+        );
+        let patch = summary_call(
+            "apply_patch",
+            &serde_json::json!({
+                "input": "*** Begin Patch\n*** Update File: src/d.rs\n@@\n-x\n+y\n*** End Patch"
+            }),
+            ToolOutput::success("Updated 1 file:\nM src/d.rs (+1 -1)"),
+        );
+        // An edit then a write of the same file is one file, counts summed.
+        let outcome = summary_outcome(vec![edit.clone(), write]);
+        assert_eq!(
+            turn_summary(&outcome, None, None, None, 120, false).as_deref(),
+            Some("1 file +5 -3")
+        );
+        let outcome = summary_outcome(vec![edit, created, failed, patch]);
+        assert_eq!(
+            turn_summary(&outcome, None, None, None, 120, false).as_deref(),
+            Some("3 files +14 -2")
+        );
+        let unchanged = summary_call(
+            "edit_file",
+            &serde_json::json!({"path": "src/a.rs"}),
+            ToolOutput::success("Edited `src/a.rs` (+0 -0, no textual change)"),
+        );
+        assert_eq!(
+            turn_summary(
+                &summary_outcome(vec![unchanged]),
+                None,
+                None,
+                None,
+                120,
+                false
+            )
+            .as_deref(),
+            Some("1 file")
+        );
+    }
+
+    #[test]
+    fn the_summary_reports_the_last_test_run_and_the_run_count() {
+        let outcome = summary_outcome(vec![test_run("3 passed, 1 failed")]);
+        assert_eq!(
+            turn_summary(&outcome, None, None, None, 120, false).as_deref(),
+            Some("tests 3/4 passed")
+        );
+        let mut failing = test_run("10 passed, 2 failed");
+        failing.output.is_error = true;
+        let outcome = summary_outcome(vec![
+            failing,
+            summary_call(
+                "shell",
+                &serde_json::json!({"command": "ls"}),
+                ToolOutput::success("a\n[exited with status 0]"),
+            ),
+            test_run("12 passed"),
+        ]);
+        assert_eq!(
+            turn_summary(&outcome, None, None, None, 120, false).as_deref(),
+            Some("tests 12/12 passed (2 runs)")
+        );
+    }
+
+    #[test]
+    fn the_summary_names_the_verdict() {
+        for (verification, expected, slot) in [
+            (turn::Verification::Verified, Some("verified"), None),
+            (turn::Verification::Checked, Some("checked"), None),
+            (
+                turn::Verification::Unverified,
+                Some("unverified"),
+                Some(Slot::Warning),
+            ),
+            (
+                turn::Verification::Failed,
+                Some("check failed"),
+                Some(Slot::Error),
+            ),
+            (turn::Verification::NotApplicable, None, None),
+        ] {
+            let outcome = turn::TurnOutcome {
+                verification,
+                ..summary_outcome(vec![test_run("1 passed")])
+            };
+            let segments =
+                summary_segments(&outcome, None, None, None, 120, false).expect("segments");
+            let verdict = segments.iter().find(|segment| segment.priority == 3);
+            assert_eq!(
+                verdict.map(|segment| segment.text.as_str()),
+                expected,
+                "{verification:?}"
+            );
+            assert_eq!(verdict.and_then(|segment| segment.slot), slot);
+        }
+    }
+
+    #[test]
+    fn the_summary_shows_saved_tokens_only_above_five_thousand() {
+        let cut = |bytes: usize| {
+            let mut output = ToolOutput::success("short");
+            output.full_text = Some(format!("short{}", "x".repeat(bytes)));
+            summary_call("read_file", &serde_json::json!({"path": "a"}), output)
+        };
+        let with_usage = |calls| turn::TurnOutcome {
+            usage: rune_net::stream::Usage {
+                output_tokens: Some(10),
+                ..rune_net::stream::Usage::default()
+            },
+            ..summary_outcome(calls)
+        };
+        let outcome = with_usage(vec![cut(4 * 4_999)]);
+        assert_eq!(
+            turn_summary(&outcome, None, None, None, 120, false).as_deref(),
+            Some("10 out")
+        );
+        let outcome = with_usage(vec![cut(4 * 3_000), cut(4 * 3_400)]);
+        assert_eq!(
+            turn_summary(&outcome, None, None, None, 120, false).as_deref(),
+            Some("10 out \u{b7} saved 6.4k")
+        );
+    }
+
+    #[test]
+    fn the_summary_drops_low_priority_segments_when_narrow() {
+        let outcome = turn::TurnOutcome {
+            verification: turn::Verification::Verified,
+            usage: rune_net::stream::Usage {
+                input_tokens: Some(18_200),
+                output_tokens: Some(1_100),
+                cache_read_tokens: Some(15_288),
+                ..rune_net::stream::Usage::default()
+            },
+            ..summary_outcome(vec![
+                summary_call(
+                    "edit_file",
+                    &serde_json::json!({"path": "src/a.rs"}),
+                    ToolOutput::success("Edited `src/a.rs` (+3 -1, lines 4-6)"),
+                ),
+                test_run("12 passed"),
+            ])
+        };
+        let row = |width: usize| {
+            turn_summary(
+                &outcome,
+                Some(std::time::Duration::from_secs(42)),
+                Some(4_000),
+                Some((3, 5)),
+                width,
+                false,
+            )
+        };
+        assert_eq!(
+            row(120).as_deref(),
+            Some(
+                "1 file +3 -1 \u{b7} tests 12/12 passed \u{b7} verified \u{b7} 18.2k in (84% cached) \u{b7} 1.1k out \u{b7} $0.004000 \u{b7} 42.0s \u{b7} plan 3/5"
+            )
+        );
+        assert_eq!(
+            row(60).as_deref(),
+            Some("1 file +3 -1 \u{b7} tests 12/12 passed \u{b7} verified \u{b7} 42.0s")
+        );
+        assert_eq!(
+            row(40).as_deref(),
+            Some("1 file +3 -1 \u{b7} tests 12/12 passed")
+        );
+        assert_eq!(row(20).as_deref(), Some("1 file +3 -1"));
+        // With usage alone the row is tokens and time.
+        let usage_only = turn::TurnOutcome {
+            calls: Vec::new(),
+            verification: turn::Verification::NotApplicable,
+            ..outcome.clone()
+        };
+        assert_eq!(
+            turn_summary(
+                &usage_only,
+                Some(std::time::Duration::from_millis(3_400)),
+                None,
+                None,
+                40,
+                true,
+            )
+            .as_deref(),
+            Some("18.2k in (84% cached), 1.1k out, 3.4s")
+        );
+    }
+
     #[test]
     fn a_turn_summary_counts_every_file_a_patch_changed() {
         let patch = turn::CallResult {
@@ -17236,8 +17677,8 @@ mod tests {
             repairs: Vec::new(),
             repaired_calls: 0,
         };
-        let summary = turn_summary(&outcome, None, None, None, true).expect("summary");
-        assert!(summary.starts_with("1 call, 2 files changed"), "{summary}");
+        let summary = turn_summary(&outcome, None, None, None, 120, true).expect("summary");
+        assert_eq!(summary, "2 files +1 -0");
     }
 
     #[test]
@@ -17262,8 +17703,8 @@ mod tests {
             repaired_calls: 0,
         };
         assert_eq!(
-            turn_summary(&outcome, Some((1, 3)), None, None, true).expect("summary"),
-            "plan 1/3, 10 out"
+            turn_summary(&outcome, None, None, Some((1, 3)), 120, true).expect("summary"),
+            "10 out, plan 1/3"
         );
         assert_eq!(plan_progress(&History::new()), None);
     }
@@ -17302,15 +17743,16 @@ mod tests {
         };
         let summary = turn_summary(
             &outcome,
-            None,
             Some(std::time::Duration::from_millis(9_400)),
             Some(1_523),
+            None,
+            120,
             true,
         )
         .expect("summary");
         assert_eq!(
             summary,
-            "2 calls, 1 file changed, 12.0k in (75% cached), 640 out, $0.001523, 9.4s"
+            "1 file, 12.0k in (75% cached), 640 out, $0.001523, 9.4s"
         );
         for (verification, word) in [
             (turn::Verification::Verified, "verified"),
@@ -17322,9 +17764,9 @@ mod tests {
                 verification,
                 ..outcome.clone()
             };
-            let summary = turn_summary(&judged, None, None, None, true).expect("summary");
+            let summary = turn_summary(&judged, None, None, None, 120, true).expect("summary");
             assert!(
-                summary.starts_with(&format!("2 calls, 1 file changed, {word}, ")),
+                summary.starts_with(&format!("1 file, {word}, ")),
                 "{summary}"
             );
         }
