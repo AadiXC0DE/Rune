@@ -252,6 +252,29 @@ pub enum SessionEvent {
         /// False when the snapshot did not finish before the turn changed files.
         complete: bool,
     },
+    /// The workspace was put back to an earlier or later checkpoint.
+    Restored {
+        /// Turn the restore refers to: undone, redone, or restored to before.
+        turn: u64,
+        /// What asked for the restore.
+        direction: RestoreDirection,
+        /// Git tree or commit id the workspace was made to match.
+        target: String,
+        /// Commit of the snapshot taken just before restoring.
+        saved: String,
+    },
+}
+
+/// What asked for a workspace restore.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RestoreDirection {
+    /// `/undo`: back to before the newest turn that changed files.
+    Undo,
+    /// `/redo`: forward to what the newest undo replaced.
+    Redo,
+    /// A restore to before a named turn.
+    Turn,
 }
 
 /// Which side of a turn a workspace checkpoint was taken on.
@@ -311,6 +334,7 @@ impl SessionEvent {
             Self::ModelSet { .. } => "model_set",
             Self::WorkspaceSet { .. } => "workspace_set",
             Self::WorkspaceCheckpoint { .. } => "workspace_checkpoint",
+            Self::Restored { .. } => "restored",
             Self::ChildOf { .. } => "child_of",
             Self::ForkedFrom { .. } => "forked_from",
         }

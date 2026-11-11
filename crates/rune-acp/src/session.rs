@@ -724,7 +724,7 @@ pub fn history_from_events(frames: &[EventFrame]) -> History {
             // client may change them while a tool batch is still being saved.
             SessionEvent::ModelSet { .. } => {}
             // A workspace snapshot can be written while a tool batch runs.
-            SessionEvent::WorkspaceCheckpoint { .. } => {}
+            SessionEvent::WorkspaceCheckpoint { .. } | SessionEvent::Restored { .. } => {}
             // The call it describes is already recorded as it ran.
             SessionEvent::ToolCallRepaired { .. } => {}
             SessionEvent::AssistantContent { message } => {

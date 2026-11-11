@@ -1187,6 +1187,7 @@ fn run_session(
         Some("recover") => return run_session_recover(paths, launch, output),
         Some("migrate") => return run_session_migrate(paths, launch, output),
         Some("fork") => return run_session_fork(paths, launch, workspace, output),
+        Some("restore") => return run_session_restore(paths, launch, workspace, output),
         _ => {}
     }
 
@@ -1291,6 +1292,141 @@ fn run_session(
         );
     }
     Ok(ExitCode::from(EXIT_OK))
+}
+
+/// Restores the workspace to its state before one turn of a session.
+fn run_session_restore(
+    paths: &Paths,
+    launch: &Launch,
+    workspace: &Utf8Path,
+    output: &OutputFlags,
+) -> Result<ExitCode> {
+    use checkpoint::{ChangeKind, Record, RestoreReport, RestoreRequest, Shadow, Timeline};
+    use rune_session::event::{RestoreDirection, SessionEvent};
+    let raw = launch.args.get(1).ok_or_else(|| {
+        RuneError::missing_field("session").with_hint("name a session, or run `rune sessions`")
+    })?;
+    let id = if raw == "last" {
+        session_log::resolve_target(&ResumeTarget::Latest, paths, workspace)?
+    } else {
+        raw.parse()?
+    };
+    let turn = launch
+        .flag("--turn")
+        .ok_or_else(|| RuneError::missing_field("turn").with_hint("pass --turn <n>"))?
+        .parse::<u64>()
+        .ok()
+        .filter(|turn| *turn > 0)
+        .ok_or_else(|| RuneError::invalid_field("turn", "expected a positive turn number"))?;
+    let dry_run = launch.has_flag("--dry-run");
+    let force = launch.has_flag("--force");
+    let log = rune_session::store::load_read_only(&paths.session_dir(&id))?;
+    let events: Vec<SessionEvent> = log.events.into_iter().map(|frame| frame.event).collect();
+    let here = trust::canonical_workspace(workspace);
+    let recorded = events.iter().find_map(|event| match event {
+        SessionEvent::WorkspaceSet { workspace } => Some(workspace.clone()),
+        _ => None,
+    });
+    if let Some(recorded) = &recorded
+        && recorded.as_str() != here.as_str()
+    {
+        return Err(RuneError::new(
+            ErrorCode::InvalidState,
+            format!("session {id} ran in {recorded}; run this command there"),
+        ));
+    }
+    let shadow = Shadow::open(paths, &here)?.ok_or_else(|| {
+        RuneError::new(
+            ErrorCode::Unsupported,
+            "this workspace has no checkpoints (it is not a git work tree)",
+        )
+    })?;
+    let mut timeline = Timeline::from_events(&events);
+    let start = timeline.before_turn(turn).ok_or_else(|| {
+        RuneError::new(
+            ErrorCode::NotFound,
+            format!("no checkpoint for turn {turn} in session {id}"),
+        )
+    })?;
+    let request = RestoreRequest {
+        turn,
+        target: start.tree,
+        direction: RestoreDirection::Turn,
+    };
+    // The writer lock is taken before anything is written, so a session that is
+    // still open elsewhere refuses the restore.
+    let recorder = if dry_run {
+        None
+    } else {
+        Some(std::sync::Arc::new(std::sync::Mutex::new(
+            session_log::Recorder::open(paths, &id)?,
+        )))
+    };
+    let record: Record = {
+        let recorder = recorder.clone();
+        std::sync::Arc::new(move |event| match &recorder {
+            Some(recorder) => recorder
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .workspace_checkpoint(event),
+            None => Ok(()),
+        })
+    };
+    let report = checkpoint::restore_to(
+        &shadow,
+        id.as_str(),
+        &mut timeline,
+        &request,
+        force,
+        dry_run,
+        &record,
+    )?;
+    let (changes, refused) = match &report {
+        RestoreReport::Done(changes) => (changes, false),
+        RestoreReport::OutsideChanges(changes) => (changes, true),
+    };
+    if output.json {
+        let listed: Vec<serde_json::Value> = changes
+            .iter()
+            .map(|change| {
+                serde_json::json!({
+                    "path": change.path,
+                    "kind": match change.kind {
+                        ChangeKind::Added => "added",
+                        ChangeKind::Modified => "modified",
+                        ChangeKind::Deleted => "deleted",
+                    },
+                    "added": change.added,
+                    "removed": change.removed,
+                })
+            })
+            .collect();
+        let mut value = serde_json::json!({
+            "turn": turn,
+            "dry_run": dry_run,
+            "changes": listed,
+        });
+        if refused {
+            value["outside_changes"] = serde_json::Value::Bool(true);
+        }
+        println!("{}", serde_json::to_string_pretty(&value)?);
+    } else {
+        let heading = if refused {
+            "these files changed outside this session since the last checkpoint:".to_owned()
+        } else if dry_run {
+            format!("undo preview: restoring to before turn {turn} would change")
+        } else {
+            format!("restored the workspace to before turn {turn}")
+        };
+        println!("{heading}");
+        for change in changes {
+            println!("{}", change.line());
+        }
+        if refused {
+            println!("run this command again with --force to restore anyway");
+        }
+    }
+    Ok(ExitCode::from(if refused { EXIT_FAILURE } else { EXIT_OK }))
 }
 
 /// Creates a separately resumable branch at an inclusive journal position.

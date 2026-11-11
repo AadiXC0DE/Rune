@@ -361,7 +361,7 @@ pub const SESSIONS: &[CommandSpec] = &[
         name: "session",
         aliases: &[],
         summary: "Inspect, search, export, fork, migrate, or recover one session",
-        usage: "rune session <last|id> [--search <text> | --record <id|all>] [--json] | rune session --id <id> [--search <text> | --record <id|all>] [--json] | rune session export <last|id> | rune session export --id <id> | rune session fork <last|id> --at <seq> [--json] | rune session fork --id <id> --at <seq> [--json] | rune session migrate <id> | rune session recover <id>",
+        usage: "rune session <last|id> [--search <text> | --record <id|all>] [--json] | rune session --id <id> [--search <text> | --record <id|all>] [--json] | rune session export <last|id> | rune session export --id <id> | rune session fork <last|id> --at <seq> [--json] | rune session fork --id <id> --at <seq> [--json] | rune session migrate <id> | rune session recover <id> | rune session restore <last|id> --turn <n> [--dry-run] [--force] [--json]",
         flags: &[
             option(
                 "--id",
@@ -379,6 +379,19 @@ pub const SESSIONS: &[CommandSpec] = &[
                 "Search saved message, tool, and summary records, including compacted context, by a case-insensitive literal fragment. Return original records and sequence positions.",
             ),
             flag("--allow-large", "Permit migrating an oversized session."),
+            option(
+                "--turn",
+                "n",
+                "Restore the workspace to its state before this turn.",
+            ),
+            flag(
+                "--dry-run",
+                "List the files a restore would change and change nothing.",
+            ),
+            flag(
+                "--force",
+                "Restore even when files changed outside the session since its last checkpoint.",
+            ),
             option(
                 "--record",
                 "id|all",

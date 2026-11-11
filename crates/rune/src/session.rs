@@ -1830,6 +1830,113 @@ impl SessionHost {
         true
     }
 
+    /// Undoes or redoes through the session's checkpoints, or previews an undo.
+    ///
+    /// None when the session has no checkpoints, so the per-file record is used.
+    fn checkpoint_restore(&self, ask: RestoreAsk, dry_run: bool) -> Option<Vec<String>> {
+        use crate::checkpoint::{RestoreReport, RestoreRequest};
+        use rune_session::event::RestoreDirection;
+        let checkpoints = self.checkpoints.as_ref()?;
+        let redo = ask == RestoreAsk::Redo;
+        let outcome = checkpoints.restore(
+            |timeline| {
+                let found = if redo {
+                    timeline.redo_target()
+                } else {
+                    timeline.undo_target()
+                };
+                Ok(found.map(|(turn, target)| RestoreRequest {
+                    turn,
+                    target,
+                    direction: if redo {
+                        RestoreDirection::Redo
+                    } else {
+                        RestoreDirection::Undo
+                    },
+                }))
+            },
+            ask == RestoreAsk::UndoConfirm,
+            dry_run,
+        );
+        let lines = match outcome {
+            Ok(None) if redo => vec!["nothing to redo".to_owned()],
+            Ok(None) => vec!["nothing to undo: no turn in this session changed files".to_owned()],
+            Ok(Some((_, RestoreReport::OutsideChanges(changes)))) => outside_change_lines(&changes),
+            Ok(Some((request, RestoreReport::Done(changes)))) => {
+                let turn = request.turn;
+                let heading = if dry_run {
+                    format!("undo preview: restoring to before turn {turn} would change")
+                } else if redo {
+                    self.queue_update(format!(
+                        "Files were restored to their state after turn {turn}."
+                    ));
+                    format!("restored the workspace to after turn {turn}")
+                } else {
+                    self.queue_update(format!(
+                        "Files were restored to their state before turn {turn}."
+                    ));
+                    format!("restored the workspace to before turn {turn}")
+                };
+                std::iter::once(heading)
+                    .chain(changes.iter().map(crate::checkpoint::FileChange::line))
+                    .collect()
+            }
+            Err(err) => error_lines(&err),
+        };
+        Some(lines)
+    }
+
+    /// Whether a complete start checkpoint exists for `turn`.
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn has_complete_checkpoint(&self, turn: u64) -> bool {
+        self.checkpoints.as_ref().is_some_and(|checkpoints| {
+            checkpoints
+                .timeline()
+                .turn_start(turn)
+                .is_some_and(|start| start.complete)
+        })
+    }
+
+    /// Restores the workspace to its state before `turn`, or lists what that would change.
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn restore_before_turn(
+        &self,
+        turn: u64,
+        dry_run: bool,
+        force: bool,
+    ) -> Result<crate::checkpoint::RestoreReport> {
+        use crate::checkpoint::{RestoreReport, RestoreRequest};
+        let Some(checkpoints) = &self.checkpoints else {
+            return Err(RuneError::new(
+                ErrorCode::Unsupported,
+                "this session has no checkpoints to restore",
+            ));
+        };
+        let outcome = checkpoints.restore(
+            |timeline| {
+                let start = timeline
+                    .before_turn(turn)
+                    .ok_or_else(|| no_checkpoint(turn))?;
+                Ok(Some(RestoreRequest {
+                    turn,
+                    target: start.tree,
+                    direction: rune_session::event::RestoreDirection::Turn,
+                }))
+            },
+            force,
+            dry_run,
+        )?;
+        let Some((_, report)) = outcome else {
+            return Err(no_checkpoint(turn));
+        };
+        if !dry_run && matches!(report, RestoreReport::Done(_)) {
+            self.queue_update(format!(
+                "Files were restored to their state before turn {turn}."
+            ));
+        }
+        Ok(report)
+    }
+
     /// Returns whether anything is available to undo.
     fn can_undo(&self) -> bool {
         !self
@@ -3071,6 +3178,15 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
     );
     // Without a repository the edit pre-images are kept on disk instead, so
     // `/undo` still works after a restart.
+    // A resumed session can undo the turns it ran before, so its timeline is
+    // rebuilt from the checkpoints and restores its log holds.
+    if let (Some(checkpoints), Some(id)) = (&checkpoints, &config.resume)
+        && let Ok(log) = rune_session::store::load_read_only(&config.paths.session_dir(id))
+    {
+        let events: Vec<rune_session::event::SessionEvent> =
+            log.events.into_iter().map(|frame| frame.event).collect();
+        checkpoints.seed(crate::checkpoint::Timeline::from_events(&events));
+    }
     let (preimage_dir, preimage_count, resumed_undo) = if no_repository {
         let dir = config.paths.session_dir(&session_id).join("preimages");
         let loaded = load_preimages(&dir);
@@ -3540,9 +3656,14 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                             }
                         }
                     }
-                    Handled::Undo => return Ok(Step::Undo),
+                    Handled::Undo => return Ok(Step::Restore(RestoreAsk::Undo)),
+                    Handled::UndoConfirm => return Ok(Step::Restore(RestoreAsk::UndoConfirm)),
+                    Handled::Redo => return Ok(Step::Restore(RestoreAsk::Redo)),
                     Handled::UndoPreview => {
-                        flush_lines(&host, sink, &host.preview_undo())?;
+                        let lines = host
+                            .checkpoint_restore(RestoreAsk::Undo, true)
+                            .unwrap_or_else(|| host.preview_undo());
+                        flush_lines(&host, sink, &lines)?;
                         return Ok(Step::Continue);
                     }
                     Handled::Reload => {
@@ -4193,8 +4314,8 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                         flush_lines(&host, &mut sink, &[line])?;
                     }
                 }
-                Step::Undo => {
-                    report_undo(&host, &mut sink)?;
+                Step::Restore(ask) => {
+                    report_undo(&host, &mut sink, ask)?;
                 }
                 Step::Continue => {}
             }
@@ -4225,7 +4346,7 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                 Some(&mut source),
             )? {
                 Step::Exit => break ExitReason::Requested,
-                Step::Undo => report_undo(&host, &mut sink)?,
+                Step::Restore(ask) => report_undo(&host, &mut sink, ask)?,
                 Step::PickModel => {
                     flush_lines(
                         &host,
@@ -4250,8 +4371,8 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
             match handle_input(input, &mut sink, &mut history_file, &mut reader, &mut cancellation_gesture, None)? {
                 Step::Exit => Ok(Action::Exit),
                 Step::Continue => Ok(Action::Continue),
-                Step::Undo => {
-                    report_undo(&host, &mut sink)?;
+                Step::Restore(ask) => {
+                    report_undo(&host, &mut sink, ask)?;
                     Ok(Action::Continue)
                 }
                 Step::PickModel => {
@@ -6048,7 +6169,15 @@ fn report(host: &SessionHost, sink: &mut LockedSink, line: &str) -> Result<Step>
 /// A file that could not be restored is reported and the rest are still
 /// attempted, because leaving the user with half their files back and no
 /// explanation is worse than a partial undo they can see.
-fn report_undo(host: &SessionHost, sink: &mut LockedSink) -> Result<()> {
+fn report_undo(host: &SessionHost, sink: &mut LockedSink, ask: RestoreAsk) -> Result<()> {
+    if let Some(lines) = host.checkpoint_restore(ask, false) {
+        flush_lines(host, sink, &lines)?;
+        return Ok(());
+    }
+    if ask == RestoreAsk::Redo {
+        flush_lines(host, sink, &["nothing to redo".to_owned()])?;
+        return Ok(());
+    }
     if !host.can_undo() {
         flush_lines(
             host,
@@ -6068,6 +6197,35 @@ fn report_undo(host: &SessionHost, sink: &mut LockedSink) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// The refusal for a restore whose turn has no checkpoint.
+fn no_checkpoint(turn: u64) -> RuneError {
+    RuneError::new(
+        ErrorCode::NotFound,
+        format!("no checkpoint for turn {turn} in this session"),
+    )
+}
+
+/// The lines shown when files changed outside the session since its last checkpoint.
+fn outside_change_lines(changes: &[crate::checkpoint::FileChange]) -> Vec<String> {
+    let mut lines =
+        vec!["these files changed outside this session since the last checkpoint:".to_owned()];
+    lines.extend(changes.iter().map(crate::checkpoint::FileChange::line));
+    lines.push(
+        "run /undo confirm to restore anyway (a snapshot of the current state is kept, so /redo brings it back)"
+            .to_owned(),
+    );
+    lines
+}
+
+/// An error and its hint, one line each.
+fn error_lines(err: &RuneError) -> Vec<String> {
+    let mut lines = vec![err.to_string()];
+    if let Some(hint) = err.hint() {
+        lines.push(format!("hint: {hint}"));
+    }
+    lines
 }
 
 /// A unified diff in the direction undo applies, with three context lines.
@@ -7696,8 +7854,12 @@ enum Handled {
     PickModel,
     /// Put back the files the session changed.
     Undo,
-    /// Show per-file diffs without changing files or undo records.
+    /// Undo even when files changed outside the session since its last checkpoint.
+    UndoConfirm,
+    /// Show what an undo would change without changing anything.
     UndoPreview,
+    /// Put back what the last undo restored.
+    Redo,
     /// Summarize older turns to free the context window.
     Compact,
     /// Show exact summarized and retained record counts without compacting.
@@ -8105,8 +8267,16 @@ enum Step {
     PickModel,
     /// Ask the user to choose a theme.
     PickTheme,
-    /// Put back the files the session changed.
+    /// Put back files: undo, undo despite outside changes, or redo.
+    Restore(RestoreAsk),
+}
+
+/// Which restore a slash command asked for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RestoreAsk {
     Undo,
+    UndoConfirm,
+    Redo,
 }
 
 /// Handles a slash command.
@@ -8174,7 +8344,9 @@ fn handle_command<W: std::io::Write>(
         "copy" => Ok(Handled::Copy),
         "new" => Ok(Handled::NewSession),
         "undo" if arguments.trim() == "preview" => Ok(Handled::UndoPreview),
+        "undo" if arguments.trim() == "confirm" => Ok(Handled::UndoConfirm),
         "undo" => Ok(Handled::Undo),
+        "redo" => Ok(Handled::Redo),
         "resume" => {
             let id = arguments.trim();
             Ok(Handled::Resume((!id.is_empty()).then(|| id.to_owned())))
@@ -13246,6 +13418,206 @@ mod tests {
     }
 
     #[cfg(unix)]
+    /// A host whose workspace is a git repository with checkpoints on.
+    /// None when git is not installed.
+    fn checkpointed_host() -> Option<(tempfile::TempDir, Utf8PathBuf, SessionHost)> {
+        let present = std::process::Command::new("git")
+            .args(["--version"])
+            .output()
+            .is_ok_and(|output| output.status.success());
+        if !present {
+            eprintln!("skipped: git is not installed");
+            return None;
+        }
+        let root = tempfile::tempdir().expect("tempdir");
+        let base = Utf8PathBuf::from_path_buf(root.path().canonicalize().expect("canonical"))
+            .expect("utf8");
+        let workspace = base.join("work");
+        std::fs::create_dir(&workspace).expect("workspace");
+        let init = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&workspace)
+            .status()
+            .expect("git init");
+        assert!(init.success());
+        std::fs::write(workspace.join("a.txt"), "first\n").expect("file");
+        let paths = Paths {
+            config_root: base.join("config"),
+            state_root: base.join("state"),
+            data_root: base.join("data"),
+        };
+        let shadow = crate::checkpoint::Shadow::open(&paths, &workspace)
+            .expect("open")
+            .expect("shadow");
+        let record: crate::checkpoint::Record = Arc::new(|_| Ok(()));
+        let notify: crate::checkpoint::Notify = Arc::new(|line| panic!("unexpected: {line}"));
+        let mut host = test_host();
+        host.checkpoints = Some(crate::checkpoint::Checkpoints::start(
+            shadow,
+            "session".to_owned(),
+            record,
+            notify,
+        ));
+        Some((root, workspace, host))
+    }
+
+    /// Runs one turn whose work is `change`, with both boundary snapshots.
+    fn checkpointed_turn(host: &SessionHost, turn: u64, change: impl FnOnce()) {
+        let checkpoints = host.checkpoints.as_ref().expect("checkpoints");
+        checkpoints.turn_started(turn);
+        assert!(checkpoints.wait_for_start(std::time::Duration::from_secs(30)));
+        change();
+        checkpoints.turn_finished(turn);
+        assert!(checkpoints.wait_idle(std::time::Duration::from_secs(30)));
+    }
+
+    #[test]
+    fn undo_reports_outside_changes_and_writes_nothing() {
+        let Some((_root, workspace, host)) = checkpointed_host() else {
+            return;
+        };
+        let file = workspace.join("a.txt");
+        checkpointed_turn(&host, 1, || {
+            std::fs::write(&file, "from the turn\n").expect("edit");
+        });
+        std::fs::write(&file, "from another editor\n").expect("edit");
+
+        let lines = host
+            .checkpoint_restore(RestoreAsk::Undo, false)
+            .expect("lines");
+        assert_eq!(
+            lines,
+            vec![
+                "these files changed outside this session since the last checkpoint:".to_owned(),
+                "M a.txt +1 -1".to_owned(),
+                "run /undo confirm to restore anyway (a snapshot of the current state is kept, so /redo brings it back)".to_owned(),
+            ]
+        );
+        assert_eq!(
+            std::fs::read_to_string(&file).expect("read"),
+            "from another editor\n"
+        );
+        assert!(host.take_updates().is_empty());
+
+        let lines = host
+            .checkpoint_restore(RestoreAsk::UndoConfirm, false)
+            .expect("lines");
+        assert_eq!(lines[0], "restored the workspace to before turn 1");
+        assert_eq!(std::fs::read_to_string(&file).expect("read"), "first\n");
+        let lines = host
+            .checkpoint_restore(RestoreAsk::Redo, false)
+            .expect("lines");
+        assert_eq!(lines[0], "restored the workspace to after turn 1");
+        assert_eq!(
+            std::fs::read_to_string(&file).expect("read"),
+            "from another editor\n"
+        );
+    }
+
+    #[test]
+    fn undo_then_redo_round_trips() {
+        let Some((_root, workspace, host)) = checkpointed_host() else {
+            return;
+        };
+        let made = workspace.join("made-by-command");
+        let bytes = b"\x00binary\xffcontent".to_vec();
+        checkpointed_turn(&host, 1, || {
+            std::fs::write(&made, &bytes).expect("create");
+        });
+        checkpointed_turn(&host, 2, || {});
+
+        let preview = host
+            .checkpoint_restore(RestoreAsk::Undo, true)
+            .expect("lines");
+        assert_eq!(
+            preview,
+            vec![
+                "undo preview: restoring to before turn 1 would change".to_owned(),
+                "A made-by-command".to_owned(),
+            ]
+        );
+        assert!(made.exists(), "a preview changes nothing");
+        let undone = host
+            .checkpoint_restore(RestoreAsk::Undo, false)
+            .expect("lines");
+        assert_eq!(
+            undone,
+            vec![
+                "restored the workspace to before turn 1".to_owned(),
+                "A made-by-command".to_owned()
+            ]
+        );
+        assert!(!made.exists());
+        let again = host
+            .checkpoint_restore(RestoreAsk::Undo, false)
+            .expect("lines");
+        assert_eq!(
+            again,
+            vec!["nothing to undo: no turn in this session changed files".to_owned()]
+        );
+        let redone = host
+            .checkpoint_restore(RestoreAsk::Redo, false)
+            .expect("lines");
+        assert_eq!(
+            redone,
+            vec![
+                "restored the workspace to after turn 1".to_owned(),
+                "A made-by-command".to_owned()
+            ]
+        );
+        assert_eq!(std::fs::read(&made).expect("read"), bytes);
+        let none = host
+            .checkpoint_restore(RestoreAsk::Redo, false)
+            .expect("lines");
+        assert_eq!(none, vec!["nothing to redo".to_owned()]);
+    }
+
+    #[test]
+    fn restore_pushes_a_context_update() {
+        let Some((_root, workspace, host)) = checkpointed_host() else {
+            return;
+        };
+        let file = workspace.join("a.txt");
+        checkpointed_turn(&host, 1, || {
+            std::fs::write(&file, "one\n").expect("edit");
+        });
+        checkpointed_turn(&host, 2, || {
+            std::fs::write(&file, "two\n").expect("edit");
+        });
+        assert!(host.has_complete_checkpoint(1));
+        assert!(!host.has_complete_checkpoint(9));
+
+        host.checkpoint_restore(RestoreAsk::Undo, true)
+            .expect("lines");
+        assert!(
+            host.take_updates().is_empty(),
+            "a preview tells the model nothing"
+        );
+        host.checkpoint_restore(RestoreAsk::Undo, false)
+            .expect("lines");
+        assert_eq!(
+            host.take_updates(),
+            vec!["Files were restored to their state before turn 2.".to_owned()]
+        );
+        host.checkpoint_restore(RestoreAsk::Redo, false)
+            .expect("lines");
+        assert_eq!(
+            host.take_updates(),
+            vec!["Files were restored to their state after turn 2.".to_owned()]
+        );
+        let preview = host.restore_before_turn(1, true, false).expect("preview");
+        assert!(
+            matches!(&preview, crate::checkpoint::RestoreReport::Done(changes) if changes.len() == 1)
+        );
+        assert_eq!(std::fs::read_to_string(&file).expect("read"), "two\n");
+        host.restore_before_turn(1, false, false).expect("restore");
+        assert_eq!(std::fs::read_to_string(&file).expect("read"), "first\n");
+        assert_eq!(
+            host.take_updates(),
+            vec!["Files were restored to their state before turn 1.".to_owned()]
+        );
+    }
+
     #[test]
     fn checkpoints_off_create_no_store() {
         let present = std::process::Command::new("git")
