@@ -122,6 +122,15 @@ with tempfile.TemporaryDirectory(prefix="rune-signals-") as directory:
                 wait_for(b"\x1b[?2004l", mark)
                 after = bytes(transcript[mark:])
                 assert all(part in after for part in RESTORED), after
+                # The restore is written before the process stops, so the
+                # continue waits for the stop; sent earlier, it is lost.
+                deadline = time.monotonic() + 15
+                while "T" not in subprocess.run(
+                    ["ps", "-o", "stat=", "-p", str(child.pid)],
+                    capture_output=True, text=True,
+                ).stdout:
+                    assert time.monotonic() < deadline, "Rune did not stop after Ctrl+Z"
+                    time.sleep(0.02)
                 mark = len(transcript)
                 os.kill(child.pid, signal.SIGCONT)
                 wait_for(b"\x1b[?2004h", mark)
