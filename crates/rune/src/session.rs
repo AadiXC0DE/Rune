@@ -271,6 +271,9 @@ struct ApprovalRequest {
     /// Whether the answer may be remembered for the session. Never true for an
     /// action that destroys data or publishes.
     rememberable: bool,
+    /// The rule an "always allow in this project" answer saves, when one may be
+    /// saved: never for an action that is not rememberable.
+    project_pattern: Option<String>,
     /// What the call would change, drawn under the scope, for an edit.
     preview: Vec<String>,
     answer: mpsc::SyncSender<ApprovalOutcome>,
@@ -1750,11 +1753,15 @@ impl SessionHost {
         };
         self.notify("approval_needed", &format!("approve {tool}: {target}"));
         let (answer, response) = mpsc::sync_channel(1);
+        let rememberable = rememberable(tool, target);
         let request = ApprovalRequest {
             tool: tool.to_owned(),
             target: target.to_owned(),
             reason: reason.clone(),
-            rememberable: rememberable(tool, target),
+            rememberable,
+            project_pattern: rememberable
+                .then(|| rune_policy::approval::project_pattern(tool, target))
+                .flatten(),
             preview: self
                 .approval_preview
                 .lock()
@@ -1785,6 +1792,23 @@ impl SessionHost {
                         format!("{reason}; approved for the rest of this session"),
                     );
                 }
+                Ok(ApprovalOutcome::AlwaysForProject) if !self.cancellation.is_cancelled() => {
+                    // A rule that cannot be saved still approves this call.
+                    let line = match self.save_project_rule(tool, target) {
+                        Ok(_) => None,
+                        Err(err) => Some(err.hint().map_or_else(
+                            || err.message().to_owned(),
+                            |hint| format!("{}\n{hint}", err.message()),
+                        )),
+                    };
+                    if let Some(line) = line {
+                        self.checkpoint_notice(line);
+                    }
+                    return (
+                        Outcome::Allow,
+                        format!("{reason}; approved for this project"),
+                    );
+                }
                 // Escape cancels the turn before it answers, so a refusal that
                 // arrives after a cancel is the cancel, whichever was seen first.
                 Ok(_) if self.cancellation.is_cancelled() => {
@@ -1800,6 +1824,73 @@ impl SessionHost {
                 }
             }
         }
+    }
+
+    /// The user file approvals are saved to.
+    fn user_config_file(&self) -> Option<Utf8PathBuf> {
+        self.permission_settings
+            .user_config_path
+            .clone()
+            .or_else(|| {
+                self.usage_paths
+                    .as_ref()
+                    .map(|paths| paths.config_file(std::env::var("RUNE_CONFIG").ok().as_deref()))
+            })
+    }
+
+    /// Saves an approval as a rule in the user file that allows the same action
+    /// in this workspace from now on, and applies it to this session.
+    ///
+    /// Returns the rule as shown: `allow shell "cargo test*" in {workspace}`.
+    /// The rule is never written into the repository.
+    fn save_project_rule(&self, tool: &str, target: &str) -> Result<String> {
+        let pattern = rune_policy::approval::project_pattern(tool, target).ok_or_else(|| {
+            RuneError::new(
+                ErrorCode::InvalidField,
+                format!("could not save the rule: no rule may be saved for `{target}`"),
+            )
+        })?;
+        let workspace = self
+            .permission_settings
+            .workspace
+            .clone()
+            .unwrap_or_else(|| rune_policy::trust::canonical_workspace(self.context.workspace()));
+        let path = self.user_config_file().ok_or_else(|| {
+            RuneError::new(
+                ErrorCode::InvalidConfiguration,
+                "could not save the rule: there is no user configuration file",
+            )
+        })?;
+        let rule = rune_core::config::ConfiguredRule {
+            tool: tool.to_owned(),
+            pattern: pattern.clone(),
+            decision: rune_core::config::RuleDecision::Allow,
+            workspace: Some(workspace.clone()),
+            saved: Some(today()),
+        };
+        let block = project_rule_block(&rule);
+        rune_policy::settings::update(&path, |old| {
+            let text = format!("{}{block}", old.unwrap_or_default());
+            toml::from_str::<rune_core::config::UserConfig>(&text).map_err(|_| {
+                RuneError::new(
+                    ErrorCode::InvalidConfiguration,
+                    format!(
+                        "could not save the rule: {path} cannot be extended automatically; add it by hand"
+                    ),
+                )
+                .with_hint(block.trim().to_owned())
+            })?;
+            Ok(text)
+        })?;
+        lock_value(&self.rules).push(rune_policy::rules::Rule::allow(
+            tool,
+            pattern.clone(),
+            rune_policy::decision::Layer::User,
+        ));
+        self.checkpoint_notice(format!(
+            "saved: allow {tool} \"{pattern}\" in this project ({path})"
+        ));
+        Ok(format!("allow {tool} \"{pattern}\" in {workspace}"))
     }
 
     /// Points the session at another model.
@@ -5661,21 +5752,10 @@ fn collect_approval_inner(
     host: &SessionHost,
     reader: &mut rune_term::input::KeyReader,
 ) -> ApprovalOutcome {
-    let choices: Vec<ApprovalOutcome> = if request.rememberable {
-        vec![
-            ApprovalOutcome::RememberForSession,
-            ApprovalOutcome::RunOnce,
-            ApprovalOutcome::Deny,
-        ]
-    } else {
-        vec![ApprovalOutcome::RunOnce, ApprovalOutcome::Deny]
-    };
+    let choices = approval_choices(request);
     let mut picker = rune_term::picker::Picker::new(
         "permission required",
-        choices
-            .iter()
-            .map(|choice| choice.label().to_owned())
-            .collect(),
+        choices.iter().map(|(label, _)| label.clone()).collect(),
         choices.len(),
     );
     picker.to(choices.len().saturating_sub(1));
@@ -5694,7 +5774,7 @@ fn collect_approval_inner(
         let key = reader.poll_choice(rune_term::shell::POLL_INTERVAL);
         let idle = key.is_none();
         if let Some(key) = key
-            && let Some(answer) = approval_key(key, &mut picker, host)
+            && let Some(answer) = approval_key(key, &mut picker, &choices, host)
         {
             return answer;
         }
@@ -5703,6 +5783,37 @@ fn collect_approval_inner(
             return ApprovalOutcome::Deny;
         }
     }
+}
+
+/// Today's date, `YYYY-MM-DD` in UTC.
+fn today() -> String {
+    jiff::Timestamp::from_millisecond(now_ms())
+        .ok()
+        .map(|at| at.strftime("%Y-%m-%d").to_string())
+        .unwrap_or_default()
+}
+
+/// The `[[permission.rules]]` block appended to the user file for a saved
+/// rule, starting with an empty line.
+fn project_rule_block(rule: &rune_core::config::ConfiguredRule) -> String {
+    let quote = |text: &str| toml::Value::String(text.to_owned()).to_string();
+    let mut block = format!(
+        "\n[[permission.rules]]\ntool = {}\nmatch = {}\ndecision = {}\n",
+        quote(&rule.tool),
+        quote(&rule.pattern),
+        quote(rule.decision.as_str()),
+    );
+    if let Some(workspace) = &rule.workspace {
+        block.push_str("workspace = ");
+        block.push_str(&quote(workspace.as_str()));
+        block.push('\n');
+    }
+    if let Some(saved) = &rule.saved {
+        block.push_str("saved = ");
+        block.push_str(&quote(saved));
+        block.push('\n');
+    }
+    block
 }
 
 /// Returns true when an approval may be remembered for the session.
@@ -5846,9 +5957,32 @@ fn approval_lines(request: &ApprovalRequest, width: usize) -> Vec<String> {
     .collect()
 }
 
+/// The picker's choices, top first, with the label each shows.
+fn approval_choices(request: &ApprovalRequest) -> Vec<(String, ApprovalOutcome)> {
+    let mut choices = Vec::with_capacity(4);
+    if let Some(pattern) = &request.project_pattern {
+        let outcome = ApprovalOutcome::AlwaysForProject;
+        choices.push((format!("{}: {pattern}", outcome.label()), outcome));
+    }
+    let rest: &[ApprovalOutcome] = if request.rememberable {
+        &[
+            ApprovalOutcome::RememberForSession,
+            ApprovalOutcome::RunOnce,
+            ApprovalOutcome::Deny,
+        ]
+    } else {
+        &[ApprovalOutcome::RunOnce, ApprovalOutcome::Deny]
+    };
+    for outcome in rest {
+        choices.push((outcome.label().to_owned(), *outcome));
+    }
+    choices
+}
+
 fn approval_key(
     key: KeyAction,
     picker: &mut rune_term::picker::Picker,
+    choices: &[(String, ApprovalOutcome)],
     host: &SessionHost,
 ) -> Option<ApprovalOutcome> {
     match key {
@@ -5857,10 +5991,10 @@ fn approval_key(
             None
         }
         KeyAction::Submit => Some(
-            ApprovalOutcome::ALL
-                .into_iter()
-                .find(|choice| picker.selected() == Some(choice.label()))
-                .unwrap_or(ApprovalOutcome::Deny),
+            choices
+                .iter()
+                .find(|(label, _)| picker.selected() == Some(label.as_str()))
+                .map_or(ApprovalOutcome::Deny, |(_, outcome)| *outcome),
         ),
         KeyAction::Up => {
             picker.up();
@@ -13545,6 +13679,136 @@ mod tests {
         );
     }
 
+    fn project_rule_host(config: &Utf8Path) -> SessionHost {
+        let mut host = test_host();
+        host.permission_settings.user_config_path = Some(config.to_owned());
+        host.permission_settings.workspace = Some(Utf8PathBuf::from("/work/app"));
+        host
+    }
+
+    #[test]
+    fn saving_a_project_rule_appends_to_the_user_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_owned()).expect("utf8");
+        let config = root.join("config.toml");
+        let before = "# my settings\ntheme = \"dark\" # keep this\n\n[limits]\n";
+        rune_core::paths::write_private(&config, before).expect("config");
+        let host = project_rule_host(&config);
+        assert_eq!(host.decide("shell", Some("docker ps")).0, Outcome::Ask);
+
+        let shown = host
+            .save_project_rule("shell", "docker ps -a")
+            .expect("saved");
+        assert_eq!(shown, "allow shell \"docker ps*\" in /work/app");
+        let after = std::fs::read_to_string(&config).expect("read");
+        let (kept, appended) = after.split_at(before.len());
+        assert_eq!(kept, before);
+        let today = today();
+        assert_eq!(
+            appended,
+            format!(
+                "\n[[permission.rules]]\ntool = \"shell\"\nmatch = \"docker ps*\"\n\
+                 decision = \"allow\"\nworkspace = \"/work/app\"\nsaved = \"{today}\"\n"
+            )
+        );
+        let parsed: rune_core::config::UserConfig = toml::from_str(&after).expect("parse");
+        let rules = parsed.permission.expect("table").rules;
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].saved.as_deref(), Some(today.as_str()));
+        // The next identical call is decided by the rule, without a prompt.
+        let (outcome, _) = host.decide("shell", Some("docker ps"));
+        assert_eq!(outcome, Outcome::Allow);
+
+        // A user file that does not exist yet is created, private.
+        let fresh = root.join("fresh.toml");
+        let host = project_rule_host(&fresh);
+        host.save_project_rule("shell", "cargo fmt --check")
+            .expect("saved");
+        let text = std::fs::read_to_string(&fresh).expect("created");
+        assert!(text.contains("match = \"cargo fmt*\""), "{text}");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(&fresh)
+                .expect("meta")
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+    }
+
+    #[test]
+    fn the_approval_picker_shows_the_rule_a_project_approval_saves() {
+        let request = |target: &str| {
+            let (answer, _response) = mpsc::sync_channel(1);
+            let rememberable = rememberable("shell", target);
+            ApprovalRequest {
+                tool: "shell".to_owned(),
+                target: target.to_owned(),
+                reason: String::new(),
+                rememberable,
+                project_pattern: rememberable
+                    .then(|| rune_policy::approval::project_pattern("shell", target))
+                    .flatten(),
+                preview: Vec::new(),
+                answer,
+            }
+        };
+        let labels = |target: &str| -> Vec<String> {
+            approval_choices(&request(target))
+                .into_iter()
+                .map(|(label, _)| label)
+                .collect()
+        };
+        assert_eq!(
+            labels("docker ps -a"),
+            [
+                "Always allow in this project: docker ps*",
+                "Remember for this session",
+                "Run once",
+                "Deny"
+            ]
+        );
+        assert_eq!(
+            approval_choices(&request("docker ps -a"))[0].1,
+            ApprovalOutcome::AlwaysForProject
+        );
+        // A consequential command is approved one run at a time.
+        assert_eq!(labels("git push"), ["Run once", "Deny"]);
+        // No safe pattern: remembered for the session only.
+        assert_eq!(
+            labels("docker ps; docker images"),
+            ["Remember for this session", "Run once", "Deny"]
+        );
+    }
+
+    #[test]
+    fn an_unextendable_file_is_left_alone() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_owned()).expect("utf8");
+        let config = root.join("config.toml");
+        let before = "permission = { rules = [] }\n";
+        rune_core::paths::write_private(&config, before).expect("config");
+        let host = project_rule_host(&config);
+        let err = host
+            .save_project_rule("shell", "docker ps -a")
+            .expect_err("refused");
+        assert_eq!(
+            err.message(),
+            format!(
+                "could not save the rule: {config} cannot be extended automatically; add it by hand"
+            )
+        );
+        let hint = err.hint().expect("hint");
+        assert!(
+            hint.starts_with("[[permission.rules]]\ntool = \"shell\""),
+            "{hint}"
+        );
+        assert!(hint.contains("match = \"docker ps*\""), "{hint}");
+        assert_eq!(std::fs::read_to_string(&config).expect("read"), before);
+        assert_eq!(host.decide("shell", Some("docker ps")).0, Outcome::Ask);
+    }
+
     #[test]
     fn approval_scope_cannot_hide_terminal_controls_or_clip_long_commands() {
         let (answer, _response) = mpsc::sync_channel(1);
@@ -13553,6 +13817,7 @@ mod tests {
             target: "printf 'a\\b'\n\t\u{1b}[2J\u{202e}TAIL-END".to_owned(),
             reason: "no rule allows it".to_owned(),
             rememberable: true,
+            project_pattern: None,
             preview: Vec::new(),
             answer,
         };
@@ -13581,6 +13846,7 @@ mod tests {
             target: "printf AUDIT_SHELL_OK".to_owned(),
             reason: "no rule allows it".to_owned(),
             rememberable: true,
+            project_pattern: None,
             preview: Vec::new(),
             answer,
         };
@@ -19238,6 +19504,7 @@ mod tests {
             target: "printf SECRET_PROMPT".to_owned(),
             reason: "no rule allows it".to_owned(),
             rememberable: true,
+            project_pattern: None,
             preview: Vec::new(),
             answer,
         };
