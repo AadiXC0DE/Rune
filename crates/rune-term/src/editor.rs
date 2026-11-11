@@ -352,6 +352,21 @@ impl Composer {
         self.settle();
     }
 
+    /// Replaces a backslash just before the caret with a line break, as one
+    /// edit. Returns whether there was one.
+    pub fn newline_after_backslash(&mut self) -> bool {
+        let end = self.byte_of(self.cursor);
+        let Some(start) = end
+            .checked_sub(1)
+            .filter(|start| self.text.get(*start..end) == Some("\\"))
+        else {
+            return false;
+        };
+        self.last_yank = None;
+        self.replace_range(start..end, "\n");
+        true
+    }
+
     /// Empties the line.
     ///
     /// Recall starts over as well. A line is cleared when it is submitted or
@@ -1290,6 +1305,32 @@ mod tests {
         assert_eq!(composer.text(), "hello world");
         assert_eq!(composer.cursor(), 11);
         assert!(!composer.redo());
+    }
+
+    #[test]
+    fn newline_after_backslash_is_one_undo_step() {
+        let mut composer = Composer::new();
+        composer.insert("one \\");
+        assert!(composer.newline_after_backslash());
+        assert_eq!(composer.text(), "one \n");
+        assert_eq!(composer.cursor(), 5);
+        assert!(composer.undo());
+        assert_eq!(composer.text(), "one \\");
+        assert_eq!(composer.cursor(), 5);
+
+        // Only the backslash right before the caret counts.
+        let mut composer = at("a\\b", 3);
+        assert!(!composer.newline_after_backslash());
+        assert_eq!(composer.text(), "a\\b");
+        let mut composer = at("a\\b", 2);
+        assert!(composer.newline_after_backslash());
+        assert_eq!(composer.text(), "a\nb");
+
+        let mut composer = Composer::new();
+        composer.insert("\\\\");
+        assert!(composer.newline_after_backslash());
+        assert_eq!(composer.text(), "\\\n");
+        assert!(!Composer::new().newline_after_backslash());
     }
 
     #[test]

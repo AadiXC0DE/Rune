@@ -44,6 +44,7 @@ mod shutdown;
 mod spec;
 mod spend;
 mod subagent;
+mod terminal_setup;
 mod version;
 mod vision_client;
 mod web_client;

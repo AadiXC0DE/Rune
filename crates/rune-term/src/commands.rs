@@ -148,6 +148,11 @@ pub const BUILTINS: &[Builtin] = &[
         summary: "list commands and active keyboard bindings",
     },
     Builtin {
+        name: "terminal-setup",
+        arguments: "",
+        summary: "configure this terminal so Shift-Enter inserts a newline",
+    },
+    Builtin {
         name: "quit",
         arguments: "",
         summary: "leave the session",

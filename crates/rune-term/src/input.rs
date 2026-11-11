@@ -38,7 +38,7 @@ pub fn render_bindings_help(active: bool) -> String {
 
 Composer:
   Enter         submit the draft; while a turn runs, queue steering
-  Alt-Enter     insert a newline at the caret
+  Shift-Enter / Ctrl-J / Alt-Enter  insert a newline (also \\ then Enter)
   Left / Right  move by one grapheme, including across newlines
   Up / Down     move between rows of a long or multiline draft
   Home / Ctrl-A start of the line; again for the draft
@@ -532,11 +532,26 @@ impl KeyReader {
                 self.composer.yank_pop();
                 KeyAction::Ignored
             }
+            (KeyCode::Enter, _, _) if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                self.composer.insert("\n");
+                KeyAction::Ignored
+            }
+            // Ctrl+J is the line feed byte, which every terminal can send.
+            (KeyCode::Char('j'), true, _) => {
+                self.composer.insert("\n");
+                KeyAction::Ignored
+            }
             (KeyCode::Enter, _, true) => {
                 self.composer.insert("\n");
                 KeyAction::Ignored
             }
-            (KeyCode::Enter, _, _) => KeyAction::Submit,
+            (KeyCode::Enter, _, _) => {
+                if self.composer.newline_after_backslash() {
+                    KeyAction::Ignored
+                } else {
+                    KeyAction::Submit
+                }
+            }
             // Tab completes rather than inserting a tab. Pasted tabs stay in
             // the draft and are displayed as spaces.
             (KeyCode::Tab, _, _) => KeyAction::Complete,
@@ -958,6 +973,67 @@ mod tests {
         for c in text.chars() {
             reader.apply(key(KeyCode::Char(c)));
         }
+    }
+
+    #[test]
+    fn shift_enter_inserts_a_newline() {
+        let mut reader = reader();
+        typed(&mut reader, "a");
+        let shift = KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT);
+        assert_eq!(reader.apply(shift), KeyAction::Ignored);
+        typed(&mut reader, "b");
+        assert_eq!(reader.line(), "a\nb");
+    }
+
+    #[test]
+    fn ctrl_j_inserts_a_newline() {
+        let mut reader = reader();
+        typed(&mut reader, "a");
+        assert_eq!(reader.apply(control('j')), KeyAction::Ignored);
+        typed(&mut reader, "b");
+        assert_eq!(reader.line(), "a\nb");
+    }
+
+    #[test]
+    fn backslash_enter_replaces_the_backslash() {
+        let enter_after = |text: &str| {
+            let mut reader = reader();
+            typed(&mut reader, text);
+            let action = reader.apply(key(KeyCode::Enter));
+            (action, reader.line().to_owned())
+        };
+        assert_eq!(enter_after("a\\"), (KeyAction::Ignored, "a\n".to_owned()));
+        // A backslash alone becomes a newline too.
+        assert_eq!(enter_after("\\"), (KeyAction::Ignored, "\n".to_owned()));
+        // Two backslashes keep the first.
+        assert_eq!(enter_after("\\\\"), (KeyAction::Ignored, "\\\n".to_owned()));
+        // With the caret away from the backslash, Enter submits.
+        assert_eq!(enter_after("a\\b"), (KeyAction::Submit, "a\\b".to_owned()));
+        let mut middle = reader();
+        typed(&mut middle, "a\\b");
+        middle.apply(key(KeyCode::Left));
+        assert_eq!(middle.apply(key(KeyCode::Enter)), KeyAction::Ignored);
+        assert_eq!(middle.line(), "a\nb");
+    }
+
+    #[test]
+    fn plain_enter_submits() {
+        let mut reader = reader();
+        typed(&mut reader, "a");
+        assert_eq!(reader.apply(key(KeyCode::Enter)), KeyAction::Submit);
+        assert_eq!(reader.line(), "a");
+        // Control+Enter is not one of the newline keys.
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL);
+        assert_eq!(reader.apply(enter), KeyAction::Submit);
+    }
+
+    #[test]
+    fn alt_enter_still_inserts_a_newline() {
+        let mut reader = reader();
+        typed(&mut reader, "a");
+        let alt = KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT);
+        assert_eq!(reader.apply(alt), KeyAction::Ignored);
+        assert_eq!(reader.line(), "a\n");
     }
 
     #[test]

@@ -17,6 +17,21 @@ pub const VERSION_QUERY: &str = "\u{1b}[>q";
 /// Asks for the primary device attributes, which every terminal answers.
 pub const DEVICE_ATTRIBUTES_QUERY: &str = "\u{1b}[c";
 
+/// Pushes kitty keyboard flag 1, which reports modified keys unambiguously.
+pub const KITTY_PUSH_DISAMBIGUATE: &str = "\u{1b}[>1u";
+/// Pops the kitty keyboard flags pushed last.
+pub const KITTY_POP: &str = "\u{1b}[<u";
+/// Turns on modifyOtherKeys mode 1, which leaves Ctrl+C as a control byte.
+pub const MODIFY_OTHER_KEYS_1: &str = "\u{1b}[>4;1m";
+/// Turns on modifyOtherKeys mode 2, which reports every modified key.
+pub const MODIFY_OTHER_KEYS_2: &str = "\u{1b}[>4;2m";
+/// Turns modifyOtherKeys off.
+pub const MODIFY_OTHER_KEYS_RESET: &str = "\u{1b}[>4m";
+/// Asks for modified keys in the `CSI code ; modifiers u` form.
+pub const FORMAT_OTHER_KEYS_CSI_U: &str = "\u{1b}[>4;1f";
+/// Puts the modified key format back to its default.
+pub const FORMAT_OTHER_KEYS_RESET: &str = "\u{1b}[>4f";
+
 /// How long a terminal that has said nothing is waited for.
 const FIRST_REPLY: Duration = Duration::from_millis(100);
 /// How long a terminal that has started answering is waited for.
@@ -51,6 +66,7 @@ pub struct TerminalEnv {
     pub wt_session: Option<String>,
     pub vte_version: Option<String>,
     pub kitty_window_id: Option<String>,
+    pub alacritty_window_id: Option<String>,
     pub wezterm_executable: Option<String>,
     pub colorfgbg: Option<String>,
 }
@@ -70,10 +86,24 @@ impl TerminalEnv {
             wt_session: get("WT_SESSION"),
             vte_version: get("VTE_VERSION"),
             kitty_window_id: get("KITTY_WINDOW_ID"),
+            alacritty_window_id: get("ALACRITTY_WINDOW_ID"),
             wezterm_executable: get("WEZTERM_EXECUTABLE"),
             colorfgbg: get("COLORFGBG"),
         }
     }
+}
+
+/// How the terminal is asked to report modified keys such as Shift+Enter.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum KeyProtocol {
+    /// Kitty keyboard flags.
+    Kitty,
+    /// modifyOtherKeys mode 1, inside tmux.
+    ModifyOtherKeysTmux,
+    /// modifyOtherKeys mode 2 in the `CSI u` format, for xterm.
+    ModifyOtherKeysXterm,
+    /// Nothing is asked for.
+    Legacy,
 }
 
 /// What the terminal reported about itself, with the environment it ran in.
@@ -129,6 +159,42 @@ impl TerminalCaps {
             yes_no(self.tmux),
             yes_no(self.ssh)
         )
+    }
+
+    /// The way modified keys are asked for in this terminal.
+    ///
+    /// Only a terminal that answered the probe is asked for anything. On
+    /// Windows the console's key records already carry Shift.
+    #[must_use]
+    pub fn key_protocol(&self) -> KeyProtocol {
+        if cfg!(windows) {
+            return KeyProtocol::Legacy;
+        }
+        if self.tmux && self.replied {
+            KeyProtocol::ModifyOtherKeysTmux
+        } else if self.kitty_keyboard.is_some() {
+            KeyProtocol::Kitty
+        } else if self
+            .name
+            .as_deref()
+            .is_some_and(|name| name.starts_with("XTerm("))
+        {
+            KeyProtocol::ModifyOtherKeysXterm
+        } else {
+            KeyProtocol::Legacy
+        }
+    }
+
+    /// "shift-enter newline" when Shift+Enter can be told apart, else "ctrl-j newline".
+    #[must_use]
+    pub fn newline_hint(&self) -> &'static str {
+        if cfg!(windows) {
+            return "shift-enter newline";
+        }
+        match self.key_protocol() {
+            KeyProtocol::Kitty | KeyProtocol::ModifyOtherKeysXterm => "shift-enter newline",
+            KeyProtocol::ModifyOtherKeysTmux | KeyProtocol::Legacy => "ctrl-j newline",
+        }
     }
 
     fn has_reply(&self) -> bool {
@@ -702,6 +768,85 @@ mod tests {
         assert_eq!(
             caps.summary(),
             "unknown; background unknown; synchronized output unknown; kitty keyboard no; tmux no; ssh no"
+        );
+    }
+
+    #[test]
+    fn key_protocol_prefers_tmux_then_kitty_then_xterm() {
+        if cfg!(windows) {
+            assert_eq!(TerminalCaps::default().key_protocol(), KeyProtocol::Legacy);
+            return;
+        }
+        let kitty = TerminalCaps {
+            kitty_keyboard: Some(0),
+            replied: true,
+            ..TerminalCaps::default()
+        };
+        assert_eq!(kitty.key_protocol(), KeyProtocol::Kitty);
+        // tmux inside kitty is still tmux.
+        let tmux = TerminalCaps {
+            tmux: true,
+            ..kitty.clone()
+        };
+        assert_eq!(tmux.key_protocol(), KeyProtocol::ModifyOtherKeysTmux);
+        let xterm = TerminalCaps {
+            name: Some("XTerm(390)".to_owned()),
+            replied: true,
+            ..TerminalCaps::default()
+        };
+        assert_eq!(xterm.key_protocol(), KeyProtocol::ModifyOtherKeysXterm);
+        let both = TerminalCaps {
+            kitty_keyboard: Some(1),
+            ..xterm.clone()
+        };
+        assert_eq!(both.key_protocol(), KeyProtocol::Kitty);
+        let other = TerminalCaps {
+            name: Some("FakeTerm(1.0)".to_owned()),
+            replied: true,
+            ..TerminalCaps::default()
+        };
+        assert_eq!(other.key_protocol(), KeyProtocol::Legacy);
+        // A skipped probe asks for nothing, even inside tmux.
+        let skipped = TerminalCaps {
+            tmux: true,
+            ..TerminalCaps::default()
+        };
+        assert_eq!(skipped.key_protocol(), KeyProtocol::Legacy);
+    }
+
+    #[test]
+    fn newline_hint_follows_protocol() {
+        let hint = |caps: TerminalCaps| caps.newline_hint();
+        let shift = if cfg!(windows) {
+            "shift-enter newline"
+        } else {
+            "ctrl-j newline"
+        };
+        assert_eq!(hint(TerminalCaps::default()), shift);
+        assert_eq!(
+            hint(TerminalCaps {
+                tmux: true,
+                replied: true,
+                kitty_keyboard: Some(1),
+                ..TerminalCaps::default()
+            }),
+            shift
+        );
+        assert_eq!(
+            hint(TerminalCaps {
+                kitty_keyboard: Some(1),
+                replied: true,
+                ..TerminalCaps::default()
+            }),
+            "shift-enter newline"
+        );
+        assert_eq!(
+            hint(TerminalCaps {
+                name: Some("XTerm(390)".to_owned()),
+                replied: true,
+                ..TerminalCaps::default()
+            }),
+            "shift-enter newline"
         );
     }
 
