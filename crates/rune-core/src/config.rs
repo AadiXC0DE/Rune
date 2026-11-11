@@ -548,6 +548,10 @@ pub struct UserConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub theme: Option<String>,
 
+    /// Color depth: `auto`, `truecolor`, `256`, `16`, or `none`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<String>,
+
     /// Whether terminal decorations use only ASCII.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ascii: Option<bool>,
@@ -762,6 +766,8 @@ pub struct Settings {
     pub fast_mode: bool,
     /// Theme selection.
     pub theme: Option<String>,
+    /// Color depth, `auto` to detect it from the terminal.
+    pub color: String,
     /// Whether terminal decorations use only ASCII.
     pub ascii: bool,
     /// Whether automatic update checks run.
@@ -829,6 +835,7 @@ impl Default for Settings {
             temperature: None,
             fast_mode: false,
             theme: None,
+            color: COLOR_VALUES[0].to_owned(),
             ascii: false,
             auto_upgrade: true,
             offline: false,
@@ -982,6 +989,7 @@ impl Settings {
                 "theme",
                 self.theme.clone().unwrap_or_else(|| "auto".to_owned()),
             ),
+            ("color", self.color.clone()),
             ("ascii", self.ascii.to_string()),
             ("web_tools", self.web_tools.to_string()),
             ("edit_tool", self.edit_tool.to_string()),
@@ -1223,6 +1231,9 @@ const PROJECT_SAFE_KEYS: &[&str] = &[
     "limits",
 ];
 
+/// Values the `color` setting accepts, the default first.
+pub const COLOR_VALUES: [&str; 5] = ["auto", "truecolor", "256", "16", "none"];
+
 /// Profile-owned keys. Present in a project file, they are ignored and reported.
 const PROFILE_ONLY_KEYS: &[&str] = &[
     "post_tool_hook",
@@ -1241,6 +1252,7 @@ const PROFILE_ONLY_KEYS: &[&str] = &[
     "mcp_tools",
     "fast_mode",
     "theme",
+    "color",
     "ascii",
     "auto_upgrade",
     "offline",
@@ -1546,6 +1558,19 @@ fn apply_user(settings: &mut Settings, user: &UserConfig, layer: Layer) {
     if let Some(theme) = &user.theme {
         settings.theme = Some(theme.clone());
         settings.sources.record("theme", layer);
+    }
+    if let Some(raw) = &user.color {
+        let value = raw.trim().to_ascii_lowercase();
+        if COLOR_VALUES.contains(&value.as_str()) {
+            settings.color = value;
+            settings.sources.record("color", layer);
+        } else {
+            settings.diagnostics.push(
+                Diagnostic::new(layer, ErrorCode::InvalidField, format!("color is `{raw}`"))
+                    .with_key("color")
+                    .with_hint("accepted values are auto, truecolor, 256, 16, and none"),
+            );
+        }
     }
     if let Some(ascii) = user.ascii {
         settings.ascii = ascii;
@@ -2212,6 +2237,7 @@ pub fn to_status_json(settings: &Settings, workspace: &Utf8Path) -> serde_json::
         "edit_tool": settings.edit_tool,
         "fast_mode": settings.fast_mode,
         "theme": settings.theme,
+        "color": settings.color,
         "ascii": settings.ascii,
         "auto_upgrade": settings.auto_upgrade,
         "context": settings.context,
@@ -3900,6 +3926,56 @@ max_agent_steps = 50
     fn unconfigured_provider_renders_as_text() {
         assert_eq!(Provider::Unconfigured.to_string(), "unconfigured");
         assert_eq!(provider_key(&Provider::Unconfigured), "default");
+    }
+
+    #[test]
+    fn color_setting_accepts_the_five_values() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert_eq!(Settings::default().color, "auto");
+        for (raw, expected) in [
+            ("auto", "auto"),
+            ("truecolor", "truecolor"),
+            ("256", "256"),
+            ("16", "16"),
+            ("none", "none"),
+            (" TrueColor ", "truecolor"),
+            ("NONE", "none"),
+        ] {
+            let user = write(&dir, "config.toml", &format!("color = \"{raw}\"\n"));
+            let settings = load(None, Some(&user), &empty_env());
+            assert!(
+                settings.diagnostics.is_empty(),
+                "{raw}: {:?}",
+                settings.diagnostics
+            );
+            assert_eq!(settings.color, expected);
+            assert_eq!(settings.source_of("color"), Layer::User);
+            let row = settings
+                .explain()
+                .into_iter()
+                .find(|row| row.key == "color")
+                .expect("color is explained");
+            assert_eq!(row.value, expected);
+            assert_eq!(
+                to_status_json(&settings, Utf8Path::new("/w"))["color"],
+                expected
+            );
+        }
+        let user = write(&dir, "config.toml", "color = \"millions\"\n");
+        let settings = load(None, Some(&user), &empty_env());
+        assert_eq!(settings.color, "auto");
+        assert!(settings.diagnostics.iter().any(|diagnostic| {
+            diagnostic.key.as_deref() == Some("color")
+                && diagnostic.code == ErrorCode::InvalidField
+                && diagnostic
+                    .hint
+                    .as_deref()
+                    .is_some_and(|hint| hint.contains("auto, truecolor, 256, 16, and none"))
+        }));
+        // The depth belongs to the profile, so a project file cannot set it.
+        let project = write(&dir, ".rune.toml", "color = \"none\"\n");
+        let settings = load(Some(&project), None, &empty_env());
+        assert_eq!(settings.color, "auto");
     }
 
     #[test]

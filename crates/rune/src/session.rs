@@ -6,7 +6,7 @@
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
-use std::io::{BufRead, Write as _};
+use std::io::{BufRead, IsTerminal as _, Write as _};
 use std::sync::{Arc, Mutex, mpsc};
 
 use crate::context_watch;
@@ -35,7 +35,7 @@ use rune_term::input::KeyAction;
 use rune_term::probe::TerminalEnv;
 use rune_term::shell::ExitReason;
 use rune_term::shell::{Action, Input, InputSource, Shell};
-use rune_term::theme::{Slot, Theme};
+use rune_term::theme::{ColorDepth, Slot, Theme, detect_depth};
 use rune_term::transcript::{self, Display, Entry};
 use rune_tools::ask_user::{Answer, Answerer, Question, Unavailable};
 use rune_tools::contract::{ExecutionContext, ToolOutput};
@@ -329,10 +329,10 @@ struct SessionHost {
     session_id: Mutex<String>,
     /// Workspace, shown as given.
     workspace: String,
-    /// Whether the terminal can render direct color.
-    truecolor: bool,
     /// What the terminal reported at startup.
     caps: rune_term::probe::TerminalCaps,
+    /// How many colors the terminal renders.
+    depth: ColorDepth,
     /// Terminal width the live region is drawn for.
     ///
     /// Held behind an atomic because a resize is noticed while the region is
@@ -1352,9 +1352,9 @@ impl SessionHost {
         &self.theme
     }
 
-    /// Returns whether the terminal renders direct color.
-    const fn truecolor(&self) -> bool {
-        self.truecolor
+    /// Returns how many colors the terminal renders.
+    const fn depth(&self) -> ColorDepth {
+        self.depth
     }
 
     /// Returns the model the session is sending to.
@@ -1422,6 +1422,7 @@ impl SessionHost {
             session_id: self.session_id_name(),
             workspace: &self.workspace,
             terminal: self.caps.summary(),
+            depth: self.depth,
             context_used: self.context_used.load(std::sync::atomic::Ordering::Relaxed),
             context_source: *self
                 .context_source
@@ -1738,7 +1739,7 @@ impl SessionHost {
             false,
             footer::DEFAULT_MINIMUM_ROWS,
         );
-        footer::render(&state, &layout, &self.theme, width, self.truecolor).join("\n")
+        footer::render(&state, &layout, &self.theme, width, self.depth).join("\n")
     }
 
     /// Returns the line the activity line should show for a finished turn.
@@ -1997,7 +1998,7 @@ impl SessionHost {
             return Vec::new();
         };
         let width = usize::from(self.width());
-        let dim = self.theme.sgr(Slot::Dim, self.truecolor);
+        let dim = self.theme.sgr(Slot::Dim, self.depth);
         let reset = rune_term::engine::Style::RESET;
 
         // The fields are borrowed separately, because each lane's text and the
@@ -2125,11 +2126,10 @@ impl SessionHost {
     fn styled_tool_line(&self, row: &str, failed: bool) -> String {
         let text = transcript::sanitize(row);
         let reset = rune_term::engine::Style::RESET;
-        let status = self.theme.sgr(
-            if failed { Slot::Error } else { Slot::Success },
-            self.truecolor,
-        );
-        let dim = self.theme.sgr(Slot::Dim, self.truecolor);
+        let status = self
+            .theme
+            .sgr(if failed { Slot::Error } else { Slot::Success }, self.depth);
+        let dim = self.theme.sgr(Slot::Dim, self.depth);
         let (glyph, rest) = text.split_once(' ').unwrap_or((text.as_str(), ""));
         let separator = if self.ascii { " - " } else { " \u{b7} " };
         match rest.split_once(separator) {
@@ -2171,7 +2171,7 @@ impl SessionHost {
         } else {
             return Vec::new();
         };
-        let sgr = |slot| self.theme.sgr(slot, self.truecolor);
+        let sgr = |slot| self.theme.sgr(slot, self.depth);
         let style = rune_term::diff::DiffStyle {
             added: sgr(Slot::Success),
             removed: sgr(Slot::Error),
@@ -2199,7 +2199,7 @@ impl SessionHost {
     /// draws; colours come from the theme, so a theme without them simply
     /// leaves them out.
     fn markdown_style(&self) -> rune_term::markdown::MarkdownStyle {
-        let sgr = |slot| self.theme.sgr(slot, self.truecolor);
+        let sgr = |slot| self.theme.sgr(slot, self.depth);
         rune_term::markdown::MarkdownStyle {
             enabled: true,
             heading: format!("\u{1b}[1m{}", sgr(Slot::Accent)),
@@ -2250,7 +2250,7 @@ impl SessionHost {
     /// Each row carries a turning glyph and the time spent so far, so a long
     /// call or a slow first token is visibly alive rather than a frozen screen.
     fn live_rows(&self) -> Vec<String> {
-        let dim = self.theme.sgr(Slot::Dim, self.truecolor);
+        let dim = self.theme.sgr(Slot::Dim, self.depth);
         let reset = rune_term::engine::Style::RESET;
         let row = |label: &str, started: std::time::Instant| {
             let elapsed = started.elapsed();
@@ -2461,7 +2461,12 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
     // and because the reasoning lane's colour has to be read off the theme
     // before the theme itself moves into the host.
     let theme = resolve_theme(&config);
-    let reasoning_escape = theme.sgr(Slot::Dim, truecolor_supported());
+    let depth = detect_depth(
+        &config.settings.color,
+        std::io::stdout().is_terminal(),
+        |key| std::env::var(key).ok(),
+    );
+    let reasoning_escape = theme.sgr(Slot::Dim, depth);
 
     // Copied before the endpoint moves into the host, so `/status` and the
     // picker can name the address and the provider without the credential that
@@ -2559,8 +2564,8 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                 .to_string(),
         ),
         workspace: config.workspace.to_string(),
-        truecolor: truecolor_supported(),
         caps: probe.caps,
+        depth,
         // Seeded from the terminal and refreshed on every frame, so a window
         // resized while the session runs is picked up.
         width: std::sync::atomic::AtomicU16::new(terminal_width()),
@@ -3181,7 +3186,7 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                     && let Some(summary) =
                         turn_summary(&outcome, plan_progress(&history), elapsed, cost, host.ascii)
                 {
-                    let dim = host.theme.sgr(Slot::Dim, host.truecolor);
+                    let dim = host.theme.sgr(Slot::Dim, host.depth);
                     let reset = rune_term::engine::Style::RESET;
                     lines.push(format!("{dim}  {summary}{reset}"));
                 }
@@ -3813,7 +3818,7 @@ fn draw_choice(
     let hint = vec![String::from(
         "Up/Down choose, Enter confirm, Esc/Ctrl-C cancel",
     )];
-    let menu = picker.rows(&host.theme, host.truecolor);
+    let menu = picker.rows(&host.theme, host.depth);
     let painted = host.paint_with_menu(settled, Some(picker.title()), &hint, &[], &menu, (0, 0))?;
     let mut sink = LockedSink { stream: out };
     sink.write_all(&painted)?;
@@ -4243,7 +4248,7 @@ fn await_submission(
                     reader.line(),
                     selected,
                     host.theme(),
-                    host.truecolor(),
+                    host.depth(),
                     host.menu_room(),
                 )
             },
@@ -4252,7 +4257,7 @@ fn await_submission(
                     paths,
                     selected,
                     host.theme(),
-                    host.truecolor(),
+                    host.depth(),
                     host.menu_room(),
                 )
             },
@@ -4367,13 +4372,13 @@ fn path_completion_rows(
     paths: &crate::path_completion::Paths,
     selected: usize,
     theme: &Theme,
-    truecolor: bool,
+    depth: ColorDepth,
     room: usize,
 ) -> Vec<String> {
     let count = paths.matches.len();
     let window = completion_window(count, selected, menu_window(count, COMPLETION_WINDOW, room));
-    let accent = theme.sgr(Slot::Accent, truecolor);
-    let dim = theme.sgr(Slot::Dim, truecolor);
+    let accent = theme.sgr(Slot::Accent, depth);
+    let dim = theme.sgr(Slot::Dim, depth);
     let mut rows: Vec<_> = window
         .clone()
         .filter_map(|index| {
@@ -4570,7 +4575,7 @@ fn run_picker(
 
     let chosen = loop {
         let room = host.menu_room();
-        let mut below = picker_menu(&mut picker, &host.theme, host.truecolor, room);
+        let mut below = picker_menu(&mut picker, &host.theme, host.depth, room);
         let typed = if picker.selected().is_none() {
             match catalog.choose(picker.query()) {
                 rune_net::catalog::ModelChoice::One(id) => Some(id),
@@ -4634,18 +4639,23 @@ fn search_prompt_history(
     let chosen = reader.with_temporary_line(|query| -> Result<Option<String>> {
         let mut picker = history_picker(recall);
         loop {
-            let rows = picker_menu(&mut picker, &Theme::no_color(), false, host.menu_room())
-                .into_iter()
-                .map(|row| {
-                    let preview = history_preview(&row, host.ascii);
-                    let slot = if row.starts_with("> ") {
-                        Slot::Accent
-                    } else {
-                        Slot::Dim
-                    };
-                    styled(&host.theme.sgr(slot, host.truecolor), &preview)
-                })
-                .collect::<Vec<_>>();
+            let rows = picker_menu(
+                &mut picker,
+                &Theme::no_color(),
+                ColorDepth::None,
+                host.menu_room(),
+            )
+            .into_iter()
+            .map(|row| {
+                let preview = history_preview(&row, host.ascii);
+                let slot = if row.starts_with("> ") {
+                    Slot::Accent
+                } else {
+                    Slot::Dim
+                };
+                styled(&host.theme.sgr(slot, host.depth), &preview)
+            })
+            .collect::<Vec<_>>();
             draw_prompt(query, host, out, &rows, rune_term::shell::prompt())?;
             match query.read_key() {
                 KeyAction::Submit | KeyAction::Complete => {
@@ -4684,7 +4694,7 @@ fn history_picker(recall: &[String]) -> rune_term::picker::Picker {
 fn picker_menu(
     picker: &mut rune_term::picker::Picker,
     theme: &Theme,
-    truecolor: bool,
+    depth: ColorDepth,
     max_rows: usize,
 ) -> Vec<String> {
     if max_rows == 0 {
@@ -4698,7 +4708,7 @@ fn picker_menu(
         rune_term::picker::DEFAULT_WINDOW,
         room,
     ));
-    let mut rows = picker.rows(theme, truecolor);
+    let mut rows = picker.rows(theme, depth);
     rows.truncate(room);
     if decorated {
         rows.insert(0, picker.title().to_owned());
@@ -5126,7 +5136,7 @@ fn completion_rows(
     line: &str,
     selected: usize,
     theme: &Theme,
-    truecolor: bool,
+    depth: ColorDepth,
     max_rows: usize,
 ) -> Vec<String> {
     if max_rows == 0 {
@@ -5137,8 +5147,8 @@ fn completion_rows(
         return Vec::new();
     }
 
-    let accent = theme.sgr(Slot::Accent, truecolor);
-    let dim = theme.sgr(Slot::Dim, truecolor);
+    let accent = theme.sgr(Slot::Accent, depth);
+    let dim = theme.sgr(Slot::Dim, depth);
     // Wide enough for every match rather than only the visible ones, so the
     // descriptions do not shift sideways as the window scrolls.
     let width = matches
@@ -5404,6 +5414,7 @@ fn render_status(info: &SessionInfo<'_>) -> String {
     let _ = writeln!(out, "session        {}", info.session_id);
     let _ = writeln!(out, "workspace      {}", info.workspace);
     let _ = writeln!(out, "terminal       {}", info.terminal);
+    let _ = writeln!(out, "colors         {}", info.depth.name());
     let _ = write!(
         out,
         "context        {}",
@@ -5827,18 +5838,6 @@ fn adopt_skill_catalog_budget(limits: &mut BudgetSet, context_window: Option<u64
         rune_core::budget::Budget::Bounded(derived),
         Layer::Default,
     );
-}
-
-/// Returns whether the terminal can render direct color.
-///
-/// Reads the environment for the two variables that advertise it. Anything else
-/// gets the indexed fallback, which every terminal renders.
-fn truecolor_supported() -> bool {
-    if std::env::var_os("NO_COLOR").is_some() {
-        return false;
-    }
-    let colorterm = std::env::var("COLORTERM").unwrap_or_default();
-    colorterm.eq_ignore_ascii_case("truecolor") || colorterm.eq_ignore_ascii_case("24bit")
 }
 
 /// Adds a finished turn to the usage ledger.
@@ -6268,6 +6267,8 @@ struct SessionInfo<'a> {
     workspace: &'a str,
     /// What the terminal reported at startup, as one line.
     terminal: String,
+    /// Color depth the session draws with.
+    depth: ColorDepth,
     /// Tokens spent from the context window.
     context_used: u64,
     /// Source of an estimate, absent for live provider-reported readings.
@@ -9429,18 +9430,10 @@ mod tests {
         let theme = resolve_theme_for(&config, true);
         assert_eq!(theme, Theme::no_color());
         for slot in rune_term::theme::SLOTS {
-            for truecolor in [false, true] {
-                assert!(theme.sgr(slot, truecolor).is_empty());
+            for depth in ColorDepth::ALL {
+                assert!(theme.sgr(slot, depth).is_empty());
             }
         }
-    }
-
-    #[test]
-    fn the_truecolor_check_reads_the_advertised_variables() {
-        // The helper consults the environment, so the assertion is on its shape
-        // rather than on a value a test would have to mutate globally.
-        let supported = truecolor_supported();
-        assert_eq!(supported, supported);
     }
 
     #[test]
@@ -9643,6 +9636,169 @@ mod tests {
             "terminal       FakeTerm(1.0); background #1e1e1e (dark); synchronized output \
              unknown; kitty keyboard no; tmux no; ssh no"
         );
+    }
+
+    #[test]
+    fn the_status_command_names_the_colour_depth() {
+        for depth in ColorDepth::ALL {
+            let mut info = test_info();
+            info.depth = depth;
+            let rendered = render_status(&info);
+            let workspace = rendered.find("workspace      /w").expect("workspace row");
+            let colors = rendered
+                .find(&format!("colors         {}\n", depth.name()))
+                .expect("colors row");
+            assert!(workspace < colors, "{rendered}");
+        }
+    }
+
+    #[test]
+    fn no_deeper_escape_than_the_depth_is_written() {
+        let themes = [
+            Theme::fx_dark(),
+            Theme::fx_light(),
+            Theme::high_contrast(),
+            Theme::no_color(),
+        ];
+        for theme in themes {
+            for depth in ColorDepth::ALL {
+                let written = fixture_transcript(&theme, depth);
+                let context = format!("{:?} at {depth:?}", theme.base());
+                let codes = sgr_codes(&written);
+                assert!(!codes.is_empty(), "{context}: no styling at all");
+                let colored = codes.iter().any(|code| {
+                    code.starts_with("38;") || code.starts_with("48;") || basic_color_code(code)
+                });
+                match depth {
+                    ColorDepth::TrueColor | ColorDepth::Ansi256 | ColorDepth::Ansi16
+                        if theme.base() != rune_term::theme::Base::Mono =>
+                    {
+                        assert!(colored, "{context}: no color written");
+                    }
+                    _ => {}
+                }
+                for code in &codes {
+                    match depth {
+                        ColorDepth::TrueColor => {}
+                        ColorDepth::Ansi256 => {
+                            assert!(
+                                !code.contains("38;2;") && !code.contains("48;2;"),
+                                "{context}: {code}"
+                            );
+                        }
+                        ColorDepth::Ansi16 => {
+                            for deep in ["38;5;", "48;5;", "38;2;", "48;2;"] {
+                                assert!(!code.contains(deep), "{context}: {code}");
+                            }
+                        }
+                        ColorDepth::None => {
+                            assert!(
+                                !code.contains("38;")
+                                    && !code.contains("48;")
+                                    && !basic_color_code(code),
+                                "{context}: {code}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Returns the bytes a turn with tool rows, an edit diff, a Markdown answer,
+    /// a failure notice and the footer writes with one theme and depth.
+    fn fixture_transcript(theme: &Theme, depth: ColorDepth) -> String {
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let mut host = test_host();
+        host.theme = theme.clone();
+        host.depth = depth;
+        *host.live_out.lock().expect("lock") =
+            Some(Arc::new(Mutex::new(SharedSink(Arc::clone(&bytes)))));
+        host.emit(Event::ToolFinished {
+            call: turn::PreparedCall {
+                id: "c1".to_owned(),
+                name: "read_file".to_owned(),
+                arguments: r#"{"path":"src/lib.rs"}"#.to_owned(),
+            },
+            output: ToolOutput::success("     1\ta\n     2\tb\n"),
+            elapsed: std::time::Duration::from_millis(2),
+        });
+        host.emit(Event::ToolFinished {
+            call: turn::PreparedCall {
+                id: "c2".to_owned(),
+                name: "edit_file".to_owned(),
+                arguments: serde_json::json!({
+                    "path": "src/lib.rs",
+                    "old_string": "keep\nold line",
+                    "new_string": "keep\nnew line",
+                })
+                .to_string(),
+            },
+            output: ToolOutput::success("edited src/lib.rs (1 replacement, +1 -1, line 2)"),
+            elapsed: std::time::Duration::from_millis(3),
+        });
+        host.emit(Event::ToolFinished {
+            call: turn::PreparedCall {
+                id: "c3".to_owned(),
+                name: "read_file".to_owned(),
+                arguments: r#"{"path":"missing.rs"}"#.to_owned(),
+            },
+            output: ToolOutput::failure("missing.rs does not exist"),
+            elapsed: std::time::Duration::from_millis(1),
+        });
+        let mut written = String::from_utf8_lossy(&bytes.lock().expect("lock")).into_owned();
+        let answer = "# Plan\n\nSome **bold** and `code` with a [link](https://a.test).\n\n\
+                      ```rust\nfn main() { let x = 1; // note\n}\n```\n\n- one\n- two\n";
+        written.push_str(&render_entries(&[Entry::assistant(answer)], &host).join("\r\n"));
+        let err = RuneError::new(ErrorCode::InvalidField, "the provider refused the request")
+            .with_hint("check the model name");
+        written.push_str(&report_failed_turn(&err, &host, None).join("\r\n"));
+        written.push_str(&host.status_line(100));
+        written
+    }
+
+    /// Returns the parameters of every SGR sequence in a byte string.
+    fn sgr_codes(text: &str) -> Vec<String> {
+        let mut codes = Vec::new();
+        let mut rest = text;
+        while let Some(start) = rest.find("\u{1b}[") {
+            let after = &rest[start.saturating_add(2)..];
+            let end = after
+                .find(|ch: char| !(ch.is_ascii_digit() || ch == ';' || ch == ':'))
+                .unwrap_or(after.len());
+            if after[end..].starts_with('m') {
+                codes.push(format!("{};", &after[..end]));
+            }
+            rest = &after[end..];
+        }
+        codes
+    }
+
+    /// Returns true when an SGR parameter list holds a basic color code.
+    fn basic_color_code(code: &str) -> bool {
+        let params: Vec<u16> = code
+            .split(';')
+            .filter_map(|param| param.parse().ok())
+            .collect();
+        let mut index = 0;
+        while let Some(param) = params.get(index) {
+            match param {
+                38 | 48 => {
+                    // Skip the extended color's own arguments.
+                    let skip = if params.get(index.saturating_add(1)) == Some(&2) {
+                        5
+                    } else {
+                        3
+                    };
+                    index = index.saturating_add(skip);
+                    continue;
+                }
+                30..=37 | 40..=47 | 90..=97 | 100..=107 => return true,
+                _ => {}
+            }
+            index = index.saturating_add(1);
+        }
+        false
     }
 
     #[test]
@@ -11078,7 +11234,14 @@ mod tests {
     fn the_dropdown_offers_a_command_being_typed() {
         let commands = command_candidates(&[]);
         let theme = Theme::no_color();
-        let rows = completion_rows(&commands, "/mod", 0, &theme, false, usize::MAX);
+        let rows = completion_rows(
+            &commands,
+            "/mod",
+            0,
+            &theme,
+            ColorDepth::Ansi256,
+            usize::MAX,
+        );
         assert_eq!(rows.len(), 2, "{rows:?}");
         assert!(rows[0].starts_with("> /model"), "{rows:?}");
         assert!(rows[1].starts_with("  /models"), "{rows:?}");
@@ -11110,7 +11273,14 @@ mod tests {
             let mut reader = rune_term::input::KeyReader::new();
             reader.replace("/audit");
             let mut selected = 0;
-            let rows = completion_rows(&commands, reader.line(), selected, &theme, false, 8);
+            let rows = completion_rows(
+                &commands,
+                reader.line(),
+                selected,
+                &theme,
+                ColorDepth::Ansi256,
+                8,
+            );
             assert_eq!(rows, ["> /audit-command  Describe audit command files."]);
             assert_eq!(completion_matches(&commands, reader.line()), 1);
             assert!(!path_key(
@@ -11128,7 +11298,14 @@ mod tests {
             ));
             assert_eq!(reader.line(), "/audit-command");
 
-            let rows = completion_rows(&commands, reader.line(), selected, &theme, false, 8);
+            let rows = completion_rows(
+                &commands,
+                reader.line(),
+                selected,
+                &theme,
+                ColorDepth::Ansi256,
+                8,
+            );
             let Idle::Submit(Input::Command { name, arguments }) = idle_key(
                 &commands,
                 KeyAction::Submit,
@@ -11183,7 +11360,7 @@ mod tests {
         let commands = command_candidates(&discovery.commands);
         assert_eq!(commands.len(), rune_term::commands::BUILTINS.len() + 9);
         let theme = Theme::no_color();
-        let rows = completion_rows(&commands, "/mod", 2, &theme, false, 8);
+        let rows = completion_rows(&commands, "/mod", 2, &theme, ColorDepth::Ansi256, 8);
         assert_eq!(rows.len(), 3);
         assert!(rows[0].starts_with("  /model [id]"));
         assert!(rows[1].starts_with("  /models"));
@@ -11196,7 +11373,7 @@ mod tests {
             "model-notes"
         );
         for line in ["/model-notes arg", "/audit-0 ", "/unknown", "prompt"] {
-            assert!(completion_rows(&commands, line, 0, &theme, false, 8).is_empty());
+            assert!(completion_rows(&commands, line, 0, &theme, ColorDepth::Ansi256, 8).is_empty());
             assert_eq!(completion_matches(&commands, line), 0);
         }
 
@@ -11208,7 +11385,14 @@ mod tests {
                 reader.replace(prefix);
                 let mut selected = 0;
                 for expected in &matches {
-                    let rows = completion_rows(&commands, prefix, selected, &theme, false, room);
+                    let rows = completion_rows(
+                        &commands,
+                        prefix,
+                        selected,
+                        &theme,
+                        ColorDepth::Ansi256,
+                        room,
+                    );
                     assert!(rows.len() <= room);
                     assert!(
                         rows.iter()
@@ -11234,7 +11418,14 @@ mod tests {
                     assert_eq!(reader.line(), prefix);
                 }
                 assert_eq!(selected, matches.len() - 1);
-                let rows = completion_rows(&commands, prefix, selected, &theme, false, room);
+                let rows = completion_rows(
+                    &commands,
+                    prefix,
+                    selected,
+                    &theme,
+                    ColorDepth::Ansi256,
+                    room,
+                );
                 assert!(matches!(
                     idle_key(
                         &commands,
@@ -11247,7 +11438,14 @@ mod tests {
                     Idle::Stay
                 ));
                 assert_eq!(selected, matches.len() - 2);
-                let rows = completion_rows(&commands, prefix, selected, &theme, false, room);
+                let rows = completion_rows(
+                    &commands,
+                    prefix,
+                    selected,
+                    &theme,
+                    ColorDepth::Ansi256,
+                    room,
+                );
                 let expected = matches[selected].name;
                 assert!(matches!(
                     idle_key(
@@ -11276,7 +11474,13 @@ mod tests {
         };
         for selected in 0..paths.matches.len() {
             for room in 1..=8 {
-                let rows = path_completion_rows(&paths, selected, &Theme::no_color(), false, room);
+                let rows = path_completion_rows(
+                    &paths,
+                    selected,
+                    &Theme::no_color(),
+                    ColorDepth::Ansi256,
+                    room,
+                );
                 assert!(rows.len() <= room);
                 assert!(
                     rows.contains(&format!("> {}", paths.matches[selected])),
@@ -11285,7 +11489,9 @@ mod tests {
                 assert!(rows.iter().all(|row| !row.contains('\u{1b}')));
             }
         }
-        assert!(path_completion_rows(&paths, 0, &Theme::no_color(), false, 0).is_empty());
+        assert!(
+            path_completion_rows(&paths, 0, &Theme::no_color(), ColorDepth::Ansi256, 0).is_empty()
+        );
     }
 
     #[test]
@@ -11333,7 +11539,7 @@ mod tests {
         // the screen for a list a reader only ever takes the top few rows of, so
         // a window is shown with a row saying how far through it is.
         let theme = Theme::no_color();
-        let rows = completion_rows(&commands, "/", 0, &theme, false, usize::MAX);
+        let rows = completion_rows(&commands, "/", 0, &theme, ColorDepth::Ansi256, usize::MAX);
         let total = rune_term::commands::BUILTINS.len();
         assert_eq!(rows.len(), COMPLETION_WINDOW.saturating_add(1), "{rows:?}");
         assert!(rows[0].starts_with("> /model"), "{rows:?}");
@@ -11351,7 +11557,14 @@ mod tests {
     fn a_list_that_fits_carries_no_position_row() {
         let commands = command_candidates(&[]);
         let theme = Theme::no_color();
-        let rows = completion_rows(&commands, "/mod", 0, &theme, false, usize::MAX);
+        let rows = completion_rows(
+            &commands,
+            "/mod",
+            0,
+            &theme,
+            ColorDepth::Ansi256,
+            usize::MAX,
+        );
         assert_eq!(rows.len(), 2, "{rows:?}");
         assert!(!rows.iter().any(|r| r.contains(" of ")), "{rows:?}");
     }
@@ -11396,7 +11609,14 @@ mod tests {
         let theme = Theme::no_color();
         let count = rune_term::commands::BUILTINS.len();
         for selected in 0..count {
-            let rows = completion_rows(&commands, "/", selected, &theme, false, usize::MAX);
+            let rows = completion_rows(
+                &commands,
+                "/",
+                selected,
+                &theme,
+                ColorDepth::Ansi256,
+                usize::MAX,
+            );
             let marked = rows.iter().filter(|r| r.starts_with('>')).count();
             assert_eq!(marked, 1, "selection {selected} marked {marked} rows");
         }
@@ -11409,7 +11629,8 @@ mod tests {
         let count = rune_term::commands::BUILTINS.len();
         for room in 1..=8 {
             for selected in 0..count {
-                let rows = completion_rows(&commands, "/", selected, &theme, false, room);
+                let rows =
+                    completion_rows(&commands, "/", selected, &theme, ColorDepth::Ansi256, room);
                 assert!(rows.len() <= room, "{rows:?}");
                 let chosen = open_completion(&commands, "/", &rows, selected).expect("completion");
                 assert!(
@@ -11419,7 +11640,7 @@ mod tests {
                 );
             }
         }
-        assert!(completion_rows(&commands, "/", 0, &theme, false, 0).is_empty());
+        assert!(completion_rows(&commands, "/", 0, &theme, ColorDepth::Ansi256, 0).is_empty());
     }
 
     #[test]
@@ -11432,18 +11653,18 @@ mod tests {
         );
         picker.to(14);
         for room in [16, 4, 3, 2, 1, 16] {
-            let menu = picker_menu(&mut picker, &theme, false, room);
+            let menu = picker_menu(&mut picker, &theme, ColorDepth::Ansi256, room);
             assert!(menu.len() <= room, "{menu:?}");
             assert_eq!(picker.selected(), Some("model-15"));
             assert!(menu.iter().any(|row| row == "> model-15"), "{menu:?}");
         }
-        assert!(picker_menu(&mut picker, &theme, false, 0).is_empty());
+        assert!(picker_menu(&mut picker, &theme, ColorDepth::Ansi256, 0).is_empty());
         picker.set_query("model-03");
-        let menu = picker_menu(&mut picker, &theme, false, 4);
+        let menu = picker_menu(&mut picker, &theme, ColorDepth::Ansi256, 4);
         assert!(menu.iter().any(|row| row == "> model-03"), "{menu:?}");
         assert!(!menu.iter().any(|row| row.contains(" of ")), "{menu:?}");
         picker.set_query("missing");
-        let menu = picker_menu(&mut picker, &theme, false, 1);
+        let menu = picker_menu(&mut picker, &theme, ColorDepth::Ansi256, 1);
         assert_eq!(menu.len(), 1);
         assert!(menu[0].contains("no match"), "{menu:?}");
     }
@@ -11453,14 +11674,21 @@ mod tests {
         let commands = command_candidates(&[]);
         // The position row must not be mistaken for a command.
         let theme = Theme::no_color();
-        let rows = completion_rows(&commands, "/", 0, &theme, false, usize::MAX);
+        let rows = completion_rows(&commands, "/", 0, &theme, ColorDepth::Ansi256, usize::MAX);
         let chosen = open_completion(&commands, "/", &rows, 0).expect("a completion");
         assert_eq!(chosen.name, "model");
         // Every command is reachable, including the ones past the first window:
         // clamping on the drawn rows instead of the matches left the tail of the
         // list unselectable.
         let last = rune_term::commands::BUILTINS.len().saturating_sub(1);
-        let rows = completion_rows(&commands, "/", last, &theme, false, usize::MAX);
+        let rows = completion_rows(
+            &commands,
+            "/",
+            last,
+            &theme,
+            ColorDepth::Ansi256,
+            usize::MAX,
+        );
         assert!(rows.iter().any(|r| r.starts_with('>')), "{rows:?}");
         let chosen = open_completion(&commands, "/", &rows, last).expect("a completion");
         assert_eq!(chosen.name, "quit");
@@ -11472,22 +11700,47 @@ mod tests {
         let theme = Theme::no_color();
         for line in ["", "hello", "/help me", "/model x", "a/b", "/zzz"] {
             assert!(
-                completion_rows(&commands, line, 0, &theme, false, usize::MAX).is_empty(),
+                completion_rows(&commands, line, 0, &theme, ColorDepth::Ansi256, usize::MAX)
+                    .is_empty(),
                 "{line:?} offered rows"
             );
         }
         // A whole command name is still offered, so the row does not vanish as
         // the last letter is typed.
-        assert!(!completion_rows(&commands, "/help", 0, &theme, false, usize::MAX).is_empty());
+        assert!(
+            !completion_rows(
+                &commands,
+                "/help",
+                0,
+                &theme,
+                ColorDepth::Ansi256,
+                usize::MAX
+            )
+            .is_empty()
+        );
     }
 
     #[test]
     fn the_highlighted_row_is_the_one_the_arrows_moved_to() {
         let commands = command_candidates(&[]);
         let theme = Theme::no_color();
-        let first = completion_rows(&commands, "/mod", 0, &theme, false, usize::MAX);
+        let first = completion_rows(
+            &commands,
+            "/mod",
+            0,
+            &theme,
+            ColorDepth::Ansi256,
+            usize::MAX,
+        );
         assert!(first[0].starts_with('>'), "{first:?}");
-        let second = completion_rows(&commands, "/mod", 1, &theme, false, usize::MAX);
+        let second = completion_rows(
+            &commands,
+            "/mod",
+            1,
+            &theme,
+            ColorDepth::Ansi256,
+            usize::MAX,
+        );
         assert!(second[1].starts_with('>'), "{second:?}");
         assert!(second[0].starts_with("  "), "{second:?}");
     }
@@ -11496,7 +11749,14 @@ mod tests {
     fn the_rows_line_up_their_descriptions() {
         let commands = command_candidates(&[]);
         let theme = Theme::no_color();
-        let rows = completion_rows(&commands, "/mod", 0, &theme, false, usize::MAX);
+        let rows = completion_rows(
+            &commands,
+            "/mod",
+            0,
+            &theme,
+            ColorDepth::Ansi256,
+            usize::MAX,
+        );
         let summaries = rune_term::commands::matching("mod");
         let columns: Vec<usize> = rows
             .iter()
@@ -11518,10 +11778,24 @@ mod tests {
         // Tab completes to the highlighted command, and Enter takes it too when
         // the name is not yet whole, so a half-typed command is never run.
         let theme = Theme::no_color();
-        let rows = completion_rows(&commands, "/mod", 0, &theme, false, usize::MAX);
+        let rows = completion_rows(
+            &commands,
+            "/mod",
+            0,
+            &theme,
+            ColorDepth::Ansi256,
+            usize::MAX,
+        );
         let chosen = open_completion(&commands, "/mod", &rows, 0).expect("a completion");
         assert_eq!(chosen.name, "model");
-        let rows = completion_rows(&commands, "/mod", 1, &theme, false, usize::MAX);
+        let rows = completion_rows(
+            &commands,
+            "/mod",
+            1,
+            &theme,
+            ColorDepth::Ansi256,
+            usize::MAX,
+        );
         let chosen = open_completion(&commands, "/mod", &rows, 1).expect("a completion");
         assert_eq!(chosen.name, "models");
         // With no dropdown there is nothing to accept.
@@ -11532,14 +11806,27 @@ mod tests {
     fn a_colorless_theme_emits_no_escapes_in_the_dropdown() {
         let commands = command_candidates(&[]);
         let theme = Theme::no_color();
-        let plain = completion_rows(&commands, "/mod", 0, &theme, false, usize::MAX);
+        let plain = completion_rows(
+            &commands,
+            "/mod",
+            0,
+            &theme,
+            ColorDepth::Ansi256,
+            usize::MAX,
+        );
         assert!(!plain.is_empty(), "nothing matched");
         for row in plain {
             assert!(!row.contains('\u{1b}'), "{row:?}");
         }
         // A colored theme does style them.
-        let styled_rows =
-            completion_rows(&commands, "/mod", 0, &Theme::fx_dark(), true, usize::MAX);
+        let styled_rows = completion_rows(
+            &commands,
+            "/mod",
+            0,
+            &Theme::fx_dark(),
+            ColorDepth::TrueColor,
+            usize::MAX,
+        );
         assert!(
             styled_rows.iter().any(|r| r.contains('\u{1b}')),
             "{styled_rows:?}"
@@ -12399,6 +12686,7 @@ mod tests {
             session_id: "sessiontest1".to_owned(),
             workspace: "/w",
             terminal: rune_term::probe::TerminalCaps::default().summary(),
+            depth: ColorDepth::Ansi256,
             context_used: 0,
             context_source: None,
             context_limit: rune_net::catalog::DEFAULT_CONTEXT_WINDOW,
@@ -12420,18 +12708,18 @@ mod tests {
         host.streaming.lock().expect("streaming").answer = text.to_owned();
         assert!(host.status_line(100).is_ascii());
         for theme in [Theme::no_color(), Theme::fx_dark(), Theme::high_contrast()] {
-            for truecolor in [true, false] {
+            for depth in ColorDepth::ALL {
                 host.theme = theme.clone();
-                host.truecolor = truecolor;
+                host.depth = depth;
                 assert!(host.status_line(100).is_ascii());
-                let rows = completion_rows(&commands, "/", 0, &theme, truecolor, 8);
+                let rows = completion_rows(&commands, "/", 0, &theme, depth, 8);
                 assert!(rows.iter().all(|row| row.is_ascii()));
                 let paths = crate::path_completion::Paths {
                     // The values are content, while the selection is a decoration.
                     range: 0..0,
                     matches: vec!["one".to_owned(), "two".to_owned()],
                 };
-                let rows = path_completion_rows(&paths, 0, &theme, truecolor, 8);
+                let rows = path_completion_rows(&paths, 0, &theme, depth, 8);
                 assert!(rows.iter().all(|row| row.is_ascii()));
             }
         }
@@ -12587,8 +12875,8 @@ mod tests {
             theme: Theme::no_color(),
             session_id: Mutex::new("sessiontest1".to_owned()),
             workspace: "/tmp".to_owned(),
-            truecolor: false,
             caps: rune_term::probe::TerminalCaps::default(),
+            depth: ColorDepth::Ansi256,
             width: std::sync::atomic::AtomicU16::new(80),
             height: std::sync::atomic::AtomicU16::new(24),
             pinned_size: Some((80, 24)),

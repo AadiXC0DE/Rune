@@ -601,7 +601,7 @@ mod tests {
         // Each line is self-contained: the first closes the style it opened,
         // the second reopens it in canonical form.
         assert_eq!(lines[0], "\u{1b}[1;31mabc\u{1b}[0m");
-        assert_eq!(lines[1], "\u{1b}[1;38;5;1mdef\u{1b}[0m");
+        assert_eq!(lines[1], "\u{1b}[1;31mdef\u{1b}[0m");
         // Replaying both lines in order ends with the style cleared, which is
         // what a reader sees when it prints one after the other.
         let mut replay = Open::default();
@@ -623,7 +623,7 @@ mod tests {
         // the second reopens it rather than leaving either half styled.
         assert_eq!(
             lines,
-            vec!["ab\u{1b}[31m\u{1b}[0m", "\u{1b}[38;5;1mcd\u{1b}[0m"]
+            vec!["ab\u{1b}[31m\u{1b}[0m", "\u{1b}[31mcd\u{1b}[0m"]
         );
     }
 

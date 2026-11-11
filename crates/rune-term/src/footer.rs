@@ -15,7 +15,7 @@ use std::time::Duration;
 use rune_core::config::PermissionMode;
 
 use crate::engine::{Style, flag};
-use crate::theme::{Base, Slot, Theme};
+use crate::theme::{Base, ColorDepth, Slot, Theme};
 use crate::width::{str_width, truncate_to_width};
 
 /// Rows the footer occupies when the terminal is too small for the layout.
@@ -189,26 +189,26 @@ pub fn render(
     layout: &Layout,
     theme: &Theme,
     width: usize,
-    truecolor: bool,
+    depth: ColorDepth,
 ) -> Vec<String> {
     if width == 0 {
         return Vec::new();
     }
     if layout.too_small {
-        return vec![fit(too_small_row(state, layout, theme, truecolor), width)];
+        return vec![fit(too_small_row(state, layout, theme, depth), width)];
     }
     vec![
-        fit(hint_row(theme, truecolor), width),
-        fit(status_row(state, theme, truecolor), width),
+        fit(hint_row(theme, depth), width),
+        fit(status_row(state, theme, depth), width),
     ]
 }
 
 /// Returns the message shown when the terminal cannot hold the layout.
-fn too_small_row(state: &FooterState, layout: &Layout, theme: &Theme, truecolor: bool) -> String {
+fn too_small_row(state: &FooterState, layout: &Layout, theme: &Theme, depth: ColorDepth) -> String {
     if let Some(retry) = state.provider_retry {
-        return retry_field(retry, theme, truecolor);
+        return retry_field(retry, theme, depth);
     }
-    let mut row = paint(theme, Slot::Error, truecolor, flag::BOLD);
+    let mut row = paint(theme, Slot::Error, depth, flag::BOLD);
     let _ = write!(
         row,
         "compact mode ({} rows): prompts work; resize for full interface",
@@ -224,27 +224,27 @@ fn too_small_row(state: &FooterState, layout: &Layout, theme: &Theme, truecolor:
 }
 
 /// Returns the hint row.
-fn hint_row(theme: &Theme, truecolor: bool) -> String {
-    let mut row = paint(theme, Slot::Dim, truecolor, flag::DIM);
+fn hint_row(theme: &Theme, depth: ColorDepth) -> String {
+    let mut row = paint(theme, Slot::Dim, depth, flag::DIM);
     row.push_str(HINTS);
     row.push_str(&reset(theme));
     row
 }
 
 /// Returns the status line.
-fn status_row(state: &FooterState, theme: &Theme, truecolor: bool) -> String {
+fn status_row(state: &FooterState, theme: &Theme, depth: ColorDepth) -> String {
     let mut row = String::new();
     if let Some(retry) = state.provider_retry {
-        row.push_str(&retry_field(retry, theme, truecolor));
-        row.push_str(&divider(theme, truecolor));
+        row.push_str(&retry_field(retry, theme, depth));
+        row.push_str(&divider(theme, depth));
     }
     if !state.model.is_empty() {
-        row.push_str(&paint(theme, Slot::Accent, truecolor, flag::BOLD));
+        row.push_str(&paint(theme, Slot::Accent, depth, flag::BOLD));
         row.push_str(&state.model);
         row.push_str(&reset(theme));
-        row.push_str(&divider(theme, truecolor));
+        row.push_str(&divider(theme, depth));
     }
-    row.push_str(&paint(theme, Slot::Dim, truecolor, 0));
+    row.push_str(&paint(theme, Slot::Dim, depth, 0));
     row.push_str(if state.planning {
         "plan"
     } else {
@@ -252,28 +252,28 @@ fn status_row(state: &FooterState, theme: &Theme, truecolor: bool) -> String {
     });
     row.push_str(&reset(theme));
     if state.unsandboxed {
-        row.push_str(&divider(theme, truecolor));
-        row.push_str(&paint(theme, Slot::Dim, truecolor, 0));
+        row.push_str(&divider(theme, depth));
+        row.push_str(&paint(theme, Slot::Dim, depth, 0));
         row.push_str("unsandboxed");
         row.push_str(&reset(theme));
     }
-    row.push_str(&divider(theme, truecolor));
-    row.push_str(&context_field(state, theme, truecolor));
+    row.push_str(&divider(theme, depth));
+    row.push_str(&context_field(state, theme, depth));
     if let Some(cost) = &state.cost {
-        row.push_str(&divider(theme, truecolor));
-        row.push_str(&paint(theme, Slot::Dim, truecolor, 0));
+        row.push_str(&divider(theme, depth));
+        row.push_str(&paint(theme, Slot::Dim, depth, 0));
         row.push_str(cost);
         row.push_str(&reset(theme));
     }
     if !state.workspace.is_empty() {
-        row.push_str(&divider(theme, truecolor));
-        row.push_str(&paint(theme, Slot::Dim, truecolor, 0));
+        row.push_str(&divider(theme, depth));
+        row.push_str(&paint(theme, Slot::Dim, depth, 0));
         row.push_str(state.workspace.trim_end_matches('/'));
         row.push_str(&reset(theme));
     }
     if !state.session_id.is_empty() {
         row.push(' ');
-        row.push_str(&paint(theme, Slot::Dim, truecolor, flag::DIM));
+        row.push_str(&paint(theme, Slot::Dim, depth, flag::DIM));
         row.push_str(state.short_session());
         row.push_str(&reset(theme));
     }
@@ -281,8 +281,8 @@ fn status_row(state: &FooterState, theme: &Theme, truecolor: bool) -> String {
 }
 
 /// Puts the attempt and pending delay first so they survive width clipping.
-fn retry_field(retry: ProviderRetry, theme: &Theme, truecolor: bool) -> String {
-    let mut field = paint(theme, Slot::Accent, truecolor, flag::BOLD);
+fn retry_field(retry: ProviderRetry, theme: &Theme, depth: ColorDepth) -> String {
+    let mut field = paint(theme, Slot::Accent, depth, flag::BOLD);
     let _ = write!(
         field,
         "provider retry {}/{}",
@@ -299,7 +299,7 @@ fn retry_field(retry: ProviderRetry, theme: &Theme, truecolor: bool) -> String {
 ///
 /// An unstated window prints only the amount spent, since a percentage of a
 /// window the provider never stated would be a guess.
-fn context_field(state: &FooterState, theme: &Theme, truecolor: bool) -> String {
+fn context_field(state: &FooterState, theme: &Theme, depth: ColorDepth) -> String {
     let mut field = String::new();
     if let Some(source) = state.context_source {
         let slot = if state.context_is_tight() {
@@ -307,7 +307,7 @@ fn context_field(state: &FooterState, theme: &Theme, truecolor: bool) -> String 
         } else {
             Slot::Dim
         };
-        field.push_str(&paint(theme, slot, truecolor, 0));
+        field.push_str(&paint(theme, slot, depth, 0));
         let _ = write!(
             field,
             "ctx ~{} ({source})",
@@ -321,7 +321,7 @@ fn context_field(state: &FooterState, theme: &Theme, truecolor: bool) -> String 
             );
         }
     } else if state.context_limit == 0 {
-        field.push_str(&paint(theme, Slot::Dim, truecolor, 0));
+        field.push_str(&paint(theme, Slot::Dim, depth, 0));
         if state.context_used == 0 {
             field.push_str("ctx ?");
         } else {
@@ -337,7 +337,7 @@ fn context_field(state: &FooterState, theme: &Theme, truecolor: bool) -> String 
         } else {
             Slot::Success
         };
-        field.push_str(&paint(theme, slot, truecolor, 0));
+        field.push_str(&paint(theme, slot, depth, 0));
         let _ = write!(
             field,
             "ctx {}% (provider-reported) ({} left)",
@@ -350,19 +350,19 @@ fn context_field(state: &FooterState, theme: &Theme, truecolor: bool) -> String 
 }
 
 /// Returns a styled field divider.
-fn divider(theme: &Theme, truecolor: bool) -> String {
-    let mut out = paint(theme, Slot::Divider, truecolor, 0);
+fn divider(theme: &Theme, depth: ColorDepth) -> String {
+    let mut out = paint(theme, Slot::Divider, depth, 0);
     out.push_str(" | ");
     out.push_str(&reset(theme));
     out
 }
 
 /// Returns the escape sequence that selects a slot with attribute bits.
-fn paint(theme: &Theme, slot: Slot, truecolor: bool, bits: u16) -> String {
+fn paint(theme: &Theme, slot: Slot, depth: ColorDepth, bits: u16) -> String {
     if theme.base() == Base::Mono {
         return String::new();
     }
-    let mut style = theme.style(slot, truecolor);
+    let mut style = theme.style(slot, depth);
     style.set_flag(bits);
     if theme.base() == Base::HighContrast {
         style.clear_flag(flag::DIM);
@@ -447,7 +447,13 @@ mod tests {
 
     fn status_of(state: &FooterState, width: usize) -> String {
         let layout = solve((100, 40), 1, false, DEFAULT_MINIMUM_ROWS);
-        let rows = strip(&render(state, &layout, &Theme::fx_dark(), width, true));
+        let rows = strip(&render(
+            state,
+            &layout,
+            &Theme::fx_dark(),
+            width,
+            ColorDepth::TrueColor,
+        ));
         rows.last().expect("status row").clone()
     }
 
@@ -468,7 +474,13 @@ mod tests {
         assert_eq!(layout.footer_rows, COMPACT_ROWS);
         assert_eq!(layout.transcript_rows, 0);
         assert_eq!(layout.prompt_rows, 0);
-        let rows = render(&state(), &layout, &Theme::fx_dark(), 80, true);
+        let rows = render(
+            &state(),
+            &layout,
+            &Theme::fx_dark(),
+            80,
+            ColorDepth::TrueColor,
+        );
         assert_eq!(rows.len(), 1);
         let message = strip(&rows).remove(0);
         assert!(
@@ -496,7 +508,13 @@ mod tests {
     #[test]
     fn a_compact_row_still_fits_a_narrow_terminal() {
         let layout = solve((12, 3), 1, false, DEFAULT_MINIMUM_ROWS);
-        let rows = render(&state(), &layout, &Theme::fx_dark(), 12, true);
+        let rows = render(
+            &state(),
+            &layout,
+            &Theme::fx_dark(),
+            12,
+            ColorDepth::TrueColor,
+        );
         assert_eq!(rows.len(), 1);
         assert!(str_width(&rows[0]) <= 12, "row too wide: {:?}", rows[0]);
     }
@@ -521,7 +539,13 @@ mod tests {
     #[test]
     fn render_returns_exactly_the_footer_rows() {
         let layout = solve((100, 40), 1, false, DEFAULT_MINIMUM_ROWS);
-        let rows = render(&state(), &layout, &Theme::fx_dark(), 100, true);
+        let rows = render(
+            &state(),
+            &layout,
+            &Theme::fx_dark(),
+            100,
+            ColorDepth::TrueColor,
+        );
         assert_eq!(rows.len(), usize::from(layout.footer_rows));
     }
 
@@ -536,7 +560,7 @@ mod tests {
         for height in [4, 24] {
             let layout = solve((80, height), 1, false, DEFAULT_MINIMUM_ROWS);
             for theme in [Theme::no_color(), Theme::high_contrast()] {
-                let rows = strip(&render(&state, &layout, &theme, 80, true));
+                let rows = strip(&render(&state, &layout, &theme, 80, ColorDepth::TrueColor));
                 assert_eq!(rows.len(), usize::from(layout.footer_rows));
                 assert!(
                     rows.last()
@@ -544,7 +568,7 @@ mod tests {
                         .starts_with("provider retry 2/3 in 250ms")
                 );
                 for width in [12, 32, 80] {
-                    for row in render(&state, &layout, &theme, width, true) {
+                    for row in render(&state, &layout, &theme, width, ColorDepth::TrueColor) {
                         assert!(str_width(&row) <= width);
                     }
                 }
@@ -578,7 +602,13 @@ mod tests {
         wide.model = "a-model-name-that-is-quite-long-indeed".to_owned();
         wide.context_used = 199_999;
         for width in [8usize, 20, 40, 200] {
-            let rows = render(&wide, &layout, &Theme::fx_dark(), width, true);
+            let rows = render(
+                &wide,
+                &layout,
+                &Theme::fx_dark(),
+                width,
+                ColorDepth::TrueColor,
+            );
             for row in &rows {
                 assert!(str_width(row) <= width, "row too wide for {width}: {row:?}");
             }
@@ -593,7 +623,13 @@ mod tests {
             "\u{4e2d}\u{6587}\u{4e2d}\u{6587}\u{4e2d}\u{6587}\u{1f680}\u{1f680}".to_owned();
         wide.workspace = "\u{4e2d}\u{6587}/\u{1f680}".to_owned();
         for width in [9usize, 13, 21, 55] {
-            let rows = render(&wide, &layout, &Theme::fx_dark(), width, true);
+            let rows = render(
+                &wide,
+                &layout,
+                &Theme::fx_dark(),
+                width,
+                ColorDepth::TrueColor,
+            );
             for row in &rows {
                 assert!(str_width(row) <= width, "row too wide for {width}: {row:?}");
             }
@@ -614,7 +650,13 @@ mod tests {
     #[test]
     fn the_hint_row_is_above_the_status_row() {
         let layout = solve((100, 40), 1, false, DEFAULT_MINIMUM_ROWS);
-        let rows = strip(&render(&state(), &layout, &Theme::fx_dark(), 100, true));
+        let rows = strip(&render(
+            &state(),
+            &layout,
+            &Theme::fx_dark(),
+            100,
+            ColorDepth::TrueColor,
+        ));
         assert!(rows[0].contains("ctrl-c cancel"), "{:?}", rows[0]);
         assert!(rows[1].contains("claude-sonnet-4"), "{:?}", rows[1]);
     }
@@ -707,16 +749,28 @@ mod tests {
     #[test]
     fn a_colorless_theme_emits_no_escapes() {
         let layout = solve((100, 40), 1, false, DEFAULT_MINIMUM_ROWS);
-        let rows = render(&state(), &layout, &Theme::no_color(), 100, true);
+        let rows = render(
+            &state(),
+            &layout,
+            &Theme::no_color(),
+            100,
+            ColorDepth::TrueColor,
+        );
         for row in &rows {
             assert!(!row.contains('\u{1b}'), "escape in {row:?}");
         }
     }
 
     #[test]
-    fn without_truecolor_the_status_row_is_quantized() {
+    fn at_256_colors_the_status_row_is_quantized() {
         let layout = solve((100, 40), 1, false, DEFAULT_MINIMUM_ROWS);
-        let rows = render(&state(), &layout, &Theme::fx_dark(), 100, false);
+        let rows = render(
+            &state(),
+            &layout,
+            &Theme::fx_dark(),
+            100,
+            ColorDepth::Ansi256,
+        );
         assert!(rows[1].contains("38;5;"), "{:?}", rows[1]);
         assert!(!rows[1].contains("38;2;"), "{:?}", rows[1]);
     }
@@ -724,8 +778,8 @@ mod tests {
     #[test]
     fn high_contrast_footer_keeps_metadata_bright_on_black() {
         let layout = solve((100, 40), 1, false, DEFAULT_MINIMUM_ROWS);
-        for truecolor in [false, true] {
-            let rows = render(&state(), &layout, &Theme::high_contrast(), 100, truecolor);
+        for depth in [ColorDepth::Ansi256, ColorDepth::TrueColor] {
+            let rows = render(&state(), &layout, &Theme::high_contrast(), 100, depth);
             for row in rows {
                 let mut grid = crate::engine::Grid::new(100, 1).expect("grid");
                 grid.feed(row.as_bytes()).expect("footer");
@@ -735,7 +789,7 @@ mod tests {
                         assert!(!cell.style.has_flag(flag::DIM), "dimmed metadata: {row:?}");
                         assert_eq!(
                             cell.style.bg,
-                            if truecolor {
+                            if depth == ColorDepth::TrueColor {
                                 crate::engine::Color::Rgb(0, 0, 0)
                             } else {
                                 crate::engine::Color::Indexed(16)

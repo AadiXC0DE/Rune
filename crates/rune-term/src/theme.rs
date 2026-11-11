@@ -5,8 +5,9 @@
 //! partial theme file is still a complete theme rather than a source of holes.
 //!
 //! Colors are resolved to an escape sequence at the point of use rather than
-//! stored as text, so a terminal without truecolor gets the same decisions
-//! quantized to the 256 color palette.
+//! stored as text, so one theme serves every [`ColorDepth`]: direct color as
+//! written, the 256 color palette by quantization, and 16 colors by a choice
+//! made by hand for each slot.
 
 use camino::Utf8Path;
 use rune_core::budget::LimitName;
@@ -61,10 +62,24 @@ pub enum Slot {
     Variable,
     /// Operators.
     Operator,
+    /// Warnings.
+    Warning,
+    /// Markdown headings.
+    Heading,
+    /// Behind code blocks.
+    CodeBg,
+    /// Behind an added diff line.
+    DiffAddedBg,
+    /// Behind a removed diff line.
+    DiffRemovedBg,
+    /// Behind the changed words of an added diff line.
+    DiffAddedWord,
+    /// Behind the changed words of a removed diff line.
+    DiffRemovedWord,
 }
 
 /// Every slot, in palette order.
-pub const SLOTS: [Slot; 16] = [
+pub const SLOTS: [Slot; 23] = [
     Slot::Fg,
     Slot::Bg,
     Slot::Accent,
@@ -81,7 +96,167 @@ pub const SLOTS: [Slot; 16] = [
     Slot::Function,
     Slot::Variable,
     Slot::Operator,
+    Slot::Warning,
+    Slot::Heading,
+    Slot::CodeBg,
+    Slot::DiffAddedBg,
+    Slot::DiffRemovedBg,
+    Slot::DiffAddedWord,
+    Slot::DiffRemovedWord,
 ];
+
+/// How many colors the terminal renders, decided once at startup.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum ColorDepth {
+    /// Direct 24-bit color.
+    TrueColor,
+    /// The 256 color palette.
+    Ansi256,
+    /// The 16 basic colors.
+    #[default]
+    Ansi16,
+    /// No color at all.
+    None,
+}
+
+impl ColorDepth {
+    /// Every depth, deepest first.
+    pub const ALL: [Self; 4] = [Self::TrueColor, Self::Ansi256, Self::Ansi16, Self::None];
+
+    /// Returns the name the `color` setting and `/status` use.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::TrueColor => "truecolor",
+            Self::Ansi256 => "256",
+            Self::Ansi16 => "16",
+            Self::None => "none",
+        }
+    }
+}
+
+/// One of the 16 basic terminal colors, or the terminal default.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Ansi16 {
+    /// The terminal's default color.
+    Default,
+    /// Palette entry 0.
+    Black,
+    /// Palette entry 1.
+    Red,
+    /// Palette entry 2.
+    Green,
+    /// Palette entry 3.
+    Yellow,
+    /// Palette entry 4.
+    Blue,
+    /// Palette entry 5.
+    Magenta,
+    /// Palette entry 6.
+    Cyan,
+    /// Palette entry 7.
+    White,
+    /// Palette entry 8.
+    BrightBlack,
+    /// Palette entry 9.
+    BrightRed,
+    /// Palette entry 10.
+    BrightGreen,
+    /// Palette entry 11.
+    BrightYellow,
+    /// Palette entry 12.
+    BrightBlue,
+    /// Palette entry 13.
+    BrightMagenta,
+    /// Palette entry 14.
+    BrightCyan,
+    /// Palette entry 15.
+    BrightWhite,
+}
+
+impl Ansi16 {
+    /// Returns the color as a palette index, or the terminal default.
+    #[must_use]
+    pub const fn color(self) -> Color {
+        match self {
+            Self::Default => Color::Default,
+            Self::Black => Color::Indexed(0),
+            Self::Red => Color::Indexed(1),
+            Self::Green => Color::Indexed(2),
+            Self::Yellow => Color::Indexed(3),
+            Self::Blue => Color::Indexed(4),
+            Self::Magenta => Color::Indexed(5),
+            Self::Cyan => Color::Indexed(6),
+            Self::White => Color::Indexed(7),
+            Self::BrightBlack => Color::Indexed(8),
+            Self::BrightRed => Color::Indexed(9),
+            Self::BrightGreen => Color::Indexed(10),
+            Self::BrightYellow => Color::Indexed(11),
+            Self::BrightBlue => Color::Indexed(12),
+            Self::BrightMagenta => Color::Indexed(13),
+            Self::BrightCyan => Color::Indexed(14),
+            Self::BrightWhite => Color::Indexed(15),
+        }
+    }
+}
+
+/// Terminal programs known to render direct color.
+const TRUECOLOR_PROGRAMS: [&str; 5] = ["iTerm.app", "vscode", "ghostty", "WezTerm", "Hyper"];
+
+/// `TERM` values known to render direct color.
+const TRUECOLOR_TERMS: [&str; 3] = ["xterm-kitty", "alacritty", "foot"];
+
+/// Decides the color depth from the `color` setting and the environment.
+///
+/// The first rule that matches wins. `NO_COLOR` comes before the setting, so a
+/// terminal that refuses color is never forced into it; `FORCE_COLOR` comes
+/// before the checks that a pipe or `TERM=dumb` would otherwise fail.
+#[must_use]
+pub fn detect_depth(
+    setting: &str,
+    stdout_is_terminal: bool,
+    lookup: impl Fn(&str) -> Option<String>,
+) -> ColorDepth {
+    if lookup("NO_COLOR").is_some_and(|value| !value.is_empty()) {
+        return ColorDepth::None;
+    }
+    match setting.trim().to_ascii_lowercase().as_str() {
+        "truecolor" => return ColorDepth::TrueColor,
+        "256" => return ColorDepth::Ansi256,
+        "16" => return ColorDepth::Ansi16,
+        "none" => return ColorDepth::None,
+        _ => {}
+    }
+    match lookup("FORCE_COLOR").as_deref() {
+        Some("3") => return ColorDepth::TrueColor,
+        Some("2") => return ColorDepth::Ansi256,
+        Some("1") => return ColorDepth::Ansi16,
+        Some("0") => return ColorDepth::None,
+        _ => {}
+    }
+    let term = lookup("TERM").unwrap_or_default();
+    if term == "dumb" || !stdout_is_terminal {
+        return ColorDepth::None;
+    }
+    let colorterm = lookup("COLORTERM").unwrap_or_default();
+    if colorterm.eq_ignore_ascii_case("truecolor") || colorterm.eq_ignore_ascii_case("24bit") {
+        return ColorDepth::TrueColor;
+    }
+    if lookup("WT_SESSION").is_some() {
+        return ColorDepth::TrueColor;
+    }
+    let program = lookup("TERM_PROGRAM").unwrap_or_default();
+    if TRUECOLOR_PROGRAMS.contains(&program.as_str()) {
+        return ColorDepth::TrueColor;
+    }
+    if term.contains("direct") || TRUECOLOR_TERMS.contains(&term.as_str()) {
+        return ColorDepth::TrueColor;
+    }
+    if term.contains("256color") || program == "Apple_Terminal" {
+        return ColorDepth::Ansi256;
+    }
+    ColorDepth::Ansi16
+}
 
 /// Syntax slots, most specific prefix first.
 ///
@@ -118,7 +293,28 @@ impl Slot {
             Self::Function => "function",
             Self::Variable => "variable",
             Self::Operator => "operator",
+            Self::Warning => "warning",
+            Self::Heading => "heading",
+            Self::CodeBg => "code_bg",
+            Self::DiffAddedBg => "diff_added_bg",
+            Self::DiffRemovedBg => "diff_removed_bg",
+            Self::DiffAddedWord => "diff_added_word",
+            Self::DiffRemovedWord => "diff_removed_word",
         }
+    }
+
+    /// Returns true for a slot that colors a surface rather than text.
+    #[must_use]
+    pub const fn is_background(self) -> bool {
+        matches!(
+            self,
+            Self::Bg
+                | Self::CodeBg
+                | Self::DiffAddedBg
+                | Self::DiffRemovedBg
+                | Self::DiffAddedWord
+                | Self::DiffRemovedWord
+        )
     }
 
     /// Returns the editor color keys this slot answers to.
@@ -139,7 +335,14 @@ impl Slot {
             | Self::Comment
             | Self::Function
             | Self::Variable
-            | Self::Operator => &[],
+            | Self::Operator
+            | Self::Warning
+            | Self::Heading
+            | Self::CodeBg
+            | Self::DiffAddedBg
+            | Self::DiffRemovedBg
+            | Self::DiffAddedWord
+            | Self::DiffRemovedWord => &[],
         }
     }
 
@@ -165,7 +368,14 @@ impl Slot {
             | Self::Success
             | Self::Link
             | Self::Divider
-            | Self::UserRail => &[],
+            | Self::UserRail
+            | Self::Warning
+            | Self::Heading
+            | Self::CodeBg
+            | Self::DiffAddedBg
+            | Self::DiffRemovedBg
+            | Self::DiffAddedWord
+            | Self::DiffRemovedWord => &[],
         }
     }
 }
@@ -261,44 +471,63 @@ impl Theme {
         &self.overrides
     }
 
-    /// Returns the style for one slot.
+    /// Returns the style for one slot at a color depth.
     ///
-    /// The color is used as the foreground, except for [`Slot::Bg`] where it is
-    /// the background, which is the only slot that describes a surface.
-    /// High contrast always sets both colors so terminal defaults cannot lower
-    /// the contrast of a themed run.
+    /// A background slot colors the surface and every other slot the text.
+    /// High contrast always sets both colors at the two palette depths, so
+    /// terminal defaults cannot lower the contrast of a themed run. At 16
+    /// colors each slot takes the base's hand-picked color, a background slot
+    /// takes none, and a user override is not consulted.
     #[must_use]
-    pub fn style(&self, slot: Slot, truecolor: bool) -> Style {
-        if self.base == Base::HighContrast {
+    pub fn style(&self, slot: Slot, depth: ColorDepth) -> Style {
+        if self.base == Base::Mono || depth == ColorDepth::None {
+            return Style::new();
+        }
+        if depth == ColorDepth::Ansi16 {
+            if slot.is_background() {
+                return Style::new();
+            }
             return Style {
-                fg: self.indexed(if slot == Slot::Bg { Slot::Fg } else { slot }, truecolor),
-                bg: self.indexed(Slot::Bg, truecolor),
+                fg: base_ansi16(self.base, slot).color(),
                 ..Style::new()
             };
         }
-        let color = self.indexed(slot, truecolor);
-        match slot {
-            Slot::Bg => Style {
+        if self.base == Base::HighContrast {
+            let (fg, bg) = if slot.is_background() {
+                (Slot::Fg, slot)
+            } else {
+                (slot, Slot::Bg)
+            };
+            return Style {
+                fg: self.indexed(fg, depth),
+                bg: self.indexed(bg, depth),
+                ..Style::new()
+            };
+        }
+        let color = self.indexed(slot, depth);
+        if slot.is_background() {
+            Style {
                 bg: color,
                 ..Style::new()
-            },
-            _ => Style {
+            }
+        } else {
+            Style {
                 fg: color,
                 ..Style::new()
-            },
+            }
         }
     }
 
     /// Returns the SGR sequence that selects a slot, empty for a default.
     #[must_use]
-    pub fn sgr(&self, slot: Slot, truecolor: bool) -> String {
-        self.style(slot, truecolor).sgr()
+    pub fn sgr(&self, slot: Slot, depth: ColorDepth) -> String {
+        self.style(slot, depth).sgr()
     }
 
-    /// Returns the slot color as the terminal should receive it.
-    fn indexed(&self, slot: Slot, truecolor: bool) -> Color {
+    /// Returns the slot color at one of the two palette depths.
+    fn indexed(&self, slot: Slot, depth: ColorDepth) -> Color {
         let color = self.get(slot);
-        if truecolor {
+        if depth == ColorDepth::TrueColor {
             return color;
         }
         match color {
@@ -630,67 +859,115 @@ fn distance(r: u8, g: u8, b: u8, pr: u8, pg: u8, pb: u8) -> u32 {
 const fn base_color(base: Base, slot: Slot) -> Color {
     match base {
         Base::Mono => Color::Default,
-        Base::Dark => dark_color(slot),
-        Base::Light => light_color(slot),
-        Base::HighContrast => high_contrast_color(slot),
+        Base::Dark => dark_color(slot).0,
+        Base::Light => light_color(slot).0,
+        Base::HighContrast => high_contrast_color(slot).0,
     }
 }
 
-/// Bright colors from the fixed 256-color cube, unchanged by quantization.
-const fn high_contrast_color(slot: Slot) -> Color {
+/// Returns the 16 color choice of a slot under a base.
+const fn base_ansi16(base: Base, slot: Slot) -> Ansi16 {
+    match base {
+        Base::Mono => Ansi16::Default,
+        Base::Dark => dark_color(slot).1,
+        Base::Light => light_color(slot).1,
+        Base::HighContrast => high_contrast_color(slot).1,
+    }
+}
+
+/// Returns a hex color as a direct color.
+const fn rgb(hex: u32) -> Color {
+    let [_, r, g, b] = hex.to_be_bytes();
+    Color::Rgb(r, g, b)
+}
+
+/// Bright colors from the fixed 256 color palette, unchanged by quantization.
+const fn high_contrast_color(slot: Slot) -> (Color, Ansi16) {
     match slot {
-        Slot::Bg => Color::Rgb(0, 0, 0),
-        Slot::Fg | Slot::Variable => Color::Rgb(255, 255, 255),
-        Slot::Dim | Slot::Divider | Slot::Comment => Color::Rgb(215, 215, 215),
-        Slot::Accent | Slot::Link | Slot::Function | Slot::Operator => Color::Rgb(95, 215, 255),
-        Slot::Error => Color::Rgb(255, 135, 135),
-        Slot::Success | Slot::String => Color::Rgb(135, 255, 135),
-        Slot::UserRail | Slot::Keyword => Color::Rgb(215, 175, 255),
-        Slot::Number => Color::Rgb(255, 215, 95),
+        Slot::Fg => (rgb(0xff_ffff), Ansi16::Default),
+        Slot::Bg => (rgb(0x00_0000), Ansi16::Default),
+        Slot::Accent => (rgb(0x5f_d7ff), Ansi16::Blue),
+        Slot::Dim => (rgb(0xd7_d7d7), Ansi16::BrightBlack),
+        Slot::Error => (rgb(0xff_8787), Ansi16::Red),
+        Slot::Success => (rgb(0x87_ff87), Ansi16::Green),
+        Slot::Link => (rgb(0x5f_d7ff), Ansi16::Cyan),
+        Slot::Divider => (rgb(0xd7_d7d7), Ansi16::BrightBlack),
+        Slot::UserRail => (rgb(0xd7_afff), Ansi16::Magenta),
+        Slot::Keyword => (rgb(0xd7_afff), Ansi16::Magenta),
+        Slot::String => (rgb(0x87_ff87), Ansi16::Green),
+        Slot::Number => (rgb(0xff_d75f), Ansi16::Yellow),
+        Slot::Comment => (rgb(0xd7_d7d7), Ansi16::BrightBlack),
+        Slot::Function => (rgb(0x5f_d7ff), Ansi16::Blue),
+        Slot::Variable => (rgb(0xff_ffff), Ansi16::Default),
+        Slot::Operator => (rgb(0x5f_d7ff), Ansi16::Cyan),
+        Slot::Warning => (rgb(0xff_d75f), Ansi16::Yellow),
+        Slot::Heading => (rgb(0x5f_d7ff), Ansi16::Blue),
+        Slot::CodeBg => (rgb(0x1c_1c1c), Ansi16::Default),
+        Slot::DiffAddedBg => (rgb(0x00_5f00), Ansi16::Default),
+        Slot::DiffRemovedBg => (rgb(0x5f_0000), Ansi16::Default),
+        Slot::DiffAddedWord => (rgb(0x00_8700), Ansi16::Default),
+        Slot::DiffRemovedWord => (rgb(0x87_0000), Ansi16::Default),
     }
 }
 
 /// Returns the built-in dark palette.
-const fn dark_color(slot: Slot) -> Color {
+const fn dark_color(slot: Slot) -> (Color, Ansi16) {
     match slot {
-        Slot::Fg => Color::Rgb(0xe6, 0xe6, 0xe6),
-        Slot::Bg => Color::Rgb(0x10, 0x10, 0x14),
-        Slot::Accent => Color::Rgb(0x7a, 0xa2, 0xf7),
-        Slot::Dim => Color::Rgb(0x6b, 0x72, 0x80),
-        Slot::Error => Color::Rgb(0xf7, 0x76, 0x8e),
-        Slot::Success => Color::Rgb(0x9e, 0xce, 0x6a),
-        Slot::Link => Color::Rgb(0x7d, 0xcf, 0xff),
-        Slot::Divider => Color::Rgb(0x2a, 0x2a, 0x33),
-        Slot::UserRail => Color::Rgb(0xbb, 0x9a, 0xf7),
-        Slot::Keyword => Color::Rgb(0xbb, 0x9a, 0xf7),
-        Slot::String => Color::Rgb(0x9e, 0xce, 0x6a),
-        Slot::Number => Color::Rgb(0xff, 0x9e, 0x64),
-        Slot::Comment => Color::Rgb(0x56, 0x5f, 0x89),
-        Slot::Function => Color::Rgb(0x7a, 0xa2, 0xf7),
-        Slot::Variable => Color::Rgb(0xc0, 0xca, 0xf5),
-        Slot::Operator => Color::Rgb(0x89, 0xdd, 0xff),
+        Slot::Fg => (rgb(0xe6_e6e6), Ansi16::Default),
+        Slot::Bg => (rgb(0x10_1014), Ansi16::Default),
+        Slot::Accent => (rgb(0x7a_a2f7), Ansi16::Blue),
+        Slot::Dim => (rgb(0x6b_7280), Ansi16::BrightBlack),
+        Slot::Error => (rgb(0xf7_768e), Ansi16::Red),
+        Slot::Success => (rgb(0x9e_ce6a), Ansi16::Green),
+        Slot::Link => (rgb(0x7d_cfff), Ansi16::Cyan),
+        Slot::Divider => (rgb(0x2a_2a33), Ansi16::BrightBlack),
+        Slot::UserRail => (rgb(0xbb_9af7), Ansi16::Magenta),
+        Slot::Keyword => (rgb(0xbb_9af7), Ansi16::Magenta),
+        Slot::String => (rgb(0x9e_ce6a), Ansi16::Green),
+        Slot::Number => (rgb(0xff_9e64), Ansi16::Yellow),
+        Slot::Comment => (rgb(0x56_5f89), Ansi16::BrightBlack),
+        Slot::Function => (rgb(0x7a_a2f7), Ansi16::Blue),
+        Slot::Variable => (rgb(0xc0_caf5), Ansi16::Default),
+        Slot::Operator => (rgb(0x89_ddff), Ansi16::Cyan),
+        Slot::Warning => (rgb(0xe0_af68), Ansi16::Yellow),
+        Slot::Heading => (rgb(0x7a_a2f7), Ansi16::Blue),
+        Slot::CodeBg => (rgb(0x1a_1b26), Ansi16::Default),
+        Slot::DiffAddedBg => (rgb(0x1f_3326), Ansi16::Default),
+        Slot::DiffRemovedBg => (rgb(0x3b_1f24), Ansi16::Default),
+        Slot::DiffAddedWord => (rgb(0x2f_5a3a), Ansi16::Default),
+        Slot::DiffRemovedWord => (rgb(0x6b_2a33), Ansi16::Default),
     }
 }
 
 /// Returns the built-in light palette.
-const fn light_color(slot: Slot) -> Color {
+///
+/// Yellow and cyan text are hard to read on white, so the 16 color choices
+/// that would use them take magenta or blue instead.
+const fn light_color(slot: Slot) -> (Color, Ansi16) {
     match slot {
-        Slot::Fg => Color::Rgb(0x1f, 0x23, 0x28),
-        Slot::Bg => Color::Rgb(0xff, 0xff, 0xff),
-        Slot::Accent => Color::Rgb(0x09, 0x69, 0xda),
-        Slot::Dim => Color::Rgb(0x6e, 0x77, 0x81),
-        Slot::Error => Color::Rgb(0xcf, 0x22, 0x2e),
-        Slot::Success => Color::Rgb(0x1a, 0x7f, 0x37),
-        Slot::Link => Color::Rgb(0x09, 0x69, 0xda),
-        Slot::Divider => Color::Rgb(0xd0, 0xd7, 0xde),
-        Slot::UserRail => Color::Rgb(0x82, 0x50, 0xdf),
-        Slot::Keyword => Color::Rgb(0xcf, 0x22, 0x2e),
-        Slot::String => Color::Rgb(0x0a, 0x30, 0x69),
-        Slot::Number => Color::Rgb(0x95, 0x38, 0x00),
-        Slot::Comment => Color::Rgb(0x6e, 0x77, 0x81),
-        Slot::Function => Color::Rgb(0x82, 0x50, 0xdf),
-        Slot::Variable => Color::Rgb(0x24, 0x29, 0x2f),
-        Slot::Operator => Color::Rgb(0x05, 0x50, 0xae),
+        Slot::Fg => (rgb(0x1f_2328), Ansi16::Default),
+        Slot::Bg => (rgb(0xff_ffff), Ansi16::Default),
+        Slot::Accent => (rgb(0x09_69da), Ansi16::Blue),
+        Slot::Dim => (rgb(0x6e_7781), Ansi16::BrightBlack),
+        Slot::Error => (rgb(0xcf_222e), Ansi16::Red),
+        Slot::Success => (rgb(0x1a_7f37), Ansi16::Green),
+        Slot::Link => (rgb(0x09_69da), Ansi16::Blue),
+        Slot::Divider => (rgb(0xd0_d7de), Ansi16::BrightBlack),
+        Slot::UserRail => (rgb(0x82_50df), Ansi16::Magenta),
+        Slot::Keyword => (rgb(0xcf_222e), Ansi16::Magenta),
+        Slot::String => (rgb(0x0a_3069), Ansi16::Green),
+        Slot::Number => (rgb(0x95_3800), Ansi16::Magenta),
+        Slot::Comment => (rgb(0x6e_7781), Ansi16::BrightBlack),
+        Slot::Function => (rgb(0x82_50df), Ansi16::Blue),
+        Slot::Variable => (rgb(0x24_292f), Ansi16::Default),
+        Slot::Operator => (rgb(0x05_50ae), Ansi16::Blue),
+        Slot::Warning => (rgb(0x9a_6700), Ansi16::Magenta),
+        Slot::Heading => (rgb(0x09_69da), Ansi16::Blue),
+        Slot::CodeBg => (rgb(0xf6_f8fa), Ansi16::Default),
+        Slot::DiffAddedBg => (rgb(0xda_fbe1), Ansi16::Default),
+        Slot::DiffRemovedBg => (rgb(0xff_ebe9), Ansi16::Default),
+        Slot::DiffAddedWord => (rgb(0xac_eebb), Ansi16::Default),
+        Slot::DiffRemovedWord => (rgb(0xff_cecb), Ansi16::Default),
     }
 }
 
@@ -800,22 +1077,24 @@ mod tests {
     #[test]
     fn every_high_contrast_pair_meets_seven_to_one_at_both_color_depths() {
         let theme = Theme::high_contrast();
-        for truecolor in [false, true] {
+        for depth in [ColorDepth::Ansi256, ColorDepth::TrueColor] {
             for slot in SLOTS {
-                let style = theme.style(slot, truecolor);
+                let style = theme.style(slot, depth);
+                let mut grid = crate::engine::Grid::new(2, 1).expect("grid");
+                grid.feed(format!("{}x", theme.sgr(slot, depth)).as_bytes())
+                    .expect("SGR");
+                assert_eq!(grid.cell(0, 0).expect("cell").style, style);
+                if slot.is_background() && slot != Slot::Bg {
+                    // A surface slot keeps the primary text on its own color.
+                    assert_eq!(style.fg, theme.style(Slot::Fg, depth).fg);
+                    assert_eq!(style.bg, theme.indexed(slot, depth));
+                    continue;
+                }
                 let foreground = luminance(palette_rgb(style.fg));
                 let background = luminance(palette_rgb(style.bg));
                 let ratio = contrast_ratio(foreground, background);
-                assert!(
-                    ratio >= 7.0,
-                    "{}: {ratio}:1 with truecolor={truecolor}",
-                    slot.name()
-                );
+                assert!(ratio >= 7.0, "{}: {ratio}:1 at {depth:?}", slot.name());
                 assert_eq!(palette_rgb(style.bg), [0, 0, 0]);
-                let mut grid = crate::engine::Grid::new(2, 1).expect("grid");
-                grid.feed(format!("{}x", theme.sgr(slot, truecolor)).as_bytes())
-                    .expect("SGR");
-                assert_eq!(grid.cell(0, 0).expect("cell").style, style);
             }
         }
     }
@@ -832,6 +1111,10 @@ mod tests {
                     levels[usize::from((cube / 6) % 6)],
                     levels[usize::from(cube % 6)],
                 ]
+            }
+            Color::Indexed(index @ 232..=255) => {
+                let grey = 8u8.saturating_add(index.saturating_sub(232).saturating_mul(10));
+                [grey, grey, grey]
             }
             _ => panic!("high contrast must use explicit RGB or fixed cube colors: {color:?}"),
         }
@@ -921,16 +1204,180 @@ mod tests {
     #[test]
     fn a_no_color_theme_emits_nothing() {
         let theme = Theme::no_color();
-        assert!(theme.sgr(Slot::Error, true).is_empty());
-        assert!(!theme.style(Slot::Error, true).has_sgr());
+        assert!(theme.sgr(Slot::Error, ColorDepth::TrueColor).is_empty());
+        assert!(!theme.style(Slot::Error, ColorDepth::TrueColor).has_sgr());
         assert_eq!(theme.get(Slot::Error), Color::Default);
     }
 
     #[test]
-    fn without_truecolor_an_rgb_color_is_quantized() {
+    fn at_256_colors_an_rgb_color_is_quantized() {
         let theme = Theme::fx_dark();
-        assert!(theme.sgr(Slot::Error, true).contains("38;2;"));
-        assert!(theme.sgr(Slot::Error, false).contains("38;5;"));
+        assert!(
+            theme
+                .sgr(Slot::Error, ColorDepth::TrueColor)
+                .contains("38;2;")
+        );
+        assert!(
+            theme
+                .sgr(Slot::Error, ColorDepth::Ansi256)
+                .contains("38;5;")
+        );
+    }
+
+    #[test]
+    fn depth_detection_follows_the_documented_order() {
+        use ColorDepth::{Ansi16, Ansi256, None, TrueColor};
+        /// A setting, whether stdout is a terminal, the environment, the depth.
+        type Case = (
+            &'static str,
+            bool,
+            &'static [(&'static str, &'static str)],
+            ColorDepth,
+        );
+        let cases: &[Case] = &[
+            (
+                "auto",
+                true,
+                &[("NO_COLOR", "1"), ("COLORTERM", "truecolor")],
+                None,
+            ),
+            ("truecolor", true, &[("NO_COLOR", "1")], None),
+            (
+                "auto",
+                true,
+                &[("NO_COLOR", ""), ("COLORTERM", "truecolor")],
+                TrueColor,
+            ),
+            ("truecolor", false, &[("TERM", "dumb")], TrueColor),
+            ("256", true, &[("COLORTERM", "truecolor")], Ansi256),
+            (" 16 ", true, &[("COLORTERM", "truecolor")], Ansi16),
+            ("NONE", true, &[("COLORTERM", "truecolor")], None),
+            ("auto", false, &[("FORCE_COLOR", "3")], TrueColor),
+            ("auto", false, &[("FORCE_COLOR", "2")], Ansi256),
+            ("auto", false, &[("FORCE_COLOR", "1")], Ansi16),
+            (
+                "auto",
+                true,
+                &[("FORCE_COLOR", "0"), ("COLORTERM", "truecolor")],
+                None,
+            ),
+            ("auto", false, &[("FORCE_COLOR", "yes")], None),
+            (
+                "auto",
+                true,
+                &[("TERM", "dumb"), ("COLORTERM", "truecolor")],
+                None,
+            ),
+            ("auto", false, &[("COLORTERM", "truecolor")], None),
+            ("auto", true, &[("COLORTERM", "TrueColor")], TrueColor),
+            ("auto", true, &[("COLORTERM", "24bit")], TrueColor),
+            ("auto", true, &[("WT_SESSION", "abc")], TrueColor),
+            ("auto", true, &[("TERM_PROGRAM", "iTerm.app")], TrueColor),
+            ("auto", true, &[("TERM_PROGRAM", "WezTerm")], TrueColor),
+            ("auto", true, &[("TERM", "xterm-direct")], TrueColor),
+            ("auto", true, &[("TERM", "xterm-kitty")], TrueColor),
+            ("auto", true, &[("TERM", "tmux-256color")], Ansi256),
+            ("auto", true, &[("TERM_PROGRAM", "Apple_Terminal")], Ansi256),
+            ("auto", true, &[("TERM", "xterm")], Ansi16),
+            ("auto", true, &[], Ansi16),
+            ("sideways", true, &[("TERM", "xterm")], Ansi16),
+        ];
+        for (setting, terminal, vars, expected) in cases {
+            let depth = detect_depth(setting, *terminal, |key| {
+                vars.iter()
+                    .find(|(name, _)| *name == key)
+                    .map(|(_, value)| (*value).to_owned())
+            });
+            assert_eq!(depth, *expected, "{setting:?} {terminal} {vars:?}");
+        }
+    }
+
+    #[test]
+    fn every_slot_has_a_value_at_every_depth() {
+        for theme in [Theme::fx_dark(), Theme::fx_light(), Theme::high_contrast()] {
+            for slot in SLOTS {
+                let pick = |style: Style| {
+                    if slot.is_background() {
+                        style.bg
+                    } else {
+                        style.fg
+                    }
+                };
+                let full = theme.style(slot, ColorDepth::TrueColor);
+                assert!(matches!(pick(full), Color::Rgb(..)), "{slot:?} {full:?}");
+                let palette = theme.style(slot, ColorDepth::Ansi256);
+                assert!(
+                    matches!(pick(palette), Color::Indexed(16..)),
+                    "{slot:?} {palette:?}"
+                );
+                let basic = theme.style(slot, ColorDepth::Ansi16);
+                assert_eq!(basic.bg, Color::Default, "{slot:?}");
+                assert!(
+                    matches!(basic.fg, Color::Default | Color::Indexed(0..16)),
+                    "{slot:?} {basic:?}"
+                );
+                assert!(!theme.style(slot, ColorDepth::None).has_sgr(), "{slot:?}");
+            }
+            // The 16 color choices are colors, not the terminal default for
+            // everything.
+            let colored = SLOTS
+                .iter()
+                .filter(|slot| theme.style(**slot, ColorDepth::Ansi16).has_sgr())
+                .count();
+            assert!(colored >= 14, "{:?}: {colored}", theme.base());
+        }
+        let light = Theme::fx_light();
+        for slot in [Slot::Warning, Slot::Number, Slot::Link, Slot::Operator] {
+            let fg = light.style(slot, ColorDepth::Ansi16).fg;
+            assert!(
+                !matches!(fg, Color::Indexed(3 | 6 | 11 | 14)),
+                "{slot:?} is yellow or cyan on white"
+            );
+        }
+    }
+
+    #[test]
+    fn background_slots_are_empty_at_sixteen_colours() {
+        for theme in [Theme::fx_dark(), Theme::fx_light(), Theme::high_contrast()] {
+            for slot in SLOTS.into_iter().filter(|slot| slot.is_background()) {
+                assert!(theme.sgr(slot, ColorDepth::Ansi16).is_empty(), "{slot:?}");
+                assert!(!theme.sgr(slot, ColorDepth::Ansi256).is_empty(), "{slot:?}");
+            }
+        }
+        let background = SLOTS.iter().filter(|slot| slot.is_background()).count();
+        assert_eq!(background, 6);
+    }
+
+    #[test]
+    fn user_overrides_do_not_change_sixteen_colour_choices() {
+        let json = r##"{
+            "type": "dark",
+            "colors": {"editor.foreground": "#ff0000", "terminal.ansiRed": "#00ff00"},
+            "tokenColors": [{"scope": "keyword", "settings": {"foreground": "#0000ff"}}]
+        }"##;
+        let theme = Theme::parse(json).expect("theme");
+        let builtin = Theme::fx_dark();
+        for slot in [Slot::Fg, Slot::Error, Slot::Keyword] {
+            assert_eq!(
+                theme.style(slot, ColorDepth::Ansi16),
+                builtin.style(slot, ColorDepth::Ansi16),
+                "{slot:?}"
+            );
+            assert_ne!(
+                theme.style(slot, ColorDepth::TrueColor),
+                builtin.style(slot, ColorDepth::TrueColor),
+                "{slot:?}"
+            );
+            assert_ne!(
+                theme.style(slot, ColorDepth::Ansi256),
+                builtin.style(slot, ColorDepth::Ansi256),
+                "{slot:?}"
+            );
+        }
+        assert_eq!(
+            theme.style(Slot::Error, ColorDepth::Ansi16).fg,
+            Color::Indexed(1)
+        );
     }
 
     #[test]
@@ -965,6 +1412,10 @@ mod tests {
     #[test]
     fn slot_names_are_stable() {
         assert_eq!(Slot::UserRail.name(), "user_rail");
-        assert_eq!(SLOTS.len(), 16);
+        assert_eq!(Slot::DiffRemovedWord.name(), "diff_removed_word");
+        assert_eq!(SLOTS.len(), 23);
+        for (index, slot) in SLOTS.iter().enumerate() {
+            assert!(!SLOTS[..index].contains(slot), "{slot:?} listed twice");
+        }
     }
 }

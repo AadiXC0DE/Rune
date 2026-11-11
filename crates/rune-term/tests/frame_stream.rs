@@ -82,9 +82,20 @@ fn a_frame_costs_bytes_in_proportion_to_what_changed() {
 fn a_committed_stream_rebuilds_the_screen_on_a_cleared_terminal() {
     let theme = Theme::fx_dark();
     let layout = footer::solve((80, 24), 1, false, footer::DEFAULT_MINIMUM_ROWS);
-    let footer = footer::render(&state(), &layout, &theme, 80, true);
+    let footer = footer::render(
+        &state(),
+        &layout,
+        &theme,
+        80,
+        rune_term::theme::ColorDepth::TrueColor,
+    );
     let transcript: Vec<String> = (0..40).map(|index| format!("line {index}")).collect();
-    let prompt = vec![theme.sgr(rune_term::theme::Slot::UserRail, true) + "> "];
+    let prompt = vec![
+        theme.sgr(
+            rune_term::theme::Slot::UserRail,
+            rune_term::theme::ColorDepth::TrueColor,
+        ) + "> ",
+    ];
 
     let mut surface = FrameSurface::new(80, 24).expect("surface");
     let mut stream: Vec<u8> = Vec::new();

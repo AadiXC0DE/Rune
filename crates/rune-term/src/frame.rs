@@ -894,7 +894,13 @@ mod tests {
         };
         let layout = crate::footer::solve((80, 24), 1, false, crate::footer::DEFAULT_MINIMUM_ROWS);
         assert!(!layout.too_small);
-        let footer = crate::footer::render(&state, &layout, &Theme::fx_dark(), 80, true);
+        let footer = crate::footer::render(
+            &state,
+            &layout,
+            &Theme::fx_dark(),
+            80,
+            crate::theme::ColorDepth::TrueColor,
+        );
         let prompt = lines(&["> "]);
         let transcript: Vec<String> = (0..40).map(|index| format!("line {index}")).collect();
         let regions = Regions::new(&transcript, &footer).with_prompt(&prompt);

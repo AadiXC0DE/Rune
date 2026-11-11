@@ -145,15 +145,11 @@ impl Style {
                 params.push(code.to_owned());
             }
         }
-        match self.fg {
-            Color::Default => {}
-            Color::Indexed(index) => params.push(format!("38;5;{index}")),
-            Color::Rgb(r, g, b) => params.push(format!("38;2;{r};{g};{b}")),
+        if let Some(code) = color_param(self.fg, 30, 90, 38) {
+            params.push(code);
         }
-        match self.bg {
-            Color::Default => {}
-            Color::Indexed(index) => params.push(format!("48;5;{index}")),
-            Color::Rgb(r, g, b) => params.push(format!("48;2;{r};{g};{b}")),
+        if let Some(code) = color_param(self.bg, 40, 100, 48) {
+            params.push(code);
         }
         if params.is_empty() {
             return String::new();
@@ -240,6 +236,22 @@ impl Style {
     /// Clears the open hyperlink.
     pub const fn clear_hyperlink(&mut self) {
         self.hyperlink = None;
+    }
+}
+
+/// Returns the SGR parameter that selects a color, absent for the default.
+///
+/// The first 16 palette entries use the basic codes, which a 16 color terminal
+/// understands; the rest use the extended form `38;5;n`.
+fn color_param(color: Color, basic: u8, bright: u8, extended: u8) -> Option<String> {
+    match color {
+        Color::Default => None,
+        Color::Indexed(index @ 0..8) => Some(basic.saturating_add(index).to_string()),
+        Color::Indexed(index @ 8..16) => {
+            Some(bright.saturating_add(index.saturating_sub(8)).to_string())
+        }
+        Color::Indexed(index) => Some(format!("{extended};5;{index}")),
+        Color::Rgb(r, g, b) => Some(format!("{extended};2;{r};{g};{b}")),
     }
 }
 
@@ -1785,7 +1797,7 @@ mod tests {
         let style = g.cell(0, 0).expect("cell").style;
         assert!(style.has_flag(flag::BOLD));
         assert_eq!(style.fg, Color::Indexed(1));
-        assert_eq!(g.style().sgr(), "\u{1b}[1;38;5;1m");
+        assert_eq!(g.style().sgr(), "\u{1b}[1;31m");
     }
 
     #[test]
@@ -2314,6 +2326,40 @@ mod tests {
         style.apply_sgr("91;102");
         assert_eq!(style.fg, Color::Indexed(9));
         assert_eq!(style.bg, Color::Indexed(10));
+    }
+
+    #[test]
+    fn low_indices_use_the_basic_sgr_codes() {
+        let mut style = Style::new();
+        style.fg = Color::Indexed(1);
+        assert_eq!(style.sgr(), "\u{1b}[31m");
+        let mut background = Style::new();
+        background.bg = Color::Indexed(9);
+        assert_eq!(background.sgr(), "\u{1b}[101m");
+        for (index, fg, bg) in [
+            (0u8, "30", "40"),
+            (7, "37", "47"),
+            (8, "90", "100"),
+            (15, "97", "107"),
+        ] {
+            let pair = Style {
+                fg: Color::Indexed(index),
+                bg: Color::Indexed(index),
+                ..Style::new()
+            };
+            assert_eq!(pair.sgr(), format!("\u{1b}[{fg};{bg}m"));
+        }
+        let extended = Style {
+            fg: Color::Indexed(16),
+            bg: Color::Indexed(255),
+            ..Style::new()
+        };
+        assert_eq!(extended.sgr(), "\u{1b}[38;5;16;48;5;255m");
+        for written in [style, background, extended] {
+            let mut replay = grid(4, 1);
+            feed(&mut replay, &format!("{}x", written.sgr()));
+            assert_eq!(replay.cell(0, 0).expect("cell").style, written);
+        }
     }
 
     #[test]
