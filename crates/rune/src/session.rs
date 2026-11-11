@@ -237,6 +237,48 @@ impl Answerer for TerminalQuestions {
     }
 }
 
+/// What a block of committed rows is, for the spacing between blocks.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum RowKind {
+    /// Nothing but the opening banner yet.
+    Start,
+    User,
+    Reasoning,
+    Assistant,
+    Tool,
+    Notice,
+    /// The dim line that closes a finished turn.
+    Summary,
+}
+
+impl RowKind {
+    /// The kind of rows an entry renders to.
+    fn of(entry: &Entry) -> Self {
+        match entry.speaker {
+            transcript::Speaker::User => Self::User,
+            transcript::Speaker::Reasoning => Self::Reasoning,
+            transcript::Speaker::Assistant => Self::Assistant,
+            transcript::Speaker::Tool => Self::Tool,
+            transcript::Speaker::Notice => Self::Notice,
+        }
+    }
+
+    /// Whether one blank row separates rows of this kind from `next` below.
+    fn gap_before(self, next: Self) -> bool {
+        use RowKind::{Assistant, Notice, Reasoning, Start, Summary, Tool, User};
+        match (self, next) {
+            (_, Summary | Start) => false,
+            (_, User) => true,
+            (Start, _) => false,
+            (User | Summary, _) => true,
+            (Reasoning, next) => next == Tool,
+            (Assistant, next) => matches!(next, Tool | Notice),
+            (Tool, next) => matches!(next, Reasoning | Assistant),
+            (Notice, next) => matches!(next, Assistant | Tool),
+        }
+    }
+}
+
 /// Host state for a turn.
 struct SessionHost {
     /// Whether the active objective is checked before a turn finishes.
@@ -393,6 +435,8 @@ struct SessionHost {
     provider_strict: bool,
     /// Escape that opens a reasoning line, resolved from the theme once.
     reasoning: Mutex<String>,
+    /// What the last rows committed to scrollback were.
+    last_kind: Mutex<RowKind>,
     /// Text streamed so far in the current step, drawn below the input.
     ///
     /// Shared and mutable because a delta arrives on the turn's own thread
@@ -976,7 +1020,7 @@ impl Host for SessionHost {
                         if !output.is_error {
                             lines.extend(self.change_preview(call, output));
                         }
-                        self.commit_lines(&lines);
+                        self.commit_as(RowKind::Tool, &lines);
                     }
                 }
             }
@@ -2572,7 +2616,48 @@ impl SessionHost {
             self.draw_stream();
             return;
         }
-        self.commit_lines(&render_entries(entries, self));
+        self.commit_lines(&self.entry_rows(entries));
+    }
+
+    /// Prints rows of one kind into scrollback, after a blank row when the
+    /// rows above are of a kind that calls for one.
+    fn commit_as(&self, kind: RowKind, lines: &[String]) {
+        self.commit_lines(&self.spaced(kind, lines));
+    }
+
+    /// Returns `lines` with the blank row the previous block calls for, and
+    /// records `kind` as the last block. Accessible output has no spacing.
+    fn spaced(&self, kind: RowKind, lines: &[String]) -> Vec<String> {
+        if lines.is_empty() || self.accessible {
+            return lines.to_vec();
+        }
+        let mut last = lock_value(&self.last_kind);
+        let mut out = Vec::with_capacity(lines.len().saturating_add(1));
+        if last.gap_before(kind) {
+            out.push(String::new());
+        }
+        out.extend_from_slice(lines);
+        *last = kind;
+        out
+    }
+
+    /// Returns the rows that keep a submitted message in scrollback: all of
+    /// it, under the user's rail.
+    fn echo_rows(&self, text: &str) -> Vec<String> {
+        self.spaced(RowKind::User, &render_entries(&[Entry::user(text)], self))
+    }
+
+    /// Renders entries one by one, each spaced from what is above it.
+    fn entry_rows(&self, entries: &[Entry]) -> Vec<String> {
+        entries
+            .iter()
+            .flat_map(|entry| {
+                self.spaced(
+                    RowKind::of(entry),
+                    &render_entries(std::slice::from_ref(entry), self),
+                )
+            })
+            .collect()
     }
 
     /// Prints finished lines into scrollback above the live region.
@@ -3152,6 +3237,7 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
         turn_started: Mutex::new(None),
         live_out: Arc::new(Mutex::new(None)),
         reasoning: Mutex::new(reasoning_escape),
+        last_kind: Mutex::new(RowKind::Start),
         reviewer: crate::auto_review::build(
             &config.settings,
             &config.paths,
@@ -3228,13 +3314,13 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
         } else {
             vec![banner]
         };
-        opening.extend(
-            theme_warning
-                .iter()
-                .chain(mcp_warnings.iter())
-                .chain(results_notice.iter())
-                .flat_map(|warning| render_entries(&[Entry::notice(warning)], &host)),
-        );
+        let notices: Vec<Entry> = theme_warning
+            .iter()
+            .chain(mcp_warnings.iter())
+            .map(Entry::warning)
+            .chain(results_notice.iter().map(Entry::notice))
+            .collect();
+        opening.extend(host.entry_rows(&notices));
         // Replay only for an interactive resume. These settled rows enter the
         // terminal's scrollback once, before the composer accepts any input.
         if (keyed || config.accessible) && config.resume.is_some() {
@@ -3242,7 +3328,7 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                 .transcript
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            opening.extend(render_entries(&entries, &host));
+            opening.extend(host.entry_rows(&entries));
         }
         // Text typed while the terminal was queried is the first draft.
         let (prompt_row, caret) = if reader.line().is_empty() {
@@ -3755,16 +3841,7 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                 // The submitted line is committed to the flow before the turn
                 // runs, so what the user typed stays on screen once the reply
                 // replaces the region it was typed in.
-                let echo = if host.accessible {
-                    transcript::accessible_lines(&[Entry::user(&text)])
-                } else {
-                    vec![transcript::render_prompt_with_ascii(
-                        rune_term::shell::prompt(),
-                        &text,
-                        usize::from(host.width()),
-                        host.ascii,
-                    )]
-                };
+                let echo = host.echo_rows(&text);
                 // The typed line is committed and an empty input row is drawn
                 // under it, so the caret has its own row from the moment the
                 // line is submitted rather than only once streaming starts.
@@ -3982,7 +4059,9 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                 {
                     let dim = host.theme().sgr(Slot::Dim, host.depth);
                     let reset = rune_term::engine::Style::RESET;
-                    lines.push(format!("{dim}  {summary}{reset}"));
+                    lines.extend(
+                        host.spaced(RowKind::Summary, &[format!("{dim}  {summary}{reset}")]),
+                    );
                 }
                 let activity = if host.accessible {
                     None
@@ -4008,16 +4087,7 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                     return Ok(Step::Continue);
                 }
                 let shown = format!("! {command}");
-                let echo = if host.accessible {
-                    transcript::accessible_lines(&[Entry::user(&shown)])
-                } else {
-                    vec![transcript::render_prompt_with_ascii(
-                        rune_term::shell::prompt(),
-                        &shown,
-                        usize::from(host.width()),
-                        host.ascii,
-                    )]
-                };
+                let echo = host.echo_rows(&shown);
                 let (prompt_row, caret) = host.idle_prompt();
                 let painted = host.paint(&echo, None, &prompt_row, &[], caret)?;
                 sink.write_all(&painted)?;
@@ -4579,7 +4649,10 @@ fn collect_approval_inner(
     );
     picker.to(choices.len().saturating_sub(1));
     host.refresh_size();
-    let lines = approval_lines(request, usize::from(host.width()));
+    let lines = host.spaced(
+        RowKind::Notice,
+        &approval_lines(request, usize::from(host.width())),
+    );
     if draw_choice(host, &picker, &lines, false).is_err() {
         return ApprovalOutcome::Deny;
     }
@@ -4655,7 +4728,10 @@ fn collect_questions_inner(
             question.options.len(),
         );
         host.refresh_size();
-        let lines = question_lines(question, usize::from(host.width()));
+        let lines = host.spaced(
+            RowKind::Notice,
+            &question_lines(question, usize::from(host.width())),
+        );
         draw_choice(host, &picker, &lines, false)?;
         loop {
             host.cancellation.check()?;
@@ -4923,12 +4999,12 @@ fn close_turn(
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take_metadata_warning()
     {
-        let entry = Entry::notice(format!("warning: {warning}"));
+        let entry = Entry::warning(warning.to_string());
         host.transcript
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .push(entry.clone());
-        lines.to_mut().extend(render_entries(&[entry], host));
+        lines.to_mut().extend(host.entry_rows(&[entry]));
     }
     let painted = host.paint(&lines, notice.as_deref(), &prompt_rows, &[], caret)?;
     if !painted.is_empty() {
@@ -4973,9 +5049,8 @@ fn edit_draft(reader: &mut rune_term::input::KeyReader, host: &SessionHost) {
             usize::from(host.width()),
         );
         let message = format!("external editor failed: {error}");
-        if let Ok(painted) =
-            host.paint(&[transcript::sanitize(&message)], None, &prompt, &[], caret)
-        {
+        let lines = host.spaced(RowKind::Notice, &[transcript::sanitize(&message)]);
+        if let Ok(painted) = host.paint(&lines, None, &prompt, &[], caret) {
             host.show(&painted);
         }
     }
@@ -6369,10 +6444,11 @@ fn flush_lines(host: &SessionHost, sink: &mut LockedSink, lines: &[String]) -> R
         // current width before committing it to scrollback.
         host.refresh_size();
         let width = usize::from(host.width()).max(1);
-        rendered = lines
+        let wrapped = lines
             .iter()
             .flat_map(|line| rune_term::width::wrap(line, width))
             .collect::<Vec<_>>();
+        rendered = host.spaced(RowKind::Notice, &wrapped);
         &rendered
     };
     let (prompt_row, caret) = host.idle_prompt();
@@ -7161,7 +7237,7 @@ fn resolve_theme_for(
                 (Theme::dark(), "dark")
             };
             let warning = format!(
-                "warning: theme {}: {}; using {polarity}",
+                "theme {}: {}; using {polarity}",
                 name.unwrap_or_default(),
                 err.message()
             );
@@ -8769,7 +8845,7 @@ fn report_turn(
         _ => {}
     }
 
-    Ok(render_entries(&entries, host))
+    Ok(host.entry_rows(&entries))
 }
 
 /// Renders a turn that ended in an error rather than an outcome.
@@ -8793,12 +8869,12 @@ fn report_failed_turn(
     if err.code() == ErrorCode::Cancelled {
         entries.push(Entry::notice("cancelled"));
     } else {
-        entries.push(Entry::notice(format!("the turn failed: {}", err.message())));
-        if let Some(hint) = err.hint() {
-            entries.push(Entry::notice(hint.to_owned()));
-        }
+        entries.push(Entry::error(
+            format!("the turn failed: {}", err.message()),
+            err.hint().map(str::to_owned),
+        ));
     }
-    render_entries(&entries, host)
+    host.entry_rows(&entries)
 }
 
 /// Keeps only the answer bytes the turn has not already added to history.
@@ -8855,13 +8931,23 @@ fn render_entries(entries: &[Entry], host: &SessionHost) -> Vec<String> {
         ascii: host.ascii,
         ..Display::default()
     };
+    let theme = host.theme();
     let lanes = transcript::Lanes {
         reasoning: host.reasoning_style(),
         reset: rune_term::engine::Style::RESET.to_owned(),
         markdown: host.markdown_style(),
+        user_rail: theme.sgr(Slot::UserRail, host.depth),
+        dim: theme.sgr(Slot::Dim, host.depth),
+        warning: theme.sgr(Slot::Warning, host.depth),
+        error: theme.sgr(Slot::Error, host.depth),
     };
     let rendered = transcript::render_lanes(entries, display, &lanes);
-    rendered.lines().map(str::to_owned).collect()
+    let rows: Vec<String> = rendered.lines().map(str::to_owned).collect();
+    debug_assert!(
+        rows.iter().all(|row| !row.ends_with(' ')),
+        "a rendered row ends with a space: {rows:?}"
+    );
+    rows
 }
 
 /// Builds the prompt for a session with the chosen options.
@@ -9641,10 +9727,14 @@ mod tests {
         close_turn(&host, &mut locked, &mut reader, &[], None, &[]).expect("close turn");
         let output = String::from_utf8(sink.lock().expect("lock").clone()).expect("utf8");
         let output = transcript::sanitize(&output)
-            .replace(['\r', '\n'], "")
-            .replace("][", " ");
+            .replace(['\r', '\n'], " ")
+            .replace("][", " ")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
         assert!(output.contains("is durable"));
         assert!(output.contains("metadata refresh failed"), "{output:?}");
+        assert!(output.starts_with("warning: "), "{output:?}");
         assert!(output.contains("do not retry this event"));
         assert!(
             recorder
@@ -9749,7 +9839,7 @@ mod tests {
         let entries = history_entries(&turns);
         let rows = full_transcript_rows(&entries, 80, false);
         let rendered = rows.join("\n");
-        assert!(rendered.starts_with("> inspect"));
+        assert!(rendered.starts_with("\u{258c} inspect"));
         assert!(rendered.contains("read_file {\"path\":\"fixture\"}"));
         for row in 1..=40 {
             assert!(
@@ -11684,7 +11774,7 @@ mod tests {
         assert_eq!(theme, Theme::dark());
         let warning = warning.expect("a warning");
         assert!(
-            warning.starts_with("warning: theme mine: unknown theme slot `colour`"),
+            warning.starts_with("theme mine: unknown theme slot `colour`"),
             "{warning}"
         );
         assert!(warning.ends_with("; using dark"), "{warning}");
@@ -15809,6 +15899,77 @@ mod tests {
         assert!(host.live_rows().is_empty(), "streamed text replaces it");
     }
 
+    #[test]
+    fn turns_are_separated_by_one_blank_row() {
+        let host = test_host();
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let out: LiveSink = Arc::new(Mutex::new(SharedSink(Arc::clone(&bytes))));
+        *host.live_out.lock().expect("output lock") = Some(out);
+        host.commit(&[Entry::user("first question")]);
+        host.commit(&[Entry::assistant("looking")]);
+        host.commit_as(RowKind::Tool, &["  tool one".to_owned()]);
+        host.commit_as(RowKind::Tool, &["  tool two".to_owned()]);
+        host.commit(&[Entry::assistant("the answer")]);
+        host.commit_as(RowKind::Summary, &["  summary".to_owned()]);
+        host.commit(&[Entry::user("second question")]);
+        let mut grid = rune_term::Grid::new(80, 40).expect("grid");
+        grid.feed(&bytes.lock().expect("bytes")).expect("replay");
+        let rows: Vec<String> = (0..12).map(|row| grid.row_text(row)).collect();
+        assert_eq!(
+            rows,
+            [
+                "",
+                "\u{258c} first question",
+                "",
+                "looking",
+                "",
+                "  tool one",
+                "  tool two",
+                "",
+                "the answer",
+                "  summary",
+                "",
+                "\u{258c} second question",
+            ],
+            "{rows:#?}"
+        );
+    }
+
+    #[test]
+    fn a_long_prompt_is_echoed_in_full() {
+        let host = test_host();
+        let first = "word ".repeat(50);
+        let second = "tail ".repeat(10);
+        let text = format!("{}\n{}END", first.trim_end(), second);
+        assert!(text.len() >= 300);
+        let rows = host.echo_rows(&text);
+        assert_eq!(rows.first().map(String::as_str), Some(""), "{rows:#?}");
+        let body = &rows[1..];
+        assert!((4..=5).contains(&body.len()), "{rows:#?}");
+        assert!(body[0].starts_with("\u{258c} word"), "{rows:#?}");
+        assert!(
+            body[1..].iter().all(|row| row.starts_with("  ")),
+            "{rows:#?}"
+        );
+        assert!(
+            body.last().is_some_and(|row| row.ends_with("END")),
+            "{rows:#?}"
+        );
+        let words: Vec<&str> = body
+            .iter()
+            .flat_map(|row| row.split_whitespace())
+            .skip(1)
+            .collect();
+        assert_eq!(words, text.split_whitespace().collect::<Vec<_>>());
+        assert!(
+            body.iter()
+                .all(|row| rune_term::width::str_width(row) <= 80)
+        );
+        // Each message is set apart from the one above by one blank row.
+        let again = host.echo_rows("next");
+        assert_eq!(again, ["", "\u{258c} next"]);
+    }
+
     fn test_host() -> SessionHost {
         let mut registry = Registry::new();
         registry
@@ -15894,6 +16055,7 @@ mod tests {
             turn_started: Mutex::new(None),
             live_out: Arc::new(Mutex::new(None)),
             reasoning: Mutex::new("\u{1b}[2m".to_owned()),
+            last_kind: Mutex::new(RowKind::Start),
             reviewer: None,
             helper_usage: crate::helper_usage::HelperUsage::default(),
             totals: Mutex::new(Totals::default()),

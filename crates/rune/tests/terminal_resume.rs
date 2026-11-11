@@ -58,7 +58,11 @@ fn interactive_resume_replays_saved_exchanges_once_before_input() {
             assert!(!text.contains("SAVED-REPLY"), "{text}");
             assert!(!text.contains("saved prompt"), "{text}");
         } else if capture.stage == "resume-long-before-input" {
-            assert_eq!(text.matches("> long saved prompt").count(), 1, "{text}");
+            assert_eq!(
+                text.matches("\u{258c} long saved prompt").count(),
+                1,
+                "{text}"
+            );
             for index in 1..=40 {
                 assert_eq!(
                     text.matches(&format!("SAVED-ROW-{index:02}")).count(),
@@ -68,16 +72,20 @@ fn interactive_resume_replays_saved_exchanges_once_before_input() {
             }
             assert!(scrolled);
         } else {
-            assert_eq!(text.matches("> saved prompt").count(), 1, "{text}");
+            assert_eq!(text.matches("\u{258c} saved prompt").count(), 1, "{text}");
             for line in ["SAVED-REPLY", "Unicode 世界 e\u{301}", "REPLY-END"] {
                 assert_eq!(text.matches(line).count(), 1, "{text}");
             }
-            assert!(text.find("> saved prompt") < text.find("SAVED-REPLY"));
+            assert!(text.find("\u{258c} saved prompt") < text.find("SAVED-REPLY"));
             assert!(text.find("SAVED-REPLY") < text.find("REPLY-END"));
             if capture.stage == "resume-id-before-input" {
-                assert_eq!(text.matches("> continue saved prompt").count(), 1, "{text}");
+                assert_eq!(
+                    text.matches("\u{258c} continue saved prompt").count(),
+                    1,
+                    "{text}"
+                );
                 assert_eq!(text.matches("CONTINUED-REPLY").count(), 1, "{text}");
-                assert!(text.find("REPLY-END") < text.find("> continue saved prompt"));
+                assert!(text.find("REPLY-END") < text.find("\u{258c} continue saved prompt"));
             }
         }
         let draft = if capture.stage == "resume-last-draft" {

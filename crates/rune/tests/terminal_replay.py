@@ -448,12 +448,13 @@ with tempfile.TemporaryDirectory(prefix="rune-r034-") as directory:
             assert (root / "app.txt").read_text() == "alpha\nBETA\nbeta two\ngamma\n"
         elif scenario == "failure":
             os.write(master, b"fail\r")
-            wait_for("[the turn failed: ", offset)
-            failed = transcript.index(b"[the turn failed: ", offset)
-            # The hint is the next bracketed line after the failure line.
-            wait_for("]\r\n", failed)
-            first_end = transcript.index(b"]\r\n", failed) + 3
-            wait_for("]\r\n", first_end)
+            wait_for("error: the turn failed: ", offset)
+            failed = transcript.index(b"error: the turn failed: ", offset)
+            # The hint is the indented row under the failure row.
+            wait_for("\r\n", failed)
+            first_end = transcript.index(b"\r\n", failed) + 2
+            wait_for("  ", first_end)
+            wait_for("\r\n", first_end)
             capture("failure-reported", expected="")
         elif scenario == "approval":
             # The turn's ticker keeps repainting an empty frame under the prompt.
