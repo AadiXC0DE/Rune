@@ -462,9 +462,116 @@ fn namespace_failure(helper: &str, observed: &str) -> String {
     }
 }
 
+/// The file Ubuntu uses to restrict unprivileged user namespaces.
+const APPARMOR_USERNS: &str = "/proc/sys/kernel/apparmor_restrict_unprivileged_userns";
+
+/// One sentence that tells the user how to get a working backend here, when there is one.
+#[must_use]
+pub fn guidance(support: &Support) -> Option<String> {
+    if support.is_full() {
+        return None;
+    }
+    let linux = cfg!(target_os = "linux");
+    let os_release = if linux {
+        std::fs::read_to_string("/etc/os-release").unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let apparmor = if linux {
+        std::fs::read_to_string(APPARMOR_USERNS).ok()
+    } else {
+        None
+    };
+    guidance_with(
+        std::env::consts::OS,
+        support,
+        &os_release,
+        apparmor.as_deref(),
+        linux && in_container(),
+    )
+}
+
+/// [`guidance`] with the operating system and what was read from the host supplied.
+fn guidance_with(
+    os: &str,
+    support: &Support,
+    os_release: &str,
+    apparmor: Option<&str>,
+    container: bool,
+) -> Option<String> {
+    match (os, support) {
+        (_, Support::Full) => None,
+        ("macos", _) => Some(
+            "sandbox-exec is missing or refused to start; commands need --allow-unsandboxed or allow_unsandboxed = true"
+                .to_owned(),
+        ),
+        ("windows", _) => Some(
+            "Windows has no command sandbox in this version; commands run under the permission mode only"
+                .to_owned(),
+        ),
+        ("linux", Support::Unsupported { .. }) => Some(format!(
+            "install bubblewrap: {}",
+            install_command(os_release)
+        )),
+        ("linux", Support::Partial { .. }) => Some(if apparmor.map(str::trim) == Some("1") {
+            "Ubuntu's AppArmor blocks unprivileged user namespaces for bwrap; add the AppArmor profile from the README section \"Linux sandbox\" or run sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0".to_owned()
+        } else if container {
+            container_hint()
+        } else {
+            "this kernel does not allow unprivileged user namespaces; enable them or set allow_unsandboxed = true".to_owned()
+        }),
+        _ => None,
+    }
+}
+
+/// The command that installs bubblewrap on the distribution `os-release` names.
+///
+/// `ID` is tried first and then each entry of `ID_LIKE`, so a derivative such as
+/// `ID=pop` gets the command of the distribution it is based on.
+fn install_command(os_release: &str) -> &'static str {
+    let value = |key: &str| {
+        os_release.lines().find_map(|line| {
+            let (name, value) = line.split_once('=')?;
+            (name.trim() == key).then(|| value.trim().trim_matches(['"', '\'']).to_owned())
+        })
+    };
+    let names: Vec<String> = [value("ID"), value("ID_LIKE")]
+        .into_iter()
+        .flatten()
+        .flat_map(|names| {
+            names
+                .split_whitespace()
+                .map(str::to_ascii_lowercase)
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    names
+        .iter()
+        .find_map(|name| match name.as_str() {
+            "debian" | "ubuntu" => Some("sudo apt-get install bubblewrap"),
+            "fedora" | "rhel" | "centos" => Some("sudo dnf install bubblewrap"),
+            "arch" => Some("sudo pacman -S bubblewrap"),
+            "alpine" => Some("sudo apk add bubblewrap"),
+            "opensuse" | "suse" => Some("sudo zypper install bubblewrap"),
+            _ => None,
+        })
+        .unwrap_or("install bubblewrap (the bwrap program) with your package manager")
+}
+
+/// The advice for a refused command inside a container.
+fn container_hint() -> String {
+    format!(
+        "this looks like a container; pass {UNSANDBOXED_OVERRIDE} to run commands without Rune's sandbox"
+    )
+}
+
 /// Builds the error for a restriction that cannot be applied.
 fn unavailable(backend: &str, support: &Support) -> RuneError {
-    unavailable_with(backend, support, in_container())
+    let error = unavailable_with(backend, support, in_container());
+    match guidance(support) {
+        Some(guidance) => error.with_hint(guidance),
+        None => error,
+    }
 }
 
 /// [`unavailable`] with whether this is a container supplied.
@@ -480,9 +587,7 @@ fn unavailable_with(backend: &str, support: &Support, container: bool) -> RuneEr
         format!("{backend} refused to run the command: {refused}: {reason}"),
     )
     .with_hint(if container {
-        format!(
-            "this looks like a container; pass {UNSANDBOXED_OVERRIDE} to run commands without Rune's sandbox"
-        )
+        container_hint()
     } else {
         format!("pass {UNSANDBOXED_OVERRIDE} to run the command with no sandbox")
     })
@@ -1364,6 +1469,104 @@ mod tests {
             host.hint(),
             Some("pass --allow-unsandboxed to run the command with no sandbox")
         );
+    }
+
+    #[test]
+    fn install_command_follows_os_release() {
+        for (os_release, expected) in [
+            (
+                "ID=pop\nID_LIKE=\"ubuntu debian\"\n",
+                "sudo apt-get install bubblewrap",
+            ),
+            (
+                "ID=\"rocky\"\nID_LIKE=\"rhel centos fedora\"\n",
+                "sudo dnf install bubblewrap",
+            ),
+            ("ID=arch\n", "sudo pacman -S bubblewrap"),
+            ("ID=alpine\nVERSION_ID=3.20.0\n", "sudo apk add bubblewrap"),
+            (
+                "ID=\"opensuse-tumbleweed\"\nID_LIKE=\"opensuse suse\"\n",
+                "sudo zypper install bubblewrap",
+            ),
+            (
+                "ID=nixos\n",
+                "install bubblewrap (the bwrap program) with your package manager",
+            ),
+        ] {
+            assert_eq!(install_command(os_release), expected, "{os_release}");
+        }
+        let missing = Support::Unsupported {
+            reason: "the bubblewrap helper (bwrap) is not installed".to_owned(),
+        };
+        assert_eq!(
+            guidance_with("linux", &missing, "ID=debian\n", None, false).as_deref(),
+            Some("install bubblewrap: sudo apt-get install bubblewrap")
+        );
+        assert_eq!(
+            guidance_with("linux", &Support::Full, "", None, false),
+            None
+        );
+    }
+
+    #[test]
+    fn apparmor_restriction_gets_its_own_guidance() {
+        let refused = Support::Partial {
+            reason: "unprivileged user namespaces are unavailable here (fixture)".to_owned(),
+        };
+        let blocked =
+            guidance_with("linux", &refused, "ID=ubuntu\n", Some("1\n"), false).expect("guidance");
+        assert_eq!(
+            blocked,
+            "Ubuntu's AppArmor blocks unprivileged user namespaces for bwrap; add the AppArmor profile from the README section \"Linux sandbox\" or run sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0"
+        );
+        assert_eq!(
+            guidance_with("linux", &refused, "ID=ubuntu\n", Some("0\n"), false).as_deref(),
+            Some(
+                "this kernel does not allow unprivileged user namespaces; enable them or set allow_unsandboxed = true"
+            )
+        );
+        assert_eq!(
+            guidance_with("linux", &refused, "", None, true).as_deref(),
+            Some(
+                "this looks like a container; pass --allow-unsandboxed to run commands without Rune's sandbox"
+            )
+        );
+        let mac = Support::Unsupported {
+            reason: "fixture".to_owned(),
+        };
+        assert_eq!(
+            guidance_with("macos", &mac, "", None, false).as_deref(),
+            Some(
+                "sandbox-exec is missing or refused to start; commands need --allow-unsandboxed or allow_unsandboxed = true"
+            )
+        );
+    }
+
+    #[test]
+    fn windows_guidance_names_the_permission_mode() {
+        let support = NullSandbox.support();
+        let guidance = guidance_with("windows", &support, "", None, false).expect("guidance");
+        assert_eq!(
+            guidance,
+            "Windows has no command sandbox in this version; commands run under the permission mode only"
+        );
+        #[cfg(windows)]
+        {
+            let error = NullSandbox
+                .wrap(
+                    &crate::command::prepare_shell(
+                        "echo fixture",
+                        Utf8Path::new("."),
+                        None,
+                        BTreeMap::new(),
+                    )
+                    .expect("prepare"),
+                    &SandboxPolicy::new(Utf8PathBuf::from("."), vec![], false),
+                    false,
+                )
+                .expect_err("refused without allow_unsandboxed");
+            assert_eq!(error.hint(), Some(guidance.as_str()));
+        }
     }
 
     use tempfile::TempDir;

@@ -1,6 +1,7 @@
 //! Read-only explanation of a shell command's sandbox policy.
 
 use std::fmt::Write as _;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use camino::Utf8Path;
 use rune_core::config::{Layer, Settings};
@@ -62,6 +63,40 @@ pub fn cache_paths(settings: &Settings) -> Vec<camino::Utf8PathBuf> {
         .collect()
 }
 
+/// Shown once per machine, the first time a Windows command runs without a
+/// sandbox because none exists there.
+pub const WINDOWS_NOTICE: &str = "note: Windows has no command sandbox in this version. Commands run as you and are limited only by the permission mode. Set allow_unsandboxed = false in the user configuration to refuse every command instead.";
+
+/// The file under the state root that records the Windows notice was shown.
+const WINDOWS_NOTICE_MARKER: &str = "windows-sandbox-notice";
+
+/// Set once this process has looked for the Windows notice marker.
+static WINDOWS_NOTICE_CHECKED: AtomicBool = AtomicBool::new(false);
+
+/// The Windows notice, when this is the first command on this machine that
+/// runs unsandboxed by default rather than by the user's choice. Showing it
+/// creates the marker, so it is returned at most once per machine.
+#[must_use]
+pub fn windows_notice(settings: &Settings, state_root: &Utf8Path) -> Option<&'static str> {
+    if !cfg!(windows) || WINDOWS_NOTICE_CHECKED.swap(true, Ordering::Relaxed) {
+        return None;
+    }
+    windows_notice_with(settings, state_root)
+}
+
+/// [`windows_notice`] without the platform and once-per-process checks.
+fn windows_notice_with(settings: &Settings, state_root: &Utf8Path) -> Option<&'static str> {
+    if !settings.allow_unsandboxed || settings.source_of("allow_unsandboxed") != Layer::Default {
+        return None;
+    }
+    let marker = state_root.join(WINDOWS_NOTICE_MARKER);
+    if marker.exists() {
+        return None;
+    }
+    let _ = rune_core::paths::write_private(&marker, "");
+    Some(WINDOWS_NOTICE)
+}
+
 /// How commands run on this machine with these settings.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Status {
@@ -119,11 +154,14 @@ pub fn status_line(settings: &Settings, status: &Status) -> String {
 
 #[derive(Debug, Serialize)]
 pub struct Report {
-    command: String,
+    /// The command explained, or none when only the backend was asked about.
+    command: Option<String>,
     backend: Sourced<String>,
     support: &'static str,
     enforcement: &'static str,
     reason: Option<String>,
+    /// How to get a working backend on this machine, when there is a way.
+    guidance: Option<String>,
     allow_unsandboxed: Sourced<bool>,
     writable_roots: Vec<PathRule>,
     temporary_roots: Vec<PathRule>,
@@ -150,7 +188,7 @@ pub fn explain(
     } else {
         return Err(RuneError::invalid_field(
             "action",
-            "expected `sandbox explain -- <command>` or `sandbox -- <command>`",
+            "expected `sandbox explain`, `sandbox explain -- <command>` or `sandbox -- <command>`",
         ));
     };
     let command = launch
@@ -160,6 +198,10 @@ pub fn explain(
         .cloned()
         .collect::<Vec<_>>()
         .join(" ");
+    // Without a command the backend is still asked to wrap one, so the
+    // enforcement shown is what any command would get. A `--` promises a
+    // command, so a blank one after it is still refused.
+    let explained = launch.separator.is_some() || !command.trim().is_empty();
     let context = ExecutionContext::new(workspace.to_owned())
         .with_offline(settings.offline)
         .with_allow_unsandboxed(settings.allow_unsandboxed)
@@ -177,13 +219,13 @@ pub fn explain(
     }
     let policy = rune_tools::shell::sandbox_policy(&context);
     let prepared = rune_exec::command::prepare_shell(
-        &command,
+        if explained { &command } else { "exit 0" },
         workspace,
         None,
         rune_exec::minimal_environment(),
     )?;
     let backend = rune_exec::detect();
-    report(
+    let mut report = report(
         &*backend,
         &prepared,
         &policy,
@@ -191,7 +233,11 @@ pub fn explain(
         saved_directory_source,
         launch,
         (&caches, &refused_caches),
-    )
+    )?;
+    if !explained {
+        report.command = None;
+    }
+    Ok(report)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -265,8 +311,9 @@ fn report(
     } else {
         "seatbelt temporary_roots from TMPDIR, system temp directory and /tmp"
     };
+    let guidance = rune_exec::sandbox::guidance(&support);
     Ok(Report {
-        command: prepared.reviewed.clone(),
+        command: Some(prepared.reviewed.clone()),
         backend: Sourced {
             value: backend.name().into(),
             source: format!(
@@ -281,6 +328,7 @@ fn report(
         },
         enforcement,
         reason,
+        guidance,
         allow_unsandboxed: Sourced {
             value: settings.allow_unsandboxed,
             source: format!(
@@ -338,7 +386,9 @@ fn report(
 
 pub fn render(report: &Report) -> String {
     let mut out = String::new();
-    let _ = writeln!(out, "command: {}", report.command);
+    if let Some(command) = &report.command {
+        let _ = writeln!(out, "command: {command}");
+    }
     let _ = writeln!(
         out,
         "backend: {} (source: {})",
@@ -351,6 +401,15 @@ pub fn render(report: &Report) -> String {
     );
     if let Some(reason) = &report.reason {
         let _ = writeln!(out, "reason: {reason}");
+    }
+    if let Some(guidance) = &report.guidance {
+        let _ = writeln!(out, "guidance: {guidance}");
+    }
+    if cfg!(windows) {
+        let _ = writeln!(
+            out,
+            "job object: commands and their children are stopped together"
+        );
     }
     let _ = writeln!(
         out,
@@ -405,6 +464,44 @@ mod tests {
     use rune_exec::sandbox::{LinuxSandbox, MacSandbox, NullSandbox};
 
     use super::*;
+
+    #[test]
+    fn the_windows_notice_is_shown_once_and_only_for_the_default() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = Utf8Path::from_path(dir.path()).expect("utf8").join("state");
+        let by_default = Settings {
+            allow_unsandboxed: true,
+            ..Settings::default()
+        };
+        let mut chosen = Settings {
+            allow_unsandboxed: true,
+            ..Settings::default()
+        };
+        chosen.sources.record("allow_unsandboxed", Layer::User);
+        assert_eq!(windows_notice_with(&chosen, &state), None);
+        let refused = Settings {
+            allow_unsandboxed: false,
+            ..Settings::default()
+        };
+        assert_eq!(windows_notice_with(&refused, &state), None);
+        assert!(!state.join(WINDOWS_NOTICE_MARKER).exists());
+        assert_eq!(
+            windows_notice_with(&by_default, &state),
+            Some(WINDOWS_NOTICE)
+        );
+        let marker = state.join(WINDOWS_NOTICE_MARKER);
+        assert_eq!(std::fs::read(&marker).expect("marker"), b"");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(&marker)
+                .expect("mode")
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        assert_eq!(windows_notice_with(&by_default, &state), None);
+    }
 
     #[test]
     fn the_status_line_names_each_state() {

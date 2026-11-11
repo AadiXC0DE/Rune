@@ -276,6 +276,8 @@ struct ApprovalRequest {
     project_pattern: Option<String>,
     /// What the call would change, drawn under the scope, for an edit.
     preview: Vec<String>,
+    /// A question shown above the request, for one the session asks itself.
+    header: Option<String>,
     answer: mpsc::SyncSender<ApprovalOutcome>,
 }
 
@@ -457,6 +459,9 @@ struct SessionHost {
     spend_limit: Mutex<Option<u64>>,
     /// Whether sandboxed shell commands may use the network; `/network` sets it.
     network: std::sync::atomic::AtomicBool,
+    /// Set once the session has asked to allow the network after a command
+    /// failed without it, so it never asks twice.
+    network_asked: std::sync::atomic::AtomicBool,
     /// Present while the meter uses an estimate rather than provider usage.
     context_source: Mutex<Option<&'static str>>,
     /// Size of the context window, zero when the provider stated none.
@@ -1294,7 +1299,9 @@ impl Host for SessionHost {
     }
 
     fn execute(&self, name: &str, arguments: &serde_json::Value) -> Result<ToolOutput> {
-        let context = self.turn_context();
+        // The session's network choice is read per call, so `/network` and an
+        // answer to the network question reach the next command.
+        let context = self.context();
         if let Some(client) = &self.mcp
             && client.tools().iter().any(|tool| tool.name == name)
         {
@@ -1308,6 +1315,12 @@ impl Host for SessionHost {
         self.wait_for_checkpoint(name);
         if name == "shell" {
             self.note_command_without_repository();
+            if let Some(paths) = &self.usage_paths
+                && let Some(notice) =
+                    crate::sandbox::windows_notice(&self.permission_settings, &paths.state_root)
+            {
+                self.checkpoint_notice(notice.to_owned());
+            }
         }
         // Captured before the call so the bytes that were there can be put
         // back. A capture failure is not fatal: the call still runs, and `/undo`
@@ -1349,7 +1362,12 @@ impl Host for SessionHost {
             }
             return Ok(output);
         }
-        self.registry.call(name, arguments, &context)
+        let output = self.registry.call(name, arguments, &context)?;
+        if name == "shell" && self.allow_network_after(&output) {
+            // The first output is discarded: the rerun is the call's result.
+            return self.registry.call(name, arguments, &self.context());
+        }
+        Ok(output)
     }
 
     fn execute_with_context(
@@ -1754,6 +1772,17 @@ impl SessionHost {
 
     /// Waits for a terminal answer while allowing cancellation to wake us.
     fn request_approval(&self, tool: &str, target: &str, reason: String) -> (Outcome, String) {
+        self.request_approval_with(tool, target, reason, None)
+    }
+
+    /// [`Self::request_approval`] with a question shown above the request.
+    fn request_approval_with(
+        &self,
+        tool: &str,
+        target: &str,
+        reason: String,
+        header: Option<&str>,
+    ) -> (Outcome, String) {
         if self
             .grants
             .lock()
@@ -1788,6 +1817,7 @@ impl SessionHost {
                 .lock()
                 .map(|mut preview| std::mem::take(&mut *preview))
                 .unwrap_or_default(),
+            header: header.map(str::to_owned),
             answer,
         };
         if requests.send(request).is_err() {
@@ -1845,6 +1875,38 @@ impl SessionHost {
                 }
             }
         }
+    }
+
+    /// Asks once per session whether commands may use the network, after a
+    /// command failed for lack of it. Returns true when the user allowed it,
+    /// with the network now on for the rest of the session.
+    fn allow_network_after(&self, output: &ToolOutput) -> bool {
+        use std::sync::atomic::Ordering;
+        let attached = self
+            .approval_requests
+            .lock()
+            .is_ok_and(|slot| slot.is_some());
+        if !output.text.contains(rune_tools::shell::NETWORK_NOTICE)
+            || self.network.load(Ordering::Relaxed)
+            || self.endpoint.offline
+            || !attached
+            || self.network_asked.swap(true, Ordering::Relaxed)
+        {
+            return false;
+        }
+        let (outcome, _) = self.request_approval_with(
+            "network",
+            "commands in this session",
+            "the command failed without network access".to_owned(),
+            Some("allow network access for commands in this session? y/n"),
+        );
+        if outcome != Outcome::Allow {
+            return false;
+        }
+        self.network.store(true, Ordering::Relaxed);
+        self.queue_update("Commands now have network access.".to_owned());
+        self.checkpoint_notice("shell network: on for this session".to_owned());
+        true
     }
 
     /// The settings the rules are built from, with the user rules as this
@@ -4330,6 +4392,7 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
         vision: std::sync::atomic::AtomicBool::new(false),
         tool_images: crate::attachments::ToolImages::default(),
         network: std::sync::atomic::AtomicBool::new(config.settings.shell_network),
+        network_asked: std::sync::atomic::AtomicBool::new(false),
         spend_limit: Mutex::new(
             config
                 .settings
@@ -6052,7 +6115,7 @@ fn project_rule_block(rule: &rune_core::config::ConfiguredRule) -> String {
 /// A command that destroys data or publishes is approved one run at a time,
 /// and so is reaching a private network address.
 fn rememberable(tool: &str, target: &str) -> bool {
-    if tool == "web_fetch_private" {
+    if matches!(tool, "web_fetch_private" | "network") {
         return false;
     }
     if tool == "shell" {
@@ -6179,15 +6242,18 @@ fn question_key(
 
 /// Quoting makes control characters visible without changing the approved scope.
 fn approval_lines(request: &ApprovalRequest, width: usize) -> Vec<String> {
-    [
-        format!("Permission request for {:?}", request.tool),
-        format!("Reason: {:?}", request.reason),
-        format!("Scope: {:?}", request.target),
-    ]
-    .into_iter()
-    .flat_map(|line| rune_term::width::wrap(&line, width.max(1)))
-    .chain(request.preview.iter().cloned())
-    .collect()
+    request
+        .header
+        .iter()
+        .cloned()
+        .chain([
+            format!("Permission request for {:?}", request.tool),
+            format!("Reason: {:?}", request.reason),
+            format!("Scope: {:?}", request.target),
+        ])
+        .flat_map(|line| rune_term::width::wrap(&line, width.max(1)))
+        .chain(request.preview.iter().cloned())
+        .collect()
 }
 
 /// The picker's choices, top first, with the label each shows.
@@ -14419,6 +14485,7 @@ mod tests {
                     .then(|| rune_policy::approval::project_pattern("shell", target))
                     .flatten(),
                 preview: Vec::new(),
+                header: None,
                 answer,
             }
         };
@@ -14487,6 +14554,7 @@ mod tests {
             rememberable: true,
             project_pattern: None,
             preview: Vec::new(),
+            header: None,
             answer,
         };
         let lines = approval_lines(&request, 80).join("\n");
@@ -14516,6 +14584,7 @@ mod tests {
             rememberable: true,
             project_pattern: None,
             preview: Vec::new(),
+            header: None,
             answer,
         };
         let mut reader = rune_term::input::KeyReader::new();
@@ -18827,6 +18896,137 @@ mod tests {
         );
     }
 
+    /// A `shell` that fails for lack of network until the context grants it.
+    struct NetworkShell;
+
+    impl rune_tools::Tool for NetworkShell {
+        fn name(&self) -> &'static str {
+            "shell"
+        }
+
+        fn description(&self) -> &'static str {
+            "Run a fixture command."
+        }
+
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+
+        fn activity(&self) -> rune_tools::Activity {
+            rune_tools::Activity::Execute
+        }
+
+        fn call(
+            &self,
+            _arguments: &serde_json::Value,
+            context: &ExecutionContext,
+        ) -> Result<ToolOutput> {
+            Ok(if context.network {
+                ToolOutput::success("ok")
+            } else {
+                ToolOutput::failure(format!(
+                    "curl: (6) Could not resolve host: example.com\n{}",
+                    rune_tools::shell::NETWORK_NOTICE
+                ))
+            })
+        }
+    }
+
+    /// A host whose `shell` is [`NetworkShell`], with approval input attached.
+    fn network_host() -> (SessionHost, mpsc::Receiver<ApprovalRequest>) {
+        let mut host = test_host();
+        host.registry
+            .insert(Box::new(NetworkShell))
+            .expect("register");
+        let (requests, pending) = mpsc::channel();
+        *host.approval_requests.lock().expect("approvals") = Some(requests);
+        (host, pending)
+    }
+
+    #[test]
+    fn a_network_failure_asks_once_and_reruns() {
+        use std::sync::atomic::Ordering;
+        let (host, pending) = network_host();
+        let arguments = serde_json::json!({"command": "curl https://example.com"});
+        std::thread::scope(|scope| {
+            let worker = scope.spawn(|| host.execute("shell", &arguments));
+            let request = pending
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("the network question");
+            assert_eq!(request.tool, "network");
+            assert_eq!(request.target, "commands in this session");
+            assert_eq!(request.reason, "the command failed without network access");
+            assert!(!request.rememberable);
+            assert_eq!(request.project_pattern, None);
+            assert_eq!(
+                request.header.as_deref(),
+                Some("allow network access for commands in this session? y/n")
+            );
+            assert_eq!(
+                approval_lines(&request, 80)[0],
+                "allow network access for commands in this session? y/n"
+            );
+            request
+                .answer
+                .send(ApprovalOutcome::RunOnce)
+                .expect("allow");
+            let output = worker.join().expect("worker").expect("output");
+            assert_eq!(output.text, "ok");
+            assert!(!output.is_error);
+        });
+        assert!(host.network.load(Ordering::Relaxed));
+        assert_eq!(
+            host.take_updates(),
+            ["Commands now have network access.".to_owned()]
+        );
+        // The choice reaches later commands of the session.
+        let later = host.execute("shell", &arguments).expect("later");
+        assert_eq!(later.text, "ok");
+        // A later failure keeps its notice and asks nothing.
+        set_network(&host, Some("off"));
+        let refused = host.execute("shell", &arguments).expect("refused");
+        assert!(
+            refused.text.contains(rune_tools::shell::NETWORK_NOTICE),
+            "{}",
+            refused.text
+        );
+        assert!(pending.try_recv().is_err(), "asked a second time");
+    }
+
+    #[test]
+    fn a_refused_network_question_keeps_the_first_output_and_offline_never_asks() {
+        use std::sync::atomic::Ordering;
+        let (host, pending) = network_host();
+        let arguments = serde_json::json!({"command": "curl https://example.com"});
+        std::thread::scope(|scope| {
+            let worker = scope.spawn(|| host.execute("shell", &arguments));
+            let request = pending
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("the network question");
+            request.answer.send(ApprovalOutcome::Deny).expect("deny");
+            let output = worker.join().expect("worker").expect("output");
+            assert!(output.is_error);
+            assert!(output.text.contains(rune_tools::shell::NETWORK_NOTICE));
+        });
+        assert!(!host.network.load(Ordering::Relaxed));
+        assert!(host.take_updates().is_empty());
+        let again = host.execute("shell", &arguments).expect("again");
+        assert!(again.text.contains(rune_tools::shell::NETWORK_NOTICE));
+        assert!(pending.try_recv().is_err(), "asked after a no");
+
+        let (mut offline, pending) = network_host();
+        offline.endpoint.offline = true;
+        let output = offline.execute("shell", &arguments).expect("offline");
+        assert!(output.text.contains(rune_tools::shell::NETWORK_NOTICE));
+        assert!(pending.try_recv().is_err(), "asked while offline");
+
+        let (detached, _) = network_host();
+        *detached.approval_requests.lock().expect("approvals") = None;
+        let output = detached.execute("shell", &arguments).expect("no input");
+        assert!(output.text.contains(rune_tools::shell::NETWORK_NOTICE));
+        assert!(!detached.network_asked.load(Ordering::Relaxed));
+    }
+
     #[test]
     fn network_command_shows_and_switches_shell_network() {
         let host = test_host();
@@ -20342,6 +20542,7 @@ mod tests {
             rememberable: true,
             project_pattern: None,
             preview: Vec::new(),
+            header: None,
             answer,
         };
         let mut reader = rune_term::input::KeyReader::line_mode();
@@ -20659,6 +20860,7 @@ mod tests {
             tool_images: crate::attachments::ToolImages::default(),
             spend_limit: Mutex::new(None),
             network: std::sync::atomic::AtomicBool::new(false),
+            network_asked: std::sync::atomic::AtomicBool::new(false),
             output_limit: std::sync::atomic::AtomicU64::new(0),
             context_source: Mutex::new(None),
             context_limit: std::sync::atomic::AtomicU64::new(

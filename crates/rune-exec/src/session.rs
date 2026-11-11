@@ -347,6 +347,9 @@ struct Inner {
     timed_out: AtomicBool,
     #[cfg(target_os = "linux")]
     terminal: Option<std::fs::File>,
+    /// The job holding the child's tree, when one could be created and joined.
+    #[cfg(windows)]
+    job: Option<crate::job::Job>,
 }
 
 impl Process {
@@ -476,6 +479,13 @@ impl Process {
             .map(std::fs::File::try_clone)
             .transpose()?;
         let mut child = spec.spawn()?;
+        // Assigned straight after the spawn, so what the child starts is in the
+        // job too. A process started before this returns can escape it, which
+        // the tree kill fallback still reaches.
+        #[cfg(windows)]
+        let job = crate::job::Job::new()
+            .and_then(|job| job.assign(&child).map(|()| job))
+            .ok();
         // Command holds the parent's slave descriptors until dropped. Keeping
         // them open would prevent EOF when the child's terminal closes.
         drop(spec);
@@ -498,6 +508,8 @@ impl Process {
             timed_out: AtomicBool::new(false),
             #[cfg(target_os = "linux")]
             terminal,
+            #[cfg(windows)]
+            job,
         });
 
         #[cfg(target_os = "linux")]
@@ -522,6 +534,18 @@ impl Process {
     #[must_use]
     pub fn id(&self) -> u32 {
         self.inner.group
+    }
+
+    /// Returns the ids of the processes in the command's job, empty when the
+    /// command has no job.
+    #[cfg(windows)]
+    #[must_use]
+    pub fn job_process_ids(&self) -> Vec<u32> {
+        self.inner
+            .job
+            .as_ref()
+            .and_then(|job| job.process_ids().ok())
+            .unwrap_or_default()
     }
 
     /// Returns true while the process has not been reaped.
@@ -555,7 +579,7 @@ impl Process {
                     std::thread::sleep(POLL_INTERVAL);
                 }
                 inner.timed_out.store(true, Ordering::SeqCst);
-                if !force_group(inner.group)
+                if !force_group(&inner)
                     && let Some(child) = lock(&inner.child).as_mut()
                 {
                     let _ = child.kill();
@@ -721,21 +745,21 @@ impl Process {
     /// Ends what is left of the group, if anything is.
     pub fn end_leftovers(&self) {
         if self.group_alive() {
-            force_group(self.inner.group);
+            force_group(&self.inner);
         }
     }
 
     /// Sends the forceful stop, falling back to the direct child when no
     /// signal program is available.
     fn end_group(&self) {
-        if !force_group(self.inner.group) {
+        if !force_group(&self.inner) {
             self.kill_leader();
         }
     }
 
     /// Sends a signal to the process group, returning whether it was delivered.
     fn signal(&self, name: &str) -> bool {
-        signal_group(self.inner.group, name)
+        signal_group(&self.inner, name)
     }
 
     /// Ends the direct child when the group cannot be signalled.
@@ -766,7 +790,7 @@ impl Process {
 impl Inner {
     /// Ends the group and reaps the child, best effort.
     fn shutdown(&self) {
-        force_group(self.group);
+        force_group(self);
         if let Some(mut child) = lock(&self.child).take() {
             let _ = child.kill();
             let _ = child.wait();
@@ -837,17 +861,22 @@ pub fn group_alive(group: u32) -> bool {
 
 /// Ends a process tree, on a platform with no process groups to signal.
 ///
-/// The platform's own tool walks the tree from the given process, which is what
-/// a group would give on the other side. It is forcible, so a caller that asked
-/// politely is answered by the tree being gone rather than by a refusal.
+/// The job the child was put in holds the whole tree, including a process
+/// whose parent has exited. Without a job, the platform's own tool walks the
+/// tree from the given process. Either way it is forcible, so a caller that
+/// asked politely is answered by the tree being gone rather than by a refusal.
 ///
 /// The standard library can only end the direct child, and the process this is
 /// called on is usually the shell rather than the work it started, so ending
 /// only that would leave the work running under a parent that no longer exists.
 #[cfg(not(unix))]
-fn signal_group(group: u32, _name: &str) -> bool {
+fn signal_group(inner: &Inner, _name: &str) -> bool {
+    #[cfg(windows)]
+    if inner.job.as_ref().is_some_and(crate::job::Job::terminate) {
+        return true;
+    }
     Command::new("taskkill")
-        .args(["/PID", &group.to_string(), "/T", "/F"])
+        .args(["/PID", &inner.group.to_string(), "/T", "/F"])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -946,7 +975,7 @@ fn spawn_waiter(inner: Arc<Inner>) -> io::Result<()> {
             // why the child is released only afterwards. An owner that keeps
             // the group ends it later, where the platform has groups to keep.
             if inner.leftovers == Leftovers::End || cfg!(not(unix)) {
-                force_group(inner.group);
+                force_group(&inner);
             }
             drop(child);
             *lock(&inner.exit) = Some(exit);
@@ -960,8 +989,8 @@ fn spawn_waiter(inner: Arc<Inner>) -> io::Result<()> {
 /// be signalled, and nothing is left to stop, so the caller treats a failed
 /// delivery as complete.
 #[cfg(unix)]
-fn signal_group(group: u32, name: &str) -> bool {
-    let target = format!("-{group}");
+fn signal_group(inner: &Inner, name: &str) -> bool {
+    let target = format!("-{}", inner.group);
     KILL_PROGRAMS.iter().any(|program| {
         Command::new(program)
             .args(["-s", name, "--", target.as_str()])
@@ -979,11 +1008,11 @@ fn signal_group(group: u32, name: &str) -> bool {
 /// members one at a time there, so a shell whose current command dies first
 /// could otherwise start the next command of a list before the kill reaches
 /// the shell itself.
-fn force_group(group: u32) -> bool {
+fn force_group(inner: &Inner) -> bool {
     if cfg!(target_os = "macos") {
-        signal_group(group, STOP_SIGNAL);
+        signal_group(inner, STOP_SIGNAL);
     }
-    signal_group(group, FORCE_SIGNAL)
+    signal_group(inner, FORCE_SIGNAL)
 }
 
 /// Returns how a child ended.

@@ -530,8 +530,8 @@ pub const ACCOUNT: &[CommandSpec] = &[
     CommandSpec {
         name: "sandbox",
         aliases: &[],
-        summary: "Explain command policy: sandbox [explain] -- <command>",
-        usage: "rune sandbox [explain] [--external-access] [--json] -- <command>",
+        summary: "Explain command policy: sandbox [explain] [-- <command>]",
+        usage: "rune sandbox [explain] [--external-access] [--json] [-- <command>]",
         flags: &[
             flag(
                 "--external-access",
