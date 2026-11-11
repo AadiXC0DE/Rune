@@ -448,6 +448,35 @@ fn tool_row_grids() {
             .any(|row| row.starts_with("  ✗ read_file missing.txt")),
         "{actual}"
     );
+    assert!(
+        rows.iter().any(|row| row.starts_with("  ✓ read 4 files")),
+        "{actual}"
+    );
+    assert!(!rows.iter().any(|row| row.contains("part-")), "{actual}");
+}
+
+#[test]
+fn shell_tail_grids() {
+    let actual = event_replay("shell-tail");
+    let running = stage_rows(&actual, "shell-running");
+    let call = running
+        .iter()
+        .position(|row| row.contains("Running for i in"))
+        .unwrap_or_else(|| panic!("running row: {actual}"));
+    let tail: Vec<&&str> = running[call + 1..]
+        .iter()
+        .take_while(|row| row.starts_with("    TAIL-"))
+        .collect();
+    assert!((1..=3).contains(&tail.len()), "{actual}");
+    assert!(tail.iter().any(|row| row.contains("TAIL-2")), "{actual}");
+    let finished = stage_rows(&actual, "shell-finished");
+    assert!(
+        finished.iter().all(|row| !row.starts_with("    TAIL-")),
+        "{actual}"
+    );
+    let header = "shell-finished: ";
+    let settled = &actual[actual.find(header).expect("finished stage")..];
+    compare_grid("shell_tail.grid", settled);
 }
 
 #[test]

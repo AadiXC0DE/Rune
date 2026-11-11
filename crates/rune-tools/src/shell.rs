@@ -1352,7 +1352,9 @@ fn wait_for_exit(
     context: &ExecutionContext,
 ) -> Result<Option<Exit>> {
     let deadline = Instant::now().checked_add(window);
+    let mut tail = TailWriter::default();
     loop {
+        tail.store(process, context);
         if let Some(exit) = process.exit() {
             return Ok(Some(exit));
         }
@@ -1376,7 +1378,9 @@ fn wait_for_progress(
     context: &ExecutionContext,
 ) -> Result<()> {
     let deadline = Instant::now().checked_add(window);
+    let mut tail = TailWriter::default();
     loop {
+        tail.store(process, context);
         if process.exit().is_some() || produced(process) > baseline {
             return Ok(());
         }
@@ -1385,6 +1389,51 @@ fn wait_for_progress(
             return Ok(());
         }
         std::thread::sleep(POLL_INTERVAL);
+    }
+}
+
+/// Shortest time between two stores of a running command's newest lines.
+const TAIL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Newest output lines kept for a host to show under a running command.
+const TAIL_LINES: usize = 3;
+
+/// Bytes read from the end of a stream to find those lines.
+const TAIL_BYTES: usize = 4096;
+
+/// Copies a running command's newest output lines into the context's tail.
+#[derive(Default)]
+struct TailWriter {
+    /// When the lines were last stored.
+    stored: Option<Instant>,
+    /// Bytes each stream had produced at that store.
+    seen: (u64, u64),
+}
+
+impl TailWriter {
+    /// Stores the newest lines of stdout, or of stderr when stdout produced
+    /// nothing new since the last store, at most every [`TAIL_INTERVAL`].
+    fn store(&mut self, process: &Process, context: &ExecutionContext) {
+        let Some(target) = &context.live_tail else {
+            return;
+        };
+        if self
+            .stored
+            .is_some_and(|stored| stored.elapsed() < TAIL_INTERVAL)
+        {
+            return;
+        }
+        let produced = (process.stdout().totals().1, process.stderr().totals().1);
+        let lines = if produced.0 > self.seen.0 {
+            process.stdout().last_lines(TAIL_LINES, TAIL_BYTES)
+        } else if produced.1 > self.seen.1 {
+            process.stderr().last_lines(TAIL_LINES, TAIL_BYTES)
+        } else {
+            return;
+        };
+        self.stored = Some(Instant::now());
+        self.seen = produced;
+        *lock(target) = lines;
     }
 }
 
@@ -1590,6 +1639,41 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg(unix)]
+    #[test]
+    fn a_running_command_stores_its_newest_lines_in_the_live_tail() {
+        let tool = Shell::default();
+        let (_dir, context) = workspace();
+        let tail = Arc::new(Mutex::new(Vec::new()));
+        let context = context.with_live_tail(Arc::clone(&tail));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let watcher = {
+            let (tail, seen) = (Arc::clone(&tail), Arc::clone(&seen));
+            std::thread::spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while Instant::now() < deadline {
+                    let lines = lock(&tail).clone();
+                    if lines.iter().any(|line| line == "four") {
+                        *lock(&seen) = lines;
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            })
+        };
+        let output = text(
+            &tool,
+            &context,
+            &serde_json::json!({
+                "action": "run",
+                "command": "printf 'one\\ntwo\\nthree\\nfour\\n'; sleep 1",
+            }),
+        );
+        watcher.join().expect("watcher");
+        assert!(output.contains("four"), "{output}");
+        assert_eq!(*lock(&seen), ["two", "three", "four"]);
+    }
+
     #[test]
     fn shutdown_ends_every_session_gracefully() {
         let tool = shell(4, TEST_CAP);

@@ -449,6 +449,15 @@ struct SessionHost {
     /// Calls still running in the current step, by call id, with the row that
     /// stands for each in the live region.
     running: Mutex<Vec<Running>>,
+    /// Finished exploration calls not yet committed, drawn dim in the live
+    /// region until they commit as one row or one each.
+    held: Mutex<Vec<HeldRow>>,
+    /// Whether bursts of exploration calls fold into one row.
+    collapse: bool,
+    /// The newest output lines of a running command, filled by the shell tool.
+    live_tail: Arc<Mutex<Vec<String>>>,
+    /// Whether file targets are written as terminal hyperlinks.
+    hyperlinks: bool,
     /// When the live region was last redrawn by the turn's idle tick.
     last_tick: Mutex<Option<std::time::Instant>>,
     /// Whether the stream changed since the last frame was written.
@@ -928,6 +937,9 @@ impl Host for SessionHost {
         // screen clear, and the rows drawn from this text reach the terminal
         // as they are. A sequence split across two deltas loses its introducer
         // in the first, so what arrives in the second is plain text.
+        if !self.keeps_hold(&event) {
+            self.flush_held();
+        }
         match &event {
             Event::ProviderRetry {
                 next_attempt,
@@ -1001,11 +1013,13 @@ impl Host for SessionHost {
                 // What the model said before calling a tool is finished, so it
                 // moves into scrollback ahead of the call it led to.
                 let mut entries = self.take_narration();
+                lock_value(&self.live_tail).clear();
                 if let Ok(mut running) = self.running.lock() {
                     running.push(Running {
                         id: call.id.clone(),
                         label: self.running_label(call, *activity),
                         started: std::time::Instant::now(),
+                        tail: call.name == "shell",
                     });
                 }
                 entries.retain(|entry| !entry.text.trim().is_empty());
@@ -1022,12 +1036,21 @@ impl Host for SessionHost {
                 // A plan change is reported by its own event.
                 if call.name == "update_plan" && !output.is_error {
                     self.request_frame();
+                } else if let Some(activity) = self.held_activity(call, output) {
+                    lock_value(&self.held).push(HeldRow {
+                        activity,
+                        row: self.finished_row(call, output, *elapsed),
+                        elapsed: *elapsed,
+                    });
+                    // Drawn at once, as a committed row would be.
+                    self.draw_stream();
                 } else {
                     let row = self.finished_row(call, output, *elapsed);
                     if self.accessible {
-                        self.commit(&[Entry::tool(row)]);
+                        // Words for glyphs, and the plain separators with them.
+                        self.commit(&[Entry::tool(row.plain(true))]);
                     } else {
-                        let mut lines = vec![self.styled_tool_line(&row, output.is_error)];
+                        let mut lines = self.styled_tool_rows(&row, output.is_error);
                         if !output.is_error {
                             lines.extend(self.change_preview(call, output));
                         }
@@ -1042,7 +1065,19 @@ impl Host for SessionHost {
                 self.commit(&entries);
             }
             Event::PlanUpdated { update } => {
-                self.draw_notice(&plan_summary(update));
+                if self.accessible {
+                    self.draw_notice(&plan_summary(update));
+                } else {
+                    let sgr = |slot| self.theme().sgr(slot, self.depth);
+                    let rows = plan_rows(
+                        update,
+                        usize::from(self.width()),
+                        &sgr(Slot::Dim),
+                        &sgr(Slot::Accent),
+                        self.ascii,
+                    );
+                    self.commit_as(RowKind::Tool, &rows);
+                }
             }
             Event::Notice { text } => self.draw_notice(text),
             Event::ContextPruned {
@@ -2948,22 +2983,73 @@ impl SessionHost {
         }
     }
 
-    /// Styles a finished call's row: the status glyph in the success or error
+    /// Draws a finished call's row: the status glyph in the success or error
     /// colour, the tool and target as text, and the details after them dimmed.
-    fn styled_tool_line(&self, row: &str, failed: bool) -> String {
-        let text = transcript::sanitize(row);
-        let reset = rune_term::engine::Style::RESET;
-        let status = self
-            .theme()
-            .sgr(if failed { Slot::Error } else { Slot::Success }, self.depth);
-        let dim = self.theme().sgr(Slot::Dim, self.depth);
-        let (glyph, rest) = text.split_once(' ').unwrap_or((text.as_str(), ""));
-        let separator = if self.ascii { " - " } else { " \u{b7} " };
-        match rest.split_once(separator) {
-            Some((call, details)) => {
-                format!("  {status}{glyph}{reset} {call}{dim}{separator}{details}{reset}")
-            }
-            None => format!("  {status}{glyph}{reset} {rest}"),
+    fn styled_tool_rows(&self, row: &ToolRow, failed: bool) -> Vec<String> {
+        let theme = self.theme();
+        let style = RowStyle {
+            status: theme.sgr(if failed { Slot::Error } else { Slot::Success }, self.depth),
+            dim: theme.sgr(Slot::Dim, self.depth),
+            ascii: self.ascii,
+            links: self.hyperlinks,
+        };
+        render_tool_row(row, usize::from(self.width()), &style)
+    }
+
+    /// Returns the activity a finished call is held under, or `None` when it
+    /// commits at once: grouping is off, it failed, it repeated an earlier
+    /// call, or it is not an exploration call.
+    fn held_activity(
+        &self,
+        call: &turn::PreparedCall,
+        output: &ToolOutput,
+    ) -> Option<rune_tools::Activity> {
+        if !self.collapse || self.accessible || output.is_error {
+            return None;
+        }
+        if output.text.starts_with(turn::REPEAT_MARKER) {
+            return None;
+        }
+        self.registry
+            .activity(&call.name)
+            .filter(|activity| groupable(*activity))
+    }
+
+    /// Returns true when an event leaves held exploration calls held: another
+    /// exploration call starting, or one finishing that is held too.
+    fn keeps_hold(&self, event: &Event) -> bool {
+        match event {
+            Event::ToolStarted { activity, .. } => groupable(*activity),
+            Event::ToolFinished { call, output, .. } => self.held_activity(call, output).is_some(),
+            _ => false,
+        }
+    }
+
+    /// Commits held exploration calls: three or more as one row, fewer as a
+    /// row each.
+    fn flush_held(&self) {
+        let held = std::mem::take(&mut *lock_value(&self.held));
+        if held.is_empty() {
+            return;
+        }
+        let lines: Vec<String> = if held.len() >= GROUP_MIN {
+            self.styled_tool_rows(&group_row(&held, self.glyphs()), false)
+        } else {
+            held.iter()
+                .flat_map(|held| self.styled_tool_rows(&held.row, false))
+                .collect()
+        };
+        self.commit_as(RowKind::Tool, &lines);
+    }
+
+    /// Returns how this session marks a finished call.
+    const fn glyphs(&self) -> RowGlyphs {
+        if self.accessible {
+            RowGlyphs::Words
+        } else if self.ascii {
+            RowGlyphs::Ascii
+        } else {
+            RowGlyphs::Unicode
         }
     }
 
@@ -3084,19 +3170,46 @@ impl SessionHost {
             let frame = spinner_frame(elapsed, self.ascii, self.reduced_motion);
             format!("{dim}  {frame} {label} {}{reset}", format_elapsed(elapsed))
         };
-        let running = self
-            .running
-            .lock()
-            .map(|running| {
-                running
-                    .iter()
-                    .map(|call| row(&call.label, call.started))
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        if !running.is_empty() {
-            return running;
+        let width = usize::from(self.width());
+        let tail = self.tail_rows(width, &dim);
+        let mut rows = Vec::new();
+        if let Ok(running) = self.running.lock() {
+            let mut tail = Some(tail);
+            for call in running.iter() {
+                rows.push(row(&call.label, call.started));
+                if call.tail
+                    && let Some(tail) = tail.take()
+                {
+                    rows.extend(tail);
+                }
+            }
         }
+        if rows.is_empty() {
+            rows.extend(self.thinking_rows(&row, width, &dim));
+        }
+        let style = RowStyle {
+            status: String::new(),
+            dim: String::new(),
+            ascii: self.ascii,
+            links: false,
+        };
+        for held in lock_value(&self.held).iter() {
+            for line in render_tool_row(&held.row, width, &style) {
+                rows.push(format!("{dim}{line}{reset}"));
+            }
+        }
+        rows
+    }
+
+    /// Returns the rows that show the model is working while nothing runs:
+    /// a `thinking` row, and in `tail` mode the newest reasoning line.
+    fn thinking_rows(
+        &self,
+        row: &dyn Fn(&str, std::time::Instant) -> String,
+        width: usize,
+        dim: &str,
+    ) -> Vec<String> {
+        let reset = rune_term::engine::Style::RESET;
         let mode = *lock_value(&self.reasoning_mode);
         let (answer_empty, newest) = self.streaming.lock().map_or((false, None), |streaming| {
             let newest = streaming
@@ -3121,11 +3234,35 @@ impl SessionHost {
         if mode == ReasoningMode::Tail
             && let Some(line) = newest
         {
-            let width = usize::from(self.width()).saturating_sub(4).max(1);
-            let line = shorten(&transcript::sanitize(&line), width, self.ascii);
+            let line = shorten(
+                &transcript::sanitize(&line),
+                width.saturating_sub(4).max(1),
+                self.ascii,
+            );
             rows.push(format!("{dim}  {line}{reset}"));
         }
         rows
+    }
+
+    /// Returns the newest output lines of a running command as dim rows,
+    /// indented under its row: each line's text after its last carriage
+    /// return, sanitized, with tabs expanded and cut to fit.
+    fn tail_rows(&self, width: usize, dim: &str) -> Vec<String> {
+        let reset = rune_term::engine::Style::RESET;
+        lock_value(&self.live_tail)
+            .iter()
+            .filter_map(|line| {
+                let line = line.trim_end_matches('\r');
+                let line = line.rsplit('\r').next().unwrap_or_default();
+                let text = rune_term::width::expand_tabs(&transcript::sanitize(line));
+                let text = text.trim_end();
+                (!text.trim().is_empty()).then(|| {
+                    let cut = shorten(text, width.saturating_sub(4), self.ascii);
+                    format!("{dim}    {cut}{reset}")
+                })
+            })
+            .take(TAIL_ROWS)
+            .collect()
     }
 
     /// Redraws the live region while a turn is quiet, at most four times a
@@ -3160,15 +3297,41 @@ impl SessionHost {
         call: &turn::PreparedCall,
         output: &ToolOutput,
         elapsed: std::time::Duration,
-    ) -> String {
-        let glyphs = if self.accessible {
-            RowGlyphs::Words
-        } else if self.ascii {
-            RowGlyphs::Ascii
+    ) -> ToolRow {
+        let mut row = tool_row(
+            &call.name,
+            &self.call_target(call),
+            output,
+            elapsed,
+            self.glyphs(),
+        );
+        row.link = self.target_link(call);
+        row
+    }
+
+    /// Returns the `file://` URI a call's target links to: the absolute path
+    /// a read, list, search, edit or write call names.
+    fn target_link(&self, call: &turn::PreparedCall) -> Option<String> {
+        use rune_tools::Activity;
+        let activity = self.registry.activity(&call.name)?;
+        if !matches!(
+            activity,
+            Activity::Read | Activity::List | Activity::Search | Activity::Edit | Activity::Write
+        ) {
+            return None;
+        }
+        let arguments: serde_json::Value = serde_json::from_str(&call.arguments).ok()?;
+        let path = arguments.get("path")?.as_str()?;
+        if path.is_empty() || path.contains('\n') {
+            return None;
+        }
+        let path = Utf8Path::new(path);
+        let absolute = if path.is_absolute() {
+            path.to_owned()
         } else {
-            RowGlyphs::Unicode
+            self.context.workspace().join(path)
         };
-        tool_row(&call.name, &self.call_target(call), output, elapsed, glyphs)
+        Some(rune_term::width::file_uri(absolute.as_str()))
     }
 
     /// Returns what a call acts on, such as a path or a command, cut to fit.
@@ -3177,7 +3340,7 @@ impl SessionHost {
         let target =
             turn::permission_target_for(&self.registry, &call.name, &arguments).unwrap_or_default();
         let width = usize::from(self.width()).saturating_sub(40).clamp(16, 72);
-        shorten(target.lines().next().unwrap_or_default(), width, self.ascii)
+        shorten_middle(target.lines().next().unwrap_or_default(), width, self.ascii)
     }
 
     /// Clears retry state when a request advances or the turn is finalized.
@@ -3205,6 +3368,7 @@ impl SessionHost {
         if let Ok(mut running) = self.running.lock() {
             running.clear();
         }
+        lock_value(&self.held).clear();
         if let Ok(mut started) = self.turn_started.lock() {
             *started = None;
         }
@@ -3379,7 +3543,9 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
     } else {
         (None, 0, BTreeMap::new())
     };
+    let live_tail = Arc::new(Mutex::new(Vec::new()));
     let mut context = ExecutionContext::new(config.workspace.clone())
+        .with_live_tail(Arc::clone(&live_tail))
         .with_offline(config.settings.offline)
         .with_allow_unsandboxed(config.settings.allow_unsandboxed)
         .with_environment(crate::provider_setup::command_environment(&config.settings))
@@ -3426,6 +3592,13 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
             watched: context_watch::Watched::of(&config.workspace, &config.paths.config_root),
         },
     };
+    let hyperlinks = hyperlinks_enabled(
+        &config.settings.hyperlinks,
+        &probe.caps,
+        depth,
+        config.accessible,
+        |key| std::env::var(key).ok(),
+    );
     let host = SessionHost {
         cache_key: std::sync::OnceLock::new(),
         usage_paths: Some(config.paths.clone()),
@@ -3535,6 +3708,10 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
         provider_strict: config.settings.provider_strict,
         streaming: Arc::new(Mutex::new(StreamingText::default())),
         running: Mutex::new(Vec::new()),
+        held: Mutex::new(Vec::new()),
+        collapse: config.settings.collapse_tool_calls,
+        live_tail,
+        hyperlinks,
         last_tick: Mutex::new(None),
         frame_dirty: std::sync::atomic::AtomicBool::new(false),
         last_frame: Mutex::new(None),
@@ -8014,6 +8191,8 @@ struct Running {
     id: String,
     label: String,
     started: std::time::Instant,
+    /// Whether the call's newest output lines are drawn under it.
+    tail: bool,
 }
 
 /// The objective the instructions carry, read once per prefix.
@@ -8904,8 +9083,121 @@ fn append_memory_note(workspace: &Utf8Path, note: &str) -> Result<Utf8PathBuf> {
     Ok(path)
 }
 
-/// Builds the scrollback row for a finished call: status, tool, target, and
-/// what it produced.
+/// A finished call's row, before it is drawn.
+#[derive(Clone, PartialEq, Eq, Debug)]
+struct ToolRow {
+    /// The status mark.
+    glyph: &'static str,
+    /// The tool, or what a group of calls did.
+    label: String,
+    /// What the call acted on, already cut to fit.
+    target: String,
+    /// What the call produced; empty for a failure.
+    result: String,
+    /// How long it ran; empty when too short to matter.
+    elapsed: String,
+    /// The first line of a failed call's error.
+    failure: Option<String>,
+    /// The `file://` URI the target links to, when it is a file.
+    link: Option<String>,
+}
+
+impl ToolRow {
+    /// Returns the row as one line, as accessible output reads it, with the
+    /// details after ` - ` and joined by `, ` when `ascii` is set.
+    fn plain(&self, ascii: bool) -> String {
+        let mut row = format!("{} {}", self.glyph, self.label);
+        if !self.target.is_empty() {
+            row.push(' ');
+            row.push_str(&self.target);
+        }
+        let failure = self
+            .failure
+            .as_deref()
+            .filter(|failure| !failure.is_empty())
+            .map(|failure| shorten(failure, 96, ascii));
+        let details: Vec<String> = failure
+            .into_iter()
+            .chain([self.result.clone(), self.elapsed.clone()])
+            .filter(|part| !part.is_empty())
+            .collect();
+        if !details.is_empty() {
+            row.push_str(if ascii { " - " } else { " \u{b7} " });
+            row.push_str(&details.join(if ascii { ", " } else { " \u{b7} " }));
+        }
+        row
+    }
+}
+
+/// How a tool row is drawn.
+struct RowStyle {
+    /// Escape for the status glyph.
+    status: String,
+    /// Escape for the result and the elapsed time.
+    dim: String,
+    /// Whether only ASCII is drawn.
+    ascii: bool,
+    /// Whether a file target is written as a hyperlink.
+    links: bool,
+}
+
+/// Widest a tool row is laid out for, so results stay near the call on a
+/// wide terminal.
+const TOOL_ROW_MAX_WIDTH: usize = 100;
+
+/// Draws a tool row: `  {glyph} {label} {target}`, then its result and time.
+///
+/// The result and time end one column short of the row's width when they fit
+/// with three spaces to spare, and follow the call after a separator
+/// otherwise. A failure's first error line is the row below.
+fn render_tool_row(row: &ToolRow, width: usize, style: &RowStyle) -> Vec<String> {
+    let reset = rune_term::engine::Style::RESET;
+    let separator = if style.ascii { " - " } else { " \u{b7} " };
+    let mut left = format!("  {} {}", row.glyph, row.label);
+    let mut styled = format!("  {}{}{reset} {}", style.status, row.glyph, row.label);
+    if !row.target.is_empty() {
+        left.push(' ');
+        left.push_str(&row.target);
+        styled.push(' ');
+        match row.link.as_deref() {
+            Some(uri) if style.links => styled.push_str(&rune_term::width::hyperlink(
+                uri,
+                &row.target,
+                &rune_term::width::link_id(),
+            )),
+            _ => styled.push_str(&row.target),
+        }
+    }
+    let right = [row.result.as_str(), row.elapsed.as_str()]
+        .into_iter()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(separator);
+    let mut rows = Vec::with_capacity(2);
+    if right.is_empty() {
+        rows.push(styled);
+    } else {
+        let limit = width.min(TOOL_ROW_MAX_WIDTH).saturating_sub(1);
+        let (left_width, right_width) = (
+            rune_term::width::str_width(&left),
+            rune_term::width::str_width(&right),
+        );
+        let gap = if left_width.saturating_add(3).saturating_add(right_width) <= limit {
+            " ".repeat(limit.saturating_sub(left_width).saturating_sub(right_width))
+        } else {
+            separator.to_owned()
+        };
+        rows.push(format!("{styled}{}{gap}{right}{reset}", style.dim));
+    }
+    if let Some(failure) = row.failure.as_deref().filter(|failure| !failure.is_empty()) {
+        let cut = shorten(failure, width.saturating_sub(4), style.ascii);
+        rows.push(format!("{}    {cut}{reset}", style.dim));
+    }
+    rows
+}
+
+/// Builds the row for a finished call: status, tool, target, and what it
+/// produced, or for a failure the first line of its error.
 ///
 /// The body is what the model asked for and already has, so only its outcome
 /// reaches the conversation; printing it again would bury the answer under the
@@ -8916,34 +9208,197 @@ fn tool_row(
     output: &ToolOutput,
     elapsed: std::time::Duration,
     glyphs: RowGlyphs,
-) -> String {
+) -> ToolRow {
     let ascii = glyphs != RowGlyphs::Unicode;
-    let glyph = match (output.is_error, glyphs) {
-        (false, RowGlyphs::Unicode) => "\u{2713}",
-        (true, RowGlyphs::Unicode) => "\u{2717}",
-        (false, RowGlyphs::Ascii) => "+",
-        (true, RowGlyphs::Ascii) => "x",
-        (false, RowGlyphs::Words) => "done",
-        (true, RowGlyphs::Words) => "failed",
-    };
-    let mut row = format!("{glyph} {name}");
-    if !target.is_empty() {
-        row.push(' ');
-        row.push_str(target);
+    ToolRow {
+        glyph: row_glyph(!output.is_error, glyphs),
+        label: transcript::sanitize(name),
+        target: transcript::sanitize(target),
+        result: if output.is_error {
+            String::new()
+        } else {
+            transcript::sanitize(&result_summary(name, output, ascii))
+        },
+        elapsed: shown_elapsed(elapsed),
+        failure: output.is_error.then(|| error_line(&output.text)),
+        link: None,
     }
-    let mut details = Vec::new();
-    let result = result_summary(name, output, ascii);
-    if !result.is_empty() {
-        details.push(result);
+}
+
+/// Returns the status mark of a finished row.
+const fn row_glyph(succeeded: bool, glyphs: RowGlyphs) -> &'static str {
+    match (succeeded, glyphs) {
+        (true, RowGlyphs::Unicode) => "\u{2713}",
+        (false, RowGlyphs::Unicode) => "\u{2717}",
+        (true, RowGlyphs::Ascii) => "+",
+        (false, RowGlyphs::Ascii) => "x",
+        (true, RowGlyphs::Words) => "done",
+        (false, RowGlyphs::Words) => "failed",
     }
+}
+
+/// Returns a call's time as a row shows it, empty under a tenth of a second.
+fn shown_elapsed(elapsed: std::time::Duration) -> String {
     if elapsed >= std::time::Duration::from_millis(100) {
-        details.push(format_elapsed(elapsed));
+        format_elapsed(elapsed)
+    } else {
+        String::new()
     }
-    if !details.is_empty() {
-        row.push_str(if ascii { " - " } else { " \u{b7} " });
-        row.push_str(&details.join(if ascii { ", " } else { " \u{b7} " }));
+}
+
+/// Returns the first non-empty line of a failed call's result, sanitized.
+///
+/// A structured error is a JSON object; its message is the line shown.
+fn error_line(text: &str) -> String {
+    let line = text
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or_default();
+    let message = serde_json::from_str::<serde_json::Value>(line)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("message")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        });
+    let message = message.unwrap_or_else(|| line.to_owned());
+    transcript::sanitize(message.lines().next().unwrap_or_default())
+}
+
+/// A successful exploration call held to be folded into one row with others.
+#[derive(Clone, Debug)]
+struct HeldRow {
+    activity: rune_tools::Activity,
+    row: ToolRow,
+    elapsed: std::time::Duration,
+}
+
+/// Returns true for the calls a burst of exploration is folded from.
+const fn groupable(activity: rune_tools::Activity) -> bool {
+    matches!(
+        activity,
+        rune_tools::Activity::Read | rune_tools::Activity::List | rune_tools::Activity::Search
+    )
+}
+
+/// Held calls at or above which they commit as one row.
+const GROUP_MIN: usize = 3;
+
+/// Returns the one row that stands for a group of held calls, such as
+/// `read 3 files, searched 1 pattern`.
+fn group_row(held: &[HeldRow], glyphs: RowGlyphs) -> ToolRow {
+    let count = |activity| held.iter().filter(|row| row.activity == activity).count();
+    let parts: Vec<String> = [
+        (rune_tools::Activity::Read, "read", "file"),
+        (rune_tools::Activity::List, "listed", "path"),
+        (rune_tools::Activity::Search, "searched", "pattern"),
+    ]
+    .into_iter()
+    .filter_map(|(activity, verb, noun)| {
+        let n = count(activity);
+        (n > 0).then(|| format!("{verb} {}", plural(n, noun)))
+    })
+    .collect();
+    let elapsed = held.iter().fold(std::time::Duration::ZERO, |sum, row| {
+        sum.saturating_add(row.elapsed)
+    });
+    ToolRow {
+        glyph: row_glyph(true, glyphs),
+        label: parts.join(", "),
+        target: String::new(),
+        result: String::new(),
+        elapsed: shown_elapsed(elapsed),
+        failure: None,
+        link: None,
     }
-    row
+}
+
+/// Most output lines drawn under a running command.
+const TAIL_ROWS: usize = 3;
+
+/// Plan steps drawn in full; a longer plan shows a window of four.
+const PLAN_ROWS: usize = 5;
+
+/// Returns the rows that show a plan: every step when there are five or
+/// fewer, otherwise four starting one before the step in progress (or at the
+/// first pending step) and a row counting the rest.
+fn plan_rows(
+    update: &rune_tools::PlanUpdate,
+    width: usize,
+    dim: &str,
+    accent: &str,
+    ascii: bool,
+) -> Vec<String> {
+    use rune_tools::update_plan::Status;
+    let reset = rune_term::engine::Style::RESET;
+    let steps = &update.plan;
+    let (start, shown) = if steps.len() <= PLAN_ROWS {
+        (0, steps.len())
+    } else {
+        let window = PLAN_ROWS.saturating_sub(1);
+        let anchor = steps
+            .iter()
+            .position(|step| step.status == Status::InProgress)
+            .map(|at| at.saturating_sub(1))
+            .or_else(|| steps.iter().position(|step| step.status == Status::Pending))
+            .unwrap_or(0);
+        (anchor.min(steps.len().saturating_sub(window)), window)
+    };
+    let room = width.saturating_sub(6);
+    let mut rows: Vec<String> = steps
+        .iter()
+        .skip(start)
+        .take(shown)
+        .map(|step| {
+            let text = shorten(&transcript::sanitize(&step.step), room, ascii);
+            match step.status {
+                Status::Completed => format!("{dim}  [x] {text}{reset}"),
+                Status::InProgress => format!("{accent}  [~] {text}{reset}"),
+                Status::Pending => format!("  [ ] {text}"),
+            }
+        })
+        .collect();
+    let rest = steps.len().saturating_sub(shown);
+    if rest > 0 {
+        let ellipsis = if ascii { "..." } else { "\u{2026}" };
+        rows.push(format!("{dim}  {ellipsis} {rest} more steps{reset}"));
+    }
+    rows
+}
+
+/// Returns whether file targets are written as hyperlinks.
+///
+/// `auto` leaves them out where a terminal is known to show the escape as
+/// text or to corrupt the screen with it: a dumb terminal, accessible output,
+/// screen, Emacs, tmux, and VTE before 0.50.
+fn hyperlinks_enabled(
+    setting: &str,
+    caps: &rune_term::probe::TerminalCaps,
+    depth: ColorDepth,
+    accessible: bool,
+    lookup: impl Fn(&str) -> Option<String>,
+) -> bool {
+    match setting {
+        "on" => return true,
+        "off" => return false,
+        _ => {}
+    }
+    let term = caps.env.term.as_deref().unwrap_or_default();
+    let old_vte = caps
+        .env
+        .vte_version
+        .as_deref()
+        .and_then(|version| version.trim().parse::<u32>().ok())
+        .is_some_and(|version| version < 5000);
+    !((depth == ColorDepth::None && term == "dumb")
+        || accessible
+        || (term.starts_with("screen") && caps.env.tmux.is_none())
+        || term.starts_with("eterm")
+        || lookup("INSIDE_EMACS").is_some_and(|value| !value.is_empty())
+        || caps.tmux
+        || old_vte)
 }
 
 /// How a finished call's status is marked.
@@ -9297,6 +9752,41 @@ fn shorten(text: &str, width: usize, ascii: bool) -> String {
     out
 }
 
+/// Cuts text to `width` columns in the middle, keeping its start and its end
+/// around the mark; the end keeps the larger half.
+fn shorten_middle(text: &str, width: usize, ascii: bool) -> String {
+    let marker = if ascii { "..." } else { "\u{2026}" };
+    if rune_term::width::str_width(text) <= width {
+        return text.to_owned();
+    }
+    let room = width.saturating_sub(rune_term::width::str_width(marker));
+    let head_room = room / 2;
+    let tail_room = room.saturating_sub(head_room);
+    let graphemes: Vec<&str> = rune_term::width::graphemes(text).collect();
+    let mut head = String::new();
+    let mut used = 0usize;
+    for grapheme in &graphemes {
+        let cell = rune_term::width::grapheme_width(grapheme);
+        if used.saturating_add(cell) > head_room {
+            break;
+        }
+        used = used.saturating_add(cell);
+        head.push_str(grapheme);
+    }
+    let mut tail: Vec<&str> = Vec::new();
+    let mut used = 0usize;
+    for grapheme in graphemes.iter().rev() {
+        let cell = rune_term::width::grapheme_width(grapheme);
+        if used.saturating_add(cell) > tail_room {
+            break;
+        }
+        used = used.saturating_add(cell);
+        tail.push(grapheme);
+    }
+    tail.reverse();
+    format!("{head}{marker}{}", tail.concat())
+}
+
 /// Renders what a turn produced, as the lines to print.
 ///
 /// Returns the lines rather than writing them, because the renderer is the only
@@ -9311,6 +9801,7 @@ fn report_turn(
     // Earlier steps and their calls were written to scrollback as they
     // finished, so what remains is the last step: its reasoning, shown in its
     // own lane above the answer, and the answer itself.
+    host.flush_held();
     let mut entries = event_entries(host);
     if !reasoning.trim().is_empty() {
         entries.push(Entry::reasoning(reasoning.to_owned()));
@@ -9342,6 +9833,7 @@ fn report_failed_turn(
     host: &SessionHost,
     diagnostic: Option<&str>,
 ) -> Vec<String> {
+    host.flush_held();
     let mut entries = event_entries(host);
     let partial = host.partial_answer();
     if !partial.trim().is_empty() {
@@ -16766,6 +17258,506 @@ mod tests {
         );
     }
 
+    /// Attaches a sink to `host` and returns the bytes written to it.
+    fn capture_output(host: &SessionHost) -> Arc<Mutex<Vec<u8>>> {
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let out: LiveSink = Arc::new(Mutex::new(SharedSink(Arc::clone(&bytes))));
+        *host.live_out.lock().expect("output lock") = Some(out);
+        bytes
+    }
+
+    /// Returns the screen rows the bytes draw on an 80 by 40 grid.
+    fn screen_rows(bytes: &Arc<Mutex<Vec<u8>>>) -> Vec<String> {
+        let mut grid = rune_term::Grid::new(80, 40).expect("grid");
+        grid.feed(&bytes.lock().expect("bytes")).expect("replay");
+        (0..40).map(|row| grid.row_text(row)).collect()
+    }
+
+    /// Runs one read of `path` through the host, failing when `error` is set.
+    fn emit_read(host: &SessionHost, path: &str, error: Option<&str>) {
+        let call = turn::PreparedCall {
+            id: format!("read-{path}"),
+            name: "read_file".to_owned(),
+            arguments: serde_json::json!({ "path": path }).to_string(),
+        };
+        host.emit(Event::ToolStarted {
+            call: call.clone(),
+            activity: rune_tools::Activity::Read,
+        });
+        host.emit(Event::ToolFinished {
+            call,
+            output: error.map_or_else(|| ToolOutput::success("     1\ta\n"), ToolOutput::failure),
+            elapsed: std::time::Duration::from_millis(40),
+        });
+    }
+
+    /// Returns the rows that hold `needle`.
+    fn rows_with<'a>(rows: &'a [String], needle: &str) -> Vec<&'a String> {
+        rows.iter().filter(|row| row.contains(needle)).collect()
+    }
+
+    /// A row with a result and a time, for the layout tests.
+    fn sample_row(target: &str) -> ToolRow {
+        ToolRow {
+            glyph: "\u{2713}",
+            label: "read_file".to_owned(),
+            target: target.to_owned(),
+            result: "3 lines".to_owned(),
+            elapsed: "1.2s".to_owned(),
+            failure: None,
+            link: None,
+        }
+    }
+
+    /// Draws a row and strips its escapes.
+    fn drawn(row: &ToolRow, width: usize, style: &RowStyle) -> Vec<String> {
+        render_tool_row(row, width, style)
+            .iter()
+            .map(|line| transcript::sanitize(line))
+            .collect()
+    }
+
+    fn plain_style() -> RowStyle {
+        RowStyle {
+            status: String::new(),
+            dim: String::new(),
+            ascii: false,
+            links: false,
+        }
+    }
+
+    #[test]
+    fn results_align_at_the_right_when_they_fit() {
+        let row = sample_row("src/lib.rs");
+        let at_80 = drawn(&row, 80, &plain_style());
+        assert_eq!(at_80.len(), 1);
+        let line = &at_80[0];
+        assert!(
+            line.starts_with("  \u{2713} read_file src/lib.rs   "),
+            "{line}"
+        );
+        assert!(line.ends_with("3 lines \u{b7} 1.2s"), "{line}");
+        assert_eq!(
+            rune_term::width::str_width(line),
+            79,
+            "ends one column short"
+        );
+        // A wide terminal still lays the row out within a hundred columns.
+        let at_140 = drawn(&row, 140, &plain_style());
+        assert_eq!(rune_term::width::str_width(&at_140[0]), 99);
+        // Too narrow for three spaces of gap: the result follows the call.
+        let long = sample_row(&"x".repeat(30));
+        let at_40 = drawn(&long, 40, &plain_style());
+        assert_eq!(
+            at_40[0],
+            format!(
+                "  \u{2713} read_file {} \u{b7} 3 lines \u{b7} 1.2s",
+                "x".repeat(30)
+            )
+        );
+        let ascii = RowStyle {
+            ascii: true,
+            ..plain_style()
+        };
+        let at_40 = drawn(&long, 40, &ascii);
+        assert!(at_40[0].ends_with(" - 3 lines - 1.2s"), "{}", at_40[0]);
+        // No result and no time: nothing is padded.
+        let bare = ToolRow {
+            result: String::new(),
+            elapsed: String::new(),
+            ..row
+        };
+        assert_eq!(
+            drawn(&bare, 80, &plain_style()),
+            ["  \u{2713} read_file src/lib.rs"]
+        );
+    }
+
+    #[test]
+    fn targets_are_cut_in_the_middle() {
+        let path = "src/very/long/path/to/the/file.rs";
+        assert_eq!(shorten_middle(path, 16, false), "src/ver\u{2026}/file.rs");
+        assert_eq!(shorten_middle(path, 16, true), "src/ve...file.rs");
+        assert_eq!(shorten_middle("short.rs", 16, false), "short.rs");
+        // Wide characters are kept whole, and the end gets the larger half.
+        assert_eq!(
+            shorten_middle("\u{754c}\u{754c}\u{754c}\u{754c}\u{754c}", 8, false),
+            "\u{754c}\u{2026}\u{754c}\u{754c}"
+        );
+        let host = test_host();
+        let call = turn::PreparedCall {
+            id: "c".to_owned(),
+            name: "read_file".to_owned(),
+            arguments: serde_json::json!({ "path": format!("{}/end.rs", "d".repeat(40)) })
+                .to_string(),
+        };
+        let target = host.call_target(&call);
+        assert!(target.starts_with("ddd"), "{target}");
+        assert!(target.ends_with("/end.rs"), "{target}");
+        assert_eq!(rune_term::width::str_width(&target), 40);
+    }
+
+    #[test]
+    fn three_reads_fold_into_one_row_and_two_do_not() {
+        let host = test_host();
+        let bytes = capture_output(&host);
+        for path in ["a.rs", "b.rs", "c.rs"] {
+            emit_read(&host, path, None);
+        }
+        // Held, they are drawn in the live region until something else happens.
+        let rows = screen_rows(&bytes);
+        assert_eq!(rows_with(&rows, "read_file").len(), 3, "{rows:#?}");
+        host.emit(Event::TextDelta {
+            delta: "DONE".to_owned(),
+        });
+        let rows = screen_rows(&bytes);
+        assert!(rows_with(&rows, "read_file").is_empty(), "{rows:#?}");
+        let group = rows_with(&rows, "read 3 files");
+        assert_eq!(group.len(), 1, "{rows:#?}");
+        assert!(group[0].starts_with("  \u{2713} read 3 files"), "{rows:#?}");
+        assert!(group[0].ends_with("120ms"), "summed time: {rows:#?}");
+
+        // Two reads then an edit: two rows of their own, then the edit.
+        let host = test_host();
+        let bytes = capture_output(&host);
+        emit_read(&host, "a.rs", None);
+        emit_read(&host, "b.rs", None);
+        host.emit(Event::ToolFinished {
+            call: turn::PreparedCall {
+                id: "e".to_owned(),
+                name: "edit_file".to_owned(),
+                arguments: r#"{"path":"a.rs"}"#.to_owned(),
+            },
+            output: ToolOutput::success("edited"),
+            elapsed: std::time::Duration::from_millis(1),
+        });
+        let rows = screen_rows(&bytes);
+        let reads: Vec<usize> = rows
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| row.contains("read_file"))
+            .map(|(at, _)| at)
+            .collect();
+        let edit = rows
+            .iter()
+            .position(|row| row.contains("edit_file"))
+            .expect("edit row");
+        assert_eq!(reads.len(), 2, "{rows:#?}");
+        assert!(reads.iter().all(|at| *at < edit), "{rows:#?}");
+        assert!(rows_with(&rows, "read 2 files").is_empty(), "{rows:#?}");
+    }
+
+    #[test]
+    fn grouping_is_off_when_collapse_tool_calls_is_false() {
+        let mut host = test_host();
+        host.collapse = false;
+        let bytes = capture_output(&host);
+        for path in ["a.rs", "b.rs", "c.rs"] {
+            emit_read(&host, path, None);
+        }
+        assert!(lock_value(&host.held).is_empty(), "nothing is held");
+        let rows = screen_rows(&bytes);
+        assert_eq!(rows_with(&rows, "read_file").len(), 3, "{rows:#?}");
+        assert!(rows_with(&rows, "read 3 files").is_empty(), "{rows:#?}");
+    }
+
+    #[test]
+    fn a_failure_ends_a_group() {
+        let host = test_host();
+        let bytes = capture_output(&host);
+        emit_read(&host, "one.rs", None);
+        emit_read(&host, "two.rs", None);
+        emit_read(&host, "three.rs", Some("three.rs does not exist"));
+        emit_read(&host, "four.rs", None);
+        emit_read(&host, "five.rs", None);
+        host.emit(Event::TextDelta {
+            delta: "DONE".to_owned(),
+        });
+        let rows = screen_rows(&bytes);
+        let at = |needle: &str| {
+            rows.iter()
+                .position(|row| row.contains(needle))
+                .unwrap_or_else(|| panic!("{needle}: {rows:#?}"))
+        };
+        let order = [
+            at("read_file one.rs"),
+            at("read_file two.rs"),
+            at("\u{2717} read_file three.rs"),
+            at("    three.rs does not exist"),
+            at("read_file four.rs"),
+            at("read_file five.rs"),
+        ];
+        assert!(order.windows(2).all(|pair| pair[0] < pair[1]), "{rows:#?}");
+        assert!(rows_with(&rows, "files").is_empty(), "no group: {rows:#?}");
+    }
+
+    #[test]
+    fn a_failed_call_shows_its_error_on_the_next_row() {
+        let error = RuneError::new(ErrorCode::NotFound, "`missing.txt` does not exist");
+        let output = ToolOutput::from_error(&error);
+        let row = tool_row(
+            "read_file",
+            "missing.txt",
+            &output,
+            std::time::Duration::from_millis(1500),
+            RowGlyphs::Unicode,
+        );
+        let rows = drawn(&row, 80, &plain_style());
+        assert_eq!(rows.len(), 2, "{rows:#?}");
+        assert!(
+            rows[0].starts_with("  \u{2717} read_file missing.txt "),
+            "{rows:#?}"
+        );
+        assert!(rows[0].ends_with(" 1.5s"), "only the time: {rows:#?}");
+        assert!(!rows[0].contains("exist"), "{rows:#?}");
+        assert_eq!(rows[1], "    `missing.txt` does not exist");
+        // A plain error keeps its first non-empty line, cut to the width.
+        let output = ToolOutput::failure(format!("\n{}\nsecond line", "e".repeat(60)));
+        let row = tool_row(
+            "shell",
+            "make",
+            &output,
+            std::time::Duration::ZERO,
+            RowGlyphs::Unicode,
+        );
+        let rows = drawn(&row, 40, &plain_style());
+        assert_eq!(rows[0], "  \u{2717} shell make");
+        assert_eq!(rows[1], format!("    {}\u{2026}", "e".repeat(35)));
+        // Accessible output keeps the error on the row.
+        let words = tool_row(
+            "shell",
+            "make",
+            &output,
+            std::time::Duration::ZERO,
+            RowGlyphs::Words,
+        );
+        assert!(words.plain(true).starts_with("failed shell make - eee"));
+        let done = tool_row(
+            "read_file",
+            "a.rs",
+            &ToolOutput::success("     1\ta\n"),
+            std::time::Duration::from_millis(1200),
+            RowGlyphs::Words,
+        );
+        assert_eq!(done.plain(true), "done read_file a.rs - 1 line, 1.2s");
+    }
+
+    #[test]
+    fn the_plan_block_has_at_most_five_rows() {
+        use rune_tools::update_plan::{Status, Step};
+        let plan = |statuses: &[Status]| rune_tools::PlanUpdate {
+            version: 1,
+            explanation: None,
+            plan: statuses
+                .iter()
+                .enumerate()
+                .map(|(at, status)| Step {
+                    step: format!("step {at}"),
+                    status: *status,
+                })
+                .collect(),
+        };
+        let short = plan(&[Status::Completed, Status::InProgress, Status::Pending]);
+        let plain = |rows: Vec<String>| -> Vec<String> {
+            rows.iter().map(|row| transcript::sanitize(row)).collect()
+        };
+        assert_eq!(
+            plain(plan_rows(&short, 80, "", "", false)),
+            ["  [x] step 0", "  [~] step 1", "  [ ] step 2"]
+        );
+        let mut statuses = vec![Status::Completed; 5];
+        statuses.extend([Status::InProgress, Status::Pending, Status::Pending]);
+        let long = plan(&statuses);
+        assert_eq!(
+            plain(plan_rows(&long, 80, "", "", false)),
+            [
+                "  [x] step 4",
+                "  [~] step 5",
+                "  [ ] step 6",
+                "  [ ] step 7",
+                "  \u{2026} 4 more steps",
+            ]
+        );
+        // Nothing in progress: the window opens at the first pending step.
+        let mut statuses = vec![Status::Completed; 2];
+        statuses.extend([Status::Pending; 6]);
+        let rows = plain(plan_rows(&plan(&statuses), 80, "", "", true));
+        assert_eq!(rows.len(), 5);
+        assert_eq!(rows[0], "  [ ] step 2");
+        assert_eq!(rows[4], "  ... 4 more steps");
+        // A step is cut to the width.
+        let wide = rune_tools::PlanUpdate {
+            version: 1,
+            explanation: None,
+            plan: vec![Step {
+                step: "w".repeat(80),
+                status: Status::Pending,
+            }],
+        };
+        let rows = plan_rows(&wide, 30, "", "", false);
+        assert_eq!(rune_term::width::str_width(&rows[0]), 30);
+    }
+
+    #[test]
+    fn hyperlinks_auto_is_off_inside_tmux_and_on_elsewhere() {
+        let caps = |term: &str, vte: Option<&str>, tmux: bool| {
+            let env = TerminalEnv {
+                term: Some(term.to_owned()),
+                vte_version: vte.map(str::to_owned),
+                tmux: tmux.then(|| "/tmp/tmux".to_owned()),
+                ..TerminalEnv::default()
+            };
+            let mut caps = rune_term::probe::TerminalCaps::from_env(env);
+            caps.tmux = tmux;
+            caps
+        };
+        let none = |_: &str| None;
+        let xterm = caps("xterm-256color", None, false);
+        let tmux = caps("tmux-256color", None, true);
+        let auto = |caps: &rune_term::probe::TerminalCaps| {
+            hyperlinks_enabled("auto", caps, ColorDepth::Ansi256, false, none)
+        };
+        assert!(auto(&xterm));
+        assert!(!auto(&tmux));
+        assert!(hyperlinks_enabled(
+            "on",
+            &tmux,
+            ColorDepth::Ansi256,
+            false,
+            none
+        ));
+        assert!(!hyperlinks_enabled(
+            "off",
+            &xterm,
+            ColorDepth::Ansi256,
+            false,
+            none
+        ));
+        assert!(!auto(&caps("screen-256color", None, false)));
+        assert!(!auto(&caps("eterm-color", None, false)));
+        assert!(!auto(&caps("xterm", Some("4800"), false)));
+        assert!(auto(&caps("xterm", Some("7600"), false)));
+        assert!(!hyperlinks_enabled(
+            "auto",
+            &caps("dumb", None, false),
+            ColorDepth::None,
+            false,
+            none
+        ));
+        assert!(!hyperlinks_enabled(
+            "auto",
+            &xterm,
+            ColorDepth::Ansi256,
+            true,
+            none
+        ));
+        assert!(!hyperlinks_enabled(
+            "auto",
+            &xterm,
+            ColorDepth::Ansi256,
+            false,
+            |key: &str| (key == "INSIDE_EMACS").then(|| "29.1,comint".to_owned())
+        ));
+    }
+
+    #[test]
+    fn a_file_target_links_to_its_absolute_path_with_an_id() {
+        let mut host = test_host();
+        host.hyperlinks = true;
+        let bytes = capture_output(&host);
+        let call = turn::PreparedCall {
+            id: "c".to_owned(),
+            name: "read_file".to_owned(),
+            arguments: r#"{"path":"src/a b.rs"}"#.to_owned(),
+        };
+        let row = host.finished_row(
+            &call,
+            &ToolOutput::success("     1\ta\n"),
+            std::time::Duration::ZERO,
+        );
+        let uri = row.link.clone().expect("a file target links");
+        assert!(uri.starts_with("file://"), "{uri}");
+        assert!(uri.ends_with("/tmp/src/a b.rs"), "{uri}");
+        let drawn = host.styled_tool_rows(&row, false).join("");
+        let id = format!("\u{1b}]8;id=rune-{}-", std::process::id());
+        assert!(drawn.contains(&id), "{drawn:?}");
+        assert!(
+            drawn.contains("/tmp/src/a%20b.rs\u{1b}\\src/a b.rs\u{1b}]8;;\u{1b}\\"),
+            "{drawn:?}"
+        );
+        host.commit_as(RowKind::Tool, &host.styled_tool_rows(&row, false));
+        let mut grid = rune_term::Grid::new(80, 40).expect("grid");
+        grid.feed(&bytes.lock().expect("bytes")).expect("replay");
+        let (line, col) = (0..40)
+            .find_map(|line| {
+                let text = grid.row_text(line);
+                let at = text.find("src/a b.rs")?;
+                let col = rune_term::width::str_width(&text[..at]);
+                Some((line, u16::try_from(col).expect("column")))
+            })
+            .expect("target drawn");
+        let linked = grid.cell_hyperlink(line, col).expect("linked cell");
+        assert!(linked.ends_with("/tmp/src/a%20b.rs"), "{linked}");
+        // A call that names no file, and a session with links off, write none.
+        let shell = turn::PreparedCall {
+            id: "s".to_owned(),
+            name: "shell".to_owned(),
+            arguments: r#"{"command":"ls"}"#.to_owned(),
+        };
+        assert!(host.target_link(&shell).is_none());
+        host.hyperlinks = false;
+        assert!(
+            !host
+                .styled_tool_rows(&row, false)
+                .join("")
+                .contains("\u{1b}]8;")
+        );
+    }
+
+    #[test]
+    fn a_running_command_shows_its_newest_output_under_its_row() {
+        let host = test_host();
+        let call = turn::PreparedCall {
+            id: "s".to_owned(),
+            name: "shell".to_owned(),
+            arguments: r#"{"command":"make"}"#.to_owned(),
+        };
+        *lock_value(&host.live_tail) = vec!["stale".to_owned()];
+        host.emit(Event::ToolStarted {
+            call: call.clone(),
+            activity: rune_tools::Activity::Execute,
+        });
+        assert!(
+            lock_value(&host.live_tail).is_empty(),
+            "a start clears the tail"
+        );
+        *lock_value(&host.live_tail) = vec![
+            "TAIL-1".to_owned(),
+            "\tTAIL-2".to_owned(),
+            "10%\r50%\rTAIL-3 done\r".to_owned(),
+            format!("TAIL-4 {}", "z".repeat(100)),
+        ];
+        let rows = host.live_rows();
+        assert!(rows[0].contains("make"), "{rows:#?}");
+        let tail: Vec<String> = rows[1..]
+            .iter()
+            .map(|row| transcript::sanitize(row))
+            .collect();
+        assert_eq!(tail.len(), 3, "at most three: {rows:#?}");
+        assert_eq!(tail[0], "    TAIL-1");
+        assert_eq!(tail[1], "            TAIL-2");
+        assert_eq!(tail[2], "    TAIL-3 done");
+        host.emit(Event::ToolFinished {
+            call,
+            output: ToolOutput::success("$ make\n[exited with status 0]\n"),
+            elapsed: std::time::Duration::from_millis(5),
+        });
+        assert!(
+            host.live_rows().iter().all(|row| !row.contains("TAIL-")),
+            "the rows go when the call ends"
+        );
+    }
+
     #[test]
     fn a_long_prompt_is_echoed_in_full() {
         let host = test_host();
@@ -16880,6 +17872,10 @@ mod tests {
             provider_strict: false,
             streaming: Arc::new(Mutex::new(StreamingText::default())),
             running: Mutex::new(Vec::new()),
+            held: Mutex::new(Vec::new()),
+            collapse: true,
+            live_tail: Arc::new(Mutex::new(Vec::new())),
+            hyperlinks: false,
             last_tick: Mutex::new(None),
             frame_dirty: std::sync::atomic::AtomicBool::new(false),
             last_frame: Mutex::new(None),

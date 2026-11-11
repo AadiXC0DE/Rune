@@ -5,7 +5,8 @@
 //! escape-aware: an escape sequence is copied whole, never split, and never
 //! counted toward a column.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::fmt::Write as _;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -310,6 +311,79 @@ pub fn expand_tabs(text: &str) -> String {
     out
 }
 
+/// Longest URI written as a hyperlink; a longer one is shown as text only.
+const MAX_LINK_URI: usize = 2_000;
+
+/// This machine's host name, read once.
+static HOST: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Hyperlinks made by this process, for their identifiers.
+static LINKS: AtomicU64 = AtomicU64::new(0);
+
+/// Returns a hyperlink identifier unique to this process: `rune-{pid}-{n}`.
+#[must_use]
+pub fn link_id() -> String {
+    let n = LINKS.fetch_add(1, Ordering::Relaxed);
+    format!("rune-{}-{n}", std::process::id())
+}
+
+/// Returns `text` as an OSC 8 hyperlink to `uri` with the identifier `id`.
+///
+/// URI bytes outside 33 to 126 are written as `%XX`. A URI longer than
+/// 2,000 bytes is not linked, so `text` is returned alone.
+#[must_use]
+pub fn hyperlink(uri: &str, text: &str, id: &str) -> String {
+    let mut encoded = String::with_capacity(uri.len());
+    for byte in uri.bytes() {
+        if (33..=126).contains(&byte) {
+            encoded.push(char::from(byte));
+        } else {
+            let _ = write!(encoded, "%{byte:02X}");
+        }
+    }
+    if encoded.len() > MAX_LINK_URI {
+        return text.to_owned();
+    }
+    format!(
+        "\u{1b}]8;id={id};{encoded}\u{1b}\\{text}{}",
+        Style::HYPERLINK_CLOSE
+    )
+}
+
+/// Returns the `file://` URI of an absolute path on this host.
+///
+/// The host is the node name on Unix and `COMPUTERNAME` on Windows, and is
+/// left empty when it cannot be read.
+#[must_use]
+pub fn file_uri(path: &str) -> String {
+    let path = path.replace('\\', "/");
+    let path = if path.starts_with('/') {
+        path
+    } else {
+        format!("/{path}")
+    };
+    format!("file://{}{path}", HOST.get_or_init(host_name))
+}
+
+/// Returns this machine's host name, empty when unknown.
+fn host_name() -> String {
+    #[cfg(unix)]
+    {
+        rustix::system::uname()
+            .nodename()
+            .to_string_lossy()
+            .into_owned()
+    }
+    #[cfg(windows)]
+    {
+        std::env::var("COMPUTERNAME").unwrap_or_default()
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        String::new()
+    }
+}
+
 /// Returns the byte offset to break a line at, keeping the word whole.
 ///
 /// The last space that fits is the break, and the space itself is dropped: it
@@ -345,6 +419,8 @@ struct Open {
     style: Style,
     /// The hyperlink target, owned so a break can reopen it without a rescan.
     link: Option<String>,
+    /// The parameters the link was opened with, such as its `id`.
+    link_params: String,
 }
 
 impl Open {
@@ -357,12 +433,18 @@ impl Open {
         match escape_link(escape) {
             // Text inside one link repeats no open sequence, so the target is
             // copied only when it actually changes.
-            Some(Link::Open(target)) => {
+            Some(Link::Open { params, target }) => {
                 if self.link.as_deref() != Some(target) {
                     self.link = target.to_owned().into();
                 }
+                if self.link_params != params {
+                    params.clone_into(&mut self.link_params);
+                }
             }
-            Some(Link::Close) => self.link = None,
+            Some(Link::Close) => {
+                self.link = None;
+                self.link_params.clear();
+            }
             None => {}
         }
     }
@@ -389,7 +471,9 @@ impl Open {
     /// Reopens the style a wrapped or broken line continues in.
     fn reopen(&self, line: &mut String) {
         if let Some(target) = &self.link {
-            line.push_str("\u{1b}]8;;");
+            line.push_str("\u{1b}]8;");
+            line.push_str(&self.link_params);
+            line.push(';');
             line.push_str(target);
             line.push_str("\u{1b}\\");
         }
@@ -401,8 +485,8 @@ impl Open {
 
 /// An OSC 8 hyperlink operation.
 enum Link<'a> {
-    /// Opens a link to a target.
-    Open(&'a str),
+    /// Opens a link to a target, with the parameters it was opened with.
+    Open { params: &'a str, target: &'a str },
     /// Closes the open link.
     Close,
 }
@@ -420,11 +504,11 @@ fn escape_sgr(escape: &str) -> Option<&str> {
 /// Returns the hyperlink operation of an escape sequence, when it is one.
 fn escape_link(escape: &str) -> Option<Link<'_>> {
     let data = osc8_payload(escape)?;
-    let target = data.split_once(';').map_or("", |(_, target)| target);
+    let (params, target) = data.split_once(';').unwrap_or((data, ""));
     if target.is_empty() {
         return Some(Link::Close);
     }
-    Some(Link::Open(target))
+    Some(Link::Open { params, target })
 }
 
 /// Returns the payload of an OSC 8 escape sequence.
@@ -625,6 +709,30 @@ mod tests {
             lines,
             vec!["ab\u{1b}[31m\u{1b}[0m", "\u{1b}[31mcd\u{1b}[0m"]
         );
+    }
+
+    #[test]
+    fn a_wrapped_link_keeps_its_id_at_the_break() {
+        let lines = wrap("\u{1b}]8;id=rune-1-0;file:///a\u{1b}\\abcdef", 3);
+        assert_eq!(
+            lines[1],
+            "\u{1b}]8;id=rune-1-0;file:///a\u{1b}\\def\u{1b}]8;;\u{1b}\\"
+        );
+    }
+
+    #[test]
+    fn a_hyperlink_escapes_its_uri_and_skips_long_ones() {
+        let link = hyperlink("file:///a b/\u{e9}", "a b", "rune-1-2");
+        assert_eq!(
+            link,
+            "\u{1b}]8;id=rune-1-2;file:///a%20b/%C3%A9\u{1b}\\a b\u{1b}]8;;\u{1b}\\"
+        );
+        assert_eq!(str_width(&link), 3, "the link adds no columns");
+        let long = format!("file:///{}", "a".repeat(2_000));
+        assert_eq!(hyperlink(&long, "a", "rune-1-3"), "a");
+        assert!(file_uri("/x/y").starts_with("file://"));
+        assert!(file_uri("/x/y").ends_with("/x/y"));
+        assert_ne!(link_id(), link_id());
     }
 
     #[test]

@@ -261,6 +261,8 @@ pub struct ExecutionContext {
     pub quote_files: bool,
     /// Whether the model can see an image a tool attaches to its result.
     pub accepts_images: bool,
+    /// The newest output lines of a running command, for a host to show.
+    pub live_tail: Option<Arc<std::sync::Mutex<Vec<String>>>>,
 }
 
 impl ExecutionContext {
@@ -284,7 +286,15 @@ impl ExecutionContext {
             cache_roots: Vec::new(),
             quote_files: true,
             accepts_images: false,
+            live_tail: None,
         }
+    }
+
+    /// Supplies where a running command's newest output lines are stored.
+    #[must_use]
+    pub fn with_live_tail(mut self, tail: Arc<std::sync::Mutex<Vec<String>>>) -> Self {
+        self.live_tail = Some(tail);
+        self
     }
 
     /// Sets whether the model can see an image a tool attaches.
@@ -435,6 +445,7 @@ impl ExecutionContext {
             cache_roots: self.cache_roots.clone(),
             quote_files: self.quote_files,
             accepts_images: self.accepts_images,
+            live_tail: self.live_tail.clone(),
         }
     }
 

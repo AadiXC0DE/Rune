@@ -3,7 +3,7 @@ edit-finished: 80x24, caret 2,17
 01||
 02|▌ edit|
 03||
-04|  ✓ edit_file app.txt · +2 -1|
+04|  ✓ edit_file app.txt                                                     +2 -1|
 05|    - beta|
 06|    + BETA|
 07|    + beta two|
