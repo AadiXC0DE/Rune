@@ -262,6 +262,7 @@ pub fn pick_styled(
         draw(&frame, (1, column))?;
 
         match reader.read_key() {
+            KeyAction::Suspend => rune_term::modes::suspend(),
             KeyAction::Submit => {
                 if picker.selected().is_some()
                     && let Some(row) = listed.get(picker.cursor())

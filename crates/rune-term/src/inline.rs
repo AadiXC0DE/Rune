@@ -192,6 +192,10 @@ impl Inline {
     /// Returns the bytes to write. Nothing here reads the terminal, so the same
     /// inputs always produce the same bytes.
     pub fn frame(&mut self, frame: &Frame<'_>) -> Vec<u8> {
+        // After a resume nothing on screen can be trusted, so repaint it all.
+        if crate::modes::take_redraw() {
+            self.invalidate();
+        }
         let body = self.render(frame, false);
         self.wrap(body)
     }
@@ -201,6 +205,10 @@ impl Inline {
     /// Like [`Inline::frame`], except that an unchanged frame whose caret is
     /// already where the last frame left it returns no bytes at all.
     pub fn frame_if_changed(&mut self, frame: &Frame<'_>) -> Vec<u8> {
+        // After a resume nothing on screen can be trusted, so repaint it all.
+        if crate::modes::take_redraw() {
+            self.invalidate();
+        }
         let body = self.render(frame, true);
         self.wrap(body)
     }

@@ -3048,6 +3048,12 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
             sink.write_all(&painted)?;
             sink.flush()?;
         }
+        // Lets a terminal test check that a crash leaves the terminal usable.
+        #[cfg(debug_assertions)]
+        assert!(
+            std::env::var("RUNE_DEBUG_PANIC_AFTER_FIRST_FRAME").as_deref() != Ok("1"),
+            "debug panic after the first frame"
+        );
     }
 
     // A resumed session keeps the title it was given.
@@ -4256,6 +4262,10 @@ fn run_steerable<T: Send>(
                     host.draw_stream_with("", 0);
                 }
             }
+            KeyAction::Suspend => {
+                gesture.disarm();
+                rune_term::modes::suspend();
+            }
             // Anything else is an edit, so a half-finished cancel gesture
             // is abandoned rather than left armed, and the line is redrawn
             // with the text that has been typed so far.
@@ -4425,6 +4435,10 @@ fn question_key(
     cancellation: &Cancellation,
 ) -> Option<usize> {
     match key {
+        KeyAction::Suspend => {
+            rune_term::modes::suspend();
+            None
+        }
         KeyAction::Submit => picker.selected().map(|_| picker.cursor()),
         KeyAction::Up => {
             picker.up();
@@ -4465,6 +4479,10 @@ fn approval_key(
     cancellation: &Cancellation,
 ) -> Option<ApprovalOutcome> {
     match key {
+        KeyAction::Suspend => {
+            rune_term::modes::suspend();
+            None
+        }
         KeyAction::Submit => Some(
             ApprovalOutcome::ALL
                 .into_iter()
@@ -4676,6 +4694,7 @@ fn edit_draft(reader: &mut rune_term::input::KeyReader, host: &SessionHost) {
             .store(true, std::sync::atomic::Ordering::Relaxed);
         let screen = TranscriptScreen(host);
         host.show(b"\x1b[?1049h\x1b[0m\x1b[2J\x1b[H\x1b[?25h");
+        rune_term::modes::mark(|modes| modes.alternate_screen = true);
         screen
     };
     let result = reader.edit_external();
@@ -4711,6 +4730,7 @@ impl Drop for TranscriptScreen<'_> {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.0.show(b"\x1b[0m\x1b[?1049l\x1b[?25h");
+        rune_term::modes::mark(|modes| modes.alternate_screen = false);
         self.0
             .transcript_open
             .store(false, std::sync::atomic::Ordering::Relaxed);
@@ -4750,6 +4770,7 @@ fn view_transcript(reader: &rune_term::input::KeyReader, host: &SessionHost) -> 
             .store(true, std::sync::atomic::Ordering::Relaxed);
         let screen = TranscriptScreen(host);
         host.show(b"\x1b[?1049h\x1b[0m\x1b[2J\x1b[H\x1b[?25l");
+        rune_term::modes::mark(|modes| modes.alternate_screen = true);
         screen
     };
 
@@ -5010,6 +5031,10 @@ fn await_submission(
         ) {
             continue;
         }
+        if key == KeyAction::Suspend {
+            suspend_session(host, out)?;
+            continue;
+        }
         let had_draft = !reader.line().is_empty();
         match idle_key(commands, key, reader, &mut selected, &rows, recall) {
             // Clearing the draft abandons the prompt a command prepared, and
@@ -5148,6 +5173,7 @@ fn idle_key(
     recall: &[String],
 ) -> Idle {
     match key {
+        KeyAction::Suspend => Idle::Stay,
         KeyAction::Submit => {
             // Enter takes the highlighted completion when the list is open
             // and the command is not yet complete, so a half-typed name is
@@ -5273,6 +5299,22 @@ fn draw_prompt(
     Ok(())
 }
 
+/// Pauses the process for the terminal's suspend key: the live region is
+/// cleared so the shell gets a clean screen, and the first frame after the
+/// process resumes repaints everything.
+fn suspend_session(host: &SessionHost, out: &LiveSink) -> Result<()> {
+    let cleared = host.clear_region()?;
+    if !cleared.is_empty() {
+        let mut sink = out
+            .lock()
+            .map_err(|_| RuneError::new(ErrorCode::Internal, "the output lock was poisoned"))?;
+        sink.write_all(&cleared)?;
+        sink.flush()?;
+    }
+    rune_term::modes::suspend();
+    Ok(())
+}
+
 /// Tells the reader how the draft is drawn, so the arrows move by drawn rows.
 fn sync_layout(reader: &mut rune_term::input::KeyReader, host: &SessionHost, marker: &str) {
     let width = usize::from(host.width());
@@ -5314,6 +5356,7 @@ fn confirm_choice(
                 }
             }
             match answer.read_key() {
+                KeyAction::Suspend => suspend_session(host, out)?,
                 KeyAction::Ignored => {
                     let typed = answer.line().to_owned();
                     answer.clear();
@@ -5377,6 +5420,7 @@ fn run_picker(
         draw_prompt(reader, host, out, &below, marker)?;
 
         match reader.read_key() {
+            KeyAction::Suspend => suspend_session(host, out)?,
             // Tab and Enter both accept: the picker is the only thing on
             // screen, so there is no typed argument for Enter to mean.
             KeyAction::Submit | KeyAction::Complete => {
@@ -5447,6 +5491,7 @@ fn search_prompt_history(
             .collect::<Vec<_>>();
             draw_prompt(query, host, out, &rows, rune_term::shell::prompt())?;
             match query.read_key() {
+                KeyAction::Suspend => suspend_session(host, out)?,
                 KeyAction::Submit | KeyAction::Complete => {
                     if let Some(prompt) = picker.selected() {
                         return Ok(Some(prompt.to_owned()));
@@ -6916,6 +6961,7 @@ fn choose_theme(
         let below = picker_menu(&mut picker, &host.theme(), host.depth, room);
         draw_prompt(reader, host, out, &below, marker)?;
         match reader.read_key() {
+            KeyAction::Suspend => suspend_session(host, out)?,
             KeyAction::Submit | KeyAction::Complete => {
                 if let Some(choice) = picker.selected().map(str::to_owned) {
                     break Some(choice);

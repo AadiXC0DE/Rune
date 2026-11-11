@@ -22,6 +22,9 @@ const DEFAULT_PROMPT_WIDTH: usize = 2;
 /// Terminal columns until the session reports its layout.
 const DEFAULT_WIDTH: usize = 80;
 
+/// How long a blocking key read waits before checking for a redraw request.
+const REDRAW_POLL: Duration = Duration::from_millis(100);
+
 /// Describes the bindings used by this reader and the session's input modes.
 /// Line input leaves editing to the terminal instead of the Rune composer.
 #[must_use]
@@ -131,6 +134,8 @@ pub enum KeyAction {
     ExternalEditor,
     /// Search recorded prompts without submitting the composer.
     HistorySearch,
+    /// Pause the process, as the terminal's suspend key does.
+    Suspend,
 }
 
 /// Navigation while the transcript owns the terminal.
@@ -213,12 +218,17 @@ impl KeyReader {
             std::io::stdin().is_terminal() && crossterm::terminal::enable_raw_mode().is_ok();
         if active {
             install_panic_hook();
+            crate::modes::install_signal_handlers();
             // A terminal that cannot bracket a paste delivers it as keystrokes,
             // which still works, so a failure is ignored.
             let _ = crossterm::ExecutableCommand::execute(
                 &mut std::io::stdout(),
                 crossterm::event::EnableBracketedPaste,
             );
+            crate::modes::mark(|modes| {
+                modes.raw = true;
+                modes.bracketed_paste = true;
+            });
         }
         Self {
             composer: Composer::new(),
@@ -360,6 +370,16 @@ impl KeyReader {
         if !self.active {
             return KeyAction::Ignored;
         }
+        // Polled rather than blocking, so a resumed process redraws without
+        // waiting for a key.
+        loop {
+            if crate::modes::redraw_pending() {
+                return KeyAction::Ignored;
+            }
+            if crossterm::event::poll(REDRAW_POLL).unwrap_or(true) {
+                break;
+            }
+        }
         let Ok(event) = crossterm::event::read() else {
             return KeyAction::Ignored;
         };
@@ -444,6 +464,8 @@ impl KeyReader {
             (KeyCode::Char('g'), true, _) => KeyAction::ExternalEditor,
             (KeyCode::Char('o'), true, _) => KeyAction::Transcript,
             (KeyCode::Char('c'), true, _) => KeyAction::Cancel,
+            #[cfg(unix)]
+            (KeyCode::Char('z'), true, _) => KeyAction::Suspend,
             (KeyCode::Char('d'), true, _) => {
                 if self.composer.is_empty() {
                     KeyAction::Interrupt
@@ -583,11 +605,8 @@ struct TerminalSuspension(bool);
 
 impl TerminalSuspension {
     fn new() -> std::io::Result<Self> {
-        use crossterm::ExecutableCommand;
         let guard = Self(true);
-        std::io::stdout().execute(crossterm::event::DisableBracketedPaste)?;
-        std::io::stdout().execute(crossterm::cursor::Show)?;
-        crossterm::terminal::disable_raw_mode()?;
+        crate::modes::pause_for_child();
         Ok(guard)
     }
 
@@ -598,9 +617,7 @@ impl TerminalSuspension {
     }
 
     fn restore() -> std::io::Result<()> {
-        use crossterm::ExecutableCommand;
-        crossterm::terminal::enable_raw_mode()?;
-        std::io::stdout().execute(crossterm::event::EnableBracketedPaste)?;
+        crate::modes::reapply();
         Ok(())
     }
 }
@@ -692,6 +709,10 @@ pub fn read_secret() -> std::io::Result<Option<String>> {
         &mut std::io::stdout(),
         crossterm::event::EnableBracketedPaste,
     );
+    crate::modes::mark(|modes| {
+        modes.raw = true;
+        modes.bracketed_paste = true;
+    });
     let mut secret = String::new();
     loop {
         match secret_event(&mut secret, crossterm::event::read()?) {
@@ -711,16 +732,7 @@ pub fn read_secret() -> std::io::Result<Option<String>> {
 /// cursor while it writes a frame, so a process that stops partway through one
 /// would otherwise leave the cursor hidden as well.
 fn restore_terminal() {
-    write_restore(&mut std::io::stdout());
-    let _ = crossterm::terminal::disable_raw_mode();
-}
-
-/// Writes the sequences that turn bracketed paste off and show the cursor.
-fn write_restore(out: &mut impl std::io::Write) {
-    let _ = crossterm::QueueableCommand::queue(out, crossterm::terminal::LeaveAlternateScreen);
-    let _ = crossterm::QueueableCommand::queue(out, crossterm::event::DisableBracketedPaste);
-    let _ = crossterm::QueueableCommand::queue(out, crossterm::cursor::Show);
-    let _ = out.flush();
+    crate::modes::restore();
 }
 
 thread_local! {
@@ -760,11 +772,13 @@ fn install_panic_hook() {
     INSTALLED.call_once(|| {
         let previous = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
-            if cfg!(panic = "abort") {
-                restore_terminal();
-            } else if CATCHING_WORKER_PANIC.get() {
+            // A caught worker panic is reported by the session, which goes on
+            // in the modes it needs; every other panic restores first, so its
+            // message is readable.
+            if CATCHING_WORKER_PANIC.get() && !cfg!(panic = "abort") {
                 return;
             }
+            restore_terminal();
             previous(info);
         }));
     });
@@ -1520,11 +1534,27 @@ mod tests {
     fn restoring_turns_paste_off_and_shows_the_cursor() {
         // What a panic hook writes before an aborting build ends the process;
         // raw mode is restored beside it through the terminal settings.
-        let mut out: Vec<u8> = Vec::new();
-        write_restore(&mut out);
+        let out = crate::modes::restore_bytes(&crate::modes::ModeState {
+            raw: true,
+            bracketed_paste: true,
+            ..crate::modes::ModeState::default()
+        });
         let text = String::from_utf8(out).expect("utf8");
         assert!(text.contains("\u{1b}[?2004l"), "{text:?}");
         assert!(text.contains("\u{1b}[?25h"), "{text:?}");
+    }
+
+    #[test]
+    fn ctrl_z_is_a_suspend_key() {
+        let mut reader = reader();
+        reader.replace("draft");
+        let action = reader.apply(control('z'));
+        if cfg!(unix) {
+            assert_eq!(action, KeyAction::Suspend);
+        } else {
+            assert_eq!(action, KeyAction::Ignored);
+        }
+        assert_eq!(reader.line(), "draft");
     }
 
     #[test]

@@ -23,6 +23,7 @@ toml = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 rustix = { workspace = true, features = ["stdio", "event"] }
+signal-hook = { workspace = true }
 
 [dev-dependencies]
 insta = { workspace = true }
