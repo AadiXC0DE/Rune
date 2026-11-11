@@ -472,6 +472,29 @@ fn summariser_effort(host: &dyn Host, request_plan: &RequestPlan) -> rune_core::
     lowest_accepted(request_plan.traits.efforts)
 }
 
+/// Returns the least reasoning that both the model and the dialect accept, or
+/// `Auto` when they share no explicit level.
+#[must_use]
+pub fn lowest_effort(
+    traits_efforts: &[rune_core::config::Effort],
+    dialect: &dyn Provider,
+) -> rune_core::config::Effort {
+    use rune_core::config::Effort;
+    let accepted = dialect.capabilities().efforts;
+    [
+        Effort::None,
+        Effort::Minimal,
+        Effort::Low,
+        Effort::Medium,
+        Effort::High,
+        Effort::Xhigh,
+        Effort::Max,
+    ]
+    .into_iter()
+    .find(|effort| traits_efforts.contains(effort) && accepted.contains(effort))
+    .unwrap_or(Effort::Auto)
+}
+
 /// Sends one summarizer request, charging it to the objective.
 fn summarize(
     host: &dyn Host,
@@ -2473,6 +2496,42 @@ Copy file paths, symbols, commands, error messages and identifiers exactly. Leav
     }
 
     /// Fails the test on any request, for a run that must not summarize.
+    /// A dialect without effort control.
+    struct NoEffort;
+
+    impl Provider for NoEffort {
+        fn name(&self) -> &'static str {
+            "no-effort"
+        }
+        fn capabilities(&self) -> rune_net::provider::ProviderCapabilities {
+            rune_net::provider::ProviderCapabilities::default()
+        }
+        fn request_path(&self) -> &'static str {
+            "/none"
+        }
+        fn build_request(&self, _plan: &RequestPlan) -> Result<serde_json::Value> {
+            Ok(serde_json::Value::Null)
+        }
+        fn reducer(&self) -> Box<dyn rune_net::stream::StreamReducer> {
+            rune_net::anthropic::Anthropic.reducer()
+        }
+    }
+
+    #[test]
+    fn the_lowest_effort_is_the_first_both_sides_accept() {
+        use rune_core::config::Effort;
+        use rune_net::anthropic::Anthropic;
+        use rune_net::provider::ALL_EFFORTS;
+
+        assert_eq!(lowest_effort(ALL_EFFORTS, &Anthropic), Effort::None);
+        assert_eq!(
+            lowest_effort(&[Effort::Auto, Effort::High, Effort::Low], &Anthropic),
+            Effort::Low
+        );
+        assert_eq!(lowest_effort(&[Effort::Auto], &Anthropic), Effort::Auto);
+        assert_eq!(lowest_effort(ALL_EFFORTS, &NoEffort), Effort::Auto);
+    }
+
     struct NoSummaryFetch;
 
     impl Fetch for NoSummaryFetch {
