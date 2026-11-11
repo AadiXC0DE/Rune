@@ -218,7 +218,9 @@ with tempfile.TemporaryDirectory(prefix="rune-r070-") as directory:
         assert b"User: " + LONG_PROMPT.encode() in terminal.output, "prompt truncated"
         assert terminal.output.count(b"Assistant: FIRST-REPLY") == 1
         assert b"Assistant:   preserved" in terminal.output
-        assert b"Reasoning: THINKING" in terminal.output
+        # Reasoning is collapsed by default: one labelled line, not the text.
+        assert b"Reasoning: thought for " in terminal.output
+        assert b"THINKING" not in terminal.output
 
         terminal.send("question")
         terminal.wait_for('Permission request for "ask_user_question"')

@@ -435,6 +435,10 @@ struct SessionHost {
     provider_strict: bool,
     /// Escape that opens a reasoning line, resolved from the theme once.
     reasoning: Mutex<String>,
+    /// How reasoning is shown this session; Alt+T cycles it.
+    reasoning_mode: Mutex<ReasoningMode>,
+    /// When the current step's reasoning began, until it is summarised.
+    reasoning_started: Mutex<Option<std::time::Instant>>,
     /// What the last rows committed to scrollback were.
     last_kind: Mutex<RowKind>,
     /// Text streamed so far in the current step, drawn below the input.
@@ -962,12 +966,17 @@ impl Host for SessionHost {
                 if !self.journal_text(Some(&delta)) {
                     return;
                 }
+                // The answer has begun, so collapsed reasoning becomes its one row.
+                if let Some(summary) = self.settle_reasoning() {
+                    self.commit(&[summary]);
+                }
                 if let Ok(mut streaming) = self.streaming.lock() {
                     streaming.answer.push_str(&delta);
                 }
                 self.request_frame();
             }
             Event::ReasoningDelta { delta } => {
+                lock_value(&self.reasoning_started).get_or_insert_with(std::time::Instant::now);
                 if let Ok(mut streaming) = self.streaming.lock() {
                     streaming.reasoning.push_str(&transcript::sanitize(delta));
                 }
@@ -2747,7 +2756,8 @@ impl SessionHost {
         // Reasoning comes first, drawn apart from the answer, in a secondary
         // colour and indented, so a reader can tell thinking from the reply.
         let mut rows: Vec<String> = Vec::new();
-        if !reasoning.trim().is_empty() {
+        let full = *lock_value(&self.reasoning_mode) == ReasoningMode::Full;
+        if full && !reasoning.trim().is_empty() {
             for line in rows_for(reasoning_rows, reasoning, width) {
                 rows.push(format!("{dim}  {line}{reset}"));
             }
@@ -2791,6 +2801,7 @@ impl SessionHost {
 
     /// Clears the streamed text, which a finished step has taken over.
     fn clear_streaming(&self) {
+        *lock_value(&self.reasoning_started) = None;
         if let Ok(mut streaming) = self.streaming.lock() {
             streaming.answer.clear();
             streaming.reasoning.clear();
@@ -2802,14 +2813,55 @@ impl SessionHost {
     /// Takes the current step's reasoning and narration as transcript entries,
     /// leaving the live text empty.
     fn take_narration(&self) -> Vec<Entry> {
+        let summary = self.settle_reasoning();
+        *lock_value(&self.reasoning_started) = None;
         let Ok(mut streaming) = self.streaming.lock() else {
             return Vec::new();
         };
-        let reasoning = std::mem::take(&mut streaming.reasoning);
+        let reasoning = summary.map_or_else(
+            || std::mem::take(&mut streaming.reasoning),
+            |entry| entry.text,
+        );
         let answer = std::mem::take(&mut streaming.answer);
         streaming.answer_rows = transcript::AssistantRows::default();
         streaming.reasoning_rows = LazyRows::default();
         vec![Entry::reasoning(reasoning), Entry::assistant(answer)]
+    }
+
+    /// Ends a step's hidden reasoning: returns its one `thought for` row and
+    /// drops the text from the live state. None in `full` mode, or when the
+    /// step has no reasoning.
+    fn settle_reasoning(&self) -> Option<Entry> {
+        if *lock_value(&self.reasoning_mode) == ReasoningMode::Full {
+            return None;
+        }
+        let mut streaming = self.streaming.lock().ok()?;
+        if streaming.reasoning.trim().is_empty() {
+            return None;
+        }
+        let started = lock_value(&self.reasoning_started).take()?;
+        streaming.reasoning.clear();
+        streaming.reasoning_rows = LazyRows::default();
+        let seconds = started.elapsed().as_secs().max(1);
+        Some(Entry::reasoning(format!("thought for {seconds}s")))
+    }
+
+    /// Moves to the next reasoning display for this session and says which.
+    fn cycle_reasoning(&self) {
+        let mode = {
+            let mut mode = lock_value(&self.reasoning_mode);
+            *mode = mode.next();
+            *mode
+        };
+        // Reasoning hidden so far is not replayed: from here it streams in full.
+        if mode == ReasoningMode::Full {
+            *lock_value(&self.reasoning_started) = None;
+            if let Ok(mut streaming) = self.streaming.lock() {
+                streaming.reasoning.clear();
+                streaming.reasoning_rows = LazyRows::default();
+            }
+        }
+        self.draw_notice(&format!("reasoning display: {}", mode.name()));
     }
 
     /// Prints finished entries into scrollback above the live region.
@@ -3045,14 +3097,35 @@ impl SessionHost {
         if !running.is_empty() {
             return running;
         }
-        let quiet = self.streaming.lock().is_ok_and(|streaming| {
-            streaming.answer.trim().is_empty() && streaming.reasoning.trim().is_empty()
+        let mode = *lock_value(&self.reasoning_mode);
+        let (answer_empty, newest) = self.streaming.lock().map_or((false, None), |streaming| {
+            let newest = streaming
+                .reasoning
+                .lines()
+                .rev()
+                .map(str::trim)
+                .find(|line| !line.is_empty())
+                .map(str::to_owned);
+            (streaming.answer.trim().is_empty(), newest)
         });
+        let quiet = answer_empty && (mode != ReasoningMode::Full || newest.is_none());
+        let reasoning_started = *lock_value(&self.reasoning_started);
         let started = self.turn_started.lock().ok().and_then(|started| *started);
-        match started {
-            Some(started) if quiet => vec![row("thinking", started)],
-            _ => Vec::new(),
+        let Some(started) = started.filter(|_| quiet) else {
+            return Vec::new();
+        };
+        // Hidden reasoning is timed from its own start; a quiet model from the turn's.
+        let hidden = mode != ReasoningMode::Full && newest.is_some();
+        let since = reasoning_started.filter(|_| hidden).unwrap_or(started);
+        let mut rows = vec![row("thinking", since)];
+        if mode == ReasoningMode::Tail
+            && let Some(line) = newest
+        {
+            let width = usize::from(self.width()).saturating_sub(4).max(1);
+            let line = shorten(&transcript::sanitize(&line), width, self.ascii);
+            rows.push(format!("{dim}  {line}{reset}"));
         }
+        rows
     }
 
     /// Redraws the live region while a turn is quiet, at most four times a
@@ -3453,6 +3526,8 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
         turn_started: Mutex::new(None),
         live_out: Arc::new(Mutex::new(None)),
         reasoning: Mutex::new(reasoning_escape),
+        reasoning_mode: Mutex::new(ReasoningMode::from_setting(&config.settings.reasoning)),
+        reasoning_started: Mutex::new(None),
         last_kind: Mutex::new(RowKind::Start),
         reviewer: crate::auto_review::build(
             &config.settings,
@@ -4851,6 +4926,10 @@ fn run_steerable<T: Send>(
                 gesture.disarm();
                 rune_term::modes::suspend();
             }
+            KeyAction::CycleReasoning => {
+                gesture.disarm();
+                host.cycle_reasoning();
+            }
             // Anything else is an edit, so a half-finished cancel gesture
             // is abandoned rather than left armed, and the line is redrawn
             // with the text that has been typed so far.
@@ -5069,6 +5148,7 @@ fn question_key(
         }
         KeyAction::Complete
         | KeyAction::Ignored
+        | KeyAction::CycleReasoning
         | KeyAction::Transcript
         | KeyAction::HistorySearch
         | KeyAction::ExternalEditor => None,
@@ -5118,6 +5198,7 @@ fn approval_key(
         }
         KeyAction::Complete
         | KeyAction::Ignored
+        | KeyAction::CycleReasoning
         | KeyAction::Transcript
         | KeyAction::HistorySearch
         | KeyAction::ExternalEditor => None,
@@ -5649,6 +5730,10 @@ fn await_submission(
             suspend_session(host, out)?;
             continue;
         }
+        if key == KeyAction::CycleReasoning {
+            host.cycle_reasoning();
+            continue;
+        }
         let had_draft = !reader.line().is_empty();
         match idle_key(commands, key, reader, &mut selected, &rows, recall) {
             // Clearing the draft abandons the prompt a command prepared, and
@@ -5787,7 +5872,7 @@ fn idle_key(
     recall: &[String],
 ) -> Idle {
     match key {
-        KeyAction::Suspend => Idle::Stay,
+        KeyAction::Suspend | KeyAction::CycleReasoning => Idle::Stay,
         KeyAction::Submit => {
             // Enter takes the highlighted completion when the list is open
             // and the command is not yet complete, so a half-typed name is
@@ -5971,7 +6056,7 @@ fn confirm_choice(
             }
             match answer.read_key() {
                 KeyAction::Suspend => suspend_session(host, out)?,
-                KeyAction::Ignored => {
+                KeyAction::Ignored | KeyAction::CycleReasoning => {
                     let typed = answer.line().to_owned();
                     answer.clear();
                     match typed.as_str() {
@@ -6055,7 +6140,7 @@ fn run_picker(
                 view_transcript(reader, host)?;
             }
             KeyAction::ExternalEditor | KeyAction::HistorySearch => {}
-            KeyAction::Ignored => {
+            KeyAction::Ignored | KeyAction::CycleReasoning => {
                 picker.set_query(reader.line());
             }
         }
@@ -6118,7 +6203,7 @@ fn search_prompt_history(
                 KeyAction::Down => {
                     picker.down();
                 }
-                KeyAction::Ignored => picker.set_query(query.line()),
+                KeyAction::Ignored | KeyAction::CycleReasoning => picker.set_query(query.line()),
                 KeyAction::HistorySearch => {
                     everywhere = !everywhere;
                     picker = switch_history_scope(&picker, everywhere, recall, all);
@@ -7642,7 +7727,7 @@ fn choose_theme(
             }
             KeyAction::Transcript => view_transcript(reader, host)?,
             KeyAction::ExternalEditor | KeyAction::HistorySearch => {}
-            KeyAction::Ignored => {
+            KeyAction::Ignored | KeyAction::CycleReasoning => {
                 picker.set_query(reader.line());
                 preview(&picker);
             }
@@ -8442,6 +8527,43 @@ enum Step {
     PickTheme,
     /// Put back files: undo, undo despite outside changes, or redo.
     Restore(RestoreAsk),
+}
+
+/// How reasoning is shown while a turn runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReasoningMode {
+    /// A live `thinking` row, then one `thought for` row.
+    Collapsed,
+    /// As collapsed, with the newest reasoning line under the activity row.
+    Tail,
+    /// Every reasoning line, streamed and kept in scrollback.
+    Full,
+}
+
+impl ReasoningMode {
+    fn from_setting(value: &str) -> Self {
+        match value {
+            "tail" => Self::Tail,
+            "full" => Self::Full,
+            _ => Self::Collapsed,
+        }
+    }
+
+    const fn next(self) -> Self {
+        match self {
+            Self::Collapsed => Self::Tail,
+            Self::Tail => Self::Full,
+            Self::Full => Self::Collapsed,
+        }
+    }
+
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Collapsed => "collapsed",
+            Self::Tail => "tail",
+            Self::Full => "full",
+        }
+    }
 }
 
 /// Which restore a slash command asked for.
@@ -10548,6 +10670,135 @@ mod tests {
         host.draw_stream();
         assert!(!replay(&mut grid).contains("provider retry"));
         assert!(event_entries(&host).is_empty());
+    }
+
+    /// A host showing reasoning in `mode`, a turn under way, and what it writes.
+    fn reasoning_host(mode: ReasoningMode) -> (SessionHost, Arc<Mutex<Vec<u8>>>) {
+        let sink: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+        let host = test_host();
+        *host.reasoning_mode.lock().expect("mode") = mode;
+        *host.turn_started.lock().expect("started") = Some(std::time::Instant::now());
+        *host.live_out.lock().expect("lock") =
+            Some(Arc::new(Mutex::new(SharedSink(Arc::clone(&sink)))));
+        (host, sink)
+    }
+
+    fn reason(host: &SessionHost, text: &str) {
+        host.emit(Event::ReasoningDelta {
+            delta: text.to_owned(),
+        });
+    }
+
+    fn written(sink: &Arc<Mutex<Vec<u8>>>) -> String {
+        String::from_utf8_lossy(&sink.lock().expect("lock")).into_owned()
+    }
+
+    #[test]
+    fn collapsed_reasoning_shows_a_thinking_row_and_commits_one_line() {
+        let (host, sink) = reasoning_host(ReasoningMode::Collapsed);
+        reason(&host, "THINK-1\n");
+        reason(&host, "THINK-2\n");
+        let live = host.live_rows().join("\n");
+        assert!(live.contains("thinking"), "{live}");
+        assert!(!live.contains("THINK"), "{live}");
+        assert!(
+            host.streaming_rows()
+                .iter()
+                .all(|row| !row.contains("THINK"))
+        );
+
+        host.emit(Event::TextDelta {
+            delta: "the answer".to_owned(),
+        });
+        let out = written(&sink);
+        assert!(out.contains("  thought for 1s"), "{out:?}");
+        assert!(!out.contains("THINK"), "{out:?}");
+        let entries = host.take_narration();
+        assert!(entries.iter().all(|entry| !entry.text.contains("THINK")));
+        assert!(
+            entries
+                .iter()
+                .all(|entry| !entry.text.contains("thought for")),
+            "committed once"
+        );
+        assert!(entries.iter().any(|entry| entry.text == "the answer"));
+    }
+
+    #[test]
+    fn tail_reasoning_shows_the_newest_line() {
+        let (host, sink) = reasoning_host(ReasoningMode::Tail);
+        reason(&host, "first idea\nsecond idea\n\n");
+        let live = host.live_rows();
+        assert_eq!(live.len(), 2, "{live:?}");
+        assert!(live[0].contains("thinking"), "{live:?}");
+        assert!(
+            live[1].contains("second idea") && !live[1].contains("first idea"),
+            "{live:?}"
+        );
+        reason(&host, &"x".repeat(400));
+        let live = host.live_rows();
+        let width = usize::from(host.width()).saturating_sub(4);
+        assert!(live[1].contains('\u{2026}'), "{live:?}");
+        assert!(live[1].matches('x').count() < width, "{live:?}");
+        host.emit(Event::TextDelta {
+            delta: "done".to_owned(),
+        });
+        assert!(written(&sink).contains("thought for"));
+    }
+
+    #[test]
+    fn full_reasoning_is_unchanged() {
+        let (host, sink) = reasoning_host(ReasoningMode::Full);
+        reason(&host, "THINK-1\n");
+        assert!(
+            host.streaming_rows()
+                .iter()
+                .any(|row| row.contains("THINK-1"))
+        );
+        assert!(
+            host.live_rows().is_empty(),
+            "the reasoning itself shows the model is working"
+        );
+        host.emit(Event::TextDelta {
+            delta: "the answer".to_owned(),
+        });
+        assert!(!written(&sink).contains("thought for"));
+        let entries = host.take_narration();
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry.speaker == transcript::Speaker::Reasoning
+                    && entry.text.contains("THINK-1"))
+        );
+    }
+
+    #[test]
+    fn reasoning_before_a_tool_call_is_summarised_first() {
+        let (host, sink) = reasoning_host(ReasoningMode::Collapsed);
+        reason(&host, "THINK-1\n");
+        host.emit(Event::ToolStarted {
+            call: turn::PreparedCall {
+                id: "c1".to_owned(),
+                name: "read_file".to_owned(),
+                arguments: r#"{"path":"a.txt"}"#.to_owned(),
+            },
+            activity: rune_tools::Activity::Read,
+        });
+        let out = written(&sink);
+        assert!(out.contains("thought for 1s"), "{out:?}");
+        assert!(!out.contains("THINK"), "{out:?}");
+        // Switching to full mid-stream shows what follows, not what was hidden.
+        reason(&host, "HIDDEN\n");
+        host.cycle_reasoning();
+        host.cycle_reasoning();
+        assert_eq!(
+            *host.reasoning_mode.lock().expect("mode"),
+            ReasoningMode::Full
+        );
+        reason(&host, "SHOWN\n");
+        let rows = host.streaming_rows().join("\n");
+        assert!(rows.contains("SHOWN") && !rows.contains("HIDDEN"), "{rows}");
+        assert!(written(&sink).contains("reasoning display: full"));
     }
 
     #[test]
@@ -16619,6 +16870,8 @@ mod tests {
             turn_started: Mutex::new(None),
             live_out: Arc::new(Mutex::new(None)),
             reasoning: Mutex::new("\u{1b}[2m".to_owned()),
+            reasoning_mode: Mutex::new(ReasoningMode::Full),
+            reasoning_started: Mutex::new(None),
             last_kind: Mutex::new(RowKind::Start),
             reviewer: None,
             helper_usage: crate::helper_usage::HelperUsage::default(),

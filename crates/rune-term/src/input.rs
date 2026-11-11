@@ -59,6 +59,7 @@ Composer:
   Ctrl-_        undo a draft edit (Ctrl-Shift-minus; legacy Ctrl-7)
   Alt-R         redo a draft edit (Alt with lowercase r)
   Ctrl-G        edit the draft in VISUAL, EDITOR, or vi
+  Alt-T         cycle how reasoning is shown
 
 Idle prompt and menus:
   Up / Down     recall prompts from the first / last draft row;
@@ -136,6 +137,8 @@ pub enum KeyAction {
     HistorySearch,
     /// Pause the process, as the terminal's suspend key does.
     Suspend,
+    /// Cycle how reasoning is shown: collapsed, tail, full.
+    CycleReasoning,
 }
 
 /// Navigation while the transcript owns the terminal.
@@ -508,6 +511,7 @@ impl KeyReader {
                 self.composer.redo();
                 KeyAction::Ignored
             }
+            (KeyCode::Char('t'), false, true) => KeyAction::CycleReasoning,
             (KeyCode::Char('w'), true, _) | (KeyCode::Backspace, _, true) => {
                 self.composer.kill_word_back();
                 KeyAction::Ignored
@@ -1631,6 +1635,16 @@ mod tests {
             assert_eq!(action, KeyAction::Ignored);
         }
         assert_eq!(reader.line(), "draft");
+    }
+
+    #[test]
+    fn alt_t_cycles_reasoning_and_inserts_nothing() {
+        let mut reader = reader();
+        reader.replace("draft");
+        let action = reader.apply(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::ALT));
+        assert_eq!(action, KeyAction::CycleReasoning);
+        assert_eq!(reader.line(), "draft");
+        assert!(render_bindings_help(true).contains("Alt-T         cycle how reasoning is shown"));
     }
 
     #[test]

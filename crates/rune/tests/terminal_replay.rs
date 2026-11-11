@@ -521,6 +521,35 @@ fn streamed_markdown_grids() {
 }
 
 #[test]
+fn reasoning_grids() {
+    let actual = event_replay("reasoning");
+    compare_grid("reasoning.grid", &actual);
+    let finished = stage_rows(&actual, "reasoning-finished");
+    assert!(
+        finished.iter().all(|row| !row.contains("THINK-")),
+        "{actual}"
+    );
+    assert!(
+        finished.iter().any(|row| row.contains("thought for")),
+        "{actual}"
+    );
+    assert!(
+        finished.iter().any(|row| row.contains("REASONED")),
+        "{actual}"
+    );
+    let full = event_replay("reasoning-full");
+    let rows = stage_rows(&full, "reasoning-full-finished");
+    for n in 1..=5 {
+        let marker = format!("THINK-{n}");
+        assert!(rows.iter().any(|row| row.contains(&marker)), "{full}");
+    }
+    assert!(
+        rows.iter().all(|row| !row.contains("thought for")),
+        "{full}"
+    );
+}
+
+#[test]
 fn full_transcript_scrolls_tools_and_replies_and_preserves_the_draft_and_caret() {
     let captures: Vec<Capture> = serde_json::from_slice(&record(
         include_str!("terminal_replay.py"),
