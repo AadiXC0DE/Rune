@@ -1,0 +1,2 @@
+data: {"candidates":[{"content":{"role":"model","parts":[{"text":"The directory is rune."}]},"index":0,"finishReason":"STOP"}],"modelVersion":"gemini-3.8-flash","usageMetadata":{"promptTokenCount":40,"candidatesTokenCount":8,"thoughtsTokenCount":4,"totalTokenCount":52}}
+
