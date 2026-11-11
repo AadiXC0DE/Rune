@@ -45,6 +45,7 @@ Run one bounded turn without an interactive session
 | `--json` | Print one JSON object instead of Markdown. |
 | `--jsonl` | Stream bounded JSONL events (takes precedence over --json); the records are listed in the README under Headless runs. |
 | `--no-save` | Do not create a session. |
+| `--checkpoints` | Snapshot the workspace before and after the turn so it can be restored with rune session restore. |
 | `--image <path>` | Attach a PNG, JPEG, GIF, or WebP file. Repeatable; 8 MiB total, at most 16 images. |
 | `--max-steps <n>` | Stop after this many model steps; the last one answers without tools. 0 means no limit. |
 | `--timeout <seconds>` | Stop the run after this many seconds and report what it did. |

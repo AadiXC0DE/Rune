@@ -110,6 +110,8 @@ pub struct Options {
     pub judge: bool,
     /// Add the last request's estimated tokens by part to the JSON result.
     pub context_report: bool,
+    /// Whether the workspace is snapshotted before and after the turn.
+    pub checkpoints: bool,
 }
 
 /// Appended to the prompt of a run nobody can answer.
@@ -802,7 +804,11 @@ struct AskHost<'a> {
     /// Calls of the current step that have a `tool_call` record.
     announced: std::sync::Mutex<std::collections::BTreeSet<String>>,
     /// The session, written as the run goes; absent with `--no-save`.
-    log: Option<LiveLog>,
+    log: Option<std::sync::Arc<LiveLog>>,
+    /// Workspace snapshots before and after the turn, with `--checkpoints`.
+    checkpoints: Option<crate::checkpoint::Checkpoints>,
+    /// Whether a changing tool call already waited for the start snapshot.
+    checkpoint_waited: std::sync::atomic::AtomicBool,
     /// The first failure to write the session, which stops the run.
     log_error: std::sync::Mutex<Option<RuneError>>,
     /// When `--timeout` ends the run, so a retry never waits past it.
@@ -1375,6 +1381,21 @@ impl Host for AskHost<'_> {
         {
             return subagent.call(self, &self.registry, arguments, context);
         }
+        if let Some(checkpoints) = &self.checkpoints
+            && self
+                .registry
+                .get(name)
+                .is_some_and(|tool| !tool.is_read_only())
+            && !self
+                .checkpoint_waited
+                .swap(true, std::sync::atomic::Ordering::SeqCst)
+            && !checkpoints.wait_for_start(CHECKPOINT_WAIT)
+        {
+            let _ = writeln!(
+                std::io::stderr(),
+                "warning: checkpoint for turn 1 was not ready; restoring this turn may be incomplete"
+            );
+        }
         self.registry.call(name, arguments, context)
     }
 
@@ -1639,6 +1660,15 @@ pub fn run(
         }
         None => (None, false),
     };
+    let log = if options.no_save {
+        None
+    } else {
+        Some(std::sync::Arc::new(LiveLog::open(
+            paths,
+            options.session_id.unwrap_or_else(SessionId::generate),
+            &options.prompt,
+        )?))
+    };
     let host = AskHost {
         goal,
         judge,
@@ -1686,15 +1716,12 @@ pub fn run(
         spent: std::sync::Mutex::new(None),
         spend_limit,
         announced: std::sync::Mutex::new(std::collections::BTreeSet::new()),
-        log: if options.no_save {
-            None
-        } else {
-            Some(LiveLog::open(
-                paths,
-                options.session_id.unwrap_or_else(SessionId::generate),
-                &options.prompt,
-            )?)
-        },
+        checkpoints: options
+            .checkpoints
+            .then(|| log.as_ref().and_then(|log| start_checkpoints(paths, log)))
+            .flatten(),
+        checkpoint_waited: std::sync::atomic::AtomicBool::new(false),
+        log,
         log_error: std::sync::Mutex::new(None),
         deadline: options
             .timeout
@@ -1752,6 +1779,9 @@ pub fn run(
         .tool_loop
         .then(|| rune_tools::git_diff::status_entries(&workspace, STATUS_LIMIT))
         .flatten();
+    if let Some(checkpoints) = &host.checkpoints {
+        checkpoints.turn_started(1);
+    }
     let outcome = turn::run_turn(&mut history, &host);
     // Whatever ended the run, nothing it started keeps running.
     host.registry.shutdown();
@@ -1885,6 +1915,9 @@ pub fn run(
     let session_id = match &host.log {
         Some(log) => {
             log.finish(error.as_ref())?;
+            if let Some(checkpoints) = &host.checkpoints {
+                checkpoints.turn_finished(1);
+            }
             log.id.to_string()
         }
         None => String::new(),
@@ -2104,6 +2137,36 @@ impl Watchdog {
         let _ = self.thread.join();
         self.fired.load(Ordering::Relaxed)
     }
+}
+
+/// Longest a changing tool call waits for the start snapshot.
+const CHECKPOINT_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Starts the snapshot worker for a saved run in a git workspace.
+fn start_checkpoints(
+    paths: &Paths,
+    log: &std::sync::Arc<LiveLog>,
+) -> Option<crate::checkpoint::Checkpoints> {
+    let notify: crate::checkpoint::Notify = std::sync::Arc::new(|line| {
+        let _ = writeln!(std::io::stderr(), "warning: {line}");
+    });
+    let workspace = crate::current_workspace().ok()?;
+    let shadow = match crate::checkpoint::Shadow::open(paths, &workspace) {
+        Ok(shadow) => shadow?,
+        Err(error) => {
+            notify(format!("checkpoint failed: {}", error.message()));
+            return None;
+        }
+    };
+    let sink = std::sync::Arc::clone(log);
+    let record: crate::checkpoint::Record =
+        std::sync::Arc::new(move |event| sink.append(vec![event]));
+    Some(crate::checkpoint::Checkpoints::start(
+        shadow,
+        log.id.to_string(),
+        record,
+        notify,
+    ))
 }
 
 /// The session of a run, written while it happens.

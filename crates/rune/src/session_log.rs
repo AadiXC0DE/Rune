@@ -302,6 +302,22 @@ impl Recorder {
         Ok(())
     }
 
+    /// The number of the latest turn begun, zero before the first.
+    pub fn current_turn(&self) -> u64 {
+        self.turn
+    }
+
+    /// Records a workspace snapshot taken at a turn boundary.
+    pub fn workspace_checkpoint(&self, event: SessionEvent) -> Result<()> {
+        if !matches!(event, SessionEvent::WorkspaceCheckpoint { .. }) {
+            return Err(RuneError::new(
+                ErrorCode::Internal,
+                format!("expected a workspace checkpoint, got {}", event.kind()),
+            ));
+        }
+        self.append(event)
+    }
+
     /// Starts an exchange before the provider can produce visible text.
     /// The number of the current or last turn, zero before the first.
     pub const fn turn_number(&self) -> u64 {
@@ -765,6 +781,7 @@ pub fn tree_of(state: &SessionState) -> Tree {
             | SessionEvent::ConstraintPinned { .. }
             | SessionEvent::ModelSet { .. }
             | SessionEvent::WorkspaceSet { .. }
+            | SessionEvent::WorkspaceCheckpoint { .. }
             | SessionEvent::ForkedFrom { .. }
             | SessionEvent::ChildOf { .. }
             | SessionEvent::HarnessNote { .. }
@@ -1217,6 +1234,7 @@ pub fn history_from(state: &SessionState) -> History {
             | SessionEvent::ObjectiveTokensRecorded { .. }
             | SessionEvent::ModelSet { .. }
             | SessionEvent::WorkspaceSet { .. }
+            | SessionEvent::WorkspaceCheckpoint { .. }
             | SessionEvent::ForkedFrom { .. }
             | SessionEvent::ChildOf { .. }
             | SessionEvent::TurnInterrupted { .. }

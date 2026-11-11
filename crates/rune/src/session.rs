@@ -429,6 +429,12 @@ struct SessionHost {
     /// command can honestly do. A file the session created is held as absent,
     /// so undoing removes it.
     undo: Mutex<BTreeMap<Utf8PathBuf, Option<Vec<u8>>>>,
+    /// Workspace snapshots at turn boundaries, when the workspace is a git work tree.
+    checkpoints: Option<crate::checkpoint::Checkpoints>,
+    /// Turn whose start snapshot a changing tool call already waited for.
+    checkpoint_waited: std::sync::atomic::AtomicU64,
+    /// Lines the checkpoint worker asked to show, not yet in the transcript.
+    checkpoint_notices: Arc<Mutex<Vec<String>>>,
     /// Review activity for the current turn.
     review_session: Arc<Mutex<ReviewSession>>,
     /// Attached only while a terminal input loop can collect an answer.
@@ -1037,6 +1043,7 @@ impl Host for SessionHost {
         {
             return subagent.call(self, &self.registry, arguments, &self.context);
         }
+        self.wait_for_checkpoint(name);
         // Captured before the call so the bytes that were there can be put
         // back. A capture failure is not fatal: the call still runs, and `/undo`
         // reports that it had nothing to restore for this file.
@@ -1087,6 +1094,7 @@ impl Host for SessionHost {
         context: &ExecutionContext,
     ) -> Result<ToolOutput> {
         if matches!(name, "web_fetch" | "update_plan" | "read_file") {
+            self.wait_for_checkpoint(name);
             return self.registry.call(name, arguments, context);
         }
         self.execute(name, arguments)
@@ -2346,6 +2354,50 @@ impl SessionHost {
         })
     }
 
+    /// Waits, once per turn, for the start snapshot before a tool that can change files.
+    fn wait_for_checkpoint(&self, name: &str) {
+        let Some(checkpoints) = &self.checkpoints else {
+            return;
+        };
+        if self
+            .registry
+            .get(name)
+            .is_none_or(rune_tools::Tool::is_read_only)
+        {
+            return;
+        }
+        let turn = checkpoints.turn();
+        let waited = self
+            .checkpoint_waited
+            .swap(turn, std::sync::atomic::Ordering::SeqCst);
+        if waited != turn && !checkpoints.wait_for_start(CHECKPOINT_WAIT) {
+            self.checkpoint_notice(format!(
+                "checkpoint for turn {turn} was not ready; restoring this turn may be incomplete"
+            ));
+        }
+        self.show_checkpoint_notices();
+    }
+
+    /// Moves the checkpoint worker's pending lines into the transcript.
+    fn show_checkpoint_notices(&self) {
+        let pending = std::mem::take(
+            &mut *self
+                .checkpoint_notices
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        for line in pending {
+            self.checkpoint_notice(line);
+        }
+    }
+
+    fn checkpoint_notice(&self, line: String) {
+        let mut entries = self.take_narration();
+        entries.retain(|entry| !entry.text.trim().is_empty());
+        entries.push(Entry::notice(line));
+        self.commit(&entries);
+    }
+
     /// Draws one notice above the input, keeping the line being typed.
     fn draw_notice(&self, notice: &str) {
         let (line, column) = self.typed_line();
@@ -2877,7 +2929,17 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
     } else {
         (Vec::new(), Totals::default())
     };
+    let session_id = recorder.id();
     let recorder = Arc::new(Mutex::new(recorder));
+    let checkpoint_notices = Arc::new(Mutex::new(Vec::new()));
+    let checkpoints = start_checkpoints(
+        &config.paths,
+        &config.workspace,
+        config.settings.checkpoints,
+        session_id.as_str(),
+        &recorder,
+        &checkpoint_notices,
+    );
     let mut context = ExecutionContext::new(config.workspace.clone())
         .with_offline(config.settings.offline)
         .with_allow_unsandboxed(config.settings.allow_unsandboxed)
@@ -3042,6 +3104,9 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
         helper_usage: config.helper_usage.clone(),
         totals: Mutex::new(initial_totals),
         undo: Mutex::new(BTreeMap::new()),
+        checkpoints,
+        checkpoint_waited: std::sync::atomic::AtomicU64::new(0),
+        checkpoint_notices,
         review_session: Arc::new(Mutex::new(ReviewSession::new(&limits))),
         approval_requests: Mutex::new(None),
         approval_preview: Mutex::new(Vec::new()),
@@ -3717,10 +3782,17 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                 // correcting a long turn and waiting it out.
                 host.transcript_history_len
                     .store(history.len(), std::sync::atomic::Ordering::Relaxed);
-                recorder
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .begin_turn()?;
+                let turn_number = {
+                    let mut recorder = recorder
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    recorder.begin_turn()?;
+                    recorder.current_turn()
+                };
+                if let Some(checkpoints) = &host.checkpoints {
+                    checkpoints.turn_started(turn_number);
+                }
+                host.show_checkpoint_notices();
                 let steered = if let Some(input) = line_input {
                     run_turn_accessible(&mut history, &host, input)
                 } else {
@@ -3761,6 +3833,9 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                                 .failed_turn(&partial, &err)?;
                         }
+                        if let Some(checkpoints) = &host.checkpoints {
+                            checkpoints.turn_finished(turn_number);
+                        }
                         let history_start = host
                             .transcript_history_len
                             .load(std::sync::atomic::Ordering::Relaxed)
@@ -3796,6 +3871,9 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .turn(&outcome)?;
+                if let Some(checkpoints) = &host.checkpoints {
+                    checkpoints.turn_finished(turn_number);
+                }
                 host.capture_history(&history);
                 // The model is read back rather than captured at start, so a
                 // turn that ran after `/model` is billed to the model that ran.
@@ -7217,6 +7295,51 @@ fn adopt_skill_catalog_budget(limits: &mut BudgetSet, context_window: Option<u64
 /// A ledger write must never end a session, so a failure is reported and the
 /// session continues: losing an accounting record is better than losing the
 /// conversation, which is already on disk.
+/// Longest a changing tool call waits for its turn's start snapshot.
+const CHECKPOINT_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Starts the snapshot worker when checkpoints are on and the workspace is a git work tree.
+///
+/// A store that cannot be opened is reported once and the session runs without it.
+fn start_checkpoints(
+    paths: &Paths,
+    workspace: &Utf8Path,
+    enabled: bool,
+    session: &str,
+    recorder: &Arc<Mutex<Recorder>>,
+    notices: &Arc<Mutex<Vec<String>>>,
+) -> Option<crate::checkpoint::Checkpoints> {
+    if !enabled {
+        return None;
+    }
+    let sink = Arc::clone(notices);
+    let notify: crate::checkpoint::Notify = Arc::new(move |line| {
+        sink.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(line);
+    });
+    let recorder = Arc::clone(recorder);
+    let record: crate::checkpoint::Record = Arc::new(move |event| {
+        recorder
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .workspace_checkpoint(event)
+    });
+    match crate::checkpoint::Shadow::open(paths, workspace) {
+        Ok(Some(shadow)) => Some(crate::checkpoint::Checkpoints::start(
+            shadow,
+            session.to_owned(),
+            record,
+            notify,
+        )),
+        Ok(None) => None,
+        Err(error) => {
+            notify(format!("checkpoint failed: {}", error.message()));
+            None
+        }
+    }
+}
+
 fn record_usage(paths: &Paths, model: &str, outcome: &turn::TurnOutcome, cost: Option<u64>) {
     let mut record = UsageRecord::new(now_ms(), model, HelperKind::Main);
     record.total_cost = cost.map(rune_net::models_dev::dollars);
@@ -12894,6 +13017,46 @@ mod tests {
         assert!(root.join("directory").is_dir());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn checkpoints_off_create_no_store() {
+        let present = std::process::Command::new("git")
+            .args(["--version"])
+            .output()
+            .is_ok_and(|output| output.status.success());
+        if !present {
+            eprintln!("skipped: git is not installed");
+            return;
+        }
+        let root = tempfile::tempdir().expect("tempdir");
+        let base = Utf8PathBuf::from_path_buf(root.path().canonicalize().expect("canonical"))
+            .expect("utf8");
+        let workspace = base.join("work");
+        std::fs::create_dir(&workspace).expect("workspace");
+        let init = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&workspace)
+            .status()
+            .expect("git init");
+        assert!(init.success());
+        let paths = Paths {
+            config_root: base.join("config"),
+            state_root: base.join("state"),
+            data_root: base.join("data"),
+        };
+        let id = SessionId::generate();
+        let recorder = Arc::new(Mutex::new(Recorder::create(&paths, &id).expect("create")));
+        let notices = Arc::new(Mutex::new(Vec::new()));
+        let store = paths.state_root.join("checkpoints");
+        let off = start_checkpoints(&paths, &workspace, false, id.as_str(), &recorder, &notices);
+        assert!(off.is_none());
+        assert!(!store.exists());
+        let on = start_checkpoints(&paths, &workspace, true, id.as_str(), &recorder, &notices);
+        assert!(on.is_some());
+        assert!(store.exists());
+        assert!(notices.lock().expect("notices").is_empty());
+    }
+
     #[test]
     fn undoing_a_change_restores_the_original_bytes() {
         let dir = tempfile::tempdir().expect("temp");
@@ -15544,6 +15707,9 @@ mod tests {
             helper_usage: crate::helper_usage::HelperUsage::default(),
             totals: Mutex::new(Totals::default()),
             undo: Mutex::new(BTreeMap::new()),
+            checkpoints: None,
+            checkpoint_waited: std::sync::atomic::AtomicU64::new(0),
+            checkpoint_notices: Arc::default(),
             review_session: Arc::new(Mutex::new(ReviewSession::new(&BudgetSet::new()))),
             approval_requests: Mutex::new(None),
             approval_preview: Mutex::new(Vec::new()),

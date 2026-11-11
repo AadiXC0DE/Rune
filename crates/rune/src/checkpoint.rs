@@ -2,16 +2,19 @@
 //!
 //! The shadow directory lives under the state root and has its own index, so
 //! the workspace's repository, index, refs and hooks are never read or written.
-#![cfg_attr(not(test), allow(dead_code))]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
+use std::sync::mpsc::{self, Sender};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use camino::{Utf8Path, Utf8PathBuf};
 use rune_core::error::{ErrorCode, Result, RuneError};
 use rune_core::paths::{self, Paths};
 use rune_exec::session::{Input, POLL_INTERVAL, Process};
+use rune_session::event::{Boundary, SessionEvent};
 use sha2::{Digest as _, Sha256};
 
 /// Directory under the state root that holds one shadow per workspace.
@@ -68,7 +71,11 @@ impl Shadow {
                     ));
                 }
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => shadow.create()?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                paths.ensure_roots()?;
+                paths::create_dir_private(&paths.state_root.join(CHECKPOINTS_DIR))?;
+                shadow.create()?;
+            }
             Err(error) => return Err(error.into()),
         }
         Ok(Some(shadow))
@@ -111,7 +118,14 @@ impl Shadow {
     }
 
     /// Writes a snapshot of the working tree and points `refs/rune/<session>` at it.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn snapshot(&self, session: &str, message: &str) -> Result<Snapshot> {
+        let (tree, skipped) = self.stage()?;
+        self.commit(session, message, tree, skipped)
+    }
+
+    /// Writes the working tree into the shadow index and returns its tree and skipped files.
+    fn stage(&self) -> Result<(String, Vec<String>)> {
         let base = self.base_excludes();
         self.write_excludes(&base, &[])?;
         let listed = self.snapshot_git(
@@ -136,6 +150,17 @@ impl Shadow {
         }
         self.snapshot_git(&["add", "-A", "--", "."], DEFAULT_DEADLINE)?;
         let tree = trimmed(&self.snapshot_git(&["write-tree"], DEFAULT_DEADLINE)?);
+        Ok((tree, skipped))
+    }
+
+    /// Commits a staged tree on top of the session ref and moves the ref to it.
+    fn commit(
+        &self,
+        session: &str,
+        message: &str,
+        tree: String,
+        skipped: Vec<String>,
+    ) -> Result<Snapshot> {
         let reference = format!("refs/rune/{session}");
         let parent = self.parent(&reference)?;
         let mut arguments = vec!["commit-tree", tree.as_str()];
@@ -154,6 +179,7 @@ impl Shadow {
     }
 
     /// Size in bytes of the shadow directory.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn size(&self) -> u64 {
         directory_size(self.git_dir.as_std_path())
     }
@@ -237,6 +263,229 @@ impl Shadow {
     fn hooks_dir(&self) -> Utf8PathBuf {
         self.git_dir.join("no-hooks")
     }
+}
+
+/// One checkpoint as the session log records it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CheckpointRecord {
+    pub turn: u64,
+    pub boundary: Boundary,
+    pub snapshot: Snapshot,
+    pub complete: bool,
+}
+
+impl CheckpointRecord {
+    fn event(&self) -> SessionEvent {
+        SessionEvent::WorkspaceCheckpoint {
+            turn: self.turn,
+            boundary: self.boundary,
+            tree: self.snapshot.tree.clone(),
+            commit: self.snapshot.commit.clone(),
+            parent: self.snapshot.parent.clone(),
+            skipped: self.snapshot.skipped.clone(),
+            complete: self.complete,
+        }
+    }
+}
+
+/// Shows a line in the transcript of the session that owns the checkpoints.
+pub type Notify = Arc<dyn Fn(String) + Send + Sync>;
+
+/// Appends a checkpoint event to the session log.
+pub type Record = Arc<dyn Fn(SessionEvent) -> Result<()> + Send + Sync>;
+
+/// One snapshot the worker is asked to take.
+struct Job {
+    turn: u64,
+    boundary: Boundary,
+}
+
+/// What the worker publishes to the threads that wait on it.
+#[derive(Default)]
+struct State {
+    /// Turn of the latest start snapshot asked for.
+    requested: u64,
+    /// Turn of the latest start snapshot taken.
+    started: u64,
+    /// Turns whose start snapshot was not ready when a change began.
+    late: BTreeSet<u64>,
+    latest: Option<CheckpointRecord>,
+}
+
+struct Shared {
+    state: Mutex<State>,
+    ready: Condvar,
+}
+
+impl Shared {
+    fn lock(&self) -> std::sync::MutexGuard<'_, State> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// Takes snapshots on one background thread, in the order asked.
+pub struct Checkpoints {
+    sender: Option<Sender<Job>>,
+    shared: Arc<Shared>,
+    worker: Option<JoinHandle<()>>,
+}
+
+impl Checkpoints {
+    pub fn start(shadow: Shadow, session: String, record: Record, notify: Notify) -> Self {
+        Self::spawn(shadow, session, record, notify, Duration::ZERO)
+    }
+
+    /// Starts a worker that sleeps for `delay` before each snapshot.
+    #[cfg(test)]
+    pub fn start_with_delay(
+        shadow: Shadow,
+        session: String,
+        record: Record,
+        notify: Notify,
+        delay: Duration,
+    ) -> Self {
+        Self::spawn(shadow, session, record, notify, delay)
+    }
+
+    fn spawn(
+        shadow: Shadow,
+        session: String,
+        record: Record,
+        notify: Notify,
+        delay: Duration,
+    ) -> Self {
+        let shared = Arc::new(Shared {
+            state: Mutex::new(State::default()),
+            ready: Condvar::new(),
+        });
+        let (sender, receiver) = mpsc::channel::<Job>();
+        let worker_shared = Arc::clone(&shared);
+        let worker = std::thread::Builder::new()
+            .name("rune-checkpoints".to_owned())
+            .spawn(move || {
+                let mut reported = false;
+                for job in receiver {
+                    if !delay.is_zero() {
+                        std::thread::sleep(delay);
+                    }
+                    let outcome = take(&shadow, &session, &record, &worker_shared, &job);
+                    if let Err(error) = outcome
+                        && !reported
+                    {
+                        reported = true;
+                        notify(format!("checkpoint failed: {}", error.message()));
+                    }
+                }
+            })
+            .ok();
+        if worker.is_none() {
+            // Without a worker nothing would mark a start snapshot taken.
+            shared.lock().started = u64::MAX;
+        }
+        Self {
+            sender: worker.as_ref().map(|_| sender),
+            shared,
+            worker,
+        }
+    }
+
+    /// Queues the start snapshot of `turn`.
+    pub fn turn_started(&self, turn: u64) {
+        self.shared.lock().requested = turn;
+        self.send(turn, Boundary::Start);
+    }
+
+    /// The turn of the latest start snapshot asked for.
+    pub fn turn(&self) -> u64 {
+        self.shared.lock().requested
+    }
+
+    /// Blocks until the start snapshot of the current turn is written, at most `wait`.
+    /// Returns false on timeout.
+    pub fn wait_for_start(&self, wait: Duration) -> bool {
+        let state = self.shared.lock();
+        let (mut state, _) = self
+            .shared
+            .ready
+            .wait_timeout_while(state, wait, |state| state.started < state.requested)
+            .unwrap_or_else(PoisonError::into_inner);
+        if state.started >= state.requested {
+            return true;
+        }
+        let turn = state.requested;
+        state.late.insert(turn);
+        false
+    }
+
+    /// Queues the end snapshot of `turn`.
+    pub fn turn_finished(&self, turn: u64) {
+        self.send(turn, Boundary::End);
+    }
+
+    /// The latest checkpoint written by this session.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn latest(&self) -> Option<CheckpointRecord> {
+        self.shared.lock().latest.clone()
+    }
+
+    fn send(&self, turn: u64, boundary: Boundary) {
+        if let Some(sender) = &self.sender {
+            let _ = sender.send(Job { turn, boundary });
+        }
+    }
+}
+
+impl Drop for Checkpoints {
+    /// Waits for the queued snapshots, so the end of the last turn is kept.
+    fn drop(&mut self) {
+        self.sender.take();
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+/// Takes one snapshot and records it, unless it repeats the previous one.
+fn take(shadow: &Shadow, session: &str, record: &Record, shared: &Shared, job: &Job) -> Result<()> {
+    let staged = shadow.stage();
+    let (complete, previous) = {
+        let mut state = shared.lock();
+        let complete = match job.boundary {
+            Boundary::Start => {
+                state.started = state.started.max(job.turn);
+                let late = state.late.remove(&job.turn);
+                shared.ready.notify_all();
+                !late
+            }
+            Boundary::End => true,
+        };
+        (
+            complete,
+            state
+                .latest
+                .as_ref()
+                .map(|record| record.snapshot.tree.clone()),
+        )
+    };
+    let (tree, skipped) = staged?;
+    if complete && previous.as_deref() == Some(tree.as_str()) {
+        return Ok(());
+    }
+    let side = match job.boundary {
+        Boundary::Start => "start",
+        Boundary::End => "end",
+    };
+    let message = format!("turn {} {side}", job.turn);
+    let snapshot = shadow.commit(session, &message, tree, skipped)?;
+    let checkpoint = CheckpointRecord {
+        turn: job.turn,
+        boundary: job.boundary,
+        snapshot,
+        complete,
+    };
+    record(checkpoint.event())?;
+    shared.lock().latest = Some(checkpoint);
+    Ok(())
 }
 
 /// A failed git command: the error, and the exit code when it exited.
@@ -389,6 +638,7 @@ fn trimmed(output: &[u8]) -> String {
 }
 
 /// Sums the sizes of the files under a directory, without following symlinks.
+#[cfg_attr(not(test), allow(dead_code))]
 fn directory_size(directory: &std::path::Path) -> u64 {
     let Ok(entries) = std::fs::read_dir(directory) else {
         return 0;
@@ -646,6 +896,145 @@ mod tests {
             "{listing}"
         );
         assert!(!listing.contains("vendor/lib/"), "{listing}");
+    }
+
+    /// The workspace checkpoints a session log holds, in order.
+    fn recorded(fixture: &Fixture, id: &rune_core::id::SessionId) -> Vec<SessionEvent> {
+        rune_session::store::load_read_only(&fixture.paths.session_dir(id))
+            .expect("log")
+            .events
+            .into_iter()
+            .map(|frame| frame.event)
+            .filter(|event| matches!(event, SessionEvent::WorkspaceCheckpoint { .. }))
+            .collect()
+    }
+
+    /// Records checkpoints into a new interactive session log.
+    fn recorder_sink(fixture: &Fixture, id: &rune_core::id::SessionId) -> Record {
+        let recorder =
+            Mutex::new(crate::session_log::Recorder::create(&fixture.paths, id).expect("recorder"));
+        Arc::new(move |event| {
+            recorder
+                .lock()
+                .expect("recorder")
+                .workspace_checkpoint(event)
+        })
+    }
+
+    fn worker(fixture: &Fixture, delay: Duration) -> (Checkpoints, rune_core::id::SessionId) {
+        let id = rune_core::id::SessionId::generate();
+        let notify: Notify = Arc::new(|line| panic!("unexpected notice: {line}"));
+        let checkpoints = Checkpoints::start_with_delay(
+            open(fixture),
+            id.as_str().to_owned(),
+            recorder_sink(fixture, &id),
+            notify,
+            delay,
+        );
+        (checkpoints, id)
+    }
+
+    #[test]
+    fn identical_trees_record_one_checkpoint() {
+        if !git_present() {
+            return;
+        }
+        let fixture = fixture();
+        let (checkpoints, id) = worker(&fixture, Duration::ZERO);
+        checkpoints.turn_started(1);
+        assert!(checkpoints.wait_for_start(Duration::from_secs(30)));
+        checkpoints.turn_finished(1);
+        checkpoints.turn_started(2);
+        assert!(checkpoints.wait_for_start(Duration::from_secs(30)));
+        std::fs::write(fixture.workspace.join("a.txt"), "changed\n").expect("edit");
+        checkpoints.turn_finished(2);
+        let latest = loop {
+            let latest = checkpoints.latest().expect("a checkpoint");
+            if latest.turn == 2 {
+                break latest;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert_eq!(latest.boundary, Boundary::End);
+        drop(checkpoints);
+        let events = recorded(&fixture, &id);
+        let shape: Vec<(u64, Boundary, bool)> = events
+            .iter()
+            .map(|event| match event {
+                SessionEvent::WorkspaceCheckpoint {
+                    turn,
+                    boundary,
+                    complete,
+                    ..
+                } => (*turn, *boundary, *complete),
+                _ => unreachable!(),
+            })
+            .collect();
+        assert_eq!(
+            shape,
+            vec![(1, Boundary::Start, true), (2, Boundary::End, true)]
+        );
+        let SessionEvent::WorkspaceCheckpoint { commit, .. } = &events[0] else {
+            unreachable!()
+        };
+        let SessionEvent::WorkspaceCheckpoint { parent, .. } = &events[1] else {
+            unreachable!()
+        };
+        assert_eq!(parent.as_deref(), Some(commit.as_str()));
+    }
+
+    #[test]
+    fn a_slow_start_snapshot_is_marked_incomplete() {
+        if !git_present() {
+            return;
+        }
+        let fixture = fixture();
+        let (checkpoints, id) = worker(&fixture, Duration::from_millis(500));
+        checkpoints.turn_started(1);
+        let started = Instant::now();
+        assert!(!checkpoints.wait_for_start(Duration::from_millis(50)));
+        assert!(started.elapsed() < Duration::from_millis(450));
+        drop(checkpoints);
+        let events = recorded(&fixture, &id);
+        assert!(
+            matches!(
+                events.as_slice(),
+                [SessionEvent::WorkspaceCheckpoint {
+                    turn: 1,
+                    boundary: Boundary::Start,
+                    complete: false,
+                    ..
+                }]
+            ),
+            "{events:?}"
+        );
+    }
+
+    #[test]
+    fn a_failed_snapshot_is_reported_once() {
+        if !git_present() {
+            return;
+        }
+        let fixture = fixture();
+        let shadow = open(&fixture);
+        std::fs::remove_dir_all(&shadow.git_dir).expect("remove shadow");
+        let id = rune_core::id::SessionId::generate();
+        let record = recorder_sink(&fixture, &id);
+        let notices = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&notices);
+        let notify: Notify = Arc::new(move |line| sink.lock().expect("notices").push(line));
+        let checkpoints = Checkpoints::start(shadow, id.as_str().to_owned(), record, notify);
+        checkpoints.turn_started(1);
+        assert!(checkpoints.wait_for_start(Duration::from_secs(30)));
+        checkpoints.turn_finished(1);
+        drop(checkpoints);
+        let notices = notices.lock().expect("notices");
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        assert!(
+            notices[0].starts_with("checkpoint failed: git "),
+            "{notices:?}"
+        );
+        assert!(recorded(&fixture, &id).is_empty());
     }
 
     #[test]

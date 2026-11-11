@@ -235,6 +235,33 @@ pub enum SessionEvent {
         /// Canonical workspace path.
         workspace: String,
     },
+    /// The workspace was snapshotted at a turn boundary.
+    WorkspaceCheckpoint {
+        /// Turn the snapshot belongs to.
+        turn: u64,
+        /// `start` (before the turn changed anything) or `end`.
+        boundary: Boundary,
+        /// Git tree id in the shadow store.
+        tree: String,
+        /// Commit id that holds the tree.
+        commit: String,
+        /// Previous commit of this session, absent for the first.
+        parent: Option<String>,
+        /// Untracked files left out for size.
+        skipped: Vec<String>,
+        /// False when the snapshot did not finish before the turn changed files.
+        complete: bool,
+    },
+}
+
+/// Which side of a turn a workspace checkpoint was taken on.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Boundary {
+    /// Before the turn changed anything.
+    Start,
+    /// After the turn's outcome was recorded.
+    End,
 }
 
 /// Where a harness note entered the conversation.
@@ -283,6 +310,7 @@ impl SessionEvent {
             Self::ConstraintPinned { .. } => "constraint_pinned",
             Self::ModelSet { .. } => "model_set",
             Self::WorkspaceSet { .. } => "workspace_set",
+            Self::WorkspaceCheckpoint { .. } => "workspace_checkpoint",
             Self::ChildOf { .. } => "child_of",
             Self::ForkedFrom { .. } => "forked_from",
         }
@@ -886,6 +914,28 @@ mod tests {
             let decoded = EventFrame::decode(&line).expect("decode");
             assert_eq!(decoded, original);
         }
+    }
+
+    #[test]
+    fn checkpoint_event_round_trips() {
+        let original = frame(
+            3,
+            SessionEvent::WorkspaceCheckpoint {
+                turn: 2,
+                boundary: Boundary::End,
+                tree: "4b825dc642cb6eb9a060e54bf8d69288fbee4904".to_owned(),
+                commit: "c0ffee".to_owned(),
+                parent: Some("beef".to_owned()),
+                skipped: vec!["big.bin".to_owned()],
+                complete: false,
+            },
+        );
+        let line = original.encode().expect("encode");
+        let value: serde_json::Value = serde_json::from_str(&line).expect("json");
+        assert_eq!(value["event"]["kind"], "workspace_checkpoint");
+        assert_eq!(value["event"]["boundary"], "end");
+        assert_eq!(original.event.kind(), "workspace_checkpoint");
+        assert_eq!(EventFrame::decode(&line).expect("decode"), original);
     }
 
     #[test]

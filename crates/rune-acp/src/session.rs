@@ -723,6 +723,8 @@ pub fn history_from_events(frames: &[EventFrame]) -> History {
             // Model settings are metadata, not conversation boundaries. A
             // client may change them while a tool batch is still being saved.
             SessionEvent::ModelSet { .. } => {}
+            // A workspace snapshot can be written while a tool batch runs.
+            SessionEvent::WorkspaceCheckpoint { .. } => {}
             // The call it describes is already recorded as it ran.
             SessionEvent::ToolCallRepaired { .. } => {}
             SessionEvent::AssistantContent { message } => {

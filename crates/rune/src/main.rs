@@ -357,6 +357,13 @@ fn run_ask(
         )
         .with_hint("add --json or --jsonl"));
     }
+    let checkpoints = launch.has_flag("--checkpoints");
+    if checkpoints && launch.has_flag("--no-save") {
+        return Err(RuneError::invalid_field(
+            "--checkpoints",
+            "--checkpoints needs a saved session; drop --no-save",
+        ));
+    }
     // Chosen now so the stream's first record can name the saved session.
     let session_id = (!launch.has_flag("--no-save")).then(rune_core::id::SessionId::generate);
     if jsonl {
@@ -454,6 +461,7 @@ fn run_ask(
         goal,
         judge,
         context_report,
+        checkpoints,
         images: launch
             .flags
             .iter()
@@ -541,6 +549,7 @@ fn run_review(
         goal: None,
         judge: false,
         context_report: false,
+        checkpoints: false,
         max_steps: None,
         timeout: None,
         max_cost_cents: None,

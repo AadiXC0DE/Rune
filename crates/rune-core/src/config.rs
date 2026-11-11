@@ -728,6 +728,11 @@ pub struct UserConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_titles: Option<bool>,
 
+    /// Whether each turn snapshots the workspace so changes, including those made by
+    /// commands, can be undone. Interactive sessions only; rune ask takes --checkpoints.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoints: Option<bool>,
+
     /// Whether project context is loaded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context: Option<bool>,
@@ -948,6 +953,8 @@ pub struct Settings {
     pub ambiguous_width: u8,
     /// Whether session titles are generated.
     pub session_titles: bool,
+    /// Whether each turn snapshots the workspace.
+    pub checkpoints: bool,
     /// Whether project context is loaded.
     pub context: bool,
     /// Additional workspace roots.
@@ -1013,6 +1020,7 @@ impl Default for Settings {
             collapse_tool_calls: false,
             ambiguous_width: 1,
             session_titles: true,
+            checkpoints: true,
             context: true,
             additional_directories: Vec::new(),
             limits: BudgetSet::new(),
@@ -1235,6 +1243,7 @@ impl Settings {
             ("collapse_tool_calls", self.collapse_tool_calls.to_string()),
             ("ambiguous_width", self.ambiguous_width.to_string()),
             ("session_titles", self.session_titles.to_string()),
+            ("checkpoints", self.checkpoints.to_string()),
             ("cache_warming", self.cache_warming.to_string()),
             ("context", self.context.to_string()),
             (
@@ -1504,6 +1513,7 @@ const PROFILE_ONLY_KEYS: &[&str] = &[
     "collapse_tool_calls",
     "ambiguous_width",
     "session_titles",
+    "checkpoints",
     "additional_directories",
     "review_model",
     "compaction_model",
@@ -1542,6 +1552,7 @@ pub const USER_KEYS: &[&str] = &[
     "collapse_tool_calls",
     "ambiguous_width",
     "session_titles",
+    "checkpoints",
     "context",
     "additional_directories",
     "limits",
@@ -1580,6 +1591,7 @@ pub const SCALAR_KEYS: &[&str] = &[
     "collapse_tool_calls",
     "ambiguous_width",
     "session_titles",
+    "checkpoints",
     "context",
     "vision_model",
     "review_model",
@@ -1619,6 +1631,7 @@ pub fn scalar_kind(key: &str) -> Option<ScalarKind> {
         | "collapse_tool_calls"
         | "terminal_title"
         | "session_titles"
+        | "checkpoints"
         | "context"
         | "cache_warming"
         | "provider_strict" => ScalarKind::Boolean,
@@ -1807,6 +1820,10 @@ pub const SETTING_HELP: &[(&str, &str)] = &[
         "Columns an East Asian ambiguous character takes, 1 or 2.",
     ),
     ("session_titles", "Name sessions from their first prompt."),
+    (
+        "checkpoints",
+        "Snapshot the workspace at each turn so command changes can be undone.",
+    ),
     (
         "cache_warming",
         "Keep the prompt cache warm while a session is idle.",
@@ -2402,6 +2419,10 @@ fn apply_user(settings: &mut Settings, user: &UserConfig, layer: Layer) {
     if let Some(titles) = user.session_titles {
         settings.session_titles = titles;
         settings.sources.record("session_titles", layer);
+    }
+    if let Some(checkpoints) = user.checkpoints {
+        settings.checkpoints = checkpoints;
+        settings.sources.record("checkpoints", layer);
     }
     if let Some(context) = user.context {
         settings.context = context;
