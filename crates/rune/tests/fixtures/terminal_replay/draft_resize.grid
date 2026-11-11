@@ -1,10 +1,10 @@
-narrow-draft: 32x24, caret 31,3
+narrow-draft: 32x24, caret 3,5
 00|session ************|
 01|ctrl-c cancel  /help commands  e|
 02|replay-fixture | auto | ctx ~###|
-03|> 234567890123456789VISIBLE-END|
-04||
-05||
+03|> 012345678901234567890123456789|
+04|  01234567890123456789VISIBLE-EN|
+05|  D|
 06||
 07||
 08||
@@ -48,14 +48,14 @@ grown-draft: 80x24, caret 63,3
 21||
 22||
 23||
-shrunk-draft: 20x24, caret 19,3
+shrunk-draft: 20x24, caret 9,6
 00|session ************|
 01|ctrl-c cancel  /help|
 02|replay-fixture | aut|
-03|> 456789VISIBLE-END|
-04||
-05||
-06||
+03|> 012345678901234567|
+04|  890123456789012345|
+05|  67890123456789VISI|
+06|  BLE-END|
 07||
 08||
 09||

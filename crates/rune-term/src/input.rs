@@ -16,6 +16,12 @@ use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 use crate::editor::Composer;
 
+/// Columns of the prompt marker until the session reports its layout.
+const DEFAULT_PROMPT_WIDTH: usize = 2;
+
+/// Terminal columns until the session reports its layout.
+const DEFAULT_WIDTH: usize = 80;
+
 /// Describes the bindings used by this reader and the session's input modes.
 /// Line input leaves editing to the terminal instead of the Rune composer.
 #[must_use]
@@ -31,27 +37,34 @@ Composer:
   Enter         submit the draft; while a turn runs, queue steering
   Alt-Enter     insert a newline at the caret
   Left / Right  move by one grapheme, including across newlines
-  Home / Ctrl-A move to the start of the whole draft
-  End / Ctrl-E  move to the end of the whole draft
+  Up / Down     move between rows of a long or multiline draft
+  Home / Ctrl-A start of the line; again for the draft
+  End / Ctrl-E  end of the line; again for the draft
   Ctrl-B / Alt-Left   move one word left
   Ctrl-F / Alt-Right  move one word right
+  Alt-B / Alt-F move one word left / right
   Backspace     delete the grapheme before the caret
   Delete        delete the grapheme at the caret
   Ctrl-D        delete at the caret; empty idle draft leaves the session
-  Ctrl-W        delete the word before the caret
-  Ctrl-U        cut from the caret to the start of the draft
-  Ctrl-K        cut from the caret to the end of the draft
+  Ctrl-W        cut the word before the caret
+  Alt-Backspace cut the word before the caret
+  Alt-D         cut the word after the caret
+  Ctrl-U        cut to the start of the line
+  Ctrl-K        cut to the end of the line
   Ctrl-Y        yank the last cut text at the caret
+  Alt-Y         cycle earlier cuts after Ctrl-Y
   Ctrl-_        undo a draft edit (Ctrl-Shift-minus; legacy Ctrl-7)
   Alt-R         redo a draft edit (Alt with lowercase r)
   Ctrl-G        edit the draft in VISUAL, EDITOR, or vi
 
 Idle prompt and menus:
-  Up / Down     recall prompts; select a menu row when a menu is open
+  Up / Down     recall prompts from the first / last draft row;
+                select a menu row when a menu is open
   Tab           complete a slash command or workspace path
   Enter         accept an incomplete command; run a complete command
   Tab / Enter   accept a path, model, or history selection
-  Ctrl-R        search workspace history by substring; type to filter
+  Ctrl-R        search workspace history by substring; type to filter;
+                Ctrl-R again switches to all workspaces and back
   Esc / Ctrl-C / Ctrl-D  cancel model/history menus (Ctrl-D: empty query)
                 cancelling preserves the draft and caret
   Esc           close a path menu first; otherwise clear the idle draft
@@ -180,6 +193,9 @@ pub fn transcript_event(event: &Event) -> TranscriptAction {
 pub struct KeyReader {
     composer: Composer,
     active: bool,
+    prompt_width: usize,
+    width: usize,
+    menu_open: bool,
 }
 
 impl KeyReader {
@@ -207,6 +223,9 @@ impl KeyReader {
         Self {
             composer: Composer::new(),
             active,
+            prompt_width: DEFAULT_PROMPT_WIDTH,
+            width: DEFAULT_WIDTH,
+            menu_open: false,
         }
     }
 
@@ -216,7 +235,21 @@ impl KeyReader {
         Self {
             composer: Composer::new(),
             active: false,
+            prompt_width: DEFAULT_PROMPT_WIDTH,
+            width: DEFAULT_WIDTH,
+            menu_open: false,
         }
+    }
+
+    /// Records how the draft is drawn, so Up and Down move by drawn rows.
+    pub const fn set_layout(&mut self, prompt_width: usize, width: usize) {
+        self.prompt_width = prompt_width;
+        self.width = width;
+    }
+
+    /// Records whether a menu under the draft takes the vertical arrows.
+    pub const fn set_menu_open(&mut self, open: bool) {
+        self.menu_open = open;
     }
 
     /// Returns whether keys are being read directly.
@@ -419,12 +452,16 @@ impl KeyReader {
                     KeyAction::Ignored
                 }
             }
-            (KeyCode::Char('a'), true, _) => {
-                self.composer.move_home();
+            (KeyCode::Char('a'), true, _) | (KeyCode::Home, _, _) => {
+                if !self.composer.move_line_start() {
+                    self.composer.move_home();
+                }
                 KeyAction::Ignored
             }
-            (KeyCode::Char('e'), true, _) => {
-                self.composer.move_end();
+            (KeyCode::Char('e'), true, _) | (KeyCode::End, _, _) => {
+                if !self.composer.move_line_end() {
+                    self.composer.move_end();
+                }
                 KeyAction::Ignored
             }
             (KeyCode::Char('u'), true, _) => {
@@ -449,16 +486,28 @@ impl KeyReader {
                 self.composer.redo();
                 KeyAction::Ignored
             }
-            (KeyCode::Char('w'), true, _) => {
-                self.composer.delete_word();
+            (KeyCode::Char('w'), true, _) | (KeyCode::Backspace, _, true) => {
+                self.composer.kill_word_back();
                 KeyAction::Ignored
             }
-            (KeyCode::Char('b'), true, _) | (KeyCode::Left, _, true) => {
+            (KeyCode::Char('b'), true, _)
+            | (KeyCode::Char('b'), false, true)
+            | (KeyCode::Left, _, true) => {
                 self.composer.move_word_left();
                 KeyAction::Ignored
             }
-            (KeyCode::Char('f'), true, _) | (KeyCode::Right, _, true) => {
+            (KeyCode::Char('f'), true, _)
+            | (KeyCode::Char('f'), false, true)
+            | (KeyCode::Right, _, true) => {
                 self.composer.move_word_right();
+                KeyAction::Ignored
+            }
+            (KeyCode::Char('d'), false, true) => {
+                self.composer.kill_word_forward();
+                KeyAction::Ignored
+            }
+            (KeyCode::Char('y'), false, true) => {
+                self.composer.yank_pop();
                 KeyAction::Ignored
             }
             (KeyCode::Enter, _, true) => {
@@ -486,18 +535,30 @@ impl KeyReader {
                 self.composer.move_right();
                 KeyAction::Ignored
             }
-            // The vertical arrows are reported rather than applied, because
-            // what they mean depends on what is on screen: a picker moves its
-            // selection, and a plain line recalls an earlier prompt.
-            (KeyCode::Up, _, _) => KeyAction::Up,
-            (KeyCode::Down, _, _) => KeyAction::Down,
-            (KeyCode::Home, _, _) => {
-                self.composer.move_home();
-                KeyAction::Ignored
+            // An open menu takes the vertical arrows. Otherwise they move
+            // between drawn rows and are reported only from the first or last
+            // row, where the session recalls an earlier prompt.
+            (KeyCode::Up, _, _) => {
+                if !self.menu_open
+                    && self
+                        .composer
+                        .move_up(self.prompt_width, self.prompt_width, self.width)
+                {
+                    KeyAction::Ignored
+                } else {
+                    KeyAction::Up
+                }
             }
-            (KeyCode::End, _, _) => {
-                self.composer.move_end();
-                KeyAction::Ignored
+            (KeyCode::Down, _, _) => {
+                if !self.menu_open
+                    && self
+                        .composer
+                        .move_down(self.prompt_width, self.prompt_width, self.width)
+                {
+                    KeyAction::Ignored
+                } else {
+                    KeyAction::Down
+                }
             }
             // A control combination that is not a known binding must not insert
             // its letter, which is what a naive fallthrough would do.
@@ -873,6 +934,9 @@ mod tests {
         KeyReader {
             composer: Composer::new(),
             active: true,
+            prompt_width: DEFAULT_PROMPT_WIDTH,
+            width: DEFAULT_WIDTH,
+            menu_open: false,
         }
     }
 
@@ -880,6 +944,48 @@ mod tests {
         for c in text.chars() {
             reader.apply(key(KeyCode::Char(c)));
         }
+    }
+
+    #[test]
+    fn alt_letters_edit_instead_of_inserting() {
+        let alt = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::ALT);
+        let mut reader = reader();
+        typed(&mut reader, "alpha beta");
+        reader.apply(alt('b'));
+        assert_eq!(reader.column(), 6);
+        reader.apply(alt('f'));
+        assert_eq!(reader.column(), 10);
+        reader.apply(KeyEvent::new(KeyCode::Backspace, KeyModifiers::ALT));
+        assert_eq!(reader.line(), "alpha ");
+        reader.apply(control('y'));
+        assert_eq!(reader.line(), "alpha beta");
+        reader.apply(key(KeyCode::Home));
+        reader.apply(alt('d'));
+        assert_eq!(reader.line(), " beta");
+        reader.apply(control('y'));
+        assert_eq!(reader.line(), "alpha beta");
+        reader.apply(alt('y'));
+        assert_eq!(reader.line(), "beta beta");
+        assert_eq!(reader.column(), 4);
+    }
+
+    #[test]
+    fn arrows_go_to_an_open_menu() {
+        let mut reader = reader();
+        typed(&mut reader, "one");
+        reader.apply(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT));
+        typed(&mut reader, "two");
+        reader.set_menu_open(true);
+        assert_eq!(reader.apply(key(KeyCode::Up)), KeyAction::Up);
+        assert_eq!(reader.column(), 7, "the caret stays while a menu is open");
+        reader.set_menu_open(false);
+        assert_eq!(reader.apply(key(KeyCode::Up)), KeyAction::Ignored);
+        assert_eq!(reader.column(), 3);
+        assert_eq!(reader.apply(key(KeyCode::Up)), KeyAction::Up);
+        assert_eq!(reader.apply(key(KeyCode::Down)), KeyAction::Ignored);
+        assert_eq!(reader.column(), 7);
+        assert_eq!(reader.apply(key(KeyCode::Down)), KeyAction::Down);
+        assert_eq!(reader.line(), "one\ntwo");
     }
 
     #[test]

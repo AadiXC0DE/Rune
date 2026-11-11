@@ -887,50 +887,94 @@ pub fn render_prompt_at(prompt: &str, input: &str, column: usize, width: usize) 
     (format!("{prompt}{shown}"), caret)
 }
 
-/// Renders draft line breaks as separate rows with an editable caret.
+/// Renders a draft on the rows it wraps to, with an editable caret.
 ///
 /// `column` counts the displayed prefix, including one cell for each newline
-/// and tab, as returned by [`crate::editor::Composer::cursor_column`]. Each
-/// logical line uses a horizontal viewport; the active line scrolls to its
-/// caret. Continuations align with the text after the prompt marker.
+/// and tab, as returned by [`crate::editor::Composer::cursor_column`]. Rows
+/// come from [`crate::editor::layout`]: the prompt marker leads the first row
+/// and later rows are indented to the text after it. A draft that fits on one
+/// row keeps the single-row viewport.
 #[must_use]
 pub fn render_draft_at(
     prompt: &str,
     input: &str,
-    mut column: usize,
+    column: usize,
     width: usize,
 ) -> (Vec<String>, (u16, u16)) {
-    if !input.contains('\n') {
+    let (marker, indent) = truncate_to_width(prompt, width.saturating_sub(1));
+    let rows = crate::editor::layout(input, indent, indent, width);
+    if rows.len() <= 1 {
         let (row, caret) = render_prompt_at(prompt, input, column, width);
         return (vec![row], (0, u16::try_from(caret).unwrap_or(u16::MAX)));
     }
-    column = column.min(str_width(&crate::editor::displayed(input)));
-    let continuation = " ".repeat(str_width(prompt).min(width.saturating_sub(1)));
-    let mut rows = Vec::new();
-    let mut caret = (0, 0);
-    let mut located = false;
-    for (index, line) in input.split('\n').enumerate() {
-        let line_width = str_width(&crate::editor::displayed(line));
-        let active = !located && column <= line_width;
-        let marker = if index == 0 { prompt } else { &continuation };
-        let (row, col) = render_prompt_at(marker, line, if active { column } else { 0 }, width);
-        rows.push(row);
-        if active {
-            caret = (
-                u16::try_from(index).unwrap_or(u16::MAX),
-                u16::try_from(col).unwrap_or(u16::MAX),
-            );
-            located = true;
-        } else if !located {
-            column = column.saturating_sub(line_width.saturating_add(1));
+    let caret = caret_index(input, column);
+    let (caret_row, caret_column) = crate::editor::caret_in(input, &rows, caret);
+    let continuation = " ".repeat(indent);
+    let chars: Vec<char> = input.chars().collect();
+    let drawn = rows
+        .iter()
+        .enumerate()
+        .map(|(index, row)| {
+            let text: String = chars
+                .get(row.start..row.end)
+                .unwrap_or_default()
+                .iter()
+                .collect();
+            let lead = if index == 0 { marker } else { &continuation };
+            // A cluster wider than the whole row is cut rather than overflowing it.
+            let shown = crate::editor::displayed(&text);
+            let (shown, _) = truncate_to_width(&shown, width.saturating_sub(indent));
+            format!("{lead}{shown}")
+        })
+        .collect();
+    let caret_column = indent
+        .saturating_add(caret_column)
+        .min(width.saturating_sub(1));
+    (
+        drawn,
+        (
+            u16::try_from(caret_row).unwrap_or(u16::MAX),
+            u16::try_from(caret_column).unwrap_or(u16::MAX),
+        ),
+    )
+}
+
+/// Returns the character index whose displayed prefix is `column` wide.
+fn caret_index(input: &str, column: usize) -> usize {
+    let mut used = 0usize;
+    let mut at = 0usize;
+    for cluster in graphemes(input) {
+        if used >= column {
+            break;
         }
+        used = used.saturating_add(str_width(&crate::editor::displayed(cluster)));
+        at = at.saturating_add(cluster.chars().count());
     }
-    (rows, caret)
+    at
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_long_draft_wraps_at_forty_columns_with_the_caret_on_the_right_row() {
+        let draft = "x".repeat(100);
+        let (rows, caret) = render_draft_at("> ", &draft, 100, 40);
+        assert_eq!(
+            rows,
+            vec![
+                format!("> {}", "x".repeat(38)),
+                format!("  {}", "x".repeat(38)),
+                format!("  {}", "x".repeat(24)),
+            ]
+        );
+        assert_eq!(caret, (2, 26));
+        assert_eq!(render_draft_at("> ", &draft, 50, 40).1, (1, 14));
+        assert_eq!(render_draft_at("> ", &draft, 38, 40).1, (1, 2));
+        assert_eq!(render_draft_at("> ", &draft, 0, 40).1, (0, 2));
+        assert!(rows.iter().all(|row| str_width(row) <= 40));
+    }
 
     #[test]
     fn tool_disclosure_bounds_rows_and_preserves_surrounding_entries() {
@@ -1080,20 +1124,20 @@ mod tests {
     }
 
     #[test]
-    fn multiline_drafts_scroll_only_the_edited_line_and_bound_narrow_carets() {
+    fn multiline_drafts_wrap_and_bound_narrow_carets() {
         let input = "first\nab書👋🏽e\u{301}Z\nlast";
         for width in 0..=12 {
             for column in 0..=str_width(&crate::editor::displayed(input)) {
                 let (rows, caret) = render_draft_at("> ", input, column, width);
-                assert_eq!(rows.len(), 3);
+                assert!(rows.len() >= 3);
                 assert!(rows.iter().all(|row| str_width(row) <= width));
                 assert!(usize::from(caret.1) < width.max(1));
-                assert!(caret.0 < 3);
+                assert!(usize::from(caret.0) < rows.len());
             }
         }
         let (rows, caret) = render_draft_at("> ", input, 14, 8);
-        assert_eq!(rows, ["> first", "  👋🏽e\u{301}Z", "  last"]);
-        assert_eq!(caret, (1, 6));
+        assert_eq!(rows, ["> first", "  ab書👋🏽", "  e\u{301}Z", "  last"]);
+        assert_eq!(caret, (2, 4));
     }
 
     #[test]
