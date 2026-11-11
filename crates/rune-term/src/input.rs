@@ -139,6 +139,8 @@ pub enum KeyAction {
     Suspend,
     /// Cycle how reasoning is shown: collapsed, tail, full.
     CycleReasoning,
+    /// Move to the next permission mode: ask, auto, then plan.
+    ModeCycle,
 }
 
 /// Navigation while the transcript owns the terminal.
@@ -559,6 +561,9 @@ impl KeyReader {
             // Tab completes rather than inserting a tab. Pasted tabs stay in
             // the draft and are displayed as spaces.
             (KeyCode::Tab, _, _) => KeyAction::Complete,
+            // An open menu keeps the key, so it never changes the mode behind it.
+            (KeyCode::BackTab, _, _) if self.menu_open => KeyAction::Ignored,
+            (KeyCode::BackTab, _, _) => KeyAction::ModeCycle,
             (KeyCode::Esc, _, _) => KeyAction::Escape,
             (KeyCode::Backspace, _, _) => {
                 self.composer.delete_back();
@@ -1645,6 +1650,19 @@ mod tests {
         assert_eq!(action, KeyAction::CycleReasoning);
         assert_eq!(reader.line(), "draft");
         assert!(render_bindings_help(true).contains("Alt-T         cycle how reasoning is shown"));
+    }
+
+    #[test]
+    fn shift_tab_cycles_modes() {
+        let mut reader = reader();
+        reader.replace("draft");
+        let back_tab = KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT);
+        assert_eq!(reader.apply(back_tab), KeyAction::ModeCycle);
+        assert_eq!(reader.line(), "draft");
+        reader.set_menu_open(true);
+        assert_eq!(reader.apply(back_tab), KeyAction::Ignored);
+        reader.set_menu_open(false);
+        assert_eq!(reader.apply(back_tab), KeyAction::ModeCycle);
     }
 
     #[test]
