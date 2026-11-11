@@ -1555,10 +1555,26 @@ pub fn run(
     context
         .additional_roots
         .clone_from(&settings.additional_directories);
-    let base_prompt = rune_context::prompt::base_prompt(
+    let mut tools = inventory::advertisement(&registry);
+    // A review is told only about the tools it may use.
+    let offered: Vec<&str> = tools
+        .iter()
+        .map(|tool| tool.name.as_str())
+        .filter(|name| {
+            !options.read_only
+                || registry
+                    .get(name)
+                    .is_some_and(rune_tools::Tool::is_read_only)
+        })
+        .collect();
+    let base_prompt = rune_context::prompt::base_prompt_with(
         context.workspace(),
         &paths.config_root,
         &settings.limits,
+        &rune_context::prompt::PromptOptions {
+            variant: settings.experiments.prompt,
+            tools: &offered,
+        },
     );
     let instruction_sizes = instruction_sizes(&base_prompt);
     let (instructions, stable_instructions_len, nested_rules) = (
@@ -1566,7 +1582,6 @@ pub fn run(
         base_prompt.stable_len,
         base_prompt.nested,
     );
-    let mut tools = inventory::advertisement(&registry);
     if let Some(client) = &mcp {
         crate::mcp::append_tools(&mut tools, client)?;
     }
