@@ -790,3 +790,75 @@ fn a_tall_code_block_streams_without_growing_the_region() {
         "{screen:?}"
     );
 }
+
+#[test]
+fn resizing_during_a_stream_leaves_no_ghosts() {
+    let captures: Vec<Capture> = serde_json::from_slice(&record(
+        include_str!("terminal_replay.py"),
+        Some("resize-stream"),
+    ))
+    .expect("captures");
+    let first = captures.first().expect("at least one capture");
+    let mut grid = Grid::new(first.cols, first.rows).expect("grid");
+    let mut scrollback = Vec::new();
+    let mut snapshot = String::new();
+    let mut stages = Vec::new();
+    for capture in captures {
+        grid.resize(capture.cols, capture.rows).expect("resize");
+        for byte in capture.bytes {
+            let top = grid.row_text(0);
+            let stats = grid.feed(&[byte]).expect("replay byte");
+            if stats.scrolled {
+                assert_eq!(stats.scroll_rows, 1, "one byte scrolled multiple rows");
+                scrollback.push(top);
+            }
+        }
+        snapshot.push_str(&screen_snapshot(
+            &capture.stage,
+            capture.cols,
+            capture.rows,
+            &grid,
+        ));
+        let screen: Vec<String> = (0..capture.rows).map(|row| grid.row_text(row)).collect();
+        let caret = usize::from(grid.cursor().row);
+        let mut seen = scrollback.clone();
+        seen.extend(screen.iter().cloned());
+        stages.push((capture.stage, screen, caret, seen));
+    }
+    let names: Vec<&str> = stages.iter().map(|stage| stage.0.as_str()).collect();
+    assert_eq!(names, ["streaming", "shrunk", "grown", "finished"]);
+    for (stage, screen, caret, seen) in &stages {
+        let hints = screen
+            .iter()
+            .filter(|row| row.starts_with("ctrl-c interrupt") || row.starts_with("/ commands"))
+            .count();
+        assert_eq!(hints, 1, "{stage}: hint rows: {screen:#?}");
+        let status = screen
+            .iter()
+            .filter(|row| row.starts_with("replay-fixture"))
+            .count();
+        assert_eq!(status, 1, "{stage}: status rows: {screen:#?}");
+        assert!(
+            screen[*caret].starts_with('>'),
+            "{stage}: the caret is not on the prompt row: {screen:#?}"
+        );
+        for index in 1..=30 {
+            let row = format!("STREAM-{index:02}");
+            assert!(
+                occurrences(seen, &row) <= 1,
+                "{stage}: {row} is shown twice: {seen:#?}"
+            );
+        }
+    }
+    let streaming = &stages[0].3;
+    let finished = &stages[3].3;
+    for index in 1..=30 {
+        let row = format!("STREAM-{index:02}");
+        if index <= 15 {
+            assert_eq!(occurrences(streaming, &row), 1, "{row}: {streaming:#?}");
+        } else {
+            assert_eq!(occurrences(finished, &row), 1, "{row}: {finished:#?}");
+        }
+    }
+    compare_grid("resize_stream.grid", &snapshot);
+}

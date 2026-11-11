@@ -99,6 +99,12 @@ pub struct Inline {
     /// whole region per delta costs every visible row each time, which is what
     /// made a long response write hundreds of times the size of the answer.
     shown: Vec<String>,
+    /// Visible width of each row of the region as last written.
+    ///
+    /// Kept apart from `shown`, which a repaint request clears while the rows
+    /// are still on screen: a later width change still needs to know how the
+    /// terminal rewrapped them.
+    shown_widths: Vec<usize>,
     /// Rows of the region that were settled into the flow when last drawn.
     shown_settled: usize,
 }
@@ -115,6 +121,7 @@ impl Inline {
             synchronized: true,
             drawn: false,
             shown: Vec::new(),
+            shown_widths: Vec::new(),
             shown_settled: 0,
         }
     }
@@ -124,8 +131,41 @@ impl Inline {
         self.synchronized = on;
     }
 
-    /// Changes the width, which invalidates nothing because every row is redrawn.
-    pub const fn set_width(&mut self, cols: u16) {
+    /// Changes the width.
+    ///
+    /// A terminal that reflows its lines rewraps the region when it narrows,
+    /// so a row wider than the new width now takes more than one screen row
+    /// and the region's top is further up than the row count says. The cursor
+    /// row is moved to where the rewrapped region puts it, and the next frame
+    /// walks up to the region's top, erases it and paints it whole.
+    pub fn set_width(&mut self, cols: u16) {
+        let cols = cols.max(1);
+        if cols == self.cols {
+            return;
+        }
+        if self.drawn {
+            let wide = usize::from(cols);
+            let above = self
+                .shown_widths
+                .iter()
+                .take(usize::from(self.cursor_row))
+                .map(|width| width.div_ceil(wide).max(1))
+                .sum::<usize>()
+                // A row whose width is no longer known still takes one row.
+                .saturating_add(
+                    usize::from(self.cursor_row).saturating_sub(self.shown_widths.len()),
+                );
+            let reflowed = above.saturating_add(
+                usize::from(self.cursor_col)
+                    .checked_div(wide)
+                    .unwrap_or_default(),
+            );
+            self.cursor_row = u16::try_from(reflowed).unwrap_or(u16::MAX);
+            self.cursor_col = self.cursor_col.checked_rem(cols).unwrap_or_default();
+            self.shown.clear();
+            self.shown_widths.clear();
+            self.shown_settled = 0;
+        }
         self.cols = cols;
     }
 
@@ -331,6 +371,18 @@ impl Inline {
             rows.iter().all(|row| !row.contains('\t')),
             "a live row holds a tab"
         );
+        // A row wider than the terminal or holding a line break takes more
+        // than one screen row, and every move back to the region's top would
+        // then land short of it.
+        #[cfg(debug_assertions)]
+        for (index, row) in rows.iter().enumerate() {
+            let width = str_width(row);
+            let cols = self.cols;
+            debug_assert!(
+                width <= usize::from(cols) && !row.contains(['\n', '\r']),
+                "live row {index} is {width} columns wide or holds a line break at {cols} columns: {row:?}"
+            );
+        }
         let live_rows = u16::try_from(rows.len()).unwrap_or(u16::MAX).max(1);
 
         // Where the caret sits, as an offset from the top of the region. The
@@ -464,6 +516,7 @@ impl Inline {
         column(&mut out, caret.1);
         out.push_str(SHOW_CURSOR);
 
+        self.shown_widths = rows.iter().map(|row| str_width(row)).collect();
         self.shown = rows;
         self.shown_settled = settled.len();
         self.cursor_row = caret_row;
@@ -491,6 +544,7 @@ impl Inline {
         self.cursor_row = 0;
         self.cursor_col = 0;
         self.shown.clear();
+        self.shown_widths.clear();
         self.shown_settled = 0;
         self.wrap(out)
     }
@@ -919,6 +973,86 @@ mod tests {
             prompt: &prompt,
             ..Frame::default()
         });
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "holds a line break at 20 columns")]
+    fn debug_check_rejects_a_row_with_a_line_break() {
+        let mut inline = Inline::new(20);
+        let footer = rows(&["status"]);
+        let prompt = rows(&["a\nb"]);
+        let _ = inline.frame(&Frame {
+            footer: &footer,
+            prompt: &prompt,
+            ..Frame::default()
+        });
+    }
+
+    #[test]
+    fn a_width_change_repaints_the_region_whole() {
+        let mut inline = Inline::new(80);
+        let footer = rows(&["status"]);
+        let prompt = rows(&["> "]);
+        let answer = rows(&["one", "two"]);
+        let _ = frame(&mut inline, &[], None, &footer, &prompt, &answer, (0, 2));
+        inline.set_width(60);
+        let bytes = frame(&mut inline, &[], None, &footer, &prompt, &answer, (0, 2));
+        let text = String::from_utf8(bytes.clone()).expect("utf-8");
+        assert!(text.contains(ERASE_BELOW), "{text:?}");
+        for row in ["one", "two", "status", "> "] {
+            assert!(text.contains(row), "{row} was not repainted: {text:?}");
+        }
+        let mut grid = crate::engine::Grid::new(60, 10).expect("grid");
+        grid.feed(&bytes).expect("feed");
+        assert_eq!(grid.row_text(3), ">");
+    }
+
+    #[test]
+    fn shrinking_counts_reflowed_rows_when_walking_up() {
+        // Five rows sit above the caret's row and one of them is 70 columns
+        // wide. At 40 columns a reflowing terminal shows that one as two rows,
+        // so the region's top is six rows up, not five.
+        let mut inline = Inline::new(80);
+        let footer = rows(&["status"]);
+        let prompt = rows(&["> "]);
+        let wide = "x".repeat(70);
+        let answer = rows(&[wide.as_str(), "a", "b", "c"]);
+        let _ = frame(&mut inline, &[], None, &footer, &prompt, &answer, (0, 2));
+        inline.set_width(40);
+        let bytes = frame(&mut inline, &[], None, &footer, &prompt, &answer, (0, 2));
+        let seq = escapes(&bytes);
+        let walk = seq
+            .iter()
+            .position(|s| s == "\u{1b}[6A")
+            .unwrap_or_else(|| panic!("no walk over the reflowed rows: {seq:?}"));
+        assert_eq!(
+            seq.get(walk.saturating_add(1)).map(String::as_str),
+            Some(ERASE_BELOW),
+            "{seq:?}"
+        );
+    }
+
+    #[test]
+    fn growing_walks_up_the_rows_that_were_drawn() {
+        // No row was wider than the old width, so nothing reflowed.
+        let mut inline = Inline::new(40);
+        let footer = rows(&["status"]);
+        let prompt = rows(&["> "]);
+        let answer = rows(&["one", "two"]);
+        let _ = frame(&mut inline, &[], None, &footer, &prompt, &answer, (0, 2));
+        inline.set_width(100);
+        let seq = escapes(&frame(
+            &mut inline,
+            &[],
+            None,
+            &footer,
+            &prompt,
+            &answer,
+            (0, 2),
+        ));
+        assert!(seq.iter().any(|s| s == "\u{1b}[3A"), "{seq:?}");
+        assert!(seq.iter().any(|s| s == ERASE_BELOW), "{seq:?}");
     }
 
     #[test]

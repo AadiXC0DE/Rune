@@ -504,6 +504,15 @@ struct SessionHost {
     /// reports a size that has nothing to do with the fixed grid the test
     /// replays the frame into.
     pinned_size: Option<(u16, u16)>,
+    /// The size the live region was last laid out for; zero until the first.
+    applied_size: Mutex<(u16, u16)>,
+    /// A size the terminal reports that is not applied yet, and when it was
+    /// last seen to change.
+    ///
+    /// A window dragged to a new size reports many sizes in a row. Each one
+    /// applied would repaint the region whole, so a size is applied once it
+    /// has held for [`RESIZE_SETTLE`].
+    pending_size: Mutex<Option<((u16, u16), std::time::Instant)>>,
     /// Draws the live region and owns every write to the terminal.
     inline: Mutex<rune_term::inline::Inline>,
     /// Held across a whole frame, paint and write together.
@@ -2722,14 +2731,42 @@ impl SessionHost {
     /// terminal cannot report it.
     ///
     /// Read every frame rather than once, because a resized window would
-    /// otherwise keep a layout measured for the old width.
+    /// otherwise keep a layout measured for the old width. A changed size is
+    /// applied once it has held for [`RESIZE_SETTLE`].
     fn refresh_size(&self) {
+        self.take_size(false);
+    }
+
+    /// Reads the terminal's size and applies it when it has settled, or at
+    /// once when `now` is set. Returns whether a size is still waiting.
+    fn take_size(&self, now: bool) -> bool {
         let Some((cols, rows)) = self.pinned_size.or_else(rune_term::shell::terminal_size) else {
-            return;
+            return lock_value(&self.pending_size).is_some();
         };
         if cols == 0 || rows == 0 {
-            return;
+            return lock_value(&self.pending_size).is_some();
         }
+        let mut applied = lock_value(&self.applied_size);
+        let mut pending = lock_value(&self.pending_size);
+        if *applied == (cols, rows) {
+            // Back to the size already laid out before the new one settled.
+            *pending = None;
+            return false;
+        }
+        let settled = match *pending {
+            Some((size, since)) if size == (cols, rows) => since.elapsed() >= RESIZE_SETTLE,
+            _ => {
+                *pending = Some(((cols, rows), std::time::Instant::now()));
+                false
+            }
+        };
+        if !(now || settled || *applied == (0, 0)) {
+            return true;
+        }
+        *applied = (cols, rows);
+        *pending = None;
+        drop(pending);
+        drop(applied);
         self.width.store(cols, std::sync::atomic::Ordering::Relaxed);
         self.height
             .store(rows, std::sync::atomic::Ordering::Relaxed);
@@ -2741,6 +2778,14 @@ impl SessionHost {
             // keep showing what reached scrollback last.
             inline.set_max_rows(rows.saturating_sub(2));
         }
+        false
+    }
+
+    /// Returns how long until a size that is waiting settles, or `None` when
+    /// no size is waiting.
+    fn resize_wait(&self) -> Option<std::time::Duration> {
+        lock_value(&self.pending_size)
+            .map(|(_, since)| RESIZE_SETTLE.saturating_sub(since.elapsed()))
     }
 
     /// Draws the live region and returns the bytes the terminal must receive.
@@ -2805,7 +2850,14 @@ impl SessionHost {
             }
             return Ok(transcript::append_lines(&lines));
         }
-        self.refresh_size();
+        // Settled lines are never held back, so a frame with some takes a
+        // waiting size at once. Any other frame waits for the size to settle
+        // and is drawn then.
+        if self.take_size(!settled.is_empty()) {
+            self.frame_dirty
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            return Ok(Vec::new());
+        }
         let footer_rows = self.status_rows(ui);
         let overflow_style = self.theme().sgr(Slot::Dim, self.depth);
         let mut inline = self
@@ -3027,6 +3079,8 @@ impl SessionHost {
             line.clone_into(&mut typed.0);
             typed.1 = column;
         }
+        // A size that settled is applied before any row is wrapped for it.
+        self.refresh_size();
         // Cleared before the rows are read, so a delta that lands while this
         // frame is painted marks the next one dirty.
         self.frame_dirty
@@ -4303,6 +4357,8 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
         width: std::sync::atomic::AtomicU16::new(terminal_width()),
         height: std::sync::atomic::AtomicU16::new(terminal_height()),
         pinned_size: None,
+        applied_size: Mutex::new((0, 0)),
+        pending_size: Mutex::new(None),
         inline: Mutex::new(rune_term::inline::Inline::new(terminal_width())),
         frame: Mutex::new(()),
         transcript: Mutex::new(transcript),
@@ -6701,16 +6757,25 @@ fn await_submission(
         let draft = reader.line().to_owned();
         let caret = reader.cursor_byte();
         reader.set_menu_open(!rows.is_empty());
-        let key = match &flash {
-            Some((_, until)) => {
+        // A size that has not settled yet is drawn once it has, so the wait
+        // for a key ends then.
+        let resize = host.resize_wait();
+        let key = match (&flash, resize) {
+            (Some((_, until)), _) => {
                 let left = until.saturating_duration_since(std::time::Instant::now());
-                reader.poll_key(left)
+                reader.poll_key(resize.map_or(left, |wait| wait.min(left)))
             }
-            None => Some(reader.read_key()),
+            (None, Some(wait)) => reader.poll_key(wait),
+            (None, None) => Some(reader.read_key()),
         };
         reader.set_menu_open(false);
         let Some(key) = key else {
-            flash = None;
+            if flash
+                .as_ref()
+                .is_some_and(|(_, until)| std::time::Instant::now() >= *until)
+            {
+                flash = None;
+            }
             continue;
         };
         if key == KeyAction::ModeCycle {
@@ -7010,6 +7075,8 @@ fn draw_prompt(
     marker: &str,
     notice: Option<&str>,
 ) -> Result<()> {
+    // A size that settled is applied before the draft is wrapped for it.
+    host.refresh_size();
     sync_layout(reader, host, marker);
     let mut sink = out
         .lock()
@@ -7027,6 +7094,15 @@ fn draw_prompt(
         sink.flush()?;
     }
     Ok(())
+}
+
+/// Waits for a key, or until a size that has not settled yet settles, when
+/// it returns `None` so the caller draws at the new size.
+fn next_key(reader: &mut rune_term::input::KeyReader, host: &SessionHost) -> Option<KeyAction> {
+    match host.resize_wait() {
+        Some(wait) => reader.poll_key(wait),
+        None => Some(reader.read_key()),
+    }
 }
 
 /// Pauses the process for the terminal's suspend key: the live region is
@@ -7152,7 +7228,10 @@ fn run_picker(
         }
         draw_prompt(reader, host, out, &below, marker, None)?;
 
-        match reader.read_key() {
+        let Some(key) = next_key(reader, host) else {
+            continue;
+        };
+        match key {
             KeyAction::Suspend => suspend_session(host, out)?,
             // Tab and Enter both accept: the picker is the only thing on
             // screen, so there is no typed argument for Enter to mean.
@@ -9045,7 +9124,10 @@ fn choose_theme(
         let room = host.menu_room();
         let below = picker_menu(&mut picker, &host.theme(), host.depth, room);
         draw_prompt(reader, host, out, &below, marker, None)?;
-        match reader.read_key() {
+        let Some(key) = next_key(reader, host) else {
+            continue;
+        };
+        match key {
             KeyAction::Suspend => suspend_session(host, out)?,
             KeyAction::Submit | KeyAction::Complete => {
                 if let Some(choice) = picker.selected().map(str::to_owned) {
@@ -10647,6 +10729,10 @@ fn window_title(session: &str, state: &str, ascii: bool) -> String {
 
 /// Shortest time between two stream frames, about sixty a second.
 const FRAME_INTERVAL: std::time::Duration = std::time::Duration::from_millis(16);
+
+/// How long a new terminal size must hold before the live region is laid out
+/// for it.
+const RESIZE_SETTLE: std::time::Duration = std::time::Duration::from_millis(50);
 
 /// Changed lines drawn under an edit's tool row before the rest is counted.
 const EDIT_PREVIEW_LINES: usize = 12;
@@ -12256,6 +12342,77 @@ mod tests {
         let end = text.rfind('G')?;
         let start = text.get(..end)?.rfind("\u{1b}[")?.saturating_add(2);
         text.get(start..end)?.parse().ok()
+    }
+
+    /// Moves a waiting size's last change back by the settle time, as if that
+    /// much time had passed.
+    fn let_size_settle(host: &SessionHost) {
+        if let Some((_, since)) = host.pending_size.lock().expect("pending size").as_mut() {
+            *since = since
+                .checked_sub(RESIZE_SETTLE)
+                .expect("an earlier instant");
+        }
+    }
+
+    #[test]
+    fn resize_events_inside_the_settle_time_repaint_once() {
+        let mut host = test_host();
+        let prompt = vec![String::from("> ")];
+        let first = host
+            .paint(&[], None, &prompt, &[], (2, 0))
+            .expect("first frame");
+        assert!(!first.is_empty());
+        for size in [(60, 24), (50, 20), (40, 24)] {
+            host.pinned_size = Some(size);
+            let bytes = host
+                .paint(&[], None, &prompt, &[], (2, 0))
+                .expect("waiting frame");
+            assert!(bytes.is_empty(), "drawn before the size settled: {size:?}");
+            assert!(host.frame_dirty.load(std::sync::atomic::Ordering::Relaxed));
+        }
+        assert!(host.resize_wait().is_some());
+        assert_eq!(host.width(), 80);
+        let_size_settle(&host);
+        let settled = String::from_utf8(
+            host.paint(&[], None, &prompt, &[], (2, 0))
+                .expect("settled frame"),
+        )
+        .expect("utf-8");
+        assert_eq!(
+            settled.matches(rune_term::inline::SHOW_CURSOR).count(),
+            1,
+            "{settled:?}"
+        );
+        assert!(settled.contains("\u{1b}[J"), "{settled:?}");
+        assert_eq!(host.width(), 40);
+        assert_eq!(host.resize_wait(), None);
+        let again = String::from_utf8(
+            host.paint(&[], None, &prompt, &[], (2, 0))
+                .expect("next frame"),
+        )
+        .expect("utf-8");
+        assert!(!again.contains("\u{1b}[J"), "{again:?}");
+    }
+
+    #[test]
+    fn a_frame_with_settled_lines_takes_a_waiting_size_at_once() {
+        let mut host = test_host();
+        let prompt = vec![String::from("> ")];
+        let _ = host
+            .paint(&[], None, &prompt, &[], (2, 0))
+            .expect("first frame");
+        host.pinned_size = Some((40, 24));
+        assert!(
+            host.paint(&[], None, &prompt, &[], (2, 0))
+                .expect("waiting frame")
+                .is_empty()
+        );
+        let bytes = host
+            .paint(&[String::from("DONE")], None, &prompt, &[], (2, 0))
+            .expect("settled lines");
+        assert!(String::from_utf8_lossy(&bytes).contains("DONE"));
+        assert_eq!(host.width(), 40);
+        assert_eq!(host.resize_wait(), None);
     }
 
     #[test]
@@ -20420,6 +20577,8 @@ mod tests {
             width: std::sync::atomic::AtomicU16::new(80),
             height: std::sync::atomic::AtomicU16::new(24),
             pinned_size: Some((80, 24)),
+            applied_size: Mutex::new((0, 0)),
+            pending_size: Mutex::new(None),
             inline: Mutex::new(rune_term::inline::Inline::new(80)),
             frame: Mutex::new(()),
             transcript: Mutex::new(Vec::new()),

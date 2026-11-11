@@ -23,38 +23,38 @@ model-open: 80x24, caret 2,3
 21||
 22||
 23||
-model-shrunk: 32x8, caret 2,3
-00|session ************|
-01|up/down select   tab complete|
-02|replay-model-01 | auto|
-03|>|
-04|> replay-model-01 (current)|
-05|  replay-model-02|
-06|  1-2 of 15|
+model-shrunk: 32x8, caret 2,2
+00|up/down select   tab complete|
+01|replay-model-01 | auto|
+02|>|
+03|> replay-model-01 (current)|
+04|  replay-model-02|
+05|  1-2 of 15|
+06||
 07||
-model-down: 32x8, caret 2,3
-00|session ************|
-01|up/down select   tab complete|
-02|replay-model-01 | auto|
-03|>|
-04|  replay-model-01 (current)|
-05|> replay-model-02|
-06|  1-2 of 15|
+model-down: 32x8, caret 2,2
+00|up/down select   tab complete|
+01|replay-model-01 | auto|
+02|>|
+03|  replay-model-01 (current)|
+04|> replay-model-02|
+05|  1-2 of 15|
+06||
 07||
-model-closed: 32x8, caret 2,3
-00|session ************|
-01|/ commands   shift-tab mode|
-02|replay-model-01 | auto|
-03|>|
+model-closed: 32x8, caret 2,2
+00|/ commands   shift-tab mode|
+01|replay-model-01 | auto|
+02|>|
+03||
 04||
 05||
 06||
 07||
-closed-grown: 80x24, caret 2,3
-00|session ************|
-01|/ commands   shift-tab mode   ctrl-j newline|
-02|replay-model-01 | auto | ctx ~###k (request bytes)|
-03|>|
+closed-grown: 80x24, caret 2,2
+00|/ commands   shift-tab mode   ctrl-j newline|
+01|replay-model-01 | auto | ctx ~###k (request bytes)|
+02|>|
+03||
 04||
 05||
 06||

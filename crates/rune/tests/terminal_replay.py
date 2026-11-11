@@ -187,13 +187,16 @@ class Provider(http.server.BaseHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(body)
                 return
-            if scenario in {"progressive", "tall-code"}:
+            if scenario in {"progressive", "tall-code", "resize-stream"}:
                 self.send_response(200)
                 self.send_header("Content-Type", "text/event-stream")
                 self.end_headers()
                 if scenario == "progressive":
                     chunks = [f"PARA-{index:03}\n\n" for index in range(1, 301)]
                     pause = 150
+                elif scenario == "resize-stream":
+                    chunks = [f"STREAM-{index:02}\n\n" for index in range(1, 31)]
+                    pause = 15
                 else:
                     chunks = ["```\n"] + [f"CODE-{index:03}\n" for index in range(1, 121)]
                     chunks.append("```\nTALL-END")
@@ -255,7 +258,7 @@ def controlling_terminal():
 
 
 scenario = sys.argv[2]
-assert scenario in {"resize", "narrow", "menu-resize", "completion-resize", "code", "transcript", "compact", "help-40", "help-80", "tools", "shell-tail", "edit", "failure", "approval", "markdown", "reasoning", "reasoning-full", "progressive", "tall-code"}, scenario
+assert scenario in {"resize", "narrow", "menu-resize", "completion-resize", "code", "transcript", "compact", "help-40", "help-80", "tools", "shell-tail", "edit", "failure", "approval", "markdown", "reasoning", "reasoning-full", "progressive", "tall-code", "resize-stream"}, scenario
 with tempfile.TemporaryDirectory(prefix="rune-r034-") as directory:
     root = pathlib.Path(directory)
     config = root / "config" / "rune"
@@ -319,7 +322,8 @@ with tempfile.TemporaryDirectory(prefix="rune-r034-") as directory:
                   "edit": (80, 24), "failure": (80, 24),
                   "approval": (80, 24), "markdown": (80, 24),
                   "reasoning": (80, 24), "reasoning-full": (80, 24),
-                  "progressive": (80, 24), "tall-code": (80, 24)}[scenario]
+                  "progressive": (80, 24), "tall-code": (80, 24),
+                  "resize-stream": (80, 24)}[scenario]
     master, slave = pty.openpty()
     fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
     try:
@@ -548,6 +552,16 @@ with tempfile.TemporaryDirectory(prefix="rune-r034-") as directory:
             stream_pause.set()
             capture("tall-code-finished", expected="TALL-END\r\n")
             assert prompts == ["code"], prompts
+        elif scenario == "resize-stream":
+            # No key is sent on either resize: the turn redraws once the new
+            # size has settled.
+            capture("streaming", b"stream\r", "STREAM-15")
+            capture("shrunk", size=(40, 24))
+            capture("grown", size=(100, 24))
+            stream_pause.set()
+            # The idle hint is drawn only once the turn has ended.
+            capture("finished", expected="/ commands")
+            assert prompts == ["stream"], prompts
         elif scenario == "markdown":
             capture("markdown-streaming", b"markdown\r", "fn main")
             markdown_step.set()

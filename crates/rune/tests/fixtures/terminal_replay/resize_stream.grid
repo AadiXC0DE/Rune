@@ -1,0 +1,100 @@
+streaming: 80x24, caret 2,23
+00|STREAM-05|
+01||
+02|STREAM-06|
+03||
+04|STREAM-07|
+05||
+06|STREAM-08|
+07||
+08|STREAM-09|
+09||
+10|STREAM-10|
+11||
+12|STREAM-11|
+13||
+14|STREAM-12|
+15||
+16|STREAM-13|
+17||
+18|STREAM-14|
+19||
+20|STREAM-15|
+21|ctrl-c interrupt   enter steer   tab queue|
+22|replay-fixture | auto | ctx ~###k (request bytes)|
+23|>|
+shrunk: 40x24, caret 2,21
+00|STREAM-05|
+01||
+02|STREAM-06|
+03||
+04|STREAM-07|
+05||
+06|STREAM-08|
+07||
+08|STREAM-09|
+09||
+10|STREAM-10|
+11||
+12|STREAM-11|
+13||
+14|STREAM-12|
+15||
+16|STREAM-13|
+17||
+18|STREAM-14|
+19|ctrl-c interrupt   enter steer|
+20|replay-fixture | auto|
+21|>|
+22||
+23||
+grown: 100x24, caret 2,21
+00|STREAM-05|
+01||
+02|STREAM-06|
+03||
+04|STREAM-07|
+05||
+06|STREAM-08|
+07||
+08|STREAM-09|
+09||
+10|STREAM-10|
+11||
+12|STREAM-11|
+13||
+14|STREAM-12|
+15||
+16|STREAM-13|
+17||
+18|STREAM-14|
+19|ctrl-c interrupt   enter steer   tab queue|
+20|replay-fixture | auto | ctx ~###k (request bytes)|
+21|>|
+22||
+23||
+finished: 100x24, caret 2,23
+00|STREAM-20|
+01||
+02|STREAM-21|
+03||
+04|STREAM-22|
+05||
+06|STREAM-23|
+07||
+08|STREAM-24|
+09||
+10|STREAM-25|
+11||
+12|STREAM-26|
+13||
+14|STREAM-27|
+15||
+16|STREAM-28|
+17||
+18|STREAM-29|
+19||
+20|STREAM-30|
+21|/ commands   shift-tab mode   ctrl-j newline|
+22|replay-fixture | auto | ctx ~###k (request bytes)|
+23|>|
