@@ -37,6 +37,9 @@ pub const EXIT_OK: u8 = 0;
 /// Exit code for a failed run.
 pub const EXIT_FAILURE: u8 = 1;
 
+/// Exit status when a `user_prompt` hook blocked the prompt.
+pub const EXIT_BLOCKED: u8 = 2;
+
 /// Exit status when a limit ended the run and its output is usable.
 pub const EXIT_LIMIT: u8 = 3;
 
@@ -135,6 +138,26 @@ fn first_message(prompt: &str, tool_loop: bool, read_only: bool) -> String {
         RUN_CONTEXT
     };
     format!("{prompt}\n\n{note}")
+}
+
+fn warn_on_stderr(message: &str) {
+    let _ = writeln!(std::io::stderr(), "warning: {message}");
+}
+
+/// Runs a run's `session_end` hooks when it is dropped.
+struct SessionEnd<'a> {
+    hooks: &'a crate::hooks::Detached,
+    reason: &'static str,
+}
+
+impl Drop for SessionEnd<'_> {
+    fn drop(&mut self) {
+        self.hooks.observe(
+            rune_core::config::HookEvent::SessionEnd,
+            &crate::hooks::payload("reason", self.reason),
+            &warn_on_stderr,
+        );
+    }
 }
 
 /// The section sizes a context report needs, from the assembled base prompt.
@@ -849,6 +872,26 @@ impl AskHost<'_> {
         })
     }
 
+    /// Runs `body` with what event hooks need from this run.
+    fn with_event_hooks<T>(&self, body: impl FnOnce(&crate::hooks::EventHooks<'_>) -> T) -> T {
+        let session_id = self
+            .log
+            .as_ref()
+            .map(|log| log.id.to_string())
+            .unwrap_or_default();
+        body(&crate::hooks::EventHooks {
+            hooks: &self.settings.hooks,
+            envelope: crate::hooks::Envelope {
+                session_id: &session_id,
+                cwd: self.context.workspace(),
+                turn: 1,
+            },
+            cancellation: &self.cancellation,
+            warn: &warn_on_stderr,
+            credential: &self.endpoint.credential,
+        })
+    }
+
     fn log(&self, write: impl FnOnce(&LiveLog) -> Result<()>) {
         let Some(log) = &self.log else {
             return;
@@ -1348,6 +1391,19 @@ impl Host for AskHost<'_> {
         self.with_tool_hooks(|hooks| hooks.pre_tool(call))
     }
 
+    fn turn_end(&self, text: &str, continues: u32) -> Option<(String, String)> {
+        self.with_event_hooks(|hooks| hooks.turn_end(text, continues))
+    }
+
+    fn pre_compact(&self, automatic: bool) {
+        self.with_event_hooks(|hooks| {
+            hooks.observe(
+                rune_core::config::HookEvent::PreCompact,
+                &crate::hooks::payload("automatic", automatic),
+            );
+        });
+    }
+
     fn post_tool_effect(&self, result: &turn::CallResult) -> Option<turn::PostToolEffect> {
         let effect = self.with_tool_hooks(|hooks| hooks.post_tool(result));
         match &effect {
@@ -1594,10 +1650,55 @@ pub fn run(
     } else {
         (Registry::new(), None, None)
     };
+    let session_id = options.session_id.unwrap_or_else(SessionId::generate);
+    let event_hooks = crate::hooks::Detached {
+        hooks: settings.hooks.clone(),
+        session_id: if options.no_save {
+            String::new()
+        } else {
+            session_id.to_string()
+        },
+        cwd: crate::current_workspace()?,
+        turn: 1,
+        credential: endpoint.credential.clone(),
+    };
+    event_hooks.observe(
+        rune_core::config::HookEvent::SessionStart,
+        &crate::hooks::payload("resumed", false),
+        &warn_on_stderr,
+    );
+    // Every way out of the run from here runs its `session_end` hooks.
+    let mut session_end = SessionEnd {
+        hooks: &event_hooks,
+        reason: "error",
+    };
+    let hook_context = match event_hooks
+        .events(&cancellation, &warn_on_stderr)
+        .user_prompt(&options.prompt)
+    {
+        crate::hooks::PromptOutcome::Send(context) => context,
+        crate::hooks::PromptOutcome::Blocked { hook, reason } => {
+            session_end.reason = "exit";
+            let error = RuneError::new(
+                ErrorCode::PermissionDenied,
+                format!("prompt blocked by hook {hook}: {reason}"),
+            );
+            return Ok(JsonResult::failure(
+                &settings.model,
+                effort.as_str(),
+                &error,
+                i32::from(EXIT_BLOCKED),
+            ));
+        }
+    };
+    let prompt = match &hook_context {
+        Some(context) => format!("{}\n\n{context}", options.prompt),
+        None => options.prompt.clone(),
+    };
     let mut history = History::new();
     let mut parts = vec![ContentPart::Text {
         text: first_message(
-            &options.prompt,
+            &prompt,
             options.tool_loop && settings.experiments.run_note,
             options.read_only,
         ),
@@ -1665,7 +1766,7 @@ pub fn run(
     } else {
         Some(std::sync::Arc::new(LiveLog::open(
             paths,
-            options.session_id.unwrap_or_else(SessionId::generate),
+            session_id,
             &options.prompt,
         )?))
     };
@@ -1733,7 +1834,14 @@ pub fn run(
     {
         let _ = writeln!(std::io::stderr(), "warning: {notice}");
     }
-    // The session log keeps the user's prompt; the run note is journaled apart.
+    // The session log keeps the user's prompt; the notes are journaled apart.
+    if let Some(context) = hook_context {
+        host.journal(&turn::JournalEntry::Note {
+            at: 0,
+            placement: turn::NotePlacement::PromptSuffix,
+            text: context,
+        });
+    }
     if options.tool_loop && settings.experiments.run_note {
         let note = if options.read_only {
             REVIEW_RUN_CONTEXT
@@ -1785,6 +1893,23 @@ pub fn run(
     let outcome = turn::run_turn(&mut history, &host);
     // Whatever ended the run, nothing it started keeps running.
     host.registry.shutdown();
+    // A run has no terminal to keep responsive, and ends right after this, so
+    // its notification hooks are waited for.
+    let notification = match &outcome {
+        Ok(outcome) => match &outcome.error {
+            None => ("turn_finished", "turn finished".to_owned()),
+            Some(error) => ("turn_failed", format!("turn failed: {}", error.message())),
+        },
+        Err(error) => ("turn_failed", format!("turn failed: {}", error.message())),
+    };
+    event_hooks.observe(
+        rune_core::config::HookEvent::Notification,
+        &crate::hooks::notification_payload(
+            notification.0,
+            &crate::hooks::redact(&notification.1, &event_hooks.credential),
+        ),
+        &warn_on_stderr,
+    );
     let command_changes = status_before
         .map(|before| changed_by_commands(&workspace, &before))
         .unwrap_or_default();
@@ -1923,6 +2048,7 @@ pub fn run(
         None => String::new(),
     };
 
+    session_end.reason = "exit";
     Ok(JsonResult {
         // A run stopped by one of its bounds has a usable partial answer.
         // The answer is usable when the run finished, a limit ended it, or a

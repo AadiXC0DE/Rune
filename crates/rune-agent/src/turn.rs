@@ -490,6 +490,17 @@ pub trait Host {
     /// Called after a summary is accepted and before it replaces earlier turns.
     fn before_compaction(&self, _history: &History) {}
 
+    /// Called before a summary request is built; `automatic` is false for a
+    /// compaction the user asked for.
+    fn pre_compact(&self, _automatic: bool) {}
+
+    /// Called when a turn is about to end by itself, with its final text and
+    /// how many times it was already continued. A hook name and message ask
+    /// the model to go on. The default lets the turn end.
+    fn turn_end(&self, _text: &str, _continues: u32) -> Option<(String, String)> {
+        None
+    }
+
     /// Called after earlier turns were replaced, before the request is rebuilt.
     ///
     /// The report carries the summary request's usage, which no other path
@@ -916,6 +927,14 @@ const VERIFICATION_REMINDER: &str = "<harness_check>Files were changed and nothi
 run since the last change to check it. Run the focused test, build, or command that \
 exercises the change and report what it shows, or say why it cannot be run.</harness_check>";
 
+/// Times turn-end hooks may continue a turn before it ends regardless.
+const MAX_HOOK_CONTINUES: u32 = 3;
+
+/// Tells the model a turn-end hook asked for more.
+fn hook_continue_note(name: &str, message: &str) -> String {
+    format!("<harness_check>Hook `{name}` asks you to continue: {message}</harness_check>")
+}
+
 /// Tells the model its last check after a change failed, once per turn.
 const CHECK_FAILED_NOTE: &str = "<harness_check>The last check after your changes failed: \
 `{command}` ({detail}). Fix it, or say why it cannot pass, before finishing.</harness_check>";
@@ -1096,6 +1115,8 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
     let mut stall_noted = false;
     // A headless question is answered with the nudge once per turn.
     let mut question_nudged = false;
+    // Times a turn-end hook continued the turn since the last tool call.
+    let mut hook_continues: u32 = 0;
     let max_attempts = limits.get_usize(LimitName::ProviderMaxAttempts).max(1);
     let timeouts =
         transport::RequestTimeouts::from_settings(&limits, host.provider_head_timeout_ms());
@@ -1426,6 +1447,13 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
                     host.emit(Event::VerificationRequested);
                     continue;
                 }
+                if hook_continues < MAX_HOOK_CONTINUES
+                    && let Some((name, message)) = host.turn_end(&text, hook_continues)
+                {
+                    hook_continues = hook_continues.saturating_add(1);
+                    push_user_note(history, host, &hook_continue_note(&name, &message));
+                    continue;
+                }
             }
             let reason = if host.objective_tokens_remaining() == Some(0) {
                 StopReason::ObjectiveBudget
@@ -1535,6 +1563,7 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
             });
         }
 
+        hook_continues = 0;
         // Execute the batch. Policy is resolved per call before anything runs,
         // so a denial never reaches a tool. On the last step nothing runs: each
         // call is answered as refused so the record stays well formed.

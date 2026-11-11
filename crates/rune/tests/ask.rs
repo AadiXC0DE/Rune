@@ -2198,6 +2198,127 @@ printf '%s' 'ignored hook output'
 }
 
 #[cfg(unix)]
+fn configure_hooks(dir: &tempfile::TempDir, hooks: &[(&str, &str, &str)]) {
+    let config = dir.path().join("config/rune/config.toml");
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(config)
+        .expect("config");
+    for (index, (event, name, script)) in hooks.iter().enumerate() {
+        let path = format!("hook-{index}.sh");
+        std::fs::write(dir.path().join(&path), script).expect("hook script");
+        writeln!(
+            file,
+            "\n[[hooks]]\nevent = '{event}'\nname = '{name}'\nargv = ['/bin/sh', '{path}']"
+        )
+        .expect("configure hook");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn session_hooks_run_in_order_and_add_prompt_context() {
+    let log = "cat >> events.jsonl; echo >> events.jsonl\n";
+    let context = "cat >> events.jsonl; echo >> events.jsonl\nprintf '%s' '{\"context\":\"branch is main\"}'\n";
+    let (output, dir, requests) = run_responses_fixture_command(
+        vec![completion_response(&json!({"content": "Done."}), "stop")],
+        Some("--json"),
+        false,
+        Some(3),
+        (&["ask"], &[]),
+        |dir, command| {
+            command.with_external_programs();
+            configure_hooks(
+                dir,
+                &[
+                    ("session_end", "end", log),
+                    ("notification", "note", log),
+                    ("user_prompt", "branch", context),
+                    ("session_start", "start", log),
+                ],
+            );
+        },
+    );
+    assert!(output.status.success(), "{output:?}");
+    let events: Vec<Value> = std::fs::read_to_string(dir.path().join("events.jsonl"))
+        .expect("events")
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("event JSON"))
+        .collect();
+    let names: Vec<&str> = events
+        .iter()
+        .map(|event| event["event"].as_str().expect("event"))
+        .collect();
+    assert_eq!(
+        names,
+        [
+            "session_start",
+            "user_prompt",
+            "notification",
+            "session_end"
+        ]
+    );
+    assert_eq!(events[0]["resumed"], false);
+    assert_eq!(events[2]["kind"], "turn_finished");
+    assert_eq!(events[2]["message"], "turn finished");
+    assert_eq!(events[3]["reason"], "exit");
+    let result: Value = serde_json::from_slice(&output.stdout).expect("ask JSON");
+    assert_eq!(events[0]["session_id"], result["session_id"]);
+    assert_eq!(requests.len(), 1);
+    let prompt = requests[0]["messages"]
+        .as_array()
+        .expect("messages")
+        .iter()
+        .find(|message| message["role"] == "user")
+        .expect("prompt")["content"]
+        .to_string();
+    assert!(
+        prompt.contains(r#"<hook-context name=\"branch\">\nbranch is main\n</hook-context>"#),
+        "{prompt}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_blocking_user_prompt_hook_stops_the_run() {
+    let (output, dir, requests) = run_responses_fixture_command(
+        Vec::new(),
+        Some("--json"),
+        false,
+        Some(3),
+        (&["ask"], &[]),
+        |dir, command| {
+            command.with_external_programs();
+            configure_hooks(
+                dir,
+                &[
+                    (
+                        "user_prompt",
+                        "guard",
+                        "printf '%s' '{\"decision\":\"block\",\"reason\":\"not today\"}'",
+                    ),
+                    ("session_end", "end", "cat > end.json"),
+                ],
+            );
+        },
+    );
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    assert!(requests.is_empty());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("prompt blocked by hook guard: not today"),
+        "{stderr}"
+    );
+    let result: Value = serde_json::from_slice(&output.stdout).expect("ask JSON");
+    assert_eq!(result["error_code"], "permission_denied");
+    assert_eq!(result["exit_code"], 2);
+    let end: Value =
+        serde_json::from_slice(&std::fs::read(dir.path().join("end.json")).expect("session end"))
+            .expect("JSON");
+    assert_eq!(end["reason"], "exit");
+}
+
+#[cfg(unix)]
 #[test]
 fn post_tool_timeout_and_nonzero_exit_preserve_completed_results_and_continue() {
     for (script, timeout_ms, expected) in [

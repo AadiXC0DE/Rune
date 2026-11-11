@@ -125,6 +125,10 @@ struct TestHost {
     efforts: Option<&'static [Effort]>,
     /// What every step appends to its last tool result.
     appendix: Option<rune_agent::turn::Appendix>,
+    /// Whether a turn-end hook always asks the model to continue.
+    turn_end_continues: bool,
+    /// The `continues` count each turn-end call saw.
+    turn_end_calls: Mutex<Vec<u32>>,
 }
 
 impl TestHost {
@@ -147,6 +151,8 @@ impl TestHost {
             hook_veto: None,
             hook_rewrites: Vec::new(),
             post_effects: Mutex::new(std::collections::VecDeque::new()),
+            turn_end_continues: false,
+            turn_end_calls: Mutex::new(Vec::new()),
             hook_calls: Mutex::new(Vec::new()),
             post_results: Mutex::new(Vec::new()),
             registry: None,
@@ -497,6 +503,15 @@ impl Host for TestHost {
         _results: &[rune_agent::turn::CallResult],
     ) -> Option<rune_agent::turn::Appendix> {
         self.appendix.clone()
+    }
+
+    fn turn_end(&self, _text: &str, continues: u32) -> Option<(String, String)> {
+        self.turn_end_calls
+            .lock()
+            .expect("turn end")
+            .push(continues);
+        self.turn_end_continues
+            .then(|| ("keep going".to_owned(), "the tests are not run".to_owned()))
     }
 
     fn post_tool(&self, result: &rune_agent::turn::CallResult) {
@@ -4845,6 +4860,41 @@ fn post_tool_append_and_replace_reach_the_model() {
     // The observer still sees each result before its effect.
     let observed = host.post_results.lock().expect("post results");
     assert_eq!(observed[0].0.output.text, "tool output");
+    history.validate().expect("paired history");
+}
+
+#[test]
+fn turn_end_continues_at_most_three_times() {
+    let endpoint = MockEndpoint::start(vec![
+        Script::text("first"),
+        Script::text("second"),
+        Script::tool_call("look", "read_file", r#"{"path":"a.txt"}"#),
+        Script::text("third"),
+        Script::text("fourth"),
+        Script::text("fifth"),
+        Script::text("sixth"),
+    ]);
+    let mut host = TestHost::new(endpoint)
+        .with_tools(vec![read_tool()])
+        .with_mode(PermissionMode::FullAccess);
+    host.turn_end_continues = true;
+    let mut history = rune_agent::History::new();
+    history.push_user("finish the work");
+    let outcome = run_turn(&mut history, &host).expect("turn");
+    // Two continues, a tool call that resets the count, then three more.
+    assert_eq!(outcome.stop_reason, StopReason::Completed);
+    assert_eq!(outcome.text, "sixth");
+    assert_eq!(
+        *host.turn_end_calls.lock().expect("turn end"),
+        [0, 1, 0, 1, 2]
+    );
+    let server = host.server.as_ref().expect("server");
+    assert_eq!(server.request_count(), 7);
+    let last = server.last_body().expect("request").to_string();
+    assert!(
+        last.contains("Hook `keep going` asks you to continue: the tests are not run"),
+        "{last}"
+    );
     history.validate().expect("paired history");
 }
 

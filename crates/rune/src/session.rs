@@ -486,6 +486,8 @@ struct SessionHost {
     preimage_count: std::sync::atomic::AtomicUsize,
     /// Whether the session said command changes cannot be undone here.
     command_notice_shown: std::sync::atomic::AtomicBool,
+    /// Failures of hooks run on their own thread, not yet in the transcript.
+    hook_notices: Arc<Mutex<Vec<String>>>,
     /// Review activity for the current turn.
     review_session: Arc<Mutex<ReviewSession>>,
     /// Attached only while a terminal input loop can collect an answer.
@@ -1073,6 +1075,19 @@ impl Host for SessionHost {
         self.with_tool_hooks(|hooks| hooks.pre_tool(call))
     }
 
+    fn turn_end(&self, text: &str, continues: u32) -> Option<(String, String)> {
+        self.with_event_hooks(&self.cancellation, |hooks| hooks.turn_end(text, continues))
+    }
+
+    fn pre_compact(&self, automatic: bool) {
+        self.with_event_hooks(&self.cancellation, |hooks| {
+            hooks.observe(
+                rune_core::config::HookEvent::PreCompact,
+                &crate::hooks::payload("automatic", automatic),
+            );
+        });
+    }
+
     fn post_tool_effect(&self, result: &turn::CallResult) -> Option<turn::PostToolEffect> {
         self.with_tool_hooks(|hooks| hooks.post_tool(result))
     }
@@ -1543,6 +1558,7 @@ impl SessionHost {
         else {
             return (Outcome::Ask, reason);
         };
+        self.notify("approval_needed", &format!("approve {tool}: {target}"));
         let (answer, response) = mpsc::sync_channel(1);
         let request = ApprovalRequest {
             tool: tool.to_owned(),
@@ -2138,12 +2154,7 @@ impl SessionHost {
     /// Runs `body` with what tool hooks need from this session.
     fn with_tool_hooks<T>(&self, body: impl FnOnce(&crate::hooks::ToolHooks<'_>) -> T) -> T {
         let session_id = self.session_id_name();
-        let turn = self.recorder.as_ref().map_or(0, |recorder| {
-            recorder
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .turn_number()
-        });
+        let turn = self.turn_number();
         let warn = |message: &str| self.draw_notice(&format!("warning: {message}"));
         let check = || self.context.check_cancelled();
         let limits = Host::limits(self);
@@ -2163,6 +2174,94 @@ impl SessionHost {
             )
             .unwrap_or(usize::MAX),
         })
+    }
+
+    /// Runs `body` with what event hooks need from this session.
+    fn with_event_hooks<T>(
+        &self,
+        cancellation: &Cancellation,
+        body: impl FnOnce(&crate::hooks::EventHooks<'_>) -> T,
+    ) -> T {
+        let session_id = self.session_id_name();
+        let warn = |message: &str| self.draw_notice(&format!("warning: {message}"));
+        body(&crate::hooks::EventHooks {
+            hooks: &self.hooks,
+            envelope: crate::hooks::Envelope {
+                session_id: &session_id,
+                cwd: self.context.workspace(),
+                turn: self.turn_number(),
+            },
+            cancellation,
+            warn: &warn,
+            credential: &self.endpoint.credential,
+        })
+    }
+
+    fn turn_number(&self) -> u64 {
+        self.recorder.as_ref().map_or(0, |recorder| {
+            recorder
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .turn_number()
+        })
+    }
+
+    /// Runs `notification` hooks without waiting for them. A failure is shown
+    /// with the next turn.
+    fn notify(&self, kind: &str, message: &str) {
+        let notices = Arc::clone(&self.hook_notices);
+        crate::hooks::Detached {
+            hooks: self.hooks.clone(),
+            session_id: self.session_id_name(),
+            cwd: self.context.workspace().to_owned(),
+            turn: self.turn_number(),
+            credential: self.endpoint.credential.clone(),
+        }
+        .notify(kind, message, move |message| {
+            notices
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(format!("warning: {message}"));
+        });
+    }
+
+    /// Moves failures of detached hooks into the transcript.
+    fn show_hook_notices(&self) {
+        let pending = std::mem::take(
+            &mut *self
+                .hook_notices
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        for line in pending {
+            self.checkpoint_notice(line);
+        }
+    }
+
+    /// Runs `session_end` hooks, writing failures to standard error, since
+    /// the terminal region is gone by then.
+    fn end_session(&self, reason: &str) {
+        let session_id = self.session_id_name();
+        let warn = |message: &str| {
+            let _ = writeln!(std::io::stderr(), "warning: {message}");
+        };
+        // A fresh token: a session ended by cancelling still runs its hooks.
+        let cancellation = Cancellation::new();
+        crate::hooks::EventHooks {
+            hooks: &self.hooks,
+            envelope: crate::hooks::Envelope {
+                session_id: &session_id,
+                cwd: self.context.workspace(),
+                turn: self.turn_number(),
+            },
+            cancellation: &cancellation,
+            warn: &warn,
+            credential: &self.endpoint.credential,
+        }
+        .observe(
+            rune_core::config::HookEvent::SessionEnd,
+            &crate::hooks::payload("reason", reason),
+        );
     }
 
     fn session_id_name(&self) -> String {
@@ -3368,6 +3467,7 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
         preimage_dir,
         preimage_count: std::sync::atomic::AtomicUsize::new(preimage_count),
         command_notice_shown: std::sync::atomic::AtomicBool::new(false),
+        hook_notices: Arc::default(),
         review_session: Arc::new(Mutex::new(ReviewSession::new(&limits))),
         approval_requests: Mutex::new(None),
         approval_preview: Mutex::new(Vec::new()),
@@ -3474,6 +3574,18 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
             "debug panic after the first frame"
         );
     }
+
+    host.with_event_hooks(&Cancellation::new(), |hooks| {
+        hooks.observe(
+            rune_core::config::HookEvent::SessionStart,
+            &crate::hooks::payload("resumed", config.resume.is_some()),
+        );
+    });
+    // Every way out of the session from here runs its `session_end` hooks.
+    let mut session_end = SessionEnd {
+        host: &host,
+        reason: "error",
+    };
 
     // A resumed session keeps the title it was given.
     let mut is_first_prompt = config.resume.is_none()
@@ -3971,15 +4083,8 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                 sink.write_all(&painted)?;
                 sink.flush()?;
 
-                if is_first_prompt {
-                    recorder
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .set_title(&session_log::derive_title(&text))?;
-                    is_first_prompt = false;
-                }
                 // Recorded before the turn runs, so a prompt that is interrupted
-                // is still recallable.
+                // or blocked is still recallable.
                 if let Some(history) = history_file.as_mut() {
                     let entry = crate::prompt_history::Entry::new(text.clone()).located(
                         &config.workspace,
@@ -3990,6 +4095,26 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                             .as_str(),
                     );
                     let _ = history.record(entry);
+                }
+                // A fresh token: the last turn's may still be cancelled.
+                let hook_context = match host
+                    .with_event_hooks(&Cancellation::new(), |hooks| hooks.user_prompt(&text))
+                {
+                    crate::hooks::PromptOutcome::Send(context) => context,
+                    crate::hooks::PromptOutcome::Blocked { hook, reason } => {
+                        return report(
+                            &host,
+                            sink,
+                            &format!("prompt blocked by hook {hook}: {reason}"),
+                        );
+                    }
+                };
+                if is_first_prompt {
+                    recorder
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .set_title(&session_log::derive_title(&text))?;
+                    is_first_prompt = false;
                 }
                 // Changes since the last request ride on this message, so
                 // the prefix the provider has cached stays as it was.
@@ -4003,6 +4128,14 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                 // resumed session rebuilds this exact message.
                 let at = u64::try_from(history.len()).unwrap_or(u64::MAX);
                 let mut composed = text.clone();
+                if let Some(context) = hook_context {
+                    composed = format!("{composed}\n\n{context}");
+                    host.journal(&turn::JournalEntry::Note {
+                        at,
+                        placement: turn::NotePlacement::PromptSuffix,
+                        text: context,
+                    });
+                }
                 if let Some(shell) = host.take_user_shell() {
                     composed = format!("{shell}\n\n{composed}");
                     host.journal(&turn::JournalEntry::Note {
@@ -4050,6 +4183,7 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                     checkpoints.turn_started(turn_number);
                 }
                 host.show_checkpoint_notices();
+                host.show_hook_notices();
                 let steered = if let Some(input) = line_input {
                     run_turn_accessible(&mut history, &host, input)
                 } else {
@@ -4089,6 +4223,7 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                                 .lock()
                                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                                 .failed_turn(&partial, &err)?;
+                            host.notify("turn_failed", &format!("turn failed: {}", err.message()));
                         }
                         if let Some(checkpoints) = &host.checkpoints {
                             checkpoints.turn_finished(turn_number);
@@ -4128,6 +4263,7 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .turn(&outcome)?;
+                host.notify("turn_finished", "turn finished");
                 if let Some(checkpoints) = &host.checkpoints {
                     checkpoints.turn_finished(turn_number);
                 }
@@ -4403,6 +4539,7 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
         let _ = sink.flush();
     }
 
+    session_end.reason = "exit";
     Ok(reason.exit_code())
 }
 
@@ -6156,6 +6293,18 @@ fn compact_session(
     let report = rune_agent::compaction::compact(history, plan, host, client, archive, &|| false)?;
     host.context_replaced(&report);
     Ok(report)
+}
+
+/// Runs a session's `session_end` hooks when it is dropped.
+struct SessionEnd<'a> {
+    host: &'a SessionHost,
+    reason: &'static str,
+}
+
+impl Drop for SessionEnd<'_> {
+    fn drop(&mut self) {
+        self.host.end_session(self.reason);
+    }
 }
 
 /// Commits one line of command output through the renderer.
@@ -16438,6 +16587,7 @@ mod tests {
             preimage_dir: None,
             preimage_count: std::sync::atomic::AtomicUsize::new(0),
             command_notice_shown: std::sync::atomic::AtomicBool::new(false),
+            hook_notices: Arc::default(),
             review_session: Arc::new(Mutex::new(ReviewSession::new(&BudgetSet::new()))),
             approval_requests: Mutex::new(None),
             approval_preview: Mutex::new(Vec::new()),
