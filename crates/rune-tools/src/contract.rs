@@ -449,6 +449,18 @@ impl ExecutionContext {
         }
     }
 
+    /// Returns a copy with its own cancellation flag, not yet cancelled.
+    ///
+    /// Used at the start of a turn, so cancelling that turn reaches its tools
+    /// without leaving later turns cancelled.
+    #[must_use]
+    pub fn with_fresh_cancellation(&self) -> Self {
+        Self {
+            cancelled: Arc::new(AtomicBool::new(false)),
+            ..self.fork()
+        }
+    }
+
     /// Returns a cancellation handle for this context.
     #[must_use]
     pub fn cancellation(&self) -> Cancellation {

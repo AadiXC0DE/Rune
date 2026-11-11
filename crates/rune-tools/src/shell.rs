@@ -480,7 +480,13 @@ impl Shell {
                 .kill_after(Duration::from_millis(timeout))
                 .map_err(RuneError::from)?;
         }
-        if let Some(exit) = wait_for_exit(&process, window, context)? {
+        let waited = wait_for_exit(&process, window, context);
+        if let Err(err) = &waited
+            && err.code() == ErrorCode::Cancelled
+        {
+            process.terminate(true);
+        }
+        if let Some(exit) = waited? {
             process.drain_output(DRAIN_WINDOW);
             let (state, exit) = match timeout {
                 Some(timeout) if process.timed_out() => {
@@ -3853,6 +3859,44 @@ mod tests {
             )
             .expect_err("the session is gone");
         assert_eq!(err.code(), ErrorCode::NotFound);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_cancelled_run_stops_its_process_group() {
+        let tool = Shell::default();
+        let (dir, context) = workspace();
+        let pid_file = dir.path().join("pid");
+        let cancellation = context.cancellation();
+        let err = std::thread::scope(|scope| {
+            let call = scope.spawn(|| {
+                tool.call(
+                    &serde_json::json!({
+                        "action": "run",
+                        "command": "echo $$ > pid; exec sleep 30",
+                    }),
+                    &context,
+                )
+            });
+            assert!(
+                wait_until(
+                    || std::fs::read_to_string(&pid_file).is_ok_and(|pid| !pid.trim().is_empty()),
+                    Duration::from_secs(10),
+                ),
+                "the command wrote its pid"
+            );
+            cancellation.cancel();
+            call.join()
+                .expect("the call thread")
+                .expect_err("the call was cancelled")
+        });
+        assert_eq!(err.code(), ErrorCode::Cancelled);
+        let pid = std::fs::read_to_string(&pid_file).expect("pid file");
+        let pid = pid.trim();
+        assert!(
+            wait_until(|| !alive(pid), Duration::from_secs(1)),
+            "process {pid} still runs after the cancelled call returned"
+        );
     }
 
     #[test]
