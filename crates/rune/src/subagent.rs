@@ -383,12 +383,12 @@ impl Host for ChildHost<'_> {
         }
         self.parent.decide_with_arguments(name, target, arguments)
     }
-    fn pre_tool(&self, call: &turn::PreparedCall) -> Result<Option<turn::HookVeto>> {
-        self.parent.pre_tool(call)
+    fn pre_tool_outcome(&self, call: &turn::PreparedCall) -> Result<turn::PreToolOutcome> {
+        self.parent.pre_tool_outcome(call)
     }
 
-    fn post_tool(&self, result: &turn::CallResult) {
-        self.parent.post_tool(result);
+    fn post_tool_effect(&self, result: &turn::CallResult) -> Option<turn::PostToolEffect> {
+        self.parent.post_tool_effect(result)
     }
 
     fn execute(&self, name: &str, arguments: &serde_json::Value) -> Result<ToolOutput> {

@@ -234,6 +234,8 @@ enum Stdin {
     Ready(Writer),
     /// Held by a write the process has not finished reading.
     Writing,
+    /// Held by a write, and closed once that write ends.
+    CloseAfterWrite,
     /// Never opened, or closed by a failed write.
     Closed,
 }
@@ -577,8 +579,8 @@ impl Process {
                         "earlier input is still waiting for the process to read it",
                     ));
                 }
-                Stdin::Closed => {
-                    *slot = Stdin::Closed;
+                closed @ (Stdin::Closed | Stdin::CloseAfterWrite) => {
+                    *slot = closed;
                     return Err(io::Error::other("the process is not taking input"));
                 }
             }
@@ -590,11 +592,13 @@ impl Process {
             .name(String::from("rune-shell-stdin"))
             .spawn(move || {
                 let written = stdin.write_input(&bytes, &inner);
-                *lock(&inner.stdin) = if written.is_ok() {
+                let mut slot = lock(&inner.stdin);
+                *slot = if written.is_ok() && matches!(*slot, Stdin::Writing) {
                     Stdin::Ready(stdin)
                 } else {
                     Stdin::Closed
                 };
+                drop(slot);
                 let _ = sender.send(written);
             });
         if let Err(err) = spawned {
@@ -616,6 +620,17 @@ impl Process {
                 Err(io::Error::other("the input writer stopped"))
             }
         }
+    }
+
+    /// Closes the child's standard input, so a reader sees the end of input.
+    ///
+    /// A write still in progress finishes first, then the pipe closes.
+    pub fn close_input(&self) {
+        let mut slot = lock(&self.inner.stdin);
+        *slot = match std::mem::replace(&mut *slot, Stdin::Closed) {
+            Stdin::Writing | Stdin::CloseAfterWrite => Stdin::CloseAfterWrite,
+            Stdin::Ready(_) | Stdin::Closed => Stdin::Closed,
+        };
     }
 
     /// Waits a bounded time for the readers to reach end of file.
@@ -1157,6 +1172,24 @@ mod tests {
             "the write did not reach the process: {:?}",
             text(process.stdout())
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn closing_input_ends_a_reader_after_its_last_write() {
+        let process = Process::start_argv(
+            &["/bin/cat".to_owned()],
+            None,
+            CAPTURE_BYTES,
+            &BTreeMap::new(),
+            Input::Piped,
+        )
+        .expect("start");
+        process.write(b"hello\n", WRITE_LIMIT).expect("write");
+        process.close_input();
+        assert_eq!(exit_of(&process), Exit::Code(0));
+        assert_eq!(text(process.stdout()), "hello\n");
+        assert!(process.write(b"more", WRITE_LIMIT).is_err());
     }
 
     #[test]

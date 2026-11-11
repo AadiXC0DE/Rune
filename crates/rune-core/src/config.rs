@@ -454,6 +454,151 @@ const fn default_hook_timeout() -> u64 {
     5_000
 }
 
+/// The points of a session a hook can run at.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HookEvent {
+    /// After the session is built, before the first prompt.
+    SessionStart,
+    /// Before a prompt is sent.
+    UserPrompt,
+    /// Before a tool call runs.
+    PreTool,
+    /// After a tool call completed.
+    PostTool,
+    /// When the model ends a turn.
+    TurnEnd,
+    /// Before history is compacted.
+    PreCompact,
+    /// When the session wants the user's attention.
+    Notification,
+    /// On the way out of a session.
+    SessionEnd,
+}
+
+impl HookEvent {
+    /// The snake case name used in configuration and payloads.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::SessionStart => "session_start",
+            Self::UserPrompt => "user_prompt",
+            Self::PreTool => "pre_tool",
+            Self::PostTool => "post_tool",
+            Self::TurnEnd => "turn_end",
+            Self::PreCompact => "pre_compact",
+            Self::Notification => "notification",
+            Self::SessionEnd => "session_end",
+        }
+    }
+}
+
+/// What a failing hook means.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OnError {
+    /// The guarded action is refused.
+    Deny,
+    /// The hook has no effect.
+    Allow,
+}
+
+/// One configured hook.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Hook {
+    /// Point of the session the hook runs at.
+    pub event: HookEvent,
+    /// Name reported with a decision or failure.
+    pub name: String,
+    /// Explicit program and arguments, without implicit shell interpretation.
+    pub argv: Vec<String>,
+    /// Deadline in milliseconds, from 1 to 60,000.
+    #[serde(default = "default_hook_timeout")]
+    pub timeout_ms: u64,
+    /// What a failure means; see `Hook::on_error`.
+    #[serde(default)]
+    pub on_error: Option<OnError>,
+    /// Tool names this hook applies to (pre_tool and post_tool only); absent means all.
+    #[serde(default)]
+    pub tools: Option<Vec<String>>,
+    /// Set for hooks read from a project file.
+    #[serde(skip)]
+    pub project: bool,
+    /// Set for hooks converted from `pre_tool_hook` or `post_tool_hook`.
+    #[serde(skip)]
+    pub legacy: bool,
+}
+
+impl Hook {
+    /// The configured failure meaning, else deny for `pre_tool` and `user_prompt`.
+    #[must_use]
+    pub fn on_error(&self) -> OnError {
+        self.on_error.unwrap_or(match self.event {
+            HookEvent::PreTool | HookEvent::UserPrompt => OnError::Deny,
+            _ => OnError::Allow,
+        })
+    }
+
+    /// Whether the hook applies to a call of `tool`.
+    #[must_use]
+    pub fn applies_to(&self, tool: &str) -> bool {
+        self.tools
+            .as_ref()
+            .is_none_or(|tools| tools.iter().any(|name| name == tool))
+    }
+
+    fn validation_error(&self) -> Option<&'static str> {
+        if self.name.trim().is_empty() {
+            Some("a hook needs a nonempty `name`")
+        } else if self
+            .argv
+            .first()
+            .is_none_or(|program| program.trim().is_empty())
+        {
+            Some("a hook needs a nonempty `argv` program")
+        } else if !(1..=60_000).contains(&self.timeout_ms) {
+            Some("`timeout_ms` must be from 1 to 60000")
+        } else if self.tools.is_some()
+            && !matches!(self.event, HookEvent::PreTool | HookEvent::PostTool)
+        {
+            Some("`tools` applies only to pre_tool and post_tool hooks")
+        } else {
+            None
+        }
+    }
+}
+
+impl From<&PreToolHook> for Hook {
+    fn from(hook: &PreToolHook) -> Self {
+        Self {
+            event: HookEvent::PreTool,
+            name: hook.name.clone(),
+            argv: hook.argv.clone(),
+            timeout_ms: hook.timeout_ms,
+            on_error: Some(OnError::Deny),
+            tools: None,
+            project: false,
+            legacy: true,
+        }
+    }
+}
+
+impl From<&PostToolHook> for Hook {
+    fn from(hook: &PostToolHook) -> Self {
+        Self {
+            event: HookEvent::PostTool,
+            name: hook.name.clone(),
+            argv: hook.argv.clone(),
+            timeout_ms: hook.timeout_ms,
+            on_error: Some(OnError::Allow),
+            tools: None,
+            project: false,
+            legacy: true,
+        }
+    }
+}
+
 /// A user configuration file as parsed.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -464,6 +609,9 @@ pub struct UserConfig {
     /// Post-tool result command. Only the user configuration may set this.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub post_tool_hook: Option<PostToolHook>,
+    /// Programs run at points of a session; see the hooks section of the README.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hooks: Option<Vec<Hook>>,
 
     /// Active provider.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -726,6 +874,8 @@ pub struct Settings {
     pub pre_tool_hook: Option<PreToolHook>,
     /// User-authorized post-tool result command, absent by default.
     pub post_tool_hook: Option<PostToolHook>,
+    /// Every valid hook: the legacy pre-tool and post-tool hooks first, then `[[hooks]]`.
+    pub hooks: Vec<Hook>,
     /// Active provider.
     pub provider: Provider,
     /// Effective model identifier for the active provider.
@@ -835,6 +985,7 @@ impl Default for Settings {
             providers: BTreeMap::new(),
             pre_tool_hook: None,
             post_tool_hook: None,
+            hooks: Vec::new(),
             web_tools: false,
             edit_tool: EditToolSetting::Auto,
             mcp_tools: McpTools::Auto,
@@ -1053,6 +1204,14 @@ impl Settings {
                 self.pre_tool_hook
                     .as_ref()
                     .map_or_else(|| "disabled".to_owned(), |hook| hook.name.clone()),
+            ),
+            (
+                "hooks",
+                if self.hooks.is_empty() {
+                    "none".to_owned()
+                } else {
+                    format!("{} configured", self.hooks.len())
+                },
             ),
             (
                 "vision_model",
@@ -1321,6 +1480,7 @@ pub const MOTION_VALUES: [&str; 2] = ["full", "reduced"];
 const PROFILE_ONLY_KEYS: &[&str] = &[
     "post_tool_hook",
     "pre_tool_hook",
+    "hooks",
     "provider",
     "models",
     "model",
@@ -1355,6 +1515,7 @@ const PROFILE_ONLY_KEYS: &[&str] = &[
 pub const USER_KEYS: &[&str] = &[
     "pre_tool_hook",
     "post_tool_hook",
+    "hooks",
     "provider",
     "offline",
     "web_tools",
@@ -1623,6 +1784,7 @@ pub const SETTING_HELP: &[(&str, &str)] = &[
         "pre_tool_hook",
         "Command that may veto a tool call before it runs.",
     ),
+    ("hooks", "Programs run at points of a session."),
     (
         "vision_model",
         "Model that describes images on the active provider.",
@@ -2031,6 +2193,35 @@ fn read_bounded(path: &Utf8Path, layer: Layer) -> std::result::Result<Option<Str
     Ok(Some(text))
 }
 
+/// Rebuilds `Settings::hooks` from the legacy tables and `[[hooks]]`, dropping invalid hooks.
+fn apply_hooks(settings: &mut Settings, user: &UserConfig, layer: Layer) {
+    let mut hooks: Vec<Hook> = settings
+        .pre_tool_hook
+        .iter()
+        .map(Hook::from)
+        .chain(settings.post_tool_hook.iter().map(Hook::from))
+        .collect();
+    if let Some(configured) = &user.hooks {
+        settings.sources.record("hooks", layer);
+        for (index, hook) in configured.iter().enumerate() {
+            if let Some(problem) = hook.validation_error() {
+                settings.diagnostics.push(
+                    Diagnostic::new(
+                        layer,
+                        ErrorCode::InvalidField,
+                        format!("hook {} was ignored: {problem}", index.saturating_add(1)),
+                    )
+                    .with_key("hooks")
+                    .with_hint("fix the `[[hooks]]` entry or remove it"),
+                );
+            } else {
+                hooks.push(hook.clone());
+            }
+        }
+    }
+    settings.hooks = hooks;
+}
+
 /// Applies a user configuration to the settings.
 fn apply_user(settings: &mut Settings, user: &UserConfig, layer: Layer) {
     if let Some(hook) = &user.post_tool_hook {
@@ -2041,6 +2232,7 @@ fn apply_user(settings: &mut Settings, user: &UserConfig, layer: Layer) {
         settings.pre_tool_hook = Some(hook.clone());
         settings.sources.record("pre_tool_hook", layer);
     }
+    apply_hooks(settings, user, layer);
     if let Some(offline) = user.offline {
         settings.offline = offline;
         settings.sources.record("offline", layer);
@@ -3072,6 +3264,133 @@ mod tests {
         let encoded = toml::to_string(&read_user(&user).expect("read").expect("config").0)
             .expect("serialize");
         assert!(encoded.contains("pre_tool_hook"));
+    }
+
+    #[test]
+    fn hooks_tables_parse_and_follow_the_legacy_hooks() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let user = write(
+            &dir,
+            "config.toml",
+            "[pre_tool_hook]\nname = 'old guard'\nargv = ['/bin/true']\n\
+             [post_tool_hook]\nname = 'old observer'\nargv = ['/bin/true']\n\
+             [[hooks]]\nevent = 'user_prompt'\nname = 'prompt check'\nargv = ['check']\n\
+             [[hooks]]\nevent = 'pre_tool'\nname = 'shell guard'\nargv = ['guard', '--strict']\n\
+             timeout_ms = 900\non_error = 'allow'\ntools = ['shell']\n",
+        );
+        let settings = load(None, Some(&user), &empty_env());
+        assert!(
+            settings.diagnostics.is_empty(),
+            "{:?}",
+            settings.diagnostics
+        );
+        let summary: Vec<_> = settings
+            .hooks
+            .iter()
+            .map(|hook| (hook.event, hook.name.as_str(), hook.on_error(), hook.legacy))
+            .collect();
+        assert_eq!(
+            summary,
+            [
+                (HookEvent::PreTool, "old guard", OnError::Deny, true),
+                (HookEvent::PostTool, "old observer", OnError::Allow, true),
+                (HookEvent::UserPrompt, "prompt check", OnError::Deny, false),
+                (HookEvent::PreTool, "shell guard", OnError::Allow, false),
+            ]
+        );
+        let guard = &settings.hooks[3];
+        assert_eq!(guard.timeout_ms, 900);
+        assert!(guard.applies_to("shell") && !guard.applies_to("read_file"));
+        assert_eq!(settings.hooks[2].timeout_ms, 5_000);
+        assert!(settings.hooks[2].applies_to("read_file"));
+        assert!(settings.hooks.iter().all(|hook| !hook.project));
+        assert_eq!(settings.source_of("hooks"), Layer::User);
+        assert!(
+            settings
+                .explain()
+                .iter()
+                .any(|row| row.key == "hooks" && row.value == "4 configured")
+        );
+        assert!(
+            Settings::default()
+                .explain()
+                .iter()
+                .any(|row| row.key == "hooks" && row.value == "none")
+        );
+        for (event, name) in [
+            (HookEvent::SessionStart, "session_start"),
+            (HookEvent::TurnEnd, "turn_end"),
+            (HookEvent::PreCompact, "pre_compact"),
+            (HookEvent::Notification, "notification"),
+            (HookEvent::SessionEnd, "session_end"),
+        ] {
+            assert_eq!(event.name(), name);
+            let hook: Hook =
+                toml::from_str(&format!("event = '{name}'\nname = 'n'\nargv = ['x']\n"))
+                    .expect("hook");
+            assert_eq!(hook.event, event);
+            assert_eq!(hook.on_error(), OnError::Allow);
+        }
+    }
+
+    #[test]
+    fn invalid_hooks_are_reported_and_dropped() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let user = write(
+            &dir,
+            "config.toml",
+            "[[hooks]]\nevent = 'pre_tool'\nname = ' '\nargv = ['x']\n\
+             [[hooks]]\nevent = 'pre_tool'\nname = 'no program'\nargv = ['']\n\
+             [[hooks]]\nevent = 'post_tool'\nname = 'no argv'\nargv = []\n\
+             [[hooks]]\nevent = 'turn_end'\nname = 'zero'\nargv = ['x']\ntimeout_ms = 0\n\
+             [[hooks]]\nevent = 'turn_end'\nname = 'long'\nargv = ['x']\ntimeout_ms = 60001\n\
+             [[hooks]]\nevent = 'user_prompt'\nname = 'filtered'\nargv = ['x']\ntools = ['shell']\n\
+             [[hooks]]\nevent = 'post_tool'\nname = 'kept'\nargv = ['x']\ntimeout_ms = 60000\n",
+        );
+        let settings = load(None, Some(&user), &empty_env());
+        let names: Vec<_> = settings
+            .hooks
+            .iter()
+            .map(|hook| hook.name.as_str())
+            .collect();
+        assert_eq!(names, ["kept"]);
+        let messages: Vec<_> = settings
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| {
+                diagnostic.code == ErrorCode::InvalidField
+                    && diagnostic.key.as_deref() == Some("hooks")
+            })
+            .map(|diagnostic| diagnostic.message.as_str())
+            .collect();
+        assert_eq!(
+            messages,
+            [
+                "hook 1 was ignored: a hook needs a nonempty `name`",
+                "hook 2 was ignored: a hook needs a nonempty `argv` program",
+                "hook 3 was ignored: a hook needs a nonempty `argv` program",
+                "hook 4 was ignored: `timeout_ms` must be from 1 to 60000",
+                "hook 5 was ignored: `timeout_ms` must be from 1 to 60000",
+                "hook 6 was ignored: `tools` applies only to pre_tool and post_tool hooks",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_project_file_cannot_set_hooks() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let project = write(
+            &dir,
+            ".rune.toml",
+            "[[hooks]]\nevent = 'pre_tool'\nname = 'repo guard'\nargv = ['/bin/false']\n",
+        );
+        let settings = load(Some(&project), None, &empty_env());
+        assert!(settings.hooks.is_empty());
+        assert!(settings.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == ErrorCode::KeyNotAllowedInScope
+                && diagnostic.key.as_deref() == Some("hooks")
+        }));
+        assert_eq!(settings.source_of("hooks"), Layer::Default);
     }
 
     #[test]

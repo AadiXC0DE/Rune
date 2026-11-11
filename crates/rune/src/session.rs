@@ -245,8 +245,8 @@ struct SessionHost {
     /// the first request's prefix.
     cache_key: std::sync::OnceLock<String>,
     usage_paths: Option<Paths>,
-    pre_tool_hook: Option<rune_core::config::PreToolHook>,
-    post_tool_hook: Option<rune_core::config::PostToolHook>,
+    /// Every configured hook, in the order they run.
+    hooks: Vec<rune_core::config::Hook>,
     accessible: bool,
     ascii: bool,
     recorder: Option<Arc<Mutex<Recorder>>>,
@@ -996,7 +996,7 @@ impl Host for SessionHost {
             // A queued message is reported once the turn ends, from the events.
             Event::SteeringApplied { .. } => {}
             // The result ends with a note saying what ran.
-            Event::CallRepaired { .. } => {}
+            Event::CallRepaired { .. } | Event::ToolRewritten { .. } => {}
             // Said in scrollback, so the reader knows why the turn went on.
             Event::VerificationRequested => {
                 let mut entries = self.take_narration();
@@ -1012,25 +1012,12 @@ impl Host for SessionHost {
         }
     }
 
-    fn pre_tool(&self, call: &turn::PreparedCall) -> Result<Option<turn::HookVeto>> {
-        crate::pre_tool_hook::run(
-            self.pre_tool_hook.as_ref(),
-            call,
-            &self.context,
-            &self.cancellation,
-        )
+    fn pre_tool_outcome(&self, call: &turn::PreparedCall) -> Result<turn::PreToolOutcome> {
+        self.with_tool_hooks(|hooks| hooks.pre_tool(call))
     }
 
-    fn post_tool(&self, result: &turn::CallResult) {
-        if let Some(message) = crate::post_tool_hook::notify(
-            self.post_tool_hook.as_ref(),
-            result,
-            &self.context,
-            &self.cancellation,
-            &self.endpoint.credential,
-        ) {
-            self.draw_notice(&message);
-        }
+    fn post_tool_effect(&self, result: &turn::CallResult) -> Option<turn::PostToolEffect> {
+        self.with_tool_hooks(|hooks| hooks.post_tool(result))
     }
 
     fn execute(&self, name: &str, arguments: &serde_json::Value) -> Result<ToolOutput> {
@@ -1945,6 +1932,36 @@ impl SessionHost {
     }
 
     /// Returns the identifier of the session now running.
+    /// Runs `body` with what tool hooks need from this session.
+    fn with_tool_hooks<T>(&self, body: impl FnOnce(&crate::hooks::ToolHooks<'_>) -> T) -> T {
+        let session_id = self.session_id_name();
+        let turn = self.recorder.as_ref().map_or(0, |recorder| {
+            recorder
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .turn_number()
+        });
+        let warn = |message: &str| self.draw_notice(&format!("warning: {message}"));
+        let check = || self.context.check_cancelled();
+        let limits = Host::limits(self);
+        body(&crate::hooks::ToolHooks {
+            hooks: &self.hooks,
+            envelope: crate::hooks::Envelope {
+                session_id: &session_id,
+                cwd: self.context.workspace(),
+                turn,
+            },
+            cancellation: &self.cancellation,
+            check: &check,
+            warn: &warn,
+            credential: &self.endpoint.credential,
+            max_result_bytes: usize::try_from(
+                limits.get_bytes(rune_core::LimitName::MaxToolResultBytes),
+            )
+            .unwrap_or(usize::MAX),
+        })
+    }
+
     fn session_id_name(&self) -> String {
         self.session_id
             .lock()
@@ -2911,8 +2928,7 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
     let host = SessionHost {
         cache_key: std::sync::OnceLock::new(),
         usage_paths: Some(config.paths.clone()),
-        pre_tool_hook: config.settings.pre_tool_hook.clone(),
-        post_tool_hook: config.settings.post_tool_hook.clone(),
+        hooks: config.settings.hooks.clone(),
         accessible: config.accessible,
         ascii: config.settings.ascii,
         recorder: Some(Arc::clone(&recorder)),
@@ -15448,8 +15464,7 @@ mod tests {
         SessionHost {
             cache_key: std::sync::OnceLock::new(),
             usage_paths: None,
-            pre_tool_hook: None,
-            post_tool_hook: None,
+            hooks: Vec::new(),
             accessible: false,
             ascii: false,
             recorder: None,

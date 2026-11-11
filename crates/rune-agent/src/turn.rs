@@ -112,6 +112,44 @@ pub struct HookVeto {
     pub reason: String,
 }
 
+/// What pre-tool hooks decided for a call.
+#[derive(Clone, Debug)]
+pub enum PreToolOutcome {
+    /// The call may run.
+    Allow,
+    /// The call is refused.
+    Veto(HookVeto),
+    /// The call runs with new arguments, checked again by policy.
+    Rewrite {
+        /// Name of the hook that rewrote the call.
+        hook: String,
+        /// The new arguments as compact JSON.
+        arguments: String,
+    },
+}
+
+/// What post-tool hooks did to a result.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PostToolEffect {
+    /// Text added after the result.
+    Append(String),
+    /// Text that replaces the result.
+    Replace(String),
+}
+
+impl PostToolEffect {
+    /// Changes a result's text as the model will see it.
+    pub fn apply(&self, output: &mut ToolOutput) {
+        match self {
+            Self::Append(text) => {
+                output.text.push_str("\n\n[hook output]\n");
+                output.text.push_str(text);
+            }
+            Self::Replace(text) => output.text.clone_from(text),
+        }
+    }
+}
+
 /// How a tool call was resolved.
 #[derive(Clone, Debug)]
 pub struct CallResult {
@@ -180,6 +218,13 @@ pub enum Event {
         to: String,
         /// What was changed in the arguments, as short phrases.
         repairs: Vec<String>,
+    },
+    /// A pre-tool hook replaced a call's arguments before policy checked it again.
+    ToolRewritten {
+        /// The call with its new arguments.
+        call: PreparedCall,
+        /// Name of the hook.
+        hook: String,
     },
     /// A tool call is about to run.
     ToolStarted {
@@ -487,6 +532,19 @@ pub trait Host {
     /// result budgets are applied. Hosts must redact data and bound external
     /// execution. This notification cannot change the tool result.
     fn post_tool(&self, _result: &CallResult) {}
+
+    /// Runs pre-tool hooks for a call; the default maps `pre_tool`.
+    fn pre_tool_outcome(&self, call: &PreparedCall) -> Result<PreToolOutcome> {
+        Ok(self
+            .pre_tool(call)?
+            .map_or(PreToolOutcome::Allow, PreToolOutcome::Veto))
+    }
+
+    /// Runs post-tool hooks for a result; the default calls `post_tool` and changes nothing.
+    fn post_tool_effect(&self, result: &CallResult) -> Option<PostToolEffect> {
+        self.post_tool(result);
+        None
+    }
 
     /// Executes a tool call, after policy has allowed it.
     fn execute(&self, name: &str, arguments: &serde_json::Value) -> Result<ToolOutput>;
@@ -1551,8 +1609,10 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
             stall_noted = true;
         }
 
-        for result in &results {
-            host.post_tool(result);
+        for result in &mut results {
+            if let Some(effect) = host.post_tool_effect(result) {
+                effect.apply(&mut result.output);
+            }
         }
         let appendix = host
             .step_appendix(history, &results)
@@ -2321,7 +2381,15 @@ fn execute_batch(
                     });
                 let prepared = match blocked {
                     Some(result) => Err(result),
-                    None => prepare_call(call, host, &offered, &mut cancelled, tool_cap, repaired),
+                    None => prepare_call(
+                        call,
+                        host,
+                        &offered,
+                        &mut cancelled,
+                        tool_cap,
+                        repaired,
+                        false,
+                    ),
                 };
                 let execution = match prepared {
                     Ok(Cleared {
@@ -3068,6 +3136,7 @@ fn prepare_call(
     cancelled: &mut bool,
     tool_cap: usize,
     repaired: &mut Vec<(String, Resolved)>,
+    rewritten: bool,
 ) -> std::result::Result<Cleared, CallResult> {
     if *cancelled || host.cancellation().is_cancelled() {
         *cancelled = true;
@@ -3135,13 +3204,16 @@ fn prepare_call(
             Some(repair) => format!("{repair}\n{HEREDOC_NOTE}"),
             None => HEREDOC_NOTE.to_owned(),
         });
-        return match authorize(&effective, arguments, host, cancelled, tool_cap) {
-            Ok((arguments, context)) => Ok(Cleared {
+        return match authorize(&effective, arguments, host, cancelled, tool_cap, rewritten) {
+            Ok(Authorized::Ready(arguments, context)) => Ok(Cleared {
                 call: effective,
                 arguments,
                 context,
                 note,
             }),
+            Ok(Authorized::Rewrite(call)) => {
+                prepare_call(&call, host, offered, cancelled, tool_cap, repaired, true)
+            }
             Err(result) => Err(with_note(result, note.as_deref())),
         };
     }
@@ -3163,13 +3235,23 @@ fn prepare_call(
     } else {
         call.clone()
     };
-    match authorize(&effective, resolved.arguments, host, cancelled, tool_cap) {
-        Ok((arguments, context)) => Ok(Cleared {
+    match authorize(
+        &effective,
+        resolved.arguments,
+        host,
+        cancelled,
+        tool_cap,
+        rewritten,
+    ) {
+        Ok(Authorized::Ready(arguments, context)) => Ok(Cleared {
             call: effective,
             arguments,
             context,
             note,
         }),
+        Ok(Authorized::Rewrite(call)) => {
+            prepare_call(&call, host, offered, cancelled, tool_cap, repaired, true)
+        }
         Err(result) => Err(with_note(result, note.as_deref())),
     }
 }
@@ -3204,14 +3286,25 @@ fn with_note(mut result: CallResult, note: Option<&str>) -> CallResult {
     result
 }
 
+/// What `authorize` cleared a call for.
+enum Authorized {
+    /// The call may run with these arguments and context.
+    Ready(serde_json::Value, ExecutionContext),
+    /// A hook replaced the arguments; the new call is prepared again.
+    Rewrite(PreparedCall),
+}
+
 /// Resolves policy, hooks and the execution context for an effective call.
+///
+/// A call that a hook already rewrote skips the hooks.
 fn authorize(
     call: &PreparedCall,
     arguments: serde_json::Value,
     host: &dyn Host,
     cancelled: &mut bool,
     tool_cap: usize,
-) -> std::result::Result<(serde_json::Value, ExecutionContext), CallResult> {
+    rewritten: bool,
+) -> std::result::Result<Authorized, CallResult> {
     let activity = host
         .tool_activity(&call.name)
         .unwrap_or_else(|| infer_activity(&call.name));
@@ -3360,9 +3453,28 @@ fn authorize(
             });
         }
     }
-    let veto = match host.pre_tool(call) {
-        Ok(veto) => {
-            veto.map(|veto| format!("pre-tool hook `{}` vetoed: {}", veto.name, veto.reason))
+    let outcome = if rewritten {
+        Ok(PreToolOutcome::Allow)
+    } else {
+        host.pre_tool_outcome(call)
+    };
+    let veto = match outcome {
+        Ok(PreToolOutcome::Allow) => None,
+        Ok(PreToolOutcome::Veto(veto)) => Some(format!(
+            "pre-tool hook `{}` vetoed: {}",
+            veto.name, veto.reason
+        )),
+        Ok(PreToolOutcome::Rewrite { hook, arguments }) => {
+            let call = PreparedCall {
+                id: call.id.clone(),
+                name: call.name.clone(),
+                arguments,
+            };
+            host.emit(Event::ToolRewritten {
+                call: call.clone(),
+                hook,
+            });
+            return Ok(Authorized::Rewrite(call));
         }
         Err(error) if error.code() == ErrorCode::Cancelled => {
             *cancelled = true;
@@ -3422,7 +3534,7 @@ fn authorize(
         call: call.clone(),
         activity,
     });
-    Ok((arguments, context))
+    Ok(Authorized::Ready(arguments, context))
 }
 
 /// Every path a patch touches with the tool it is decided as, in patch order:
@@ -3462,7 +3574,7 @@ fn execute_call(
         arguments,
         context,
         note,
-    } = match prepare_call(call, host, offered, cancelled, tool_cap, repaired) {
+    } = match prepare_call(call, host, offered, cancelled, tool_cap, repaired, false) {
         Ok(cleared) => cleared,
         Err(result) => return result,
     };
