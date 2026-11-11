@@ -215,6 +215,7 @@ Inspect or change workspace trust
 | Flag | Description |
 |---|---|
 | `--json` | Emit JSON. |
+| `--yes` | Approve project hooks and rules without asking. |
 ### `rune config [--explain] [--json] | rune config get <key> [--json] | rune config set <key> <value> | rune config unset <key> | rune config path [--json] | rune config edit`
 
 Show, read or change the configuration and where each value came from

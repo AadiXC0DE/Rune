@@ -547,7 +547,10 @@ pub const ACCOUNT: &[CommandSpec] = &[
         aliases: &[],
         summary: "Inspect or change workspace trust",
         usage: "rune projects [status|approve|reject|reset]",
-        flags: &[flag("--json", "Emit JSON.")],
+        flags: &[
+            flag("--json", "Emit JSON."),
+            flag("--yes", "Approve project hooks and rules without asking."),
+        ],
         requirements: Requirements::NONE,
         supports_json: true,
     },

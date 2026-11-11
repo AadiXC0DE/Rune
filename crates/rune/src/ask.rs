@@ -1650,6 +1650,17 @@ pub fn run(
     } else {
         (Registry::new(), None, None)
     };
+    // Approved project hooks run after the user's hooks of the same event.
+    let project_hooks = crate::project_trust::session_hooks(paths, &crate::current_workspace()?)?;
+    if let Some(problem) = &project_hooks.problem {
+        warn_on_stderr(problem);
+    }
+    if project_hooks.unapproved {
+        warn_on_stderr("project hooks in .rune/hooks.toml are not approved and were skipped");
+    }
+    let mut with_project_hooks = settings.clone();
+    with_project_hooks.hooks.extend(project_hooks.hooks);
+    let settings = &with_project_hooks;
     let session_id = options.session_id.unwrap_or_else(SessionId::generate);
     let event_hooks = crate::hooks::Detached {
         hooks: settings.hooks.clone(),

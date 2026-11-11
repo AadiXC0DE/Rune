@@ -32,6 +32,7 @@ mod mcp;
 mod model_limits;
 mod path_completion;
 mod permissions;
+mod project_trust;
 mod prompt_history;
 mod provider_setup;
 mod reference;
@@ -1540,6 +1541,12 @@ fn run_projects(
     let canonical = trust::canonical_workspace(workspace);
     let mut store = trust::TrustStore::load(&paths.trust_file())?;
     let action = launch.args.first().map_or("status", String::as_str);
+    let project_hooks = project_trust::ProjectHooks::read(workspace);
+    if !matches!(action, "status" | "list") {
+        // Created private before any record is written, or a first write
+        // would leave a state root that every later run refuses.
+        rune_core::paths::create_dir_private(&paths.state_root)?;
+    }
 
     match action {
         "status" | "list" => {}
@@ -1549,6 +1556,7 @@ fn run_projects(
             if !output.json {
                 println!("approved {canonical}");
             }
+            approve_project_hooks(paths, &canonical, &project_hooks, launch, output)?;
         }
         "reject" => {
             store.reject(&canonical);
@@ -1562,6 +1570,9 @@ fn run_projects(
             // path's record is cleared.
             store.reset(&canonical);
             store.save(&paths.trust_file())?;
+            let mut approvals = project_trust::load(paths)?;
+            approvals.reset(&canonical);
+            approvals.save(paths)?;
             if !output.json {
                 println!("cleared the recorded decision for {canonical}");
             }
@@ -1587,6 +1598,7 @@ fn run_projects(
             Some(t) => println!("{canonical}: {}", t.as_str()),
             None => println!("{canonical}: no decision recorded"),
         }
+        print_project_hooks(paths, &canonical, &project_hooks)?;
         let known = store.entries();
         if known.is_empty() {
             println!("no workspaces have a recorded decision");
@@ -1598,6 +1610,88 @@ fn run_projects(
         }
     }
     Ok(ExitCode::from(EXIT_OK))
+}
+
+/// Prints whether the project hooks are approved, listing them when not.
+fn print_project_hooks(
+    paths: &Paths,
+    workspace: &Utf8Path,
+    hooks: &project_trust::ProjectHooks,
+) -> Result<()> {
+    match hooks {
+        project_trust::ProjectHooks::None => println!("project hooks: none"),
+        project_trust::ProjectHooks::Malformed(diagnostic) => {
+            println!("project hooks: none");
+            println!("  {}", project_trust::ignored(diagnostic));
+        }
+        project_trust::ProjectHooks::Present { digest, hooks } => {
+            if project_trust::load(paths)?.hooks_approved(workspace, digest) {
+                println!("project hooks: approved");
+            } else {
+                let noun = if hooks.len() == 1 { "hook" } else { "hooks" };
+                println!("project hooks: not approved ({} {noun})", hooks.len());
+                for hook in hooks {
+                    println!("{}", project_trust::hook_line(hook));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Approves the project hooks after the user saw the exact commands: asked on
+/// a terminal, or with `--yes` without one.
+fn approve_project_hooks(
+    paths: &Paths,
+    workspace: &Utf8Path,
+    hooks: &project_trust::ProjectHooks,
+    launch: &Launch,
+    output: &OutputFlags,
+) -> Result<()> {
+    use std::io::{IsTerminal as _, Write as _};
+
+    let project_trust::ProjectHooks::Present { digest, hooks } = hooks else {
+        return Ok(());
+    };
+    let mut approvals = project_trust::load(paths)?;
+    if approvals.hooks_approved(workspace, digest) {
+        return Ok(());
+    }
+    let yes = launch.has_flag("--yes");
+    let ask = !yes && !output.json && std::io::stdin().is_terminal();
+    if !output.json {
+        for hook in hooks {
+            println!("{}", project_trust::hook_line(hook));
+        }
+    }
+    let approved = if yes {
+        true
+    } else if ask {
+        print!("run these commands as you, outside the sandbox? [y/N] ");
+        std::io::stdout().flush()?;
+        let mut answer = String::new();
+        std::io::stdin().read_line(&mut answer)?;
+        matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+    } else {
+        let line = "project hooks not approved: pass --yes to approve them without a prompt";
+        if output.json {
+            eprintln!("{line}");
+        } else {
+            println!("{line}");
+        }
+        false
+    };
+    if approved {
+        approvals.approve_hooks(workspace, digest);
+        approvals.save(paths)?;
+        if !output.json {
+            println!(
+                "approved the project hooks in {}",
+                project_trust::HOOKS_FILE
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Replaces the running binary with a verified artifact.
