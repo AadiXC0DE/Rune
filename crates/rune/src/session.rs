@@ -437,6 +437,32 @@ struct SessionHost {
     warming: Arc<crate::cache_warming::WarmState>,
     /// Time between cache warming pings.
     warm_interval: std::time::Duration,
+    /// Model a custom command chose for the next prompt only.
+    pending_model: Mutex<Option<String>>,
+    /// Custom commands whose ignored directives were already reported.
+    ignored_reported: Mutex<std::collections::BTreeSet<String>>,
+}
+
+/// Runs one turn on a model other than the session's, restoring it on drop.
+///
+/// A guard rather than a reset after the turn, because a turn can end through
+/// an error on any of several paths and each must leave the session model.
+struct TurnModel<'a> {
+    host: &'a SessionHost,
+    previous: String,
+}
+
+impl<'a> TurnModel<'a> {
+    fn apply(host: &'a SessionHost, model: &str) -> Self {
+        let previous = std::mem::replace(&mut *lock_model(&host.model), model.to_owned());
+        Self { host, previous }
+    }
+}
+
+impl Drop for TurnModel<'_> {
+    fn drop(&mut self) {
+        std::mem::take(&mut self.previous).clone_into(&mut lock_model(&self.host.model));
+    }
 }
 
 /// Locks the model, recovering from a poisoned lock.
@@ -2787,6 +2813,8 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
         last_plan: Mutex::new(None),
         warming: Arc::default(),
         warm_interval: crate::cache_warming::WARM_INTERVAL,
+        pending_model: Mutex::new(None),
+        ignored_reported: Mutex::new(std::collections::BTreeSet::new()),
         planning: std::sync::atomic::AtomicBool::new(false),
         unsandboxed: config.settings.allow_unsandboxed && !rune_exec::detect().support().is_full(),
         questions: config.questions,
@@ -2959,6 +2987,9 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                     );
                 }
                 let mut note = |text: String| captured.extend_from_slice(text.as_bytes());
+                // A model chosen by a command belongs to the prompt right after
+                // it, so any other command in between drops it.
+                lock_value(&host.pending_model).take();
                 if ends_warming(&handled) {
                     host.stop_warming();
                 }
@@ -3192,10 +3223,34 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                     // Expanded text goes to the composer for review, never
                     // straight to the model: a template with a wrong argument
                     // should be visible before it is sent.
-                    Handled::Expand(prompt) => {
-                        note(format!(
-                            "-- /{name} expanded; edit before sending --\n{prompt}"
-                        ));
+                    Handled::Expand { text, model } => {
+                        // Reported once per session, so a command used often
+                        // does not repeat what it already said.
+                        let ignored = commands
+                            .commands
+                            .iter()
+                            .find(|command| command.name == name)
+                            .and_then(rune_context::commands::Command::ignored_notice);
+                        if let Some(line) = ignored
+                            && lock_value(&host.ignored_reported).insert(name.clone())
+                        {
+                            host.transcript
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .push(Entry::notice(&line));
+                            note(format!("{line}\n"));
+                        }
+                        match model {
+                            Some(model) => {
+                                note(format!(
+                                    "-- /{name} expanded; edit before sending; the turn uses model {model} --\n{text}"
+                                ));
+                                *lock_value(&host.pending_model) = Some(model);
+                            }
+                            None => note(format!(
+                                "-- /{name} expanded; edit before sending --\n{text}"
+                            )),
+                        }
                     }
                     Handled::Continue => {}
                 }
@@ -3204,6 +3259,10 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                 Ok(Step::Continue)
             }
             Input::Prompt(text) => {
+                // Held for the whole arm, so every way the turn ends puts the
+                // session model back.
+                let pending = lock_value(&host.pending_model).take();
+                let _turn_model = pending.map(|model| TurnModel::apply(&host, &model));
                 // The submitted line is committed to the flow before the turn
                 // runs, so what the user typed stays on screen once the reply
                 // replaces the region it was typed in.
@@ -4572,7 +4631,17 @@ fn await_submission(
         ) {
             continue;
         }
+        let had_draft = !reader.line().is_empty();
         match idle_key(commands, key, reader, &mut selected, &rows, recall) {
+            // Clearing the draft abandons the prompt a command prepared, and
+            // the model it chose with it.
+            Idle::Stay
+                if had_draft
+                    && reader.line().is_empty()
+                    && matches!(key, KeyAction::Escape | KeyAction::Cancel) =>
+            {
+                lock_value(&host.pending_model).take();
+            }
             Idle::Stay => {}
             Idle::Leave => return Ok(None),
             Idle::Submit(input) => return Ok(Some(input)),
@@ -6596,8 +6665,9 @@ enum Handled {
     Continue,
     /// End the session.
     Exit,
-    /// Place this text in the composer for review.
-    Expand(String),
+    /// Place this text in the composer for review, with the model the next
+    /// turn runs on when the command names one.
+    Expand { text: String, model: Option<String> },
     /// Forget every recorded prompt.
     ClearHistory,
     /// Send later turns to this model.
@@ -7174,6 +7244,13 @@ fn handle_command<W: std::io::Write>(
             let _ = writeln!(output, "/history clear  forget every recorded prompt");
             let listing = rune_context::commands::render_listing(&commands.commands);
             let _ = writeln!(output, "{listing}");
+            for line in commands
+                .commands
+                .iter()
+                .filter_map(rune_context::commands::Command::ignored_notice)
+            {
+                let _ = writeln!(output, "{line}");
+            }
             // A command file that was refused is invisible otherwise, and a
             // silent skip looks like a file that was never read.
             for warning in &commands.warnings {
@@ -7186,9 +7263,13 @@ fn handle_command<W: std::io::Write>(
                 let _ = writeln!(output, "unknown command `/{other}`; try /help");
                 return Ok(Handled::Continue);
             };
-            let parts: Vec<String> = arguments.split_whitespace().map(str::to_owned).collect();
-            match command.expand(&parts) {
-                Ok(text) => Ok(Handled::Expand(text)),
+            let expanded = rune_context::commands::split_arguments(arguments)
+                .and_then(|parts| command.expand(&parts));
+            match expanded {
+                Ok(text) => Ok(Handled::Expand {
+                    text,
+                    model: command.model.clone(),
+                }),
                 Err(err) => {
                     let _ = writeln!(output, "{err}");
                     if let Some(hint) = err.hint() {
@@ -12616,7 +12697,10 @@ mod tests {
             .expect("expand command");
             assert_eq!(
                 result,
-                Handled::Expand("Describe audit command files.".to_owned())
+                Handled::Expand {
+                    text: "Describe audit command files.".to_owned(),
+                    model: None,
+                }
             );
         }
     }
@@ -13174,6 +13258,201 @@ mod tests {
     }
 
     #[test]
+    fn a_command_model_applies_to_one_turn() {
+        use std::io::{BufRead, BufReader, Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("listener");
+        let address = listener.local_addr().expect("address");
+        let requests: Arc<Mutex<Vec<serde_json::Value>>> = Arc::default();
+        let seen = Arc::clone(&requests);
+        // Not joined: a session that sent fewer requests than expected leaves
+        // this thread waiting, and the assertions below report it instead.
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let mut stream = stream.expect("accept");
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .expect("timeout");
+                let mut reader = BufReader::new(&mut stream);
+                let mut line = String::new();
+                let mut length = 0;
+                loop {
+                    line.clear();
+                    reader.read_line(&mut line).expect("header");
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        length = value.trim().parse().expect("length");
+                    }
+                }
+                let mut body = vec![0; length];
+                reader.read_exact(&mut body).expect("request body");
+                seen.lock()
+                    .expect("requests")
+                    .push(serde_json::from_slice::<serde_json::Value>(&body).expect("JSON"));
+                let response = concat!(
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"answer\"},\"finish_reason\":\"stop\"}]}\n\n",
+                    "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5}}\n\n",
+                    "data: [DONE]\n\n"
+                );
+                write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}", response.len()).expect("response");
+            }
+        });
+
+        let temp = tempfile::tempdir().expect("root");
+        let root = Utf8PathBuf::from_path_buf(temp.path().to_owned()).expect("utf8");
+        let workspace = root.join("work");
+        std::fs::create_dir_all(workspace.join(".claude/commands")).expect("commands");
+        std::fs::write(
+            workspace.join(".claude/commands/quick.md"),
+            "---\ndescription: Quick answer\nmodel: claude-haiku-4-5\nallowed-tools: Bash(git *)\n---\nAnswer briefly: $ARGUMENTS\n",
+        )
+        .expect("command file");
+
+        let mut config = colorless_config();
+        config.accessible = true;
+        config.paths = Paths {
+            config_root: root.join("config"),
+            state_root: root.join("state"),
+            data_root: root.join("data"),
+        };
+        config.workspace = workspace;
+        config.settings.model = "session-model".to_owned();
+        config.settings.offline = true;
+        config.endpoint = Endpoint::new(format!("http://{address}/v1"), "k").offline(true);
+
+        let output: Arc<Mutex<Vec<u8>>> = Arc::default();
+        let input = "/quick \"two words\"\nfirst\n/quick again\n/status\nsecond\n/quit\n";
+        let code = run(
+            config,
+            std::io::Cursor::new(input),
+            SharedBuffer(Arc::clone(&output)),
+        )
+        .expect("session");
+        assert_eq!(code, 0);
+
+        let text = String::from_utf8_lossy(&output.lock().expect("output")).into_owned();
+        assert!(
+            text.contains("the turn uses model claude-haiku-4-5"),
+            "{text}"
+        );
+        assert!(text.contains("Answer briefly: two words"), "{text}");
+        assert_eq!(
+            text.matches("/quick: ignored frontmatter key allowed-tools")
+                .count(),
+            1,
+            "{text}"
+        );
+        let requests = requests.lock().expect("requests");
+        let models: Vec<&str> = requests
+            .iter()
+            .map(|body| body["model"].as_str().expect("model"))
+            .collect();
+        // The second command's model was dropped by the command after it.
+        assert_eq!(models, ["claude-haiku-4-5", "session-model"], "{text}");
+    }
+
+    #[test]
+    fn help_lists_ignored_directives_once() {
+        let mut discovery = rune_context::commands::Discovery::default();
+        for (name, ignored) in [
+            (
+                "commit",
+                vec![
+                    "frontmatter key allowed-tools".to_owned(),
+                    "!`command` lines (2)".to_owned(),
+                ],
+            ),
+            ("plain", Vec::new()),
+        ] {
+            discovery.commands.push(rune_context::commands::Command {
+                name: name.to_owned(),
+                description: "does a thing".to_owned(),
+                argument_hint: None,
+                body: "Body".to_owned(),
+                model: None,
+                ignored,
+                origin: rune_context::commands::Origin::Project,
+                source: None,
+            });
+        }
+
+        let mut output = Vec::new();
+        handle_command(
+            "help",
+            "",
+            &discovery,
+            None,
+            Utf8Path::new("/w"),
+            &test_info(),
+            &mut output,
+        )
+        .expect("handled");
+        let text = String::from_utf8_lossy(&output);
+        let lines: Vec<&str> = text
+            .lines()
+            .filter(|line| line.contains("ignored"))
+            .collect();
+        assert_eq!(
+            lines,
+            ["/commit: ignored frontmatter key allowed-tools, !`command` lines (2)"],
+            "{text}"
+        );
+        let listing = text.find("/plain").expect("listing");
+        let notice = text.find("/commit: ignored").expect("notice");
+        assert!(listing < notice, "the notice follows the listing: {text}");
+    }
+
+    #[test]
+    fn a_command_with_an_unterminated_quote_expands_nothing() {
+        let mut discovery = rune_context::commands::Discovery::default();
+        discovery.commands.push(rune_context::commands::Command {
+            name: "fix".to_owned(),
+            description: "Fix it".to_owned(),
+            argument_hint: None,
+            body: "Fix $ARGUMENTS".to_owned(),
+            model: Some("claude-haiku-4-5".to_owned()),
+            ignored: Vec::new(),
+            origin: rune_context::commands::Origin::Project,
+            source: None,
+        });
+
+        let mut output = Vec::new();
+        let handled = handle_command(
+            "fix",
+            "\"open",
+            &discovery,
+            None,
+            Utf8Path::new("/w"),
+            &test_info(),
+            &mut output,
+        )
+        .expect("handled");
+        assert_eq!(handled, Handled::Continue);
+        let text = String::from_utf8_lossy(&output);
+        assert!(text.contains("unterminated quote"), "{text}");
+        assert!(text.contains("hint: close the quote"), "{text}");
+
+        let quoted = handle_command(
+            "fix",
+            "\"two words\" three",
+            &discovery,
+            None,
+            Utf8Path::new("/w"),
+            &test_info(),
+            &mut Vec::new(),
+        )
+        .expect("handled");
+        assert_eq!(
+            quoted,
+            Handled::Expand {
+                text: "Fix two words three".to_owned(),
+                model: Some("claude-haiku-4-5".to_owned()),
+            }
+        );
+    }
+
+    #[test]
     fn a_user_command_expands_for_review_instead_of_running() {
         let mut discovery = rune_context::commands::Discovery::default();
         discovery.commands.push(rune_context::commands::Command {
@@ -13181,6 +13460,8 @@ mod tests {
             description: "Fix it".to_owned(),
             argument_hint: None,
             body: "Fix $1 now".to_owned(),
+            model: None,
+            ignored: Vec::new(),
             origin: rune_context::commands::Origin::Project,
             source: None,
         });
@@ -13196,7 +13477,13 @@ mod tests {
             &mut output,
         )
         .expect("handled");
-        assert_eq!(handled, Handled::Expand("Fix parser now".to_owned()));
+        assert_eq!(
+            handled,
+            Handled::Expand {
+                text: "Fix parser now".to_owned(),
+                model: None,
+            }
+        );
     }
 
     #[test]
@@ -13207,6 +13494,8 @@ mod tests {
             description: "Fix it".to_owned(),
             argument_hint: None,
             body: "Fix $1 now".to_owned(),
+            model: None,
+            ignored: Vec::new(),
             origin: rune_context::commands::Origin::Project,
             source: None,
         });
@@ -14199,6 +14488,8 @@ mod tests {
             last_plan: Mutex::new(None),
             warming: Arc::default(),
             warm_interval: std::time::Duration::from_millis(50),
+            pending_model: Mutex::new(None),
+            ignored_reported: Mutex::new(std::collections::BTreeSet::new()),
         }
     }
 }
