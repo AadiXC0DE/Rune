@@ -414,6 +414,9 @@ struct SessionHost {
     /// The settings the rules were built from, so `/permissions` can rebuild
     /// them for another mode.
     permission_settings: Settings,
+    /// The user file's rules as this session has them: the ones loaded, plus
+    /// rules saved from a prompt, less rules deleted with `/permissions`.
+    user_rules: Mutex<Vec<rune_core::config::ConfiguredRule>>,
     /// Behind a lock because `/effort` changes it between turns.
     effort: Mutex<Effort>,
     /// Whether the user chose the effort, in the settings or with `/effort`;
@@ -1826,6 +1829,17 @@ impl SessionHost {
         }
     }
 
+    /// The settings the rules are built from, with the user rules as this
+    /// session has them.
+    fn rule_settings(&self) -> Settings {
+        let mut settings = self.permission_settings.clone();
+        settings
+            .user_rules
+            .clone_from(&lock_value(&self.user_rules));
+        settings.permission_mode = self.mode();
+        settings
+    }
+
     /// The user file approvals are saved to.
     fn user_config_file(&self) -> Option<Utf8PathBuf> {
         self.permission_settings
@@ -1887,6 +1901,7 @@ impl SessionHost {
             pattern.clone(),
             rune_policy::decision::Layer::User,
         ));
+        lock_value(&self.user_rules).push(rule);
         self.checkpoint_notice(format!(
             "saved: allow {tool} \"{pattern}\" in this project ({path})"
         ));
@@ -4146,6 +4161,7 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
         rules: Mutex::new(config.rules),
         mode: Mutex::new(config.settings.permission_mode),
         permission_settings: config.settings.clone(),
+        user_rules: Mutex::new(config.settings.user_rules.clone()),
         effort: Mutex::new(config.settings.effort),
         effort_set: std::sync::atomic::AtomicBool::new(
             config.settings.source_of("effort") != rune_core::config::Layer::Default,
@@ -8377,15 +8393,15 @@ fn lock_rules(rules: &Mutex<RuleSet>) -> std::sync::MutexGuard<'_, RuleSet> {
 fn set_permissions(host: &SessionHost, requested: Option<&str>) -> String {
     let current = host.mode();
     let Some(requested) = requested else {
-        return format!(
-            "permissions are {}; choose ask, auto, or full-access",
-            current.label()
-        );
+        return permissions_panel(host);
     };
+    if let Some(number) = requested.strip_prefix("delete") {
+        return delete_rule(host, number.trim());
+    }
     let Some(mode) = PermissionMode::from_name(requested) else {
         return format!("`{requested}` is not a permission mode; choose ask, auto, or full-access");
     };
-    let mut settings = host.permission_settings.clone();
+    let mut settings = host.rule_settings();
     settings.permission_mode = mode;
     let rules = match crate::permissions::validated(&settings) {
         Ok(rules) => rules,
@@ -8416,6 +8432,156 @@ fn set_permissions(host: &SessionHost, requested: Option<&str>) -> String {
         "permissions set to {} for the calls that follow",
         mode.label()
     )
+}
+
+/// A configured rule as `/permissions` lists it: `allow shell "git status*"`.
+fn rule_text(rule: &rune_policy::rules::Rule) -> String {
+    format!(
+        "{} {} {:?}",
+        rule.outcome.as_str(),
+        rule.tool.escape_debug(),
+        rule.pattern
+    )
+}
+
+/// The mode, the session grants and the configured rules, numbered for
+/// `/permissions delete <n>`. Built-in rules are left to `rune permissions`.
+fn permissions_panel(host: &SessionHost) -> String {
+    use std::fmt::Write as _;
+
+    let mut out = format!(
+        "permission mode: {}\nsession grants:\n",
+        host.mode().label()
+    );
+    let grants = lock_value(&host.grants);
+    if grants.is_empty() {
+        out.push_str("  (none)\n");
+    }
+    for grant in grants.entries() {
+        let _ = writeln!(out, "  {} {}", grant.tool, grant.target.escape_debug());
+    }
+    drop(grants);
+    out.push_str("saved rules:\n");
+    let configured = crate::permissions::configured(&host.rule_settings());
+    if configured.is_empty() {
+        out.push_str("  (none)\n");
+    }
+    for (index, entry) in configured.iter().enumerate() {
+        let source = match &entry.source {
+            crate::permissions::RuleSource::UserFile(_) => "user file".to_owned(),
+            crate::permissions::RuleSource::SavedFromPrompt(date) => {
+                format!("saved {date}, this project")
+            }
+            crate::permissions::RuleSource::ProjectFile(_) => "project file".to_owned(),
+        };
+        let _ = writeln!(
+            out,
+            "  {}. {}  ({source})",
+            index.saturating_add(1),
+            rule_text(&entry.rule)
+        );
+    }
+    out.trim_end().to_owned()
+}
+
+/// Deletes rule `n` of the panel from the user file and from this session.
+fn delete_rule(host: &SessionHost, number: &str) -> String {
+    let settings = host.rule_settings();
+    let configured = crate::permissions::configured(&settings);
+    let Some(n) = number
+        .parse::<usize>()
+        .ok()
+        .filter(|n| (1..=configured.len()).contains(n))
+    else {
+        return format!("`{number}` is not a saved rule number; /permissions lists them");
+    };
+    let entry = &configured[n.saturating_sub(1)];
+    if let crate::permissions::RuleSource::ProjectFile(path) = &entry.source {
+        return format!("rule {n} comes from {path} in the repository; edit that file");
+    }
+    // User rules come first in the panel, in the order the session holds them.
+    let Some(rule) = settings
+        .user_rules
+        .iter()
+        .filter(|rule| crate::permissions::applies_here(rule, &settings))
+        .nth(n.saturating_sub(1))
+        .cloned()
+    else {
+        return format!("`{number}` is not a saved rule number; /permissions lists them");
+    };
+    let Some(path) = host.user_config_file() else {
+        return "there is no user configuration file".to_owned();
+    };
+    let result = rune_policy::settings::update(&path, |old| {
+        let old = old.unwrap_or_default();
+        let missing = || {
+            RuneError::new(
+                ErrorCode::InvalidConfiguration,
+                format!(
+                    "rule {n} is not in a [[permission.rules]] block of {path}; remove it by hand"
+                ),
+            )
+        };
+        let text = without_rule_block(old, &rule).ok_or_else(missing)?;
+        toml::from_str::<rune_core::config::UserConfig>(&text).map_err(|_| missing())?;
+        Ok(text)
+    });
+    if let Err(err) = result {
+        return err.message().to_owned();
+    }
+    {
+        let mut user_rules = lock_value(&host.user_rules);
+        if let Some(position) = user_rules.iter().position(|kept| *kept == rule) {
+            user_rules.remove(position);
+        }
+    }
+    {
+        let mut rules = lock_rules(&host.rules);
+        let mut kept = RuleSet::new();
+        let mut dropped = false;
+        for existing in rules.rules() {
+            if !dropped && *existing == entry.rule {
+                dropped = true;
+            } else {
+                kept.push(existing.clone());
+            }
+        }
+        *rules = kept;
+    }
+    format!("deleted rule {n}: {}", rule_text(&entry.rule))
+}
+
+/// Removes the first `[[permission.rules]]` block whose fields equal `rule`.
+///
+/// A block runs from its header line to the line before the next line that
+/// starts with `[`, or to the end of the file. Returns None when no block
+/// matches.
+fn without_rule_block(text: &str, rule: &rune_core::config::ConfiguredRule) -> Option<String> {
+    let lines: Vec<&str> = text.split_inclusive('\n').collect();
+    let starts = |line: &str| line.trim_start().starts_with('[');
+    let mut index = 0;
+    while index < lines.len() {
+        if lines[index].trim() != "[[permission.rules]]" {
+            index = index.saturating_add(1);
+            continue;
+        }
+        let end = lines[index.saturating_add(1)..]
+            .iter()
+            .position(|line| starts(line))
+            .map_or(lines.len(), |offset| {
+                index.saturating_add(1).saturating_add(offset)
+            });
+        let block = lines[index..end].concat();
+        let parsed = toml::from_str::<rune_core::config::UserConfig>(&block)
+            .ok()
+            .and_then(|config| config.permission)
+            .map(|table| table.rules);
+        if parsed.as_deref() == Some(std::slice::from_ref(rule)) {
+            return Some([lines[..index].concat(), lines[end..].concat()].concat());
+        }
+        index = end;
+    }
+    None
 }
 
 /// Returns the mode Shift+Tab moves to, and whether it plans.
@@ -9077,7 +9243,8 @@ enum Handled {
     SetModel(String),
     /// Show the reasoning effort, or set it for the requests that follow.
     Effort(Option<String>),
-    /// Show the permission mode, or switch it for the calls that follow.
+    /// Show the mode and saved rules, switch the mode for the calls that
+    /// follow, or delete a saved rule.
     Permissions(Option<String>),
     /// Copy this conversation into a new session and continue in the copy.
     Fork,
@@ -18270,10 +18437,157 @@ mod tests {
         );
     }
 
+    fn panel_host(settings: Settings) -> SessionHost {
+        let mut host = test_host();
+        *host.user_rules.get_mut().expect("rules") = settings.user_rules.clone();
+        host.permission_settings = settings;
+        *host.rules.get_mut().expect("rules") =
+            crate::permissions::validated(&host.rule_settings()).expect("rules");
+        host
+    }
+
+    fn configured_rule(
+        tool: &str,
+        pattern: &str,
+        decision: rune_core::config::RuleDecision,
+    ) -> rune_core::config::ConfiguredRule {
+        rune_core::config::ConfiguredRule {
+            tool: tool.to_owned(),
+            pattern: pattern.to_owned(),
+            decision,
+            workspace: None,
+            saved: None,
+        }
+    }
+
+    #[test]
+    fn permissions_panel_lists_rules_with_sources() {
+        use rune_core::config::RuleDecision;
+        let empty = test_host();
+        assert_eq!(
+            set_permissions(&empty, None),
+            "permission mode: auto\nsession grants:\n  (none)\nsaved rules:\n  (none)"
+        );
+
+        let settings = Settings {
+            user_config_path: Some(Utf8PathBuf::from("/home/u/config.toml")),
+            workspace: Some(Utf8PathBuf::from("/work/app")),
+            user_rules: vec![
+                configured_rule("shell", "rm *", RuleDecision::Deny),
+                rune_core::config::ConfiguredRule {
+                    workspace: Some(Utf8PathBuf::from("/work/app")),
+                    saved: Some("2026-11-10".to_owned()),
+                    ..configured_rule("shell", "docker ps*", RuleDecision::Allow)
+                },
+                rune_core::config::ConfiguredRule {
+                    workspace: Some(Utf8PathBuf::from("/work/other")),
+                    ..configured_rule("shell", "make*", RuleDecision::Allow)
+                },
+            ],
+            project_rules: vec![
+                configured_rule("write_file", "migrations/*", RuleDecision::Ask),
+                configured_rule("shell", "curl*", RuleDecision::Allow),
+            ],
+            ..Settings::default()
+        };
+        let host = panel_host(settings);
+        host.grants
+            .lock()
+            .expect("grants")
+            .insert(SessionGrant::literal("shell", "npm run e2e"));
+        assert_eq!(
+            set_permissions(&host, None),
+            "permission mode: auto\n\
+             session grants:\n  shell npm run e2e\n\
+             saved rules:\n\
+             \x20 1. deny shell \"rm *\"  (user file)\n\
+             \x20 2. allow shell \"docker ps*\"  (saved 2026-11-10, this project)\n\
+             \x20 3. ask write_file \"migrations/*\"  (project file)"
+        );
+    }
+
+    #[test]
+    fn deleting_a_saved_rule_rewrites_only_its_block() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_owned()).expect("utf8");
+        let config = root.join("config.toml");
+        let head = "# rules\ntheme = \"dark\"\n\n[[permission.rules]]\n# no rm\ntool = \"shell\"\nmatch = \"rm *\"\ndecision = \"deny\"\n\n";
+        let saved = "[[permission.rules]]\ntool = \"shell\"\nmatch = \"docker ps*\"\ndecision = \"allow\"\nworkspace = \"/work/app\"\nsaved = \"2026-11-10\"\n\n";
+        let tail = "[limits]\nmax_agent_steps = 40\n";
+        rune_core::paths::write_private(&config, &format!("{head}{saved}{tail}")).expect("config");
+        let mut settings = rune_core::config::load(
+            None,
+            Some(&config),
+            &rune_core::config::EnvironmentOverrides::default(),
+        );
+        assert_eq!(settings.user_rules.len(), 2, "{:?}", settings.diagnostics);
+        settings.workspace = Some(Utf8PathBuf::from("/work/app"));
+        let host = panel_host(settings);
+        assert_eq!(host.decide("shell", Some("docker ps")).0, Outcome::Allow);
+
+        assert_eq!(
+            set_permissions(&host, Some("delete 2")),
+            "deleted rule 2: allow shell \"docker ps*\""
+        );
+        assert_eq!(
+            std::fs::read_to_string(&config).expect("read"),
+            format!("{head}{tail}")
+        );
+        assert_eq!(host.decide("shell", Some("docker ps")).0, Outcome::Ask);
+        // A rebuild for another mode keeps the deletion and the other rule.
+        set_permissions(&host, Some("auto"));
+        assert_eq!(host.decide("shell", Some("docker ps")).0, Outcome::Ask);
+        assert_eq!(host.decide("shell", Some("rm -rf x")).0, Outcome::Deny);
+        assert!(
+            set_permissions(&host, None)
+                .ends_with("saved rules:\n  1. deny shell \"rm *\"  (user file)")
+        );
+        assert_eq!(
+            set_permissions(&host, Some("delete 5")),
+            "`5` is not a saved rule number; /permissions lists them"
+        );
+
+        // A rule written another way is not rewritten.
+        let inline = "permission = { rules = [{ tool = \"shell\", match = \"rm *\", decision = \"deny\" }] }\n";
+        rune_core::paths::write_private(&config, inline).expect("config");
+        let mut settings = rune_core::config::load(
+            None,
+            Some(&config),
+            &rune_core::config::EnvironmentOverrides::default(),
+        );
+        settings.workspace = Some(Utf8PathBuf::from("/work/app"));
+        let host = panel_host(settings);
+        assert_eq!(
+            set_permissions(&host, Some("delete 1")),
+            format!("rule 1 is not in a [[permission.rules]] block of {config}; remove it by hand")
+        );
+        assert_eq!(std::fs::read_to_string(&config).expect("read"), inline);
+        assert_eq!(host.decide("shell", Some("rm -rf x")).0, Outcome::Deny);
+    }
+
+    #[test]
+    fn project_rules_cannot_be_deleted_here() {
+        let settings = Settings {
+            workspace: Some(Utf8PathBuf::from("/work/app")),
+            project_rules: vec![configured_rule(
+                "shell",
+                "rm *",
+                rune_core::config::RuleDecision::Deny,
+            )],
+            ..Settings::default()
+        };
+        let host = panel_host(settings);
+        assert_eq!(
+            set_permissions(&host, Some("delete 1")),
+            "rule 1 comes from /work/app/.rune.toml in the repository; edit that file"
+        );
+        assert_eq!(host.decide("shell", Some("rm -rf x")).0, Outcome::Deny);
+    }
+
     #[test]
     fn permissions_switch_the_mode_and_rules_and_forget_grants_when_narrowed() {
         let host = test_host();
-        assert!(set_permissions(&host, None).starts_with("permissions are auto"));
+        assert!(set_permissions(&host, None).starts_with("permission mode: auto\n"));
         // Auto allows a routine test command; ask leaves it to the mode default.
         let (before, _) = host.decide("shell", Some("cargo test"));
         assert_eq!(before, Outcome::Allow);
@@ -19768,6 +20082,7 @@ mod tests {
             rules: Mutex::new(crate::permissions::validated(&Settings::default()).expect("rules")),
             mode: Mutex::new(PermissionMode::Auto),
             permission_settings: Settings::default(),
+            user_rules: Mutex::new(Vec::new()),
             effort: Mutex::new(Effort::Auto),
             effort_set: std::sync::atomic::AtomicBool::new(false),
             effort_noticed: Mutex::new(std::collections::BTreeSet::new()),

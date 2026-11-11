@@ -217,11 +217,7 @@ pub fn configured(settings: &Settings) -> Vec<Configured> {
     let user_file = settings.user_config_path.clone().unwrap_or_default();
     let mut out = Vec::new();
     for rule in &settings.user_rules {
-        if rule
-            .workspace
-            .as_ref()
-            .is_some_and(|workspace| Some(workspace) != settings.workspace.as_ref())
-        {
+        if !applies_here(rule, settings) {
             continue;
         }
         let source = rule.saved.clone().map_or_else(
@@ -254,6 +250,15 @@ pub fn configured(settings: &Settings) -> Vec<Configured> {
         });
     }
     out
+}
+
+/// Whether a user rule applies in the settings' workspace: it names no
+/// workspace, or names this one.
+#[must_use]
+pub fn applies_here(rule: &ConfiguredRule, settings: &Settings) -> bool {
+    rule.workspace
+        .as_ref()
+        .is_none_or(|workspace| Some(workspace) == settings.workspace.as_ref())
 }
 
 /// The project file's `allow` rules, in file order.

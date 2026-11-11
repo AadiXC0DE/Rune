@@ -750,10 +750,12 @@ approval says. Each prompt sent in plan mode tells the model it is planning.
 `/plan off` leaves it so the plan can be carried out. `/effort` shows the
 reasoning effort in force and the levels the provider accepts, and
 `/effort <level>` sets it for the requests that follow. `/permissions` shows
-the permission mode, and `/permissions ask|auto|full-access` switches it for the
-calls that follow, rebuilding the rules as if the session had started in that
-mode; a switch to a mode that allows less forgets the session's remembered
-approvals. `/fork` copies the conversation into a new
+the permission mode, the session's remembered approvals and the configured rules
+with where each came from, and `/permissions ask|auto|full-access` switches it
+for the calls that follow, rebuilding the rules as if the session had started in
+that mode; a switch to a mode that allows less forgets the session's remembered
+approvals. `/permissions delete <n>` removes rule n from the user file; a rule
+from the project file is edited there. `/fork` copies the conversation into a new
 session and continues there, leaving the earlier session as it was.
 
 When the model's prices are known, each turn's summary line, `/cost`, the status

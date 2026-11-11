@@ -54,8 +54,8 @@ pub const BUILTINS: &[Builtin] = &[
     },
     Builtin {
         name: "permissions",
-        arguments: "[mode]",
-        summary: "show the permission mode, or switch it",
+        arguments: "[mode|delete <n>]",
+        summary: "show the mode and saved rules, switch mode, or delete a saved rule",
     },
     Builtin {
         name: "effort",
