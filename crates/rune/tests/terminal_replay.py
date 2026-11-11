@@ -25,11 +25,45 @@ errors = []
 code_steps = [threading.Event(), threading.Event()]
 transcript_live_step = threading.Event()
 transcript_live_finished = threading.Event()
+markdown_step = threading.Event()
+MARKDOWN_DELTAS = [
+    "# Plan\n\n- first item\n- second item\n\n",
+    "```rust\nfn main() {\n    println!(\"hi\");\n}\n```\n\n",
+    "| name | size |\n| --- | --- |\n| a | 1 |\n",
+    "| bb | 22 |\n\nMARKDOWN-END",
+]
+
+
+def tool_call(index, name, arguments):
+    return {"index": index, "id": f"{name}-{index}", "type": "function",
+            "function": {"name": name, "arguments": json.dumps(arguments)}}
+
+
+def tool_step(*calls):
+    return [{"index": 0, "delta": {"tool_calls": list(calls)},
+             "finish_reason": "tool_calls"}]
+
+
+def text_step(answer):
+    return [{"index": 0, "delta": {"content": answer}, "finish_reason": None},
+            {"index": 0, "delta": {}, "finish_reason": "stop"}]
+
+
+def event(choice):
+    return ("data: " + json.dumps({"choices": [choice]}) + "\n\n").encode()
 
 
 class Provider(http.server.BaseHTTPRequestHandler):
     def log_message(self, *_args):
         pass
+
+    def answer_choices(self, choices):
+        body = b"".join(event(choice) for choice in choices) + b"data: [DONE]\n\n"
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
     def do_GET(self):
         body = json.dumps({"data": [
@@ -45,6 +79,49 @@ class Provider(http.server.BaseHTTPRequestHandler):
         try:
             request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
             prompts.append(request["messages"][-1]["content"])
+            if scenario == "failure":
+                body = json.dumps({"error": {
+                    "message": "invalid api key", "type": "invalid_request_error",
+                }}).encode()
+                self.send_response(401)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            if scenario == "tools":
+                self.answer_choices(tool_step(
+                    tool_call(0, "read_file", {"path": "notes.txt"}),
+                    tool_call(1, "read_file", {"path": "missing.txt"}),
+                ) if len(prompts) == 1 else text_step("TOOLS-DONE"))
+                return
+            if scenario == "edit":
+                self.answer_choices(tool_step(tool_call(0, "edit_file", {
+                    "path": "app.txt", "old_string": "beta",
+                    "new_string": "BETA\nbeta two",
+                })) if len(prompts) == 1 else text_step(
+                    "EDIT-DONE" if len(prompts) == 2 else "EDIT-CHECKED"
+                ))
+                return
+            if scenario == "approval":
+                self.answer_choices(tool_step(tool_call(0, "shell", {
+                    "command": "echo GRID-APPROVAL",
+                })))
+                return
+            if scenario == "markdown":
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.end_headers()
+                for index, chunk in enumerate(MARKDOWN_DELTAS):
+                    self.wfile.write(event({"index": 0, "delta": {"content": chunk},
+                                            "finish_reason": None}))
+                    self.wfile.flush()
+                    if index == 1:
+                        assert markdown_step.wait(10), "markdown frame was not captured"
+                self.wfile.write(event({"index": 0, "delta": {}, "finish_reason": "stop"})
+                                 + b"data: [DONE]\n\n")
+                self.wfile.flush()
+                return
             if scenario == "transcript":
                 if prompts[-1] == "live":
                     self.send_response(200)
@@ -134,7 +211,7 @@ def controlling_terminal():
 
 
 scenario = sys.argv[2]
-assert scenario in {"resize", "narrow", "menu-resize", "completion-resize", "code", "transcript", "compact", "help-40", "help-80"}, scenario
+assert scenario in {"resize", "narrow", "menu-resize", "completion-resize", "code", "transcript", "compact", "help-40", "help-80", "tools", "edit", "failure", "approval", "markdown"}, scenario
 with tempfile.TemporaryDirectory(prefix="rune-r034-") as directory:
     root = pathlib.Path(directory)
     config = root / "config" / "rune"
@@ -146,6 +223,10 @@ with tempfile.TemporaryDirectory(prefix="rune-r034-") as directory:
         (root / "transcript.txt").write_text(
             "\n".join(f"TOOL-{index:02}" for index in range(1, 31)) + "\n"
         )
+    if scenario == "tools":
+        (root / "notes.txt").write_text("first note\nsecond note\nthird note\n")
+    if scenario == "edit":
+        (root / "app.txt").write_text("alpha\nbeta\ngamma\n")
     if scenario.startswith("help-"):
         commands = root / ".rune" / "commands"
         commands.mkdir(parents=True)
@@ -180,12 +261,16 @@ with tempfile.TemporaryDirectory(prefix="rune-r034-") as directory:
         "NO_COLOR": "1",
         "TERM": "xterm-256color",
     })
-    if scenario == "transcript":
+    if scenario in {"transcript", "tools", "edit", "markdown"}:
         environment["RUNE_PERMISSION_MODE"] = "full-access"
+    if scenario == "approval":
+        environment["RUNE_PERMISSION_MODE"] = "ask"
     cols, rows = {"resize": (32, 24), "narrow": (12, 24),
                   "menu-resize": (80, 24), "completion-resize": (80, 24), "code": (32, 24),
                   "transcript": (80, 24), "compact": (80, 4),
-                  "help-40": (40, 24), "help-80": (80, 24)}[scenario]
+                  "help-40": (40, 24), "help-80": (80, 24),
+                  "tools": (80, 24), "edit": (80, 24), "failure": (80, 24),
+                  "approval": (80, 24), "markdown": (80, 24)}[scenario]
     master, slave = pty.openpty()
     fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
     try:
@@ -211,7 +296,7 @@ with tempfile.TemporaryDirectory(prefix="rune-r034-") as directory:
                 transcript.extend(os.read(master, 65536))
         assert not errors, errors
 
-    def capture(stage, keys=b"", expected="\x1b[?25h", size=None):
+    def capture(stage, keys=b"", expected="\x1b[?25h", size=None, repaint=None):
         global offset, cols, rows
         start = len(transcript)
         if size is not None:
@@ -225,9 +310,15 @@ with tempfile.TemporaryDirectory(prefix="rune-r034-") as directory:
             os.write(master, keys)
         wait_for(expected, start)
         deadline = time.monotonic() + 10
-        while select.select([master], [], [], 0.15)[0]:
+        changed = time.monotonic()
+        while time.monotonic() - changed < 0.15:
             assert time.monotonic() < deadline, "terminal never finished drawing"
-            transcript.extend(os.read(master, 65536))
+            if select.select([master], [], [], 0.05)[0]:
+                data = os.read(master, 65536)
+                transcript.extend(data)
+                # A repaint that draws nothing does not count as drawing.
+                if repaint is None or data.replace(repaint, b""):
+                    changed = time.monotonic()
         captures.append({"stage": stage, "cols": cols, "rows": rows,
                          "bytes": list(transcript[offset:])})
         offset = len(transcript)
@@ -343,6 +434,36 @@ with tempfile.TemporaryDirectory(prefix="rune-r034-") as directory:
             capture("empty", b"\x0f", "Esc/Ctrl-O")
             capture("empty-closed", b"\x1b", "\x1b[?1049l")
             assert len(prompts) == 4, prompts
+        elif scenario == "tools":
+            capture("tools-finished", b"tools\r", "TOOLS-DONE\r\n")
+            assert len(prompts) == 2, prompts
+        elif scenario == "edit":
+            # The turn asks for a check once after the edit, so it ends on the
+            # reply to that request.
+            capture("edit-finished", b"edit\r", "EDIT-CHECKED\r\n")
+            assert len(prompts) == 3, prompts
+            assert prompts[2].startswith("<harness_check>"), prompts
+            assert (root / "app.txt").read_text() == "alpha\nBETA\nbeta two\ngamma\n"
+        elif scenario == "failure":
+            os.write(master, b"fail\r")
+            wait_for("[the turn failed: ", offset)
+            failed = transcript.index(b"[the turn failed: ", offset)
+            # The hint is the next bracketed line after the failure line.
+            wait_for("]\r\n", failed)
+            first_end = transcript.index(b"]\r\n", failed) + 3
+            wait_for("]\r\n", first_end)
+            capture("failure-reported", expected="")
+        elif scenario == "approval":
+            # The turn's ticker keeps repainting an empty frame under the prompt.
+            capture("approval-open", b"approve\r", "permission required",
+                    repaint=b"\x1b[?25l\r\x1b[1G\x1b[?25h")
+            capture("approval-cancelled", b"\x1b", "cancelled")
+            assert prompts == ["approve"], prompts
+        elif scenario == "markdown":
+            capture("markdown-streaming", b"markdown\r", "fn main")
+            markdown_step.set()
+            capture("markdown-finished", expected="MARKDOWN-END\r\n")
+            assert prompts == ["markdown"], prompts
         else:
             # Wait for the committed ending, rather than an intermediate frame.
             capture("finished-answer", b"long-word\r", "END-LONG-W\r\nORD\r\n")

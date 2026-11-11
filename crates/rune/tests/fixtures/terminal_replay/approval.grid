@@ -1,0 +1,50 @@
+approval-open: 80x24, caret 0,9
+00|session ************|
+01|> approve|
+02|Permission request for "shell"|
+03|Reason: "ask: no rule matched `echo GRID-APPROVAL`, so the mode's default|
+04|applies"|
+05|Scope: "echo GRID-APPROVAL"|
+06|permission required|
+07|ctrl-c cancel  /help commands  esc clear|
+08|replay-fixture | ask | ctx ~###k (request bytes)|
+09|Up/Down choose, Enter confirm, Esc/Ctrl-C cancel|
+10|  Remember for this session|
+11|  Run once|
+12|> Deny|
+13||
+14||
+15||
+16||
+17||
+18||
+19||
+20||
+21||
+22||
+23||
+approval-cancelled: 80x24, caret 2,11
+00|session ************|
+01|> approve|
+02|Permission request for "shell"|
+03|Reason: "ask: no rule matched `echo GRID-APPROVAL`, so the mode's default|
+04|applies"|
+05|Scope: "echo GRID-APPROVAL"|
+06|[refused shell: ask: no rule matched `echo GRID-APPROVAL`, so the mode's]|
+07|[default applies; approval was denied]|
+08|[cancelled]|
+09|ctrl-c cancel  /help commands  esc clear|
+10|replay-fixture | ask | ctx ~###k (request bytes)|
+11|>|
+12||
+13||
+14||
+15||
+16||
+17||
+18||
+19||
+20||
+21||
+22||
+23||

@@ -2,6 +2,12 @@
 //! Fixtures compare every screen row and the caret. The narrow fixture also
 //! compares the answer recovered from scrollback, where clipping loses bytes.
 //! Normalize CRLF in checked-in grids; all screen content stays exact.
+//!
+//! Updating a grid: run the test with RUNE_BLESS_GRIDS=1, for example
+//! `RUNE_BLESS_GRIDS=1 cargo test -p rune --test terminal_replay`. Each changed fixture
+//! is rewritten and its changed lines are printed. Review the fixture diff with
+//! `git diff crates/rune/tests/fixtures` before committing; a grid that changed
+//! without a reason is a regression, not a new baseline.
 
 #![cfg(unix)]
 #![allow(clippy::expect_used, clippy::panic)]
@@ -41,6 +47,99 @@ fn record(script: &str, scenario: Option<&str>) -> Vec<u8> {
         String::from_utf8_lossy(&output.stderr)
     );
     output.stdout
+}
+
+fn fixture_path(name: &str) -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/terminal_replay")
+        .join(name)
+}
+
+/// Compares a replayed grid with its fixture, or rewrites the fixture when
+/// `RUNE_BLESS_GRIDS` is exactly `1`.
+fn compare_grid(name: &str, actual: &str) {
+    let path = fixture_path(name);
+    let expected = std::fs::read_to_string(&path)
+        .unwrap_or_default()
+        .replace("\r\n", "\n");
+    let old: Vec<&str> = expected.split_inclusive('\n').collect();
+    let new: Vec<&str> = actual.split_inclusive('\n').collect();
+    let total = old.len().max(new.len());
+    let mut changed = 0_usize;
+    let mut pairs = String::new();
+    for index in 0..total {
+        let (before, after) = (old.get(index), new.get(index));
+        if before == after {
+            continue;
+        }
+        changed = changed.saturating_add(1);
+        if let Some(line) = before {
+            writeln!(pairs, "-{}", line.trim_end_matches('\n')).expect("diff row");
+        }
+        if let Some(line) = after {
+            writeln!(pairs, "+{}", line.trim_end_matches('\n')).expect("diff row");
+        }
+    }
+    let bless = std::env::var_os("RUNE_BLESS_GRIDS").is_some_and(|value| value == "1");
+    if bless {
+        if changed > 0 {
+            std::fs::write(&path, actual).expect("write blessed grid");
+        }
+        eprintln!("blessed {name}: {changed} of {total} lines differ\n{pairs}");
+        return;
+    }
+    assert!(
+        changed == 0,
+        "{name}: {changed} of {total} lines differ\n{pairs}run with RUNE_BLESS_GRIDS=1 to accept the new grid, then review the fixture diff"
+    );
+}
+
+/// Returns what follows an elapsed time that is `run` plus the start of `tail`.
+fn after_duration<'a>(run: &str, tail: &'a str) -> Option<&'a str> {
+    let number = run.bytes().filter(|byte| *byte == b'.').count() <= 1;
+    let clock = tail
+        .strip_prefix('m')
+        .filter(|_| !run.contains('.'))
+        .and_then(|seconds| {
+            let two = seconds.get(..2)?;
+            let rest = seconds.get(2..)?;
+            two.bytes()
+                .all(|byte| byte.is_ascii_digit())
+                .then_some(rest)?
+                .strip_prefix('s')
+        });
+    let unit = clock.or_else(|| {
+        number
+            .then(|| tail.strip_prefix("ms").or_else(|| tail.strip_prefix('s')))
+            .flatten()
+    })?;
+    (!unit.starts_with(|c: char| c.is_ascii_alphanumeric())).then_some(unit)
+}
+
+/// Replaces each elapsed time with `<t>`, since it differs between runs.
+fn mask_durations(line: &str) -> String {
+    let mut masked = String::with_capacity(line.len());
+    let mut rest = line;
+    while let Some(start) = rest.find(|c: char| c.is_ascii_digit()) {
+        let (before, from_digit) = rest.split_at(start);
+        masked.push_str(before);
+        let past_figures = from_digit.trim_start_matches(|c: char| c.is_ascii_digit() || c == '.');
+        let figures = from_digit.len().saturating_sub(past_figures.len());
+        let run = from_digit
+            .get(..figures)
+            .unwrap_or_default()
+            .trim_end_matches('.');
+        let (number, tail) = from_digit.split_at(run.len());
+        rest = if let Some(after) = after_duration(number, tail) {
+            masked.push_str("<t>");
+            after
+        } else {
+            masked.push_str(number);
+            tail
+        };
+    }
+    masked.push_str(rest);
+    masked
 }
 
 /// Replaces each figure of the context estimate and of the room left with `#`.
@@ -93,7 +192,7 @@ fn screen_snapshot(stage: &str, cols: u16, rows: u16, grid: &Grid) -> String {
         let line = line
             .split_once(" | /")
             .map_or(line.as_str(), |(status, _)| status);
-        let line = mask_estimates(line);
+        let line = mask_durations(&mask_estimates(line));
         writeln!(snapshot, "{row:02}|{line}|").expect("snapshot row");
     }
     snapshot
@@ -197,24 +296,15 @@ fn four_row_compact_mode_message_matches_provider_traffic() {
 #[test]
 fn long_draft_grids() {
     let actual = fixed_size_replay(include_str!("terminal_draft.py"), 80, 24);
-    assert_eq!(
-        actual,
-        include_str!("fixtures/terminal_replay/long_draft.grid").replace("\r\n", "\n")
-    );
+    compare_grid("long_draft.grid", &actual);
 }
 
 #[test]
 fn short_menu_grids() {
     let actual = fixed_size_replay(include_str!("terminal_menu.py"), 32, 8);
-    assert_eq!(
-        actual,
-        include_str!("fixtures/terminal_replay/short_menu.grid").replace("\r\n", "\n")
-    );
+    compare_grid("short_menu.grid", &actual);
     let resized = event_replay("menu-resize");
-    assert_eq!(
-        resized,
-        include_str!("fixtures/terminal_replay/menu_resize.grid").replace("\r\n", "\n")
-    );
+    compare_grid("menu_resize.grid", &resized);
 }
 
 #[test]
@@ -314,18 +404,114 @@ fn settled_help_preserves_every_command_description_in_scrollback_at_40_and_80_c
 #[test]
 fn draft_resize_grids() {
     let actual = event_replay("resize");
-    assert_eq!(
-        actual,
-        include_str!("fixtures/terminal_replay/draft_resize.grid").replace("\r\n", "\n")
-    );
+    compare_grid("draft_resize.grid", &actual);
 }
 
 #[test]
 fn twelve_column_text_grids_and_scrollback() {
     let actual = event_replay("narrow");
-    assert_eq!(
-        actual,
-        include_str!("fixtures/terminal_replay/narrow.grid").replace("\r\n", "\n")
+    compare_grid("narrow.grid", &actual);
+}
+
+/// The screen rows of one stage of a snapshot, without their frame.
+fn stage_rows<'a>(snapshot: &'a str, stage: &str) -> Vec<&'a str> {
+    let header = format!("{stage}: ");
+    snapshot
+        .lines()
+        .skip_while(|line| !line.starts_with(&header))
+        .skip(1)
+        .map_while(|line| line.split_once('|')?.1.strip_suffix('|'))
+        .collect()
+}
+
+#[test]
+fn mask_durations_replaces_only_time_tokens() {
+    assert_eq!(mask_durations("a 0.3s b"), "a <t> b");
+    assert_eq!(mask_durations("14ms)"), "<t>)");
+    assert_eq!(mask_durations("3m05s"), "<t>");
+    assert_eq!(mask_durations("12 lines"), "12 lines");
+    assert_eq!(mask_durations("v2s3"), "v2s3");
+}
+
+#[test]
+fn tool_row_grids() {
+    let actual = event_replay("tools");
+    compare_grid("tools.grid", &actual);
+    let rows = stage_rows(&actual, "tools-finished");
+    assert!(
+        rows.iter()
+            .any(|row| row.starts_with("  ✓ read_file notes.txt")),
+        "{actual}"
+    );
+    assert!(
+        rows.iter()
+            .any(|row| row.starts_with("  ✗ read_file missing.txt")),
+        "{actual}"
+    );
+}
+
+#[test]
+fn edit_diff_grids() {
+    let actual = event_replay("edit");
+    compare_grid("edit.grid", &actual);
+    let rows = stage_rows(&actual, "edit-finished");
+    let call = rows
+        .iter()
+        .position(|row| row.contains("edit_file"))
+        .expect("edit_file row");
+    let below = rows.get(call..).expect("rows below the call");
+    assert!(below.iter().any(|row| row.contains("+ BETA")), "{actual}");
+    assert!(below.iter().any(|row| row.contains("- beta")), "{actual}");
+}
+
+#[test]
+fn failed_turn_grids() {
+    let actual = event_replay("failure");
+    compare_grid("failure.grid", &actual);
+    let rows = stage_rows(&actual, "failure-reported");
+    let failed = rows
+        .iter()
+        .position(|row| row.contains("[the turn failed: "))
+        .expect("failure row");
+    let hint = rows
+        .iter()
+        .skip(failed.saturating_add(1))
+        .find(|row| !row.is_empty())
+        .expect("hint row");
+    assert!(hint.starts_with('[') && hint.ends_with(']'), "{actual}");
+}
+
+#[test]
+fn approval_prompt_grids() {
+    let actual = event_replay("approval");
+    compare_grid("approval.grid", &actual);
+    let open = stage_rows(&actual, "approval-open").join("\n");
+    assert!(open.contains("permission required"), "{actual}");
+    assert!(open.contains("Scope: \"echo GRID-APPROVAL\""), "{actual}");
+    assert!(open.contains("> Deny"), "{actual}");
+    let cancelled = stage_rows(&actual, "approval-cancelled").join("\n");
+    assert!(cancelled.contains("cancelled"), "{actual}");
+}
+
+#[test]
+fn streamed_markdown_grids() {
+    let actual = event_replay("markdown");
+    compare_grid("markdown.grid", &actual);
+    let streaming = stage_rows(&actual, "markdown-streaming");
+    assert!(
+        streaming.iter().any(|row| row.contains("fn main")),
+        "{actual}"
+    );
+    let finished = stage_rows(&actual, "markdown-finished");
+    assert!(
+        finished.iter().any(|row| row.contains("MARKDOWN-END")),
+        "{actual}"
+    );
+    assert!(
+        finished
+            .iter()
+            .any(|row| row.contains("name") && row.contains("size")),
+        "{actual}"
     );
 }
 
