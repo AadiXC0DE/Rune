@@ -35,6 +35,10 @@ pub enum Input {
         /// Everything after the name.
         arguments: String,
     },
+    /// A command to run in the workspace, typed after `!`.
+    Shell(String),
+    /// A note for the workspace `AGENTS.md`, typed after `#`.
+    Memory(String),
     /// Nothing to do.
     Empty,
 }
@@ -43,7 +47,9 @@ impl Input {
     /// Classifies a line of input.
     ///
     /// A leading slash is a command only when it is followed by a letter, so a
-    /// path typed as a prompt is not mistaken for one.
+    /// path typed as a prompt is not mistaken for one. A `#` is a note only
+    /// when a space or a letter follows it, so a Markdown heading or an issue
+    /// number stays a prompt.
     #[must_use]
     pub fn parse(line: &str) -> Self {
         let trimmed = line.trim();
@@ -72,6 +78,17 @@ impl Input {
                     arguments,
                 };
             }
+        }
+        if let Some(rest) = trimmed.strip_prefix('!') {
+            return Self::Shell(rest.trim().to_owned());
+        }
+        if let Some(rest) = trimmed.strip_prefix('#')
+            && rest
+                .chars()
+                .next()
+                .is_none_or(|c| c == ' ' || c.is_alphabetic())
+        {
+            return Self::Memory(rest.trim().to_owned());
         }
         Self::Prompt(trimmed.to_owned())
     }
@@ -434,6 +451,38 @@ mod tests {
                 arguments: String::new()
             }
         );
+    }
+
+    #[test]
+    fn bang_and_hash_lines_parse_to_their_inputs() {
+        assert_eq!(
+            Input::parse("!echo hi \n"),
+            Input::Shell("echo hi".to_owned())
+        );
+        assert_eq!(Input::parse("! ls -la"), Input::Shell("ls -la".to_owned()));
+        assert_eq!(Input::parse("!"), Input::Shell(String::new()));
+        assert_eq!(
+            Input::parse("# always use tabs"),
+            Input::Memory("always use tabs".to_owned())
+        );
+        assert_eq!(
+            Input::parse("#prefer small commits"),
+            Input::Memory("prefer small commits".to_owned())
+        );
+        assert_eq!(Input::parse("#"), Input::Memory(String::new()));
+    }
+
+    #[test]
+    fn hash_digits_and_headings_stay_prompts() {
+        assert_eq!(
+            Input::parse("#1 is broken"),
+            Input::Prompt("#1 is broken".to_owned())
+        );
+        assert_eq!(
+            Input::parse("## Title"),
+            Input::Prompt("## Title".to_owned())
+        );
+        assert_eq!(Input::parse("#!"), Input::Prompt("#!".to_owned()));
     }
 
     #[test]
