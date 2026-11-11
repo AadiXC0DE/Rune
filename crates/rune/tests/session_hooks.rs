@@ -85,3 +85,63 @@ fn a_blocked_prompt_is_not_sent_and_session_hooks_bracket_the_session() {
     assert!(!recorded.is_empty(), "no session was saved");
     assert!(!recorded.contains("print the key"), "{recorded}");
 }
+
+/// Runs a session in `root` that quits at once, with project hooks only.
+fn quick_session(root: &Utf8PathBuf, args: &[&str]) -> std::process::Output {
+    let config = root.join("fixture.toml");
+    std::fs::write(
+        &config,
+        "provider = \"chat_completions\"\nbase_url = \"http://127.0.0.1:1/v1\"\n\
+         [models.chat_completions]\nid = \"fixture-model\"\n",
+    )
+    .expect("config");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_rune"))
+        .isolated_env()
+        .env("HOME", root)
+        .env("RUNE_HOME", root.join("state"))
+        .env("XDG_CONFIG_HOME", root.join("config"))
+        .env("XDG_DATA_HOME", root.join("data"))
+        .env("RUNE_CONFIG", &config)
+        .env("OPENAI_API_KEY", "fixture-key")
+        .current_dir(root)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("CLI");
+    let mut input = child.stdin.take().expect("stdin");
+    writeln!(input, "/quit").expect("input");
+    drop(input);
+    child.wait_with_output().expect("output")
+}
+
+#[test]
+fn project_hooks_run_in_a_session_only_after_approval() {
+    let dir = tempfile::tempdir().expect("workspace");
+    let root = Utf8PathBuf::from_path_buf(dir.path().canonicalize().expect("root")).expect("utf8");
+    std::fs::create_dir_all(root.join(".rune")).expect("project directory");
+    std::fs::write(
+        root.join(".rune/hooks.toml"),
+        "[[hooks]]\nevent = \"session_start\"\nname = \"marker\"\n\
+         argv = [\"/bin/sh\", \"-c\", \": > project-hook-ran\"]\n",
+    )
+    .expect("hooks file");
+    let notice = "project hooks in .rune/hooks.toml are not approved and will not run; \
+                  review them with rune projects status";
+
+    let output = quick_session(&root, &["--offline", "--accessible"]);
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(stdout.matches(notice).count(), 1, "{stdout}");
+    assert!(!root.join("project-hook-ran").exists());
+
+    let approval = quick_session(&root, &["projects", "approve", "--yes"]);
+    assert!(approval.status.success(), "{approval:?}");
+
+    let output = quick_session(&root, &["--offline", "--accessible"]);
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(!stdout.contains(notice), "{stdout}");
+    assert!(root.join("project-hook-ran").exists());
+}

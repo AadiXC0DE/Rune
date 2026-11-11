@@ -2115,6 +2115,46 @@ fn edit_distance(left: &str, right: &str) -> usize {
     previous.last().copied().unwrap_or(0)
 }
 
+/// Top level of a project hooks file.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProjectHooksFile {
+    #[serde(default)]
+    hooks: Vec<Hook>,
+}
+
+/// Reads a project hooks file: its exact text and its hooks, each marked as
+/// read from the project.
+///
+/// A missing file is `Ok(None)`. A file that cannot be read or parsed, has a
+/// top-level key other than `hooks`, or holds an invalid hook is one
+/// diagnostic, and none of its hooks are used.
+pub fn read_project_hooks(
+    path: &Utf8Path,
+) -> std::result::Result<Option<(String, Vec<Hook>)>, Diagnostic> {
+    let Some(text) = read_bounded(path, Layer::Project)? else {
+        return Ok(None);
+    };
+    let invalid = |message: String| {
+        Diagnostic::new(Layer::Project, ErrorCode::InvalidConfiguration, message)
+            .with_path(path)
+            .with_hint("fix the file; until then none of its hooks run")
+    };
+    let file: ProjectHooksFile = toml::from_str(&text)
+        .map_err(|err| invalid(format!("could not parse: {}", err.message())))?;
+    let mut hooks = file.hooks;
+    for (index, hook) in hooks.iter_mut().enumerate() {
+        if let Some(problem) = hook.validation_error() {
+            return Err(invalid(format!(
+                "hook {}: {problem}",
+                index.saturating_add(1)
+            )));
+        }
+        hook.project = true;
+    }
+    Ok(Some((text, hooks)))
+}
+
 /// Reads the project configuration file.
 ///
 /// Returns the parsed configuration together with a diagnostic for every
@@ -3449,6 +3489,39 @@ mod tests {
                 && diagnostic.key.as_deref() == Some("hooks")
         }));
         assert_eq!(settings.source_of("hooks"), Layer::Default);
+    }
+
+    #[test]
+    fn a_project_hooks_file_marks_its_hooks_and_keeps_its_text() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let body = "[[hooks]]\nevent = 'pre_tool'\nname = 'repo guard'\nargv = ['/bin/true']\n";
+        let path = write(&dir, "hooks.toml", body);
+        let (text, hooks) = read_project_hooks(&path)
+            .expect("readable")
+            .expect("present");
+        assert_eq!(text, body);
+        assert_eq!(hooks.len(), 1);
+        assert!(hooks[0].project);
+        assert_eq!(hooks[0].event, HookEvent::PreTool);
+        let missing = Utf8PathBuf::from_path_buf(dir.path().join("absent.toml")).expect("utf8");
+        assert!(read_project_hooks(&missing).expect("missing").is_none());
+    }
+
+    #[test]
+    fn a_malformed_project_hooks_file_gives_a_diagnostic_and_no_hooks() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let hook = "[[hooks]]\nevent = 'pre_tool'\nname = 'ok'\nargv = ['/bin/true']\n";
+        for body in [
+            format!("model = 'other'\n{hook}"),
+            format!("{hook}[[hooks]]\nevent = 'pre_tool'\nname = ''\nargv = ['/bin/true']\n"),
+            "[[hooks]\n".to_owned(),
+        ] {
+            let path = write(&dir, "hooks.toml", &body);
+            let diagnostic = read_project_hooks(&path).expect_err(&body);
+            assert_eq!(diagnostic.code, ErrorCode::InvalidConfiguration, "{body}");
+            assert_eq!(diagnostic.layer, Layer::Project);
+            assert_eq!(diagnostic.path.as_ref(), Some(&path));
+        }
     }
 
     #[test]

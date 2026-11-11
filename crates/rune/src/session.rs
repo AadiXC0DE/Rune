@@ -3233,6 +3233,15 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
     // is a guess, and deriving from it would shrink the catalog for every model
     // that states no window rather than keeping the documented fallback.
     adopt_skill_catalog_budget(&mut limits, config.settings.context_window);
+    let project_hooks = crate::project_trust::session_hooks(&config.paths, &config.workspace)?;
+    let project_hook_warnings: Vec<String> = project_hooks
+        .problem
+        .iter()
+        .cloned()
+        .chain(project_hooks.unapproved.then(|| {
+            "project hooks in .rune/hooks.toml are not approved and will not run; review them with rune projects status".to_owned()
+        }))
+        .collect();
     let connection =
         crate::mcp::connect_interactive(&config.settings, &config.paths, &config.workspace)?;
     let (mcp, mcp_warnings) = match connection {
@@ -3420,7 +3429,13 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
     let host = SessionHost {
         cache_key: std::sync::OnceLock::new(),
         usage_paths: Some(config.paths.clone()),
-        hooks: config.settings.hooks.clone(),
+        hooks: config
+            .settings
+            .hooks
+            .iter()
+            .cloned()
+            .chain(project_hooks.hooks)
+            .collect(),
         accessible: config.accessible,
         ascii: config.settings.ascii,
         recorder: Some(Arc::clone(&recorder)),
@@ -3609,6 +3624,7 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
         let notices: Vec<Entry> = theme_warning
             .iter()
             .chain(mcp_warnings.iter())
+            .chain(project_hook_warnings.iter())
             .map(Entry::warning)
             .chain(results_notice.iter().map(Entry::notice))
             .collect();

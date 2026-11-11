@@ -2279,6 +2279,79 @@ fn session_hooks_run_in_order_and_add_prompt_context() {
 }
 
 #[cfg(unix)]
+fn write_project_hooks(dir: &tempfile::TempDir) {
+    std::fs::create_dir_all(dir.path().join(".rune")).expect("project directory");
+    std::fs::write(
+        dir.path().join(".rune/hooks.toml"),
+        "[[hooks]]\nevent = 'session_start'\nname = 'marker'\n\
+         argv = ['/bin/sh', '-c', 'echo project >> order.txt']\n",
+    )
+    .expect("hooks file");
+}
+
+#[cfg(unix)]
+#[test]
+fn unapproved_project_hooks_are_skipped_with_a_warning() {
+    // Full access does not approve them either.
+    let (output, dir, requests) = run_responses_fixture_command(
+        vec![completion_response(&json!({"content": "Done."}), "stop")],
+        Some("--json"),
+        false,
+        Some(3),
+        (&["--permission-mode", "full-access", "ask"], &[]),
+        |dir, command| {
+            command.with_external_programs();
+            write_project_hooks(dir);
+        },
+    );
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(requests.len(), 1);
+    assert!(!dir.path().join("order.txt").exists());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(
+            "warning: project hooks in .rune/hooks.toml are not approved and were skipped"
+        ),
+        "{stderr}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn approved_project_hooks_run() {
+    let (output, dir, _) = run_responses_fixture_command(
+        vec![completion_response(&json!({"content": "Done."}), "stop")],
+        Some("--json"),
+        false,
+        Some(3),
+        (&["ask"], &[]),
+        |dir, command| {
+            command.with_external_programs();
+            configure_hooks(
+                dir,
+                &[("session_start", "user", "echo user >> order.txt\n")],
+            );
+            write_project_hooks(dir);
+            let approval = isolated_command(dir)
+                .args(["projects", "approve", "--yes"])
+                .stdin(Stdio::null())
+                .output()
+                .expect("approve");
+            assert!(approval.status.success(), "{approval:?}");
+            assert!(!dir.path().join("order.txt").exists());
+        },
+    );
+    assert!(output.status.success(), "{output:?}");
+    // After the user's hooks of the same event.
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("order.txt")).expect("hooks ran"),
+        "user\nproject\n"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains("project hooks"), "{stderr}");
+}
+
+#[cfg(unix)]
 #[test]
 fn a_blocking_user_prompt_hook_stops_the_run() {
     let (output, dir, requests) = run_responses_fixture_command(
