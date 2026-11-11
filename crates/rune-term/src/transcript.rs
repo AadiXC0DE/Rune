@@ -925,10 +925,24 @@ fn assistant_line(
         *fence = Some(open);
         return delimiter(line);
     }
-    wrap(
-        &crate::markdown::style_line(line, markdown, ascii, width),
-        width,
-    )
+    let styled = crate::markdown::style_line(line, markdown, ascii, width);
+    let body_width = if styled.indent == 0 {
+        width
+    } else {
+        width.saturating_sub(styled.indent).max(8)
+    };
+    wrap(&styled.body, body_width)
+        .into_iter()
+        .enumerate()
+        .map(|(index, row)| {
+            let prefix = if index == 0 {
+                &styled.first
+            } else {
+                &styled.continuation
+            };
+            format!("{prefix}{row}")
+        })
+        .collect()
 }
 
 /// The kind of Markdown block a streaming answer is in.
