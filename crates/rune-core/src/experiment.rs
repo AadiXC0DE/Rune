@@ -6,6 +6,7 @@ use crate::error::{Result, RuneError};
 const KEYS: &[&str] = &[
     "goal",
     "map",
+    "overlay",
     "prompt",
     "question_nudge",
     "run_note",
@@ -36,6 +37,30 @@ impl PromptVariant {
     }
 }
 
+/// Whether the model-family notes are sent.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum OverlaySwitch {
+    /// Only the notes adopted for a family.
+    #[default]
+    Default,
+    /// The notes of every family.
+    On,
+    /// No notes.
+    Off,
+}
+
+impl OverlaySwitch {
+    /// Returns the `RUNE_EXPERIMENT` spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::On => "on",
+            Self::Off => "off",
+        }
+    }
+}
+
 /// Switches for behaviour under measurement. The default is the shipped behaviour.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Experiments {
@@ -52,6 +77,8 @@ pub struct Experiments {
     pub goal_judge: bool,
     /// `prompt=v1|v2-min|v2-structured`: the system prompt text and its tool guidance.
     pub prompt: PromptVariant,
+    /// `overlay=default|on|off`: the notes for the model's family after the tool guidance.
+    pub overlay: OverlaySwitch,
 }
 
 impl Default for Experiments {
@@ -63,6 +90,7 @@ impl Default for Experiments {
             snapshot: false,
             goal_judge: false,
             prompt: PromptVariant::V1,
+            overlay: OverlaySwitch::Default,
         }
     }
 }
@@ -121,6 +149,18 @@ impl Experiments {
                 };
                 continue;
             }
+            if key == "overlay" {
+                experiments.overlay = match value {
+                    "default" => OverlaySwitch::Default,
+                    "on" => OverlaySwitch::On,
+                    "off" => OverlaySwitch::Off,
+                    _ => {
+                        return Err(invalid(format!("`{value}` is not a value of `{key}`"))
+                            .with_hint("use default, on or off"));
+                    }
+                };
+                continue;
+            }
             let on = match value {
                 "on" => true,
                 "off" => false,
@@ -174,6 +214,9 @@ impl Experiments {
         if self.prompt != default.prompt {
             parts.push(format!("prompt={}", self.prompt.as_str()));
         }
+        if self.overlay != default.overlay {
+            parts.push(format!("overlay={}", self.overlay.as_str()));
+        }
         parts.sort();
         parts.join(",")
     }
@@ -219,7 +262,7 @@ mod tests {
         assert_eq!(error.message(), "unknown experiment key `unknown`");
         assert_eq!(
             error.hint(),
-            Some("known keys are goal, map, prompt, question_nudge, run_note, snapshot")
+            Some("known keys are goal, map, overlay, prompt, question_nudge, run_note, snapshot")
         );
         assert_eq!(error.field(), Some("RUNE_EXPERIMENT"));
         assert_eq!(message("map"), "`map` is not in key=value form");
@@ -265,6 +308,22 @@ mod tests {
         let error = Experiments::parse("prompt=v2").unwrap_err();
         assert_eq!(error.message(), "`v2` is not a value of `prompt`");
         assert_eq!(error.hint(), Some("use v1, v2-min or v2-structured"));
+    }
+
+    #[test]
+    fn overlay_takes_default_on_or_off() {
+        assert_eq!(Experiments::default().overlay, OverlaySwitch::Default);
+        let on = Experiments::parse("overlay=on").unwrap();
+        assert_eq!(on.overlay, OverlaySwitch::On);
+        assert_eq!(on.render(), "overlay=on");
+        let off = Experiments::parse("overlay=off,prompt=v1").unwrap();
+        assert_eq!(off.overlay, OverlaySwitch::Off);
+        assert_eq!(off.prompt, PromptVariant::V1);
+        assert_eq!(off.render(), "overlay=off");
+        assert_eq!(Experiments::parse("overlay=default").unwrap().render(), "");
+        let error = Experiments::parse("overlay=yes").unwrap_err();
+        assert_eq!(error.message(), "`yes` is not a value of `overlay`");
+        assert_eq!(error.hint(), Some("use default, on or off"));
     }
 
     #[test]

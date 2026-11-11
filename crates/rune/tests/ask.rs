@@ -416,6 +416,39 @@ fn ask_sends_tool_guidance_under_the_v2_experiment() {
 }
 
 #[test]
+fn ask_sends_the_open_weight_overlay_when_switched_on() {
+    for switched_on in [true, false] {
+        let (output, _, requests) = run_responses_fixture_command(
+            vec![completion_response(&json!({"content": "ok"}), "stop")],
+            Some("--json"),
+            true,
+            None,
+            (&["ask"], &[]),
+            |_, command| {
+                command.env("RUNE_MODEL", "deepseek-chat");
+                if switched_on {
+                    command.env("RUNE_EXPERIMENT", "overlay=on");
+                }
+            },
+        );
+        assert_eq!(output.status.code(), Some(0), "{output:?}");
+        let system = requests[0]["messages"][0]["content"]
+            .as_str()
+            .expect("system text");
+        assert_eq!(
+            system.contains("Never write a tool call as text"),
+            switched_on,
+            "{system}"
+        );
+        assert_eq!(
+            system.contains("Notes for this model:"),
+            switched_on,
+            "{system}"
+        );
+    }
+}
+
+#[test]
 fn ask_offers_the_subagent_tool() {
     let (output, _, requests) = run_responses_fixture_command(
         vec![completion_response(&json!({"content": "ok"}), "stop")],

@@ -1,0 +1,8 @@
+{
+  "description": "No model-family notes, adopted or not.",
+  "env": {
+    "RUNE_EXPERIMENT": "overlay=off"
+  },
+  "flags": [],
+  "files": {}
+}
