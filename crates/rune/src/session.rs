@@ -1660,6 +1660,11 @@ impl SessionHost {
                         format!("{reason}; approved for the rest of this session"),
                     );
                 }
+                // Escape cancels the turn before it answers, so a refusal that
+                // arrives after a cancel is the cancel, whichever was seen first.
+                Ok(_) if self.cancellation.is_cancelled() => {
+                    return (Outcome::Deny, format!("{reason}; approval was cancelled"));
+                }
                 Ok(_) => return (Outcome::Deny, format!("{reason}; approval was denied")),
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
