@@ -57,6 +57,7 @@ const SCENARIOS: &[&str] = &[
     "goal_experiment_judge",
     "goal_judge_spend",
     "context_report",
+    "hook_continue",
 ];
 
 /// Scenarios built in Rust, which have no file.
@@ -396,6 +397,12 @@ fn unknown_window_no_compaction() {
 #[test]
 fn context_overflow() {
     run_scenario("context_overflow");
+}
+
+#[test]
+fn hook_continue() {
+    // A turn-end hook that asks once for more gets exactly one more request.
+    run_scenario("hook_continue");
 }
 
 #[test]
