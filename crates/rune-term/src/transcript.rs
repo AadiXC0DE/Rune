@@ -612,7 +612,7 @@ fn render_entry(entry: &Entry, display: Display, lanes: &Lanes, out: &mut String
         // A finished answer is whole, so its tables can be measured and aligned.
         let aligned;
         let source = if lanes.markdown.enabled {
-            aligned = crate::markdown::align_tables(&text, display.ascii);
+            aligned = crate::markdown::align_tables(&text, &lanes.markdown, display.ascii, width);
             &aligned
         } else {
             &text

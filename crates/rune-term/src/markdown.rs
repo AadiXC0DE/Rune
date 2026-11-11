@@ -6,7 +6,8 @@
 //! wrapper measures only visible text and reopens a style at each break.
 //!
 //! Only the constructs that read badly as raw text are handled: headings,
-//! quotes, list bullets, rules, emphasis, inline code and links. Anything that
+//! quotes, lists, rules, emphasis, strikethrough, inline code, links, images
+//! and tables. Anything that
 //! does not parse cleanly is left as the model wrote it, because showing a
 //! stray marker is better than hiding text.
 
@@ -27,6 +28,8 @@ pub struct MarkdownStyle {
     pub italic: String,
     /// Opens inline code.
     pub code: String,
+    /// Opens struck-through text.
+    pub strike: String,
     /// Opens link text.
     pub link: String,
     /// Opens quoted text, list markers and rules.
@@ -64,6 +67,7 @@ impl MarkdownStyle {
             bold: "\u{1b}[1m".to_owned(),
             italic: "\u{1b}[3m".to_owned(),
             code: String::new(),
+            strike: STRIKE.to_owned(),
             link: "\u{1b}[4m".to_owned(),
             dim: "\u{1b}[2m".to_owned(),
             reset: "\u{1b}[0m".to_owned(),
@@ -73,6 +77,12 @@ impl MarkdownStyle {
         }
     }
 }
+
+/// Selects struck-through text.
+pub const STRIKE: &str = "\u{1b}[9m";
+
+/// Longest horizontal rule, in columns.
+const RULE_COLUMNS: usize = 40;
 
 /// One styled source line, ready to wrap.
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
@@ -143,6 +153,11 @@ fn style_line_with(
     } else {
         line
     };
+    // A table row is held as written until its table is complete and can be
+    // measured; until then it is drawn dim.
+    if line.starts_with('|') && is_row(line) {
+        return StyledLine::plain(format!("{}{line}{}", style.dim, style.reset));
+    }
     let indent_len = line
         .len()
         .saturating_sub(line.trim_start_matches(' ').len());
@@ -150,7 +165,7 @@ fn style_line_with(
 
     if indent_len <= 3 && is_rule(rest) {
         let glyph = if ascii { "-" } else { "\u{2500}" };
-        let length = width.clamp(3, 48);
+        let length = width.clamp(1, RULE_COLUMNS);
         return StyledLine::plain(format!(
             "{}{}{}",
             style.dim,
@@ -344,6 +359,14 @@ fn inline(text: &str, ctx: Ctx<'_>) -> String {
                 at = at.saturating_add(consumed);
                 continue;
             }
+        }
+
+        if let Some((consumed, inner)) = delimited(rest, "~~", before) {
+            out.push_str(&style.strike);
+            out.push_str(&inline(inner, ctx));
+            out.push_str(&style.reset);
+            at = at.saturating_add(consumed);
+            continue;
         }
 
         if let Some((consumed, inner)) =
@@ -560,9 +583,10 @@ fn link(text: &str, ctx: Ctx<'_>) -> Option<(usize, String)> {
 /// A table can only be measured once all of its rows exist, so this runs on a
 /// finished answer rather than while it streams. Cells keep their Markdown, so
 /// emphasis and code inside them are still styled afterwards. Text outside a
-/// table, and inside a code fence, is left exactly as written.
+/// table, and inside a code fence, is left exactly as written. A table of more
+/// than one column that is wider than `width` becomes one record per row.
 #[must_use]
-pub fn align_tables(text: &str, ascii: bool) -> String {
+pub fn align_tables(text: &str, style: &MarkdownStyle, ascii: bool, width: usize) -> String {
     let lines: Vec<&str> = text.split('\n').collect();
     let mut out: Vec<String> = Vec::with_capacity(lines.len());
     let mut fence = false;
@@ -584,7 +608,7 @@ pub fn align_tables(text: &str, ascii: bool) -> String {
                 rows.push(cells(row));
                 next = next.saturating_add(1);
             }
-            out.extend(render_table(&rows, ascii));
+            out.extend(render_table(&rows, style, ascii, width));
             index = next;
             continue;
         }
@@ -595,9 +619,13 @@ pub fn align_tables(text: &str, ascii: bool) -> String {
 }
 
 /// Columns a cell occupies once its Markdown markers are drawn away.
-fn visible_width(cell: &str) -> usize {
+fn visible_width(cell: &str, style: &MarkdownStyle) -> usize {
     let plain = MarkdownStyle {
         enabled: true,
+        links: LinkContext {
+            hyperlinks: style.links.hyperlinks,
+            ..LinkContext::default()
+        },
         ..MarkdownStyle::default()
     };
     let ctx = Ctx {
@@ -646,14 +674,26 @@ fn cells(line: &str) -> Vec<String> {
 }
 
 /// Renders rows, the first being the header, with every column padded to
-/// its widest cell.
-fn render_table(rows: &[Vec<String>], ascii: bool) -> Vec<String> {
+/// its widest cell, or as records when the columns do not fit in `width`.
+fn render_table(
+    rows: &[Vec<String>],
+    style: &MarkdownStyle,
+    ascii: bool,
+    width: usize,
+) -> Vec<String> {
     let columns = rows.iter().map(Vec::len).max().unwrap_or_default();
     let mut widths = vec![0_usize; columns];
     for row in rows {
         for (column, cell) in row.iter().enumerate() {
-            widths[column] = widths[column].max(visible_width(cell));
+            widths[column] = widths[column].max(visible_width(cell, style));
         }
+    }
+    let total = widths
+        .iter()
+        .sum::<usize>()
+        .saturating_add(columns.saturating_sub(1).saturating_mul(3));
+    if columns > 1 && total > width {
+        return records(rows, columns);
     }
     let (bar, rule, cross) = if ascii {
         ("|", "-", "+")
@@ -670,7 +710,7 @@ fn render_table(rows: &[Vec<String>], ascii: bool) -> Vec<String> {
             }
             let cell = row.get(column).map_or("", String::as_str);
             text.push_str(cell);
-            let pad = width.saturating_sub(visible_width(cell));
+            let pad = width.saturating_sub(visible_width(cell, style));
             text.extend(std::iter::repeat_n(' ', pad));
         }
         text.trim_end().to_owned()
@@ -692,6 +732,29 @@ fn render_table(rows: &[Vec<String>], ascii: bool) -> Vec<String> {
     out
 }
 
+/// Renders each data row as one record: a bold header and its cell per
+/// column, with a blank row between records. A missing header is named by
+/// its column number.
+fn records(rows: &[Vec<String>], columns: usize) -> Vec<String> {
+    let header = rows.first().map_or(&[][..], Vec::as_slice);
+    let mut out = Vec::new();
+    for (index, row) in rows.iter().skip(1).enumerate() {
+        if index > 0 {
+            out.push(String::new());
+        }
+        for column in 0..columns {
+            let name = header
+                .get(column)
+                .filter(|name| !name.is_empty())
+                .cloned()
+                .unwrap_or_else(|| format!("column {}", column.saturating_add(1)));
+            let cell = row.get(column).map_or("", String::as_str);
+            out.push(format!("**{name}**: {cell}").trim_end().to_owned());
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -704,6 +767,7 @@ mod tests {
             bold: "<b>".to_owned(),
             italic: "<i>".to_owned(),
             code: "<c>".to_owned(),
+            strike: "<s>".to_owned(),
             link: "<a>".to_owned(),
             dim: "<d>".to_owned(),
             reset: "</>".to_owned(),
@@ -937,7 +1001,7 @@ mod tests {
     fn a_pipe_table_is_aligned_and_its_delimiter_becomes_a_rule() {
         let text =
             "Results:\n| Task | Pass |\n|---|:-:|\n| pagination | yes |\n| csv | **no** |\nafter";
-        let aligned = align_tables(text, true);
+        let aligned = align_tables(text, &marked(), true, 80);
         let lines: Vec<&str> = aligned.lines().collect();
         assert_eq!(lines[0], "Results:");
         assert_eq!(lines[1], "Task       | Pass");
@@ -955,7 +1019,59 @@ mod tests {
     #[test]
     fn pipes_outside_a_table_and_inside_code_are_left_alone() {
         let text = "a | b\n```\n| x | y |\n|---|---|\n```";
-        assert_eq!(align_tables(text, false), text);
+        assert_eq!(align_tables(text, &marked(), false, 80), text);
+    }
+
+    #[test]
+    fn a_table_wider_than_the_terminal_becomes_records() {
+        let text = "| name | role | note |\n|---|---|---|\n| ada | lead | wrote the first program |\n| bo | dev | x |";
+        assert_eq!(
+            align_tables(text, &marked(), false, 80).lines().next(),
+            Some("name \u{2502} role \u{2502} note")
+        );
+        let records = align_tables(text, &marked(), false, 30);
+        assert_eq!(
+            records,
+            "**name**: ada\n**role**: lead\n**note**: wrote the first program\n\n\
+             **name**: bo\n**role**: dev\n**note**: x"
+        );
+        assert_eq!(styled("**name**: ada"), "<b>name</>: ada");
+        // A header row with fewer cells names the missing column by number.
+        let short = "| a |\n|---|\n| one | two words here |";
+        assert_eq!(
+            align_tables(short, &marked(), false, 10),
+            "**a**: one\n**column 2**: two words here"
+        );
+        // One column never falls back, and a table in a fence stays code.
+        let single = "| a |\n|---|\n| a long single cell |";
+        assert!(!align_tables(single, &marked(), false, 5).contains("**"));
+        let fenced = format!("```\n{text}\n```");
+        assert_eq!(align_tables(&fenced, &marked(), false, 10), fenced);
+    }
+
+    #[test]
+    fn open_table_rows_are_dim_until_aligned() {
+        assert_eq!(styled("| a | b |"), "<d>| a | b |</>");
+        assert_eq!(styled("a | b"), "a | b");
+    }
+
+    #[test]
+    fn strikethrough_uses_sgr_nine() {
+        assert_eq!(styled("a ~~gone~~ b"), "a <s>gone</> b");
+        assert_eq!(styled("~~ not ~~ and ~single~"), "~~ not ~~ and ~single~");
+        let line = style_line("~~x~~", &MarkdownStyle::attributes(), false, 80);
+        assert_eq!(line.body, "\u{1b}[9mx\u{1b}[0m");
+    }
+
+    #[test]
+    fn the_rule_is_at_most_forty_columns() {
+        let rule = |width| style_line("---", &marked(), false, width).body;
+        assert_eq!(rule(80), format!("<d>{}</>", "\u{2500}".repeat(40)));
+        assert_eq!(rule(12), format!("<d>{}</>", "\u{2500}".repeat(12)));
+        assert_eq!(
+            style_line("***", &marked(), true, 100).body,
+            format!("<d>{}</>", "-".repeat(40))
+        );
     }
 
     #[test]
