@@ -3763,6 +3763,12 @@ impl SessionHost {
                 function: sgr(Slot::Function),
                 reset: rune_term::engine::Style::RESET.to_owned(),
             },
+            links: rune_term::markdown::LinkContext {
+                hyperlinks: self.hyperlinks,
+                workspace: Some(self.context.workspace().to_owned()),
+                host: rune_term::width::host().to_owned(),
+                vscode: self.caps.env.term_program.as_deref() == Some("vscode"),
+            },
         }
     }
 
@@ -20369,6 +20375,25 @@ mod tests {
             false,
             |key: &str| (key == "INSIDE_EMACS").then(|| "29.1,comint".to_owned())
         ));
+    }
+
+    #[test]
+    fn answer_links_follow_the_hyperlinks_setting() {
+        let mut host = test_host();
+        host.hyperlinks = true;
+        let style = host.markdown_style();
+        assert!(style.links.hyperlinks);
+        assert_eq!(
+            style.links.workspace.as_deref(),
+            Some(host.context.workspace())
+        );
+        let row = rune_term::markdown::style_line("see https://a.test/x", &style, false, 80);
+        assert!(row.body.contains("\u{1b}]8;id=rune-"), "{row:?}");
+        host.hyperlinks = false;
+        let style = host.markdown_style();
+        assert!(!style.links.hyperlinks);
+        let row = rune_term::markdown::style_line("see [x](https://a.test/x)", &style, false, 80);
+        assert!(row.body.ends_with(" (https://a.test/x)"), "{row:?}");
     }
 
     #[test]

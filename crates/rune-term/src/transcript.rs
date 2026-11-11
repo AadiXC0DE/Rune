@@ -780,6 +780,7 @@ impl AssistantRows {
             &mut fence,
             ascii,
             &self.markdown,
+            false,
         ));
         rows
     }
@@ -815,6 +816,7 @@ impl AssistantRows {
                 &mut self.fence,
                 self.ascii,
                 &self.markdown,
+                true,
             ));
             self.base_fence = self.fence;
             self.covered = offset;
@@ -845,6 +847,7 @@ impl AssistantRows {
                 &mut self.fence,
                 self.ascii,
                 &self.markdown,
+                true,
             );
             self.finished.push((end, rows, self.fence));
         }
@@ -897,6 +900,7 @@ fn assistant_line(
     fence: &mut Option<Fence>,
     ascii: bool,
     markdown: &crate::markdown::MarkdownStyle,
+    complete: bool,
 ) -> Vec<String> {
     // A fence line is syntax rather than content, so styled output dims it.
     let delimiter = |line: &str| {
@@ -925,7 +929,11 @@ fn assistant_line(
         *fence = Some(open);
         return delimiter(line);
     }
-    let styled = crate::markdown::style_line(line, markdown, ascii, width);
+    let styled = if complete {
+        crate::markdown::style_line(line, markdown, ascii, width)
+    } else {
+        crate::markdown::style_open_line(line, markdown, ascii, width)
+    };
     let body_width = if styled.indent == 0 {
         width
     } else {
