@@ -6290,3 +6290,181 @@ fn a_check_repeated_after_a_session_ended_is_run_again() {
     assert_eq!(repeat_pointers(&host), 0);
     assert!(outcome.calls[2].executed);
 }
+
+fn polling_shell_spec() -> ToolSpec {
+    ToolSpec {
+        name: "shell".to_owned(),
+        description: "Run a command.".to_owned(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "action": { "type": "string" },
+                "command": { "type": "string" },
+            },
+            "required": ["action"],
+        }),
+    }
+}
+
+const CURL: &str = r#"{"action":"run","command":"curl -s localhost:8080"}"#;
+
+fn shell_rules() -> RuleSet {
+    let mut rules = RuleSet::new();
+    rules.push(Rule::allow("shell", "*", Layer::User));
+    rules.push(Rule::allow("edit_file", "*", Layer::User));
+    rules
+}
+
+fn loop_refusals(host: &TestHost) -> usize {
+    host.events()
+        .iter()
+        .filter(|event| {
+            matches!(event, Event::ToolDenied { reason, .. }
+                if reason.contains("returned the same result 4 times"))
+        })
+        .count()
+}
+
+#[test]
+fn a_call_that_keeps_returning_the_same_result_is_refused_then_stalls() {
+    let scripts = (1..=7)
+        .map(|index| Script::tool_call(&format!("c{index}"), "shell", CURL))
+        .collect();
+    let endpoint = MockEndpoint::start(scripts);
+    let host = TestHost::new(endpoint)
+        .with_tools(vec![polling_shell_spec()])
+        .with_rules(shell_rules())
+        .with_tool_response(ToolOutput::success("same"));
+    let mut history = rune_agent::History::new();
+    history.push_user("wait for the server");
+    let outcome = run_turn(&mut history, &host).expect("turn");
+    assert_eq!(host.executed_calls().len(), 4);
+    assert_eq!(loop_refusals(&host), 2);
+    assert_stalled(&outcome, &history);
+    let error = outcome.error.as_ref().expect("error");
+    assert!(
+        error.to_string().contains(
+            "`shell` returned the same result 4 times and was sent again after 2 refusals"
+        ),
+        "{error}"
+    );
+    assert_eq!(outcome.calls.len(), 7);
+    assert!(outcome.calls[6].output.text.starts_with(STALLED));
+}
+
+#[test]
+fn a_call_that_keeps_returning_the_same_result_matches_by_canonical_arguments() {
+    let spaced = r#"{ "command": "curl -s localhost:8080",  "action": "run" }"#;
+    let scripts = vec![
+        Script::tool_call("c1", "shell", CURL),
+        Script::tool_call("c2", "shell", spaced),
+        Script::tool_call("c3", "shell", CURL),
+        Script::tool_call("c4", "shell", spaced),
+        Script::tool_call("c5", "shell", CURL),
+        Script::text("the server is not answering"),
+    ];
+    let endpoint = MockEndpoint::start(scripts);
+    let host = TestHost::new(endpoint)
+        .with_tools(vec![polling_shell_spec()])
+        .with_rules(shell_rules())
+        .with_tool_response(ToolOutput::success("same"));
+    let mut history = rune_agent::History::new();
+    history.push_user("wait for the server");
+    let outcome = run_turn(&mut history, &host).expect("turn");
+    assert_eq!(outcome.stop_reason, StopReason::Completed);
+    assert_eq!(host.executed_calls().len(), 4);
+    assert_eq!(loop_refusals(&host), 1);
+    assert!(!outcome.calls[4].executed);
+    history.validate().expect("paired history");
+}
+
+/// A command whose output changes on every run.
+struct Counter {
+    runs: AtomicUsize,
+}
+
+impl rune_tools::Tool for Counter {
+    fn name(&self) -> &'static str {
+        "shell"
+    }
+    fn description(&self) -> &'static str {
+        "Print a counter."
+    }
+    fn input_schema(&self) -> serde_json::Value {
+        polling_shell_spec().input_schema
+    }
+    fn activity(&self) -> rune_tools::Activity {
+        rune_tools::Activity::Execute
+    }
+    fn call(
+        &self,
+        _arguments: &serde_json::Value,
+        _context: &ExecutionContext,
+    ) -> Result<ToolOutput> {
+        let run = self.runs.fetch_add(1, Ordering::SeqCst);
+        Ok(ToolOutput::success(format!("count {run}")))
+    }
+}
+
+#[test]
+fn a_changing_result_is_never_refused() {
+    let mut scripts: Vec<Script> = (1..=10)
+        .map(|index| Script::tool_call(&format!("c{index}"), "shell", CURL))
+        .collect();
+    scripts.push(Script::text("the counter keeps moving"));
+    let endpoint = MockEndpoint::start(scripts);
+    let mut host = TestHost::new(endpoint)
+        .with_tools(vec![polling_shell_spec()])
+        .with_rules(shell_rules());
+    let mut registry = Registry::new();
+    registry
+        .insert(Box::new(Counter {
+            runs: AtomicUsize::new(0),
+        }))
+        .expect("counter");
+    host.registry = Some(registry);
+    let mut history = rune_agent::History::new();
+    history.push_user("watch the counter");
+    let outcome = run_turn(&mut history, &host).expect("turn");
+    assert_eq!(outcome.stop_reason, StopReason::Completed);
+    assert_eq!(outcome.calls.len(), 10);
+    assert!(outcome.calls.iter().all(|call| call.executed));
+    assert_eq!(loop_refusals(&host), 0);
+}
+
+#[test]
+fn a_change_between_results_resets_the_loop_count() {
+    let edit = r#"{"path":"a.txt","old_string":"a","new_string":"b"}"#;
+    let mut scripts: Vec<Script> = (1..=3)
+        .map(|index| Script::tool_call(&format!("c{index}"), "shell", CURL))
+        .collect();
+    scripts.push(Script::tool_call("edit", "edit_file", edit));
+    scripts.extend((4..=7).map(|index| Script::tool_call(&format!("c{index}"), "shell", CURL)));
+    scripts.push(Script::text("done"));
+    scripts.push(Script::text("done"));
+    let endpoint = MockEndpoint::start(scripts);
+    let edit_spec = ToolSpec {
+        name: "edit_file".to_owned(),
+        description: "Edit a file.".to_owned(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string" },
+                "old_string": { "type": "string" },
+                "new_string": { "type": "string" },
+            },
+            "required": ["path"],
+        }),
+    };
+    let host = TestHost::new(endpoint)
+        .with_tools(vec![polling_shell_spec(), edit_spec])
+        .with_rules(shell_rules())
+        .with_tool_response(ToolOutput::success("same"));
+    let mut history = rune_agent::History::new();
+    history.push_user("change it and poll");
+    let outcome = run_turn(&mut history, &host).expect("turn");
+    assert_eq!(outcome.stop_reason, StopReason::Completed);
+    assert_eq!(host.executed_calls().len(), 8);
+    assert_eq!(loop_refusals(&host), 0);
+    history.validate().expect("paired history");
+}

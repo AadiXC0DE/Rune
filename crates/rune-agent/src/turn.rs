@@ -1359,17 +1359,11 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
             settle!(StopReason::StepLimit);
         }
 
-        if let Some(call) = stalled {
+        if let Some((_, message)) = stalled {
             settle!(
                 StopReason::Stalled,
-                RuneError::new(
-                    ErrorCode::LimitExceeded,
-                    format!(
-                        "the model sent the failing `{}` call again after it was refused twice",
-                        call.name
-                    ),
-                )
-                .with_invariant(LimitName::MaxConsecutiveToolFailures.as_str())
+                RuneError::new(ErrorCode::LimitExceeded, message)
+                    .with_invariant(LimitName::MaxConsecutiveToolFailures.as_str())
             );
         }
 
@@ -1862,11 +1856,11 @@ fn execute_batch(
     limits: &BudgetSet,
     previous: &[CallResult],
     repaired: &mut Vec<(String, Resolved)>,
-) -> (Vec<CallResult>, Option<PreparedCall>) {
+) -> (Vec<CallResult>, Option<(PreparedCall, String)>) {
     let mut results = Vec::with_capacity(calls.len());
     let mut cancelled = false;
-    // The call that stalled the run; everything after it is answered unrun.
-    let mut stalled: Option<PreparedCall> = None;
+    // The call that stalled the run and why; everything after it is answered unrun.
+    let mut stalled: Option<(PreparedCall, String)> = None;
     let failure_limit = limits.get(LimitName::MaxConsecutiveToolFailures).value();
     let offered = host.tools();
     let turn_cap = limits.get_usize(LimitName::MaxTurnResultBytes);
@@ -1929,7 +1923,14 @@ fn execute_batch(
                     None
                 };
                 let blocked = blocked
-                    .or_else(|| repeat_guard(&view, host, history, previous, &results, cancelled));
+                    .or_else(|| repeat_guard(&view, host, history, previous, &results, cancelled))
+                    .or_else(|| {
+                        guard_result(
+                            loop_guard(&view, host, previous, &results, cancelled),
+                            &view,
+                            &mut stalled,
+                        )
+                    });
                 let prepared = match blocked {
                     Some(result) => Err(result),
                     None => prepare_call(call, host, &offered, &mut cancelled, tool_cap, repaired),
@@ -2008,6 +2009,13 @@ fn execute_batch(
         };
         let result = blocked
             .or_else(|| repeat_guard(&view, host, history, previous, &results, cancelled))
+            .or_else(|| {
+                guard_result(
+                    loop_guard(&view, host, previous, &results, cancelled),
+                    &view,
+                    &mut stalled,
+                )
+            })
             .or_else(|| overwrite_guard(&view, host, history))
             .unwrap_or_else(|| {
                 execute_call(
@@ -2365,8 +2373,8 @@ enum Guard {
     Run,
     /// The call is answered with a nudge and the turn goes on.
     Refuse(CallResult),
-    /// The call is answered and the run stops.
-    Stall(CallResult),
+    /// The call is answered and the run stops, for the reason given.
+    Stall(CallResult, String),
 }
 
 /// Checks failures in request order, across batches but only within this turn.
@@ -2415,7 +2423,13 @@ fn failure_guard(
         }
     };
     if refusals >= 2 {
-        return Guard::Stall(deny(STALLED_CALL.to_owned()));
+        return Guard::Stall(
+            deny(STALLED_CALL.to_owned()),
+            format!(
+                "the model sent the failing `{}` call again after it was refused twice",
+                call.name
+            ),
+        );
     }
     // The limit is how many identical failures in a row are allowed; the
     // next attempt is refused.
@@ -2430,16 +2444,118 @@ fn failure_guard(
 fn guard_result(
     guard: Guard,
     call: &PreparedCall,
-    stalled: &mut Option<PreparedCall>,
+    stalled: &mut Option<(PreparedCall, String)>,
 ) -> Option<CallResult> {
     match guard {
         Guard::Run => None,
         Guard::Refuse(result) => Some(result),
-        Guard::Stall(result) => {
-            *stalled = Some(call.clone());
+        Guard::Stall(result, message) => {
+            *stalled = Some((call.clone(), message));
             Some(result)
         }
     }
+}
+
+/// Executed calls the loop guard looks back over.
+const LOOP_WINDOW: usize = 10;
+/// Identical results in the window after which the same call is refused.
+const LOOP_REPEATS: usize = 4;
+/// Answer given in place of a call that keeps returning the same result.
+const LOOP_REFUSAL: &str = "not run: this exact call has returned the same result {n} times. \
+Do not send it again. Read the result above and change something: different arguments, \
+another tool, or say what is blocking you.";
+/// How every loop refusal begins.
+const LOOP_REFUSAL_PREFIX: &str = "not run: this exact call has returned the same result";
+
+/// Refuses a call that keeps returning the same result with nothing changed
+/// in between, within this turn.
+///
+/// Only executed calls since the last change count, at most [`LOOP_WINDOW`]
+/// of them. When the newest [`LOOP_REPEATS`] identical calls among them
+/// succeeded with the same text, the call is refused; one sent again after
+/// two such refusals stalls the run. Repeated failures are left to the
+/// failure guard and its configurable cap. Arguments compare as JSON values, so key
+/// order and spacing do not matter.
+fn loop_guard(
+    call: &PreparedCall,
+    host: &dyn Host,
+    previous: &[CallResult],
+    results: &[CallResult],
+    cancelled: bool,
+) -> Guard {
+    if cancelled || host.cancellation().is_cancelled() || call.name == "read_tool_result" {
+        return Guard::Run;
+    }
+    let canonical = serde_json::from_str::<serde_json::Value>(&call.arguments).ok();
+    let interact = call.name == "shell"
+        && canonical
+            .as_ref()
+            .and_then(|value| value.get("action"))
+            .and_then(serde_json::Value::as_str)
+            == Some("interact");
+    if interact {
+        return Guard::Run;
+    }
+    let same = |other: &PreparedCall| {
+        other.name == call.name
+            && match (
+                &canonical,
+                serde_json::from_str::<serde_json::Value>(&other.arguments).ok(),
+            ) {
+                (Some(left), Some(right)) => *left == right,
+                _ => other.arguments == call.arguments,
+            }
+    };
+    let mut executed: usize = 0;
+    let mut outputs: Vec<&ToolOutput> = Vec::new();
+    let mut refusals: usize = 0;
+    for result in previous
+        .iter()
+        .chain(results)
+        .rev()
+        .take_while(|result| !verify::is_change(result))
+    {
+        if result.executed {
+            executed = executed.saturating_add(1);
+            if executed > LOOP_WINDOW {
+                break;
+            }
+            if same(&result.call) {
+                outputs.push(&result.output);
+            }
+        } else if same(&result.call) && result.output.text.starts_with(LOOP_REFUSAL_PREFIX) {
+            refusals = refusals.saturating_add(1);
+        }
+    }
+    let looping = outputs.len() >= LOOP_REPEATS
+        && outputs[..LOOP_REPEATS]
+            .iter()
+            .all(|output| !output.is_error && output.text == outputs[0].text);
+    if !looping {
+        return Guard::Run;
+    }
+    let deny = |text: String| {
+        host.emit(Event::ToolDenied {
+            call: call.clone(),
+            reason: text.clone(),
+        });
+        CallResult {
+            call: call.clone(),
+            output: ToolOutput::failure(text),
+            executed: false,
+        }
+    };
+    if refusals >= 2 {
+        return Guard::Stall(
+            deny(STALLED_CALL.to_owned()),
+            format!(
+                "`{}` returned the same result {LOOP_REPEATS} times and was sent again after 2 \
+                 refusals",
+                call.name
+            ),
+        );
+    }
+    Guard::Refuse(deny(LOOP_REFUSAL.replace("{n}", &LOOP_REPEATS.to_string())))
 }
 
 /// The call as the guards compare it: in its repaired form when repair

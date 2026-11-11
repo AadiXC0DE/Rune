@@ -157,14 +157,20 @@ fn limits(steps: u64, result_bytes: u64) -> BudgetSet {
 
 /// Returns the endpoint a turn that always asks for another tool call.
 ///
-/// The mock repeats its last script once the sequence is exhausted, so one
-/// script drives every step.
+/// Each step reads a different file: a call that keeps returning the same
+/// result would be refused and end the turn before the step limit.
 fn endpoint() -> MockEndpoint {
-    MockEndpoint::start(vec![Script::tool_call(
-        "call_1",
-        "read_file",
-        "{\"path\":\"a.rs\"}",
-    )])
+    MockEndpoint::start(
+        (0..64)
+            .map(|step| {
+                Script::tool_call(
+                    &format!("call_{step}"),
+                    "read_file",
+                    &format!("{{\"path\":\"a{step}.rs\"}}"),
+                )
+            })
+            .collect(),
+    )
 }
 
 /// Returns the tool-result bytes the history retained.

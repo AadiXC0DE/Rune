@@ -9,7 +9,7 @@
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -78,6 +78,12 @@ pub const STOP_TARGET: &str = "stop";
 /// Input sent to a session is judged together with the command it goes to, so
 /// that command is kept where every view can read it.
 static COMMANDS: Mutex<BTreeMap<String, String>> = Mutex::new(BTreeMap::new());
+
+/// Idle interactions in a row after which each one carries [`IDLE_HINT`].
+const IDLE_POLLS_BEFORE_HINT: u32 = 4;
+/// Added to an interaction with a session that keeps producing nothing.
+const IDLE_HINT: &str =
+    "[the process has produced no new output; wait longer with a larger yield_time_ms, or stop it]";
 
 /// Sessions started in this process, counted across every instance so that no
 /// two sessions share an id.
@@ -281,6 +287,8 @@ struct Session {
     network_denied: bool,
     /// The deadline the command was given, in milliseconds.
     timeout_ms: Option<u64>,
+    /// Interactions in a row that sent nothing and saw no new output.
+    idle_polls: AtomicU32,
 }
 
 impl Session {
@@ -302,6 +310,7 @@ impl Session {
             input,
             network_denied,
             timeout_ms: None,
+            idle_polls: AtomicU32::new(0),
         }
     }
 
@@ -588,6 +597,16 @@ impl Shell {
         if ended.is_some() {
             session.process.drain_output(DRAIN_WINDOW);
         }
+        let idle = chars.is_none() && ended.is_none() && produced(&session.process) == baseline;
+        let idle_polls = if idle {
+            session
+                .idle_polls
+                .fetch_add(1, Ordering::Relaxed)
+                .saturating_add(1)
+        } else {
+            session.idle_polls.store(0, Ordering::Relaxed);
+            0
+        };
         let state = match ended {
             Some(exit) => session.ended_state(exit),
             None => format!("session {id} running, {}", ended_by(session.process.id())),
@@ -610,6 +629,12 @@ impl Shell {
             let mut output = finish(text, exit, session.network_denied);
             output.check = check.map(|check| with_exit(check, exit));
             return Ok(output);
+        }
+        if idle_polls >= IDLE_POLLS_BEFORE_HINT {
+            if !text.is_empty() && !text.ends_with('\n') {
+                text.push('\n');
+            }
+            text.push_str(IDLE_HINT);
         }
         Ok(ToolOutput::success(text))
     }
@@ -2627,6 +2652,34 @@ mod tests {
         let stopped = stop(&tool, &context, &id);
         assert!(stopped.contains("ended"), "{stopped}");
         assert_eq!(tool.live_sessions(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn idle_interacts_get_a_hint_on_the_fourth_poll() {
+        let tool = Shell::default();
+        let (_dir, context) = workspace();
+        let started = text(
+            &tool,
+            &context,
+            &serde_json::json!({ "action": "run", "command": "sleep 30", "yield_time_ms": 0 }),
+        );
+        let (id, _group) = running(&started);
+        for poll in 1..=5 {
+            let polled = text(
+                &tool,
+                &context,
+                &serde_json::json!({ "action": "interact", "session_id": id, "yield_time_ms": 10 }),
+            );
+            assert!(polled.contains(" running"), "{polled}");
+            assert_eq!(
+                polled.contains(IDLE_HINT),
+                poll >= 4,
+                "poll {poll}: {polled}"
+            );
+        }
+        let stopped = stop(&tool, &context, &id);
+        assert!(stopped.contains("ended"), "{stopped}");
     }
 
     #[cfg(unix)]
