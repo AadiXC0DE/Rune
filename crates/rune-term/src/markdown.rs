@@ -103,7 +103,7 @@ pub fn style_line(line: &str, style: &MarkdownStyle, ascii: bool, width: usize) 
 }
 
 /// Returns true for a thematic break: three or more of one of `-`, `*`, `_`.
-fn is_rule(text: &str) -> bool {
+pub(crate) fn is_rule(text: &str) -> bool {
     let compact: Vec<char> = text.chars().filter(|ch| *ch != ' ').collect();
     compact.len() >= 3
         && matches!(compact.first(), Some('-' | '*' | '_'))
@@ -111,7 +111,7 @@ fn is_rule(text: &str) -> bool {
 }
 
 /// Returns the text of an ATX heading.
-fn heading(text: &str) -> Option<&str> {
+pub(crate) fn heading(text: &str) -> Option<&str> {
     let level = text.bytes().take_while(|byte| *byte == b'#').count();
     if !(1..=6).contains(&level) {
         return None;
@@ -125,7 +125,7 @@ fn heading(text: &str) -> Option<&str> {
 }
 
 /// Returns the item text of an unordered list line.
-fn bullet(text: &str) -> Option<&str> {
+pub(crate) fn bullet(text: &str) -> Option<&str> {
     let mut chars = text.chars();
     let marker = chars.next()?;
     if !matches!(marker, '-' | '*' | '+') {
@@ -304,12 +304,12 @@ fn visible_width(cell: &str) -> usize {
         .map_or(0, |line| line.width)
 }
 
-fn is_row(line: &str) -> bool {
+pub(crate) fn is_row(line: &str) -> bool {
     let line = line.trim();
     line.starts_with('|') && line.len() > 1
 }
 
-fn is_delimiter(line: &str) -> bool {
+pub(crate) fn is_delimiter(line: &str) -> bool {
     let line = line.trim();
     is_row(line) && line.contains('-') && line.chars().all(|ch| matches!(ch, '|' | '-' | ':' | ' '))
 }
