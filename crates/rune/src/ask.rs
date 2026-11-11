@@ -816,6 +816,33 @@ struct AskHost<'a> {
 impl AskHost<'_> {
     /// Writes to the session log; the first failure stops the run, because a
     /// run whose record is incomplete should not go on spending.
+    /// Runs `body` with what tool hooks need from this run.
+    fn with_tool_hooks<T>(&self, body: impl FnOnce(&crate::hooks::ToolHooks<'_>) -> T) -> T {
+        let session_id = self
+            .log
+            .as_ref()
+            .map(|log| log.id.to_string())
+            .unwrap_or_default();
+        let warn = |message: &str| {
+            let _ = writeln!(std::io::stderr(), "warning: {message}");
+        };
+        let check = || self.context.check_cancelled();
+        body(&crate::hooks::ToolHooks {
+            hooks: &self.settings.hooks,
+            envelope: crate::hooks::Envelope {
+                session_id: &session_id,
+                cwd: self.context.workspace(),
+                turn: 1,
+            },
+            cancellation: &self.cancellation,
+            check: &check,
+            warn: &warn,
+            credential: &self.endpoint.credential,
+            max_result_bytes: usize::try_from(self.limits.get_bytes(LimitName::MaxToolResultBytes))
+                .unwrap_or(usize::MAX),
+        })
+    }
+
     fn log(&self, write: impl FnOnce(&LiveLog) -> Result<()>) {
         let Some(log) = &self.log else {
             return;
@@ -1311,26 +1338,21 @@ impl Host for AskHost<'_> {
         });
     }
 
-    fn pre_tool(&self, call: &turn::PreparedCall) -> Result<Option<turn::HookVeto>> {
-        crate::pre_tool_hook::run(
-            self.settings.pre_tool_hook.as_ref(),
-            call,
-            &self.context,
-            &self.cancellation,
-        )
+    fn pre_tool_outcome(&self, call: &turn::PreparedCall) -> Result<turn::PreToolOutcome> {
+        self.with_tool_hooks(|hooks| hooks.pre_tool(call))
     }
 
-    fn post_tool(&self, result: &turn::CallResult) {
-        self.log(|log| log.result(result));
-        if let Some(message) = crate::post_tool_hook::notify(
-            self.settings.post_tool_hook.as_ref(),
-            result,
-            &self.context,
-            &self.cancellation,
-            &self.endpoint.credential,
-        ) {
-            let _ = writeln!(std::io::stderr(), "warning: {message}");
+    fn post_tool_effect(&self, result: &turn::CallResult) -> Option<turn::PostToolEffect> {
+        let effect = self.with_tool_hooks(|hooks| hooks.post_tool(result));
+        match &effect {
+            Some(effect) => {
+                let mut changed = result.clone();
+                effect.apply(&mut changed.output);
+                self.log(|log| log.result(&changed));
+            }
+            None => self.log(|log| log.result(result)),
         }
+        effect
     }
 
     fn execute(&self, name: &str, arguments: &serde_json::Value) -> Result<ToolOutput> {

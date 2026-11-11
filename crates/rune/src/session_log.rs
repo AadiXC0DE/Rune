@@ -303,6 +303,11 @@ impl Recorder {
     }
 
     /// Starts an exchange before the provider can produce visible text.
+    /// The number of the current or last turn, zero before the first.
+    pub const fn turn_number(&self) -> u64 {
+        self.turn
+    }
+
     pub fn begin_turn(&mut self) -> Result<()> {
         if !self.active_turn {
             let turn = self.turn.saturating_add(1);

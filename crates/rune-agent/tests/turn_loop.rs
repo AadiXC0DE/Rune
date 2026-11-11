@@ -61,6 +61,10 @@ struct TestHost {
     tool_response: Mutex<Option<ToolOutput>>,
     tool_error: Option<RuneError>,
     hook_veto: Option<rune_agent::turn::HookVeto>,
+    /// Argument texts a pre-tool hook replaces, with their replacements.
+    hook_rewrites: Vec<(String, String)>,
+    /// What post-tool hooks do to each result, in order.
+    post_effects: Mutex<std::collections::VecDeque<rune_agent::turn::PostToolEffect>>,
     hook_calls: Mutex<Vec<String>>,
     post_results: Mutex<Vec<(rune_agent::turn::CallResult, std::thread::ThreadId)>>,
     /// Real tools used by regressions that must reach the implementation.
@@ -141,6 +145,8 @@ impl TestHost {
             tool_response: Mutex::new(None),
             tool_error: None,
             hook_veto: None,
+            hook_rewrites: Vec::new(),
+            post_effects: Mutex::new(std::collections::VecDeque::new()),
             hook_calls: Mutex::new(Vec::new()),
             post_results: Mutex::new(Vec::new()),
             registry: None,
@@ -454,6 +460,35 @@ impl Host for TestHost {
             .expect("hook calls")
             .push(call.id.clone());
         Ok(self.hook_veto.clone())
+    }
+
+    fn pre_tool_outcome(
+        &self,
+        call: &rune_agent::turn::PreparedCall,
+    ) -> Result<rune_agent::turn::PreToolOutcome> {
+        let veto = self.pre_tool(call)?;
+        if let Some((_, arguments)) = self
+            .hook_rewrites
+            .iter()
+            .find(|(from, _)| *from == call.arguments)
+        {
+            return Ok(rune_agent::turn::PreToolOutcome::Rewrite {
+                hook: "fixture rewriter".to_owned(),
+                arguments: arguments.clone(),
+            });
+        }
+        Ok(veto.map_or(
+            rune_agent::turn::PreToolOutcome::Allow,
+            rune_agent::turn::PreToolOutcome::Veto,
+        ))
+    }
+
+    fn post_tool_effect(
+        &self,
+        result: &rune_agent::turn::CallResult,
+    ) -> Option<rune_agent::turn::PostToolEffect> {
+        self.post_tool(result);
+        self.post_effects.lock().expect("effects").pop_front()
     }
 
     fn step_appendix(
@@ -4691,6 +4726,125 @@ fn pre_tool_hooks_cannot_override_a_policy_denial() {
     let outcome = run_turn(&mut history, &host).expect("turn");
     assert!(!outcome.calls[0].executed);
     assert!(host.hook_calls.lock().expect("hook calls").is_empty());
+    history.validate().expect("paired history");
+}
+
+#[test]
+fn a_rewrite_is_checked_by_policy_again() {
+    let shell =
+        |command: &str| serde_json::json!({ "action": "run", "command": command }).to_string();
+    let mut rules = RuleSet::new();
+    rules.push(Rule::allow("shell", "ls*", Layer::User));
+    rules.push(Rule::deny("shell", "rm *", Layer::User));
+
+    // An allowed call rewritten into a denied one is refused by policy.
+    let endpoint = MockEndpoint::start(vec![
+        Script::tool_call("call_1", "shell", &shell("ls")),
+        Script::text("done"),
+    ]);
+    let mut host = TestHost::new(endpoint)
+        .with_tools(vec![polling_shell_spec()])
+        .with_rules(rules.clone());
+    host.hook_rewrites = vec![(shell("ls"), shell("rm -rf x"))];
+    let mut history = rune_agent::History::new();
+    history.push_user("list");
+    let outcome = run_turn(&mut history, &host).expect("turn");
+    assert!(!outcome.calls[0].executed);
+    assert!(outcome.calls[0].output.is_error);
+    assert!(host.executed_calls().is_empty());
+    assert_eq!(*host.hook_calls.lock().expect("hook calls"), ["call_1"]);
+    assert_eq!(
+        *host.decisions.lock().expect("decisions"),
+        [
+            ("shell".to_owned(), Some("ls".to_owned())),
+            ("shell".to_owned(), Some("rm -rf x".to_owned())),
+        ]
+    );
+    assert!(host.events().iter().any(|event| matches!(
+        event,
+        Event::ToolRewritten { call, hook }
+            if hook == "fixture rewriter" && call.id == "call_1" && call.arguments == shell("rm -rf x")
+    )));
+    assert!(
+        host.events()
+            .iter()
+            .any(|event| matches!(event, Event::ToolDenied { .. }))
+    );
+    history.validate().expect("paired history");
+
+    // A denied call never reaches the hook; an allowed one rewritten into
+    // another allowed command runs the new command.
+    let endpoint = MockEndpoint::start(vec![
+        Script::tool_call("call_2", "shell", &shell("rm x")),
+        Script::tool_call("call_3", "shell", &shell("ls x")),
+        Script::text("done"),
+    ]);
+    let mut host = TestHost::new(endpoint)
+        .with_tools(vec![polling_shell_spec()])
+        .with_rules(rules);
+    host.hook_rewrites = vec![(shell("rm x"), shell("ls")), (shell("ls x"), shell("ls"))];
+    let mut history = rune_agent::History::new();
+    history.push_user("clean up");
+    let outcome = run_turn(&mut history, &host).expect("turn");
+    assert!(!outcome.calls[0].executed);
+    assert!(outcome.calls[1].executed);
+    assert_eq!(outcome.calls[1].call.arguments, shell("ls"));
+    assert_eq!(*host.hook_calls.lock().expect("hook calls"), ["call_3"]);
+    assert_eq!(
+        host.executed_calls(),
+        [(
+            "shell".to_owned(),
+            serde_json::json!({ "action": "run", "command": "ls" })
+        )]
+    );
+    history.validate().expect("paired history");
+}
+
+#[test]
+fn post_tool_append_and_replace_reach_the_model() {
+    let endpoint = MockEndpoint::start(vec![
+        Script::tool_call("first", "read_file", r#"{"path":"a.txt"}"#),
+        Script::tool_call("second", "read_file", r#"{"path":"b.txt"}"#),
+        Script::text("done"),
+    ]);
+    let host = TestHost::new(endpoint)
+        .with_tools(vec![read_tool()])
+        .with_mode(PermissionMode::FullAccess);
+    host.post_effects.lock().expect("effects").extend([
+        rune_agent::turn::PostToolEffect::Append("checked by the hook".to_owned()),
+        rune_agent::turn::PostToolEffect::Replace("replaced by the hook".to_owned()),
+    ]);
+    let mut history = rune_agent::History::new();
+    history.push_user("read both");
+    let outcome = run_turn(&mut history, &host).expect("turn");
+    assert_eq!(
+        outcome.calls[0].output.text,
+        "tool output\n\n[hook output]\nchecked by the hook"
+    );
+    assert_eq!(outcome.calls[1].output.text, "replaced by the hook");
+    let request = host
+        .server
+        .as_ref()
+        .expect("server")
+        .last_body()
+        .expect("request");
+    let results: Vec<_> = request["messages"]
+        .as_array()
+        .expect("messages")
+        .iter()
+        .filter(|message| message["role"] == "tool")
+        .map(|message| message["content"].clone())
+        .collect();
+    assert_eq!(
+        results,
+        [
+            "tool output\n\n[hook output]\nchecked by the hook",
+            "replaced by the hook"
+        ]
+    );
+    // The observer still sees each result before its effect.
+    let observed = host.post_results.lock().expect("post results");
+    assert_eq!(observed[0].0.output.text, "tool output");
     history.validate().expect("paired history");
 }
 

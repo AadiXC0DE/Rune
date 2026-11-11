@@ -1505,6 +1505,7 @@ impl<W: Write + Send + 'static> Host for TurnHost<W> {
             }
             Event::PlanUpdated { .. }
             | Event::CallRepaired { .. }
+            | Event::ToolRewritten { .. }
             | Event::SteeringApplied { .. }
             | Event::VerificationRequested
             | Event::ContextPruned { .. }
