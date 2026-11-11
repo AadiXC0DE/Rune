@@ -144,7 +144,8 @@ pub fn encode_request(
 ///
 /// A reply without the checkpoint headings gets one nudge asking for them; if
 /// that reply still lacks them, a complete free-form reply is kept. The usage
-/// of the summary requests is returned, not recorded.
+/// of the summary requests is returned, not recorded. This is the compaction
+/// a user asks for; the host hears `pre_compact(false)`.
 pub fn compact(
     history: &mut History,
     plan: &Plan,
@@ -153,11 +154,15 @@ pub fn compact(
     archive: Option<&dyn Archive>,
     cancelled: &dyn Fn() -> bool,
 ) -> Result<CompactionReport> {
-    summarize_and_apply(history, plan, host, client, archive, cancelled, false)
+    summarize_and_apply(
+        history, plan, host, client, archive, cancelled, false, false,
+    )
 }
 
 /// Compacts with the same-prefix request unless `overflow` says the provider
-/// has already refused the conversation as too long.
+/// has already refused the conversation as too long. `automatic` is false
+/// for a compaction the user asked for.
+#[allow(clippy::too_many_arguments)]
 fn summarize_and_apply(
     history: &mut History,
     plan: &Plan,
@@ -166,8 +171,10 @@ fn summarize_and_apply(
     archive: Option<&dyn Archive>,
     cancelled: &dyn Fn() -> bool,
     overflow: bool,
+    automatic: bool,
 ) -> Result<CompactionReport> {
     turn::check_objective_budget(host)?;
+    host.pre_compact(automatic);
     let limits = host.limits();
     let shared = if overflow {
         None
@@ -602,6 +609,7 @@ pub fn compact_now(
         None,
         &|| cancellation.is_cancelled(),
         true,
+        true,
     )?;
     host.context_replaced(&report);
     let after_tokens = size(history)?;
@@ -747,9 +755,16 @@ pub fn auto_compact_encoded(
         return Ok((pruned, encoded));
     };
     let cancellation = host.cancellation();
-    let mut report = compact(history, &compaction_plan, host, client, None, &|| {
-        cancellation.is_cancelled()
-    })?;
+    let mut report = summarize_and_apply(
+        history,
+        &compaction_plan,
+        host,
+        client,
+        None,
+        &|| cancellation.is_cancelled(),
+        false,
+        true,
+    )?;
     report.pruned_results = pruned.map_or(0, |done| done.report.pruned_results);
     host.context_replaced(&report);
     request.instructions = host.instructions();
@@ -2030,6 +2045,22 @@ mod tests {
         assert!(body_has_no_tools(&bodies[0]));
     }
 
+    #[test]
+    fn pre_compact_hears_whether_a_compaction_was_asked_for() {
+        let mut host = SummaryHost::new();
+        host.window = Some(1_000_000);
+        let fetch = ReplyFetch::new(&[(CHECKPOINT_REPLY, "stop"), (CHECKPOINT_REPLY, "stop")]);
+        let mut history = short_history();
+        let cut = plan(&history, &host.limits()).expect("a plan");
+        compact(&mut history, &cut, &host, &fetch, None, &|| false).expect("compacts");
+        let mut history = short_history();
+        assert!(compact_now(&mut history, &host, &fetch, 100).expect("compacts"));
+        assert_eq!(
+            *host.pre_compact.lock().expect("pre compact"),
+            [false, true]
+        );
+    }
+
     fn body_has_no_tools(body: &serde_json::Value) -> bool {
         body.get("tools").is_none()
     }
@@ -2276,6 +2307,7 @@ Copy file paths, symbols, commands, error messages and identifiers exactly. Leav
         window: Option<u64>,
         compaction_model: Option<String>,
         abandoned: std::sync::Mutex<u32>,
+        pre_compact: std::sync::Mutex<Vec<bool>>,
     }
 
     impl SummaryHost {
@@ -2288,6 +2320,7 @@ Copy file paths, symbols, commands, error messages and identifiers exactly. Leav
                 window: None,
                 compaction_model: None,
                 abandoned: std::sync::Mutex::new(0),
+                pre_compact: std::sync::Mutex::new(Vec::new()),
             }
         }
 
@@ -2305,6 +2338,13 @@ Copy file paths, symbols, commands, error messages and identifiers exactly. Leav
     }
 
     impl Host for SummaryHost {
+        fn pre_compact(&self, automatic: bool) {
+            self.pre_compact
+                .lock()
+                .expect("pre compact")
+                .push(automatic);
+        }
+
         // The fixture history is short, so only the newest exchange is kept.
         fn limits(&self) -> BudgetSet {
             let mut limits = BudgetSet::new();
