@@ -2468,7 +2468,7 @@ fn malformed_user_config_names_the_field_for_provider_commands() {
     let root = camino::Utf8Path::from_path(dir.path()).expect("utf8");
     let path = root.join("config/rune/config.toml");
     rune_core::paths::create_dir_private(path.parent().expect("parent")).expect("directory");
-    rune_core::paths::write_private(&path, "model = 'wrong-key'\n").expect("config");
+    rune_core::paths::write_private(&path, "offline = 'maybe'\n").expect("config");
     for args in [
         vec!["auth"],
         vec!["auth", "--json"],
@@ -2485,7 +2485,7 @@ fn malformed_user_config_names_the_field_for_provider_commands() {
         let error = String::from_utf8(out.stderr).expect("stderr");
         assert!(
             error.contains("user configuration")
-                && error.contains("unknown field `model`")
+                && error.contains("offline = 'maybe'")
                 && error.contains("rune doctor"),
             "{args:?}: {error}"
         );
@@ -2496,7 +2496,20 @@ fn malformed_user_config_names_the_field_for_provider_commands() {
         .output()
         .expect("doctor");
     let report: serde_json::Value = serde_json::from_slice(&doctor.stdout).expect("doctor report");
-    assert!(report.to_string().contains("unknown field `model`"));
+    assert!(
+        report.to_string().contains("expected a boolean"),
+        "{report}"
+    );
+
+    // An unknown key costs only itself, and doctor names it.
+    rune_core::paths::write_private(&path, "model = 'wrong-key'\n").expect("config");
+    let doctor = config_mutation_command(root)
+        .args(["doctor", "--json"])
+        .output()
+        .expect("doctor");
+    let report = String::from_utf8_lossy(&doctor.stdout);
+    assert!(report.contains("unknown key model"), "{report}");
+    assert!(report.contains("did you mean models?"), "{report}");
 }
 
 #[test]
@@ -2579,4 +2592,156 @@ fn trace_flag_writes_pairs_for_an_ask_run() {
     let response = std::fs::read_to_string(trace.join("0001-response.txt")).expect("response");
     assert!(response.starts_with("status: 200\n\n"), "{response}");
     assert!(response.contains("read_file"), "{response}");
+}
+
+/// Runs `rune config ...` against one user file.
+fn config_command(
+    root: &camino::Utf8Path,
+    path: &camino::Utf8Path,
+    args: &[&str],
+) -> std::process::Output {
+    config_mutation_command(root)
+        .arg("config")
+        .args(args)
+        .env("RUNE_CONFIG", path)
+        .output()
+        .expect("config")
+}
+
+fn private_file(path: &camino::Utf8Path, text: &str) {
+    rune_core::paths::create_dir_private(path.parent().expect("parent")).expect("parent");
+    rune_core::paths::write_private(path, text).expect("write");
+}
+
+#[test]
+fn config_set_edits_one_line_and_keeps_the_rest() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let root = camino::Utf8Path::from_path(dir.path()).expect("utf8");
+    let path = root.join("custom/config.toml");
+    let before = "# my settings\n\ntheme   =   \"light\"   # old\n  effort = 'low'\n\n[pre_tool_hook]\nname = \"guard\"\nargv = [\"true\"]\n";
+    private_file(&path, before);
+    let out = config_command(root, &path, &["set", "theme", "dark"]);
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        format!("set theme = \"dark\" in {path}\n")
+    );
+    let after = std::fs::read_to_string(&path).expect("read");
+    assert_eq!(
+        after,
+        before.replace("theme   =   \"light\"   # old", "theme = \"dark\"")
+    );
+
+    // A value of the wrong type is refused and the file is left alone.
+    let refused = config_command(root, &path, &["set", "offline", "maybe"]);
+    assert!(!refused.status.success(), "{refused:?}");
+    assert_eq!(std::fs::read_to_string(&path).expect("read"), after);
+
+    let table = config_command(root, &path, &["set", "models", "x"]);
+    assert!(!table.status.success());
+    assert!(
+        String::from_utf8_lossy(&table.stderr)
+            .contains("models is not a single value; use rune config edit"),
+        "{table:?}"
+    );
+
+    let typo = config_command(root, &path, &["set", "permision_mode", "ask"]);
+    assert_eq!(typo.status.code(), Some(2), "{typo:?}");
+    let stderr = String::from_utf8_lossy(&typo.stderr);
+    assert!(
+        stderr.contains("unknown setting permision_mode"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("did you mean permission_mode?"), "{stderr}");
+    assert_eq!(std::fs::read_to_string(&path).expect("read"), after);
+}
+
+#[test]
+fn config_set_inserts_before_the_first_table() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let root = camino::Utf8Path::from_path(dir.path()).expect("utf8");
+    let path = root.join("custom/config.toml");
+    private_file(
+        &path,
+        "# top\neffort = \"low\"\n\n[pre_tool_hook]\nname = \"guard\"\nargv = [\"true\"]\n",
+    );
+    let out = config_command(root, &path, &["set", "offline", "yes"]);
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("read"),
+        "# top\neffort = \"low\"\noffline = true\n\n[pre_tool_hook]\nname = \"guard\"\nargv = [\"true\"]\n"
+    );
+
+    // A file of comments only gets the line at the top.
+    let comments = root.join("custom/comments.toml");
+    private_file(&comments, "# one\n# two\n");
+    let out = config_command(root, &comments, &["set", "theme", "dark"]);
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(
+        std::fs::read_to_string(&comments).expect("read"),
+        "theme = \"dark\"\n# one\n# two\n"
+    );
+}
+
+#[test]
+fn config_unset_removes_the_line() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let root = camino::Utf8Path::from_path(dir.path()).expect("utf8");
+    let path = root.join("custom/config.toml");
+    private_file(&path, "# keep\ntheme = \"dark\"\neffort = \"low\"\n");
+    let out = config_command(root, &path, &["unset", "theme"]);
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("read"),
+        "# keep\neffort = \"low\"\n"
+    );
+    let again = config_command(root, &path, &["unset", "theme"]);
+    assert!(!again.status.success());
+    assert!(
+        String::from_utf8_lossy(&again.stderr).contains(&format!("theme is not set in {path}")),
+        "{again:?}"
+    );
+}
+
+#[test]
+fn config_get_prints_value_and_source_json() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let root = camino::Utf8Path::from_path(dir.path()).expect("utf8");
+    let path = root.join("custom/config.toml");
+    private_file(&path, "theme = \"dark\"\nbogus_key = 1\n");
+    let text = config_command(root, &path, &["get", "theme"]);
+    assert!(text.status.success(), "{text:?}");
+    assert_eq!(String::from_utf8_lossy(&text.stdout), "dark\n");
+    let json = config_command(root, &path, &["get", "theme", "--json"]);
+    assert!(json.status.success(), "{json:?}");
+    let value: serde_json::Value = serde_json::from_slice(&json.stdout).expect("json");
+    assert_eq!(
+        value,
+        serde_json::json!({"key": "theme", "value": "dark", "source": "user"})
+    );
+    let unknown = config_command(root, &path, &["get", "them"]);
+    assert_eq!(unknown.status.code(), Some(2), "{unknown:?}");
+    let stderr = String::from_utf8_lossy(&unknown.stderr);
+    assert!(stderr.contains("unknown setting them"), "{stderr}");
+    assert!(stderr.contains("did you mean theme?"), "{stderr}");
+}
+
+#[test]
+fn config_path_honours_rune_config() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let root = camino::Utf8Path::from_path(dir.path()).expect("utf8");
+    let path = root.join("elsewhere/settings.toml");
+    let text = config_command(root, &path, &["path"]);
+    assert!(text.status.success(), "{text:?}");
+    assert_eq!(String::from_utf8_lossy(&text.stdout), format!("{path}\n"));
+    let json = config_command(root, &path, &["path", "--json"]);
+    assert!(json.status.success(), "{json:?}");
+    let value: serde_json::Value = serde_json::from_slice(&json.stdout).expect("json");
+    assert_eq!(value["path"], path.as_str());
+    assert!(
+        value["project"]
+            .as_str()
+            .is_some_and(|project| project.ends_with(".rune.toml")),
+        "{value}"
+    );
 }

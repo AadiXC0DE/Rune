@@ -145,6 +145,8 @@ pub enum Unit {
     Count,
     /// Hundredths of a US dollar.
     Cents,
+    /// A percentage, 0 to 100.
+    Percent,
 }
 
 impl Unit {
@@ -156,6 +158,7 @@ impl Unit {
             Self::Millis => "ms",
             Self::Count => "items",
             Self::Cents => "cents",
+            Self::Percent => "percent",
         }
     }
 }
@@ -523,7 +526,6 @@ impl LimitName {
             | Self::SubagentChildren
             | Self::McpRestartLimit
             | Self::ReviewHoldsPerTurn
-            | Self::CompactionTriggerPercent
             | Self::ContextCapTokens
             | Self::CompactionKeepTokens
             | Self::WebFetchRedirects
@@ -531,10 +533,30 @@ impl LimitName {
             | Self::VisionBatchImages
             | Self::AdditionalDirectories
             | Self::SteeringQueueDepth
-            | Self::MaxAgentSteps => Unit::Count,
-            Self::ReadFileLines => Unit::Count,
+            | Self::MaxAgentSteps
+            | Self::ReadFileLines
+            | Self::ListEntries
+            | Self::ProviderMaxAttempts => Unit::Count,
+            Self::CompactionTriggerPercent => Unit::Percent,
             Self::SessionSpendCents => Unit::Cents,
-            _ => Unit::Bytes,
+            Self::MaxToolResultBytes
+            | Self::MaxTurnResultBytes
+            | Self::SkillCatalogBytes
+            | Self::SkillDescriptionBytes
+            | Self::SkillFileBytes
+            | Self::McpDescriptionBytes
+            | Self::McpSearchResultBytes
+            | Self::McpServerInstructionsBytes
+            | Self::McpSelectedSchemaBytes
+            | Self::ProjectInstructionFileBytes
+            | Self::ProjectInstructionsTotalBytes
+            | Self::RepositoryMapBytes
+            | Self::ImageAdapterOutputBytes
+            | Self::CommandOutputBytes
+            | Self::ReadFileLineBytes
+            | Self::ReviewContextBytes
+            | Self::WebFetchBytes
+            | Self::PromptHistoryBytes => Unit::Bytes,
         }
     }
 
@@ -872,6 +894,22 @@ pub struct LimitDescription {
 mod tests {
     use super::*;
     use crate::config::Layer;
+
+    #[test]
+    fn non_byte_limits_have_non_byte_units() {
+        for name in LimitName::all() {
+            let key = name.as_str();
+            let unit = name.unit();
+            if key.ends_with("_bytes") {
+                assert_eq!(unit, Unit::Bytes, "{key}");
+            } else {
+                assert_ne!(unit, Unit::Bytes, "{key}");
+            }
+            if key.ends_with("_percent") {
+                assert_eq!(unit, Unit::Percent, "{key}");
+            }
+        }
+    }
 
     #[test]
     fn every_limit_has_a_distinct_key() {

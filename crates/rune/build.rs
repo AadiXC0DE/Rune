@@ -21,6 +21,7 @@ fn main() {
 
     println!("cargo:rustc-env=RUNE_COMMIT={commit}");
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-env-changed=RUNE_CHANNEL");
 
     // Watch the branch, not the pointer to it. A detached checkout has no ref to
     // watch, so HEAD itself is the fallback.
