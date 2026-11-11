@@ -23,9 +23,9 @@ pub mod tree;
 pub mod usage;
 
 pub use event::{
-    EventFrame, LogRead, LogSalvage, LogStop, MAX_FRAME_BYTES, MAX_LOG_BYTES, NotePlacement,
-    SCHEMA_VERSION, SessionEvent, check_log_capacity, read_log, read_log_limited, salvage_log,
-    salvage_log_limited,
+    Boundary, EventFrame, LogRead, LogSalvage, LogStop, MAX_FRAME_BYTES, MAX_LOG_BYTES,
+    NotePlacement, SCHEMA_VERSION, SessionEvent, check_log_capacity, read_log, read_log_limited,
+    salvage_log, salvage_log_limited,
 };
 pub use recovery::{RecoveryDefect, RecoveryReport, recover};
 pub use report::{Breakdown, Period, Summary, TokenTotals, render_text, summarize, to_json};

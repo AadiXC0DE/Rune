@@ -209,6 +209,10 @@ pub const RUN: &[CommandSpec] = &[
                 "Stream bounded JSONL events (takes precedence over --json); the records are listed in the README under Headless runs.",
             ),
             flag("--no-save", "Do not create a session."),
+            flag(
+                "--checkpoints",
+                "Snapshot the workspace before and after the turn so it can be restored with rune session restore.",
+            ),
             option(
                 "--image",
                 "path",
