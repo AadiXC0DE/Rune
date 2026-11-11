@@ -270,6 +270,8 @@ struct SessionHost {
     pending_updates: Mutex<Vec<PendingUpdate>>,
     /// What the instructions were built from, to notice when it changes.
     watched: Mutex<context_watch::Watched>,
+    /// Instruction files below the workspace root, sent on first touch.
+    nested_rules: Mutex<Vec<rune_context::InstructionFile>>,
     /// The instructions with the repository map, fixed until compaction.
     mapped: prompt::MappedInstructions,
     tools: Vec<ToolSpec>,
@@ -503,15 +505,28 @@ impl Host for SessionHost {
 
     fn step_appendix(
         &self,
-        _history: &History,
-        _results: &[turn::CallResult],
+        history: &History,
+        results: &[turn::CallResult],
     ) -> Option<turn::Appendix> {
         self.watch_instruction_files();
         let lines = self.take_updates();
-        (!lines.is_empty()).then(|| turn::Appendix {
-            text: turn::context_update(&lines),
-            keys: Vec::new(),
-        })
+        let rules = context_watch::scoped_rules(
+            history,
+            results,
+            &lock_value(&self.nested_rules),
+            self.context.workspace(),
+            &self.limits,
+        );
+        let mut appendix = rules.unwrap_or_default();
+        if !lines.is_empty() {
+            let update = turn::context_update(&lines);
+            appendix.text = if appendix.text.is_empty() {
+                update
+            } else {
+                format!("{update}\n{}", appendix.text)
+            };
+        }
+        (!appendix.text.is_empty()).then_some(appendix)
     }
 
     fn goal_judge(&self) -> Option<String> {
@@ -1212,11 +1227,11 @@ impl SessionHost {
             return;
         };
         let workspace = self.context.workspace().to_owned();
-        let (text, stable_len) =
-            prompt::base_instructions_split(&workspace, &paths.config_root, &self.limits);
-        *lock_value(&self.instructions) = text;
+        let base = prompt::base_prompt(&workspace, &paths.config_root, &self.limits);
+        *lock_value(&self.instructions) = base.instructions;
         self.stable_instructions_len
-            .store(stable_len, std::sync::atomic::Ordering::Relaxed);
+            .store(base.stable_len, std::sync::atomic::Ordering::Relaxed);
+        *lock_value(&self.nested_rules) = base.nested;
         *lock_value(&self.watched) = context_watch::Watched::of(&workspace, &paths.config_root);
         lock_value(&self.pending_updates).retain(|update| update.kind == UpdateKind::Other);
     }
@@ -2378,7 +2393,8 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
     // is a guess, and deriving from it would shrink the catalog for every model
     // that states no window rather than keeping the documented fallback.
     adopt_skill_catalog_budget(&mut limits, config.settings.context_window);
-    let prompt = build_prompt(&config.workspace, &config.paths.config_root, &limits);
+    let mut prompt = build_prompt(&config.workspace, &config.paths.config_root, &limits);
+    let nested_rules = std::mem::take(&mut prompt.nested);
     let connection =
         crate::mcp::connect_interactive(&config.settings, &config.paths, &config.workspace)?;
     let (mcp, mcp_warnings) = match connection {
@@ -2492,6 +2508,7 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
             &config.workspace,
             &config.paths.config_root,
         )),
+        nested_rules: Mutex::new(nested_rules),
         mapped: prompt::MappedInstructions::default(),
         tools,
         rules: Mutex::new(config.rules),
@@ -6947,11 +6964,11 @@ fn render_entries(entries: &[Entry], host: &SessionHost) -> Vec<String> {
 
 /// Builds the prompt for a session.
 fn build_prompt(workspace: &Utf8Path, config_root: &Utf8Path, limits: &BudgetSet) -> Prompt {
-    let (instructions, stable_len) =
-        prompt::base_instructions_split(workspace, config_root, limits);
+    let base = prompt::base_prompt(workspace, config_root, limits);
     Prompt {
-        instructions,
-        stable_len,
+        instructions: base.instructions,
+        stable_len: base.stable_len,
+        nested: base.nested,
         included: Vec::new(),
         omissions: Vec::new(),
     }
@@ -12537,6 +12554,7 @@ mod tests {
             frozen_objective: Mutex::new(FrozenObjective::Unread),
             pending_updates: Mutex::new(Vec::new()),
             watched: Mutex::new(context_watch::Watched::default()),
+            nested_rules: Mutex::new(Vec::new()),
             tools: Vec::new(),
             rules: Mutex::new(crate::permissions::validated(&Settings::default()).expect("rules")),
             mode: Mutex::new(PermissionMode::Auto),

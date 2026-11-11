@@ -68,6 +68,9 @@ pub struct Prompt {
     pub instructions: String,
     /// Bytes of `instructions` that are the same in every workspace.
     pub stable_len: usize,
+    /// Instruction files below the workspace root, left out of `instructions`
+    /// and sent when their directory is first touched.
+    pub nested: Vec<InstructionFile>,
     /// Sections that contributed.
     pub included: Vec<IncludedSection>,
     /// Sections that were shortened or dropped.
@@ -222,6 +225,7 @@ pub fn assemble(inputs: &Inputs<'_>, limits: &BudgetSet) -> Result<Prompt> {
     Ok(Prompt {
         instructions,
         stable_len,
+        nested: Vec::new(),
         included,
         omissions,
     })
@@ -398,9 +402,10 @@ fn instructions_under(
     limits: &BudgetSet,
 ) -> Prompt {
     let skills = crate::skills::discover(workspace, home, config_root).unwrap_or_default();
-    let project = crate::instructions::Options::new(workspace, home, config_root)
+    let discovery = crate::instructions::Options::new(workspace, home, config_root)
         .discover()
         .unwrap_or_default();
+    let project = discovery.upfront;
     let override_text = read_override(config_root);
     let system = override_text.as_deref().unwrap_or(SYSTEM_PROMPT);
     let environment = environment(workspace);
@@ -412,15 +417,18 @@ fn instructions_under(
         host_instructions: environment.as_deref(),
         project: &project,
     };
-    assemble(&inputs, limits).unwrap_or_else(|_| Prompt {
+    let mut prompt = assemble(&inputs, limits).unwrap_or_else(|_| Prompt {
         instructions: system.to_owned(),
         stable_len: 0,
+        nested: Vec::new(),
         included: vec![IncludedSection {
             section: Section::System,
             bytes: system.len(),
         }],
         omissions: Vec::new(),
-    })
+    });
+    prompt.nested = discovery.nested;
+    prompt
 }
 
 /// Describes the machine a command will run on, in one line.

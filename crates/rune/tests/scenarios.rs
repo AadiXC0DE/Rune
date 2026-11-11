@@ -46,6 +46,7 @@ const SCENARIOS: &[&str] = &[
     "stall_same_failure",
     "stall_same_file",
     "checkpoint_same_prefix",
+    "nested_rules",
     "goal_judge_continue",
     "goal_judge_same_reason",
     "goal_without_judge",
@@ -122,6 +123,13 @@ fn the_tool_list_is_byte_identical_across_runs() {
     assert_eq!(first.len(), 4);
     assert!(first.iter().all(|list| *list == first[0]));
     assert_eq!(first, second);
+}
+
+#[test]
+fn nested_rules() {
+    let report = run_scenario("nested_rules");
+    let third = &report.requests[2].body;
+    assert_eq!(third.matches("Use tabs in a.").count(), 1, "{third}");
 }
 
 #[test]

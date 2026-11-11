@@ -740,6 +740,8 @@ struct AskHost<'a> {
     instructions: String,
     /// Leading bytes of the instructions that are the same in every workspace.
     stable_instructions_len: usize,
+    /// Instruction files below the workspace root, sent on first touch.
+    nested_rules: Vec<rune_context::InstructionFile>,
     /// The tools offered, fixed for the run so the prefix never moves.
     tools: Vec<ToolSpec>,
     /// The instructions with the repository map, fixed for the run.
@@ -944,6 +946,20 @@ impl Host for AskHost<'_> {
 
     fn stable_instructions_len(&self) -> usize {
         self.stable_instructions_len
+    }
+
+    fn step_appendix(
+        &self,
+        history: &History,
+        results: &[turn::CallResult],
+    ) -> Option<turn::Appendix> {
+        crate::context_watch::scoped_rules(
+            history,
+            results,
+            &self.nested_rules,
+            self.context.workspace(),
+            &self.settings.limits,
+        )
     }
 
     fn instruction_sizes(&self) -> rune_agent::tokens::InstructionSizes {
@@ -1545,8 +1561,11 @@ pub fn run(
         &settings.limits,
     );
     let instruction_sizes = instruction_sizes(&base_prompt);
-    let (instructions, stable_instructions_len) =
-        (base_prompt.instructions, base_prompt.stable_len);
+    let (instructions, stable_instructions_len, nested_rules) = (
+        base_prompt.instructions,
+        base_prompt.stable_len,
+        base_prompt.nested,
+    );
     let mut tools = inventory::advertisement(&registry);
     if let Some(client) = &mcp {
         crate::mcp::append_tools(&mut tools, client)?;
@@ -1567,6 +1586,7 @@ pub fn run(
         paths,
         instructions,
         stable_instructions_len,
+        nested_rules,
         tools,
         mapped: rune_context::prompt::MappedInstructions::default(),
         instruction_sizes,

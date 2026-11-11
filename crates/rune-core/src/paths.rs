@@ -58,6 +58,8 @@ pub mod names {
     pub const TRACE_FILE: &str = "trace.log";
     /// Project instructions file name.
     pub const INSTRUCTIONS_FILE: &str = "AGENTS.md";
+    /// Instruction file read in a directory that has no `AGENTS.md`.
+    pub const FALLBACK_INSTRUCTIONS_FILE: &str = "CLAUDE.md";
     /// User system prompt override in the config root.
     pub const SYSTEM_PROMPT_FILE: &str = "SYSTEM.md";
     /// Project configuration file name.
