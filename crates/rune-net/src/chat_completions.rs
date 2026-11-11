@@ -12,7 +12,7 @@ use crate::compat::{
     CacheMarkers, EmptyContent, Family, ReasoningReplay, ThinkingFormat, shape_call_id,
 };
 use crate::message::{ContentPart, Message, Role};
-use crate::provider::{Provider, RequestPlan};
+use crate::provider::{MarkerPolicy, Provider, RequestPlan};
 use crate::stream::{
     FinishReason, Limit, StreamReducer, Usage, incomplete_stream, protocol_violation,
     stream_failure,
@@ -90,7 +90,10 @@ impl Provider for ChatCompletions {
             }));
         }
 
+        // Wire messages before the last plan message's, for a shared-prefix request.
+        let mut shared = 0;
         for (index, message) in plan.messages.iter().enumerate() {
+            shared = messages.len();
             if message.role == Role::Tool {
                 // One tool message can carry a whole batch of results, because
                 // the history groups them, so it expands to one wire message per
@@ -211,11 +214,17 @@ impl Provider for ChatCompletions {
         }
 
         if compat.cache_control == CacheMarkers::Anthropic
+            && plan.cache_markers != MarkerPolicy::None
             && let Some(messages) = body
                 .get_mut("messages")
                 .and_then(serde_json::Value::as_array_mut)
         {
-            mark_cache_breakpoints(messages, !plan.instructions.is_empty());
+            let marked = if plan.cache_markers == MarkerPolicy::SharedPrefix {
+                &mut messages[..shared]
+            } else {
+                &mut messages[..]
+            };
+            mark_cache_breakpoints(marked, !plan.instructions.is_empty());
         }
 
         Ok(serde_json::Value::Object(body))

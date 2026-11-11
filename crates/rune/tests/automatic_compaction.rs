@@ -71,9 +71,18 @@ fn fixture_turns_compact_before_the_next_cli_model_request() {
                 continue;
             }
             let request: Value = serde_json::from_slice(&bytes).expect("request JSON");
-            let summary = request["messages"][0]["content"]
-                .as_str()
-                .is_some_and(|text| {
+            // The instruction is the system text of a standalone summary
+            // request, or the last user message of one that shares the prefix.
+            let messages = request["messages"].as_array().expect("messages");
+            let summary = [messages.first(), messages.last()]
+                .into_iter()
+                .flatten()
+                .filter_map(|message| {
+                    message["content"]
+                        .as_str()
+                        .or_else(|| message["content"][0]["text"].as_str())
+                })
+                .any(|text| {
                     text.starts_with(rune_agent::compaction::CHECKPOINT_OPENING)
                         || text.starts_with(rune_agent::compaction::CHECKPOINT_UPDATE_OPENING)
                 });

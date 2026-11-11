@@ -1578,6 +1578,49 @@ fn request_origin(host: &dyn Host) -> String {
     format!("{}:{}", host.dialect().name(), host.model())
 }
 
+/// Builds the next request from `history` as the loop sends it, before the
+/// host prepares it.
+pub(crate) fn request_plan(host: &dyn Host, history: &mut History) -> RequestPlan {
+    let mut plan = RequestPlan::new(host.model());
+    plan.instructions = host.instructions();
+    plan.messages = history.to_messages();
+    (plan.compat, plan.traits) = host.compat(&plan.model);
+    plan.origin = request_origin(host);
+    plan.tools = host.tools();
+    plan.tool_choice = if plan.tools.is_empty() {
+        ToolChoice::None
+    } else {
+        ToolChoice::Auto
+    };
+    plan.parallel_tool_calls = host.limits().get(LimitName::ParallelToolCalls).value() != Some(1);
+    plan.effort = host.effort();
+    let temperature = host.temperature();
+    if rune_net::compat::accepts_sampling(&plan.traits, plan.effort, &plan.compat) {
+        plan.sampling = plan.traits.sampling;
+        if temperature.is_some() {
+            plan.sampling.temperature = temperature;
+        }
+    } else if temperature.is_some() && history.notice_temperature_once() {
+        host.emit(Event::Notice {
+            text: format!(
+                "temperature is not sent to {}: it does not accept one",
+                plan.model
+            ),
+        });
+    }
+    if host.dialect().capabilities().requires_output_ceiling {
+        plan.max_output_tokens = host
+            .max_output_tokens()
+            .map(|known| known.min(MAX_REQUESTED_OUTPUT_TOKENS));
+    }
+    plan.fast_mode = host.fast_mode();
+    plan.provider_order = host.provider_order();
+    plan.provider_strict = host.provider_strict();
+    plan.cache_key = host.cache_key();
+    plan.reasoning_summary = !history.reasoning_summary_refused();
+    plan
+}
+
 /// Streams a request, retrying a transient failure within a bounded budget.
 ///
 /// Applies queued steering before rebuilding a retry request. Returns the
@@ -1616,47 +1659,10 @@ fn stream_with_retry(
         }
         attempt = attempt.saturating_add(1);
 
-        let mut plan = RequestPlan::new(host.model());
-        plan.instructions = host.instructions();
-        plan.messages = history.to_messages();
-        (plan.compat, plan.traits) = host.compat(&plan.model);
-        plan.origin = request_origin(host);
-        plan.tools = host.tools();
-        plan.tool_choice = if plan.tools.is_empty() {
-            ToolChoice::None
-        } else {
-            ToolChoice::Auto
-        };
+        let mut plan = request_plan(host, history);
         if last_step {
             plan.tool_choice = ToolChoice::None;
         }
-        plan.parallel_tool_calls =
-            host.limits().get(LimitName::ParallelToolCalls).value() != Some(1);
-        plan.effort = host.effort();
-        let temperature = host.temperature();
-        if rune_net::compat::accepts_sampling(&plan.traits, plan.effort, &plan.compat) {
-            plan.sampling = plan.traits.sampling;
-            if temperature.is_some() {
-                plan.sampling.temperature = temperature;
-            }
-        } else if temperature.is_some() && history.notice_temperature_once() {
-            host.emit(Event::Notice {
-                text: format!(
-                    "temperature is not sent to {}: it does not accept one",
-                    plan.model
-                ),
-            });
-        }
-        if host.dialect().capabilities().requires_output_ceiling {
-            plan.max_output_tokens = host
-                .max_output_tokens()
-                .map(|known| known.min(MAX_REQUESTED_OUTPUT_TOKENS));
-        }
-        plan.fast_mode = host.fast_mode();
-        plan.provider_order = host.provider_order();
-        plan.provider_strict = host.provider_strict();
-        plan.cache_key = host.cache_key();
-        plan.reasoning_summary = !history.reasoning_summary_refused();
         host.prepare_request(history, &mut plan, client)?;
         let encoded = host.take_encoded_request();
         cancellation.check()?;

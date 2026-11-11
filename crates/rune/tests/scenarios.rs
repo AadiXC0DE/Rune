@@ -43,10 +43,11 @@ const SCENARIOS: &[&str] = &[
     "deepseek_thinking_tools",
     "stall_same_failure",
     "stall_same_file",
+    "checkpoint_same_prefix",
 ];
 
 /// Scenarios built in Rust, which have no file.
-const BUILT_IN: &[&str] = &["long_150_steps", "prune_long_run"];
+const BUILT_IN: &[&str] = &["long_150_steps", "prune_long_run", "checkpoint_same_prefix"];
 
 fn directory() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/scenarios")
@@ -715,6 +716,111 @@ fn prune_long_run() {
         "prune_long_run failed:\n{}\nstderr:\n{}",
         failures.join("\n"),
         report.stderr
+    );
+}
+
+#[test]
+fn checkpoint_same_prefix() {
+    // A ceiling of 6,400 tokens (10 percent of 64,000) with nothing kept
+    // verbatim. Five reads of 3,000 bytes put request 6 over it, so request 6
+    // is the summarizer's: the conversation so far plus one instruction.
+    let file = format!(
+        "{}{}\n",
+        format!("{}\n", "x".repeat(79)).repeat(37),
+        "y".repeat(39)
+    );
+    let names = ["a", "b", "c", "d", "e"];
+    let workspace = names
+        .iter()
+        .map(|name| (format!("{name}.txt"), file.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let mut turns: Vec<Turn> = names
+        .iter()
+        .enumerate()
+        .map(|(n, name)| Turn {
+            tool_calls: vec![ScriptedCall {
+                id: format!("call_{}", n + 1),
+                name: "read_file".to_owned(),
+                arguments: serde_json::json!({"path": format!("{name}.txt")}),
+            }],
+            ..Turn::default()
+        })
+        .collect();
+    let checkpoint = [
+        "## Goal",
+        "## Constraints",
+        "## Decisions",
+        "## State",
+        "### Done",
+        "### In progress",
+        "### Blocked",
+        "## Next steps",
+        "## Files that matter",
+        "## Facts to keep",
+    ]
+    .iter()
+    .map(|heading| format!("{heading}\n- read a.txt to e.txt, one at a time"))
+    .collect::<Vec<_>>()
+    .join("\n");
+    turns.push(Turn {
+        text: Some(checkpoint),
+        match_text: Some("Write a checkpoint of the conversation above".to_owned()),
+        ..Turn::default()
+    });
+    turns.push(Turn {
+        text: Some("Done.".to_owned()),
+        ..Turn::default()
+    });
+    let run = Scenario {
+        name: "checkpoint_same_prefix".to_owned(),
+        prompt: "Read a.txt, b.txt, c.txt, d.txt and e.txt, one at a time.".to_owned(),
+        workspace,
+        global_args: Vec::new(),
+        ask_args: vec!["--json".to_owned(), "--no-save".to_owned()],
+        env: BTreeMap::from([
+            ("RUNE_CONTEXT_WINDOW".to_owned(), "64000".to_owned()),
+            (
+                "RUNE_LIMITS".to_owned(),
+                "compaction_trigger_percent=10,compaction_keep_tokens=0".to_owned(),
+            ),
+        ]),
+        provider: None,
+        user_config: None,
+        timeout_s: 120,
+        turns,
+        expect: Expect {
+            exit_code: Some(0),
+            request_contains: vec![
+                scenario::RequestContains {
+                    request: 6,
+                    text: "Write a checkpoint of the conversation above".to_owned(),
+                },
+                scenario::RequestContains {
+                    request: 6,
+                    text: "\"tool_choice\":\"none\"".to_owned(),
+                },
+                scenario::RequestContains {
+                    request: 7,
+                    text: "<conversation-checkpoint>".to_owned(),
+                },
+            ],
+            ..Expect::default()
+        },
+    };
+    let report = scenario::run(Path::new(env!("CARGO_BIN_EXE_rune")), &run);
+    let failures = scenario::check(&run, &report);
+    assert!(
+        failures.is_empty(),
+        "checkpoint_same_prefix failed:\n{}\nstderr:\n{}",
+        failures.join("\n"),
+        report.stderr
+    );
+    let summarizer = &report.requests[5];
+    assert!(
+        summarizer.cached_tokens * 2 >= summarizer.prompt_tokens,
+        "the summarizer missed the cached prefix: {} of {} tokens cached",
+        summarizer.cached_tokens,
+        summarizer.prompt_tokens
     );
 }
 

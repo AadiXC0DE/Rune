@@ -12,7 +12,7 @@ use rune_core::id::ToolCallId;
 
 use crate::compat::{CallIdShape, ClaudeThinking, shape_call_id};
 use crate::message::{ContentPart, Message, Role};
-use crate::provider::{Provider, RequestPlan, ToolChoice};
+use crate::provider::{MarkerPolicy, Provider, RequestPlan, ToolChoice};
 use crate::stream::{
     FinishReason, Limit, StreamReducer, Usage, incomplete_stream, protocol_violation,
     stream_failure,
@@ -86,9 +86,14 @@ impl Provider for Anthropic {
 
     fn build_request(&self, plan: &RequestPlan) -> Result<serde_json::Value> {
         let mut messages: Vec<serde_json::Value> = Vec::new();
-
+        // Blocks the last plan message adds, which a shared-prefix request leaves unmarked.
+        let mut newest_blocks = 0;
         for message in &plan.messages {
             let encoded = encode_message(message, plan)?;
+            newest_blocks = encoded
+                .get("content")
+                .and_then(serde_json::Value::as_array)
+                .map_or(usize::MAX, Vec::len);
             merge_adjacent(&mut messages, encoded);
         }
 
@@ -160,9 +165,11 @@ impl Provider for Anthropic {
                 serde_json::json!([{
                     "type": "text",
                     "text": plan.instructions,
-                    "cache_control": cache_control(),
                 }]),
             );
+            if plan.cache_markers != MarkerPolicy::None {
+                body["system"][0]["cache_control"] = cache_control();
+            }
         }
 
         if plan.has_tools() {
@@ -195,7 +202,7 @@ impl Provider for Anthropic {
             }
         }
 
-        mark_cache_breakpoints(&mut body);
+        mark_cache_breakpoints(&mut body, plan.cache_markers, newest_blocks);
         Ok(serde_json::Value::Object(body))
     }
 }
@@ -417,7 +424,22 @@ fn cache_control() -> serde_json::Value {
 /// the next request reads back before adding its own. That is three of the
 /// four markers a request may carry. A thinking block or an empty text block
 /// cannot hold one, so the newest block that can is used.
-fn mark_cache_breakpoints(body: &mut serde_json::Map<String, serde_json::Value>) {
+///
+/// Under `SharedPrefix` the conversation marker skips the `newest_blocks`
+/// blocks the last plan message added, and under `None` nothing is marked.
+fn mark_cache_breakpoints(
+    body: &mut serde_json::Map<String, serde_json::Value>,
+    policy: MarkerPolicy,
+    newest_blocks: usize,
+) {
+    if policy == MarkerPolicy::None {
+        return;
+    }
+    let skip = if policy == MarkerPolicy::SharedPrefix {
+        newest_blocks
+    } else {
+        0
+    };
     if let Some(last) = body
         .get_mut("tools")
         .and_then(serde_json::Value::as_array_mut)
@@ -426,14 +448,28 @@ fn mark_cache_breakpoints(body: &mut serde_json::Map<String, serde_json::Value>)
     {
         last.insert("cache_control".to_owned(), cache_control());
     }
-    let block = body
-        .get_mut("messages")
-        .and_then(serde_json::Value::as_array_mut)
-        .and_then(|messages| messages.last_mut())
-        .and_then(|message| message.get_mut("content"))
-        .and_then(serde_json::Value::as_array_mut)
-        .and_then(|blocks| blocks.iter_mut().rev().find(|block| can_hold_marker(block)))
-        .and_then(serde_json::Value::as_object_mut);
+    let block = if skip == 0 {
+        body.get_mut("messages")
+            .and_then(serde_json::Value::as_array_mut)
+            .and_then(|messages| messages.last_mut())
+            .and_then(|message| message.get_mut("content"))
+            .and_then(serde_json::Value::as_array_mut)
+            .and_then(|blocks| blocks.iter_mut().rev().find(|block| can_hold_marker(block)))
+    } else {
+        body.get_mut("messages")
+            .and_then(serde_json::Value::as_array_mut)
+            .and_then(|messages| {
+                messages
+                    .iter_mut()
+                    .rev()
+                    .filter_map(|message| message.get_mut("content"))
+                    .filter_map(serde_json::Value::as_array_mut)
+                    .flat_map(|blocks| blocks.iter_mut().rev())
+                    .skip(skip)
+                    .find(|block| can_hold_marker(block))
+            })
+    }
+    .and_then(serde_json::Value::as_object_mut);
     if let Some(block) = block {
         block.insert("cache_control".to_owned(), cache_control());
     }
@@ -1027,6 +1063,84 @@ mod tests {
     }
 
     #[test]
+    fn a_shared_prefix_request_marks_the_previous_tail() {
+        let ephemeral = serde_json::json!({"type": "ephemeral"});
+        let mut plan = plan_with_user("first");
+        plan.messages
+            .push(Message::assistant(vec![ContentPart::Text {
+                text: "answer".to_owned(),
+            }]));
+        plan.messages.push(Message::user("one-off"));
+        plan.tools = vec![ToolSpec {
+            name: "a".to_owned(),
+            description: "a tool".to_owned(),
+            input_schema: serde_json::json!({"type": "object"}),
+        }];
+        plan.cache_markers = MarkerPolicy::SharedPrefix;
+        let body = Anthropic.build_request(&plan).expect("build");
+        assert_eq!(body["tools"][0]["cache_control"], ephemeral);
+        assert_eq!(body["system"][0]["cache_control"], ephemeral);
+        assert_eq!(
+            body["messages"][1]["content"][0]["cache_control"],
+            ephemeral
+        );
+        assert!(
+            body["messages"][2]["content"][0]
+                .get("cache_control")
+                .is_none()
+        );
+        assert!(
+            body["messages"][0]["content"][0]
+                .get("cache_control")
+                .is_none()
+        );
+
+        // An instruction after a tool result merges into its user message;
+        // the marker stays on the result.
+        let mut plan = RequestPlan::new("m");
+        plan.messages = vec![
+            Message::user("start"),
+            Message::assistant(vec![ContentPart::ToolCall {
+                id: ToolCallId::new("toolu_1").expect("id"),
+                name: "read_file".to_owned(),
+                arguments: "{}".to_owned(),
+            }]),
+            Message {
+                role: Role::Tool,
+                parts: vec![ContentPart::ToolResult {
+                    id: ToolCallId::new("toolu_1").expect("id"),
+                    name: "read_file".to_owned(),
+                    content: "contents".to_owned(),
+                    is_error: false,
+                }],
+                replay: None,
+                origin: None,
+            },
+            Message::user("one-off"),
+        ];
+        plan.cache_markers = MarkerPolicy::SharedPrefix;
+        let body = Anthropic.build_request(&plan).expect("build");
+        let last = &body["messages"][2]["content"];
+        assert_eq!(last[0]["type"], "tool_result");
+        assert_eq!(last[0]["cache_control"], ephemeral);
+        assert!(last[1].get("cache_control").is_none());
+        assert_eq!(body.to_string().matches("cache_control").count(), 1);
+    }
+
+    #[test]
+    fn a_request_without_markers_has_none() {
+        let mut plan = plan_with_user("first");
+        plan.tools = vec![ToolSpec {
+            name: "a".to_owned(),
+            description: "a tool".to_owned(),
+            input_schema: serde_json::json!({"type": "object"}),
+        }];
+        plan.cache_markers = MarkerPolicy::None;
+        let body = Anthropic.build_request(&plan).expect("build");
+        assert!(!body.to_string().contains("cache_control"));
+    }
+
+    #[test]
     fn a_marker_skips_blocks_that_cannot_hold_one() {
         let mut body = serde_json::Map::new();
         body.insert(
@@ -1037,7 +1151,7 @@ mod tests {
                 {"type": "text", "text": ""},
             ]}]),
         );
-        mark_cache_breakpoints(&mut body);
+        mark_cache_breakpoints(&mut body, MarkerPolicy::Full, 0);
         let blocks = &body["messages"][0]["content"];
         assert!(blocks[0].get("cache_control").is_some());
         assert!(blocks[1].get("cache_control").is_none());

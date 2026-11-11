@@ -155,11 +155,10 @@ pub fn compact(
 ) -> Result<CompactionReport> {
     turn::check_objective_budget(host)?;
     let limits = host.limits();
-    let request = render_summary_request(history, plan);
-    let mut request_plan = RequestPlan::new(host.model());
-    request_plan.instructions = checkpoint_instruction(starts_with_checkpoint(history));
-    request_plan.messages = transport::one_shot_messages(&request);
-    request_plan.cache_key = host.cache_key();
+    let mut request_plan = match shared_prefix_request(history, host, &limits)? {
+        Some(shared) => shared,
+        None => standalone_request(history, plan, host),
+    };
     let first = summarize(host, client, &limits, &mut request_plan, cancelled)?;
     let mut usage = first.usage;
     let summary = if is_checkpoint_reply(&first) {
@@ -218,6 +217,102 @@ pub fn compact(
         remaining_turns: history.len(),
         usage,
     })
+}
+
+/// Output ceiling of a summarizer request.
+pub const SUMMARY_OUTPUT_TOKENS: u64 = 8_192;
+
+/// Builds the summarizer request as the next normal request plus the
+/// checkpoint instruction, so a provider with prompt caching reads the
+/// conversation from cache.
+///
+/// Returns `None` when that request would not fit the window, when the window
+/// is unknown, or when the conversation holds images, whose bytes only the
+/// host's own preparation attaches.
+fn shared_prefix_request(
+    history: &mut History,
+    host: &dyn Host,
+    limits: &BudgetSet,
+) -> Result<Option<RequestPlan>> {
+    let window = bounded_window(
+        Window(host.context_window().unwrap_or(0)),
+        history,
+        &host.model(),
+    );
+    let window = crate::tokens::effective_window(window.0, limits);
+    if window == 0 {
+        return Ok(None);
+    }
+    let update = starts_with_checkpoint(history);
+    let mut request_plan = turn::request_plan(host, history);
+    let has_image = request_plan.messages.iter().any(|message| {
+        message
+            .parts
+            .iter()
+            .any(|part| matches!(part, ContentPart::Image { .. }))
+    });
+    if has_image {
+        return Ok(None);
+    }
+    request_plan
+        .messages
+        .push(Message::user(checkpoint_instruction(update)));
+    request_plan.tool_choice = rune_net::provider::ToolChoice::None;
+    request_plan.cache_markers = rune_net::provider::MarkerPolicy::SharedPrefix;
+    request_plan.effort = summariser_effort(host, &request_plan);
+    // A manual thinking budget is clamped below the output ceiling, and a
+    // changed budget invalidates the cached messages, so it is added on top.
+    let thinking = if host.dialect().name() == rune_net::anthropic::NAME {
+        rune_net::anthropic::thinking_budget(request_plan.effort).unwrap_or(0)
+    } else {
+        0
+    };
+    request_plan.max_output_tokens = Some(SUMMARY_OUTPUT_TOKENS.saturating_add(thinking));
+    let estimate = request_estimate(
+        host.dialect(),
+        &request_plan,
+        Window(window),
+        history.anchor(),
+    )?;
+    Ok(
+        (estimate.input_tokens.saturating_add(SUMMARY_OUTPUT_TOKENS) <= window)
+            .then_some(request_plan),
+    )
+}
+
+/// Builds the summarizer request from a text rendering of the removed turns.
+fn standalone_request(history: &History, plan: &Plan, host: &dyn Host) -> RequestPlan {
+    let request = render_summary_request(history, plan);
+    let mut request_plan = RequestPlan::new(host.model());
+    request_plan.instructions = checkpoint_instruction(starts_with_checkpoint(history));
+    request_plan.messages = transport::one_shot_messages(&request);
+    request_plan.cache_key = host.cache_key();
+    request_plan
+}
+
+/// Returns the reasoning effort of a summarizer request.
+///
+/// On the Anthropic dialect the session effort is kept, because changing the
+/// thinking settings invalidates the cached messages. Elsewhere it is the
+/// lowest effort the model accepts, or `Auto` when none is listed.
+fn summariser_effort(host: &dyn Host, request_plan: &RequestPlan) -> rune_core::config::Effort {
+    use rune_core::config::Effort;
+    const ORDER: [Effort; 7] = [
+        Effort::None,
+        Effort::Minimal,
+        Effort::Low,
+        Effort::Medium,
+        Effort::High,
+        Effort::Xhigh,
+        Effort::Max,
+    ];
+    if host.dialect().name() == rune_net::anthropic::NAME {
+        return request_plan.effort;
+    }
+    ORDER
+        .into_iter()
+        .find(|effort| request_plan.traits.efforts.contains(effort))
+        .unwrap_or(Effort::Auto)
 }
 
 /// Sends one summarizer request, charging it to the objective.

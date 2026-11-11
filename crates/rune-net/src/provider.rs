@@ -82,6 +82,21 @@ pub struct RequestPlan {
     /// The dialect and model of this request, as `dialect:model`; empty when
     /// the caller does not say.
     pub origin: String,
+    /// Which cache markers a dialect that places them may add.
+    pub cache_markers: MarkerPolicy,
+}
+
+/// Which cache markers a dialect that places them may add.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum MarkerPolicy {
+    /// The stable prefix and the newest message.
+    #[default]
+    Full,
+    /// The stable prefix and the message before the newest one: a one-off request
+    /// appended to a prefix other requests share reads the cache and writes nothing new.
+    SharedPrefix,
+    /// None: a one-off request that shares no prefix.
+    None,
 }
 
 impl RequestPlan {
@@ -108,6 +123,7 @@ impl RequestPlan {
             reasoning_summary: true,
             sampling: crate::compat::Sampling::default(),
             origin: String::new(),
+            cache_markers: MarkerPolicy::Full,
         }
     }
 
@@ -504,6 +520,7 @@ mod routing_tests {
             reasoning_summary: true,
             sampling: crate::compat::Sampling::default(),
             origin: String::new(),
+            cache_markers: MarkerPolicy::Full,
         }
     }
 
