@@ -64,6 +64,8 @@ pub struct Frame<'a> {
     pub menu: &'a [String],
     /// Where the caret belongs, as a row within `prompt` and a column.
     pub caret: (u16, u16),
+    /// The style of the row that says arriving rows were left out above.
+    pub overflow_style: &'a str,
 }
 
 /// The region repainted in place at the bottom of the screen.
@@ -240,6 +242,7 @@ impl Inline {
             prompt,
             menu,
             caret,
+            overflow_style,
         } = *frame;
         // The input row is always present, even when nothing is being typed.
         // Without it the caret has no home of its own and falls back onto the
@@ -293,14 +296,23 @@ impl Inline {
         let menu_room = usize::from(self.max_rows).saturating_sub(reserved);
         let menu = &menu[..menu.len().min(menu_room)];
         let room = menu_room.saturating_sub(menu.len());
-        let visible: &[String] = if arriving.len() > room {
-            arriving
-                .get(arriving.len().saturating_sub(room)..)
-                .unwrap_or(arriving)
-        } else {
-            arriving
-        };
-        rows.extend(visible.iter().map(|row| self.clip(row)));
+        if arriving.len() > room && room > 0 {
+            // The newest rows are shown under one row that counts the rest.
+            let shown = room.saturating_sub(1);
+            let hidden = arriving.len().saturating_sub(shown);
+            let reset = if overflow_style.is_empty() {
+                ""
+            } else {
+                crate::engine::Style::RESET
+            };
+            rows.push(self.clip(&format!(
+                "{overflow_style}... {hidden} more lines above (ctrl-o shows everything){reset}"
+            )));
+            let tail = arriving.get(arriving.len().saturating_sub(shown)..);
+            rows.extend(tail.unwrap_or_default().iter().map(|row| self.clip(row)));
+        } else if arriving.len() <= room {
+            rows.extend(arriving.iter().map(|row| self.clip(row)));
+        }
 
         if let Some(activity) = activity {
             rows.push(self.clip(activity));
@@ -558,6 +570,7 @@ mod tests {
             prompt: &prompt,
             menu: &["choice".to_owned()],
             caret: (19, 9),
+            overflow_style: "",
         }))
         .expect("feed");
         assert_eq!(inline.shown.len(), 5);
@@ -671,6 +684,7 @@ mod tests {
             prompt,
             menu: &[],
             caret,
+            overflow_style: "",
         })
     }
 
@@ -690,6 +704,7 @@ mod tests {
             prompt,
             menu,
             caret,
+            overflow_style: "",
         })
     }
 
@@ -1331,6 +1346,7 @@ mod tests {
             prompt: &rows(&["> /mod"]),
             menu: &[],
             caret: (0, 6),
+            overflow_style: "",
         });
         grid.feed(&without).expect("feed");
         let before = grid.text();
@@ -1344,6 +1360,7 @@ mod tests {
             prompt: &rows(&["> /mod"]),
             menu: &rows(&["  /model", "  /models"]),
             caret: (0, 6),
+            overflow_style: "",
         });
         grid.feed(&with).expect("feed");
         let after = grid.text();
@@ -1391,6 +1408,7 @@ mod tests {
             prompt: &rows(&["> "]),
             menu: &[],
             caret: (0, 2),
+            overflow_style: "",
         });
         grid.feed(&plain).expect("feed");
         assert!(grid.text().contains('>'), "{}", grid.text());
@@ -1699,6 +1717,65 @@ mod tests {
     }
 
     #[test]
+    fn arriving_rows_that_do_not_fit_are_marked_above() {
+        let mut inline = Inline::new(80);
+        inline.set_max_rows(10);
+        let mut grid = crate::engine::Grid::new(80, 12).expect("grid");
+        let arriving: Vec<String> = (1..=30).map(|i| format!("line {i}")).collect();
+        let footer = rows(&["hints", "status"]);
+        let prompt = rows(&["> "]);
+        let bytes = inline.frame(&Frame {
+            arriving: &arriving,
+            footer: &footer,
+            prompt: &prompt,
+            caret: (0, 2),
+            ..Frame::default()
+        });
+        grid.feed(&bytes).expect("feed");
+        assert_eq!(
+            grid.row_text(0),
+            "... 24 more lines above (ctrl-o shows everything)"
+        );
+        assert_eq!(grid.row_text(1), "line 25");
+        assert_eq!(grid.row_text(6), "line 30");
+        assert_eq!(grid.row_text(7), "hints");
+        assert_eq!(grid.row_text(9), ">");
+
+        // With a style, the marker row is drawn in it and reset after.
+        let styled = String::from_utf8_lossy(&inline.frame(&Frame {
+            arriving: &arriving,
+            footer: &footer,
+            prompt: &prompt,
+            caret: (0, 2),
+            overflow_style: "\u{1b}[2m",
+            ..Frame::default()
+        }))
+        .into_owned();
+        assert!(
+            styled.contains("\u{1b}[2m... 24 more lines above (ctrl-o shows everything)\u{1b}[0m"),
+            "{styled:?}"
+        );
+
+        // Room for one row shows only the marker.
+        let mut tight = Inline::new(80);
+        tight.set_max_rows(4);
+        let mut grid = crate::engine::Grid::new(80, 6).expect("grid");
+        grid.feed(&tight.frame(&Frame {
+            arriving: &arriving,
+            footer: &footer,
+            prompt: &prompt,
+            caret: (0, 2),
+            ..Frame::default()
+        }))
+        .expect("feed");
+        assert_eq!(
+            grid.row_text(0),
+            "... 30 more lines above (ctrl-o shows everything)"
+        );
+        assert_eq!(grid.row_text(1), "hints");
+    }
+
+    #[test]
     fn a_shrinking_region_never_scrolls_the_screen() {
         // Erasing rows that are gone must not write a newline past the region's
         // last row: at the bottom of the screen that scrolls, which pushes the
@@ -1840,6 +1917,7 @@ mod tests {
                 prompt: &rows(&["> abc"]),
                 menu: &[],
                 caret,
+                overflow_style: "",
             })
         };
         let first = draw(&mut inline, (0, 2));

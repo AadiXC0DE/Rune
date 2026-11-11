@@ -760,3 +760,33 @@ fn a_streamed_answer_is_readable_from_its_first_line() {
         );
     }
 }
+
+#[test]
+fn a_tall_code_block_streams_without_growing_the_region() {
+    let stages = rows_by_stage("tall-code");
+    assert_eq!(stages.len(), 2);
+    let (_, paused) = &stages[0];
+    // Rows that left the screen are the first of the rows seen.
+    assert_eq!(occurrences(&paused[..paused.len() - 24], "CODE-001"), 1);
+    for index in 1..=80 {
+        let code = format!("CODE-{index:03}");
+        assert!(
+            occurrences(paused, &code) <= 1,
+            "{code} at the pause: {paused:?}"
+        );
+    }
+    let (_, finished) = &stages[1];
+    for index in 1..=120 {
+        let code = format!("CODE-{index:03}");
+        assert_eq!(
+            occurrences(finished, &code),
+            1,
+            "{code} at the end: {finished:?}"
+        );
+    }
+    let screen = &finished[finished.len() - 24..];
+    assert!(
+        !screen.iter().any(|row| row.contains("more lines above")),
+        "{screen:?}"
+    );
+}
